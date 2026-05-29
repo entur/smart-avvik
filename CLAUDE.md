@@ -21,3 +21,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - All SQL targets BigQuery Standard SQL; legacy SQL is not used.
 - Text fields are filtered to Norwegian (`language IS NULL OR UPPER(language) = 'NO'`) — preserve this when adding queries against SX data.
 - The two-year partition window (`_PARTITIONTIME >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR)`) is the standard lookback for training queries.
+- When generating a query, show the full SQL  to allow me to copy it. Do not run it.
