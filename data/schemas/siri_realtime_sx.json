@@ -1,0 +1,710 @@
+[
+  {
+    "mode": "NULLABLE",
+    "name": "creationTime",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "participantRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "situationNumber",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "version",
+    "type": "INTEGER"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "sourceType",
+        "type": "STRING"
+      }
+    ],
+    "mode": "NULLABLE",
+    "name": "source",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "versionedAtTime",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "progress",
+    "type": "STRING"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "startTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "endTime",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "validityPeriods",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "undefinedReason",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "severity",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "priority",
+    "type": "INTEGER"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "reportType",
+    "type": "STRING"
+  },
+  {
+    "mode": "REPEATED",
+    "name": "keywords",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "planned",
+    "type": "BOOLEAN"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "summaries",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "descriptions",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "details",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "advices",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "value",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "language",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "labels",
+        "type": "RECORD"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "uri",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "infoLinks",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "fields": [
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "operatorRef",
+                "type": "STRING"
+              },
+              {
+                "fields": [
+                  {
+                    "mode": "NULLABLE",
+                    "name": "value",
+                    "type": "STRING"
+                  },
+                  {
+                    "mode": "NULLABLE",
+                    "name": "language",
+                    "type": "STRING"
+                  }
+                ],
+                "mode": "REPEATED",
+                "name": "operatorNames",
+                "type": "RECORD"
+              }
+            ],
+            "mode": "REPEATED",
+            "name": "affectedOperators",
+            "type": "RECORD"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "networkRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "vehicleMode",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "airSubmode",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "busSubmode",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "coachSubmode",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "metroSubmode",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "railSubmode",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "tramSubmode",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "waterSubmode",
+            "type": "STRING"
+          },
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "lineRef",
+                "type": "STRING"
+              },
+              {
+                "fields": [
+                  {
+                    "mode": "NULLABLE",
+                    "name": "routeRef",
+                    "type": "STRING"
+                  },
+                  {
+                    "fields": [
+                      {
+                        "mode": "NULLABLE",
+                        "name": "affectedOnly",
+                        "type": "BOOLEAN"
+                      },
+                      {
+                        "fields": [
+                          {
+                            "mode": "NULLABLE",
+                            "name": "stopPointRef",
+                            "type": "STRING"
+                          },
+                          {
+                            "fields": [
+                              {
+                                "mode": "NULLABLE",
+                                "name": "value",
+                                "type": "STRING"
+                              },
+                              {
+                                "mode": "NULLABLE",
+                                "name": "language",
+                                "type": "STRING"
+                              }
+                            ],
+                            "mode": "REPEATED",
+                            "name": "stopPointNames",
+                            "type": "RECORD"
+                          },
+                          {
+                            "mode": "REPEATED",
+                            "name": "stopConditions",
+                            "type": "STRING"
+                          }
+                        ],
+                        "mode": "REPEATED",
+                        "name": "stopPoints",
+                        "type": "RECORD"
+                      }
+                    ],
+                    "mode": "NULLABLE",
+                    "name": "stopPoints",
+                    "type": "RECORD"
+                  },
+                  {
+                    "fields": [
+                      {
+                        "fields": [
+                          {
+                            "mode": "NULLABLE",
+                            "name": "firstQuayRef",
+                            "type": "STRING"
+                          },
+                          {
+                            "mode": "NULLABLE",
+                            "name": "lastQuayRef",
+                            "type": "STRING"
+                          }
+                        ],
+                        "mode": "NULLABLE",
+                        "name": "indirectSectionRef",
+                        "type": "RECORD"
+                      }
+                    ],
+                    "mode": "REPEATED",
+                    "name": "sections",
+                    "type": "RECORD"
+                  }
+                ],
+                "mode": "REPEATED",
+                "name": "routes",
+                "type": "RECORD"
+              },
+              {
+                "fields": [
+                  {
+                    "fields": [
+                      {
+                        "mode": "NULLABLE",
+                        "name": "firstQuayRef",
+                        "type": "STRING"
+                      },
+                      {
+                        "mode": "NULLABLE",
+                        "name": "lastQuayRef",
+                        "type": "STRING"
+                      }
+                    ],
+                    "mode": "NULLABLE",
+                    "name": "indirectSectionRef",
+                    "type": "RECORD"
+                  }
+                ],
+                "mode": "REPEATED",
+                "name": "sections",
+                "type": "RECORD"
+              }
+            ],
+            "mode": "REPEATED",
+            "name": "affectedLines",
+            "type": "RECORD"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "allLines",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "networks",
+        "type": "RECORD"
+      },
+      {
+        "fields": [
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "mobilityImpairedAccess",
+                "type": "BOOLEAN"
+              },
+              {
+                "fields": [
+                  {
+                    "mode": "NULLABLE",
+                    "name": "wheelchairAccess",
+                    "type": "STRING"
+                  },
+                  {
+                    "mode": "NULLABLE",
+                    "name": "stepFreeAccess",
+                    "type": "STRING"
+                  },
+                  {
+                    "mode": "NULLABLE",
+                    "name": "escalatorFreeAccess",
+                    "type": "STRING"
+                  },
+                  {
+                    "mode": "NULLABLE",
+                    "name": "liftFreeAccess",
+                    "type": "STRING"
+                  }
+                ],
+                "mode": "REPEATED",
+                "name": "limitations",
+                "type": "RECORD"
+              }
+            ],
+            "mode": "NULLABLE",
+            "name": "accessibilityAssessment",
+            "type": "RECORD"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "stopPlaceRef",
+            "type": "STRING"
+          },
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "value",
+                "type": "STRING"
+              },
+              {
+                "mode": "NULLABLE",
+                "name": "language",
+                "type": "STRING"
+              }
+            ],
+            "mode": "REPEATED",
+            "name": "placeNames",
+            "type": "RECORD"
+          },
+          {
+            "fields": [
+              {
+                "fields": [
+                  {
+                    "mode": "NULLABLE",
+                    "name": "componentRef",
+                    "type": "STRING"
+                  },
+                  {
+                    "mode": "NULLABLE",
+                    "name": "componentType",
+                    "type": "STRING"
+                  },
+                  {
+                    "mode": "NULLABLE",
+                    "name": "accessFeatureType",
+                    "type": "STRING"
+                  }
+                ],
+                "mode": "REPEATED",
+                "name": "components",
+                "type": "RECORD"
+              }
+            ],
+            "mode": "NULLABLE",
+            "name": "affectedComponent",
+            "type": "RECORD"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "stopPlaces",
+        "type": "RECORD"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "stopPointRef",
+            "type": "STRING"
+          },
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "value",
+                "type": "STRING"
+              },
+              {
+                "mode": "NULLABLE",
+                "name": "language",
+                "type": "STRING"
+              }
+            ],
+            "mode": "REPEATED",
+            "name": "stopPointNames",
+            "type": "RECORD"
+          },
+          {
+            "mode": "REPEATED",
+            "name": "stopConditions",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "stopPoints",
+        "type": "RECORD"
+      },
+      {
+        "fields": [
+          {
+            "mode": "REPEATED",
+            "name": "vehicleJourneyRefs",
+            "type": "STRING"
+          },
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "dataFrameRef",
+                "type": "STRING"
+              },
+              {
+                "mode": "NULLABLE",
+                "name": "datedVehicleJourneyRef",
+                "type": "STRING"
+              }
+            ],
+            "mode": "NULLABLE",
+            "name": "framedVehicleJourneyRef",
+            "type": "RECORD"
+          },
+          {
+            "mode": "REPEATED",
+            "name": "datedVehicleJourneyRefs",
+            "type": "STRING"
+          },
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "operatorRef",
+                "type": "STRING"
+              },
+              {
+                "fields": [
+                  {
+                    "mode": "NULLABLE",
+                    "name": "value",
+                    "type": "STRING"
+                  },
+                  {
+                    "mode": "NULLABLE",
+                    "name": "language",
+                    "type": "STRING"
+                  }
+                ],
+                "mode": "REPEATED",
+                "name": "operatorNames",
+                "type": "RECORD"
+              }
+            ],
+            "mode": "NULLABLE",
+            "name": "operator",
+            "type": "RECORD"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "lineRef",
+            "type": "STRING"
+          },
+          {
+            "fields": [
+              {
+                "mode": "NULLABLE",
+                "name": "routeRef",
+                "type": "STRING"
+              },
+              {
+                "fields": [
+                  {
+                    "mode": "NULLABLE",
+                    "name": "affectedOnly",
+                    "type": "BOOLEAN"
+                  },
+                  {
+                    "fields": [
+                      {
+                        "mode": "NULLABLE",
+                        "name": "stopPointRef",
+                        "type": "STRING"
+                      },
+                      {
+                        "fields": [
+                          {
+                            "mode": "NULLABLE",
+                            "name": "value",
+                            "type": "STRING"
+                          },
+                          {
+                            "mode": "NULLABLE",
+                            "name": "language",
+                            "type": "STRING"
+                          }
+                        ],
+                        "mode": "REPEATED",
+                        "name": "stopPointNames",
+                        "type": "RECORD"
+                      },
+                      {
+                        "mode": "REPEATED",
+                        "name": "stopConditions",
+                        "type": "STRING"
+                      }
+                    ],
+                    "mode": "REPEATED",
+                    "name": "stopPoints",
+                    "type": "RECORD"
+                  }
+                ],
+                "mode": "NULLABLE",
+                "name": "stopPoints",
+                "type": "RECORD"
+              },
+              {
+                "fields": [
+                  {
+                    "fields": [
+                      {
+                        "mode": "NULLABLE",
+                        "name": "firstQuayRef",
+                        "type": "STRING"
+                      },
+                      {
+                        "mode": "NULLABLE",
+                        "name": "lastQuayRef",
+                        "type": "STRING"
+                      }
+                    ],
+                    "mode": "NULLABLE",
+                    "name": "indirectSectionRef",
+                    "type": "RECORD"
+                  }
+                ],
+                "mode": "REPEATED",
+                "name": "sections",
+                "type": "RECORD"
+              }
+            ],
+            "mode": "REPEATED",
+            "name": "routes",
+            "type": "RECORD"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "originAimedDepartureTime",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "vehicleJourneys",
+        "type": "RECORD"
+      }
+    ],
+    "mode": "NULLABLE",
+    "name": "affects",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "adviceType",
+            "type": "STRING"
+          }
+        ],
+        "mode": "NULLABLE",
+        "name": "advice",
+        "type": "RECORD"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "consequences",
+    "type": "RECORD"
+  },
+  {
+    "defaultValueExpression": "CURRENT_TIMESTAMP()",
+    "mode": "NULLABLE",
+    "name": "ingestionTime",
+    "type": "TIMESTAMP"
+  }
+]

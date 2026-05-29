@@ -1,0 +1,70 @@
+[
+  {
+    "name": "trial_id",
+    "type": "INTEGER"
+  },
+  {
+    "name": "predicted_duration_minutes",
+    "type": "FLOAT"
+  },
+  {
+    "name": "category",
+    "type": "STRING"
+  },
+  {
+    "name": "creationTime",
+    "type": "STRING"
+  },
+  {
+    "name": "participantRef",
+    "type": "STRING"
+  },
+  {
+    "name": "situationNumber",
+    "type": "STRING"
+  },
+  {
+    "name": "duration_minutes",
+    "type": "INTEGER"
+  },
+  {
+    "name": "summary",
+    "type": "STRING"
+  },
+  {
+    "name": "description",
+    "type": "STRING"
+  },
+  {
+    "name": "year",
+    "type": "INTEGER"
+  },
+  {
+    "name": "month",
+    "type": "INTEGER"
+  },
+  {
+    "name": "day",
+    "type": "INTEGER"
+  },
+  {
+    "name": "dayofweek",
+    "type": "INTEGER"
+  },
+  {
+    "name": "hour",
+    "type": "INTEGER"
+  },
+  {
+    "name": "severity",
+    "type": "STRING"
+  },
+  {
+    "name": "affected",
+    "type": "STRING"
+  },
+  {
+    "name": "affected_type",
+    "type": "STRING"
+  }
+]

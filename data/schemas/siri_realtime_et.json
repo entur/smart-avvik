@@ -1,0 +1,872 @@
+[
+  {
+    "mode": "NULLABLE",
+    "name": "recordedAtTime",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "lineRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "directionRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "datedVehicleJourneyRef",
+    "type": "STRING"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "dataFrameRef",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "datedVehicleJourneyRef",
+        "type": "STRING"
+      }
+    ],
+    "mode": "NULLABLE",
+    "name": "framedVehicleJourneyRef",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "estimatedVehicleJourneyCode",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "extraJourney",
+    "type": "BOOLEAN"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "cancellation",
+    "type": "BOOLEAN"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "journeyPatternRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "REPEATED",
+    "name": "vehicleModes",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "routeRef",
+    "type": "STRING"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "publishedLineNames",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "destinationDisplayAtOrigins",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "groupOfLinesRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "externalLineRef",
+    "type": "STRING"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "originNames",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "originRef",
+    "type": "STRING"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "value",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "language",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "destinationNames",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "destinationRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "operatorRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "originAimedDepartureTime",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "destinationAimedArrivalTime",
+    "type": "STRING"
+  },
+  {
+    "mode": "REPEATED",
+    "name": "vehicleFeatureRefs",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "productCategoryRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "REPEATED",
+    "name": "serviceFeatureRefs",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "monitored",
+    "type": "BOOLEAN"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "predictionInaccurate",
+    "type": "BOOLEAN"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "dataSource",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "occupancy",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "blockRef",
+    "type": "STRING"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "vehicleJourneyRef",
+    "type": "STRING"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "dataFrameRef",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "datedVehicleJourneyRef",
+        "type": "STRING"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "additionalVehicleJourneyRef",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "vehicleRef",
+    "type": "STRING"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "stopPointRef",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "order",
+        "type": "INTEGER"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "value",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "language",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "stopPointNames",
+        "type": "RECORD"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "extraCall",
+        "type": "BOOLEAN"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "cancellation",
+        "type": "BOOLEAN"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "predictionInaccurate",
+        "type": "BOOLEAN"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "occupancy",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "requestStop",
+        "type": "BOOLEAN"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "value",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "language",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "destinationDisplays",
+        "type": "RECORD"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "aimedArrivalTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "expectedArrivalTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "actualArrivalTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "arrivalPlatformName",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "arrivalStatus",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "arrivalBoardingActivity",
+        "type": "STRING"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "aimedQuayRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "expectedQuayRef",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "arrivalStopAssignments",
+        "type": "RECORD"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "aimedDepartureTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "expectedDepartureTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "actualDepartureTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "departurePlatformName",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "departureStatus",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "departureBoardingActivity",
+        "type": "STRING"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "aimedQuayRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "expectedQuayRef",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "departureStopAssignments",
+        "type": "RECORD"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "compoundTrainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainComponentRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "entranceToVehicleRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "passengerCategory",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "occupancyLevel",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "occupancyPercentage",
+            "type": "FLOAT"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "alightingCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "boardingCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "onboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pushchairsOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "wheelchairsOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pramsOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "bicycleOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "totalNumberOfReservedSeats",
+            "type": "INTEGER"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "recordedDepartureOccupancies",
+        "type": "RECORD"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "compoundTrainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainComponentRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "entranceToVehicleRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "passengerCategory",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "totalCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "seatingCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "standingCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pushchairCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "wheelchairPlaceCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pramPlaceCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "bicycleRackCapacity",
+            "type": "INTEGER"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "recordedDepartureCapacities",
+        "type": "RECORD"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "recordedCalls",
+    "type": "RECORD"
+  },
+  {
+    "fields": [
+      {
+        "mode": "NULLABLE",
+        "name": "stopPointRef",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "order",
+        "type": "INTEGER"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "value",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "language",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "stopPointNames",
+        "type": "RECORD"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "extraCall",
+        "type": "BOOLEAN"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "cancellation",
+        "type": "BOOLEAN"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "predictionInaccurate",
+        "type": "BOOLEAN"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "occupancy",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "requestStop",
+        "type": "BOOLEAN"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "value",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "language",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "destinationDisplays",
+        "type": "RECORD"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "aimedArrivalTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "expectedArrivalTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "arrivalPlatformName",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "arrivalStatus",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "arrivalBoardingActivity",
+        "type": "STRING"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "aimedQuayRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "expectedQuayRef",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "arrivalStopAssignments",
+        "type": "RECORD"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "aimedDepartureTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "expectedDepartureTime",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "departurePlatformName",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "departureStatus",
+        "type": "STRING"
+      },
+      {
+        "mode": "NULLABLE",
+        "name": "departureBoardingActivity",
+        "type": "STRING"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "aimedQuayRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "expectedQuayRef",
+            "type": "STRING"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "departureStopAssignments",
+        "type": "RECORD"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "compoundTrainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainComponentRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "entranceToVehicleRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "passengerCategory",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "occupancyLevel",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "occupancyPercentage",
+            "type": "FLOAT"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "alightingCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "boardingCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "onboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pushchairsOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "wheelchairsOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pramsOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "bicycleOnboardCount",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "totalNumberOfReservedSeats",
+            "type": "INTEGER"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "expectedDepartureOccupancies",
+        "type": "RECORD"
+      },
+      {
+        "fields": [
+          {
+            "mode": "NULLABLE",
+            "name": "compoundTrainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "trainComponentRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "entranceToVehicleRef",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "passengerCategory",
+            "type": "STRING"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "totalCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "seatingCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "standingCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pushchairCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "wheelchairPlaceCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "pramPlaceCapacity",
+            "type": "INTEGER"
+          },
+          {
+            "mode": "NULLABLE",
+            "name": "bicycleRackCapacity",
+            "type": "INTEGER"
+          }
+        ],
+        "mode": "REPEATED",
+        "name": "expectedDepartureCapacities",
+        "type": "RECORD"
+      }
+    ],
+    "mode": "REPEATED",
+    "name": "estimatedCalls",
+    "type": "RECORD"
+  },
+  {
+    "mode": "NULLABLE",
+    "name": "isCompleteStopSequence",
+    "type": "BOOLEAN"
+  }
+]
