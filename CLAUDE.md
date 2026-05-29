@@ -13,8 +13,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Important BigQuery tables
 
-- ent-anshar-prd:realtime.siri_realtime_sx_production: SIRI Estimated Timetable, real-time updates to the planned timetable
-- ent-anshar-prd:realtime.siri_realtime_et_production: Situation Exchange, textual incident and disruption messages
+- ent-anshar-prd:realtime.siri_realtime_sx_production: SIRI-SX (Situation Exchange), textual incident and disruption messages
+- ent-anshar-prd:realtime.siri_realtime_et_production: SIRI-ET (Estimated Timetable), real-time updates to the planned timetable
 
 ## Conventions
 
