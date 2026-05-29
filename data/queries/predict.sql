@@ -17,5 +17,5 @@ FROM
         dayofweek,
         hour,
         duration_minutes
-      FROM `disruptions.training_cat2`
+      FROM `disruptions.training`
     ))
