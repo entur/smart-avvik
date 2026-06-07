@@ -1,5 +1,4 @@
-CREATE OR REPLACE TABLE `disruptions.disruptions` AS
-WITH
+. This shoudl
   -- 1. Keep only the latest snapshot of each situation = best estimate of the
   --    final/true validity window. `version` is NULL for ~73% of situations, so
   --    order primarily by versionedAtTime, falling back to version then
