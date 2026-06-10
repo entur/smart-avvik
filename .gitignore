@@ -1,3 +1,4 @@
 settings.local.json
 .ipynb_checkpoints/
 docs/kix-docs/
+.DS_Store
