@@ -21,4 +21,5 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - All SQL targets BigQuery Standard SQL; legacy SQL is not used.
 - Text fields are filtered to Norwegian (`language IS NULL OR UPPER(language) = 'NO'`) — preserve this when adding queries against SX data.
 - The two-year partition window (`_PARTITIONTIME >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR)`) is the standard lookback for training queries.
-- When generating a query, show the full SQL  to allow me to copy it. Do not run it.
+- Consider cost before running BigQuery operations. Ask for permission before running anything more expensive than $10.
+- In docs/kix-docs, references to R1, R2 etc refers to the documents docs/kix-docs/docs/Context/r1-entur-rolle-og-mandat.md, docs/kix-docs/docs/Context/r2-entur-teknisk-deep-dive.md etc.
