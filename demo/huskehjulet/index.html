@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Huskehjulet — avvikslæring over tid (E05)</title>
+<style>
+  :root {
+    --bg: #0a0e14;
+    --bg2: #0e141d;
+    --card: #131a24;
+    --card-edge: #1e2937;
+    --text: #d8dee9;
+    --muted: #7b8794;
+    --frost: #7fd1ff;
+    --frost-dim: #2a4a61;
+    --amber: #ffb454;
+    --red: #ff6b6b;
+    --green: #7ce38b;
+    --spine: #233040;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.55;
+    overflow-x: hidden;
+  }
+  section { max-width: 760px; margin: 0 auto; padding: 18vh 24px; }
+  h1 { font-size: clamp(2.6rem, 8vw, 5rem); letter-spacing: .04em; font-weight: 800; }
+  h2 { font-size: clamp(1.5rem, 4vw, 2.2rem); margin-bottom: 1rem; font-weight: 700; }
+  p.lede { font-size: 1.15rem; color: var(--muted); max-width: 38em; }
+  .accent { color: var(--frost); }
+  .reveal { opacity: 0; transform: translateY(28px); transition: opacity .7s ease, transform .7s ease; }
+  .reveal.in { opacity: 1; transform: none; }
+
+  /* hero */
+  .hero { min-height: 92vh; display: flex; flex-direction: column; justify-content: center; }
+  .hero .tag { color: var(--frost); font-size: .85rem; letter-spacing: .25em; text-transform: uppercase; margin-bottom: 1.2rem; }
+  .hero p.lede { margin-top: 1.4rem; }
+  .real-badge {
+    display: inline-block; margin-top: 2rem; padding: .45em 1em; border: 1px solid var(--frost-dim);
+    border-radius: 99px; color: var(--frost); font-size: .85rem;
+  }
+  .scroll-hint { margin-top: 9vh; color: var(--muted); font-size: .85rem; animation: bob 2.2s ease-in-out infinite; }
+  @keyframes bob { 0%,100% { transform: translateY(0);} 50% { transform: translateY(8px);} }
+
+  /* incident cards */
+  .card {
+    background: var(--card); border: 1px solid var(--card-edge); border-radius: 10px;
+    padding: 16px 18px; margin: 14px 0; transition: border-color .8s ease, box-shadow .8s ease;
+  }
+  .card .when { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .82rem; margin-bottom: .3rem; }
+  .card .sum { font-weight: 650; margin-bottom: .25rem; }
+  .card .desc { color: var(--muted); font-size: .92rem; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: .7rem; }
+  .badge {
+    font-size: .75rem; padding: .18em .65em; border-radius: 99px;
+    border: 1px solid var(--card-edge); color: var(--muted); font-variant-numeric: tabular-nums;
+  }
+  .badge.cold { border-color: var(--frost-dim); color: var(--frost); }
+  .badge.dur { border-color: #4a3520; color: var(--amber); }
+
+  /* timeline */
+  .tl { position: relative; padding-left: 34px; }
+  .tl::before {
+    content: ""; position: absolute; left: 10px; top: 0; bottom: 0; width: 2px;
+    background: var(--spine); transition: background 1.2s ease, box-shadow 1.2s ease;
+  }
+  body.pattern-on .tl::before { background: var(--frost); box-shadow: 0 0 14px rgba(127, 209, 255, .55); }
+  .tl .card { position: relative; }
+  .tl .card::before {
+    content: ""; position: absolute; left: -30px; top: 22px; width: 10px; height: 10px;
+    border-radius: 50%; background: var(--spine); transition: background .8s ease, box-shadow .8s ease;
+  }
+  body.pattern-on .tl .card.frost { border-color: var(--frost-dim); box-shadow: 0 0 22px rgba(127, 209, 255, .12); }
+  body.pattern-on .tl .card.frost::before { background: var(--frost); box-shadow: 0 0 10px var(--frost); }
+  .month-mark { color: var(--muted); font-size: .78rem; letter-spacing: .18em; text-transform: uppercase; margin: 2.2rem 0 .4rem; }
+  .burst-note {
+    border-left: 3px solid var(--amber); padding: .5em .9em; margin: 1.4rem 0; color: var(--amber);
+    font-size: .9rem; opacity: 0; transition: opacity .8s ease .3s;
+  }
+  body.pattern-on .burst-note { opacity: 1; }
+
+  /* pattern overlay */
+  .pattern-banner {
+    position: sticky; top: 14px; z-index: 5; margin: 0 auto 2rem; max-width: 460px; text-align: center;
+    background: rgba(13, 27, 38, .92); border: 1px solid var(--frost-dim); border-radius: 12px;
+    padding: 14px 20px; backdrop-filter: blur(6px);
+  }
+  .pattern-banner .pb-title { color: var(--frost); font-weight: 700; letter-spacing: .12em; text-transform: uppercase; font-size: .85rem; }
+  .stats-row { display: flex; flex-wrap: wrap; gap: 14px; margin: 2rem 0; }
+  .stat { flex: 1 1 130px; background: var(--card); border: 1px solid var(--card-edge); border-radius: 10px; padding: 16px; text-align: center; }
+  .stat .num { font-size: 1.9rem; font-weight: 800; color: var(--frost); font-variant-numeric: tabular-nums; }
+  .stat .lbl { font-size: .8rem; color: var(--muted); margin-top: .2rem; }
+
+  /* bar chart */
+  .chart { margin: 1.6rem 0; }
+  .bar-row { display: grid; grid-template-columns: 9.5em 1fr 3.2em; align-items: center; gap: 12px; margin: 10px 0; }
+  .bar-lbl { font-size: .85rem; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  .bar-track { background: var(--bg2); border-radius: 5px; height: 22px; overflow: hidden; }
+  .bar-fill { height: 100%; width: 0; border-radius: 5px; background: var(--frost-dim); transition: width 1.1s cubic-bezier(.2,.7,.2,1); }
+  .bar-fill.hot { background: linear-gradient(90deg, #3d7ea6, var(--frost)); }
+  .bar-val { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .baseline-note { font-size: .78rem; color: var(--muted); margin-top: .5rem; }
+
+  .callout {
+    border: 1px solid var(--card-edge); border-left: 3px solid var(--amber);
+    background: var(--card); border-radius: 8px; padding: 16px 18px; margin: 1.6rem 0; font-size: .95rem;
+  }
+  .callout strong { color: var(--amber); }
+  .callout.blue { border-left-color: var(--frost); }
+  .callout.blue strong { color: var(--frost); }
+
+  /* operational message mock */
+  .opmsg {
+    background: #0d1b26; border: 1px solid var(--frost-dim); border-radius: 12px; padding: 20px 22px; margin: 1.8rem 0;
+  }
+  .opmsg .om-head { color: var(--frost); font-size: .78rem; letter-spacing: .2em; text-transform: uppercase; margin-bottom: .7rem; }
+  .opmsg .om-line { margin: .45rem 0; }
+  .opmsg .om-line b { color: var(--frost); }
+  .opmsg .om-src { color: var(--muted); font-size: .78rem; margin-top: .9rem; }
+
+  table { border-collapse: collapse; width: 100%; margin: 1.4rem 0; font-size: .92rem; }
+  th, td { padding: .55em .8em; text-align: right; border-bottom: 1px solid var(--card-edge); font-variant-numeric: tabular-nums; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .08em; }
+  td.best { color: var(--green); font-weight: 700; }
+
+  /* counterfactual */
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 2rem 0; }
+  @media (max-width: 620px) { .split { grid-template-columns: 1fr; } }
+  .pane { border-radius: 12px; padding: 20px; border: 1px solid var(--card-edge); }
+  .pane.today { background: var(--card); }
+  .pane.wheel { background: #0d1f1a; border-color: #1d4434; }
+  .pane h3 { font-size: 1rem; margin-bottom: .8rem; }
+  .pane.today h3 { color: var(--red); }
+  .pane.wheel h3 { color: var(--green); }
+  .pane ul { list-style: none; }
+  .pane li { margin: .55rem 0; font-size: .92rem; color: var(--muted); padding-left: 1.2em; position: relative; }
+  .pane li::before { content: "—"; position: absolute; left: 0; }
+  .pane.wheel li::before { content: "✓"; color: var(--green); }
+
+  blockquote {
+    font-size: 1.25rem; font-style: italic; color: var(--text); border-left: 3px solid var(--frost);
+    padding-left: 1.2em; margin: 2rem 0;
+  }
+  blockquote cite { display: block; font-size: .8rem; font-style: normal; color: var(--muted); margin-top: .6rem; }
+
+  /* closing */
+  .closing { min-height: 80vh; display: flex; flex-direction: column; justify-content: center; text-align: center; }
+  .closing h2 { font-size: clamp(1.8rem, 5vw, 3rem); max-width: 16em; margin: 0 auto 1rem; }
+
+  footer { max-width: 760px; margin: 0 auto; padding: 4vh 24px 10vh; color: var(--muted); font-size: .82rem; }
+  footer h3 { color: var(--text); font-size: .9rem; margin: 1.6rem 0 .5rem; }
+  footer ul { padding-left: 1.2em; }
+  footer li { margin: .3rem 0; }
+  footer code { background: var(--card); padding: .1em .4em; border-radius: 4px; font-size: .92em; }
+</style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="tag">E05 · Avvikslæring over tid</div>
+  <h1>HUSKE<span class="accent">HJULET</span></h1>
+  <p class="lede">Jernbaneavvik gjentar seg i mønstre som mennesker ikke ser, fordi hver hendelse
+    behandles som isolert. Dette er historien om <strong style="color:var(--text)">én sporveksel-plaget
+    stasjon</strong> — fortalt av dataene selv.</p>
+  <div class="real-badge">Alle hendelser er ekte SIRI-SX-meldinger · Drammen stasjon · jan 2025 – jan 2026</div>
+  <div class="scroll-hint">▼ scroll</div>
+</section>
+
+<section>
+  <div class="reveal">
+    <h2>Fredag 3. januar 2025</h2>
+    <p class="lede">Oslo-området våkner til <strong style="color:var(--frost)">−9,5&nbsp;°C</strong> og 40&nbsp;cm snø.
+      Klokken 06:32 kommer den første meldingen.</p>
+  </div>
+  <div id="day1"></div>
+  <p class="reveal lede" style="margin-top:2rem">Tre meldinger på under seks timer. Samme stasjon, samme årsak.
+    I driftssentralen: tre isolerte hendelser, som håndteres — og glemmes.</p>
+</section>
+
+<section>
+  <div class="reveal">
+    <h2>Så skjer det igjen. Og igjen.</h2>
+    <p class="lede">Seks uker senere svikter sporvekslene ved Drammen på nytt — tre ganger på fire dager,
+      i 1,7&nbsp;meter snø. Utover året fortsetter det. Scroll gjennom hele året:</p>
+  </div>
+  <div class="tl" id="timeline"></div>
+</section>
+
+<section id="pattern-section">
+  <div class="pattern-banner reveal">
+    <div class="pb-title">⟁ Mønster identifisert</div>
+    <div style="font-size:.92rem; margin-top:.3rem">Sporvekselfeil · Drammen stasjon · 21 hendelser på 13 måneder</div>
+  </div>
+  <div class="reveal">
+    <h2>Dette er ikke uflaks. Det er et mønster.</h2>
+    <div class="stats-row">
+      <div class="stat"><div class="num">21</div><div class="lbl">sporvekselfeil<br>på 13 måneder</div></div>
+      <div class="stat"><div class="num">4</div><div class="lbl">byger med gjentatte<br>feil samme uke</div></div>
+      <div class="stat"><div class="num">3,5×</div><div class="lbl">hyppigere på dager<br>under −5&nbsp;°C</div></div>
+    </div>
+    <p class="lede">9 av 21 hendelser traff dager med minimumstemperatur under −5&nbsp;°C —
+      dager som bare utgjør 12&nbsp;% av året. Og oktober-bygen viser et annet mønster:
+      <em>samme feil tre ganger på fire dager</em> — en komponent som aldri ble ordentlig frisk.</p>
+  </div>
+</section>
+
+<section>
+  <div class="reveal">
+    <h2>Fellesnevneren: streng kulde</h2>
+    <p class="lede">Vi koblet to års lokaliserte avvik i Oslo-området mot daglig værdata.
+      Hvor mye oftere svikter sporvekslene, gitt været? (1,0 = normal hyppighet)</p>
+    <div class="chart" id="rr-chart">
+      <div class="bar-row"><div class="bar-lbl">under −5&nbsp;°C</div><div class="bar-track"><div class="bar-fill hot" data-w="100"></div></div><div class="bar-val accent">2,51</div></div>
+      <div class="bar-row"><div class="bar-lbl">−5 til 0&nbsp;°C</div><div class="bar-track"><div class="bar-fill" data-w="29"></div></div><div class="bar-val">0,74</div></div>
+      <div class="bar-row"><div class="bar-lbl">0 til 5&nbsp;°C</div><div class="bar-track"><div class="bar-fill" data-w="29"></div></div><div class="bar-val">0,74</div></div>
+      <div class="bar-row"><div class="bar-lbl">over 5&nbsp;°C</div><div class="bar-track"><div class="bar-fill" data-w="33"></div></div><div class="bar-val">0,83</div></div>
+      <div class="bar-row"><div class="bar-lbl">snø på bakken</div><div class="bar-track"><div class="bar-fill hot" data-w="65"></div></div><div class="bar-val">1,64</div></div>
+      <div class="baseline-note">Hyppighetsrate relativt til kategoriens egen normalrate · 712 dager · vær: Oslo Blindern (GHCN-D)</div>
+    </div>
+    <div class="callout">
+      <strong>Dataene korrigerer intuisjonen.</strong> Hypotesen var «sporvekselfeil ved lav temperatur og fuktig luft».
+      Virkeligheten: feilene kommer i <em>streng kulde</em> — og skjevt mot <em>tørre</em> dager (kalde høytrykk).
+      Signalfeil, som ofte får skylden for vinterkaos, viser <em>ingen</em> værkobling i det hele tatt.
+    </div>
+    <div class="callout blue">
+      <strong>Og effekten er på hyppighet, ikke varighet.</strong> Kulda gjør ikke hver feil verre —
+      den gjør at det smeller oftere. Riktig respons er beredskap, ikke lengre prognoser.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="reveal">
+    <h2>Hva sier hukommelsen om neste gang?</h2>
+    <p class="lede">Med 21 presedenser kan systemet svare på det driftssentralen faktisk lurer på
+      når melding nr. 22 tikker inn:</p>
+    <div class="opmsg">
+      <div class="om-head">⟁ Huskehjulet · sporvekselfeil Drammen</div>
+      <div class="om-line"><b>22. gang</b> på to år ved denne stasjonen.</div>
+      <div class="om-line">Median varighet: <b>76 min</b> · 8 av 10 løst innen <b>3,5 timer</b>.</div>
+      <div class="om-line">Værvarsel i morgen: −8&nbsp;°C → forvent <b>2,5× flere</b> sporvekselfeil i regionen.</div>
+      <div class="om-line">Forrige gang (12. jan, −15&nbsp;°C): løst på 91 min.</div>
+      <div class="om-src">Basert på 21 reelle presedenser — hver enkelt kan slås opp og etterprøves.</div>
+    </div>
+    <p class="lede">Er et slikt oppslag i hukommelsen naivt sammenlignet med maskinlæring?
+      Vi testet det mot en trent BigQuery&nbsp;ML-modell, på identiske hendelser modellen aldri hadde sett:</p>
+    <table>
+      <thead><tr><th>Metode</th><th>Typisk feil (median)</th><th>Snittfeil (MAE)</th></tr></thead>
+      <tbody>
+        <tr><td>Trent ML-modell (boosted trees)</td><td>8,6 min</td><td class="best">48,4 min</td></tr>
+        <tr><td><span class="accent">Huskehjulet</span> — median av tidligere lignende hendelser</td><td>9,0 min</td><td>50,3 min</td></tr>
+        <tr><td>Naiv basislinje (global median)</td><td>7,0 min</td><td>54,2 min</td></tr>
+      </tbody>
+    </table>
+    <div class="callout blue">
+      <strong>Hukommelsen er like treffsikker som modellen</strong> — forskjellen er innenfor støy.
+      Men der modellen er en svart boks, kan huskehjulet <em>vise sitt arbeid</em>:
+      «sist gang tok det 91 minutter» er en påstand en operatør kan kontrollere og stole på.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="reveal">
+    <blockquote>«Systematisk arkivering av SIRI-SX-meldinger nasjonalt ville skape et avvikskorpus
+      som muliggjør mønsterdeteksjon. Denne dataen strømmer i dag — og forsvinner.»
+      <cite>R13 · Avvik og forstyrrelser i norsk kollektivtrafikk</cite></blockquote>
+    <div class="split">
+      <div class="pane today">
+        <h3>I dag</h3>
+        <ul>
+          <li>21 isolerte hendelser, håndtert hver for seg</li>
+          <li>Ingen kobling mellom januar, februar og oktober</li>
+          <li>Hver kuldeknekk overrasker på nytt</li>
+          <li>Erfaringen bor i hodene til de som var på vakt</li>
+        </ul>
+      </div>
+      <div class="pane wheel">
+        <h3>Med huskehjulet</h3>
+        <ul>
+          <li>Mønsteret flagges allerede ved hendelse 3–4</li>
+          <li>Kuldevarsel utløser sporveksel-beredskap</li>
+          <li>Oktober-bygen avslører en komponent som bør byttes, ikke lappes</li>
+          <li>Hver ny hendelse gjør systemet litt klokere</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="closing">
+  <div class="reveal">
+    <h2>Infrastrukturen har hukommelse.<br>Det mangler bare noen som husker.</h2>
+    <p class="lede" style="margin:1rem auto 0">Alt i denne demoen finnes allerede i Enturs datastrømmer.</p>
+  </div>
+</section>
+
+<footer>
+  <h3>Om dataene</h3>
+  <ul>
+    <li><strong>Hendelsene er ekte:</strong> alle 21 avvik er faktiske SIRI-SX-meldinger fra NSB/Vy
+      (tekst, tidspunkt og målt varighet uendret). Varighet = tid fra første melding til «åpnet»-melding;
+      påvirkning på trafikken er målt fra SIRI-ET.</li>
+    <li><strong>Været er ekte:</strong> daglige observasjoner fra Oslo Blindern (GHCN-D / NOAA), brukt som
+      regional proxy — Drammen ligger ~40 km unna. Neste steg er timesoppløsning og luftfuktighet fra MET Frost.</li>
+    <li><strong>Hyppighetsratene</strong> (2,51× osv.) er beregnet over alle lokaliserte avvik i Oslo-området,
+      to år, per væravhengig kategori. Sesong er en konfunderende faktor; sporvekselens kuldekobling skal leses
+      relativt til andre kategoriers generelle vintereffekt (1,7×).</li>
+    <li><strong>Mønsterdeteksjonen er enkel statistikk</strong> (gruppering + presedensoppslag), ikke en
+      produksjonsmodell — det er poenget: minne slår ikke ML, det matcher ML og er etterprøvbart.</li>
+  </ul>
+  <h3>Metode og reproduksjon</h3>
+  <ul>
+    <li>Analyse: <code>docs/huskehjulet/LEARNINGS.md</code> i kix-avvik-repoet</li>
+    <li>Spørringer: <code>data/queries/huskehjul_census.sql</code> · <code>huskehjul_backtest.sql</code> · <code>huskehjul_weather.sql</code></li>
+    <li>Team KI-eksperimentering · Entur · juni 2026</li>
+  </ul>
+</footer>
+
+<script>
+const INCIDENTS = [
+  {ts:"2025-01-03 06:32", sum:"Stengt: Drammen–Sande", desc:"Drammen–Sande er stengt for togtrafikk. Dette skyldes feil på en sporveksel.", re:324, im:632, tmin:-9.5, snw:40, day1:true},
+  {ts:"2025-01-03 06:35", sum:"Toget står", desc:"Toget står mellom Drammen og Sande. Dette skyldes feil på en sporveksel.", re:259, im:629, tmin:-9.5, snw:40, day1:true},
+  {ts:"2025-01-03 12:20", sum:"Toget står", desc:"Toget står på Drammen. Dette skyldes feil på en sporveksel.", re:17, im:284, tmin:-9.5, snw:40, day1:true},
+  {ts:"2025-02-18 18:50", sum:"Delvis stengt: Brakerøya–Drammen", desc:"Brakerøya–Drammen har færre spor i bruk. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:140, im:262, tmin:-7.7, snw:170, burst:"Tre sporvekselfeil på fire dager — midt i en kuldeperiode med 1,7–2,1 m snø."},
+  {ts:"2025-02-20 08:29", sum:"Stengt: Brakerøya–Drammen", desc:"Brakerøya–Drammen er stengt for togtrafikk. Du må regne med forsinkelser, og at noen tog kan bli innstilt. Dette skyldes feil på en sporveksel.", re:76, im:99, tmin:-7.1, snw:180},
+  {ts:"2025-02-21 09:25", sum:"Delvis stengt: Drammen", desc:"Drammen har færre spor i bruk. Dette skyldes feil på en sporveksel.", re:51, im:93, tmin:-1.6, snw:210},
+  {ts:"2025-03-13 13:13", sum:"Delvis stengt: Asker", desc:"Asker har færre spor i bruk. Du må regne med forsinkelser, og at noen tog kan bli innstilt. Dette skyldes feil på en sporveksel.", re:58, im:175, tmin:-5.1, snw:0},
+  {ts:"2025-03-14 11:49", sum:"Stengt: Drammen–Sande", desc:"Drammen-Sande er stengt for togtrafikk. Du må regne med forsinkelser, og at noen tog kan bli innstilt. Dette skyldes feil på en sporveksel.", re:53, im:177, tmin:-7.2, snw:0},
+  {ts:"2025-03-18 04:44", sum:"Delvis stengt: Asker", desc:"Asker har færre spor i bruk. Dette skyldes feil på en sporveksel.", re:42, im:77, tmin:-1.7, snw:0},
+  {ts:"2025-05-13 02:12", sum:"Redusert hastighet: Drammen", desc:"Drammen: Togene kjører saktere. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:106, im:106, tmin:10.3, snw:0},
+  {ts:"2025-09-03 03:56", sum:"Redusert hastighet: Drammen–Gulskogen", desc:"Drammen–Gulskogen: Togene kjører saktere. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:40, im:40, tmin:14.6, snw:0},
+  {ts:"2025-09-05 15:20", sum:"Delvis stengt: Drammen stasjon", desc:"Drammen stasjon har færre spor i bruk. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:37, im:52, tmin:15.1, snw:0},
+  {ts:"2025-09-14 17:33", sum:"Stengt: Sande–Drammen", desc:"Sande–Drammen er stengt for togtrafikk. Dette skyldes feil på en sporveksel.", re:1, im:189, tmin:11.3, snw:null},
+  {ts:"2025-09-25 09:00", sum:"Delvis stengt: Drammen", desc:"Drammen har færre spor i bruk. Du må regne med forsinkelser, og at noen tog kan bli innstilt. Dette skyldes feil på en sporveksel.", re:38, im:128, tmin:3.1, snw:0},
+  {ts:"2025-09-25 09:47", sum:"Delvis stengt: Drammen", desc:"Drammen har færre spor i bruk. Du må regne med forsinkelser, og at noen tog kan bli innstilt. Dette skyldes feil på en sporveksel.", re:94, im:94, tmin:3.1, snw:0},
+  {ts:"2025-10-05 13:06", sum:"Delvis stengt: Drammen", desc:"Drammen har færre spor i bruk. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:1386, im:1386, tmin:8.2, snw:0, burst:"Samme feilbilde tre ganger på fire dager — inkludert en feil som varte i nesten et døgn. En komponent som lappes, men ikke friskmeldes."},
+  {ts:"2025-10-07 22:11", sum:"Delvis stengt: Drammen", desc:"Drammen har færre spor i bruk. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:96, im:96, tmin:7.7, snw:0},
+  {ts:"2025-10-08 04:07", sum:"Delvis stengt: Drammen", desc:"Drammen har færre spor i bruk. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:212, im:212, tmin:7.7, snw:0},
+  {ts:"2025-11-25 03:12", sum:"Delvis stengt: Gulskogen", desc:"Gulskogen har færre spor i bruk. Du må regne med forsinkelser. Dette skyldes feil på en sporveksel.", re:434, im:434, tmin:-1.5, snw:0},
+  {ts:"2026-01-09 18:28", sum:"Stengt: Gulskogen–Drammen", desc:"Gulskogen–Drammen er stengt for togtrafikk. Du må regne med forsinkelser, og at noen tog kan bli innstilt. Dette skyldes feil på en sporveksel.", re:32, im:32, tmin:-12.9, snw:100, burst:"Ny kuldeknekk, nye sporvekselfeil: −12,9 °C og −15,3 °C med tre dagers mellomrom."},
+  {ts:"2026-01-12 15:15", sum:"Stengt: Gulskogen–Drammen", desc:"Gulskogen–Drammen er stengt for togtrafikk. Du må regne med forsinkelser, og at noen tog kan bli innstilt. Dette skyldes feil på en sporveksel.", re:91, im:91, tmin:-15.3, snw:80}
+];
+
+const MONTHS = ["januar","februar","mars","april","mai","juni","juli","august","september","oktober","november","desember"];
+
+function fmtDur(min) {
+  if (min >= 90) {
+    const h = Math.floor(min / 60), m = min % 60;
+    return m ? `${h} t ${m} min` : `${h} t`;
+  }
+  return `${min} min`;
+}
+function fmtWhen(ts) {
+  const [d, t] = ts.split(" ");
+  const [y, mo, da] = d.split("-");
+  return `${parseInt(da)}. ${MONTHS[parseInt(mo) - 1]} ${y} · kl ${t}`;
+}
+function cardHTML(ev) {
+  const frost = ev.tmin !== null && ev.tmin <= -5;
+  const badges = [
+    `<span class="badge dur">varighet ${fmtDur(ev.re)}</span>`,
+    ev.im > ev.re ? `<span class="badge">trafikk påvirket ${fmtDur(ev.im)}</span>` : "",
+    ev.tmin !== null ? `<span class="badge ${frost ? "cold" : ""}">${ev.tmin < 0 ? "❄ " : ""}${String(ev.tmin).replace(".", ",")} °C</span>` : "",
+    ev.snw > 0 ? `<span class="badge cold">${Math.round(ev.snw / 10)} cm snø</span>` : ""
+  ].join("");
+  return `<div class="card reveal ${frost ? "frost" : ""}">
+    <div class="when">${fmtWhen(ev.ts)}</div>
+    <div class="sum">${ev.sum}</div>
+    <div class="desc">${ev.desc}</div>
+    <div class="badges">${badges}</div>
+  </div>`;
+}
+
+// act 1: the three Jan 3 incidents
+document.getElementById("day1").innerHTML = INCIDENTS.filter(e => e.day1).map(cardHTML).join("");
+
+// timeline: everything after Jan 3, with month markers and burst notes
+const tl = document.getElementById("timeline");
+let html = "", lastMonth = "";
+for (const ev of INCIDENTS.filter(e => !e.day1)) {
+  const [y, mo] = ev.ts.split("-");
+  const mk = `${MONTHS[parseInt(mo) - 1]} ${y}`;
+  if (mk !== lastMonth) { html += `<div class="month-mark reveal">${mk}</div>`; lastMonth = mk; }
+  if (ev.burst) html += `<div class="burst-note">${ev.burst}</div>`;
+  html += cardHTML(ev);
+}
+tl.innerHTML = html;
+
+// scroll reveals
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+}, { threshold: 0.12 });
+document.querySelectorAll(".reveal").forEach(el => io.observe(el));
+
+// pattern activation: light up the frost thread once the pattern section is reached
+const patternIO = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) { document.body.classList.add("pattern-on"); patternIO.disconnect(); }
+}, { threshold: 0.25 });
+patternIO.observe(document.getElementById("pattern-section"));
+
+// bar chart animation
+const chartIO = new IntersectionObserver(entries => {
+  for (const e of entries) if (e.isIntersecting) {
+    e.target.querySelectorAll(".bar-fill").forEach(b => { b.style.width = b.dataset.w + "%"; });
+    chartIO.disconnect();
+  }
+}, { threshold: 0.4 });
+chartIO.observe(document.getElementById("rr-chart"));
+</script>
+</body>
+</html>
