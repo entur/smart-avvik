@@ -1,0 +1,1251 @@
+## -----------------------------------------------------------------
+## SIRI Profile Superset Ontology
+## -----------------------------------------------------------------
+## A machine-readable knowledge graph of the Nordic SIRI Profile
+## documentation. Represents ALL services, objects, relationships,
+## enumerations, and profile constraints as a superset.
+##
+## Purpose:   LLM entry point for the SIRI Profile Documentation
+## Generated: 2026-04-13
+## Source:     Services/, Objects/, and Guides/ in this repository
+## Note:       Separate from NeTEx ontology by design — SIRI is
+##             real-time data that REFERENCES planned NeTEx objects.
+##             Cross-references are declared here as bridging links.
+## -----------------------------------------------------------------
+
+@prefix siri:    <https://siri-cen.eu/ontology#> .
+@prefix netex:   <https://netex-cen.eu/ontology#> .
+@prefix profile: <https://siri-cen.eu/profile#> .
+@prefix doc:     <https://siri-cen.eu/doc#> .
+@prefix rdfs:    <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl:     <http://www.w3.org/2002/07/owl#> .
+@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .
+@prefix skos:    <http://www.w3.org/2004/02/skos/core#> .
+@prefix tm-commons:  <https://w3id.org/transmodel/commons#> .
+@prefix tm-journeys: <https://w3id.org/transmodel/journeys#> .
+@prefix tm-fac:      <https://w3id.org/transmodel/facilities#> .
+@prefix tm-org:      <https://w3id.org/transmodel/organisations#> .
+
+## =================================================================
+## PROFILE
+## =================================================================
+
+profile:NordicSIRI a siri:Profile ;
+    rdfs:label "Nordic SIRI Profile" ;
+    skos:notation "NSP" ;
+    skos:definition "Nordic localisation of SIRI 2.0 for real-time public transport data exchange" ;
+    siri:version "1.1" ;
+    siri:basedOn "SIRI 2.0 XML Schema (CEN/TS 15531)" .
+
+## =================================================================
+## RELATIONSHIP TO NeTEx
+## =================================================================
+## SIRI provides real-time updates that REFERENCE planned NeTEx objects.
+## These are declared here as external references — the canonical
+## definitions live in the NeTEx ontology (netex-ontology.ttl).
+## Transmodel lineage is declared via skos:exactMatch/closeMatch.
+## The NeTEx ontology lives in the Profile_Documentation_v2 repo.
+## -----------------------------------------------------------------
+
+netex:Line
+    rdfs:label "Line (NeTEx)" ;
+    skos:definition "Planned line — referenced by SIRI via LineRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-journeys:Line .
+
+netex:Route
+    rdfs:label "Route (NeTEx)" ;
+    skos:definition "Planned route — referenced by SIRI via RouteRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-journeys:Route .
+
+netex:ServiceJourney
+    rdfs:label "ServiceJourney (NeTEx)" ;
+    skos:definition "Planned journey template — referenced by SIRI via DatedVehicleJourneyRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-journeys:ServiceJourney .
+
+netex:JourneyPattern
+    rdfs:label "JourneyPattern (NeTEx)" ;
+    skos:definition "Planned stop sequence — referenced by SIRI via JourneyPatternRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-journeys:JourneyPattern .
+
+netex:Operator
+    rdfs:label "Operator (NeTEx)" ;
+    skos:definition "Transport operator — referenced by SIRI via OperatorRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-org:Operator .
+
+netex:Quay
+    rdfs:label "Quay (NeTEx / NSR)" ;
+    skos:definition "Physical boarding point — referenced by SIRI via StopPointRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-fac:Quay .
+
+netex:StopPlace
+    rdfs:label "StopPlace (NeTEx / NSR)" ;
+    skos:definition "Physical stop location — referenced by SIRI-SX via StopPlaceRef and SIRI-FM via StopPlaceRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-fac:StopPlace .
+
+netex:GroupOfLines
+    rdfs:label "GroupOfLines / Network (NeTEx)" ;
+    skos:definition "Logical line grouping — referenced by SIRI via GroupOfLinesRef / NetworkRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:closeMatch tm-commons:GroupOfEntities .
+
+netex:DatedServiceJourney
+    rdfs:label "DatedServiceJourney (NeTEx)" ;
+    skos:definition "Journey instance on a specific date — linked via FramedVehicleJourneyRef" ;
+    siri:externalRepo "Profile_Documentation_v2" ;
+    skos:exactMatch tm-journeys:DatedVehicleJourney .
+
+## =================================================================
+## DATA GOVERNANCE
+## =================================================================
+
+siri:RealTimeProducer a siri:DataSource ;
+    rdfs:label "Real-time data producer" ;
+    skos:definition "Operator or data provider producing SIRI messages. Identified by ProducerRef/DataSource codespace." .
+
+siri:CentralAggregator a siri:DataSource ;
+    rdfs:label "Central aggregator" ;
+    skos:definition "Entur AS collects SIRI data from all producers and provides a unified real-time feed." .
+
+## =================================================================
+## SIRI SERVICES
+## =================================================================
+
+siri:SIRI_ET a siri:Service ;
+    rdfs:label "SIRI-ET — Estimated Timetable" ;
+    skos:definition "Exchanges continuous same-day timetable updates: delays, cancellations, extra journeys, platform changes" ;
+    doc:description "Services/SIRI-ET/Description_SIRI-ET.md" ;
+    doc:table "Services/SIRI-ET/Table_SIRI-ET.md" ;
+    doc:examples "Services/SIRI-ET/Examples/" ;
+    profile:status "in-scope" ;
+    siri:deliveryType siri:EstimatedTimetableDelivery ;
+    siri:coreObject siri:EstimatedVehicleJourney .
+
+siri:SIRI_SX a siri:Service ;
+    rdfs:label "SIRI-SX — Situation Exchange" ;
+    skos:definition "Exchanges textual descriptions of planned and unplanned disruptions affecting public transport" ;
+    doc:description "Services/SIRI-SX/Description_SIRI-SX.md" ;
+    doc:table "Services/SIRI-SX/Table_SIRI-SX.md" ;
+    doc:examples "Services/SIRI-SX/Examples/" ;
+    profile:status "in-scope" ;
+    siri:deliveryType siri:SituationExchangeDelivery ;
+    siri:coreObject siri:PtSituationElement .
+
+siri:SIRI_VM a siri:Service ;
+    rdfs:label "SIRI-VM — Vehicle Monitoring" ;
+    skos:definition "Exchanges vehicle position, delay, status, and occupancy data in real time" ;
+    doc:description "Services/SIRI-VM/Description_SIRI-VM.md" ;
+    doc:table "Services/SIRI-VM/Table_SIRI-VM.md" ;
+    doc:examples "Services/SIRI-VM/Examples/" ;
+    profile:status "in-scope" ;
+    siri:deliveryType siri:VehicleMonitoringDelivery ;
+    siri:coreObject siri:MonitoredVehicleJourney .
+
+siri:SIRI_FM a siri:Service ;
+    rdfs:label "SIRI-FM — Facility Monitoring" ;
+    skos:definition "Exchanges facility status, accessibility, and counting data for PT infrastructure" ;
+    doc:description "Services/SIRI-FM/Description_SIRI-FM.md" ;
+    doc:table "Services/SIRI-FM/Table_SIRI-FM.md" ;
+    doc:examples "Services/SIRI-FM/Examples/" ;
+    profile:status "extended" ;
+    rdfs:comment "Not part of the official Nordic SIRI Profile v1.1 scope, but documented for parking and facility monitoring use cases" ;
+    siri:deliveryType siri:FacilityMonitoringDelivery ;
+    siri:coreObject siri:FacilityCondition .
+
+## --- Services NOT in scope ---
+
+siri:SIRI_PT a siri:Service ;
+    rdfs:label "SIRI-PT — Production Timetable" ;
+    profile:status "not-in-scope" ;
+    skos:definition "Timetable changes outside current operating day" .
+
+siri:SIRI_SM a siri:Service ;
+    rdfs:label "SIRI-SM — Stop Monitoring" ;
+    profile:status "not-in-scope" ;
+    skos:definition "Arrival/transfer times for same operating day" .
+
+siri:SIRI_ST a siri:Service ;
+    rdfs:label "SIRI-ST — Stop Timetable" ;
+    profile:status "not-in-scope" ;
+    skos:definition "Stop changes outside current operating day" .
+
+siri:SIRI_CM a siri:Service ;
+    rdfs:label "SIRI-CM — Connection Monitoring" ;
+    profile:status "not-in-scope" ;
+    skos:definition "Guaranteed interchange monitoring" .
+
+siri:SIRI_CT a siri:Service ;
+    rdfs:label "SIRI-CT — Connection Timetable" ;
+    profile:status "not-in-scope" ;
+    skos:definition "Interchange changes outside operating day" .
+
+siri:SIRI_GM a siri:Service ;
+    rdfs:label "SIRI-GM — General Messaging" ;
+    profile:status "not-in-scope" ;
+    skos:definition "General text-based information" .
+
+## =================================================================
+## CONTAINER / DELIVERY STRUCTURE
+## =================================================================
+
+siri:ServiceDelivery a owl:Class ;
+    rdfs:label "ServiceDelivery" ;
+    skos:definition "Top-level container wrapping one delivery type with producer metadata" ;
+    doc:description "Objects/ServiceDelivery/Description_ServiceDelivery.md" ;
+    doc:table "Objects/ServiceDelivery/Table_ServiceDelivery.md" ;
+    siri:contains siri:EstimatedTimetableDelivery ,
+                  siri:SituationExchangeDelivery ,
+                  siri:VehicleMonitoringDelivery ,
+                  siri:FacilityMonitoringDelivery ;
+    rdfs:comment "Exactly ONE delivery type per ServiceDelivery message" .
+
+siri:EstimatedTimetableDelivery a owl:Class ;
+    rdfs:label "EstimatedTimetableDelivery" ;
+    skos:definition "Delivery wrapper for SIRI-ET containing EstimatedJourneyVersionFrames" ;
+    doc:table "Services/SIRI-ET/Table_SIRI-ET.md" ;
+    siri:containedIn siri:ServiceDelivery ;
+    siri:contains siri:EstimatedJourneyVersionFrame .
+
+siri:SituationExchangeDelivery a owl:Class ;
+    rdfs:label "SituationExchangeDelivery" ;
+    skos:definition "Delivery wrapper for SIRI-SX containing PtSituationElements" ;
+    doc:table "Services/SIRI-SX/Table_SIRI-SX.md" ;
+    siri:containedIn siri:ServiceDelivery ;
+    siri:contains siri:PtSituationElement .
+
+siri:VehicleMonitoringDelivery a owl:Class ;
+    rdfs:label "VehicleMonitoringDelivery" ;
+    skos:definition "Delivery wrapper for SIRI-VM containing VehicleActivities" ;
+    doc:table "Services/SIRI-VM/Table_SIRI-VM.md" ;
+    siri:containedIn siri:ServiceDelivery ;
+    siri:contains siri:VehicleActivity .
+
+siri:FacilityMonitoringDelivery a owl:Class ;
+    rdfs:label "FacilityMonitoringDelivery" ;
+    skos:definition "Delivery wrapper for SIRI-FM containing FacilityConditions" ;
+    doc:table "Services/SIRI-FM/Table_SIRI-FM.md" ;
+    siri:containedIn siri:ServiceDelivery ;
+    siri:contains siri:FacilityCondition .
+
+siri:EstimatedJourneyVersionFrame a owl:Class ;
+    rdfs:label "EstimatedJourneyVersionFrame" ;
+    skos:definition "Timestamped container grouping EstimatedVehicleJourneys" ;
+    siri:containedIn siri:EstimatedTimetableDelivery ;
+    siri:contains siri:EstimatedVehicleJourney .
+
+## =================================================================
+## SIRI-ET OBJECTS
+## =================================================================
+
+siri:EstimatedVehicleJourney a owl:Class ;
+    rdfs:label "EstimatedVehicleJourney" ;
+    skos:definition "Journey-level real-time timetable data: delays, cancellations, extra journeys, platform changes" ;
+    doc:description "Objects/EstimatedVehicleJourney/Description_EstimatedVehicleJourney.md" ;
+    siri:inService siri:SIRI_ET ;
+    siri:containedIn siri:EstimatedJourneyVersionFrame ;
+    siri:contains siri:RecordedCall , siri:EstimatedCall .
+
+siri:EstimatedCall a owl:Class ;
+    rdfs:label "EstimatedCall" ;
+    skos:definition "Per-stop estimated arrival/departure for a stop not yet served" ;
+    doc:description "Objects/EstimatedCall/Description_EstimatedCall.md" ;
+    siri:inService siri:SIRI_ET ;
+    siri:childOf siri:EstimatedVehicleJourney .
+
+siri:RecordedCall a owl:Class ;
+    rdfs:label "RecordedCall" ;
+    skos:definition "Per-stop actual arrival/departure for an already-served stop" ;
+    doc:description "Objects/RecordedCall/Description_RecordedCall.md" ;
+    siri:inService siri:SIRI_ET ;
+    siri:childOf siri:EstimatedVehicleJourney .
+
+siri:StopAssignment a owl:Class ;
+    rdfs:label "ArrivalStopAssignment / DepartureStopAssignment" ;
+    skos:definition "Platform change: maps a stop to an expected quay (replaces planned assignment)" ;
+    siri:inService siri:SIRI_ET ;
+    siri:childOf siri:EstimatedCall .
+
+siri:JourneyRelations a owl:Class ;
+    rdfs:label "JourneyRelations" ;
+    skos:definition "Relations between journeys (e.g. through-running, splitting, joining)" ;
+    siri:inService siri:SIRI_ET ;
+    siri:childOf siri:EstimatedVehicleJourney .
+
+## =================================================================
+## SIRI-VM OBJECTS
+## =================================================================
+
+siri:VehicleActivity a owl:Class ;
+    rdfs:label "VehicleActivity" ;
+    skos:definition "Container for a single vehicle's monitoring data with validity timestamps" ;
+    doc:description "Objects/VehicleActivity/Description_VehicleActivity.md" ;
+    siri:inService siri:SIRI_VM ;
+    siri:containedIn siri:VehicleMonitoringDelivery ;
+    siri:contains siri:MonitoredVehicleJourney , siri:ProgressBetweenStops .
+
+siri:MonitoredVehicleJourney a owl:Class ;
+    rdfs:label "MonitoredVehicleJourney" ;
+    skos:definition "Real-time vehicle position, delay, status, and occupancy for a planned journey" ;
+    doc:description "Objects/MonitoredVehicleJourney/Description_MonitoredVehicleJourney.md" ;
+    siri:inService siri:SIRI_VM ;
+    siri:childOf siri:VehicleActivity ;
+    siri:contains siri:VehicleLocation , siri:MonitoredCall .
+
+siri:VehicleLocation a owl:Class ;
+    rdfs:label "VehicleLocation" ;
+    skos:definition "GPS coordinates (WGS84) of the vehicle: Longitude, Latitude" ;
+    siri:inService siri:SIRI_VM ;
+    siri:childOf siri:MonitoredVehicleJourney .
+
+siri:MonitoredCall a owl:Class ;
+    rdfs:label "MonitoredCall" ;
+    skos:definition "Current or most recent stop being served: StopPointRef, VehicleAtStop" ;
+    siri:inService siri:SIRI_VM ;
+    siri:childOf siri:MonitoredVehicleJourney .
+
+siri:ProgressBetweenStops a owl:Class ;
+    rdfs:label "ProgressBetweenStops" ;
+    skos:definition "Progress between previous and next stop: LinkDistance, Percentage" ;
+    siri:inService siri:SIRI_VM ;
+    siri:childOf siri:VehicleActivity .
+
+## =================================================================
+## SIRI-SX OBJECTS
+## =================================================================
+
+siri:PtSituationElement a owl:Class ;
+    rdfs:label "PtSituationElement" ;
+    skos:definition "Core situation object: disruption/deviation with affected targets, severity, textual descriptions, validity" ;
+    doc:description "Objects/PtSituationElement/Description_PtSituationElement.md" ;
+    siri:inService siri:SIRI_SX ;
+    siri:containedIn siri:SituationExchangeDelivery ;
+    siri:contains siri:Affects , siri:ValidityPeriod , siri:InfoLinks .
+
+siri:Affects a owl:Class ;
+    rdfs:label "Affects" ;
+    skos:definition "What a situation impacts: networks, stop places, stop points, vehicle journeys" ;
+    doc:description "Objects/Affects/Description_Affects.md" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:PtSituationElement ;
+    siri:contains siri:AffectedNetwork ,
+                  siri:AffectedStopPlace ,
+                  siri:AffectedStopPoint ,
+                  siri:AffectedVehicleJourney .
+
+siri:AffectedNetwork a owl:Class ;
+    rdfs:label "AffectedNetwork" ;
+    skos:definition "Network/line-level impact with operator, mode, and line details" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:Affects ;
+    siri:contains siri:AffectedLine .
+
+siri:AffectedLine a owl:Class ;
+    rdfs:label "AffectedLine" ;
+    skos:definition "A specific line affected within a network, with optional route and section details" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:AffectedNetwork .
+
+siri:AffectedStopPlace a owl:Class ;
+    rdfs:label "AffectedStopPlace" ;
+    skos:definition "Physical stop location impact with accessibility assessment and affected components" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:Affects ;
+    siri:contains siri:AffectedComponent , siri:AccessibilityAssessment .
+
+siri:AffectedComponent a owl:Class ;
+    rdfs:label "AffectedComponent" ;
+    skos:definition "Specific component of a stop place (quay, entrance, access space) that is affected" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:AffectedStopPlace .
+
+siri:AffectedStopPoint a owl:Class ;
+    rdfs:label "AffectedStopPoint" ;
+    skos:definition "Logical stop point impact with boarding/alighting conditions" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:Affects .
+
+siri:AffectedVehicleJourney a owl:Class ;
+    rdfs:label "AffectedVehicleJourney" ;
+    skos:definition "Specific journey affected by a situation, with route and departure time" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:Affects .
+
+siri:ValidityPeriod a owl:Class ;
+    rdfs:label "ValidityPeriod" ;
+    skos:definition "Time range (StartTime + optional EndTime) when a situation is active" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:PtSituationElement .
+
+siri:InfoLinks a owl:Class ;
+    rdfs:label "InfoLinks" ;
+    skos:definition "Collection of hyperlinks (Uri + Label) for additional situation information" ;
+    siri:inService siri:SIRI_SX ;
+    siri:childOf siri:PtSituationElement .
+
+## =================================================================
+## SIRI-FM OBJECTS
+## =================================================================
+
+siri:FacilityCondition a owl:Class ;
+    rdfs:label "FacilityCondition" ;
+    skos:definition "Status report for a facility: condition, counting, remedy, and validity" ;
+    siri:inService siri:SIRI_FM ;
+    siri:containedIn siri:FacilityMonitoringDelivery ;
+    siri:contains siri:Facility ,
+                  siri:FacilityStatus ,
+                  siri:MonitoredCounting ,
+                  siri:MonitoringInfo ,
+                  siri:Remedy .
+
+siri:Facility a owl:Class ;
+    rdfs:label "Facility" ;
+    skos:definition "Inline facility definition: code, class, features, location, accessibility" ;
+    siri:inService siri:SIRI_FM ;
+    siri:childOf siri:FacilityCondition ;
+    siri:contains siri:FacilityLocation ,
+                  siri:AccessibilityAssessment ;
+    rdfs:comment "Choice with FacilityRef — use inline Facility or reference, not both" .
+
+siri:FacilityStatus a owl:Class ;
+    rdfs:label "FacilityStatus" ;
+    skos:definition "Current operational status of a facility with optional accessibility impact" ;
+    siri:inService siri:SIRI_FM ;
+    siri:childOf siri:FacilityCondition ;
+    siri:contains siri:AccessibilityAssessment .
+
+siri:FacilityLocation a owl:Class ;
+    rdfs:label "FacilityLocation" ;
+    skos:definition "Where the facility is: references to lines, stops, vehicles, operators" ;
+    siri:inService siri:SIRI_FM ;
+    siri:childOf siri:Facility .
+
+siri:MonitoredCounting a owl:Class ;
+    rdfs:label "MonitoredCounting" ;
+    skos:definition "Numerical counting data: type, unit, count/percentage, trend" ;
+    siri:inService siri:SIRI_FM ;
+    siri:childOf siri:FacilityCondition .
+
+siri:MonitoringInfo a owl:Class ;
+    rdfs:label "MonitoringInfo" ;
+    skos:definition "Monitoring metadata: interval, type, period" ;
+    siri:inService siri:SIRI_FM ;
+    siri:childOf siri:FacilityCondition .
+
+siri:Remedy a owl:Class ;
+    rdfs:label "Remedy" ;
+    skos:definition "Corrective action: type (replace/repair/remove/otherRoute/otherLocation), description, period" ;
+    siri:inService siri:SIRI_FM ;
+    siri:childOf siri:FacilityCondition .
+
+## =================================================================
+## SHARED OBJECTS
+## =================================================================
+
+siri:FramedVehicleJourneyRef a owl:Class ;
+    rdfs:label "FramedVehicleJourneyRef" ;
+    skos:definition "Journey reference with date: DataFrameRef (operating date) + DatedVehicleJourneyRef (ServiceJourney ID)" ;
+    doc:description "Objects/FramedVehicleJourneyRef/Description_FramedVehicleJourneyRef.md" ;
+    siri:usedIn siri:SIRI_ET , siri:SIRI_VM , siri:SIRI_SX ;
+    rdfs:comment "Primary mechanism for linking SIRI real-time data to planned NeTEx journeys" .
+
+siri:AccessibilityAssessment a owl:Class ;
+    rdfs:label "AccessibilityAssessment" ;
+    skos:definition "Accessibility impact: MobilityImpairedAccess, Limitations (wheelchair, step-free, escalator, lift)" ;
+    siri:usedIn siri:SIRI_SX , siri:SIRI_FM ;
+    siri:namespace "http://www.ifopt.org.uk/acsb" ;
+    rdfs:comment "Uses ACSB namespace (xmlns:acsb). Child elements must be acsb: prefixed." .
+
+siri:AccessibilityLimitation a owl:Class ;
+    rdfs:label "AccessibilityLimitation" ;
+    skos:definition "Specific accessibility limits: WheelchairAccess, StepFreeAccess, EscalatorFreeAccess, LiftFreeAccess, AudibleSignalsAvailable, VisualSignsAvailable" ;
+    siri:childOf siri:AccessibilityAssessment ;
+    siri:namespace "http://www.ifopt.org.uk/acsb" .
+
+siri:SimpleContactStructure a owl:Class ;
+    rdfs:label "SimpleContactStructure" ;
+    skos:definition "Contact point: PhoneNumber, Url" ;
+    siri:usedIn siri:SIRI_ET .
+
+siri:SituationRef a owl:Class ;
+    rdfs:label "SituationRef" ;
+    skos:definition "Reference to a published PtSituationElement via SituationSimpleRef" ;
+    siri:usedIn siri:SIRI_ET , siri:SIRI_FM ;
+    rdfs:comment "Cross-service link: ET/FM messages can reference SX situations" .
+
+## =================================================================
+## CROSS-REFERENCES (SIRI → NeTEx)
+## =================================================================
+## Each ref maps a SIRI element to the NeTEx object it references.
+## These are the bridge between real-time and planned data.
+## -----------------------------------------------------------------
+
+## --- SIRI-ET references ---
+
+siri:EstimatedVehicleJourney siri:hasRef [
+    siri:property "LineRef" ;
+    siri:target netex:Line ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "FramedVehicleJourneyRef" ;
+    siri:target netex:ServiceJourney ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "Choice with DatedVehicleJourneyRef and EstimatedVehicleJourneyCode"
+] , [
+    siri:property "JourneyPatternRef" ;
+    siri:target netex:JourneyPattern ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "RouteRef" ;
+    siri:target netex:Route ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "Mandatory for replacement departures (ExtraJourney=true)"
+] , [
+    siri:property "GroupOfLinesRef" ;
+    siri:target netex:GroupOfLines ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "Mandatory for replacement departures"
+] , [
+    siri:property "OperatorRef" ;
+    siri:target netex:Operator ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "ExternalLineRef" ;
+    siri:target netex:Line ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "Line being replaced by an ExtraJourney"
+] , [
+    siri:property "SituationRef" ;
+    siri:target siri:PtSituationElement ;
+    siri:xsdCardinality "0..n" ;
+    rdfs:comment "Cross-service link to SIRI-SX situations"
+] .
+
+siri:EstimatedCall siri:hasRef [
+    siri:property "StopPointRef" ;
+    siri:target netex:Quay ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "NSR Quay ID"
+] .
+
+siri:RecordedCall siri:hasRef [
+    siri:property "StopPointRef" ;
+    siri:target netex:Quay ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "NSR Quay ID"
+] .
+
+## --- SIRI-VM references ---
+
+siri:MonitoredVehicleJourney siri:hasRef [
+    siri:property "LineRef" ;
+    siri:target netex:Line ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "FramedVehicleJourneyRef" ;
+    siri:target netex:ServiceJourney ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "Choice with VehicleJourneyRef — one must be set"
+] , [
+    siri:property "OperatorRef" ;
+    siri:target netex:Operator ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "OriginRef" ;
+    siri:target netex:StopPlace ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "DestinationRef" ;
+    siri:target netex:StopPlace ;
+    siri:xsdCardinality "0..1"
+] .
+
+siri:MonitoredCall siri:hasRef [
+    siri:property "StopPointRef" ;
+    siri:target netex:Quay ;
+    siri:xsdCardinality "1..1"
+] .
+
+## --- SIRI-SX references ---
+
+siri:AffectedNetwork siri:hasRef [
+    siri:property "NetworkRef" ;
+    siri:target netex:GroupOfLines ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "OperatorRef" ;
+    siri:target netex:Operator ;
+    siri:xsdCardinality "0..1"
+] .
+
+siri:AffectedLine siri:hasRef [
+    siri:property "LineRef" ;
+    siri:target netex:Line ;
+    siri:xsdCardinality "1..1"
+] .
+
+siri:AffectedStopPlace siri:hasRef [
+    siri:property "StopPlaceRef" ;
+    siri:target netex:StopPlace ;
+    siri:xsdCardinality "1..1"
+] .
+
+siri:AffectedStopPoint siri:hasRef [
+    siri:property "StopPointRef" ;
+    siri:target netex:Quay ;
+    siri:xsdCardinality "1..1"
+] .
+
+siri:AffectedVehicleJourney siri:hasRef [
+    siri:property "FramedVehicleJourneyRef" ;
+    siri:target netex:ServiceJourney ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "Choice with VehicleJourneyRef or DatedVehicleJourneyRef"
+] , [
+    siri:property "LineRef" ;
+    siri:target netex:Line ;
+    siri:xsdCardinality "0..1"
+] .
+
+## --- SIRI-FM references ---
+
+siri:FacilityLocation siri:hasRef [
+    siri:property "LineRef" ;
+    siri:target netex:Line ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "StopPointRef" ;
+    siri:target netex:Quay ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "StopPlaceRef" ;
+    siri:target netex:StopPlace ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "OperatorRef" ;
+    siri:target netex:Operator ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "DatedVehicleJourneyRef" ;
+    siri:target netex:DatedServiceJourney ;
+    siri:xsdCardinality "0..1"
+] .
+
+siri:FacilityCondition siri:hasRef [
+    siri:property "SituationRef" ;
+    siri:target siri:PtSituationElement ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "Cross-service link to SIRI-SX situations"
+] .
+
+## =================================================================
+## ENUMERATIONS
+## =================================================================
+
+## --- VehicleStatusEnumeration (SIRI-VM) ---
+
+siri:VehicleStatusEnum a siri:Enumeration ;
+    rdfs:label "VehicleStatusEnumeration" ;
+    siri:usedIn siri:SIRI_VM ;
+    siri:values "expected", "notExpected", "cancelled", "assigned",
+                "signedOn", "atOrigin", "inProgress", "aborted",
+                "offRoute", "completed", "assumedCompleted", "notRun" .
+
+## --- OccupancyEnumeration (SIRI-ET, SIRI-VM) ---
+
+siri:OccupancyEnum a siri:Enumeration ;
+    rdfs:label "OccupancyEnumeration" ;
+    siri:usedIn siri:SIRI_ET , siri:SIRI_VM ;
+    siri:values "full", "seatsAvailable", "standingAvailable",
+                "unknown", "empty", "manySeatAvailable",
+                "fewSeatAvailable", "standingRoomOnly",
+                "crushStandingRoomOnly", "notAcceptingPassengers" .
+
+## --- ArrivalStatus / DepartureStatus (SIRI-ET) ---
+
+siri:CallStatusEnum a siri:Enumeration ;
+    rdfs:label "ArrivalStatusEnumeration / DepartureStatusEnumeration" ;
+    siri:usedIn siri:SIRI_ET ;
+    siri:values "onTime", "early", "delayed", "cancelled",
+                "missed", "arrived", "departed", "noReport" .
+
+## --- BoardingActivity (SIRI-ET) ---
+
+siri:BoardingActivityEnum a siri:Enumeration ;
+    rdfs:label "ArrivalBoardingActivityEnumeration / DepartureBoardingActivityEnumeration" ;
+    siri:usedIn siri:SIRI_ET ;
+    siri:values "boarding", "noBoarding", "alighting", "noAlighting",
+                "passThru" .
+
+## --- Progress (SIRI-SX) ---
+
+siri:ProgressEnum a siri:Enumeration ;
+    rdfs:label "WorkflowStatusEnumeration" ;
+    siri:usedIn siri:SIRI_SX ;
+    siri:values "open", "closed" ;
+    rdfs:comment "Nordic Profile restricts to open/closed only" .
+
+## --- ReportType (SIRI-SX) ---
+
+siri:ReportTypeEnum a siri:Enumeration ;
+    rdfs:label "ReportTypeEnumeration" ;
+    siri:usedIn siri:SIRI_SX ;
+    siri:values "general", "incident" .
+
+## --- Severity (SIRI-SX) ---
+
+siri:SeverityEnum a siri:Enumeration ;
+    rdfs:label "SeverityEnumeration" ;
+    siri:usedIn siri:SIRI_SX ;
+    siri:values "unknown", "verySlight", "slight", "normal",
+                "severe", "verySevere", "noImpact", "undefined" .
+
+## --- StopCondition (SIRI-SX) ---
+
+siri:StopConditionEnum a siri:Enumeration ;
+    rdfs:label "RoutePointTypeEnumeration (StopCondition)" ;
+    siri:usedIn siri:SIRI_SX ;
+    siri:values "stop", "startPoint", "destination",
+                "notStopping", "requestStop", "exceptionalStop" .
+
+## --- ComponentType (SIRI-SX) ---
+
+siri:ComponentTypeEnum a siri:Enumeration ;
+    rdfs:label "AffectedComponentTypeEnumeration" ;
+    siri:usedIn siri:SIRI_SX ;
+    siri:values "accessSpace", "boardingPosition", "entrance", "quay" .
+
+## --- FacilityStatus (SIRI-FM) ---
+
+siri:FacilityStatusEnum a siri:Enumeration ;
+    rdfs:label "FacilityStatusEnumeration" ;
+    siri:usedIn siri:SIRI_FM ;
+    siri:values "unknown", "available", "notAvailable",
+                "partiallyAvailable", "added", "removed" .
+
+## --- FacilityClass (SIRI-FM) ---
+
+siri:FacilityClassEnum a siri:Enumeration ;
+    rdfs:label "FacilityClassEnumeration" ;
+    siri:usedIn siri:SIRI_FM ;
+    siri:values "unknown", "fixedEquipment", "mobileEquipment",
+                "siteComponent", "site", "parkingBay",
+                "vehicle", "stop", "line" .
+
+## --- CountingType (SIRI-FM) ---
+
+siri:CountingTypeEnum a siri:Enumeration ;
+    rdfs:label "CountingTypeEnumeration" ;
+    siri:usedIn siri:SIRI_FM ;
+    siri:values "availabilityCount", "reservedCount", "inUseCount",
+                "outOfOrderCount", "presentCount", "chargingLevel",
+                "availableRunningDistance", "currentStateCount" ;
+    rdfs:comment "No totalCount or capacityCount exists — infer total from sum or use Percentage" .
+
+## --- CountedFeatureUnit (SIRI-FM) ---
+
+siri:CountedFeatureUnitEnum a siri:Enumeration ;
+    rdfs:label "CountedFeatureUnitEnumeration" ;
+    siri:usedIn siri:SIRI_FM ;
+    siri:values "bays", "seats", "otherSpaces", "devices",
+                "vehicles", "persons", "passengers",
+                "entrances", "exits" .
+
+## --- FacilityFeature categories (SIRI-FM) ---
+
+siri:FacilityFeatureEnum a siri:Enumeration ;
+    rdfs:label "AllFacilitiesFeatureStructure (16 categories)" ;
+    siri:usedIn siri:SIRI_FM ;
+    siri:values "AccessFacility", "AccommodationFacility",
+                "AssistanceFacility", "FareClassFacility",
+                "HireFacility", "LuggageFacility",
+                "MobilityFacility", "NuisanceFacility",
+                "ParkingFacility", "PassengerCommsFacility",
+                "PassengerInformationFacility", "RefreshmentFacility",
+                "ReservedSpaceFacility", "RetailFacility",
+                "SanitaryFacility", "TicketingFacility" .
+
+## --- RemedyType (SIRI-FM) ---
+
+siri:RemedyTypeEnum a siri:Enumeration ;
+    rdfs:label "RemedyTypeEnumeration" ;
+    siri:usedIn siri:SIRI_FM ;
+    siri:values "unknown", "replace", "repair", "remove",
+                "otherRoute", "otherLocation" .
+
+## --- VehicleMode (shared) ---
+
+siri:VehicleModeEnum a siri:Enumeration ;
+    rdfs:label "VehicleModesEnumeration" ;
+    siri:usedIn siri:SIRI_ET , siri:SIRI_VM , siri:SIRI_SX ;
+    siri:values "air", "bus", "coach", "ferry", "metro",
+                "rail", "tram", "water" .
+
+## --- AccessibilityLimitation values (ACSB) ---
+
+siri:AccessibilityValueEnum a siri:Enumeration ;
+    rdfs:label "LimitationStatusEnumeration (ACSB)" ;
+    siri:usedIn siri:SIRI_SX , siri:SIRI_FM ;
+    siri:values "true", "false", "unknown" ;
+    rdfs:comment "Tristate for WheelchairAccess, StepFreeAccess, etc." .
+
+## =================================================================
+## KEY ELEMENT SPECIFICATIONS
+## =================================================================
+## Important element-level details from Table files, captured as
+## profile constraints.
+## -----------------------------------------------------------------
+
+## --- ServiceDelivery elements ---
+
+siri:ServiceDelivery siri:hasElement [
+    siri:property "ResponseTimestamp" ;
+    siri:type xsd:dateTime ;
+    siri:xsdCardinality "1..1" ;
+    skos:definition "When the dataset was generated/published"
+] , [
+    siri:property "ProducerRef" ;
+    siri:type xsd:NMTOKEN ;
+    siri:xsdCardinality "1..1" ;
+    skos:definition "Codespace identifying the data producer"
+] .
+
+## --- EstimatedVehicleJourney key elements ---
+
+siri:EstimatedVehicleJourney siri:hasElement [
+    siri:property "RecordedAtTime" ;
+    siri:type xsd:dateTime ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "DirectionRef" ;
+    siri:type xsd:NMTOKEN ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "Mandatory but not semantically used — set to 0 if unknown"
+] , [
+    siri:property "Cancellation" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "true = entire journey cancelled. Choice with ExtraJourney"
+] , [
+    siri:property "ExtraJourney" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "true = replacement departure. Requires VehicleMode, RouteRef, GroupOfLinesRef"
+] , [
+    siri:property "DataSource" ;
+    siri:type xsd:string ;
+    siri:xsdCardinality "1..1" ;
+    skos:definition "Data source codespace"
+] , [
+    siri:property "IsCompleteStopSequence" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "Must ALWAYS be true in Nordic Profile"
+] , [
+    siri:property "Monitored" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "Occupancy" ;
+    siri:type "OccupancyEnumeration" ;
+    siri:xsdCardinality "0..1"
+] .
+
+## --- EstimatedCall key elements ---
+
+siri:EstimatedCall siri:hasElement [
+    siri:property "Order" ;
+    siri:type xsd:integer ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "Cancellation" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "true = this specific stop is cancelled"
+] , [
+    siri:property "RequestStop" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "AimedArrivalTime" ;
+    siri:type xsd:dateTime ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "ExpectedArrivalTime" ;
+    siri:type xsd:dateTime ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "ArrivalStatus" ;
+    siri:type "CallStatusEnumeration" ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "AimedDepartureTime" ;
+    siri:type xsd:dateTime ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "ExpectedDepartureTime" ;
+    siri:type xsd:dateTime ;
+    siri:xsdCardinality "0..1"
+] , [
+    siri:property "DepartureStatus" ;
+    siri:type "CallStatusEnumeration" ;
+    siri:xsdCardinality "0..1"
+] .
+
+## --- MonitoredVehicleJourney key elements ---
+
+siri:MonitoredVehicleJourney siri:hasElement [
+    siri:property "Delay" ;
+    siri:type xsd:duration ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "PT0S = on time. Mandatory in Nordic Profile"
+] , [
+    siri:property "VehicleRef" ;
+    siri:type xsd:NMTOKEN ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "Bearing" ;
+    siri:type xsd:decimal ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "Heading in degrees 0-360"
+] , [
+    siri:property "Velocity" ;
+    siri:type xsd:nonNegativeInteger ;
+    siri:xsdCardinality "0..1" ;
+    rdfs:comment "Speed in cm/s"
+] , [
+    siri:property "DataSource" ;
+    siri:type xsd:string ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "IsCompleteStopSequence" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "Must ALWAYS be false in Nordic Profile (only MonitoredCall)"
+] , [
+    siri:property "InCongestion" ;
+    siri:type xsd:boolean ;
+    siri:xsdCardinality "0..1"
+] .
+
+## --- PtSituationElement key elements ---
+
+siri:PtSituationElement siri:hasElement [
+    siri:property "CreationTime" ;
+    siri:type xsd:dateTime ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "ParticipantRef" ;
+    siri:type xsd:NMTOKEN ;
+    siri:xsdCardinality "1..1"
+] , [
+    siri:property "SituationNumber" ;
+    siri:type xsd:string ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "Format: CODESPACE:SituationNumber:ID"
+] , [
+    siri:property "Progress" ;
+    siri:type "WorkflowStatusEnumeration" ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "open or closed"
+] , [
+    siri:property "UndefinedReason" ;
+    siri:type xsd:string ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "Mandatory but always empty"
+] , [
+    siri:property "ReportType" ;
+    siri:type "ReportTypeEnumeration" ;
+    siri:xsdCardinality "1..1" ;
+    rdfs:comment "general = informational, incident = impacts operation"
+] , [
+    siri:property "Summary" ;
+    siri:type "NaturalLanguageStringStructure" ;
+    siri:xsdCardinality "1..n" ;
+    rdfs:comment "Max 160 chars per language"
+] , [
+    siri:property "Description" ;
+    siri:type "NaturalLanguageStringStructure" ;
+    siri:xsdCardinality "0..n"
+] , [
+    siri:property "Advice" ;
+    siri:type "NaturalLanguageStringStructure" ;
+    siri:xsdCardinality "0..n" ;
+    rdfs:comment "Actionable guidance for passengers"
+] .
+
+## =================================================================
+## SERVICE CHAINS (navigational shortcuts)
+## =================================================================
+
+siri:ETChain rdfs:comment """
+    ServiceDelivery → EstimatedTimetableDelivery
+      → EstimatedJourneyVersionFrame → EstimatedVehicleJourney
+        → RecordedCalls + EstimatedCalls
+    Real-time timetable chain: from message envelope to per-stop predictions.
+""" ;
+    siri:step1 siri:ServiceDelivery ;
+    siri:step2 siri:EstimatedTimetableDelivery ;
+    siri:step3 siri:EstimatedJourneyVersionFrame ;
+    siri:step4 siri:EstimatedVehicleJourney ;
+    siri:step5 siri:EstimatedCall .
+
+siri:VMChain rdfs:comment """
+    ServiceDelivery → VehicleMonitoringDelivery
+      → VehicleActivity → MonitoredVehicleJourney
+        → VehicleLocation + MonitoredCall
+    Vehicle tracking chain: from message to GPS position and current stop.
+""" ;
+    siri:step1 siri:ServiceDelivery ;
+    siri:step2 siri:VehicleMonitoringDelivery ;
+    siri:step3 siri:VehicleActivity ;
+    siri:step4 siri:MonitoredVehicleJourney ;
+    siri:step5 siri:VehicleLocation .
+
+siri:SXChain rdfs:comment """
+    ServiceDelivery → SituationExchangeDelivery
+      → PtSituationElement → Affects
+        → AffectedNetwork / AffectedStopPlace / AffectedVehicleJourney
+    Situation chain: from message to impacted targets.
+""" ;
+    siri:step1 siri:ServiceDelivery ;
+    siri:step2 siri:SituationExchangeDelivery ;
+    siri:step3 siri:PtSituationElement ;
+    siri:step4 siri:Affects ;
+    siri:step5 siri:AffectedNetwork .
+
+siri:FMChain rdfs:comment """
+    ServiceDelivery → FacilityMonitoringDelivery
+      → FacilityCondition → Facility + FacilityStatus + MonitoredCounting
+    Facility chain: from message to facility status and counting data.
+""" ;
+    siri:step1 siri:ServiceDelivery ;
+    siri:step2 siri:FacilityMonitoringDelivery ;
+    siri:step3 siri:FacilityCondition ;
+    siri:step4 siri:Facility ;
+    siri:step5 siri:MonitoredCounting .
+
+## =================================================================
+## CROSS-SERVICE LINKS
+## =================================================================
+## SIRI services reference each other to provide richer context.
+## -----------------------------------------------------------------
+
+siri:ETtoSX rdfs:comment """
+    EstimatedVehicleJourney → SituationRef → PtSituationElement
+    An ET journey can reference SX situations explaining the deviation.
+""" ;
+    siri:from siri:EstimatedVehicleJourney ;
+    siri:to siri:PtSituationElement ;
+    siri:via "SituationRef" .
+
+siri:FMtoSX rdfs:comment """
+    FacilityCondition → SituationRef → PtSituationElement
+    A facility condition can reference an SX situation.
+""" ;
+    siri:from siri:FacilityCondition ;
+    siri:to siri:PtSituationElement ;
+    siri:via "SituationRef" .
+
+siri:VMrequiresET rdfs:comment """
+    SIRI-VM requires valid NeTEx or SIRI-ET data to exist first.
+    Vehicle positions are only meaningful when there is a journey to track.
+""" ;
+    siri:from siri:SIRI_VM ;
+    siri:to siri:SIRI_ET ;
+    siri:relationship "prerequisite" .
+
+## =================================================================
+## PROFILE CONSTRAINTS (Nordic-specific rules)
+## =================================================================
+
+profile:NordicSIRI siri:constraint [
+    siri:rule "ET-001" ;
+    siri:description "IsCompleteStopSequence must always be true in SIRI-ET" ;
+    siri:service siri:SIRI_ET ;
+    siri:element "EstimatedVehicleJourney/IsCompleteStopSequence" ;
+    siri:value "true"
+] , [
+    siri:rule "ET-002" ;
+    siri:description "All stops must be included: RecordedCalls + EstimatedCalls = complete sequence" ;
+    siri:service siri:SIRI_ET
+] , [
+    siri:rule "ET-003" ;
+    siri:description "Replacement departures (ExtraJourney=true) require VehicleMode, RouteRef, GroupOfLinesRef, ExternalLineRef" ;
+    siri:service siri:SIRI_ET
+] , [
+    siri:rule "VM-001" ;
+    siri:description "IsCompleteStopSequence must always be false in SIRI-VM (only MonitoredCall)" ;
+    siri:service siri:SIRI_VM ;
+    siri:element "MonitoredVehicleJourney/IsCompleteStopSequence" ;
+    siri:value "false"
+] , [
+    siri:rule "VM-002" ;
+    siri:description "Delay is mandatory — use PT0S when on time" ;
+    siri:service siri:SIRI_VM ;
+    siri:element "MonitoredVehicleJourney/Delay"
+] , [
+    siri:rule "VM-003" ;
+    siri:description "VehicleRef is mandatory — every vehicle must have a unique ID" ;
+    siri:service siri:SIRI_VM ;
+    siri:element "MonitoredVehicleJourney/VehicleRef"
+] , [
+    siri:rule "VM-004" ;
+    siri:description "Vehicle coordinates must be WGS84" ;
+    siri:service siri:SIRI_VM ;
+    siri:element "MonitoredVehicleJourney/VehicleLocation"
+] , [
+    siri:rule "SX-001" ;
+    siri:description "Closing a situation requires Progress=closed and EndTime ≥ 5 hours in the future" ;
+    siri:service siri:SIRI_SX
+] , [
+    siri:rule "SX-002" ;
+    siri:description "Summary max 160 characters per language" ;
+    siri:service siri:SIRI_SX ;
+    siri:element "PtSituationElement/Summary"
+] , [
+    siri:rule "SX-003" ;
+    siri:description "SituationNumber format: CODESPACE:SituationNumber:ID — must be unique and stable" ;
+    siri:service siri:SIRI_SX ;
+    siri:element "PtSituationElement/SituationNumber"
+] , [
+    siri:rule "SX-004" ;
+    siri:description "UndefinedReason is mandatory but always empty" ;
+    siri:service siri:SIRI_SX ;
+    siri:element "PtSituationElement/UndefinedReason"
+] , [
+    siri:rule "SX-005" ;
+    siri:description "Progress restricted to open/closed only in Nordic Profile" ;
+    siri:service siri:SIRI_SX ;
+    siri:element "PtSituationElement/Progress"
+] , [
+    siri:rule "ID-001" ;
+    siri:description "All IDs follow format: Codespace:ObjectType:Identifier" ;
+    rdfs:comment "Examples: NSB:ServiceJourney:1-2492-2343, NSR:Quay:709, RUT:Line:31"
+] , [
+    siri:rule "DATA-001" ;
+    siri:description "Single XML file per delivery" ;
+    rdfs:comment "Applies to all services"
+] .
+
+## =================================================================
+## COMMUNICATION PATTERNS
+## =================================================================
+
+siri:PubSub a siri:CommunicationPattern ;
+    rdfs:label "Publish/Subscribe" ;
+    skos:definition "Consumer subscribes to SIRI data; producer pushes updates continuously" ;
+    doc:description "Guides/DataExchange/DataExchange_Guide.md" .
+
+siri:RequestResponse a siri:CommunicationPattern ;
+    rdfs:label "Request/Response" ;
+    skos:definition "Consumer requests data on demand; producer responds with current state" ;
+    doc:description "Guides/DataExchange/DataExchange_Guide.md" .
+
+## =================================================================
+## GUIDES (documentation references)
+## =================================================================
+
+doc:GetStarted a doc:Guide ;
+    rdfs:label "Get Started" ;
+    doc:path "Guides/GetStarted/GetStarted_Guide.md" ;
+    skos:definition "Introduction to SIRI and the Nordic Profile" .
+
+doc:GeneralInformation a doc:Guide ;
+    rdfs:label "General Information" ;
+    doc:path "Guides/GeneralInformation/GeneralInformation_Guide.md" ;
+    skos:definition "SIRI overview, terminology, and conventions" .
+
+doc:DataExchange a doc:Guide ;
+    rdfs:label "Data Exchange" ;
+    doc:path "Guides/DataExchange/DataExchange_Guide.md" ;
+    skos:definition "Communication patterns: Pub/Sub, Request/Response" .
+
+doc:ParkingAccessibility a doc:Guide ;
+    rdfs:label "Parking & Accessibility (FM)" ;
+    doc:path "Guides/Parking/Parking_Implementation_Guide.md" ;
+    skos:definition "Implementing parking monitoring with SIRI-FM" .
+
+doc:Validation a doc:Guide ;
+    rdfs:label "Validation" ;
+    doc:path "Guides/Validation/Validation_Guide.md" ;
+    skos:definition "Validating SIRI XML against the official XSD" .
+
+doc:Glossary a doc:Guide ;
+    rdfs:label "Glossary" ;
+    doc:path "Guides/Glossary/Glossary.md" ;
+    skos:definition "Terminology and definitions" .
+
+doc:BussForTog a doc:Guide ;
+    rdfs:label "Buss for tog — XSD-dekningsanalyse" ;
+    doc:path "Guides/BussForTog/BussForTog_XSD_Dekningsanalyse.md" ;
+    skos:definition "Coverage analysis of bus-for-train attributes against SIRI v2.2 XSD" .
+
+## =================================================================
+## NAMESPACES (XML)
+## =================================================================
+
+siri:SIRINamespace a siri:XMLNamespace ;
+    rdfs:label "SIRI namespace" ;
+    siri:uri "http://www.siri.org.uk/siri" ;
+    siri:prefix "siri" .
+
+siri:ACSBNamespace a siri:XMLNamespace ;
+    rdfs:label "ACSB namespace (accessibility)" ;
+    siri:uri "http://www.ifopt.org.uk/acsb" ;
+    siri:prefix "acsb" ;
+    rdfs:comment "Required for AccessibilityAssessment, AccessibilityLimitation, WheelchairAccess, etc." .
+
+siri:IFOPTNamespace a siri:XMLNamespace ;
+    rdfs:label "IFOPT namespace (stop infrastructure)" ;
+    siri:uri "http://www.ifopt.org.uk/ifopt" ;
+    siri:prefix "ifopt" .
+
+## =================================================================
+## TRANSMODEL ALIGNMENT
+## =================================================================
+## SIRI concepts are rooted in the CEN Transmodel Reference Data Model.
+## These skos:exactMatch / skos:closeMatch triples establish the
+## conceptual lineage without creating hard owl:imports dependencies.
+## Transmodel ontology: https://w3id.org/transmodel/
+## -----------------------------------------------------------------
+
+## --- Real-time journey views ---
+
+siri:EstimatedVehicleJourney skos:closeMatch tm-journeys:MonitoredVehicleJourney ;
+    rdfs:seeAlso tm-journeys:VehicleJourney .
+
+siri:MonitoredVehicleJourney skos:closeMatch tm-journeys:MonitoredVehicleJourney ;
+    rdfs:seeAlso tm-journeys:VehicleJourney .
+
+## --- Accessibility ---
+
+siri:AccessibilityAssessment skos:exactMatch tm-fac:AccessibilityAssessment .
+siri:AccessibilityLimitation skos:exactMatch tm-fac:AccessibilityLimitation .
+
+## --- Facilities ---
+
+siri:Facility skos:broadMatch tm-fac:Facility .
+siri:FacilityCondition skos:closeMatch tm-fac:StatusOfEquipment .
+
+## --- Situations / Validity ---
+
+siri:ValidityPeriod skos:closeMatch tm-fac:ValidityCondition .
+
+## --- Vehicle modes ---
+
+siri:VehicleModeEnum skos:closeMatch tm-journeys:VehicleMode .
+
+## --- Stop infrastructure ---
+
+siri:AffectedStopPlace skos:closeMatch tm-fac:StopPlace .
+siri:AffectedStopPoint skos:closeMatch tm-journeys:ScheduledStopPoint .
+
+## =================================================================
+## END OF ONTOLOGY
+## =================================================================
