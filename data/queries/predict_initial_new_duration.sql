@@ -14,8 +14,8 @@
 -- 'Innstilt grunnet manglende bestilling%'). That filter is intentionally omitted here
 -- so every incident is scored; add it to `src` to match the training slice.
 --
--- Companion "traffic impacted for ~Y min" number: swap the model to dur_init_impact
--- and the quantile filter to target='impact' — the `feat` block is identical.
+-- Companion "traffic impacted for ~Y min" number: predict_initial_new_impact.sql —
+-- same query with dur_init_impact and target='impact'. Keep the two files in sync.
 --
 -- ACTUALS ("what actually happened"): the actual_* columns come from rail_calls_new
 -- (ET-derived realized cancellations + departure delays) measured within onset + 12h,
