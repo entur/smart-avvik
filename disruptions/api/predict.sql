@@ -1,5 +1,5 @@
--- Score EVERY post-training NSB disruption in disruptions_initial_today with BOTH duration
--- models and set the predictions against what actually happened from SIRI-ET.
+-- Score EVERY NSB disruption in disruptions_initial_today (today's situations) with BOTH
+-- duration models and set the predictions against what actually happened from SIRI-ET.
 --
 --   * reopen (dur_init_reopen) -> "trains running again in ~X min"
 --   * impact (dur_init_impact) -> "timetable fully back to normal in ~Y min" (>= reopen)

@@ -1,40 +1,24 @@
--- Build disruptions.disruptions_initial_today: the post-training slice of the per-situation
--- INITIAL-version table.
+-- Build disruptions.disruptions_initial_today: TODAY's NSB situations in the INITIAL-version
+-- per-situation feature/label shape, so predict.sql can score the live incidents.
 --
--- create_disruptions_initial.sql does a full 2-year build of disruptions.disruptions_initial
--- (the training population). This script applies that SAME feature/label logic to ONLY the
--- NSB situations whose onset falls on/after the day disruptions_initial was last built, and
--- writes them to disruptions_initial_new — the population predict_initial_new_duration.sql and
--- predict_610_duration.sql score against. New incidents carry situationNumbers the training
--- table never saw, so this gives the predict_* queries a fresh, schema-identical slice to run on.
+-- create_disruptions_initial.sql does the full 2-year build of disruptions.disruptions_initial
+-- (the training population). This script applies the SAME first-version feature snapshot and
+-- reopening/impact labelling, but scoped to today's SIRI-SX partitions only
+-- (DATE(_PARTITIONTIME) = CURRENT_DATE(), participantRef = 'NSB'). It is a plain CREATE OR
+-- REPLACE over today's partition — no EXECUTE IMMEDIATE, no 2-year scan, no dedup against the
+-- training table.
 --
--- HOW (mirrors update_categories.sql):
---  1. last_update_date = the day disruptions.disruptions_initial was last modified (from the
---     dataset's __TABLES__ metadata, last_modified_time in epoch ms).
---  2. Re-scan SIRI-SX for partitions on/after that day (>= so the build day is re-covered) and
---     run create_disruptions_initial.sql's first-version feature snapshot + reopening/impact
---     labelling on it.
---  3. Keep only situations NOT already in disruptions_initial (dedup by participantRef,
---     situationNumber). Cost scales with the recent window, not the whole 2-year history.
+-- IN-PROGRESS vs COMPLETED: unlike the training build (inner JOIN on the reopening message and
+-- reopen_minutes BETWEEN 1 AND 10080), this uses a LEFT JOIN to end_times and applies NO
+-- reopen-window filter, so situations that have NOT reopened yet are KEPT — with reopen_ts,
+-- reopen_minutes and (therefore) impact_minutes NULL. That is intentional: today's incidents are
+-- usually still ongoing when scored, and predict.sql reads only the feature columns, not the
+-- labels.
 --
--- WHY EXECUTE IMMEDIATE: same reason as update_categories.sql — inlining the date as a literal
--- lets the _PARTITIONTIME filter prune to just the recent partitions (a scripting variable in
--- the filter may not prune). The single literal '%' in LIKE 'Åpnet%' is escaped as '%%' so
--- FORMAT leaves it intact.
---
--- IMPACT LABEL uses rail_calls_new (the recent-window ET table), NOT the 2-year rail_calls —
--- new incidents' calls only live in the recent slice. Refresh rail_calls_new first
--- (create_rail_calls_new.sql) so each incident's onset + 12h window is covered, or impact_minutes
--- collapses to reopen_minutes for any incident outside rail_calls_new's 30-day range. Bump that
--- script's lookback if last_update_date is more than ~30 days ago.
---
--- EDGE CASES:
---  * Only reopened situations survive (inner JOIN end_times, same as the training build), so a
---    very recent incident that hasn't reopened yet won't appear until it does — re-run then.
---  * A situation straddling the build day (onset just before last_update_date, not yet in
---    disruptions_initial) would have its onset clipped to the pruned window. The NOT EXISTS dedup
---    removes anything already captured; the residual straddlers are a rare in-progress-at-build
---    tail.
+-- IMPACT LABEL uses rail_calls_today (today's ET slice), NOT the 2-year rail_calls — today's
+-- incidents' calls only live in the recent slice. Refresh rail_calls_today first
+-- (rail_calls_today.sql) so each incident's onset + 12h window is covered; otherwise
+-- impact_minutes collapses to reopen_minutes (and is NULL while a situation has not reopened).
 --
 -- Impact thresholds (15 min / 60 min gap / 12 h cap) are inlined literals here — identical to
 -- create_disruptions_initial.sql's DECLAREs; keep them in sync if you tune them there.
@@ -65,7 +49,7 @@ end_times AS (
   WHERE EXISTS (
     SELECT 1 FROM UNNEST(summaries) AS s
     WHERE (s.language IS NULL OR UPPER(s.language) = 'NO')
-      AND (s.value = 'Toget kjører igjen' OR s.value LIKE 'Åpnet%%')
+      AND (s.value = 'Toget kjører igjen' OR s.value LIKE 'Åpnet%')
   )
   GROUP BY participantRef, situationNumber
 ),
@@ -134,8 +118,8 @@ base AS (
   WHERE (fv.severity IS NULL OR fv.severity != 'NO_IMPACT')
 ),
 -- Impacted calls (cancel or big delay) at affected stops, within the look window.
--- rail_calls_new (recent ET), NOT rail_calls (2-year) — new incidents' calls live in the
--- recent slice. impact_delay_min = 15, impact_window_hour = 12 (inlined; see header).
+-- rail_calls_today (today's ET), NOT rail_calls (2-year) — today's incidents' calls live in
+-- the recent slice. impact_delay_min = 15, impact_window_hour = 12 (inlined; see header).
 impacted AS (
   SELECT b.situationNumber, r.aimed_dep AS ts
   FROM base AS b
