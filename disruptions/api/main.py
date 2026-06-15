@@ -17,6 +17,7 @@ _LAST_INGESTION_TIME_QUERY = (Path(__file__).parent / "last_ingestion_time.sql")
 _RAIL_CALLS_QUERY = (Path(__file__).parent / "rail_calls_today.sql").read_text()
 _DISRUPTIONS_QUERY = (Path(__file__).parent / "disruptions_today.sql").read_text()
 _UPDATE_CATEGORIES_QUERY = (Path(__file__).parent / "update_categories.sql").read_text()
+_PREDICT_QUERY = (Path(__file__).parent / "predict.sql").read_text()
 
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
@@ -24,6 +25,7 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     bq_client.query(_RAIL_CALLS_QUERY).result()
     bq_client.query(_DISRUPTIONS_QUERY).result()
     bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
+    bq_client.query(_PREDICT_QUERY).result()
 
 
 

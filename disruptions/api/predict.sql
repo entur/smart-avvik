@@ -1,39 +1,44 @@
--- Predict reopening duration ("trains running again in ~X min") for EVERY post-training
--- NSB disruption in disruptions_initial_new (all affected stops, not just 610), and set
--- it against what actually happened from SIRI-ET.
+-- Score EVERY post-training NSB disruption in disruptions_initial_today with BOTH duration
+-- models and set the predictions against what actually happened from SIRI-ET.
 --
--- dur_init_reopen was trained on training_initial's feature shape, so we rebuild that
--- shape here: category lookup, od_corridors, and the exact stop_*/od_* multi-hot columns
--- the model expects (names taken verbatim from ML.FEATURE_INFO). The model predicts
--- LN(reopen_minutes), so the point estimate in minutes = EXP(predicted_label); the
+--   * reopen (dur_init_reopen) -> "trains running again in ~X min"
+--   * impact (dur_init_impact) -> "timetable fully back to normal in ~Y min" (>= reopen)
+--
+-- Both models were trained on training_initial's feature shape, so we rebuild that shape
+-- once in `feat`: category lookup, od_corridors, and the exact stop_*/od_* multi-hot
+-- columns the models expect (names taken verbatim from ML.FEATURE_INFO). Each model
+-- predicts LN(minutes), so the point estimate in minutes = EXP(predicted_label); the
 -- P50/P80/P90 range applies the calibrated LN-residual offsets from duration_quantiles
--- (target='reopen') for "running again in ~X, up to ~Z min" comms.
+-- for "running again in ~X, up to ~Z min" comms.
+--
+-- QUANTILES: each model uses its OWN calibrated LN-residual offsets from duration_quantiles
+-- (target='reopen' for the reopen model, target='impact' for the impact model; see
+-- create_quantiles.sql). Both join the per-category offset and COALESCE to the global
+-- '__ALL__' row for sparse / UNKNOWN / previously-unseen categories.
 --
 -- NOTE on population: create_training_initial.sql dropped "order not received" rows
 -- (description LIKE 'Bestilling ikke mottatt%' / 'Ingen bestilling mottatt%' /
 -- 'Innstilt grunnet manglende bestilling%'). That filter is intentionally omitted here
 -- so every incident is scored; add it to `src` to match the training slice.
 --
--- Companion "traffic impacted for ~Y min" number: predict_initial_new_impact.sql —
--- same query with dur_init_impact and target='impact'. Keep the two files in sync.
---
--- ACTUALS ("what actually happened"): the actual_* columns come from rail_calls_new
+-- ACTUALS ("what actually happened"): the actual_* columns come from rail_calls_today
 -- (ET-derived realized cancellations + departure delays) measured within onset + 12h,
 -- matched to each incident by affected STOP (stop_place IN affected_stops) OR by named
 -- TRAIN (jkey IN affected_journeys). The train match matters because journey-only
 -- situations carry NO affected_stops, so a stop-only join reads 0 even when the named
 -- train was cancelled/delayed. actual_impact_min mirrors create_disruptions_initial's
 -- impact label (impacted call = cancelled OR dep_delay >= 15 min; a >60-min quiet gap
--- ends the episode; 12h cap) — the apples-to-apples realized duration vs pred_reopen_min.
--- NOTE: rail_calls_new must cover each incident's onset + 12h or the actuals come back
--- 0/NULL (refresh it first with create_rail_calls_new.sql); a 0 there now means "no
--- measured impact at the stops OR on the named trains, OR no ET coverage yet".
+-- ends the episode; 12h cap) — the apples-to-apples realized duration vs the predictions.
+-- NOTE: rail_calls_today must cover each incident's onset + 12h or the actuals come back
+-- 0/NULL (refresh it first with rail_calls_today.sql); a 0 there now means "no measured
+-- impact at the stops OR on the named trains, OR no ET coverage yet".
 --
 -- actual_impact_min_lb is a SEPARATE variant that also looks back 60 min before onset,
 -- to catch impact that began before the SX was posted (forward-only actual_impact_min
 -- misses it). It equals actual_impact_min when there's no pre-onset impact; it is NOT a
 -- redefinition of the impact label (which is strictly forward from onset).
 
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.predictions_today` AS
 WITH
 src AS (
   SELECT
@@ -45,8 +50,7 @@ src AS (
       FROM UNNEST(d.affected_journeys) AS j
       WHERE REGEXP_CONTAINS(j, r':\d+_([A-Za-z]+-[A-Za-z]+)')
     ) AS od_corridors
-  FROM `disruptions.disruptions_today` AS d
-  WHERE d.participantRef = 'NSB'
+  FROM `disruptions.disruptions_initial_today` AS d
 ),
 feat AS (
   SELECT
@@ -148,6 +152,56 @@ feat AS (
   LEFT JOIN `disruptions.categories` AS c
     ON d.summary = c.summary AND d.description = c.description
 ),
+-- ===== predictions: one ML.PREDICT per model, both fed the shared `feat` shape =====
+-- reopen model: "trains running again in ~X min". Per-category 'reopen' offsets, with the
+-- global '__ALL__' row as fallback for sparse / UNKNOWN / unseen categories.
+reopen_pred AS (
+  SELECT
+    p.situationNumber,
+    p.onset_ts,
+    p.category,
+    p.num_affected_stops,
+    p.declared_min,
+    p.summary,
+    ROUND(EXP(p.predicted_label))                                    AS pred_reopen_min,   -- point estimate
+    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))  AS reopen_p50_min,
+    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))  AS reopen_p80_min,
+    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))  AS reopen_p90_min     -- "up to ~Z min"
+  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_reopen`,
+                  (SELECT * FROM feat)) AS p
+  LEFT JOIN (
+    SELECT category, off_p50, off_p80, off_p90
+    FROM `disruptions.duration_quantiles`
+    WHERE target = 'reopen' AND category != '__ALL__'
+  ) AS qc ON qc.category = p.category
+  CROSS JOIN (
+    SELECT off_p50, off_p80, off_p90
+    FROM `disruptions.duration_quantiles`
+    WHERE target = 'reopen' AND category = '__ALL__'
+  ) AS qg
+),
+-- impact model: "timetable fully back to normal in ~Y min" (>= reopen). Per-category
+-- 'impact' offsets, with the global '__ALL__' row as fallback.
+impact_pred AS (
+  SELECT
+    p.situationNumber,
+    ROUND(EXP(p.predicted_label))                                    AS pred_impact_min,   -- point estimate
+    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))  AS impact_p50_min,
+    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))  AS impact_p80_min,
+    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))  AS impact_p90_min     -- "up to ~Z min"
+  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_impact`,
+                  (SELECT * FROM feat)) AS p
+  LEFT JOIN (
+    SELECT category, off_p50, off_p80, off_p90
+    FROM `disruptions.duration_quantiles`
+    WHERE target = 'impact' AND category != '__ALL__'
+  ) AS qc ON qc.category = p.category
+  CROSS JOIN (
+    SELECT off_p50, off_p80, off_p90
+    FROM `disruptions.duration_quantiles`
+    WHERE target = 'impact' AND category = '__ALL__'
+  ) AS qg
+),
 -- ===== realized outcome per incident (matched by affected stop OR named train) =====
 inc AS (
   SELECT
@@ -172,7 +226,7 @@ calls AS (
     r.dep_delay_min,
     (r.call_cancelled OR r.dep_delay_min >= 15) AS impacted   -- 15-min threshold (label default)
   FROM inc AS i
-  JOIN `disruptions.rail_calls_new` AS r
+  JOIN `disruptions.rail_calls_today` AS r
     ON r.aimed_dep BETWEEN i.onset_ts AND TIMESTAMP_ADD(i.onset_ts, INTERVAL 12 HOUR)
    AND ( r.stop_place IN UNNEST(i.affected_stops)
       OR r.jkey       IN UNNEST(i.affected_jkeys) )
@@ -220,7 +274,7 @@ actual_impact AS (
 calls_pre AS (
   SELECT i.situationNumber, r.aimed_dep
   FROM inc AS i
-  JOIN `disruptions.rail_calls_new` AS r
+  JOIN `disruptions.rail_calls_today` AS r
     ON r.aimed_dep >= TIMESTAMP_SUB(i.onset_ts, INTERVAL 60 MINUTE)
    AND r.aimed_dep <  i.onset_ts
    AND ( r.stop_place IN UNNEST(i.affected_stops)
@@ -259,38 +313,32 @@ actual_impact_lb AS (
   GROUP BY s.situationNumber
 )
 SELECT
-  p.situationNumber,
-  p.onset_ts,
-  p.category,
-  p.num_affected_stops,
-  p.declared_min                                       AS declared_window_min,
-  ROUND(EXP(p.predicted_label))                                       AS pred_reopen_min,   -- point estimate
-  ROUND(EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))     AS reopen_p50_min,
-  ROUND(EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))     AS reopen_p80_min,
-  ROUND(EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))     AS reopen_p90_min,    -- "up to ~Z min"
-  -- what actually happened (ET-derived, matched by affected stop OR named train; 0/NULL until rail_calls_new covers onset+12h)
+  r.situationNumber,
+  r.onset_ts,
+  r.category,
+  r.num_affected_stops,
+  r.declared_min                                       AS declared_window_min,   -- operator's own estimate
+  -- reopen model: "trains running again in ~X min"
+  r.pred_reopen_min,
+  r.reopen_p50_min,
+  r.reopen_p80_min,
+  r.reopen_p90_min,
+  -- impact model: "timetable fully back to normal in ~Y min" (>= reopen)
+  i.pred_impact_min,
+  i.impact_p50_min,
+  i.impact_p80_min,
+  i.impact_p90_min,
+  -- what actually happened (ET-derived, matched by affected stop OR named train; 0/NULL until rail_calls_today covers onset+12h)
   IFNULL(s.actual_n_calls, 0)                          AS actual_n_calls,
   IFNULL(s.actual_n_cancelled, 0)                      AS actual_n_cancelled,
   IFNULL(s.actual_n_delayed15, 0)                      AS actual_n_delayed15,
   s.actual_max_delay_min,
   a.actual_impact_min,                                                       -- forward-only (onset -> onset+12h)
   b.actual_impact_min_lb,                                                    -- incl. 60-min pre-onset look-back
-  p.summary
-FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_reopen`,
-                (SELECT * FROM feat)) AS p
--- per-category calibrated offsets, with the global '__ALL__' row as fallback for
--- sparse / UNKNOWN / unseen categories (see create_quantiles.sql)
-LEFT JOIN (
-  SELECT category, off_p50, off_p80, off_p90
-  FROM `disruptions.duration_quantiles`
-  WHERE target = 'reopen' AND category != '__ALL__'
-) AS qc ON qc.category = p.category
-CROSS JOIN (
-  SELECT off_p50, off_p80, off_p90
-  FROM `disruptions.duration_quantiles`
-  WHERE target = 'reopen' AND category = '__ALL__'
-) AS qg
+  r.summary
+FROM reopen_pred AS r
+JOIN impact_pred           AS i USING (situationNumber)
 LEFT JOIN actual_stats     AS s USING (situationNumber)
 LEFT JOIN actual_impact    AS a USING (situationNumber)
 LEFT JOIN actual_impact_lb AS b USING (situationNumber)
-ORDER BY pred_reopen_min DESC, p.onset_ts;
+ORDER BY r.pred_reopen_min DESC, r.onset_ts;
