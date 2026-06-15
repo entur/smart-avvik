@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import bigquery
 from google.cloud.bigquery import QueryJob
 from pydantic import BaseModel
@@ -120,6 +121,15 @@ async def lifespan(app: FastAPI):
 bq_client = bigquery.Client()
 app = FastAPI(lifespan=lifespan)
 
+# Public, read-only JSON API — allow any origin so it can be consumed from
+# browsers (only GET endpoints are exposed, so this carries no write risk).
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
+
 
 def get_last_ingestion_time() -> datetime | None:
     """Return the most recent ingestionTime for today's SIRI-SX partitions."""
@@ -135,19 +145,28 @@ def poll_for_changes(
     """Poll get_last_ingestion_time() once per minute, calling on_change when it changes.
 
     Pass a stop_event to interrupt the loop cleanly between polls (used for shutdown).
+
+    Each poll (and its on_change rebuild) is wrapped: a failure — e.g. a transient
+    BigQuery error, or SIRI read access not yet granted to the runtime identity — is
+    logged and retried on the next tick rather than killing this daemon thread for good.
+    That lets the service self-recover once access lands, without a restart.
     """
-    last_seen = get_last_ingestion_time()
-    on_change(last_seen)
+    last_seen = None
+    seen_any = False
     while True:
+        try:
+            current = get_last_ingestion_time()
+            if not seen_any or current != last_seen:
+                last_seen = current
+                seen_any = True
+                on_change(current)
+        except Exception:
+            logger.exception("Ingestion poll failed; retrying on next tick")
         if stop_event is not None:
             if stop_event.wait(interval):
                 return
         else:
             time.sleep(interval)
-        current = get_last_ingestion_time()
-        if current != last_seen:
-            last_seen = current
-            on_change(current)
 
 
 class Estimate(BaseModel):
