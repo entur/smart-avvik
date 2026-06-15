@@ -57,6 +57,7 @@ feat AS (
     -- pass-through (not features; ML.PREDICT carries them to the output)
     d.situationNumber,
     d.onset_ts,
+    d.reopen_ts,   -- non-NULL once a reopening message was seen => disruption is over
     d.summary,
     d.declared_window_minutes AS declared_min,   -- operator's own estimate, for comparison
     -- scalar / categorical features
@@ -159,6 +160,7 @@ reopen_pred AS (
   SELECT
     p.situationNumber,
     p.onset_ts,
+    p.reopen_ts,
     p.category,
     p.num_affected_stops,
     p.declared_min,
@@ -315,6 +317,7 @@ actual_impact_lb AS (
 SELECT
   r.situationNumber,
   r.onset_ts,
+  r.reopen_ts,   -- NULL while ongoing; set to the reopening-message time once the line is back ("over")
   r.category,
   r.num_affected_stops,
   r.declared_min                                       AS declared_window_min,   -- operator's own estimate
