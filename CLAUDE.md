@@ -16,6 +16,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - ent-anshar-prd:realtime.siri_realtime_sx_production: SIRI-SX (Situation Exchange), textual incident and disruption messages
 - ent-anshar-prd:realtime.siri_realtime_et_production: SIRI-ET (Estimated Timetable), real-time updates to the planned timetable
 
+## Deployment
+
+The `/disruptions` API (`disruptions/api/main.py`) runs on Cloud Run, deployed from source
+(Cloud Build builds the Dockerfile in that directory). Redeploy from `disruptions/api/`:
+
+```sh
+gcloud run deploy kix-avvik-disruptions \
+  --source . \
+  --project ent-kixavvik-dev \
+  --region europe-west1 \
+  --service-account application@ent-kixavvik-dev.iam.gserviceaccount.com \
+  --min-instances 1 \
+  --max-instances 1 \
+  --no-cpu-throttling
+```
+
+- `--min/--max-instances 1`: the app runs one background poller thread and an in-process
+  cache, so it must be a single always-on instance — more instances mean duplicate pollers
+  and unshared caches.
+- `--no-cpu-throttling`: keeps CPU allocated between requests so the poller keeps running.
+- Public, read-only service; the SA needs SIRI read access (granted via the team group).
+- Service URL: https://kix-avvik-disruptions-305411154596.europe-west1.run.app
+
 ## Conventions
 
 - All SQL targets BigQuery Standard SQL; legacy SQL is not used.
