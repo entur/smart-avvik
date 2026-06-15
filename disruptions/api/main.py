@@ -8,16 +8,23 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from google.cloud import bigquery
+from google.cloud.bigquery import QueryJob
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _LAST_INGESTION_TIME_QUERY = (Path(__file__).parent / "last_ingestion_time.sql").read_text()
-
+_RAIL_CALLS_QUERY = (Path(__file__).parent / "rail_calls_today.sql").read_text()
+_DISRUPTIONS_QUERY = (Path(__file__).parent / "disruptions_today.sql").read_text()
+_UPDATE_CATEGORIES_QUERY = (Path(__file__).parent / "update_categories.sql").read_text()
 
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
+    bq_client.query(_RAIL_CALLS_QUERY).result()
+    bq_client.query(_DISRUPTIONS_QUERY).result()
+    bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
+
 
 
 @asynccontextmanager
@@ -36,13 +43,14 @@ async def lifespan(app: FastAPI):
         thread.join(timeout=5)
 
 
+
+bq_client = bigquery.Client()
 app = FastAPI(lifespan=lifespan)
 
 
 def get_last_ingestion_time() -> datetime | None:
     """Return the most recent ingestionTime for today's SIRI-SX partitions."""
-    client = bigquery.Client()
-    row = next(iter(client.query(_LAST_INGESTION_TIME_QUERY).result()))
+    row = next(iter(bq_client.query(_LAST_INGESTION_TIME_QUERY).result()))
     return row.last_ingestion_time
 
 

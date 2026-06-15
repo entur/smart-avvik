@@ -1,4 +1,4 @@
--- Build disruptions.disruptions_initial_new: the post-training slice of the per-situation
+-- Build disruptions.disruptions_initial_today: the post-training slice of the per-situation
 -- INITIAL-version table.
 --
 -- create_disruptions_initial.sql does a full 2-year build of disruptions.disruptions_initial

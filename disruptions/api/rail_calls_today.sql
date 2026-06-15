@@ -29,7 +29,7 @@ WITH last_snap AS (
 calls AS (
   SELECT
     s.jkey, s.lineRef,
-    rc.stopPointRef AS quay,update_rail_calls_new.sql
+    rc.stopPointRef AS quay,
     rc.order AS stop_order,
     SAFE.TIMESTAMP(rc.aimedDepartureTime) AS aimed_dep,
     DATE(SAFE.TIMESTAMP(rc.aimedDepartureTime)) AS call_date,
