@@ -180,6 +180,11 @@ Tables/models (`ent-kixavvik-dev:disruptions`): `disruptions_initial`,
 ## Recommended next steps
 
 - Ship the **reopen model + calibrated intervals**; present impact as a **range**.
-- Try **per-category quantile offsets** for tighter intervals on common causes.
+- **Done — per-category quantile offsets** (`create_quantiles.sql`): offsets are now
+  calibrated per `(target, category)` for categories with ≥100 train residuals, with a
+  global `'__ALL__'` fallback row for sparser/UNKNOWN categories. This separates the
+  tight, fast-recovery causes (`materiell/teknisk` reopen P90 ≈ 24 min) from the long
+  infra ones (`infrastruktur/strøm` reopen P90 ≈ 459 min) that a single global offset
+  blurred together. Consumers join on category and COALESCE to `'__ALL__'`.
 - Expose the **tail classifier** as a standalone "risk of extended disruption" flag.
 - Add **weather / stop-reliability** features; revisit the impact threshold knobs.

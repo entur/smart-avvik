@@ -264,10 +264,10 @@ SELECT
   p.category,
   p.num_affected_stops,
   p.declared_min                                       AS declared_window_min,
-  ROUND(EXP(p.predicted_label))                        AS pred_reopen_min,   -- point estimate
-  ROUND(EXP(p.predicted_label + q.off_p50))            AS reopen_p50_min,
-  ROUND(EXP(p.predicted_label + q.off_p80))            AS reopen_p80_min,
-  ROUND(EXP(p.predicted_label + q.off_p90))            AS reopen_p90_min,    -- "up to ~Z min"
+  ROUND(EXP(p.predicted_label))                                       AS pred_reopen_min,   -- point estimate
+  ROUND(EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))     AS reopen_p50_min,
+  ROUND(EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))     AS reopen_p80_min,
+  ROUND(EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))     AS reopen_p90_min,    -- "up to ~Z min"
   -- what actually happened (ET-derived, matched by affected stop OR named train; 0/NULL until rail_calls_new covers onset+12h)
   IFNULL(s.actual_n_calls, 0)                          AS actual_n_calls,
   IFNULL(s.actual_n_cancelled, 0)                      AS actual_n_cancelled,
@@ -278,11 +278,18 @@ SELECT
   p.summary
 FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_reopen`,
                 (SELECT * FROM feat)) AS p
+-- per-category calibrated offsets, with the global '__ALL__' row as fallback for
+-- sparse / UNKNOWN / unseen categories (see create_quantiles.sql)
+LEFT JOIN (
+  SELECT category, off_p50, off_p80, off_p90
+  FROM `disruptions.duration_quantiles`
+  WHERE target = 'reopen' AND category != '__ALL__'
+) AS qc ON qc.category = p.category
 CROSS JOIN (
   SELECT off_p50, off_p80, off_p90
   FROM `disruptions.duration_quantiles`
-  WHERE target = 'reopen'
-) AS q
+  WHERE target = 'reopen' AND category = '__ALL__'
+) AS qg
 LEFT JOIN actual_stats     AS s USING (situationNumber)
 LEFT JOIN actual_impact    AS a USING (situationNumber)
 LEFT JOIN actual_impact_lb AS b USING (situationNumber)
