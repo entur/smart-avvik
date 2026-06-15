@@ -323,11 +323,13 @@ SELECT
   r.reopen_p50_min,
   r.reopen_p80_min,
   r.reopen_p90_min,
-  -- impact model: "timetable fully back to normal in ~Y min" (>= reopen)
-  i.pred_impact_min,
-  i.impact_p50_min,
-  i.impact_p80_min,
-  i.impact_p90_min,
+  -- impact model: "timetable fully back to normal in ~Y min". Floored at the matching
+  -- reopen estimate because impact_minutes = GREATEST(reopen_minutes, tail) by label
+  -- definition, but the two independent regressors don't enforce it at predict time.
+  GREATEST(r.pred_reopen_min, i.pred_impact_min) AS pred_impact_min,
+  GREATEST(r.reopen_p50_min,  i.impact_p50_min)  AS impact_p50_min,
+  GREATEST(r.reopen_p80_min,  i.impact_p80_min)  AS impact_p80_min,
+  GREATEST(r.reopen_p90_min,  i.impact_p90_min)  AS impact_p90_min,
   -- what actually happened (ET-derived, matched by affected stop OR named train; 0/NULL until rail_calls_today covers onset+12h)
   IFNULL(s.actual_n_calls, 0)                          AS actual_n_calls,
   IFNULL(s.actual_n_cancelled, 0)                      AS actual_n_cancelled,
