@@ -16,6 +16,7 @@
 SELECT
   situationNumber,
   summary,
+  description,
   category,
   onset_ts,
   reopen_ts,                  -- NULL while ongoing; reopening-message time once trains run again

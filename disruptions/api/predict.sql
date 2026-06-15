@@ -59,6 +59,7 @@ feat AS (
     d.onset_ts,
     d.reopen_ts,   -- non-NULL once a reopening message was seen => disruption is over
     d.summary,
+    d.description,
     d.declared_window_minutes AS declared_min,   -- operator's own estimate, for comparison
     -- scalar / categorical features
     IFNULL(c.category,   'UNKNOWN') AS category,
@@ -165,6 +166,7 @@ reopen_pred AS (
     p.num_affected_stops,
     p.declared_min,
     p.summary,
+    p.description,
     ROUND(EXP(p.predicted_label))                                    AS pred_reopen_min,   -- point estimate
     ROUND(EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))  AS reopen_p50_min,
     ROUND(EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))  AS reopen_p80_min,
@@ -340,7 +342,8 @@ SELECT
   s.actual_max_delay_min,
   a.actual_impact_min,                                                       -- forward-only (onset -> onset+12h)
   b.actual_impact_min_lb,                                                    -- incl. 60-min pre-onset look-back
-  r.summary
+  r.summary,
+  r.description
 FROM reopen_pred AS r
 JOIN impact_pred           AS i USING (situationNumber)
 LEFT JOIN actual_stats     AS s USING (situationNumber)

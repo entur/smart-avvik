@@ -33,6 +33,7 @@ class _CachedDisruption:
 
     situation_number: str
     summary: str | None
+    description: str | None
     category: str
     onset_ts: datetime
     reopen_ts: datetime | None  # set once trains run again; impact may still linger after this
@@ -64,6 +65,7 @@ def refresh_disruptions_cache() -> None:
         _CachedDisruption(
             situation_number=r.situationNumber,
             summary=r.summary,
+            description=r.description,
             category=r.category,
             onset_ts=r.onset_ts,
             reopen_ts=r.reopen_ts,
@@ -166,6 +168,7 @@ class Estimate(BaseModel):
 class Disruption(BaseModel):
     situation_number: str
     summary: str | None
+    description: str | None
     category: str
     onset: datetime
     minutes_since_onset: int
@@ -217,6 +220,7 @@ def _to_disruption(d: _CachedDisruption, now: datetime) -> Disruption:
     return Disruption(
         situation_number=d.situation_number,
         summary=d.summary,
+        description=d.description,
         category=d.category,
         onset=d.onset_ts,
         minutes_since_onset=max(0, round((now - d.onset_ts).total_seconds() / 60)),
