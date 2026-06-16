@@ -420,7 +420,12 @@ async def disruptions() -> DisruptionsResponse:
         cached = _disruptions_cache
         refreshed_at = _disruptions_refreshed_at
 
-    items = [_to_disruption(d, now) for d in cached]
+    items = [
+        disruption
+        for d in cached
+        for disruption in [_to_disruption(d, now)]
+        if disruption.impact.p90_min_from_now > 0
+    ]
     reopened_count = sum(1 for x in items if x.reopened)
     return DisruptionsResponse(
         as_of=now,
