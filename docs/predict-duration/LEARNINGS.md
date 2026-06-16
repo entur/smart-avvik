@@ -261,3 +261,65 @@ as from ET.
 median win, leakage-safe, top-ranked features); leave the **reopen** model unchanged.
 To productionize, the `/disruptions` poller must compute `preonset_features` at
 predict time from the live ET feed (it already reads ET for `rail_calls`).
+
+---
+
+## Re-predicting impact *during* a disruption (2026-06)
+
+The onset models predict once and never update. This experiment builds a
+re-prediction model that refreshes the **remaining** impact at checkpoints `t` while
+a disruption is live — "trains impacted for ~Y *more* min" — and asks whether
+watching ET delays as they accumulate helps. Artifacts:
+`create_impact_checkpoints.sql` → `train_impact_remaining.sql` (tables
+`impact_checkpoints`, `training_checkpoints`; models `impact_remaining_full`,
+`impact_remaining_noet`).
+
+**Setup.** For each impacted situation, emit one row per checkpoint
+`t ∈ {10,20,30,45,60,90,120,180,240,300,360}` min where `t < impact_minutes` (still
+ongoing) → 28,991 checkpoint rows over 5,603 situations. Label `remaining_minutes =
+impact_minutes − t` on `LN`. Features: onset features (reused from
+`training_initial`) + **elapsed_min** + leakage-safe reopen-state (`reopened_by_t`,
+`minutes_since_reopen`) + ET observed in `[onset, t]` (cumulative + recent-30-min +
+`mins_since_last_impact`). Leakage anchored at the checkpoint `cp_ts = onset+t`
+(same `knowable_delay` transform, relative to `cp_ts`); raw `reopen_minutes` and
+`impact_minutes` are **not** features (future knowledge). is_eval is the same
+situation-level split, so a situation is wholly train or eval. `impact_remaining_noet`
+is the ablation: drops the ET-observed-so-far features.
+
+**Held-out eval (n=5,740 checkpoints), remaining-impact MAE / median AE:**
+
+| model | MAE | medAE |
+|---|---|---|
+| during_full (+ET-so-far) | 134.6 | 53.2 |
+| during_noet (ablation)   | 136.1 | 52.0 |
+| naive_median             | 142.7 | 69.0 |
+| onset_static (never re-predict: `onset_total − t`) | 165.1 | 75.0 |
+
+**Finding 1 — re-prediction itself is a large, robust win.** Refreshing the estimate
+beats projecting the static onset number forward by **−18% MAE / −29% median**, and
+the gap *grows with elapsed time* (by >120 min elapsed: MAE 202 vs 267, −24%) because
+the static estimate goes stale and floors out once a disruption outlasts its onset
+prediction. **The reframe is sound — re-predict ongoing disruptions.**
+
+**Finding 2 — the win comes from the clock + the reopen event, not from watching ET.**
+`during_full` ≈ `during_noet` (within ~1% MAE; noet is marginally better on median).
+The ET-so-far features are *informative but redundant*: in `ML.GLOBAL_EXPLAIN` they
+are 4 of the top 11 (`mins_since_last_impact` #5, `cum_cancel` #6, `cum_maxdelay`,
+`rec_impacted`), yet `elapsed_min` + `minutes_since_reopen` + onset context substitute
+for them almost completely. So the user's specific hypothesis ("look at actual delays
+while it's under way") doesn't pay off for *this* sessionized label — elapsed time
+dominates.
+
+**Finding 3 — ET's only niche is the post-reopening tail.** Split by regime:
+after the track reopens (n=3,625) ET helps ~3% (MAE 100.7 vs 103.6) — residual
+congestion is genuinely observable as it clears; while the line is still shut
+(n=2,115) ET is useless/slightly worse (192.9 vs 191.7) — no trains run, and the
+unobservable physical repair governs the remaining time.
+
+**Verdict.** Adopt re-prediction for live disruptions; the pragmatic production choice
+is **`impact_remaining_noet`** — essentially as accurate as the full model, and it
+needs no ET join at predict time (only the clock + the onset features + the
+already-tracked reopen event). Keep the ET-during features only as an optional
+refinement for the post-reopening phase. Combined recommendation: onset =
+`dur_init_impact_et` (pre-onset ET helps); during = `impact_remaining_noet`, re-run on
+the poller's cadence.
