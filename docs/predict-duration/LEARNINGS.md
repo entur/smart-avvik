@@ -334,3 +334,75 @@ of drifting overdue. Impact intervals use new per-category `target='remaining'` 
 in `duration_quantiles` (added to `create_quantiles.sql`; eval coverage 0.50/0.76/0.85).
 The reopen estimate is untouched (still the onset `dur_init_reopen`). Needs a Cloud Run
 redeploy to take effect.
+
+---
+
+## Weather features from frost.met.no (2026-06)
+
+Tests the long-standing "add weather / stop-reliability features" next step: does
+ambient weather at onset (snow, wind, frost, heat, rain) improve the duration
+predictions? Source: `disruptions.frost_weather` (155M met.no observations, 2 y,
+hourly+coarser). Artifacts: `create_weather_features.sql` → `train_dur_wx.sql`
+(tables `frost_stations`, `stopplace_station`, `station_weather_hourly`,
+`weather_features`, `training_initial_wx`, `training_initial_etwx`; models
+`dur_init_reopen_wx`, `dur_init_impact_wx`, `dur_init_impact_etwx`, and tail-risk
+classifiers `tail_clf_base/et/etwx`).
+
+**Geographic link (the crux).** Disruptions name NSR **StopPlaces**; frost is keyed
+by met.no **station**. Each affected StopPlace is mapped to its nearest ≤3 stations
+within 25 km (NSR stop-place coords vs station coords), and weather is read
+**areally** across all stations near a situation's stops — this fills per-station
+element gaps (precip-only gauges complemented by neighbours with temp/wind) and
+matches the regional scale of the weather that matters to rail. Coverage: 192/210
+affected stops have a station within 25 km; **95% of situations get some weather,
+82% temperature, 94% precipitation**.
+
+**Leakage is easy here (unlike ET).** Weather observations are ground-truth of the
+past and are never revised with future knowledge, so any window ending at onset is
+leakage-safe. Features are areal aggregates over windows ending at `onset_ts`: 6 h /
+24 h rain accumulation, last-3 h temperature, 24 h temp min/max (frost & heat), 6 h
+peak wind & gust, and max snow depth on the ground.
+
+**The raw signal is real but tail-shaped.** Median impact by onset weather bucket:
+**snow-on-ground 68 min, high-wind 83 min vs mild/dry 33 min** (~2–2.5×), with p90
+also lifted (snow 372, wind 524 vs 247). Reopen median is **flat (8–12 min) across
+all weather** — like ET, the "track clear" timing is about the physical incident,
+not ambient conditions.
+
+**Held-out eval (n=1568, same FARM_FINGERPRINT split):**
+
+| target | model | MAE all | medAE all | MAE bulk | medAE bulk |
+|---|---|---|---|---|---|
+| impact | baseline        | 87.4 | 26.1 | 38.9 | 22.0 |
+| impact | +ET             | 85.2 | 23.5 | 37.5 | 19.1 |
+| impact | +weather        | 87.9 | 27.9 | 38.9 | 21.5 |
+| impact | +ET+weather     | 84.9 | 25.4 | 37.9 | 19.9 |
+| reopen | baseline        | 33.6 | 5.0  | 9.7  | 4.6  |
+| reopen | +weather        | 34.1 | 5.1  | 10.0 | 4.6  |
+
+**Finding — weather does not improve the duration POINT models.** Reopen: flat-to-worse.
+Impact: weather alone ≈ baseline, and weather on top of ET ≈ ET (marginally better
+heavy-tail MAE, slightly worse on the comms-relevant median). In `ML.GLOBAL_EXPLAIN`
+the weather features rank **19th and below** (top: `wx_temp_min24`, a winter proxy),
+far under `declared_window`, the ET features, and `category`. **Why:** by the time an
+SX is posted, severe weather is already *priced in* — the operator has categorised it
+(`category`, `declared_window_minutes`) and the pre-onset ET delays/cancellations are
+already elevated (`pre_stop_maxdelay`, `pre_stop_cancel`). Weather is a leading
+indicator of signals the model already sees; it adds no orthogonal information. Same
+shape as the ET-during result: informative in isolation, redundant in the model.
+
+**Weather's one niche — extended-disruption RISK — is marginal.** A long-impact
+(≥120 min, base rate 25%) classifier is the natural home for a tail-heavy signal.
+AUC on held-out eval: base **0.767**, +ET **0.767** (ET adds nothing to tail risk),
+**+ET+weather 0.776** (+0.009). So weather is the *only* family that helps flag a
+long disruption — but the lift sits within the eval AUC standard error (~0.02 at
+n=1568), so it is suggestive, not conclusive.
+
+**Verdict.** Do **not** wire weather into the reopen or impact point models — no
+benefit beyond category + pre-onset ET. The real snow/wind→duration relationship is
+already captured upstream. If the standalone "risk of extended disruption" flag is
+ever built, weather is the one feature family worth including there (it beats ET for
+tail risk), pending a larger eval to confirm the AUC lift. Possible future angle not
+pursued: weather *during* a still-shut disruption (where ET was useless) — an ongoing
+storm might predict slower physical repair — but given onset weather is redundant and
+ET-during didn't pay off, the expected value is low.
