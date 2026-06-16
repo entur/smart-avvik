@@ -1,4 +1,13 @@
-. This shoudl
+-- disruptions.disruptions: one row per SIRI-SX situation (all operators) over the last 2
+-- years, reduced to a single best-estimate record -- the latest snapshot per
+-- (participantRef, situationNumber), its validity periods collapsed to one span (earliest
+-- start -> latest end = duration_minutes), the first Norwegian summary/description, and the
+-- affected stops / lines / dated journeys flattened to arrays. Excludes NO_IMPACT situations
+-- and caps duration to 1..10080 min (7 days). NOT participant-filtered -- downstream queries
+-- restrict participantRef as needed (e.g. 'NSB'). Standard 2-year partition lookback; this is
+-- a full rebuild (CREATE OR REPLACE), so re-run it to pick up newer situations.
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.disruptions` AS
+WITH
   -- 1. Keep only the latest snapshot of each situation = best estimate of the
   --    final/true validity window. `version` is NULL for ~73% of situations, so
   --    order primarily by versionedAtTime, falling back to version then
