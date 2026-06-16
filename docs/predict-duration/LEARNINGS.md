@@ -188,3 +188,76 @@ Tables/models (`ent-kixavvik-dev:disruptions`): `disruptions_initial`,
   blurred together. Consumers join on category and COALESCE to `'__ALL__'`.
 - Expose the **tail classifier** as a standalone "risk of extended disruption" flag.
 - Add **weather / stop-reliability** features; revisit the impact threshold knobs.
+
+---
+
+## Feeding SIRI-ET back in as features (2026-06)
+
+Until now SIRI-ET (`rail_calls`) was used only to build the `impact_minutes`
+*label* — never as a *feature*. Both models predicted purely from the first SX
+snapshot. This experiment tested whether realized ET delays, available at onset,
+improve the models. Artifacts: `create_preonset_features.sql` → `train_dur_et.sql`
+(tables `preonset_features`, `training_initial_et`; models `dur_init_reopen_et`,
+`dur_init_impact_et`).
+
+**Leakage control (the crux).** `rail_calls.dep_delay_min` is the *final* realized
+delay, so a train aimed before onset but departing after onset would leak its
+future delay. Every pre-onset feature uses a leakage-safe transform:
+`knowable_delay = LEAST(final_delay, minutes the train was already overdue at onset)`
+— for a train that had departed by onset this is the true delay, otherwise only its
+lateness-so-far. Cancellations are counted only for calls whose `aimed_dep` had
+already passed at onset (mild residual assumption that the cancel was known by then).
+Features come from three angles the user asked about, windowed to [onset−60min, onset):
+affected **stops**, affected **lines** (earlier journeys on the same line), and the
+named **journeys** themselves (180-min lookback, since a single trip is sparse).
+
+**Coverage.** 92% of situations have ET calls at an affected stop in the 90-min
+pre-onset window; **40% already show impact** (a cancel or ≥15-min delay) at an
+affected stop *before the SX is posted*.
+
+**The signal is strong for impact, absent for reopen.** Leakage-safe pre-onset
+state vs the labels (medians): pre-onset **cancel → impact 95 min**, del≥15 → 59,
+quiet → 21, no-data → 12 — monotone, ~4.5× span. Reopen is **flat (10–12 min) across
+all states** — "track clear" timing is about the physical incident, not current
+congestion.
+
+**Held-out eval (n=1568, same FARM_FINGERPRINT split → fair head-to-head):**
+
+| target | model | MAE all | medAE all | MAE bulk | medAE bulk |
+|---|---|---|---|---|---|
+| impact | baseline | 87.4 | 26.1 | 38.9 | 22.0 |
+| impact | **+ET** | **85.2** | **23.5** | **37.5** | **19.1** |
+| reopen | baseline | 33.6 | 5.0 | 9.7 | 4.6 |
+| reopen | +ET | 33.8 | 5.1 | 10.0 | 4.6 |
+
+Impact median error drops **~10% (all) / ~13% (bulk)** — the comms-relevant typical
+case. MAE moves less (heavy tail dominates it). Reopen is flat-to-worse → **don't add
+ET to the reopen model.** In `ML.GLOBAL_EXPLAIN`, **5 of the top 11 impact features
+are ET-derived**: `pre_stop_maxdelay` (#2, 0.21) and `pre_stop_cancel` (#3, 0.15)
+outrank category, priority, and hour; `pre_stop_calls` (#5), `pre_jour_maxdelay`
+(#9). Affected-**stop** features dominate; same-line and same-journey add a little.
+By pre-onset state, the absolute win is largest on the hardest **pre-onset-cancel**
+subset (impact MAE 125.8 → 115.1), with median sharpening across all buckets.
+
+**Early warning before the SX (idea: detect disruptions from ET alone) — weak.**
+Averaged over situations, the affected-stop impact rate in the hour before onset is
+only **~1.5× the stops' ambient base rate** (0.04 vs 0.026), and only **14% show a
+clear ≥3× escalation**. ET is therefore a poor stand-alone *detector* (too many false
+positives at busy hubs), even though the *conditional* signal feeds the duration
+model well. The 40% "already impacted" headline is mostly ambient hub noise; the
+actionable early-warning subset is the ~14% with genuine escalation.
+
+**Re-predicting *during* a disruption (the strongest reframe) — promising, not yet
+built.** Among disruptions still ongoing at onset+30, severity observed in the first
+30 min separates total impact (multi-cancel@30 → median 161 vs clearing@30 → 101,
+~1.6×). Real but noisier than the onset features, because the 60-min sessionization
+gap lets impact resume after a lull. A survival/nowcast model that re-predicts
+remaining impact at t>onset would likely be driven mostly by **elapsed time** (a
+disruption still live at +120 min is long by definition), with ET delay texture
+secondary. Worth a dedicated build; expect the gain to come from the clock as much
+as from ET.
+
+**Verdict.** Ship pre-onset ET features for the **impact** model (clean ~10–13%
+median win, leakage-safe, top-ranked features); leave the **reopen** model unchanged.
+To productionize, the `/disruptions` poller must compute `preonset_features` at
+predict time from the live ET feed (it already reads ET for `rail_calls`).
