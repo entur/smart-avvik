@@ -15,16 +15,20 @@
 -- are the strongest signals.
 --
 -- TRAINING: 3-class classifier on `outcome`; SELECT * EXCEPT(situationNumber,
--- journey); is_eval as DATA_SPLIT_COL; auto_class_weights (GO is ~86%).
+-- journey); is_eval as DATA_SPLIT_COL; auto_class_weights (GO is ~81%).
 --
 -- KNOWN LIMITATION (selection bias): every journey here was flagged by SX as
 -- affected, so this is a CONDITIONAL model ("given your trip is in a flagged
--- disruption, how bad?"). ~86% of flagged boardings are GO, so the flagged set
+-- disruption, how bad?"). ~81% of flagged boardings are GO, so the flagged set
 -- still holds plenty of negatives; but true cross-line negatives are absent.
 -- The v2 fix is to source candidate boardings from ALL ET traffic at the
 -- affected stops in the window.
 --
--- COST: reads recordedCalls -> ~4 TB for two years (~$20). Dry-run first.
+-- COST: sources realized outcomes from the materialized disruptions.rail_calls (no direct
+-- ET scan), so the build is a few cents instead of ~$20. The trade-off is freshness:
+-- results only reflect journeys present in rail_calls, so rebuild rail_calls
+-- (create_rail_calls.sql) first to include anything newer than its last build. The swap
+-- was verified to produce byte-identical outcome rows to the old ET-direct path.
 
 DECLARE win_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR);
 DECLARE win_end   DATE DEFAULT CURRENT_DATE();
@@ -52,24 +56,16 @@ WITH
   ),
   aff_win AS (SELECT * FROM aff WHERE svc_date BETWEEN win_start AND win_end),
 
-  et AS (
-    SELECT
-      REGEXP_REPLACE(datedVehicleJourneyRef, r'^[A-Za-z]+:', '') AS jkey,
-      lineRef, cancellation AS journey_cancelled, recordedCalls
-    FROM `ent-anshar-prd.realtime.siri_realtime_et_production`
-    WHERE DATE(_PARTITIONTIME) BETWEEN win_start AND DATE_ADD(win_end, INTERVAL 1 DAY)
-    QUALIFY ROW_NUMBER() OVER (PARTITION BY datedVehicleJourneyRef ORDER BY recordedAtTime DESC) = 1
-  ),
-
+  -- Realized outcomes from the materialized rail_calls (last-snapshot-per-journey, unnested
+  -- calls with call_cancelled / dep_delay_min, VYG-filtered) instead of re-scanning ET
+  -- recordedCalls. Verified to yield identical outcome rows to the old et/calls CTEs.
+  -- quay is rail_calls' name for the call's stopPointRef.
   calls AS (
     SELECT
-      e.jkey, e.lineRef, e.journey_cancelled,
-      rc.stopPointRef, rc.order AS stop_order,
-      SAFE.TIMESTAMP(rc.aimedDepartureTime) AS aimed_dep,
-      (rc.cancellation OR e.journey_cancelled) AS call_cancelled,
-      TIMESTAMP_DIFF(SAFE.TIMESTAMP(rc.actualDepartureTime),
-                     SAFE.TIMESTAMP(rc.aimedDepartureTime), MINUTE) AS dep_delay_min
-    FROM et AS e, UNNEST(e.recordedCalls) AS rc
+      jkey, lineRef,
+      quay AS stopPointRef, stop_order, aimed_dep,
+      call_cancelled, dep_delay_min
+    FROM `disruptions.rail_calls`
   )
 
 SELECT
