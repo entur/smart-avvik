@@ -23,7 +23,8 @@ WITH sit AS (
     cd AS cand_date
   FROM `disruptions.disruptions` AS d
   LEFT JOIN `disruptions.categories` AS c
-    ON d.summary = c.summary AND d.description = c.description,
+    ON  IFNULL(d.summary, '__NULL__')     = IFNULL(c.summary, '__NULL__')
+    AND IFNULL(d.description, '__NULL__') = IFNULL(c.description, '__NULL__'),
   UNNEST(d.affected_stops) AS st,
   -- onset day and the next day cover the 12h window across midnight
   UNNEST([DATE(SAFE.TIMESTAMP(d.creationTime)),

@@ -52,10 +52,12 @@ WITH
     -- NULL-safe join: many NSB situations have a NULL summary (and/or description), and
     -- plain `=` yields NULL (never TRUE) on a NULL side, so those situations would never
     -- match a category row and fall through to 'UNKNOWN' regardless of the categories
-    -- table's coverage. IS NOT DISTINCT FROM treats NULL = NULL as a match.
+    -- table's coverage. Use IFNULL-sentinel equality: NULL-safe AND hash-joinable. (IS NOT
+    -- DISTINCT FROM is also NULL-safe but not hash-joinable and blew the on-demand CPU limit
+    -- -- see huskehjul_backtest.sql.)
     LEFT JOIN `disruptions.categories` AS c
-      ON d.summary     IS NOT DISTINCT FROM c.summary
-     AND d.description IS NOT DISTINCT FROM c.description,
+      ON  IFNULL(d.summary, '__NULL__')     = IFNULL(c.summary, '__NULL__')
+     AND IFNULL(d.description, '__NULL__') = IFNULL(c.description, '__NULL__'),
     UNNEST(d.affected_journeys) AS j
     WHERE d.participantRef = 'NSB'
   ),

@@ -170,7 +170,8 @@ feat AS (
     ('JAR-OSL'  IN UNNEST(d.od_corridors)) AS od_JAR_OSL
   FROM src AS d
   LEFT JOIN `disruptions.categories` AS c
-    ON d.summary = c.summary AND d.description = c.description
+    ON  IFNULL(d.summary, '__NULL__')     = IFNULL(c.summary, '__NULL__')
+    AND IFNULL(d.description, '__NULL__') = IFNULL(c.description, '__NULL__')
 ),
 -- ===== predictions: one ML.PREDICT per model, both fed the shared `feat` shape =====
 -- reopen model: "trains running again in ~X min". Per-category 'reopen' offsets, with the

@@ -90,7 +90,8 @@ SELECT
   %s
 FROM base AS b
 LEFT JOIN `disruptions.categories` AS c
-  ON b.summary = c.summary AND b.description = c.description
+  ON  IFNULL(b.summary, '__NULL__')     = IFNULL(c.summary, '__NULL__')
+  AND IFNULL(b.description, '__NULL__') = IFNULL(c.description, '__NULL__')
 WHERE b.description IS NULL OR (
       b.description NOT LIKE 'Bestilling ikke mottatt%%'
   AND b.description NOT LIKE 'Ingen bestilling mottatt%%'

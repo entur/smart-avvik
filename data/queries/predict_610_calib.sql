@@ -9,7 +9,8 @@ disr AS (
     cd                                    AS cand_date
   FROM `disruptions.disruptions_new` AS d
   LEFT JOIN `disruptions.categories` AS c
-    ON d.summary = c.summary AND d.description = c.description,
+    ON  IFNULL(d.summary, '__NULL__')     = IFNULL(c.summary, '__NULL__')
+    AND IFNULL(d.description, '__NULL__') = IFNULL(c.description, '__NULL__'),
   UNNEST([DATE(SAFE.TIMESTAMP(d.creationTime)),
           DATE_ADD(DATE(SAFE.TIMESTAMP(d.creationTime)), INTERVAL 1 DAY)]) AS cd
   WHERE 'NSR:StopPlace:610' IN UNNEST(d.affected_stops)

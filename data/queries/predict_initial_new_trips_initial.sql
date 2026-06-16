@@ -44,7 +44,8 @@ src AS (
     REGEXP_REPLACE(j, r'^[A-Za-z]+:', '') AS jkey
   FROM `disruptions.disruptions_initial_new` AS d
   LEFT JOIN `disruptions.categories` AS c
-    ON d.summary = c.summary AND d.description = c.description,
+    ON  IFNULL(d.summary, '__NULL__')     = IFNULL(c.summary, '__NULL__')
+    AND IFNULL(d.description, '__NULL__') = IFNULL(c.description, '__NULL__'),
   UNNEST(d.affected_journeys) AS j
   WHERE d.participantRef = 'NSB'
     AND SAFE.TIMESTAMP(d.creationTime) IS NOT NULL

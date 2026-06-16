@@ -42,7 +42,8 @@ WITH
       PARSE_DATE('%y-%m-%d', REGEXP_EXTRACT(j, r'_(\d{2}-\d{2}-\d{2})$')) AS svc_date
     FROM `disruptions.disruptions_initial` AS d
     LEFT JOIN `disruptions.categories` AS c
-      ON d.summary = c.summary AND d.description = c.description,
+      ON  IFNULL(d.summary, '__NULL__')     = IFNULL(c.summary, '__NULL__')
+      AND IFNULL(d.description, '__NULL__') = IFNULL(c.description, '__NULL__'),
     UNNEST(d.affected_journeys) AS j
     WHERE d.participantRef = 'NSB'
   ),

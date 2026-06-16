@@ -24,8 +24,10 @@ WITH situations AS (
     d.summary, d.description, c.category, stop_ref
   FROM `ent-kixavvik-dev.disruptions.disruptions_initial` AS d
   LEFT JOIN `ent-kixavvik-dev.disruptions.categories` AS c
-    ON  c.summary IS NOT DISTINCT FROM d.summary
-    AND c.description IS NOT DISTINCT FROM d.description
+    -- IFNULL-sentinel equality: NULL-safe AND hash-joinable (IS NOT DISTINCT FROM blew the
+    -- on-demand CPU limit -- see huskehjul_backtest.sql).
+    ON  IFNULL(c.summary, '__NULL__')     = IFNULL(d.summary, '__NULL__')
+    AND IFNULL(c.description, '__NULL__') = IFNULL(d.description, '__NULL__')
   CROSS JOIN UNNEST(d.affected_stops) AS stop_ref
   WHERE ARRAY_LENGTH(d.affected_stops) <= 3   -- localized incidents only (see header)
 )
