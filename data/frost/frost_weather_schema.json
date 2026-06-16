@@ -1,0 +1,15 @@
+[
+  {"name": "source_id", "type": "STRING", "mode": "NULLABLE", "description": "Frost source id incl. sensor suffix, e.g. SN18700:0"},
+  {"name": "reference_time", "type": "TIMESTAMP", "mode": "NULLABLE", "description": "UTC time the observation refers to"},
+  {"name": "element_id", "type": "STRING", "mode": "NULLABLE", "description": "Frost element id, e.g. air_temperature or mean(air_temperature P1D)"},
+  {"name": "time_offset", "type": "STRING", "mode": "NULLABLE", "description": "ISO-8601 offset of the value within its time series, e.g. PT0H"},
+  {"name": "time_resolution", "type": "STRING", "mode": "NULLABLE", "description": "ISO-8601 resolution, e.g. PT1H, P1D"},
+  {"name": "level_type", "type": "STRING", "mode": "NULLABLE", "description": "Measurement level type, e.g. height_above_ground"},
+  {"name": "level_value", "type": "FLOAT", "mode": "NULLABLE", "description": "Level value (e.g. 2 for 2 m)"},
+  {"name": "level_unit", "type": "STRING", "mode": "NULLABLE", "description": "Level unit, e.g. m"},
+  {"name": "value", "type": "STRING", "mode": "NULLABLE", "description": "Observed value as text; numeric for most elements, but a timestamp for unit='Date' elements (e.g. time_of_maximum_*). Use SAFE_CAST(value AS FLOAT64) for numeric elements."},
+  {"name": "unit", "type": "STRING", "mode": "NULLABLE", "description": "Value unit, e.g. degC"},
+  {"name": "quality_code", "type": "INTEGER", "mode": "NULLABLE", "description": "MET quality control flag (0 = best)"},
+  {"name": "performance_category", "type": "STRING", "mode": "NULLABLE", "description": "MET performance category, e.g. C"},
+  {"name": "exposure_category", "type": "STRING", "mode": "NULLABLE", "description": "MET exposure category code"}
+]

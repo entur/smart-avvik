@@ -1,0 +1,15 @@
+# Frost credentials — contains client_secret, never commit
+auth.txt
+
+# Transient
+*.tmp
+*.csv.gz.tmp
+download.log
+bq_err.txt
+
+# Downloaded observations (multi-GB). Remove this line to track them (consider git-lfs).
+observations/
+
+# Large intermediate inputs (regenerable via the scripts in README.md)
+quays_coords.csv
+timeseries_in_window.json
