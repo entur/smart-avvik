@@ -16,10 +16,12 @@
 -- so a back-off always resolves. Filter on n_boardings / n_situations to gate trust.
 --
 -- METRICS: cancel_rate and trouble_rate (cancelled OR dep_delay >= 10 min) are the
--- headline alert signals. Delay percentiles/mean/std are over NON-cancelled boardings
--- only (clamped >= 0; cancellations are the separate cancel_rate). Each row also
--- carries the UNCONDITIONAL baseline (all NSB calls at the same line+hour) and the
--- lift = conditional / baseline, so a consumer can rank by "how much the flag adds".
+-- headline alert signals. A NULL cancellation flag is read as "not cancelled" (SIRI
+-- convention; see the COALESCE note on the flagged CTE) so the denominators are ALL
+-- boardings, not just those with a determinate flag. Delay percentiles/mean/std are over
+-- NON-cancelled boardings only (clamped >= 0; cancellations are the separate cancel_rate).
+-- Each row also carries the UNCONDITIONAL baseline (all NSB calls at the same line+hour)
+-- and the lift = conditional / baseline, so a consumer can rank by "how much the flag adds".
 --
 -- RANKING (alert_score + alert_tier): a single rankable score so the consumer can
 -- order cells directly instead of juggling raw metrics.
@@ -54,15 +56,20 @@ WITH
   ),
 
   -- One row per flagged boarding (situation x affected journey x boardable stop).
+  -- COALESCE(call_cancelled, FALSE): in SIRI ET the cancellation flag is only set when a
+  -- trip is actually cancelled, so NULL means "not cancelled". Without the COALESCE,
+  -- is_trouble is NULL for an on-time NULL-flag train, and AVG(CAST(... AS INT64)) below
+  -- silently drops those rows from the denominator -- which over-states cancel/trouble
+  -- rates on lines where the flag is often NULL (e.g. long-distance F4/RE).
   flagged AS (
     SELECT
       a.category,
       a.situationNumber,
       REPLACE(r.lineRef, 'VYG:Line:', '')                       AS line,
       EXTRACT(HOUR FROM r.aimed_dep AT TIME ZONE 'Europe/Oslo')  AS hour,
-      r.call_cancelled,
-      IF(NOT r.call_cancelled, GREATEST(r.dep_delay_min, 0), NULL) AS delay_min,
-      (r.call_cancelled OR r.dep_delay_min >= 10)                AS is_trouble
+      COALESCE(r.call_cancelled, FALSE)                          AS call_cancelled,
+      IF(NOT COALESCE(r.call_cancelled, FALSE), GREATEST(r.dep_delay_min, 0), NULL) AS delay_min,
+      (COALESCE(r.call_cancelled, FALSE) OR r.dep_delay_min >= 10) AS is_trouble
     FROM aff AS a
     JOIN `disruptions.rail_calls` AS r USING (jkey)
     WHERE r.aimed_dep IS NOT NULL
@@ -92,11 +99,13 @@ WITH
   ),
 
   -- Unconditional baseline (ALL NSB calls), cubed over (line, hour) only.
+  -- Same COALESCE(call_cancelled, FALSE) as the flagged set, so baseline and conditional
+  -- rates (and the lift between them) treat a NULL cancellation flag identically.
   base AS (
     SELECT
       REPLACE(lineRef, 'VYG:Line:', '')                        AS line,
       EXTRACT(HOUR FROM aimed_dep AT TIME ZONE 'Europe/Oslo')  AS hour,
-      call_cancelled, dep_delay_min
+      COALESCE(call_cancelled, FALSE) AS call_cancelled, dep_delay_min
     FROM `disruptions.rail_calls`
     WHERE call_cancelled OR dep_delay_min IS NOT NULL
   ),
