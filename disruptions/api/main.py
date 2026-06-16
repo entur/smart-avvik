@@ -4,7 +4,7 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -23,6 +23,7 @@ _DISRUPTIONS_QUERY = (Path(__file__).parent / "disruptions_today.sql").read_text
 _UPDATE_CATEGORIES_QUERY = (Path(__file__).parent / "update_categories.sql").read_text()
 _PREDICT_QUERY = (Path(__file__).parent / "predict.sql").read_text()
 _ACTIVE_DISRUPTIONS_QUERY = (Path(__file__).parent / "active_disruptions.sql").read_text()
+_DISRUPTIONS_AS_OF_QUERY = (Path(__file__).parent / "disruptions_as_of.sql").read_text()
 _ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text()
 
 # Hour-of-day in the impact lookup is Europe/Oslo local time (matches the table build),
@@ -67,35 +68,92 @@ _disruptions_cache: list[_CachedDisruption] = []
 _disruptions_refreshed_at: datetime | None = None
 
 
+def _row_to_cached(r) -> _CachedDisruption:
+    """Map one BigQuery row (active_disruptions.sql / disruptions_as_of.sql share the same
+    column set) to a _CachedDisruption."""
+    return _CachedDisruption(
+        situation_number=r.situationNumber,
+        summary=r.summary,
+        description=r.description,
+        category=r.category,
+        onset_ts=r.onset_ts,
+        reopen_ts=r.reopen_ts,
+        # NULL for journey-only situations (no affected stops -> ARRAY_LENGTH(NULL)); the
+        # response model requires an int, so treat "no stops" as 0. (Kept out of the SQL so the
+        # model still sees the raw feature value it was trained on.)
+        num_affected_stops=r.num_affected_stops or 0,
+        declared_window_min=r.declared_window_min,
+        pred_reopen_min=r.pred_reopen_min,
+        reopen_p50_min=r.reopen_p50_min,
+        reopen_p80_min=r.reopen_p80_min,
+        reopen_p90_min=r.reopen_p90_min,
+        pred_impact_min=r.pred_impact_min,
+        impact_p50_min=r.impact_p50_min,
+        impact_p80_min=r.impact_p80_min,
+        impact_p90_min=r.impact_p90_min,
+    )
+
+
 def refresh_disruptions_cache() -> None:
     """Reload the active-disruptions cache from predictions_today (reopen_ts IS NULL)."""
     rows = bq_client.query(_ACTIVE_DISRUPTIONS_QUERY).result()
-    disruptions = [
-        _CachedDisruption(
-            situation_number=r.situationNumber,
-            summary=r.summary,
-            description=r.description,
-            category=r.category,
-            onset_ts=r.onset_ts,
-            reopen_ts=r.reopen_ts,
-            num_affected_stops=r.num_affected_stops,
-            declared_window_min=r.declared_window_min,
-            pred_reopen_min=r.pred_reopen_min,
-            reopen_p50_min=r.reopen_p50_min,
-            reopen_p80_min=r.reopen_p80_min,
-            reopen_p90_min=r.reopen_p90_min,
-            pred_impact_min=r.pred_impact_min,
-            impact_p50_min=r.impact_p50_min,
-            impact_p80_min=r.impact_p80_min,
-            impact_p90_min=r.impact_p90_min,
-        )
-        for r in rows
-    ]
+    disruptions = [_row_to_cached(r) for r in rows]
     with _disruptions_lock:
         global _disruptions_cache, _disruptions_refreshed_at
         _disruptions_cache = disruptions
         _disruptions_refreshed_at = datetime.now(timezone.utc)
     logger.info("Refreshed disruptions cache: %d active disruptions", len(disruptions))
+
+
+def fetch_disruptions_as_of(as_of: datetime) -> list[_CachedDisruption]:
+    """Reconstruct the disruptions that were active AS OF `as_of` by running the point-in-time
+    query against BigQuery (disruptions_as_of.sql), bypassing the live cache.
+
+    The cache only ever holds today's disruptions scored as-of now, so an arbitrary historical
+    instant has to be rebuilt from SX: onset/features, reopen state and the during-disruption
+    features are all computed using only versions with event_ts <= `as_of`. Returns the same
+    _CachedDisruption shape as the cache, so the endpoint renders it identically (with `as_of`
+    standing in for `now`)."""
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("as_of", "TIMESTAMP", as_of)],
+    )
+    rows = bq_client.query(_DISRUPTIONS_AS_OF_QUERY, job_config=job_config).result()
+    return [_row_to_cached(r) for r in rows]
+
+
+# /situation renders one disruption by its situationNumber. Rather than the live cache (which
+# only holds today's set and is filtered for the feed) we reconstruct it from SX as of now, via
+# the same point-in-time query as GET /disruptions?at=now. The whole "as of now" snapshot is
+# cached for 5 minutes and indexed by situationNumber, so repeated detail lookups share a single
+# BigQuery run instead of one query per id. Guarded by its own lock.
+_SITUATION_CACHE_TTL = timedelta(minutes=5)
+_situation_lock = threading.Lock()
+_situation_snapshot: dict[str, _CachedDisruption] = {}
+_situation_snapshot_at: datetime | None = None
+
+
+def get_situation(situation_id: str) -> _CachedDisruption | None:
+    """Return the disruption with this situationNumber, reconstructed as of now.
+
+    Backed by a 5-minute cache of today's disruptions (rebuilt from SX with the same
+    point-in-time query as GET /disruptions?at=now), so a burst of detail requests costs at
+    most one BigQuery run per 5 minutes. Returns None if no NSB disruption with that
+    situationNumber exists in the lookback window (yesterday and today)."""
+    global _situation_snapshot, _situation_snapshot_at
+    now = datetime.now(timezone.utc)
+    with _situation_lock:
+        if (
+            _situation_snapshot_at is not None
+            and now - _situation_snapshot_at < _SITUATION_CACHE_TTL
+        ):
+            return _situation_snapshot.get(situation_id)
+    # Stale or never loaded: rebuild outside the lock (BigQuery call) and publish. A concurrent
+    # request may rebuild in parallel — a harmless duplicate query, not worth serializing on.
+    snapshot = {d.situation_number: d for d in fetch_disruptions_as_of(now)}
+    with _situation_lock:
+        _situation_snapshot = snapshot
+        _situation_snapshot_at = now
+    return snapshot.get(situation_id)
 
 
 # In-process copy of disruptions.category_line_hour_impact, indexed by (category, line,
@@ -595,18 +653,44 @@ def _to_disruption(d: _CachedDisruption, now: datetime) -> Disruption:
     response_description="Disruptions with reopen/impact estimates as minutes from `as_of`",
     tags=["disruptions"],
 )
-async def disruptions() -> DisruptionsResponse:
+async def disruptions(
+    at: datetime | None = Query(
+        default=None,
+        description=(
+            "Optional point in time (ISO 8601, e.g. `2026-06-15T09:00:00Z`) to reconstruct the "
+            "feed AS OF. When omitted (the default), the live feed is served from the in-process "
+            "cache as of the current time. When given, the disruptions active at that instant are "
+            "rebuilt from BigQuery using only data known by then (no later reopening/updates leak "
+            "in), and every estimate is expressed relative to `at` rather than now. A naive value "
+            "is assumed UTC. Must not be in the future."
+        ),
+    ),
+) -> DisruptionsResponse:
     """List today's disruptions (still-ongoing and recently reopened), each with reopen and
     impact estimates as **minutes from now**.
 
     Reopened disruptions are kept in the response and flagged (`reopened: true`) because impact
     typically takes a while to resolve after the line reopens. Use `active_count` /
     `reopened_count` to split the two, and `as_of` as the reference point for every estimate.
+
+    Pass `at` to reconstruct the feed at a past instant instead of now (see the parameter docs);
+    `as_of` then echoes `at`, and `refreshed_at` is null because the result is queried live rather
+    than served from the cache.
     """
-    now = datetime.now(timezone.utc)
-    with _disruptions_lock:
-        cached = _disruptions_cache
-        refreshed_at = _disruptions_refreshed_at
+    if at is None:
+        now = datetime.now(timezone.utc)
+        with _disruptions_lock:
+            cached = _disruptions_cache
+            refreshed_at = _disruptions_refreshed_at
+    else:
+        now = at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+        if now > datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=400,
+                detail="`at` must not be in the future; point-in-time reconstruction only covers past instants.",
+            )
+        cached = fetch_disruptions_as_of(now)
+        refreshed_at = None
 
     items = [
         disruption
@@ -625,6 +709,34 @@ async def disruptions() -> DisruptionsResponse:
         reopened_count=reopened_count,
         disruptions=items,
     )
+
+
+@app.get(
+    "/situation",
+    summary="Render a single disruption by its SIRI-SX situationNumber",
+    response_description="The disruption with reopen/impact estimates as minutes from `as_of`.",
+    tags=["disruptions"],
+)
+async def situation(
+    id: str = Query(
+        description="SIRI-SX situationNumber to render, e.g. 'ENT:SituationNumber:1234'.",
+    ),
+) -> Disruption:
+    """Render a single disruption identified by its `situationNumber`.
+
+    Unlike /disruptions — which only surfaces alert-worthy situations — this returns the
+    requested situation regardless of alert tier, reconstructed from SIRI-SX as of now (the
+    same point-in-time build as GET /disruptions?at=now) and cached for 5 minutes. Every
+    estimate is expressed as minutes from the render time. 404 if no NSB disruption with that
+    situationNumber is found in the lookback window (yesterday and today).
+    """
+    d = get_situation(f"NSB:SituationNumber:{id}")
+    if d is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No disruption found for situationNumber {id!r}.",
+        )
+    return _to_disruption(d, datetime.now(timezone.utc))
 
 
 @app.get(
