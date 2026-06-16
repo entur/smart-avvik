@@ -49,8 +49,13 @@ WITH
       IFNULL(c.category, 'UNKNOWN')         AS category,
       REGEXP_REPLACE(j, r'^[A-Za-z]+:', '') AS jkey
     FROM `disruptions.disruptions` AS d
+    -- NULL-safe join: many NSB situations have a NULL summary (and/or description), and
+    -- plain `=` yields NULL (never TRUE) on a NULL side, so those situations would never
+    -- match a category row and fall through to 'UNKNOWN' regardless of the categories
+    -- table's coverage. IS NOT DISTINCT FROM treats NULL = NULL as a match.
     LEFT JOIN `disruptions.categories` AS c
-      ON d.summary = c.summary AND d.description = c.description,
+      ON d.summary     IS NOT DISTINCT FROM c.summary
+     AND d.description IS NOT DISTINCT FROM c.description,
     UNNEST(d.affected_journeys) AS j
     WHERE d.participantRef = 'NSB'
   ),
