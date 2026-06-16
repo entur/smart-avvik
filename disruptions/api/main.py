@@ -426,6 +426,11 @@ class Disruption(BaseModel):
         ),
     )
 
+    def should_alert(self) -> bool:
+        return (self.alert is not None
+                and self.alert.alert_tier != "suppress"
+                and self.alert.delay_p90 > self.minutes_since_onset)
+
 
 class DisruptionsResponse(BaseModel):
     """Today's disruptions plus the timing context needed to interpret the estimates."""
@@ -607,8 +612,10 @@ async def disruptions() -> DisruptionsResponse:
         disruption
         for d in cached
         for disruption in [_to_disruption(d, now)]
-        if disruption.impact.p90_min_from_now > 0
+        if disruption.should_alert()
     ]
+
+
     reopened_count = sum(1 for x in items if x.reopened)
     return DisruptionsResponse(
         as_of=now,
