@@ -1,15 +1,23 @@
--- Score EVERY NSB disruption in disruptions_initial_today (today's situations) with BOTH
+-- Score EVERY NSB disruption in disruptions_initial_today (today's situations) with the
 -- duration models and set the predictions against what actually happened from SIRI-ET.
 --
---   * reopen (dur_init_reopen) -> "trains running again in ~X min"
---   * impact (dur_init_impact) -> "timetable fully back to normal in ~Y min" (>= reopen)
+--   * reopen (dur_init_reopen)        -> "trains running again in ~X min"
+--   * impact (impact_remaining_noet)  -> "timetable fully back to normal in ~Y min" (>= reopen)
 --
--- Both models were trained on training_initial's feature shape, so we rebuild that shape
--- once in `feat`: category lookup, od_corridors, and the exact stop_*/od_* multi-hot
--- columns the models expect (names taken verbatim from ML.FEATURE_INFO). Each model
--- predicts LN(minutes), so the point estimate in minutes = EXP(predicted_label); the
--- P50/P80/P90 range applies the calibrated LN-residual offsets from duration_quantiles
--- for "running again in ~X, up to ~Z min" comms.
+-- The reopen model is the onset model (predicts time-to-reopen from the first SX
+-- snapshot). The impact estimate now comes from the DURING-disruption model
+-- impact_remaining_noet: it re-estimates the REMAINING impact each rebuild using how
+-- long the disruption has already run plus the onset features, then we add elapsed_min
+-- back to express it as minutes-from-onset. Held-out, re-estimating beats the old static
+-- onset projection by ~18% MAE / ~29% median, and the gain grows the longer a disruption
+-- runs (see docs/predict-duration/LEARNINGS.md).
+--
+-- Both models share `feat`, rebuilt once here: category lookup, od_corridors, the exact
+-- stop_*/od_* multi-hot columns (names verbatim from ML.FEATURE_INFO), and the three
+-- time-varying during features (elapsed_min, reopened_by_t, minutes_since_reopen). Each
+-- model predicts LN(minutes); point estimate = EXP(predicted_label) (impact adds
+-- elapsed_min), and the P50/P80/P90 range applies the calibrated LN-residual offsets from
+-- duration_quantiles ('reopen' / 'remaining' targets) for "running again in ~X, up to ~Z min".
 --
 -- QUANTILES: each model uses its OWN calibrated LN-residual offsets from duration_quantiles
 -- (target='reopen' for the reopen model, target='impact' for the impact model; see
@@ -73,6 +81,16 @@ feat AS (
     d.month,
     d.dayofweek,
     d.hour,
+    -- During-disruption features for impact_remaining_noet, as-of this predict run
+    -- (CURRENT_TIMESTAMP is evaluated once per query). elapsed_min advances every
+    -- rebuild, so the impact estimate re-anchors to how long the disruption has
+    -- already run instead of being a fixed onset projection. reopen state is the
+    -- observed reopening message (NULL while still shut). The onset reopen/impact
+    -- models ignore these extra columns (ML.PREDICT matches features by name).
+    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), d.onset_ts, MINUTE)                      AS elapsed_min,
+    (d.reopen_ts IS NOT NULL)                                                   AS reopened_by_t,
+    IF(d.reopen_ts IS NOT NULL,
+       GREATEST(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), d.reopen_ts, MINUTE), 0), 0) AS minutes_since_reopen,
     -- top-50 stop multi-hot (exact column names the model was trained on)
     ('NSR:StopPlace:337' IN UNNEST(d.affected_stops)) AS stop_NSR_StopPlace_337,
     ('NSR:StopPlace:288' IN UNNEST(d.affected_stops)) AS stop_NSR_StopPlace_288,
@@ -184,26 +202,32 @@ reopen_pred AS (
     WHERE target = 'reopen' AND category = '__ALL__'
   ) AS qg
 ),
--- impact model: "timetable fully back to normal in ~Y min" (>= reopen). Per-category
--- 'impact' offsets, with the global '__ALL__' row as fallback.
+-- impact model: "timetable fully back to normal in ~Y min" (>= reopen). Uses the
+-- DURING-disruption model impact_remaining_noet, which predicts the REMAINING impact
+-- from now given how long the disruption has already run (elapsed_min) and whether the
+-- line has reopened. We express it back as minutes-FROM-ONSET (= elapsed_min +
+-- remaining) so the API's existing "minutes from now = est_from_onset - elapsed"
+-- machinery is unchanged -- but because elapsed_min is re-read each rebuild, the
+-- estimate re-anchors instead of drifting stale once a disruption outlasts its onset
+-- projection. Per-category 'remaining' offsets bound it, global '__ALL__' as fallback.
 impact_pred AS (
   SELECT
     p.situationNumber,
-    ROUND(EXP(p.predicted_label))                                    AS pred_impact_min,   -- point estimate
-    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))  AS impact_p50_min,
-    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))  AS impact_p80_min,
-    ROUND(EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))  AS impact_p90_min     -- "up to ~Z min"
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_impact`,
+    ROUND(p.elapsed_min + EXP(p.predicted_label))                                    AS pred_impact_min,   -- point estimate
+    ROUND(p.elapsed_min + EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))  AS impact_p50_min,
+    ROUND(p.elapsed_min + EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))  AS impact_p80_min,
+    ROUND(p.elapsed_min + EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))  AS impact_p90_min     -- "up to ~Z min"
+  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.impact_remaining_noet`,
                   (SELECT * FROM feat)) AS p
   LEFT JOIN (
     SELECT category, off_p50, off_p80, off_p90
     FROM `disruptions.duration_quantiles`
-    WHERE target = 'impact' AND category != '__ALL__'
+    WHERE target = 'remaining' AND category != '__ALL__'
   ) AS qc ON qc.category = p.category
   CROSS JOIN (
     SELECT off_p50, off_p80, off_p90
     FROM `disruptions.duration_quantiles`
-    WHERE target = 'impact' AND category = '__ALL__'
+    WHERE target = 'remaining' AND category = '__ALL__'
   ) AS qg
 ),
 -- ===== realized outcome per incident (matched by affected stop OR named train) =====

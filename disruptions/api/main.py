@@ -28,8 +28,10 @@ _ACTIVE_DISRUPTIONS_QUERY = (Path(__file__).parent / "active_disruptions.sql").r
 class _CachedDisruption:
     """One active disruption as cached from predictions_today.
 
-    Holds only the static parts: the onset and the model's minutes-FROM-ONSET estimates.
-    "Minutes from now" is derived per request (onset + estimate - now), never cached.
+    Holds the onset and the models' minutes-FROM-ONSET estimates. "Minutes from now"
+    is derived per request (onset + estimate - now), never cached. The impact estimate
+    is re-anchored to elapsed time on each rebuild (it comes from the during-disruption
+    model), so it stays fresh between refreshes rather than drifting overdue.
     """
 
     situation_number: str
@@ -129,7 +131,9 @@ For each active disruption the API serves two estimates:
 * **reopen** — when trains are expected to be running again on the affected line.
 * **impact** — when the timetable is expected to be *fully back to normal*. This
   usually lags the reopening, so a disruption is kept in the response (flagged
-  `reopened`) for a while after trains start moving again.
+  `reopened`) for a while after trains start moving again. The impact estimate is
+  re-computed as the disruption runs (it factors in how long it has already lasted),
+  so it tracks long-running disruptions instead of going stale at the onset guess.
 
 **Reading the estimates.** Every estimate is expressed as **whole minutes from
 `as_of`** (the response's server time), not as an absolute timestamp. So

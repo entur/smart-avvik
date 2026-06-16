@@ -34,6 +34,13 @@ WITH resid AS (
   SELECT 'impact' AS target, category, LN(impact_minutes) - predicted_label AS e
   FROM ML.PREDICT(MODEL `disruptions.dur_init_impact`,
        (SELECT * FROM `disruptions.training_initial` WHERE NOT is_eval))
+  UNION ALL
+  -- 'remaining' = the DURING-disruption model (impact_remaining_noet). Calibrated on
+  -- the checkpoint residuals (one row per (situation, elapsed t)); the API uses these
+  -- to bound the live "impacted for ~Y more min" re-estimate. See predict.sql.
+  SELECT 'remaining' AS target, category, LN(remaining_minutes) - predicted_label AS e
+  FROM ML.PREDICT(MODEL `disruptions.impact_remaining_noet`,
+       (SELECT * FROM `disruptions.training_checkpoints` WHERE NOT is_eval))
 ),
 -- per-category offsets, kept only where there is enough support for a stable P90
 by_cat AS (
@@ -67,6 +74,10 @@ preds AS (
   UNION ALL
   SELECT 'impact' AS target, category, impact_minutes AS actual, predicted_label AS pred_ln
   FROM ML.PREDICT(MODEL `disruptions.dur_init_impact`, (SELECT * FROM ev))
+  UNION ALL
+  SELECT 'remaining' AS target, category, remaining_minutes AS actual, predicted_label AS pred_ln
+  FROM ML.PREDICT(MODEL `disruptions.impact_remaining_noet`,
+                  (SELECT * FROM `disruptions.training_checkpoints` WHERE is_eval))
 ),
 glob AS (
   SELECT target, off_p50, off_p80, off_p90

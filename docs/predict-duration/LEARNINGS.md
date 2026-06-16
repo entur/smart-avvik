@@ -323,3 +323,14 @@ already-tracked reopen event). Keep the ET-during features only as an optional
 refinement for the post-reopening phase. Combined recommendation: onset =
 `dur_init_impact_et` (pre-onset ET helps); during = `impact_remaining_noet`, re-run on
 the poller's cadence.
+
+**Wired into the `/disruptions` API (2026-06).** `disruptions/api/predict.sql` now
+serves the impact estimate from `impact_remaining_noet`: `feat` gained the three during
+features (`elapsed_min`, `reopened_by_t`, `minutes_since_reopen`, as-of the predict
+run), and `pred_impact_min` is computed as `elapsed_min + EXP(predicted_label)` —
+expressed as minutes-from-onset so `main.py`'s "minutes from now = est − elapsed"
+serving is unchanged, but each rebuild re-anchors the estimate to elapsed time instead
+of drifting overdue. Impact intervals use new per-category `target='remaining'` offsets
+in `duration_quantiles` (added to `create_quantiles.sql`; eval coverage 0.50/0.76/0.85).
+The reopen estimate is untouched (still the onset `dur_init_reopen`). Needs a Cloud Run
+redeploy to take effect.
