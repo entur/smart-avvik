@@ -4,3 +4,6 @@
 fastapi[standard]>=0.136.3
 google-cloud-bigquery>=3.41.0
 uvicorn[standard]>=0.34
+# zoneinfo needs an IANA tz database; the python:3.13-slim image ships without one,
+# so bundle it for the Europe/Oslo hour-of-day lookup in the alert profiles.
+tzdata>=2024.1

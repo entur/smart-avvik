@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import bigquery
 from google.cloud.bigquery import QueryJob
@@ -22,6 +23,11 @@ _DISRUPTIONS_QUERY = (Path(__file__).parent / "disruptions_today.sql").read_text
 _UPDATE_CATEGORIES_QUERY = (Path(__file__).parent / "update_categories.sql").read_text()
 _PREDICT_QUERY = (Path(__file__).parent / "predict.sql").read_text()
 _ACTIVE_DISRUPTIONS_QUERY = (Path(__file__).parent / "active_disruptions.sql").read_text()
+_ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text()
+
+# Hour-of-day in the impact lookup is Europe/Oslo local time (matches the table build),
+# so resolve "now" to the Oslo hour when looking up a profile.
+_OSLO = ZoneInfo("Europe/Oslo")
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,62 @@ def refresh_disruptions_cache() -> None:
     logger.info("Refreshed disruptions cache: %d active disruptions", len(disruptions))
 
 
+# In-process copy of disruptions.category_line_hour_impact, indexed by (category, line,
+# hour) for the back-off lookup. Tiny table, rarely changes (rebuilt offline), so we load
+# the whole thing. Guarded by its own lock — independent of the disruptions cache.
+_impact_lookup: dict[tuple[str, str, int], dict] = {}
+_impact_lock = threading.Lock()
+
+# Minimum distinct situations behind a cell before we trust it; thinner cells are skipped
+# and the lookup backs off to a coarser grain (the global '*/*/-1' row is always accepted).
+_MIN_SITUATIONS = 30
+
+
+def refresh_impact_lookup() -> None:
+    """Reload the (category, line, hour) -> impact-profile lookup from BigQuery."""
+    rows = bq_client.query(_ALERT_PROFILES_QUERY).result()
+    table = {(r["category"], r["line"], r["hour"]): dict(r.items()) for r in rows}
+    with _impact_lock:
+        global _impact_lookup
+        _impact_lookup = table
+    logger.info("Refreshed impact lookup: %d cells", len(table))
+
+
+def _candidate_keys(category: str, line: str, hour: int) -> list[tuple[str, str, int]]:
+    """Lookup keys from most specific to coarsest, dropping hour before line.
+
+    e.g. ('signal','R31',8) -> (signal,R31,8) (signal,R31,-1) (signal,*,8) (signal,*,-1) (*,*,-1).
+    The trailing ('*','*',-1) global row is always the last resort. '*' / -1 inputs mean the
+    caller has no line / no hour, so those back-off steps are skipped.
+    """
+    keys: list[tuple[str, str, int]] = []
+    if category != "*":
+        if line != "*" and hour != -1:
+            keys += [(category, line, hour), (category, line, -1), (category, "*", hour)]
+        elif line != "*":
+            keys += [(category, line, -1)]
+        elif hour != -1:
+            keys += [(category, "*", hour)]
+        keys.append((category, "*", -1))
+    keys.append(("*", "*", -1))
+    seen: set[tuple[str, str, int]] = set()
+    return [k for k in keys if not (k in seen or seen.add(k))]
+
+
+def lookup_alert_profile(category: str, line: str = "*", hour: int = -1) -> dict | None:
+    """Return the most specific impact-profile cell for (category, line, hour) with enough
+    data, backing off to coarser grains and finally the global row. None if nothing loaded."""
+    with _impact_lock:
+        table = _impact_lookup
+    if not table:
+        return None
+    for key in _candidate_keys(category, line, hour):
+        row = table.get(key)
+        if row is not None and (key == ("*", "*", -1) or row["n_situations"] >= _MIN_SITUATIONS):
+            return row
+    return None
+
+
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
@@ -100,11 +162,23 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
     bq_client.query(_PREDICT_QUERY).result()
     refresh_disruptions_cache()
+    # The impact lookup is a static, offline-built table — reloading it here just keeps it
+    # current if it was rebuilt. Isolated so a missing/erroring lookup never breaks the feed.
+    try:
+        refresh_impact_lookup()
+    except Exception:
+        logger.exception("Impact lookup refresh failed; serving disruptions without alert profiles")
 
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Eager initial load so /alert_profile works before the first ingestion change fires
+    # the poller's rebuild. Tolerate failure — the poller retries on every tick.
+    try:
+        refresh_impact_lookup()
+    except Exception:
+        logger.exception("Initial impact lookup load failed; will retry on ingestion poll")
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
@@ -242,6 +316,59 @@ class Estimate(BaseModel):
     )
 
 
+class AlertProfile(BaseModel):
+    """Historical impact profile for a disruption category (optionally a line and hour-of-day),
+    for deciding whether a disruption is worth pushing to passengers.
+
+    Derived from 2 years of realized NSB outcomes: for boardings flagged by an SX situation of
+    this category, how often was the trip cancelled or badly delayed, and how bad. `grain` and
+    the `matched_*` fields say exactly which cell was used after back-off (a sparse specific cell
+    falls back to a coarser one), so a category-only match (`matched_line` = `*`,
+    `matched_hour` = -1) is distinguishable from a precise category×line×hour match.
+    """
+
+    grain: str = Field(
+        description=(
+            "Which dimensions the matched cell is specific on: 'C'/'L'/'H' = "
+            "category/line/hour, '-' = aggregated. e.g. 'C-H' = category & hour, line pooled."
+        ),
+    )
+    matched_category: str = Field(description="Category of the matched cell.")
+    matched_line: str = Field(description="Line of the matched cell; '*' if pooled over lines.")
+    matched_hour: int = Field(
+        description="Hour-of-day (Europe/Oslo, 0-23) of the matched cell; -1 if pooled over hours.",
+    )
+    alert_tier: str = Field(
+        description=(
+            "'high' / 'medium' / 'low' / 'suppress'. 'suppress' means the flag is no worse than "
+            "this line+hour's normal traffic, or too little data to trust."
+        ),
+    )
+    alert_score: float = Field(
+        description=(
+            "Rankable priority: confidence-weighted expected lost minutes per flagged boarding "
+            "(a cancellation counted as 60). Higher = more worth alerting."
+        ),
+    )
+    cancel_rate: float = Field(description="P(boarding cancelled) given a flag of this category.")
+    trouble_rate: float = Field(
+        description="P(cancelled OR delayed >= 10 min) given a flag of this category.",
+    )
+    trouble_lift: float | None = Field(
+        description=(
+            "trouble_rate relative to the unconditional baseline at the same line+hour. "
+            ">1 means the flag signals more trouble than normal; ~1 means no added signal."
+        ),
+    )
+    exp_disruption_min: float = Field(
+        description="Expected lost minutes per flagged boarding (cancellation = 60 min equiv).",
+    )
+    delay_p50: int | None = Field(description="Median departure delay (min) among non-cancelled.")
+    delay_p90: int | None = Field(description="90th-pct departure delay (min) among non-cancelled.")
+    n_situations: int = Field(description="Distinct historical situations behind this cell.")
+    n_boardings: int = Field(description="Historical flagged boardings behind this cell.")
+
+
 class Disruption(BaseModel):
     """A single disruption, with reopen and impact estimates resolved to minutes from `as_of`."""
 
@@ -290,6 +417,14 @@ class Disruption(BaseModel):
             "the reopening."
         ),
     )
+    alert: AlertProfile | None = Field(
+        default=None,
+        description=(
+            "How alert-worthy this disruption is right now, from the historical impact of its "
+            "category at the current Oslo hour (line-agnostic — a disruption spans lines; use "
+            "the /alert_profile endpoint for a specific line). Null if no profile is loaded."
+        ),
+    )
 
 
 class DisruptionsResponse(BaseModel):
@@ -326,7 +461,7 @@ class DisruptionsResponse(BaseModel):
                         "situation_number": "ENT:SituationNumber:1234",
                         "summary": "Signalfeil ved Oslo S",
                         "description": "Innstilte og forsinkede tog grunnet signalfeil.",
-                        "category": "signalFailure",
+                        "category": "infrastruktur/signal",
                         "onset": "2026-06-15T08:45:00Z",
                         "minutes_since_onset": 45,
                         "reopened": False,
@@ -347,6 +482,22 @@ class DisruptionsResponse(BaseModel):
                             "p80_min_from_now": 100,
                             "p90_min_from_now": 130,
                             "overdue": False,
+                        },
+                        "alert": {
+                            "grain": "C-H",
+                            "matched_category": "infrastruktur/signal",
+                            "matched_line": "*",
+                            "matched_hour": 8,
+                            "alert_tier": "high",
+                            "alert_score": 13.1,
+                            "cancel_rate": 0.1527,
+                            "trouble_rate": 0.329,
+                            "trouble_lift": 3.96,
+                            "exp_disruption_min": 13.4,
+                            "delay_p50": 2,
+                            "delay_p90": 13,
+                            "n_situations": 1933,
+                            "n_boardings": 40395,
                         },
                     }
                 ],
@@ -379,6 +530,33 @@ def _estimate(
     )
 
 
+def _oslo_hour(now: datetime) -> int:
+    """Hour-of-day (0-23) in Europe/Oslo, matching the impact lookup's hour dimension."""
+    return now.astimezone(_OSLO).hour
+
+
+def _alert_profile_model(row: dict | None) -> AlertProfile | None:
+    """Build the AlertProfile response from a lookup row (None passes through)."""
+    if row is None:
+        return None
+    return AlertProfile(
+        grain=row["grain"],
+        matched_category=row["category"],
+        matched_line=row["line"],
+        matched_hour=row["hour"],
+        alert_tier=row["alert_tier"],
+        alert_score=row["alert_score"],
+        cancel_rate=row["cancel_rate"],
+        trouble_rate=row["trouble_rate"],
+        trouble_lift=row["trouble_lift"],
+        exp_disruption_min=row["exp_disruption_min"],
+        delay_p50=row["delay_p50"],
+        delay_p90=row["delay_p90"],
+        n_situations=row["n_situations"],
+        n_boardings=row["n_boardings"],
+    )
+
+
 def _to_disruption(d: _CachedDisruption, now: datetime) -> Disruption:
     """Render a cached disruption with estimates resolved to minutes from `now`."""
     reopened_at = d.reopen_ts
@@ -402,6 +580,7 @@ def _to_disruption(d: _CachedDisruption, now: datetime) -> Disruption:
         impact=_estimate(
             d.onset_ts, d.pred_impact_min, d.impact_p50_min, d.impact_p80_min, d.impact_p90_min, now
         ),
+        alert=_alert_profile_model(lookup_alert_profile(d.category, "*", _oslo_hour(now))),
     )
 
 
@@ -439,6 +618,42 @@ async def disruptions() -> DisruptionsResponse:
         reopened_count=reopened_count,
         disruptions=items,
     )
+
+
+@app.get(
+    "/alert_profile",
+    summary="Historical impact profile for a category (optionally a line and hour)",
+    response_description="The most specific impact profile with enough data, after back-off.",
+    tags=["disruptions"],
+)
+async def alert_profile(
+    category: str = Query(description="Disruption category, e.g. 'infrastruktur/signal'."),
+    line: str = Query(
+        default="*",
+        description="Line code without the 'VYG:Line:' prefix, e.g. 'R31'. Omit (or '*') to pool over lines.",
+    ),
+    hour: int | None = Query(
+        default=None,
+        ge=-1,
+        le=23,
+        description=(
+            "Hour-of-day in Europe/Oslo (0-23). Omit to use the current Oslo hour; pass -1 to "
+            "pool over all hours."
+        ),
+    ),
+) -> AlertProfile:
+    """Look up the historical impact profile for a (category, line, hour) cell.
+
+    Backs off to coarser cells when the specific one is too sparse — drop the hour, then the
+    line, finally the global row — so a result is (almost) always returned. Check `grain` /
+    `matched_*` to see how specific the match actually is, and `alert_tier` / `alert_score`
+    to rank it. 404 only if the lookup table has not loaded yet.
+    """
+    h = _oslo_hour(datetime.now(timezone.utc)) if hour is None else hour
+    row = lookup_alert_profile(category, line, h)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No impact profile available (lookup not loaded).")
+    return _alert_profile_model(row)
 
 
 @app.get(
