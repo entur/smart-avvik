@@ -41,8 +41,12 @@ WITH
       REGEXP_REPLACE(j, r'^[A-Za-z]+:', '') AS jkey,
       PARSE_DATE('%y-%m-%d', REGEXP_EXTRACT(j, r'_(\d{2}-\d{2}-\d{2})$')) AS svc_date
     FROM `disruptions.disruptions` AS d
+    -- NULL-safe join: many NSB situations have a NULL summary/description, and plain `=`
+    -- yields NULL (never TRUE) on a NULL side, so those would never match a category row
+    -- and fall through to 'UNKNOWN'. IS NOT DISTINCT FROM treats NULL = NULL as a match.
     LEFT JOIN `disruptions.categories` AS c
-      ON d.summary = c.summary AND d.description = c.description,
+      ON d.summary     IS NOT DISTINCT FROM c.summary
+     AND d.description IS NOT DISTINCT FROM c.description,
     UNNEST(d.affected_journeys) AS j
     WHERE d.participantRef = 'NSB'
   ),
