@@ -730,7 +730,7 @@ async def situation(
     estimate is expressed as minutes from the render time. 404 if no NSB disruption with that
     situationNumber is found in the lookback window (yesterday and today).
     """
-    d = get_situation(f"NSB:SituationNumber:{id}")
+    d = get_situation(id)
     if d is None:
         raise HTTPException(
             status_code=404,
