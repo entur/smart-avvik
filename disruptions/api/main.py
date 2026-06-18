@@ -217,7 +217,20 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
     bq_client.query(_RAIL_CALLS_QUERY).result()
     bq_client.query(_DISRUPTIONS_QUERY).result()
-    bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
+    # AI.CLASSIFY (Gemini) categorisation of any *new* free text. Isolated so a failure here
+    # never kills the rebuild: predict.sql LEFT JOINs disruptions.categories and falls back to
+    # 'UNKNOWN' (with the global '__ALL__' quantile offsets) for unclassified text, so the feed
+    # still serves — already-classified incidents keep their category; genuinely new text shows
+    # UNKNOWN until classification succeeds. The runtime SA needs roles/aiplatform.user for this
+    # step; until that grant lands the call 403s and we degrade gracefully rather than serving an
+    # empty feed.
+    try:
+        bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
+    except Exception:
+        logger.exception(
+            "Category classification (AI.CLASSIFY) failed; serving with existing categories "
+            "(new text -> UNKNOWN). Check the SA has roles/aiplatform.user."
+        )
     bq_client.query(_PREDICT_QUERY).result()
     refresh_disruptions_cache()
     # The impact lookup is a static, offline-built table — reloading it here just keeps it
