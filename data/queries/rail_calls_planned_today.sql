@@ -1,0 +1,91 @@
+-- PLANNED-timetable call source for live per-call serving: every UPCOMING call of every Vy/NSB
+-- journey currently in the ET feed, with its scheduled (aimed) departure/arrival, stop and order.
+--
+-- This is the forward-looking sibling of rail_calls_today.sql (disruptions/api/). That table is
+-- for realized actuals (recordedCalls only, departure-only) so it cannot answer "will this train
+-- -- which has NOT run yet -- be cancelled / late?". Here we take ALL calls of each journey's last
+-- snapshot, from recordedCalls (past stops) AND estimatedCalls (the upcoming stops, which
+-- create_rail_calls.sql skips unless cancelled), keeping the AIMED times. The future stops come
+-- from estimatedCalls; that's the planned timetable a freshly-reported situation needs.
+--
+-- DROP-IN: exposes the columns predict_calls.sql reads from rail_calls (jkey, lineRef, stop_place,
+-- stop_name, stop_order, aimed_dep, aimed_arr) -- for live serving, point predict_calls' call
+-- source at this table instead of rail_calls. call_cancelled here is what ET ALREADY declares
+-- (not the model's prediction); call_source distinguishes recorded vs estimated stops.
+--
+-- HORIZON: ET only carries journeys it currently knows (active + near-future within the operating
+-- day), so the forward horizon is bounded by how far ahead ET emits -- not a full multi-day plan.
+-- A NeTEx planned-timetable feed would extend it; ET is the pragmatic source already wired here.
+-- CURRENT_DATE() partition prune keeps it a tiny scan; re-run as often as you want fresh.
+--
+-- WHY ET AND NOT GTFS AS THE JOURNEY SOURCE: the GTFS timetable
+-- (ent-data-sharing-ext-prd.timetable_gtfs.gtfs_last_recorded_ent_v1) is a richer schedule, but
+-- its trip_id is a NeTEx ServiceJourney ref -- it does NOT match SX affected_journeys, which are
+-- DatedServiceJourney refs (0 native matches). A parsed train-number+date bridge finds only ~57%
+-- of SX-named trains, because GTFS is the BASE schedule and SX skews toward the replacement /
+-- renumbered / extra runs that only ET carries. ET's datedVehicleJourneyRef shares SX's namespace,
+-- so it is the correct journey source. GTFS is used ONLY to resolve stop_name below (by StopPlace,
+-- not by journey), since the NSR quays join returns the ref but a NULL name.
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.rail_calls_planned_today` AS
+WITH last_snap AS (
+  SELECT
+    REGEXP_REPLACE(datedVehicleJourneyRef, r'^[A-Za-z]+:', '') AS jkey,
+    lineRef,
+    cancellation AS journey_cancelled,
+    recordedCalls,
+    estimatedCalls
+  FROM `ent-anshar-prd.realtime.siri_realtime_et_production`
+  WHERE DATE(_PARTITIONTIME) = CURRENT_DATE()
+    AND lineRef LIKE 'VYG:%'
+    AND datedVehicleJourneyRef IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY datedVehicleJourneyRef ORDER BY SAFE.TIMESTAMP(recordedAtTime) DESC) = 1
+),
+calls AS (
+  -- recorded (operated / past) stops -- planned times
+  SELECT
+    s.jkey, s.lineRef, rc.stopPointRef AS quay, rc.order AS stop_order, 'recorded' AS call_source,
+    (rc.cancellation OR s.journey_cancelled) AS call_cancelled,
+    SAFE.TIMESTAMP(rc.aimedDepartureTime) AS aimed_dep,
+    SAFE.TIMESTAMP(rc.aimedArrivalTime)   AS aimed_arr
+  FROM last_snap AS s, UNNEST(s.recordedCalls) AS rc
+  UNION ALL
+  -- estimated (upcoming / future) stops -- ALL of them (the forward schedule), planned times
+  SELECT
+    s.jkey, s.lineRef, ec.stopPointRef, ec.order, 'estimated',
+    (ec.cancellation OR s.journey_cancelled),
+    SAFE.TIMESTAMP(ec.aimedDepartureTime),
+    SAFE.TIMESTAMP(ec.aimedArrivalTime)
+  FROM last_snap AS s, UNNEST(s.estimatedCalls) AS ec
+),
+dedup AS (
+  -- a stop can appear in both lists across the journey's life; keep one (prefer recorded)
+  SELECT *
+  FROM calls
+  WHERE COALESCE(aimed_dep, aimed_arr) IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY jkey, stop_order ORDER BY (call_source = 'recorded') DESC) = 1
+),
+-- StopPlace -> human name from GTFS (the NSR quays join yields stopPlaceRef but a NULL name).
+-- A small recent window of GTFS partitions covers every currently-served stop; names are stable.
+gtfs_names AS (
+  SELECT parent_station AS stop_place, ANY_VALUE(stop_name) AS stop_name
+  FROM `ent-data-sharing-ext-prd.timetable_gtfs.gtfs_last_recorded_ent_v1`
+  WHERE agency_id LIKE 'VYG:%'
+    AND operating_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+                           AND DATE_ADD(CURRENT_DATE(), INTERVAL 2 DAY)
+    AND parent_station IS NOT NULL
+  GROUP BY parent_station
+)
+SELECT
+  d.jkey, d.lineRef, d.quay,
+  q.stopPlaceRef            AS stop_place,
+  COALESCE(n.stop_name, q.name) AS stop_name,
+  d.stop_order, d.aimed_dep, d.aimed_arr,
+  DATE(COALESCE(d.aimed_dep, d.aimed_arr), 'Europe/Oslo') AS call_date,
+  d.call_cancelled, d.call_source
+FROM dedup AS d
+LEFT JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` AS q
+  ON d.quay = q.id
+LEFT JOIN gtfs_names AS n
+  ON q.stopPlaceRef = n.stop_place;

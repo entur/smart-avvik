@@ -193,6 +193,15 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
   correctly: a train ~98%/93% cancelled at its first two stops but ~3-9% from stop 3 on — so
   "boarding here? take the next train" vs "boarding downstream? ~2 min late" falls straight out
   of the per-call grain.
+- **Forward (live) serving works — planned call source + live query.**
+  `rail_calls_planned_today.sql` → `disruptions.rail_calls_planned_today` takes the AIMED times of
+  every call of each journey in today's ET snapshot, including all `estimatedCalls` (the UPCOMING
+  stops `rail_calls` skips), giving an ~49h forward schedule (≫ the 12h window) with
+  `aimed_dep`/`aimed_arr`/`stop_order`/`stop_place`. `predict_calls_today.sql` is `predict_calls`
+  pointed at it over recent situations → `call_predictions_today`, scoring trains that have NOT
+  run yet. Demonstrated end-to-end: future R31 departures (22:06–23:00) score 4 min typ / 24 min
+  p90 under a "Forsinkelse forventes" situation vs 1 min / 3–5 min under "Normal hastighet" —
+  the right contrast, from onset features, before departure.
 
 ## What did not work / limits found
 
@@ -201,6 +210,14 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
   irreducible noise. Cancellation (yes/no) is far more learnable than delay (how many minutes).
 - The delay point model under-predicts the tail by design (predicts ~median) — addressed by the
   separate `delay_p90_calib` p90 layer (see above).
+- **GTFS could not replace ET as the journey/call source.** The GTFS timetable
+  (`timetable_gtfs.gtfs_last_recorded_ent_v1`) is a richer, cheaper schedule (names,
+  StopPlace, dep+arr, ±weeks horizon, 14 MB vs ET's 7.8 GB), but its `trip_id` is a NeTEx
+  `ServiceJourney` ref — **0 native matches** to SX `affected_journeys` (`DatedServiceJourney`).
+  A parsed train-number+date bridge finds only **~57%** of SX-named trains (GTFS is the BASE
+  schedule; SX skews to replacement/renumbered/extra runs that only ET carries). So ET stays the
+  journey source; GTFS is used **only to resolve `stop_name`** (join by StopPlace, not journey) —
+  now 100% named.
 
 ## Data-quality / missing-data issues identified
 
@@ -221,14 +238,18 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 
 ## Recommended next steps (per-call family)
 
-- Done: p90 delay layer (`delay_p90_calib`), P(cancel) recalibration (`cancel_platt`), and the
-  serving query (`predict_calls.sql` → `call_predictions`).
-- **Forward-serving gap (the one real remaining piece):** `predict_calls.sql` scores against
-  `rail_calls` (realized) — leak-free (all features are onset/planned) but it only covers calls
-  that already happened. True live serving needs a PLANNED-timetable source of the affected
-  journeys' upcoming calls carrying `aimed_dep`/`aimed_arr`/`stop_order` (today's
-  `rail_calls_today.sql` is departure-only and realized). Wire that in, then point the API at
-  `call_predictions` (cache a slice as `main.py` does for `predictions_today`).
+- Done: p90 delay layer (`delay_p90_calib`), P(cancel) recalibration (`cancel_platt`), the
+  serving query (`predict_calls.sql` → `call_predictions`), and the live forward path
+  (`rail_calls_planned_today.sql` + `predict_calls_today.sql` → `call_predictions_today`).
+- **Remaining to ship live:** (a) an active-situations feed for the live query (it uses a
+  recent-`disruptions` stand-in now; wire `active_disruptions.sql`/refresh `disruptions` first —
+  the refresh ORDER is planned-source → disruptions → predict_calls_today → cache); (b) API
+  wiring: cache a `call_predictions_today` slice and expose a per-train endpoint, as `main.py`
+  does for `predictions_today`. (`stop_name` is now resolved via GTFS — 100% named.)
+- Horizon note: the planned source is ET-bounded (~today + ~2 days); a NeTEx planned-timetable
+  feed would extend it, but ET already exceeds the 12h window the model uses.
+- Keep `predict_calls.sql` and `predict_calls_today.sql` in sync (same scoring; only the call
+  source + situation window differ).
 - Optional v2: a **joint trip-completion** probability (boarding served AND alighting served),
   which the two per-call probabilities approximate but don't model jointly.
 - Re-fit `cancel_platt` (and `delay_p90_calib`) on a rolling trailing window as data arrives.
@@ -236,9 +257,11 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 ## State (per-call family)
 
 - New, committed: `create_training_calls.sql`, `train_call_models.sql`, `create_delay_p90_calib.sql`,
-  `create_cancel_calibration.sql`, `predict_calls.sql`.
-- Serving table: `disruptions.call_predictions` (per-call product output; rebuild like
-  `predictions_today`).
+  `create_cancel_calibration.sql`, `predict_calls.sql`, `rail_calls_planned_today.sql`,
+  `predict_calls_today.sql`.
+- Serving tables: `disruptions.call_predictions` (retrospective, over `rail_calls`) and
+  `disruptions.call_predictions_today` (live forward, over `rail_calls_planned_today`); plus the
+  planned call source `disruptions.rail_calls_planned_today`.
 - Tables/models: `disruptions.training_calls`; models `call_cancel_clf` + `cancel_platt`
   (Platt recalibration), `dep_delay_reg`, `arr_delay_reg` (delay models trained on `LN(1+delay)`
   — serving must back-transform); table `disruptions.delay_p90_calib` (p90 lookup keyed on
