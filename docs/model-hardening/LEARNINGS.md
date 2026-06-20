@@ -164,6 +164,13 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
   monotonically across all deciles). Top drivers: `num_journeys`, **`status`**, `num_stops` —
   disruption size + onset-declared outcome. This is a real, calibrated per-train cancellation
   probability — the headline result.
+- **P(cancel) recalibration (`create_cancel_calibration.sql`).** The classifier trains through
+  2026-03 (~13.9% rate) but recent conditions run ~10%, so raw P(cancel) over-predicts low /
+  under-predicts high. A Platt layer (`cancel_platt`, logistic of the realized outcome on the raw
+  score) fit on the post-training trailing window re-centers it. Validated honestly (fit
+  2026-04..05, test unseen 2026-06): log-loss 0.164 → 0.157, mean P 0.113 → 0.103 vs actual
+  0.095, high-confidence deciles markedly closer. Serve as a 2nd step: `p_cal =
+  predict(cancel_platt, logit(p_raw))`. Refit periodically to track the base rate.
 - **Delay regressors — valid but weak; needed a log target.** Raw-minute regressors LOST to a
   trivial "predict the median" baseline on MAE (3.67/3.79 vs 3.34/3.20) — classic
   mean-seeking-on-skew. Retraining on **`LN(1+delay)`** (back-transform `EXP(pred)−1`) flipped
@@ -204,16 +211,18 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 
 ## Recommended next steps (per-call family)
 
-- Recalibrate P(cancel) on a trailing window (the p90 delay layer is done — `delay_p90_calib`).
+- Done: p90 delay layer (`delay_p90_calib`) and P(cancel) recalibration (`cancel_platt`).
+- Serving: enumerate planned calls on a situation's affected journeys, score the models, apply
+  the calibrators, expose per-stop P(cancel) + typical/p90 delay. (Not built — training-side only.)
 - Optional v2: a **joint trip-completion** probability (boarding served AND alighting served),
   which the two per-call probabilities approximate but don't model jointly.
-- Serving: enumerate planned calls on a situation's affected journeys, score the three models,
-  expose per-stop P(cancel) + typical delay. (Not built — training-side only this pass.)
+- Re-fit `cancel_platt` (and `delay_p90_calib`) on a rolling trailing window as data arrives.
 
 ## State (per-call family)
 
-- New, committed: `create_training_calls.sql`, `train_call_models.sql`, `create_delay_p90_calib.sql`.
-- Tables/models: `disruptions.training_calls`; models `call_cancel_clf`, `dep_delay_reg`,
-  `arr_delay_reg` (delay models trained on `LN(1+delay)` — serving must back-transform); table
-  `disruptions.delay_p90_calib` (p90 lookup keyed on `ROUND(predicted_log,1)`, clamp to per-side
-  range at serving).
+- New, committed: `create_training_calls.sql`, `train_call_models.sql`, `create_delay_p90_calib.sql`,
+  `create_cancel_calibration.sql`.
+- Tables/models: `disruptions.training_calls`; models `call_cancel_clf` + `cancel_platt`
+  (Platt recalibration), `dep_delay_reg`, `arr_delay_reg` (delay models trained on `LN(1+delay)`
+  — serving must back-transform); table `disruptions.delay_p90_calib` (p90 lookup keyed on
+  `ROUND(predicted_log,1)`, clamp to per-side range at serving).
