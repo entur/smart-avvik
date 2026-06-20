@@ -183,6 +183,16 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
   models. Validated on the holdout: **93.7% coverage at the nominal p90** (97% at p95) — slightly
   conservative (integer ties + the seasonal shift), which is the safe side for a worst case. The
   worst predicted decile has a typical delay ~7 min but a p90 of ~38 min — the gap worth showing.
+- **Serving layer (`predict_calls.sql` → `disruptions.call_predictions`).** Mirrors the
+  per-situation path (`predict.sql` → `predictions_today` → API cache): one product-shaped row
+  per (situation × affected call) with calibrated `p_cancel`, `dep_delay_typ/p90`, and
+  `arr_delay_typ/p90`. Feature construction is copied verbatim from `create_training_calls.sql`
+  (no train/serve skew); calibration is applied inline (Platt closed form from `ML.WEIGHTS`,
+  p90 lookup from `delay_p90_calib`). 110k rows / 3.6k situations / 5.1k trains over a 30-day
+  window; mean `p_cancel` 0.096 = the realized recent rate. A worked turn-short example reads
+  correctly: a train ~98%/93% cancelled at its first two stops but ~3-9% from stop 3 on — so
+  "boarding here? take the next train" vs "boarding downstream? ~2 min late" falls straight out
+  of the per-call grain.
 
 ## What did not work / limits found
 
@@ -211,9 +221,14 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 
 ## Recommended next steps (per-call family)
 
-- Done: p90 delay layer (`delay_p90_calib`) and P(cancel) recalibration (`cancel_platt`).
-- Serving: enumerate planned calls on a situation's affected journeys, score the models, apply
-  the calibrators, expose per-stop P(cancel) + typical/p90 delay. (Not built — training-side only.)
+- Done: p90 delay layer (`delay_p90_calib`), P(cancel) recalibration (`cancel_platt`), and the
+  serving query (`predict_calls.sql` → `call_predictions`).
+- **Forward-serving gap (the one real remaining piece):** `predict_calls.sql` scores against
+  `rail_calls` (realized) — leak-free (all features are onset/planned) but it only covers calls
+  that already happened. True live serving needs a PLANNED-timetable source of the affected
+  journeys' upcoming calls carrying `aimed_dep`/`aimed_arr`/`stop_order` (today's
+  `rail_calls_today.sql` is departure-only and realized). Wire that in, then point the API at
+  `call_predictions` (cache a slice as `main.py` does for `predictions_today`).
 - Optional v2: a **joint trip-completion** probability (boarding served AND alighting served),
   which the two per-call probabilities approximate but don't model jointly.
 - Re-fit `cancel_platt` (and `delay_p90_calib`) on a rolling trailing window as data arrives.
@@ -221,7 +236,9 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 ## State (per-call family)
 
 - New, committed: `create_training_calls.sql`, `train_call_models.sql`, `create_delay_p90_calib.sql`,
-  `create_cancel_calibration.sql`.
+  `create_cancel_calibration.sql`, `predict_calls.sql`.
+- Serving table: `disruptions.call_predictions` (per-call product output; rebuild like
+  `predictions_today`).
 - Tables/models: `disruptions.training_calls`; models `call_cancel_clf` + `cancel_platt`
   (Platt recalibration), `dep_delay_reg`, `arr_delay_reg` (delay models trained on `LN(1+delay)`
   — serving must back-transform); table `disruptions.delay_p90_calib` (p90 lookup keyed on
