@@ -169,14 +169,21 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
   mean-seeking-on-skew. Retraining on **`LN(1+delay)`** (back-transform `EXP(pred)−1`) flipped
   it: MAE **3.05 / 3.04**, now beating the median baseline (~5–9% lift). They predict the
   *typical* delay (~2 min).
+- **p90 "bad case" delay — added (`create_delay_p90_calib.sql`).** BQML boosted trees have no
+  native quantile loss, and the delay tail is heteroscedastic (log-residual p90 grows with the
+  predicted level), so a single multiplier is wrong. Built `disruptions.delay_p90_calib`: a
+  per-side, per-prediction-bucket (`ROUND(predicted_log,1)`) empirical-p90 lookup over the point
+  models. Validated on the holdout: **93.7% coverage at the nominal p90** (97% at p95) — slightly
+  conservative (integer ties + the seasonal shift), which is the safe side for a worst case. The
+  worst predicted decile has a typical delay ~7 min but a p90 of ~38 min — the gap worth showing.
 
 ## What did not work / limits found
 
 - **Delay magnitude is only weakly predictable** (R² ~0.13; spread-thin feature importances).
   Conditional on a train running, exact per-call lateness from onset features carries a lot of
   irreducible noise. Cancellation (yes/no) is far more learnable than delay (how many minutes).
-- The delay point model under-predicts the tail by design (predicts ~median). A **p90 quantile
-  model** for the "bad case" is the natural next add, not done in v1.
+- The delay point model under-predicts the tail by design (predicts ~median) — addressed by the
+  separate `delay_p90_calib` p90 layer (see above).
 
 ## Data-quality / missing-data issues identified
 
@@ -197,7 +204,7 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 
 ## Recommended next steps (per-call family)
 
-- Recalibrate P(cancel) on a trailing window; add a **p90 delay quantile** model for "bad case".
+- Recalibrate P(cancel) on a trailing window (the p90 delay layer is done — `delay_p90_calib`).
 - Optional v2: a **joint trip-completion** probability (boarding served AND alighting served),
   which the two per-call probabilities approximate but don't model jointly.
 - Serving: enumerate planned calls on a situation's affected journeys, score the three models,
@@ -205,6 +212,8 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 
 ## State (per-call family)
 
-- New, committed: `create_training_calls.sql`, `train_call_models.sql`.
+- New, committed: `create_training_calls.sql`, `train_call_models.sql`, `create_delay_p90_calib.sql`.
 - Tables/models: `disruptions.training_calls`; models `call_cancel_clf`, `dep_delay_reg`,
-  `arr_delay_reg` (delay models trained on `LN(1+delay)` — serving must back-transform).
+  `arr_delay_reg` (delay models trained on `LN(1+delay)` — serving must back-transform); table
+  `disruptions.delay_p90_calib` (p90 lookup keyed on `ROUND(predicted_log,1)`, clamp to per-side
+  range at serving).
