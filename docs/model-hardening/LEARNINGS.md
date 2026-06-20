@@ -124,3 +124,87 @@ should pay off most.
 - Tables rebuilt: `disruptions.rail_calls` (+ `rail_calls_pre_rebuild` backup),
   `disruptions.disruptions` (now with onset text + `status`).
 - Experiment artifacts (dur_ab_*, trip_ab_*, toi_status) cleaned up.
+
+---
+
+# Follow-up: full-population per-call models ("any situation")
+
+Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model that works on
+**any** rail situation and answers, for a passenger's **specific train**, two questions —
+"will my train be cancelled?" and "how late will it be?" — separately at the **boarding** stop
+("will it leave?") and the **alighting** stop ("will I reach my destination?").
+
+## Design
+
+- **Grain = the affected call.** One row per (situation × stop on an affected journey) whose
+  scheduled time is within 12h of onset. This is the prediction unit the product needs, it
+  represents **partial / turn-short cancellations** naturally (`call_cancelled` is per stop),
+  and the situation-level "chance of cancellation" falls out as the mean over a situation's
+  calls. Built by `create_training_calls.sql` → `disruptions.training_calls` (1.32M rows, 50k
+  situations, 17% call cancel rate). Labels come from the rebuilt `rail_calls` (realized ops),
+  **not** SX text — so every situation gets a label, not just the 7.8% that announce an
+  all-clear.
+- **Three models** (`train_call_models.sql`): `call_cancel_clf` (BOOSTED_TREE_CLASSIFIER),
+  `dep_delay_reg`, `arr_delay_reg` (BOOSTED_TREE_REGRESSOR). Boarding answer = classifier +
+  `dep_delay_reg`; destination answer = classifier + `arr_delay_reg`. Window keeps terminal
+  arrival-only stops via `COALESCE(aimed_dep, aimed_arr)` (the destinations — the old
+  `category_predictiveness.sql` join dropped them).
+- **Leak-free, onset-only features:** `status` (onset regex), `planned`, affected-counts,
+  onset time parts, and per-call **planned** attributes (line, stop, stop_order, scheduled
+  time, `min_from_onset`). Deliberately EXCLUDED as leaky: `duration_minutes` and `severity`
+  (latest-snapshot = resolved state), latest text, and the realized call fields.
+- **Temporal split** (not random): train onset < 2026-04-01, test on/after. Keyed on onset date
+  so a whole situation's calls land on one side — no within-situation grouping leak.
+
+## What worked
+
+- **Cancellation classifier — strong and productionizable.** On the temporal holdout:
+  **ROC-AUC 0.885** (vs ~0.79 for the old slice model), **log-loss 0.197 — 42% better** than the
+  base-rate baseline (0.338), and **well-calibrated** (predicted P(cancel) tracks actual
+  monotonically across all deciles). Top drivers: `num_journeys`, **`status`**, `num_stops` —
+  disruption size + onset-declared outcome. This is a real, calibrated per-train cancellation
+  probability — the headline result.
+- **Delay regressors — valid but weak; needed a log target.** Raw-minute regressors LOST to a
+  trivial "predict the median" baseline on MAE (3.67/3.79 vs 3.34/3.20) — classic
+  mean-seeking-on-skew. Retraining on **`LN(1+delay)`** (back-transform `EXP(pred)−1`) flipped
+  it: MAE **3.05 / 3.04**, now beating the median baseline (~5–9% lift). They predict the
+  *typical* delay (~2 min).
+
+## What did not work / limits found
+
+- **Delay magnitude is only weakly predictable** (R² ~0.13; spread-thin feature importances).
+  Conditional on a train running, exact per-call lateness from onset features carries a lot of
+  irreducible noise. Cancellation (yes/no) is far more learnable than delay (how many minutes).
+- The delay point model under-predicts the tail by design (predicts ~median). A **p90 quantile
+  model** for the "bad case" is the natural next add, not done in v1.
+
+## Data-quality / missing-data issues identified
+
+1. **SX↔ET journey-ref format boundary (caps usable history at ~13 months).** `rail_calls`
+   covers 2024-06+, but SX `affected_journeys` only join to ET calls from **~April/May 2025**
+   onward. Before that, ET used a short `<line>:<date>` ref (e.g. `66:2024-08-06`) while SX used
+   the NeTEx `DatedServiceJourney:…` form — **no shared key**, unrecoverable without a timetable
+   crosswalk. (The operator prefix also flipped `NSB:`→`VYG:`.) So the SX↔ET join — used here
+   AND by `category_predictiveness.sql` / `category_line_hour_impact` — is effectively
+   2025-05 → present. Plenty for v1, but a hard ceiling on history.
+2. **Seasonal cancellation shift, exposed by the temporal split.** Call cancel rate is ~13.9%
+   in the train period but ~10.3% in the spring-2026 holdout. The model handles it via
+   `onset_month` (spring 2025 is in train) and stays calibrated, but a periodic recalibration on
+   a recent window would tighten the slight low-end over-prediction. A random split would have
+   hidden this entirely.
+3. **`call_cancelled` is NULL for served calls** (SIRI convention) — must `COALESCE(...,FALSE)`
+   or the classifier label errors out. Fixed in `create_training_calls.sql`.
+
+## Recommended next steps (per-call family)
+
+- Recalibrate P(cancel) on a trailing window; add a **p90 delay quantile** model for "bad case".
+- Optional v2: a **joint trip-completion** probability (boarding served AND alighting served),
+  which the two per-call probabilities approximate but don't model jointly.
+- Serving: enumerate planned calls on a situation's affected journeys, score the three models,
+  expose per-stop P(cancel) + typical delay. (Not built — training-side only this pass.)
+
+## State (per-call family)
+
+- New, committed: `create_training_calls.sql`, `train_call_models.sql`.
+- Tables/models: `disruptions.training_calls`; models `call_cancel_clf`, `dep_delay_reg`,
+  `arr_delay_reg` (delay models trained on `LN(1+delay)` — serving must back-transform).
