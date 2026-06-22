@@ -246,11 +246,13 @@ _call_pred_by_jkey: dict[str, list[_CallPred]] = {}
 _call_pred_refreshed_at: datetime | None = None
 
 # The planned call source is an ~8 GB ET partition scan, but the published schedule barely moves
-# minute-to-minute -- so rebuild it at most once per TTL, not on every ingestion. The per-call
+# hour-to-hour -- so rebuild it at most once per TTL, not on every ingestion. The per-call
 # predictions themselves (which DO change as situations evolve) are cheap and rebuilt every tick.
+# At 60 min the scan costs ~190 GB/day (~$1.2); a freshly-reported situation still scores against
+# a schedule at most an hour stale, well within the model's 12 h window.
 _planned_lock = threading.Lock()
 _planned_refreshed_at: datetime | None = None
-_PLANNED_TTL = timedelta(minutes=10)
+_PLANNED_TTL = timedelta(minutes=60)
 
 
 def maybe_refresh_planned_calls() -> None:
