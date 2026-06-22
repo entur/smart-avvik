@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -25,6 +26,10 @@ _PREDICT_QUERY = (Path(__file__).parent / "predict.sql").read_text()
 _ACTIVE_DISRUPTIONS_QUERY = (Path(__file__).parent / "active_disruptions.sql").read_text()
 _DISRUPTIONS_AS_OF_QUERY = (Path(__file__).parent / "disruptions_as_of.sql").read_text()
 _ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text()
+# Per-call (per-train) serving: the planned-timetable call source and the scoring query.
+_RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.sql").read_text()
+_PREDICT_CALLS_QUERY = (Path(__file__).parent / "predict_calls.sql").read_text()
+_CALL_PREDICTIONS_QUERY = "SELECT * FROM `ent-kixavvik-dev.disruptions.call_predictions_today`"
 
 # Hour-of-day in the impact lookup is Europe/Oslo local time (matches the table build),
 # so resolve "now" to the Oslo hour when looking up a profile.
@@ -212,6 +217,91 @@ def lookup_alert_profile(category: str, line: str = "*", hour: int = -1) -> dict
     return None
 
 
+# ---- Per-call (per-train) predictions cache --------------------------------------------------
+# disruptions.call_predictions_today holds one row per (affected call) of today's situations:
+# a calibrated cancellation probability and typical/p90 delay, at each stop. Cached here indexed
+# by jkey (the dated journey) so /journey is a dict lookup. Guarded by its own lock.
+@dataclass(frozen=True)
+class _CallPred:
+    """One scored call (stop on a journey) within a situation's 12h window."""
+
+    situation_number: str
+    summary: str | None
+    jkey: str
+    line: str | None
+    stop_place: str
+    stop_name: str | None
+    stop_order: int
+    aimed_dep: datetime | None
+    aimed_arr: datetime | None
+    p_cancel: float
+    dep_delay_typ_min: int | None
+    dep_delay_p90_min: int | None
+    arr_delay_typ_min: int | None
+    arr_delay_p90_min: int | None
+
+
+_call_pred_lock = threading.Lock()
+_call_pred_by_jkey: dict[str, list[_CallPred]] = {}
+_call_pred_refreshed_at: datetime | None = None
+
+# The planned call source is an ~8 GB ET partition scan, but the published schedule barely moves
+# minute-to-minute -- so rebuild it at most once per TTL, not on every ingestion. The per-call
+# predictions themselves (which DO change as situations evolve) are cheap and rebuilt every tick.
+_planned_lock = threading.Lock()
+_planned_refreshed_at: datetime | None = None
+_PLANNED_TTL = timedelta(minutes=10)
+
+
+def maybe_refresh_planned_calls() -> None:
+    """Rebuild disruptions.rail_calls_planned_today if it is stale (older than _PLANNED_TTL).
+
+    Time-gated because it scans today's ET partition (~8 GB); the schedule is stable enough that
+    a 10-minute cadence is plenty. Always runs on first call (refreshed_at is None)."""
+    global _planned_refreshed_at
+    now = datetime.now(timezone.utc)
+    with _planned_lock:
+        fresh = (
+            _planned_refreshed_at is not None and now - _planned_refreshed_at < _PLANNED_TTL
+        )
+    if fresh:
+        return
+    bq_client.query(_RAIL_CALLS_PLANNED_QUERY).result()
+    with _planned_lock:
+        _planned_refreshed_at = now
+    logger.info("Rebuilt planned call source (rail_calls_planned_today)")
+
+
+def refresh_call_predictions_cache() -> None:
+    """Reload the per-call predictions cache from call_predictions_today, indexed by jkey."""
+    rows = bq_client.query(_CALL_PREDICTIONS_QUERY).result()
+    by_jkey: dict[str, list[_CallPred]] = {}
+    for r in rows:
+        by_jkey.setdefault(r.jkey, []).append(
+            _CallPred(
+                situation_number=r.situationNumber,
+                summary=r.summary,
+                jkey=r.jkey,
+                line=r.lineRef,
+                stop_place=r.stop_place,
+                stop_name=r.stop_name,
+                stop_order=r.stop_order,
+                aimed_dep=r.aimed_dep,
+                aimed_arr=r.aimed_arr,
+                p_cancel=r.p_cancel,
+                dep_delay_typ_min=r.dep_delay_typ_min,
+                dep_delay_p90_min=r.dep_delay_p90_min,
+                arr_delay_typ_min=r.arr_delay_typ_min,
+                arr_delay_p90_min=r.arr_delay_p90_min,
+            )
+        )
+    with _call_pred_lock:
+        global _call_pred_by_jkey, _call_pred_refreshed_at
+        _call_pred_by_jkey = by_jkey
+        _call_pred_refreshed_at = datetime.now(timezone.utc)
+    logger.info("Refreshed per-call predictions cache: %d journeys", len(by_jkey))
+
+
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
@@ -239,6 +329,15 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
         refresh_impact_lookup()
     except Exception:
         logger.exception("Impact lookup refresh failed; serving disruptions without alert profiles")
+    # Per-call (per-train) predictions for /journey. Isolated so any failure here never breaks the
+    # main /disruptions feed. The planned call source is rebuilt on a TTL (it scans ET); the
+    # scoring + cache reload run every tick (cheap: materialized inputs + ML.PREDICT).
+    try:
+        maybe_refresh_planned_calls()
+        bq_client.query(_PREDICT_CALLS_QUERY).result()
+        refresh_call_predictions_cache()
+    except Exception:
+        logger.exception("Per-call predictions refresh failed; /journey will serve stale or empty")
 
 
 
@@ -582,6 +681,48 @@ class DisruptionsResponse(BaseModel):
     }
 
 
+class CallPrediction(BaseModel):
+    """Per-stop prediction for one train: chance the stop is cancelled, plus typical/p90 delay.
+
+    Read the BOARDING stop's `cancel_probability` + `dep_delay_*` for "will my train leave, how
+    late?"; read the ALIGHTING stop's `cancel_probability` + `arr_delay_*` for "will I reach my
+    destination, how late?". Delays are whole minutes for a train that runs; `*_p90` is the
+    conservative "bad case". Departure fields are null at a terminal, arrival fields at an origin.
+    """
+
+    stop_place: str = Field(description="NSR StopPlace ref of this stop.")
+    stop_name: str | None = Field(description="Human-readable stop name (null if unresolved).")
+    stop_order: int = Field(description="Position of this stop along the journey (1 = origin).")
+    scheduled_departure: datetime | None = Field(description="Aimed departure (UTC); null at terminal.")
+    scheduled_arrival: datetime | None = Field(description="Aimed arrival (UTC); null at origin.")
+    cancel_probability: float = Field(
+        description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1.",
+    )
+    dep_delay_typ_min: int | None = Field(description="Typical departure delay (min) if it runs.")
+    dep_delay_p90_min: int | None = Field(description="Bad-case (p90) departure delay (min).")
+    arr_delay_typ_min: int | None = Field(description="Typical arrival delay (min) if it runs.")
+    arr_delay_p90_min: int | None = Field(description="Bad-case (p90) arrival delay (min).")
+
+
+class JourneyResponse(BaseModel):
+    """Per-train predictions for a journey currently affected by a disruption.
+
+    `calls` are the affected stops within 12h of the situation's onset, ordered along the line.
+    When a journey is touched by more than one situation, the most severe (highest peak
+    cancellation probability) is returned and named in `situation_number`.
+    """
+
+    journey_ref: str = Field(description="The journey looked up (echoes the request `id`).")
+    line: str | None = Field(description="Line ref of the train, e.g. 'VYG:Line:R31'.")
+    situation_number: str = Field(description="The SIRI-SX situation these predictions come from.")
+    summary: str | None = Field(description="Short Norwegian summary of that situation.")
+    as_of: datetime = Field(description="Server time of the response (UTC).")
+    refreshed_at: datetime | None = Field(
+        description="When the per-call cache was last rebuilt (UTC); null until first refresh.",
+    )
+    calls: list[CallPrediction] = Field(description="Affected stops, ordered by stop_order.")
+
+
 def _minutes_from_now(onset_ts: datetime, est_min_from_onset: float, now: datetime) -> int:
     """Convert a minutes-from-onset estimate to whole minutes from now.
 
@@ -750,6 +891,85 @@ async def situation(
             detail=f"No disruption found for situationNumber {id!r}.",
         )
     return _to_disruption(d, datetime.now(timezone.utc))
+
+
+@app.get(
+    "/journey",
+    summary="Per-train cancellation + delay predictions for a journey",
+    response_description="Per-stop predictions for the affected train.",
+    tags=["disruptions"],
+)
+async def journey(
+    id: str = Query(
+        description=(
+            "Journey identifier — a SIRI DatedServiceJourney ref (e.g. "
+            "'VYG:DatedServiceJourney:318_LHM-DRM_25-09-01') or the bare jkey. The operator "
+            "prefix is stripped, so either form works."
+        ),
+    ),
+    from_stop: str | None = Query(
+        default=None,
+        description="Optional boarding StopPlace ref (NSR:StopPlace:...) to filter the calls to.",
+    ),
+    to_stop: str | None = Query(
+        default=None,
+        description="Optional alighting StopPlace ref (NSR:StopPlace:...) to filter the calls to.",
+    ),
+) -> JourneyResponse:
+    """Per-train predictions for a journey currently affected by a disruption.
+
+    Returns the affected stops, each with a calibrated cancellation probability and typical/p90
+    delay. For a passenger: the boarding stop answers "will my train leave, and how late?"
+    (`cancel_probability` + `dep_delay_*`); the alighting stop answers "will I reach my
+    destination, and how late?" (`cancel_probability` + `arr_delay_*`). Pass `from_stop` /
+    `to_stop` to return just those stops.
+
+    404 if no active disruption affects this journey (the train is not in today's per-call
+    predictions). When several situations touch the journey, the most severe is returned.
+    """
+    jkey = re.sub(r"^[A-Za-z]+:", "", id)
+    with _call_pred_lock:
+        rows = _call_pred_by_jkey.get(jkey)
+        refreshed_at = _call_pred_refreshed_at
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active disruption affecting journey {id!r}.",
+        )
+    # A journey can be touched by several situations; surface the most severe (highest peak
+    # cancellation probability across its stops).
+    by_sit: dict[str, list[_CallPred]] = {}
+    for r in rows:
+        by_sit.setdefault(r.situation_number, []).append(r)
+    chosen = max(by_sit.values(), key=lambda rs: max(x.p_cancel for x in rs))
+    calls = sorted(chosen, key=lambda x: x.stop_order)
+    if from_stop is not None or to_stop is not None:
+        wanted = {s for s in (from_stop, to_stop) if s is not None}
+        calls = [c for c in calls if c.stop_place in wanted]
+    head = chosen[0]
+    return JourneyResponse(
+        journey_ref=id,
+        line=head.line,
+        situation_number=head.situation_number,
+        summary=head.summary,
+        as_of=datetime.now(timezone.utc),
+        refreshed_at=refreshed_at,
+        calls=[
+            CallPrediction(
+                stop_place=c.stop_place,
+                stop_name=c.stop_name,
+                stop_order=c.stop_order,
+                scheduled_departure=c.aimed_dep,
+                scheduled_arrival=c.aimed_arr,
+                cancel_probability=c.p_cancel,
+                dep_delay_typ_min=c.dep_delay_typ_min,
+                dep_delay_p90_min=c.dep_delay_p90_min,
+                arr_delay_typ_min=c.arr_delay_typ_min,
+                arr_delay_p90_min=c.arr_delay_p90_min,
+            )
+            for c in calls
+        ],
+    )
 
 
 @app.get(

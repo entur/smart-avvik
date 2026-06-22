@@ -109,6 +109,18 @@ base AS (
         WHERE dvjr IS NOT NULL
       )
     ) AS affected_journeys,
+    -- affected_lines: needed by the per-call models' num_lines feature (predict_calls.sql).
+    -- Mirrors create_disruptions.sql's affected_lines; additive column, existing consumers ignore it.
+    (
+      SELECT ARRAY_AGG(line_ref ORDER BY line_ref)
+      FROM (
+        SELECT journeys.lineRef AS line_ref
+        FROM UNNEST(fv.affects.vehicleJourneys) AS journeys WHERE journeys.lineRef IS NOT NULL
+        UNION DISTINCT
+        SELECT al.lineRef
+        FROM UNNEST(fv.affects.networks) AS n, UNNEST(n.affectedLines) AS al WHERE al.lineRef IS NOT NULL
+      )
+    ) AS affected_lines,
     EXTRACT(MONTH     FROM fv.event_ts AT TIME ZONE 'Europe/Oslo') AS month,
     EXTRACT(DAY       FROM fv.event_ts AT TIME ZONE 'Europe/Oslo') AS day,
     EXTRACT(DAYOFWEEK FROM fv.event_ts AT TIME ZONE 'Europe/Oslo') AS dayofweek,

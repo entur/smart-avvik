@@ -241,11 +241,16 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 - Done: p90 delay layer (`delay_p90_calib`), P(cancel) recalibration (`cancel_platt`), the
   serving query (`predict_calls.sql` → `call_predictions`), and the live forward path
   (`rail_calls_planned_today.sql` + `predict_calls_today.sql` → `call_predictions_today`).
-- **Remaining to ship live:** (a) an active-situations feed for the live query (it uses a
-  recent-`disruptions` stand-in now; wire `active_disruptions.sql`/refresh `disruptions` first —
-  the refresh ORDER is planned-source → disruptions → predict_calls_today → cache); (b) API
-  wiring: cache a `call_predictions_today` slice and expose a per-train endpoint, as `main.py`
-  does for `predictions_today`. (`stop_name` is now resolved via GTFS — 100% named.)
+- **API wiring — done.** `disruptions/api/` now serves per-train predictions: `disruptions_today.sql`
+  gained `affected_lines`; `rail_calls_planned_today.sql` (planned source) + `predict_calls.sql`
+  (live scoring, status derived inline from onset text, fed by `disruptions_initial_today`) build
+  `call_predictions_today`; `main.py` adds an in-process cache (indexed by jkey) and a **`/journey`**
+  endpoint (`?id=&from_stop=&to_stop=`) returning per-stop P(cancel)+typ/p90 delay, picking the
+  most-severe situation when several touch a train. Cost-shaped: the ~8 GB ET scan
+  (`rail_calls_planned_today`) is TTL-gated to ~10 min; the scoring query is **2.4 MB** so it runs
+  every ingestion. Validated end-to-end (runtime smoke test: 55 journeys cached; a turn-/start-short
+  L2 train reads 0.94-0.99 cancel on its early stops). **Only `gcloud run deploy` remains** (see
+  CLAUDE.md) — not deployed from here.
 - Horizon note: the planned source is ET-bounded (~today + ~2 days); a NeTEx planned-timetable
   feed would extend it, but ET already exceeds the 12h window the model uses.
 - Keep `predict_calls.sql` and `predict_calls_today.sql` in sync (same scoring; only the call
@@ -262,6 +267,9 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
 - Serving tables: `disruptions.call_predictions` (retrospective, over `rail_calls`) and
   `disruptions.call_predictions_today` (live forward, over `rail_calls_planned_today`); plus the
   planned call source `disruptions.rail_calls_planned_today`.
+- API (`disruptions/api/`): new `rail_calls_planned_today.sql`, `predict_calls.sql`; modified
+  `disruptions_today.sql` (+`affected_lines`) and `main.py` (per-call cache + `/journey`). Built
+  but not yet deployed.
 - Tables/models: `disruptions.training_calls`; models `call_cancel_clf` + `cancel_platt`
   (Platt recalibration), `dep_delay_reg`, `arr_delay_reg` (delay models trained on `LN(1+delay)`
   — serving must back-transform); table `disruptions.delay_p90_calib` (p90 lookup keyed on
