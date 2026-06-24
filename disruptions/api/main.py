@@ -243,7 +243,19 @@ class _CallPred:
 
 _call_pred_lock = threading.Lock()
 _call_pred_by_jkey: dict[str, list[_CallPred]] = {}
+# Same scored calls, indexed by situationNumber, so /impact can resolve a passenger's train from
+# (situation, from_stop, at) without a journey ref. Built from the same rows as _call_pred_by_jkey.
+_call_pred_by_situation: dict[str, list[_CallPred]] = {}
 _call_pred_refreshed_at: datetime | None = None
+
+# /impact matches the passenger's intended departure (`at`) to the nearest affected departure at
+# `from_stop`. If the closest affected call is further than this, the train is treated as not
+# affected (omitted) — wide enough to absorb an approximate `at`, tight enough not to grab a
+# different service on the line.
+_IMPACT_AT_TOLERANCE = timedelta(minutes=90)
+
+# Default boarding stop for /impact when the caller omits from_stop: Oslo S, the busiest hub.
+_DEFAULT_FROM_STOP = "NSR:StopPlace:337"  # Oslo S
 
 # The planned call source is an ~8 GB ET partition scan, but the published schedule barely moves
 # hour-to-hour -- so rebuild it at most once per TTL, not on every ingestion. The per-call
@@ -278,30 +290,36 @@ def refresh_call_predictions_cache() -> None:
     """Reload the per-call predictions cache from call_predictions_today, indexed by jkey."""
     rows = bq_client.query(_CALL_PREDICTIONS_QUERY).result()
     by_jkey: dict[str, list[_CallPred]] = {}
+    by_situation: dict[str, list[_CallPred]] = {}
     for r in rows:
-        by_jkey.setdefault(r.jkey, []).append(
-            _CallPred(
-                situation_number=r.situationNumber,
-                summary=r.summary,
-                jkey=r.jkey,
-                line=r.lineRef,
-                stop_place=r.stop_place,
-                stop_name=r.stop_name,
-                stop_order=r.stop_order,
-                aimed_dep=r.aimed_dep,
-                aimed_arr=r.aimed_arr,
-                p_cancel=r.p_cancel,
-                dep_delay_typ_min=r.dep_delay_typ_min,
-                dep_delay_p90_min=r.dep_delay_p90_min,
-                arr_delay_typ_min=r.arr_delay_typ_min,
-                arr_delay_p90_min=r.arr_delay_p90_min,
-            )
+        pred = _CallPred(
+            situation_number=r.situationNumber,
+            summary=r.summary,
+            jkey=r.jkey,
+            line=r.lineRef,
+            stop_place=r.stop_place,
+            stop_name=r.stop_name,
+            stop_order=r.stop_order,
+            aimed_dep=r.aimed_dep,
+            aimed_arr=r.aimed_arr,
+            p_cancel=r.p_cancel,
+            dep_delay_typ_min=r.dep_delay_typ_min,
+            dep_delay_p90_min=r.dep_delay_p90_min,
+            arr_delay_typ_min=r.arr_delay_typ_min,
+            arr_delay_p90_min=r.arr_delay_p90_min,
         )
+        by_jkey.setdefault(r.jkey, []).append(pred)
+        by_situation.setdefault(r.situationNumber, []).append(pred)
     with _call_pred_lock:
-        global _call_pred_by_jkey, _call_pred_refreshed_at
+        global _call_pred_by_jkey, _call_pred_by_situation, _call_pred_refreshed_at
         _call_pred_by_jkey = by_jkey
+        _call_pred_by_situation = by_situation
         _call_pred_refreshed_at = datetime.now(timezone.utc)
-    logger.info("Refreshed per-call predictions cache: %d journeys", len(by_jkey))
+    logger.info(
+        "Refreshed per-call predictions cache: %d journeys, %d situations",
+        len(by_jkey),
+        len(by_situation),
+    )
 
 
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
@@ -725,6 +743,84 @@ class JourneyResponse(BaseModel):
     calls: list[CallPrediction] = Field(description="Affected stops, ordered by stop_order.")
 
 
+class StopPrediction(BaseModel):
+    """Prediction for one stop on one train: chance it is cancelled, plus delay if it runs.
+
+    Serves as both a `departure_prediction` (the boarding stop — `scheduled_time` is the aimed
+    departure and `delay_*` the departure delay, answering "will my train leave, how late?") and an
+    `arrival_prediction` (the alighting stop — `scheduled_time` is the aimed arrival and `delay_*`
+    the arrival delay, answering "will I reach my destination, how late?"). `delay_p90_min` is the
+    conservative "bad case".
+    """
+
+    stop_place: str = Field(description="NSR StopPlace ref of this stop.")
+    stop_name: str | None = Field(description="Human-readable stop name (null if unresolved).")
+    stop_order: int = Field(description="Position of this stop along the journey (1 = origin).")
+    scheduled_time: datetime | None = Field(
+        description="Aimed departure (departure_prediction) or arrival (arrival_prediction), UTC.",
+    )
+    cancel_probability: float = Field(
+        description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1.",
+    )
+    delay_typ_min: int | None = Field(description="Typical delay (min) at this stop if the train runs.")
+    delay_p90_min: int | None = Field(description="Bad-case (p90) delay (min) at this stop.")
+
+
+class SituationImpact(BaseModel):
+    """How one situation impacts the passenger's trip, worst-case across the lines it affects."""
+
+    situation_number: str = Field(description="SIRI-SX situationNumber of this situation.")
+    summary: str | None = Field(description="Short Norwegian summary of the situation.")
+    departure_prediction: StopPrediction = Field(
+        description="Worst-case boarding prediction across the lines this situation affects.",
+    )
+    arrival_prediction: StopPrediction | None = Field(
+        description="Worst-case alighting prediction; null when `to_stop` is omitted.",
+    )
+
+
+class LineImpact(BaseModel):
+    """How one line is impacted for the passenger's trip, worst-case across the situations on it.
+
+    The line's train is the one departing `from_stop` nearest `at`; the arrival prediction is that
+    same train at `to_stop`.
+    """
+
+    line: str | None = Field(description="Line ref of the affected train, e.g. 'VYG:Line:R31'.")
+    departure_prediction: StopPrediction = Field(
+        description="Worst-case boarding prediction across the situations affecting this line.",
+    )
+    arrival_prediction: StopPrediction | None = Field(
+        description="Worst-case alighting prediction; null when `to_stop` is omitted or not served.",
+    )
+
+
+class ImpactResponse(BaseModel):
+    """Situations and lines affecting a passenger's intended trip, per-train scored.
+
+    Same per-train model as /journey, but trains are resolved from each situation plus the trip
+    (`from_stop` + intended departure `at`, optional `to_stop`) rather than a journey ref. The
+    underlying unit is a (situation × line) cell — the train on that line departing `from_stop`
+    nearest `at` — exposed two ways: `situations` rolls cells up per situation (worst-case over
+    its lines), `lines` rolls them up per line (worst-case over the situations affecting it), so a
+    line is never listed once per situation. When `situation` is given, `situations` is length 1
+    (or 0 if that situation does not affect the trip) and `lines` is its per-line breakdown.
+    """
+
+    as_of: datetime = Field(description="Server time of the response (UTC).")
+    refreshed_at: datetime | None = Field(
+        description="When the per-call cache was last rebuilt (UTC); null until first refresh.",
+    )
+    from_stop: str = Field(description="The boarding StopPlace ref queried (echoes the request).")
+    to_stop: str | None = Field(description="The alighting StopPlace ref queried, if any.")
+    situations: list[SituationImpact] = Field(
+        description="Situations affecting the trip, most severe first; length 1 when `situation` is given.",
+    )
+    lines: list[LineImpact] = Field(
+        description="Lines affecting the trip, most severe first; each line appears once.",
+    )
+
+
 def _minutes_from_now(onset_ts: datetime, est_min_from_onset: float, now: datetime) -> int:
     """Convert a minutes-from-onset estimate to whole minutes from now.
 
@@ -971,6 +1067,214 @@ async def journey(
             )
             for c in calls
         ],
+    )
+
+
+@dataclass(frozen=True)
+class _TripCell:
+    """One (situation × line) impact for the passenger's trip: the train on this line departing
+    from_stop nearest `at`, scored at the boarding stop (and the alighting stop if to_stop given)."""
+
+    situation_number: str
+    summary: str | None
+    line: str | None
+    departure: StopPrediction
+    arrival: StopPrediction | None
+
+
+def _departure_prediction(c: _CallPred) -> StopPrediction:
+    """Boarding-stop prediction: cancellation chance + departure delay at this call."""
+    return StopPrediction(
+        stop_place=c.stop_place,
+        stop_name=c.stop_name,
+        stop_order=c.stop_order,
+        scheduled_time=c.aimed_dep,
+        cancel_probability=c.p_cancel,
+        delay_typ_min=c.dep_delay_typ_min,
+        delay_p90_min=c.dep_delay_p90_min,
+    )
+
+
+def _arrival_prediction(c: _CallPred) -> StopPrediction:
+    """Alighting-stop prediction: cancellation chance + arrival delay at this call."""
+    return StopPrediction(
+        stop_place=c.stop_place,
+        stop_name=c.stop_name,
+        stop_order=c.stop_order,
+        scheduled_time=c.aimed_arr,
+        cancel_probability=c.p_cancel,
+        delay_typ_min=c.arr_delay_typ_min,
+        delay_p90_min=c.arr_delay_p90_min,
+    )
+
+
+def _worst(preds: list[StopPrediction | None]) -> StopPrediction | None:
+    """Most severe prediction: highest cancellation probability, then largest p90 delay.
+
+    None-valued entries (e.g. a train that does not serve the alighting stop) are ignored; returns
+    None only if nothing remains."""
+    present = [p for p in preds if p is not None]
+    if not present:
+        return None
+    return max(present, key=lambda p: (p.cancel_probability, p.delay_p90_min or 0))
+
+
+def _trip_cells(
+    scope: dict[str, list[_CallPred]],
+    from_stop: str,
+    to_stop: str | None,
+    at: datetime,
+) -> list[_TripCell]:
+    """Build one (situation × line) cell for every line with a departure from `from_stop` near `at`.
+
+    Within a situation, lines are resolved independently: the boarding call is the one on that line
+    closest to `at` (and within _IMPACT_AT_TOLERANCE); the arrival call is that same train at
+    `to_stop`. Situations with no qualifying departure are skipped."""
+    cells: list[_TripCell] = []
+    for calls in scope.values():
+        board = [
+            c
+            for c in calls
+            if c.stop_place == from_stop
+            and c.aimed_dep is not None
+            and abs(c.aimed_dep - at) <= _IMPACT_AT_TOLERANCE
+        ]
+        if not board:
+            continue
+        # Per line, keep the boarding call nearest the intended departure.
+        by_line: dict[str | None, _CallPred] = {}
+        for c in board:
+            cur = by_line.get(c.line)
+            if cur is None or abs(c.aimed_dep - at) < abs(cur.aimed_dep - at):
+                by_line[c.line] = c
+        for line, bcall in by_line.items():
+            arrival = None
+            if to_stop is not None:
+                acall = next(
+                    (
+                        c
+                        for c in calls
+                        if c.jkey == bcall.jkey
+                        and c.stop_place == to_stop
+                        and c.aimed_arr is not None
+                    ),
+                    None,
+                )
+                if acall is not None:
+                    arrival = _arrival_prediction(acall)
+            cells.append(
+                _TripCell(
+                    situation_number=bcall.situation_number,
+                    summary=bcall.summary,
+                    line=line,
+                    departure=_departure_prediction(bcall),
+                    arrival=arrival,
+                )
+            )
+    return cells
+
+
+def _severity_key(p: StopPrediction) -> tuple[float, int]:
+    """Sort key for ordering impacts most-severe first (the departure prediction is always set)."""
+    return (p.cancel_probability, p.delay_p90_min or 0)
+
+
+@app.get(
+    "/impact",
+    summary="Per-train cancellation + delay impact on a passenger's trip",
+    response_description="Situations and lines affecting the trip, each with departure/arrival predictions.",
+    tags=["disruptions"],
+)
+async def impact(
+    from_stop: str = Query(
+        default=_DEFAULT_FROM_STOP,
+        description=(
+            "Boarding StopPlace ref (NSR:StopPlace:...). Defaults to Oslo S (NSR:StopPlace:337)."
+        ),
+    ),
+    at: datetime | None = Query(
+        default=None,
+        description=(
+            "Intended departure time from `from_stop` (ISO 8601). Used to pick, per line, the "
+            "affected train closest to this time. Defaults to the current time. A naive value is "
+            "assumed UTC."
+        ),
+    ),
+    situation: str | None = Query(
+        default=None,
+        description=(
+            "Optional SIRI-SX situationNumber. When given, only that situation is considered "
+            "(`situations` is length 1, or 0 if it does not affect the trip). When omitted, every "
+            "situation affecting a departure from `from_stop` near `at` is returned."
+        ),
+    ),
+    to_stop: str | None = Query(
+        default=None,
+        description="Optional alighting StopPlace ref (NSR:StopPlace:...) for the arrival prediction.",
+    ),
+) -> ImpactResponse:
+    """Per-train impact of one or more situations on a passenger's intended trip.
+
+    Resolves, for each affected line, the train departing `from_stop` nearest `at`, and scores it
+    at the boarding stop (`departure_prediction`: will it leave, how late?) and — when `to_stop`
+    is given — at the alighting stop (`arrival_prediction`: will I arrive, how late?), using the
+    same per-call model as /journey.
+
+    The result is exposed two ways: `situations` (one entry per situation, worst-case over its
+    lines) and `lines` (one entry per line, worst-case over the situations affecting it). Pass
+    `situation` to scope to a single situation. Both lists are empty when nothing affects the trip.
+    """
+    if at is None:
+        at_utc = datetime.now(timezone.utc)
+    else:
+        at_utc = at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+    with _call_pred_lock:
+        by_situation = _call_pred_by_situation
+        refreshed_at = _call_pred_refreshed_at
+    if situation is not None:
+        calls = by_situation.get(situation)
+        scope = {situation: calls} if calls else {}
+    else:
+        scope = by_situation
+
+    cells = _trip_cells(scope, from_stop, to_stop, at_utc)
+
+    # situations: roll cells up per situation (worst-case over that situation's lines).
+    by_sit: dict[str, list[_TripCell]] = {}
+    for cell in cells:
+        by_sit.setdefault(cell.situation_number, []).append(cell)
+    situations = [
+        SituationImpact(
+            situation_number=sit_num,
+            summary=group[0].summary,
+            departure_prediction=_worst([c.departure for c in group]),
+            arrival_prediction=_worst([c.arrival for c in group]),
+        )
+        for sit_num, group in by_sit.items()
+    ]
+    situations.sort(key=lambda s: _severity_key(s.departure_prediction), reverse=True)
+
+    # lines: roll cells up per line (worst-case over the situations affecting that line).
+    by_line: dict[str | None, list[_TripCell]] = {}
+    for cell in cells:
+        by_line.setdefault(cell.line, []).append(cell)
+    lines = [
+        LineImpact(
+            line=line,
+            departure_prediction=_worst([c.departure for c in group]),
+            arrival_prediction=_worst([c.arrival for c in group]),
+        )
+        for line, group in by_line.items()
+    ]
+    lines.sort(key=lambda x: _severity_key(x.departure_prediction), reverse=True)
+
+    return ImpactResponse(
+        as_of=datetime.now(timezone.utc),
+        refreshed_at=refreshed_at,
+        from_stop=from_stop,
+        to_stop=to_stop,
+        situations=situations,
+        lines=lines,
     )
 
 
