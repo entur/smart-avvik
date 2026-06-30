@@ -96,6 +96,12 @@ SELECT
   t.jkey, t.lineRef, t.quay,
   q.stopPlaceRef AS stop_place,
   q.name         AS stop_name,
+  LAG(q.stopPlaceRef) OVER (
+    PARTITION BY t.jkey ORDER BY t.stop_order
+  ) AS prev_stop_place,
+  LEAD(q.stopPlaceRef) OVER (
+    PARTITION BY t.jkey ORDER BY t.stop_order
+  ) AS next_stop_place,
   t.stop_order,
   t.aimed_dep,
   t.call_date,
