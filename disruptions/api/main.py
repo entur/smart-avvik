@@ -239,6 +239,13 @@ class _CallPred:
     dep_delay_p90_min: int | None
     arr_delay_typ_min: int | None
     arr_delay_p90_min: int | None
+    # Exceedance stack (2026-07-02): calibrated P(arr_delay >= t | runs), the interval read off
+    # the survival curve, and p_impact = P(cancelled OR >= 10 min late). All None at an origin.
+    p_arr_ge10: float | None
+    p_arr_ge20: float | None
+    arr_delay_p50_stack_min: int | None
+    arr_delay_p90_stack_min: int | None
+    p_impact: float | None
 
 
 _call_pred_lock = threading.Lock()
@@ -307,6 +314,11 @@ def refresh_call_predictions_cache() -> None:
             dep_delay_p90_min=r.dep_delay_p90_min,
             arr_delay_typ_min=r.arr_delay_typ_min,
             arr_delay_p90_min=r.arr_delay_p90_min,
+            p_arr_ge10=r.p_arr_ge10,
+            p_arr_ge20=r.p_arr_ge20,
+            arr_delay_p50_stack_min=r.arr_delay_p50_stack_min,
+            arr_delay_p90_stack_min=r.arr_delay_p90_stack_min,
+            p_impact=r.p_impact,
         )
         by_jkey.setdefault(r.jkey, []).append(pred)
         by_situation.setdefault(r.situationNumber, []).append(pred)
@@ -721,7 +733,24 @@ class CallPrediction(BaseModel):
     dep_delay_typ_min: int | None = Field(description="Typical departure delay (min) if it runs.")
     dep_delay_p90_min: int | None = Field(description="Bad-case (p90) departure delay (min).")
     arr_delay_typ_min: int | None = Field(description="Typical arrival delay (min) if it runs.")
-    arr_delay_p90_min: int | None = Field(description="Bad-case (p90) arrival delay (min).")
+    arr_delay_p90_min: int | None = Field(
+        description="Bad-case (p90) arrival delay (min), from the calibrated exceedance stack "
+        "when available (narrower at the same coverage than the legacy per-bucket lookup).",
+    )
+    arr_delay_p50_min: int | None = Field(
+        default=None,
+        description="Median arrival delay (min) from the exceedance stack; with arr_delay_p90_min "
+        "this forms the 'expect X-Y min' interval. Null at an origin.",
+    )
+    arr_ge10_probability: float | None = Field(
+        default=None,
+        description="Calibrated P(arrival >= 10 min late | the train runs), 0-1. Null at an origin.",
+    )
+    impact_probability: float | None = Field(
+        default=None,
+        description="Calibrated P(this stop is cancelled OR the arrival is >= 10 min late), 0-1 — "
+        "the recommended single alerting score. Null at an origin.",
+    )
 
 
 class JourneyResponse(BaseModel):
@@ -763,7 +792,24 @@ class StopPrediction(BaseModel):
         description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1.",
     )
     delay_typ_min: int | None = Field(description="Typical delay (min) at this stop if the train runs.")
-    delay_p90_min: int | None = Field(description="Bad-case (p90) delay (min) at this stop.")
+    delay_p90_min: int | None = Field(
+        description="Bad-case (p90) delay (min) at this stop. On arrival predictions this comes "
+        "from the calibrated exceedance stack when available.",
+    )
+    delay_p50_min: int | None = Field(
+        default=None,
+        description="Median delay (min) from the exceedance stack; with delay_p90_min this forms "
+        "the 'expect X-Y min' interval. Arrival predictions only (null on departures).",
+    )
+    ge10_probability: float | None = Field(
+        default=None,
+        description="Calibrated P(delay >= 10 min | the train runs), 0-1. Arrival predictions only.",
+    )
+    impact_probability: float | None = Field(
+        default=None,
+        description="Calibrated P(cancelled OR >= 10 min late) — the recommended single alerting "
+        "score. Arrival predictions only.",
+    )
 
 
 class SituationImpact(BaseModel):
@@ -1063,7 +1109,14 @@ async def journey(
                 dep_delay_typ_min=c.dep_delay_typ_min,
                 dep_delay_p90_min=c.dep_delay_p90_min,
                 arr_delay_typ_min=c.arr_delay_typ_min,
-                arr_delay_p90_min=c.arr_delay_p90_min,
+                arr_delay_p90_min=(
+                    c.arr_delay_p90_stack_min
+                    if c.arr_delay_p90_stack_min is not None
+                    else c.arr_delay_p90_min
+                ),
+                arr_delay_p50_min=c.arr_delay_p50_stack_min,
+                arr_ge10_probability=c.p_arr_ge10,
+                impact_probability=c.p_impact,
             )
             for c in calls
         ],
@@ -1104,7 +1157,14 @@ def _arrival_prediction(c: _CallPred) -> StopPrediction:
         scheduled_time=c.aimed_arr,
         cancel_probability=c.p_cancel,
         delay_typ_min=c.arr_delay_typ_min,
-        delay_p90_min=c.arr_delay_p90_min,
+        delay_p90_min=(
+            c.arr_delay_p90_stack_min
+            if c.arr_delay_p90_stack_min is not None
+            else c.arr_delay_p90_min
+        ),
+        delay_p50_min=c.arr_delay_p50_stack_min,
+        ge10_probability=c.p_arr_ge10,
+        impact_probability=c.p_impact,
     )
 
 

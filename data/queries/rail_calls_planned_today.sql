@@ -42,12 +42,17 @@ WITH last_snap AS (
     PARTITION BY datedVehicleJourneyRef ORDER BY SAFE.TIMESTAMP(recordedAtTime) DESC) = 1
 ),
 calls AS (
-  -- recorded (operated / past) stops -- planned times
+  -- recorded (operated / past) stops -- planned times + the REALIZED departure delay, which the
+  -- 2026-07-02 propagation features (line_pre_*/net_pre_*/line_now_*/own_prev_delay in
+  -- predict_calls*.sql) read as the live-observable state. Same delay definition as
+  -- create_rail_calls.sql: actual vs aimed departure, minutes.
   SELECT
     s.jkey, s.lineRef, rc.stopPointRef AS quay, rc.order AS stop_order, 'recorded' AS call_source,
     (rc.cancellation OR s.journey_cancelled) AS call_cancelled,
     SAFE.TIMESTAMP(rc.aimedDepartureTime) AS aimed_dep,
-    SAFE.TIMESTAMP(rc.aimedArrivalTime)   AS aimed_arr
+    SAFE.TIMESTAMP(rc.aimedArrivalTime)   AS aimed_arr,
+    TIMESTAMP_DIFF(SAFE.TIMESTAMP(rc.actualDepartureTime),
+                   SAFE.TIMESTAMP(rc.aimedDepartureTime), MINUTE) AS dep_delay_min
   FROM last_snap AS s, UNNEST(s.recordedCalls) AS rc
   UNION ALL
   -- estimated (upcoming / future) stops -- ALL of them (the forward schedule), planned times
@@ -55,7 +60,8 @@ calls AS (
     s.jkey, s.lineRef, ec.stopPointRef, ec.order, 'estimated',
     (ec.cancellation OR s.journey_cancelled),
     SAFE.TIMESTAMP(ec.aimedDepartureTime),
-    SAFE.TIMESTAMP(ec.aimedArrivalTime)
+    SAFE.TIMESTAMP(ec.aimedArrivalTime),
+    CAST(NULL AS INT64)
   FROM last_snap AS s, UNNEST(s.estimatedCalls) AS ec
 ),
 dedup AS (
@@ -81,7 +87,7 @@ SELECT
   d.jkey, d.lineRef, d.quay,
   q.stopPlaceRef            AS stop_place,
   COALESCE(n.stop_name, q.name) AS stop_name,
-  d.stop_order, d.aimed_dep, d.aimed_arr,
+  d.stop_order, d.aimed_dep, d.aimed_arr, d.dep_delay_min,
   DATE(COALESCE(d.aimed_dep, d.aimed_arr), 'Europe/Oslo') AS call_date,
   d.call_cancelled, d.call_source
 FROM dedup AS d

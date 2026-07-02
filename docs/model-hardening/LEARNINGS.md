@@ -373,3 +373,162 @@ tables silently biased an earlier per-category read and flipped its conclusions.
 - Calib chain rebuilt against the new models: `dep_delay_reg_eval`, `arr_delay_reg_eval`,
   `delay_p90_calib`, `delay_point_calib`.
 - No serving-code change needed; `predict_calls.sql` picks up the new models + consistent calib tables.
+
+---
+
+# Follow-up: exceedance reframing + delay-propagation features
+
+Session date: 2026-07-02 (afternoon). Goal: step back and look for *new approaches* to the
+actual product question — "for a journey from_stop → to_stop under an active SX situation,
+what delay should the passenger expect (as an interval), ignoring minor delays (<5–10 min),
+without crying wolf?" All experiments on the usual temporal holdout (onset ≥ 2026-04-01),
+NSB only, arrival side (= what the passenger experiences at to_stop).
+
+## The reframing: the product question is classification, not regression
+
+Every result in this project says cancellation (yes/no, AUC 0.885) is learnable while delay
+minutes (R² ~0.13) are not. But "will my arrival be ≥10 min late?" **is a yes/no question** —
+the current stack just answers it by thresholding a median-seeking regressor + a p90 lookup.
+Quantified on the holdout (225,610 non-cancelled calls, 9.7% of them ≥10 min late), the current
+serving path offers only two operating points for a ≥10-min alert, both bad:
+
+| alert rule | alerts | precision | recall |
+|---|---|---|---|
+| point estimate ≥ 10 (`EXP(pred)−1`) | 944 | 63.1% | **2.7%** — never fires |
+| p90 lookup ≥ 10 | 81,307 (36% of all calls!) | **19.7%** | 73.2% — cries wolf |
+
+The regressor's ranking power for the ≥10 event is AUC 0.781. Everything below replaces the
+decision layer with **direct exceedance classifiers** `P(arr_delay ≥ t)` for t ∈ {5,10,20,40}
+(BOOSTED_TREE_CLASSIFIER on the same population, same leak-free features).
+
+## Feature experiments (≥10-min model, holdout AUC / log-loss)
+
+| variant | features | AUC | log-loss |
+|---|---|---|---|
+| v1 | current 11 (as pruned regressors) | 0.788 | 0.280 |
+| v2 | + `category` (16-way, leak-free via onset-text join, 99.99% coverage) | 0.787 | 0.276 |
+| v3 | + category + text (`stated_min`, flags) + **pre-onset line congestion** | **0.801** | 0.259 |
+| v4 | v3 + **ask-time propagation** (`own_prev_delay`, `line_now_*`) | **0.910** | 0.173 |
+
+- **`category` adds nothing** on top of `status`+`lineRef` — "informative in isolation,
+  redundant in the model" strikes again. Its global-explain weight (0.063) is real but AUC-flat.
+- **Text features are marginal:** only ~5% of onset texts state minutes (`"ca. 30 minutter"`);
+  `stated_min` earns modest weight (0.035 > `status` 0.019); `buss for tog`/`stengt`/`redusert
+  hastighet` flags are dead (≤0.0006).
+- **Pre-onset line congestion is the first genuinely additive onset-time feature found since
+  the original set.** `line_pre_delay` = mean positive dep-delay on the same line in the 60 min
+  *before* onset (from `rail_calls`, leak-free, +~1 GB to build). Single-feature corr with the
+  outcome 0.37 ≈ the entire old model's explanatory power; #1 global-explain feature in v3 (0.186).
+- **Ask-time propagation features are a step change.** `own_prev_delay` (the train's own dep
+  delay at its latest stop with aimed time ≥30 min before the predicted call) has **corr 0.88**
+  with the outcome; `line_now_delay` (line state in the hour ending ~30–90 min before the call,
+  via hourly buckets) corr 0.56. v4 = AUC **0.910** overall, **0.928** on the 64% of calls where
+  `own_prev_delay` exists, **0.842** on the rest — and it is **calibrated raw** (0.14→0.11,
+  0.45→0.44, 0.96→0.99 across deciles; the earlier variants over-predict at the low end due to
+  the seasonal base-rate shift and would want a Platt layer).
+- v4 PR curve (≥10): **91.5% precision @ 43% recall** (thr 0.7), **98.6% @ 28%** (thr 0.9).
+  v3 at the same precision: ~11% recall. The current point path: 63% @ 2.7%.
+
+## Interval layer: discrete survival curve from the stack
+
+Monotonicity-enforce the four probabilities (cummax; raw violation rate 1.9%), then read
+quantiles off the piecewise-linear survival curve. At matched ~94% coverage the stack's mean
+p90 width **ties** the existing `delay_p90_calib` (11.35 vs 11.19 min) — but coverage is far
+better *distributed*: `infrastruktur/strøm` 85.7%→88.9%, `drift/personale` same coverage at
+width 17.5 vs 27.7, `materiell/teknisk` 15.0 vs 16.8. The stack is conditionally sharp where
+the plog-bucket lookup is category-blind, and the alert probabilities come for free.
+
+## Product-level alert ("should the passenger worry?")
+
+`p_impact = p_cancel + (1−p_cancel)·p_ge10` (existing `call_cancel_clf` × v3 exceedance model),
+label = cancelled OR ≥10 min late (holdout base rate 18.6%): **AUC 0.841**, well-calibrated in
+the alert region, and the threshold policy *abstains by itself* in the low-signal categories:
+
+| thr | alerts | precision | recall |
+|---|---|---|---|
+| 0.5 | 30,902 | 77.3% | 48.7% |
+| 0.7 | 17,313 | 91.0% | 32.1% |
+| 0.9 | 8,222 | 98.6% | 16.5% |
+
+Per category at thr 0.7: precision 76–95% everywhere it fires; **zero alerts** in
+`infrastruktur/stasjon` (base rate 3%) and `ytre/dyr` — the categories where the old point
+model was worse than a constant. `drift/kapasitet` (benign anchor): 117 alerts out of 57k calls.
+This is the requested "don't cry wolf" shape: alert only above a precision-picked threshold,
+otherwise stay quiet; `p_impact` itself is the certainty estimate.
+
+## Caveats (be honest when productionizing)
+
+- **Realized-vs-live optimism.** The backtest uses *realized* delays for `own_prev_delay` /
+  `line_now_*`. Live serving would use ET's current estimated delays; for a train sitting still
+  the estimate lags reality, so live performance will be somewhat below the backtest. The
+  ≥30-min observation cutoff and the hourly line buckets (state ends 30–90 min before the call)
+  are conservative in the other direction.
+- **Two regimes, one model.** v4's propagation features use `-1` sentinels when unavailable, so
+  one model serves both: plan-ahead (features absent → falls back to ~v3 quality, AUC ~0.84 on
+  that slice) and near-term (≤~1–2h before the call → AUC ~0.93). `predict_calls_today`'s
+  10-min refresh cadence already matches the near-term regime; it would need to compute the two
+  live features from ET at scoring time.
+- Interval interpolation beyond t=40 is an extrapolation heuristic; the ≥40 base rate in the
+  holdout is only 0.6%.
+
+## Recommended next steps
+
+1. ~~Productionize the exceedance stack (arr side first)~~ — **DONE same day, see next section.**
+2. Dep-side twins for the boarding stop.
+3. Retrain `call_cancel_clf` with the propagation features — likely a similar (smaller) lift.
+4. Optional headroom check: local XGBoost/LightGBM on the same table to see if BQML is leaving
+   anything on the table; and a joint trip-completion model (boarding AND alighting served).
+
+## Productionization (same day, 2026-07-02)
+
+The stack is now wired end-to-end (SQL + API code; **not yet committed or deployed**):
+
+- **`create_training_calls.sql`** computes all validated features in the one canonical place:
+  `category` (leak-free onset-text join, deduped — `categories` has ~4 duplicate text pairs that
+  otherwise fan out the join), `stated_min`, `line_pre_*`, `net_pre_*`, `line_now_*` (hourly
+  buckets), `own_prev_delay`. Rebuilt: 1,317,843 rows — byte-count parity with the old base.
+- **`train_call_models.sql`**: the three legacy models' EXCEPT lists now spell out the new
+  columns (contracts frozen — a verbatim retrain reproduces the validated models); section 4
+  adds `arr_ge{5,10,20,40}_clf`. Production `arr_ge10_clf` holdout: **AUC 0.9107 / log-loss
+  0.1725** (= experiment; dropping the dead text flags cost nothing).
+- **`create_exceedance_calibration.sql`** (new): `arr_ge{t}_platt` per threshold, cancel_platt
+  recipe (fit on the post-training holdout; REFIT AFTER ANY MODEL RETRAIN — serving reads the
+  coefficients live from ML.WEIGHTS). Validated: p_ge10 calibration tracks actuals within ~1pt
+  across deciles; the q=0.10 interval covers **93.8% / 94.4%** (Apr–May / June) at mean width
+  **8.6 min** vs the legacy p90 lookup's 11.2 min at the same coverage — ~23% narrower.
+- **`rail_calls_planned_today.sql`** (both copies) now carries `dep_delay_min` on recorded
+  calls (actual vs aimed, same definition as rail_calls) = the live-observable state.
+- **Serving** (`predict_calls.sql` retrospective; `predict_calls_today.sql` +
+  `disruptions/api/predict_calls.sql` live): per-threshold Platt closed forms from ML.WEIGHTS,
+  GREATEST-cascade monotonicity, interpolated p50/p90 crossings (tail `40*SQRT(s40/q)` capped
+  at 90), new columns `p_arr_ge{5,10,20,40}`, `arr_delay_p50/p90_stack_min`, `p_impact`.
+  Live variants compute state features under the live information constraint: only OBSERVED
+  outcomes from the planned snapshot; `line_now_*` is a per-line NOW-CAST of the last observed
+  60 min (converges to training semantics as the refresh cycle approaches the call);
+  `own_prev_delay`'s `-1` sentinel already means "no upstream observation" in training, so
+  not-yet-started trains are in-distribution.
+- **API (`main.py`)**: `/journey` and `/impact` responses gained `arr_delay_p50_min` /
+  `delay_p50_min`, `arr_ge10_probability` / `ge10_probability`, `impact_probability`; the
+  existing `*_p90` field now serves the (narrower, better-calibrated) stack p90 when available.
+  Refresh order is deploy-safe: the scoring query recreates the table schema before the cache
+  reads it, inside the existing try/except.
+- **Validated end-to-end**: retrospective `call_predictions` (110k rows: mean p_ge10 0.105 ≈
+  base rate, mean p_impact 0.184 ≈ realized 18.6%, 0 monotonicity violations / interval
+  inversions) and live `call_predictions_today` (75 situations / 2,259 calls; a currently-stuck
+  RE20 reads P(≥10)=0.99 with a 39–87 min interval toward Göteborg while quiet calls sit ~0).
+- **Remaining to ship**: commit, then `gcloud run deploy` from `disruptions/api/` (CLAUDE.md).
+  Post-deploy hygiene: refit `arr_ge*_platt` + `cancel_platt` on a rolling window; the
+  exceedance stack's own eval artifacts are `exp_prod_stack_eval` (+ the earlier `exp_*`
+  experiment tables/models, droppable).
+
+## Artifacts (all experiment-prefixed, cheap to keep or drop)
+
+- Tables: `exp_training_calls_v2` (+category/text/pre-onset), `exp_training_calls_v4`
+  (+ask-time propagation), `exp_arr_ge10_eval{,_v3,_v4}`, `exp_survival_eval`, `exp_impact_eval`.
+- Models: `exp_arr_ge10_clf{,_v2,_v3,_v4}`, `exp_arr_ge{5,20,40}_clf_v3`.
+- Total session cost ≈ $1 (8 trainings ≈ 15 GB billed each; table builds ~1–3 GB each).
+- Ops gotcha: two long inline `bq query` CREATE TABLE calls hung client-side without ever
+  submitting a job (0 CPU, empty output; exit 144 on kill). Workaround that worked: write the
+  SQL to a file and submit with `--nosynchronous_mode`, then poll the job. Also: a naive
+  line×time-range join against `rail_calls` blows up (each line joins its full 2-year history);
+  use hourly line-state buckets + partition-pruned self-joins instead (1.05 GB, seconds).
