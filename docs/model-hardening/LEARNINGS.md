@@ -478,8 +478,11 @@ otherwise stay quiet; `p_impact` itself is the certainty estimate.
 3. ~~Retrain `call_cancel_clf` with the propagation features~~ — **DONE same day, see
    "Cancellation classifier + propagation" below. NOT "a similar (smaller) lift" — the biggest
    single-model jump of the project (AUC 0.885 → 0.950).**
-4. Optional headroom check: local XGBoost/LightGBM on the same table to see if BQML is leaving
-   anything on the table; and a joint trip-completion model (boarding AND alighting served).
+4. ~~Optional headroom check: local XGBoost/LightGBM on the same table to see if BQML is leaving
+   anything on the table; and a joint trip-completion model (boarding AND alighting served).~~ —
+   **DONE, see "Headroom check + joint trip-completion" below. Exceedance stacks: BQML is near
+   ceiling. Cancel: real headroom, ~80% of it recoverable inside BQML with tuned hyperparameters.
+   Joint model: beats the product approximation, mostly by fixing its calibration bias.**
 
 ## Productionization (same day, 2026-07-02)
 
@@ -588,6 +591,78 @@ own_prev_delay), same population (all calls, is_eval = FALSE), same options.
 - Deploy-skew note: between the model swap and the platt refit (~15 min) the live app scored the
   new model through the old platt coefficients — transient, self-healed on the next tick.
 - Artifact: `exp_cancel_clf_v2` (identical to the new prod model; droppable).
+
+## Headroom check + joint trip-completion (step 4), same night (2026-07-02)
+
+Both halves run locally (XGBoost 3.3 / LightGBM 4.6, macOS + `brew install libomp`) on a full
+pull of `training_calls` (1.32M rows, $0.01 to export). Same contracts as
+`train_call_models.sql`, same temporal split; BQML compared via **per-row ML.PREDICT outputs on
+identical holdout rows** (the per-row AUC reproduces ML.EVALUATE to 4 decimals, so the harness
+is trustworthy). Tuned local variants early-stop on a temporal carve from train
+(`call_date >= 2026-02-01`), then refit on the full train at the found iteration count — same
+data budget as BQML. CIs are cluster bootstraps by situationNumber (rows within a situation
+correlate; a row bootstrap would be overconfident).
+
+**Half 1 — is BQML leaving anything on the table?** (holdout AUC / log-loss / PR-AUC)
+
+| target | BQML prod | XGB 50 trees | XGB tuned | LGBM tuned |
+|---|---|---|---|---|
+| cancel | 0.9504 / 0.1484 / 0.798 | 0.9564 / 0.1311 / 0.838 | 0.9624 / 0.1217 / 0.858 | **0.9632 / 0.1215 / 0.858** |
+| arr_ge10 | 0.9108 / 0.1725 / 0.728 | 0.9122 / 0.1683 / 0.731 | **0.9157 / 0.1641 / 0.742** | 0.9148 / 0.1651 / 0.740 |
+| dep_ge10 | 0.8995 / 0.1875 / 0.697 | 0.9027 / 0.1798 / 0.705 | 0.9047 / 0.1778 / 0.714 | **0.9050 / 0.1776 / 0.714** |
+
+- **Exceedance stacks: BQML is near the ceiling.** Best local gain ~+0.005 AUC (both CIs
+  ≈ [+0.003, +0.007]) — statistically real, practically nothing. No reason to leave BQML.
+- **Cancel: real headroom.** +0.0128 AUC [95% CI +0.0110, +0.0144], log-loss −18%, PR-AUC
+  0.798 → 0.858. A *budget-matched* 50-tree XGBoost already beats prod (0.9564), so the gap is
+  hyperparameter defaults + library, not tree count.
+- **~80% of the cancel headroom is recoverable inside BQML**: `exp_cancel_clf_tuned`
+  (max_iterations 300, learn_rate 0.05, max_tree_depth 8, subsample 0.8, colsample_bytree 0.8,
+  early_stop FALSE, NO_SPLIT — the config local tuning found) scores **0.9606 / 0.1275** on the
+  holdout vs prod 0.9504 / 0.1484. The residual ~0.3pt AUC to LightGBM is library-level (native
+  categorical splits vs one-hot). **Not promoted** — promoting = update section 1 options in
+  `train_call_models.sql`, retrain, refit `cancel_platt`, rebuild serving tables (~$0.50; note
+  the tuned training billed 66 GB ≈ $0.41 — per-iteration billing makes 300 iterations ~6× the
+  50-iteration trainings).
+
+**Half 2 — joint trip-completion vs the product approximation.** Pair grain = (situation ×
+journey × board stop × alight stop), board < alight in stop_order, board non-terminal; label
+`trip_broken` = board OR alight call cancelled. 88.5k journeys → 11.36M raw pairs, sampled to
+40/journey = 3.04M (holdout: 595k pairs, broken rate 13.9%). Features: both calls' per-call
+sets (_b/_a) + shared situation/line features + stops_between/ride_min. Joint model = the
+tuned-LGBM recipe above.
+
+| candidate (holdout pairs) | AUC | log-loss | PR-AUC | mean p vs actual 0.1385 |
+|---|---|---|---|---|
+| joint LGBM | **0.9733** | **0.1204** | **0.9150** | 0.1320 |
+| product of BQML p_cancel (= what /journey implies) | 0.9525 | 0.1787 | 0.8353 | 0.1649 |
+| product of local-LGBM p_cancel | 0.9654 | 0.1423 | 0.8869 | 0.1507 |
+| max(p_b, p_a) (BQML) | 0.9519 | 0.1759 | 0.8343 | 0.1314 |
+
+- Joint − product(BQML): **+0.0209 AUC [95% CI +0.0182, +0.0236]**. Against the product of the
+  *same* library it's +0.008 — so roughly half the gap is joint modeling proper, half is the
+  better base learner.
+- **The main win is calibration, and the direction is instructive**: the independence product
+  systematically *over*-predicts trip-broken (mean 0.165 vs actual 0.139) because the two
+  cancellation events are positively correlated (whole-journey cancellations dominate), i.e.
+  P(both served) > P(b)·P(a). Low-risk deciles are ~5× over-predicted (0.011 vs 0.002); a
+  Platt layer on the product could recenter the mean but not the shape. The joint model is
+  near-calibrated raw (deciles within ~3pts, slightly conservative).
+- Top joint features: `stop_place` of both ends, `own_prev_delay_a`, `num_stops`,
+  `line_now_cancel_a` — the propagation features carry over.
+- **Productionization path (if wanted):** materialize the pair table in BQ (self-join of
+  `training_calls`, ~11M rows), train a BQML twin (with the tuned hyperparameters), serve
+  `/journey` from the (from_stop, to_stop) pair row directly instead of combining per-call
+  p_cancel — the /journey endpoint already receives exactly that pair. Until then, treat the
+  product-implied "trip broken" number as an over-estimate at the low end.
+
+- Artifacts: model `exp_cancel_clf_tuned` (droppable; keep if promoting). Local scripts in the
+  session scratchpad only (`pull_data.py`, `train_local.py`, `joint_trip.py`) — method fully
+  described above. Session cost ≈ $0.45.
+- Ops notes: XGBoost/LightGBM wheels on macOS arm64 need `brew install libomp`; parquet written
+  from BQ dataframes needs `import db_dtypes` before `read_parquet` (registers the `dbdate`
+  dtype); a leading `--` SQL comment makes `bq query "$(cat f.sql)"` parse as a flag — pipe the
+  file via stdin instead.
 
 ## Artifacts (all experiment-prefixed, cheap to keep or drop)
 
