@@ -5,13 +5,13 @@
 -- Split: train on is_eval = FALSE (onset < 2026-04-01); the temporal holdout (is_eval = TRUE)
 -- is the TEST set, evaluated separately with ML.EVALUATE. Probabilities are left uncalibrated
 -- by class weighting (no auto_class_weights); Platt layers fit on the holdout re-center them
--- (cancel_platt for the classifier, arr_ge*_platt for the exceedance stack).
+-- (cancel_platt for the classifier, arr_ge*/dep_ge*_platt for the exceedance stacks).
 --
 -- FEATURE CONTRACTS ARE EXPLICIT: training_calls gained new columns on 2026-07-02 (category,
 -- stated_min, line_pre_*, net_pre_*, line_now_*, own_prev_delay). The three original models'
 -- EXCEPT lists below now spell those columns out so a verbatim retrain reproduces the validated
 -- models -- do NOT silently absorb new columns into an old model's contract. The exceedance
--- classifiers (4.) are the only models validated WITH the new features.
+-- classifiers (4., 5.) are the only models validated WITH the new features.
 --
 -- The two delay columns MUST be excepted from every classifier: dep_delay_pos/arr_delay_pos are
 -- NULL exactly when call_cancelled is TRUE, i.e. a perfect leak of the cancellation label.
@@ -147,3 +147,64 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
        arr_delay_pos >= 40 AS y_ge
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
+
+-- 5. Departure-delay EXCEEDANCE stack: P(dep_delay >= t), t in {5, 10, 20, 40} ---------------
+-- Boarding-stop twins of the arrival stack (4.): "will my train LEAVE >= t min late?". Same
+-- feature contract, same thresholds (dep base rates track arr almost exactly: holdout >=10 is
+-- 9.9% vs arr 9.7%; >=40 is 0.61% -- thin, tail is extrapolation territory on both sides).
+-- Population mirrors dep_delay_reg: non-cancelled calls with a departure (terminals excluded).
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_clf`
+OPTIONS(
+  model_type        = 'BOOSTED_TREE_CLASSIFIER',
+  input_label_cols  = ['y_ge'],
+  max_iterations    = 50,
+  early_stop        = TRUE,
+  enable_global_explain = TRUE
+) AS
+SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
+                planned, num_lines, is_terminal, is_origin, stop_place),
+       dep_delay_pos >= 5 AS y_ge
+FROM `disruptions.training_calls`
+WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`
+OPTIONS(
+  model_type        = 'BOOSTED_TREE_CLASSIFIER',
+  input_label_cols  = ['y_ge'],
+  max_iterations    = 50,
+  early_stop        = TRUE,
+  enable_global_explain = TRUE
+) AS
+SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
+                planned, num_lines, is_terminal, is_origin, stop_place),
+       dep_delay_pos >= 10 AS y_ge
+FROM `disruptions.training_calls`
+WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_clf`
+OPTIONS(
+  model_type        = 'BOOSTED_TREE_CLASSIFIER',
+  input_label_cols  = ['y_ge'],
+  max_iterations    = 50,
+  early_stop        = TRUE,
+  enable_global_explain = TRUE
+) AS
+SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
+                planned, num_lines, is_terminal, is_origin, stop_place),
+       dep_delay_pos >= 20 AS y_ge
+FROM `disruptions.training_calls`
+WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_clf`
+OPTIONS(
+  model_type        = 'BOOSTED_TREE_CLASSIFIER',
+  input_label_cols  = ['y_ge'],
+  max_iterations    = 50,
+  early_stop        = TRUE,
+  enable_global_explain = TRUE
+) AS
+SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
+                planned, num_lines, is_terminal, is_origin, stop_place),
+       dep_delay_pos >= 40 AS y_ge
+FROM `disruptions.training_calls`
+WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;

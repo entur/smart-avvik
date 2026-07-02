@@ -239,13 +239,19 @@ class _CallPred:
     dep_delay_p90_min: int | None
     arr_delay_typ_min: int | None
     arr_delay_p90_min: int | None
-    # Exceedance stack (2026-07-02): calibrated P(arr_delay >= t | runs), the interval read off
-    # the survival curve, and p_impact = P(cancelled OR >= 10 min late). All None at an origin.
+    # Exceedance stacks (2026-07-02): calibrated P(delay >= t | runs) per side, the interval read
+    # off each survival curve, and the alert P(cancelled OR >= 10 min late) per side. The arrival
+    # fields are None at an origin; the departure fields are None at a terminal.
     p_arr_ge10: float | None
     p_arr_ge20: float | None
     arr_delay_p50_stack_min: int | None
     arr_delay_p90_stack_min: int | None
     p_impact: float | None
+    p_dep_ge10: float | None
+    p_dep_ge20: float | None
+    dep_delay_p50_stack_min: int | None
+    dep_delay_p90_stack_min: int | None
+    p_impact_dep: float | None
 
 
 _call_pred_lock = threading.Lock()
@@ -319,6 +325,11 @@ def refresh_call_predictions_cache() -> None:
             arr_delay_p50_stack_min=r.arr_delay_p50_stack_min,
             arr_delay_p90_stack_min=r.arr_delay_p90_stack_min,
             p_impact=r.p_impact,
+            p_dep_ge10=r.p_dep_ge10,
+            p_dep_ge20=r.p_dep_ge20,
+            dep_delay_p50_stack_min=r.dep_delay_p50_stack_min,
+            dep_delay_p90_stack_min=r.dep_delay_p90_stack_min,
+            p_impact_dep=r.p_impact_dep,
         )
         by_jkey.setdefault(r.jkey, []).append(pred)
         by_situation.setdefault(r.situationNumber, []).append(pred)
@@ -731,7 +742,24 @@ class CallPrediction(BaseModel):
         description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1.",
     )
     dep_delay_typ_min: int | None = Field(description="Typical departure delay (min) if it runs.")
-    dep_delay_p90_min: int | None = Field(description="Bad-case (p90) departure delay (min).")
+    dep_delay_p90_min: int | None = Field(
+        description="Bad-case (p90) departure delay (min), from the calibrated exceedance stack "
+        "when available (narrower at the same coverage than the legacy per-bucket lookup).",
+    )
+    dep_delay_p50_min: int | None = Field(
+        default=None,
+        description="Median departure delay (min) from the exceedance stack; with "
+        "dep_delay_p90_min this forms the 'expect X-Y min' interval. Null at a terminal.",
+    )
+    dep_ge10_probability: float | None = Field(
+        default=None,
+        description="Calibrated P(departure >= 10 min late | the train runs), 0-1. Null at a terminal.",
+    )
+    dep_impact_probability: float | None = Field(
+        default=None,
+        description="Calibrated P(this stop is cancelled OR the departure is >= 10 min late), 0-1 "
+        "— the boarding-stop alerting score. Null at a terminal.",
+    )
     arr_delay_typ_min: int | None = Field(description="Typical arrival delay (min) if it runs.")
     arr_delay_p90_min: int | None = Field(
         description="Bad-case (p90) arrival delay (min), from the calibrated exceedance stack "
@@ -793,22 +821,22 @@ class StopPrediction(BaseModel):
     )
     delay_typ_min: int | None = Field(description="Typical delay (min) at this stop if the train runs.")
     delay_p90_min: int | None = Field(
-        description="Bad-case (p90) delay (min) at this stop. On arrival predictions this comes "
-        "from the calibrated exceedance stack when available.",
+        description="Bad-case (p90) delay (min) at this stop, from the calibrated exceedance "
+        "stack for that side when available.",
     )
     delay_p50_min: int | None = Field(
         default=None,
         description="Median delay (min) from the exceedance stack; with delay_p90_min this forms "
-        "the 'expect X-Y min' interval. Arrival predictions only (null on departures).",
+        "the 'expect X-Y min' interval.",
     )
     ge10_probability: float | None = Field(
         default=None,
-        description="Calibrated P(delay >= 10 min | the train runs), 0-1. Arrival predictions only.",
+        description="Calibrated P(delay >= 10 min | the train runs) on this side, 0-1.",
     )
     impact_probability: float | None = Field(
         default=None,
-        description="Calibrated P(cancelled OR >= 10 min late) — the recommended single alerting "
-        "score. Arrival predictions only.",
+        description="Calibrated P(cancelled OR >= 10 min late) on this side — the recommended "
+        "single alerting score.",
     )
 
 
@@ -1107,7 +1135,14 @@ async def journey(
                 scheduled_arrival=c.aimed_arr,
                 cancel_probability=c.p_cancel,
                 dep_delay_typ_min=c.dep_delay_typ_min,
-                dep_delay_p90_min=c.dep_delay_p90_min,
+                dep_delay_p90_min=(
+                    c.dep_delay_p90_stack_min
+                    if c.dep_delay_p90_stack_min is not None
+                    else c.dep_delay_p90_min
+                ),
+                dep_delay_p50_min=c.dep_delay_p50_stack_min,
+                dep_ge10_probability=c.p_dep_ge10,
+                dep_impact_probability=c.p_impact_dep,
                 arr_delay_typ_min=c.arr_delay_typ_min,
                 arr_delay_p90_min=(
                     c.arr_delay_p90_stack_min
@@ -1144,7 +1179,14 @@ def _departure_prediction(c: _CallPred) -> StopPrediction:
         scheduled_time=c.aimed_dep,
         cancel_probability=c.p_cancel,
         delay_typ_min=c.dep_delay_typ_min,
-        delay_p90_min=c.dep_delay_p90_min,
+        delay_p90_min=(
+            c.dep_delay_p90_stack_min
+            if c.dep_delay_p90_stack_min is not None
+            else c.dep_delay_p90_min
+        ),
+        delay_p50_min=c.dep_delay_p50_stack_min,
+        ge10_probability=c.p_dep_ge10,
+        impact_probability=c.p_impact_dep,
     )
 
 

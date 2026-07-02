@@ -474,7 +474,7 @@ otherwise stay quiet; `p_impact` itself is the certainty estimate.
 ## Recommended next steps
 
 1. ~~Productionize the exceedance stack (arr side first)~~ — **DONE same day, see next section.**
-2. Dep-side twins for the boarding stop.
+2. ~~Dep-side twins for the boarding stop.~~ — **DONE same day, see "Dep-side twins" below.**
 3. Retrain `call_cancel_clf` with the propagation features — likely a similar (smaller) lift.
 4. Optional headroom check: local XGBoost/LightGBM on the same table to see if BQML is leaving
    anything on the table; and a joint trip-completion model (boarding AND alighting served).
@@ -520,6 +520,43 @@ The stack is now wired end-to-end (SQL + API code; **not yet committed or deploy
   Post-deploy hygiene: refit `arr_ge*_platt` + `cancel_platt` on a rolling window; the
   exceedance stack's own eval artifacts are `exp_prod_stack_eval` (+ the earlier `exp_*`
   experiment tables/models, droppable).
+
+## Dep-side twins (boarding stop), same day (2026-07-02, evening)
+
+Next-step 2 executed: the departure-side exceedance stack `dep_ge{5,10,20,40}_clf` +
+`dep_ge*_platt`, answering "will my train LEAVE >= t min late?" at the boarding stop. Same
+feature contract, population = non-cancelled calls with a departure (mirrors `dep_delay_reg`).
+Dep base rates track arr almost exactly (holdout >=10: 9.9% vs 9.7%; >=40: 0.61% vs 0.6%).
+
+- **Holdout (onset >= 2026-04-01) AUC / log-loss:** >=5 0.844/0.361, **>=10 0.899/0.187**,
+  >=20 0.930/0.068, >=40 0.969/0.014 — a hair under the arr twins (arr >=10: 0.911), expected:
+  departure delay at the boarding stop has less accumulated propagation signal than arrival.
+- **Calibrated (Platt on the holdout):** mean P(>=10) 0.103 vs actual 0.102 (Apr–May),
+  0.094 vs 0.088 (June). Interval p90 coverage **93.3% / 94.0%** at mean width ~9 min
+  (arr stack: 93.8/94.4 @ 8.6). p50 coverage 75% — conservative on the low side, same shape
+  as arr. Zero monotonicity violations after the GREATEST cascade.
+- **Boarding alert `p_impact_dep` = p_cancel + (1−p_cancel)·P(dep>=10)** (label: cancelled OR
+  departs >=10 late; holdout base rate 18.9%): thr 0.5 = 83.5% precision @ 58% recall,
+  **thr 0.7 = 91.5% @ 48%**, thr 0.9 = 97.5% @ 32%. Notably BETTER recall than the arrival
+  alert at matched precision (arr: 32% @ 91%) — the departure event is easier to rank because
+  the boarding stop is closer to the observed upstream state.
+- **Serving:** all three `predict_calls*.sql` gained `dge*`/`wd*` CTEs, the dep survival
+  cascade, and columns `p_dep_ge{5,10,20,40}`, `dep_delay_p50/p90_stack_min`, `p_impact_dep`
+  (NULL at terminals, mirroring the arr stack's NULL-at-origins). `main.py`: `CallPrediction`
+  gains `dep_delay_p50_min` / `dep_ge10_probability` / `dep_impact_probability`;
+  `dep_delay_p90_min` now serves the stack value when available; `/impact`'s
+  `departure_prediction` (StopPrediction) now populates `delay_p50_min` / `ge10_probability` /
+  `impact_probability` on the departure side too.
+- **Validated:** rebuilt `call_predictions` (110,135 rows — mean p_dep_ge10 0.108 ≈ base rate,
+  mean p_impact_dep 0.188 ≈ realized 0.189, 0 interval inversions, dep fields NULL exactly at
+  terminals) and the live `call_predictions_today` via the API query.
+- **Ops note found while validating:** `data/queries/predict_calls_today.sql` reads situations
+  from `disruptions.disruptions`, which is the MANUALLY-rebuilt training extract (last rebuild
+  2026-06-20) — so that variant is empty whenever the extract is older than its 4-day window.
+  Not a regression (the deployed API reads `disruptions_initial_today`, refreshed every
+  ingestion), but rebuild `disruptions.disruptions` first if you want the repo live variant.
+- Same hygiene as arr: refit `dep_ge*_platt` after any dep-exceedance retrain (ML.WEIGHTS is
+  read live at serving), and periodically on a trailing window.
 
 ## Artifacts (all experiment-prefixed, cheap to keep or drop)
 

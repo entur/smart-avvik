@@ -190,6 +190,26 @@ ge40 AS (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
   FROM ML.PREDICT(MODEL `disruptions.arr_ge40_clf`, (SELECT * FROM calls))
 ),
+dge5 AS (
+  SELECT situationNumber, jkey, stop_order,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge5_clf`, (SELECT * FROM calls))
+),
+dge10 AS (
+  SELECT situationNumber, jkey, stop_order,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge10_clf`, (SELECT * FROM calls))
+),
+dge20 AS (
+  SELECT situationNumber, jkey, stop_order,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge20_clf`, (SELECT * FROM calls))
+),
+dge40 AS (
+  SELECT situationNumber, jkey, stop_order,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge40_clf`, (SELECT * FROM calls))
+),
 w AS (
   SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
@@ -215,6 +235,26 @@ w40 AS (
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
   FROM ML.WEIGHTS(MODEL `disruptions.arr_ge40_platt`)
 ),
+wd5 AS (
+  SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge5_platt`)
+),
+wd10 AS (
+  SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge10_platt`)
+),
+wd20 AS (
+  SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge20_platt`)
+),
+wd40 AS (
+  SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt`)
+),
 bounds AS (
   SELECT side, MIN(plog_bucket) AS lo, MAX(plog_bucket) AS hi
   FROM `disruptions.delay_p90_calib` GROUP BY side
@@ -237,7 +277,23 @@ scored AS (
       1/(1+EXP(-(w20.b + w20.a * LN(GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)))))),
       1/(1+EXP(-(w40.b + w40.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6))))))
     ) AS s20,
-    1/(1+EXP(-(w40.b + w40.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)))))) AS s40
+    1/(1+EXP(-(w40.b + w40.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)))))) AS s40,
+    GREATEST(
+      1/(1+EXP(-(wd5.b + wd5.a * LN(GREATEST(LEAST(dge5.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge5.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd10.b + wd10.a * LN(GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd20.b + wd20.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
+    ) AS d5,
+    GREATEST(
+      1/(1+EXP(-(wd10.b + wd10.a * LN(GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd20.b + wd20.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
+    ) AS d10,
+    GREATEST(
+      1/(1+EXP(-(wd20.b + wd20.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
+    ) AS d20,
+    1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)))))) AS d40
   FROM calls AS c
   JOIN clf  USING (situationNumber, jkey, stop_order)
   JOIN dep  USING (situationNumber, jkey, stop_order)
@@ -246,7 +302,12 @@ scored AS (
   JOIN ge10 USING (situationNumber, jkey, stop_order)
   JOIN ge20 USING (situationNumber, jkey, stop_order)
   JOIN ge40 USING (situationNumber, jkey, stop_order)
+  JOIN dge5  USING (situationNumber, jkey, stop_order)
+  JOIN dge10 USING (situationNumber, jkey, stop_order)
+  JOIN dge20 USING (situationNumber, jkey, stop_order)
+  JOIN dge40 USING (situationNumber, jkey, stop_order)
   CROSS JOIN w5 CROSS JOIN w10 CROSS JOIN w20 CROSS JOIN w40
+  CROSS JOIN wd5 CROSS JOIN wd10 CROSS JOIN wd20 CROSS JOIN wd40
 )
 SELECT
   s.situationNumber, s.summary, s.onset_ts,
@@ -280,7 +341,31 @@ SELECT
       LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))
     + (1 - 1/(1+EXP(-(w.b + w.a *
       LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))) * s.s10
-  , 4)) AS p_impact
+  , 4)) AS p_impact,
+  -- exceedance stack (departure side = the boarding stop; NULL at a terminal: no departure)
+  IF(s.is_terminal, NULL, ROUND(s.d5, 4))  AS p_dep_ge5,
+  IF(s.is_terminal, NULL, ROUND(s.d10, 4)) AS p_dep_ge10,
+  IF(s.is_terminal, NULL, ROUND(s.d20, 4)) AS p_dep_ge20,
+  IF(s.is_terminal, NULL, ROUND(s.d40, 4)) AS p_dep_ge40,
+  IF(s.is_terminal, NULL, CAST(ROUND(CASE
+    WHEN s.d5  <= 0.5 THEN (1 - 0.5) / GREATEST(1 - s.d5, 0.001) * 5
+    WHEN s.d10 <= 0.5 THEN 5  + (s.d5  - 0.5) / GREATEST(s.d5  - s.d10, 0.001) * 5
+    WHEN s.d20 <= 0.5 THEN 10 + (s.d10 - 0.5) / GREATEST(s.d10 - s.d20, 0.001) * 10
+    WHEN s.d40 <= 0.5 THEN 20 + (s.d20 - 0.5) / GREATEST(s.d20 - s.d40, 0.001) * 20
+    ELSE LEAST(40 * SQRT(s.d40 / 0.5), 90) END) AS INT64)) AS dep_delay_p50_stack_min,
+  IF(s.is_terminal, NULL, CAST(ROUND(CASE
+    WHEN s.d5  <= 0.1 THEN (1 - 0.1) / GREATEST(1 - s.d5, 0.001) * 5
+    WHEN s.d10 <= 0.1 THEN 5  + (s.d5  - 0.1) / GREATEST(s.d5  - s.d10, 0.001) * 5
+    WHEN s.d20 <= 0.1 THEN 10 + (s.d10 - 0.1) / GREATEST(s.d10 - s.d20, 0.001) * 10
+    WHEN s.d40 <= 0.1 THEN 20 + (s.d20 - 0.1) / GREATEST(s.d20 - s.d40, 0.001) * 20
+    ELSE LEAST(40 * SQRT(s.d40 / 0.1), 90) END) AS INT64)) AS dep_delay_p90_stack_min,
+  -- boarding alert: P(cancelled OR departs >= 10 min late)
+  IF(s.is_terminal, NULL, ROUND(
+    1/(1+EXP(-(w.b + w.a *
+      LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))
+    + (1 - 1/(1+EXP(-(w.b + w.a *
+      LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))) * s.d10
+  , 4)) AS p_impact_dep
 FROM scored AS s
 CROSS JOIN w
 LEFT JOIN bounds AS bd ON bd.side = 'dep'
