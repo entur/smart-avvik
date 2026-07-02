@@ -28,6 +28,10 @@ WHERE is_eval = FALSE;
 -- regressor on raw minutes chases the mean and loses to "predict the median" on MAE. Train on
 -- LN(1 + delay) instead -> the prediction back-transforms (EXP(pred) - 1) to ~the conditional
 -- median = the "typical delay" the product wants. Serving must apply that back-transform.
+-- Pruned feature set: planned, num_lines, is_terminal, is_origin had 0 global-explain attribution
+-- and stop_place ~0.004 (stop_order carries the position signal). Retraining without all five was
+-- accuracy-neutral on the holdout (MAE 3.0317 vs 3.0326, RMSE marginally better), so they are dropped
+-- from both regressors for a leaner feature contract. arr_delay_reg below mirrors this EXCEPT list.
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_delay_reg`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_REGRESSOR',
@@ -36,7 +40,8 @@ OPTIONS(
   early_stop        = TRUE,
   enable_global_explain = TRUE
 ) AS
-SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval),
+SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
+                planned, num_lines, is_terminal, is_origin, stop_place),
        LN(1 + dep_delay_pos) AS dep_log
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
@@ -50,7 +55,8 @@ OPTIONS(
   early_stop        = TRUE,
   enable_global_explain = TRUE
 ) AS
-SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval),
+SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
+                planned, num_lines, is_terminal, is_origin, stop_place),
        LN(1 + arr_delay_pos) AS arr_log
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
