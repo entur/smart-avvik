@@ -8,18 +8,22 @@
 -- (cancel_platt for the classifier, arr_ge*/dep_ge*_platt for the exceedance stacks).
 --
 -- FEATURE CONTRACTS ARE EXPLICIT: training_calls gained new columns on 2026-07-02 (category,
--- stated_min, line_pre_*, net_pre_*, line_now_*, own_prev_delay). The three original models'
--- EXCEPT lists below now spell those columns out so a verbatim retrain reproduces the validated
--- models -- do NOT silently absorb new columns into an old model's contract. The exceedance
--- classifiers (4., 5.) are the only models validated WITH the new features.
+-- stated_min, line_pre_*, net_pre_*, line_now_*, own_prev_delay). The delay regressors' EXCEPT
+-- lists below spell those columns out so a verbatim retrain reproduces the validated models --
+-- do NOT silently absorb new columns into an old model's contract. The cancellation classifier
+-- (1.) and the exceedance classifiers (4., 5.) are validated WITH the new features (measured
+-- A/Bs, 2026-07-02); the regressors (2., 3.) remain on the frozen pre-propagation contract.
 --
 -- The two delay columns MUST be excepted from every classifier: dep_delay_pos/arr_delay_pos are
 -- NULL exactly when call_cancelled is TRUE, i.e. a perfect leak of the cancellation label.
 
 -- 1. Cancellation classifier --------------------------------------------------------------
--- Contract frozen at the original 16 features (2026-06-20). Retraining WITH the propagation
--- features is untested for this model -- likely a lift (see LEARNINGS next steps), but do it as
--- a measured A/B, not by accident.
+-- Contract: ALL feature columns incl. the 2026-07-02 category/text/propagation set. Measured
+-- A/B vs the frozen 16-feature contract (holdout, onset >= 2026-04-01): AUC 0.8855 -> 0.9504,
+-- log-loss 0.1965 -> 0.1484. Top new features: line_now_cancel (attribution 0.43, the #1
+-- feature overall -- observed cancellations on the line raise P(cancel) for its coming calls)
+-- and own_prev_delay (0.23). The no-line-state slice is a statistical tie, so the plan-ahead
+-- regime does not regress. REFIT cancel_platt after any retrain of this model.
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
@@ -28,10 +32,7 @@ OPTIONS(
   early_stop        = TRUE,
   enable_global_explain = TRUE
 ) AS
-SELECT * EXCEPT(situationNumber, jkey, call_date, dep_delay_pos, arr_delay_pos, is_eval,
-                category, stated_min, line_pre_n, line_pre_delay, line_pre_cancel,
-                net_pre_delay, net_pre_cancel, line_now_n, line_now_delay, line_now_cancel,
-                own_prev_delay)
+SELECT * EXCEPT(situationNumber, jkey, call_date, dep_delay_pos, arr_delay_pos, is_eval)
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE;
 

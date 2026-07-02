@@ -475,7 +475,9 @@ otherwise stay quiet; `p_impact` itself is the certainty estimate.
 
 1. ~~Productionize the exceedance stack (arr side first)~~ — **DONE same day, see next section.**
 2. ~~Dep-side twins for the boarding stop.~~ — **DONE same day, see "Dep-side twins" below.**
-3. Retrain `call_cancel_clf` with the propagation features — likely a similar (smaller) lift.
+3. ~~Retrain `call_cancel_clf` with the propagation features~~ — **DONE same day, see
+   "Cancellation classifier + propagation" below. NOT "a similar (smaller) lift" — the biggest
+   single-model jump of the project (AUC 0.885 → 0.950).**
 4. Optional headroom check: local XGBoost/LightGBM on the same table to see if BQML is leaving
    anything on the table; and a joint trip-completion model (boarding AND alighting served).
 
@@ -557,6 +559,35 @@ Dep base rates track arr almost exactly (holdout >=10: 9.9% vs 9.7%; >=40: 0.61%
   ingestion), but rebuild `disruptions.disruptions` first if you want the repo live variant.
 - Same hygiene as arr: refit `dep_ge*_platt` after any dep-exceedance retrain (ML.WEIGHTS is
   read live at serving), and periodically on a trailing window.
+
+## Cancellation classifier + propagation features, same day (2026-07-02, late evening)
+
+Next-step 3 executed as a measured A/B: `exp_cancel_clf_v2` = the production classifier's 16
+features + the 2026-07-02 columns (category, stated_min, line_pre_*, net_pre_*, line_now_*,
+own_prev_delay), same population (all calls, is_eval = FALSE), same options.
+
+- **Holdout A/B: AUC 0.8855 → 0.9504, log-loss 0.1965 → 0.1484 (−24%).** The biggest
+  single-model improvement of the project — bigger than expected ("likely a smaller lift").
+- **`line_now_cancel` is the #1 feature overall** (attribution 0.43, ahead of `num_journeys`
+  0.29): the observed cancellation share on the line in the last hour directly predicts whether
+  the coming calls will be cancelled — mass-cancellation situations announce themselves in the
+  line state. `own_prev_delay` #3 (0.23); `line_pre_cancel` adds a little (0.03); `category`
+  contributes here too (0.10) unlike in the exceedance models.
+- **Regime check (the reason to trust it):** on the dominant "line state observed" slice AUC is
+  0.885 → 0.950; on the small no-line-state slice (night/sparse lines) it is a statistical tie
+  (0.979 vs 0.986, log-loss 0.130 both) — the plan-ahead regime does not regress. Live behavior:
+  before anything is observed the model leans on status/size (≈ old quality); once cancellations
+  start appearing on the line, p_cancel for its remaining calls rises. Same live-information
+  constraint as the exceedance stack (linenow now-cast; -1 sentinels).
+- **Productionized:** `train_call_models.sql` section 1 contract updated (EXCEPT only
+  keys/labels/is_eval); prod `call_cancel_clf` retrained (reproduces 0.9504/0.1484 exactly);
+  **`cancel_platt` refit immediately after** (mandatory — serving reads its ML.WEIGHTS live);
+  serving tables rebuilt. No serving-SQL or API change needed: the `calls` CTE already carries
+  all features and ML.PREDICT matches by name — the deployed revision picks the new model up on
+  its next 10-min tick. Downstream, p_impact / p_impact_dep inherit the better p_cancel term.
+- Deploy-skew note: between the model swap and the platt refit (~15 min) the live app scored the
+  new model through the old platt coefficients — transient, self-healed on the next tick.
+- Artifact: `exp_cancel_clf_v2` (identical to the new prod model; droppable).
 
 ## Artifacts (all experiment-prefixed, cheap to keep or drop)
 
