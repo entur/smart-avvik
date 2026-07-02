@@ -274,3 +274,102 @@ Goal shift (2026-06-20, same day): move off the 7.8% reopening slice to a model 
   (Platt recalibration), `dep_delay_reg`, `arr_delay_reg` (delay models trained on `LN(1+delay)`
   — serving must back-transform); table `disruptions.delay_p90_calib` (p90 lookup keyed on
   `ROUND(predicted_log,1)`, clamp to per-side range at serving).
+
+---
+
+# Follow-up: delay-regressor diagnosis by category/line + feature pruning
+
+Session date: 2026-07-02. Goal: understand *where* the delay regressors (`dep_delay_reg`) work
+and where they don't — by category and by line — and test whether a simple grouped-median lookup
+rivals the model. Ended with an accuracy-neutral feature prune shipped to prod.
+
+## Methodology trap found first (the most reusable lesson)
+
+To attach a `category` to each `call_predictions` / `dep_delay_reg_eval` row, join through
+**`disruptions`** (all NSB situations) on `situationNumber` and match `categories` on
+`d.onset_summary`/`d.onset_description` (leak-free first-version text) — **99.5% coverage**
+(109,741/110,265 rows; 3,618/3,621 situations).
+**Do NOT join through `disruptions_initial` / `disruptions_initial_new`.** Those keep only
+*reopened* situations (inner `JOIN end_times` on "Toget kjører igjen"/"Åpnet…"), so they reach only
+**~6% (445/3,621)** of the predicted situations — a biased slice. `disruptions_initial_new` is not
+"the whole range" — it's the recent **incremental complement** of `disruptions_initial` (the
+`NOT EXISTS` dedup), 413 recent NSB situations. All 3,621 `call_predictions` situations are NSB, so
+operator isn't the filter — the reopen requirement is. Routing category through the `_initial`
+tables silently biased an earlier per-category read and flipped its conclusions.
+
+## What we found (all on the temporal holdout, onset ≥ 2026-04-01)
+
+- **Prediction quality is strongly category-dependent, and the model's real skill is narrow.**
+  Per-category MAE vs a "predict this category's median" baseline (skill = 1 − MAE_model/MAE_median):
+  the model beats the median baseline meaningfully in **only one large category** —
+  `materiell/teknisk` (+0.15, n=37.7k). Skill ≈ 0 for the biggest categories
+  (`infrastruktur/signal` n=55.5k +0.012, `drift/kapasitet` n=53k −0.002, `infrastruktur/spor`
+  n=25k −0.021), i.e. a category-median lookup would match the model on **~60% of volume**. The
+  model is **actively worse** than the median for `ytre/vær/vinter` (−0.33) and
+  `infrastruktur/stasjon` (−0.10) → those should fall back to the median.
+- **Systematic under-prediction everywhere** (bias < 0), expected from the median-targeting
+  `LN(1+delay)`→`EXP−1` transform on a right-skewed target. Pathological for
+  **`infrastruktur/strøm`**: predicts ~2.4 min vs 7.5 actual (bias −5.0, RMSE 22.9) — blind to the
+  power-incident tail.
+- **p90 coverage holds up out-of-sample** — ~92–95% for the bulk (slightly conservative, safe
+  side), and it *rescues weather* (point model harmful there, but p90 covers 96.8%). **One real
+  failure: `infrastruktur/strøm` at 85.4%** — both the point estimate *and* the interval under-cover
+  the power tail. Root cause is architectural: `delay_p90_calib` is keyed only on the predicted-log
+  bucket (`create_delay_p90_calib.sql:13`, category-blind), so strøm calls land in low-pred buckets
+  whose p90 is calibrated to the thinner general tail. Fix = add category/strøm-flag or a tail
+  multiplier to the p90 bucket key. (`drift/planlagt` also under-covers at 0.84, small n.)
+- **`lineRef` is important; `stop_place` is not.** `ML.GLOBAL_EXPLAIN` on `dep_delay_reg`:
+  `stop_order` 0.128, **`lineRef` 0.124**, `min_from_onset` 0.119, `num_stops` 0.102,
+  `num_journeys` 0.084, `status` 0.029, then small; **`stop_place` ~0.004 (near-dead)**; and
+  `planned` / `num_lines` / `is_terminal` / `is_origin` = **0**. The model uses *which line* and
+  *position in the trip*, not the specific station. (`category` is not a feature — `status` is.)
+- **Grouped-median baseline** (built on train, applied to holdout with min-support-30 back-off):
+  overall MAE model **3.03** < `category+line+stop` 3.169 < `category+line` 3.221 < `category` 3.265
+  — model wins overall, but adding `stop_place` barely helps (matches its ~0 importance), and
+  adding `line` to the median *hurts* sparse categories (vær 1.59→2.01, strøm 7.50→7.86) by thinning
+  the data. Per-category it splits exactly as the skill numbers say: median ties/beats the model on
+  the low-delay high-volume infra categories; model wins the high-delay ones.
+- **Per-line (all VYG/Vy lines):** the model beats a line-median on nearly every line, but its
+  *skill* is concentrated in volatile regional/long lines (R31 +0.128, RE20 +0.124, R22 +0.119) and
+  is ~0/negative on the most punctual commuter line (R21 −0.035). Under-prediction scales with line
+  delay level: bias **−8.7 on F4** (mean 16.5 min), −7.0 on R40, −4.1 on R31.
+
+## What we changed and shipped
+
+- **Pruned 5 zero/near-zero-signal features** (`planned`, `num_lines`, `is_terminal`, `is_origin`,
+  `stop_place`) from **both** `dep_delay_reg` and `arr_delay_reg` in `train_call_models.sql`
+  (classifier `call_cancel_clf` left unchanged — its features weren't validated). First proved it
+  on a throwaway `dep_delay_reg_pruned`: holdout **MAE 3.0317 vs 3.0326**, RMSE marginally better,
+  **84.8% of predictions byte-identical** — zero accuracy cost. `stop_place` is still emitted by
+  `create_training_calls.sql`/`predict_calls.sql` as an output key, just no longer a model feature,
+  so serving is unaffected (`ML.PREDICT` ignores extra columns).
+- **Committed** (`7c46b73`), then **made live**: retrained both regressors
+  (`CREATE OR REPLACE MODEL`, each as its own `bq` job) — `dep_delay_reg` now **11 features**,
+  holdout **MAE 3.046 / RMSE 6.797** (≈ original 3.033 / 6.817, within boosted-tree run variance,
+  no regression); `arr_delay_reg` also 11 features, **MAE 3.047 / RMSE 7.040** (healthy, consistent
+  with dep — but *reasonableness-checked only*, no strict before/after: the old arr model was
+  overwritten before a baseline was captured).
+- **Rebuilt the downstream calib chain** against the new models so there's no model/calib skew:
+  `dep_delay_reg_eval`, `arr_delay_reg_eval` (Stage 1, read the models) → `delay_p90_calib` (Stage 1,
+  reads models directly) → `delay_point_calib` (Stage 2, reads the fresh eval tables).
+  `apply_delay_point_calib.sql` is SELECT-only (no persisted table) — not part of the rebuild.
+
+## Recommended next steps
+
+- **Hybrid serving:** use the model for high-delay segments (`materiell/teknisk`, volatile
+  regional lines) and a `category`(+`line`) median lookup for the low-delay high-volume bulk where
+  they're statistically interchangeable; explicitly fall back to the median for `ytre/vær/vinter`
+  and `infrastruktur/stasjon`, where the model is worse than a constant.
+- **Category/line-aware p90** (or a tail multiplier) to fix `infrastruktur/strøm` coverage (85%→~90%)
+  and the long-distance under-prediction (F4/R40/R31) without disturbing the already-calibrated bulk.
+- If a strict arrival-side before/after is wanted, retrain a 16-feature `arr` variant once and diff;
+  low priority given the dep-side symmetry.
+
+## State
+
+- Committed: `train_call_models.sql` (both regressors' `EXCEPT` lists pruned; `7c46b73`).
+- Live models retrained: `dep_delay_reg`, `arr_delay_reg` (11 features each). Test model
+  `dep_delay_reg_pruned` created then dropped.
+- Calib chain rebuilt against the new models: `dep_delay_reg_eval`, `arr_delay_reg_eval`,
+  `delay_p90_calib`, `delay_point_calib`.
+- No serving-code change needed; `predict_calls.sql` picks up the new models + consistent calib tables.
