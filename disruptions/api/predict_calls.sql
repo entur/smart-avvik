@@ -19,6 +19,15 @@
 --     layers -> calibrated P(delay >= t) per side, monotonicity-enforced survival curves ->
 --     arr_delay_p50/p90_stack_min + dep_delay_p50/p90_stack_min intervals and the alerts
 --     p_impact (arrival) / p_impact_dep (departure) = p_cancel + (1-p_cancel) * P(>=10).
+--   * 2026-07-03 ALERT CALIBRATION IS ASK-HORIZON-AWARE: the 30-min platt layers are fit at
+--     the training anchoring, so earlier asks are overconfident. p_cancel and both alerts now
+--     pick platt weights by minutes-until-call at scoring time: <45 min -> cancel_platt /
+--     dep_ge10_platt as before; then cancel_platt_lead{60,120,240} / _plan + the dep_ge10
+--     twins (create_leadtime_calibration.sql; bucket boundaries at 1.5x each horizon, 'plan'
+--     beyond 6 h). p_impact_dep composes per-horizon cancel + PLAIN per-horizon ge10 (no
+--     cross-threshold cascade) -- exactly the composition validated out-of-sample in
+--     eval/impact_eval.py. The p_*_ge* columns and intervals keep the 30-min layers (no
+--     per-horizon fits for ge5/20/40 or the arr side yet; p_impact's arr term likewise).
 --
 -- Cheap: reads the small materialized rail_calls_planned_today + today's situations + ML.PREDICT
 -- (no ET scan here -- that cost is in rail_calls_planned_today.sql, rebuilt on a TTL by main.py).
@@ -260,13 +269,67 @@ wd40 AS (
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
   FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt`)
 ),
+-- per-ask-horizon platt lookups for the alert path (see header): '30' = the standard layers
+wch AS (
+  SELECT '30' AS lead_bucket, b, a FROM w
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.cancel_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.cancel_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.cancel_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.cancel_platt_plan`)
+),
+wdh AS (
+  SELECT '30' AS lead_bucket, b, a FROM wd10
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge10_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge10_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge10_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge10_platt_plan`)
+),
 bounds AS (
   SELECT side, MIN(plog_bucket) AS lo, MAX(plog_bucket) AS hi
   FROM `disruptions.delay_p90_calib` GROUP BY side
 ),
 scored AS (
   SELECT
-    c.*, clf.p_raw AS p_cancel_raw, dep.dep_plog, arr.arr_plog,
+    c.*, clf.p_raw AS p_cancel_raw, dge10.p_raw AS p_dep10_raw, dep.dep_plog, arr.arr_plog,
+    CASE
+      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 45  THEN '30'
+      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 90  THEN '60'
+      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 180 THEN '120'
+      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 360 THEN '240'
+      ELSE 'plan'
+    END AS lead_bucket,
     GREATEST(
       1/(1+EXP(-(w5.b + w5.a * LN(GREATEST(LEAST(ge5.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge5.p_raw,1-1e-6),1e-6)))))),
       1/(1+EXP(-(w10.b + w10.a * LN(GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)))))),
@@ -319,7 +382,7 @@ SELECT
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
   s.et_declared_cancelled,
-  ROUND(1/(1+EXP(-(w.b + w.a *
+  ROUND(1/(1+EXP(-(wch.b + wch.a *
     LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)))))), 4) AS p_cancel,
   IF(s.is_terminal, NULL, GREATEST(CAST(ROUND(EXP(s.dep_plog)-1) AS INT64), 0)) AS dep_delay_typ_min,
   IF(s.is_terminal, NULL, dpq.p90_min)                                          AS dep_delay_p90_min,
@@ -342,9 +405,9 @@ SELECT
     WHEN s.s40 <= 0.1 THEN 20 + (s.s20 - 0.1) / GREATEST(s.s20 - s.s40, 0.001) * 20
     ELSE LEAST(40 * SQRT(s.s40 / 0.1), 90) END) AS INT64)) AS arr_delay_p90_stack_min,
   IF(s.is_origin, NULL, ROUND(
-    1/(1+EXP(-(w.b + w.a *
+    1/(1+EXP(-(wch.b + wch.a *
       LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))
-    + (1 - 1/(1+EXP(-(w.b + w.a *
+    + (1 - 1/(1+EXP(-(wch.b + wch.a *
       LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))) * s.s10
   , 4)) AS p_impact,
   -- exceedance stack (departure side = the boarding stop; NULL at a terminal: no departure)
@@ -364,15 +427,25 @@ SELECT
     WHEN s.d20 <= 0.1 THEN 10 + (s.d10 - 0.1) / GREATEST(s.d10 - s.d20, 0.001) * 10
     WHEN s.d40 <= 0.1 THEN 20 + (s.d20 - 0.1) / GREATEST(s.d20 - s.d40, 0.001) * 20
     ELSE LEAST(40 * SQRT(s.d40 / 0.1), 90) END) AS INT64)) AS dep_delay_p90_stack_min,
-  -- boarding alert: P(cancelled OR departs >= 10 min late)
+  -- boarding alert: P(cancelled OR departs >= 10 min late). Per-horizon cancel + PLAIN
+  -- per-horizon ge10 (not the s.d10 cascade) -- the composition validated in eval/impact_eval.py.
   IF(s.is_terminal, NULL, ROUND(
-    1/(1+EXP(-(w.b + w.a *
+    1/(1+EXP(-(wch.b + wch.a *
       LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))
-    + (1 - 1/(1+EXP(-(w.b + w.a *
-      LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))) * s.d10
-  , 4)) AS p_impact_dep
+    + (1 - 1/(1+EXP(-(wch.b + wch.a *
+      LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)))))))
+      * 1/(1+EXP(-(wdh.b + wdh.a *
+      LN(GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6))))))
+  , 4)) AS p_impact_dep,
+  -- the ge10 term above, exposed for transparency: p_impact_dep = p_cancel + (1-p_cancel) * this
+  IF(s.is_terminal, NULL, ROUND(
+    1/(1+EXP(-(wdh.b + wdh.a *
+      LN(GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6))))))
+  , 4)) AS p_dep_ge10_h,
+  s.lead_bucket AS platt_lead_bucket
 FROM scored AS s
-CROSS JOIN w
+JOIN wch ON wch.lead_bucket = s.lead_bucket
+JOIN wdh ON wdh.lead_bucket = s.lead_bucket
 LEFT JOIN bounds AS bd ON bd.side = 'dep'
 LEFT JOIN `disruptions.delay_p90_calib` AS dpq
   ON dpq.side = 'dep' AND dpq.plog_bucket = LEAST(GREATEST(ROUND(s.dep_plog,1), bd.lo), bd.hi)

@@ -609,5 +609,271 @@ def lead_findings(mo):
     return
 
 
+@app.cell(hide_code=True)
+def platt_header(mo):
+    mo.md("""
+    ## Egne platt-lag per spørretidspunkt
+
+    Forrige avsnitt viste problemet: sannsynlighetene er kalibrert for ~30-minuttersregimet.
+    Spør vi tidligere, er modellen **overkonfident**, og terskelen for 90 % presisjon må heves
+    fra 0,62 til 0,86–0,88. Samme tall betyr da forskjellige ting på ulike tidspunkter, og
+    tidligvarsling blir upraktisk å styre.
+
+    Løsningen: ett platt-lag (logistisk rekalibrering av rå modellscore) **per spørrehorisont**
+    og per modellhode (innstilling og ≥ 10 min forsinkelse). Horisonter: ved melding (plan),
+    240, 120, 60 og 30 min før avgang — 30-minutterslaget er dagens produksjonskalibrering.
+
+    **Ærlig evaluering:** koeffisientene tilpasses kun på hendelser med start 1. april–15. mai
+    (del A) og testes på hendelser fra 16. mai og utover (del B), som verken modellhodene eller
+    platt-lagene har sett. Produksjonslagene i BigQuery (`cancel_platt_lead*`,
+    `dep_ge10_platt_lead*`, se `data/queries/create_leadtime_calibration.sql`) tilpasses på hele
+    holdout-vinduet etterpå.
+    """)
+    return
+
+
+@app.cell
+def platt_scoring(client, pd):
+    _pq = """
+    WITH s AS (
+      SELECT * FROM `ent-kixavvik-dev.disruptions.leadtime_scored`
+    ),
+    wc AS (
+      SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
+             MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
+      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)
+    ),
+    wd AS (
+      SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
+             MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
+      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)
+    )
+    SELECT s.lead_min, s.onset_date, s.min_from_onset,
+           s.call_cancelled, s.dep_delay_pos, s.is_terminal,
+           s.p_cancel_raw, s.p_dep10_raw,
+           ROUND(1/(1+EXP(-(wc.b + wc.a * LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)))))), 6) AS p_cancel_felles,
+           ROUND(1/(1+EXP(-(wd.b + wd.a * LN(GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6)))))), 6) AS p_dep10_felles
+    FROM s CROSS JOIN wc CROSS JOIN wd
+    WHERE s.lead_min = -1 OR s.min_from_onset >= s.lead_min
+    """
+    df_platt = client.query(_pq).to_dataframe()
+    df_platt["del_a"] = pd.to_datetime(df_platt.onset_date) <= pd.Timestamp("2026-05-15")
+    df_platt["cancelled"] = df_platt.call_cancelled.fillna(False).astype(bool)
+    df_platt["y"] = df_platt.cancelled | (df_platt.dep_delay_pos.fillna(0) >= 10)
+    df_platt["elig"] = (~df_platt.is_terminal.fillna(False).astype(bool)) & (
+        df_platt.cancelled | df_platt.dep_delay_pos.notna()
+    )
+    f"{len(df_platt):,} rader; del A (tilpasning): {df_platt.del_a.mean():.0%}"
+    return (df_platt,)
+
+
+@app.cell
+def platt_fit(df_platt, np, pd):
+    def fit_platt(p_raw, y):
+        """Platt-skalering: logistisk regresjon y ~ sigmoid(b + a*logit(p_raw)), Newton-iterasjon."""
+        _p = np.clip(np.asarray(p_raw, dtype=float), 1e-6, 1 - 1e-6)
+        _x = np.log(_p / (1 - _p))
+        _yv = np.asarray(y, dtype=float)
+        _a, _b = 1.0, 0.0
+        for _ in range(50):
+            _z = np.clip(_a * _x + _b, -35, 35)
+            _q = 1 / (1 + np.exp(-_z))
+            _w = np.maximum(_q * (1 - _q), 1e-12)
+            _g = np.array([((_q - _yv) * _x).sum(), (_q - _yv).sum()])
+            _H = np.array([[(_w * _x * _x).sum(), (_w * _x).sum()],
+                           [(_w * _x).sum(), _w.sum()]])
+            _da, _db = np.linalg.solve(_H, _g)
+            _a, _b = _a - _da, _b - _db
+            if max(abs(_da), abs(_db)) < 1e-9:
+                break
+        return float(_a), float(_b)
+
+
+    def apply_platt(p_raw, a, b):
+        _p = np.clip(np.asarray(p_raw, dtype=float), 1e-6, 1 - 1e-6)
+        _x = np.log(_p / (1 - _p))
+        return 1 / (1 + np.exp(-np.clip(a * _x + b, -35, 35)))
+
+
+    _coef = []
+    _bframes = []
+    for _L in [-1, 30, 60, 120, 240]:
+        _h = df_platt[df_platt.lead_min == _L]
+        _fa = _h[_h.del_a]
+        # samme tilpasningspopulasjoner som produksjons-SQLen: innstillingshodet paa alle
+        # rader ved horisonten, forsinkelseshodet der forsinkelse er observert
+        _ac, _bc = fit_platt(_fa.p_cancel_raw, _fa.cancelled)
+        _fd = _fa[_fa.dep_delay_pos.notna()]
+        _ad, _bd = fit_platt(_fd.p_dep10_raw, (_fd.dep_delay_pos >= 10).astype(bool))
+        _coef.append({"lead_min": _L, "a_cancel": _ac, "b_cancel": _bc,
+                      "a_dep10": _ad, "b_dep10": _bd})
+
+        _bt = _h[(~_h.del_a) & _h.elig].copy()
+        _pc = apply_platt(_bt.p_cancel_raw, _ac, _bc)
+        _pd10 = apply_platt(_bt.p_dep10_raw, _ad, _bd)
+        _bt["p_egen"] = _pc + (1 - _pc) * _pd10
+        _bt["p_felles"] = _bt.p_cancel_felles + (1 - _bt.p_cancel_felles) * _bt.p_dep10_felles
+        _bframes.append(_bt)
+
+    platt_coef = pd.DataFrame(_coef)
+    platt_b = pd.concat(_bframes, ignore_index=True)
+    platt_coef.round(3)
+    return (platt_b,)
+
+
+@app.cell(hide_code=True)
+def platt_metrics_cell(pd, platt_b, recall_at_precision):
+    _rows = []
+    for _L, _navn in [(-1, "ved melding (plan)"), (240, "240 min før"), (120, "120 min før"),
+                      (60, "60 min før"), (30, "30 min før")]:
+        _v = platt_b[platt_b.lead_min == _L]
+        _yv = _v.y.to_numpy(dtype=bool)
+        _rec, _thr_f = recall_at_precision(_yv, _v.p_felles.to_numpy(), 0.90)
+        _, _thr_e = recall_at_precision(_yv, _v.p_egen.to_numpy(), 0.90)
+        _hit_f = (_v.p_felles >= 0.65).to_numpy()
+        _hit_e = (_v.p_egen >= 0.65).to_numpy()
+        _rows.append({
+            "spørretidspunkt": _navn,
+            "avganger": len(_v),
+            "andel rammet": _yv.mean(),
+            "snitt p (felles)": _v.p_felles.mean(),
+            "snitt p (eget lag)": _v.p_egen.mean(),
+            "terskel @90 % (felles)": _thr_f,
+            "terskel @90 % (eget lag)": _thr_e,
+            "presisjon @0,65 (felles)": _yv[_hit_f].mean() if _hit_f.any() else float("nan"),
+            "presisjon @0,65 (eget lag)": _yv[_hit_e].mean() if _hit_e.any() else float("nan"),
+            "dekning @90 % presisjon": _rec,
+        })
+    platt_metrics = pd.DataFrame(_rows).round(3)
+    platt_metrics
+    return
+
+
+@app.cell(hide_code=True)
+def platt_charts_expl(mo):
+    mo.md("""
+    Tabellen over viser før/etter på del B. Kolonnene «felles» bruker dagens produksjonslag
+    (tilpasset 30-minuttersregimet), «eget lag» bruker horisontens eget lag tilpasset på del A.
+    Figurene under viser det samme grafisk:
+
+    - **Kalibreringskurvene:** med felles lag ligger tidlig-kurvene langt under diagonalen
+      (overkonfident); med eget lag per horisont legger alle seg på diagonalen.
+    - **Terskelfigurene:** til venstre terskelen som trengs for 90 % presisjon — med eget lag
+      samler den seg i stedet for å jages mot 0,96. Til høyre presisjonen hvis vi låser terskelen
+      til 0,65 — med eget lag holder den seg over 90 %-målet på alle spørretidspunkter.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def platt_fig(np, pd, platt_b, plt):
+    _varianter = [("ved melding", -1, "#eda100"), ("60 min før", 60, "#1baf7a"), ("30 min før", 30, "#2a78d6")]
+    _fig, (_ax1, _ax2) = plt.subplots(1, 2, figsize=(11.5, 4.8), sharey=True)
+
+    for _navn, _L, _farge in _varianter:
+        _v = platt_b[platt_b.lead_min == _L]
+        for _ax, _kol in ((_ax1, "p_felles"), (_ax2, "p_egen")):
+            _bins = pd.cut(_v[_kol], np.linspace(0, 1, 21))
+            _g = _v.groupby(_bins, observed=True).agg(pred=(_kol, "mean"), real=("y", "mean"), n=("y", "size"))
+            _g = _g[_g.n >= 50]
+            _ax.plot(_g.pred, _g.real, color=_farge, lw=2, marker="o", ms=4, label=_navn)
+
+    for _ax, _tittel in ((_ax1, "Felles platt-lag (dagens)"), (_ax2, "Eget platt-lag per horisont")):
+        _ax.plot([0, 1], [0, 1], color="#9a9a92", lw=1, ls="--", zorder=0)
+        _ax.set_xlabel("modellens predikerte sannsynlighet (gruppert)")
+        _ax.set_title(_tittel, fontsize=11)
+        _ax.set_xlim(0, 1)
+        _ax.set_ylim(0, 1.02)
+        _ax.grid(True, color="#e8e7e0", lw=0.7)
+        _ax.set_axisbelow(True)
+        _ax.spines["top"].set_visible(False)
+        _ax.spines["right"].set_visible(False)
+    _ax1.set_ylabel("hvor ofte avgangen faktisk ble rammet")
+    _ax1.legend(frameon=False, loc="upper left")
+    _ax1.annotate("under diagonalen =\noverkonfident modell",
+                  xy=(0.62, 0.35), xytext=(0.45, 0.08),
+                  fontsize=9, color="#444444",
+                  arrowprops=dict(arrowstyle="-", color="#9a9a92", lw=0.8))
+    _ax2.annotate("kurvene legger seg på diagonalen:\nsannsynlighetene kan tas bokstavelig",
+                  xy=(0.50, 0.52), xytext=(0.03, 0.90),
+                  fontsize=9, color="#444444",
+                  arrowprops=dict(arrowstyle="-", color="#9a9a92", lw=0.8))
+    plt.tight_layout()
+    _fig
+    return
+
+
+@app.cell(hide_code=True)
+def platt_thr_fig(np, platt_b, plt, recall_at_precision):
+    _ordre = [(-1, "ved\nmelding"), (240, "240"), (120, "120"), (60, "60"), (30, "30")]
+    _xpos = np.arange(len(_ordre))
+    _thr_f, _thr_e, _pre_f, _pre_e = [], [], [], []
+    for _L, _ in _ordre:
+        _v = platt_b[platt_b.lead_min == _L]
+        _yv = _v.y.to_numpy(dtype=bool)
+        _thr_f.append(recall_at_precision(_yv, _v.p_felles.to_numpy(), 0.90)[1])
+        _thr_e.append(recall_at_precision(_yv, _v.p_egen.to_numpy(), 0.90)[1])
+        _pre_f.append(float(_yv[(_v.p_felles >= 0.65).to_numpy()].mean()))
+        _pre_e.append(float(_yv[(_v.p_egen >= 0.65).to_numpy()].mean()))
+
+    _fig, (_ax1, _ax2) = plt.subplots(1, 2, figsize=(11.5, 4.8))
+
+    _ax1.plot(_xpos, _thr_f, color="#9a9a92", lw=2, marker="o", ms=6, label="felles lag (dagens)")
+    _ax1.plot(_xpos, _thr_e, color="#2a78d6", lw=2, marker="o", ms=6, label="eget lag per horisont")
+    _ax1.set_ylabel("terskel som gir 90 % presisjon")
+    _ax1.set_title("Nødvendig terskel per spørretidspunkt", fontsize=11)
+    _ax1.set_ylim(0, 1.02)
+    _ax1.annotate("terskelen må jages oppover\nnår modellen er overkonfident",
+                  xy=(1, _thr_f[1]), xytext=(1.3, 0.72),
+                  fontsize=9, color="#444444",
+                  arrowprops=dict(arrowstyle="-", color="#9a9a92", lw=0.8))
+
+    _ax2.plot(_xpos, _pre_f, color="#9a9a92", lw=2, marker="o", ms=6, label="felles lag (dagens)")
+    _ax2.plot(_xpos, _pre_e, color="#2a78d6", lw=2, marker="o", ms=6, label="eget lag per horisont")
+    _ax2.axhline(0.90, color="#eda100", lw=1.5, ls="--")
+    _ax2.annotate("mål: 90 % presisjon", xy=(0.05, 0.905), fontsize=9, color="#444444")
+    _ax2.set_ylabel("presisjon ved fast terskel 0,65")
+    _ax2.set_title("Én fast terskel på tvers av horisonter", fontsize=11)
+    _ax2.set_ylim(0.4, 1.02)
+
+    for _ax in (_ax1, _ax2):
+        _ax.set_xticks(_xpos, [_n for _, _n in _ordre])
+        _ax.set_xlabel("spørretidspunkt (min før avgang)")
+        _ax.grid(True, color="#e8e7e0", lw=0.7)
+        _ax.set_axisbelow(True)
+        _ax.spines["top"].set_visible(False)
+        _ax.spines["right"].set_visible(False)
+        _ax.legend(frameon=False, loc="lower right")
+    plt.tight_layout()
+    _fig
+    return
+
+
+@app.cell(hide_code=True)
+def platt_findings(mo):
+    mo.md("""
+    ### Funn: egne platt-lag gjør tidligvarsling styrbar
+
+    - **Rangeringen er uendret** (platt-laget er monotont), men sannsynlighetene blir ærlige:
+      snitt predikert p på del B treffer nå andelen rammede på alle horisonter (f.eks. 240 min
+      før: 0,14 → 0,09 mot reelt 0,07; ved melding: 0,23 → 0,19 mot 0,17).
+    - **Én fast terskel fungerer på tvers av horisonter.** Med dagens felles lag gir terskel 0,65
+      alt fra 47 % til 94 % presisjon avhengig av når man spør; med eget lag per horisont gir
+      samme terskel **≥ 91 % presisjon overalt**. Terskelen som trengs for 90 % presisjon samler
+      seg rundt 0,48–0,63 i stedet for å spre seg 0,53–0,96.
+    - Koeffisientene viser mekanikken: jo tidligere horisonten er, desto mer krymper laget
+      skårene mot basisraten (a < 1) og skyver dem ned (b < 0) — nøyaktig den overkonfidensen
+      forrige avsnitt påviste.
+    - **Produksjon:** `data/queries/create_leadtime_calibration.sql` tilpasser lagene på hele
+      holdout-vinduet: `cancel_platt_{lead60,lead120,lead240,plan}` og tilsvarende
+      `dep_ge10_platt_*` i BigQuery. Servering velger lag etter minutter til avgang ved
+      spørretidspunktet (≲ 45 min → dagens lag; ellers nærmeste horisont; utenfor
+      sanntidsrekkevidde → plan-laget) og bruker samme lukkede form
+      `sigmoid(b + a·logit(p_rå))` som i dag. Lagene må re-tilpasses etter hver
+      hodetrening, som de eksisterende.
+    """)
+    return
+
+
 if __name__ == "__main__":
     app.run()
