@@ -24,12 +24,28 @@
 -- feature overall -- observed cancellations on the line raise P(cancel) for its coming calls)
 -- and own_prev_delay (0.23). The no-line-state slice is a statistical tie, so the plan-ahead
 -- regime does not regress. REFIT cancel_platt after any retrain of this model.
+--
+-- HYPERPARAMETERS TUNED 2026-07-02 (step-4 headroom check, docs/model-hardening/LEARNINGS.md):
+-- local XGBoost/LightGBM showed +1.3pt AUC over the BQML defaults; this config (found by local
+-- tuning, validated in BQML as exp_cancel_clf_tuned) recovers ~80% of it in-warehouse:
+-- holdout AUC 0.9504 -> 0.9606, log-loss 0.1484 -> 0.1275. The residual ~0.3pt is library-level
+-- (native categorical splits), unreachable in BQML. NOTE: BQML bills boosted-tree training per
+-- iteration -- 300 iterations scans ~66 GB (~$0.41) vs ~$0.07 for the 50-iteration models below.
+-- WALL-TIME WARNING: with enable_global_explain the explain phase dominates at this size --
+-- the 2026-07-03 promotion run took 5.4 h (training itself ~22 min; billed only ~$0.46, the
+-- explain phase is slot-invisible). Plan retrains overnight, or drop the option if attribution
+-- inspection isn't needed.
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['call_cancelled'],
-  max_iterations    = 50,
-  early_stop        = TRUE,
+  max_iterations    = 300,
+  learn_rate        = 0.05,
+  max_tree_depth    = 8,
+  subsample         = 0.8,
+  colsample_bytree  = 0.8,
+  early_stop        = FALSE,
+  data_split_method = 'NO_SPLIT',
   enable_global_explain = TRUE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, dep_delay_pos, arr_delay_pos, is_eval)

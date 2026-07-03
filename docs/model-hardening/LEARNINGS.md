@@ -620,10 +620,20 @@ correlate; a row bootstrap would be overconfident).
   (max_iterations 300, learn_rate 0.05, max_tree_depth 8, subsample 0.8, colsample_bytree 0.8,
   early_stop FALSE, NO_SPLIT — the config local tuning found) scores **0.9606 / 0.1275** on the
   holdout vs prod 0.9504 / 0.1484. The residual ~0.3pt AUC to LightGBM is library-level (native
-  categorical splits vs one-hot). **Not promoted** — promoting = update section 1 options in
-  `train_call_models.sql`, retrain, refit `cancel_platt`, rebuild serving tables (~$0.50; note
-  the tuned training billed 66 GB ≈ $0.41 — per-iteration billing makes 300 iterations ~6× the
-  50-iteration trainings).
+  categorical splits vs one-hot). Per-iteration billing makes 300 iterations ~6× the
+  50-iteration trainings (66 GB ≈ $0.41).
+- **PROMOTED 2026-07-03**: prod `call_cancel_clf` retrained with the tuned options — holdout
+  **AUC 0.9603 / log-loss 0.1278** (reproduces the experiment within subsample noise;
+  `subsample=0.8` makes retrains non-deterministic, unlike the default-options models).
+  `cancel_platt` refit immediately after (49 s — skew window ~minutes); calibrated deciles
+  track actuals within ~1–7 pts, still slightly conservative at the high end (decile 8: mean_p
+  0.85 vs actual 0.90 — the safe direction for alerting). `call_predictions` rebuilt; the live
+  service picks up model+platt on its 10-min tick, no deploy. p_impact / p_impact_dep inherit
+  the better p_cancel automatically. **Ops gotcha: the retrain took 5.4 h wall-clock** — the
+  training itself finished in ~22 min (matching the experiment), the rest was the
+  `enable_global_explain` phase, which at 300 trees × depth 8 is ~40× the old 50×6 SHAP cost
+  and is invisible in slot/console stats (job looks frozen at constant slot-time; billed only
+  74 GB ≈ $0.46). Schedule future retrains overnight or drop the option.
 
 **Half 2 — joint trip-completion vs the product approximation.** Pair grain = (situation ×
 journey × board stop × alight stop), board < alight in stop_order, board non-terminal; label
