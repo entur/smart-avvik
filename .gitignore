@@ -4,3 +4,4 @@ docs/kix-docs/
 docs/kix-docs/*
 .DS_Store
 __pycache__/
+__marimo__/
