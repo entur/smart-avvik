@@ -19,15 +19,17 @@
 --     layers -> calibrated P(delay >= t) per side, monotonicity-enforced survival curves ->
 --     arr_delay_p50/p90_stack_min + dep_delay_p50/p90_stack_min intervals and the alerts
 --     p_impact (arrival) / p_impact_dep (departure) = p_cancel + (1-p_cancel) * P(>=10).
---   * 2026-07-03 ALERT CALIBRATION IS ASK-HORIZON-AWARE: the 30-min platt layers are fit at
---     the training anchoring, so earlier asks are overconfident. p_cancel and both alerts now
---     pick platt weights by minutes-until-call at scoring time: <45 min -> cancel_platt /
---     dep_ge10_platt as before; then cancel_platt_lead{60,120,240} / _plan + the dep_ge10
---     twins (create_leadtime_calibration.sql; bucket boundaries at 1.5x each horizon, 'plan'
---     beyond 6 h). p_impact_dep composes per-horizon cancel + PLAIN per-horizon ge10 (no
---     cross-threshold cascade) -- exactly the composition validated out-of-sample in
---     eval/impact_eval.py. The p_*_ge* columns and intervals keep the 30-min layers (no
---     per-horizon fits for ge5/20/40 or the arr side yet; p_impact's arr term likewise).
+--   * 2026-07-03 ALL CALIBRATION IS ASK-HORIZON-AWARE: every platt layer is fit at the
+--     training anchoring (~30 min before the call), so earlier asks are mis-calibrated
+--     (alerts overconfident, the ge5 rungs under-predicted -> intervals too optimistic).
+--     Each call gets a lead_bucket from minutes-until-call at scoring time (<45 min -> the
+--     standard *_platt layers; then *_platt_lead{60,120,240} / *_platt_plan from
+--     create_leadtime_calibration.sql; bucket boundaries at 1.5x each horizon, 'plan' beyond
+--     6 h), and every layer -- p_cancel, both alerts, the ge-stack columns and the intervals
+--     -- is picked from that bucket. The alerts compose per-horizon cancel + PLAIN per-horizon
+--     ge10 (no cross-threshold cascade): the dep side validated out-of-sample in
+--     eval/impact_eval.py, the arr side + remaining heads A/B-checked the same way.
+--     p_arr_ge10_h / p_dep_ge10_h expose the alert ge10 terms; platt_lead_bucket the bucket.
 --
 -- Cheap: reads the small materialized rail_calls_planned_today + today's situations + ML.PREDICT
 -- (no ET scan here -- that cost is in rail_calls_planned_today.sql, rebuilt on a TTL by main.py).
@@ -163,7 +165,15 @@ calls AS (
     IFNULL(ln.line_now_n, 0)        AS line_now_n,
     IFNULL(ln.line_now_delay, -1)   AS line_now_delay,
     IFNULL(ln.line_now_cancel, -1)  AS line_now_cancel,
-    IFNULL(o.own_prev_delay, -1)    AS own_prev_delay
+    IFNULL(o.own_prev_delay, -1)    AS own_prev_delay,
+    -- ask-horizon bucket: which platt layer calibrates this call's scores (see header)
+    CASE
+      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 45  THEN '30'
+      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 90  THEN '60'
+      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 180 THEN '120'
+      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 360 THEN '240'
+      ELSE 'plan'
+    END AS lead_bucket
   FROM base AS b
   LEFT JOIN linepre AS lp ON lp.situationNumber = b.situationNumber AND lp.lineRef = b.lineRef
   LEFT JOIN netpre  AS np ON np.situationNumber = b.situationNumber
@@ -316,52 +326,207 @@ wdh AS (
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.dep_ge10_platt_plan`)
 ),
+w5h AS (
+  SELECT '30' AS lead_bucket, b, a FROM w5
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge5_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge5_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge5_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge5_platt_plan`)
+),
+w10h AS (
+  SELECT '30' AS lead_bucket, b, a FROM w10
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge10_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge10_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge10_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge10_platt_plan`)
+),
+w20h AS (
+  SELECT '30' AS lead_bucket, b, a FROM w20
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge20_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge20_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge20_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge20_platt_plan`)
+),
+w40h AS (
+  SELECT '30' AS lead_bucket, b, a FROM w40
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge40_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge40_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge40_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.arr_ge40_platt_plan`)
+),
+wd5h AS (
+  SELECT '30' AS lead_bucket, b, a FROM wd5
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge5_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge5_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge5_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge5_platt_plan`)
+),
+wd20h AS (
+  SELECT '30' AS lead_bucket, b, a FROM wd20
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge20_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge20_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge20_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge20_platt_plan`)
+),
+wd40h AS (
+  SELECT '30' AS lead_bucket, b, a FROM wd40
+  UNION ALL
+  SELECT '60',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt_lead60`)
+  UNION ALL
+  SELECT '120',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt_lead120`)
+  UNION ALL
+  SELECT '240',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt_lead240`)
+  UNION ALL
+  SELECT 'plan',
+         MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
+         MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
+  FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt_plan`)
+),
 bounds AS (
   SELECT side, MIN(plog_bucket) AS lo, MAX(plog_bucket) AS hi
   FROM `disruptions.delay_p90_calib` GROUP BY side
 ),
 scored AS (
   SELECT
-    c.*, clf.p_raw AS p_cancel_raw, dge10.p_raw AS p_dep10_raw, dep.dep_plog, arr.arr_plog,
-    CASE
-      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 45  THEN '30'
-      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 90  THEN '60'
-      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 180 THEN '120'
-      WHEN TIMESTAMP_DIFF(c.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 360 THEN '240'
-      ELSE 'plan'
-    END AS lead_bucket,
+    c.*, clf.p_raw AS p_cancel_raw, dge10.p_raw AS p_dep10_raw, ge10.p_raw AS p_arr10_raw,
+    dep.dep_plog, arr.arr_plog,
     GREATEST(
-      1/(1+EXP(-(w5.b + w5.a * LN(GREATEST(LEAST(ge5.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge5.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(w10.b + w10.a * LN(GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(w20.b + w20.a * LN(GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(w40.b + w40.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6))))))
+      1/(1+EXP(-(w5h.b + w5h.a * LN(GREATEST(LEAST(ge5.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge5.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(w10h.b + w10h.a * LN(GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(w20h.b + w20h.a * LN(GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(w40h.b + w40h.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6))))))
     ) AS s5,
     GREATEST(
-      1/(1+EXP(-(w10.b + w10.a * LN(GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(w20.b + w20.a * LN(GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(w40.b + w40.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6))))))
+      1/(1+EXP(-(w10h.b + w10h.a * LN(GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge10.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(w20h.b + w20h.a * LN(GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(w40h.b + w40h.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6))))))
     ) AS s10,
     GREATEST(
-      1/(1+EXP(-(w20.b + w20.a * LN(GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(w40.b + w40.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6))))))
+      1/(1+EXP(-(w20h.b + w20h.a * LN(GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(w40h.b + w40h.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6))))))
     ) AS s20,
-    1/(1+EXP(-(w40.b + w40.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)))))) AS s40,
+    1/(1+EXP(-(w40h.b + w40h.a * LN(GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(ge40.p_raw,1-1e-6),1e-6)))))) AS s40,
     GREATEST(
-      1/(1+EXP(-(wd5.b + wd5.a * LN(GREATEST(LEAST(dge5.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge5.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(wd10.b + wd10.a * LN(GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(wd20.b + wd20.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
+      1/(1+EXP(-(wd5h.b + wd5h.a * LN(GREATEST(LEAST(dge5.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge5.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wdh.b + wdh.a * LN(GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd20h.b + wd20h.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd40h.b + wd40h.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
     ) AS d5,
     GREATEST(
-      1/(1+EXP(-(wd10.b + wd10.a * LN(GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(wd20.b + wd20.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
+      1/(1+EXP(-(wdh.b + wdh.a * LN(GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge10.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd20h.b + wd20h.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd40h.b + wd40h.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
     ) AS d10,
     GREATEST(
-      1/(1+EXP(-(wd20.b + wd20.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
-      1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
+      1/(1+EXP(-(wd20h.b + wd20h.a * LN(GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge20.p_raw,1-1e-6),1e-6)))))),
+      1/(1+EXP(-(wd40h.b + wd40h.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6))))))
     ) AS d20,
-    1/(1+EXP(-(wd40.b + wd40.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)))))) AS d40
+    1/(1+EXP(-(wd40h.b + wd40h.a * LN(GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(dge40.p_raw,1-1e-6),1e-6)))))) AS d40
   FROM calls AS c
   JOIN clf  USING (situationNumber, jkey, stop_order)
   JOIN dep  USING (situationNumber, jkey, stop_order)
@@ -374,8 +539,14 @@ scored AS (
   JOIN dge10 USING (situationNumber, jkey, stop_order)
   JOIN dge20 USING (situationNumber, jkey, stop_order)
   JOIN dge40 USING (situationNumber, jkey, stop_order)
-  CROSS JOIN w5 CROSS JOIN w10 CROSS JOIN w20 CROSS JOIN w40
-  CROSS JOIN wd5 CROSS JOIN wd10 CROSS JOIN wd20 CROSS JOIN wd40
+  JOIN w5h   ON w5h.lead_bucket   = c.lead_bucket
+  JOIN w10h  ON w10h.lead_bucket  = c.lead_bucket
+  JOIN w20h  ON w20h.lead_bucket  = c.lead_bucket
+  JOIN w40h  ON w40h.lead_bucket  = c.lead_bucket
+  JOIN wd5h  ON wd5h.lead_bucket  = c.lead_bucket
+  JOIN wdh   ON wdh.lead_bucket   = c.lead_bucket
+  JOIN wd20h ON wd20h.lead_bucket = c.lead_bucket
+  JOIN wd40h ON wd40h.lead_bucket = c.lead_bucket
 )
 SELECT
   s.situationNumber, s.summary, s.onset_ts,
@@ -404,11 +575,15 @@ SELECT
     WHEN s.s20 <= 0.1 THEN 10 + (s.s10 - 0.1) / GREATEST(s.s10 - s.s20, 0.001) * 10
     WHEN s.s40 <= 0.1 THEN 20 + (s.s20 - 0.1) / GREATEST(s.s20 - s.s40, 0.001) * 20
     ELSE LEAST(40 * SQRT(s.s40 / 0.1), 90) END) AS INT64)) AS arr_delay_p90_stack_min,
+  -- arrival alert: per-horizon cancel + PLAIN per-horizon arr ge10 (not the s.s10 cascade),
+  -- mirroring the dep-side composition validated in eval/impact_eval.py
   IF(s.is_origin, NULL, ROUND(
     1/(1+EXP(-(wch.b + wch.a *
       LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))
     + (1 - 1/(1+EXP(-(wch.b + wch.a *
-      LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6))))))) * s.s10
+      LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)))))))
+      * 1/(1+EXP(-(w10h.b + w10h.a *
+      LN(GREATEST(LEAST(s.p_arr10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_arr10_raw,1-1e-6),1e-6))))))
   , 4)) AS p_impact,
   -- exceedance stack (departure side = the boarding stop; NULL at a terminal: no departure)
   IF(s.is_terminal, NULL, ROUND(s.d5, 4))  AS p_dep_ge5,
@@ -437,15 +612,21 @@ SELECT
       * 1/(1+EXP(-(wdh.b + wdh.a *
       LN(GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6))))))
   , 4)) AS p_impact_dep,
-  -- the ge10 term above, exposed for transparency: p_impact_dep = p_cancel + (1-p_cancel) * this
+  -- the plain ge10 alert terms, exposed for transparency:
+  -- p_impact(_dep) = p_cancel + (1-p_cancel) * p_arr_ge10_h (resp. p_dep_ge10_h)
+  IF(s.is_origin, NULL, ROUND(
+    1/(1+EXP(-(w10h.b + w10h.a *
+      LN(GREATEST(LEAST(s.p_arr10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_arr10_raw,1-1e-6),1e-6))))))
+  , 4)) AS p_arr_ge10_h,
   IF(s.is_terminal, NULL, ROUND(
     1/(1+EXP(-(wdh.b + wdh.a *
       LN(GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6))))))
   , 4)) AS p_dep_ge10_h,
   s.lead_bucket AS platt_lead_bucket
 FROM scored AS s
-JOIN wch ON wch.lead_bucket = s.lead_bucket
-JOIN wdh ON wdh.lead_bucket = s.lead_bucket
+JOIN wch  ON wch.lead_bucket  = s.lead_bucket
+JOIN wdh  ON wdh.lead_bucket  = s.lead_bucket
+JOIN w10h ON w10h.lead_bucket = s.lead_bucket
 LEFT JOIN bounds AS bd ON bd.side = 'dep'
 LEFT JOIN `disruptions.delay_p90_calib` AS dpq
   ON dpq.side = 'dep' AND dpq.plog_bucket = LEAST(GREATEST(ROUND(s.dep_plog,1), bd.lo), bd.hi)

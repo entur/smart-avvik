@@ -864,12 +864,15 @@ def platt_findings(mo):
     - Koeffisientene viser mekanikken: jo tidligere horisonten er, desto mer krymper laget
       skårene mot basisraten (a < 1) og skyver dem ned (b < 0) — nøyaktig den overkonfidensen
       forrige avsnitt påviste.
-    - **Produksjon:** `data/queries/create_leadtime_calibration.sql` tilpasser lagene på hele
-      holdout-vinduet: `cancel_platt_{lead60,lead120,lead240,plan}` og tilsvarende
-      `dep_ge10_platt_*` i BigQuery. Servering velger lag etter minutter til avgang ved
-      spørretidspunktet (≲ 45 min → dagens lag; ellers nærmeste horisont; utenfor
-      sanntidsrekkevidde → plan-laget) og bruker samme lukkede form
-      `sigmoid(b + a·logit(p_rå))` som i dag. Lagene må re-tilpasses etter hver
+    - **Produksjon:** `data/queries/create_leadtime_calibration.sql` tilpasser lag på hele
+      holdout-vinduet for **alle ni modellhodene** (kansellering + arr/dep ge5–ge40):
+      `*_platt_{lead60,lead120,lead240,plan}` i BigQuery. Servering (`predict_calls.sql`)
+      velger lag per avgang etter minutter til avgang ved spørretidspunktet (< 45 min →
+      dagens lag; grenser 90/180/360; > 6 t → plan-laget) for varsler, ge-kolonner og
+      intervaller, med samme lukkede form `sigmoid(b + a·logit(p_rå))` som før. Samme
+      A/B-sjekk på ankomstsiden: presisjon ved fast terskel 0,65 gikk fra 0,38–0,93 til
+      0,87–0,94, og ge5-hodene (som fellelaget *under*-predikerte tidlig, 0,085 mot reelt
+      0,200 ved melding) treffer nå basisraten. Lagene må re-tilpasses etter hver
       hodetrening, som de eksisterende.
     """)
     return
