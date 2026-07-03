@@ -10,6 +10,7 @@ dependencies = [
     "fastapi[standard]>=0.136.3",
     "google-cloud-bigquery[pandas]>=3.41.0",
     "jupyterlab>=4.5.7",
+    "marimo>=0.23.13",
     "matplotlib>=3.10.9",
     "nbformat>=5.10.4",
     "plotly>=6.7.0",
