@@ -103,6 +103,11 @@ base AS (
         SELECT dvjr
         FROM UNNEST(fv.affects.vehicleJourneys) AS journeys, UNNEST(journeys.datedVehicleJourneyRefs) AS dvjr
         WHERE dvjr IS NOT NULL
+        UNION DISTINCT
+        -- plain vehicleJourneyRefs: ServiceJourney refs (RUT/KOL, replacement buses), NOT date-scoped
+        SELECT vjr
+        FROM UNNEST(fv.affects.vehicleJourneys) AS journeys, UNNEST(journeys.vehicleJourneyRefs) AS vjr
+        WHERE vjr IS NOT NULL
       )
     ) AS affected_journeys,
     EXTRACT(MONTH     FROM fv.event_ts AT TIME ZONE 'Europe/Oslo') AS month,

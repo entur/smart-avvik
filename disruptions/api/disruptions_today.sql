@@ -107,6 +107,11 @@ base AS (
         SELECT dvjr
         FROM UNNEST(fv.affects.vehicleJourneys) AS journeys, UNNEST(journeys.datedVehicleJourneyRefs) AS dvjr
         WHERE dvjr IS NOT NULL
+        UNION DISTINCT
+        -- plain vehicleJourneyRefs: ServiceJourney refs (RUT/KOL, replacement buses), NOT date-scoped
+        SELECT vjr
+        FROM UNNEST(fv.affects.vehicleJourneys) AS journeys, UNNEST(journeys.vehicleJourneyRefs) AS vjr
+        WHERE vjr IS NOT NULL
       )
     ) AS affected_journeys,
     -- affected_lines: needed by the per-call models' num_lines feature (predict_calls.sql).

@@ -2,7 +2,7 @@
 -- years, reduced to a single best-estimate record -- the latest snapshot per
 -- (participantRef, situationNumber), its validity periods collapsed to one span (earliest
 -- start -> latest end = duration_minutes), the first Norwegian summary/description, and the
--- affected stops / lines / dated journeys flattened to arrays. Excludes NO_IMPACT situations
+-- affected stops / lines / journeys flattened to arrays. Excludes NO_IMPACT situations
 -- and caps duration to 1..10080 min (7 days). NOT participant-filtered -- downstream queries
 -- restrict participantRef as needed (e.g. 'NSB'). Standard 2-year partition lookback; this is
 -- a full rebuild (CREATE OR REPLACE), so re-run it to pick up newer situations.
@@ -135,7 +135,10 @@ SELECT
       WHERE al.lineRef IS NOT NULL
     )
   ) AS affected_lines,
-  -- Dated journey refs, kept separately.
+  -- Journey refs, kept separately. The plain vehicleJourneyRefs branch carries
+  -- ServiceJourney refs (RUT/KOL situations, Vy replacement buses) -- unlike the
+  -- DatedServiceJourney refs of the other two branches these are NOT date-scoped,
+  -- so joins on them need an operating date alongside the jkey.
   (
     SELECT ARRAY_AGG(journey_ref ORDER BY journey_ref)
     FROM (
@@ -147,6 +150,11 @@ SELECT
       FROM UNNEST(affects.vehicleJourneys) AS journeys,
            UNNEST(journeys.datedVehicleJourneyRefs) AS dvjr
       WHERE dvjr IS NOT NULL
+      UNION DISTINCT
+      SELECT vjr
+      FROM UNNEST(affects.vehicleJourneys) AS journeys,
+           UNNEST(journeys.vehicleJourneyRefs) AS vjr
+      WHERE vjr IS NOT NULL
     )
   ) AS affected_journeys,
   EXTRACT(YEAR      FROM start_ts) AS year,
