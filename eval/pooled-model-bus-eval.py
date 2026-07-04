@@ -175,7 +175,17 @@ def _(np, pd):
             _sub, _ycol, _pcol = df[df["eligible_dep"].astype(bool)], "label_dep", "p_impact_dep"
         return _sub[_ycol].to_numpy(dtype=bool), _sub[_pcol].to_numpy(dtype=float)
 
-    return THR, auc_score, metric_slice, pr_curve
+    def recall_at_precision(y, p, target=0.90):
+        """Høyeste dekning oppnåelig ved >= target presisjon; returnerer (dekning, terskel)."""
+        _thr, _prec, _rec = pr_curve(y, p)
+        _ok = _prec >= target
+        if not _ok.any():
+            return float("nan"), float("nan")
+        _i = np.argmax(_rec * _ok)
+        return float(_rec[_i]), float(_thr[_i])
+
+
+    return THR, auc_score, metric_slice, pr_curve, recall_at_precision
 
 
 @app.cell
@@ -569,6 +579,179 @@ def _(THR, metric_sel, mo, nsb_cmp):
 
     {_lines}
     """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md("""
+    ## Hvor tidlig kan vi varsle, per operatør?
+
+    Målet er å varsle på tre tidspunkter: **idet avviksmeldingen kommer**, **60 min før avgang**
+    og **30 min før avgang**. To ting begrenser dette per operatør:
+
+    1. **Taket — meldingen må finnes.** Operatørene har svært ulik meldingskultur. En
+       journey-nivå-telling over hele vinduet (mars 2025–juni 2026, mot avgangen fra
+       *origin*-stoppet, inkl. meldinger som kommer ETTER avgang) viser medianledetid og
+       hvor ofte meldingen i det hele tatt finnes 30/60 min før:
+
+    | operatør | median | etter avgang | ≥ 30 min | ≥ 60 min |
+    |---|---|---|---|---|
+    | GOA | +77 min | 21 % | 64 % | 55 % |
+    | NSB | +49 min | 31 % | 57 % | 47 % |
+    | TRO | +42 min | 36 % | 54 % | 46 % |
+    | FIN | +5 min | 47 % | 40 % | 33 % |
+    | RUT | −6 min | 56 % | 34 % | 32 % |
+    | NOR | +2 min | 44 % | 34 % | 31 % |
+    | MOR | −23 min | 72 % | 18 % | 13 % |
+    | SKY | 0 min | 50 % | 8 % | 7 % |
+    | ATB | −10 min | 67 % | 9 % | 6 % |
+    | SOF | +4 min | 37 % | 4 % | 3 % |
+    | KOL | +4 min | 33 % | 2 % | 1 % |
+    | OST | −19 min | 90 % | 1 % | 1 % |
+    | GCO | −19 min | 86 % | 6 % | 5 % |
+
+    (Engangstelling 2026-07-04. KOL/SOF sender *før* avgang, men typisk bare minutter før;
+    MOR/ATB/OST/GCO sender som regel etterpå.)
+
+    2. **Informasjonsforfall.** Jo tidligere vi spør, jo mindre vet vi om kjøretøyets og
+       linjens sanntidstilstand. Som i NSB-analysen re-skåres holdouten med de to
+       sanntidsforankrede egenskapene (`own_prev_delay`, `line_now_*`) beregnet slik de ville
+       sett ut L ∈ {30, 60, 120, 240} min før avgang, pluss en «ved melding»-variant uten
+       observerbar tilstand (ren planlegging). L = 30 reproduserer treningsforankringen eksakt
+       (verifisert: 0 avvik). Tabellen bygges av `data/queries/leadtime_eval_pooled_all.sql`.
+
+    Merk: GCO har bare ~37 rammede avganger i holdouten — tallene der er støy.
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(client):
+    # Lead-time-skåring av pooled_all-familien: cancel + dep_ge10 med operatørbevisste
+    # platt-lag (lukket form), kombinert til p_impact_dep. ~3,1M rader (629k avganger x 5).
+    _lq = """
+    WITH inp AS (
+      SELECT * FROM `ent-kixavvik-dev.disruptions.leadtime_eval_pooled_all`
+    ),
+    clf AS (
+      SELECT situationNumber, operator, jkey, stop_order, lead_min,
+             (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
+      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled_all`, (SELECT * FROM inp))
+    ),
+    d10 AS (
+      SELECT situationNumber, operator, jkey, stop_order, lead_min,
+             (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
+      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled_all`, (SELECT * FROM inp))
+    ),
+    wc AS (
+      SELECT MAX(IF(processed_input = '__INTERCEPT__', weight, NULL)) AS b,
+             MAX(IF(processed_input = 'raw_logit', weight, NULL)) AS a
+      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`)
+    ),
+    wc_op AS (
+      SELECT cw.category AS operator, cw.weight AS w
+      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`),
+           UNNEST(category_weights) AS cw
+      WHERE processed_input = 'operator'
+    ),
+    wd AS (
+      SELECT MAX(IF(processed_input = '__INTERCEPT__', weight, NULL)) AS b,
+             MAX(IF(processed_input = 'raw_logit', weight, NULL)) AS a
+      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`)
+    ),
+    wd_op AS (
+      SELECT cw.category AS operator, cw.weight AS w
+      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
+           UNNEST(category_weights) AS cw
+      WHERE processed_input = 'operator'
+    ),
+    logits AS (
+      SELECT e.operator, e.lead_min, e.min_from_onset,
+             (e.call_cancelled OR COALESCE(e.dep_delay_pos, 0) >= 10) AS label_dep,
+             LN(GREATEST(LEAST(c.p_raw, 1 - 1e-6), 1e-6)
+                / (1 - GREATEST(LEAST(c.p_raw, 1 - 1e-6), 1e-6))) AS lc,
+             LN(GREATEST(LEAST(d.p_raw, 1 - 1e-6), 1e-6)
+                / (1 - GREATEST(LEAST(d.p_raw, 1 - 1e-6), 1e-6))) AS ld
+      FROM inp AS e
+      JOIN clf AS c USING (situationNumber, operator, jkey, stop_order, lead_min)
+      JOIN d10 AS d USING (situationNumber, operator, jkey, stop_order, lead_min)
+      WHERE NOT e.is_terminal AND (e.call_cancelled OR e.dep_delay_pos IS NOT NULL)
+    )
+    SELECT operator, lead_min, min_from_onset, label_dep,
+           ROUND(pc + (1 - pc) * pd, 4) AS p_impact_dep
+    FROM (
+      SELECT l.*,
+             1 / (1 + EXP(-(wc.b + wc.a * l.lc + IFNULL(wco.w, 0)))) AS pc,
+             1 / (1 + EXP(-(wd.b + wd.a * l.ld + IFNULL(wdo.w, 0)))) AS pd
+      FROM logits AS l
+      CROSS JOIN wc CROSS JOIN wd
+      LEFT JOIN wc_op AS wco USING (operator)
+      LEFT JOIN wd_op AS wdo USING (operator)
+    )
+    """
+    df_lead_all = client.query(_lq).to_dataframe()
+    df_lead_all["y"] = df_lead_all.label_dep.astype(bool)
+    df_lead_all["p"] = df_lead_all.p_impact_dep.astype(float)
+    f"{len(df_lead_all):,} rader ({df_lead_all.lead_min.nunique()} lead-varianter, {df_lead_all.operator.nunique()} operatører)"
+    return (df_lead_all,)
+
+
+@app.cell(hide_code=True)
+def _(df_lead_all, mo, pd, recall_at_precision):
+    _asks = [(-1, "melding"), (60, "60min"), (30, "30min")]
+    _rows = []
+    for _op, _d in df_lead_all.groupby("operator"):
+        _cohort = _d[_d.lead_min == 30]  # én rad per avgang
+        _n_imp = int(_cohort.y.sum())
+        _row = {"operator": _op, "rammede": _n_imp,
+                "tak ≥30": float((_cohort[_cohort.y].min_from_onset >= 30).mean()) if _n_imp else float("nan"),
+                "tak ≥60": float((_cohort[_cohort.y].min_from_onset >= 60).mean()) if _n_imp else float("nan")}
+        for _L, _navn in _asks:
+            _v = _d[_d.lead_min == _L]
+            if _L > 0:
+                _v = _v[_v.min_from_onset >= _L]
+            if len(_v) < 50 or _v.y.sum() < 5 or (~_v.y).sum() < 5:
+                _rec, _thr, _andel = float("nan"), float("nan"), float("nan")
+            else:
+                _rec, _thr = recall_at_precision(_v.y.to_numpy(), _v.p.to_numpy(), 0.90)
+                _andel = float((_v.y & (_v.p >= _thr)).sum() / _n_imp) if _rec == _rec else float("nan")
+            _row[f"dekning@90 {_navn}"] = _rec
+            _row[f"terskel {_navn}"] = _thr
+            _row[f"andel av alle {_navn}"] = _andel
+        _rows.append(_row)
+    lead_ops = pd.DataFrame(_rows).sort_values("rammede", ascending=False).reset_index(drop=True)
+    mo.vstack([
+        mo.md("### Varsling per operatør og spørretidspunkt (avgangssiden, 90 % presisjon)"),
+        lead_ops.style.format({c: "{:.3f}" for c in lead_ops.columns if c not in ("operator", "rammede")})
+            .background_gradient(subset=[c for c in lead_ops.columns if c.startswith("andel")],
+                                 cmap="RdYlGn", vmin=0, vmax=0.7),
+    ])
+    return (lead_ops,)
+
+
+@app.cell(hide_code=True)
+def _(lead_ops, np, plt):
+    _pl = lead_ops.dropna(subset=["andel av alle 30min"]).sort_values("andel av alle 30min")
+    _ypos = np.arange(len(_pl))
+    _fig, _ax = plt.subplots(figsize=(9.5, 0.42 * len(_pl) + 1.6))
+    _ax.barh(_ypos + 0.27, _pl["andel av alle melding"], height=0.25, color="#eda100", label="ved melding (plan)")
+    _ax.barh(_ypos, _pl["andel av alle 60min"], height=0.25, color="#1baf7a", label="60 min før avgang")
+    _ax.barh(_ypos - 0.27, _pl["andel av alle 30min"], height=0.25, color="#2a78d6", label="30 min før avgang")
+    _ax.plot(_pl["tak ≥30"], _ypos - 0.27, "|", color="#333333", ms=11, mew=1.6, label="tak: meldingen finnes")
+    _ax.plot(_pl["tak ≥60"], _ypos, "|", color="#333333", ms=11, mew=1.6)
+    _ax.set_yticks(_ypos)
+    _ax.set_yticklabels(_pl.operator)
+    _ax.set_xlabel("andel av ALLE rammede avganger varslet @ 90 % presisjon")
+    _ax.set_title("Hvor tidlig kan vi varsle, per operatør?", fontsize=11)
+    _ax.set_xlim(0, 1.0)
+    _ax.grid(True, axis="x", color="#e8e7e0", lw=0.7)
+    _ax.set_axisbelow(True)
+    _ax.spines["top"].set_visible(False)
+    _ax.spines["right"].set_visible(False)
+    _ax.legend(frameon=False, loc="lower right")
+    plt.tight_layout()
+    _fig
     return
 
 

@@ -29,6 +29,11 @@ codespaces on the ET side.
 - **Cost ≈ $3.7 total** (models+platts $2.43, bus_calls $0.57, training table $0.39,
   recon/eval ~$0.3); ~75 min wall, dominated by the 300-iteration cancel model (~25 min)
   and everything else in parallel beside it.
+- **Lead time is the real bus bottleneck, and it is per-operator message culture, not
+  the model** (see "Lead time" below): GOA/TRO can alert 30 min ahead for 77–86% of
+  impacted departures at 90% precision, NSB-like operators land ~25–50%, while
+  MOR/ATB/OST/GCO usually publish the SX only *after* the journey has left — for them
+  "alert at message arrival" is the only regime that exists.
 
 ## Who publishes what (SX side → ET side)
 
@@ -169,6 +174,82 @@ ATB .3783/.3664, OST .2676/.2525 — every operator within ~1.5 pt, mild uniform
   the rail pooled build; both families identically affected).
 - Jan 2026 GOA producer gap still under-counts that month's labels.
 
+## Lead time: how early can bus alerts fire?
+
+Port of the NSB lead-time analysis (`data/queries/leadtime_eval.sql`, commit 4ee02e2) to
+the pooled family: `data/queries/leadtime_eval_pooled_all.sql` re-anchors the two
+ask-time features (`own_prev_delay`, `line_now_*`) at L ∈ {30, 60, 120, 240} min before
+each holdout departure plus a plan-ahead "at message arrival" variant (sentinel
+features), scored with the `_pooled_all` cancel/dep_ge10 heads + operator-aware platts.
+The lead-30 variant reproduces the training anchoring with 0 mismatches (629,670 rows).
+Analysis lives in `eval/pooled-model-bus-eval.py` (lead-time section).
+
+**Ceiling first — when does the message even exist?** Journey-level census over the full
+window (SX creation vs the affected journey's origin departure, *including* messages
+that arrive after departure, which the training universe excludes):
+
+| operatør | median lead | msg after dep | ≥ 30 min | ≥ 60 min |
+|---|---|---|---|---|
+| GOA | +77 min | 21% | 64% | 55% |
+| NSB | +49 min | 31% | 57% | 47% |
+| TRO | +42 min | 36% | 54% | 46% |
+| FIN | +5 min | 47% | 40% | 33% |
+| RUT | −6 min | 56% | 34% | 32% |
+| NOR | +2 min | 44% | 34% | 31% |
+| MOR | −23 min | 72% | 18% | 13% |
+| SKY | 0 min | 50% | 8% | 7% |
+| ATB | −10 min | 67% | 9% | 6% |
+| SOF | +4 min | 37% | 4% | 3% |
+| KOL | +4 min | 33% | 2% | 1% |
+| OST | −19 min | 90% | 1% | 1% |
+| GCO | −19 min | 86% | 6% | 5% |
+
+Two publishing cultures: GOA/NSB/TRO (and partly FIN/RUT/NOR via planned route changes)
+announce ahead; KOL/SOF/SKY publish minutes before departure; MOR/ATB/OST/GCO mostly
+publish after the fact. No model fixes the second and third groups' 60-min alerting —
+the message doesn't exist yet.
+
+**Alerting at the three ask points** (holdout, dep-side, 90% precision; "share of ALL" =
+recall × ceiling within the message-before-call universe):
+
+| operatør | rammede | at message (plan) | 60 min før | 30 min før |
+|---|---|---|---|---|
+| GOA | 3,227 | 72% | 74% | **86%** |
+| TRO | 10,795 | 91% | 58% | **77%** |
+| FIN | 3,700 | 32% | 35% | 51% |
+| SOF | 18,499 | 72% | 18% | 50% |
+| SKY | 5,751 | 32% | 16% | 39% |
+| NSB | 46,354 | 31% | 15% | 36% |
+| NOR | 4,401 | 2% | 19% | 36% |
+| KOL | 26,935 | 2% | 15% | 31% |
+| RUT | 59,944 | **60%** | 2% | 25% |
+| MOR | 29,759 | 30% | 7% | 23% |
+| ATB | 1,211 | 91% | 4% | 22% |
+| OST | 437 | 5% | — | 1% |
+| GCO | 37 | (too few) | — | — |
+
+Reading it:
+
+- **GOA and TRO are better alerting targets than NSB itself** — planned-heavy message
+  culture × strong models. GOA: 86% of impacted departures alertable 30 min ahead.
+- **RUT inverts the pattern**: 60% coverage at message arrival but only 2% at 60 min —
+  its journey-scoped messages are reactive per-departure notices, so the right policy is
+  "alert the moment the SX lands", not fixed pre-departure horizons.
+- **KOL needs the near-departure realtime state**: plan-ahead coverage is ~2% (the
+  request-stop notices genuinely don't announce the outcome), rising to 31% at 30 min —
+  the propagation features do the work.
+- **ATB's 91% "at message" is survivor-conditioned**: the few messages that do precede a
+  call essentially announce a certainty; two thirds of its messages arrive too late to
+  be in the universe at all.
+- Thresholds for 90% precision vary by operator and horizon (0.32–0.93) — a fixed 0.65
+  does NOT give uniform precision across horizons; per-horizon platts (as built for NSB
+  serving, 9ff46b6/2e76400) would be needed per family before serving early alerts.
+
+**Policy that fits the data**: alert at SX arrival for everyone (catches RUT/ATB-style
+reactive notices immediately), then re-evaluate continuously toward departure — the same
+two-stage policy as the NSB analysis, which the 30/60-min columns show is per-operator
+gated by message culture, not model quality.
+
 ## Where this leaves the architecture
 
 The two builds together answer the pooling question with a size condition:
@@ -186,7 +267,7 @@ this eval suggests bus needs the rail rows.
 ## Not done — gates before any serving change
 
 Same list as the rail pooled build (per-ask-horizon platts, NSB/VYG-hard-coded serving
-path, lead-time analysis, promotion decision), plus:
+path, promotion decision — lead-time analysis is now done, see above), plus:
 
 - live serving for bus would need anshar TTL scans per codespace (last_recorded is a
   daily batch — training-only);
@@ -203,4 +284,5 @@ bq query --nouse_legacy_sql < data/queries/create_training_calls_pooled_all.sql 
 # train: run each statement as its own job (see file header)
 # calibrate: each statement its own job
 bq query --nouse_legacy_sql < data/queries/eval_pooled_all_models.sql
+bq query --nouse_legacy_sql < data/queries/leadtime_eval_pooled_all.sql   # ~$0.31
 ```
