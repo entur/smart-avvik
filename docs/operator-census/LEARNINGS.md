@@ -27,8 +27,13 @@ first; total census cost well under $1, no anshar full scans).
   historical build nearly free** (722 GB total, clustered by `dataSource`, one row per call,
   cancellation flags at 94% parity with `rail_calls`) — vs the ~10 TiB / $63 anshar scans.
   Training source only; live serving keeps the anshar TTL scan.
-- **SJN is blocked** (ET refs unparseable since Dec 2021; a train-number+date join recovers
-  only 65% of a tiny volume). **FLT** mostly publishes >7-day-validity messages that our
+- **SJN is blocked** (2026-07-05 re-check: its trains publish ET via dataSource **BNR**
+  with `<trainnr>:<date>` refs; an exact train-number+date join recovers **72%** over 12
+  months — the missing 28% are trains with NO ET record on the disruption date, i.e. the
+  planned-cancelled/bus-replaced departures the SX itself announces, so no join key —
+  time-based or otherwise — can recover them. `last_recorded` carries only SJN's `B…`
+  replacement buses, and that feed died 2026-05-13. 741 joinable journeys/yr ≈ 0.5% of
+  NSB's volume). **FLT** mostly publishes >7-day-validity messages that our
   duration cap drops. **GCO** — the biggest SX publisher at 122k situations/yr — turns out
   to be automated demand-responsive boat/ferry notices, not human disruption messages.
 
@@ -50,7 +55,7 @@ SX volumes from `disruptions.disruptions` (12 months to 2026-07-03); joins measu
 | TRO | Svipper (Troms) | 2,792 | 73% | ✓ | 98.3% | Joinable (bus project) |
 | FIN | Snelandia (Finnmark) | 1,357 | 92% | ✓ | 98.3% | Joinable (bus project) |
 | SKY | Skyss | 6,612 | 18% | ✓ | not measured | Partial refs only |
-| SJN | SJ Nord | 235 | 100% (`SJN:DatedServiceJourney:`) | ✗ ET legacy `<trainnr>:<date>`; no parseable refs in `last_recorded` since 2021-12-22 | 65% via train-number+date (45/69, 60 d) | **Blocked** — custom join possible, volume too small to justify |
+| SJN | SJ Nord | 235 | 100% (`SJN:DatedServiceJourney:`) | ✗ ET legacy `<trainnr>:<date>` via dataSource BNR; `last_recorded` has only `B…` replacement buses (feed dead 2026-05-13) | 72% via exact train-number+date (741/1,027, 12 mo); misses = no ET published that day (planned-cancelled trains), unrecoverable by any key | **Blocked** — custom join possible, volume too small to justify |
 | FLT | Flytoget | 1 in table; **204/30 d in raw SX** | 100% | ✓ (`ServiceJourney`) | not measured | 184/204 situations exceed the 7-day duration cap in `create_disruptions.sql` (long-validity info messages); ~20/30 d usable — marginal, single line |
 
 Label richness for the two viable candidates (affected/flagged calls vs operator baseline):
