@@ -232,9 +232,13 @@ def threshold_sweep(arr_eval, dep_eval, mo, np, pr_sweep):
     sweep_arr = pr_sweep(arr_eval.y.to_numpy(), arr_eval.p.to_numpy(), _ts)
     sweep_dep = pr_sweep(dep_eval.y.to_numpy(), dep_eval.p.to_numpy(), _ts)
     _no = {"threshold": "terskel", "alerts": "varsler", "precision": "presisjon", "recall": "dekning"}
+    # Bare DataFrames render as marimo's paginated table (default page_size 10), which only
+    # embeds the first 10 of 14 threshold rows in the static export. Wrap in mo.ui.table with
+    # page_size = row count so the whole sweep is baked in; selection=None drops the checkboxes.
+    _tbl = lambda df: mo.ui.table(df.round(3).rename(columns=_no), page_size=len(df), selection=None)
     mo.hstack([
-        mo.vstack([mo.md("**Ankomst — `p_impact`**"), sweep_arr.round(3).rename(columns=_no)]),
-        mo.vstack([mo.md("**Avgang — `p_impact_dep`**"), sweep_dep.round(3).rename(columns=_no)]),
+        mo.vstack([mo.md("**Ankomst — `p_impact`**"), _tbl(sweep_arr)]),
+        mo.vstack([mo.md("**Avgang — `p_impact_dep`**"), _tbl(sweep_dep)]),
     ], gap=2)
     return sweep_arr, sweep_dep
 

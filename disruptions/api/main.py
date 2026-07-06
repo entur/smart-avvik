@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from google.cloud import bigquery
 from google.cloud.bigquery import QueryJob
 from pydantic import BaseModel, Field
@@ -452,6 +453,18 @@ app.add_middleware(
     allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+# Pre-rendered marimo eval notebooks, served read-only at /eval (index at /eval/,
+# each notebook at /eval/<name>.html). They are static snapshots built offline by
+# export_eval.sh — outputs baked in — so serving them costs no BigQuery and starts no
+# kernel. The directory is generated (absent in a fresh checkout until exported), so
+# mount it only when present rather than failing startup.
+_EVAL_STATIC_DIR = Path(__file__).parent / "eval_static"
+if _EVAL_STATIC_DIR.is_dir():
+    app.mount("/eval", StaticFiles(directory=_EVAL_STATIC_DIR, html=True), name="eval")
+    logger.info("Mounted static eval notebooks at /eval from %s", _EVAL_STATIC_DIR)
+else:
+    logger.info("No eval_static/ directory; /eval not mounted (run export_eval.sh to build it)")
 
 
 def get_last_ingestion_time() -> datetime | None:

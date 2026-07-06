@@ -19,6 +19,13 @@ SERVICE_ACCOUNT="application@ent-kixavvik-dev.iam.gserviceaccount.com"
 # Run from the directory this script lives in (disruptions/api/).
 cd "$(dirname "$0")"
 
+# Render the eval notebooks to static HTML (runs their BigQuery cells under your ADC)
+# so the fresh snapshots ship in the deploy source and get served at /eval. Set
+# SKIP_EVAL_EXPORT=1 to reuse the existing eval_static/ (e.g. a code-only redeploy).
+if [ "${SKIP_EVAL_EXPORT:-}" != "1" ]; then
+  ./export_eval.sh
+fi
+
 gcloud run deploy "$SERVICE" \
   --source . \
   --project "$PROJECT" \

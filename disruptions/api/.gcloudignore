@@ -1,0 +1,12 @@
+# Controls what `gcloud run deploy --source .` uploads as build context.
+#
+# We intentionally do NOT `#!include:.gitignore` here: eval_static/ is gitignored
+# (it's generated), but it MUST ship so main.py can serve /eval. deploy.sh runs
+# export_eval.sh first to (re)build it. Everything else worth excluding is listed
+# explicitly below.
+.git
+.gcloudignore
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
