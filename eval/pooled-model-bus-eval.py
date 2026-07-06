@@ -30,7 +30,6 @@ def imports():
     import marimo as mo
     import numpy as np
     import pandas as pd
-    import seaborn as sns
     import matplotlib.pyplot as plt
     from google.cloud import bigquery
 
