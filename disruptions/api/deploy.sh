@@ -26,6 +26,12 @@ if [ "${SKIP_EVAL_EXPORT:-}" != "1" ]; then
   ./export_eval.sh
 fi
 
+# Build the journey-prediction demo UI (demo/reisedemo -> demo_static/, served at /demo).
+# Set SKIP_DEMO_BUILD=1 to reuse the existing demo_static/ (e.g. a backend-only redeploy).
+if [ "${SKIP_DEMO_BUILD:-}" != "1" ]; then
+  ../../demo/reisedemo/build.sh
+fi
+
 gcloud run deploy "$SERVICE" \
   --source . \
   --project "$PROJECT" \
