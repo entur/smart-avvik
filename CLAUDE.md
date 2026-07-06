@@ -38,6 +38,12 @@ gcloud run deploy kix-avvik-disruptions \
 - `--no-cpu-throttling`: keeps CPU allocated between requests so the poller keeps running.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - Service URL: https://kix-avvik-disruptions-305411154596.europe-west1.run.app
+- The partner demo UI at `/demo` (predictions vs realized outcomes for a chosen trip) lives in
+  `demo/reisedemo/` (React + Vite) and is built into `disruptions/api/demo_static/` by
+  `deploy.sh` (`SKIP_DEMO_BUILD=1` to skip). Its data is served by the `/demo-api` endpoints
+  from static tables built by `data/queries/create_demo_predictions.sql` — re-run that query
+  after model/calibration retrains. `data/queries/refresh_demo_recent.sh` extends the tables
+  with the last ~25 days straight from SIRI-ET/SX (run before a partner demo; ~$2).
 
 ## Conventions
 

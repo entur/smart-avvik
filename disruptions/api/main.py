@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -30,6 +30,24 @@ _ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text
 _RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.sql").read_text()
 _PREDICT_CALLS_QUERY = (Path(__file__).parent / "predict_calls.sql").read_text()
 _CALL_PREDICTIONS_QUERY = "SELECT * FROM `ent-kixavvik-dev.disruptions.call_predictions_today`"
+# /demo-api: retrospective journey search over the static demo tables
+# (built offline by data/queries/create_demo_predictions.sql).
+_DEMO_JOURNEYS_QUERY = (Path(__file__).parent / "demo_journeys.sql").read_text()
+_DEMO_STOPS_QUERY = """
+    SELECT stop_place, stop_name, n_calls
+    FROM `ent-kixavvik-dev.disruptions.demo_stops`
+    ORDER BY n_calls DESC
+"""
+_DEMO_HIGHLIGHTS_QUERY = """
+    SELECT situationNumber, summary, category, onset_ts, n_cancelled, n_delayed10,
+           window_start, window_end, from_stop, from_name, to_stop, to_name
+    FROM `ent-kixavvik-dev.disruptions.demo_highlights`
+    ORDER BY n_cancelled + n_delayed10 DESC
+"""
+_DEMO_WINDOW_QUERY = """
+    SELECT MIN(call_date) AS window_start, MAX(call_date) AS window_end
+    FROM `ent-kixavvik-dev.disruptions.demo_calls`
+"""
 
 # Hour-of-day in the impact lookup is Europe/Oslo local time (matches the table build),
 # so resolve "now" to the Oslo hour when looking up a profile.
@@ -464,6 +482,16 @@ if _EVAL_STATIC_DIR.is_dir():
     logger.info("Mounted static eval notebooks at /eval from %s", _EVAL_STATIC_DIR)
 else:
     logger.info("No eval_static/ directory; /eval not mounted (run export_eval.sh to build it)")
+
+# The journey-prediction demo UI (demo/reisedemo), built to static assets by its build script.
+# Same pattern as /eval: generated directory, mounted only when present. The data behind it is
+# served by the /demo-api endpoints below.
+_DEMO_STATIC_DIR = Path(__file__).parent / "demo_static"
+if _DEMO_STATIC_DIR.is_dir():
+    app.mount("/demo", StaticFiles(directory=_DEMO_STATIC_DIR, html=True), name="demo")
+    logger.info("Mounted demo UI at /demo from %s", _DEMO_STATIC_DIR)
+else:
+    logger.info("No demo_static/ directory; /demo not mounted (run demo/reisedemo/build.sh)")
 
 
 def get_last_ingestion_time() -> datetime | None:
@@ -1438,6 +1466,334 @@ async def alert_profile(
     if row is None:
         raise HTTPException(status_code=404, detail="No impact profile available (lookup not loaded).")
     return _alert_profile_model(row)
+
+
+# ---- /demo-api: retrospective "how good were the predictions?" journey demo -------------------
+# Serves the static demo dataset (temporal holdout 2026-04 -> 2026-06, NSB rail) built by
+# data/queries/create_demo_predictions.sql: for every SX-flagged call, the calibrated
+# predictions the models would have served at three ask times, next to the realized outcome.
+# The UI at /demo (demo/reisedemo, built into demo_static/) consumes these endpoints.
+
+# The alert decision shown in the demo: flag when P(cancelled OR >= 10 min late) crosses the
+# production operating threshold (>= 91 % precision at every ask horizon per eval/impact_eval.py).
+_DEMO_ALERT_THRESHOLD = 0.65
+# Realized outcome counts as "trouble" when the call was cancelled or >= 10 min late — the
+# same event the impact probability predicts.
+_DEMO_TROUBLE_DELAY_MIN = 10
+
+# The demo tables are near-static snapshots (extend_demo_recent.sql refreshes them on
+# demand), so their metadata (stop picker, scenario list, date window) is cached with a
+# TTL long enough to keep BigQuery traffic negligible but short enough that a dataset
+# refresh shows up without a redeploy. Guarded by its own lock.
+_DEMO_META_TTL_S = 30 * 60
+_demo_meta_lock = threading.Lock()
+_demo_meta_cache: "tuple[float, DemoMeta] | None" = None
+
+
+class DemoStop(BaseModel):
+    """A stop available in the demo dataset's journey search."""
+
+    stop_place: str = Field(description="NSR StopPlace ref.")
+    stop_name: str | None = Field(description="Human-readable stop name.")
+    n_calls: int = Field(description="Rail calls at this stop within the demo window.")
+
+
+class DemoHighlight(BaseModel):
+    """A pre-picked high-impact situation, with a suggested trip + window that showcases it."""
+
+    situation_number: str = Field(description="SIRI-SX situationNumber.")
+    summary: str | None = Field(description="First-version Norwegian summary of the situation.")
+    category: str | None = Field(description="Disruption category.")
+    onset: datetime = Field(description="When the SX message arrived (UTC).")
+    n_cancelled: int = Field(description="Realized cancelled calls among the flagged calls.")
+    n_delayed10: int = Field(description="Realized >= 10 min late (non-cancelled) flagged calls.")
+    window_start: datetime = Field(description="First affected departure (UTC).")
+    window_end: datetime = Field(description="Last affected departure (UTC).")
+    from_stop: str = Field(description="Suggested boarding StopPlace ref.")
+    from_name: str | None = Field(description="Suggested boarding stop name.")
+    to_stop: str = Field(description="Suggested alighting StopPlace ref.")
+    to_name: str | None = Field(description="Suggested alighting stop name.")
+
+
+class DemoMeta(BaseModel):
+    """Everything the demo UI needs to render its controls."""
+
+    window_start: date = Field(description="First date covered by the demo dataset.")
+    window_end: date = Field(description="Last date covered by the demo dataset.")
+    alert_threshold: float = Field(description="Impact-probability threshold behind `would_alert`.")
+    stops: list[DemoStop] = Field(description="Stops offered in the from/to pickers.")
+    highlights: list[DemoHighlight] = Field(description="One-click example scenarios, worst first.")
+
+
+class DemoSnapshot(BaseModel):
+    """The prediction as it stood at one ask time, plus how it compares to the outcome."""
+
+    cancel_probability: float = Field(description="Calibrated P(this call is cancelled), 0-1.")
+    ge10_probability: float | None = Field(description="Calibrated P(>= 10 min late | runs), 0-1.")
+    impact_probability: float | None = Field(
+        description="Calibrated P(cancelled OR >= 10 min late), 0-1 — the alerting score.",
+    )
+    delay_p50_min: int | None = Field(description="Median predicted delay (min) if the call runs.")
+    delay_p90_min: int | None = Field(description="Bad-case (p90) predicted delay (min).")
+    would_alert: bool = Field(
+        description="Whether this prediction crosses the alert threshold (see meta).",
+    )
+    verdict: str | None = Field(
+        description=(
+            "Prediction vs realized outcome: 'hit' (alerted, trouble came), 'correct_reject' "
+            "(no alert, no trouble), 'miss' (no alert, trouble came), 'false_alarm' (alerted, "
+            "no trouble). Null when the outcome is unknown."
+        ),
+    )
+
+
+class DemoSide(BaseModel):
+    """One end of the journey (boarding or alighting): outcome + the three ask-time snapshots."""
+
+    stop_place: str = Field(description="NSR StopPlace ref of this end.")
+    stop_name: str | None = Field(description="Stop name of this end.")
+    scheduled_time: datetime = Field(description="Aimed departure (boarding) / arrival (alighting), UTC.")
+    actual_cancelled: bool = Field(description="Whether this call was cancelled.")
+    actual_delay_min: int | None = Field(
+        description="Realized delay in whole minutes (negative = early); null if unobserved.",
+    )
+    actual_trouble: bool | None = Field(
+        description="Realized outcome: cancelled OR >= 10 min late. Null when unknown.",
+    )
+    minutes_from_onset: int | None = Field(
+        description=(
+            "Minutes from SX message arrival to this call's aimed time — how much warning was "
+            "possible. Null when no situation flagged the journey."
+        ),
+    )
+    at_message: DemoSnapshot | None = Field(
+        description="Prediction at SX message arrival (no observable train state yet).",
+    )
+    t60: DemoSnapshot | None = Field(
+        description="Prediction 60 min before the call; null if the SX arrived later than that.",
+    )
+    t30: DemoSnapshot | None = Field(
+        description="Prediction 30 min before the call; null if the SX arrived later than that.",
+    )
+
+
+class DemoSituation(BaseModel):
+    """The SX situation whose predictions are shown for this journey (most severe if several)."""
+
+    situation_number: str = Field(description="SIRI-SX situationNumber.")
+    summary: str | None = Field(description="First-version Norwegian summary.")
+    category: str | None = Field(description="Disruption category.")
+    onset: datetime | None = Field(description="When the SX message arrived (UTC).")
+
+
+class DemoJourney(BaseModel):
+    """One matching journey: departure predictions/outcome left, arrival right."""
+
+    journey_ref: str = Field(description="Dated journey key (jkey).")
+    line: str | None = Field(description="Line ref, e.g. 'NSB:Line:L1'.")
+    situation: DemoSituation | None = Field(
+        description="The situation behind the predictions; null if nothing flagged this journey.",
+    )
+    departure: DemoSide = Field(description="Boarding stop: outcome + ask-time snapshots.")
+    arrival: DemoSide = Field(description="Alighting stop: outcome + ask-time snapshots.")
+
+
+class DemoJourneysResponse(BaseModel):
+    """Journeys from `from_stop` to `to_stop` departing within [start, end]."""
+
+    from_stop: str = Field(description="Boarding StopPlace ref queried.")
+    to_stop: str = Field(description="Alighting StopPlace ref queried.")
+    start: datetime = Field(description="Window start (UTC).")
+    end: datetime = Field(description="Window end (UTC).")
+    count: int = Field(description="Number of journeys returned.")
+    journeys: list[DemoJourney] = Field(description="Matching journeys, earliest departure first.")
+
+
+def _demo_actual_trouble(cancelled: bool, delay_min: int | None) -> bool | None:
+    """Realized 'trouble' = cancelled or >= 10 min late; None when the delay was unobserved."""
+    if cancelled:
+        return True
+    if delay_min is None:
+        return None
+    return delay_min >= _DEMO_TROUBLE_DELAY_MIN
+
+
+def _demo_snapshot(row, side: str, lead: str, actual_trouble: bool | None) -> DemoSnapshot | None:
+    """Build one ask-time snapshot from the flat demo_journeys.sql row; None if unavailable
+    (no situation, or the SX message had not yet arrived at this ask time)."""
+    p_cancel = row[f"{side}_{lead}_p_cancel"]
+    if p_cancel is None:
+        return None
+    p_impact = row[f"{side}_{lead}_p_impact"]
+    would_alert = p_impact is not None and p_impact >= _DEMO_ALERT_THRESHOLD
+    verdict = None
+    if actual_trouble is not None:
+        verdict = (
+            ("hit" if actual_trouble else "false_alarm")
+            if would_alert
+            else ("miss" if actual_trouble else "correct_reject")
+        )
+    return DemoSnapshot(
+        cancel_probability=p_cancel,
+        ge10_probability=row[f"{side}_{lead}_p_ge10"],
+        impact_probability=p_impact,
+        delay_p50_min=row[f"{side}_{lead}_p50"],
+        delay_p90_min=row[f"{side}_{lead}_p90"],
+        would_alert=would_alert,
+        verdict=verdict,
+    )
+
+
+def _demo_side(row, side: str, stop_place: str, stop_name, scheduled, cancelled: bool,
+               delay_min: int | None) -> DemoSide:
+    """Assemble one end of a journey: realized outcome + the three ask-time snapshots."""
+    actual_trouble = _demo_actual_trouble(cancelled, delay_min)
+    return DemoSide(
+        stop_place=stop_place,
+        stop_name=stop_name,
+        scheduled_time=scheduled,
+        actual_cancelled=cancelled,
+        actual_delay_min=delay_min,
+        actual_trouble=actual_trouble,
+        minutes_from_onset=row[f"{side}_min_from_onset"],
+        at_message=_demo_snapshot(row, side, "onset", actual_trouble),
+        t60=_demo_snapshot(row, side, "l60", actual_trouble),
+        t30=_demo_snapshot(row, side, "l30", actual_trouble),
+    )
+
+
+def get_demo_meta() -> DemoMeta:
+    """Load and serve the demo dataset's metadata: window, stops, highlight scenarios."""
+    global _demo_meta_cache
+    with _demo_meta_lock:
+        if _demo_meta_cache is not None and time.monotonic() - _demo_meta_cache[0] < _DEMO_META_TTL_S:
+            return _demo_meta_cache[1]
+    window = next(iter(bq_client.query(_DEMO_WINDOW_QUERY).result()))
+    if window.window_start is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Demo dataset not built (run data/queries/create_demo_predictions.sql).",
+        )
+    stops = [
+        DemoStop(stop_place=r.stop_place, stop_name=r.stop_name, n_calls=r.n_calls)
+        for r in bq_client.query(_DEMO_STOPS_QUERY).result()
+    ]
+    highlights = [
+        DemoHighlight(
+            situation_number=r.situationNumber,
+            summary=r.summary,
+            category=r.category,
+            onset=r.onset_ts,
+            n_cancelled=r.n_cancelled,
+            n_delayed10=r.n_delayed10,
+            window_start=r.window_start,
+            window_end=r.window_end,
+            from_stop=r.from_stop,
+            from_name=r.from_name,
+            to_stop=r.to_stop,
+            to_name=r.to_name,
+        )
+        for r in bq_client.query(_DEMO_HIGHLIGHTS_QUERY).result()
+    ]
+    meta = DemoMeta(
+        window_start=window.window_start,
+        window_end=window.window_end,
+        alert_threshold=_DEMO_ALERT_THRESHOLD,
+        stops=stops,
+        highlights=highlights,
+    )
+    with _demo_meta_lock:
+        _demo_meta_cache = (time.monotonic(), meta)
+    return meta
+
+
+@app.get(
+    "/demo-api/meta",
+    summary="Demo dataset metadata: date window, stops, example scenarios",
+    response_description="Window, stop picker entries and one-click highlight scenarios.",
+    tags=["demo"],
+)
+async def demo_meta() -> DemoMeta:
+    """Metadata for the /demo UI's controls.
+
+    The demo dataset is a static snapshot of the models' temporal holdout (no retraining data):
+    every prediction shown was computed with only information available at the stated ask time,
+    and outcomes are the realized SIRI-ET delays/cancellations. Cached in-process after the
+    first call.
+    """
+    return get_demo_meta()
+
+
+@app.get(
+    "/demo-api/journeys",
+    summary="Journeys between two stops with ask-time predictions vs realized outcome",
+    response_description="Matching journeys, each with departure and arrival sides.",
+    tags=["demo"],
+)
+async def demo_journeys(
+    from_stop: str = Query(description="Boarding StopPlace ref (NSR:StopPlace:...)."),
+    to_stop: str = Query(description="Alighting StopPlace ref (NSR:StopPlace:...)."),
+    start: datetime = Query(description="Window start for the departure time (ISO 8601, naive = UTC)."),
+    end: datetime = Query(description="Window end for the departure time (ISO 8601, naive = UTC)."),
+) -> DemoJourneysResponse:
+    """All journeys departing `from_stop` within [start, end] that later call at `to_stop`.
+
+    For each journey, both ends carry the realized outcome and — when an SX situation flagged
+    it — the calibrated predictions as they stood at message arrival, 60 min and 30 min before
+    the call (each later ask time only exists when the message had arrived by then). Journeys
+    no situation flagged are returned too, with `situation: null`: the models only score
+    SX-flagged calls, so "no prediction" is itself the served answer.
+    """
+    if from_stop == to_stop:
+        raise HTTPException(status_code=400, detail="from_stop and to_stop must differ.")
+    start_utc = start if start.tzinfo is not None else start.replace(tzinfo=timezone.utc)
+    end_utc = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+    if end_utc <= start_utc:
+        raise HTTPException(status_code=400, detail="end must be after start.")
+    if end_utc - start_utc > timedelta(days=7):
+        raise HTTPException(status_code=400, detail="Window too wide; keep it within 7 days.")
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("from_stop", "STRING", from_stop),
+            bigquery.ScalarQueryParameter("to_stop", "STRING", to_stop),
+            bigquery.ScalarQueryParameter("start_ts", "TIMESTAMP", start_utc),
+            bigquery.ScalarQueryParameter("end_ts", "TIMESTAMP", end_utc),
+        ],
+    )
+    rows = bq_client.query(_DEMO_JOURNEYS_QUERY, job_config=job_config).result()
+    journeys = []
+    for r in rows:
+        situation = None
+        if r.situationNumber is not None:
+            situation = DemoSituation(
+                situation_number=r.situationNumber,
+                summary=r.summary,
+                category=r.category,
+                onset=r.onset_ts,
+            )
+        journeys.append(
+            DemoJourney(
+                journey_ref=r.jkey,
+                line=r.lineRef,
+                situation=situation,
+                departure=_demo_side(
+                    r, "dep", r.from_stop, r.from_name, r.from_aimed_dep,
+                    r.act_dep_cancelled, r.act_dep_delay_min,
+                ),
+                arrival=_demo_side(
+                    r, "arr", r.to_stop, r.to_name, r.to_aimed_arr,
+                    r.act_arr_cancelled, r.act_arr_delay_min,
+                ),
+            )
+        )
+    return DemoJourneysResponse(
+        from_stop=from_stop,
+        to_stop=to_stop,
+        start=start_utc,
+        end=end_utc,
+        count=len(journeys),
+        journeys=journeys,
+    )
 
 
 @app.get(
