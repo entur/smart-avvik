@@ -44,7 +44,7 @@ def bq_client(bigquery):
 
 
 @app.cell
-def score_holdout(client):
+def score_holdout(client, mo):
     # Radnivå-skåring av pooled_all-familien på holdout (samme pipeline som
     # eval_pooled_all_models.sql, men returnerer rader i stedet for aggregater).
     _q = """
@@ -124,7 +124,10 @@ def score_holdout(client):
     scored = client.query(_q).to_dataframe()
     scored["p_impact_arr"] = scored["p_cancel"] + (1 - scored["p_cancel"]) * scored["p_a10"]
     scored["p_impact_dep"] = scored["p_cancel"] + (1 - scored["p_cancel"]) * scored["p_d10"]
-    scored.groupby("operator").size().rename("holdout-rader").to_frame()
+    # Bare DataFrames paginate at 10 rows, so the static export would only embed 10 of the
+    # 13 operators — same fix as impact_eval.py: page_size = row count, selection=None.
+    _counts = scored.groupby("operator").size().rename("holdout-rader").reset_index()
+    mo.ui.table(_counts, page_size=len(_counts), selection=None)
     return (scored,)
 
 
