@@ -33,7 +33,6 @@ def imports():
     import marimo as mo
     import numpy as np
     import pandas as pd
-    import seaborn as sns
     import matplotlib.pyplot as plt
     from google.cloud import bigquery
 
@@ -366,9 +365,11 @@ def gate_tables(fam_metrics, mo, pd):
 
     _nsb = _delta_table("NSB", "pooled", "prod")
     _goa = _delta_table("GOA", "pooled", "zeroshot")
-    _sty = lambda t, lim: t.style.format("{:+.4f}", subset=[c for c in t.columns if c.startswith("Δ")])\
-        .format("{:.4f}", subset=[c for c in t.columns if not c.startswith("Δ")])\
-        .background_gradient(subset=[c for c in t.columns if c.startswith("Δ")], cmap="RdYlGn", vmin=-lim, vmax=lim)
+
+    def _sty(t, lim):
+        return t.style.format("{:+.4f}", subset=[c for c in t.columns if c.startswith("Δ")]) \
+            .format("{:.4f}", subset=[c for c in t.columns if not c.startswith("Δ")]) \
+            .background_gradient(subset=[c for c in t.columns if c.startswith("Δ")], cmap="RdYlGn", vmin=-lim, vmax=lim)
     mo.vstack([
         mo.md("**NSB: paritets-gaten** (Δ = pooled − prod; skal være ~0)"),
         _sty(_nsb, 0.02),
