@@ -18,7 +18,10 @@ function lineCode(line: string | null): string {
 
 function Actual({ side }: { side: DemoSide }) {
   if (side.actual_cancelled) return <span className="chip chip-red">Innstilt</span>;
-  if (side.actual_delay_min === null) return <span className="chip chip-muted">Ukjent utfall</span>;
+  if (side.actual_delay_min === null) {
+    const future = side.scheduled_time !== null && new Date(side.scheduled_time).getTime() > Date.now();
+    return <span className="chip chip-muted">{future ? 'Ikke kjørt ennå' : 'Ukjent utfall'}</span>;
+  }
   if (side.actual_delay_min >= 10)
     return <span className="chip chip-red">+{side.actual_delay_min} min</span>;
   if (side.actual_delay_min >= 3)

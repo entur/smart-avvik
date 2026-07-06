@@ -15,12 +15,19 @@ for partnere med egne designspråk.
 
 ## Data
 
-Statisk snapshot av modellenes temporale holdout (NSB-tog, 1. apr – 20. jun 2026): alle
-tall er utenfor treningsdataene. Bygges av `data/queries/create_demo_predictions.sql`
-(tabellene `disruptions.demo_predictions`, `demo_calls`, `demo_stops`,
-`demo_highlights`), som gjenbruker `leadtime_scored` + per-horisont-platt-lagene og
-speiler serveringsmatematikken i `disruptions/api/predict_calls.sql`. Kjør spørringen på
-nytt etter modell-/kalibreringsretrening for å oppdatere demoen.
+To lag, samme tabeller (`disruptions.demo_predictions`, `demo_calls`, `demo_stops`,
+`demo_highlights`) — alle tall er utenfor treningsdataene:
+
+- **Holdout** (NSB-tog, 1. apr – 20. jun 2026): bygges av
+  `data/queries/create_demo_predictions.sql`, som gjenbruker `leadtime_scored` +
+  per-horisont-platt-lagene og speiler serveringsmatematikken i
+  `disruptions/api/predict_calls.sql`. Kjør på nytt etter
+  modell-/kalibreringsretrening (da må også recent-laget kjøres på nytt).
+- **Ferske dager** (siste ~25 dager, t.o.m. i dag): `data/queries/refresh_demo_recent.sh`
+  (kjører `extend_demo_recent.sql`, ~$2) henter realiserte avganger rett fra SIRI-ET/SX,
+  regner ut featurene på nytt forankret ved spørretidspunktene og scorer alle ni hodene.
+  Kjør før en partnerdemo; kjøringer inntil ~3 uker fra hverandre holder vinduet tett.
+  API-et plukker opp det nye vinduet innen ~30 min (metadata-cache) uten redeploy.
 
 ## Kjøre lokalt
 

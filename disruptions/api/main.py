@@ -1482,10 +1482,13 @@ _DEMO_ALERT_THRESHOLD = 0.65
 # same event the impact probability predicts.
 _DEMO_TROUBLE_DELAY_MIN = 10
 
-# The demo tables are static snapshots, so their metadata (stop picker, scenario list, date
-# window) is fetched once and cached for the process lifetime. Guarded by its own lock.
+# The demo tables are near-static snapshots (extend_demo_recent.sql refreshes them on
+# demand), so their metadata (stop picker, scenario list, date window) is cached with a
+# TTL long enough to keep BigQuery traffic negligible but short enough that a dataset
+# refresh shows up without a redeploy. Guarded by its own lock.
+_DEMO_META_TTL_S = 30 * 60
 _demo_meta_lock = threading.Lock()
-_demo_meta_cache: "DemoMeta | None" = None
+_demo_meta_cache: "tuple[float, DemoMeta] | None" = None
 
 
 class DemoStop(BaseModel):
@@ -1661,11 +1664,11 @@ def _demo_side(row, side: str, stop_place: str, stop_name, scheduled, cancelled:
 
 
 def get_demo_meta() -> DemoMeta:
-    """Load (once) and serve the demo dataset's metadata: window, stops, highlight scenarios."""
+    """Load and serve the demo dataset's metadata: window, stops, highlight scenarios."""
     global _demo_meta_cache
     with _demo_meta_lock:
-        if _demo_meta_cache is not None:
-            return _demo_meta_cache
+        if _demo_meta_cache is not None and time.monotonic() - _demo_meta_cache[0] < _DEMO_META_TTL_S:
+            return _demo_meta_cache[1]
     window = next(iter(bq_client.query(_DEMO_WINDOW_QUERY).result()))
     if window.window_start is None:
         raise HTTPException(
@@ -1701,7 +1704,7 @@ def get_demo_meta() -> DemoMeta:
         highlights=highlights,
     )
     with _demo_meta_lock:
-        _demo_meta_cache = meta
+        _demo_meta_cache = (time.monotonic(), meta)
     return meta
 
 

@@ -42,7 +42,8 @@ gcloud run deploy kix-avvik-disruptions \
   `demo/reisedemo/` (React + Vite) and is built into `disruptions/api/demo_static/` by
   `deploy.sh` (`SKIP_DEMO_BUILD=1` to skip). Its data is served by the `/demo-api` endpoints
   from static tables built by `data/queries/create_demo_predictions.sql` — re-run that query
-  after model/calibration retrains.
+  after model/calibration retrains. `data/queries/refresh_demo_recent.sh` extends the tables
+  with the last ~25 days straight from SIRI-ET/SX (run before a partner demo; ~$2).
 
 ## Conventions
 
