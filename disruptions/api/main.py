@@ -991,6 +991,7 @@ def _to_disruption(d: _CachedDisruption, now: datetime) -> Disruption:
     summary="List today's active and recently-reopened disruptions",
     response_description="Disruptions with reopen/impact estimates as minutes from `as_of`",
     tags=["disruptions"],
+    deprecated=True,
 )
 async def disruptions(
     at: datetime | None = Query(
@@ -1005,7 +1006,10 @@ async def disruptions(
         ),
     ),
 ) -> DisruptionsResponse:
-    """List today's disruptions (still-ongoing and recently reopened), each with reopen and
+    """**Deprecated:** use `/impact` (a passenger's trip) or `/journey` (a specific train) for
+    per-train cancellation and delay predictions instead.
+
+    List today's disruptions (still-ongoing and recently reopened), each with reopen and
     impact estimates as **minutes from now**.
 
     Reopened disruptions are kept in the response and flagged (`reopened: true`) because impact
@@ -1055,13 +1059,17 @@ async def disruptions(
     summary="Render a single disruption by its SIRI-SX situationNumber",
     response_description="The disruption with reopen/impact estimates as minutes from `as_of`.",
     tags=["disruptions"],
+    deprecated=True,
 )
 async def situation(
     id: str = Query(
         description="SIRI-SX situationNumber to render, e.g. 'ENT:SituationNumber:1234'.",
     ),
 ) -> Disruption:
-    """Render a single disruption identified by its `situationNumber`.
+    """**Deprecated:** use `/impact?situation=...` for the per-train impact of a single
+    situation instead.
+
+    Render a single disruption identified by its `situationNumber`.
 
     Unlike /disruptions — which only surfaces alert-worthy situations — this returns the
     requested situation regardless of alert tier, reconstructed from SIRI-SX as of now (the
@@ -1398,6 +1406,7 @@ async def impact(
     summary="Historical impact profile for a category (optionally a line and hour)",
     response_description="The most specific impact profile with enough data, after back-off.",
     tags=["disruptions"],
+    deprecated=True,
 )
 async def alert_profile(
     category: str = Query(description="Disruption category, e.g. 'infrastruktur/signal'."),
@@ -1415,7 +1424,10 @@ async def alert_profile(
         ),
     ),
 ) -> AlertProfile:
-    """Look up the historical impact profile for a (category, line, hour) cell.
+    """**Deprecated:** use the calibrated per-train `impact_probability` served by `/impact`
+    and `/journey` to decide whether to alert, instead of these historical category profiles.
+
+    Look up the historical impact profile for a (category, line, hour) cell.
 
     Backs off to coarser cells when the specific one is too sparse — drop the hour, then the
     line, finally the global row — so a result is (almost) always returned. Check `grain` /
