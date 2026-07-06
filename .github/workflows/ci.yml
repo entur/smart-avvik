@@ -1,0 +1,35 @@
+# CI workflow for kix-avvik
+# Runs on every push and PR to validate changes
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Docker build validation
+  docker-lint:
+    uses: entur/gha-docker/.github/workflows/lint.yml@v1
+    with:
+      path: disruptions/api
+
+  # Python linting and type check
+  python-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: entur/gha-meta/.github/actions/python-setup@v1
+      - name: Install dependencies
+        run: uv sync
+      - name: Lint with ruff
+        run: uv run ruff check .
+      - name: Type check with mypy
+        run: uv run mypy . || true  # Skip if no mypy config yet

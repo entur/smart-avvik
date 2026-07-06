@@ -1,0 +1,34 @@
+# PR verification workflow for kix-avvik
+# Validates pull request metadata and runs CI checks
+
+name: PR Verification
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Verify PR metadata (title, body, labels)
+  verify-pr:
+    uses: entur/gha-meta/.github/workflows/verify-pr.yml@v1
+
+  # Lint Helm charts
+  helm-lint:
+    uses: entur/gha-helm/.github/workflows/lint.yml@v1
+    with:
+      chart: helm/kix-avvik
+
+  # Run unit tests (if any)
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: entur/gha-meta/.github/actions/python-setup@v1
+      - name: Run tests
+        run: |
+          echo "No unit tests configured yet"

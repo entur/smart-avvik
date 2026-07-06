@@ -1,0 +1,28 @@
+# Base values for kix-avvik Helm chart
+# Copy this file to env/values-kub-ent-{env}.yaml and override environment-specific settings
+
+common:
+  # Application identity - must match .entur/application.yaml metadata.name
+  app: kix-avvik
+  shortname: kixavvik
+  team: team-ki-eksperimentering
+
+  # Container image - set via CI/CD (overridden in deploy workflow)
+  container:
+    image: PLACEHOLDER_IMAGE
+    cpu: 0.5
+    memory: 1024
+    memoryLimit: 2048
+    # Health check port matches Cloud Run's PORT env var
+    internalPort: 8080
+
+  # Ingress configuration - override per environment in env/values-*.yaml
+  ingress:
+    enabled: true
+    trafficType: public  # Public API for disruption information
+
+  # ConfigMap for environment variables
+  configmap:
+    enabled: true
+    data:
+      PYTHONUNBUFFERED: "1"
