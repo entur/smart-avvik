@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from google.cloud import bigquery
-from google.cloud.bigquery import QueryJob
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)

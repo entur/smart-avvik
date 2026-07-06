@@ -1,0 +1,12 @@
+apiVersion: v2
+name: kix-avvik
+description: KIX Proaktivt avvik - Predict disruption duration from SIRI-SX messages
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+
+dependencies:
+  - name: common
+    version: "1.22.0"
+    repository: "https://entur.github.io/helm-charts"
+    alias: common

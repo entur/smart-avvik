@@ -1,0 +1,22 @@
+# PR Verification Workflow
+#
+# Validates pull request metadata (title, body, labels, etc.) against Entur
+# conventions. Runs on every PR event -- including edits to the title/body --
+# so developers get immediate feedback. Code and chart checks run in build.yml.
+
+name: PR Verification
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-pr:
+    name: Verify PR
+    if: ${{ github.event_name == 'pull_request' }}
+    uses: entur/gha-meta/.github/workflows/verify-pr.yml@v1

@@ -13,3 +13,6 @@ disruptions/api/eval_static/
 disruptions/api/demo_static/
 demo/reisedemo/node_modules/
 demo/reisedemo/tsconfig.tsbuildinfo
+
+# Helm dependency archives (re-fetched by `helm dependency update`; Chart.lock is committed)
+helm/**/charts/

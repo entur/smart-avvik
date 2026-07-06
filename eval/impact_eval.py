@@ -33,7 +33,6 @@ def imports():
     import marimo as mo
     import numpy as np
     import pandas as pd
-    import seaborn as sns
     import matplotlib.pyplot as plt
     from google.cloud import bigquery
 
@@ -235,7 +234,8 @@ def threshold_sweep(arr_eval, dep_eval, mo, np, pr_sweep):
     # Bare DataFrames render as marimo's paginated table (default page_size 10), which only
     # embeds the first 10 of 14 threshold rows in the static export. Wrap in mo.ui.table with
     # page_size = row count so the whole sweep is baked in; selection=None drops the checkboxes.
-    _tbl = lambda df: mo.ui.table(df.round(3).rename(columns=_no), page_size=len(df), selection=None)
+    def _tbl(df):
+        return mo.ui.table(df.round(3).rename(columns=_no), page_size=len(df), selection=None)
     mo.hstack([
         mo.vstack([mo.md("**Ankomst — `p_impact`**"), _tbl(sweep_arr)]),
         mo.vstack([mo.md("**Avgang — `p_impact_dep`**"), _tbl(sweep_dep)]),

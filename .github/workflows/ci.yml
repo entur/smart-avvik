@@ -1,0 +1,88 @@
+# Continuous Integration Workflow
+#
+# This is a reusable workflow (workflow_call) -- it is NOT triggered directly
+# by events. It is called by build.yml (on PRs) and cd.yml (on push to main,
+# or workflow_dispatch without a pre-built image).
+#
+# Pipeline:
+#   1. Lint (parallel)   -- Dockerfile (hadolint) and Helm chart per environment
+#   2. Test              -- ruff lint in a uv-managed environment
+#   3. Docker build      -- build the image from disruptions/api
+#   4. Docker scan/push  -- scan for vulnerabilities and push to the registry (parallel)
+#
+# The output `image_and_tag` is passed back to the caller (cd.yml) so it
+# knows which image to deploy.
+
+name: CI
+
+on:
+  workflow_call:
+    outputs:
+      image_and_tag:
+        description: Fully qualified image reference
+        value: ${{ jobs.docker-push.outputs.image_and_tag }}
+
+jobs:
+  # --- Linting (runs in parallel with test) ---
+
+  docker-lint:
+    uses: entur/gha-docker/.github/workflows/lint.yml@v1
+    with:
+      dockerfile: disruptions/api/Dockerfile
+
+  # Helm charts are linted per environment to catch env-specific value errors
+  helm-lint:
+    strategy:
+      matrix:
+        environment: [dev, tst, prd]
+    uses: entur/gha-helm/.github/workflows/lint.yml@v1
+    with:
+      chart: helm/kix-avvik
+      environment: ${{ matrix.environment }}
+      values: values-kub-ent-${{ matrix.environment }}.yaml
+
+  # --- Build and Test ---
+
+  test:
+    if: github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+      - name: Install uv
+        run: pip install uv
+      - name: Install dependencies
+        run: uv sync
+      - name: Lint with ruff
+        run: uv run ruff check .
+
+  # --- Docker Build, Scan, and Push ---
+  # Only runs after all lints and tests pass to avoid wasting resources on broken builds
+
+  docker:
+    needs: [test, docker-lint, helm-lint]
+    uses: entur/gha-docker/.github/workflows/build.yml@v1
+    with:
+      # The image is self-contained in disruptions/api (main.py + *.sql +
+      # requirements.txt); both paths are relative to the repository root.
+      context: disruptions/api
+      dockerfile: disruptions/api/Dockerfile
+
+  # Scan and push run in parallel -- a vulnerability finding does not block the
+  # push, but the scan results are available for review on the PR
+  docker-scan:
+    needs: [docker]
+    uses: entur/gha-security/.github/workflows/docker-scan.yml@v2
+    secrets: inherit
+    with:
+      image_artifact: ${{ needs.docker.outputs.image_artifact }}
+
+  docker-push:
+    needs: [docker]
+    uses: entur/gha-docker/.github/workflows/push.yml@v1
+    secrets: inherit
