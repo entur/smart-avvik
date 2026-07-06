@@ -56,6 +56,27 @@ publishers (NOR + GCO) that fold into one network. Rail keeps `operator` = parti
 (NSB→rail_calls/VYG, GOA) exactly as in the rail-only pooled build. BRA/BFO/TEL/VKT
 codespaces were dropped (<1k refs combined; BRA alone would add 24M call rows).
 
+### Why SJN is not in the pool
+
+SJN publishes SX fine (~235 situations/yr, 100% `SJN:DatedServiceJourney:` refs), but the
+label side is blocked — deep-dived 2026-07-05 (details in
+[the operator census](../operator-census/LEARNINGS.md)):
+
+- **`last_recorded` — this family's training source — has no SJN trains at all**: only
+  its `B…`-prefixed rail-replacement buses, and even that feed died 2026-05-13. SJN's
+  trains publish ET via dataSource **BNR** (Bane NOR) with legacy `<trainnr>:<date>`
+  refs, so labels would need anshar scans, unlike every operator in the pool.
+- **An exact train-number+date join against BNR-ET recovers 72%** (741/1,027 dated
+  journeys over 12 months). The remaining 28% have **no ET record on the disruption
+  date at all** — these are the planned-cancelled/bus-replaced departures the SX itself
+  announces. No join key (aimed-time-based or otherwise) can recover a record that was
+  never published, and a date-tolerant join would match the wrong day's healthy train
+  and poison the labels.
+- **Volume kills it**: 741 joinable journeys/yr ≈ 0.5% of NSB's ref volume, and the
+  joinable set systematically excludes announced cancellations — the label-richest
+  slice. If SJN ever becomes a product priority: exact `trainnr+date` against BNR-ET,
+  labels from `estimatedCalls`, partition-pruned to the ~200 disruption dates/yr.
+
 ## What was built
 
 | Artifact | Script | Notes |
