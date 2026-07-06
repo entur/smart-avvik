@@ -26,7 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
-        uses: entur/gha-meta/.github/actions/python-setup@v1
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        run: pip install uv
       - name: Install dependencies
         run: uv sync
       - name: Lint with ruff
