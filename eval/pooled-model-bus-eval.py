@@ -7,7 +7,7 @@ app = marimo.App(width="medium")
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # Pooled buss-modeller — evaluering
+    # Hvor bra er varslene? (Alle operatører)
 
     **Kort fortalt:** den all-operatør-poolede modellfamilien (`*_pooled_all`, 13 operatører:
     NSB/GOA på skinner + KOL, SOF, NOR, SKY, ATB, OST, FIN, MOR, RUT, TRO, GCO på buss/lokal)

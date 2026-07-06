@@ -7,7 +7,7 @@ app = marimo.App(width="medium")
 @app.cell(hide_code=True)
 def _(mo):
     mo.md("""
-    # Impact-evaluering
+    # Hvor bra er varslene? (kun Vy tog)
 
     **Kort fortalt:** mens en avviksmelding er aktiv — hvor godt klarer vi å forutsi hvilke
     stopp passasjerene faktisk vil merke det på: et innstilt tog, eller et tog som er
