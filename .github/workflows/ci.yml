@@ -14,11 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Docker build validation
+  # Docker linting
   docker-lint:
     uses: entur/gha-docker/.github/workflows/lint.yml@v1
     with:
-      path: disruptions/api
+      context: disruptions/api
 
   # Python linting and type check
   python-check:
