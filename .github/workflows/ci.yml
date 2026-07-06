@@ -18,7 +18,7 @@ jobs:
   docker-lint:
     uses: entur/gha-docker/.github/workflows/lint.yml@v1
     with:
-      context: disruptions/api
+      dockerfile: disruptions/api/Dockerfile
 
   # Python linting and type check
   python-check:
