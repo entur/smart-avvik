@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { Modal } from '@entur/modal';
 import { SearchableDropdown, type NormalizedDropdownItemType } from '@entur/dropdown';
 import { TextField } from '@entur/form';
-import { FilterChip } from '@entur/chip';
+import { ChoiceChip, ChoiceChipGroup, FilterChip } from '@entur/chip';
+import { BusIcon, TrainIcon } from '@entur/icons';
 import { PrimaryButton, SecondaryButton } from '@entur/button';
 import { SmallAlertBox } from '@entur/alert';
 import { Label } from '@entur/typography';
@@ -12,6 +13,43 @@ import { WEEKDAYS, WEEKDAY_SHORT } from '../format';
 type Item = NormalizedDropdownItemType<string>;
 
 const DEFAULT_DAYS = [0, 1, 2, 3, 4];
+
+// The all-operator stop list runs to ~20k+ entries, so the dropdowns get their items from a
+// ranked resolver (prefix matches first, then word-start, then substring; busiest stops first)
+// capped at MAX_SHOWN — the full list is never rendered. Passing a function as `items` also
+// makes SearchableDropdown skip its own label filter, so the resolver's ranking is what shows.
+const MAX_SHOWN = 60;
+
+function modeIcons(mode: string) {
+  const icons = [];
+  if (mode.includes('Tog')) icons.push(TrainIcon);
+  if (mode.includes('Buss')) icons.push(BusIcon);
+  return icons;
+}
+
+function rankItems(pool: StopItem[], query: string): Item[] {
+  const q = query.trim().toLowerCase();
+  const scored: { s: StopItem; rank: number }[] = [];
+  for (const s of pool) {
+    const name = (s.stop_name ?? s.stop_place).toLowerCase();
+    if (q === '') {
+      scored.push({ s, rank: 2 });
+      continue;
+    }
+    const idx = name.indexOf(q);
+    if (idx === -1) continue;
+    // prefix match > start of a later word > anywhere in the name
+    const rank = idx === 0 ? 0 : name[idx - 1] === ' ' || name[idx - 1] === '(' ? 1 : 2;
+    scored.push({ s, rank });
+  }
+  scored.sort((a, b) => a.rank - b.rank || b.s.n_calls - a.s.n_calls);
+  return scored.slice(0, MAX_SHOWN).map(({ s }) => ({
+    value: s.stop_place,
+    label: s.stop_name ?? s.stop_place,
+    icons: modeIcons(s.mode),
+    itemKey: s.stop_place,
+  }));
+}
 
 export default function AddJourneyModal({
   open,
@@ -24,13 +62,13 @@ export default function AddJourneyModal({
   stops: StopItem[];
   onCreate: (journey: NewJourney) => Promise<void>;
 }) {
-  const items = useMemo<Item[]>(
-    () =>
-      stops
-        .map((s) => ({ value: s.stop_place, label: s.stop_name ?? s.stop_place }))
-        .sort((a, b) => a.label.localeCompare(b.label, 'nb')),
-    [stops],
+  const [mode, setMode] = useState('alle');
+  const pool = useMemo(
+    () => (mode === 'alle' ? stops : stops.filter((s) => s.mode.toLowerCase().includes(mode))),
+    [stops, mode],
   );
+  // New resolver identity per pool change → the dropdowns re-resolve when the facet toggles.
+  const items = useMemo(() => (text: string) => rankItems(pool, text), [pool]);
 
   const [from, setFrom] = useState<Item | null>(null);
   const [to, setTo] = useState<Item | null>(null);
@@ -43,6 +81,7 @@ export default function AddJourneyModal({
   // Reset the form each time the modal opens.
   useEffect(() => {
     if (open) {
+      setMode('alle');
       setFrom(null);
       setTo(null);
       setBegin('07:00');
@@ -96,9 +135,20 @@ export default function AddJourneyModal({
   return (
     <Modal open={open} onDismiss={onClose} size="medium" title="Legg til reise">
       <div className="av-form">
+        <ChoiceChipGroup
+          name="stop-mode"
+          label="Transportmiddel"
+          value={mode}
+          onChange={(e) => setMode(e.target.value)}
+        >
+          <ChoiceChip value="alle">Alle</ChoiceChip>
+          <ChoiceChip value="tog">Tog</ChoiceChip>
+          <ChoiceChip value="buss">Buss</ChoiceChip>
+        </ChoiceChipGroup>
         <SearchableDropdown
           label="Fra"
           items={items}
+          debounceTimeout={0}
           selectedItem={from}
           onChange={(item) => setFrom(item)}
           placeholder="Søk etter stopp"
@@ -107,6 +157,7 @@ export default function AddJourneyModal({
         <SearchableDropdown
           label="Til"
           items={items}
+          debounceTimeout={0}
           selectedItem={to}
           onChange={(item) => setTo(item)}
           placeholder="Søk etter stopp"

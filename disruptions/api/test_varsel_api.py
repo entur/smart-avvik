@@ -49,8 +49,8 @@ SNAPSHOT = {
     ]
 }
 STOPS = [
-    {"stop_place": "A", "stop_name": "Oslo S"},
-    {"stop_place": "B", "stop_name": "Lillehammer"},
+    {"stop_place": "A", "stop_name": "Oslo S", "mode": "Tog/Buss", "n_calls": 900},
+    {"stop_place": "B", "stop_name": "Lillehammer", "mode": "Tog", "n_calls": 120},
 ]
 
 varsel.configure(snapshot_provider=lambda: SNAPSHOT, stops_provider=lambda: STOPS)
@@ -78,7 +78,10 @@ def test_config_reports_push_enabled():
 def test_stops():
     r = client.get("/varsel-api/stops")
     assert r.status_code == 200
-    assert {s["stop_place"] for s in r.json()} == {"A", "B"}
+    body = r.json()
+    assert {s["stop_place"] for s in body} == {"A", "B"}
+    assert {s["mode"] for s in body} == {"Tog/Buss", "Tog"}
+    assert all(s["n_calls"] > 0 for s in body)
 
 
 def test_journey_crud_and_live_match():

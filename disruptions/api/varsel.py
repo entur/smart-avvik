@@ -496,10 +496,12 @@ class ConfigResponse(BaseModel):
 
 
 class StopItem(BaseModel):
-    """A rail stop offered in the from/to pickers."""
+    """A stop offered in the from/to pickers."""
 
     stop_place: str = Field(description="NSR StopPlace ref.")
     stop_name: str | None = Field(description="Human-readable stop name.")
+    mode: str = Field(description='Families serving the stop today: "Tog", "Buss" or "Tog/Buss".')
+    n_calls: int = Field(description="Scheduled calls at the stop today; pickers rank matches by it.")
 
 
 class DeviceIn(BaseModel):
@@ -591,11 +593,19 @@ async def config() -> ConfigResponse:
     )
 
 
-@router.get("/stops", summary="Rail stops for the journey pickers")
+@router.get("/stops", summary="Stops for the journey pickers")
 async def stops() -> list[StopItem]:
-    """The Vy rail stops currently in the planned timetable, for the from/to dropdowns."""
+    """All stops in today's planned timetable (rail and bus), for the from/to pickers."""
     rows = _stops_provider() if _stops_provider is not None else []
-    return [StopItem(stop_place=r["stop_place"], stop_name=r.get("stop_name")) for r in rows]
+    return [
+        StopItem(
+            stop_place=r["stop_place"],
+            stop_name=r.get("stop_name"),
+            mode=r.get("mode", "Tog"),
+            n_calls=r.get("n_calls", 0),
+        )
+        for r in rows
+    ]
 
 
 @router.post("/devices", summary="Register or refresh a device's push subscription")

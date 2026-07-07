@@ -8,6 +8,8 @@ export interface Config {
 export interface StopItem {
   stop_place: string;
   stop_name: string | null;
+  mode: string; // 'Tog' | 'Buss' | 'Tog/Buss' — which families serve the stop today
+  n_calls: number; // scheduled calls today — traffic signal for ranking picker matches
 }
 
 export interface Alert {

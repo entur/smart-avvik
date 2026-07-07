@@ -62,15 +62,19 @@ _DEMO_WINDOW_QUERY = """
 # /varsel-api/stops: stops for the avviksvarsel journey pickers, from the planned-timetable call
 # sources rebuilt on their TTLs (tiny GROUP BY over small tables). Rail and bus are queried
 # separately and merged in Python (refresh_varsel_stops) so a missing/failing bus table never
-# drops the rail stops.
+# drops the rail stops. Each row carries today's call count (pickers rank matches by traffic)
+# and which families serve the stop — GOA is the one rail operator in the bus/pooled table.
 _VARSEL_STOPS_QUERY = """
-    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name
+    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name, COUNT(*) AS n_calls,
+           TRUE AS has_rail, FALSE AS has_bus
     FROM `ent-kixavvik-dev.disruptions.rail_calls_planned_today`
     WHERE stop_place IS NOT NULL
     GROUP BY stop_place
 """
 _VARSEL_STOPS_BUS_QUERY = """
-    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name
+    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name, COUNT(*) AS n_calls,
+           LOGICAL_OR(operator = 'GOA') AS has_rail,
+           LOGICAL_OR(operator != 'GOA') AS has_bus
     FROM `ent-kixavvik-dev.disruptions.bus_calls_planned_today`
     WHERE stop_place IS NOT NULL
     GROUP BY stop_place
@@ -460,9 +464,9 @@ def refresh_call_predictions_cache() -> None:
 
 
 # ---- Avviksvarsel providers ------------------------------------------------------------------
-# The varsel module (registered-journey push alerts) reads the live per-call snapshot and a small
-# rail-stop list through these providers, injected via varsel.configure() at startup so varsel
-# never imports main (no cycle). The stop list is refreshed alongside the planned call source.
+# The varsel module (registered-journey push alerts) reads the live per-call snapshot and the
+# stop list (rail + bus) through these providers, injected via varsel.configure() at startup so
+# varsel never imports main (no cycle). The stop list is refreshed alongside the planned sources.
 _varsel_stops_lock = threading.Lock()
 _varsel_stops_cache: list[dict] = []
 
@@ -471,15 +475,33 @@ def refresh_varsel_stops() -> None:
     """Reload the stop picker list from the rail AND bus planned call sources (tiny scans).
 
     Each source is queried independently and merged by stop_place, so a missing/failing bus table
-    never drops the rail stops (and vice versa)."""
-    merged: dict[str, str | None] = {}
+    never drops the rail stops (and vice versa). The merge sums call counts and ORs the mode
+    flags — a stop served by both families gets mode "Tog/Buss"."""
+    merged: dict[str, dict] = {}
     for q in (_VARSEL_STOPS_QUERY, _VARSEL_STOPS_BUS_QUERY):
         try:
             for r in bq_client.query(q).result():
-                merged.setdefault(r.stop_place, r.stop_name)
+                e = merged.setdefault(
+                    r.stop_place,
+                    {"stop_place": r.stop_place, "stop_name": None, "n_calls": 0,
+                     "has_rail": False, "has_bus": False},
+                )
+                e["stop_name"] = e["stop_name"] or r.stop_name
+                e["n_calls"] += r.n_calls
+                e["has_rail"] = e["has_rail"] or r.has_rail
+                e["has_bus"] = e["has_bus"] or r.has_bus
         except Exception:
             logger.exception("A varsel stops sub-query failed; continuing with the other source(s)")
-    stops = [{"stop_place": sp, "stop_name": name} for sp, name in merged.items()]
+    stops = [
+        {
+            "stop_place": e["stop_place"],
+            "stop_name": e["stop_name"],
+            "n_calls": e["n_calls"],
+            "mode": "Tog/Buss" if e["has_rail"] and e["has_bus"]
+            else ("Tog" if e["has_rail"] else "Buss"),
+        }
+        for e in merged.values()
+    ]
     with _varsel_stops_lock:
         global _varsel_stops_cache
         _varsel_stops_cache = stops
