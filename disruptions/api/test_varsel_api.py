@@ -32,7 +32,6 @@ os.environ.update(
 )
 
 import json  # noqa: E402
-from datetime import datetime  # noqa: E402
 
 import varsel  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
