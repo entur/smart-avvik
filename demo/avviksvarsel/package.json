@@ -18,9 +18,9 @@
     "@entur/icons": "^9.0.4",
     "@entur/layout": "^3.7.5",
     "@entur/loader": "^0.7.4",
+    "@entur/menu": "^6.3.1",
     "@entur/modal": "^1.8.16",
     "@entur/tokens": "^3.24.0",
-    "@entur/travel": "^7.0.4",
     "@entur/typography": "^2.1.12",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

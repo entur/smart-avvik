@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SkipToContent } from '@entur/a11y';
 import { Contrast } from '@entur/layout';
-import { TravelTag } from '@entur/travel';
+import { Logo } from '@entur/menu';
 import { Heading1, Heading3, LeadParagraph, Paragraph } from '@entur/typography';
 import { PrimaryButton } from '@entur/button';
 import { AddIcon } from '@entur/icons';
@@ -118,7 +118,7 @@ export default function App() {
 
       <Contrast as="header" className="av-header">
         <div className="av-header-inner">
-          <TravelTag transport="rail" label="Tog" />
+          <Logo />
           <Heading1 as="h1" margin="none" className="av-header-title">
             Avviksvarsel
           </Heading1>
