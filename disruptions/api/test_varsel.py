@@ -7,7 +7,6 @@ weekday filter, overnight rejection, and the alert-worthiness gate. No BigQuery,
 from dataclasses import dataclass
 from datetime import datetime
 
-import varsel
 from varsel import _OSLO, match_journey
 
 
