@@ -1700,8 +1700,9 @@ async def alert_profile(
 # The UI at /demo (demo/reisedemo, built into demo_static/) consumes these endpoints.
 
 # The alert decision shown in the demo: flag when P(cancelled OR >= 10 min late) crosses the
-# production operating threshold (>= 91 % precision at every ask horizon per eval/impact_eval.py).
-_DEMO_ALERT_THRESHOLD = 0.65
+# operator's live alerting threshold (varsel.threshold_for — the per-operator cuts tuned at
+# ~90 % precision by eval/tune_alert_thresholds.py, 0.65 default), so the demo's verdicts
+# replay exactly what the varsel push pipeline would have decided.
 # Realized outcome counts as "trouble" when the call was cancelled or >= 10 min late — the
 # same event the impact probability predicts.
 _DEMO_TROUBLE_DELAY_MIN = 10
@@ -1748,7 +1749,10 @@ class DemoMeta(BaseModel):
 
     window_start: date = Field(description="First date covered by the demo dataset.")
     window_end: date = Field(description="Last date covered by the demo dataset.")
-    alert_threshold: float = Field(description="Impact-probability threshold behind `would_alert`.")
+    alert_threshold: float = Field(
+        description="Default impact-probability threshold behind `would_alert`; each journey "
+        "carries its operator's actual threshold.",
+    )
     stops: list[DemoStop] = Field(description="Stops offered in the from/to pickers.")
     highlights: list[DemoHighlight] = Field(description="One-click example scenarios, worst first.")
 
@@ -1764,7 +1768,7 @@ class DemoSnapshot(BaseModel):
     delay_p50_min: int | None = Field(description="Median predicted delay (min) if the call runs.")
     delay_p90_min: int | None = Field(description="Bad-case (p90) predicted delay (min).")
     would_alert: bool = Field(
-        description="Whether this prediction crosses the alert threshold (see meta).",
+        description="Whether this prediction crosses the journey's `alert_threshold`.",
     )
     verdict: str | None = Field(
         description=(
@@ -1823,6 +1827,9 @@ class DemoJourney(BaseModel):
     )
     operator: str = Field(description="Codespace the journey runs in, e.g. 'NSB', 'GOA', 'RUT'.")
     mode: str = Field(description="Vehicle noun for the operator: 'Tog' or 'Buss'.")
+    alert_threshold: float = Field(
+        description="The operator's alerting threshold applied in this journey's `would_alert`.",
+    )
     line: str | None = Field(description="Line ref, e.g. 'NSB:Line:L1'.")
     situation: DemoSituation | None = Field(
         description="The situation behind the predictions; null if nothing flagged this journey.",
@@ -1851,14 +1858,15 @@ def _demo_actual_trouble(cancelled: bool, delay_min: int | None) -> bool | None:
     return delay_min >= _DEMO_TROUBLE_DELAY_MIN
 
 
-def _demo_snapshot(row, side: str, lead: str, actual_trouble: bool | None) -> DemoSnapshot | None:
+def _demo_snapshot(row, side: str, lead: str, actual_trouble: bool | None,
+                   threshold: float) -> DemoSnapshot | None:
     """Build one ask-time snapshot from the flat demo_journeys.sql row; None if unavailable
     (no situation, or the SX message had not yet arrived at this ask time)."""
     p_cancel = row[f"{side}_{lead}_p_cancel"]
     if p_cancel is None:
         return None
     p_impact = row[f"{side}_{lead}_p_impact"]
-    would_alert = p_impact is not None and p_impact >= _DEMO_ALERT_THRESHOLD
+    would_alert = p_impact is not None and p_impact >= threshold
     verdict = None
     if actual_trouble is not None:
         verdict = (
@@ -1878,7 +1886,7 @@ def _demo_snapshot(row, side: str, lead: str, actual_trouble: bool | None) -> De
 
 
 def _demo_side(row, side: str, stop_place: str, stop_name, scheduled, cancelled: bool,
-               delay_min: int | None) -> DemoSide:
+               delay_min: int | None, threshold: float) -> DemoSide:
     """Assemble one end of a journey: realized outcome + the three ask-time snapshots."""
     actual_trouble = _demo_actual_trouble(cancelled, delay_min)
     return DemoSide(
@@ -1889,9 +1897,9 @@ def _demo_side(row, side: str, stop_place: str, stop_name, scheduled, cancelled:
         actual_delay_min=delay_min,
         actual_trouble=actual_trouble,
         minutes_from_onset=row[f"{side}_min_from_onset"],
-        at_message=_demo_snapshot(row, side, "onset", actual_trouble),
-        t60=_demo_snapshot(row, side, "l60", actual_trouble),
-        t30=_demo_snapshot(row, side, "l30", actual_trouble),
+        at_message=_demo_snapshot(row, side, "onset", actual_trouble, threshold),
+        t60=_demo_snapshot(row, side, "l60", actual_trouble, threshold),
+        t30=_demo_snapshot(row, side, "l30", actual_trouble, threshold),
     )
 
 
@@ -1933,7 +1941,7 @@ def get_demo_meta() -> DemoMeta:
     meta = DemoMeta(
         window_start=window.window_start,
         window_end=window.window_end,
-        alert_threshold=_DEMO_ALERT_THRESHOLD,
+        alert_threshold=varsel.threshold_for(None),
         stops=stops,
         highlights=highlights,
     )
@@ -2006,20 +2014,22 @@ async def demo_journeys(
                 category=r.category,
                 onset=r.onset_ts,
             )
+        threshold = varsel.threshold_for(r.operator)
         journeys.append(
             DemoJourney(
                 journey_ref=f"{r.operator}:{r.jkey}",
                 operator=r.operator,
                 mode=varsel.mode_label(r.operator),
+                alert_threshold=threshold,
                 line=r.lineRef,
                 situation=situation,
                 departure=_demo_side(
                     r, "dep", r.from_stop, r.from_name, r.from_aimed_dep,
-                    r.act_dep_cancelled, r.act_dep_delay_min,
+                    r.act_dep_cancelled, r.act_dep_delay_min, threshold,
                 ),
                 arrival=_demo_side(
                     r, "arr", r.to_stop, r.to_name, r.to_aimed_arr,
-                    r.act_arr_cancelled, r.act_arr_delay_min,
+                    r.act_arr_cancelled, r.act_arr_delay_min, threshold,
                 ),
             )
         )

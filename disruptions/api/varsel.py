@@ -83,7 +83,9 @@ _OPERATOR_ALERT_THRESHOLD: dict[str, float] = {
 }
 
 
-def _threshold_for(operator: str | None) -> float:
+def threshold_for(operator: str | None) -> float:
+    """The alerting threshold for an operator (None -> the default). Shared by the varsel
+    matcher and the /demo verdicts so both surfaces apply the same operating point."""
     return _OPERATOR_ALERT_THRESHOLD.get(operator or "", _ALERT_THRESHOLD)
 
 
@@ -342,7 +344,7 @@ def match_journey(journey: dict, by_situation: dict[str, list]) -> list[Alert]:
             continue
         worst = max(matching_boardings, key=_severity)
         impact = worst.p_impact_dep
-        threshold = _threshold_for(worst.operator)
+        threshold = threshold_for(worst.operator)
         alertworthy = (
             impact >= threshold
             if impact is not None

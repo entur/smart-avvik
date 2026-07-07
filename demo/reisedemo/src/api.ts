@@ -66,6 +66,7 @@ export interface DemoJourney {
   journey_ref: string; // operator-prefixed, e.g. 'RUT:ServiceJourney:...'
   operator: string;
   mode: string; // 'Tog' | 'Buss'
+  alert_threshold: number; // the operator's alerting threshold behind would_alert
   line: string | null;
   situation: DemoSituation | null;
   departure: DemoSide;

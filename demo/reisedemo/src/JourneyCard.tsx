@@ -74,11 +74,13 @@ function Side({
   side,
   onsetTime,
   hasSituation,
+  threshold,
 }: {
   title: string;
   side: DemoSide;
   onsetTime: string | null;
   hasSituation: boolean;
+  threshold: number;
 }) {
   const flagged = side.minutes_from_onset !== null;
   return (
@@ -100,7 +102,7 @@ function Side({
               <th>Prediksjon gitt</th>
               <th>Innstilt</th>
               <th>Forsinkelse</th>
-              <th>Varsel</th>
+              <th title="Operatørens varslingsterskel">Varsel ≥ {fmtPct(threshold)}</th>
               <th></th>
             </tr>
           </thead>
@@ -146,8 +148,10 @@ export default function JourneyCard({ journey }: { journey: DemoJourney }) {
         )}
       </header>
       <div className="sides">
-        <Side title="Avgang" side={journey.departure} onsetTime={onsetTime} hasSituation={sit !== null} />
-        <Side title="Ankomst" side={journey.arrival} onsetTime={onsetTime} hasSituation={sit !== null} />
+        <Side title="Avgang" side={journey.departure} onsetTime={onsetTime} hasSituation={sit !== null}
+              threshold={journey.alert_threshold} />
+        <Side title="Ankomst" side={journey.arrival} onsetTime={onsetTime} hasSituation={sit !== null}
+              threshold={journey.alert_threshold} />
       </div>
     </article>
   );
