@@ -43,7 +43,7 @@ import re
 import threading
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -63,6 +63,11 @@ _ALERT_THRESHOLD = 0.65
 _TROUBLE_DELAY_MIN = 10
 # Keep state bounded: a client-generated device may register at most this many journeys.
 _MAX_JOURNEYS_PER_DEVICE = 20
+# A freshly-created push subscription can 404/410 at the push service for a short window before
+# it has propagated (seen especially with FCM/Android). Within this grace period we treat such a
+# response as transient and do NOT drop the device, so an immediate test-push or first alert
+# doesn't silently unsubscribe the user.
+_SUBSCRIPTION_GRACE = timedelta(minutes=10)
 
 _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
@@ -349,9 +354,14 @@ def _send_push(subscription: dict, payload: dict) -> str:
         return "sent"
     except WebPushException as exc:
         status = getattr(exc.response, "status_code", None)
+        body = (getattr(exc.response, "text", "") or "")[:400]
+        endpoint = str(subscription.get("endpoint", ""))
+        host = endpoint.split("/", 3)[2] if "://" in endpoint else endpoint[:40]
+        logger.warning(
+            "Web push failed: status=%s host=%s body=%r exc=%s", status, host, body, exc
+        )
         if status in (404, 410):
             return "gone"
-        logger.warning("Web push failed (status %s): %s", status, exc)
         return "error"
     except Exception:
         logger.exception("Web push raised unexpectedly")
@@ -364,6 +374,21 @@ def _drop_device(device_id: str) -> None:
     with _state_lock:
         if _devices.pop(device_id, None) is not None:
             logger.info("Dropped expired push subscription for device %s", device_id)
+
+
+def _device_is_fresh(device_id: str) -> bool:
+    """True while a device's subscription is younger than the propagation grace window. A 404/410
+    for such a subscription is likely a transient push-service delay, not a dead endpoint, so the
+    caller should retry later rather than drop it."""
+    with _state_lock:
+        dev = _devices.get(device_id)
+    if dev is None:
+        return False
+    try:
+        created = datetime.fromisoformat(dev["created_ts"])
+    except (KeyError, ValueError):
+        return False
+    return datetime.now(timezone.utc) - created < _SUBSCRIPTION_GRACE
 
 
 def check_and_notify(by_situation: dict[str, list]) -> None:
@@ -408,9 +433,16 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                     _notified.add(key)
                 changed = True
             elif result == "gone":
-                _drop_device(journey["device_id"])
-                changed = True
-                break  # no point trying more alerts for this now-unsubscribed device
+                if _device_is_fresh(journey["device_id"]):
+                    # Likely transient (subscription still propagating): keep it, retry next tick.
+                    logger.info(
+                        "Transient push failure for fresh device %s; keeping subscription",
+                        journey["device_id"],
+                    )
+                else:
+                    _drop_device(journey["device_id"])
+                    changed = True
+                break  # stop this device's remaining alerts this tick either way
 
     if changed:
         _save_state()
@@ -639,6 +671,12 @@ async def test_push(body: TestIn) -> dict:
     }
     result = _send_push(subscription, payload)
     if result == "gone":
+        if _device_is_fresh(body.device_id):
+            # A brand-new subscription can briefly 404/410 before it propagates — don't drop it.
+            raise HTTPException(
+                status_code=425,
+                detail="Varselet er nettopp slått på. Vent et lite øyeblikk og prøv testvarsel igjen.",
+            )
         _drop_device(body.device_id)
         _save_state()
         raise HTTPException(status_code=410, detail="Abonnementet er utløpt; slå på varsler på nytt.")

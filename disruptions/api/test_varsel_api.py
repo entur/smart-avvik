@@ -153,6 +153,41 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     assert len(sent) == 2
 
 
+def _register_matching_journey():
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    client.post(
+        "/varsel-api/journeys",
+        json={
+            "device_id": DEVICE, "from_stop": "A", "from_name": "Oslo S",
+            "to_stop": "B", "to_name": "Lillehammer",
+            "begin": "07:00", "end": "09:00", "days": [0, 1, 2, 3, 4],
+        },
+    )
+
+
+def test_transient_410_keeps_fresh_device(monkeypatch):
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "gone")
+    _register_matching_journey()
+    # A 404/410 on a freshly-created subscription is treated as transient -> device kept.
+    varsel.check_and_notify(SNAPSHOT)
+    assert DEVICE in varsel._devices
+    # Age it past the grace window -> a 410 now drops it.
+    with varsel._state_lock:
+        varsel._devices[DEVICE]["created_ts"] = "2000-01-01T00:00:00+00:00"
+    varsel.check_and_notify(SNAPSHOT)
+    assert DEVICE not in varsel._devices
+
+
+def test_test_push_fresh_410_is_425_not_dropped(monkeypatch):
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "gone")
+    r = client.post("/varsel-api/test", json={"device_id": DEVICE})
+    assert r.status_code == 425  # "try again shortly", subscription still propagating
+    assert DEVICE in varsel._devices  # not dropped
+
+
 def test_test_push(monkeypatch):
     _reset_state()
     # No device yet -> 404.
