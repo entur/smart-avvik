@@ -1,0 +1,38 @@
+# Build context for the root Dockerfile is the whole repo, so keep it lean.
+# Docker's .dockerignore is NOT gitignore syntax: use **/ to match nested paths.
+#
+# Kept (needed by the build): demo/reisedemo, demo/avviksvarsel (front-end
+# sources), disruptions/api (API + *.sql + committed eval_static/), Dockerfile.
+
+.git
+
+# Repo areas the image never needs.
+data/
+notebooks/
+docs/
+eval/            # marimo notebook *sources*; the served snapshots are in disruptions/api/eval_static/
+helm/
+memory/
+.github/
+.idea/
+.agents/
+.claude/
+.entur/
+
+# Front-end deps are reinstalled with `npm ci` inside the build.
+**/node_modules
+
+# Generated front-end bundles: rebuilt in the Dockerfile's node stage, so a stale
+# local copy must not leak in via the API-dir COPY.
+disruptions/api/demo_static/
+disruptions/api/varsel_static/
+
+# Local-only avviksvarsel state (durable state lives in the GCS bucket in prod).
+disruptions/api/varsel_state.json
+
+# Build/editor cruft.
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.tsbuildinfo
+**/.DS_Store

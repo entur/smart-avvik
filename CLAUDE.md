@@ -18,18 +18,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Deployment
 
-The `/disruptions` API (`disruptions/api/main.py`) runs on Cloud Run, deployed from source
-(Cloud Build builds the Dockerfile in that directory). Redeploy from `disruptions/api/`:
+The `/disruptions` API (`disruptions/api/main.py`) runs on **both** Cloud Run and Kubernetes
+(`kix-avvik.dev.entur.io`; see the Kubernetes memory note). Both build the **same image** from
+the multi-stage `Dockerfile` at the **repo root** — its node stage builds the `/demo` and
+`/varsel` front-ends (from `demo/reisedemo` + `demo/avviksvarsel`, which is why the context is
+the repo root, not `disruptions/api`), and its python stage assembles the API. Kubernetes builds
+it via `.github/workflows/ci.yml`; Cloud Run via `disruptions/api/deploy.sh` (which now runs
+`gcloud run deploy --source .` from the repo root so it picks up the root Dockerfile):
 
 ```sh
-gcloud run deploy kix-avvik-disruptions \
-  --source . \
-  --project ent-kixavvik-dev \
-  --region europe-west1 \
-  --service-account application@ent-kixavvik-dev.iam.gserviceaccount.com \
-  --min-instances 1 \
-  --max-instances 1 \
-  --no-cpu-throttling
+disruptions/api/deploy.sh          # normal redeploy (front-ends built in-image)
+RUN_EVAL_EXPORT=1 disruptions/api/deploy.sh   # also re-render /eval first (needs ADC)
 ```
 
 - `--min/--max-instances 1`: the app runs one background poller thread and an in-process
@@ -38,15 +37,20 @@ gcloud run deploy kix-avvik-disruptions \
 - `--no-cpu-throttling`: keeps CPU allocated between requests so the poller keeps running.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - Service URL: https://kix-avvik-disruptions-305411154596.europe-west1.run.app
+- **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
+  app's `npm ci && npm run build`, and Vite writes into `disruptions/api/{demo,varsel}_static/`
+  (both gitignored). `demo/*/build.sh` do the same locally for dev; the deploy no longer calls
+  them. **`/eval` is the exception**: its marimo snapshots run BigQuery under a developer's ADC, so
+  they can't be built in the image/CI — they are rendered offline by `export_eval.sh` and
+  **committed** under `disruptions/api/eval_static/`, shipped as-is. Refresh them (and commit)
+  after a retrain via `RUN_EVAL_EXPORT=1 deploy.sh`.
 - The partner demo UI at `/demo` (predictions vs realized outcomes for a chosen trip) lives in
-  `demo/reisedemo/` (React + Vite) and is built into `disruptions/api/demo_static/` by
-  `deploy.sh` (`SKIP_DEMO_BUILD=1` to skip). Its data is served by the `/demo-api` endpoints
+  `demo/reisedemo/` (React + Vite). Its data is served by the `/demo-api` endpoints
   from static tables built by `data/queries/create_demo_predictions.sql` — re-run that query
   after model/calibration retrains. `data/queries/refresh_demo_recent.sh` extends the tables
   with the last ~25 days straight from SIRI-ET/SX (run before a partner demo; ~$2).
 - The **Avviksvarsel** PWA at `/varsel` (register a journey → Web Push when a live disruption is
-  predicted to hit it; Vy rail only) lives in `demo/avviksvarsel/` (React + Vite + Entur Linje) and
-  builds into `disruptions/api/varsel_static/` via `deploy.sh` (`SKIP_VARSEL_BUILD=1` to skip). Its
+  predicted to hit it; Vy rail only) lives in `demo/avviksvarsel/` (React + Vite + Entur Linje). Its
   API is `/varsel-api` (see `disruptions/api/varsel.py`); the matcher runs in the poller's refresh
   cycle. Install steps for phones are in `demo/avviksvarsel/README.md`. Two extra env vars beyond
   the base deploy:

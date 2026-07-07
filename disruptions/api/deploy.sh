@@ -2,8 +2,13 @@
 #
 # Deploy the /disruptions API to Cloud Run.
 #
-# Deploys from source (Cloud Build builds the Dockerfile in this directory).
-# Run from disruptions/api/ — the script cd's there itself so it works from anywhere.
+# Deploys from the REPO ROOT (Cloud Build builds the root Dockerfile). That
+# Dockerfile is multi-stage: it builds the /demo and /varsel front-ends itself, so
+# — unlike before — this script no longer runs their build.sh scripts. It is the
+# same image CI builds and deploys to Kubernetes.
+#
+# The repo-root context is what lets the Dockerfile reach demo/reisedemo and
+# demo/avviksvarsel; .gcloudignore (at the repo root) keeps the upload small.
 #
 # Flags worth knowing (see CLAUDE.md for the full rationale):
 #   --min/--max-instances 1  one background poller thread + in-process cache => single always-on instance
@@ -16,27 +21,18 @@ PROJECT="ent-kixavvik-dev"
 REGION="europe-west1"
 SERVICE_ACCOUNT="application@ent-kixavvik-dev.iam.gserviceaccount.com"
 
-# Run from the directory this script lives in (disruptions/api/).
-cd "$(dirname "$0")"
+# Repo root (this script lives in disruptions/api/).
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
-# Render the eval notebooks to static HTML (runs their BigQuery cells under your ADC)
-# so the fresh snapshots ship in the deploy source and get served at /eval. Set
-# SKIP_EVAL_EXPORT=1 to reuse the existing eval_static/ (e.g. a code-only redeploy).
-if [ "${SKIP_EVAL_EXPORT:-}" != "1" ]; then
-  ./export_eval.sh
+# The /eval snapshots (disruptions/api/eval_static/) are committed and ship as-is,
+# so a normal deploy does NOT re-render them. Set RUN_EVAL_EXPORT=1 to refresh them
+# first — this runs the marimo notebooks' BigQuery cells under your ADC. Do it (and
+# commit the result) after a model/calibration retrain; see CLAUDE.md.
+if [ "${RUN_EVAL_EXPORT:-}" = "1" ]; then
+  "$(dirname "$0")/export_eval.sh"
 fi
 
-# Build the journey-prediction demo UI (demo/reisedemo -> demo_static/, served at /demo).
-# Set SKIP_DEMO_BUILD=1 to reuse the existing demo_static/ (e.g. a backend-only redeploy).
-if [ "${SKIP_DEMO_BUILD:-}" != "1" ]; then
-  ../../demo/reisedemo/build.sh
-fi
-
-# Build the Avviksvarsel PWA (demo/avviksvarsel -> varsel_static/, served at /varsel).
-# Set SKIP_VARSEL_BUILD=1 to reuse the existing varsel_static/ (e.g. a backend-only redeploy).
-if [ "${SKIP_VARSEL_BUILD:-}" != "1" ]; then
-  ../../demo/avviksvarsel/build.sh
-fi
+cd "$REPO_ROOT"
 
 gcloud run deploy "$SERVICE" \
   --source . \

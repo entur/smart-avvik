@@ -28,7 +28,7 @@ jobs:
   docker-lint:
     uses: entur/gha-docker/.github/workflows/lint.yml@v1
     with:
-      dockerfile: disruptions/api/Dockerfile
+      dockerfile: Dockerfile
 
   # Helm charts are linted per environment to catch env-specific value errors
   helm-lint:
@@ -68,10 +68,12 @@ jobs:
     needs: [test, docker-lint, helm-lint]
     uses: entur/gha-docker/.github/workflows/build.yml@v1
     with:
-      # The image is self-contained in disruptions/api (main.py + *.sql +
-      # requirements.txt); both paths are relative to the repository root.
-      context: disruptions/api
-      dockerfile: disruptions/api/Dockerfile
+      # Context is the repo root: the multi-stage Dockerfile builds the /demo and
+      # /varsel front-ends from demo/reisedemo + demo/avviksvarsel (outside the API
+      # dir), then assembles the API image from disruptions/api. Both paths are
+      # relative to the repository root.
+      context: .
+      dockerfile: Dockerfile
 
   # Scan and push run in parallel -- a vulnerability finding does not block the
   # push, but the scan results are available for review on the PR
