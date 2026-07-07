@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   fetchJourneys,
   fetchMeta,
@@ -9,6 +9,7 @@ import {
 } from './api';
 import { fmtDate, fmtDateTime, fromLocalInput, toLocalInput } from './format';
 import JourneyCard from './JourneyCard';
+import StopCombobox from './StopCombobox';
 
 // The most informative snapshot before the call: the latest ask time that existed.
 function lastSnapshot(side: DemoSide) {
@@ -36,7 +37,7 @@ function Stats({ result }: { result: DemoJourneysResponse }) {
       </span>
       {right + wrong > 0 && (
         <span>
-          siste prediksjon før toget:{' '}
+          siste prediksjon før avgang:{' '}
           <strong className="stat-good">{right} riktige</strong>
           {tallies.miss > 0 && (
             <>
@@ -85,11 +86,6 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const stops = useMemo(
-    () => (meta ? [...meta.stops].sort((a, b) => (a.stop_name ?? '').localeCompare(b.stop_name ?? '', 'nb')) : []),
-    [meta],
-  );
-
   async function search(from = fromStop, to = toStop, startVal = start, endVal = end) {
     if (!from || !to || !startVal || !endVal) return;
     setLoading(true);
@@ -133,14 +129,14 @@ export default function App() {
         <p>
           Hvor godt treffer prediksjonene for forsinkelser og innstillinger? Velg en strekning og
           et tidsrom fra evalueringsperioden, og sammenlign det modellene meldte — idet
-          avviksmeldingen kom, 60 og 30 minutter før toget — med det som faktisk skjedde.
+          avviksmeldingen kom, 60 og 30 minutter før avgang — med det som faktisk skjedde.
         </p>
         {meta && (
           <p className="data-note">
-            Datagrunnlag: NSB-tog {fmtDate(meta.window_start)} – {fmtDate(meta.window_end)} —
-            modellenes holdout pluss de siste dagene; alle tall er utenfor treningsdataene.
-            Varsel når P(innstilt eller ≥ 10 min forsinket) ≥{' '}
-            {Math.round(meta.alert_threshold * 100)} %.
+            Datagrunnlag: tog (Vy/NSB, Go-Ahead) og buss {fmtDate(meta.window_start)} –{' '}
+            {fmtDate(meta.window_end)} — modellenes holdout, pluss de siste dagene for NSB-tog;
+            alle tall er utenfor treningsdataene. Varsel når P(innstilt eller ≥ 10 min forsinket)
+            ≥ {Math.round(meta.alert_threshold * 100)} %.
           </p>
         )}
       </header>
@@ -164,7 +160,7 @@ export default function App() {
               </option>
               {meta.highlights.map((h, i) => (
                 <option key={h.situation_number} value={i}>
-                  {fmtDateTime(h.window_start)} — {h.summary ?? h.situation_number} (
+                  {fmtDateTime(h.window_start)} — [{h.mode}] {h.summary ?? h.situation_number} (
                   {h.n_cancelled} innstilte, {h.n_delayed10} forsinkede)
                 </option>
               ))}
@@ -179,16 +175,13 @@ export default function App() {
           >
             <div className="control">
               <label htmlFor="from">Fra</label>
-              <select id="from" value={fromStop} onChange={(e) => setFromStop(e.target.value)} required>
-                <option value="" disabled>
-                  Velg stasjon …
-                </option>
-                {stops.map((s) => (
-                  <option key={s.stop_place} value={s.stop_place}>
-                    {s.stop_name ?? s.stop_place}
-                  </option>
-                ))}
-              </select>
+              <StopCombobox
+                id="from"
+                stops={meta.stops}
+                value={fromStop}
+                onChange={setFromStop}
+                placeholder="Søk etter stopp …"
+              />
             </div>
             <button
               type="button"
@@ -203,16 +196,13 @@ export default function App() {
             </button>
             <div className="control">
               <label htmlFor="to">Til</label>
-              <select id="to" value={toStop} onChange={(e) => setToStop(e.target.value)} required>
-                <option value="" disabled>
-                  Velg stasjon …
-                </option>
-                {stops.map((s) => (
-                  <option key={s.stop_place} value={s.stop_place}>
-                    {s.stop_name ?? s.stop_place}
-                  </option>
-                ))}
-              </select>
+              <StopCombobox
+                id="to"
+                stops={meta.stops}
+                value={toStop}
+                onChange={setToStop}
+                placeholder="Søk etter stopp …"
+              />
             </div>
             <div className="control">
               <label htmlFor="start">Avgang fra</label>
@@ -261,7 +251,11 @@ export default function App() {
           {journeys.length === 0 ? (
             <p className="empty">Ingen reiser i valgt tidsrom.</p>
           ) : (
-            journeys.map((j) => <JourneyCard key={j.journey_ref} journey={j} />)
+            journeys.map((j) => (
+              // Bus jkeys repeat per operating day, so the ref alone is not unique in a
+              // multi-day window — key on ref + departure time.
+              <JourneyCard key={`${j.journey_ref}|${j.departure.scheduled_time}`} journey={j} />
+            ))
           )}
           <footer className="legend">
             <span>

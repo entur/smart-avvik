@@ -45,12 +45,12 @@ _CALL_PREDICTIONS_BUS_QUERY = (
 # (built offline by data/queries/create_demo_predictions.sql).
 _DEMO_JOURNEYS_QUERY = (Path(__file__).parent / "demo_journeys.sql").read_text()
 _DEMO_STOPS_QUERY = """
-    SELECT stop_place, stop_name, n_calls
+    SELECT stop_place, stop_name, n_calls, mode
     FROM `ent-kixavvik-dev.disruptions.demo_stops`
     ORDER BY n_calls DESC
 """
 _DEMO_HIGHLIGHTS_QUERY = """
-    SELECT situationNumber, summary, category, onset_ts, n_cancelled, n_delayed10,
+    SELECT situationNumber, operator, summary, category, onset_ts, n_cancelled, n_delayed10,
            window_start, window_end, from_stop, from_name, to_stop, to_name
     FROM `ent-kixavvik-dev.disruptions.demo_highlights`
     ORDER BY n_cancelled + n_delayed10 DESC
@@ -1671,7 +1671,8 @@ async def alert_profile(
 
 
 # ---- /demo-api: retrospective "how good were the predictions?" journey demo -------------------
-# Serves the static demo dataset (temporal holdout 2026-04 -> 2026-06, NSB rail) built by
+# Serves the static demo dataset (temporal holdout 2026-04 -> 2026-06, NSB rail on the prod
+# model family + GOA/bus on the pooled_all family) built by
 # data/queries/create_demo_predictions.sql: for every SX-flagged call, the calibrated
 # predictions the models would have served at three ask times, next to the realized outcome.
 # The UI at /demo (demo/reisedemo, built into demo_static/) consumes these endpoints.
@@ -1697,13 +1698,16 @@ class DemoStop(BaseModel):
 
     stop_place: str = Field(description="NSR StopPlace ref.")
     stop_name: str | None = Field(description="Human-readable stop name.")
-    n_calls: int = Field(description="Rail calls at this stop within the demo window.")
+    n_calls: int = Field(description="Calls at this stop within the demo window.")
+    mode: str = Field(description="What serves this stop: 'Tog', 'Buss' or 'Tog/Buss'.")
 
 
 class DemoHighlight(BaseModel):
     """A pre-picked high-impact situation, with a suggested trip + window that showcases it."""
 
     situation_number: str = Field(description="SIRI-SX situationNumber.")
+    operator: str = Field(description="Codespace of the worst-hit journey, e.g. 'NSB' or 'RUT'.")
+    mode: str = Field(description="Vehicle noun for that operator: 'Tog' or 'Buss'.")
     summary: str | None = Field(description="First-version Norwegian summary of the situation.")
     category: str | None = Field(description="Disruption category.")
     onset: datetime = Field(description="When the SX message arrived (UTC).")
@@ -1791,7 +1795,12 @@ class DemoSituation(BaseModel):
 class DemoJourney(BaseModel):
     """One matching journey: departure predictions/outcome left, arrival right."""
 
-    journey_ref: str = Field(description="Dated journey key (jkey).")
+    journey_ref: str = Field(
+        description="Operator-prefixed journey key, e.g. 'NSB:DatedServiceJourney:...' or "
+        "'RUT:ServiceJourney:...' — same format /journey accepts.",
+    )
+    operator: str = Field(description="Codespace the journey runs in, e.g. 'NSB', 'GOA', 'RUT'.")
+    mode: str = Field(description="Vehicle noun for the operator: 'Tog' or 'Buss'.")
     line: str | None = Field(description="Line ref, e.g. 'NSB:Line:L1'.")
     situation: DemoSituation | None = Field(
         description="The situation behind the predictions; null if nothing flagged this journey.",
@@ -1877,12 +1886,14 @@ def get_demo_meta() -> DemoMeta:
             detail="Demo dataset not built (run data/queries/create_demo_predictions.sql).",
         )
     stops = [
-        DemoStop(stop_place=r.stop_place, stop_name=r.stop_name, n_calls=r.n_calls)
+        DemoStop(stop_place=r.stop_place, stop_name=r.stop_name, n_calls=r.n_calls, mode=r.mode)
         for r in bq_client.query(_DEMO_STOPS_QUERY).result()
     ]
     highlights = [
         DemoHighlight(
             situation_number=r.situationNumber,
+            operator=r.operator,
+            mode=varsel.mode_label(r.operator),
             summary=r.summary,
             category=r.category,
             onset=r.onset_ts,
@@ -1975,7 +1986,9 @@ async def demo_journeys(
             )
         journeys.append(
             DemoJourney(
-                journey_ref=r.jkey,
+                journey_ref=f"{r.operator}:{r.jkey}",
+                operator=r.operator,
+                mode=varsel.mode_label(r.operator),
                 line=r.lineRef,
                 situation=situation,
                 departure=_demo_side(

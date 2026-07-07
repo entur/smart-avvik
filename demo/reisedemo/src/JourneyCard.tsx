@@ -131,6 +131,7 @@ export default function JourneyCard({ journey }: { journey: DemoJourney }) {
   return (
     <article className="card">
       <header className="card-head">
+        <span className="mode-tag" title={journey.operator}>{journey.mode}</span>
         <span className="line-badge">{lineCode(journey.line)}</span>
         <span className="card-times">
           {fmtTime(journey.departure.scheduled_time)} → {fmtTime(journey.arrival.scheduled_time)}

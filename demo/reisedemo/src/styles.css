@@ -98,7 +98,8 @@ body {
 }
 
 select,
-input[type='datetime-local'] {
+input[type='datetime-local'],
+.combobox input[type='text'] {
   font: inherit;
   color: var(--text);
   background: var(--surface);
@@ -113,6 +114,61 @@ input:focus-visible,
 button:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+/* ---- searchable stop combobox ---- */
+
+.combobox {
+  position: relative;
+}
+
+.combobox input[type='text'] {
+  width: 100%;
+}
+
+.combobox-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 100%;
+  width: max-content;
+  max-width: 320px;
+  z-index: 20;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgb(26 32 39 / 0.12);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.combobox-option {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.combobox-option.active {
+  background: var(--accent-soft);
+}
+
+.combobox-option .option-mode {
+  flex: none;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.combobox-more {
+  padding: 7px 10px;
+  font-size: 12px;
+  color: var(--text-faint);
 }
 
 .query-row {
@@ -229,6 +285,14 @@ button.primary:disabled {
   padding: 12px 18px;
   border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
+}
+
+.mode-tag {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
 }
 
 .line-badge {
