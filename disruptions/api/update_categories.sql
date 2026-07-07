@@ -13,13 +13,13 @@
 -- missing summary or description still dedups correctly. Re-runs only pay to classify unseen text.
 DECLARE cat_array STRING DEFAULT (
   SELECT STRING_AGG(FORMAT('(%T, %T)', category, description), ',\n      ' ORDER BY sort_order)
-  FROM `ent-kixavvik-dev.disruptions.category_taxonomy`
+  FROM `disruptions.category_taxonomy`
 );
 
 EXECUTE IMMEDIATE FORMAT(r"""
-INSERT INTO `ent-kixavvik-dev.disruptions.categories` (summary, description, category)
+INSERT INTO `disruptions.categories` (summary, description, category)
 WITH texts AS (
-  SELECT summary, description FROM `ent-kixavvik-dev.disruptions.disruptions_initial_today`
+  SELECT summary, description FROM `disruptions.disruptions_initial_today`
   WHERE summary IS NOT NULL OR description IS NOT NULL
   GROUP BY summary, description
 )
@@ -38,7 +38,7 @@ WHERE (summary IS NOT NULL OR description IS NOT NULL)
   -- stands in for NULL so missing summary/description still dedup correctly)
   AND NOT EXISTS (
     SELECT 1
-    FROM `ent-kixavvik-dev.disruptions.categories` AS c
+    FROM `disruptions.categories` AS c
     WHERE IFNULL(c.summary,     '__NULL__') = IFNULL(t.summary,     '__NULL__')
       AND IFNULL(c.description, '__NULL__') = IFNULL(t.description, '__NULL__')
   )

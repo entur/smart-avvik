@@ -20,7 +20,7 @@
 -- STOP NAMES: NSR quays give stopPlaceRef but a NULL name; GTFS gtfs_last_recorded_ent_v1 supplies
 -- the StopPlace name (by parent_station) for ALL agencies here (no VYG filter), COALESCE'd with the
 -- quay name. CURRENT_DATE() partition prune keeps the ET scan small; re-run on a TTL from main.py.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.bus_calls_planned_today` AS
+CREATE OR REPLACE TABLE `disruptions.bus_calls_planned_today` AS
 WITH last_snap AS (
   SELECT
     REGEXP_REPLACE(COALESCE(datedVehicleJourneyRef, framedVehicleJourneyRef.datedVehicleJourneyRef),

@@ -23,7 +23,7 @@
 -- Impact thresholds (15 min / 60 min gap / 12 h cap) are inlined literals here — identical to
 -- create_disruptions_initial.sql's DECLAREs; keep them in sync if you tune them there.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.disruptions_initial_today` AS
+CREATE OR REPLACE TABLE `disruptions.disruptions_initial_today` AS
 WITH all_versions AS (
   SELECT
     participantRef, situationNumber, version, creationTime,
@@ -140,7 +140,7 @@ base AS (
 impacted AS (
   SELECT b.situationNumber, r.aimed_dep AS ts
   FROM base AS b
-  JOIN `ent-kixavvik-dev.disruptions.rail_calls_today` AS r
+  JOIN `disruptions.rail_calls_today` AS r
     ON r.stop_place IN UNNEST(b.affected_stops)
    AND r.aimed_dep BETWEEN b.onset_ts AND TIMESTAMP_ADD(b.onset_ts, INTERVAL 12 HOUR)
    AND (r.call_cancelled OR r.dep_delay_min >= 15)

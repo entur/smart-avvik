@@ -23,7 +23,7 @@ f AS (
          COALESCE(operating_date, DATE '1000-01-01') AS inst,
          lineRef, stop_place, stop_name, stop_order, call_date, aimed_dep,
          call_cancelled, dep_delay_min
-  FROM `ent-kixavvik-dev.disruptions.demo_calls`
+  FROM `disruptions.demo_calls`
   WHERE stop_place = @from_stop
     AND call_date BETWEEN DATE(@start_ts) AND DATE(@end_ts)
     AND aimed_dep BETWEEN @start_ts AND @end_ts
@@ -33,7 +33,7 @@ t AS (
          COALESCE(operating_date, DATE '1000-01-01') AS inst,
          stop_place, stop_name, stop_order, call_date, aimed_arr,
          call_cancelled, arr_delay_min
-  FROM `ent-kixavvik-dev.disruptions.demo_calls`
+  FROM `disruptions.demo_calls`
   WHERE stop_place = @to_stop
     AND call_date BETWEEN DATE(@start_ts) AND DATE_ADD(DATE(@end_ts), INTERVAL 1 DAY)
     AND aimed_arr IS NOT NULL
@@ -56,12 +56,12 @@ j AS (
                              ORDER BY f.stop_order, t.stop_order) = 1
 ),
 pf AS (
-  SELECT * FROM `ent-kixavvik-dev.disruptions.demo_predictions`
+  SELECT * FROM `disruptions.demo_predictions`
   WHERE stop_place = @from_stop
     AND call_date BETWEEN DATE(@start_ts) AND DATE(@end_ts)
 ),
 pt AS (
-  SELECT * FROM `ent-kixavvik-dev.disruptions.demo_predictions`
+  SELECT * FROM `disruptions.demo_predictions`
   WHERE stop_place = @to_stop
     AND call_date BETWEEN DATE(@start_ts) AND DATE_ADD(DATE(@end_ts), INTERVAL 1 DAY)
 ),

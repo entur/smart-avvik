@@ -11,4 +11,4 @@ SELECT
   base_trouble_rate, trouble_lift,
   exp_disruption_min, confidence,
   alert_score, alert_tier
-FROM `ent-kixavvik-dev.disruptions.category_line_hour_impact`
+FROM `disruptions.category_line_hour_impact`

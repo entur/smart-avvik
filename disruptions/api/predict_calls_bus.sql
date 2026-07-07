@@ -21,11 +21,11 @@
 -- per-call hour bucket). onset/time features come from SAFE.TIMESTAMP(creationTime) in UTC for
 -- verbatim train/serve parity. Keep the feature block in sync with predict_calls.sql + the training
 -- build (create_training_calls_pooled_all.sql).
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.call_predictions_bus_today` AS
+CREATE OR REPLACE TABLE `disruptions.call_predictions_bus_today` AS
 WITH
 cat AS (
   SELECT summary, description, ANY_VALUE(category) AS category
-  FROM `ent-kixavvik-dev.disruptions.categories`
+  FROM `disruptions.categories`
   GROUP BY summary, description
 ),
 sit AS (
@@ -51,7 +51,7 @@ sit AS (
     IFNULL(SAFE_CAST(REGEXP_EXTRACT(
       LOWER(CONCAT(IFNULL(d.summary,''), ' ', IFNULL(d.description,''))),
       r'([0-9]+)\s*min') AS INT64), -1) AS stated_min
-  FROM `ent-kixavvik-dev.disruptions.disruptions_bus_initial_today` AS d
+  FROM `disruptions.disruptions_bus_initial_today` AS d
   LEFT JOIN cat AS c
     ON IFNULL(d.summary,'')     = IFNULL(c.summary,'')
    AND IFNULL(d.description,'') = IFNULL(c.description,'')
@@ -89,7 +89,7 @@ base AS (
     EXTRACT(DAYOFWEEK FROM COALESCE(r.aimed_dep, r.aimed_arr)) AS call_dow,
     a.category, a.stated_min
   FROM aff AS a
-  JOIN `ent-kixavvik-dev.disruptions.bus_calls_planned_today` AS r
+  JOIN `disruptions.bus_calls_planned_today` AS r
     ON r.operator = a.operator AND r.jkey = a.jkey
   WHERE (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
     AND TIMESTAMP_DIFF(COALESCE(r.aimed_dep, r.aimed_arr), a.onset_ts, MINUTE) BETWEEN 0 AND 720
@@ -102,7 +102,7 @@ base AS (
 observed AS (
   SELECT operator, lineRef, jkey, stop_order, aimed_dep, dep_delay_min,
          COALESCE(call_cancelled, FALSE) AS call_cancelled
-  FROM `ent-kixavvik-dev.disruptions.bus_calls_planned_today`
+  FROM `disruptions.bus_calls_planned_today`
   WHERE COALESCE(call_cancelled, FALSE) OR dep_delay_min IS NOT NULL
 ),
 sitline AS (
@@ -242,7 +242,7 @@ dge40 AS (
   FROM ML.PREDICT(MODEL `disruptions.dep_ge40_clf_pooled_all`, (SELECT * FROM calls))
 ),
 -- operator-aware, ask-horizon-aware platt coefficients, one slice per head
-pwt AS (SELECT * FROM `ent-kixavvik-dev.disruptions.pooled_all_platt_weights`),
+pwt AS (SELECT * FROM `disruptions.pooled_all_platt_weights`),
 scored AS (
   SELECT
     c.*,

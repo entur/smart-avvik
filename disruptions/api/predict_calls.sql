@@ -34,11 +34,11 @@
 -- Cheap: reads the small materialized rail_calls_planned_today + today's situations + ML.PREDICT
 -- (no ET scan here -- that cost is in rail_calls_planned_today.sql, rebuilt on a TTL by main.py).
 -- Keep the feature block + scoring tail in sync with data/queries/predict_calls_today.sql.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.call_predictions_today` AS
+CREATE OR REPLACE TABLE `disruptions.call_predictions_today` AS
 WITH
 cat AS (
   SELECT summary, description, ANY_VALUE(category) AS category
-  FROM `ent-kixavvik-dev.disruptions.categories`
+  FROM `disruptions.categories`
   GROUP BY summary, description
 ),
 sit AS (
@@ -64,7 +64,7 @@ sit AS (
     IFNULL(SAFE_CAST(REGEXP_EXTRACT(
       LOWER(CONCAT(IFNULL(d.summary,''), ' ', IFNULL(d.description,''))),
       r'([0-9]+)\s*min') AS INT64), -1) AS stated_min
-  FROM `ent-kixavvik-dev.disruptions.disruptions_initial_today` AS d
+  FROM `disruptions.disruptions_initial_today` AS d
   LEFT JOIN cat AS c
     ON IFNULL(d.summary,'')     = IFNULL(c.summary,'')
    AND IFNULL(d.description,'') = IFNULL(c.description,'')
@@ -97,13 +97,13 @@ base AS (
     EXTRACT(DAYOFWEEK FROM COALESCE(r.aimed_dep, r.aimed_arr)) AS call_dow,
     a.category, a.stated_min
   FROM aff AS a
-  JOIN `ent-kixavvik-dev.disruptions.rail_calls_planned_today` AS r USING (jkey)
+  JOIN `disruptions.rail_calls_planned_today` AS r USING (jkey)
   WHERE (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
     AND TIMESTAMP_DIFF(COALESCE(r.aimed_dep, r.aimed_arr), a.onset_ts, MINUTE) BETWEEN 0 AND 720
 ),
 observed AS (
   SELECT lineRef, jkey, stop_order, aimed_dep, dep_delay_min, COALESCE(call_cancelled, FALSE) AS call_cancelled
-  FROM `ent-kixavvik-dev.disruptions.rail_calls_planned_today`
+  FROM `disruptions.rail_calls_planned_today`
   WHERE COALESCE(call_cancelled, FALSE) OR dep_delay_min IS NOT NULL
 ),
 sitline AS (

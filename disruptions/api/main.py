@@ -32,32 +32,32 @@ _ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text
 # NSB/prod family (rail): predict_calls.sql -> call_predictions_today.
 _RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.sql").read_text()
 _PREDICT_CALLS_QUERY = (Path(__file__).parent / "predict_calls.sql").read_text()
-_CALL_PREDICTIONS_QUERY = "SELECT * FROM `ent-kixavvik-dev.disruptions.call_predictions_today`"
+_CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
 # Bus/GOA family (pooled_all): the bus planned call source, the bus SX source, and the bus scoring
 # query -> call_predictions_bus_today (same columns as call_predictions_today PLUS `operator`).
 _BUS_CALLS_PLANNED_QUERY = (Path(__file__).parent / "bus_calls_planned_today.sql").read_text()
 _DISRUPTIONS_BUS_QUERY = (Path(__file__).parent / "disruptions_bus_initial_today.sql").read_text()
 _PREDICT_CALLS_BUS_QUERY = (Path(__file__).parent / "predict_calls_bus.sql").read_text()
 _CALL_PREDICTIONS_BUS_QUERY = (
-    "SELECT * FROM `ent-kixavvik-dev.disruptions.call_predictions_bus_today`"
+    "SELECT * FROM `disruptions.call_predictions_bus_today`"
 )
 # /demo-api: retrospective journey search over the static demo tables
 # (built offline by data/queries/create_demo_predictions.sql).
 _DEMO_JOURNEYS_QUERY = (Path(__file__).parent / "demo_journeys.sql").read_text()
 _DEMO_STOPS_QUERY = """
     SELECT stop_place, stop_name, n_calls, mode
-    FROM `ent-kixavvik-dev.disruptions.demo_stops`
+    FROM `disruptions.demo_stops`
     ORDER BY n_calls DESC
 """
 _DEMO_HIGHLIGHTS_QUERY = """
     SELECT situationNumber, operator, summary, category, onset_ts, n_cancelled, n_delayed10,
            window_start, window_end, from_stop, from_name, to_stop, to_name
-    FROM `ent-kixavvik-dev.disruptions.demo_highlights`
+    FROM `disruptions.demo_highlights`
     ORDER BY n_cancelled + n_delayed10 DESC
 """
 _DEMO_WINDOW_QUERY = """
     SELECT MIN(call_date) AS window_start, MAX(call_date) AS window_end
-    FROM `ent-kixavvik-dev.disruptions.demo_calls`
+    FROM `disruptions.demo_calls`
 """
 # /varsel-api/stops: stops for the avviksvarsel journey pickers, from the planned-timetable call
 # sources rebuilt on their TTLs (tiny GROUP BY over small tables). Rail and bus are queried
@@ -67,7 +67,7 @@ _DEMO_WINDOW_QUERY = """
 _VARSEL_STOPS_QUERY = """
     SELECT stop_place, ANY_VALUE(stop_name) AS stop_name, COUNT(*) AS n_calls,
            TRUE AS has_rail, FALSE AS has_bus
-    FROM `ent-kixavvik-dev.disruptions.rail_calls_planned_today`
+    FROM `disruptions.rail_calls_planned_today`
     WHERE stop_place IS NOT NULL
     GROUP BY stop_place
 """
@@ -75,7 +75,7 @@ _VARSEL_STOPS_BUS_QUERY = """
     SELECT stop_place, ANY_VALUE(stop_name) AS stop_name, COUNT(*) AS n_calls,
            LOGICAL_OR(operator = 'GOA') AS has_rail,
            LOGICAL_OR(operator != 'GOA') AS has_bus
-    FROM `ent-kixavvik-dev.disruptions.bus_calls_planned_today`
+    FROM `disruptions.bus_calls_planned_today`
     WHERE stop_place IS NOT NULL
     GROUP BY stop_place
 """

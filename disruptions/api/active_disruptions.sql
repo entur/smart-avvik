@@ -32,5 +32,5 @@ SELECT
   impact_p50_min,
   impact_p80_min,
   impact_p90_min
-FROM `ent-kixavvik-dev.disruptions.predictions_today`
+FROM `disruptions.predictions_today`
 ORDER BY reopen_ts IS NOT NULL, onset_ts DESC   -- still-ongoing first, then reopened, newest onset first

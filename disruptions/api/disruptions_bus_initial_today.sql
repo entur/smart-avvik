@@ -13,7 +13,7 @@
 -- framed datedVehicleJourneyRef, the datedVehicleJourneyRefs array, and the plain vehicleJourneyRefs
 -- (ServiceJourney refs for RUT/KOL/etc. -- the 2026-07-03 extraction fix). onset is keyed off
 -- creationTime downstream (predict_calls_bus.sql), for verbatim train/serve parity.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.disruptions_bus_initial_today` AS
+CREATE OR REPLACE TABLE `disruptions.disruptions_bus_initial_today` AS
 WITH all_versions AS (
   SELECT
     participantRef, situationNumber, version, creationTime,

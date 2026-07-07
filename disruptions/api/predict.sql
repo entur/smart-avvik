@@ -46,7 +46,7 @@
 -- misses it). It equals actual_impact_min when there's no pre-onset impact; it is NOT a
 -- redefinition of the impact label (which is strictly forward from onset).
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.predictions_today` AS
+CREATE OR REPLACE TABLE `disruptions.predictions_today` AS
 WITH
 src AS (
   SELECT
@@ -190,7 +190,7 @@ reopen_pred AS (
     ROUND(EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))  AS reopen_p50_min,
     ROUND(EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))  AS reopen_p80_min,
     ROUND(EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))  AS reopen_p90_min     -- "up to ~Z min"
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_reopen`,
+  FROM ML.PREDICT(MODEL `disruptions.dur_init_reopen`,
                   (SELECT * FROM feat)) AS p
   LEFT JOIN (
     SELECT category, off_p50, off_p80, off_p90
@@ -218,7 +218,7 @@ impact_pred AS (
     ROUND(p.elapsed_min + EXP(p.predicted_label + COALESCE(qc.off_p50, qg.off_p50)))  AS impact_p50_min,
     ROUND(p.elapsed_min + EXP(p.predicted_label + COALESCE(qc.off_p80, qg.off_p80)))  AS impact_p80_min,
     ROUND(p.elapsed_min + EXP(p.predicted_label + COALESCE(qc.off_p90, qg.off_p90)))  AS impact_p90_min     -- "up to ~Z min"
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.impact_remaining_noet`,
+  FROM ML.PREDICT(MODEL `disruptions.impact_remaining_noet`,
                   (SELECT * FROM feat)) AS p
   LEFT JOIN (
     SELECT category, off_p50, off_p80, off_p90

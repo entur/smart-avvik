@@ -26,7 +26,7 @@
 -- renumbered / extra runs that only ET carries. ET's datedVehicleJourneyRef shares SX's namespace,
 -- so it is the correct journey source. GTFS is used ONLY to resolve stop_name below (by StopPlace,
 -- not by journey), since the NSR quays join returns the ref but a NULL name.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.rail_calls_planned_today` AS
+CREATE OR REPLACE TABLE `disruptions.rail_calls_planned_today` AS
 WITH last_snap AS (
   SELECT
     REGEXP_REPLACE(datedVehicleJourneyRef, r'^[A-Za-z]+:', '') AS jkey,
