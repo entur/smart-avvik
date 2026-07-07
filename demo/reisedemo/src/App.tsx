@@ -134,9 +134,9 @@ export default function App() {
         {meta && (
           <p className="data-note">
             Datagrunnlag: tog (Vy/NSB, Go-Ahead) og buss {fmtDate(meta.window_start)} –{' '}
-            {fmtDate(meta.window_end)} — modellenes holdout, pluss de siste dagene for NSB-tog;
-            alle tall er utenfor treningsdataene. Varsel når P(innstilt eller ≥ 10 min forsinket)
-            ≥ {Math.round(meta.alert_threshold * 100)} %.
+            {fmtDate(meta.window_end)} — modellenes holdout pluss de siste dagene (buss
+            oppdateres daglig, til og med i går); alle tall er utenfor treningsdataene. Varsel
+            når P(innstilt eller ≥ 10 min forsinket) ≥ {Math.round(meta.alert_threshold * 100)} %.
           </p>
         )}
       </header>

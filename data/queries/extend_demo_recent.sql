@@ -1,6 +1,11 @@
--- Extend the /demo dataset with RECENT days (everything after the static holdout build,
--- which ends 2026-06-20 — see create_demo_predictions.sql), so partner demos can show
+-- Extend the /demo dataset's NSB rows with RECENT days (everything after the static holdout
+-- build, which ends 2026-06-20 — see create_demo_predictions.sql), so partner demos can show
 -- yesterday's — and today's completed — journeys next to what the models predicted.
+--
+-- This is the MANUAL, full-fidelity NSB layer (anshar recordedCalls extraction, same-day
+-- capable, ~$2.5/run). The unattended freshness path is extend_demo_recent_daily.sql
+-- (all operators from last_recorded, nightly scheduled query, ~10-17 % thinner for rail):
+-- its next run replaces the NSB slice this script writes, so run this right before demos.
 --
 -- Self-contained and safe to re-run (idempotent per run window): typically run it right
 -- before a demo, via data/queries/refresh_demo_recent.sh.
