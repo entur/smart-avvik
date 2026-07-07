@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+# Local-only avviksvarsel state (durable state lives in the GCS bucket in prod).
+varsel_state.json

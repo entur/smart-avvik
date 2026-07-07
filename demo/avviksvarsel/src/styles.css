@@ -1,0 +1,220 @@
+/* App-level layout for the Avviksvarsel PWA. Brand colours come from Entur Linje tokens
+   (imported in main.tsx); this file only adds phone-first layout and a few token-driven accents —
+   no hardcoded hex. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--lavender-10);
+  color: var(--colors-blues-blueMain, var(--lavender-90));
+  min-height: 100vh;
+}
+
+/* ---- header (Contrast band) ---- */
+
+.av-header {
+  padding: env(safe-area-inset-top) 0 0;
+}
+
+.av-header-inner {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.av-header-title {
+  margin: 0;
+}
+
+/* ---- main ---- */
+
+.av-main {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem calc(3rem + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.av-intro {
+  margin: 0;
+}
+
+.av-loading {
+  display: flex;
+  justify-content: center;
+  padding: 3rem 0;
+}
+
+/* ---- cards ---- */
+
+.av-card {
+  background: var(--basecolors-frame-default);
+  border: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  border-radius: var(--border-radiuses-large, 0.5rem);
+  padding: 1rem 1.125rem;
+  box-shadow: 0 1px 3px rgb(24 28 86 / 0.06);
+}
+
+.av-status {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.av-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.av-status-note {
+  margin: 0;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* ---- section ---- */
+
+.av-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+}
+
+.av-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.av-empty {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* ---- journey list ---- */
+
+.av-journey-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.875rem;
+}
+
+.av-journey {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.av-journey-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.av-route {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  font-weight: 600;
+  font-size: var(--font-sizes-large, 1rem);
+}
+
+.av-route-arrow {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+.av-journey-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.av-chip {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--font-sizes-small, 0.75rem);
+  font-weight: 600;
+  color: var(--lavender-90);
+  background: var(--lavender-20, var(--lavender-10));
+  border: 1px solid var(--blue-50);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  white-space: nowrap;
+}
+
+.av-muted {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* ---- alerts on a journey ---- */
+
+.av-alerts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.av-alerts-lead {
+  font-weight: 600;
+}
+
+.av-alert-summary {
+  display: block;
+  font-weight: 600;
+}
+
+.av-alert-detail {
+  display: block;
+}
+
+/* ---- add-journey form ---- */
+
+.av-form {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.av-form-times {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.av-form-times > * {
+  flex: 1 1 8rem;
+}
+
+.av-form-days {
+  border: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.av-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.av-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}

@@ -1,0 +1,35 @@
+{
+  "name": "avviksvarsel",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@entur/a11y": "^0.2.113",
+    "@entur/alert": "^0.19.4",
+    "@entur/button": "^4.0.11",
+    "@entur/chip": "^0.10.16",
+    "@entur/dropdown": "^8.1.8",
+    "@entur/form": "^9.3.8",
+    "@entur/icons": "^9.0.4",
+    "@entur/layout": "^3.7.5",
+    "@entur/loader": "^0.7.4",
+    "@entur/modal": "^1.8.16",
+    "@entur/tokens": "^3.24.0",
+    "@entur/travel": "^7.0.4",
+    "@entur/typography": "^2.1.12",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.0"
+  }
+}

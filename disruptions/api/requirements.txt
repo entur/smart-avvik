@@ -7,3 +7,7 @@ uvicorn[standard]>=0.34
 # zoneinfo needs an IANA tz database; the python:3.13-slim image ships without one,
 # so bundle it for the Europe/Oslo hour-of-day lookup in the alert profiles.
 tzdata>=2024.1
+# Avviksvarsel (/varsel): Web Push sender (pulls py_vapid + cryptography) and durable
+# subscription/journey state in a GCS blob so it survives Cloud Run redeploys.
+pywebpush>=2.0.0
+google-cloud-storage>=2.16.0

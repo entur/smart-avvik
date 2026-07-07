@@ -32,6 +32,12 @@ if [ "${SKIP_DEMO_BUILD:-}" != "1" ]; then
   ../../demo/reisedemo/build.sh
 fi
 
+# Build the Avviksvarsel PWA (demo/avviksvarsel -> varsel_static/, served at /varsel).
+# Set SKIP_VARSEL_BUILD=1 to reuse the existing varsel_static/ (e.g. a backend-only redeploy).
+if [ "${SKIP_VARSEL_BUILD:-}" != "1" ]; then
+  ../../demo/avviksvarsel/build.sh
+fi
+
 gcloud run deploy "$SERVICE" \
   --source . \
   --project "$PROJECT" \

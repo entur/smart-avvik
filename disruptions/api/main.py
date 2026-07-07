@@ -15,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from google.cloud import bigquery
 from pydantic import BaseModel, Field
 
+import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -47,6 +49,14 @@ _DEMO_HIGHLIGHTS_QUERY = """
 _DEMO_WINDOW_QUERY = """
     SELECT MIN(call_date) AS window_start, MAX(call_date) AS window_end
     FROM `ent-kixavvik-dev.disruptions.demo_calls`
+"""
+# /varsel-api/stops: rail stops for the avviksvarsel journey pickers, from the planned-timetable
+# call source rebuilt by maybe_refresh_planned_calls() (tiny GROUP BY over a small table).
+_VARSEL_STOPS_QUERY = """
+    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name
+    FROM `ent-kixavvik-dev.disruptions.rail_calls_planned_today`
+    WHERE stop_place IS NOT NULL
+    GROUP BY stop_place
 """
 
 # Hour-of-day in the impact lookup is Europe/Oslo local time (matches the table build),
@@ -363,6 +373,34 @@ def refresh_call_predictions_cache() -> None:
     )
 
 
+# ---- Avviksvarsel providers ------------------------------------------------------------------
+# The varsel module (registered-journey push alerts) reads the live per-call snapshot and a small
+# rail-stop list through these providers, injected via varsel.configure() at startup so varsel
+# never imports main (no cycle). The stop list is refreshed alongside the planned call source.
+_varsel_stops_lock = threading.Lock()
+_varsel_stops_cache: list[dict] = []
+
+
+def refresh_varsel_stops() -> None:
+    """Reload the rail-stop picker list from rail_calls_planned_today (tiny scan)."""
+    rows = bq_client.query(_VARSEL_STOPS_QUERY).result()
+    stops = [{"stop_place": r.stop_place, "stop_name": r.stop_name} for r in rows]
+    with _varsel_stops_lock:
+        global _varsel_stops_cache
+        _varsel_stops_cache = stops
+    logger.info("Refreshed varsel stops: %d", len(stops))
+
+
+def _varsel_stops() -> list[dict]:
+    with _varsel_stops_lock:
+        return _varsel_stops_cache
+
+
+def _varsel_snapshot() -> dict[str, list]:
+    with _call_pred_lock:
+        return _call_pred_by_situation
+
+
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
@@ -399,6 +437,18 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
         refresh_call_predictions_cache()
     except Exception:
         logger.exception("Per-call predictions refresh failed; /journey will serve stale or empty")
+    # Rail-stop picker list for the avviksvarsel PWA. Isolated so a failure never breaks the feed.
+    try:
+        refresh_varsel_stops()
+    except Exception:
+        logger.exception("Varsel stops refresh failed; /varsel-api/stops may be stale or empty")
+    # Registered-journey push alerts: match every journey against the fresh snapshot and push any
+    # newly alert-worthy hit. Isolated (like the other steps) so a push failure never breaks the
+    # feed rebuild. No-op when VAPID is unconfigured.
+    try:
+        varsel.check_and_notify(_varsel_snapshot())
+    except Exception:
+        logger.exception("Avviksvarsel notify failed")
 
 
 
@@ -410,6 +460,14 @@ async def lifespan(app: FastAPI):
         refresh_impact_lookup()
     except Exception:
         logger.exception("Initial impact lookup load failed; will retry on ingestion poll")
+    # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
+    # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
+    varsel.configure(snapshot_provider=_varsel_snapshot, stops_provider=_varsel_stops)
+    varsel.load_state()
+    try:
+        refresh_varsel_stops()
+    except Exception:
+        logger.exception("Initial varsel stops load failed; will retry on ingestion poll")
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
@@ -462,14 +520,20 @@ app = FastAPI(
     contact={"name": "Entur — Team KI-eksperimentering"},
 )
 
-# Public, read-only JSON API — allow any origin so it can be consumed from
-# browsers (only GET endpoints are exposed, so this carries no write risk).
+# Public API — allow any origin so it can be consumed from browsers. The disruptions feed is
+# read-only (GET); the avviksvarsel endpoints (/varsel-api) additionally accept POST/DELETE to
+# register a device's push subscription and journeys, keyed only by a client-generated device_id
+# (prototype, no auth — see demo/avviksvarsel/README.md).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
+
+# Avviksvarsel API (registered-journey push alerts). Registered before the /varsel static mount
+# so /varsel-api/* resolves to these routes.
+app.include_router(varsel.router)
 
 # Pre-rendered marimo eval notebooks, served read-only at /eval (index at /eval/,
 # each notebook at /eval/<name>.html). They are static snapshots built offline by
@@ -492,6 +556,16 @@ if _DEMO_STATIC_DIR.is_dir():
     logger.info("Mounted demo UI at /demo from %s", _DEMO_STATIC_DIR)
 else:
     logger.info("No demo_static/ directory; /demo not mounted (run demo/reisedemo/build.sh)")
+
+# The Avviksvarsel PWA (demo/avviksvarsel), built to static assets by its build script. Same
+# generated-directory pattern as /eval and /demo; the manifest, service worker and icons ship in
+# this directory and are served at /varsel/. Its data + push endpoints are /varsel-api (above).
+_VARSEL_STATIC_DIR = Path(__file__).parent / "varsel_static"
+if _VARSEL_STATIC_DIR.is_dir():
+    app.mount("/varsel", StaticFiles(directory=_VARSEL_STATIC_DIR, html=True), name="varsel")
+    logger.info("Mounted avviksvarsel PWA at /varsel from %s", _VARSEL_STATIC_DIR)
+else:
+    logger.info("No varsel_static/ directory; /varsel not mounted (run demo/avviksvarsel/build.sh)")
 
 
 def get_last_ingestion_time() -> datetime | None:

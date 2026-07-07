@@ -44,6 +44,19 @@ gcloud run deploy kix-avvik-disruptions \
   from static tables built by `data/queries/create_demo_predictions.sql` — re-run that query
   after model/calibration retrains. `data/queries/refresh_demo_recent.sh` extends the tables
   with the last ~25 days straight from SIRI-ET/SX (run before a partner demo; ~$2).
+- The **Avviksvarsel** PWA at `/varsel` (register a journey → Web Push when a live disruption is
+  predicted to hit it; Vy rail only) lives in `demo/avviksvarsel/` (React + Vite + Entur Linje) and
+  builds into `disruptions/api/varsel_static/` via `deploy.sh` (`SKIP_VARSEL_BUILD=1` to skip). Its
+  API is `/varsel-api` (see `disruptions/api/varsel.py`); the matcher runs in the poller's refresh
+  cycle. Install steps for phones are in `demo/avviksvarsel/README.md`. Two extra env vars beyond
+  the base deploy:
+  - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
+    Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
+    `push_enabled=false`); the journey list still works. Regenerate with
+    `uv run --with pywebpush python disruptions/api/gen_vapid.py`.
+  - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
+    so registrations survive redeploys (Cloud Run fs is tmpfs). The runtime SA needs
+    `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
 
 ## Conventions
 
