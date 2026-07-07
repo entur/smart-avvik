@@ -61,6 +61,32 @@ _ALERT_THRESHOLD = 0.65
 # A journey counts as "trouble" when cancelled or >= this many minutes late (matches the impact
 # probability's definition), used for the notification wording.
 _TROUBLE_DELAY_MIN = 10
+
+# Per-operator alert threshold overrides (default _ALERT_THRESHOLD). The pooled bus family is
+# calibrated per operator, but a single 0.65 cut still under-/over-alerts a few operators (e.g.
+# KOL/OST — see docs/pooled-models-bus/LEARNINGS.md). Populate from eval/pooled-model-bus-eval.py.
+_OPERATOR_ALERT_THRESHOLD: dict[str, float] = {}
+
+
+def _threshold_for(operator: str | None) -> float:
+    return _OPERATOR_ALERT_THRESHOLD.get(operator or "", _ALERT_THRESHOLD)
+
+
+# Rail codespaces (operator == ref codespace). vehicleMode is NULL for most bus producers, so the
+# vehicle noun is derived from the codespace, not the feed; everything not rail is labelled "Buss".
+_RAIL_CODESPACES = frozenset({"VYG", "NSB", "GOA", "SJN", "FLT"})
+
+
+def mode_label(operator: str | None) -> str:
+    """User-facing vehicle noun for an operator: 'Tog' (rail) or 'Buss' (everything else)."""
+    return "Tog" if operator in _RAIL_CODESPACES else "Buss"
+
+
+# FOLLOW-UP (needs its own eval before enabling): MOR/ATB/OST/GCO publish the SX *after* departure,
+# so match_journey's pre-departure boarding requirement means those journeys rarely match. Serving
+# them well needs an "alert at message arrival" policy (arrival-side impact, relaxed future-boarding
+# requirement); deferred until validated. See docs/pooled-models-bus/LEARNINGS.md (Lead time).
+_AFTER_DEPARTURE_OPERATORS = frozenset({"MOR", "ATB", "OST", "GCO"})
 # Keep state bounded: a client-generated device may register at most this many journeys.
 _MAX_JOURNEYS_PER_DEVICE = 20
 # A freshly-created push subscription can 404/410 at the push service for a short window before
@@ -224,7 +250,12 @@ class Alert(BaseModel):
 
     situation_number: str = Field(description="SIRI-SX situationNumber of the disruption.")
     summary: str | None = Field(description="Short Norwegian summary of the situation.")
-    line: str | None = Field(description="Line ref of the worst affected train, e.g. 'VYG:Line:R31'.")
+    operator: str | None = Field(
+        default=None,
+        description="Ref codespace of the worst affected journey (VYG, RUT, KOL, ...).",
+    )
+    mode: str = Field(default="Tog", description="Vehicle noun for the UI: 'Tog' or 'Buss'.")
+    line: str | None = Field(description="Line ref of the worst affected vehicle, e.g. 'VYG:Line:R31'.")
     departure_time: datetime | None = Field(
         description="Aimed departure from the boarding stop of the worst affected train (UTC).",
     )
@@ -262,12 +293,15 @@ def match_journey(journey: dict, by_situation: dict[str, list]) -> list[Alert]:
 
     alerts: list[Alert] = []
     for sit_num, calls in by_situation.items():
-        by_jkey: dict[str, list] = {}
+        # Group by (operator, jkey): bus ServiceJourney jkeys are not date-scoped, so a single
+        # situation (e.g. a GCO notice fanning across county codespaces) can carry the same jkey for
+        # two different operators' journeys — keying on jkey alone would merge them.
+        by_key: dict[tuple[str, str], list] = {}
         for c in calls:
-            by_jkey.setdefault(c.jkey, []).append(c)
+            by_key.setdefault((c.operator, c.jkey), []).append(c)
 
         matching_boardings: list[Any] = []
-        for group in by_jkey.values():
+        for group in by_key.values():
             board = next(
                 (
                     c
@@ -293,15 +327,18 @@ def match_journey(journey: dict, by_situation: dict[str, list]) -> list[Alert]:
             continue
         worst = max(matching_boardings, key=_severity)
         impact = worst.p_impact_dep
+        threshold = _threshold_for(worst.operator)
         alertworthy = (
-            impact >= _ALERT_THRESHOLD
+            impact >= threshold
             if impact is not None
-            else worst.p_cancel >= _ALERT_THRESHOLD
+            else worst.p_cancel >= threshold
         )
         alerts.append(
             Alert(
                 situation_number=sit_num,
                 summary=worst.summary,
+                operator=worst.operator,
+                mode=mode_label(worst.operator),
                 line=worst.line,
                 departure_time=worst.aimed_dep,
                 cancel_probability=worst.p_cancel,
@@ -324,7 +361,7 @@ def _notification_payload(journey: dict, alert: Alert) -> dict:
     parts = []
     if alert.departure_time is not None:
         hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-        parts.append(f"Tog kl {hhmm}:")
+        parts.append(f"{alert.mode} kl {hhmm}:")
     parts.append(f"{pct} % sjanse for innstilling")
     if alert.delay_typ_min:
         parts.append(f"typisk {alert.delay_typ_min} min forsinket")

@@ -58,9 +58,9 @@ export default function AddJourneyModal({
   }
 
   function validate(): string | null {
-    if (!from) return 'Velg en fra-stasjon.';
-    if (!to) return 'Velg en til-stasjon.';
-    if (from.value === to.value) return 'Fra- og til-stasjon må være ulike.';
+    if (!from) return 'Velg et fra-stopp.';
+    if (!to) return 'Velg et til-stopp.';
+    if (from.value === to.value) return 'Fra- og til-stopp må være ulike.';
     if (!begin || !end) return 'Velg tidsrom.';
     if (begin >= end) return 'Tidsrommet må starte før det slutter.';
     if (days.length === 0) return 'Velg minst én ukedag.';
@@ -101,7 +101,7 @@ export default function AddJourneyModal({
           items={items}
           selectedItem={from}
           onChange={(item) => setFrom(item)}
-          placeholder="Søk etter stasjon"
+          placeholder="Søk etter stopp"
           clearable
         />
         <SearchableDropdown
@@ -109,7 +109,7 @@ export default function AddJourneyModal({
           items={items}
           selectedItem={to}
           onChange={(item) => setTo(item)}
-          placeholder="Søk etter stasjon"
+          placeholder="Søk etter stopp"
           clearable
         />
 

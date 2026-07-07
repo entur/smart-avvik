@@ -13,6 +13,8 @@ export interface StopItem {
 export interface Alert {
   situation_number: string;
   summary: string | null;
+  operator: string | null;
+  mode: string; // 'Tog' | 'Buss' — vehicle noun for the UI
   line: string | null;
   departure_time: string | null;
   cancel_probability: number;

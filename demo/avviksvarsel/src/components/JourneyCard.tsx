@@ -7,7 +7,7 @@ import { fmtDelay, fmtPct, fmtTime, formatDays } from '../format';
 
 function AlertLine({ alert }: { alert: Alert }) {
   const parts: string[] = [];
-  if (alert.departure_time) parts.push(`Tog kl ${fmtTime(alert.departure_time)}`);
+  if (alert.departure_time) parts.push(`${alert.mode ?? 'Tog'} kl ${fmtTime(alert.departure_time)}`);
   parts.push(`${fmtPct(alert.cancel_probability)} sjanse for innstilling`);
   const delay = fmtDelay(alert.delay_typ_min);
   if (delay) parts.push(delay);
