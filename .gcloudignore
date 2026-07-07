@@ -1,0 +1,45 @@
+# Controls what `gcloud run deploy --source .` (disruptions/api/deploy.sh, run
+# from the repo root) uploads as Cloud Build context. When this file exists gcloud
+# uses it verbatim and does NOT fall back to .gitignore, so every exclusion is
+# listed here explicitly.
+#
+# We must ship: demo/reisedemo + demo/avviksvarsel (front-end sources the root
+# Dockerfile builds), disruptions/api (incl. the committed eval_static/ snapshots),
+# and the Dockerfile itself. Everything else worth excluding is below.
+#
+# Syntax is gitignore-style (unlike .dockerignore): `node_modules/` matches at any
+# depth.
+
+.git
+.gcloudignore
+
+# Repo areas the image never needs.
+data/
+notebooks/
+docs/
+eval/
+helm/
+memory/
+.github/
+.idea/
+.agents/
+.claude/
+.entur/
+
+# Front-end deps are reinstalled with `npm ci` inside the build (these are large:
+# ~160 MB combined, so excluding them keeps the upload small).
+node_modules/
+
+# Generated front-end bundles: rebuilt in the Dockerfile's node stage.
+disruptions/api/demo_static/
+disruptions/api/varsel_static/
+
+# Local-only avviksvarsel state (durable state lives in the GCS bucket in prod).
+disruptions/api/varsel_state.json
+
+# Build/editor cruft.
+__pycache__/
+*.pyc
+*.pyo
+*.tsbuildinfo
+.DS_Store
