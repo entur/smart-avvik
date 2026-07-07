@@ -120,6 +120,15 @@ def test_alertworthy_gate():
     assert fallback and fallback[0].alertworthy is True
 
 
+def test_per_operator_threshold():
+    # RUT's tuned threshold is 0.75 (stricter than the 0.65 default), TRO's is 0.55 (looser):
+    # the same 0.70 impact prob is push-worthy for TRO but not for RUT.
+    rut = match_journey(_journey(), {"S1": _train(MON_0800, operator="RUT", p_impact_dep=0.70)})
+    assert rut and rut[0].alertworthy is False
+    tro = match_journey(_journey(), {"S1": _train(MON_0800, operator="TRO", p_impact_dep=0.70)})
+    assert tro and tro[0].alertworthy is True
+
+
 def test_worst_train_wins():
     # Two trains in the window; the alert reports the more severe one.
     calls = _train(_oslo(2026, 7, 6, 7, 30), jkey="t1", p_cancel=0.3) + _train(

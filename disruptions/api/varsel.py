@@ -63,9 +63,24 @@ _ALERT_THRESHOLD = 0.65
 _TROUBLE_DELAY_MIN = 10
 
 # Per-operator alert threshold overrides (default _ALERT_THRESHOLD). The pooled bus family is
-# calibrated per operator, but a single 0.65 cut still under-/over-alerts a few operators (e.g.
-# KOL/OST — see docs/pooled-models-bus/LEARNINGS.md). Populate from eval/pooled-model-bus-eval.py.
-_OPERATOR_ALERT_THRESHOLD: dict[str, float] = {}
+# calibrated per operator, but a single 0.65 cut under-/over-alerts several operators; these
+# values align every operator at ~90 % pooled precision on the serving-matched holdout
+# (eval/tune_alert_thresholds.py, tuned 2026-07-07 — re-run after retrains/platt refits).
+# GOA/TRO/ATB run conservative → lower cut buys recall (GOA .81→.87, ATB .65→.79) at the bar;
+# RUT/KOL/FIN/NOR/MOR sit below the bar at 0.65 → higher cut restores precision (MOR .80→.96).
+# SOF/SKY stay on the default (already at/near the bar); OST and GCO have too little holdout
+# evidence to override (OST: ~6 alerts at any >=90 % cut). NSB is the rail family (0.65
+# validated at ~91 % in eval/impact_eval.py) and is deliberately absent.
+_OPERATOR_ALERT_THRESHOLD: dict[str, float] = {
+    "ATB": 0.55,
+    "FIN": 0.75,
+    "GOA": 0.50,
+    "KOL": 0.75,
+    "MOR": 0.90,
+    "NOR": 0.80,
+    "RUT": 0.75,
+    "TRO": 0.55,
+}
 
 
 def _threshold_for(operator: str | None) -> float:
