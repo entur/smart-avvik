@@ -8,11 +8,15 @@ export interface Config {
 export interface StopItem {
   stop_place: string;
   stop_name: string | null;
+  mode: string; // 'Tog' | 'Buss' | 'Tog/Buss' — which families serve the stop today
+  n_calls: number; // scheduled calls today — traffic signal for ranking picker matches
 }
 
 export interface Alert {
   situation_number: string;
   summary: string | null;
+  operator: string | null;
+  mode: string; // 'Tog' | 'Buss' — vehicle noun for the UI
   line: string | null;
   departure_time: string | null;
   cancel_probability: number;

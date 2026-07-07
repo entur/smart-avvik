@@ -61,6 +61,49 @@ _ALERT_THRESHOLD = 0.65
 # A journey counts as "trouble" when cancelled or >= this many minutes late (matches the impact
 # probability's definition), used for the notification wording.
 _TROUBLE_DELAY_MIN = 10
+
+# Per-operator alert threshold overrides (default _ALERT_THRESHOLD). The pooled bus family is
+# calibrated per operator, but a single 0.65 cut under-/over-alerts several operators; these
+# values align every operator at ~90 % pooled precision on the serving-matched holdout
+# (eval/tune_alert_thresholds.py, tuned 2026-07-07 — re-run after retrains/platt refits).
+# GOA/TRO/ATB run conservative → lower cut buys recall (GOA .81→.87, ATB .65→.79) at the bar;
+# RUT/KOL/FIN/NOR/MOR sit below the bar at 0.65 → higher cut restores precision (MOR .80→.96).
+# SOF/SKY stay on the default (already at/near the bar); OST and GCO have too little holdout
+# evidence to override (OST: ~6 alerts at any >=90 % cut). NSB is the rail family (0.65
+# validated at ~91 % in eval/impact_eval.py) and is deliberately absent.
+_OPERATOR_ALERT_THRESHOLD: dict[str, float] = {
+    "ATB": 0.55,
+    "FIN": 0.75,
+    "GOA": 0.50,
+    "KOL": 0.75,
+    "MOR": 0.90,
+    "NOR": 0.80,
+    "RUT": 0.75,
+    "TRO": 0.55,
+}
+
+
+def threshold_for(operator: str | None) -> float:
+    """The alerting threshold for an operator (None -> the default). Shared by the varsel
+    matcher and the /demo verdicts so both surfaces apply the same operating point."""
+    return _OPERATOR_ALERT_THRESHOLD.get(operator or "", _ALERT_THRESHOLD)
+
+
+# Rail codespaces (operator == ref codespace). vehicleMode is NULL for most bus producers, so the
+# vehicle noun is derived from the codespace, not the feed; everything not rail is labelled "Buss".
+_RAIL_CODESPACES = frozenset({"VYG", "NSB", "GOA", "SJN", "FLT"})
+
+
+def mode_label(operator: str | None) -> str:
+    """User-facing vehicle noun for an operator: 'Tog' (rail) or 'Buss' (everything else)."""
+    return "Tog" if operator in _RAIL_CODESPACES else "Buss"
+
+
+# FOLLOW-UP (needs its own eval before enabling): MOR/ATB/OST/GCO publish the SX *after* departure,
+# so match_journey's pre-departure boarding requirement means those journeys rarely match. Serving
+# them well needs an "alert at message arrival" policy (arrival-side impact, relaxed future-boarding
+# requirement); deferred until validated. See docs/pooled-models-bus/LEARNINGS.md (Lead time).
+_AFTER_DEPARTURE_OPERATORS = frozenset({"MOR", "ATB", "OST", "GCO"})
 # Keep state bounded: a client-generated device may register at most this many journeys.
 _MAX_JOURNEYS_PER_DEVICE = 20
 # A freshly-created push subscription can 404/410 at the push service for a short window before
@@ -224,7 +267,12 @@ class Alert(BaseModel):
 
     situation_number: str = Field(description="SIRI-SX situationNumber of the disruption.")
     summary: str | None = Field(description="Short Norwegian summary of the situation.")
-    line: str | None = Field(description="Line ref of the worst affected train, e.g. 'VYG:Line:R31'.")
+    operator: str | None = Field(
+        default=None,
+        description="Ref codespace of the worst affected journey (VYG, RUT, KOL, ...).",
+    )
+    mode: str = Field(default="Tog", description="Vehicle noun for the UI: 'Tog' or 'Buss'.")
+    line: str | None = Field(description="Line ref of the worst affected vehicle, e.g. 'VYG:Line:R31'.")
     departure_time: datetime | None = Field(
         description="Aimed departure from the boarding stop of the worst affected train (UTC).",
     )
@@ -262,12 +310,15 @@ def match_journey(journey: dict, by_situation: dict[str, list]) -> list[Alert]:
 
     alerts: list[Alert] = []
     for sit_num, calls in by_situation.items():
-        by_jkey: dict[str, list] = {}
+        # Group by (operator, jkey): bus ServiceJourney jkeys are not date-scoped, so a single
+        # situation (e.g. a GCO notice fanning across county codespaces) can carry the same jkey for
+        # two different operators' journeys — keying on jkey alone would merge them.
+        by_key: dict[tuple[str, str], list] = {}
         for c in calls:
-            by_jkey.setdefault(c.jkey, []).append(c)
+            by_key.setdefault((c.operator, c.jkey), []).append(c)
 
         matching_boardings: list[Any] = []
-        for group in by_jkey.values():
+        for group in by_key.values():
             board = next(
                 (
                     c
@@ -293,15 +344,18 @@ def match_journey(journey: dict, by_situation: dict[str, list]) -> list[Alert]:
             continue
         worst = max(matching_boardings, key=_severity)
         impact = worst.p_impact_dep
+        threshold = threshold_for(worst.operator)
         alertworthy = (
-            impact >= _ALERT_THRESHOLD
+            impact >= threshold
             if impact is not None
-            else worst.p_cancel >= _ALERT_THRESHOLD
+            else worst.p_cancel >= threshold
         )
         alerts.append(
             Alert(
                 situation_number=sit_num,
                 summary=worst.summary,
+                operator=worst.operator,
+                mode=mode_label(worst.operator),
                 line=worst.line,
                 departure_time=worst.aimed_dep,
                 cancel_probability=worst.p_cancel,
@@ -324,7 +378,7 @@ def _notification_payload(journey: dict, alert: Alert) -> dict:
     parts = []
     if alert.departure_time is not None:
         hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-        parts.append(f"Tog kl {hhmm}:")
+        parts.append(f"{alert.mode} kl {hhmm}:")
     parts.append(f"{pct} % sjanse for innstilling")
     if alert.delay_typ_min:
         parts.append(f"typisk {alert.delay_typ_min} min forsinket")
@@ -459,10 +513,12 @@ class ConfigResponse(BaseModel):
 
 
 class StopItem(BaseModel):
-    """A rail stop offered in the from/to pickers."""
+    """A stop offered in the from/to pickers."""
 
     stop_place: str = Field(description="NSR StopPlace ref.")
     stop_name: str | None = Field(description="Human-readable stop name.")
+    mode: str = Field(description='Families serving the stop today: "Tog", "Buss" or "Tog/Buss".')
+    n_calls: int = Field(description="Scheduled calls at the stop today; pickers rank matches by it.")
 
 
 class DeviceIn(BaseModel):
@@ -554,11 +610,19 @@ async def config() -> ConfigResponse:
     )
 
 
-@router.get("/stops", summary="Rail stops for the journey pickers")
+@router.get("/stops", summary="Stops for the journey pickers")
 async def stops() -> list[StopItem]:
-    """The Vy rail stops currently in the planned timetable, for the from/to dropdowns."""
+    """All stops in today's planned timetable (rail and bus), for the from/to pickers."""
     rows = _stops_provider() if _stops_provider is not None else []
-    return [StopItem(stop_place=r["stop_place"], stop_name=r.get("stop_name")) for r in rows]
+    return [
+        StopItem(
+            stop_place=r["stop_place"],
+            stop_name=r.get("stop_name"),
+            mode=r.get("mode", "Tog"),
+            n_calls=r.get("n_calls", 0),
+        )
+        for r in rows
+    ]
 
 
 @router.post("/devices", summary="Register or refresh a device's push subscription")

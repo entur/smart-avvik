@@ -1,6 +1,11 @@
--- Extend the /demo dataset with RECENT days (everything after the static holdout build,
--- which ends 2026-06-20 — see create_demo_predictions.sql), so partner demos can show
+-- Extend the /demo dataset's NSB rows with RECENT days (everything after the static holdout
+-- build, which ends 2026-06-20 — see create_demo_predictions.sql), so partner demos can show
 -- yesterday's — and today's completed — journeys next to what the models predicted.
+--
+-- This is the MANUAL, full-fidelity NSB layer (anshar recordedCalls extraction, same-day
+-- capable, ~$2.5/run). The unattended freshness path is extend_demo_recent_daily.sql
+-- (all operators from last_recorded, nightly scheduled query, ~10-17 % thinner for rail):
+-- its next run replaces the NSB slice this script writes, so run this right before demos.
 --
 -- Self-contained and safe to re-run (idempotent per run window): typically run it right
 -- before a demo, via data/queries/refresh_demo_recent.sh.
@@ -673,12 +678,15 @@ SELECT
 FROM per_lead
 GROUP BY situationNumber, jkey, stop_order;
 
--- 6 ---- merge into the demo tables: replace everything this run can rebuild.
+-- 6 ---- merge into the demo tables: replace everything this run can rebuild. NSB-scoped:
+-- the demo tables also hold GOA/bus rows from the pooled family (see the multi-operator
+-- create_demo_predictions.sql), which this NSB-only refresh must leave untouched.
 DELETE FROM `ent-kixavvik-dev.disruptions.demo_predictions`
-WHERE onset_ts >= TIMESTAMP(GREATEST(DATE '2026-06-20', DATE_SUB(CURRENT_DATE(), INTERVAL 25 DAY)));
+WHERE operator = 'NSB'
+  AND onset_ts >= TIMESTAMP(GREATEST(DATE '2026-06-20', DATE_SUB(CURRENT_DATE(), INTERVAL 25 DAY)));
 
 INSERT INTO `ent-kixavvik-dev.disruptions.demo_predictions`
-  (situationNumber, jkey, stop_order, call_date, min_from_onset,
+  (operator, situationNumber, jkey, stop_order, call_date, min_from_onset,
    lineRef, stop_place, stop_name, aimed_dep, aimed_arr,
    onset_ts, summary, category,
    act_cancelled, act_dep_delay_min, act_arr_delay_min,
@@ -689,7 +697,7 @@ INSERT INTO `ent-kixavvik-dev.disruptions.demo_predictions`
    l30_p_cancel, l30_p_dep_ge10, l30_p_arr_ge10, l30_p_impact_dep, l30_p_impact_arr,
    l30_dep_p50, l30_dep_p90, l30_arr_p50, l30_arr_p90)
 SELECT
-  situationNumber, jkey, stop_order, call_date, min_from_onset,
+  'NSB', situationNumber, jkey, stop_order, call_date, min_from_onset,
   lineRef, stop_place, stop_name, aimed_dep, aimed_arr,
   onset_ts, summary, category,
   act_cancelled, act_dep_delay_min, act_arr_delay_min,
@@ -702,32 +710,40 @@ SELECT
 FROM recent_predictions;
 
 DELETE FROM `ent-kixavvik-dev.disruptions.demo_calls`
-WHERE call_date > DATE '2026-06-20'
+WHERE operator = 'NSB'
+  AND call_date > DATE '2026-06-20'
   AND call_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 25 DAY);
 
 INSERT INTO `ent-kixavvik-dev.disruptions.demo_calls`
-  (jkey, lineRef, stop_place, stop_name, stop_order, call_date,
+  (operator, operating_date, jkey, lineRef, stop_place, stop_name, stop_order, call_date,
    aimed_dep, aimed_arr, call_cancelled, dep_delay_min, arr_delay_min)
 SELECT
-  jkey, lineRef, stop_place, stop_name, stop_order, call_date,
+  'NSB', CAST(NULL AS DATE), jkey, lineRef, stop_place, stop_name, stop_order, call_date,
   aimed_dep, aimed_arr, COALESCE(call_cancelled, FALSE), dep_delay_min, arr_delay_min
 FROM rc
 WHERE call_date > DATE '2026-06-20'
   AND call_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 25 DAY);
 
 -- 7 ---- refresh the derived picker/scenario tables over the full window
--- (same definitions as create_demo_predictions.sql).
+-- (same definitions as the multi-operator create_demo_predictions.sql).
 CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.demo_stops` AS
 SELECT stop_place,
        ANY_VALUE(stop_name) AS stop_name,
-       COUNT(*) AS n_calls
+       COUNT(*) AS n_calls,
+       CASE
+         WHEN LOGICAL_OR(operator IN ('NSB', 'GOA')) AND LOGICAL_OR(operator NOT IN ('NSB', 'GOA'))
+           THEN 'Tog/Buss'
+         WHEN LOGICAL_OR(operator IN ('NSB', 'GOA')) THEN 'Tog'
+         ELSE 'Buss'
+       END AS mode
 FROM `ent-kixavvik-dev.disruptions.demo_calls`
+WHERE stop_place IS NOT NULL
 GROUP BY stop_place
 HAVING COUNT(*) >= 200;
 
 CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.demo_highlights` AS
 WITH impact AS (
-  SELECT situationNumber, jkey,
+  SELECT situationNumber, operator, jkey,
          ANY_VALUE(summary)  AS summary,
          ANY_VALUE(category) AS category,
          ANY_VALUE(onset_ts) AS onset_ts,
@@ -737,7 +753,7 @@ WITH impact AS (
          MIN(aimed_dep) AS first_dep,
          MAX(aimed_dep) AS last_dep
   FROM `ent-kixavvik-dev.disruptions.demo_predictions`
-  GROUP BY situationNumber, jkey
+  GROUP BY situationNumber, operator, jkey
 ),
 per_sit AS (
   SELECT situationNumber,
@@ -749,7 +765,8 @@ per_sit AS (
          SUM(n_calls)      AS n_calls,
          MIN(first_dep)    AS window_start,
          MAX(last_dep)     AS window_end,
-         ARRAY_AGG(jkey ORDER BY n_cancelled + n_delayed10 DESC, n_calls DESC LIMIT 1)[OFFSET(0)] AS top_jkey
+         ARRAY_AGG(STRUCT(operator, jkey)
+                   ORDER BY n_cancelled + n_delayed10 DESC, n_calls DESC LIMIT 1)[OFFSET(0)] AS top
   FROM impact
   GROUP BY situationNumber
 ),
@@ -761,12 +778,19 @@ exemplar AS (
          ARRAY_AGG(d.stop_name  ORDER BY d.stop_order DESC LIMIT 1)[OFFSET(0)] AS to_name
   FROM per_sit AS s
   JOIN `ent-kixavvik-dev.disruptions.demo_predictions` AS d
-    ON d.situationNumber = s.situationNumber AND d.jkey = s.top_jkey
+    ON d.situationNumber = s.situationNumber
+   AND d.operator = s.top.operator AND d.jkey = s.top.jkey
   GROUP BY s.situationNumber
 )
-SELECT p.*, e.from_stop, e.from_name, e.to_stop, e.to_name
+SELECT p.situationNumber, p.top.operator AS operator,
+       p.summary, p.category, p.onset_ts,
+       p.n_cancelled, p.n_delayed10, p.n_calls,
+       p.window_start, p.window_end,
+       e.from_stop, e.from_name, e.to_stop, e.to_name
 FROM per_sit AS p
 JOIN exemplar AS e USING (situationNumber)
 WHERE p.n_cancelled + p.n_delayed10 >= 5
+QUALIFY ROW_NUMBER() OVER (PARTITION BY p.top.operator
+                           ORDER BY p.n_cancelled + p.n_delayed10 DESC) <= 10
 ORDER BY p.n_cancelled + p.n_delayed10 DESC
 LIMIT 40;

@@ -4,10 +4,13 @@ export interface DemoStop {
   stop_place: string;
   stop_name: string | null;
   n_calls: number;
+  mode: string; // 'Tog' | 'Buss' | 'Tog/Buss'
 }
 
 export interface DemoHighlight {
   situation_number: string;
+  operator: string;
+  mode: string; // 'Tog' | 'Buss'
   summary: string | null;
   category: string | null;
   onset: string;
@@ -60,7 +63,10 @@ export interface DemoSituation {
 }
 
 export interface DemoJourney {
-  journey_ref: string;
+  journey_ref: string; // operator-prefixed, e.g. 'RUT:ServiceJourney:...'
+  operator: string;
+  mode: string; // 'Tog' | 'Buss'
+  alert_threshold: number; // the operator's alerting threshold behind would_alert
   line: string | null;
   situation: DemoSituation | null;
   departure: DemoSide;

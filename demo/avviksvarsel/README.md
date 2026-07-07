@@ -1,12 +1,13 @@
 # Avviksvarsel — mobil PWA med push-varsel
 
-A phone-first installable web app (PWA) where a traveller registers train journeys
+A phone-first installable web app (PWA) where a traveller registers journeys
 (from-stop → to-stop, a recurring daily time window and weekday selector) and gets a **Web Push
-notification** when a live disruption is predicted to affect one of their trains. Tapping the
+notification** when a live disruption is predicted to affect one of their departures. Tapping the
 notification opens the app, which lists each registered journey and the disruptions currently
 hitting it.
 
-Scope: **Vy rail (VYG) only** — matches the live per-call prediction cache. React 19 + Vite +
+Scope: everything in the live per-call prediction cache — **Vy rail (NSB), Go-Ahead and the
+trained bus operators** (RUT, KOL, SKY, ATB, TRO, NOR, OST, FIN, MOR). React 19 + Vite +
 [Entur Linje](https://linje.entur.no) design system.
 
 Served by the disruptions API at **`/varsel`**; data + push endpoints are **`/varsel-api`**
@@ -18,10 +19,11 @@ Served by the disruptions API at **`/varsel`**; data + push endpoints are **`/va
 - The API's poller (~1/min) refreshes the per-call prediction cache. After each refresh,
   `varsel.check_and_notify()` matches every registered journey against the live situations and
   sends a push for any newly alert-worthy hit.
-- A journey **matches** a situation when it flags a train departing the from-stop inside the
+- A journey **matches** a situation when it flags a departure from the from-stop inside the
   journey's weekday + time window that later calls at the to-stop (direction check). A match is
-  **pushed** only when the worst matching train crosses the production alert threshold
-  (`P(cancelled OR ≥10 min late) ≥ 0.65`); the in-app list shows *all* current matches.
+  **pushed** only when the worst matching departure crosses the operator's alert threshold
+  (`P(cancelled OR ≥10 min late)` ≥ 0.65 by default; per-operator cuts tuned at ~90 % precision
+  by `eval/tune_alert_thresholds.py`); the in-app list shows *all* current matches.
 - Subscriptions + journeys are keyed by a client-generated `device_id` (no login — prototype).
   State persists to a GCS blob so it survives Cloud Run redeploys.
 

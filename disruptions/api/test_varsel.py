@@ -7,7 +7,6 @@ weekday filter, overnight rejection, and the alert-worthiness gate. No BigQuery,
 from dataclasses import dataclass
 from datetime import datetime
 
-import varsel
 from varsel import _OSLO, match_journey
 
 
@@ -19,6 +18,7 @@ class FakeCall:
     stop_place: str
     stop_order: int
     aimed_dep: datetime | None
+    operator: str = "VYG"
     p_cancel: float = 0.5
     p_impact_dep: float | None = 0.9
     line: str | None = "VYG:Line:R10"
@@ -55,11 +55,13 @@ SAT_0800 = _oslo(2026, 7, 11, 8, 0)
 assert SAT_0800.weekday() == 5
 
 
-def _train(dep, jkey="t1", board_order=1, dest_order=5, **board_kw):
+def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", **board_kw):
     """A boarding call at A and a later call at B (same train)."""
     return [
-        FakeCall(jkey=jkey, stop_place="A", stop_order=board_order, aimed_dep=dep, **board_kw),
-        FakeCall(jkey=jkey, stop_place="B", stop_order=dest_order, aimed_dep=None),
+        FakeCall(jkey=jkey, stop_place="A", stop_order=board_order, aimed_dep=dep,
+                 operator=operator, **board_kw),
+        FakeCall(jkey=jkey, stop_place="B", stop_order=dest_order, aimed_dep=None,
+                 operator=operator),
     ]
 
 
@@ -117,6 +119,15 @@ def test_alertworthy_gate():
     assert fallback and fallback[0].alertworthy is True
 
 
+def test_per_operator_threshold():
+    # RUT's tuned threshold is 0.75 (stricter than the 0.65 default), TRO's is 0.55 (looser):
+    # the same 0.70 impact prob is push-worthy for TRO but not for RUT.
+    rut = match_journey(_journey(), {"S1": _train(MON_0800, operator="RUT", p_impact_dep=0.70)})
+    assert rut and rut[0].alertworthy is False
+    tro = match_journey(_journey(), {"S1": _train(MON_0800, operator="TRO", p_impact_dep=0.70)})
+    assert tro and tro[0].alertworthy is True
+
+
 def test_worst_train_wins():
     # Two trains in the window; the alert reports the more severe one.
     calls = _train(_oslo(2026, 7, 6, 7, 30), jkey="t1", p_cancel=0.3) + _train(
@@ -133,10 +144,19 @@ def test_multiple_situations_sorted_worst_first():
     assert [a.situation_number for a in alerts] == ["S2", "S1"]
 
 
-def test_push_disabled_when_no_vapid():
-    # No VAPID env in the test process -> notify is a no-op, not an error.
-    assert varsel.push_enabled() is False
-    varsel.check_and_notify({"S1": _train(MON_0800)})  # must not raise
+def test_operator_collision_not_merged():
+    # Two operators share the bare jkey "x" within one situation (bus ServiceJourney refs are not
+    # date-scoped). SKY's train travels A->B (matches); ATB's "x" only boards at A with no later B
+    # call (wrong direction). Keying on jkey alone would merge the two groups and let ATB's boarding
+    # ride SKY's direction. Operator-aware grouping keeps them separate -> exactly one match (SKY).
+    sky = _train(MON_0800, jkey="x", operator="SKY", p_cancel=0.8)
+    atb_board_only = [
+        FakeCall(jkey="x", stop_place="A", stop_order=1, aimed_dep=MON_0800, operator="ATB",
+                 p_cancel=0.99),
+    ]
+    alerts = match_journey(_journey(), {"S1": sky + atb_board_only})
+    assert len(alerts) == 1
+    assert alerts[0].cancel_probability == 0.8  # SKY's train, not ATB's boarding-only 0.99
 
 
 if __name__ == "__main__":

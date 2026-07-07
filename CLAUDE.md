@@ -50,7 +50,8 @@ RUN_EVAL_EXPORT=1 disruptions/api/deploy.sh   # also re-render /eval first (need
   after model/calibration retrains. `data/queries/refresh_demo_recent.sh` extends the tables
   with the last ~25 days straight from SIRI-ET/SX (run before a partner demo; ~$2).
 - The **Avviksvarsel** PWA at `/varsel` (register a journey → Web Push when a live disruption is
-  predicted to hit it; Vy rail only) lives in `demo/avviksvarsel/` (React + Vite + Entur Linje). Its
+  predicted to hit it; rail + the trained bus operators, per-operator alert thresholds) lives in
+  `demo/avviksvarsel/` (React + Vite + Entur Linje). Its
   API is `/varsel-api` (see `disruptions/api/varsel.py`); the matcher runs in the poller's refresh
   cycle. Install steps for phones are in `demo/avviksvarsel/README.md`. Two extra env vars beyond
   the base deploy:

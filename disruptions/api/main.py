@@ -29,19 +29,28 @@ _ACTIVE_DISRUPTIONS_QUERY = (Path(__file__).parent / "active_disruptions.sql").r
 _DISRUPTIONS_AS_OF_QUERY = (Path(__file__).parent / "disruptions_as_of.sql").read_text()
 _ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text()
 # Per-call (per-train) serving: the planned-timetable call source and the scoring query.
+# NSB/prod family (rail): predict_calls.sql -> call_predictions_today.
 _RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.sql").read_text()
 _PREDICT_CALLS_QUERY = (Path(__file__).parent / "predict_calls.sql").read_text()
 _CALL_PREDICTIONS_QUERY = "SELECT * FROM `ent-kixavvik-dev.disruptions.call_predictions_today`"
+# Bus/GOA family (pooled_all): the bus planned call source, the bus SX source, and the bus scoring
+# query -> call_predictions_bus_today (same columns as call_predictions_today PLUS `operator`).
+_BUS_CALLS_PLANNED_QUERY = (Path(__file__).parent / "bus_calls_planned_today.sql").read_text()
+_DISRUPTIONS_BUS_QUERY = (Path(__file__).parent / "disruptions_bus_initial_today.sql").read_text()
+_PREDICT_CALLS_BUS_QUERY = (Path(__file__).parent / "predict_calls_bus.sql").read_text()
+_CALL_PREDICTIONS_BUS_QUERY = (
+    "SELECT * FROM `ent-kixavvik-dev.disruptions.call_predictions_bus_today`"
+)
 # /demo-api: retrospective journey search over the static demo tables
 # (built offline by data/queries/create_demo_predictions.sql).
 _DEMO_JOURNEYS_QUERY = (Path(__file__).parent / "demo_journeys.sql").read_text()
 _DEMO_STOPS_QUERY = """
-    SELECT stop_place, stop_name, n_calls
+    SELECT stop_place, stop_name, n_calls, mode
     FROM `ent-kixavvik-dev.disruptions.demo_stops`
     ORDER BY n_calls DESC
 """
 _DEMO_HIGHLIGHTS_QUERY = """
-    SELECT situationNumber, summary, category, onset_ts, n_cancelled, n_delayed10,
+    SELECT situationNumber, operator, summary, category, onset_ts, n_cancelled, n_delayed10,
            window_start, window_end, from_stop, from_name, to_stop, to_name
     FROM `ent-kixavvik-dev.disruptions.demo_highlights`
     ORDER BY n_cancelled + n_delayed10 DESC
@@ -50,11 +59,23 @@ _DEMO_WINDOW_QUERY = """
     SELECT MIN(call_date) AS window_start, MAX(call_date) AS window_end
     FROM `ent-kixavvik-dev.disruptions.demo_calls`
 """
-# /varsel-api/stops: rail stops for the avviksvarsel journey pickers, from the planned-timetable
-# call source rebuilt by maybe_refresh_planned_calls() (tiny GROUP BY over a small table).
+# /varsel-api/stops: stops for the avviksvarsel journey pickers, from the planned-timetable call
+# sources rebuilt on their TTLs (tiny GROUP BY over small tables). Rail and bus are queried
+# separately and merged in Python (refresh_varsel_stops) so a missing/failing bus table never
+# drops the rail stops. Each row carries today's call count (pickers rank matches by traffic)
+# and which families serve the stop — GOA is the one rail operator in the bus/pooled table.
 _VARSEL_STOPS_QUERY = """
-    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name
+    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name, COUNT(*) AS n_calls,
+           TRUE AS has_rail, FALSE AS has_bus
     FROM `ent-kixavvik-dev.disruptions.rail_calls_planned_today`
+    WHERE stop_place IS NOT NULL
+    GROUP BY stop_place
+"""
+_VARSEL_STOPS_BUS_QUERY = """
+    SELECT stop_place, ANY_VALUE(stop_name) AS stop_name, COUNT(*) AS n_calls,
+           LOGICAL_OR(operator = 'GOA') AS has_rail,
+           LOGICAL_OR(operator != 'GOA') AS has_bus
+    FROM `ent-kixavvik-dev.disruptions.bus_calls_planned_today`
     WHERE stop_place IS NOT NULL
     GROUP BY stop_place
 """
@@ -256,6 +277,7 @@ class _CallPred:
     situation_number: str
     summary: str | None
     jkey: str
+    operator: str  # ref codespace (== SIRI ref prefix): VYG, GOA, RUT, KOL, SKY, ATB, ...
     line: str | None
     stop_place: str
     stop_name: str | None
@@ -283,9 +305,16 @@ class _CallPred:
 
 
 _call_pred_lock = threading.Lock()
-_call_pred_by_jkey: dict[str, list[_CallPred]] = {}
+# Keyed by (operator, jkey): bus ServiceJourney refs are NOT date-scoped, so the bare jkey collides
+# across operators (SKY:ServiceJourney:12345 and ATB:ServiceJourney:12345 both strip to the same
+# jkey). The operator is the ref codespace prefix, which /journey recovers from the id.
+_call_pred_by_key: dict[tuple[str, str], list[_CallPred]] = {}
+# jkey -> the set of operators that carry it, so a bare-jkey /journey lookup (no prefix) can still
+# resolve when unambiguous, and 409 when it is not.
+_call_pred_by_jkey_index: dict[str, set[str]] = {}
 # Same scored calls, indexed by situationNumber, so /impact can resolve a passenger's train from
-# (situation, from_stop, at) without a journey ref. Built from the same rows as _call_pred_by_jkey.
+# (situation, from_stop, at) without a journey ref. situationNumber is publisher-namespaced, so the
+# NSB and bus tables merge here without collision.
 _call_pred_by_situation: dict[str, list[_CallPred]] = {}
 _call_pred_refreshed_at: datetime | None = None
 
@@ -327,64 +356,152 @@ def maybe_refresh_planned_calls() -> None:
     logger.info("Rebuilt planned call source (rail_calls_planned_today)")
 
 
-def refresh_call_predictions_cache() -> None:
-    """Reload the per-call predictions cache from call_predictions_today, indexed by jkey."""
-    rows = bq_client.query(_CALL_PREDICTIONS_QUERY).result()
-    by_jkey: dict[str, list[_CallPred]] = {}
-    by_situation: dict[str, list[_CallPred]] = {}
-    for r in rows:
-        pred = _CallPred(
-            situation_number=r.situationNumber,
-            summary=r.summary,
-            jkey=r.jkey,
-            line=r.lineRef,
-            stop_place=r.stop_place,
-            stop_name=r.stop_name,
-            stop_order=r.stop_order,
-            aimed_dep=r.aimed_dep,
-            aimed_arr=r.aimed_arr,
-            p_cancel=r.p_cancel,
-            dep_delay_typ_min=r.dep_delay_typ_min,
-            dep_delay_p90_min=r.dep_delay_p90_min,
-            arr_delay_typ_min=r.arr_delay_typ_min,
-            arr_delay_p90_min=r.arr_delay_p90_min,
-            p_arr_ge10=r.p_arr_ge10,
-            p_arr_ge20=r.p_arr_ge20,
-            arr_delay_p50_stack_min=r.arr_delay_p50_stack_min,
-            arr_delay_p90_stack_min=r.arr_delay_p90_stack_min,
-            p_impact=r.p_impact,
-            p_dep_ge10=r.p_dep_ge10,
-            p_dep_ge20=r.p_dep_ge20,
-            dep_delay_p50_stack_min=r.dep_delay_p50_stack_min,
-            dep_delay_p90_stack_min=r.dep_delay_p90_stack_min,
-            p_impact_dep=r.p_impact_dep,
+# The bus planned scan is heavier than rail (it materialises calls for ~10 bus/local codespaces
+# off the same ET partition, ~12 GB/run). Give it its own, slower TTL and its own lock so a stale
+# or failed bus scan degrades bus only and never gates the rail cadence.
+_bus_planned_lock = threading.Lock()
+_bus_planned_refreshed_at: datetime | None = None
+_BUS_PLANNED_TTL = timedelta(minutes=120)
+
+
+def maybe_refresh_bus_planned_calls() -> None:
+    """Rebuild disruptions.bus_calls_planned_today if it is stale (older than _BUS_PLANNED_TTL).
+
+    Same rationale as maybe_refresh_planned_calls, but slower — the bus schedule is just as stable
+    and the scan is larger. Always runs on first call (refreshed_at is None)."""
+    global _bus_planned_refreshed_at
+    now = datetime.now(timezone.utc)
+    with _bus_planned_lock:
+        fresh = (
+            _bus_planned_refreshed_at is not None
+            and now - _bus_planned_refreshed_at < _BUS_PLANNED_TTL
         )
-        by_jkey.setdefault(r.jkey, []).append(pred)
-        by_situation.setdefault(r.situationNumber, []).append(pred)
+    if fresh:
+        return
+    bq_client.query(_BUS_CALLS_PLANNED_QUERY).result()
+    with _bus_planned_lock:
+        _bus_planned_refreshed_at = now
+    logger.info("Rebuilt bus planned call source (bus_calls_planned_today)")
+
+
+def _call_pred_from_row(r, operator: str) -> _CallPred:
+    """Map one prediction row (call_predictions_today or _bus_today) to a _CallPred, tagging it
+    with its operator (the ref codespace)."""
+    return _CallPred(
+        situation_number=r.situationNumber,
+        summary=r.summary,
+        jkey=r.jkey,
+        operator=operator,
+        line=r.lineRef,
+        stop_place=r.stop_place,
+        stop_name=r.stop_name,
+        stop_order=r.stop_order,
+        aimed_dep=r.aimed_dep,
+        aimed_arr=r.aimed_arr,
+        p_cancel=r.p_cancel,
+        dep_delay_typ_min=r.dep_delay_typ_min,
+        dep_delay_p90_min=r.dep_delay_p90_min,
+        arr_delay_typ_min=r.arr_delay_typ_min,
+        arr_delay_p90_min=r.arr_delay_p90_min,
+        p_arr_ge10=r.p_arr_ge10,
+        p_arr_ge20=r.p_arr_ge20,
+        arr_delay_p50_stack_min=r.arr_delay_p50_stack_min,
+        arr_delay_p90_stack_min=r.arr_delay_p90_stack_min,
+        p_impact=r.p_impact,
+        p_dep_ge10=r.p_dep_ge10,
+        p_dep_ge20=r.p_dep_ge20,
+        dep_delay_p50_stack_min=r.dep_delay_p50_stack_min,
+        dep_delay_p90_stack_min=r.dep_delay_p90_stack_min,
+        p_impact_dep=r.p_impact_dep,
+    )
+
+
+def refresh_call_predictions_cache() -> None:
+    """Reload the per-call predictions cache from BOTH the NSB (call_predictions_today) and the
+    bus/GOA (call_predictions_bus_today) tables, keyed by (operator, jkey).
+
+    NSB rows are tagged with the lineRef codespace ('VYG'); bus rows carry an explicit `operator`
+    column. The bus load is isolated so a missing/failing bus table (e.g. before the first bus
+    predict runs) never blocks NSB serving."""
+    by_key: dict[tuple[str, str], list[_CallPred]] = {}
+    by_situation: dict[str, list[_CallPred]] = {}
+    by_jkey_index: dict[str, set[str]] = {}
+
+    def _ingest(rows, operator_of: Callable[..., str]) -> None:
+        for r in rows:
+            op = operator_of(r)
+            pred = _call_pred_from_row(r, op)
+            by_key.setdefault((op, r.jkey), []).append(pred)
+            by_situation.setdefault(r.situationNumber, []).append(pred)
+            by_jkey_index.setdefault(r.jkey, set()).add(op)
+
+    # NSB/prod family: operator is the rail codespace of the lineRef (VYG:Line:... -> 'VYG').
+    _ingest(
+        bq_client.query(_CALL_PREDICTIONS_QUERY).result(),
+        lambda r: (r.lineRef or "VYG").split(":")[0],
+    )
+    # Bus/GOA/pooled family: the table carries an explicit operator column.
+    try:
+        _ingest(bq_client.query(_CALL_PREDICTIONS_BUS_QUERY).result(), lambda r: r.operator)
+    except Exception:
+        logger.exception(
+            "Bus per-call predictions load failed; serving NSB-only this refresh "
+            "(is call_predictions_bus_today built yet?)"
+        )
+
     with _call_pred_lock:
-        global _call_pred_by_jkey, _call_pred_by_situation, _call_pred_refreshed_at
-        _call_pred_by_jkey = by_jkey
+        global _call_pred_by_key, _call_pred_by_jkey_index
+        global _call_pred_by_situation, _call_pred_refreshed_at
+        _call_pred_by_key = by_key
+        _call_pred_by_jkey_index = by_jkey_index
         _call_pred_by_situation = by_situation
         _call_pred_refreshed_at = datetime.now(timezone.utc)
     logger.info(
-        "Refreshed per-call predictions cache: %d journeys, %d situations",
-        len(by_jkey),
+        "Refreshed per-call predictions cache: %d (operator, journey) keys, %d situations",
+        len(by_key),
         len(by_situation),
     )
 
 
 # ---- Avviksvarsel providers ------------------------------------------------------------------
-# The varsel module (registered-journey push alerts) reads the live per-call snapshot and a small
-# rail-stop list through these providers, injected via varsel.configure() at startup so varsel
-# never imports main (no cycle). The stop list is refreshed alongside the planned call source.
+# The varsel module (registered-journey push alerts) reads the live per-call snapshot and the
+# stop list (rail + bus) through these providers, injected via varsel.configure() at startup so
+# varsel never imports main (no cycle). The stop list is refreshed alongside the planned sources.
 _varsel_stops_lock = threading.Lock()
 _varsel_stops_cache: list[dict] = []
 
 
 def refresh_varsel_stops() -> None:
-    """Reload the rail-stop picker list from rail_calls_planned_today (tiny scan)."""
-    rows = bq_client.query(_VARSEL_STOPS_QUERY).result()
-    stops = [{"stop_place": r.stop_place, "stop_name": r.stop_name} for r in rows]
+    """Reload the stop picker list from the rail AND bus planned call sources (tiny scans).
+
+    Each source is queried independently and merged by stop_place, so a missing/failing bus table
+    never drops the rail stops (and vice versa). The merge sums call counts and ORs the mode
+    flags — a stop served by both families gets mode "Tog/Buss"."""
+    merged: dict[str, dict] = {}
+    for q in (_VARSEL_STOPS_QUERY, _VARSEL_STOPS_BUS_QUERY):
+        try:
+            for r in bq_client.query(q).result():
+                e = merged.setdefault(
+                    r.stop_place,
+                    {"stop_place": r.stop_place, "stop_name": None, "n_calls": 0,
+                     "has_rail": False, "has_bus": False},
+                )
+                e["stop_name"] = e["stop_name"] or r.stop_name
+                e["n_calls"] += r.n_calls
+                e["has_rail"] = e["has_rail"] or r.has_rail
+                e["has_bus"] = e["has_bus"] or r.has_bus
+        except Exception:
+            logger.exception("A varsel stops sub-query failed; continuing with the other source(s)")
+    stops = [
+        {
+            "stop_place": e["stop_place"],
+            "stop_name": e["stop_name"],
+            "n_calls": e["n_calls"],
+            "mode": "Tog/Buss" if e["has_rail"] and e["has_bus"]
+            else ("Tog" if e["has_rail"] else "Buss"),
+        }
+        for e in merged.values()
+    ]
     with _varsel_stops_lock:
         global _varsel_stops_cache
         _varsel_stops_cache = stops
@@ -434,7 +551,18 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     try:
         maybe_refresh_planned_calls()
         bq_client.query(_PREDICT_CALLS_QUERY).result()
-        refresh_call_predictions_cache()
+        # Bus/GOA (pooled_all) per-call predictions. Nested + isolated so any bus failure degrades
+        # bus only — NSB /journey keeps serving from call_predictions_today. Builds today's bus SX
+        # snapshot, refreshes the bus planned source on its own TTL, then scores.
+        try:
+            bq_client.query(_DISRUPTIONS_BUS_QUERY).result()
+            maybe_refresh_bus_planned_calls()
+            bq_client.query(_PREDICT_CALLS_BUS_QUERY).result()
+        except Exception:
+            logger.exception(
+                "Bus per-call predictions failed; /journey + /varsel serve NSB-only this tick"
+            )
+        refresh_call_predictions_cache()  # loads whichever of the two tables are present
     except Exception:
         logger.exception("Per-call predictions refresh failed; /journey will serve stale or empty")
     # Rail-stop picker list for the avviksvarsel PWA. Isolated so a failure never breaks the feed.
@@ -1196,9 +1324,10 @@ async def situation(
 async def journey(
     id: str = Query(
         description=(
-            "Journey identifier — a SIRI DatedServiceJourney ref (e.g. "
-            "'VYG:DatedServiceJourney:318_LHM-DRM_25-09-01') or the bare jkey. The operator "
-            "prefix is stripped, so either form works."
+            "Journey identifier — a SIRI journey ref: rail 'VYG:DatedServiceJourney:318_LHM-DRM_"
+            "25-09-01' or bus 'RUT:ServiceJourney:<id>'. The codespace prefix disambiguates the "
+            "operator; the bare jkey ('DatedServiceJourney:…' / 'ServiceJourney:…') also works when "
+            "a single operator carries it (else 409 — include the prefix)."
         ),
     ),
     from_stop: str | None = Query(
@@ -1221,10 +1350,30 @@ async def journey(
     404 if no active disruption affects this journey (the train is not in today's per-call
     predictions). When several situations touch the journey, the most severe is returned.
     """
-    jkey = re.sub(r"^[A-Za-z]+:", "", id)
+    # Recover the operator (codespace prefix) so bus ServiceJourney jkeys don't collide across
+    # operators. The cache jkey is the ref minus its leading codespace and itself starts with a
+    # ref-type token ("DatedServiceJourney:"/"ServiceJourney:"), so we try the prefixed reading
+    # first ((operator, jkey) from "<CS>:<jkey>") and, if that misses, fall back to treating the
+    # whole id as a bare jkey — which resolves only when a single operator carries it (else 409).
+    m = re.match(r"^([A-Za-z]+):", id)
+    ambiguous_ops: list[str] | None = None
     with _call_pred_lock:
-        rows = _call_pred_by_jkey.get(jkey)
         refreshed_at = _call_pred_refreshed_at
+        rows = _call_pred_by_key.get((m.group(1), id[m.end():])) if m else None
+        if rows is None:
+            ops = _call_pred_by_jkey_index.get(id, set())
+            if len(ops) > 1:
+                ambiguous_ops = sorted(ops)
+            elif ops:
+                rows = _call_pred_by_key.get((next(iter(ops)), id))
+    if ambiguous_ops is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Journey key {id!r} is ambiguous across operators {ambiguous_ops}; "
+                "include the codespace prefix (e.g. 'RUT:ServiceJourney:...')."
+            ),
+        )
     if not rows:
         raise HTTPException(
             status_code=404,
@@ -1378,7 +1527,8 @@ def _trip_cells(
                     (
                         c
                         for c in calls
-                        if c.jkey == bcall.jkey
+                        if c.operator == bcall.operator
+                        and c.jkey == bcall.jkey
                         and c.stop_place == to_stop
                         and c.aimed_arr is not None
                     ),
@@ -1543,14 +1693,16 @@ async def alert_profile(
 
 
 # ---- /demo-api: retrospective "how good were the predictions?" journey demo -------------------
-# Serves the static demo dataset (temporal holdout 2026-04 -> 2026-06, NSB rail) built by
+# Serves the static demo dataset (temporal holdout 2026-04 -> 2026-06, NSB rail on the prod
+# model family + GOA/bus on the pooled_all family) built by
 # data/queries/create_demo_predictions.sql: for every SX-flagged call, the calibrated
 # predictions the models would have served at three ask times, next to the realized outcome.
 # The UI at /demo (demo/reisedemo, built into demo_static/) consumes these endpoints.
 
 # The alert decision shown in the demo: flag when P(cancelled OR >= 10 min late) crosses the
-# production operating threshold (>= 91 % precision at every ask horizon per eval/impact_eval.py).
-_DEMO_ALERT_THRESHOLD = 0.65
+# operator's live alerting threshold (varsel.threshold_for — the per-operator cuts tuned at
+# ~90 % precision by eval/tune_alert_thresholds.py, 0.65 default), so the demo's verdicts
+# replay exactly what the varsel push pipeline would have decided.
 # Realized outcome counts as "trouble" when the call was cancelled or >= 10 min late — the
 # same event the impact probability predicts.
 _DEMO_TROUBLE_DELAY_MIN = 10
@@ -1569,13 +1721,16 @@ class DemoStop(BaseModel):
 
     stop_place: str = Field(description="NSR StopPlace ref.")
     stop_name: str | None = Field(description="Human-readable stop name.")
-    n_calls: int = Field(description="Rail calls at this stop within the demo window.")
+    n_calls: int = Field(description="Calls at this stop within the demo window.")
+    mode: str = Field(description="What serves this stop: 'Tog', 'Buss' or 'Tog/Buss'.")
 
 
 class DemoHighlight(BaseModel):
     """A pre-picked high-impact situation, with a suggested trip + window that showcases it."""
 
     situation_number: str = Field(description="SIRI-SX situationNumber.")
+    operator: str = Field(description="Codespace of the worst-hit journey, e.g. 'NSB' or 'RUT'.")
+    mode: str = Field(description="Vehicle noun for that operator: 'Tog' or 'Buss'.")
     summary: str | None = Field(description="First-version Norwegian summary of the situation.")
     category: str | None = Field(description="Disruption category.")
     onset: datetime = Field(description="When the SX message arrived (UTC).")
@@ -1594,7 +1749,10 @@ class DemoMeta(BaseModel):
 
     window_start: date = Field(description="First date covered by the demo dataset.")
     window_end: date = Field(description="Last date covered by the demo dataset.")
-    alert_threshold: float = Field(description="Impact-probability threshold behind `would_alert`.")
+    alert_threshold: float = Field(
+        description="Default impact-probability threshold behind `would_alert`; each journey "
+        "carries its operator's actual threshold.",
+    )
     stops: list[DemoStop] = Field(description="Stops offered in the from/to pickers.")
     highlights: list[DemoHighlight] = Field(description="One-click example scenarios, worst first.")
 
@@ -1610,7 +1768,7 @@ class DemoSnapshot(BaseModel):
     delay_p50_min: int | None = Field(description="Median predicted delay (min) if the call runs.")
     delay_p90_min: int | None = Field(description="Bad-case (p90) predicted delay (min).")
     would_alert: bool = Field(
-        description="Whether this prediction crosses the alert threshold (see meta).",
+        description="Whether this prediction crosses the journey's `alert_threshold`.",
     )
     verdict: str | None = Field(
         description=(
@@ -1663,7 +1821,15 @@ class DemoSituation(BaseModel):
 class DemoJourney(BaseModel):
     """One matching journey: departure predictions/outcome left, arrival right."""
 
-    journey_ref: str = Field(description="Dated journey key (jkey).")
+    journey_ref: str = Field(
+        description="Operator-prefixed journey key, e.g. 'NSB:DatedServiceJourney:...' or "
+        "'RUT:ServiceJourney:...' — same format /journey accepts.",
+    )
+    operator: str = Field(description="Codespace the journey runs in, e.g. 'NSB', 'GOA', 'RUT'.")
+    mode: str = Field(description="Vehicle noun for the operator: 'Tog' or 'Buss'.")
+    alert_threshold: float = Field(
+        description="The operator's alerting threshold applied in this journey's `would_alert`.",
+    )
     line: str | None = Field(description="Line ref, e.g. 'NSB:Line:L1'.")
     situation: DemoSituation | None = Field(
         description="The situation behind the predictions; null if nothing flagged this journey.",
@@ -1692,14 +1858,15 @@ def _demo_actual_trouble(cancelled: bool, delay_min: int | None) -> bool | None:
     return delay_min >= _DEMO_TROUBLE_DELAY_MIN
 
 
-def _demo_snapshot(row, side: str, lead: str, actual_trouble: bool | None) -> DemoSnapshot | None:
+def _demo_snapshot(row, side: str, lead: str, actual_trouble: bool | None,
+                   threshold: float) -> DemoSnapshot | None:
     """Build one ask-time snapshot from the flat demo_journeys.sql row; None if unavailable
     (no situation, or the SX message had not yet arrived at this ask time)."""
     p_cancel = row[f"{side}_{lead}_p_cancel"]
     if p_cancel is None:
         return None
     p_impact = row[f"{side}_{lead}_p_impact"]
-    would_alert = p_impact is not None and p_impact >= _DEMO_ALERT_THRESHOLD
+    would_alert = p_impact is not None and p_impact >= threshold
     verdict = None
     if actual_trouble is not None:
         verdict = (
@@ -1719,7 +1886,7 @@ def _demo_snapshot(row, side: str, lead: str, actual_trouble: bool | None) -> De
 
 
 def _demo_side(row, side: str, stop_place: str, stop_name, scheduled, cancelled: bool,
-               delay_min: int | None) -> DemoSide:
+               delay_min: int | None, threshold: float) -> DemoSide:
     """Assemble one end of a journey: realized outcome + the three ask-time snapshots."""
     actual_trouble = _demo_actual_trouble(cancelled, delay_min)
     return DemoSide(
@@ -1730,9 +1897,9 @@ def _demo_side(row, side: str, stop_place: str, stop_name, scheduled, cancelled:
         actual_delay_min=delay_min,
         actual_trouble=actual_trouble,
         minutes_from_onset=row[f"{side}_min_from_onset"],
-        at_message=_demo_snapshot(row, side, "onset", actual_trouble),
-        t60=_demo_snapshot(row, side, "l60", actual_trouble),
-        t30=_demo_snapshot(row, side, "l30", actual_trouble),
+        at_message=_demo_snapshot(row, side, "onset", actual_trouble, threshold),
+        t60=_demo_snapshot(row, side, "l60", actual_trouble, threshold),
+        t30=_demo_snapshot(row, side, "l30", actual_trouble, threshold),
     )
 
 
@@ -1749,12 +1916,14 @@ def get_demo_meta() -> DemoMeta:
             detail="Demo dataset not built (run data/queries/create_demo_predictions.sql).",
         )
     stops = [
-        DemoStop(stop_place=r.stop_place, stop_name=r.stop_name, n_calls=r.n_calls)
+        DemoStop(stop_place=r.stop_place, stop_name=r.stop_name, n_calls=r.n_calls, mode=r.mode)
         for r in bq_client.query(_DEMO_STOPS_QUERY).result()
     ]
     highlights = [
         DemoHighlight(
             situation_number=r.situationNumber,
+            operator=r.operator,
+            mode=varsel.mode_label(r.operator),
             summary=r.summary,
             category=r.category,
             onset=r.onset_ts,
@@ -1772,7 +1941,7 @@ def get_demo_meta() -> DemoMeta:
     meta = DemoMeta(
         window_start=window.window_start,
         window_end=window.window_end,
-        alert_threshold=_DEMO_ALERT_THRESHOLD,
+        alert_threshold=varsel.threshold_for(None),
         stops=stops,
         highlights=highlights,
     )
@@ -1845,18 +2014,22 @@ async def demo_journeys(
                 category=r.category,
                 onset=r.onset_ts,
             )
+        threshold = varsel.threshold_for(r.operator)
         journeys.append(
             DemoJourney(
-                journey_ref=r.jkey,
+                journey_ref=f"{r.operator}:{r.jkey}",
+                operator=r.operator,
+                mode=varsel.mode_label(r.operator),
+                alert_threshold=threshold,
                 line=r.lineRef,
                 situation=situation,
                 departure=_demo_side(
                     r, "dep", r.from_stop, r.from_name, r.from_aimed_dep,
-                    r.act_dep_cancelled, r.act_dep_delay_min,
+                    r.act_dep_cancelled, r.act_dep_delay_min, threshold,
                 ),
                 arrival=_demo_side(
                     r, "arr", r.to_stop, r.to_name, r.to_aimed_arr,
-                    r.act_arr_cancelled, r.act_arr_delay_min,
+                    r.act_arr_cancelled, r.act_arr_delay_min, threshold,
                 ),
             )
         )
