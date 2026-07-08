@@ -127,7 +127,7 @@ export default function App() {
 
       <main id="main-content" className="av-main">
         <LeadParagraph className="av-intro">
-          Registrer togreisene dine, så varsler vi deg når et avvik kan ramme en av dem.
+          Registrer kollektivreisene dine, så varsler vi deg når et avvik kan ramme en av dem.
         </LeadParagraph>
 
         {loading ? (
