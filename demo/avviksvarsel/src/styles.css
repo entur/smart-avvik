@@ -80,6 +80,28 @@ body {
   color: var(--basecolors-text-subdued, var(--grey-70));
 }
 
+/* ---- iOS "add to Home Screen" instructions ---- */
+
+.av-ios-steps {
+  margin: 0.5rem 0 0;
+  padding-left: 1.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.av-ios-steps li::marker {
+  font-weight: 700;
+  color: var(--colors-blues-blueMain, var(--lavender-90));
+}
+
+.av-ios-share-glyph {
+  width: 1.05em;
+  height: 1.05em;
+  vertical-align: -0.2em;
+  margin: 0 0.1em;
+}
+
 /* ---- section ---- */
 
 .av-section {

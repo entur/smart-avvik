@@ -21,6 +21,28 @@ function computeState(config: Config): State {
   return Notification.permission as State;
 }
 
+// The iOS "Share" glyph (square.and.arrow.up) drawn inline so it matches the actual button an
+// iPhone user taps in Safari. Inherits the surrounding text colour via currentColor.
+function ShareGlyph() {
+  return (
+    <svg
+      className="av-ios-share-glyph"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.7}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      role="img"
+      aria-label="Del-ikonet"
+    >
+      <path d="M12 3.5v11" />
+      <path d="M8.2 6.8 12 3l3.8 3.8" />
+      <path d="M8 8.5H7a2 2 0 0 0-2 2V19a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-8.5a2 2 0 0 0-2-2h-1" />
+    </svg>
+  );
+}
+
 export default function VarselStatus({ config, deviceId }: { config: Config; deviceId: string }) {
   const [state, setState] = useState<State>(() => computeState(config));
   const [subscribed, setSubscribed] = useState(false);
@@ -109,10 +131,19 @@ export default function VarselStatus({ config, deviceId }: { config: Config; dev
       )}
 
       {state === 'ios-not-installed' && (
-        <SmallAlertBox variant="information" title="Legg appen til på Hjem-skjerm" width="fluid">
-          For å få varsler på iPhone: trykk <strong>Del</strong>-knappen nederst, velg{' '}
-          <strong>«Legg til på Hjem-skjerm»</strong>, og åpne appen derfra. Da kan du slå på
-          varsler.
+        <SmallAlertBox variant="information" title="Slå på varsler på iPhone" width="fluid">
+          <Paragraph margin="none">
+            På iPhone må appen ligge på Hjem-skjermen før den kan varsle deg:
+          </Paragraph>
+          <ol className="av-ios-steps">
+            <li>
+              Trykk <strong>Del</strong>-knappen <ShareGlyph /> nederst i Safari.
+            </li>
+            <li>
+              Velg <strong>«Legg til på Hjem-skjerm»</strong>.
+            </li>
+            <li>Åpne appen fra Hjem-skjermen, og slå på varsler her.</li>
+          </ol>
         </SmallAlertBox>
       )}
 

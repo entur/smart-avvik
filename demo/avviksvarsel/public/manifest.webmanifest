@@ -1,7 +1,7 @@
 {
   "name": "Entur Avviksvarsel",
   "short_name": "Avviksvarsel",
-  "description": "Få varsel når et avvik kan ramme togreisene dine.",
+  "description": "Få varsel når et avvik kan ramme kollektivreisene dine.",
   "lang": "nb",
   "dir": "ltr",
   "start_url": "/varsel/",
