@@ -62,13 +62,17 @@ def _parse_path(d: str) -> list[tuple[float, float]]:
             i += 2
             cmd = "l"
         elif cmd == "H":
-            x = float(tokens[i]); i += 1
+            x = float(tokens[i])
+            i += 1
         elif cmd == "h":
-            x += float(tokens[i]); i += 1
+            x += float(tokens[i])
+            i += 1
         elif cmd == "V":
-            y = float(tokens[i]); i += 1
+            y = float(tokens[i])
+            i += 1
         elif cmd == "v":
-            y += float(tokens[i]); i += 1
+            y += float(tokens[i])
+            i += 1
         else:  # a stray number under Z/z — shouldn't happen for these paths
             i += 1
             continue
