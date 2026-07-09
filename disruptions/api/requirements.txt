@@ -1,4 +1,4 @@
-# Runtime deps for the Cloud Run /disruptions API only (not the repo's full
+# Runtime deps for the /disruptions API image only (not the repo's full
 # notebook/ML stack). Kept in sync with the relevant entries in pyproject.toml.
 # No pandas extra: the app iterates BigQuery RowIterator directly, never to_dataframe().
 fastapi[standard]>=0.136.3
@@ -8,6 +8,6 @@ uvicorn[standard]>=0.34
 # so bundle it for the Europe/Oslo hour-of-day lookup in the alert profiles.
 tzdata>=2024.1
 # Avviksvarsel (/varsel): Web Push sender (pulls py_vapid + cryptography) and durable
-# subscription/journey state in a GCS blob so it survives Cloud Run redeploys.
+# subscription/journey state in a GCS blob so it survives redeploys.
 pywebpush>=2.0.0
 google-cloud-storage>=2.16.0

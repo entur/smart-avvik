@@ -1,6 +1,6 @@
 """Generate a VAPID keypair for Avviksvarsel Web Push.
 
-Prints the three env vars to set on the Cloud Run service (and for local testing):
+Prints the three env vars to set on the deployment (and for local testing):
 
     VAPID_PRIVATE_KEY   raw base64url of the P-256 private scalar (loaded via Vapid02.from_raw)
     VAPID_PUBLIC_KEY    base64url uncompressed public point — the browser applicationServerKey

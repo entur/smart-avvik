@@ -18,32 +18,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Deployment
 
-The `/disruptions` API (`disruptions/api/main.py`) runs on **both** Cloud Run and Kubernetes
-(`kix-avvik.dev.entur.io`; see the Kubernetes memory note). Both build the **same image** from
-the multi-stage `Dockerfile` at the **repo root** — its node stage builds the `/demo` and
-`/varsel` front-ends (from `demo/reisedemo` + `demo/avviksvarsel`, which is why the context is
-the repo root, not `disruptions/api`), and its python stage assembles the API. Kubernetes builds
-it via `.github/workflows/ci.yml`; Cloud Run via `disruptions/api/deploy.sh` (which now runs
-`gcloud run deploy --source .` from the repo root so it picks up the root Dockerfile):
+The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
+path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
+Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
+node stage builds the `/demo` and `/varsel` front-ends (from `demo/reisedemo` +
+`demo/avviksvarsel`, which is why the context is the repo root, not `disruptions/api`), and its
+python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
 
 ```sh
-disruptions/api/deploy.sh          # normal redeploy (front-ends built in-image)
-RUN_EVAL_EXPORT=1 disruptions/api/deploy.sh   # also re-render /eval first (needs ADC)
+git push origin main                         # builds the image (ci.yml) and deploys to dev (cd.yml)
+gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispatch-only)
 ```
 
-- `--min/--max-instances 1`: the app runs one background poller thread and an in-process
-  cache, so it must be a single always-on instance — more instances mean duplicate pollers
+- **Single always-on instance** (`deployment.forceReplicas: 1` in the Helm chart): the app runs
+  one background poller thread and an in-process cache, so more replicas mean duplicate pollers
   and unshared caches.
-- `--no-cpu-throttling`: keeps CPU allocated between requests so the poller keeps running.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
-- Service URL: https://kix-avvik-disruptions-305411154596.europe-west1.run.app
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
   app's `npm ci && npm run build`, and Vite writes into `disruptions/api/{demo,varsel}_static/`
-  (both gitignored). `demo/*/build.sh` do the same locally for dev; the deploy no longer calls
-  them. **`/eval` is the exception**: its marimo snapshots run BigQuery under a developer's ADC, so
-  they can't be built in the image/CI — they are rendered offline by `export_eval.sh` and
-  **committed** under `disruptions/api/eval_static/`, shipped as-is. Refresh them (and commit)
-  after a retrain via `RUN_EVAL_EXPORT=1 deploy.sh`.
+  (both gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
+  its marimo snapshots run BigQuery under a developer's ADC, so they can't be built in the
+  image/CI — they are rendered offline by `disruptions/api/export_eval.sh` and **committed** under
+  `disruptions/api/eval_static/`, shipped as-is. Refresh them by running that script, then commit
+  and push.
 - The partner demo UI at `/demo` (predictions vs realized outcomes for a chosen trip) lives in
   `demo/reisedemo/` (React + Vite). Its data is served by the `/demo-api` endpoints
   from static tables built by `data/queries/create_demo_predictions.sql` — re-run that query
@@ -60,7 +57,7 @@ RUN_EVAL_EXPORT=1 disruptions/api/deploy.sh   # also re-render /eval first (need
     `push_enabled=false`); the journey list still works. Regenerate with
     `uv run --with pywebpush python disruptions/api/gen_vapid.py`.
   - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
-    so registrations survive redeploys (Cloud Run fs is tmpfs). The runtime SA needs
+    so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
 
 ## Conventions

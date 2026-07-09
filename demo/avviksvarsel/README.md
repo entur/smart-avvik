@@ -25,7 +25,7 @@ Served by the disruptions API at **`/varsel`**; data + push endpoints are **`/va
   (`P(cancelled OR ≥10 min late)` ≥ 0.65 by default; per-operator cuts tuned at ~90 % precision
   by `eval/tune_alert_thresholds.py`); the in-app list shows *all* current matches.
 - Subscriptions + journeys are keyed by a client-generated `device_id` (no login — prototype).
-  State persists to a GCS blob so it survives Cloud Run redeploys.
+  State persists to a GCS blob so it survives redeploys.
 
 ## Install on a phone
 

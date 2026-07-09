@@ -9,7 +9,7 @@ __marimo__/
 # disruptions/api/eval_static/ is intentionally NOT ignored: the /eval snapshots
 # run BigQuery under a developer's ADC, so they can't be built in the image or CI.
 # They are rendered offline (export_eval.sh) and committed, then shipped in the
-# image on both deploy paths. Refresh with RUN_EVAL_EXPORT=1 (see deploy.sh).
+# image. Refresh by running disruptions/api/export_eval.sh, then commit and push.
 
 # Built into the image by the root Dockerfile's node stage; not committed.
 disruptions/api/demo_static/

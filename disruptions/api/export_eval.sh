@@ -5,11 +5,11 @@
 # The notebooks (repo-root eval/*.py) run BigQuery ML.PREDICT cells, so we render
 # them OFFLINE here — under your ADC, with the repo's full notebook stack — and bake
 # the outputs into HTML. main.py then serves that HTML read-only at /eval as plain
-# static files, so a public visit costs no BigQuery and spins up no kernel. Re-run
-# this to refresh the results (deploy.sh runs it automatically before deploying).
+# static files, so a public visit costs no BigQuery and spins up no kernel. Run this
+# to refresh the results, then commit them and push (CI builds them into the image).
 #
 # Output: disruptions/api/eval_static/{<notebook>.html, index.html}. That directory is
-# gitignored (generated) but ships in the deploy source via .gcloudignore.
+# committed (unlike demo_static/varsel_static, which CI rebuilds) and shipped in the image.
 set -euo pipefail
 
 API_DIR="$(cd "$(dirname "$0")" && pwd)"

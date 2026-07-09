@@ -42,8 +42,9 @@ cd demo/reisedemo && npm install && npm run dev
 ## Bygge og deploye
 
 `./build.sh` bygger til `disruptions/api/demo_static/` (generert katalog, ikke i git);
-API-et serverer den på `/demo`. `disruptions/api/deploy.sh` kjører bygget automatisk før
-deploy (sett `SKIP_DEMO_BUILD=1` for å gjenbruke forrige bygg).
+API-et serverer den på `/demo`. For deploy bygges front-endene automatisk inn i imaget
+(rot-`Dockerfile`ens node-steg via `.github/workflows/ci.yml`), så `build.sh` trengs bare
+for lokal utvikling.
 
 Teknologivalg (React + Vite + TypeScript) følger Entur-standarden fra Kompass /
 kunnskapsbasen; Linje-designsystemet (`@entur/*`) er bevisst *ikke* brukt siden demoen

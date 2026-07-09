@@ -23,7 +23,7 @@ Design notes
   so trivial flags don't spam the phone. The in-app list shows *all* current matches regardless.
 * **State** (devices / journeys / notified) is tiny JSON, guarded by a re-entrant lock and written
   through to a local file and — when ``VARSEL_STATE_BUCKET`` is set — a GCS blob, so it survives a
-  Cloud Run redeploy (the container fs is tmpfs). Single always-on instance ⇒ last-write-wins is
+  redeploy (the container fs is ephemeral). Single always-on instance ⇒ last-write-wins is
   safe.
 * **VAPID** keys come from env (``VAPID_PRIVATE_KEY`` raw base64url, ``VAPID_PUBLIC_KEY``,
   ``VAPID_SUBJECT``). When unset, push is disabled gracefully: ``/config`` reports

@@ -2,14 +2,13 @@
 #
 # Build context is the REPO ROOT (not disruptions/api) because the front-end
 # sources live in demo/reisedemo and demo/avviksvarsel, outside the API dir. The
-# CI build (.github/workflows/ci.yml) and the Cloud Run deploy (disruptions/api/
-# deploy.sh) both build this file from the root.
+# CI build (.github/workflows/ci.yml) builds this file from the root.
 #
 # Why multi-stage: the /demo and /varsel UIs are Vite bundles generated from
 # source — the generated demo_static/ and varsel_static/ are gitignored, so they
 # are NOT in the checkout and must be built here. (The /eval snapshots are
 # different: they run BigQuery under a developer's ADC, so they are rendered
-# offline and committed under disruptions/api/eval_static/ — see deploy.sh.)
+# offline and committed under disruptions/api/eval_static/ — see export_eval.sh.)
 #
 # Runtime base is distroless (Entur Golden Path for Python; see entur/ai
 # guides/reference/docker.md). It ships only glibc + the CPython 3.13 runtime —
@@ -85,9 +84,9 @@ COPY disruptions/api/ .
 COPY --from=frontends /build/disruptions/api/demo_static ./demo_static
 COPY --from=frontends /build/disruptions/api/varsel_static ./varsel_static
 
-# Cloud Run and the Helm chart both route traffic to 8080. Single worker on
-# purpose: the app keeps an in-process cache and one background poller thread, so
-# multiple workers would mean duplicate pollers and unshared caches.
+# The Helm chart routes traffic to 8080. Single worker on purpose: the app keeps
+# an in-process cache and one background poller thread, so multiple workers would
+# mean duplicate pollers and unshared caches.
 #
 # Exec form (distroless has no shell): the image's ENTRYPOINT is the CPython
 # interpreter, so this runs `python -m uvicorn ...`. The port is fixed to 8080

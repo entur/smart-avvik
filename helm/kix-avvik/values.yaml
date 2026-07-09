@@ -27,7 +27,7 @@ common:
 
   ingress:
     enabled: true
-    trafficType: public  # public read-only API, same exposure as the Cloud Run service
+    trafficType: public  # public read-only API
 
   configmap:
     enabled: true
