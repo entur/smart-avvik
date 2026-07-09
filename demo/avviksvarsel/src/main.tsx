@@ -19,7 +19,22 @@ import '@entur/a11y/dist/styles.css';
 import '@entur/loader/dist/styles.css';
 
 import App from './App';
+import { reportClientError } from './api';
 import './styles.css';
+
+// Uncaught exceptions and promise rejections are forwarded to the server log (best-effort,
+// throttled — see api.ts) so client-side failures are visible without a connected devtools.
+window.addEventListener('error', (event) => {
+  reportClientError('window', event.message, event.error instanceof Error ? event.error.stack : undefined);
+});
+window.addEventListener('unhandledrejection', (event) => {
+  const reason: unknown = event.reason;
+  reportClientError(
+    'unhandledrejection',
+    reason instanceof Error ? reason.message : String(reason),
+    reason instanceof Error ? reason.stack : undefined,
+  );
+});
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

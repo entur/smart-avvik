@@ -32,19 +32,30 @@ os.environ.update(
 )
 
 import json  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
 
 import varsel  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from test_varsel import FakeCall, _oslo  # reuse the synthetic call shape  # noqa: E402
+from test_varsel import FakeCall, _OSLO  # reuse the synthetic call shape  # noqa: E402
 
 DEVICE = "dev-abc12345"
 SUBSCRIPTION = {"endpoint": "https://push.example.com/x", "keys": {"p256dh": "k", "auth": "a"}}
 
-# Oslo stops A (order 1) -> B (order 5) on a Monday 08:00 train flagged by situation S1.
+# Oslo stops A (order 1) -> B (order 5) on a train flagged by situation S1. The endpoints match
+# against the real clock (departed trains are filtered out), so the departure must lie in the
+# future: two hours from now, matched by all-day/all-days journey windows below.
+DEP = datetime.now(tz=_OSLO) + timedelta(hours=2)
 SNAPSHOT = {
     "S1": [
-        FakeCall("t1", "A", 1, _oslo(2026, 7, 6, 8, 0), p_cancel=0.82, p_impact_dep=0.9),
+        FakeCall("t1", "A", 1, DEP, p_cancel=0.82, p_impact_dep=0.9),
+        FakeCall("t1", "B", 5, None),
+    ]
+}
+# Same shape, but the train left hours ago — must never produce an alert.
+SNAPSHOT_DEPARTED = {
+    "S1": [
+        FakeCall("t1", "A", 1, DEP - timedelta(hours=4), p_cancel=0.82, p_impact_dep=0.9),
         FakeCall("t1", "B", 5, None),
     ]
 }
@@ -92,15 +103,15 @@ def test_journey_crud_and_live_match():
         "from_name": "Oslo S",
         "to_stop": "B",
         "to_name": "Lillehammer",
-        "begin": "07:00",
-        "end": "09:00",
-        "days": [0, 1, 2, 3, 4],
+        "begin": "00:00",
+        "end": "23:59",
+        "days": [0, 1, 2, 3, 4, 5, 6],
     }
     r = client.post("/varsel-api/journeys", json=payload)
     assert r.status_code == 200, r.text
     created = r.json()
     jid = created["journey_id"]
-    # The synthetic Monday-08:00 situation should show up as a live match on this journey.
+    # The synthetic in-two-hours situation should show up as a live match on this journey.
     assert len(created["alerts"]) == 1
     assert created["alerts"][0]["situation_number"] == "S1"
     assert created["alerts"][0]["alertworthy"] is True
@@ -136,9 +147,9 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
             "from_name": "Oslo S",
             "to_stop": "B",
             "to_name": "Lillehammer",
-            "begin": "07:00",
-            "end": "09:00",
-            "days": [0, 1, 2, 3, 4],
+            "begin": "00:00",
+            "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6],
         },
     )
     varsel.check_and_notify(SNAPSHOT)
@@ -162,9 +173,38 @@ def _register_matching_journey():
         json={
             "device_id": DEVICE, "from_stop": "A", "from_name": "Oslo S",
             "to_stop": "B", "to_name": "Lillehammer",
-            "begin": "07:00", "end": "09:00", "days": [0, 1, 2, 3, 4],
+            "begin": "00:00", "end": "23:59", "days": [0, 1, 2, 3, 4, 5, 6],
         },
     )
+
+
+def test_departed_train_produces_no_alerts(monkeypatch):
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    # The live listing reads the injected snapshot provider; point it at the departed train.
+    monkeypatch.setattr(varsel, "_snapshot_provider", lambda: SNAPSHOT_DEPARTED)
+    _register_matching_journey()
+    # The situation is still open, but its train left hours ago: no live match, no push.
+    varsel.check_and_notify(SNAPSHOT_DEPARTED)
+    assert sent == []
+    listing = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()
+    assert listing["journeys"][0]["alerts"] == []
+
+
+def test_client_log():
+    r = client.post(
+        "/varsel-api/client-log",
+        json={
+            "context": "fetch",
+            "message": "GET /varsel-api/journeys: TypeError: Failed to fetch",
+            "device_id": DEVICE,
+            "url": "/varsel/",
+        },
+    )
+    assert r.status_code == 200 and r.json()["status"] == "ok"
+    # Validation: an empty message is rejected.
+    assert client.post("/varsel-api/client-log", json={"context": "fetch", "message": ""}).status_code == 422
 
 
 def test_transient_410_keeps_fresh_device(monkeypatch):

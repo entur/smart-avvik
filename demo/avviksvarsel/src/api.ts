@@ -49,12 +49,73 @@ export interface NewJourney {
   days: number[];
 }
 
+// ---- Client -> server error reporting ---------------------------------------------------------
+// Failed fetches, 5xx responses and uncaught exceptions are forwarded to POST
+// /varsel-api/client-log so browser-side failures show up in the server logs. Best-effort: a
+// report that cannot be sent (typically because the network is down — the very thing that made
+// fetch fail) is queued and flushed after the next successful request, so even offline blips
+// leave a trace once connectivity returns.
+
+interface ClientLogEntry {
+  context: string;
+  message: string;
+  stack?: string;
+}
+
+const pendingReports: ClientLogEntry[] = [];
+const lastReportAt = new Map<string, number>();
+const REPORT_THROTTLE_MS = 30_000; // per-context, so a 60s poll loop can't spam the server
+const MAX_PENDING_REPORTS = 10;
+
+async function sendReport(entry: ClientLogEntry): Promise<void> {
+  try {
+    await fetch('/varsel-api/client-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      keepalive: true, // survives tab close / backgrounding
+      body: JSON.stringify({
+        ...entry,
+        device_id: localStorage.getItem('avviksvarsel.device_id'),
+        url: location.pathname,
+      }),
+    });
+  } catch {
+    if (pendingReports.length < MAX_PENDING_REPORTS) pendingReports.push(entry);
+  }
+}
+
+export function reportClientError(context: string, message: string, stack?: string): void {
+  const now = Date.now();
+  if (now - (lastReportAt.get(context) ?? 0) < REPORT_THROTTLE_MS) return;
+  lastReportAt.set(context, now);
+  void sendReport({ context, message, stack });
+}
+
+function flushPendingReports(): void {
+  while (pendingReports.length > 0) void sendReport(pendingReports.shift()!);
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  let res: Response;
+  try {
+    res = await fetch(url, init);
+  } catch (e) {
+    // Network-level failure (offline, connection reset, server restarting) — the browser's
+    // "Failed to fetch" is meaningless to the user; report the details, show Norwegian.
+    reportClientError('fetch', `${init?.method ?? 'GET'} ${url}: ${String(e)}`);
+    throw new Error('Får ikke kontakt med tjeneren. Sjekk nettforbindelsen og prøv igjen.');
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => null);
-    throw new Error(body?.detail ?? `${res.status} ${res.statusText}`);
+    const message = body?.detail ?? `${res.status} ${res.statusText}`;
+    // 4xx are expected user-level outcomes (validation, journey cap, test-push races) — only
+    // server-side failures are worth a log line.
+    if (res.status >= 500) {
+      reportClientError('http', `${init?.method ?? 'GET'} ${url}: ${message}`);
+    }
+    throw new Error(message);
   }
+  flushPendingReports();
   return res.status === 204 ? (undefined as T) : res.json();
 }
 

@@ -48,12 +48,21 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
 
+  const refreshFailures = useRef(0);
+
   const refreshJourneys = useCallback(async () => {
     try {
       const res = await fetchJourneys(deviceId);
       setJourneys(res.journeys);
+      refreshFailures.current = 0;
+      setError(null); // a recovered poll must clear an earlier error, or it sticks forever
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // A single failed background poll (phone briefly offline, server redeploying) isn't worth
+      // a red banner over data that is at most a minute stale — surface it only when it persists.
+      refreshFailures.current += 1;
+      if (refreshFailures.current >= 2) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     }
   }, [deviceId]);
 

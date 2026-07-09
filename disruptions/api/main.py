@@ -15,9 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from google.cloud import bigquery
 from pydantic import BaseModel, Field
 
+import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 _LAST_INGESTION_TIME_QUERY = (Path(__file__).parent / "last_ingestion_time.sql").read_text()

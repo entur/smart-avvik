@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -262,6 +262,21 @@ def _dep_p90(call: Any) -> int | None:
     return call.dep_delay_p90_stack_min if call.dep_delay_p90_stack_min is not None else call.dep_delay_p90_min
 
 
+def _dep_typ(call: Any) -> int | None:
+    """Boarding-side typical delay, preferring the calibrated exceedance-stack p50."""
+    return call.dep_delay_p50_stack_min if call.dep_delay_p50_stack_min is not None else call.dep_delay_typ_min
+
+
+def _expected_dep(call: Any) -> datetime | None:
+    """When the vehicle is expected to actually leave the boarding stop: aimed departure plus the
+    predicted typical delay. Once this has passed the traveller can no longer catch it, so the
+    match is moot — the scored calls stay in the snapshot for as long as their situation is open,
+    which can be many hours past the departures they describe."""
+    if call.aimed_dep is None:
+        return None
+    return call.aimed_dep + timedelta(minutes=max(_dep_typ(call) or 0, 0))
+
+
 class Alert(BaseModel):
     """One situation currently hitting a registered journey — the worst matching train's numbers."""
 
@@ -293,15 +308,22 @@ def _severity(call: Any) -> tuple[float, int]:
     return (call.p_cancel, _dep_p90(call) or 0)
 
 
-def match_journey(journey: dict, by_situation: dict[str, list]) -> list[Alert]:
+def match_journey(
+    journey: dict, by_situation: dict[str, list], now: datetime | None = None
+) -> list[Alert]:
     """Situations currently hitting `journey`, worst-first — one :class:`Alert` per situation.
 
     For each situation, group its scored calls by dated journey (jkey). A train matches when it has
     a boarding call at ``from_stop`` whose aimed departure (in Europe/Oslo) falls on one of the
-    journey's weekdays and inside its ``[begin, end]`` window, AND the same train later calls at
+    journey's weekdays and inside its ``[begin, end]`` window, whose expected departure (aimed +
+    predicted typical delay) has not yet passed ``now``, AND the same train later calls at
     ``to_stop`` (a call with higher stop_order — the travel direction). Per situation the worst such
     train (highest cancellation prob, then p90 delay) supplies the alert's numbers.
+
+    ``now`` is injectable for tests; it defaults to the current time.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
     days = set(journey["days"])
     begin_min = _parse_hhmm(journey["begin"])
     end_min = _parse_hhmm(journey["end"])
@@ -332,6 +354,12 @@ def match_journey(journey: dict, by_situation: dict[str, list]) -> list[Alert]:
             local = board.aimed_dep.astimezone(_OSLO)
             tod = local.hour * 60 + local.minute
             if local.weekday() not in days or not (begin_min <= tod <= end_min):
+                continue
+            # Departed trains are moot: a situation can stay open (and its scored calls stay in
+            # the snapshot) long after the departures it affects, so without this a morning delay
+            # keeps alerting all day.
+            expected = _expected_dep(board)
+            if expected is not None and expected < now:
                 continue
             # Direction: the same train must call at to_stop further along the line.
             if not any(
@@ -422,6 +450,46 @@ def _send_push(subscription: dict, payload: dict) -> str:
         return "error"
 
 
+def _log_push(
+    kind: str,
+    result: str,
+    device_id: str,
+    payload: dict,
+    *,
+    journey_id: str | None = None,
+    alert: Alert | None = None,
+) -> None:
+    """One structured log line per push attempt, message text included — the audit trail of what
+    was actually sent to whom (``jsonPayload.event = "push"`` in Cloud Logging)."""
+    fields = {
+        "event": "push",
+        "push_kind": kind,  # "alert" (journey×situation match) or "test"
+        "result": result,  # "sent", "gone" or "error"
+        "device_id": device_id,
+        "journey_id": journey_id,
+        "title": payload.get("title"),
+        "body": payload.get("body"),
+    }
+    if alert is not None:
+        fields.update(
+            situation_number=alert.situation_number,
+            operator=alert.operator,
+            line=alert.line,
+            departure_time=alert.departure_time,
+            cancel_probability=alert.cancel_probability,
+            impact_probability=alert.impact_probability,
+        )
+    logger.info(
+        "Push %s (%s) to device %s: %s | %s",
+        result,
+        kind,
+        device_id,
+        payload.get("title"),
+        str(payload.get("body", "")).replace("\n", " / "),
+        extra={"fields": fields},
+    )
+
+
 def _drop_device(device_id: str) -> None:
     """Forget a device whose push subscription is gone (404/410). Journeys are kept — the client
     re-attaches its subscription (same device_id) if the user re-enables notifications."""
@@ -481,7 +549,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             with _state_lock:
                 if key in _notified:
                     continue
-            result = _send_push(device, _notification_payload(journey, alert))
+            payload = _notification_payload(journey, alert)
+            result = _send_push(device, payload)
+            _log_push("alert", result, journey["device_id"], payload, journey_id=jid, alert=alert)
             if result == "sent":
                 with _state_lock:
                     _notified.add(key)
@@ -594,6 +664,16 @@ class TestIn(BaseModel):
     """Request a test push to verify the pipe end to end."""
 
     device_id: str = Field(min_length=8, max_length=100)
+
+
+class ClientLogIn(BaseModel):
+    """A browser-side error the PWA forwards into the server log (see api.ts reportClientError)."""
+
+    context: str = Field(min_length=1, max_length=80, description='Where it happened: "fetch", "http", "window", …')
+    message: str = Field(min_length=1, max_length=1000)
+    device_id: str | None = Field(default=None, max_length=100)
+    stack: str | None = Field(default=None, max_length=4000)
+    url: str | None = Field(default=None, max_length=300, description="Client page path.")
 
 
 # ---- Router ----------------------------------------------------------------------------------
@@ -718,6 +798,46 @@ async def delete_journey(
     return {"status": "ok"}
 
 
+# Open, unauthenticated endpoint — a global per-minute cap keeps a misbehaving (or malicious)
+# client from flooding the server log. Beyond the cap reports are dropped, not errored, so the
+# client never retries harder because of the throttle itself.
+_CLIENT_LOG_MAX_PER_MIN = 60
+_client_log_lock = threading.Lock()
+_client_log_window_start: datetime | None = None
+_client_log_count = 0
+
+
+@router.post("/client-log", summary="Forward a client-side error into the server log")
+async def client_log(body: ClientLogIn, request: Request) -> dict:
+    """Log a browser-side error (failed fetch, HTTP error, uncaught exception) server-side, so
+    client failures are visible next to the server logs in Cloud Logging
+    (``jsonPayload.event = "client_error"``)."""
+    global _client_log_window_start, _client_log_count
+    now = datetime.now(timezone.utc)
+    with _client_log_lock:
+        if _client_log_window_start is None or now - _client_log_window_start >= timedelta(minutes=1):
+            _client_log_window_start, _client_log_count = now, 0
+        _client_log_count += 1
+        if _client_log_count > _CLIENT_LOG_MAX_PER_MIN:
+            return {"status": "throttled"}
+    logger.warning(
+        "Client error [%s] %s",
+        body.context,
+        body.message,
+        extra={
+            "fields": {
+                "event": "client_error",
+                "client_context": body.context,
+                "device_id": body.device_id,
+                "client_url": body.url,
+                "stack": body.stack,
+                "user_agent": request.headers.get("user-agent"),
+            }
+        },
+    )
+    return {"status": "ok"}
+
+
 @router.post("/test", summary="Send a test push to verify delivery")
 async def test_push(body: TestIn) -> dict:
     """Send a "Varsler er aktivert" push to this device — proves the subscription works."""
@@ -734,6 +854,7 @@ async def test_push(body: TestIn) -> dict:
         "url": "/varsel/",
     }
     result = _send_push(subscription, payload)
+    _log_push("test", result, body.device_id, payload)
     if result == "gone":
         if _device_is_fresh(body.device_id):
             # A brand-new subscription can briefly 404/410 before it propagates — don't drop it.

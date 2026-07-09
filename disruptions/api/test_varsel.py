@@ -1,7 +1,8 @@
 """Matcher unit checks for varsel.match_journey — synthetic _CallPred-shaped rows.
 
 Runs standalone (`python test_varsel.py`) or under pytest. Covers direction, window edges, the
-weekday filter, overnight rejection, and the alert-worthiness gate. No BigQuery, no network.
+weekday filter, overnight rejection, the departed-train filter (no alert once the expected
+departure has passed) and the alert-worthiness gate. No BigQuery, no network.
 """
 
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ class FakeCall:
     summary: str | None = "Signalfeil"
     dep_delay_typ_min: int | None = 4
     dep_delay_p90_min: int | None = 15
+    dep_delay_p50_stack_min: int | None = 3
     dep_delay_p90_stack_min: int | None = 12
 
 
@@ -54,6 +56,14 @@ assert MON_0800.weekday() == 0
 SAT_0800 = _oslo(2026, 7, 11, 8, 0)
 assert SAT_0800.weekday() == 5
 
+# The tests pin their own "now" (early Monday, before every test departure) — the matcher drops
+# boardings whose expected departure has passed, and the fixed test dates lie in the real past.
+NOW = _oslo(2026, 7, 6, 6, 0)
+
+
+def match(journey, by_situation, now=NOW):
+    return match_journey(journey, by_situation, now)
+
 
 def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", **board_kw):
     """A boarding call at A and a later call at B (same train)."""
@@ -66,7 +76,7 @@ def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", **board_
 
 
 def test_basic_match():
-    alerts = match_journey(_journey(), {"S1": _train(MON_0800, p_cancel=0.8, p_impact_dep=0.9)})
+    alerts = match(_journey(), {"S1": _train(MON_0800, p_cancel=0.8, p_impact_dep=0.9)})
     assert len(alerts) == 1
     a = alerts[0]
     assert a.situation_number == "S1"
@@ -81,50 +91,72 @@ def test_direction_reverse_no_match():
         FakeCall("t1", "A", 5, MON_0800),
         FakeCall("t1", "B", 1, None),
     ]
-    assert match_journey(_journey(), {"S1": calls}) == []
+    assert match(_journey(), {"S1": calls}) == []
 
 
 def test_missing_destination_no_match():
     # Boarding in window but the train never calls at B.
     calls = [FakeCall("t1", "A", 1, MON_0800)]
-    assert match_journey(_journey(), {"S1": calls}) == []
+    assert match(_journey(), {"S1": calls}) == []
 
 
 def test_window_edges():
     j = _journey(begin="07:00", end="09:00")
-    assert match_journey(j, {"S1": _train(_oslo(2026, 7, 6, 7, 0))})  # exactly begin -> match
-    assert match_journey(j, {"S1": _train(_oslo(2026, 7, 6, 9, 0))})  # exactly end -> match
-    assert not match_journey(j, {"S1": _train(_oslo(2026, 7, 6, 6, 59))})  # just before
-    assert not match_journey(j, {"S1": _train(_oslo(2026, 7, 6, 9, 1))})  # just after
+    assert match(j, {"S1": _train(_oslo(2026, 7, 6, 7, 0))})  # exactly begin -> match
+    assert match(j, {"S1": _train(_oslo(2026, 7, 6, 9, 0))})  # exactly end -> match
+    assert not match(j, {"S1": _train(_oslo(2026, 7, 6, 6, 59))})  # just before
+    assert not match(j, {"S1": _train(_oslo(2026, 7, 6, 9, 1))})  # just after
 
 
 def test_weekday_filter():
     weekdays_only = _journey(days=(0, 1, 2, 3, 4))
-    assert not match_journey(weekdays_only, {"S1": _train(SAT_0800)})  # Saturday excluded
+    assert not match(weekdays_only, {"S1": _train(SAT_0800)})  # Saturday excluded
     weekend = _journey(days=(5, 6))
-    assert match_journey(weekend, {"S1": _train(SAT_0800)})  # Saturday included
+    assert match(weekend, {"S1": _train(SAT_0800)})  # Saturday included
 
 
 def test_overnight_rejection():
     # A day-window [07:00, 09:00] must not catch a 23:30 departure (no wrap-around).
-    assert not match_journey(_journey(), {"S1": _train(_oslo(2026, 7, 6, 23, 30))})
+    assert not match(_journey(), {"S1": _train(_oslo(2026, 7, 6, 23, 30))})
+
+
+def test_departed_train_no_match():
+    # The situation stays open all day, but the 08:00 train (expected 08:03 with the 3 min
+    # typical delay) left long ago — no alert lingering at noon.
+    assert match(_journey(), {"S1": _train(MON_0800)}, now=_oslo(2026, 7, 6, 12, 0)) == []
+    # Still catchable just before the expected departure.
+    assert match(_journey(), {"S1": _train(MON_0800)}, now=_oslo(2026, 7, 6, 8, 2))
+
+
+def test_delayed_train_catchable_until_expected_departure():
+    # 08:00 aimed + 25 min predicted typical delay -> still listed at 08:15, gone at 08:26.
+    late = {"S1": _train(MON_0800, dep_delay_p50_stack_min=25)}
+    assert match(_journey(), late, now=_oslo(2026, 7, 6, 8, 15))
+    assert match(_journey(), late, now=_oslo(2026, 7, 6, 8, 26)) == []
+
+
+def test_expected_departure_falls_back_to_typ_delay():
+    # No calibrated stack p50 -> the expected departure uses dep_delay_typ_min (4 min default).
+    train = {"S1": _train(MON_0800, dep_delay_p50_stack_min=None)}
+    assert match(_journey(), train, now=_oslo(2026, 7, 6, 8, 3))
+    assert match(_journey(), train, now=_oslo(2026, 7, 6, 8, 5)) == []
 
 
 def test_alertworthy_gate():
     # Below threshold on both impact and cancel -> listed but not push-worthy.
-    mild = match_journey(_journey(), {"S1": _train(MON_0800, p_cancel=0.1, p_impact_dep=0.2)})
+    mild = match(_journey(), {"S1": _train(MON_0800, p_cancel=0.1, p_impact_dep=0.2)})
     assert mild and mild[0].alertworthy is False
     # Impact prob unavailable -> fall back to cancellation prob.
-    fallback = match_journey(_journey(), {"S1": _train(MON_0800, p_cancel=0.7, p_impact_dep=None)})
+    fallback = match(_journey(), {"S1": _train(MON_0800, p_cancel=0.7, p_impact_dep=None)})
     assert fallback and fallback[0].alertworthy is True
 
 
 def test_per_operator_threshold():
     # RUT's tuned threshold is 0.75 (stricter than the 0.65 default), TRO's is 0.55 (looser):
     # the same 0.70 impact prob is push-worthy for TRO but not for RUT.
-    rut = match_journey(_journey(), {"S1": _train(MON_0800, operator="RUT", p_impact_dep=0.70)})
+    rut = match(_journey(), {"S1": _train(MON_0800, operator="RUT", p_impact_dep=0.70)})
     assert rut and rut[0].alertworthy is False
-    tro = match_journey(_journey(), {"S1": _train(MON_0800, operator="TRO", p_impact_dep=0.70)})
+    tro = match(_journey(), {"S1": _train(MON_0800, operator="TRO", p_impact_dep=0.70)})
     assert tro and tro[0].alertworthy is True
 
 
@@ -133,14 +165,14 @@ def test_worst_train_wins():
     calls = _train(_oslo(2026, 7, 6, 7, 30), jkey="t1", p_cancel=0.3) + _train(
         _oslo(2026, 7, 6, 8, 30), jkey="t2", p_cancel=0.85
     )
-    alerts = match_journey(_journey(), {"S1": calls})
+    alerts = match(_journey(), {"S1": calls})
     assert len(alerts) == 1 and alerts[0].cancel_probability == 0.85
 
 
 def test_multiple_situations_sorted_worst_first():
     s1 = _train(MON_0800, jkey="a", p_cancel=0.4)
     s2 = _train(MON_0800, jkey="b", p_cancel=0.9)
-    alerts = match_journey(_journey(), {"S1": s1, "S2": s2})
+    alerts = match(_journey(), {"S1": s1, "S2": s2})
     assert [a.situation_number for a in alerts] == ["S2", "S1"]
 
 
@@ -154,7 +186,7 @@ def test_operator_collision_not_merged():
         FakeCall(jkey="x", stop_place="A", stop_order=1, aimed_dep=MON_0800, operator="ATB",
                  p_cancel=0.99),
     ]
-    alerts = match_journey(_journey(), {"S1": sky + atb_board_only})
+    alerts = match(_journey(), {"S1": sky + atb_board_only})
     assert len(alerts) == 1
     assert alerts[0].cancel_probability == 0.8  # SKY's train, not ATB's boarding-only 0.99
 
