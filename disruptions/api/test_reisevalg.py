@@ -41,6 +41,13 @@ from reisevalg import (  # noqa: E402
 
 _OSLO = reisevalg._OSLO
 
+# The U2 backtest measured the volume signal's precision at 0.60 — below the 0.8 honesty bar —
+# so the SHIPPED default is VOLUME_NUDGE_ENABLED=False (a volume-only "congested" never fires
+# the nudge). The decision-matrix tests below exercise the full mechanism with the gate open;
+# the shipped below-bar default is pinned in test_volume_precision_gate_blocks_nudge_by_default.
+VOLUME_NUDGE_SHIPPED = reisevalg.VOLUME_NUDGE_ENABLED
+reisevalg.VOLUME_NUDGE_ENABLED = True
+
 app = FastAPI()
 app.include_router(reisevalg.router)
 client = TestClient(app)
@@ -352,10 +359,10 @@ def test_rail_degraded_reachable_with_zero_road_data():
 
 # ---- decide(): per-source staleness -------------------------------------------------------------
 def test_stale_road_observation_yields_unknown():
-    # A successful fetch whose DATA is over the volume cutoff (200 min > 180) is stale-by-age.
+    # A successful fetch whose DATA is over the volume cutoff (280 min > 250) is stale-by-age.
     d = decide(
         now=NOW,
-        road_observations=[_road("congested", age_min=200)],
+        road_observations=[_road("congested", age_min=280)],
         departures=_normal_board(),
         rail_observed_at=NOW,
     )
@@ -396,6 +403,47 @@ def test_0830_with_0700_volume_observation_can_recommend():
         rail_observed_at=now,
     )
     assert d.state is State.TRAIN_RECOMMENDED
+
+
+def test_volume_precision_gate_blocks_nudge_by_default(monkeypatch):
+    # The shipped default: U2 measured precision 0.60 < the 0.8 bar, so the gate is closed.
+    assert VOLUME_NUDGE_SHIPPED is False
+    assert reisevalg.VOLUME_PRECISION_MEASURED < reisevalg.VOLUME_PRECISION_BAR
+    monkeypatch.setattr(reisevalg, "VOLUME_NUDGE_ENABLED", False)
+    # Volume-congested + rail normal -> honest UNKNOWN with its own reason, never a nudge.
+    d = decide(
+        now=NOW,
+        road_observations=[_road("congested")],
+        departures=_normal_board(),
+        rail_observed_at=NOW,
+    )
+    assert (d.state, d.reason) == (State.UNKNOWN, Reason.VOLUME_BELOW_PRECISION_BAR)
+    assert d.road_source == "volume"
+    # DATEX (a measured travel time) is not gated.
+    d2 = decide(
+        now=NOW,
+        road_observations=[_road("congested", source="datex", age_min=5, travel=60.0)],
+        departures=_normal_board(),
+        rail_observed_at=NOW,
+    )
+    assert d2.state is State.TRAIN_RECOMMENDED
+    # Volume-normal is unaffected (a false "normal" cannot cause a false nudge).
+    d3 = decide(
+        now=NOW,
+        road_observations=[_road("normal")],
+        departures=_normal_board(),
+        rail_observed_at=NOW,
+    )
+    assert (d3.state, d3.reason) == (State.NO_ADVANTAGE, Reason.ROAD_NORMAL)
+    # Rail-degraded still wins with the gate closed (reachable without a valid road nudge).
+    board = [_dep(10, cancelled=True)] + _normal_board()[1:]
+    d4 = decide(
+        now=NOW,
+        road_observations=[_road("congested")],
+        departures=board,
+        rail_observed_at=NOW,
+    )
+    assert d4.state is State.TRAIN_DEGRADED
 
 
 def test_stale_rail_board_yields_unknown():

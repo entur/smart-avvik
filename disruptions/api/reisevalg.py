@@ -81,10 +81,11 @@ CORRIDOR_CAR_ORIGIN = (59.7889, 10.2456)
 # ---- Decision constants (derived offline, applied online — see module docstring) -------------
 # Per-hour volume deficit that counts as congestion: volume below (1 - deficit) x the
 # same-point/weekday/hour median. Queues push volume BELOW baseline downstream of the
-# bottleneck (throughput collapse). PLACEHOLDER — pending U2 backtest.
-CONGESTION_VOLUME_DEFICIT = 0.25
+# bottleneck (throughput collapse). U2 backtest (2026-07-11): 0.15 was the best of 8 variants
+# (precision 0.60 on 6/10 flagged mornings vs bus-probe/SX ground truth); 0.25 scored 0.40.
+CONGESTION_VOLUME_DEFICIT = 0.15
 # Fraction of reporting corridor points that must show the deficit for an hour to count as
-# corridor-congested. PLACEHOLDER — pending U2 backtest.
+# corridor-congested. U2 backtest (2026-07-11): 0.5, from the winning d15 variant.
 CONGESTION_POINT_FRAC = 0.5
 # "Trains normal" arrival-side gate: expected Oslo S arrival delay of each of the next
 # RAIL_CHECK_N departures must be <= this (delay accumulates after Lier — a departure-side gate
@@ -104,20 +105,28 @@ MORNING_WINDOW_END = time(9, 30)
 # A nudge requires an actual rail departure within this many minutes (the user is deciding now).
 DEPARTURE_LOOKAHEAD_MIN = 60
 # Anti-flap: "congested" requires the deficit to hold over the last N hourly observations.
-# PLACEHOLDER — pending U2 backtest.
+# U2 backtest (2026-07-11): N=2 (part of the winning d15 variant).
 PERSISTENCE_N = 2
 # Per-source staleness cutoffs. Hourly volumes are inherently old when published — a single
 # short cutoff would make the volume provider stale-by-rule at every fetch, hence the wide
-# volume window (usable up to ~3 h old, always confidence "low").
-# PLACEHOLDER — pending the U1 publication-lag measurement (worst-case observed lag + 60 min).
-VOLUME_MAX_AGE_MIN = 180
+# volume window (usable up to ~4 h old, always confidence "low"). U1 measured the current-hour
+# publication lag at 134-194 min (night sample; worst case + 60 min ≈ 250). Even so, U2's
+# timing simulation shows rush-onset detection lands after the morning window — the wide cutoff
+# keeps the observation *visible*, the precision gate below keeps it from ever nudging.
+VOLUME_MAX_AGE_MIN = 250
 DATEX_MAX_AGE_MIN = 15
 RAIL_MAX_AGE_MIN = 10
-# R5's honesty bar, recorded here for the U2 handoff: volume-only road data may keep mapping
-# "congested" to TRAIN_RECOMMENDED only if the U2 backtest shows >= this precision on flagged
-# rush mornings; below the bar the volume signal must be routed to UNKNOWN for nudging purposes
-# (and the measured precision recorded in docs/bil-avvik/LEARNINGS.md next to this constant).
+# R5's honesty bar: volume-only road data may map "congested" to TRAIN_RECOMMENDED only if the
+# U2 backtest shows >= this precision on flagged rush mornings; below the bar the volume signal
+# routes to UNKNOWN for nudging purposes (measured value recorded in docs/bil-avvik/LEARNINGS.md).
 VOLUME_PRECISION_BAR = 0.8
+# U2 backtest (2026-07-11): best variant (d15) precision = 0.60 (6/10 flagged mornings
+# confirmed congested against bus-probe + SX ground truth) — BELOW the bar. The volume provider
+# is therefore backtest-evidence only: its "congested" observation surfaces in the per-source
+# breakdown but never fires the nudge. Re-derive by re-running data/queries/reisevalg_*.sql
+# after baseline changes (or when a better road source lands) and update this literal.
+VOLUME_PRECISION_MEASURED = 0.60
+VOLUME_NUDGE_ENABLED = VOLUME_PRECISION_MEASURED >= VOLUME_PRECISION_BAR
 # Structural-drift guard: baselines older than this are not trusted (E18 roadwork reshapes
 # volumes on week scale; the offline re-derivation loop is enforced, not remembered).
 BASELINES_MAX_AGE_DAYS = 180
@@ -240,6 +249,7 @@ class RecommendationReason(str, Enum):
     NO_RAIL_DATA = "NO_RAIL_DATA"
     NO_UPCOMING_DEPARTURE = "NO_UPCOMING_DEPARTURE"
     OUTSIDE_MORNING_WINDOW = "OUTSIDE_MORNING_WINDOW"
+    VOLUME_BELOW_PRECISION_BAR = "VOLUME_BELOW_PRECISION_BAR"
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
 
@@ -266,6 +276,8 @@ _COPY: dict[tuple[RecommendationState, RecommendationReason], str] = {
         "Usikkert nå — veidataene er for gamle til å vurdere køen på E18.",
     (_State.UNKNOWN, _Reason.NO_ROAD_DATA):
         "Usikkert nå — mangler ferske veidata for E18.",
+    (_State.UNKNOWN, _Reason.VOLUME_BELOW_PRECISION_BAR):
+        "Mulig kø på E18, men datagrunnlaget er ikke presist nok til å anbefale togbytte.",
     (_State.UNKNOWN, _Reason.RAIL_DATA_STALE):
         "Usikkert nå — sanntidsdataene for tog er for gamle.",
     (_State.UNKNOWN, _Reason.NO_RAIL_DATA):
@@ -1052,6 +1064,22 @@ def decide(
     state_since = road_state_since or winning.observed_at
 
     if winning.state == "congested":
+        # R5 precision gate: a volume-only "congested" may never fire the nudge while the
+        # measured backtest precision (VOLUME_PRECISION_MEASURED) is below the bar — it
+        # surfaces honestly as UNKNOWN with its own reason instead of a low-confidence
+        # recommendation. DATEX (a measured travel time) is not gated here.
+        if winning.source == "volume" and not VOLUME_NUDGE_ENABLED:
+            return Decision(
+                state=_State.UNKNOWN,
+                reason=_Reason.VOLUME_BELOW_PRECISION_BAR,
+                car_delay_min=car_delay_min,
+                state_since=state_since,
+                valid_until=min(window_end, road_valid, rail_valid),
+                road_source=road_source,
+                road_stale=road_stale,
+                upcoming=upcoming,
+                predicted_cancel=predicted_cancel,
+            )
         # Minutes saved is only claimable from a source that measures drive time (DATEX);
         # volumes never carry one. car_time_now − (wait + rail time) = car − (arrival − now).
         saved_min = None
