@@ -1,0 +1,105 @@
+{
+  "_comment": [
+    "Curated E18 corridor registration points, Lier -> Oslo, in corridor order",
+    "(ascending EV18 road reference). Verified against the SVV Trafikkdata GraphQL",
+    "API (https://trafikkdata-api.atlas.vegvesen.no/) on 2026-07-11.",
+    "toward_oslo_heading is the byDirection.heading string that means 'driving toward",
+    "Oslo' AT THAT POINT -- it varies per point (Liertoppen / Asker / Oslo / Festning).",
+    "Consumed by download_volumes.py to set the toward_oslo flag per row."
+  ],
+  "points": [
+    {
+      "id": "97858V180819",
+      "name": "E18 Kjellstad nordgående",
+      "road_ref": "EV18 S47D1 m1935",
+      "lat": 59.76695,
+      "lon": 10.256637,
+      "toward_oslo_heading": "Liertoppen",
+      "first_data": "2024-09-18T15:00:00+02:00",
+      "note": "One-way northbound carriageway (Kjellstad-heading rows are always 0). Data starts 2024-09-18."
+    },
+    {
+      "id": "38517V180819",
+      "name": "E18 Tranby X",
+      "road_ref": "EV18 S47D1 m9984",
+      "lat": 59.8085,
+      "lon": 10.291157,
+      "toward_oslo_heading": "Asker",
+      "first_data": "2024-09-05T13:00:00+02:00",
+      "note": "Data starts 2024-09-05."
+    },
+    {
+      "id": "28285V444233",
+      "name": "Holmen",
+      "road_ref": "EV18 S49D1 m2563",
+      "lat": 59.852087,
+      "lon": 10.478874,
+      "toward_oslo_heading": "Oslo",
+      "first_data": "2002-01-01T00:00:00+01:00"
+    },
+    {
+      "id": "00378V444233",
+      "name": "Slependen (Ikea)",
+      "road_ref": "EV18 S50D1 m1850",
+      "lat": 59.873068,
+      "lon": 10.498405,
+      "toward_oslo_heading": "Oslo",
+      "first_data": "2005-02-01T00:00:00+01:00"
+    },
+    {
+      "id": "88537V444232",
+      "name": "Gyssestad",
+      "road_ref": "EV18 S51D1 m749",
+      "lat": 59.88035,
+      "lon": 10.511647,
+      "toward_oslo_heading": "Oslo",
+      "first_data": "1989-01-09T12:00:00+01:00"
+    },
+    {
+      "id": "68557V444232",
+      "name": "Blommenholm",
+      "road_ref": "EV18 S52D1 m1122",
+      "lat": 59.891773,
+      "lon": 10.535189,
+      "toward_oslo_heading": "Oslo",
+      "first_data": "1992-11-23T09:00:00+01:00"
+    },
+    {
+      "id": "33438V444232",
+      "name": "Høvik",
+      "road_ref": "EV18 S53D1 m3630",
+      "lat": 59.901659,
+      "lon": 10.59024,
+      "toward_oslo_heading": "Oslo",
+      "first_data": "1992-05-21T13:00:00+02:00"
+    },
+    {
+      "id": "04925V444232",
+      "name": "Lysakerlokket",
+      "road_ref": "EV18 S54D1 m723",
+      "lat": 59.911891,
+      "lon": 10.633088,
+      "toward_oslo_heading": "Oslo",
+      "first_data": "2003-10-01T00:00:00+02:00"
+    },
+    {
+      "id": "79755V625294",
+      "name": "Maritim",
+      "road_ref": "EV18 S55D1 m1561",
+      "lat": 59.918562,
+      "lon": 10.666507,
+      "toward_oslo_heading": "Oslo",
+      "first_data": "2002-01-01T00:00:00+01:00"
+    },
+    {
+      "id": "59192V1878201",
+      "name": "Bjørvikatunellen vestgående",
+      "road_ref": "EV18 S55D1 m8975",
+      "lat": 59.905621,
+      "lon": 10.75322,
+      "toward_oslo_heading": "Festning",
+      "first_data": "2010-04-23T11:00:00+02:00",
+      "note": "One-way westbound tube of Operatunnelen (Ekeberg-heading rows are always 0); measures inflow to the centre from the EAST, not the Lier->Oslo flow -- city-centre congestion proxy only."
+    }
+  ]
+}
