@@ -60,6 +60,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
 
+- The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
+  Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)
+  lives in `disruptions/api/reisevalg.py`. Road signal: SVV Trafikkdata volumes gated to
+  UNKNOWN (measured precision 0.60 < 0.8 bar) + a DATEX II stub behind optional
+  `SVV_DATEX_USER`/`SVV_DATEX_PASSWORD` (unset = provider unavailable; when provisioning,
+  use Secret Manager like the VAPID keys). Its `disruptions.svv_baselines` lookup loads in
+  the poller/lifespan and is deliberately NOT in `copy_runtime_to_prd.sh` — prd serves the
+  road side as UNKNOWN until a road provider is validated. Rebuild baselines/backtest with
+  `data/queries/reisevalg_*.sql`; raw volume backfill via `data/svv/download_volumes.py`.
+
 ## Conventions
 
 - All SQL targets BigQuery Standard SQL; legacy SQL is not used.
