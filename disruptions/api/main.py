@@ -16,6 +16,7 @@ from google.cloud import bigquery
 from pydantic import BaseModel, Field
 
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
+import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 
 logger = logging.getLogger(__name__)
@@ -518,6 +519,22 @@ def _varsel_snapshot() -> dict[str, list]:
         return _call_pred_by_situation
 
 
+def _reisevalg_call_predictions(journey_ref: str) -> list | None:
+    """Per-call prediction rows for a full dated journey ref (e.g.
+    'VYG:DatedServiceJourney:81613_DRM-DAL_26-07-13'), or None when no active disruption
+    touches it. Mirrors /journey's codespace-prefix resolution over the (operator, jkey)
+    cache; injected into reisevalg via configure() as a strictly read-only lookup (its
+    snapshot veto can only demote a recommendation, never promote one)."""
+    m = re.match(r"^([A-Za-z]+):", journey_ref)
+    with _call_pred_lock:
+        rows = _call_pred_by_key.get((m.group(1), journey_ref[m.end():])) if m else None
+        if rows is None:
+            ops = _call_pred_by_jkey_index.get(journey_ref, set())
+            if len(ops) == 1:
+                rows = _call_pred_by_key.get((next(iter(ops)), journey_ref))
+    return list(rows) if rows else None
+
+
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
@@ -545,6 +562,13 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
         refresh_impact_lookup()
     except Exception:
         logger.exception("Impact lookup refresh failed; serving disruptions without alert profiles")
+    # Road-volume baselines for /reisevalg-api — same offline-built-lookup pattern as the impact
+    # lookup above. Isolated so a missing/erroring table (it only exists once the reisevalg
+    # backtest has run) never breaks the feed; the road side just reports unavailable.
+    try:
+        reisevalg.refresh_baselines()
+    except Exception:
+        logger.exception("SVV baselines refresh failed; reisevalg road side may be unavailable")
     # Per-call (per-train) predictions for /journey. Isolated so any failure here never breaks the
     # main /disruptions feed. The planned call source is rebuilt on a TTL (it scans ET); the
     # scoring + cache reload run every tick (cheap: materialized inputs + ML.PREDICT).
@@ -596,6 +620,14 @@ async def lifespan(app: FastAPI):
         refresh_varsel_stops()
     except Exception:
         logger.exception("Initial varsel stops load failed; will retry on ingestion poll")
+    # Reisevalg: inject the read-only per-call snapshot lookup + BigQuery client, then eager-load
+    # the road-volume baselines so the volume provider can serve before the first ingestion tick.
+    # Tolerant of failure (and of the table not existing yet) — the poller retries on every tick.
+    reisevalg.configure(snapshot_lookup=_reisevalg_call_predictions, bq_client=bq_client)
+    try:
+        reisevalg.refresh_baselines()
+    except Exception:
+        logger.exception("Initial svv baselines load failed; will retry on ingestion poll")
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
@@ -662,6 +694,10 @@ app.add_middleware(
 # Avviksvarsel API (registered-journey push alerts). Registered before the /varsel static mount
 # so /varsel-api/* resolves to these routes.
 app.include_router(varsel.router)
+
+# Reisevalg API (car vs train recommendation for the Lier -> Oslo S corridor). Registered before
+# the static mounts, like /varsel-api.
+app.include_router(reisevalg.router)
 
 # Pre-rendered marimo eval notebooks, served read-only at /eval (index at /eval/,
 # each notebook at /eval/<name>.html). They are static snapshots built offline by
