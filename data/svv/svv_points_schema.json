@@ -1,0 +1,10 @@
+[
+  {"name": "id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "name", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "road_ref", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "lat", "type": "FLOAT", "mode": "REQUIRED"},
+  {"name": "lon", "type": "FLOAT", "mode": "REQUIRED"},
+  {"name": "toward_oslo_heading", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "first_data", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "note", "type": "STRING", "mode": "NULLABLE"}
+]
