@@ -249,6 +249,40 @@ def test_arrival_side_gate():
     assert d2.state is State.TRAIN_RECOMMENDED
 
 
+def test_realtime_blind_board_yields_unknown():
+    # All inspected departures are timetable-only (realtime=False, on time, not cancelled):
+    # "not cancelled, on time" is vacuous during a SIRI->JP realtime outage -> UNKNOWN.
+    blind = [
+        _dep(10, realtime=False, ref="VYG:DatedServiceJourney:1_A"),
+        _dep(25, realtime=False, ref="VYG:DatedServiceJourney:2_B"),
+        _dep(40, realtime=False, ref="VYG:DatedServiceJourney:3_C"),
+    ]
+    d = decide(
+        now=NOW,
+        road_observations=[_road("congested")],
+        departures=blind,
+        rail_observed_at=NOW,
+    )
+    assert (d.state, d.reason) == (State.UNKNOWN, Reason.NO_RAIL_DATA)
+    # An explicit cancellation on a realtime=False row is still real signal: the degraded
+    # checks run BEFORE the realtime requirement.
+    d2 = decide(
+        now=NOW,
+        road_observations=[_road("congested")],
+        departures=[_dep(10, realtime=False, cancelled=True)] + blind[1:],
+        rail_observed_at=NOW,
+    )
+    assert (d2.state, d2.reason) == (State.TRAIN_DEGRADED, Reason.RAIL_CANCELLATIONS)
+    # One realtime departure among the inspected ones is evidence enough for the normal path.
+    d3 = decide(
+        now=NOW,
+        road_observations=[_road("congested")],
+        departures=[_dep(10, realtime=True)] + blind[1:],
+        rail_observed_at=NOW,
+    )
+    assert d3.state is State.TRAIN_RECOMMENDED
+
+
 def test_snapshot_veto_demotes_and_never_promotes():
     # JP shows everything on time, but the prediction snapshot flags the first departure with
     # p_cancel above the bar -> the predictive layer vetoes (demote-only).
@@ -494,6 +528,23 @@ def test_road_state_since_threads_through():
     assert d.state_since == since
 
 
+def test_state_since_not_borrowed_by_winning_datex():
+    # road_state_since is the VOLUME provider's run start; a winning DATEX observation must
+    # use its own observed_at, never the volume pipeline's run start.
+    datex = _road("congested", source="datex", age_min=5, travel=60.0)
+    volume_run_start = NOW - timedelta(hours=3)
+    d = decide(
+        now=NOW,
+        road_observations=[datex, _road("congested", age_min=30)],
+        departures=_normal_board(),
+        rail_observed_at=NOW,
+        road_state_since=volume_run_start,
+    )
+    assert d.road_source == "datex"
+    assert d.state_since == datex.observed_at
+    assert d.state_since != volume_run_start
+
+
 # ---- Volume provider: anti-flap + baselines ------------------------------------------------------
 def _baseline_cells(point="97858V180819", direction="Oslo", median=1000, p10=700):
     """Baseline rows for every weekday hour so any test hour resolves."""
@@ -545,6 +596,17 @@ def test_volume_judgment_anti_flap_and_state_since():
     assert obs2.state == "congested"
     assert run_start2 == h(6)
     assert obs2.observed_at == h(7)
+
+
+def test_volume_judgment_requires_adjacent_hours():
+    # The backtested d15 rule (LAG(hour) = hour - 1) demands CONSECUTIVE congested hours:
+    # congested at H-3 and H-1 with a gap (no usable hour between) does not make a run.
+    h = lambda i: _oslo(2026, 7, 8, i, 0).astimezone(timezone.utc) + timedelta(hours=1)  # noqa: E731
+    obs, _ = volume_judgment([(h(4), "congested"), (h(6), "congested")])
+    assert obs.state == "normal"
+    # Consecutive congested hours -> congested, as before.
+    obs2, _ = volume_judgment([(h(5), "congested"), (h(6), "congested")])
+    assert obs2.state == "congested"
 
 
 def test_volume_provider_unavailable_without_baselines(monkeypatch):
@@ -604,6 +666,95 @@ def test_datex_stub_reports_unavailable(monkeypatch):
     monkeypatch.setattr(reisevalg, "_SVV_DATEX_USER", "user")
     monkeypatch.setattr(reisevalg, "_SVV_DATEX_PASSWORD", "pass")
     assert reisevalg._datex_provider() is None
+
+
+# ---- _TTLCache + HTTP fetchers ---------------------------------------------------------------------
+def test_ttl_cache_single_flight_serves_previous_value():
+    cache = reisevalg._TTLCache("test_single_flight", timedelta(seconds=90))
+    earlier = NOW - timedelta(minutes=5)
+    cache.get(lambda: "seeded", earlier)  # stale by NOW (TTL 90 s)
+    cache._refreshing = True  # simulate another caller's in-flight refresh
+
+    def must_not_fetch():
+        raise AssertionError("fetch invoked despite an in-flight refresh")
+
+    value, fetched_at = cache.get(must_not_fetch, NOW)
+    assert (value, fetched_at) == ("seeded", earlier)
+
+
+def test_ttl_cache_failure_cooldown_suppresses_retry():
+    cache = reisevalg._TTLCache("test_cooldown", timedelta(seconds=90))
+    earlier = NOW - timedelta(minutes=5)
+    cache.get(lambda: "seeded", earlier)
+    calls = {"n": 0}
+
+    def failing():
+        calls["n"] += 1
+        raise RuntimeError("upstream down (test)")
+
+    # Stale -> one fetch attempted; it fails, the previous value is served with OLD fetched_at.
+    assert cache.get(failing, NOW) == ("seeded", earlier)
+    assert calls["n"] == 1
+    # Within the failure cooldown the fetcher is NOT invoked again (no retry/log storm).
+    assert cache.get(failing, NOW + timedelta(seconds=5)) == ("seeded", earlier)
+    assert calls["n"] == 1
+    # After the cooldown the next get() retries (this also proves _refreshing was released).
+    cache.get(failing, NOW + timedelta(seconds=45))
+    assert calls["n"] == 2
+    # A successful fetch clears the cooldown and swaps the value in.
+    later = NOW + timedelta(seconds=90)
+    assert cache.get(lambda: "recovered", later) == ("recovered", later)
+
+
+def test_post_json_raises_on_graphql_errors(monkeypatch):
+    import io
+    import json as _json
+    import urllib.request as _urllib_request
+
+    class _FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _fake_urlopen(body):
+        return lambda req, timeout=None: _FakeResponse(_json.dumps(body).encode("utf-8"))
+
+    good = {"data": {"stopPlace": {"estimatedCalls": []}}}
+    monkeypatch.setattr(_urllib_request, "urlopen", _fake_urlopen(good))
+    assert reisevalg._post_json("https://jp.test/", {}, {}) == good
+    # 200-with-errors, missing data key, and null data must all raise (so the TTL caches take
+    # the failure path and serve the previous value) instead of parsing as an empty board.
+    for bad in (
+        {"errors": [{"message": "boom"}], "data": None},
+        {"no_data_envelope": 1},
+        {"data": None},
+    ):
+        monkeypatch.setattr(_urllib_request, "urlopen", _fake_urlopen(bad))
+        try:
+            reisevalg._post_json("https://jp.test/", {}, {})
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"expected RuntimeError for body {bad}")
+
+
+def test_car_fetcher_raises_on_empty_trip_patterns(monkeypatch):
+    monkeypatch.setattr(
+        reisevalg, "_post_json", lambda *a, **k: {"data": {"trip": {"tripPatterns": []}}}
+    )
+    try:
+        reisevalg._default_car_fetcher()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected RuntimeError on empty tripPatterns")
+    # Through the cache, that failure preserves the previous good baseline (no None-for-6h).
+    cache = reisevalg._TTLCache("test_car_baseline", timedelta(seconds=90))
+    earlier = NOW - timedelta(minutes=5)
+    cache.get(lambda: 36.0, earlier)
+    assert cache.get(reisevalg._default_car_fetcher, NOW) == (36.0, earlier)
 
 
 # ---- Board parsing --------------------------------------------------------------------------------
