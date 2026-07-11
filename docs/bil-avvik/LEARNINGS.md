@@ -206,7 +206,7 @@ instrument. Backtest window 06:00–09:30 vs live 05:30–09:30.
 | SVV DATEX II GetTravelTimeData / GetSituation | registration (org, fixed IP), free, NLOD | 5-min travel times, E18 covered; **no archive** — request prepared (`datex-access-request.md`); fixed-IP question vs GKE egress NAT unresolved |
 | Entur JP v3 (`ET-Client-Name`) | open | departure board incl. cancellations + `datedServiceJourney` refs (verified live); car routing Lier→Oslo S 36 min/40.9 km |
 | kix-avvik per-call predictions | in-process | joins JP refs exactly (`VYG:DatedServiceJourney:…`) |
-| SIRI-ET `last_recorded` (bus probe) | in-house BQ | RUT 250/160 corridor probes work; Brakar/NOR lack stop names (negative finding) |
+| SIRI-ET `last_recorded` (bus probe) | in-house BQ | RUT 250/160 corridor probes work; Brakar/NOR lack stop names (negative finding — but `stopPointRef` is quay-level for ALL operators in `last_recorded`, so an NSR `quays_last_version` join could still rescue them; the finding is about name-addressability in the U2 pass, not a proven dead end) |
 | Park-and-ride occupancy | **not open** | Bane NOR app backend only; NSR/NeTEx has static capacity |
 
 ## Cost ledger
@@ -223,7 +223,9 @@ $100 cap; the $10-per-operation ask-first bar was never approached.
    never plaintext Helm values.
 2. **Build the bus-probe live provider** (RUT 250/160 realized run times via SIRI-ET) behind
    the existing `RoadObservation` interface, and backtest it against the same ground truth —
-   it may make DATEX optional.
+   it may make DATEX optional. Constraint: the live provider must read from an anshar/SIRI-ET
+   real-time scan (the `rail_calls_planned_today.sql` pattern) — `last_recorded` is a daily
+   batch table, training-only (established repo learning); it cannot feed a live signal.
 3. Observe the live endpoint through at least one normal-traffic week (post-fellesferie,
    post-summer-works) before drawing live-behavior conclusions; verify cluster egress to
    `trafikkdata-api.atlas.vegvesen.no` on the first dev deploy.

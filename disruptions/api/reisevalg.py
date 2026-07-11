@@ -12,6 +12,8 @@ the question in docs/bil-avvik: "is the train the better choice right now?". It 
   NOT the `trip` query, which omits cancelled journeys and would make "not cancelled" vacuously
   true during a real stop), arrival-side gated at Oslo S, plus the in-process per-call
   prediction snapshot injected from main.py (the snapshot can only demote, never promote);
+  "trains normal" additionally requires realtime evidence on at least one inspected departure —
+  a timetable-only board (realtime outage) yields UNKNOWN, never a nudge;
 * a **car baseline** from Journey Planner's car routing (free-flow; the minutes-saved number is
   only claimable when a road provider supplies an actual travel time).
 
@@ -416,6 +418,13 @@ def _get_baselines() -> tuple[dict[tuple[str, int, int], dict[str, Any]], dateti
 
 
 # ---- Single-flight TTL cache ------------------------------------------------------------------
+# Failure cooldown: after a failed fetch, get() serves the previous value without re-attempting
+# for this long — prevents per-request retry+log storms against JP/SVV during upstream
+# degradation (code review 2026-07-11: single-flight stops concurrent stacking, not sequential
+# per-request retries).
+_FAILURE_COOLDOWN = timedelta(seconds=30)
+
+
 class _TTLCache:
     """Module-level input cache: TTL + fetched_at, per-cache lock, single-flight refresh.
 
@@ -423,7 +432,8 @@ class _TTLCache:
     (fetch OUTSIDE the lock, swap under it) while concurrent callers serve the previous value
     immediately. A failing fetch logs (``event=reisevalg_<name>_error``) and serves the previous
     value with its OLD fetched_at — staleness is judged by the caller against fetched_at / the
-    data's own observed_at, never masked here.
+    data's own observed_at, never masked here. After a failure, ``_FAILURE_COOLDOWN`` suppresses
+    new fetch attempts (still serving the previous value); a successful fetch clears it.
     """
 
     def __init__(self, name: str, ttl: timedelta):
@@ -433,6 +443,7 @@ class _TTLCache:
         self._value: Any = None
         self._fetched_at: datetime | None = None
         self._refreshing = False
+        self._last_failure_at: datetime | None = None
 
     def get(self, fetch: Callable[[], Any], now: datetime) -> tuple[Any, datetime | None]:
         with self._lock:
@@ -440,23 +451,35 @@ class _TTLCache:
                 return self._value, self._fetched_at
             if self._refreshing:  # single-flight: another caller is already fetching
                 return self._value, self._fetched_at
+            if (
+                self._last_failure_at is not None
+                and now - self._last_failure_at < _FAILURE_COOLDOWN
+            ):  # failure cooldown: don't hammer a degraded upstream on every request
+                return self._value, self._fetched_at
             self._refreshing = True
         try:
-            value = fetch()
-        except Exception:
-            logger.exception(
-                "reisevalg %s fetch failed; serving previous value",
-                self._name,
-                extra={"fields": {"event": f"reisevalg_{self._name}_error"}},
-            )
+            try:
+                value = fetch()
+            except Exception:
+                logger.exception(
+                    "reisevalg %s fetch failed; serving previous value",
+                    self._name,
+                    extra={"fields": {"event": f"reisevalg_{self._name}_error"}},
+                )
+                with self._lock:
+                    self._last_failure_at = now
+                    return self._value, self._fetched_at
+            with self._lock:
+                self._value = value
+                self._fetched_at = now
+                self._last_failure_at = None
+                return value, self._fetched_at
+        finally:
+            # Always release the single-flight marker — even on exceptions the inner handler
+            # doesn't catch (BaseException, a raising log handler) — or every later get()
+            # would serve the stale value forever.
             with self._lock:
                 self._refreshing = False
-                return self._value, self._fetched_at
-        with self._lock:
-            self._value = value
-            self._fetched_at = now
-            self._refreshing = False
-            return value, self._fetched_at
 
     def reset(self) -> None:
         """Drop the cached value (used by tests between scenarios)."""
@@ -464,6 +487,7 @@ class _TTLCache:
             self._value = None
             self._fetched_at = None
             self._refreshing = False
+            self._last_failure_at = None
 
 
 # TTLs: the board is realtime (short); volumes only change hourly (a ~15 min poll is plenty and
@@ -479,7 +503,14 @@ _volume_run_start: datetime | None = None
 
 # ---- HTTP -------------------------------------------------------------------------------------
 def _post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
-    """POST a JSON body and parse the JSON response. Timeout <= 3 s on every call."""
+    """POST a JSON body and parse the JSON response. Timeout <= 3 s on every call.
+
+    GraphQL servers legitimately answer HTTP 200 with an ``errors`` array (or without a usable
+    ``data`` envelope — both JP and Trafikkdata wrap results in ``{"data": ...}``). Raising here
+    (mirroring ``data/svv/download_volumes.py``'s ``gql`` guard) routes those responses through
+    the :class:`_TTLCache` failure path — serve the previous value — instead of parsing them
+    into an empty board/None and caching that as fresh success.
+    """
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -487,7 +518,14 @@ def _post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        body = json.loads(resp.read().decode("utf-8"))
+    if isinstance(body, dict) and (
+        body.get("errors") or "data" not in body or body.get("data") is None
+    ):
+        raise RuntimeError(
+            f"GraphQL error response: {str(body.get('errors', 'no data key'))[:200]}"
+        )
+    return body
 
 
 # ---- Rail: Journey Planner departure board ----------------------------------------------------
@@ -586,14 +624,19 @@ def _default_board_fetcher() -> list[Departure]:
     return parse_board(data)
 
 
-def _default_car_fetcher() -> float | None:
+def _default_car_fetcher() -> float:
     """Free-flow car minutes Lier -> Oslo S from JP car routing (near-static, cached hours)."""
     data = _post_json(
         _JP_URL, {"query": _JP_CAR_QUERY}, headers={"ET-Client-Name": _ET_CLIENT_NAME}
     )
     patterns = ((data.get("data") or {}).get("trip") or {}).get("tripPatterns") or []
     durations = [p.get("duration") for p in patterns if p.get("duration")]
-    return min(durations) / 60.0 if durations else None
+    if not durations:
+        # An empty/missing tripPatterns response is an upstream failure, not "no baseline":
+        # raising routes it through the cache's failure path, which preserves the previous
+        # good baseline instead of caching None as fresh success for the full 6 h TTL.
+        raise RuntimeError("JP car routing returned no tripPatterns with a duration")
+    return min(durations) / 60.0
 
 
 # ---- Road: Trafikkdata volume-anomaly provider -------------------------------------------------
@@ -701,17 +744,27 @@ def volume_judgment(
 ) -> tuple[RoadObservation | None, datetime | None]:
     """Aggregate hourly states into one volume observation, with observation-based anti-flap.
 
-    "Congested" requires the deficit to hold over the last ``PERSISTENCE_N`` observations; a
-    deficit in only the newest hour reports "normal" (not yet persistent). ``observed_at`` is
-    the end of the newest included hour — the data's own timestamp, so the publication lag is
-    visible to the staleness gate. The second return value is the start of the current run of
-    the reported state (feeds ``state_since``). Pure.
+    "Congested" requires the deficit to hold over the last ``PERSISTENCE_N`` observations AND
+    those observations to be hour-adjacent; a deficit in only the newest hour reports "normal"
+    (not yet persistent). ``observed_at`` is the end of the newest included hour — the data's
+    own timestamp, so the publication lag is visible to the staleness gate. The second return
+    value is the start of the current run of the reported state (feeds ``state_since``). Pure.
     """
     if not hour_states:
         return None, None
     states = sorted(hour_states)
-    tail = [s for _, s in states[-PERSISTENCE_N:]]
-    congested = len(tail) >= PERSISTENCE_N and all(s == "congested" for s in tail)
+    tail = states[-PERSISTENCE_N:]
+    # Hour-adjacency: the backtested d15 variant (reisevalg_road_baseline.sql,
+    # LAG(hour) = hour - 1) requires CONSECUTIVE congested hours — the measured 0.60 precision
+    # only describes the adjacent-hours rule. A gap in usable hours breaks the run.
+    adjacent = all(
+        tail[i + 1][0] - tail[i][0] == timedelta(hours=1) for i in range(len(tail) - 1)
+    )
+    congested = (
+        len(tail) >= PERSISTENCE_N
+        and adjacent
+        and all(s == "congested" for _, s in tail)
+    )
     state = "congested" if congested else "normal"
     observed_at = states[-1][0]
     run_start: datetime | None = None
@@ -1045,6 +1098,24 @@ def decide(
             predicted_cancel=predicted_cancel,
         )
 
+    # 4b) Realtime-evidence requirement: during a SIRI->JP realtime outage the board serves
+    # pure timetable rows (realtime=false, aimed==expected, cancellations invisible) — "not
+    # cancelled, on time" is then vacuous. Without realtime on any inspected departure,
+    # "trains normal" is unknowable, never assertable. Explicit cancellations above still
+    # demote first (a cancelled non-realtime row is real signal).
+    if not any(d.realtime for d in next_deps):
+        return Decision(
+            state=_State.UNKNOWN,
+            reason=_Reason.NO_RAIL_DATA,
+            car_delay_min=car_delay_min,
+            state_since=now,
+            valid_until=now + _UNKNOWN_REVISIT,
+            road_source=road_source,
+            road_stale=road_stale,
+            upcoming=upcoming,
+            predicted_cancel=predicted_cancel,
+        )
+
     # 5) Rail is normal — now the road side decides. No fresh road observation means UNKNOWN
     # (honesty rule: stale or missing input never yields a nudge).
     if winning is None:
@@ -1061,7 +1132,14 @@ def decide(
 
     rail_valid = rail_observed_at + timedelta(minutes=RAIL_MAX_AGE_MIN)
     road_valid = winning.observed_at + timedelta(minutes=_road_max_age(winning.source))
-    state_since = road_state_since or winning.observed_at
+    # road_state_since is the VOLUME provider's trailing-run start — apply it only when the
+    # volume observation actually won; DATEX (or injected) observations use their own
+    # observed_at (see the caller's comment in _build_recommendation).
+    state_since = (
+        road_state_since
+        if winning.source == "volume" and road_state_since is not None
+        else winning.observed_at
+    )
 
     if winning.state == "congested":
         # R5 precision gate: a volume-only "congested" may never fire the nudge while the

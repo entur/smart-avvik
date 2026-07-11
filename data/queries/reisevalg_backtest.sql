@@ -7,7 +7,7 @@
 --     volume-deficit rule at several thresholds + hindsight volume-ratio flags,
 --     plus detection timing under the measured ~150 min publication lag);
 --   * ground truth: bus-probe run-time inflation (disruptions.reisevalg_bus_mornings,
---     built by the U2 analysis from RUT:Line:160 Sandvika->Vika atrium and
+--     built by reisevalg_bus_probe.sql from RUT:Line:160 Sandvika->Vika atrium and
 --     RUT:Line:250 IKEA Slependen->Vika atrium realized run times in
 --     ent-data-sharing-ext-prd.realtime_siri_et.realtime_siri_et_last_recorded)
 --     and corridor road-incident SX counts (disruptions.disruptions text filter).
