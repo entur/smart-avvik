@@ -136,9 +136,7 @@ export default function App() {
 
       <main id="main-content" className="av-main">
         <LeadParagraph className="av-intro">
-          Registrer kollektivreisene dine, så varsler vi deg når et avvik kan ramme en av dem. Du får
-          bare push når sjansen for at avgangen blir innstilt eller minst 10 minutter forsinket
-          krysser operatørens varslingsterskel (standard 65 %).
+          Registrer kollektivreisene dine, så varsler vi deg når et avvik kan ramme en av dem.
         </LeadParagraph>
 
         {loading ? (
