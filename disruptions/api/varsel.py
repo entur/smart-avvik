@@ -19,8 +19,18 @@ Design notes
   validates ``begin < end``, so overnight windows never reach the matcher (and are ignored if
   they somehow do).
 * **Push gate** — a match is *pushed* only when the worst matching train crosses the same
-  production alert threshold used by ``/demo`` and eval (``P(cancelled OR ≥10 min late) ≥ 0.65``),
-  so trivial flags don't spam the phone. The in-app list shows *all* current matches regardless.
+  production alert threshold used by ``/demo`` and eval (``P(cancelled OR ≥10 min late) ≥ 0.65``,
+  per-operator cuts in :data:`_OPERATOR_ALERT_THRESHOLD`), so trivial flags don't spam the phone.
+  The gate is literally ``/demo``'s ``would_alert`` (main._demo_snapshot): the calibrated impact
+  probability and nothing else — no cancellation-probability fallback (measured 2026-07-27: in
+  ``call_predictions_{,bus_}today`` ``p_impact_dep`` is NULL only where ``aimed_dep`` is NULL,
+  i.e. at terminals the matcher already skips, so the old fallback could never fire on a boarding).
+  The in-app list shows *all* current matches regardless, flagged with ``alertworthy``.
+* **What the push says** — the *alerting* quantity, in ``/demo``'s wording: P(innstilling eller
+  ≥ 10 min forsinkelse), then whichever driver dominates (likely cancellation, or the
+  exceedance-stack delay interval). Never the raw ``dep_delay_typ_min`` regression: for today's
+  alert-worthy boardings its median is 2 min against the stack p50's 15 min (rail), so quoting it
+  made a 93 %-impact alert read as "1 % sjanse for innstilling, typisk 2 min forsinket".
 * **State** (devices / journeys / notified) is tiny JSON, guarded by a re-entrant lock and written
   through to a local file and — when ``VARSEL_STATE_BUCKET`` is set — a GCS blob, so it survives a
   redeploy (the container fs is ephemeral). Single always-on instance ⇒ last-write-wins is
@@ -58,9 +68,15 @@ _OSLO = ZoneInfo("Europe/Oslo")
 # Push a match only when the worst matching train's impact probability crosses this — the same
 # operating threshold as /demo and eval/impact_eval.py (>=91 % precision at every ask horizon).
 _ALERT_THRESHOLD = 0.65
-# A journey counts as "trouble" when cancelled or >= this many minutes late (matches the impact
-# probability's definition), used for the notification wording.
-_TROUBLE_DELAY_MIN = 10
+# A journey counts as "trouble" when cancelled or >= this many minutes late — the event the impact
+# probability predicts. Public because /demo scores its realized outcomes against the same bar
+# (main._DEMO_TROUBLE_DELAY_MIN), as it takes its threshold from threshold_for(): one definition of
+# "trouble" behind both surfaces.
+TROUBLE_DELAY_MIN = 10
+# Above this cancellation probability the wording leads with "mest sannsynlig innstilt" instead of
+# the delay interval: when the train probably isn't running, a predicted delay is beside the point
+# (bus alerts are mostly cancellation-driven, rail alerts mostly delay-driven).
+_CANCEL_LIKELY = 0.5
 
 # Per-operator alert threshold overrides (default _ALERT_THRESHOLD). The pooled bus family is
 # calibrated per operator, but a single 0.65 cut under-/over-alerts several operators; these
@@ -292,20 +308,34 @@ class Alert(BaseModel):
         description="Aimed departure from the boarding stop of the worst affected train (UTC).",
     )
     cancel_probability: float = Field(description="Calibrated P(the train is cancelled), 0-1.")
-    delay_typ_min: int | None = Field(description="Typical departure delay (min) if it runs.")
+    delay_p50_min: int | None = Field(
+        description="Median departure delay (min) if it runs, from the calibrated exceedance stack "
+        "— the same figure as /demo's delay column, not the weak raw regression.",
+    )
     delay_p90_min: int | None = Field(description="Bad-case (p90) departure delay (min).")
+    ge10_probability: float | None = Field(
+        default=None,
+        description="Calibrated P(departure >= 10 min late | the train runs), 0-1.",
+    )
     impact_probability: float | None = Field(
         default=None,
         description="Calibrated P(cancelled OR >= 10 min late) at boarding — the alerting score.",
+    )
+    alert_threshold: float = Field(
+        description="The operator's alerting threshold applied to impact_probability here (as "
+        "shown per card on /demo).",
     )
     alertworthy: bool = Field(
         description="Whether this match crosses the push threshold (a notification is/was sent).",
     )
 
 
-def _severity(call: Any) -> tuple[float, int]:
-    """Order matching trains most-severe first: cancellation prob, then bad-case delay."""
-    return (call.p_cancel, _dep_p90(call) or 0)
+def _severity(call: Any) -> tuple[float, int, float]:
+    """Order matching trains most-severe first by the *alerting* score — the impact probability the
+    push gate reads — then bad-case delay, then cancellation prob as a deterministic tie-break.
+    Ordering by p_cancel instead (as this did until 2026-07-27) could hand the alert's numbers to a
+    train other than the one that crossed the threshold."""
+    return (call.p_impact_dep or 0.0, _dep_p90(call) or 0, call.p_cancel)
 
 
 def match_journey(
@@ -318,7 +348,7 @@ def match_journey(
     journey's weekdays and inside its ``[begin, end]`` window, whose expected departure (aimed +
     predicted typical delay) has not yet passed ``now``, AND the same train later calls at
     ``to_stop`` (a call with higher stop_order — the travel direction). Per situation the worst such
-    train (highest cancellation prob, then p90 delay) supplies the alert's numbers.
+    train (highest impact probability — see :func:`_severity`) supplies the alert's numbers.
 
     ``now`` is injectable for tests; it defaults to the current time.
     """
@@ -373,11 +403,9 @@ def match_journey(
         worst = max(matching_boardings, key=_severity)
         impact = worst.p_impact_dep
         threshold = threshold_for(worst.operator)
-        alertworthy = (
-            impact >= threshold
-            if impact is not None
-            else worst.p_cancel >= threshold
-        )
+        # Exactly /demo's would_alert (main._demo_snapshot): the calibrated impact probability must
+        # exist and cross the operator's cut. No p_cancel fallback — see the module docstring.
+        alertworthy = impact is not None and impact >= threshold
         alerts.append(
             Alert(
                 situation_number=sit_num,
@@ -387,31 +415,60 @@ def match_journey(
                 line=worst.line,
                 departure_time=worst.aimed_dep,
                 cancel_probability=worst.p_cancel,
-                delay_typ_min=worst.dep_delay_typ_min,
+                delay_p50_min=_dep_typ(worst),
                 delay_p90_min=_dep_p90(worst),
+                ge10_probability=worst.p_dep_ge10,
                 impact_probability=impact,
+                alert_threshold=threshold,
                 alertworthy=alertworthy,
             )
         )
-    alerts.sort(key=lambda a: (a.cancel_probability, a.delay_p90_min or 0), reverse=True)
+    alerts.sort(
+        key=lambda a: (a.impact_probability or 0.0, a.delay_p90_min or 0, a.cancel_probability),
+        reverse=True,
+    )
     return alerts
 
 
 # ---- Notify ----------------------------------------------------------------------------------
+def _delay_phrase(alert: Alert) -> str | None:
+    """"typisk 15–27 min forsinket" from the exceedance-stack interval (p50–p90, /demo's delay
+    column); collapsed to one number when they coincide, None when neither is known."""
+    p50, p90 = alert.delay_p50_min, alert.delay_p90_min
+    if not p50 and not p90:
+        return None
+    if p50 and p90 and p90 > p50:
+        return f"typisk {p50}–{p90} min forsinket"
+    return f"typisk {p90 or p50} min forsinket"
+
+
 def _notification_payload(journey: dict, alert: Alert) -> dict:
-    """Norwegian Web Push payload for one journey×situation match."""
+    """Norwegian Web Push payload for one journey×situation match.
+
+    Leads with the number the push gate actually fired on — P(innstilling eller ≥ 10 min
+    forsinkelse), worded as on ``/demo`` — then the dominant driver: a likely cancellation, else the
+    exceedance-stack delay interval. Cancellation probability alone plus the raw typical-delay
+    regression (what this said until 2026-07-27) understates a delay-driven alert badly.
+    """
     from_name = journey.get("from_name") or journey["from_stop"]
     to_name = journey.get("to_name") or journey["to_stop"]
-    pct = round(alert.cancel_probability * 100)
-    parts = []
+    # alertworthy alerts always carry an impact probability (the gate requires it); the fallback
+    # only matters if this is ever called for a listed-but-not-pushed match.
+    score = alert.impact_probability if alert.impact_probability is not None else alert.cancel_probability
+    lead = (
+        f"{round(score * 100)} % sjanse for innstilling eller "
+        f"≥ {TROUBLE_DELAY_MIN} min forsinkelse"
+    )
+    detail = (
+        "mest sannsynlig innstilt"
+        if alert.cancel_probability >= _CANCEL_LIKELY
+        else _delay_phrase(alert)
+    )
+    if detail:
+        lead = f"{lead} — {detail}"
     if alert.departure_time is not None:
         hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-        parts.append(f"{alert.mode} kl {hhmm}:")
-    parts.append(f"{pct} % sjanse for innstilling")
-    if alert.delay_typ_min:
-        parts.append(f"typisk {alert.delay_typ_min} min forsinket")
-    detail = ", ".join(parts[1:]) if len(parts) > 1 else parts[0]
-    lead = (parts[0] + " " + detail) if alert.departure_time is not None else detail
+        lead = f"{alert.mode} kl {hhmm}: {lead}"
     body = f"{alert.summary}\n{lead}" if alert.summary else lead
     return {
         "title": f"Avvik: {from_name} → {to_name}",
@@ -477,7 +534,11 @@ def _log_push(
             line=alert.line,
             departure_time=alert.departure_time,
             cancel_probability=alert.cancel_probability,
+            ge10_probability=alert.ge10_probability,
+            delay_p50_min=alert.delay_p50_min,
+            delay_p90_min=alert.delay_p90_min,
             impact_probability=alert.impact_probability,
+            alert_threshold=alert.alert_threshold,
         )
     logger.info(
         "Push %s (%s) to device %s: %s | %s",

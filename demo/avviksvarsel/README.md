@@ -23,7 +23,13 @@ Served by the disruptions API at **`/varsel`**; data + push endpoints are **`/va
   journey's weekday + time window that later calls at the to-stop (direction check). A match is
   **pushed** only when the worst matching departure crosses the operator's alert threshold
   (`P(cancelled OR ≥10 min late)` ≥ 0.65 by default; per-operator cuts tuned at ~90 % precision
-  by `eval/tune_alert_thresholds.py`); the in-app list shows *all* current matches.
+  by `eval/tune_alert_thresholds.py`); the in-app list shows *all* current matches, labelling the
+  ones below the threshold. "Worst" is by that same impact probability, and the gate is exactly
+  `/demo`'s `would_alert` — impact probability only, no cancellation-probability fallback.
+- The push text quotes the **impact probability** and, when the delay drives it, the
+  exceedance-stack `p50–p90` interval — the figures `/demo` shows. It deliberately does not quote
+  `dep_delay_typ_min`: that raw regression reads ~2 min on boardings whose calibrated impact is
+  > 90 %, which made real alerts look trivial (fixed 2026-07-27).
 - Subscriptions + journeys are keyed by a client-generated `device_id` (no login — prototype).
   State persists to a GCS blob so it survives redeploys.
 

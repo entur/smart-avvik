@@ -3,14 +3,24 @@ import { DeleteIcon } from '@entur/icons';
 import { SmallAlertBox } from '@entur/alert';
 import { Paragraph, SmallText } from '@entur/typography';
 import type { Alert, Journey } from '../api';
-import { fmtDelay, fmtPct, fmtTime, formatDays } from '../format';
+import { CANCEL_LIKELY, TROUBLE_DELAY_MIN, fmtDelay, fmtPct, fmtTime, formatDays } from '../format';
 
+// One situation hitting the journey. The lead number is the alerting score the push gate reads —
+// P(innstilling eller >= 10 min forsinkelse), the same quantity and wording /demo shows — followed
+// by the dominant driver. A match below the operator's threshold is listed but not pushed, and says
+// so, so the list explains rather than contradicts the phone's notifications.
 function AlertLine({ alert }: { alert: Alert }) {
   const parts: string[] = [];
   if (alert.departure_time) parts.push(`${alert.mode ?? 'Tog'} kl ${fmtTime(alert.departure_time)}`);
-  parts.push(`${fmtPct(alert.cancel_probability)} sjanse for innstilling`);
-  const delay = fmtDelay(alert.delay_typ_min);
-  if (delay) parts.push(delay);
+  parts.push(
+    `${fmtPct(alert.impact_probability ?? alert.cancel_probability)} sjanse for innstilling eller ≥ ${TROUBLE_DELAY_MIN} min forsinkelse`,
+  );
+  const driver =
+    alert.cancel_probability >= CANCEL_LIKELY
+      ? 'mest sannsynlig innstilt'
+      : fmtDelay(alert.delay_p50_min, alert.delay_p90_min);
+  if (driver) parts.push(driver);
+  if (!alert.alertworthy) parts.push(`under varslingsterskelen (${fmtPct(alert.alert_threshold)})`);
   return (
     <SmallAlertBox variant={alert.alertworthy ? 'negative' : 'warning'} width="fluid">
       {alert.summary && (

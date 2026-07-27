@@ -42,8 +42,15 @@ export function formatDays(days: number[]): string {
     .join(', ');
 }
 
-/** Delay phrasing for an alert: "typisk 6 min forsinket" (omitted when unknown/zero). */
-export function fmtDelay(typ: number | null): string | null {
-  if (!typ) return null;
-  return `typisk ${typ} min forsinket`;
+// Mirrors varsel.py: an alert counts as trouble at >= 10 min late, and above a 50 % cancellation
+// probability the wording leads with the cancellation instead of the delay interval.
+export const TROUBLE_DELAY_MIN = 10;
+export const CANCEL_LIKELY = 0.5;
+
+/** Delay phrasing for an alert from the exceedance-stack interval: "typisk 15–27 min forsinket"
+ *  (collapsed when p50 and p90 coincide, omitted when neither is known). */
+export function fmtDelay(p50: number | null, p90: number | null): string | null {
+  if (!p50 && !p90) return null;
+  if (p50 && p90 && p90 > p50) return `typisk ${p50}–${p90} min forsinket`;
+  return `typisk ${p90 ?? p50} min forsinket`;
 }

@@ -1740,8 +1740,8 @@ async def alert_profile(
 # ~90 % precision by eval/tune_alert_thresholds.py, 0.65 default), so the demo's verdicts
 # replay exactly what the varsel push pipeline would have decided.
 # Realized outcome counts as "trouble" when the call was cancelled or >= 10 min late — the
-# same event the impact probability predicts.
-_DEMO_TROUBLE_DELAY_MIN = 10
+# same event the impact probability predicts, so it comes from varsel (single definition).
+_DEMO_TROUBLE_DELAY_MIN = varsel.TROUBLE_DELAY_MIN
 
 # The demo tables are near-static snapshots (extend_demo_recent.sql refreshes them on
 # demand), so their metadata (stop picker, scenario list, date window) is cached with a

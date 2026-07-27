@@ -20,10 +20,12 @@ export interface Alert {
   line: string | null;
   departure_time: string | null;
   cancel_probability: number;
-  delay_typ_min: number | null;
+  delay_p50_min: number | null; // median delay from the exceedance stack (as /demo shows)
   delay_p90_min: number | null;
-  impact_probability: number | null;
-  alertworthy: boolean;
+  ge10_probability: number | null;
+  impact_probability: number | null; // P(innstilling eller >= 10 min forsinkelse) — the alert score
+  alert_threshold: number; // the operator's cut applied to impact_probability
+  alertworthy: boolean; // impact_probability >= alert_threshold, i.e. a push is/was sent
 }
 
 export interface Journey {
