@@ -22,15 +22,14 @@ def _(mo):
     modeller (AUC 0.88–0.997, presisjon 0.84–0.96 @ 0.65), men NSB taper 0.4–0.5 AUC-poeng på
     fortynning — paritets-gaten FEILET, så skinner og buss bør serveres fra hver sin familie.
     """)
-    return
 
 
 @app.cell
 def imports():
     import marimo as mo
+    import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
-    import matplotlib.pyplot as plt
     from google.cloud import bigquery
 
     return bigquery, mo, np, pd, plt
@@ -139,7 +138,6 @@ def _(mo):
     `cancel` = P(innstilt) mot faktisk innstilling; `impact_*` = sammensatt
     p_impact mot innstilt ELLER ≥10 min forsinkelse, på kvalifiserte stopp.
     """)
-    return
 
 
 @app.cell
@@ -247,7 +245,6 @@ def _(mo):
     presisjonskrav (≥ 0.85 / 0.90 / 0.95) — dvs. hva en per-operatør-terskel ville gitt i stedet
     for felles 0.65.
     """)
-    return
 
 
 @app.cell
@@ -288,7 +285,6 @@ def _(THR, metric_sel, metric_slice, np, op_metrics, plt, scored):
     _fig.supxlabel("terskel")
     _fig.tight_layout()
     _fig
-    return
 
 
 @app.cell
@@ -321,7 +317,6 @@ def _(THR, metric_sel, metric_slice, np, op_metrics, pd, pr_curve, scored):
     thr_targets.style.format("{:.3f}", na_rep="—").format({"n": "{:,.0f}"}).background_gradient(
         subset=[c for c in thr_targets.columns if c.startswith("rec")], cmap="RdYlGn", vmin=0, vmax=1
     )
-    return
 
 
 @app.cell(hide_code=True)
@@ -338,7 +333,6 @@ def _(mo):
     per-operatør-intercept + felles helning holder over hele sannsynlighetsskalaen,
     ikke bare i snitt.
     """)
-    return
 
 
 @app.cell
@@ -377,7 +371,6 @@ def _(metric_sel, metric_slice, np, op_metrics, plt, scored):
     _fig2.supylabel("observert andel")
     _fig2.tight_layout()
     _fig2
-    return
 
 
 @app.cell(hide_code=True)
@@ -392,7 +385,6 @@ def _(mo):
     Tabellene under deler differansen (Δ = pooled_all − prod) etter kategori, status og
     tid-fra-onset; migrasjonscellen teller varsler som flytter seg over/under terskelen.
     """)
-    return
 
 
 @app.cell
@@ -545,7 +537,6 @@ def _(THR, auc_score, metric_sel, mo, nsb_cmp, pd):
         mo.md("### Δ etter tid fra onset"),
         _style(_slice_table(_df, "onset_band")),
     ])
-    return
 
 
 @app.cell
@@ -581,7 +572,6 @@ def _(THR, metric_sel, mo, nsb_cmp):
 
     {_lines}
     """)
-    return
 
 
 @app.cell(hide_code=True)
@@ -625,7 +615,6 @@ def _(mo):
 
     Merk: GCO har bare ~37 rammede avganger i holdouten — tallene der er støy.
     """)
-    return
 
 
 @app.cell(hide_code=True)
@@ -717,7 +706,7 @@ def _(df_lead_all, mo, pd, recall_at_precision):
                 _rec, _thr, _andel = float("nan"), float("nan"), float("nan")
             else:
                 _rec, _thr = recall_at_precision(_v.y.to_numpy(), _v.p.to_numpy(), 0.90)
-                _andel = float((_v.y & (_v.p >= _thr)).sum() / _n_imp) if _rec == _rec else float("nan")
+                _andel = float((_v.y & (_v.p >= _thr)).sum() / _n_imp) if pd.notna(_rec) else float("nan")
             _row[f"dekning@90 {_navn}"] = _rec
             _row[f"terskel {_navn}"] = _thr
             _row[f"andel av alle {_navn}"] = _andel
@@ -754,7 +743,6 @@ def _(lead_ops, np, plt):
     _ax.legend(frameon=False, loc="lower right")
     plt.tight_layout()
     _fig
-    return
 
 
 if __name__ == "__main__":

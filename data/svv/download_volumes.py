@@ -37,7 +37,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -115,7 +115,7 @@ def gql(variables):
 def rows_for_node(point_id, node, toward_heading):
     """Flatten one byHour node into one row per direction."""
     local = datetime.fromisoformat(node["from"])  # Oslo local with offset
-    utc = local.astimezone(timezone.utc)
+    utc = local.astimezone(UTC)
     tot = node["total"] or {}
     tot_vn = tot.get("volumeNumbers") or {}
     total_volume = tot_vn.get("volume")
@@ -178,7 +178,8 @@ def main():
     args = ap.parse_args()
 
     OUTDIR.mkdir(exist_ok=True)
-    points = json.load(open(HERE / "points.json"))["points"]
+    with open(HERE / "points.json") as fh:
+        points = json.load(fh)["points"]
     if args.limit:
         points = points[: args.limit]
     todo = [p for p in points if not (OUTDIR / f"{p['id']}.ndjson.gz").exists()]
