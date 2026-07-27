@@ -22,6 +22,7 @@ import argparse
 import base64
 import csv
 import gzip
+import itertools
 import json
 import sys
 import threading
@@ -30,14 +31,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).parent
 OUTDIR = HERE / "observations"
 
-WINDOW_START = datetime(2024, 6, 16, tzinfo=timezone.utc)
-WINDOW_END = datetime(2026, 6, 16, tzinfo=timezone.utc)
+WINDOW_START = datetime(2024, 6, 16, tzinfo=UTC)
+WINDOW_END = datetime(2026, 6, 16, tzinfo=UTC)
 WINDOW_SECONDS = (WINDOW_END - WINDOW_START).total_seconds()
 WINDOW_DAYS = WINDOW_SECONDS / 86400
 
@@ -68,9 +69,10 @@ def log(msg):
 
 
 def load_cid():
-    for line in open(HERE / "auth.txt"):
-        if line.startswith("client_id:"):
-            return line.split(":", 1)[1].strip()
+    with open(HERE / "auth.txt") as fh:
+        for line in fh:
+            if line.startswith("client_id:"):
+                return line.split(":", 1)[1].strip()
     raise SystemExit("no client_id in auth.txt")
 
 
@@ -177,7 +179,7 @@ def time_chunks(n):
     """Split the window into n contiguous datetime sub-windows."""
     step = WINDOW_SECONDS / n
     bounds = [WINDOW_START + timedelta(seconds=step * i) for i in range(n)] + [WINDOW_END]
-    return list(zip(bounds[:-1], bounds[1:]))
+    return list(itertools.pairwise(bounds))
 
 
 def process_station(source, by_res):
@@ -227,7 +229,8 @@ def main():
     OUTDIR.mkdir(exist_ok=True)
 
     # Build {station: {resolution: set(elementId)}} from the manifest, kept resolutions only.
-    manifest = json.load(open(HERE / "timeseries_in_window.json"))
+    with open(HERE / "timeseries_in_window.json") as fh:
+        manifest = json.load(fh)
     stations = {}
     for s in manifest:
         res = s.get("timeResolution")
