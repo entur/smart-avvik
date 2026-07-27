@@ -1,0 +1,11 @@
+[
+  {"name": "point_id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "hour_start_utc", "type": "TIMESTAMP", "mode": "REQUIRED"},
+  {"name": "hour_start_oslo", "type": "DATETIME", "mode": "REQUIRED"},
+  {"name": "date_oslo", "type": "DATE", "mode": "REQUIRED"},
+  {"name": "heading", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "toward_oslo", "type": "BOOLEAN", "mode": "REQUIRED"},
+  {"name": "volume", "type": "INTEGER", "mode": "NULLABLE"},
+  {"name": "coverage_pct", "type": "FLOAT", "mode": "NULLABLE"},
+  {"name": "total_volume", "type": "INTEGER", "mode": "NULLABLE"}
+]
