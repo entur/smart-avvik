@@ -56,7 +56,7 @@ import threading
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta
 from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -181,7 +181,7 @@ _JP_BOARD_QUERY = """
     }
   }
 }
-""" % CORRIDOR_FROM_STOP
+""" % CORRIDOR_FROM_STOP  # noqa: UP031  (%-format: the GraphQL body is all braces, which .format() would need doubled)
 
 # Journey Planner car-baseline query — verified live with curl 2026-07-11 (Lier → Oslo S,
 # 2131 s / 40.9 km free-flow). directMode car with no transit modes = pure car routing.
@@ -195,7 +195,7 @@ _JP_CAR_QUERY = """
     tripPatterns { duration }
   }
 }
-""" % (CORRIDOR_CAR_ORIGIN[0], CORRIDOR_CAR_ORIGIN[1], CORRIDOR_TO_STOP)
+""" % (CORRIDOR_CAR_ORIGIN[0], CORRIDOR_CAR_ORIGIN[1], CORRIDOR_TO_STOP)  # noqa: UP031  (see above)
 
 # svv_baselines lookup (loaded by refresh_baselines, never on the request path). Built offline
 # by data/queries/reisevalg_road_baseline.sql (U2): per point x toward-Oslo direction x
@@ -208,7 +208,7 @@ _BASELINES_QUERY = """
 
 def _now() -> datetime:
     """The current instant (UTC). Module-level so tests can freeze time."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _parse_ts(value: str | None) -> datetime | None:
@@ -216,14 +216,14 @@ def _parse_ts(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value).astimezone(timezone.utc)
+        return datetime.fromisoformat(value).astimezone(UTC)
     except ValueError:
         return None
 
 
 def _utc(dt: datetime | None) -> datetime | None:
     """Normalize an aware datetime to UTC for the response (freshness fields are ISO-8601 UTC)."""
-    return dt.astimezone(timezone.utc) if dt is not None else None
+    return dt.astimezone(UTC) if dt is not None else None
 
 
 # ---- States and reasons ----------------------------------------------------------------------
@@ -390,7 +390,7 @@ def refresh_baselines() -> None:
             }
             if r.built_at is not None and (built_at is None or r.built_at > built_at):
                 built_at = r.built_at
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001  (deliberate: any load failure degrades the road side to unavailable)
         logger.warning(
             "svv_baselines unavailable (%s: %s); reisevalg road volume side reports unavailable "
             "(expected until data/queries/reisevalg_road_baseline.sql has run)",
@@ -403,7 +403,7 @@ def refresh_baselines() -> None:
         global _baselines
         _baselines = table
         _baselines_built_at = built_at
-        _baselines_refreshed_at = datetime.now(timezone.utc)
+        _baselines_refreshed_at = datetime.now(UTC)
     logger.info(
         "Refreshed svv baselines: %d cells (built_at=%s)",
         len(table),

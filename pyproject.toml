@@ -6,28 +6,44 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "anywidget>=0.11.0",
-    "db-dtypes>=1.6.0",
-    "fastapi[standard]>=0.136.3",
+    "db-dtypes>=1.7.1",
+    "fastapi[standard]>=0.140.2",
     "google-cloud-bigquery-storage>=2.39.0",
-    "google-cloud-bigquery[pandas]>=3.41.0",
+    "google-cloud-bigquery[pandas]>=3.42.2",
     "jupyterlab>=4.6.2",
-    "marimo>=0.23.13",
-    "matplotlib>=3.10.9",
+    "marimo>=0.23.15",
+    "matplotlib>=3.11.1",
     "nbformat>=5.10.4",
     "playwright>=1.61.0",
-    "plotly>=6.7.0",
+    "plotly>=6.9.0",
     "seaborn>=0.13.2",
 ]
 
 [project.optional-dependencies]
 simulator = [
-    "fastapi[standard]>=0.115",
-    "uvicorn[standard]>=0.34",
-    "pydantic-settings>=2.7",
+    "fastapi[standard]>=0.140.2",
+    "uvicorn[standard]>=0.51.0",
+    "pydantic-settings>=2.14.2",
 ]
 
 [dependency-groups]
 dev = [
-    "mypy>=2.1.0",
-    "ruff>=0.15.20",
+    "mypy>=2.3.0",
+    "ruff>=0.16.0",
 ]
+
+# ruff 0.16 widened its default rule set well beyond E/F (B, UP, SIM, PLR, I, C4, RUF, ...).
+# The defaults are adopted as-is; the two exemptions below are rules that misfire on a
+# framework/tool idiom rather than findings worth fixing.
+[tool.ruff.lint.flake8-bugbear]
+# `param: str = Query(...)` in an endpoint signature is how FastAPI declares query
+# parameters — it is not the mutable-default bug B008 looks for.
+extend-immutable-calls = ["fastapi.Query"]
+
+[tool.ruff.lint.per-file-ignores]
+# marimo notebooks: a cell's trailing bare expression IS the cell's rendered output (it shows
+# up in the /eval snapshots), so B018 "useless expression" does not apply. Only the marimo
+# apps are listed — eval/tune_alert_thresholds.py is a plain script, where B018 is a real bug.
+"eval/impact_eval.py" = ["B018"]
+"eval/pooled-model-bus-eval.py" = ["B018"]
+"eval/pooled-model-train-eval.py" = ["B018"]

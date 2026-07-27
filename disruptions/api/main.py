@@ -5,19 +5,18 @@ import time
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
+import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
+import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from google.cloud import bigquery
 from pydantic import BaseModel, Field
-
-import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
-import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
-import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +155,7 @@ def refresh_disruptions_cache() -> None:
     with _disruptions_lock:
         global _disruptions_cache, _disruptions_refreshed_at
         _disruptions_cache = disruptions
-        _disruptions_refreshed_at = datetime.now(timezone.utc)
+        _disruptions_refreshed_at = datetime.now(UTC)
     logger.info("Refreshed disruptions cache: %d active disruptions", len(disruptions))
 
 
@@ -195,7 +194,7 @@ def get_situation(situation_id: str) -> _CachedDisruption | None:
     most one BigQuery run per 5 minutes. Returns None if no NSB disruption with that
     situationNumber exists in the lookback window (yesterday and today)."""
     global _situation_snapshot, _situation_snapshot_at
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with _situation_lock:
         if (
             _situation_snapshot_at is not None
@@ -344,7 +343,7 @@ def maybe_refresh_planned_calls() -> None:
     Time-gated because it scans today's ET partition (~8 GB); the schedule is stable enough that
     a 10-minute cadence is plenty. Always runs on first call (refreshed_at is None)."""
     global _planned_refreshed_at
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with _planned_lock:
         fresh = (
             _planned_refreshed_at is not None and now - _planned_refreshed_at < _PLANNED_TTL
@@ -371,7 +370,7 @@ def maybe_refresh_bus_planned_calls() -> None:
     Same rationale as maybe_refresh_planned_calls, but slower — the bus schedule is just as stable
     and the scan is larger. Always runs on first call (refreshed_at is None)."""
     global _bus_planned_refreshed_at
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with _bus_planned_lock:
         fresh = (
             _bus_planned_refreshed_at is not None
@@ -456,7 +455,7 @@ def refresh_call_predictions_cache() -> None:
         _call_pred_by_key = by_key
         _call_pred_by_jkey_index = by_jkey_index
         _call_pred_by_situation = by_situation
-        _call_pred_refreshed_at = datetime.now(timezone.utc)
+        _call_pred_refreshed_at = datetime.now(UTC)
     logger.info(
         "Refreshed per-call predictions cache: %d (operator, journey) keys, %d situations",
         len(by_key),
@@ -1286,13 +1285,13 @@ async def disruptions(
     than served from the cache.
     """
     if at is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         with _disruptions_lock:
             cached = _disruptions_cache
             refreshed_at = _disruptions_refreshed_at
     else:
-        now = at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
-        if now > datetime.now(timezone.utc):
+        now = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
+        if now > datetime.now(UTC):
             raise HTTPException(
                 status_code=400,
                 detail="`at` must not be in the future; point-in-time reconstruction only covers past instants.",
@@ -1348,7 +1347,7 @@ async def situation(
             status_code=404,
             detail=f"No disruption found for situationNumber {id!r}.",
         )
-    return _to_disruption(d, datetime.now(timezone.utc))
+    return _to_disruption(d, datetime.now(UTC))
 
 
 @app.get(
@@ -1431,7 +1430,7 @@ async def journey(
         line=head.line,
         situation_number=head.situation_number,
         summary=head.summary,
-        as_of=datetime.now(timezone.utc),
+        as_of=datetime.now(UTC),
         refreshed_at=refreshed_at,
         calls=[
             CallPrediction(
@@ -1635,9 +1634,9 @@ async def impact(
     `situation` to scope to a single situation. Both lists are empty when nothing affects the trip.
     """
     if at is None:
-        at_utc = datetime.now(timezone.utc)
+        at_utc = datetime.now(UTC)
     else:
-        at_utc = at if at.tzinfo is not None else at.replace(tzinfo=timezone.utc)
+        at_utc = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
     with _call_pred_lock:
         by_situation = _call_pred_by_situation
         refreshed_at = _call_pred_refreshed_at
@@ -1679,7 +1678,7 @@ async def impact(
     lines.sort(key=lambda x: _severity_key(x.departure_prediction), reverse=True)
 
     return ImpactResponse(
-        as_of=datetime.now(timezone.utc),
+        as_of=datetime.now(UTC),
         refreshed_at=refreshed_at,
         from_stop=from_stop,
         to_stop=to_stop,
@@ -1721,7 +1720,7 @@ async def alert_profile(
     `matched_*` to see how specific the match actually is, and `alert_tier` / `alert_score`
     to rank it. 404 only if the lookup table has not loaded yet.
     """
-    h = _oslo_hour(datetime.now(timezone.utc)) if hour is None else hour
+    h = _oslo_hour(datetime.now(UTC)) if hour is None else hour
     row = lookup_alert_profile(category, line, h)
     if row is None:
         raise HTTPException(status_code=404, detail="No impact profile available (lookup not loaded).")
@@ -2025,8 +2024,8 @@ async def demo_journeys(
     """
     if from_stop == to_stop:
         raise HTTPException(status_code=400, detail="from_stop and to_stop must differ.")
-    start_utc = start if start.tzinfo is not None else start.replace(tzinfo=timezone.utc)
-    end_utc = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+    start_utc = start if start.tzinfo is not None else start.replace(tzinfo=UTC)
+    end_utc = end if end.tzinfo is not None else end.replace(tzinfo=UTC)
     if end_utc <= start_utc:
         raise HTTPException(status_code=400, detail="end must be after start.")
     if end_utc - start_utc > timedelta(days=7):

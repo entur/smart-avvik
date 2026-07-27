@@ -25,15 +25,14 @@ def header(mo):
     (`pooled-model-bus-eval.py`) tester samme idé utvidet til buss — der **feiler** gaten,
     og arkitekturen ender som to familier.
     """)
-    return
 
 
 @app.cell
 def imports():
     import marimo as mo
+    import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
-    import matplotlib.pyplot as plt
     from google.cloud import bigquery
 
 
@@ -70,7 +69,6 @@ def build_md(mo):
       GOA-onset-tekstene (delte meldingsmaler).
     - **Totalkostnad ≈ $1,6** (trening $1,40, GOA-tabellen $0,10) og ~40 min vegg-tid.
     """)
-    return
 
 
 @app.cell(hide_code=True)
@@ -95,7 +93,6 @@ def families_md(mo):
     Platt-laget for den poolede familien er **ett delt fitt** på det poolede holdout-settet
     (~95 % NSB-rader) — kalibreringsavsnittet under sjekker om GOA rir den kurven akseptabelt.
     """)
-    return
 
 
 @app.cell
@@ -292,7 +289,6 @@ def headline_md(mo):
     2. **Hva vinner GOA på pooling?** Sammenlikn `GOA/pooled` mot `GOA/zeroshot` — gapet er
        verdien av å trene med GOA-radene inne.
     """)
-    return
 
 
 @app.cell(hide_code=True)
@@ -339,7 +335,6 @@ def gate_md(mo):
     **Gaten passerer** når NSB-differansene er støy (± noen få tusendeler); GOA-gevinsten viser
     hva selve poolingen kjøper utover ren egenskaps-overføring.
     """)
-    return
 
 
 @app.cell(hide_code=True)
@@ -376,7 +371,6 @@ def gate_tables(fam_metrics, mo, pd):
         mo.md("**GOA: pooling-gevinsten** (Δ = pooled − zeroshot)"),
         _sty(_goa, 0.05),
     ])
-    return
 
 
 @app.cell(hide_code=True)
@@ -395,7 +389,6 @@ def pr_fig_md(mo):
     - **Høyre (NSB):** pooled- og prod-kurvene ligger oppå hverandre — poolingen er gratis
       for NSB. Det er hele gaten.
     """)
-    return
 
 
 @app.cell(hide_code=True)
@@ -430,14 +423,13 @@ def pr_figure(THR, metric_slice, plt, pr_curve, scored):
     _ax1.annotate("terskel 0,65: pooling gir\n+5 pp presisjon ved litt\nlavere dekning",
                   xy=(0.92, 0.95), xytext=(0.35, 0.55),
                   fontsize=9, color="#444444",
-                  arrowprops=dict(arrowstyle="-", color="#9a9a92", lw=0.8))
+                  arrowprops={"arrowstyle": "-", "color": "#9a9a92", "lw": 0.8})
     _ax2.annotate("kurvene ligger oppå hverandre:\npooling er gratis for NSB",
                   xy=(0.59, 0.91), xytext=(0.12, 0.35),
                   fontsize=9, color="#444444",
-                  arrowprops=dict(arrowstyle="-", color="#9a9a92", lw=0.8))
+                  arrowprops={"arrowstyle": "-", "color": "#9a9a92", "lw": 0.8})
     plt.tight_layout()
     _fig
-    return
 
 
 @app.cell(hide_code=True)
@@ -456,7 +448,6 @@ def calib_md(mo):
     **per-operatør-intercept i platt-laget** første ratt å vri på — det er nøyaktig det den
     all-operatør-poolede familien i neste notatbok gjør (`sigmoid(b + a·logit + w[operatør])`).
     """)
-    return
 
 
 @app.cell(hide_code=True)
@@ -490,10 +481,9 @@ def calib_figure(metric_slice, np, pd, plt, scored):
     _ax2.annotate("støyete med ~5,4k stopp, men følger\ndiagonalen; i snitt +1,4 pp overskudd\npå innstilling — greit for et delt lag",
                   xy=(0.62, 0.55), xytext=(0.40, 0.13),
                   fontsize=9, color="#444444",
-                  arrowprops=dict(arrowstyle="-", color="#9a9a92", lw=0.8))
+                  arrowprops={"arrowstyle": "-", "color": "#9a9a92", "lw": 0.8})
     plt.tight_layout()
     _fig
-    return
 
 
 @app.cell(hide_code=True)
@@ -560,7 +550,6 @@ def findings(mo):
     `train_call_models_pooled.sql` → `create_pooled_calibration.sql` → `eval_pooled_models.sql`,
     alle i `data/queries/`.
     """)
-    return
 
 
 if __name__ == "__main__":

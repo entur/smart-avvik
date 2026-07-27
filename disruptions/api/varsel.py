@@ -53,7 +53,7 @@ import re
 import threading
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -190,7 +190,7 @@ _STATE_BLOB = os.environ.get("VARSEL_STATE_BLOB", "varsel_state.json")
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _serialize_state() -> str:
@@ -353,7 +353,7 @@ def match_journey(
     ``now`` is injectable for tests; it defaults to the current time.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
     days = set(journey["days"])
     begin_min = _parse_hhmm(journey["begin"])
     end_min = _parse_hhmm(journey["end"])
@@ -571,7 +571,7 @@ def _device_is_fresh(device_id: str) -> bool:
         created = datetime.fromisoformat(dev["created_ts"])
     except (KeyError, ValueError):
         return False
-    return datetime.now(timezone.utc) - created < _SUBSCRIPTION_GRACE
+    return datetime.now(UTC) - created < _SUBSCRIPTION_GRACE
 
 
 def check_and_notify(by_situation: dict[str, list]) -> None:
@@ -874,7 +874,7 @@ async def client_log(body: ClientLogIn, request: Request) -> dict:
     client failures are visible next to the server logs in Cloud Logging
     (``jsonPayload.event = "client_error"``)."""
     global _client_log_window_start, _client_log_count
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     with _client_log_lock:
         if _client_log_window_start is None or now - _client_log_window_start >= timedelta(minutes=1):
             _client_log_window_start, _client_log_count = now, 0

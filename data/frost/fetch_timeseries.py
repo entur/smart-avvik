@@ -35,9 +35,10 @@ STEPS = {
 
 
 def load_cid():
-    for line in open(HERE / "auth.txt"):
-        if line.startswith("client_id:"):
-            return line.split(":", 1)[1].strip()
+    with open(HERE / "auth.txt") as fh:
+        for line in fh:
+            if line.startswith("client_id:"):
+                return line.split(":", 1)[1].strip()
     raise SystemExit("no client_id in auth.txt")
 
 
@@ -63,7 +64,8 @@ def get(url, cid, tries=5):
 
 def main():
     cid = load_cid()
-    ids = [s["id"] for s in json.load(open(HERE / "near_stations.json"))]
+    with open(HERE / "near_stations.json") as fh:
+        ids = [s["id"] for s in json.load(fh)]
     print(f"near stations: {len(ids)}", file=sys.stderr)
 
     all_series = []
@@ -77,7 +79,8 @@ def main():
               f"+{len(d.get('data',[]))} series (total {len(all_series)})", file=sys.stderr)
         time.sleep(0.2)
 
-    json.dump(all_series, open(HERE / "timeseries_in_window.json", "w"), ensure_ascii=False)
+    with open(HERE / "timeseries_in_window.json", "w") as fh:
+        json.dump(all_series, fh, ensure_ascii=False)
     print(f"\nwrote timeseries_in_window.json: {len(all_series)} series", file=sys.stderr)
 
     # Volume estimate (upper bound: assumes every timestep present).

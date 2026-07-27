@@ -42,7 +42,8 @@ def main():
                          "nearest quay is within this many km.")
     args = ap.parse_args()
 
-    stations = json.load(open(HERE / "stations_all.json"))["data"]
+    with open(HERE / "stations_all.json") as fh:
+        stations = json.load(fh)["data"]
 
     qlat, qlon = [], []
     with open(HERE / "quays_coords.csv") as f:
@@ -87,7 +88,8 @@ def main():
     if args.max_km is not None:
         near = [r for r in rows if r["nearest_quay_km"] <= args.max_km]
         outj = HERE / "near_stations.json"
-        json.dump(near, open(outj, "w"), ensure_ascii=False, indent=2)
+        with open(outj, "w") as fh:
+            json.dump(near, fh, ensure_ascii=False, indent=2)
         print(f"\nwrote {outj}: {len(near)} stations within {args.max_km} km of a quay",
               file=sys.stderr)
 
