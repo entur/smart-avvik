@@ -31,13 +31,13 @@ os.environ.update(
     VARSEL_STATE_PATH=_STATE_PATH,
 )
 
-import json  # noqa: E402
-from datetime import datetime, timedelta  # noqa: E402
+import json
+from datetime import datetime, timedelta
 
-import varsel  # noqa: E402
-from fastapi import FastAPI  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
-from test_varsel import FakeCall, _OSLO  # reuse the synthetic call shape  # noqa: E402
+import varsel
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from test_varsel import _OSLO, FakeCall  # reuse the synthetic call shape
 
 DEVICE = "dev-abc12345"
 SUBSCRIPTION = {"endpoint": "https://push.example.com/x", "keys": {"p256dh": "k", "auth": "a"}}

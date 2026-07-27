@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate create_pooled_all_platt_weights.sql.
 
 Flattens every operator-aware Platt model in the _pooled_all family (9 heads x 5 ask-horizon

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Generate the Avviksvarsel PWA icons and favicon — the Entur logo mark on Entur Lavender.
 
 The home-screen / PWA / favicon artwork is the official Entur "EN" logo (white wordmark + coral

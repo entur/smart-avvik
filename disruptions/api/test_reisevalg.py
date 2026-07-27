@@ -20,23 +20,27 @@ import os
 os.environ.pop("SVV_DATEX_USER", None)
 os.environ.pop("SVV_DATEX_PASSWORD", None)
 
-from dataclasses import dataclass  # noqa: E402
-from datetime import datetime, timedelta, timezone  # noqa: E402
-from types import SimpleNamespace  # noqa: E402
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
-import reisevalg  # noqa: E402
-from fastapi import FastAPI  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
-from reisevalg import (  # noqa: E402
+import reisevalg
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from reisevalg import (
     Departure,
     HourVolume,
-    RecommendationReason as Reason,
-    RecommendationState as State,
     RoadObservation,
     decide,
     parse_board,
     volume_hour_states,
     volume_judgment,
+)
+from reisevalg import (
+    RecommendationReason as Reason,
+)
+from reisevalg import (
+    RecommendationState as State,
 )
 
 _OSLO = reisevalg._OSLO
@@ -371,7 +375,7 @@ def test_outside_window_short_circuits():
         assert (d.state, d.reason) == (State.OUTSIDE_WINDOW, Reason.OUTSIDE_MORNING_WINDOW)
     # Saturday's verdict is valid until Monday's window opens.
     d = decide(now=SATURDAY, road_observations=[], departures=None, rail_observed_at=None)
-    assert d.valid_until == _oslo(2026, 7, 13, 5, 30).astimezone(timezone.utc)
+    assert d.valid_until == _oslo(2026, 7, 13, 5, 30).astimezone(UTC)
 
 
 def test_in_window_but_no_departure_within_hour():
@@ -577,15 +581,15 @@ def test_volume_hour_states_deficit_direction_and_coverage():
     ]
     states = volume_hour_states(rows, base)
     assert states == [
-        (h6.astimezone(timezone.utc) + timedelta(hours=1), "congested"),
-        (h7.astimezone(timezone.utc) + timedelta(hours=1), "normal"),
+        (h6.astimezone(UTC) + timedelta(hours=1), "congested"),
+        (h7.astimezone(UTC) + timedelta(hours=1), "normal"),
     ]
 
 
 def test_volume_judgment_anti_flap_and_state_since():
-    h = lambda i: _oslo(2026, 7, 8, i, 0).astimezone(timezone.utc) + timedelta(hours=1)  # noqa: E731
+    h = lambda i: _oslo(2026, 7, 8, i, 0).astimezone(UTC) + timedelta(hours=1)
     # Deficit only in the newest observation: persistence (N=2) unmet -> "normal", no nudge.
-    obs, run_start = volume_judgment([(h(6), "normal"), (h(7), "congested")])
+    obs, _run_start = volume_judgment([(h(6), "normal"), (h(7), "congested")])
     assert obs.state == "normal"
     assert obs.confidence == "low" and obs.travel_time_min is None
     # Deficit holds over the last N observations -> "congested"; state_since is the first
@@ -601,7 +605,7 @@ def test_volume_judgment_anti_flap_and_state_since():
 def test_volume_judgment_requires_adjacent_hours():
     # The backtested d15 rule (LAG(hour) = hour - 1) demands CONSECUTIVE congested hours:
     # congested at H-3 and H-1 with a gap (no usable hour between) does not make a run.
-    h = lambda i: _oslo(2026, 7, 8, i, 0).astimezone(timezone.utc) + timedelta(hours=1)  # noqa: E731
+    h = lambda i: _oslo(2026, 7, 8, i, 0).astimezone(UTC) + timedelta(hours=1)
     obs, _ = volume_judgment([(h(4), "congested"), (h(6), "congested")])
     assert obs.state == "normal"
     # Consecutive congested hours -> congested, as before.
@@ -815,14 +819,14 @@ def test_parse_board_direction_and_modes():
     cancelled = [d for d in rails if d.cancelled]
     assert len(cancelled) == 1
     assert round(cancelled[0].oslo_arrival_delay_min()) == 12
-    healthy = [d for d in rails if not d.cancelled][0]
+    healthy = next(d for d in rails if not d.cancelled)
     assert healthy.dated_journey_ref == "VYG:DatedServiceJourney:81613_DRM-DAL_26-07-08"
-    assert healthy.aimed_dep == datetime(2026, 7, 8, 6, 10, tzinfo=timezone.utc)
+    assert healthy.aimed_dep == datetime(2026, 7, 8, 6, 10, tzinfo=UTC)
 
 
 # ---- Endpoint: contract, isolation, end-to-end -----------------------------------------------------
 def _iso_utc(value):
-    return value is None or value.endswith("Z") or value.endswith("+00:00")
+    return value is None or value.endswith(("Z", "+00:00"))
 
 
 def _assert_contract(body):
@@ -870,29 +874,29 @@ def test_endpoint_recommended_full_contract(monkeypatch):
 def test_endpoint_all_five_states_serialize(monkeypatch):
     scenarios = [
         (
-            dict(providers=[lambda: _road("congested")], departures=_normal_board()),
+            {"providers": [lambda: _road("congested")], "departures": _normal_board()},
             "TRAIN_RECOMMENDED",
         ),
         (
-            dict(providers=[lambda: _road("normal")], departures=_normal_board()),
+            {"providers": [lambda: _road("normal")], "departures": _normal_board()},
             "NO_ADVANTAGE",
         ),
         (
-            dict(
-                providers=[lambda: _road("normal")],
-                departures=[_dep(10, cancelled=True)] + _normal_board()[1:],
-            ),
+            {
+                "providers": [lambda: _road("normal")],
+                "departures": [_dep(10, cancelled=True)] + _normal_board()[1:],
+            },
             "TRAIN_DEGRADED",
         ),
         (
-            dict(
-                now=SATURDAY,
-                providers=[lambda: _road("normal", now=SATURDAY)],
-                departures=_normal_board(now=SATURDAY),
-            ),
+            {
+                "now": SATURDAY,
+                "providers": [lambda: _road("normal", now=SATURDAY)],
+                "departures": _normal_board(now=SATURDAY),
+            },
             "OUTSIDE_WINDOW",
         ),
-        (dict(providers=[], departures=_normal_board()), "UNKNOWN"),
+        ({"providers": [], "departures": _normal_board()}, "UNKNOWN"),
     ]
     for kwargs, expected in scenarios:
         _wire(monkeypatch, **kwargs)
@@ -973,7 +977,7 @@ def test_endpoint_datex_unset_falls_through_to_volume(monkeypatch):
     assert body["road_source"] == "volume"
     # state_since = the first observation of the current congested run (end of hour 6-7).
     assert body["state_since"] == (
-        (h6 + timedelta(hours=1)).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        (h6 + timedelta(hours=1)).astimezone(UTC).isoformat().replace("+00:00", "Z")
     )
     names = [e["name"] for e in body["road"]]
     assert names == ["datex", "volume"]

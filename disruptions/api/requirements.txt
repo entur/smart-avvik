@@ -1,13 +1,13 @@
 # Runtime deps for the /disruptions API image only (not the repo's full
 # notebook/ML stack). Kept in sync with the relevant entries in pyproject.toml.
 # No pandas extra: the app iterates BigQuery RowIterator directly, never to_dataframe().
-fastapi[standard]>=0.136.3
-google-cloud-bigquery>=3.41.0
-uvicorn[standard]>=0.34
+fastapi[standard]>=0.140.2
+google-cloud-bigquery>=3.42.2
+uvicorn[standard]>=0.51.0
 # zoneinfo needs an IANA tz database; the python:3.13-slim image ships without one,
 # so bundle it for the Europe/Oslo hour-of-day lookup in the alert profiles.
-tzdata>=2024.1
+tzdata>=2026.3
 # Avviksvarsel (/varsel): Web Push sender (pulls py_vapid + cryptography) and durable
 # subscription/journey state in a GCS blob so it survives redeploys.
-pywebpush>=2.0.0
-google-cloud-storage>=2.16.0
+pywebpush>=2.3.0
+google-cloud-storage>=3.13.0

@@ -86,8 +86,10 @@ def main() -> None:
         ok = [(t, pr, rc, na) for t, pr, rc, na in grid if pr >= TARGET_PRECISION]
         pick = ok[0][0] if ok else float("nan")
         pick_alerts = ok[0][3] if ok else 0
-        best_prec = max((pr for _, pr, _, na in grid if pr == pr and na >= MIN_ALERTS), default=float("nan"))
-        steps = round(abs(pick - DEFAULT_THRESHOLD) * 20) if pick == pick else 0  # 0.05 grid units
+        best_prec = max(
+            (pr for _, pr, _, na in grid if pd.notna(pr) and na >= MIN_ALERTS), default=float("nan")
+        )
+        steps = round(abs(pick - DEFAULT_THRESHOLD) * 20) if pd.notna(pick) else 0  # 0.05 grid units
         reason = ""
         if n_pos < MIN_IMPACTED:
             final, reason = DEFAULT_THRESHOLD, f"too few impacted ({n_pos})"

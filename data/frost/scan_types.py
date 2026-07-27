@@ -4,8 +4,8 @@
 # ///
 """Scan every observations/*.csv.gz for values that won't parse as the numeric
 types we want, so the BigQuery schema can be set correctly before loading."""
-import csv
 import collections
+import csv
 import glob
 import gzip
 import sys

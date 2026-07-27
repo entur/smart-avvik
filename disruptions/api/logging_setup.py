@@ -20,7 +20,7 @@ Logging), e.g.::
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # Keys a `fields` dict may not override (the entry's own schema).
 _RESERVED = {"timestamp", "severity", "message", "logger"}
@@ -34,7 +34,7 @@ class JsonFormatter(logging.Formatter):
         if record.exc_info:
             message += "\n" + self.formatException(record.exc_info)
         entry = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc)
+            "timestamp": datetime.fromtimestamp(record.created, tz=UTC)
             .isoformat(timespec="milliseconds")
             .replace("+00:00", "Z"),
             "severity": record.levelname,

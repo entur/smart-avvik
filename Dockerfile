@@ -19,8 +19,8 @@
 # them via PYTHONPATH. Reference: entur/epimetheus uses the same pattern.
 
 # ---- Stage 1: build the two Vite front-ends -------------------------------
-# Vite 7 needs Node >=20.19 / >=22.12; node:22-slim satisfies that.
-FROM node:22-slim AS frontends
+# Vite 8 needs Node >=20.19 / >=22.12; node:24-slim (the current LTS line) satisfies that.
+FROM node:24-slim AS frontends
 
 # Each app's vite.config.ts writes its bundle to ../../disruptions/api/<x>_static,
 # i.e. /build/disruptions/api/{demo,varsel}_static from the app dirs below. Create
