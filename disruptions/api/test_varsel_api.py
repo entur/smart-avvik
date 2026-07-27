@@ -156,7 +156,10 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     assert len(sent) == 1
     assert sent[0]["title"] == "Avvik: Oslo S → Lillehammer"
     assert sent[0]["url"] == "/varsel/"
-    assert "82 %" in sent[0]["body"]
+    # The body leads with the alerting score (p_impact_dep 0.9), and this match is cancellation-
+    # driven (p_cancel 0.82), so it says so rather than quoting a delay.
+    assert "90 % sjanse for innstilling eller ≥ 10 min forsinkelse" in sent[0]["body"]
+    assert "mest sannsynlig innstilt" in sent[0]["body"]
     # Second pass: already notified -> no new push.
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1

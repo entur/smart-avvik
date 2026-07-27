@@ -2,13 +2,14 @@
 
 Runs standalone (`python test_varsel.py`) or under pytest. Covers direction, window edges, the
 weekday filter, overnight rejection, the departed-train filter (no alert once the expected
-departure has passed) and the alert-worthiness gate. No BigQuery, no network.
+departure has passed), the alert-worthiness gate and the notification wording. No BigQuery, no
+network.
 """
 
 from dataclasses import dataclass
 from datetime import datetime
 
-from varsel import _OSLO, match_journey
+from varsel import _OSLO, _notification_payload, match_journey
 
 
 @dataclass
@@ -22,6 +23,7 @@ class FakeCall:
     operator: str = "VYG"
     p_cancel: float = 0.5
     p_impact_dep: float | None = 0.9
+    p_dep_ge10: float | None = 0.8
     line: str | None = "VYG:Line:R10"
     summary: str | None = "Signalfeil"
     dep_delay_typ_min: int | None = 4
@@ -81,7 +83,10 @@ def test_basic_match():
     a = alerts[0]
     assert a.situation_number == "S1"
     assert a.cancel_probability == 0.8
+    assert a.delay_p50_min == 3  # exceedance-stack p50, not the dep_delay_typ_min regression (4)
     assert a.delay_p90_min == 12  # prefers the exceedance-stack p90
+    assert a.impact_probability == 0.9
+    assert a.alert_threshold == 0.65  # VYG -> the default cut
     assert a.alertworthy is True
 
 
@@ -143,12 +148,13 @@ def test_expected_departure_falls_back_to_typ_delay():
 
 
 def test_alertworthy_gate():
-    # Below threshold on both impact and cancel -> listed but not push-worthy.
+    # Below the impact threshold -> listed but not push-worthy.
     mild = match(_journey(), {"S1": _train(MON_0800, p_cancel=0.1, p_impact_dep=0.2)})
     assert mild and mild[0].alertworthy is False
-    # Impact prob unavailable -> fall back to cancellation prob.
-    fallback = match(_journey(), {"S1": _train(MON_0800, p_cancel=0.7, p_impact_dep=None)})
-    assert fallback and fallback[0].alertworthy is True
+    # No impact prob -> never pushed, exactly as /demo's would_alert (no p_cancel fallback), even
+    # with a high cancellation probability.
+    no_impact = match(_journey(), {"S1": _train(MON_0800, p_cancel=0.7, p_impact_dep=None)})
+    assert no_impact and no_impact[0].alertworthy is False
 
 
 def test_per_operator_threshold():
@@ -161,17 +167,20 @@ def test_per_operator_threshold():
 
 
 def test_worst_train_wins():
-    # Two trains in the window; the alert reports the more severe one.
-    calls = _train(_oslo(2026, 7, 6, 7, 30), jkey="t1", p_cancel=0.3) + _train(
-        _oslo(2026, 7, 6, 8, 30), jkey="t2", p_cancel=0.85
-    )
+    # Two trains in the window; the alert reports the one with the higher impact probability — the
+    # score the push gate reads — even though the other looks worse on cancellation probability.
+    calls = _train(
+        _oslo(2026, 7, 6, 7, 30), jkey="t1", p_cancel=0.55, p_impact_dep=0.6
+    ) + _train(_oslo(2026, 7, 6, 8, 30), jkey="t2", p_cancel=0.05, p_impact_dep=0.95)
     alerts = match(_journey(), {"S1": calls})
-    assert len(alerts) == 1 and alerts[0].cancel_probability == 0.85
+    assert len(alerts) == 1
+    assert alerts[0].impact_probability == 0.95
+    assert alerts[0].alertworthy is True  # would have been False if t1 supplied the numbers
 
 
 def test_multiple_situations_sorted_worst_first():
-    s1 = _train(MON_0800, jkey="a", p_cancel=0.4)
-    s2 = _train(MON_0800, jkey="b", p_cancel=0.9)
+    s1 = _train(MON_0800, jkey="a", p_impact_dep=0.4)
+    s2 = _train(MON_0800, jkey="b", p_impact_dep=0.9)
     alerts = match(_journey(), {"S1": s1, "S2": s2})
     assert [a.situation_number for a in alerts] == ["S2", "S1"]
 
@@ -189,6 +198,45 @@ def test_operator_collision_not_merged():
     alerts = match(_journey(), {"S1": sky + atb_board_only})
     assert len(alerts) == 1
     assert alerts[0].cancel_probability == 0.8  # SKY's train, not ATB's boarding-only 0.99
+
+
+def _push_body(**board_kw) -> str:
+    """The Web Push body for the single match produced by a train with these boarding numbers."""
+    journey = _journey()
+    alerts = match(journey, {"S1": _train(MON_0800, **board_kw)})
+    assert len(alerts) == 1
+    return _notification_payload(journey, alerts[0])["body"]
+
+
+def test_push_body_leads_with_the_alerting_score():
+    # The real regression (prd, 2026-07-27): a 93 % impact alert on a train with a 1 % cancellation
+    # probability read "1 % sjanse for innstilling, typisk 2 min forsinket" — the two numbers that
+    # matter least. The body must quote the impact probability and the exceedance-stack interval.
+    body = _push_body(
+        p_cancel=0.01,
+        p_impact_dep=0.93,
+        dep_delay_typ_min=2,
+        dep_delay_p50_stack_min=15,
+        dep_delay_p90_stack_min=27,
+    )
+    assert "93 % sjanse for innstilling eller ≥ 10 min forsinkelse" in body
+    assert "typisk 15–27 min forsinket" in body
+    assert "1 %" not in body and "2 min" not in body
+
+
+def test_push_body_leads_with_cancellation_when_that_dominates():
+    # Bus alerts are mostly cancellation-driven (p_cancel .75-.95): a small delay interval would be
+    # beside the point for a train that probably isn't running.
+    body = _push_body(operator="SKY", p_cancel=0.95, p_impact_dep=0.97,
+                      dep_delay_p50_stack_min=3, dep_delay_p90_stack_min=8)
+    assert "97 % sjanse for innstilling eller ≥ 10 min forsinkelse" in body
+    assert "mest sannsynlig innstilt" in body
+    assert "min forsinket" not in body
+
+
+def test_push_body_collapses_a_single_delay_figure():
+    body = _push_body(p_cancel=0.02, dep_delay_p50_stack_min=12, dep_delay_p90_stack_min=12)
+    assert "typisk 12 min forsinket" in body
 
 
 if __name__ == "__main__":
