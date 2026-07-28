@@ -653,15 +653,24 @@ class HourVolume:
 
 
 def _volume_query(point_ids: list[str], from_dt: datetime, to_dt: datetime) -> str:
-    """One aliased Trafikkdata GraphQL query covering every corridor point (verified live with
-    curl 2026-07-11 — aliases work, so the trailing window is a single call, not per-point)."""
+    """One aliased Trafikkdata GraphQL query covering every corridor point, so the trailing
+    window is a single call rather than one per point.
+
+    Each `p<i>:` fragment must close exactly the nine blocks it opens (trafficData, volume,
+    byHour, edges, node, byDirection, total, volumeNumbers, coverage) — the outer document
+    braces are added by the return below. An earlier version emitted one `}` too many, which
+    closed the document after `p0` and left `p1:` onward as trailing garbage; Trafikkdata
+    rejected the whole query with "extra tokens ... Offending token 'p1'", so every
+    multi-point fetch failed while a single-point one still parsed. test_volume_query_*
+    pins the brace balance.
+    """
     parts = []
     for i, pid in enumerate(point_ids):
         parts.append(
             f'p{i}: trafficData(trafficRegistrationPointId: "{pid}") {{ volume {{ '
             f'byHour(from: "{from_dt.isoformat()}", to: "{to_dt.isoformat()}") {{ '
             "edges { node { from to byDirection { heading "
-            "total { volumeNumbers { volume } coverage { percentage } } } } } } } } }"
+            "total { volumeNumbers { volume } coverage { percentage } } } } } } } }"
         )
     return "{ " + " ".join(parts) + " }"
 
