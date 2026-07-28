@@ -142,7 +142,10 @@ the 2025 summer engineering works.
   arrival-side at Oslo S over the JP departure board (`estimatedCalls` — includes cancelled
   trips; the `trip` query silently drops them) plus the kix-avvik per-call prediction snapshot
   (demote-only). Road providers behind a frozen `RoadObservation` interface: Trafikkdata
-  volumes (live, gated), DATEX stub (activates when credentials exist). 35 hermetic tests.
+  volumes (wired and gated — but see the correction below: the fetch itself was broken until
+  2026-07-28, so it never actually returned a row), DATEX stub (activates when credentials
+  exist). 35 hermetic tests — and the hermeticism is exactly why the broken fetch shipped:
+  every test injects a fake fetcher, so nothing exercised the real query builder's output.
 - **Honesty machinery that actually bit:** the R5 precision gate is real code — because the
   backtest measured 0.60 < 0.8, a volume-only "congested" returns
   `UNKNOWN / VOLUME_BELOW_PRECISION_BAR` ("Mulig kø på E18, men datagrunnlaget er ikke presist
@@ -152,6 +155,40 @@ the 2025 summer engineering works.
   `reisevalg_road_mornings`, `reisevalg_backtest`, `reisevalg_bus_*` (probe tables);
   `data/svv/download_volumes.py` (re-runnable backfill), `data/queries/reisevalg_*.sql`
   (re-runnable analysis).
+
+### Correction 2026-07-28: the live volume fetch never worked
+
+Found while verifying a dev deploy. `_volume_query` emitted one `}` too many per point
+fragment, so the GraphQL document closed early and Trafikkdata rejected the whole request
+(`Offending token '}'` for one point, `'p1'` for more). This affected **every** point count,
+so the live volume provider had never returned a row in production — not once, at any time
+between 2026-07-11 and the fix.
+
+**The findings in this document are unaffected.** Nothing in the analysis ran through that
+function:
+
+- the 340,504-row ingest used `data/svv/download_volumes.py`, which has its own
+  correctly-formed query (GraphQL variables, one point per request, cursor pagination);
+- every quantitative result — precision 0.60 and the 8 deficit variants, `svv_baselines`,
+  the rail-normal / opportunity / conflict rates, break-even, the ≤4.1% drift check — is
+  computed in BigQuery by `data/queries/reisevalg_*.sql` over that table;
+- the publication-lag figure was re-measured with the fixed fetcher on 2026-07-28:
+  **152 min**, inside the 134–194 min band and this time in daytime, so
+  `VOLUME_MAX_AGE_MIN = 250` stands;
+- the in-window endpoint captures below were always injected, and the one live capture
+  (`OUTSIDE_WINDOW`) short-circuits before the fetcher.
+
+Two lessons worth carrying forward:
+
+- **"Verified live with curl" verified different text than the code emitted.** Aliases do
+  work (a 3-point call returns 12 rows), but the brace error entered when the hand-typed
+  curl query was translated into Python string-building. Treat a curl note as evidence about
+  the *API*, never about the builder.
+- **The failure was invisible by design.** The TTL cache caught it, logged one
+  `volume fetch failed; serving previous value` per pod with a retry cooldown, and the
+  precision gate meant no user-facing output changed — so a real outage in the road side
+  looked exactly like the intended gating. `test_volume_query_is_brace_balanced` and
+  `test_volume_query_requests_every_point_once` now pin the query shape.
 
 ### Captured endpoint responses
 
@@ -202,7 +239,7 @@ instrument. Backtest window 06:00–09:30 vs live 05:30–09:30.
 
 | Source | Access | Verdict |
 |---|---|---|
-| SVV Trafikkdata GraphQL | open, no key, User-Agent | hourly volumes only; 2y history; publication lag 134–194 min |
+| SVV Trafikkdata GraphQL | open, no key, User-Agent | hourly volumes only; 2y history; publication lag 134–194 min (re-measured 152 min on 2026-07-28). Aliased multi-point queries work — one call covers the corridor. Reachable from the GKE cluster (confirmed 2026-07-27: dev got a GraphQL error response, not a connection failure) |
 | SVV DATEX II GetTravelTimeData / GetSituation | registration (org, fixed IP), free, NLOD | 5-min travel times, E18 covered; **no archive** — request prepared (`datex-access-request.md`); fixed-IP question vs GKE egress NAT unresolved |
 | Entur JP v3 (`ET-Client-Name`) | open | departure board incl. cancellations + `datedServiceJourney` refs (verified live); car routing Lier→Oslo S 36 min/40.9 km |
 | kix-avvik per-call predictions | in-process | joins JP refs exactly (`VYG:DatedServiceJourney:…`) |
@@ -226,9 +263,15 @@ $100 cap; the $10-per-operation ask-first bar was never approached.
    it may make DATEX optional. Constraint: the live provider must read from an anshar/SIRI-ET
    real-time scan (the `rail_calls_planned_today.sql` pattern) — `last_recorded` is a daily
    batch table, training-only (established repo learning); it cannot feed a live signal.
+   Note: the Trafikkdata provider is **not** a validated baseline to compare against — it
+   only started returning data on 2026-07-28 (see the correction above), so any live
+   comparison between the two providers starts from scratch.
 3. Observe the live endpoint through at least one normal-traffic week (post-fellesferie,
-   post-summer-works) before drawing live-behavior conclusions; verify cluster egress to
-   `trafikkdata-api.atlas.vegvesen.no` on the first dev deploy.
+   post-summer-works) before drawing live-behavior conclusions. When reading that week, note
+   that a road side stuck on `UNKNOWN` has **two** possible causes — the intended precision
+   gate and a failing fetch — and they are indistinguishable from the response alone; check
+   the `reisevalg_volume_error` log event to tell them apart. (Cluster egress to
+   `trafikkdata-api.atlas.vegvesen.no` is already confirmed — see the API access map.)
 4. prd stays road-side-`UNKNOWN` by design: `svv_baselines` is deliberately **not** in
    `copy_runtime_to_prd.sh` until the verdict on a validated road provider is positive.
 5. If the PDF's authors intend the *routine-rush* reading (daily mode comparison rather than
