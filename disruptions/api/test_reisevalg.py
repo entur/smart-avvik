@@ -570,6 +570,44 @@ def _hour_row(point, hour_start, volume, heading="Oslo", coverage=100.0):
     )
 
 
+def test_volume_query_is_brace_balanced():
+    """Regression: the query builder used to emit one `}` too many per point, which closed the
+    GraphQL document early. Trafikkdata then rejected the whole request ("extra tokens ...
+    Offending token '}'" for one point, "'p1'" for more), so EVERY live volume fetch failed
+    while the TTL cache logged one error per pod and served the previous value. Assert the
+    document is balanced and never closes before the end, for one point and for many."""
+    f = datetime(2026, 7, 8, 6, 0, tzinfo=UTC)
+    t = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
+    for n in (1, 2, 5):
+        q = reisevalg._volume_query([f"P{i}" for i in range(n)], f, t)
+        assert q.count("{") == q.count("}"), f"unbalanced braces for {n} point(s): {q}"
+        depth = 0
+        for pos, ch in enumerate(q):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                assert depth > 0 or pos == len(q) - 1, (
+                    f"document closed at char {pos} of {len(q)} for {n} point(s); "
+                    f"trailing garbage: {q[pos + 1:pos + 20]!r}"
+                )
+        assert depth == 0
+        # Every point must be addressable in the response by its alias.
+        for i in range(n):
+            assert f"p{i}: trafficData(" in q
+
+
+def test_volume_query_requests_every_point_once():
+    """One aliased call covers the whole corridor -- not one request per point."""
+    f = datetime(2026, 7, 8, 6, 0, tzinfo=UTC)
+    t = datetime(2026, 7, 8, 8, 0, tzinfo=UTC)
+    q = reisevalg._volume_query(["AAA", "BBB", "CCC"], f, t)
+    assert q.count("trafficData(") == 3
+    assert q.count("byHour(") == 3
+    for pid in ("AAA", "BBB", "CCC"):
+        assert f'trafficRegistrationPointId: "{pid}"' in q
+
+
 def test_volume_hour_states_deficit_direction_and_coverage():
     base = _baseline_cells()
     h6, h7 = _oslo(2026, 7, 8, 6, 0), _oslo(2026, 7, 8, 7, 0)
