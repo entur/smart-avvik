@@ -28,6 +28,7 @@ Design notes
 
 import json
 import logging
+import re
 import threading
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -53,6 +54,14 @@ _DEPART_BUCKET = timedelta(minutes=5)
 # Only propose an alternative that saves at least this much — shaving a minute off is noise, and
 # quoting it as advice would cost more trust than it buys.
 _MIN_MINUTES_SAVED = 3
+# An NSR stop reference, e.g. NSR:StopPlace:337 or NSR:Quay:11274. Deliberately excludes the quote
+# and brace characters that would let a value escape the GraphQL string literal it is spliced into.
+_STOP_REF = re.compile(r"^[A-Za-z]{2,10}:(StopPlace|Quay):[A-Za-z0-9_-]{1,40}$")
+
+
+def _is_stop_ref(value: str) -> bool:
+    """True when `value` is shaped like an NSR stop reference."""
+    return bool(_STOP_REF.match(value or ""))
 # How many patterns to ask JP for. Enough that a few can be filtered out (wrong line, too slow)
 # and something still survives.
 _NUM_TRIP_PATTERNS = 6
@@ -179,18 +188,33 @@ class _KeyedTTLCache:
             with self._lock:
                 self._failed_at[key] = now
                 self._refreshing.discard(key)
+                self._expire_failures(now)
                 entry = self._entries.get(key)
             return entry[0] if entry else None
         with self._lock:
             self._entries[key] = (value, now)
             self._failed_at.pop(key, None)
             self._refreshing.discard(key)
+            self._expire_failures(now)
             # Keep the cache bounded: stop pairs are user-chosen, so this is unbounded in principle.
             if len(self._entries) > 500:
                 oldest = sorted(self._entries.items(), key=lambda kv: kv[1][1])[:100]
                 for k, _ in oldest:
                     self._entries.pop(k, None)
         return value
+
+    def _expire_failures(self, now: datetime) -> None:
+        """Drop failure marks that can no longer suppress a fetch. Caller holds the lock.
+
+        `_entries` is capped but `_failed_at` was not, and it only ever shed a key on a later
+        *success* for that same key. The key embeds a 5-minute wall-clock bucket, so it grows with
+        time rather than with traffic: a stop pair mints up to 288 keys a day whether anyone asks
+        again or not, and on a long-lived single pod that never comes back. Runs on the failure path
+        too — during a total Journey Planner outage the success path never executes.
+        """
+        stale = [k for k, t in self._failed_at.items() if now - t >= self._failure_cooldown]
+        for k in stale:
+            self._failed_at.pop(k, None)
 
 
 _cache = _KeyedTTLCache(_TTL, _FAILURE_COOLDOWN)
@@ -352,6 +376,18 @@ def find_faster(
     `depart_after` is when the traveller can realistically leave. Returns None on any failure, on
     an empty result, and when nothing saves at least `_MIN_MINUTES_SAVED` minutes.
     """
+    if not (_is_stop_ref(from_stop) and _is_stop_ref(to_stop)):
+        # Both refs are spliced into the GraphQL document as string literals, and both originate in
+        # unauthenticated input (/impact's query params, JourneyIn's fields) validated only as short
+        # strings. Nothing reaches here today with a quote in it -- find_faster is only called once
+        # the refs have matched real stop_places in the prediction cache -- but that containment is
+        # an accident of an unrelated code path, and the sibling reisevalg module was already bitten
+        # once by hand-built GraphQL (PR #22). Refuse the shape here, where the assumption lives.
+        logger.warning(
+            "Refusing a Journey Planner lookup for a non-NSR stop ref",
+            extra={"fields": {"event": "alternatives_error", "reason": "bad_stop_ref"}},
+        )
+        return None
     now = now or datetime.now(depart_after.tzinfo)
     bucket = int(depart_after.timestamp() // _DEPART_BUCKET.total_seconds())
     key = (from_stop, to_stop, bucket)

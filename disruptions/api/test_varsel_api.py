@@ -98,6 +98,12 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
 
 varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
 
+# Suite-wide: this provider calls the REAL _impact_for_trip, which calls alternatives.find_faster
+# whenever with_alternative=True. Individual tests stubbing find_faster is not enough — any test that
+# exercises the poller path without stubbing it would issue a live HTTPS request to api.entur.io from
+# CI and eat the 3 s timeout, failing open so nobody would notice. Make it structurally impossible.
+main.alternatives.find_faster = lambda *a, **k: None
+
 app = FastAPI()
 app.include_router(varsel.router)
 client = TestClient(app)
@@ -110,6 +116,7 @@ def _reset_state():
         varsel._notified.clear()
         varsel._messages.clear()
         varsel._alternatives.clear()
+        varsel._message_attempts.clear()
     _use_snapshot(SNAPSHOT)
 
 
@@ -368,6 +375,56 @@ def test_llm_call_cap_is_respected(monkeypatch):
     assert len(sent) == 2, "both journeys are still pushed"
     bodies = sorted(p["body"] for p in sent)
     assert bodies[0] != bodies[1], "one written, one deterministic"
+
+
+def test_a_message_that_cannot_be_written_is_not_retried_forever(monkeypatch):
+    """A write that fails for a payload-dependent reason fails the same way every tick. Without a
+    give-up point the poller re-issues it every 60 s for the situation's whole life (~720 calls),
+    each one burning a slot from the per-cycle cap that a journey which WOULD have succeeded cannot
+    then use — and none of it can change anything, because the push already went out with the
+    deterministic wording on the first tick.
+    """
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(
+        varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent"
+    )
+    attempts = []
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda *a, **k: attempts.append(1) or None
+    )
+    _register(DEVICE)
+
+    for _ in range(10):  # ten poller cycles on the same live situation
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert len(attempts) == varsel._MAX_MESSAGE_ATTEMPTS, (
+        f"expected the write to be abandoned after {varsel._MAX_MESSAGE_ATTEMPTS} attempts, "
+        f"got {len(attempts)}"
+    )
+    assert len(sent) == 1, "the push still went out once, with the deterministic wording"
+
+
+def test_a_written_message_clears_the_failure_count(monkeypatch):
+    """The give-up counter must not leak across a recovery: a transient failure followed by a
+    success has to leave the journey able to be re-written for the next situation.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        return None if len(calls) == 1 else "Skrevet melding."
+
+    monkeypatch.setattr(varsel, "_write_message", flaky)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)  # fails
+    varsel.check_and_notify(SNAPSHOT)  # succeeds
+    assert not varsel._message_attempts, "a success must clear the count, not leave it at 1"
+
+    varsel.check_and_notify(SNAPSHOT)  # cached now -- no third call
+    assert len(calls) == 2
 
 
 def test_journey_listing_carries_the_pushed_message(monkeypatch):

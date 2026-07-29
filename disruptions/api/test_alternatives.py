@@ -12,6 +12,8 @@ import alternatives
 from alternatives import _KeyedTTLCache, find_faster, select_faster
 
 REF = datetime(2026, 7, 29, 9, 0, tzinfo=UTC)  # the disrupted train's predicted arrival
+FROM = "NSR:StopPlace:337"  # Oslo S — find_faster requires real NSR ref shapes (see the guard test)
+TO = "NSR:StopPlace:418"  # Drammen
 
 
 def _pattern(arrive_min, *, dep_min=0, line="VYG:Line:R11", dsj="VYG:DatedServiceJourney:X_26-07-29",
@@ -128,7 +130,7 @@ def test_find_faster_contains_a_parsing_failure():
     ]
     alternatives._cache = _KeyedTTLCache(timedelta(minutes=2), timedelta(minutes=2))
     try:
-        assert find_faster("A", "B", reference_arrival=REF,
+        assert find_faster(FROM, TO, reference_arrival=REF,
                            depart_after=REF - timedelta(minutes=40),
                            excluded_jkeys=set(), excluded_lines=set(), now=REF) is None
     finally:
@@ -210,8 +212,8 @@ def test_find_faster_returns_none_on_empty_patterns():
     try:
         assert (
             find_faster(
-                "A",
-                "B",
+                FROM,
+                TO,
                 reference_arrival=REF,
                 depart_after=REF - timedelta(minutes=40),
                 excluded_jkeys=set(),
@@ -222,6 +224,63 @@ def test_find_faster_returns_none_on_empty_patterns():
         )
     finally:
         alternatives._fetch_patterns = original
+
+
+def test_a_stop_ref_that_could_escape_the_graphql_literal_is_refused_before_any_fetch():
+    """Both refs are spliced into the GraphQL document as string literals and both originate in
+    unauthenticated input. Nothing malformed reaches find_faster today, but only because an unrelated
+    code path filters it — so the guard belongs here, where the assumption is actually made.
+    """
+    original = alternatives._fetch_patterns
+    attempts = []
+    alternatives._fetch_patterns = lambda *a, **k: attempts.append(1) or [_pattern(-20)]
+    alternatives._cache = _KeyedTTLCache(timedelta(minutes=2), timedelta(minutes=2))
+    hostile = [
+        'NSR:StopPlace:1"} ) { id } } evil { ',  # closes the literal and opens a new selection
+        "NSR:StopPlace:1\nfoo",
+        "A",
+        "",
+        "NSR:Line:337",  # a real ref shape, but not a stop
+    ]
+    try:
+        for ref in hostile:
+            for pair in ((ref, TO), (FROM, ref)):
+                assert (
+                    find_faster(
+                        pair[0], pair[1], reference_arrival=REF,
+                        depart_after=REF - timedelta(minutes=40),
+                        excluded_jkeys=set(), excluded_lines=set(), now=REF,
+                    )
+                    is None
+                ), f"{ref!r} must not reach the Journey Planner"
+        assert not attempts, "the guard must refuse before the fetch, not after"
+        # And the shapes that are legitimate still work.
+        assert find_faster(
+            FROM, "NSR:Quay:11274", reference_arrival=REF,
+            depart_after=REF - timedelta(minutes=40),
+            excluded_jkeys=set(), excluded_lines=set(), now=REF,
+        ) is not None
+    finally:
+        alternatives._fetch_patterns = original
+
+
+def test_failure_marks_do_not_accumulate_past_their_cooldown():
+    """`_entries` was capped but `_failed_at` was not, and it only shed a key on a later SUCCESS for
+    that same key. The key embeds a 5-minute wall-clock bucket, so it grew with time rather than
+    traffic — and during a total JP outage the success path that pruned it never ran at all.
+    """
+    cache = _KeyedTTLCache(timedelta(seconds=0), timedelta(minutes=5))
+
+    def boom():
+        raise RuntimeError("JP down")
+
+    now = REF
+    for i in range(50):  # 50 distinct keys, as a moving departure bucket would mint
+        cache.get(("A", "B", i), boom, now)
+    assert len(cache._failed_at) == 50, "inside the cooldown the marks are still load-bearing"
+
+    cache.get(("A", "B", 999), boom, now + timedelta(minutes=6))
+    assert len(cache._failed_at) == 1, "expired marks cannot suppress a fetch, so they are garbage"
 
 
 def test_find_faster_buckets_the_departure_time_for_cache_reuse():
@@ -238,8 +297,8 @@ def test_find_faster_buckets_the_departure_time_for_cache_reuse():
         base = REF - timedelta(minutes=40)
         for offset in (0, 1, 2):
             find_faster(
-                "A",
-                "B",
+                FROM,
+                TO,
                 reference_arrival=REF,
                 depart_after=base + timedelta(minutes=offset),
                 excluded_jkeys=set(),
