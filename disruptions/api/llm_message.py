@@ -33,6 +33,7 @@ Design notes
 import json
 import logging
 import os
+import re
 import threading
 from collections.abc import Callable
 from datetime import datetime
@@ -168,6 +169,17 @@ def _claude_write(payload_json: str) -> str:
             extra={"fields": {"event": "llm_message", "provider": "claude", "result": "refusal"}},
         )
         return ""
+    if response.stop_reason not in (None, "end_turn", "stop_sequence"):
+        # Mirrors the Gemini finish_reason guard. A truncated reply is not a message. Today the JSON
+        # schema means truncation also fails _extract_message's json.loads, but that is a side effect
+        # of the schema, not a guard: drop the schema or get a prose answer and the raw-text fallback
+        # would push half a sentence. Reject it here, where the reason is still known.
+        logger.warning(
+            "Claude reply was not complete (stop_reason=%s)",
+            response.stop_reason,
+            extra={"fields": {"event": "llm_message", "provider": "claude", "result": "truncated"}},
+        )
+        return ""
     return "".join(block.text for block in response.content if block.type == "text")
 
 
@@ -266,10 +278,23 @@ def _pct(value: float | None) -> int | None:
 
 # Per-field cap on free text entering the prompt.
 _TEXT_MAX_CHARS = 400
+# Names (stops, lines, legs) are short by nature; a long one is a sign of something else.
+_NAME_MAX_CHARS = 80
+# Ceiling on how many situations and lines are described. A journey caught by a network-wide event
+# can match many at once, and without a bound both the prompt and the logged payload grow with it.
+_MAX_PAYLOAD_ITEMS = 6
 
 
-def _bounded_text(value: object) -> str | None:
-    """Collapse whitespace, drop non-printables, and truncate. For publisher free text."""
+def _bounded_text(value: object, limit: int = _TEXT_MAX_CHARS) -> str | None:
+    """Collapse whitespace, drop non-printables, and truncate.
+
+    For EVERY string entering the prompt, not just publisher free text. The fence used to guard only
+    `summary`/`description`, which held solely because the other strings — stop and leg names, line
+    codes — come from the NSR registry and the Journey Planner, and because `reise.fra` only falls
+    back to the client-supplied ref when that ref already matched a real stop. That is containment by
+    accident of an unrelated code path; the invariant this module states is structural, so enforce it
+    where the values are actually consumed.
+    """
     if not isinstance(value, str):
         return None
     collapsed = " ".join(value.split())
@@ -278,7 +303,7 @@ def _bounded_text(value: object) -> str | None:
     # text could close the fence and address the model directly (review 2026-07-29). No legitimate
     # Norwegian stop name or disruption description needs them.
     fenced = printable.replace("<", " ").replace(">", " ")
-    return " ".join(fenced.split())[:_TEXT_MAX_CHARS] or None
+    return " ".join(fenced.split())[:limit] or None
 
 
 # CLIENT-supplied stop names never reach this prompt.
@@ -331,17 +356,19 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
     for line in getattr(impact, "lines", []) or []:
         obs = getattr(line, "latest_observation", None)
         entry: dict[str, Any] = {
-            "linje": getattr(line, "line", None),
-            "operator": getattr(line, "operator", None),
+            "linje": _bounded_text(getattr(line, "line", None), _NAME_MAX_CHARS),
+            "operator": _bounded_text(getattr(line, "operator", None), _NAME_MAX_CHARS),
         }
         if obs is not None:
             entry["siste_observasjon"] = {
                 "innstilt": obs.cancelled,
-                "stopp": obs.at_stop_name or obs.at_stop,
+                "stopp": _bounded_text(obs.at_stop_name or obs.at_stop, _NAME_MAX_CHARS),
                 "forsinket_min": obs.delayed_min,
                 "observert_kl": _hhmm(obs.observed_at),
             }
         lines.append(entry)
+        if len(lines) >= _MAX_PAYLOAD_ITEMS:
+            break
 
     # SX text is publisher-authored and `description` is "often several sentences" with no upper
     # bound. Capping it bounds the injection surface, the token spend, and the log record size; a
@@ -351,14 +378,17 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
             "sammendrag": _bounded_text(getattr(sit, "summary", None)),
             "beskrivelse": _bounded_text(getattr(sit, "description", None)),
         }
-        for sit in (getattr(impact, "situations", []) or [])
+        for sit in (getattr(impact, "situations", []) or [])[:_MAX_PAYLOAD_ITEMS]
     ]
 
     payload: dict[str, Any] = {
         "reise": {
-            # Server-side names only — see the note above _canonical_stop_name.
-            "fra": _canonical_stop_name(journey.get("from_stop")) or journey.get("from_stop"),
-            "til": _canonical_stop_name(journey.get("to_stop")) or journey.get("to_stop"),
+            # Server-side names only — see the note above _canonical_stop_name. The fallback is the
+            # client-supplied ref, so it is bounded like everything else rather than trusted.
+            "fra": _canonical_stop_name(journey.get("from_stop"))
+            or _bounded_text(journey.get("from_stop"), _NAME_MAX_CHARS),
+            "til": _canonical_stop_name(journey.get("to_stop"))
+            or _bounded_text(journey.get("to_stop"), _NAME_MAX_CHARS),
         },
         "transportmiddel": getattr(alert, "mode", None),
         "avgang_kl": _hhmm(getattr(alert, "departure_time", None)),
@@ -380,10 +410,10 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
             "minutter_spart": alt.minutes_saved,
             "reisevei": [
                 {
-                    "transportmiddel": leg.mode,
-                    "linje": leg.public_code or leg.line,
-                    "fra": leg.from_name,
-                    "til": leg.to_name,
+                    "transportmiddel": _bounded_text(leg.mode, _NAME_MAX_CHARS),
+                    "linje": _bounded_text(leg.public_code or leg.line, _NAME_MAX_CHARS),
+                    "fra": _bounded_text(leg.from_name, _NAME_MAX_CHARS),
+                    "til": _bounded_text(leg.to_name, _NAME_MAX_CHARS),
                 }
                 for leg in (alt.legs or [])
                 if leg.mode != "foot"
@@ -405,6 +435,14 @@ def _extract_message(raw: str) -> str | None:
     text = (raw or "").strip()
     if not text:
         return None
+    if text.startswith("```"):
+        # A model that ignores the schema is exactly the model that fences its JSON. Without this the
+        # reply starts with a backtick, misses the JSON branch, and a short ```json {"melding": …}```
+        # block goes to a lock screen verbatim, backticks and all.
+        text = re.sub(r"^```[A-Za-z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+        if not text:
+            return None
     if text.startswith(("{", "[")):
         try:
             parsed = json.loads(text)

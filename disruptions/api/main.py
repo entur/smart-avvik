@@ -545,8 +545,6 @@ def _varsel_impact(
 ) -> "ImpactResponse":
     """/impact for a registered journey's boarding window, injected into varsel via configure().
 
-    `select="worst"` rather than /impact's `nearest`: an alert asks "is any train in this window
-    alert-worthy?", not "which train leaves closest to a given minute". Same matcher, same severity
     `with_alternative` defaults to False so the /varsel-api request path never makes a blocking
     Journey Planner call; the poller passes True. Keep this signature in step with varsel._impact's
     call: it is the one cross-module contract in this design, both test doubles hand-write their own
@@ -1240,7 +1238,10 @@ class LineImpact(BaseModel):
         description="Worst-case boarding prediction across the situations affecting this line.",
     )
     arrival_prediction: StopPrediction | None = Field(
-        description="Worst-case alighting prediction; null when `to_stop` is omitted or not served.",
+        description="Worst-case alighting prediction; null when `to_stop` is omitted. When "
+        "`to_stop` IS given, only trains that actually reach it after the boarding stop are "
+        "returned at all, so this is non-null — a line whose trains all terminate short is "
+        "omitted from the response rather than returned with a null arrival.",
     )
     latest_observation: LatestObservation | None = Field(
         default=None,
@@ -1740,8 +1741,10 @@ def _trip_cells(
         # operators' journeys — keying on jkey alone would merge them and let one train's boarding
         # ride the other's direction.
         by_journey: dict[tuple[str, str], list[_CallPred]] = {}
+        by_line_all: dict[str | None, list[_CallPred]] = {}
         for c in calls:
             by_journey.setdefault((c.operator, c.jkey), []).append(c)
+            by_line_all.setdefault(c.line, []).append(c)
 
         # Eligibility BEFORE per-line selection. Selecting first and checking the destination after
         # would drop a whole line whenever its most severe train happens not to serve `to_stop`,
@@ -1796,12 +1799,11 @@ def _trip_cells(
                     jkey=bcall.jkey,
                     departure=_departure_prediction(bcall),
                     arrival=_arrival_prediction(acall) if acall is not None else None,
-                    calls=tuple(
-                        c
-                        for c in calls
-                        if c.operator == bcall.operator and c.jkey == bcall.jkey
-                    ),
-                    line_calls=tuple(c for c in calls if c.line == line),
+                    # Reuse the groupings built above rather than re-scanning the situation's whole
+                    # call list once per emitted cell (that made a single O(calls) pass into
+                    # O(calls x lines), on both the /impact request path and every poller journey).
+                    calls=tuple(by_journey.get((bcall.operator, bcall.jkey), ())),
+                    line_calls=tuple(by_line_all.get(line, ())),
                 )
             )
     return cells

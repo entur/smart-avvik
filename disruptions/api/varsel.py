@@ -144,6 +144,11 @@ _MAX_JOURNEYS_PER_DEVICE = 20
 # every other cache, so an unbounded fan-out of LLM calls would stall ingestion. Journeys beyond the
 # cap get the deterministic wording this tick and are picked up on the next one.
 _MAX_LLM_CALLS_PER_CYCLE = 8
+# Give-up point for writing one journey × situation's message. Failures are payload-dependent as
+# often as they are transient (a refusal, an over-long or unparseable reply), so a write that failed
+# twice will very likely keep failing for this exact payload — and retrying costs a slot from the
+# per-cycle cap without being able to change what any user already saw.
+_MAX_MESSAGE_ATTEMPTS = 3
 # How long past a window's end a train from that window can still be worth alerting about. A train
 # is only ever dropped by its own predicted expected departure (`catchable_after`); this bound just
 # stops journey_windows from discarding the window before that check runs. Sized above the p90 delays
@@ -243,6 +248,9 @@ _messages: dict[str, str] = {}
 # (see match_journey) -- without this the field would be structurally null on the only endpoint that
 # serves it, which is how it shipped until review on 2026-07-29.
 _alternatives: dict[str, Any] = {}
+# Same key, same lifecycle: how many times writing this message has failed, so a payload the LLM
+# cannot handle is not retried on every tick for the situation's whole life.
+_message_attempts: dict[str, int] = {}
 
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
@@ -756,6 +764,8 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             _messages.pop(key, None)
         for key in [k for k in _alternatives if k.rsplit("|", 1)[1] not in live]:
             _alternatives.pop(key, None)
+        for key in [k for k in _message_attempts if k.rsplit("|", 1)[1] not in live]:
+            _message_attempts.pop(key, None)
         changed = bool(stale)
 
     # ---- Loop 1: one impact call and one written message per distinct journey definition --------
@@ -789,9 +799,16 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         with _state_lock:
             if worst.alternative_journey is not None:
                 _alternatives[message_key] = worst.alternative_journey
-        with _state_lock:
             already_written = message_key in _messages
+            attempts = _message_attempts.get(message_key, 0)
         if already_written:
+            continue
+        if attempts >= _MAX_MESSAGE_ATTEMPTS:
+            # Without this the retry never stops. A write that fails for a payload-dependent reason
+            # (a refusal, an over-long reply, an unparseable one) fails again on every 60 s tick for
+            # the situation's whole life -- ~720 Vertex calls that can change nothing, because the
+            # push already went out with the deterministic wording, each one burning a slot from
+            # _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have succeeded now cannot use.
             continue
         if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE:
             logger.info(
@@ -802,9 +819,10 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             )
             continue
         llm_calls += 1
-        # Belt and braces: _write_message already contains its own failures, but this loop is the
-        # notification path. Nothing the message step does may stop the remaining journeys being
-        # scored or the pushes going out.
+        # _write_message catches Exception itself, so this is belt and braces for a future edit that
+        # lets one escape. It records an attempt rather than `continue`-ing past the counter, so a
+        # raiser is subject to the same give-up rule as a None. Delivery is unaffected either way:
+        # loop 2 pushes independently and falls back to the deterministic wording.
         try:
             message = _write_message(journey, worst, journey_key=key)
         except Exception:
@@ -814,10 +832,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 exc_info=True,
                 extra={"fields": {"event": "llm_message", "result": "error"}},
             )
-            continue
-        if message:
-            with _state_lock:
+            message = None
+        with _state_lock:
+            if message:
                 _messages[message_key] = message
+                _message_attempts.pop(message_key, None)
+            else:
+                _message_attempts[message_key] = attempts + 1
 
     # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
     for jid, journey in journeys:
@@ -996,8 +1017,13 @@ async def stops() -> list[StopItem]:
 
 
 @router.post("/devices", summary="Register or refresh a device's push subscription")
-async def upsert_device(body: DeviceIn) -> dict:
-    """Store the browser's PushSubscription for this device_id (idempotent upsert)."""
+def upsert_device(body: DeviceIn) -> dict:
+    """Store the browser's PushSubscription for this device_id (idempotent upsert).
+
+    Plain `def`, not `async def`: `_save_state` constructs a GCS client and uploads the blob, which
+    is blocking network I/O. On `async def` that runs on the single-worker event loop and freezes
+    every other route, `/health` included. Same rule as `list_journeys`/`create_journey`/`/impact`.
+    """
     with _state_lock:
         existing = _devices.get(body.device_id)
         _devices[body.device_id] = {
@@ -1009,8 +1035,11 @@ async def upsert_device(body: DeviceIn) -> dict:
 
 
 @router.delete("/devices/{device_id}", summary="Forget a device's push subscription")
-async def delete_device(device_id: str) -> dict:
-    """Remove a device's subscription (e.g. the user turned notifications off). Journeys are kept."""
+def delete_device(device_id: str) -> dict:
+    """Remove a device's subscription (e.g. the user turned notifications off). Journeys are kept.
+
+    Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
+    """
     with _state_lock:
         _devices.pop(device_id, None)
         _save_state()
@@ -1106,11 +1135,14 @@ def create_journey(body: JourneyIn) -> Journey:
 
 
 @router.delete("/journeys/{journey_id}", summary="Delete a registered journey")
-async def delete_journey(
+def delete_journey(
     journey_id: str,
     device_id: str = Query(description="The owning device; a journey is only deleted by its owner."),
 ) -> dict:
-    """Delete a journey. 404 if it doesn't exist or isn't owned by this device."""
+    """Delete a journey. 404 if it doesn't exist or isn't owned by this device.
+
+    Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
+    """
     with _state_lock:
         rec = _journeys.get(journey_id)
         if rec is None or rec["device_id"] != device_id:
@@ -1161,8 +1193,13 @@ async def client_log(body: ClientLogIn, request: Request) -> dict:
 
 
 @router.post("/test", summary="Send a test push to verify delivery")
-async def test_push(body: TestIn) -> dict:
-    """Send a "Varsler er aktivert" push to this device — proves the subscription works."""
+def test_push(body: TestIn) -> dict:
+    """Send a "Varsler er aktivert" push to this device — proves the subscription works.
+
+    Plain `def`: `_send_push` blocks for up to `_PUSH_TIMEOUT_S` (10 s) against a client-supplied
+    push endpoint. On `async def` a slow endpoint freezes the whole event loop for that long, which
+    is enough to fail a liveness probe. See `upsert_device`.
+    """
     if not push_enabled():
         raise HTTPException(status_code=503, detail="Push er ikke konfigurert på tjeneren.")
     with _state_lock:
