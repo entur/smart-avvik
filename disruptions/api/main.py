@@ -276,6 +276,7 @@ class _CallPred:
 
     situation_number: str
     summary: str | None
+    description: str | None  # the operator's own explanation; often several sentences
     jkey: str
     operator: str  # ref codespace (== SIRI ref prefix): VYG, GOA, RUT, KOL, SKY, ATB, ...
     line: str | None
@@ -284,6 +285,14 @@ class _CallPred:
     stop_order: int
     aimed_dep: datetime | None
     aimed_arr: datetime | None
+    # OBSERVED state (what ET already declares), as opposed to everything below it (what the models
+    # predict). `call_source` is 'recorded' once the vehicle has actually served the stop and
+    # 'estimated' while it is still upcoming, so it is the flag that says whether the two observed
+    # fields mean anything. Freshness is bounded by the planned-source TTL, not by "now" -- see
+    # maybe_refresh_planned_calls.
+    et_declared_cancelled: bool | None
+    et_dep_delay_min: int | None
+    call_source: str | None
     p_cancel: float
     dep_delay_typ_min: int | None
     dep_delay_p90_min: int | None
@@ -390,6 +399,7 @@ def _call_pred_from_row(r, operator: str) -> _CallPred:
     return _CallPred(
         situation_number=r.situationNumber,
         summary=r.summary,
+        description=r.description,
         jkey=r.jkey,
         operator=operator,
         line=r.lineRef,
@@ -398,6 +408,9 @@ def _call_pred_from_row(r, operator: str) -> _CallPred:
         stop_order=r.stop_order,
         aimed_dep=r.aimed_dep,
         aimed_arr=r.aimed_arr,
+        et_declared_cancelled=r.et_declared_cancelled,
+        et_dep_delay_min=r.et_dep_delay_min,
+        call_source=r.call_source,
         p_cancel=r.p_cancel,
         dep_delay_typ_min=r.dep_delay_typ_min,
         dep_delay_p90_min=r.dep_delay_p90_min,

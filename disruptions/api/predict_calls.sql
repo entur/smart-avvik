@@ -46,6 +46,10 @@ sit AS (
     d.situationNumber,
     SAFE.TIMESTAMP(d.creationTime) AS onset_ts,
     d.summary,
+    -- Carried for serving only (never a feature): /impact returns the operator's own explanation
+    -- alongside the summary. Joined back at the final SELECT rather than threaded through `base`,
+    -- so this free text never widens the ML.PREDICT inputs.
+    d.description,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -82,6 +86,12 @@ base AS (
     a.situationNumber, a.onset_ts, a.summary,
     a.jkey, r.lineRef, r.stop_place, r.stop_name, r.aimed_dep, r.aimed_arr,
     r.call_cancelled AS et_declared_cancelled,
+    -- OBSERVED state, not predicted: the realized departure delay on a call ET has already
+    -- operated, and whether this call came from recordedCalls ('recorded' -> observed) or
+    -- estimatedCalls ('estimated' -> still in the future). /impact reads these as
+    -- `latest_observation`; the propagation features already read the same two columns.
+    r.dep_delay_min AS et_dep_delay_min,
+    r.call_source,
     COALESCE(r.aimed_dep, r.aimed_arr) AS call_ts,
     IFNULL(a.status, 'other') AS status,
     IFNULL(a.planned, FALSE)  AS planned,
@@ -549,10 +559,10 @@ scored AS (
   JOIN wd40h ON wd40h.lead_bucket = c.lead_bucket
 )
 SELECT
-  s.situationNumber, s.summary, s.onset_ts,
+  s.situationNumber, s.summary, sd.description, s.onset_ts,
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
-  s.et_declared_cancelled,
+  s.et_declared_cancelled, s.et_dep_delay_min, s.call_source,
   ROUND(1/(1+EXP(-(wch.b + wch.a *
     LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)))))), 4) AS p_cancel,
   IF(s.is_terminal, NULL, GREATEST(CAST(ROUND(EXP(s.dep_plog)-1) AS INT64), 0)) AS dep_delay_typ_min,
@@ -624,6 +634,11 @@ SELECT
   , 4)) AS p_dep_ge10_h,
   s.lead_bucket AS platt_lead_bucket
 FROM scored AS s
+-- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
+-- join can never fan out the scored calls even if the source ever carries a duplicate.
+LEFT JOIN (
+  SELECT situationNumber, ANY_VALUE(description) AS description FROM sit GROUP BY situationNumber
+) AS sd ON sd.situationNumber = s.situationNumber
 JOIN wch  ON wch.lead_bucket  = s.lead_bucket
 JOIN wdh  ON wdh.lead_bucket  = s.lead_bucket
 JOIN w10h ON w10h.lead_bucket = s.lead_bucket
