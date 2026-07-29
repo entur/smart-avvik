@@ -5,10 +5,26 @@ import { Paragraph, SmallText } from '@entur/typography';
 import type { Alert, Journey } from '../api';
 import { CANCEL_LIKELY, TROUBLE_DELAY_MIN, fmtDelay, fmtPct, fmtTime, formatDays } from '../format';
 
-// One situation hitting the journey. The lead number is the alerting score the push gate reads —
-// P(innstilling eller >= 10 min forsinkelse), the same quantity and wording /demo shows — followed
-// by the dominant driver. A match below the operator's threshold is listed but not pushed, and says
-// so, so the list explains rather than contradicts the phone's notifications.
+// "Sist observert: Asker, 18 min forsinket (kl 07:42)" — what has actually happened on the line, as
+// opposed to what is predicted. Shown with its time because the observation can be up to an hour
+// old; without the time "sist observert" would read as "right now".
+function observationText(obs: NonNullable<Alert['latest_observation']>): string | null {
+  const stop = obs.at_stop_name ?? obs.at_stop;
+  if (!stop) return null;
+  const state = obs.cancelled
+    ? 'innstilt'
+    : obs.delayed_min
+      ? `${obs.delayed_min} min forsinket`
+      : 'i rute';
+  const when = obs.observed_at ? ` (kl ${fmtTime(obs.observed_at)})` : '';
+  return `Sist observert: ${stop}, ${state}${when}`;
+}
+
+// One situation hitting the journey. When a written message exists it leads — it is what the phone's
+// notification said, so the list should not contradict it. The probability line stays underneath as
+// the detail: the alerting score the push gate reads (P(innstilling eller >= 10 min forsinkelse), the
+// same quantity and wording /demo shows) followed by the dominant driver. A match below the
+// operator's threshold is listed but not pushed, and says so.
 function AlertLine({ alert }: { alert: Alert }) {
   const parts: string[] = [];
   if (alert.departure_time) parts.push(`${alert.mode ?? 'Tog'} kl ${fmtTime(alert.departure_time)}`);
@@ -21,12 +37,16 @@ function AlertLine({ alert }: { alert: Alert }) {
       : fmtDelay(alert.delay_p50_min, alert.delay_p90_min);
   if (driver) parts.push(driver);
   if (!alert.alertworthy) parts.push(`under varslingsterskelen (${fmtPct(alert.alert_threshold)})`);
+  const observation = alert.latest_observation ? observationText(alert.latest_observation) : null;
   return (
     <SmallAlertBox variant={alert.alertworthy ? 'negative' : 'warning'} width="fluid">
-      {alert.summary && (
-        <span className="av-alert-summary">{alert.summary}</span>
+      {alert.message ? (
+        <span className="av-alert-message">{alert.message}</span>
+      ) : (
+        alert.summary && <span className="av-alert-summary">{alert.summary}</span>
       )}
       <span className="av-alert-detail">{parts.join(' · ')}</span>
+      {observation && <span className="av-alert-observed">{observation}</span>}
     </SmallAlertBox>
   );
 }
