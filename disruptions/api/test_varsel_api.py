@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 import varsel
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from test_varsel import _OSLO, FakeCall  # reuse the synthetic call shape
+from test_varsel import _OSLO, FakeCall, main  # reuse the synthetic call shape + the stubbed main
 
 DEVICE = "dev-abc12345"
 SUBSCRIPTION = {"endpoint": "https://push.example.com/x", "keys": {"p256dh": "k", "auth": "a"}}
@@ -49,14 +49,14 @@ DEP = datetime.now(tz=_OSLO) + timedelta(hours=2)
 SNAPSHOT = {
     "S1": [
         FakeCall("t1", "A", 1, DEP, p_cancel=0.82, p_impact_dep=0.9),
-        FakeCall("t1", "B", 5, None),
+        FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
     ]
 }
 # Same shape, but the train left hours ago — must never produce an alert.
 SNAPSHOT_DEPARTED = {
     "S1": [
         FakeCall("t1", "A", 1, DEP - timedelta(hours=4), p_cancel=0.82, p_impact_dep=0.9),
-        FakeCall("t1", "B", 5, None),
+        FakeCall("t1", "B", 5, None, aimed_arr=DEP - timedelta(hours=4) + timedelta(minutes=40)),
     ]
 }
 STOPS = [
@@ -64,7 +64,29 @@ STOPS = [
     {"stop_place": "B", "stop_name": "Lillehammer", "mode": "Tog", "n_calls": 120},
 ]
 
-varsel.configure(snapshot_provider=lambda: SNAPSHOT, stops_provider=lambda: STOPS)
+# Point varsel at main's real /impact provider over a snapshot the tests can swap. Driving the real
+# provider (rather than faking impact responses) means these e2e checks exercise the same matcher
+# and severity order the deployed app does.
+_active_snapshot = {"value": SNAPSHOT}
+
+
+def _use_snapshot(snapshot):
+    _active_snapshot["value"] = snapshot
+
+
+def _impact_provider(*, from_stop, to_stop, window_start, window_end):
+    main._call_pred_by_situation = _active_snapshot["value"]
+    return main._impact_for_trip(
+        from_stop=from_stop,
+        to_stop=to_stop,
+        window_start=window_start,
+        window_end=window_end,
+        select="worst",
+        with_alternative=False,  # no Journey Planner calls from the test suite
+    )
+
+
+varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
 
 app = FastAPI()
 app.include_router(varsel.router)
@@ -76,6 +98,8 @@ def _reset_state():
         varsel._devices.clear()
         varsel._journeys.clear()
         varsel._notified.clear()
+        varsel._messages.clear()
+    _use_snapshot(SNAPSHOT)
 
 
 def test_config_reports_push_enabled():
@@ -181,12 +205,191 @@ def _register_matching_journey():
     )
 
 
+JOURNEY_BODY = {
+    "from_stop": "A", "from_name": "Oslo S", "to_stop": "B", "to_name": "Lillehammer",
+    "begin": "00:00", "end": "23:59", "days": [0, 1, 2, 3, 4, 5, 6],
+}
+
+
+def _register(device_id, **overrides):
+    client.post(
+        "/varsel-api/devices", json={"device_id": device_id, "subscription": SUBSCRIPTION}
+    )
+    r = client.post(
+        "/varsel-api/journeys", json={"device_id": device_id, **JOURNEY_BODY, **overrides}
+    )
+    assert r.status_code == 200, r.text
+    return r.json()["journey_id"]
+
+
+def _count_provider_calls(monkeypatch):
+    """Wrap the impact provider so a test can count how many times it is consulted."""
+    calls = []
+    real = varsel._impact_provider
+
+    def counting(**kw):
+        calls.append(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(varsel, "_impact_provider", counting)
+    return calls
+
+
+def test_same_journey_on_two_devices_shares_one_impact_call_and_one_message(monkeypatch):
+    """R6: two devices watching the same trip get identical text, computed once."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = []
+
+    def fake_write(journey, alert, *, journey_key):
+        written.append(journey_key)
+        return "Signalfeil ved Asker. Ta R10 kl 08:14 i stedet."
+
+    monkeypatch.setattr(varsel, "_write_message", fake_write)
+    provider_calls = _count_provider_calls(monkeypatch)
+
+    _register("dev-first-0001")
+    _register("dev-second-002")
+    provider_calls.clear()  # registration itself renders each journey; count only the notify pass
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(sent) == 2, "both devices must be notified"
+    assert sent[0]["body"] == sent[1]["body"] == "Signalfeil ved Asker. Ta R10 kl 08:14 i stedet."
+    assert len(written) == 1, "one written message per journey definition, not per device"
+    # No window is scored twice. (A journey can legitimately span more than one window -- today's
+    # and tomorrow's -- so the claim is "no duplicated work", not "exactly one call".)
+    distinct = {tuple(sorted(kw.items(), key=str)) for kw in provider_calls}
+    assert len(provider_calls) == len(distinct), (
+        f"{len(provider_calls)} impact calls for {len(distinct)} distinct windows -- "
+        "the second device re-drove work the first had already done"
+    )
+
+
+def test_different_journeys_are_computed_separately(monkeypatch):
+    """The compute cache keys on the journey definition — different trips must not share it."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: None)
+    provider_calls = _count_provider_calls(monkeypatch)
+
+    _register("dev-first-0001")  # 00:00-23:59
+    _register("dev-second-002", begin="06:00", end="10:00")
+    provider_calls.clear()
+
+    varsel.check_and_notify(SNAPSHOT)
+    starts = {kw["window_start"].astimezone(_OSLO).strftime("%H:%M") for kw in provider_calls}
+    assert "00:00" in starts and "06:00" in starts, (
+        f"both journey definitions must be scored; saw window starts {sorted(starts)}"
+    )
+
+
+def test_dedup_is_per_device_not_per_journey_definition(monkeypatch):
+    """The KTD7 trap: sharing the dedup key would let the first device silently suppress the rest."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: None)
+
+    first = _register("dev-first-0001")
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+    # A second device registers the identical journey after the first was already notified.
+    _register("dev-second-002")
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 2, "the second device must still get its own first push"
+    # ...and neither is pushed twice.
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 2
+    assert any(k.startswith(first) for k in varsel._notified)
+
+
+def test_message_failure_falls_back_to_the_deterministic_body(monkeypatch):
+    """A failing message writer costs wording, never the notification."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: None)
+
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+    assert "90 % sjanse for innstilling eller ≥ 10 min forsinkelse" in sent[0]["body"]
+
+
+def test_message_writer_exception_is_contained(monkeypatch):
+    """_write_message swallows everything, but assert the notify path survives a raiser too."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+
+    def boom(journey, alert, *, journey_key):
+        raise RuntimeError("Vertex exploded")
+
+    monkeypatch.setattr(varsel, "_write_message", boom)
+    _register(DEVICE)
+    try:
+        varsel.check_and_notify(SNAPSHOT)
+    except RuntimeError:
+        raise AssertionError("a message-writer failure must not break the notify pass") from None
+    assert len(sent) == 1, "the push still goes out with the deterministic wording"
+
+
+def test_llm_call_cap_is_respected(monkeypatch):
+    """With the cap at 1 and two alerting journeys, one gets written text and both are pushed."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 1)
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda journey, alert, *, journey_key: written.append(journey_key) or "Skrevet melding.",
+    )
+
+    _register("dev-first-0001")
+    _register("dev-second-002", begin="06:00", end="23:00")
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, "the cap must bound written messages per cycle"
+    assert len(sent) == 2, "both journeys are still pushed"
+    bodies = sorted(p["body"] for p in sent)
+    assert bodies[0] != bodies[1], "one written, one deterministic"
+
+
+def test_journey_listing_carries_the_pushed_message(monkeypatch):
+    """The in-app list says exactly what the push said — read from cache, not re-written."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda *a, **k: "Toget er mest sannsynlig innstilt."
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    assert r.status_code == 200
+    alerts = r.json()["journeys"][0]["alerts"]
+    assert alerts and alerts[0]["message"] == "Toget er mest sannsynlig innstilt."
+
+
+def test_journey_listing_omits_the_internal_impact_reference():
+    """Alert.impact is a working reference for the message writer, not part of the contract."""
+    _reset_state()
+    _register(DEVICE)
+    r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    alerts = r.json()["journeys"][0]["alerts"]
+    assert alerts, "the synthetic snapshot should produce a live match"
+    assert "impact" not in alerts[0]
+
+
 def test_departed_train_produces_no_alerts(monkeypatch):
     _reset_state()
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
-    # The live listing reads the injected snapshot provider; point it at the departed train.
-    monkeypatch.setattr(varsel, "_snapshot_provider", lambda: SNAPSHOT_DEPARTED)
+    _use_snapshot(SNAPSHOT_DEPARTED)
     _register_matching_journey()
     # The situation is still open, but its train left hours ago: no live match, no push.
     varsel.check_and_notify(SNAPSHOT_DEPARTED)

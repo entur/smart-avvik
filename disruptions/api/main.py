@@ -533,6 +533,25 @@ def _varsel_snapshot() -> dict[str, list]:
         return _call_pred_by_situation
 
 
+def _varsel_impact(
+    *, from_stop: str, to_stop: str, window_start: datetime, window_end: datetime
+) -> "ImpactResponse":
+    """/impact for a registered journey's boarding window, injected into varsel via configure().
+
+    `select="worst"` rather than /impact's `nearest`: an alert asks "is any train in this window
+    alert-worthy?", not "which train leaves closest to a given minute". Same matcher, same severity
+    order and same response shaping as the HTTP endpoint — that is the point of routing varsel
+    through here instead of letting it keep its own matcher.
+    """
+    return _impact_for_trip(
+        from_stop=from_stop,
+        to_stop=to_stop,
+        window_start=window_start,
+        window_end=window_end,
+        select="worst",
+    )
+
+
 def _reisevalg_call_predictions(journey_ref: str) -> list | None:
     """Per-call prediction rows for a full dated journey ref (e.g.
     'VYG:DatedServiceJourney:81613_DRM-DAL_26-07-13'), or None when no active disruption
@@ -628,7 +647,7 @@ async def lifespan(app: FastAPI):
         logger.exception("Initial impact lookup load failed; will retry on ingestion poll")
     # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
     # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
-    varsel.configure(snapshot_provider=_varsel_snapshot, stops_provider=_varsel_stops)
+    varsel.configure(impact_provider=_varsel_impact, stops_provider=_varsel_stops)
     varsel.load_state()
     try:
         refresh_varsel_stops()
@@ -1166,6 +1185,17 @@ class SituationImpact(BaseModel):
         default=None,
         description="The operator's fuller Norwegian explanation; often several sentences.",
     )
+    line: str | None = Field(
+        default=None,
+        description="Line ref the worst-case prediction below came from — which of this "
+        "situation's lines the numbers describe. Look it up in `lines` for that line's "
+        "`latest_observation`.",
+    )
+    operator: str | None = Field(
+        default=None,
+        description="Ref codespace of that line's journey (VYG, GOA, RUT, ...). Determines which "
+        "calibration family and alerting threshold apply.",
+    )
     departure_prediction: StopPrediction = Field(
         description="Worst-case boarding prediction across the lines this situation affects.",
     )
@@ -1659,34 +1689,36 @@ def _trip_cells(
 
     cells: list[_TripCell] = []
     for calls in scope.values():
-        board = [
-            c
-            for c in calls
-            if c.stop_place == from_stop
-            and c.aimed_dep is not None
-            and window_start <= c.aimed_dep <= window_end
-        ]
-        if not board:
-            continue
-        # Per line, keep one boarding call per the selection strategy.
-        by_line: dict[str | None, _CallPred] = {}
-        for c in board:
-            cur = by_line.get(c.line)
-            if cur is None or better(c, cur):
-                by_line[c.line] = c
-        for line, bcall in by_line.items():
-            # The selected train's own calls, and every call on the same line in this situation --
-            # keyed on (operator, jkey) because bus ServiceJourney refs are not date-scoped and can
-            # collide across operators within one situation.
-            own = tuple(
-                c for c in calls if c.operator == bcall.operator and c.jkey == bcall.jkey
-            )
-            arrival = None
+        # Group by (operator, jkey): bus ServiceJourney refs are not date-scoped, so one situation
+        # (e.g. a notice fanning across county codespaces) can carry the same jkey for two
+        # operators' journeys — keying on jkey alone would merge them and let one train's boarding
+        # ride the other's direction.
+        by_journey: dict[tuple[str, str], list[_CallPred]] = {}
+        for c in calls:
+            by_journey.setdefault((c.operator, c.jkey), []).append(c)
+
+        # Eligibility BEFORE per-line selection. Selecting first and checking the destination after
+        # would drop a whole line whenever its most severe train happens not to serve `to_stop`,
+        # silently losing an alert for a less severe train on that line that does.
+        eligible: list[tuple[_CallPred, _CallPred | None]] = []
+        for group in by_journey.values():
+            bcall = None
+            for c in group:
+                if (
+                    c.stop_place == from_stop
+                    and c.aimed_dep is not None
+                    and window_start <= c.aimed_dep <= window_end
+                    and (bcall is None or better(c, bcall))
+                ):
+                    bcall = c
+            if bcall is None:
+                continue
+            acall = None
             if to_stop is not None:
                 acall = next(
                     (
                         c
-                        for c in own
+                        for c in group
                         if c.stop_place == to_stop
                         and c.aimed_arr is not None
                         and c.stop_order > bcall.stop_order
@@ -1695,7 +1727,16 @@ def _trip_cells(
                 )
                 if acall is None:
                     continue  # this train does not reach to_stop in the travel direction
-                arrival = _arrival_prediction(acall)
+            eligible.append((bcall, acall))
+
+        # Per line, keep one eligible train per the selection strategy.
+        by_line: dict[str | None, tuple[_CallPred, _CallPred | None]] = {}
+        for bcall, acall in eligible:
+            cur = by_line.get(bcall.line)
+            if cur is None or better(bcall, cur[0]):
+                by_line[bcall.line] = (bcall, acall)
+
+        for line, (bcall, acall) in by_line.items():
             cells.append(
                 _TripCell(
                     situation_number=bcall.situation_number,
@@ -1705,8 +1746,12 @@ def _trip_cells(
                     operator=bcall.operator,
                     jkey=bcall.jkey,
                     departure=_departure_prediction(bcall),
-                    arrival=arrival,
-                    calls=own,
+                    arrival=_arrival_prediction(acall) if acall is not None else None,
+                    calls=tuple(
+                        c
+                        for c in calls
+                        if c.operator == bcall.operator and c.jkey == bcall.jkey
+                    ),
                     line_calls=tuple(c for c in calls if c.line == line),
                 )
             )
@@ -1768,16 +1813,22 @@ def _impact_response(
     by_sit: dict[str, list[_TripCell]] = {}
     for cell in cells:
         by_sit.setdefault(cell.situation_number, []).append(cell)
-    situations = [
-        SituationImpact(
-            situation_number=sit_num,
-            summary=group[0].summary,
-            description=group[0].description,
-            departure_prediction=_worst([c.departure for c in group]),
-            arrival_prediction=_worst([c.arrival for c in group]),
+    situations = []
+    for sit_num, group in by_sit.items():
+        # Which line the worst-case numbers came from, so a caller can join back to that line's
+        # latest_observation (and, for /varsel, its per-operator alerting threshold).
+        worst_cell = max(group, key=lambda c: _severity_key(c.departure))
+        situations.append(
+            SituationImpact(
+                situation_number=sit_num,
+                summary=group[0].summary,
+                description=group[0].description,
+                line=worst_cell.line,
+                operator=worst_cell.operator,
+                departure_prediction=_worst([c.departure for c in group]),
+                arrival_prediction=_worst([c.arrival for c in group]),
+            )
         )
-        for sit_num, group in by_sit.items()
-    ]
     situations.sort(key=lambda s: _severity_key(s.departure_prediction), reverse=True)
 
     # lines: roll cells up per line (worst-case over the situations affecting that line).
