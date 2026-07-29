@@ -18,6 +18,7 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import impact
 import main
 import varsel
 from varsel import _OSLO, _notification_payload
@@ -25,7 +26,7 @@ from varsel import _OSLO, _notification_payload
 
 @dataclass
 class FakeCall:
-    """Duck-types main._CallPred for the fields the matcher reads."""
+    """Duck-types impact.CallPred for the fields the matcher reads."""
 
     jkey: str
     stop_place: str
@@ -90,19 +91,24 @@ assert SAT_0800.weekday() == 5
 NOW = _oslo(2026, 7, 6, 6, 0)
 
 
+# The engine reads its snapshot through an injected provider (main owns the real cache).
+_snapshot: dict = {}
+impact.configure(snapshot_provider=lambda: (_snapshot, None))
+
+
 def install(by_situation):
     """Point varsel at main's real /impact provider over this synthetic snapshot.
 
     `with_alternative=False` keeps the Journey Planner out of the matcher tests — the alternative
     lookup has its own hermetic suite in test_alternatives.py.
     """
-    main._call_pred_by_situation = by_situation
+    _snapshot.clear(); _snapshot.update(by_situation)
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                 with_alternative=False):
+                 with_alternative=False, min_impact=0.0):
         # Pass the flag THROUGH rather than hard-coding False: hard-coding it made the suite blind to
         # a Journey Planner call reappearing on the request path (review 2026-07-29).
-        return main._impact_for_trip(
+        return impact.for_trip(
             from_stop=from_stop,
             to_stop=to_stop,
             window_start=window_start,
@@ -110,6 +116,7 @@ def install(by_situation):
             select="worst",
             catchable_after=catchable_after,
             with_alternative=with_alternative,
+            min_impact=min_impact,
         )
 
     varsel.configure(impact_provider=provider, stops_provider=list)
@@ -130,19 +137,19 @@ def test_the_real_provider_signature_matches():
     `install()` above and test_varsel_api's provider both hand-write a signature that happens to fit.
     Any test that only uses a double cannot catch this; this one must call the real function.
     """
-    main._call_pred_by_situation = {"S1": _train(MON_0800)}
+    _snapshot.clear(); _snapshot.update({"S1": _train(MON_0800)})
     varsel.configure(impact_provider=main._varsel_impact, stops_provider=list)
     try:
         # Every keyword varsel._impact actually sends, through the real provider.
         alerts = varsel.match_journey(_journey(), NOW)
         assert alerts, "the real provider must answer the matcher"
         # And the poller's path, which additionally asks for an alternative.
-        original = main.alternatives.find_faster
-        main.alternatives.find_faster = lambda *a, **k: None  # no network
+        original = impact.alternatives.find_faster
+        impact.alternatives.find_faster = lambda *a, **k: None  # no network
         try:
             assert varsel.match_journey(_journey(), NOW, with_alternative=True)
         finally:
-            main.alternatives.find_faster = original
+            impact.alternatives.find_faster = original
     finally:
         install({})  # restore the double for the remaining tests
 

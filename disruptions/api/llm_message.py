@@ -12,31 +12,41 @@ Design notes
   selected and is asked to phrase them — so a bad reply degrades the wording, never the decision.
 * **Two backends, one contract.** Claude Sonnet 5 on Vertex AI is primary. When the project cannot
   serve it (Anthropic publisher models need Model Garden enablement on top of
-  ``roles/aiplatform.user``), the provider latches to Gemini on Vertex for the process lifetime and
-  logs loudly. Gemini access is already proven in this project by the ``AI.CLASSIFY`` step in
-  ``update_categories.sql``. Model IDs come from env so neither is pinned in code.
+  ``roles/aiplatform.user``), the provider latches to Gemini on Vertex and logs loudly. The latch
+  expires after ``_LATCH_TTL`` rather than lasting the process lifetime, so a Model Garden rollout
+  or a transient 404 does not disable the preferred backend until the next deploy. Gemini access is
+  already proven in this project by the ``AI.CLASSIFY`` step in ``update_categories.sql``. Model IDs
+  come from env so neither is pinned in code.
 * **Fail open, always.** No credentials, an unsupported model, a timeout, an empty or over-long
   reply — every path returns ``None`` and the caller falls back to the deterministic wording. A push
   must never be lost to an LLM problem.
-* **The payload is fenced, and pre-rounded.** SX free text is publisher-authored and reaches the
-  prompt verbatim, so it travels inside an explicit data delimiter and the system prompt frames the
-  whole thing as data describing a disruption rather than as instructions. Every figure is chosen
-  and rounded by our code; the model is told to use only what it is given.
+* **The payload is fenced, pre-rounded, and scoped to one alert.** SX free text is
+  publisher-authored and reaches the prompt verbatim, so every string in the payload — not just the
+  situation text — is stripped of angle brackets and length-capped, and the whole document travels
+  inside an explicit data delimiter that the system prompt frames as data rather than instructions.
+  The situations and lines described are filtered to the alert's own, so the words and the numbers
+  always refer to the same disruption. Every figure is chosen and rounded by our code, and a reply
+  containing a figure that is not in the payload is rejected (``_is_grounded``) rather than pushed.
 * **`dep_delay_typ_min` is never in the payload.** For alert-worthy boardings its median is ~2 min
   against the exceedance stack's ~15 min, and quoting it is exactly what made a 93 %-impact alert
   read as "1 % sjanse for innstilling, typisk 2 min forsinket" before the 2026-07-27 fix. The
   payload is built from the :class:`varsel.Alert` fields, which do not carry it.
-* **Everything sent and received is logged** under ``jsonPayload.event = "llm_message"``, next to
-  the existing ``event = "push"`` trail: what was said to a traveller must stay reconstructible.
+* **What was said to a traveller is logged** under ``jsonPayload.event = "llm_message"``, next to
+  the existing ``event = "push"`` trail — the message, the model that wrote it, and the situation.
+  The prompt itself is not: it embeds the traveller's origin, destination and departure time, and
+  ``journey_key`` is a home-to-work pattern with times and weekdays. Records carry
+  ``journey_digest`` (a hash) for correlation instead, and the full prompt/reply goes to DEBUG
+  behind ``VARSEL_LLM_LOG_PROMPTS``.
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -73,6 +83,22 @@ _MAX_TOKENS = 600
 # _MAX_LLM_CALLS_PER_CYCLE=8 sequential calls that is over an hour of stalled ingestion, so the
 # budget is set to match reisevalg's "<= 3 s per external call" rule with a little headroom.
 _TIMEOUT_S = 8.0
+# Log the full prompt and reply (at DEBUG). Off by default: the prompt embeds the traveller's
+# origin, destination and departure time. Turn on temporarily when debugging message quality.
+_LOG_PROMPTS = os.environ.get("VARSEL_LLM_LOG_PROMPTS", "").lower() in ("1", "true", "yes")
+
+
+def _key_digest(journey_key: str) -> str:
+    """A short stable digest of a journey key, for correlating log lines without logging the key.
+
+    `journey_key` is from|to|begin|end|days — a commute pattern. This keeps log records joinable
+    (same journey → same digest) without putting the pattern itself in Cloud Logging next to
+    event="push" records that carry device_id.
+    """
+    if not journey_key:
+        return ""
+    return hashlib.sha256(journey_key.encode("utf-8")).hexdigest()[:12]
+
 
 _SYSTEM_PROMPT = """\
 Du skriver korte varsler til reisende i norsk kollektivtrafikk, på bokmål.
@@ -89,6 +115,10 @@ Regler:
 regne ut nye tall eller finne på detaljer.
 - Sannsynligheten i `sannsynlighet_prosent` er sjansen for innstilling ELLER minst 10 minutter \
 forsinkelse. Omtal den slik, ikke som «forsinkelse».
+- `forsinkelse_min` (`typisk` og `verstefall`) er et ANSLAG som bare gjelder HVIS avgangen faktisk \
+kjører. Skriv «kan bli … forsinket», aldri «er … forsinket».
+- `mest_sannsynlig_innstilt: true` betyr at innstilling er det mest sannsynlige utfallet – da er \
+det innstillingen som er hovedpoenget, ikke forsinkelsen.
 - Hvis `siste_observasjon` finnes, nevn den med tidspunktet sitt – det er en observasjon fra et \
 tidligere tidspunkt, ikke nødvendigvis situasjonen akkurat nå.
 - Hvis `alternativ_reise` finnes, er det det mest nyttige rådet.
@@ -111,8 +141,13 @@ class _ConfigurationError(Exception):
 
 
 _lock = threading.Lock()
+# How long a backend stays pinned (after a success) or latched off (after a configuration
+# failure) before it is re-tested. Both used to last the process lifetime, which on a single
+# always-on pod means "until the next deploy" -- see _candidates.
+_LATCH_TTL = timedelta(minutes=30)
 _active: str | None = None  # "claude" | "gemini" | None (not yet resolved)
-_latched_off: set[str] = set()  # backends this project cannot serve
+_active_at: datetime | None = None  # when _active was pinned
+_latched_off: dict[str, datetime] = {}  # backend -> when this project last failed to serve it
 
 
 def _claude_client() -> Any:
@@ -255,16 +290,33 @@ def llm_enabled() -> bool:
     return bool(_candidates())
 
 
-def _candidates() -> tuple[str, ...]:
-    """Backends still worth trying, in preference order."""
+def _candidates(now: datetime | None = None) -> tuple[str, ...]:
+    """Backends still worth trying, in preference order.
+
+    Both kinds of stickiness expire after `_LATCH_TTL`. Neither used to:
+
+    * `_latched_off` was add-only, so a single 404 during a Model Garden rollout disabled the
+      preferred backend until the next redeploy — on a single always-on pod, potentially weeks.
+    * `_active` pinned the first backend that produced a message, and was cleared only by a
+      configuration error. After Claude succeeded once, every later content-dependent Claude failure
+      (a 400, a refusal — the paths that deliberately do NOT latch) went straight to the template
+      wording without ever trying Gemini, even though Gemini would have answered.
+
+    Re-testing costs one call per TTL per backend; not re-testing costs every message until a deploy.
+    """
+    now = now or datetime.now(UTC)
     if _PROVIDER in _BACKENDS:
         order: tuple[str, ...] = (_PROVIDER,)
     else:
         order = _AUTO_ORDER
     with _lock:
-        if _active is not None:
-            return (_active,) if _active not in _latched_off else ()
-        return tuple(name for name in order if name not in _latched_off)
+        live_off = {n for n, at in _latched_off.items() if now - at < _LATCH_TTL}
+        pinned = _active if _active_at and now - _active_at < _LATCH_TTL else None
+        if pinned is not None and pinned not in live_off:
+            # The pinned backend first, then the rest as fallbacks for THIS call: a content-dependent
+            # failure on the pinned one must still be able to reach the other.
+            return (pinned,) + tuple(n for n in order if n != pinned and n not in live_off)
+        return tuple(name for name in order if name not in live_off)
 
 
 # ---- Payload ---------------------------------------------------------------------------------
@@ -352,8 +404,20 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
     delay figures are the exceedance-stack interval — never the weak typical-delay regression, which
     ``Alert`` does not carry in the first place.
     """
+    # Scope the free text to the alert this payload is ABOUT. The headline figures below
+    # (sannsynlighet_prosent, forsinkelse_min, avgang_kl) all come from one Alert -- the worst
+    # alert-worthy one -- while `impact` carries every situation and line the trip matched. Handing
+    # the model all of the words and one of the numbers lets it pair a 93 % figure from a signal
+    # failure on R11 with the wording of an unrelated "buss for tog" notice on another line, or quote
+    # an observation from a line the traveller is not taking. It has no key to tell them apart, so
+    # give it only the ones that belong to this alert (2026-07-29 review).
+    alert_situation = getattr(alert, "situation_number", None)
+    alert_line = getattr(alert, "line", None)
+
     lines = []
     for line in getattr(impact, "lines", []) or []:
+        if alert_line is not None and getattr(line, "line", None) != alert_line:
+            continue
         obs = getattr(line, "latest_observation", None)
         entry: dict[str, Any] = {
             "linje": _bounded_text(getattr(line, "line", None), _NAME_MAX_CHARS),
@@ -373,12 +437,18 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
     # SX text is publisher-authored and `description` is "often several sentences" with no upper
     # bound. Capping it bounds the injection surface, the token spend, and the log record size; a
     # 300-char notification cannot use more than this anyway.
+    all_situations = list(getattr(impact, "situations", []) or [])
+    if alert_situation is not None:
+        own = [s for s in all_situations if getattr(s, "situation_number", None) == alert_situation]
+        # Fall back to the full list only if the alert's own situation is somehow absent, so a
+        # mismatch degrades to the old behaviour rather than to an empty prompt.
+        all_situations = own or all_situations
     situations = [
         {
             "sammendrag": _bounded_text(getattr(sit, "summary", None)),
             "beskrivelse": _bounded_text(getattr(sit, "description", None)),
         }
-        for sit in (getattr(impact, "situations", []) or [])[:_MAX_PAYLOAD_ITEMS]
+        for sit in all_situations[:_MAX_PAYLOAD_ITEMS]
     ]
 
     payload: dict[str, Any] = {
@@ -457,6 +527,35 @@ def _extract_message(raw: str) -> str | None:
     return text
 
 
+# Numbers and clock times the model may use without them appearing in the payload: small counts and
+# the "10 minutter" that the impact definition itself is phrased in.
+_FREE_NUMBERS = frozenset({"1", "2", "10"})
+_NUMBER_RE = re.compile(r"\d{1,2}:\d{2}|\d+")
+
+
+def _is_grounded(text: str, payload_json: str) -> bool:
+    """True when every figure in the reply also appears in the payload.
+
+    The prompt forbids inventing numbers, but a prompt is not an enforcement mechanism and this text
+    reaches a lock screen as authoritative transit advice, under Entur's name, after the alert gate
+    has already fired. The deterministic wording is free and always available, so rejecting an
+    ungrounded reply costs one degraded message — much less than one confidently wrong departure time.
+
+    Percentages are allowed +/-1 because the prompt rounds them, and `_FREE_NUMBERS` covers the
+    small counts ("ett av to tog") and the 10-minute bar the impact definition is stated in.
+    """
+    present = set(_NUMBER_RE.findall(payload_json))
+    for token in _NUMBER_RE.findall(text):
+        if token in present or token in _FREE_NUMBERS:
+            continue
+        if ":" not in token and token.isdigit():
+            n = int(token)
+            if any(str(n + d) in present for d in (-1, 1)):
+                continue  # a rounded percentage
+        return False
+    return True
+
+
 def write_message(payload: dict, *, journey_key: str = "", situation_number: str = "") -> str | None:
     """A short Norwegian message for this payload, or None when no backend could produce one.
 
@@ -464,7 +563,7 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
     process lifetime and the next one is tried; on a transient failure this returns None and the
     next poller cycle tries again.
     """
-    global _active
+    global _active, _active_at
     if not llm_enabled():
         return None
     payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -479,9 +578,9 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                 extra={"fields": {"event": "llm_message", "provider": name, "result": "latched_off"}},
             )
             with _lock:
-                _latched_off.add(name)
+                _latched_off[name] = datetime.now(UTC)
                 if _active == name:
-                    _active = None
+                    _active = _active_at = None
             continue
         except Exception:
             logger.warning(
@@ -493,13 +592,27 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
             return None
 
         message = _extract_message(raw)
+        if message and not _is_grounded(message, payload_json):
+            logger.warning(
+                "%s invented a figure that is not in the payload; using the deterministic wording",
+                name,
+                extra={
+                    "fields": {
+                        "event": "llm_message",
+                        "provider": name,
+                        "result": "ungrounded",
+                        "reply": raw,
+                    }
+                },
+            )
+            message = None
         with _lock:
             # Pin the backend only when it actually produced something. Pinning on any non-exception
             # return meant a Claude 400 or refusal (which now return "" rather than latching) stuck
             # _active='claude' forever, so every later push silently used template wording and the
             # Gemini fallback never ran (review 2026-07-29).
             if message:
-                _active = name
+                _active, _active_at = name, datetime.now(UTC)
         if not message:
             logger.warning(
                 "%s returned nothing usable; trying the next backend",
@@ -509,10 +622,16 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                 },
             )
             continue
+        # What was said to a traveller stays reconstructible at INFO: the message, which model wrote
+        # it, and the situation. The PROMPT does not -- `journey_key` is literally
+        # from|to|begin|end|days, i.e. a home-to-work pattern with times and weekdays, and the payload
+        # embeds the same origin/destination and departure time. With a small user base that is
+        # quasi-identifying, and it sits in the same log as event="push" records carrying device_id.
+        # Hash the key for correlation, and put the raw prompt behind VARSEL_LLM_LOG_PROMPTS.
         logger.info(
             "LLM message via %s for %s/%s: %s",
             name,
-            journey_key,
+            _key_digest(journey_key),
             situation_number,
             message,
             extra={
@@ -520,14 +639,28 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                     "event": "llm_message",
                     "provider": name,
                     "model": _CLAUDE_MODEL if name == "claude" else _GEMINI_MODEL,
-                    "result": "ok" if message else "rejected",
-                    "journey_key": journey_key,
+                    "result": "ok",
+                    "journey_digest": _key_digest(journey_key),
                     "situation_number": situation_number,
-                    "payload": payload_json,
-                    "reply": raw,
                     "message": message,
                 }
             },
         )
+        if _LOG_PROMPTS:
+            logger.debug(
+                "LLM prompt/reply for %s/%s",
+                _key_digest(journey_key),
+                situation_number,
+                extra={
+                    "fields": {
+                        "event": "llm_message_prompt",
+                        "provider": name,
+                        "journey_digest": _key_digest(journey_key),
+                        "situation_number": situation_number,
+                        "payload": payload_json,
+                        "reply": raw,
+                    }
+                },
+            )
         return message
     return None

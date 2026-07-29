@@ -16,8 +16,14 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import impact
 import main
 from test_varsel import FakeCall
+
+# The engine reads its snapshot through an injected provider (main owns the cache). These tests
+# drive it directly, so they own the provider too.
+_snapshot: dict = {}
+impact.configure(snapshot_provider=lambda: (_snapshot, None))
 
 A, B, C = "NSR:StopPlace:A", "NSR:StopPlace:B", "NSR:StopPlace:C"
 
@@ -51,7 +57,7 @@ def _scope(**situations):
 
 def _cells(scope, *, from_stop=A, to_stop=B, start=None, end=None, select="nearest", at=None):
     at = at or _at(8)
-    return main._trip_cells(
+    return impact._trip_cells(
         scope,
         from_stop,
         to_stop,
@@ -101,7 +107,7 @@ def test_worst_picks_the_most_severe_train_regardless_of_distance():
 
 def test_nearest_without_at_is_a_programming_error():
     try:
-        main._trip_cells(_scope(S1=_train("j1", 8)), A, B, _at(7), _at(9), select="nearest")
+        impact._trip_cells(_scope(S1=_train("j1", 8)), A, B, _at(7), _at(9), select="nearest")
     except ValueError:
         return
     raise AssertionError("select='nearest' without `at` must raise, not silently pick a train")
@@ -121,6 +127,48 @@ def test_reverse_direction_produces_no_cell():
 def test_to_stop_not_served_yields_no_cell():
     scope = _scope(S1=_train("j1", 8, to_stop=C))
     assert _cells(scope, to_stop=B) == []
+
+
+def test_a_severe_train_that_skips_to_stop_does_not_hide_a_less_severe_one_that_serves_it():
+    """The eligibility-before-selection invariant, which _trip_cells says was got wrong twice.
+
+    Two trains on ONE line: the more severe terminates short of `to_stop`, the less severe reaches
+    it. Selecting per line first and checking the destination afterwards drops the whole line — the
+    traveller loses the alert for the train they can actually take. Its twin (`catchable_after`) has
+    regression tests in test_varsel.py; this one had only a comment.
+    """
+    scope = _scope(
+        S1=_train("skips", 8, 10, to_stop=C, p_impact_dep=0.99)
+        + _train("serves", 8, 30, to_stop=B, p_impact_dep=0.70)
+    )
+    cells = _cells(scope, to_stop=B, select="worst", at=None, start=_at(7), end=_at(9))
+    assert len(cells) == 1, "the line must still be represented"
+    assert cells[0].jkey == "serves"
+    assert cells[0].departure.impact_probability == 0.70
+
+
+def test_journey_planner_is_skipped_below_the_impact_gate():
+    """The poller only KEEPS an alternative for a situation that crosses the alert gate, so asking
+    the Journey Planner about every disruption-touched journey spent a blocking 3 s HTTPS round trip
+    on the ingestion thread to compute a value that was then discarded.
+    """
+    asked = []
+    original = impact.alternatives.find_faster
+    impact.alternatives.find_faster = lambda *a, **k: asked.append(1) or None
+    try:
+        for p_impact, gate, expected in ((0.20, 0.50, 0), (0.93, 0.50, 1), (0.20, 0.0, 1)):
+            asked.clear()
+            _snapshot.clear()
+            _snapshot.update(_scope(S1=_train("j1", 8, p_impact_dep=p_impact)))
+            impact.for_trip(
+                from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+                select="worst", with_alternative=True, min_impact=gate,
+            )
+            assert len(asked) == expected, (
+                f"p_impact={p_impact} against gate={gate} should have asked {expected} time(s)"
+            )
+    finally:
+        impact.alternatives.find_faster = original
 
 
 def test_to_stop_omitted_gives_a_cell_with_no_arrival():
@@ -153,24 +201,24 @@ def test_operator_collision_keeps_journeys_separate():
 def test_worst_orders_on_impact_probability_not_cancellation():
     """The regression this fixes: p_cancel-first ordering could hand a situation's numbers to a
     train other than the one that crossed the alert threshold."""
-    low_cancel_high_impact = main._departure_prediction(
+    low_cancel_high_impact = impact._departure_prediction(
         FakeCall(jkey="a", stop_place=A, stop_order=1, aimed_dep=_at(8), p_cancel=0.05,
                  p_impact_dep=0.95)
     )
-    high_cancel_low_impact = main._departure_prediction(
+    high_cancel_low_impact = impact._departure_prediction(
         FakeCall(jkey="b", stop_place=A, stop_order=1, aimed_dep=_at(8), p_cancel=0.40,
                  p_impact_dep=0.42)
     )
-    worst = main._worst([high_cancel_low_impact, low_cancel_high_impact])
+    worst = impact._worst([high_cancel_low_impact, low_cancel_high_impact])
     assert worst is low_cancel_high_impact
 
 
 def test_worst_ignores_none_entries():
-    pred = main._departure_prediction(
+    pred = impact._departure_prediction(
         FakeCall(jkey="a", stop_place=A, stop_order=1, aimed_dep=_at(8))
     )
-    assert main._worst([None, pred, None]) is pred
-    assert main._worst([None, None]) is None
+    assert impact._worst([None, pred, None]) is pred
+    assert impact._worst([None, None]) is None
 
 
 def test_multi_line_situation_rolls_up_to_the_highest_impact_line():
@@ -179,14 +227,14 @@ def test_multi_line_situation_rolls_up_to_the_highest_impact_line():
         + _train("r11", 8, 5, line="VYG:Line:R11", p_cancel=0.1, p_impact_dep=0.99)
     )
     cells = _cells(scope)
-    sit = main._worst([c.departure for c in cells])
+    sit = impact._worst([c.departure for c in cells])
     assert sit.impact_probability == 0.99
 
 
 # ---- latest_observation -----------------------------------------------------------------------
 def test_latest_observation_absent_when_nothing_observed():
     cells = _cells(_scope(S1=_train("j1", 8)))  # FakeCall defaults to an unobserved future call
-    assert main._latest_observation(cells) is None
+    assert impact._latest_observation(cells) is None
 
 
 def test_latest_observation_takes_the_furthest_observed_call():
@@ -200,9 +248,9 @@ def test_latest_observation_takes_the_furthest_observed_call():
         FakeCall(jkey="j1", stop_place=B, stop_order=5, aimed_dep=None,
                  aimed_arr=dep + timedelta(minutes=40), stop_name="Drammen"),
     ]
-    obs = main._latest_observation([main._TripCell(
+    obs = impact._latest_observation([impact.TripCell(
         situation_number="S1", summary=None, description=None, line="VYG:Line:R10",
-        operator="VYG", jkey="j1", departure=main._departure_prediction(calls[0]),
+        operator="VYG", jkey="j1", departure=impact._departure_prediction(calls[0]),
         arrival=None, calls=calls,
     )])
     assert (obs.at_stop, obs.at_stop_name, obs.delayed_min) == ("NSR:StopPlace:X", "Asker", 18)
@@ -214,9 +262,9 @@ def test_latest_observation_reports_cancellation_without_a_delay():
     """An ET-declared cancellation is an observation even when no delay was recorded."""
     call = FakeCall(jkey="j1", stop_place=A, stop_order=1, aimed_dep=_at(8), stop_name="Oslo S",
                     call_source="recorded", et_declared_cancelled=True, et_dep_delay_min=None)
-    obs = main._latest_observation([main._TripCell(
+    obs = impact._latest_observation([impact.TripCell(
         situation_number="S1", summary=None, description=None, line="VYG:Line:R10",
-        operator="VYG", jkey="j1", departure=main._departure_prediction(call),
+        operator="VYG", jkey="j1", departure=impact._departure_prediction(call),
         arrival=None, calls=[call],
     )])
     assert obs.cancelled is True
@@ -227,9 +275,9 @@ def test_latest_observation_ignores_estimated_calls():
     """`estimated` means the vehicle has not served the stop yet -- a delay there is not observed."""
     call = FakeCall(jkey="j1", stop_place=A, stop_order=1, aimed_dep=_at(8),
                     call_source="estimated", et_dep_delay_min=9)
-    obs = main._latest_observation([main._TripCell(
+    obs = impact._latest_observation([impact.TripCell(
         situation_number="S1", summary=None, description=None, line="VYG:Line:R10",
-        operator="VYG", jkey="j1", departure=main._departure_prediction(call),
+        operator="VYG", jkey="j1", departure=impact._departure_prediction(call),
         arrival=None, calls=[call],
     )])
     assert obs is None
@@ -241,7 +289,7 @@ def test_impact_response_shape_matches_the_togpuls_contract():
     non-empty `situation_number` on each entry. Everything else it ignores."""
     scope = _scope(S1=_train("j1", 8))
     cells = _cells(scope)
-    resp = main._impact_response(
+    resp = impact._impact_response(
         cells, from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
     )
     payload = resp.model_dump(mode="json")
@@ -259,9 +307,9 @@ def test_no_journey_planner_call_without_a_to_stop():
     calls = []
     original = alternatives.find_faster
     alternatives.find_faster = lambda *a, **k: calls.append(1)
-    main._call_pred_by_situation = _scope(S1=_train("j1", 8))
+    _snapshot.clear(); _snapshot.update(_scope(S1=_train("j1", 8)))
     try:
-        resp = main._impact_for_trip(
+        resp = impact.for_trip(
             from_stop=A,
             to_stop=None,
             window_start=_at(7),
@@ -277,7 +325,7 @@ def test_no_journey_planner_call_without_a_to_stop():
 
 def test_impact_response_carries_the_new_fields():
     scope = _scope(S1=_train("j1", 8, operator="RUT", description="Buss for tog"))
-    resp = main._impact_response(
+    resp = impact._impact_response(
         _cells(scope), from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
     )
     assert resp.situations[0].description == "Buss for tog"
@@ -295,17 +343,17 @@ def test_real_http_route_satisfies_the_togpuls_contract():
     """
     from fastapi.testclient import TestClient
 
-    main._call_pred_by_situation = _scope(S1=_train("j1", 8, description="Signalfeil"))
+    _snapshot.clear(); _snapshot.update(_scope(S1=_train("j1", 8, description="Signalfeil")))
     main._call_pred_refreshed_at = _at(8)
-    original = main.alternatives.find_faster
-    main.alternatives.find_faster = lambda *a, **k: None  # no network from the suite
+    original = impact.alternatives.find_faster
+    impact.alternatives.find_faster = lambda *a, **k: None  # no network from the suite
     try:
         r = TestClient(main.app).get(
             "/impact",
             params={"from_stop": A, "to_stop": B, "at": _at(8).isoformat()},
         )
     finally:
-        main.alternatives.find_faster = original
+        impact.alternatives.find_faster = original
 
     assert r.status_code == 200, r.text
     body = r.json()
@@ -323,7 +371,7 @@ def test_real_http_route_satisfies_the_togpuls_contract():
 def test_real_http_route_handles_a_trip_with_nothing_affecting_it():
     from fastapi.testclient import TestClient
 
-    main._call_pred_by_situation = {}
+    _snapshot.clear(); _snapshot.update({})
     r = TestClient(main.app).get("/impact", params={"from_stop": A, "to_stop": B})
     assert r.status_code == 200
     body = r.json()

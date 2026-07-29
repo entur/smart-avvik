@@ -32,16 +32,16 @@ os.environ.update(
 )
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import alternatives
+import impact
 import varsel
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_varsel import (  # reuse the synthetic call shape + the stubbed main
     _OSLO,
     FakeCall,
-    main,
 )
 
 DEVICE = "dev-abc12345"
@@ -79,10 +79,14 @@ def _use_snapshot(snapshot):
     _active_snapshot["value"] = snapshot
 
 
+# The engine reads its snapshot through an injected provider; the tests own it here so
+# _use_snapshot swaps what the real matcher sees.
+impact.configure(snapshot_provider=lambda: (_active_snapshot["value"], None))
+
+
 def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                     with_alternative=False):
-    main._call_pred_by_situation = _active_snapshot["value"]
-    return main._impact_for_trip(
+                     with_alternative=False, min_impact=0.0):
+    return impact.for_trip(
         from_stop=from_stop,
         to_stop=to_stop,
         window_start=window_start,
@@ -93,16 +97,17 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
         # call reappearing on the request path. alternatives.find_faster is stubbed in the tests that
         # care, so nothing here reaches the network either way.
         with_alternative=with_alternative,
+        min_impact=min_impact,
     )
 
 
 varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
 
-# Suite-wide: this provider calls the REAL _impact_for_trip, which calls alternatives.find_faster
+# Suite-wide: this provider calls the REAL impact.for_trip, which calls alternatives.find_faster
 # whenever with_alternative=True. Individual tests stubbing find_faster is not enough — any test that
 # exercises the poller path without stubbing it would issue a live HTTPS request to api.entur.io from
 # CI and eat the 3 s timeout, failing open so nobody would notice. Make it structurally impossible.
-main.alternatives.find_faster = lambda *a, **k: None
+impact.alternatives.find_faster = lambda *a, **k: None
 
 app = FastAPI()
 app.include_router(varsel.router)
@@ -368,7 +373,10 @@ def test_llm_call_cap_is_respected(monkeypatch):
     )
 
     _register("dev-first-0001")
-    _register("dev-second-002", begin="06:00", end="23:00")
+    # A DIFFERENT journey definition (so it does not share the first one's message cache), but one
+    # that still contains DEP. Hardcoding "06:00"-"23:00" here made the test fail whenever it ran
+    # after ~21:00 Europe/Oslo, since DEP is now+2h: a latent CI landmine, not a real assertion.
+    _register("dev-second-002", begin="00:01", end="23:59")
     varsel.check_and_notify(SNAPSHOT)
 
     assert len(written) == 1, "the cap must bound written messages per cycle"
@@ -425,6 +433,52 @@ def test_a_written_message_clears_the_failure_count(monkeypatch):
 
     varsel.check_and_notify(SNAPSHOT)  # cached now -- no third call
     assert len(calls) == 2
+
+
+def test_a_message_written_about_another_train_is_not_shown(monkeypatch):
+    """Both caches outlive the train they describe: they are pruned when the SITUATION ends (up to
+    its 12 h window), while the alert underneath is re-scored every tick and catchable_after walks
+    departed trains out of the result. Keyed on (journey, situation) alone, a message written at
+    06:05 about the 07:52 train still headed the card at 08:40, above a freshly computed line about
+    the 09:12 one. The key carries the departure so that cannot happen.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: "Om det tidligere toget.")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(varsel._messages) == 1
+    stale_key = next(iter(varsel._messages))
+
+    # Same journey, same situation, a LATER train: the cached text must not be attached to it.
+    later = stale_key[0], stale_key[1], "2099-01-01T06:00:00+00:00"
+    varsel._messages[later] = varsel._messages.pop(stale_key)
+    r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    alerts = r.json()["journeys"][0]["alerts"]
+    assert alerts and alerts[0]["message"] is None, (
+        "text written about a different departure must not head this alert"
+    )
+
+
+def test_a_departed_alternative_is_not_offered(monkeypatch):
+    """A stale alternative is worse than none: it advises catching a train that has already left."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    key = varsel._message_key(
+        varsel.journey_key(next(iter(varsel._journeys.values()))),
+        varsel.match_journey(next(iter(varsel._journeys.values())))[0],
+    )
+    gone = alternatives.AlternativeJourney(
+        departure_time=datetime.now(UTC) - timedelta(hours=1),
+        arrival_time=datetime.now(UTC) - timedelta(minutes=20),
+        duration_min=40, minutes_saved=15, legs=[],
+    )
+    varsel._alternatives[key] = gone
+    alerts = client.get("/varsel-api/journeys", params={"device_id": DEVICE}).json()[
+        "journeys"][0]["alerts"]
+    assert alerts and alerts[0]["alternative_journey"] is None
 
 
 def test_journey_listing_carries_the_pushed_message(monkeypatch):

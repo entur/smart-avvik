@@ -51,11 +51,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `demo/avviksvarsel/` (React + Vite + Entur Linje). Its
   API is `/varsel-api` (see `disruptions/api/varsel.py`), which runs in the poller's refresh cycle.
   **It does not match on its own — it calls `/impact`** through an injected in-process provider
-  (`main._varsel_impact`), so there is one matcher and one severity order behind both surfaces;
-  varsel keeps only its own policy on top (drop trains that can no longer be caught, plus the
-  per-operator alert gate). Work is shared per journey *definition* (`varsel.journey_key`): two
+  (`main._varsel_impact`, structurally typed as `varsel.ImpactProvider`), so there is one matcher and
+  one severity order behind both surfaces; varsel keeps only its own policy on top (drop trains that
+  can no longer be caught, plus the per-operator alert gate). The matcher itself lives in
+  `disruptions/api/impact.py` — extracted from `main.py` so `varsel` can *type* that contract rather
+  than hold it as `Callable[..., Any]`; it broke silently once and took all push alerting with it
+  while the test suite stayed green. `main` owns the prediction cache and injects a reader via
+  `impact.configure()`. Note `main.py` imports it as `impact_engine`: the `/impact` route function is
+  itself named `impact`, and a bare `impact.` inside that function would resolve to the route.
+  Work is shared per journey *definition* (`varsel.journey_key`): two
   devices watching the same trip drive one `/impact` call and one written message and see identical
   text, while push dedup stays keyed on `journey_id` so each device is still notified once.
+  **`to_stop` narrows `/impact`**: only trains that actually reach it are returned, so a caller
+  passing it sees fewer situations than one that does not.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
@@ -78,7 +86,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
     2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
     available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
-    `VERTEX_GEMINI_LOCATION` when their regional availability diverges.
+    `VERTEX_GEMINI_LOCATION` when their regional availability diverges. The backend latch expires
+    after 30 min (`llm_message._LATCH_TTL`), so enabling Model Garden takes effect without a
+    redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
+    destination and departure time); records carry a hashed `journey_digest`, and
+    `VARSEL_LLM_LOG_PROMPTS=true` puts the full prompt/reply at DEBUG.
   - `/impact` also returns `alternative_journey` when `to_stop` is given — a faster way there from
     the Journey Planner (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no credentials).
 
