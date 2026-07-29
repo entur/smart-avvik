@@ -75,6 +75,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from alternatives import AlternativeJourney
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -230,6 +231,11 @@ _notified: set[str] = set()  # {"journey_id|situationNumber"} — dedup, pruned 
 # journey × situation rather than one per device. In-memory only: a redeploy re-writes messages
 # rather than restoring stale advice from before the restart.
 _messages: dict[str, str] = {}
+# Same key, same lifecycle: the alternative the poller found for that journey x situation. Cached
+# rather than recomputed because the request path deliberately does NOT call the Journey Planner
+# (see match_journey) -- without this the field would be structurally null on the only endpoint that
+# serves it, which is how it shipped until review on 2026-07-29.
+_alternatives: dict[str, Any] = {}
 
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
@@ -412,14 +418,20 @@ class Alert(BaseModel):
     alertworthy: bool = Field(
         description="Whether this match crosses the push threshold (a notification is/was sent).",
     )
+    # Typed Any, not main.LatestObservation: importing main here would be the cycle this module
+    # exists to avoid. The cost is OpenAPI fidelity -- the generated schema for this one field is
+    # untyped, where /impact's equivalent is fully described. Runtime serialization is unaffected.
     latest_observation: Any | None = Field(
         default=None,
-        description="What has actually been observed on this line so far (cancellation, delay and "
-        "where), with the time of that observation; null when nothing has been observed yet.",
+        description="What has actually been observed on this line so far: {cancelled, at_stop, "
+        "at_stop_name, delayed_min, observed_at}. Null when nothing has been observed yet. See "
+        "/impact's LatestObservation for the full schema and its staleness bound.",
     )
-    alternative_journey: Any | None = Field(
+    alternative_journey: AlternativeJourney | None = Field(
         default=None,
-        description="A faster way from from_stop to to_stop than this train, when one exists.",
+        description="A faster way from from_stop to to_stop than this train, when one exists. "
+        "Found by the poller (the request path deliberately skips the Journey Planner lookup), so "
+        "this is populated once a push has been produced for this journey × situation.",
     )
     message: str | None = Field(
         default=None,
@@ -727,6 +739,8 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         _notified.difference_update(stale)
         for key in [k for k in _messages if k.rsplit("|", 1)[1] not in live]:
             _messages.pop(key, None)
+        for key in [k for k in _alternatives if k.rsplit("|", 1)[1] not in live]:
+            _alternatives.pop(key, None)
         changed = bool(stale)
 
     # ---- Loop 1: one impact call and one written message per distinct journey definition --------
@@ -755,6 +769,11 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         if worst is None:
             continue
         message_key = f"{key}|{worst.situation_number}"
+        # Record the alternative even if no message gets written (cap reached, LLM disabled): the
+        # in-app list wants it either way.
+        with _state_lock:
+            if worst.alternative_journey is not None:
+                _alternatives[message_key] = worst.alternative_journey
         with _state_lock:
             already_written = message_key in _messages
         if already_written:
@@ -994,7 +1013,10 @@ def _journey_model(jid: str, rec: dict) -> Journey:
     alerts = match_journey(rec)
     with _state_lock:
         for alert in alerts:
-            alert.message = _messages.get(f"{key}|{alert.situation_number}")
+            cache_key = f"{key}|{alert.situation_number}"
+            alert.message = _messages.get(cache_key)
+            # The request path does not call the Journey Planner, so this comes from the poller.
+            alert.alternative_journey = _alternatives.get(cache_key)
     return Journey(
         journey_id=jid,
         from_stop=rec["from_stop"],

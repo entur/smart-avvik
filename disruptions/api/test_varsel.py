@@ -100,6 +100,8 @@ def install(by_situation):
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
                  with_alternative=False):
+        # Pass the flag THROUGH rather than hard-coding False: hard-coding it made the suite blind to
+        # a Journey Planner call reappearing on the request path (review 2026-07-29).
         return main._impact_for_trip(
             from_stop=from_stop,
             to_stop=to_stop,
@@ -107,7 +109,7 @@ def install(by_situation):
             window_end=window_end,
             select="worst",
             catchable_after=catchable_after,
-            with_alternative=False,
+            with_alternative=with_alternative,
         )
 
     varsel.configure(impact_provider=provider, stops_provider=list)

@@ -285,6 +285,61 @@ def test_impact_response_carries_the_new_fields():
     assert resp.alternative_journey is None
 
 
+def test_real_http_route_satisfies_the_togpuls_contract():
+    """Drive the actual `@app.get("/impact")` route, not just the helpers.
+
+    Review 2026-07-29 pointed out that every other check here calls internals, so query-param
+    parsing, the response envelope and HTTP-level serialization of the new fields were untested — the
+    contract this file claims to pin was never exercised end to end. This sends exactly what
+    togpuls/clients/disruptions.py sends and asserts on exactly what it reads.
+    """
+    from fastapi.testclient import TestClient
+
+    main._call_pred_by_situation = _scope(S1=_train("j1", 8, description="Signalfeil"))
+    main._call_pred_refreshed_at = _at(8)
+    original = main.alternatives.find_faster
+    main.alternatives.find_faster = lambda *a, **k: None  # no network from the suite
+    try:
+        r = TestClient(main.app).get(
+            "/impact",
+            params={"from_stop": A, "to_stop": B, "at": _at(8).isoformat()},
+        )
+    finally:
+        main.alternatives.find_faster = original
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # The two things togpuls actually depends on.
+    assert isinstance(body["situations"], list) and body["situations"]
+    for sit in body["situations"]:
+        assert isinstance(sit["situation_number"], str) and sit["situation_number"]
+    # And the additive fields, over the wire rather than in-process.
+    assert body["situations"][0]["description"] == "Signalfeil"
+    assert "latest_observation" in body["lines"][0]
+    assert body["lines"][0]["operator"] == "VYG"
+    assert body["alternative_journey"] is None
+
+
+def test_real_http_route_handles_a_trip_with_nothing_affecting_it():
+    from fastapi.testclient import TestClient
+
+    main._call_pred_by_situation = {}
+    r = TestClient(main.app).get("/impact", params={"from_stop": A, "to_stop": B})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["situations"] == [] and body["lines"] == []
+    assert body["from_stop"] == A and body["to_stop"] == B
+
+
+def test_impact_endpoint_is_not_a_coroutine():
+    """It makes a blocking Journey Planner call, so FastAPI must run it in the threadpool. As
+    `async def` it would block the single-worker event loop and freeze /health (review 2026-07-29;
+    the rule is documented at reisevalg.py:28)."""
+    import inspect
+
+    assert not inspect.iscoroutinefunction(main.impact)
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
