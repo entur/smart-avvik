@@ -13,8 +13,13 @@ from datetime import UTC, datetime, timedelta
 
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
 
-import llm_message  # noqa: E402
-from llm_message import _ConfigurationError, _extract_message, build_payload, write_message  # noqa: E402
+import llm_message
+from llm_message import (
+    _ConfigurationError,
+    _extract_message,
+    build_payload,
+    write_message,
+)
 
 DEP = datetime(2026, 7, 29, 6, 12, tzinfo=UTC)  # 08:12 Europe/Oslo
 

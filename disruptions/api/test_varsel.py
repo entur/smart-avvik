@@ -18,9 +18,9 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
-import main  # noqa: E402
-import varsel  # noqa: E402
-from varsel import _OSLO, _notification_payload  # noqa: E402
+import main
+import varsel
+from varsel import _OSLO, _notification_payload
 
 
 @dataclass
@@ -108,7 +108,7 @@ def install(by_situation):
             with_alternative=False,
         )
 
-    varsel.configure(impact_provider=provider, stops_provider=lambda: [])
+    varsel.configure(impact_provider=provider, stops_provider=list)
 
 
 def match(journey, by_situation, now=NOW):
