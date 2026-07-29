@@ -199,6 +199,24 @@ def _pct(value: float | None) -> int | None:
     return round(value * 100) if value is not None else None
 
 
+# Stop display names are CLIENT-supplied (JourneyIn.from_name/to_name, up to 120 chars of free
+# text), and journey_key deliberately ignores them — so two devices with the same stops share one
+# written message even when they typed different names. That means one device's free text can reach
+# another device's notification, which makes these the one genuinely attacker-controlled strings in
+# the payload. The <reisedata> fence and the system prompt already frame the payload as data; this
+# strips the shape an instruction block needs (newlines, control characters, unbounded length) so
+# the fence is not the only thing standing between a hostile name and someone else's push.
+_NAME_MAX_CHARS = 60
+
+
+def _clean_name(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    collapsed = " ".join(value.split())  # folds newlines/tabs/runs into single spaces
+    printable = "".join(ch for ch in collapsed if ch.isprintable())
+    return printable[:_NAME_MAX_CHARS] or None
+
+
 def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
     """The trimmed, pre-rounded view of one journey × situation handed to the model.
 
@@ -234,8 +252,8 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
 
     payload: dict[str, Any] = {
         "reise": {
-            "fra": journey.get("from_name") or journey.get("from_stop"),
-            "til": journey.get("to_name") or journey.get("to_stop"),
+            "fra": _clean_name(journey.get("from_name")) or journey.get("from_stop"),
+            "til": _clean_name(journey.get("to_name")) or journey.get("to_stop"),
         },
         "transportmiddel": getattr(alert, "mode", None),
         "avgang_kl": _hhmm(getattr(alert, "departure_time", None)),
