@@ -91,7 +91,8 @@ def _reset(provider="auto", enabled=True):
     llm_message._ENABLED = enabled
     llm_message._PROJECT = "ent-kixavvik-test"
     llm_message._active = None
-    llm_message._latched_off = set()
+    llm_message._active_at = None
+    llm_message._latched_off = {}
 
 
 # ---- gates ------------------------------------------------------------------------------------
@@ -277,6 +278,100 @@ def test_every_string_in_the_payload_is_fenced_not_just_situation_text():
     )
 
 
+def test_payload_describes_only_the_alert_it_is_about():
+    """The headline figures come from ONE alert while `impact` carries every situation and line the
+    trip matched. Handing the model all the words and one set of numbers let it pair a 93 % figure
+    from a signal failure on R11 with the wording of an unrelated notice on another line — it has no
+    key to tell them apart.
+    """
+    class Alert(FakeAlert):
+        situation_number = "S-MINE"
+        line = "VYG:Line:R11"
+
+    impact = FakeImpact(
+        situations=[
+            FakeSituation(summary="Signalfeil ved Asker", description="Gjelder R11."),
+            FakeSituation(summary="Buss for tog Drammen", description="Helt annen situasjon."),
+        ],
+        lines=[FakeLine(line="VYG:Line:R11"), FakeLine(line="VYG:Line:R20")],
+    )
+    impact.situations[0].situation_number = "S-MINE"
+    impact.situations[1].situation_number = "S-OTHER"
+    payload = build_payload(JOURNEY, impact, Alert())
+    assert [s["sammendrag"] for s in payload["situasjoner"]] == ["Signalfeil ved Asker"]
+    assert [line["linje"] for line in payload["linjer"]] == ["VYG:Line:R11"]
+
+
+def test_an_invented_figure_is_rejected_rather_than_pushed():
+    """The prompt forbids inventing numbers, but a prompt is not enforcement, and this text reaches
+    a lock screen as Entur's advice after the alert gate has already fired. The deterministic
+    wording is free, so rejecting an ungrounded reply costs one degraded message.
+    """
+    _reset(provider="claude")
+    replies = iter([
+        '{"melding": "Toget kl 09:47 er innstilt."}',   # 09:47 appears nowhere in the payload
+        '{"melding": "93 % sjanse for trøbbel kl 08:12."}',  # both figures are in the payload
+    ])
+    llm_message._BACKENDS["claude"] = lambda body: next(replies)
+    try:
+        assert write_message(build_payload(JOURNEY, FakeImpact(), FakeAlert())) is None
+        assert write_message(build_payload(JOURNEY, FakeImpact(), FakeAlert())) is not None
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+
+
+def test_a_pinned_backend_still_falls_through_on_a_content_failure():
+    """`_active` used to pin permanently on first success, so every later content-dependent Claude
+    failure (a 400, a refusal — the paths that deliberately do not latch) went straight to the
+    template wording without ever trying Gemini, which would have answered.
+    """
+    _reset(provider="auto")
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding": "Fra Claude."}'
+    llm_message._BACKENDS["gemini"] = lambda body: '{"melding": "Fra Gemini."}'
+    try:
+        assert write_message(build_payload(JOURNEY, FakeImpact(), FakeAlert())) == "Fra Claude."
+        assert llm_message._active == "claude"
+        llm_message._BACKENDS["claude"] = lambda body: ""  # refusal / 400: returns "", no latch
+        assert write_message(build_payload(JOURNEY, FakeImpact(), FakeAlert())) == "Fra Gemini."
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+        llm_message._BACKENDS["gemini"] = llm_message._gemini_write
+
+
+def test_a_latched_off_backend_is_retried_after_the_ttl():
+    """The latch was add-only, so one 404 during a Model Garden rollout disabled the preferred
+    backend until the next redeploy — on a single always-on pod, potentially weeks.
+    """
+    _reset(provider="auto")
+    llm_message._latched_off = {"claude": datetime.now(UTC) - timedelta(minutes=5)}
+    assert "claude" not in llm_message._candidates()
+    llm_message._latched_off = {
+        "claude": datetime.now(UTC) - llm_message._LATCH_TTL - timedelta(minutes=1)
+    }
+    assert "claude" in llm_message._candidates(), "an expired latch must be re-tested"
+
+
+def test_the_prompt_frames_the_delay_interval_as_conditional():
+    """`forsinkelse_min` is the exceedance-stack interval CONDITIONAL on the train running. Left
+    unexplained, a model renders it as fact ("toget er 15-27 min forsinket") — the same class of
+    mis-framing as the 2026-07-27 regression this module was built around.
+    """
+    assert "kan bli" in llm_message._SYSTEM_PROMPT
+    assert "forsinkelse_min" in llm_message._SYSTEM_PROMPT
+    assert "mest_sannsynlig_innstilt" in llm_message._SYSTEM_PROMPT
+
+
+def test_the_prompt_itself_is_not_logged_at_info(caplog=None):
+    """journey_key is from|to|begin|end|days — a commute pattern with times and weekdays — and the
+    payload carries the same origin/destination. With a small user base that is quasi-identifying,
+    and it sits in the same log as event="push" records carrying device_id.
+    """
+    assert llm_message._LOG_PROMPTS is False, "prompt logging must be opt-in"
+    digest = llm_message._key_digest("A|B|06:00|09:00|0,1,2,3,4")
+    assert digest and "|" not in digest and "06:00" not in digest
+    assert digest == llm_message._key_digest("A|B|06:00|09:00|0,1,2,3,4"), "must be stable"
+
+
 def test_payload_item_counts_are_bounded():
     """A journey caught by a network-wide event matches many situations and lines at once; without a
     ceiling both the prompt and the logged payload grow with the disruption.
@@ -346,7 +441,7 @@ def test_transient_failure_returns_none_without_latching():
     llm_message._BACKENDS["claude"] = lambda body: (_ for _ in ()).throw(RuntimeError("timeout"))
     try:
         assert write_message({"a": 1}) is None
-        assert llm_message._latched_off == set(), "a timeout must not disable the backend"
+        assert llm_message._latched_off == {}, "a timeout must not disable the backend"
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
 

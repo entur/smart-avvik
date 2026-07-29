@@ -70,13 +70,16 @@ import re
 import threading
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from time import monotonic
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from alternatives import AlternativeJourney
 from fastapi import APIRouter, HTTPException, Query, Request
+from impact import ImpactResponse, LatestObservation, severity_key
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -140,6 +143,12 @@ def mode_label(operator: str | None) -> str:
 _AFTER_DEPARTURE_OPERATORS = frozenset({"MOR", "ATB", "OST", "GCO"})
 # Keep state bounded: a client-generated device may register at most this many journeys.
 _MAX_JOURNEYS_PER_DEVICE = 20
+# ...and the service as a whole holds at most this many of each. The per-device cap bounds nothing
+# globally: `device_id` is client-generated and `upsert_device` accepts any value, so without these
+# the poller's per-cycle work is bounded only by how many people install the PWA. Sized for an
+# experiment with a pilot group; raise deliberately after measuring a cycle, not by discovering it.
+_MAX_DEVICES = 500
+_MAX_JOURNEYS = 2000
 # Written messages per refresh cycle. The matcher runs on the poller thread, which also rebuilds
 # every other cache, so an unbounded fan-out of LLM calls would stall ingestion. Journeys beyond the
 # cap get the deterministic wording this tick and are picked up on the next one.
@@ -149,6 +158,14 @@ _MAX_LLM_CALLS_PER_CYCLE = 8
 # twice will very likely keep failing for this exact payload — and retrying costs a slot from the
 # per-cycle cap without being able to change what any user already saw.
 _MAX_MESSAGE_ATTEMPTS = 3
+# Wall-clock ceiling for the whole message-writing pass. The call cap alone does not bound time:
+# one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
+# worst case. Journeys past the budget take the deterministic wording and are re-tried next tick.
+_MAX_LLM_SECONDS_PER_CYCLE = 30.0
+# Web Push sends are independent, I/O-bound, and each can block for _PUSH_TIMEOUT_S against a
+# client-supplied endpoint. Sequential delivery meant one sick push service stalled the whole poller
+# -- and with it every cache rebuild -- for devices x 10 s. Fan them out instead.
+_PUSH_WORKERS = 8
 # How long past a window's end a train from that window can still be worth alerting about. A train
 # is only ever dropped by its own predicted expected departure (`catchable_after`); this bound just
 # stops journey_windows from discarding the window before that check runs. Sized above the p90 delays
@@ -192,18 +209,42 @@ def push_enabled() -> bool:
 
 
 # ---- Injected providers (set by main.configure to avoid an import cycle) ---------------------
-# `impact_provider` is main's /impact code path: (from_stop, to_stop, window_start, window_end) ->
-# ImpactResponse. Injected rather than called over HTTP -- the app is deliberately a single
-# always-on instance with an in-process prediction cache, and a loopback request would add a round
-# trip and a base-URL config for no isolation benefit. What matters is that there is now ONE matcher
-# and one severity order behind both surfaces.
-_impact_provider: Callable[..., Any] | None = None
+class ImpactProvider(Protocol):
+    """main's /impact code path, injected rather than called over HTTP.
+
+    Injected because the app is deliberately a single always-on instance with an in-process
+    prediction cache: a loopback request would add a round trip and a base-URL config for no
+    isolation benefit. What matters is that there is ONE matcher and one severity order behind both
+    surfaces.
+
+    Spelled as a Protocol rather than `Callable[..., Any]` because this is the only cross-module
+    contract in the design, and on 2026-07-29 it broke silently: an added keyword reached a provider
+    that did not accept it, every matcher call raised TypeError, check_and_notify's per-journey guard
+    swallowed it, and all push alerting stopped with a green test suite (both test doubles hand-write
+    their own provider, so nothing checked the real one). `...` would have accepted that drift; this
+    does not.
+    """
+
+    def __call__(
+        self,
+        *,
+        from_stop: str,
+        to_stop: str,
+        window_start: datetime,
+        window_end: datetime,
+        catchable_after: datetime | None = ...,
+        with_alternative: bool = ...,
+        min_impact: float = ...,
+    ) -> ImpactResponse: ...
+
+
+_impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 
 
 def configure(
     *,
-    impact_provider: Callable[..., Any],
+    impact_provider: ImpactProvider,
     stops_provider: Callable[[], list[dict]],
 ) -> None:
     """Wire in main.py's /impact provider and stop list (called once at startup)."""
@@ -218,8 +259,14 @@ def _impact(
     window_end: datetime,
     catchable_after: datetime | None = None,
     with_alternative: bool = False,
-) -> Any | None:
-    """One /impact call for a journey's boarding window, or None when unconfigured."""
+) -> ImpactResponse | None:
+    """One /impact call for a journey's boarding window, or None when unconfigured.
+
+    `min_impact` is the *default* alert threshold rather than a per-operator one: the operator is a
+    property of the matched train, which is only known after the call. It is the floor of the
+    per-operator cuts (GOA 0.50), so no alert-worthy journey is ever denied an alternative — it just
+    means a few sub-threshold-for-their-operator trips still pay the lookup.
+    """
     if _impact_provider is None:
         return None
     return _impact_provider(
@@ -229,7 +276,22 @@ def _impact(
         window_end=window_end,
         catchable_after=catchable_after,
         with_alternative=with_alternative,
+        min_impact=min(_OPERATOR_ALERT_THRESHOLD.values(), default=_ALERT_THRESHOLD)
+        if with_alternative
+        else 0.0,
     )
+
+
+def _message_key(key: str, alert: "Alert") -> tuple[str, str, str]:
+    """Cache key for a written message / alternative: (journey definition, situation, departure).
+
+    A tuple, not an f-string: `journey_key` itself embeds four `|` separators, so the string form
+    needed `rsplit` on one line and `split` on the next three lines apart, with nothing declaring
+    which encoding a key used. Including the departure is what keeps the cached text tied to the
+    train it describes (see _journey_model).
+    """
+    dep = alert.departure_time.isoformat() if alert.departure_time else ""
+    return (key, alert.situation_number, dep)
 
 
 # ---- State: devices, journeys, notified ------------------------------------------------------
@@ -242,15 +304,15 @@ _notified: set[str] = set()  # {"journey_id|situationNumber"} — dedup, pruned 
 # registration, so every device on the same trip gets the same text and one message is written per
 # journey × situation rather than one per device. In-memory only: a redeploy re-writes messages
 # rather than restoring stale advice from before the restart.
-_messages: dict[str, str] = {}
+_messages: dict[tuple[str, str, str], str] = {}
 # Same key, same lifecycle: the alternative the poller found for that journey x situation. Cached
 # rather than recomputed because the request path deliberately does NOT call the Journey Planner
 # (see match_journey) -- without this the field would be structurally null on the only endpoint that
 # serves it, which is how it shipped until review on 2026-07-29.
-_alternatives: dict[str, Any] = {}
+_alternatives: dict[tuple[str, str, str], AlternativeJourney] = {}
 # Same key, same lifecycle: how many times writing this message has failed, so a payload the LLM
 # cannot handle is not retried on every tick for the situation's whole life.
-_message_attempts: dict[str, int] = {}
+_message_attempts: dict[tuple[str, str, str], int] = {}
 
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
@@ -277,13 +339,26 @@ def _apply_state(raw: str) -> None:
         _notified = set(data.get("notified", []))
 
 
+_gcs_client = None
+_gcs_client_lock = threading.Lock()
+
+
 def _gcs_blob():
-    """The state blob handle when a bucket is configured, else None (import is lazy)."""
+    """The state blob handle when a bucket is configured, else None (import is lazy).
+
+    The client is built once and reused. Constructing a fresh `storage.Client()` per call meant every
+    device registration and every journey delete paid an ADC resolution plus a metadata-server token
+    fetch before the upload — on the request path, under `_state_lock`.
+    """
+    global _gcs_client
     if not _STATE_BUCKET:
         return None
     from google.cloud import storage
 
-    return storage.Client().bucket(_STATE_BUCKET).blob(_STATE_BLOB)
+    with _gcs_client_lock:
+        if _gcs_client is None:
+            _gcs_client = storage.Client()
+    return _gcs_client.bucket(_STATE_BUCKET).blob(_STATE_BLOB)
 
 
 def load_state() -> None:
@@ -437,10 +512,7 @@ class Alert(BaseModel):
     alertworthy: bool = Field(
         description="Whether this match crosses the push threshold (a notification is/was sent).",
     )
-    # Typed Any, not main.LatestObservation: importing main here would be the cycle this module
-    # exists to avoid. The cost is OpenAPI fidelity -- the generated schema for this one field is
-    # untyped, where /impact's equivalent is fully described. Runtime serialization is unaffected.
-    latest_observation: Any | None = Field(
+    latest_observation: LatestObservation | None = Field(
         default=None,
         description="What has actually been observed on this line so far: {cancelled, at_stop, "
         "at_stop_name, delayed_min, observed_at}. Null when nothing has been observed yet. See "
@@ -463,7 +535,7 @@ class Alert(BaseModel):
     # so it sees the complete picture (every situation's text, every line's observation, the
     # alternative) rather than just the headline numbers. exclude=True keeps it out of the API
     # response — it is a working reference, not part of the contract.
-    impact: Any | None = Field(default=None, exclude=True, repr=False)
+    impact: ImpactResponse | None = Field(default=None, exclude=True, repr=False)
 
 
 def match_journey(
@@ -538,13 +610,14 @@ def match_journey(
 
 
 def _alert_severity(alert: Alert) -> tuple[float, int, float]:
-    """Same order as main._severity_key: the alerting score first, then bad-case delay, then
-    cancellation probability as a deterministic tie-break."""
-    return (
-        alert.impact_probability or 0.0,
-        alert.delay_p90_min or 0,
-        alert.cancel_probability,
-    )
+    """The shared severity order, applied to an Alert.
+
+    Delegates to `impact.severity_key` rather than restating it. Keeping a second copy in sync by
+    comment is what let the two orders drift apart in the first place (main's was cancellation-first
+    while this one was impact-first), and `Alert` carries the same three field names as
+    `StopPrediction`, so the one function serves both.
+    """
+    return severity_key(alert)
 
 
 # ---- Notify ----------------------------------------------------------------------------------
@@ -760,11 +833,11 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         live = set(by_situation.keys())
         stale = {k for k in _notified if k.split("|", 1)[1] not in live}
         _notified.difference_update(stale)
-        for key in [k for k in _messages if k.rsplit("|", 1)[1] not in live]:
+        for key in [k for k in _messages if k[1] not in live]:
             _messages.pop(key, None)
-        for key in [k for k in _alternatives if k.rsplit("|", 1)[1] not in live]:
+        for key in [k for k in _alternatives if k[1] not in live]:
             _alternatives.pop(key, None)
-        for key in [k for k in _message_attempts if k.rsplit("|", 1)[1] not in live]:
+        for key in [k for k in _message_attempts if k[1] not in live]:
             _message_attempts.pop(key, None)
         changed = bool(stale)
 
@@ -775,6 +848,12 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
 
     alerts_by_key: dict[str, list[Alert]] = {}
     llm_calls = 0
+    # Wall-clock budget, not just a call count. _MAX_LLM_CALLS_PER_CYCLE caps journeys, but one
+    # "call" can be two backend attempts (a refusal or an unparseable reply falls through to the
+    # other backend), so 8 journeys x 2 x _TIMEOUT_S is ~128 s rather than the 64 s the count
+    # suggests. This is the ingestion thread: every second here is a second /disruptions, /journey,
+    # /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1 to finish.
+    llm_deadline = monotonic() + _MAX_LLM_SECONDS_PER_CYCLE
     for key, journey in by_journey_key.items():
         try:
             alerts = match_journey(journey, with_alternative=True)
@@ -793,7 +872,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         worst = next((a for a in alerts if a.alertworthy), None)
         if worst is None:
             continue
-        message_key = f"{key}|{worst.situation_number}"
+        message_key = _message_key(key, worst)
         # Record the alternative even if no message gets written (cap reached, LLM disabled): the
         # in-app list wants it either way.
         with _state_lock:
@@ -810,10 +889,12 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             # push already went out with the deterministic wording, each one burning a slot from
             # _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have succeeded now cannot use.
             continue
-        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE:
+        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() >= llm_deadline:
             logger.info(
-                "Written-message cap (%d) reached this cycle; %s gets the deterministic wording",
-                _MAX_LLM_CALLS_PER_CYCLE,
+                "Written-message budget spent this cycle (%d calls / %.0fs); %s gets the "
+                "deterministic wording",
+                llm_calls,
+                _MAX_LLM_SECONDS_PER_CYCLE,
                 key,
                 extra={"fields": {"event": "llm_message", "result": "capped"}},
             )
@@ -841,6 +922,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 _message_attempts[message_key] = attempts + 1
 
     # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
+    # Collect first, then fan out. One broad situation produces one send per registration in a single
+    # cycle, and each send can block for _PUSH_TIMEOUT_S against a client-supplied endpoint (FCM,
+    # Mozilla, Apple). Sequentially that is devices x 10 s of a stalled poller in the bad case --
+    # minutes during which no cache is rebuilt and nobody else is alerted.
+    # Parallel ACROSS devices, sequential WITHIN one: a "gone" result must still stop that device's
+    # remaining alerts for the tick, which only holds if its own sends stay ordered.
+    per_device: dict[str, list[tuple[str, dict, dict, Alert, str]]] = {}
     for jid, journey in journeys:
         device = None
         with _state_lock:
@@ -855,17 +943,34 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         for alert in alerts_by_key.get(key, []):
             if not alert.alertworthy:
                 continue
-            notified_key = f"{jid}|{alert.situation_number}"
             with _state_lock:
-                if notified_key in _notified:
+                if f"{jid}|{alert.situation_number}" in _notified:
                     continue
-                message = _messages.get(f"{key}|{alert.situation_number}")
+            per_device.setdefault(journey["device_id"], []).append(
+                (jid, device, journey, alert, key)
+            )
+
+    def _deliver_device(items: list[tuple[str, dict, dict, Alert, str]]) -> list[tuple]:
+        """One device's pending alerts, in order, stopping at a dead subscription."""
+        out = []
+        for jid, device, journey, alert, key in items:
+            with _state_lock:
+                message = _messages.get(_message_key(key, alert))
             payload = _notification_payload(journey, alert, message)
             result = _send_push(device, payload)
+            out.append((jid, journey, alert, result, payload))
+            if result == "gone":
+                break  # stop this device's remaining alerts this tick
+        return out
+
+    if per_device:
+        with ThreadPoolExecutor(max_workers=min(_PUSH_WORKERS, len(per_device))) as pool:
+            batches = list(pool.map(_deliver_device, per_device.values()))
+        for jid, journey, alert, result, payload in [r for batch in batches for r in batch]:
             _log_push("alert", result, journey["device_id"], payload, journey_id=jid, alert=alert)
             if result == "sent":
                 with _state_lock:
-                    _notified.add(notified_key)
+                    _notified.add(f"{jid}|{alert.situation_number}")
                 changed = True
             elif result == "gone":
                 if _device_is_fresh(journey["device_id"]):
@@ -877,7 +982,6 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 else:
                     _drop_device(journey["device_id"])
                     changed = True
-                break  # stop this device's remaining alerts this tick either way
 
     if changed:
         _save_state()
@@ -1026,6 +1130,13 @@ def upsert_device(body: DeviceIn) -> dict:
     """
     with _state_lock:
         existing = _devices.get(body.device_id)
+        if existing is None and len(_devices) >= _MAX_DEVICES:
+            logger.warning(
+                "Global device cap (%d) reached; refusing a new registration",
+                _MAX_DEVICES,
+                extra={"fields": {"event": "varsel_capacity", "kind": "devices"}},
+            )
+            raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
         _devices[body.device_id] = {
             "subscription": body.subscription,
             "created_ts": existing["created_ts"] if existing else _now_iso(),
@@ -1046,21 +1157,34 @@ def delete_device(device_id: str) -> dict:
     return {"status": "ok"}
 
 
-def _journey_model(jid: str, rec: dict) -> Journey:
+def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) -> Journey:
     """A journey plus its live alerts, each annotated with the message that was pushed for it.
 
     The message is read from :data:`_messages` rather than written here: the list endpoint is a
     request path, and writing one per request would mean an LLM call per page view. Reading the
     cached text also means the in-app list says exactly what the push said.
+
+    `alerts` lets the caller supply an already-scored result, so a device with several registrations
+    of the same journey definition runs the matcher once rather than once per registration.
     """
     key = journey_key(rec)
-    alerts = match_journey(rec)
+    alerts = match_journey(rec) if alerts is None else alerts
     with _state_lock:
+        now = datetime.now(UTC)
         for alert in alerts:
-            cache_key = f"{key}|{alert.situation_number}"
+            # The cache key carries the DEPARTURE, so text only ever appears above the train it was
+            # written about. Both caches live as long as the situation (up to its 12 h window) while
+            # the alert underneath is re-scored every tick and `catchable_after` walks departed
+            # trains out of the result — so keyed on (journey, situation) alone, a message written
+            # at 06:05 about the 07:52 train still headed the card at 08:40, above a freshly
+            # computed line reading 40 % for the 09:12 one.
+            cache_key = _message_key(key, alert)
             alert.message = _messages.get(cache_key)
-            # The request path does not call the Journey Planner, so this comes from the poller.
-            alert.alternative_journey = _alternatives.get(cache_key)
+            alt = _alternatives.get(cache_key)
+            # An alternative that has itself departed is worse than none: it advises catching a
+            # train that has already left.
+            if alt is not None and (alt.departure_time is None or alt.departure_time >= now):
+                alert.alternative_journey = alt
     return Journey(
         journey_id=jid,
         from_stop=rec["from_stop"],
@@ -1088,7 +1212,16 @@ def list_journeys(
     see :func:`match_journey`."""
     with _state_lock:
         mine = [(jid, rec) for jid, rec in _journeys.items() if rec["device_id"] == device_id]
-    journeys = [_journey_model(jid, rec) for jid, rec in mine]
+    # Score each distinct journey DEFINITION once, exactly as check_and_notify's loop 1 does. A
+    # device at the 20-journey cap with overlapping registrations would otherwise run the full
+    # matcher up to 20 times per page view, and the PWA polls this every 60 s.
+    by_key: dict[str, list[Alert]] = {}
+    journeys = []
+    for jid, rec in mine:
+        key = journey_key(rec)
+        if key not in by_key:
+            by_key[key] = match_journey(rec)
+        journeys.append(_journey_model(jid, rec, alerts=by_key[key]))
     journeys.sort(key=lambda j: j.created_ts)
     return JourneysResponse(journeys=journeys)
 
@@ -1105,6 +1238,13 @@ def create_journey(body: JourneyIn) -> Journey:
                 status_code=409,
                 detail=f"Maks {_MAX_JOURNEYS_PER_DEVICE} reiser per enhet.",
             )
+        if len(_journeys) >= _MAX_JOURNEYS:
+            logger.warning(
+                "Global journey cap (%d) reached; refusing a new registration",
+                _MAX_JOURNEYS,
+                extra={"fields": {"event": "varsel_capacity", "kind": "journeys"}},
+            )
+            raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
         jid = uuid.uuid4().hex
         rec = {
             "device_id": body.device_id,
