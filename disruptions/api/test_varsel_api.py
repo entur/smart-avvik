@@ -34,6 +34,7 @@ os.environ.update(
 import json
 from datetime import datetime, timedelta
 
+import alternatives
 import varsel
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -88,7 +89,10 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
         window_end=window_end,
         select="worst",
         catchable_after=catchable_after,
-        with_alternative=False,  # no Journey Planner calls from the test suite
+        # Passed THROUGH, not hard-coded: hard-coding False made the suite blind to a Journey Planner
+        # call reappearing on the request path. alternatives.find_faster is stubbed in the tests that
+        # care, so nothing here reaches the network either way.
+        with_alternative=with_alternative,
     )
 
 
@@ -105,6 +109,7 @@ def _reset_state():
         varsel._journeys.clear()
         varsel._notified.clear()
         varsel._messages.clear()
+        varsel._alternatives.clear()
     _use_snapshot(SNAPSHOT)
 
 
@@ -389,6 +394,60 @@ def test_journey_listing_omits_the_internal_impact_reference():
     alerts = r.json()["journeys"][0]["alerts"]
     assert alerts, "the synthetic snapshot should produce a live match"
     assert "impact" not in alerts[0]
+
+
+def test_journey_handlers_are_not_coroutines():
+    """They reach the impact provider, which can make a blocking Journey Planner call, so FastAPI
+    must run them in the anyio threadpool. As `async def` they would block the single-worker event
+    loop and freeze /health (review 2026-07-29; rule documented at reisevalg.py:28)."""
+    import inspect
+
+    assert not inspect.iscoroutinefunction(varsel.list_journeys)
+    assert not inspect.iscoroutinefunction(varsel.create_journey)
+
+
+def test_request_path_does_not_call_the_journey_planner(monkeypatch):
+    """The poller opts into the alternative lookup; the request path must not, or a device with 20
+    journeys x 2 windows would fan out ~40 blocking external calls on one GET."""
+    _reset_state()
+    import alternatives
+
+    calls = []
+    monkeypatch.setattr(alternatives, "find_faster", lambda *a, **k: calls.append(1))
+    _register(DEVICE)
+    calls.clear()
+    r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    assert r.status_code == 200
+    assert calls == [], "GET /varsel-api/journeys must not consult the Journey Planner"
+
+
+def test_listing_surfaces_the_alternative_the_poller_found(monkeypatch):
+    """The field is populated from the poller's cache. It used to be structurally null here, because
+    the request path skips the lookup and nothing carried the result across (review 2026-07-29)."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: "Ta R10 i stedet.")
+    fake_alt = alternatives.AlternativeJourney(
+        departure_time=DEP, arrival_time=DEP + timedelta(minutes=30),
+        duration_min=30, minutes_saved=12, legs=[],
+    )
+    real_match = varsel.match_journey
+
+    def with_alt(journey, now=None, *, with_alternative=False):
+        alerts = real_match(journey, now, with_alternative=with_alternative)
+        if with_alternative:  # emulate the poller's JP hit
+            for a in alerts:
+                a.alternative_journey = fake_alt
+        return alerts
+
+    monkeypatch.setattr(varsel, "match_journey", with_alt)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    alerts = r.json()["journeys"][0]["alerts"]
+    assert alerts and alerts[0]["alternative_journey"] is not None
+    assert alerts[0]["alternative_journey"]["minutes_saved"] == 12
 
 
 def test_departed_train_produces_no_alerts(monkeypatch):

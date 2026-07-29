@@ -90,6 +90,49 @@ def test_empty_and_malformed_patterns_are_survivable():
     assert _select([]) is None
     assert _select([{}]) is None
     assert _select([{"expectedEndTime": "not-a-timestamp", "legs": []}]) is None
+    assert _select([None]) is None
+
+
+def test_malformed_patterns_do_not_raise():
+    """Regression (review 2026-07-29): each of these raised TypeError out of select_faster, through
+    find_faster (which only guarded the FETCH), through main._impact_for_trip, and into
+    varsel.check_and_notify — where the per-journey guard turned it into every alert for that journey
+    being silently dropped for the cycle. One bad JP pattern must cost the alternative, nothing more.
+    """
+    naive = {  # JP always sends an offset; a naive timestamp cannot be compared to a UTC reference
+        "expectedStartTime": "2026-07-29T08:00:00",
+        "expectedEndTime": "2026-07-29T08:30:00",
+        "duration": 1800,
+        "legs": [],
+    }
+    aware_end = (REF - timedelta(minutes=20)).isoformat()
+    cases = {
+        "naive timestamps": naive,
+        "non-numeric duration": {**naive, "expectedEndTime": aware_end, "duration": "1800"},
+        "legs not a list": {**naive, "expectedEndTime": aware_end, "legs": 5},
+        "leg not a dict": {**naive, "expectedEndTime": aware_end, "legs": ["nope"]},
+        "null legs": {**naive, "expectedEndTime": aware_end, "legs": None},
+    }
+    for label, pattern in cases.items():
+        got = _select([pattern])  # must not raise
+        if label == "naive timestamps":
+            assert got is None, "an uncomparable timestamp is not an alternative"
+
+
+def test_find_faster_contains_a_parsing_failure():
+    """The fail-open contract covers parsing, not just fetching."""
+    original = alternatives._fetch_patterns
+    alternatives._fetch_patterns = lambda *a, **k: [
+        {"expectedStartTime": "2026-07-29T08:00:00", "expectedEndTime": "2026-07-29T08:30:00",
+         "duration": 1800, "legs": []}
+    ]
+    alternatives._cache = _KeyedTTLCache(timedelta(minutes=2), timedelta(minutes=2))
+    try:
+        assert find_faster("A", "B", reference_arrival=REF,
+                           depart_after=REF - timedelta(minutes=40),
+                           excluded_jkeys=set(), excluded_lines=set(), now=REF) is None
+    finally:
+        alternatives._fetch_patterns = original
 
 
 def test_legs_are_summarised_in_order():

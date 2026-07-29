@@ -57,6 +57,11 @@ _MIN_MINUTES_SAVED = 3
 # and something still survives.
 _NUM_TRIP_PATTERNS = 6
 
+# Verified live with curl 2026-07-29 (Oslo S -> Drammen and Oslo S -> Stavanger), following the
+# same in-file convention as reisevalg.py's two JP queries -- a brace slip in one of those cost a
+# fix commit (PR #22), so the document is checked against the real endpoint before the parser is
+# written, and the date says when.
+#
 # Modes a traveller on a disrupted public-transport trip could actually switch to. Air is
 # deliberately absent (JP will happily route Oslo -> Stavanger by plane otherwise), and every
 # access/egress/direct mode is foot so the fallback is never "drive" or "cycle for two hours".
@@ -228,12 +233,19 @@ def _fetch_patterns(from_stop: str, to_stop: str, depart_after: datetime) -> lis
 
 # ---- Parsing / selection ---------------------------------------------------------------------
 def _parse_ts(value: str | None) -> datetime | None:
-    if not value:
+    """Parse a JP timestamp, rejecting anything we cannot safely compare.
+
+    A *naive* timestamp is treated as malformed rather than coerced: JP always returns an offset, and
+    silently assuming one would make the comparison against `reference_arrival` (which is UTC-aware)
+    either raise or be wrong by up to two hours. Verified 2026-07-29 that a naive value used to raise
+    TypeError all the way out of find_faster."""
+    if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _strip_codespace(ref: str | None) -> str | None:
@@ -247,7 +259,10 @@ def _strip_codespace(ref: str | None) -> str | None:
 def _rides_the_disruption(
     pattern: dict, excluded_jkeys: set[str], excluded_lines: set[str]
 ) -> bool:
-    for leg in pattern.get("legs") or []:
+    legs = pattern.get("legs")
+    for leg in legs if isinstance(legs, list) else ():
+        if not isinstance(leg, dict):
+            continue
         line_id = (leg.get("line") or {}).get("id")
         if line_id and line_id in excluded_lines:
             return True
@@ -266,6 +281,11 @@ def _to_alternative(pattern: dict, reference_arrival: datetime) -> AlternativeJo
     if saved < _MIN_MINUTES_SAVED:
         return None
     duration = pattern.get("duration")
+    if not isinstance(duration, int | float):
+        duration = None  # JP sends seconds; anything else is malformed, not a reason to crash
+    legs = pattern.get("legs")
+    if not isinstance(legs, list):
+        legs = []
     return AlternativeJourney(
         departure_time=_parse_ts(pattern.get("expectedStartTime")),
         arrival_time=arrival,
@@ -281,7 +301,8 @@ def _to_alternative(pattern: dict, reference_arrival: datetime) -> AlternativeJo
                 start_time=_parse_ts(leg.get("expectedStartTime")),
                 end_time=_parse_ts(leg.get("expectedEndTime")),
             )
-            for leg in pattern.get("legs") or []
+            for leg in legs
+            if isinstance(leg, dict)
         ],
     )
 
@@ -299,6 +320,8 @@ def select_faster(
     """
     best: AlternativeJourney | None = None
     for pattern in patterns:
+        if not isinstance(pattern, dict):
+            continue
         if _rides_the_disruption(pattern, excluded_jkeys, excluded_lines):
             continue
         candidate = _to_alternative(pattern, reference_arrival)
@@ -335,9 +358,22 @@ def find_faster(
     patterns = _cache.get(key, lambda: _fetch_patterns(from_stop, to_stop, depart_after), now)
     if not patterns:
         return None
-    return select_faster(
-        patterns,
-        reference_arrival=reference_arrival,
-        excluded_jkeys=excluded_jkeys,
-        excluded_lines=excluded_lines,
-    )
+    # "Fail open, ALWAYS" has to cover parsing, not just fetching. Until 2026-07-29 only the fetch
+    # was guarded, so one malformed pattern raised out of here, through main._impact_for_trip, into
+    # varsel.check_and_notify -- where the per-journey guard turned it into every alert for that
+    # journey being silently dropped for the cycle. A bad alternative must cost the alternative only.
+    try:
+        return select_faster(
+            patterns,
+            reference_arrival=reference_arrival,
+            excluded_jkeys=excluded_jkeys,
+            excluded_lines=excluded_lines,
+        )
+    except Exception:
+        logger.warning(
+            "Could not interpret the Journey Planner reply for %s; offering no alternative",
+            key,
+            exc_info=True,
+            extra={"fields": {"event": "alternatives_error"}},
+        )
+        return None
