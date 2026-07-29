@@ -120,6 +120,33 @@ def match(journey, by_situation, now=NOW):
     return varsel.match_journey(journey, now)
 
 
+def test_the_real_provider_signature_matches():
+    """Wire main._varsel_impact itself into varsel.configure, not a hand-written double.
+
+    This is the one cross-module contract the /impact rewrite introduced, and on 2026-07-29 it was
+    broken for real: varsel._impact passed `with_alternative=` to a provider that did not accept it,
+    so every matcher call raised TypeError — swallowed by check_and_notify's per-journey guard, which
+    meant ALL push alerting was dead and both journey endpoints 500'd. The suite stayed green because
+    `install()` above and test_varsel_api's provider both hand-write a signature that happens to fit.
+    Any test that only uses a double cannot catch this; this one must call the real function.
+    """
+    main._call_pred_by_situation = {"S1": _train(MON_0800)}
+    varsel.configure(impact_provider=main._varsel_impact, stops_provider=list)
+    try:
+        # Every keyword varsel._impact actually sends, through the real provider.
+        alerts = varsel.match_journey(_journey(), NOW)
+        assert alerts, "the real provider must answer the matcher"
+        # And the poller's path, which additionally asks for an alternative.
+        original = main.alternatives.find_faster
+        main.alternatives.find_faster = lambda *a, **k: None  # no network
+        try:
+            assert varsel.match_journey(_journey(), NOW, with_alternative=True)
+        finally:
+            main.alternatives.find_faster = original
+    finally:
+        install({})  # restore the double for the remaining tests
+
+
 def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", situation="S1",
            **board_kw):
     """A boarding call at A and a later call at B (same train, 40 min later).
@@ -238,6 +265,19 @@ def test_departed_worst_train_does_not_suppress_a_catchable_one_other_line():
     assert len(alerts) == 1
     assert alerts[0].line == "VYG:Line:R11"
     assert alerts[0].impact_probability == 0.80
+
+
+def test_window_just_ended_but_train_still_catchable():
+    """Regression (review 2026-07-29): journey_windows dropped a window the moment its end passed,
+    discarding the case the alert exists for — a train inside the window, predicted heavily late, that
+    the traveller can still make. Per-train catchability is `catchable_after`'s job, not the window's.
+    """
+    late = _train(_oslo(2026, 7, 6, 7, 52), dep_delay_p50_stack_min=45, p_impact_dep=0.9)
+    j = _journey(begin="07:00", end="08:00")
+    # 08:02: window ended two minutes ago, train expected 08:37 -> still catchable, must alert.
+    assert match(j, {"S1": late}, now=_oslo(2026, 7, 6, 8, 2))
+    # 08:40: expected departure has passed -> correctly silent.
+    assert match(j, {"S1": late}, now=_oslo(2026, 7, 6, 8, 40)) == []
 
 
 def test_delayed_train_catchable_until_expected_departure():

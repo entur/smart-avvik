@@ -274,7 +274,11 @@ def _bounded_text(value: object) -> str | None:
         return None
     collapsed = " ".join(value.split())
     printable = "".join(ch for ch in collapsed if ch.isprintable())
-    return printable[:_TEXT_MAX_CHARS] or None
+    # Strip angle brackets: json.dumps escapes quotes but leaves "</reisedata>" intact, so publisher
+    # text could close the fence and address the model directly (review 2026-07-29). No legitimate
+    # Norwegian stop name or disruption description needs them.
+    fenced = printable.replace("<", " ").replace(">", " ")
+    return " ".join(fenced.split())[:_TEXT_MAX_CHARS] or None
 
 
 # CLIENT-supplied stop names never reach this prompt.
@@ -452,7 +456,21 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
 
         message = _extract_message(raw)
         with _lock:
-            _active = name
+            # Pin the backend only when it actually produced something. Pinning on any non-exception
+            # return meant a Claude 400 or refusal (which now return "" rather than latching) stuck
+            # _active='claude' forever, so every later push silently used template wording and the
+            # Gemini fallback never ran (review 2026-07-29).
+            if message:
+                _active = name
+        if not message:
+            logger.warning(
+                "%s returned nothing usable; trying the next backend",
+                name,
+                extra={
+                    "fields": {"event": "llm_message", "provider": name, "result": "rejected"}
+                },
+            )
+            continue
         logger.info(
             "LLM message via %s for %s/%s: %s",
             name,
