@@ -64,7 +64,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
-  - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_CLAUDE_REGION` /
+  - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_LOCATION` /
     `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` — the push text is written by an LLM on Vertex AI
     (`disruptions/api/llm_message.py`) from the enriched `/impact` payload. No API keys: both
     backends use the runtime SA's ADC (`roles/aiplatform.user`, already granted for `AI.CLASSIFY`).
@@ -75,6 +75,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
     wording, so a push is never lost to an LLM problem. **Off in prd** (`VARSEL_LLM_ENABLED=false`)
     until validated in dev. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
+    `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
+    2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
+    available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
+    `VERTEX_GEMINI_LOCATION` when their regional availability diverges.
   - `/impact` also returns `alternative_journey` when `to_stop` is given — a faster way there from
     the Journey Planner (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no credentials).
 

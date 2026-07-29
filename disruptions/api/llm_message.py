@@ -48,10 +48,16 @@ _OSLO = ZoneInfo("Europe/Oslo")
 _PROVIDER = os.environ.get("VARSEL_LLM_PROVIDER", "auto").strip().lower()
 _ENABLED = os.environ.get("VARSEL_LLM_ENABLED", "true").strip().lower() not in ("false", "0", "no")
 _PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
-# europe-west1 keeps inference in the region the rest of this stack runs in. "global" is the
-# documented alternative when a model is not served regionally.
-_REGION = os.environ.get("VERTEX_CLAUDE_REGION", "europe-west1")
+# Location defaults to "global", NOT to the region the rest of the stack runs in: measured
+# 2026-07-29 against ent-kixavvik-dev, gemini-3.5-flash serves at `global` and 404s at
+# europe-west1, so a region-pinned default silently breaks the backend. Per-backend overrides exist
+# because regional availability differs per model — Anthropic models, when enabled, are typically
+# served from a narrower set of regions than Gemini.
+_LOCATION = os.environ.get("VERTEX_LOCATION", "global")
+_CLAUDE_LOCATION = os.environ.get("VERTEX_CLAUDE_LOCATION") or _LOCATION
+_GEMINI_LOCATION = os.environ.get("VERTEX_GEMINI_LOCATION") or _LOCATION
 _CLAUDE_MODEL = os.environ.get("VERTEX_CLAUDE_MODEL", "claude-sonnet-5")
+# Verified live in ent-kixavvik-dev 2026-07-29 (location=global).
 _GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.5-flash")
 
 # Web Push bodies are truncated by the platform and read on a lock screen. Anything longer than this
@@ -104,7 +110,7 @@ _latched_off: set[str] = set()  # backends this project cannot serve
 def _claude_client() -> Any:
     from anthropic import AnthropicVertex
 
-    return AnthropicVertex(project_id=_PROJECT, region=_REGION)
+    return AnthropicVertex(project_id=_PROJECT, region=_CLAUDE_LOCATION)
 
 
 def _claude_write(payload_json: str) -> str:
@@ -130,7 +136,9 @@ def _claude_write(payload_json: str) -> str:
             messages=[{"role": "user", "content": f"<reisedata>\n{payload_json}\n</reisedata>"}],
         )
     except (NotFoundError, PermissionDeniedError) as exc:
-        raise _ConfigurationError(f"{_CLAUDE_MODEL} not available in {_PROJECT}: {exc}") from exc
+        raise _ConfigurationError(
+            f"{_CLAUDE_MODEL} not available in {_PROJECT}/{_CLAUDE_LOCATION}: {exc}"
+        ) from exc
     except BadRequestError as exc:
         # A malformed request is ours to fix, not something to retry every poller tick.
         raise _ConfigurationError(f"Claude rejected the request shape: {exc}") from exc
@@ -140,11 +148,18 @@ def _claude_write(payload_json: str) -> str:
 
 
 def _gemini_write(payload_json: str) -> str:
-    """One Gemini call on Vertex — the fallback when this project cannot serve Sonnet 5."""
+    """One Gemini call on Vertex — the fallback when this project cannot serve Sonnet 5.
+
+    ``thinking_budget: 0`` is load-bearing, not a tuning choice. Gemini 3.5 Flash thinks by default
+    and thinking tokens are drawn from ``max_output_tokens``: measured 2026-07-29, a 600-token budget
+    went 573 on thinking and 12 on output, so the reply came back truncated mid-sentence with
+    ``finish_reason=MAX_TOKENS``. A two-sentence notification does not need reasoning; with thinking
+    off the same call answers completely in ~17 tokens.
+    """
     from google import genai
     from google.api_core import exceptions as gexc
 
-    client = genai.Client(vertexai=True, project=_PROJECT, location=_REGION)
+    client = genai.Client(vertexai=True, project=_PROJECT, location=_GEMINI_LOCATION)
     try:
         response = client.models.generate_content(
             model=_GEMINI_MODEL,
@@ -152,12 +167,26 @@ def _gemini_write(payload_json: str) -> str:
             config={
                 "system_instruction": _SYSTEM_PROMPT,
                 "max_output_tokens": _MAX_TOKENS,
+                "thinking_config": {"thinking_budget": 0},
                 "response_mime_type": "application/json",
                 "response_schema": _RESPONSE_SCHEMA,
             },
         )
     except (gexc.NotFound, gexc.PermissionDenied, gexc.InvalidArgument) as exc:
-        raise _ConfigurationError(f"{_GEMINI_MODEL} not available in {_PROJECT}: {exc}") from exc
+        raise _ConfigurationError(
+            f"{_GEMINI_MODEL} not available in {_PROJECT}/{_GEMINI_LOCATION}: {exc}"
+        ) from exc
+    # A truncated reply is not a message. Returning it would hand the caller a half-sentence, and
+    # _extract_message cannot always tell the difference — so reject it here, at the one place that
+    # can see finish_reason, and let the deterministic wording take over.
+    finish = getattr((response.candidates or [None])[0], "finish_reason", None)
+    if finish is not None and str(getattr(finish, "name", finish)).upper() not in ("STOP", "FINISH_REASON_STOP"):
+        logger.warning(
+            "Gemini reply did not finish cleanly (%s); discarding it",
+            finish,
+            extra={"fields": {"event": "llm_message", "provider": "gemini", "result": "truncated"}},
+        )
+        return ""
     return response.text or ""
 
 
@@ -289,16 +318,25 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
 
 # ---- Public entry point ----------------------------------------------------------------------
 def _extract_message(raw: str) -> str | None:
-    """Pull the message out of a reply, tolerating a model that answered in plain text."""
+    """Pull the message out of a reply, tolerating a model that answered in plain text.
+
+    A reply that *starts* like the JSON we asked for but does not parse is rejected outright rather
+    than passed through as prose. That distinction is not pedantry: a truncated reply looks exactly
+    like `{"melding": "Det er 93 % sjan` — valid-looking, unparseable, and the raw-text fallback
+    would have put that fragment on a traveller's lock screen (observed 2026-07-29 before Gemini's
+    thinking budget was fixed). Only a reply that never claimed to be JSON gets the prose treatment.
+    """
     text = (raw or "").strip()
     if not text:
         return None
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, dict):
-            text = str(parsed.get("melding") or "").strip()
-    except (json.JSONDecodeError, ValueError):
-        pass  # not JSON: treat the whole reply as the message
+    if text.startswith(("{", "[")):
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None  # malformed JSON -- truncated or garbled, not a message
+        if not isinstance(parsed, dict):
+            return None
+        text = str(parsed.get("melding") or "").strip()
     text = text.strip().strip('"').strip()
     if not text or len(text) > _MAX_CHARS:
         return None
