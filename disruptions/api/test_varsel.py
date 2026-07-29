@@ -98,13 +98,15 @@ def install(by_situation):
     """
     main._call_pred_by_situation = by_situation
 
-    def provider(*, from_stop, to_stop, window_start, window_end):
+    def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
+                 with_alternative=False):
         return main._impact_for_trip(
             from_stop=from_stop,
             to_stop=to_stop,
             window_start=window_start,
             window_end=window_end,
             select="worst",
+            catchable_after=catchable_after,
             with_alternative=False,
         )
 
@@ -200,6 +202,40 @@ def test_departed_train_no_match():
     assert match(_journey(), {"S1": _train(MON_0800)}, now=_oslo(2026, 7, 6, 12, 0)) == []
     # Still catchable just before the expected departure.
     assert match(_journey(), {"S1": _train(MON_0800)}, now=_oslo(2026, 7, 6, 8, 2))
+
+
+def test_departed_worst_train_does_not_suppress_a_catchable_one_same_line():
+    """Regression (review 2026-07-29): catchability used to be applied AFTER /impact rolled up to
+    the worst train per situation, so a departed worst-case train hid a later, still-catchable,
+    alert-worthy train on the same line. The alert must survive and report the catchable train."""
+    calls = (
+        # 07:30, the most severe train in the window -- but long gone by 09:00.
+        _train(_oslo(2026, 7, 6, 7, 30), jkey="gone", p_cancel=0.9, p_impact_dep=0.99)
+        # 08:45, less severe but still over the 0.65 threshold, and still catchable.
+        + _train(_oslo(2026, 7, 6, 8, 45), jkey="catchable", p_cancel=0.2, p_impact_dep=0.80)
+    )
+    alerts = match(_journey(begin="07:00", end="09:00"), {"S1": calls},
+                   now=_oslo(2026, 7, 6, 8, 40))
+    assert len(alerts) == 1, "the situation must not vanish because its worst train departed"
+    assert alerts[0].impact_probability == 0.80, "must report the catchable train, not the gone one"
+    assert alerts[0].departure_time == _oslo(2026, 7, 6, 8, 45)
+    assert alerts[0].alertworthy is True
+
+
+def test_departed_worst_train_does_not_suppress_a_catchable_one_other_line():
+    """Same trap across two lines of one situation: the rollup takes the worst line, so a departed
+    train on line A must not hide a catchable alert-worthy train on line B."""
+    calls = (
+        _train(_oslo(2026, 7, 6, 7, 30), jkey="gone", p_cancel=0.9, p_impact_dep=0.99,
+               line="VYG:Line:R10")
+        + _train(_oslo(2026, 7, 6, 8, 45), jkey="ok", p_cancel=0.2, p_impact_dep=0.80,
+                 line="VYG:Line:R11")
+    )
+    alerts = match(_journey(begin="07:00", end="09:00"), {"S1": calls},
+                   now=_oslo(2026, 7, 6, 8, 40))
+    assert len(alerts) == 1
+    assert alerts[0].line == "VYG:Line:R11"
+    assert alerts[0].impact_probability == 0.80
 
 
 def test_delayed_train_catchable_until_expected_departure():
