@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import threading
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -65,6 +66,12 @@ _GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.5-flash")
 _MAX_CHARS = 300
 # Room for adaptive thinking plus one or two Norwegian sentences.
 _MAX_TOKENS = 600
+# Hard per-call wall clock. This runs on the poller thread that also rebuilds every BigQuery cache,
+# so an unbounded call stalls ingestion for /disruptions, /journey, /demo and /reisevalg too. The
+# Anthropic SDK defaults to 600 s with two retries; google-genai is likewise unbounded. At
+# _MAX_LLM_CALLS_PER_CYCLE=8 sequential calls that is over an hour of stalled ingestion, so the
+# budget is set to match reisevalg's "<= 3 s per external call" rule with a little headroom.
+_TIMEOUT_S = 8.0
 
 _SYSTEM_PROMPT = """\
 Du skriver korte varsler til reisende i norsk kollektivtrafikk, på bokmål.
@@ -110,7 +117,12 @@ _latched_off: set[str] = set()  # backends this project cannot serve
 def _claude_client() -> Any:
     from anthropic import AnthropicVertex
 
-    return AnthropicVertex(project_id=_PROJECT, region=_CLAUDE_LOCATION)
+    # max_retries=0: the SDK's default 2 retries with backoff multiply the wall clock on the
+    # ingestion thread, and a failed message just falls back to the deterministic wording -- the
+    # next poller tick is the retry.
+    return AnthropicVertex(
+        project_id=_PROJECT, region=_CLAUDE_LOCATION, timeout=_TIMEOUT_S, max_retries=0
+    )
 
 
 def _claude_write(payload_json: str) -> str:
@@ -140,10 +152,22 @@ def _claude_write(payload_json: str) -> str:
             f"{_CLAUDE_MODEL} not available in {_PROJECT}/{_CLAUDE_LOCATION}: {exc}"
         ) from exc
     except BadRequestError as exc:
-        # A malformed request is ours to fix, not something to retry every poller tick.
-        raise _ConfigurationError(f"Claude rejected the request shape: {exc}") from exc
+        # NOT a _ConfigurationError: part of the request is unauthenticated client input, so a
+        # rejected shape can be payload-dependent. Latching on it would let one crafted journey name
+        # disable this backend for every user until the pod restarts. Fail this call only.
+        logger.warning(
+            "Claude rejected the request: %s",
+            exc,
+            extra={"fields": {"event": "llm_message", "provider": "claude", "result": "rejected"}},
+        )
+        return ""
     if response.stop_reason == "refusal":
-        raise _ConfigurationError("Claude declined the request (stop_reason=refusal)")
+        # Refusal is a function of request CONTENT -- same reasoning as above, do not latch.
+        logger.warning(
+            "Claude declined this payload (stop_reason=refusal)",
+            extra={"fields": {"event": "llm_message", "provider": "claude", "result": "refusal"}},
+        )
+        return ""
     return "".join(block.text for block in response.content if block.type == "text")
 
 
@@ -157,9 +181,14 @@ def _gemini_write(payload_json: str) -> str:
     off the same call answers completely in ~17 tokens.
     """
     from google import genai
-    from google.api_core import exceptions as gexc
+    from google.genai import errors as genai_errors
 
-    client = genai.Client(vertexai=True, project=_PROJECT, location=_GEMINI_LOCATION)
+    client = genai.Client(
+        vertexai=True,
+        project=_PROJECT,
+        location=_GEMINI_LOCATION,
+        http_options={"timeout": int(_TIMEOUT_S * 1000)},  # google-genai takes milliseconds
+    )
     try:
         response = client.models.generate_content(
             model=_GEMINI_MODEL,
@@ -172,10 +201,17 @@ def _gemini_write(payload_json: str) -> str:
                 "response_schema": _RESPONSE_SCHEMA,
             },
         )
-    except (gexc.NotFound, gexc.PermissionDenied, gexc.InvalidArgument) as exc:
-        raise _ConfigurationError(
-            f"{_GEMINI_MODEL} not available in {_PROJECT}/{_GEMINI_LOCATION}: {exc}"
-        ) from exc
+    # google-genai raises google.genai.errors.ClientError -- which has NO relationship to
+    # google.api_core.exceptions (verified: issubclass(...) is False). Catching the api_core family
+    # here, as this did until review on 2026-07-29, meant a genuinely unavailable Gemini model never
+    # latched off and was retried on every call forever. Only 404/403 are configuration problems;
+    # 400 can be payload-dependent, so it is deliberately NOT latched (see _claude_write).
+    except genai_errors.ClientError as exc:
+        if getattr(exc, "code", None) in (404, 403):
+            raise _ConfigurationError(
+                f"{_GEMINI_MODEL} not available in {_PROJECT}/{_GEMINI_LOCATION}: {exc}"
+            ) from exc
+        raise
     # A truncated reply is not a message. Returning it would hand the caller a half-sentence, and
     # _extract_message cannot always tell the difference — so reject it here, at the one place that
     # can see finish_reason, and let the deterministic wording take over.
@@ -228,22 +264,54 @@ def _pct(value: float | None) -> int | None:
     return round(value * 100) if value is not None else None
 
 
-# Stop display names are CLIENT-supplied (JourneyIn.from_name/to_name, up to 120 chars of free
-# text), and journey_key deliberately ignores them — so two devices with the same stops share one
-# written message even when they typed different names. That means one device's free text can reach
-# another device's notification, which makes these the one genuinely attacker-controlled strings in
-# the payload. The <reisedata> fence and the system prompt already frame the payload as data; this
-# strips the shape an instruction block needs (newlines, control characters, unbounded length) so
-# the fence is not the only thing standing between a hostile name and someone else's push.
-_NAME_MAX_CHARS = 60
+# Per-field cap on free text entering the prompt.
+_TEXT_MAX_CHARS = 400
 
 
-def _clean_name(value: object) -> str | None:
+def _bounded_text(value: object) -> str | None:
+    """Collapse whitespace, drop non-printables, and truncate. For publisher free text."""
     if not isinstance(value, str):
         return None
-    collapsed = " ".join(value.split())  # folds newlines/tabs/runs into single spaces
+    collapsed = " ".join(value.split())
     printable = "".join(ch for ch in collapsed if ch.isprintable())
-    return printable[:_NAME_MAX_CHARS] or None
+    return printable[:_TEXT_MAX_CHARS] or None
+
+
+# CLIENT-supplied stop names never reach this prompt.
+#
+# `JourneyIn.from_name`/`to_name` are up to 120 chars of unauthenticated free text, and
+# `varsel.journey_key` deliberately ignores them — so two devices registering the same stops share
+# ONE written message, and whichever registered first supplies the names. That is a path from one
+# device's free text into another device's push notification.
+#
+# Sanitising it was not enough, and the reason is worth stating: the system prompt *instructs* the
+# model to use the stop names from the data, so a clean, single-line, 60-char string like
+# "Oslo S (info: enturvarsel.no)" is reproduced faithfully — a shape filter cannot help when the
+# content is the payload. So the prompt gets SERVER-SIDE names only: the canonical stop name from
+# the same stop list that backs the `/varsel-api/stops` picker, falling back to the bare NSR ref.
+# Client names are still used for that device's OWN notification title (`_notification_payload`
+# reads the device's own record), which is not a cross-device path.
+_stop_name_provider: Callable[[], list[dict]] | None = None
+
+
+def configure(*, stop_name_provider: Callable[[], list[dict]]) -> None:
+    """Wire in the canonical stop list (main.refresh_varsel_stops' cache) at startup."""
+    global _stop_name_provider
+    _stop_name_provider = stop_name_provider
+
+
+def _canonical_stop_name(stop_place: object) -> str | None:
+    """The registry name for a StopPlace ref, or None when it cannot be resolved."""
+    if not isinstance(stop_place, str) or _stop_name_provider is None:
+        return None
+    try:
+        for row in _stop_name_provider() or ():
+            if row.get("stop_place") == stop_place:
+                name = row.get("stop_name")
+                return name if isinstance(name, str) and name.strip() else None
+    except Exception:  # a provider hiccup must never break message writing
+        logger.warning("Stop-name lookup failed; using refs", exc_info=True)
+    return None
 
 
 def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
@@ -271,18 +339,22 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
             }
         lines.append(entry)
 
+    # SX text is publisher-authored and `description` is "often several sentences" with no upper
+    # bound. Capping it bounds the injection surface, the token spend, and the log record size; a
+    # 300-char notification cannot use more than this anyway.
     situations = [
         {
-            "sammendrag": getattr(sit, "summary", None),
-            "beskrivelse": getattr(sit, "description", None),
+            "sammendrag": _bounded_text(getattr(sit, "summary", None)),
+            "beskrivelse": _bounded_text(getattr(sit, "description", None)),
         }
         for sit in (getattr(impact, "situations", []) or [])
     ]
 
     payload: dict[str, Any] = {
         "reise": {
-            "fra": _clean_name(journey.get("from_name")) or journey.get("from_stop"),
-            "til": _clean_name(journey.get("to_name")) or journey.get("to_stop"),
+            # Server-side names only — see the note above _canonical_stop_name.
+            "fra": _canonical_stop_name(journey.get("from_stop")) or journey.get("from_stop"),
+            "til": _canonical_stop_name(journey.get("to_stop")) or journey.get("to_stop"),
         },
         "transportmiddel": getattr(alert, "mode", None),
         "avgang_kl": _hhmm(getattr(alert, "departure_time", None)),

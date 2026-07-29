@@ -8,10 +8,15 @@ alert-worthy match. Tapping it opens the app, which lists the journeys and the d
 currently hitting them (served by :func:`GET /varsel-api/journeys`).
 
 The matching itself **is** ``/impact``: :func:`match_journey` turns a registered journey into
-boarding windows and asks main's ``/impact`` provider about each one, then applies what is genuinely
-varsel's own policy on top — dropping trains that can no longer be caught, and the per-operator
-alert gate. It used to re-implement the matcher, which had already drifted (the two severity orders
-disagreed); there is now one matcher and one severity order behind both surfaces.
+boarding windows and asks main's ``/impact`` provider about each one — passing ``catchable_after``
+so the matcher itself excludes departures the traveller can no longer make — then applies the one
+policy that is genuinely varsel's: the per-operator alert gate. It used to re-implement the matcher,
+which had already drifted (the two severity orders disagreed); there is now one matcher and one
+severity order behind both surfaces.
+
+  Catchability has to be *inside* candidate selection. Filtering it afterwards, on the rolled-up
+  worst-per-situation result, let a departed worst-case train suppress a later train on the same line
+  that was both still catchable and alert-worthy — a missed alert, found in review 2026-07-29.
 
 Design notes
 ------------
@@ -194,7 +199,13 @@ def configure(
     _stops_provider = stops_provider
 
 
-def _impact(journey: dict, window_start: datetime, window_end: datetime) -> Any | None:
+def _impact(
+    journey: dict,
+    window_start: datetime,
+    window_end: datetime,
+    catchable_after: datetime | None = None,
+    with_alternative: bool = False,
+) -> Any | None:
     """One /impact call for a journey's boarding window, or None when unconfigured."""
     if _impact_provider is None:
         return None
@@ -203,6 +214,8 @@ def _impact(journey: dict, window_start: datetime, window_end: datetime) -> Any 
         to_stop=journey["to_stop"],
         window_start=window_start,
         window_end=window_end,
+        catchable_after=catchable_after,
+        with_alternative=with_alternative,
     )
 
 
@@ -311,16 +324,6 @@ def _typ_delay(pred: Any) -> int | None:
     """Typical delay off a StopPrediction, preferring the calibrated exceedance-stack p50 and
     falling back to the raw regression only when the stack has nothing (as main.py does)."""
     return pred.delay_p50_min if pred.delay_p50_min is not None else pred.delay_typ_min
-
-
-def _expected_dep(pred: Any) -> datetime | None:
-    """When the vehicle is expected to actually leave the boarding stop: aimed departure plus the
-    predicted typical delay. Once this has passed the traveller can no longer catch it, so the
-    match is moot — scored calls stay in the cache for as long as their situation is open, which
-    can be many hours past the departures they describe."""
-    if pred.scheduled_time is None:
-        return None
-    return pred.scheduled_time + timedelta(minutes=max(_typ_delay(pred) or 0, 0))
 
 
 def journey_key(journey: dict) -> str:
@@ -432,20 +435,29 @@ class Alert(BaseModel):
     impact: Any | None = Field(default=None, exclude=True, repr=False)
 
 
-def match_journey(journey: dict, now: datetime | None = None) -> list[Alert]:
+def match_journey(
+    journey: dict, now: datetime | None = None, *, with_alternative: bool = False
+) -> list[Alert]:
     """Situations currently hitting `journey`, worst-first — one :class:`Alert` per situation.
 
     The matching itself is ``/impact``'s: this asks the impact provider about each of the journey's
     boarding windows (``select="worst"`` — if any train in the window is alert-worthy the traveller
     needs to know) and keeps what is left of varsel's own policy on top of the result:
 
-    * **not yet departed** — a situation stays open, and its scored calls stay in the cache, long
-      after the departures it describes; without this a morning delay would keep alerting all day.
+    * **not yet departed** — handed to the matcher as ``catchable_after=now`` rather than applied
+      here, so a departed train is never a candidate in the first place (a situation stays open, and
+      its scored calls stay in the cache, long after the departures it describes; without this a
+      morning delay would keep alerting all day).
     * **the per-operator alert gate** — exactly ``/demo``'s ``would_alert``: the calibrated impact
       probability must exist and cross :func:`threshold_for`. No cancellation-probability fallback
       (see the module docstring).
 
     ``now`` is injectable for tests; it defaults to the current time.
+
+    `with_alternative` is **off by default**: the Journey Planner lookup is a blocking external call,
+    and a device with 20 registered journeys x 2 windows would fan out ~40 of them on a single
+    request. The poller passes True (the push is where the advice matters); the request path leaves it
+    off and the in-app list shows the cached written message, which already names the alternative.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -454,7 +466,10 @@ def match_journey(journey: dict, now: datetime | None = None) -> list[Alert]:
     # one tomorrow, and the same situation can reach into both).
     worst_by_situation: dict[str, Alert] = {}
     for window_start, window_end in journey_windows(journey, now):
-        impact = _impact(journey, window_start, window_end)
+        impact = _impact(
+            journey, window_start, window_end, catchable_after=now,
+            with_alternative=with_alternative,
+        )
         if impact is None:
             continue
         observation_by_line = {
@@ -462,9 +477,6 @@ def match_journey(journey: dict, now: datetime | None = None) -> list[Alert]:
         }
         for sit in impact.situations or []:
             dep = sit.departure_prediction
-            expected = _expected_dep(dep)
-            if expected is not None and expected < now:
-                continue  # can no longer be caught
             threshold = threshold_for(sit.operator)
             impact_p = dep.impact_probability
             alert = Alert(
@@ -725,7 +737,19 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     alerts_by_key: dict[str, list[Alert]] = {}
     llm_calls = 0
     for key, journey in by_journey_key.items():
-        alerts = match_journey(journey)
+        try:
+            alerts = match_journey(journey, with_alternative=True)
+        except Exception:
+            # One journey's failure must not stop the remaining journeys being scored or any push
+            # going out. Empty alerts for this key; the next tick retries.
+            logger.warning(
+                "Scoring failed for journey %s; skipping it this cycle",
+                key,
+                exc_info=True,
+                extra={"fields": {"event": "varsel_match_error"}},
+            )
+            alerts_by_key[key] = []
+            continue
         alerts_by_key[key] = alerts
         worst = next((a for a in alerts if a.alertworthy), None)
         if worst is None:
@@ -986,11 +1010,16 @@ def _journey_model(jid: str, rec: dict) -> Journey:
 
 
 @router.get("/journeys", summary="A device's journeys with the disruptions currently hitting them")
-async def list_journeys(
+def list_journeys(
     device_id: str = Query(description="Client-generated device UUID."),
 ) -> JourneysResponse:
     """Every journey registered by this device, each annotated with the situations currently
-    affecting it (the same matcher used for push, but with no dedup — this is the live picture)."""
+    affecting it (the same matcher used for push, but with no dedup — this is the live picture).
+
+    Plain ``def`` (NOT ``async def``), as in ``reisevalg.recommendation``: the impact provider can
+    make a blocking Journey Planner call, which must run in the anyio threadpool rather than on the
+    single-worker event loop. The alternative lookup is additionally skipped on this request path —
+    see :func:`match_journey`."""
     with _state_lock:
         mine = [(jid, rec) for jid, rec in _journeys.items() if rec["device_id"] == device_id]
     journeys = [_journey_model(jid, rec) for jid, rec in mine]
@@ -999,8 +1028,10 @@ async def list_journeys(
 
 
 @router.post("/journeys", summary="Register a journey for alerts")
-async def create_journey(body: JourneyIn) -> Journey:
-    """Register a from→to journey with a recurring weekday+time window. Capped per device."""
+def create_journey(body: JourneyIn) -> Journey:
+    """Register a from→to journey with a recurring weekday+time window. Capped per device.
+
+    Plain ``def`` for the same reason as :func:`list_journeys`."""
     with _state_lock:
         mine = sum(1 for rec in _journeys.values() if rec["device_id"] == body.device_id)
         if mine >= _MAX_JOURNEYS_PER_DEVICE:

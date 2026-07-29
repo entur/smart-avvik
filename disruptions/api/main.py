@@ -10,6 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import alternatives  # sibling module: Journey Planner faster-alternative lookup for /impact
+import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
@@ -534,7 +535,12 @@ def _varsel_snapshot() -> dict[str, list]:
 
 
 def _varsel_impact(
-    *, from_stop: str, to_stop: str, window_start: datetime, window_end: datetime
+    *,
+    from_stop: str,
+    to_stop: str,
+    window_start: datetime,
+    window_end: datetime,
+    catchable_after: datetime | None = None,
 ) -> "ImpactResponse":
     """/impact for a registered journey's boarding window, injected into varsel via configure().
 
@@ -549,6 +555,7 @@ def _varsel_impact(
         window_start=window_start,
         window_end=window_end,
         select="worst",
+        catchable_after=catchable_after,
     )
 
 
@@ -648,6 +655,7 @@ async def lifespan(app: FastAPI):
     # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
     # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
     varsel.configure(impact_provider=_varsel_impact, stops_provider=_varsel_stops)
+    llm_message.configure(stop_name_provider=_varsel_stops)
     varsel.load_state()
     try:
         refresh_varsel_stops()
@@ -1651,6 +1659,20 @@ def _call_severity(c: _CallPred) -> tuple[float, int, float]:
     return (c.p_impact_dep or 0.0, p90 or 0, c.p_cancel)
 
 
+def _expected_departure(c: _CallPred) -> datetime | None:
+    """When the vehicle is expected to actually leave this stop: aimed departure plus the predicted
+    typical delay. A train whose aimed time has passed can still be catchable if it is predicted
+    25 min late, which is why this is not simply a comparison against the aimed time."""
+    if c.aimed_dep is None:
+        return None
+    typ = (
+        c.dep_delay_p50_stack_min
+        if c.dep_delay_p50_stack_min is not None
+        else c.dep_delay_typ_min
+    )
+    return c.aimed_dep + timedelta(minutes=max(typ or 0, 0))
+
+
 def _trip_cells(
     scope: dict[str, list[_CallPred]],
     from_stop: str,
@@ -1660,6 +1682,7 @@ def _trip_cells(
     *,
     select: str = "nearest",
     at: datetime | None = None,
+    catchable_after: datetime | None = None,
 ) -> list[_TripCell]:
     """Build one (situation × line) cell per line with a departure from `from_stop` in the window.
 
@@ -1676,6 +1699,12 @@ def _trip_cells(
       asking "my train leaves about now" means.
     * ``"worst"`` — the most severe boarding call by :func:`_call_severity`. What an alert gate
       means: if any train in the window is alert-worthy, the traveller needs to know.
+
+    `catchable_after` drops boardings whose *expected* departure has already passed. It belongs here,
+    in candidate selection, and not in a post-filter on the rolled-up result: filtering afterwards
+    would let a departed worst-case train suppress the whole situation, hiding a later train on the
+    same line that is both still catchable and alert-worthy. (That is the same ordering trap as the
+    `to_stop` eligibility check below — worth stating twice, since it was made twice.)
     """
     if select == "nearest" and at is None:
         raise ValueError("select='nearest' requires `at` (the intended departure to measure from)")
@@ -1685,7 +1714,13 @@ def _trip_cells(
     def better(candidate: _CallPred, current: _CallPred) -> bool:
         if select == "nearest":
             return abs(candidate.aimed_dep - at) < abs(current.aimed_dep - at)
-        return _call_severity(candidate) > _call_severity(current)
+        # Tie-break on aimed departure then journey ref: without it an exact three-way severity tie
+        # resolves on BigQuery row order, so the reported train could flip between refreshes.
+        return (_call_severity(candidate), -candidate.aimed_dep.timestamp(), candidate.jkey) > (
+            _call_severity(current),
+            -current.aimed_dep.timestamp(),
+            current.jkey,
+        )
 
     cells: list[_TripCell] = []
     for calls in scope.values():
@@ -1704,12 +1739,15 @@ def _trip_cells(
         for group in by_journey.values():
             bcall = None
             for c in group:
-                if (
-                    c.stop_place == from_stop
-                    and c.aimed_dep is not None
-                    and window_start <= c.aimed_dep <= window_end
-                    and (bcall is None or better(c, bcall))
-                ):
+                if c.stop_place != from_stop or c.aimed_dep is None:
+                    continue
+                if not (window_start <= c.aimed_dep <= window_end):
+                    continue
+                if catchable_after is not None:
+                    expected = _expected_departure(c)
+                    if expected is not None and expected < catchable_after:
+                        continue  # already gone -- cannot be the traveller's train
+                if bcall is None or better(c, bcall):
                     bcall = c
             if bcall is None:
                 continue
@@ -1778,7 +1816,16 @@ def _latest_observation(cells: list[_TripCell]) -> "LatestObservation | None":
     own = [c for cell in cells for c in cell.calls]
     line = [c for cell in cells for c in cell.line_calls]
     for pool in (own, line):
-        observed = [c for c in pool if _is_observed(c) and _call_ts(c) is not None]
+        # An observation must actually say something. A recorded call at a TERMINAL has no departure,
+        # so et_dep_delay_min is structurally NULL: admitting it made the PWA render "i rute" and
+        # hide the line's real observed state (review 2026-07-29).
+        observed = [
+            c
+            for c in pool
+            if _is_observed(c)
+            and _call_ts(c) is not None
+            and (c.et_dep_delay_min is not None or c.et_declared_cancelled)
+        ]
         if not observed:
             continue
         best = max(observed, key=lambda c: (_call_ts(c), c.stop_order))
@@ -1879,6 +1926,7 @@ def _impact_for_trip(
     select: str = "nearest",
     at: datetime | None = None,
     situation: str | None = None,
+    catchable_after: datetime | None = None,
     with_alternative: bool = True,
 ) -> ImpactResponse:
     """Score a trip against the live per-call cache and shape the /impact response.
@@ -1897,7 +1945,14 @@ def _impact_for_trip(
         scope = by_situation
 
     cells = _trip_cells(
-        scope, from_stop, to_stop, window_start, window_end, select=select, at=at
+        scope,
+        from_stop,
+        to_stop,
+        window_start,
+        window_end,
+        select=select,
+        at=at,
+        catchable_after=catchable_after,
     )
 
     alternative = None
@@ -1906,10 +1961,11 @@ def _impact_for_trip(
         if reference is not None:
             # Leave from the worst affected train's aimed departure onwards: an "alternative" that
             # left before the traveller could get to the platform is not one.
-            depart_after = min(
-                (c.departure.scheduled_time for c in cells if c.departure.scheduled_time),
-                default=window_start,
-            )
+            # Anchor on the train the alert is about, never earlier than now: planning from a
+            # past instant returns "alternatives" that have already left.
+            worst_dep = _worst([c.departure for c in cells])
+            anchor = (worst_dep.scheduled_time if worst_dep else None) or window_start
+            depart_after = max(anchor, datetime.now(UTC))
             alternative = alternatives.find_faster(
                 from_stop,
                 to_stop,
@@ -1934,7 +1990,7 @@ def _impact_for_trip(
     response_description="Situations and lines affecting the trip, each with departure/arrival predictions.",
     tags=["disruptions"],
 )
-async def impact(
+def impact(
     from_stop: str = Query(
         default=_DEFAULT_FROM_STOP,
         description=(
@@ -1972,6 +2028,11 @@ async def impact(
     The result is exposed two ways: `situations` (one entry per situation, worst-case over its
     lines) and `lines` (one entry per line, worst-case over the situations affecting it). Pass
     `situation` to scope to a single situation. Both lists are empty when nothing affects the trip.
+
+    Plain ``def`` (NOT ``async def``) on purpose, matching ``reisevalg.recommendation``: this may
+    make a blocking Journey Planner call, which must run in the anyio threadpool. On the
+    single-worker event loop it would freeze ``/journey``, ``/varsel-api`` and the ``/health``
+    liveness probe (found in review 2026-07-29 -- it was ``async def`` with a blocking urlopen).
     """
     if at is None:
         at_utc = datetime.now(UTC)

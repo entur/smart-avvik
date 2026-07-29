@@ -78,7 +78,8 @@ def _use_snapshot(snapshot):
     _active_snapshot["value"] = snapshot
 
 
-def _impact_provider(*, from_stop, to_stop, window_start, window_end):
+def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
+                     with_alternative=False):
     main._call_pred_by_situation = _active_snapshot["value"]
     return main._impact_for_trip(
         from_stop=from_stop,
@@ -86,6 +87,7 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end):
         window_start=window_start,
         window_end=window_end,
         select="worst",
+        catchable_after=catchable_after,
         with_alternative=False,  # no Journey Planner calls from the test suite
     )
 
