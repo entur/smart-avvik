@@ -541,8 +541,18 @@ def _varsel_impact(
     window_start: datetime,
     window_end: datetime,
     catchable_after: datetime | None = None,
+    with_alternative: bool = False,
 ) -> "ImpactResponse":
     """/impact for a registered journey's boarding window, injected into varsel via configure().
+
+    `select="worst"` rather than /impact's `nearest`: an alert asks "is any train in this window
+    alert-worthy?", not "which train leaves closest to a given minute". Same matcher, same severity
+    `with_alternative` defaults to False so the /varsel-api request path never makes a blocking
+    Journey Planner call; the poller passes True. Keep this signature in step with varsel._impact's
+    call: it is the one cross-module contract in this design, both test doubles hand-write their own
+    provider, and a mismatch here raises TypeError on every matcher call -- silently swallowed by
+    check_and_notify's per-journey guard, i.e. all alerting dead with a green test suite. That
+    happened on 2026-07-29; the regression test is test_the_real_provider_signature_matches.
 
     `select="worst"` rather than /impact's `nearest`: an alert asks "is any train in this window
     alert-worthy?", not "which train leaves closest to a given minute". Same matcher, same severity
@@ -556,6 +566,7 @@ def _varsel_impact(
         window_end=window_end,
         select="worst",
         catchable_after=catchable_after,
+        with_alternative=with_alternative,
     )
 
 

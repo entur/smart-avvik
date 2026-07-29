@@ -144,6 +144,13 @@ _MAX_JOURNEYS_PER_DEVICE = 20
 # every other cache, so an unbounded fan-out of LLM calls would stall ingestion. Journeys beyond the
 # cap get the deterministic wording this tick and are picked up on the next one.
 _MAX_LLM_CALLS_PER_CYCLE = 8
+# How long past a window's end a train from that window can still be worth alerting about. A train
+# is only ever dropped by its own predicted expected departure (`catchable_after`); this bound just
+# stops journey_windows from discarding the window before that check runs. Sized above the p90 delays
+# the exceedance stack produces (~90 min at the top of the curve).
+_WINDOW_CATCH_UP = timedelta(minutes=90)
+# Per-send wall clock for a Web Push delivery (see _send_push).
+_PUSH_TIMEOUT_S = 10.0
 # A freshly-created push subscription can 404/410 at the push service for a short window before
 # it has propagated (seen especially with FCM/Android). Within this grace period we treat such a
 # response as transient and do NOT drop the device, so an immediate test-push or first alert
@@ -373,8 +380,12 @@ def journey_windows(journey: dict, now: datetime) -> list[tuple[datetime, dateti
         midnight = datetime.combine(local_date, time(0, 0), tzinfo=_OSLO)
         start = midnight + timedelta(minutes=begin_min)
         end = midnight + timedelta(minutes=end_min)
-        if end < local_now:
-            continue  # the whole window is in the past
+        # Keep offering a window for a grace period after its end. Dropping it the moment `end`
+        # passes discards exactly the case the alert exists for: a 07:52 train in an 07:00-08:00
+        # window, predicted 45 min late, is still catchable at 08:02. `catchable_after` does the real
+        # per-train filtering downstream, so this only has to be generous enough not to pre-empt it.
+        if end + _WINDOW_CATCH_UP < local_now:
+            continue  # even a heavily delayed train in this window has gone
         windows.append((start.astimezone(UTC), end.astimezone(UTC)))
     return windows
 
@@ -599,6 +610,10 @@ def _send_push(subscription: dict, payload: dict) -> str:
             vapid_private_key=_vapid,
             vapid_claims={"sub": _VAPID_SUBJECT},
             ttl=3600,
+            # pywebpush passes this to requests; without it the default is None -- block forever. The
+            # endpoint URL comes from the client, so an unresponsive host would hang the poller
+            # thread and stop ingestion for every other feature (review 2026-07-29).
+            timeout=_PUSH_TIMEOUT_S,
         )
         return "sent"
     except WebPushException as exc:
@@ -1075,7 +1090,19 @@ def create_journey(body: JourneyIn) -> Journey:
         }
         _journeys[jid] = rec
         _save_state()
-    return _journey_model(jid, rec)
+    try:
+        return _journey_model(jid, rec)
+    except Exception:
+        # The registration is already committed, so a failure rendering the response would otherwise
+        # burn one of the 20 per-device slots on every retry while the UI shows nothing (review
+        # 2026-07-29). Roll it back and let the client retry cleanly.
+        with _state_lock:
+            _journeys.pop(jid, None)
+            _save_state()
+        logger.exception("Could not render the new journey; rolled the registration back")
+        raise HTTPException(
+            status_code=503, detail="Kunne ikke opprette reisen akkurat nå. Prøv igjen."
+        ) from None
 
 
 @router.delete("/journeys/{journey_id}", summary="Delete a registered journey")
