@@ -16,8 +16,8 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
-import main  # noqa: E402
-from test_varsel import FakeCall  # noqa: E402  (shared synthetic _CallPred shape)
+import main
+from test_varsel import FakeCall
 
 A, B, C = "NSR:StopPlace:A", "NSR:StopPlace:B", "NSR:StopPlace:C"
 

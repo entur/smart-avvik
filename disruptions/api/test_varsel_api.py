@@ -37,7 +37,11 @@ from datetime import datetime, timedelta
 import varsel
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from test_varsel import _OSLO, FakeCall, main  # reuse the synthetic call shape + the stubbed main
+from test_varsel import (  # reuse the synthetic call shape + the stubbed main
+    _OSLO,
+    FakeCall,
+    main,
+)
 
 DEVICE = "dev-abc12345"
 SUBSCRIPTION = {"endpoint": "https://push.example.com/x", "keys": {"p256dh": "k", "auth": "a"}}
