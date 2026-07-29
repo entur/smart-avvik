@@ -21,6 +21,7 @@ class FakeCall:
     stop_order: int
     aimed_dep: datetime | None
     stop_name: str | None = None
+    situation_number: str = "S1"
     operator: str = "VYG"
     p_cancel: float = 0.5
     p_impact_dep: float | None = 0.9
