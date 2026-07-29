@@ -9,9 +9,11 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import alternatives  # sibling module: Journey Planner faster-alternative lookup for /impact
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
+from alternatives import AlternativeJourney
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -1130,11 +1132,40 @@ class StopPrediction(BaseModel):
     )
 
 
+class LatestObservation(BaseModel):
+    """What has actually been *observed* on a line so far, as opposed to predicted.
+
+    Sourced from the ET-derived planned call tables (`recordedCalls` for operated stops, plus any
+    call ET has already declared cancelled) — so these are facts, not model output.
+
+    **Freshness:** the underlying planned source is rebuilt on a TTL (60 min for rail, 120 min for
+    bus), so an observation can be up to that old. `observed_at` is part of this object precisely so
+    the age is visible rather than implied by the word "latest" — quote it with its time.
+
+    **Scope:** the prediction cache only holds calls belonging to journeys a live situation touches,
+    so this is the latest stop on this line *that a live situation reaches*, not a whole-line view.
+    """
+
+    cancelled: bool = Field(description="Whether ET has declared this call cancelled.")
+    at_stop: str | None = Field(description="NSR StopPlace ref of the latest observed stop.")
+    at_stop_name: str | None = Field(default=None, description="Human-readable name of that stop.")
+    delayed_min: int | None = Field(
+        description="Minutes late at `at_stop` (0 when on time or early); null if not recorded.",
+    )
+    observed_at: datetime | None = Field(
+        default=None, description="Aimed time of the observed call (UTC) — how old this fact is.",
+    )
+
+
 class SituationImpact(BaseModel):
     """How one situation impacts the passenger's trip, worst-case across the lines it affects."""
 
     situation_number: str = Field(description="SIRI-SX situationNumber of this situation.")
     summary: str | None = Field(description="Short Norwegian summary of the situation.")
+    description: str | None = Field(
+        default=None,
+        description="The operator's fuller Norwegian explanation; often several sentences.",
+    )
     departure_prediction: StopPrediction = Field(
         description="Worst-case boarding prediction across the lines this situation affects.",
     )
@@ -1151,11 +1182,21 @@ class LineImpact(BaseModel):
     """
 
     line: str | None = Field(description="Line ref of the affected train, e.g. 'VYG:Line:R31'.")
+    operator: str | None = Field(
+        default=None,
+        description="Ref codespace of the affected journey (VYG, GOA, RUT, ...). Determines which "
+        "calibration family and alerting threshold apply.",
+    )
     departure_prediction: StopPrediction = Field(
         description="Worst-case boarding prediction across the situations affecting this line.",
     )
     arrival_prediction: StopPrediction | None = Field(
         description="Worst-case alighting prediction; null when `to_stop` is omitted or not served.",
+    )
+    latest_observation: LatestObservation | None = Field(
+        default=None,
+        description="What has actually been observed on this line so far; null when nothing has "
+        "been observed yet (every affected call is still upcoming).",
     )
 
 
@@ -1182,6 +1223,13 @@ class ImpactResponse(BaseModel):
     )
     lines: list[LineImpact] = Field(
         description="Lines affecting the trip, most severe first; each line appears once.",
+    )
+    alternative_journey: AlternativeJourney | None = Field(
+        default=None,
+        description="A faster way from `from_stop` to `to_stop` than the worst affected train's "
+        "predicted arrival, from the Journey Planner. Null when `to_stop` is omitted, when nothing "
+        "is faster, or when the Journey Planner is unavailable. One per trip, not per line — the "
+        "traveller picks one way to get there.",
     )
 
 
@@ -1479,14 +1527,24 @@ async def journey(
 
 @dataclass(frozen=True)
 class _TripCell:
-    """One (situation × line) impact for the passenger's trip: the train on this line departing
-    from_stop nearest `at`, scored at the boarding stop (and the alighting stop if to_stop given)."""
+    """One (situation × line) impact for the passenger's trip: the train on this line selected out
+    of the boarding window, scored at the boarding stop (and the alighting stop if to_stop given).
+
+    `calls` are the selected train's own calls and `line_calls` every call on the same line within
+    the situation — the two pools :func:`_latest_observation` reads, preferring the traveller's own
+    train over the line as a whole.
+    """
 
     situation_number: str
     summary: str | None
+    description: str | None
     line: str | None
+    operator: str | None
+    jkey: str | None
     departure: StopPrediction
     arrival: StopPrediction | None
+    calls: tuple = ()
+    line_calls: tuple = ()
 
 
 def _departure_prediction(c: _CallPred) -> StopPrediction:
@@ -1529,28 +1587,76 @@ def _arrival_prediction(c: _CallPred) -> StopPrediction:
     )
 
 
+def _severity_key(p: StopPrediction) -> tuple[float, int, float]:
+    """Order impacts most-severe first, by the *alerting* score — the calibrated impact probability
+    the /varsel push gate and /demo's would_alert both fire on — then bad-case delay, then
+    cancellation probability as a deterministic tie-break.
+
+    Ordering by cancellation probability instead (as this did until 2026-07-29) could hand a
+    situation's headline numbers to a train other than the one that crossed the alert threshold:
+    a 5 %-cancel / 95 %-impact train is the one the traveller cares about, not a
+    40 %-cancel / 42 %-impact one. Same key as varsel's matcher, which had it right.
+    """
+    return (p.impact_probability or 0.0, p.delay_p90_min or 0, p.cancel_probability)
+
+
 def _worst(preds: list[StopPrediction | None]) -> StopPrediction | None:
-    """Most severe prediction: highest cancellation probability, then largest p90 delay.
+    """Most severe prediction by :func:`_severity_key`.
 
     None-valued entries (e.g. a train that does not serve the alighting stop) are ignored; returns
     None only if nothing remains."""
     present = [p for p in preds if p is not None]
     if not present:
         return None
-    return max(present, key=lambda p: (p.cancel_probability, p.delay_p90_min or 0))
+    return max(present, key=_severity_key)
+
+
+def _call_severity(c: _CallPred) -> tuple[float, int, float]:
+    """:func:`_severity_key` on a raw boarding call, for the `worst` selection strategy."""
+    p90 = (
+        c.dep_delay_p90_stack_min
+        if c.dep_delay_p90_stack_min is not None
+        else c.dep_delay_p90_min
+    )
+    return (c.p_impact_dep or 0.0, p90 or 0, c.p_cancel)
 
 
 def _trip_cells(
     scope: dict[str, list[_CallPred]],
     from_stop: str,
     to_stop: str | None,
-    at: datetime,
+    window_start: datetime,
+    window_end: datetime,
+    *,
+    select: str = "nearest",
+    at: datetime | None = None,
 ) -> list[_TripCell]:
-    """Build one (situation × line) cell for every line with a departure from `from_stop` near `at`.
+    """Build one (situation × line) cell per line with a departure from `from_stop` in the window.
 
-    Within a situation, lines are resolved independently: the boarding call is the one on that line
-    closest to `at` (and within _IMPACT_AT_TOLERANCE); the arrival call is that same train at
-    `to_stop`. Situations with no qualifying departure are skipped."""
+    A boarding call qualifies when its aimed departure falls inside the inclusive
+    ``[window_start, window_end]`` window and the same train later calls at `to_stop` (a higher
+    stop_order — the travel direction). Situations with no qualifying departure are skipped.
+
+    The window is the primitive because the two callers ask different questions of the same data:
+    ``/impact`` asks about one intended departure (window = ``at`` ± :data:`_IMPACT_AT_TOLERANCE`),
+    while a registered /varsel journey is a recurring ``[begin, end]`` window. `select` is how they
+    differ on which train to keep per line:
+
+    * ``"nearest"`` — the boarding call closest to `at` (which is then required). What a passenger
+      asking "my train leaves about now" means.
+    * ``"worst"`` — the most severe boarding call by :func:`_call_severity`. What an alert gate
+      means: if any train in the window is alert-worthy, the traveller needs to know.
+    """
+    if select == "nearest" and at is None:
+        raise ValueError("select='nearest' requires `at` (the intended departure to measure from)")
+    if select not in ("nearest", "worst"):
+        raise ValueError(f"unknown boarding selection strategy: {select!r}")
+
+    def better(candidate: _CallPred, current: _CallPred) -> bool:
+        if select == "nearest":
+            return abs(candidate.aimed_dep - at) < abs(current.aimed_dep - at)
+        return _call_severity(candidate) > _call_severity(current)
+
     cells: list[_TripCell] = []
     for calls in scope.values():
         board = [
@@ -1558,47 +1664,217 @@ def _trip_cells(
             for c in calls
             if c.stop_place == from_stop
             and c.aimed_dep is not None
-            and abs(c.aimed_dep - at) <= _IMPACT_AT_TOLERANCE
+            and window_start <= c.aimed_dep <= window_end
         ]
         if not board:
             continue
-        # Per line, keep the boarding call nearest the intended departure.
+        # Per line, keep one boarding call per the selection strategy.
         by_line: dict[str | None, _CallPred] = {}
         for c in board:
             cur = by_line.get(c.line)
-            if cur is None or abs(c.aimed_dep - at) < abs(cur.aimed_dep - at):
+            if cur is None or better(c, cur):
                 by_line[c.line] = c
         for line, bcall in by_line.items():
+            # The selected train's own calls, and every call on the same line in this situation --
+            # keyed on (operator, jkey) because bus ServiceJourney refs are not date-scoped and can
+            # collide across operators within one situation.
+            own = tuple(
+                c for c in calls if c.operator == bcall.operator and c.jkey == bcall.jkey
+            )
             arrival = None
             if to_stop is not None:
                 acall = next(
                     (
                         c
-                        for c in calls
-                        if c.operator == bcall.operator
-                        and c.jkey == bcall.jkey
-                        and c.stop_place == to_stop
+                        for c in own
+                        if c.stop_place == to_stop
                         and c.aimed_arr is not None
+                        and c.stop_order > bcall.stop_order
                     ),
                     None,
                 )
-                if acall is not None:
-                    arrival = _arrival_prediction(acall)
+                if acall is None:
+                    continue  # this train does not reach to_stop in the travel direction
+                arrival = _arrival_prediction(acall)
             cells.append(
                 _TripCell(
                     situation_number=bcall.situation_number,
                     summary=bcall.summary,
+                    description=bcall.description,
                     line=line,
+                    operator=bcall.operator,
+                    jkey=bcall.jkey,
                     departure=_departure_prediction(bcall),
                     arrival=arrival,
+                    calls=own,
+                    line_calls=tuple(c for c in calls if c.line == line),
                 )
             )
     return cells
 
 
-def _severity_key(p: StopPrediction) -> tuple[float, int]:
-    """Sort key for ordering impacts most-severe first (the departure prediction is always set)."""
-    return (p.cancel_probability, p.delay_p90_min or 0)
+def _is_observed(c: _CallPred) -> bool:
+    """True when ET has told us something about this call rather than us predicting it: the vehicle
+    has served the stop ('recorded'), or ET has already declared the call cancelled."""
+    return c.call_source == "recorded" or bool(c.et_declared_cancelled)
+
+
+def _call_ts(c: _CallPred) -> datetime | None:
+    return c.aimed_dep or c.aimed_arr
+
+
+def _latest_observation(cells: list[_TripCell]) -> "LatestObservation | None":
+    """The furthest-along observed call across `cells`, or None when nothing has been observed.
+
+    Prefers an observation on the traveller's own selected train — "your train is 18 min late at
+    Asker" is more actionable than the same fact about a different service — and falls back to the
+    line as a whole, which is what matters when their own train has not started yet.
+    """
+    own = [c for cell in cells for c in cell.calls]
+    line = [c for cell in cells for c in cell.line_calls]
+    for pool in (own, line):
+        observed = [c for c in pool if _is_observed(c) and _call_ts(c) is not None]
+        if not observed:
+            continue
+        best = max(observed, key=lambda c: (_call_ts(c), c.stop_order))
+        return LatestObservation(
+            cancelled=bool(best.et_declared_cancelled),
+            at_stop=best.stop_place,
+            at_stop_name=best.stop_name,
+            # Clamped at 0: a vehicle that left early is not "delayed -2 min", and this field is
+            # read as a delay by both the PWA and the message writer.
+            delayed_min=(
+                max(best.et_dep_delay_min, 0) if best.et_dep_delay_min is not None else None
+            ),
+            observed_at=_call_ts(best),
+        )
+    return None
+
+
+def _impact_response(
+    cells: list[_TripCell],
+    *,
+    from_stop: str,
+    to_stop: str | None,
+    refreshed_at: datetime | None,
+    alternative_journey: AlternativeJourney | None,
+) -> ImpactResponse:
+    """Roll trip cells up into the two views the response exposes.
+
+    Extracted from the endpoint so /varsel-api gets the same shaping (and the same severity order)
+    through the in-process provider that an HTTP caller gets.
+    """
+    # situations: roll cells up per situation (worst-case over that situation's lines).
+    by_sit: dict[str, list[_TripCell]] = {}
+    for cell in cells:
+        by_sit.setdefault(cell.situation_number, []).append(cell)
+    situations = [
+        SituationImpact(
+            situation_number=sit_num,
+            summary=group[0].summary,
+            description=group[0].description,
+            departure_prediction=_worst([c.departure for c in group]),
+            arrival_prediction=_worst([c.arrival for c in group]),
+        )
+        for sit_num, group in by_sit.items()
+    ]
+    situations.sort(key=lambda s: _severity_key(s.departure_prediction), reverse=True)
+
+    # lines: roll cells up per line (worst-case over the situations affecting that line).
+    by_line: dict[str | None, list[_TripCell]] = {}
+    for cell in cells:
+        by_line.setdefault(cell.line, []).append(cell)
+    lines = [
+        LineImpact(
+            line=line,
+            operator=group[0].operator,
+            departure_prediction=_worst([c.departure for c in group]),
+            arrival_prediction=_worst([c.arrival for c in group]),
+            latest_observation=_latest_observation(group),
+        )
+        for line, group in by_line.items()
+    ]
+    lines.sort(key=lambda x: _severity_key(x.departure_prediction), reverse=True)
+
+    return ImpactResponse(
+        as_of=datetime.now(UTC),
+        refreshed_at=refreshed_at,
+        from_stop=from_stop,
+        to_stop=to_stop,
+        situations=situations,
+        lines=lines,
+        alternative_journey=alternative_journey,
+    )
+
+
+def _reference_arrival(cells: list[_TripCell]) -> datetime | None:
+    """The predicted arrival at `to_stop` of the worst affected train — the bar an alternative has
+    to beat. Aimed arrival plus the predicted arrival delay, since the aimed time is not what the
+    traveller will actually experience."""
+    arrivals = [c.arrival for c in cells if c.arrival is not None]
+    worst = _worst(arrivals)
+    if worst is None or worst.scheduled_time is None:
+        return None
+    delay = worst.delay_p50_min if worst.delay_p50_min is not None else worst.delay_typ_min
+    return worst.scheduled_time + timedelta(minutes=max(delay or 0, 0))
+
+
+def _impact_for_trip(
+    *,
+    from_stop: str,
+    to_stop: str | None,
+    window_start: datetime,
+    window_end: datetime,
+    select: str = "nearest",
+    at: datetime | None = None,
+    situation: str | None = None,
+    with_alternative: bool = True,
+) -> ImpactResponse:
+    """Score a trip against the live per-call cache and shape the /impact response.
+
+    The single entry point for both surfaces: the HTTP endpoint calls it with a point-in-time window
+    derived from `at`, and varsel calls it with a registered journey's recurring window. Keeping one
+    entry point is what stops the two from drifting apart again.
+    """
+    with _call_pred_lock:
+        by_situation = _call_pred_by_situation
+        refreshed_at = _call_pred_refreshed_at
+    if situation is not None:
+        calls = by_situation.get(situation)
+        scope = {situation: calls} if calls else {}
+    else:
+        scope = by_situation
+
+    cells = _trip_cells(
+        scope, from_stop, to_stop, window_start, window_end, select=select, at=at
+    )
+
+    alternative = None
+    if with_alternative and to_stop is not None and cells:
+        reference = _reference_arrival(cells)
+        if reference is not None:
+            # Leave from the worst affected train's aimed departure onwards: an "alternative" that
+            # left before the traveller could get to the platform is not one.
+            depart_after = min(
+                (c.departure.scheduled_time for c in cells if c.departure.scheduled_time),
+                default=window_start,
+            )
+            alternative = alternatives.find_faster(
+                from_stop,
+                to_stop,
+                reference_arrival=reference,
+                depart_after=depart_after,
+                excluded_jkeys={c.jkey for c in cells if c.jkey},
+                excluded_lines={c.line for c in cells if c.line},
+            )
+
+    return _impact_response(
+        cells,
+        from_stop=from_stop,
+        to_stop=to_stop,
+        refreshed_at=refreshed_at,
+        alternative_journey=alternative,
+    )
 
 
 @app.get(
@@ -1650,53 +1926,14 @@ async def impact(
         at_utc = datetime.now(UTC)
     else:
         at_utc = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
-    with _call_pred_lock:
-        by_situation = _call_pred_by_situation
-        refreshed_at = _call_pred_refreshed_at
-    if situation is not None:
-        calls = by_situation.get(situation)
-        scope = {situation: calls} if calls else {}
-    else:
-        scope = by_situation
-
-    cells = _trip_cells(scope, from_stop, to_stop, at_utc)
-
-    # situations: roll cells up per situation (worst-case over that situation's lines).
-    by_sit: dict[str, list[_TripCell]] = {}
-    for cell in cells:
-        by_sit.setdefault(cell.situation_number, []).append(cell)
-    situations = [
-        SituationImpact(
-            situation_number=sit_num,
-            summary=group[0].summary,
-            departure_prediction=_worst([c.departure for c in group]),
-            arrival_prediction=_worst([c.arrival for c in group]),
-        )
-        for sit_num, group in by_sit.items()
-    ]
-    situations.sort(key=lambda s: _severity_key(s.departure_prediction), reverse=True)
-
-    # lines: roll cells up per line (worst-case over the situations affecting that line).
-    by_line: dict[str | None, list[_TripCell]] = {}
-    for cell in cells:
-        by_line.setdefault(cell.line, []).append(cell)
-    lines = [
-        LineImpact(
-            line=line,
-            departure_prediction=_worst([c.departure for c in group]),
-            arrival_prediction=_worst([c.arrival for c in group]),
-        )
-        for line, group in by_line.items()
-    ]
-    lines.sort(key=lambda x: _severity_key(x.departure_prediction), reverse=True)
-
-    return ImpactResponse(
-        as_of=datetime.now(UTC),
-        refreshed_at=refreshed_at,
+    return _impact_for_trip(
         from_stop=from_stop,
         to_stop=to_stop,
-        situations=situations,
-        lines=lines,
+        window_start=at_utc - _IMPACT_AT_TOLERANCE,
+        window_end=at_utc + _IMPACT_AT_TOLERANCE,
+        select="nearest",
+        at=at_utc,
+        situation=situation,
     )
 
 
