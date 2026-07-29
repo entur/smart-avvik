@@ -251,6 +251,30 @@ def test_impact_response_shape_matches_the_togpuls_contract():
         assert isinstance(sit["situation_number"], str) and sit["situation_number"]
 
 
+def test_no_journey_planner_call_without_a_to_stop():
+    """There is no arrival to beat without a destination, so /impact must not reach out at all —
+    a public read endpoint should not make an external HTTP call it cannot use."""
+    import alternatives
+
+    calls = []
+    original = alternatives.find_faster
+    alternatives.find_faster = lambda *a, **k: calls.append(1)
+    main._call_pred_by_situation = _scope(S1=_train("j1", 8))
+    try:
+        resp = main._impact_for_trip(
+            from_stop=A,
+            to_stop=None,
+            window_start=_at(7),
+            window_end=_at(9),
+            select="nearest",
+            at=_at(8),
+        )
+    finally:
+        alternatives.find_faster = original
+    assert calls == [], "the Journey Planner must not be consulted without a to_stop"
+    assert resp.alternative_journey is None
+
+
 def test_impact_response_carries_the_new_fields():
     scope = _scope(S1=_train("j1", 8, operator="RUT", description="Buss for tog"))
     resp = main._impact_response(
