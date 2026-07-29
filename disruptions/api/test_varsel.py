@@ -26,10 +26,24 @@ class FakeCall:
     p_dep_ge10: float | None = 0.8
     line: str | None = "VYG:Line:R10"
     summary: str | None = "Signalfeil"
+    description: str | None = None
     dep_delay_typ_min: int | None = 4
     dep_delay_p90_min: int | None = 15
     dep_delay_p50_stack_min: int | None = 3
     dep_delay_p90_stack_min: int | None = 12
+    # Observed state. Defaults describe an upcoming call with nothing observed yet, so existing
+    # cases keep their meaning and a test opts in to an observation explicitly.
+    et_declared_cancelled: bool | None = False
+    et_dep_delay_min: int | None = None
+    call_source: str | None = "estimated"
+    # Arrival side -- unused by the pre-U2 matcher, needed once /impact builds cells from these.
+    aimed_arr: datetime | None = None
+    arr_delay_typ_min: int | None = None
+    arr_delay_p90_min: int | None = None
+    arr_delay_p50_stack_min: int | None = None
+    arr_delay_p90_stack_min: int | None = None
+    p_arr_ge10: float | None = None
+    p_impact: float | None = None
 
 
 def _journey(begin="07:00", end="09:00", days=(0, 1, 2, 3, 4)):
