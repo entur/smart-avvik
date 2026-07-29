@@ -241,6 +241,23 @@ def test_strips_wrapping_quotes():
     assert _extract_message('"Toget er innstilt."') == "Toget er innstilt."
 
 
+def test_rejects_a_truncated_json_reply():
+    """Observed 2026-07-29: Gemini spent its whole token budget thinking and returned
+    '{"melding": "Det er 93 % sjan'. The old raw-text fallback would have pushed that fragment to a
+    lock screen. A reply that claims to be JSON and is not is a failure, not prose."""
+    assert _extract_message('{"melding": "Det er 93 % sjan') is None
+    assert _extract_message('{"melding":') is None
+    assert _extract_message("[") is None
+
+
+def test_still_accepts_prose_that_never_claimed_to_be_json():
+    assert _extract_message("Toget er innstilt. Ta buss 31.") == "Toget er innstilt. Ta buss 31."
+
+
+def test_rejects_json_that_is_not_an_object():
+    assert _extract_message('["Toget er innstilt."]') is None
+
+
 def test_rejects_an_empty_reply():
     assert _extract_message("") is None
     assert _extract_message('{"melding": "   "}') is None
