@@ -88,10 +88,12 @@ jobs:
     needs: [test, docker-lint, helm-lint]
     uses: entur/gha-docker/.github/workflows/build.yml@v1
     with:
-      # Context is the repo root: the multi-stage Dockerfile builds the /demo and
-      # /varsel front-ends from demo/reisedemo + demo/avviksvarsel (outside the API
-      # dir), then assembles the API image from disruptions/api. Both paths are
-      # relative to the repository root.
+      # Context is the repo root: the multi-stage Dockerfile builds the /demo,
+      # /varsel and /historikk front-ends from demo/reisedemo + demo/avviksvarsel +
+      # demo/varselhistorikk (outside the API dir), then assembles the API image
+      # from disruptions/api. All paths are relative to the repository root.
+      # Those builds run `tsc -b`, so a TypeScript error fails the image build —
+      # there is no separate front-end job.
       context: .
       dockerfile: Dockerfile
 

@@ -1,8 +1,9 @@
 # Build context for the root Dockerfile is the whole repo, so keep it lean.
 # Docker's .dockerignore is NOT gitignore syntax: use **/ to match nested paths.
 #
-# Kept (needed by the build): demo/reisedemo, demo/avviksvarsel (front-end
-# sources), disruptions/api (API + *.sql + committed eval_static/), Dockerfile.
+# Kept (needed by the build): demo/reisedemo, demo/avviksvarsel,
+# demo/varselhistorikk (front-end sources), disruptions/api (API + *.sql +
+# committed eval_static/), Dockerfile.
 
 .git
 
@@ -26,6 +27,7 @@ memory/
 # local copy must not leak in via the API-dir COPY.
 disruptions/api/demo_static/
 disruptions/api/varsel_static/
+disruptions/api/historikk_static/
 
 # Local-only avviksvarsel state (durable state lives in the GCS bucket in prod).
 disruptions/api/varsel_state.json

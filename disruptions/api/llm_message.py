@@ -88,12 +88,17 @@ _TIMEOUT_S = 8.0
 _LOG_PROMPTS = os.environ.get("VARSEL_LLM_LOG_PROMPTS", "").lower() in ("1", "true", "yes")
 
 
-def _key_digest(journey_key: str) -> str:
-    """A short stable digest of a journey key, for correlating log lines without logging the key.
+def key_digest(journey_key: str) -> str:
+    """A short stable digest of a journey key, for correlating records without storing the key.
 
-    `journey_key` is from|to|begin|end|days — a commute pattern. This keeps log records joinable
+    `journey_key` is from|to|begin|end|days — a commute pattern. This keeps records joinable
     (same journey → same digest) without putting the pattern itself in Cloud Logging next to
     event="push" records that carry device_id.
+
+    Public because :mod:`decisions` stores the same digest on every recorded alert decision: an
+    ``event="llm_message"`` log line and its row in ``disruptions.varsel_decisions`` have to be
+    joinable, which only holds if both sides compute the digest the same way. One implementation,
+    not two that agree by comment.
     """
     if not journey_key:
         return ""
@@ -631,7 +636,7 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
         logger.info(
             "LLM message via %s for %s/%s: %s",
             name,
-            _key_digest(journey_key),
+            key_digest(journey_key),
             situation_number,
             message,
             extra={
@@ -640,7 +645,7 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                     "provider": name,
                     "model": _CLAUDE_MODEL if name == "claude" else _GEMINI_MODEL,
                     "result": "ok",
-                    "journey_digest": _key_digest(journey_key),
+                    "journey_digest": key_digest(journey_key),
                     "situation_number": situation_number,
                     "message": message,
                 }
@@ -649,13 +654,13 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
         if _LOG_PROMPTS:
             logger.debug(
                 "LLM prompt/reply for %s/%s",
-                _key_digest(journey_key),
+                key_digest(journey_key),
                 situation_number,
                 extra={
                     "fields": {
                         "event": "llm_message_prompt",
                         "provider": name,
-                        "journey_digest": _key_digest(journey_key),
+                        "journey_digest": key_digest(journey_key),
                         "situation_number": situation_number,
                         "payload": payload_json,
                         "reply": raw,
