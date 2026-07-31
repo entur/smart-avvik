@@ -11,9 +11,12 @@
 -- the latest recordedAtTime, and null the "actuals" on rows still flagged estimated so an
 -- un-departed call cannot masquerade as an on-time one.
 --
--- COST: ~$0.08/run, essentially all of it the ET side — an 11-day operatingDate slice,
--- partition-pruned and cluster-pruned (dataSource) to the operators we actually serve, cf.
--- extend_demo_recent_daily.sql's ~$0.2 for 27 days.
+-- COST: ~$0.01/run — measured, not estimated: `bq query --dry_run` reports 1.53 GB scanned
+-- (2026-08-01, empty decision log). Nearly all of it is the ET side: an 11-day operatingDate
+-- slice, partition-pruned, cluster-pruned on dataSource to the operators we serve, and reading
+-- only the eight columns below. That column pruning is why this is an order of magnitude under
+-- extend_demo_recent_daily.sql's ~$0.2 for 27 days, which carries far more of the row.
+-- The ET side is fixed; the decision-log side grows with the log, so re-measure if it matters.
 --
 -- The decision-log side is a FULL scan, not a partitioned one: varsel_decisions is partitioned on
 -- DATE(decided_at) but this query selects on call_date, and the grouping sits behind a view, so

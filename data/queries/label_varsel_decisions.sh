@@ -11,7 +11,8 @@
 # have a row, so nothing is duplicated. Idempotence is the reason the window is 10 days rather
 # than 1 — a week of missed runs catches up on its own.
 #
-# Cost ~$0.08/run (an 11-day partition-pruned slice of last_recorded).
+# Cost ~$0.01/run (measured: 1.53 GB scanned, an 11-day partition- and cluster-pruned slice of
+# last_recorded reading only the columns the join needs).
 #
 # PROJECT matters: dev and prd each hold their own decisions and label them separately. This table
 # is deliberately absent from copy_runtime_to_prd.sh — copying it would overwrite one
