@@ -367,9 +367,9 @@ def test_the_prompt_itself_is_not_logged_at_info(caplog=None):
     and it sits in the same log as event="push" records carrying device_id.
     """
     assert llm_message._LOG_PROMPTS is False, "prompt logging must be opt-in"
-    digest = llm_message._key_digest("A|B|06:00|09:00|0,1,2,3,4")
+    digest = llm_message.key_digest("A|B|06:00|09:00|0,1,2,3,4")
     assert digest and "|" not in digest and "06:00" not in digest
-    assert digest == llm_message._key_digest("A|B|06:00|09:00|0,1,2,3,4"), "must be stable"
+    assert digest == llm_message.key_digest("A|B|06:00|09:00|0,1,2,3,4"), "must be stable"
 
 
 def test_payload_item_counts_are_bounded():

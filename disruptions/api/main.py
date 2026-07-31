@@ -11,6 +11,8 @@ from zoneinfo import ZoneInfo
 
 # Aliased: the route function below is also called `impact`, and inside its body a bare
 # `impact.` would resolve to that function rather than to this module.
+import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
+import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
 import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
@@ -637,6 +639,13 @@ async def lifespan(app: FastAPI):
     impact_engine.configure(snapshot_provider=_impact_snapshot)
     varsel.configure(impact_provider=_varsel_impact, stops_provider=_varsel_stops)
     llm_message.configure(stop_name_provider=_varsel_stops)
+    # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
+    # by a provisioning script because prd is an isolated project fed by free copies that nobody
+    # runs build scripts against — without this the table would simply be missing there. Its own
+    # failure path is internal (logged, never raised), so a BigQuery problem cannot block startup.
+    decisions.configure(bq_client=bq_client)
+    decisions.ensure_table()
+    historikk.configure(bq_client=bq_client)
     varsel.load_state()
     try:
         refresh_varsel_stops()
@@ -721,6 +730,10 @@ app.include_router(varsel.router)
 # the static mounts, like /varsel-api.
 app.include_router(reisevalg.router)
 
+# Varselhistorikk API (what Avviksvarsel decided, and whether it turned out right). Registered
+# before the /historikk static mount, like the two above.
+app.include_router(historikk.router)
+
 # Pre-rendered marimo eval notebooks, served read-only at /eval (index at /eval/,
 # each notebook at /eval/<name>.html). They are static snapshots built offline by
 # export_eval.sh — outputs baked in — so serving them costs no BigQuery and starts no
@@ -752,6 +765,21 @@ if _VARSEL_STATIC_DIR.is_dir():
     logger.info("Mounted avviksvarsel PWA at /varsel from %s", _VARSEL_STATIC_DIR)
 else:
     logger.info("No varsel_static/ directory; /varsel not mounted (run demo/avviksvarsel/build.sh)")
+
+# The Varselhistorikk UI (demo/varselhistorikk) — which alert decisions were taken and how they
+# turned out. Same generated-directory pattern as the mounts above; its data comes from
+# /historikk-api (registered further up, before these mounts).
+_HISTORIKK_STATIC_DIR = Path(__file__).parent / "historikk_static"
+if _HISTORIKK_STATIC_DIR.is_dir():
+    app.mount(
+        "/historikk", StaticFiles(directory=_HISTORIKK_STATIC_DIR, html=True), name="historikk"
+    )
+    logger.info("Mounted varselhistorikk UI at /historikk from %s", _HISTORIKK_STATIC_DIR)
+else:
+    logger.info(
+        "No historikk_static/ directory; /historikk not mounted "
+        "(run demo/varselhistorikk/build.sh)"
+    )
 
 
 def get_last_ingestion_time() -> datetime | None:

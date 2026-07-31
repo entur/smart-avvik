@@ -1,12 +1,13 @@
-# Image for the /disruptions API plus its two front-ends (/demo and /varsel).
+# Image for the /disruptions API plus its front-ends (/demo, /varsel, /historikk).
 #
 # Build context is the REPO ROOT (not disruptions/api) because the front-end
-# sources live in demo/reisedemo and demo/avviksvarsel, outside the API dir. The
-# CI build (.github/workflows/ci.yml) builds this file from the root.
+# sources live in demo/reisedemo, demo/avviksvarsel and demo/varselhistorikk,
+# outside the API dir. The CI build (.github/workflows/ci.yml) builds this file
+# from the root.
 #
-# Why multi-stage: the /demo and /varsel UIs are Vite bundles generated from
-# source — the generated demo_static/ and varsel_static/ are gitignored, so they
-# are NOT in the checkout and must be built here. (The /eval snapshots are
+# Why multi-stage: those UIs are Vite bundles generated from source — the
+# generated demo_static/, varsel_static/ and historikk_static/ are gitignored, so
+# they are NOT in the checkout and must be built here. (The /eval snapshots are
 # different: they run BigQuery under a developer's ADC, so they are rendered
 # offline and committed under disruptions/api/eval_static/ — see export_eval.sh.)
 #
@@ -18,12 +19,12 @@
 # venv in a slim builder stage and copied in; the distroless interpreter runs
 # them via PYTHONPATH. Reference: entur/epimetheus uses the same pattern.
 
-# ---- Stage 1: build the two Vite front-ends -------------------------------
+# ---- Stage 1: build the Vite front-ends -----------------------------------
 # Vite 8 needs Node >=20.19 / >=22.12; node:24-slim (the current LTS line) satisfies that.
 FROM node:24-slim AS frontends
 
 # Each app's vite.config.ts writes its bundle to ../../disruptions/api/<x>_static,
-# i.e. /build/disruptions/api/{demo,varsel}_static from the app dirs below. Create
+# i.e. /build/disruptions/api/{demo,varsel,historikk}_static from the app dirs below. Create
 # that parent up front so Vite's emptyOutDir always has somewhere to write.
 RUN mkdir -p /build/disruptions/api
 
@@ -39,6 +40,12 @@ WORKDIR /build/demo/avviksvarsel
 COPY demo/avviksvarsel/package.json demo/avviksvarsel/package-lock.json ./
 RUN npm ci --no-fund --no-audit
 COPY demo/avviksvarsel/ ./
+RUN npm run build
+
+WORKDIR /build/demo/varselhistorikk
+COPY demo/varselhistorikk/package.json demo/varselhistorikk/package-lock.json ./
+RUN npm ci --no-fund --no-audit
+COPY demo/varselhistorikk/ ./
 RUN npm run build
 
 # ---- Stage 2: install the Python deps into a venv -------------------------
@@ -75,14 +82,17 @@ WORKDIR /app
 # Python deps (installed in stage 2).
 COPY --from=pybuild /opt/venv /opt/venv
 
-# App code + *.sql + the committed eval_static/ snapshots. demo_static/ and
-# varsel_static/ are gitignored (and .dockerignore'd), so they are absent here.
+# App code + *.sql + the committed eval_static/ snapshots. demo_static/,
+# varsel_static/ and historikk_static/ are gitignored (and .dockerignore'd), so
+# they are absent here.
 COPY disruptions/api/ .
 
-# The freshly built /demo and /varsel bundles from stage 1. Copied last so they
-# always win over any stale locally-built copy that slipped into the context.
+# The freshly built /demo, /varsel and /historikk bundles from stage 1. Copied
+# last so they always win over any stale locally-built copy that slipped into the
+# context.
 COPY --from=frontends /build/disruptions/api/demo_static ./demo_static
 COPY --from=frontends /build/disruptions/api/varsel_static ./varsel_static
+COPY --from=frontends /build/disruptions/api/historikk_static ./historikk_static
 
 # The Helm chart routes traffic to 8080. Single worker on purpose: the app keeps
 # an in-process cache and one background poller thread, so multiple workers would

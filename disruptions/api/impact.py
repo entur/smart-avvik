@@ -170,6 +170,14 @@ class SituationImpact(BaseModel):
         description="Ref codespace of that line's journey (VYG, GOA, RUT, ...). Determines which "
         "calibration family and alerting threshold apply.",
     )
+    jkey: str | None = Field(
+        default=None,
+        description="Journey key of the train `departure_prediction` describes — the SIRI-ET "
+        "`datedVehicleJourneyRef` with its codespace prefix stripped, so `(operator, jkey, "
+        "call_date, stop_order)` joins back to realized ET outcomes. Describes the DEPARTURE side "
+        "only: `arrival_prediction` is picked worst-first over arrivals independently and may come "
+        "from a different train. Null when the cell carried no journey ref.",
+    )
     departure_prediction: StopPrediction = Field(
         description="Worst-case boarding prediction across the lines this situation affects.",
     )
@@ -542,6 +550,9 @@ def _impact_response(
     for sit_num, group in by_sit.items():
         # Which line the worst-case numbers came from, so a caller can join back to that line's
         # latest_observation (and, for /varsel, its per-operator alerting threshold).
+        # `_worst` is max-by-severity_key over the same group in the same order, so worst_cell IS
+        # the cell behind departure_prediction -- which is what makes carrying its jkey honest
+        # rather than approximate. Keep the two selections in step if either ever changes.
         worst_cell = max(group, key=lambda c: severity_key(c.departure))
         situations.append(
             SituationImpact(
@@ -550,6 +561,7 @@ def _impact_response(
                 description=group[0].description,
                 line=worst_cell.line,
                 operator=worst_cell.operator,
+                jkey=worst_cell.jkey,
                 departure_prediction=_worst([c.departure for c in group]),
                 arrival_prediction=_worst([c.arrival for c in group]),
             )
