@@ -1,35 +1,63 @@
-"""Matcher unit checks for varsel.match_journey — synthetic _CallPred-shaped rows.
+"""Matcher checks for varsel.match_journey — synthetic _CallPred-shaped rows.
 
-Runs standalone (`python test_varsel.py`) or under pytest. Covers direction, window edges, the
-weekday filter, overnight rejection, the departed-train filter (no alert once the expected
-departure has passed), the alert-worthiness gate and the notification wording. No BigQuery, no
-network.
+Runs standalone (`uv run --with fastapi --with pydantic python test_varsel.py`) or under pytest.
+No BigQuery, no network: the BigQuery client is stubbed before main is imported, and the impact
+provider is main's real one driven over an injected synthetic snapshot — so these exercise the
+actual /impact matcher plus varsel's policy on top of it, end to end.
+
+Covers direction, window edges, the weekday filter, overnight rejection, the departed-train filter
+(no alert once the expected departure has passed), the alert-worthiness gate, the per-operator
+thresholds, and the notification wording.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from varsel import _OSLO, _notification_payload, match_journey
+# --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
+from google.cloud import bigquery as _bq
+
+_bq.Client = lambda *a, **k: None  # type: ignore[assignment]
+
+import impact
+import main
+import varsel
+from varsel import _OSLO, _notification_payload
 
 
 @dataclass
 class FakeCall:
-    """Duck-types main._CallPred for the fields the matcher reads."""
+    """Duck-types impact.CallPred for the fields the matcher reads."""
 
     jkey: str
     stop_place: str
     stop_order: int
     aimed_dep: datetime | None
+    stop_name: str | None = None
+    situation_number: str = "S1"
     operator: str = "VYG"
     p_cancel: float = 0.5
     p_impact_dep: float | None = 0.9
     p_dep_ge10: float | None = 0.8
     line: str | None = "VYG:Line:R10"
     summary: str | None = "Signalfeil"
+    description: str | None = None
     dep_delay_typ_min: int | None = 4
     dep_delay_p90_min: int | None = 15
     dep_delay_p50_stack_min: int | None = 3
     dep_delay_p90_stack_min: int | None = 12
+    # Observed state. Defaults describe an upcoming call with nothing observed yet, so existing
+    # cases keep their meaning and a test opts in to an observation explicitly.
+    et_declared_cancelled: bool | None = False
+    et_dep_delay_min: int | None = None
+    call_source: str | None = "estimated"
+    # Arrival side -- unused by the pre-U2 matcher, needed once /impact builds cells from these.
+    aimed_arr: datetime | None = None
+    arr_delay_typ_min: int | None = None
+    arr_delay_p90_min: int | None = None
+    arr_delay_p50_stack_min: int | None = None
+    arr_delay_p90_stack_min: int | None = None
+    p_arr_ge10: float | None = None
+    p_impact: float | None = None
 
 
 def _journey(begin="07:00", end="09:00", days=(0, 1, 2, 3, 4)):
@@ -63,17 +91,83 @@ assert SAT_0800.weekday() == 5
 NOW = _oslo(2026, 7, 6, 6, 0)
 
 
+# The engine reads its snapshot through an injected provider (main owns the real cache).
+_snapshot: dict = {}
+impact.configure(snapshot_provider=lambda: (_snapshot, None))
+
+
+def install(by_situation):
+    """Point varsel at main's real /impact provider over this synthetic snapshot.
+
+    `with_alternative=False` keeps the Journey Planner out of the matcher tests — the alternative
+    lookup has its own hermetic suite in test_alternatives.py.
+    """
+    _snapshot.clear(); _snapshot.update(by_situation)
+
+    def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
+                 with_alternative=False, min_impact=0.0):
+        # Pass the flag THROUGH rather than hard-coding False: hard-coding it made the suite blind to
+        # a Journey Planner call reappearing on the request path (review 2026-07-29).
+        return impact.for_trip(
+            from_stop=from_stop,
+            to_stop=to_stop,
+            window_start=window_start,
+            window_end=window_end,
+            select="worst",
+            catchable_after=catchable_after,
+            with_alternative=with_alternative,
+            min_impact=min_impact,
+        )
+
+    varsel.configure(impact_provider=provider, stops_provider=list)
+
+
 def match(journey, by_situation, now=NOW):
-    return match_journey(journey, by_situation, now)
+    install(by_situation)
+    return varsel.match_journey(journey, now)
 
 
-def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", **board_kw):
-    """A boarding call at A and a later call at B (same train)."""
+def test_the_real_provider_signature_matches():
+    """Wire main._varsel_impact itself into varsel.configure, not a hand-written double.
+
+    This is the one cross-module contract the /impact rewrite introduced, and on 2026-07-29 it was
+    broken for real: varsel._impact passed `with_alternative=` to a provider that did not accept it,
+    so every matcher call raised TypeError — swallowed by check_and_notify's per-journey guard, which
+    meant ALL push alerting was dead and both journey endpoints 500'd. The suite stayed green because
+    `install()` above and test_varsel_api's provider both hand-write a signature that happens to fit.
+    Any test that only uses a double cannot catch this; this one must call the real function.
+    """
+    _snapshot.clear(); _snapshot.update({"S1": _train(MON_0800)})
+    varsel.configure(impact_provider=main._varsel_impact, stops_provider=list)
+    try:
+        # Every keyword varsel._impact actually sends, through the real provider.
+        alerts = varsel.match_journey(_journey(), NOW)
+        assert alerts, "the real provider must answer the matcher"
+        # And the poller's path, which additionally asks for an alternative.
+        original = impact.alternatives.find_faster
+        impact.alternatives.find_faster = lambda *a, **k: None  # no network
+        try:
+            assert varsel.match_journey(_journey(), NOW, with_alternative=True)
+        finally:
+            impact.alternatives.find_faster = original
+    finally:
+        install({})  # restore the double for the remaining tests
+
+
+def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", situation="S1",
+           **board_kw):
+    """A boarding call at A and a later call at B (same train, 40 min later).
+
+    `situation` goes on both calls: the cache tags every scored call with its own situationNumber
+    (that is how main groups them), so a fixture that puts two situations in one scope has to say
+    which is which on the calls themselves, not just in the dict key.
+    """
     return [
         FakeCall(jkey=jkey, stop_place="A", stop_order=board_order, aimed_dep=dep,
-                 operator=operator, **board_kw),
+                 operator=operator, situation_number=situation, **board_kw),
         FakeCall(jkey=jkey, stop_place="B", stop_order=dest_order, aimed_dep=None,
-                 operator=operator),
+                 aimed_arr=dep + timedelta(minutes=40) if dep is not None else None,
+                 operator=operator, situation_number=situation),
     ]
 
 
@@ -94,7 +188,7 @@ def test_direction_reverse_no_match():
     # Same stops but to_stop (B) comes BEFORE from_stop (A) on this train — wrong direction.
     calls = [
         FakeCall("t1", "A", 5, MON_0800),
-        FakeCall("t1", "B", 1, None),
+        FakeCall("t1", "B", 1, None, aimed_arr=MON_0800 - timedelta(minutes=30)),
     ]
     assert match(_journey(), {"S1": calls}) == []
 
@@ -114,10 +208,23 @@ def test_window_edges():
 
 
 def test_weekday_filter():
+    # `now` sits early on the Saturday so the horizon is not what decides these — the weekday is.
+    sat_morning = _oslo(2026, 7, 11, 6, 0)
     weekdays_only = _journey(days=(0, 1, 2, 3, 4))
-    assert not match(weekdays_only, {"S1": _train(SAT_0800)})  # Saturday excluded
+    assert not match(weekdays_only, {"S1": _train(SAT_0800)}, now=sat_morning)  # Sat excluded
     weekend = _journey(days=(5, 6))
-    assert match(weekend, {"S1": _train(SAT_0800)})  # Saturday included
+    assert match(weekend, {"S1": _train(SAT_0800)}, now=sat_morning)  # Sat included
+
+
+def test_only_today_and_tomorrow_are_considered():
+    """The prediction cache is built from today's ET partition, so its horizon is roughly the
+    operating day. A window several days out is not something we can score yet — and offering
+    tomorrow matters because late in the evening that is the next relevant window."""
+    saturday_journey = _journey(days=(5,))
+    # Monday morning: Saturday's window is five days away -> nothing to say.
+    assert match(saturday_journey, {"S1": _train(SAT_0800)}, now=_oslo(2026, 7, 6, 6, 0)) == []
+    # Friday evening: Saturday is tomorrow -> the window is offered.
+    assert match(saturday_journey, {"S1": _train(SAT_0800)}, now=_oslo(2026, 7, 10, 22, 0))
 
 
 def test_overnight_rejection():
@@ -131,6 +238,53 @@ def test_departed_train_no_match():
     assert match(_journey(), {"S1": _train(MON_0800)}, now=_oslo(2026, 7, 6, 12, 0)) == []
     # Still catchable just before the expected departure.
     assert match(_journey(), {"S1": _train(MON_0800)}, now=_oslo(2026, 7, 6, 8, 2))
+
+
+def test_departed_worst_train_does_not_suppress_a_catchable_one_same_line():
+    """Regression (review 2026-07-29): catchability used to be applied AFTER /impact rolled up to
+    the worst train per situation, so a departed worst-case train hid a later, still-catchable,
+    alert-worthy train on the same line. The alert must survive and report the catchable train."""
+    calls = (
+        # 07:30, the most severe train in the window -- but long gone by 09:00.
+        _train(_oslo(2026, 7, 6, 7, 30), jkey="gone", p_cancel=0.9, p_impact_dep=0.99)
+        # 08:45, less severe but still over the 0.65 threshold, and still catchable.
+        + _train(_oslo(2026, 7, 6, 8, 45), jkey="catchable", p_cancel=0.2, p_impact_dep=0.80)
+    )
+    alerts = match(_journey(begin="07:00", end="09:00"), {"S1": calls},
+                   now=_oslo(2026, 7, 6, 8, 40))
+    assert len(alerts) == 1, "the situation must not vanish because its worst train departed"
+    assert alerts[0].impact_probability == 0.80, "must report the catchable train, not the gone one"
+    assert alerts[0].departure_time == _oslo(2026, 7, 6, 8, 45)
+    assert alerts[0].alertworthy is True
+
+
+def test_departed_worst_train_does_not_suppress_a_catchable_one_other_line():
+    """Same trap across two lines of one situation: the rollup takes the worst line, so a departed
+    train on line A must not hide a catchable alert-worthy train on line B."""
+    calls = (
+        _train(_oslo(2026, 7, 6, 7, 30), jkey="gone", p_cancel=0.9, p_impact_dep=0.99,
+               line="VYG:Line:R10")
+        + _train(_oslo(2026, 7, 6, 8, 45), jkey="ok", p_cancel=0.2, p_impact_dep=0.80,
+                 line="VYG:Line:R11")
+    )
+    alerts = match(_journey(begin="07:00", end="09:00"), {"S1": calls},
+                   now=_oslo(2026, 7, 6, 8, 40))
+    assert len(alerts) == 1
+    assert alerts[0].line == "VYG:Line:R11"
+    assert alerts[0].impact_probability == 0.80
+
+
+def test_window_just_ended_but_train_still_catchable():
+    """Regression (review 2026-07-29): journey_windows dropped a window the moment its end passed,
+    discarding the case the alert exists for — a train inside the window, predicted heavily late, that
+    the traveller can still make. Per-train catchability is `catchable_after`'s job, not the window's.
+    """
+    late = _train(_oslo(2026, 7, 6, 7, 52), dep_delay_p50_stack_min=45, p_impact_dep=0.9)
+    j = _journey(begin="07:00", end="08:00")
+    # 08:02: window ended two minutes ago, train expected 08:37 -> still catchable, must alert.
+    assert match(j, {"S1": late}, now=_oslo(2026, 7, 6, 8, 2))
+    # 08:40: expected departure has passed -> correctly silent.
+    assert match(j, {"S1": late}, now=_oslo(2026, 7, 6, 8, 40)) == []
 
 
 def test_delayed_train_catchable_until_expected_departure():
@@ -179,8 +333,8 @@ def test_worst_train_wins():
 
 
 def test_multiple_situations_sorted_worst_first():
-    s1 = _train(MON_0800, jkey="a", p_impact_dep=0.4)
-    s2 = _train(MON_0800, jkey="b", p_impact_dep=0.9)
+    s1 = _train(MON_0800, jkey="a", situation="S1", p_impact_dep=0.4)
+    s2 = _train(MON_0800, jkey="b", situation="S2", p_impact_dep=0.9)
     alerts = match(_journey(), {"S1": s1, "S2": s2})
     assert [a.situation_number for a in alerts] == ["S2", "S1"]
 

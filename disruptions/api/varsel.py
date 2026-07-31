@@ -7,17 +7,34 @@ registered journey against the live situations and sends a Web Push notification
 alert-worthy match. Tapping it opens the app, which lists the journeys and the disruptions
 currently hitting them (served by :func:`GET /varsel-api/journeys`).
 
-The matcher mirrors ``main._trip_cells``: a journey matches a situation when that situation flags
-a train departing ``from_stop`` inside the journey's weekday+time window that later calls at
-``to_stop`` (higher stop_order = same direction). The severity shown/pushed is the worst such
-train's calibrated cancellation / delay / impact numbers.
+The matching itself **is** ``/impact``: :func:`match_journey` turns a registered journey into
+boarding windows and asks main's ``/impact`` provider about each one — passing ``catchable_after``
+so the matcher itself excludes departures the traveller can no longer make — then applies the one
+policy that is genuinely varsel's: the per-operator alert gate. It used to re-implement the matcher,
+which had already drifted (the two severity orders disagreed); there is now one matcher and one
+severity order behind both surfaces.
+
+  Catchability has to be *inside* candidate selection. Filtering it afterwards, on the rolled-up
+  worst-per-situation result, let a departed worst-case train suppress a later train on the same line
+  that was both still catchable and alert-worthy — a missed alert, found in review 2026-07-29.
 
 Design notes
 ------------
 * **Weekdays** are ``0=Monday … 6=Sunday`` (Python ``date.weekday()``), consistent with the PWA.
 * **Windows** are non-wrapping inclusive ``[begin, end]`` in Europe/Oslo local time; the PWA
   validates ``begin < end``, so overnight windows never reach the matcher (and are ignored if
-  they somehow do).
+  they somehow do). :func:`journey_windows` offers today's and tomorrow's window, because the
+  prediction cache carries near-future departures and late in the evening the next relevant window
+  is tomorrow's.
+* **Work is shared per journey definition, delivery is not.** :func:`journey_key` collapses
+  registrations that describe the same trip, so two devices watching the same train drive one
+  ``/impact`` call and one written message — and see identical text (``_messages``). Push dedup
+  (``_notified``) stays keyed on ``journey_id``: sharing it would let the first device notified
+  suppress everyone else's push.
+* **The push text is written by an LLM** (:mod:`llm_message`, Claude Sonnet 5 on Vertex with a
+  Gemini fallback) from the enriched ``/impact`` payload — the situation's own words, what has been
+  observed on the line, and any faster alternative. It phrases the alert; it never decides it. Every
+  failure path falls back to :func:`_deterministic_body`, the previous template wording.
 * **Push gate** — a match is *pushed* only when the worst matching train crosses the same
   production alert threshold used by ``/demo`` and eval (``P(cancelled OR ≥10 min late) ≥ 0.65``,
   per-operator cuts in :data:`_OPERATOR_ALERT_THRESHOLD`), so trivial flags don't spam the phone.
@@ -40,10 +57,10 @@ Design notes
   ``push_enabled=false`` and :func:`check_and_notify` is a no-op, so the app still renders the
   journey list.
 
-No import of main.py (avoids a cycle): main injects a snapshot provider (the live
-``_call_pred_by_situation``) and a stops provider via :func:`configure`, and passes the snapshot
-directly to :func:`check_and_notify`. The matcher only reads attributes off the cached call
-objects, so it duck-types the ``_CallPred`` shape.
+No import of main.py (avoids a cycle): main injects its ``/impact`` provider and a stops provider via
+:func:`configure`, and passes the live per-call snapshot to :func:`check_and_notify` (used only to
+prune state for situations that have ended). Everything read off the impact response is duck-typed,
+so the tests can drive this with a synthetic provider.
 """
 
 import json
@@ -53,12 +70,16 @@ import re
 import threading
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from time import monotonic
+from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+from alternatives import AlternativeJourney
 from fastapi import APIRouter, HTTPException, Query, Request
+from impact import ImpactResponse, LatestObservation, severity_key
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -122,6 +143,36 @@ def mode_label(operator: str | None) -> str:
 _AFTER_DEPARTURE_OPERATORS = frozenset({"MOR", "ATB", "OST", "GCO"})
 # Keep state bounded: a client-generated device may register at most this many journeys.
 _MAX_JOURNEYS_PER_DEVICE = 20
+# ...and the service as a whole holds at most this many of each. The per-device cap bounds nothing
+# globally: `device_id` is client-generated and `upsert_device` accepts any value, so without these
+# the poller's per-cycle work is bounded only by how many people install the PWA. Sized for an
+# experiment with a pilot group; raise deliberately after measuring a cycle, not by discovering it.
+_MAX_DEVICES = 500
+_MAX_JOURNEYS = 2000
+# Written messages per refresh cycle. The matcher runs on the poller thread, which also rebuilds
+# every other cache, so an unbounded fan-out of LLM calls would stall ingestion. Journeys beyond the
+# cap get the deterministic wording this tick and are picked up on the next one.
+_MAX_LLM_CALLS_PER_CYCLE = 8
+# Give-up point for writing one journey × situation's message. Failures are payload-dependent as
+# often as they are transient (a refusal, an over-long or unparseable reply), so a write that failed
+# twice will very likely keep failing for this exact payload — and retrying costs a slot from the
+# per-cycle cap without being able to change what any user already saw.
+_MAX_MESSAGE_ATTEMPTS = 3
+# Wall-clock ceiling for the whole message-writing pass. The call cap alone does not bound time:
+# one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
+# worst case. Journeys past the budget take the deterministic wording and are re-tried next tick.
+_MAX_LLM_SECONDS_PER_CYCLE = 30.0
+# Web Push sends are independent, I/O-bound, and each can block for _PUSH_TIMEOUT_S against a
+# client-supplied endpoint. Sequential delivery meant one sick push service stalled the whole poller
+# -- and with it every cache rebuild -- for devices x 10 s. Fan them out instead.
+_PUSH_WORKERS = 8
+# How long past a window's end a train from that window can still be worth alerting about. A train
+# is only ever dropped by its own predicted expected departure (`catchable_after`); this bound just
+# stops journey_windows from discarding the window before that check runs. Sized above the p90 delays
+# the exceedance stack produces (~90 min at the top of the curve).
+_WINDOW_CATCH_UP = timedelta(minutes=90)
+# Per-send wall clock for a Web Push delivery (see _send_push).
+_PUSH_TIMEOUT_S = 10.0
 # A freshly-created push subscription can 404/410 at the push service for a short window before
 # it has propagated (seen especially with FCM/Android). Within this grace period we treat such a
 # response as transient and do NOT drop the device, so an immediate test-push or first alert
@@ -158,23 +209,89 @@ def push_enabled() -> bool:
 
 
 # ---- Injected providers (set by main.configure to avoid an import cycle) ---------------------
-_snapshot_provider: Callable[[], dict[str, list]] | None = None
+class ImpactProvider(Protocol):
+    """main's /impact code path, injected rather than called over HTTP.
+
+    Injected because the app is deliberately a single always-on instance with an in-process
+    prediction cache: a loopback request would add a round trip and a base-URL config for no
+    isolation benefit. What matters is that there is ONE matcher and one severity order behind both
+    surfaces.
+
+    Spelled as a Protocol rather than `Callable[..., Any]` because this is the only cross-module
+    contract in the design, and on 2026-07-29 it broke silently: an added keyword reached a provider
+    that did not accept it, every matcher call raised TypeError, check_and_notify's per-journey guard
+    swallowed it, and all push alerting stopped with a green test suite (both test doubles hand-write
+    their own provider, so nothing checked the real one). `...` would have accepted that drift; this
+    does not.
+    """
+
+    def __call__(
+        self,
+        *,
+        from_stop: str,
+        to_stop: str,
+        window_start: datetime,
+        window_end: datetime,
+        catchable_after: datetime | None = ...,
+        with_alternative: bool = ...,
+        min_impact: float = ...,
+    ) -> ImpactResponse: ...
+
+
+_impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 
 
 def configure(
     *,
-    snapshot_provider: Callable[[], dict[str, list]],
+    impact_provider: ImpactProvider,
     stops_provider: Callable[[], list[dict]],
 ) -> None:
-    """Wire in main.py's live per-call snapshot and rail-stop list (called once at startup)."""
-    global _snapshot_provider, _stops_provider
-    _snapshot_provider = snapshot_provider
+    """Wire in main.py's /impact provider and stop list (called once at startup)."""
+    global _impact_provider, _stops_provider
+    _impact_provider = impact_provider
     _stops_provider = stops_provider
 
 
-def _snapshot() -> dict[str, list]:
-    return _snapshot_provider() if _snapshot_provider is not None else {}
+def _impact(
+    journey: dict,
+    window_start: datetime,
+    window_end: datetime,
+    catchable_after: datetime | None = None,
+    with_alternative: bool = False,
+) -> ImpactResponse | None:
+    """One /impact call for a journey's boarding window, or None when unconfigured.
+
+    `min_impact` is the *default* alert threshold rather than a per-operator one: the operator is a
+    property of the matched train, which is only known after the call. It is the floor of the
+    per-operator cuts (GOA 0.50), so no alert-worthy journey is ever denied an alternative — it just
+    means a few sub-threshold-for-their-operator trips still pay the lookup.
+    """
+    if _impact_provider is None:
+        return None
+    return _impact_provider(
+        from_stop=journey["from_stop"],
+        to_stop=journey["to_stop"],
+        window_start=window_start,
+        window_end=window_end,
+        catchable_after=catchable_after,
+        with_alternative=with_alternative,
+        min_impact=min(_OPERATOR_ALERT_THRESHOLD.values(), default=_ALERT_THRESHOLD)
+        if with_alternative
+        else 0.0,
+    )
+
+
+def _message_key(key: str, alert: "Alert") -> tuple[str, str, str]:
+    """Cache key for a written message / alternative: (journey definition, situation, departure).
+
+    A tuple, not an f-string: `journey_key` itself embeds four `|` separators, so the string form
+    needed `rsplit` on one line and `split` on the next three lines apart, with nothing declaring
+    which encoding a key used. Including the departure is what keeps the cached text tied to the
+    train it describes (see _journey_model).
+    """
+    dep = alert.departure_time.isoformat() if alert.departure_time else ""
+    return (key, alert.situation_number, dep)
 
 
 # ---- State: devices, journeys, notified ------------------------------------------------------
@@ -183,6 +300,19 @@ _state_lock = threading.RLock()
 _devices: dict[str, dict] = {}  # device_id -> {"subscription": {...}, "created_ts": iso}
 _journeys: dict[str, dict] = {}  # journey_id -> journey record (see POST /journeys)
 _notified: set[str] = set()  # {"journey_id|situationNumber"} — dedup, pruned when a situation ends
+# {"journey_key|situationNumber" -> written message}. Keyed on the journey *definition*, not the
+# registration, so every device on the same trip gets the same text and one message is written per
+# journey × situation rather than one per device. In-memory only: a redeploy re-writes messages
+# rather than restoring stale advice from before the restart.
+_messages: dict[tuple[str, str, str], str] = {}
+# Same key, same lifecycle: the alternative the poller found for that journey x situation. Cached
+# rather than recomputed because the request path deliberately does NOT call the Journey Planner
+# (see match_journey) -- without this the field would be structurally null on the only endpoint that
+# serves it, which is how it shipped until review on 2026-07-29.
+_alternatives: dict[tuple[str, str, str], AlternativeJourney] = {}
+# Same key, same lifecycle: how many times writing this message has failed, so a payload the LLM
+# cannot handle is not retried on every tick for the situation's whole life.
+_message_attempts: dict[tuple[str, str, str], int] = {}
 
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
@@ -209,13 +339,26 @@ def _apply_state(raw: str) -> None:
         _notified = set(data.get("notified", []))
 
 
+_gcs_client = None
+_gcs_client_lock = threading.Lock()
+
+
 def _gcs_blob():
-    """The state blob handle when a bucket is configured, else None (import is lazy)."""
+    """The state blob handle when a bucket is configured, else None (import is lazy).
+
+    The client is built once and reused. Constructing a fresh `storage.Client()` per call meant every
+    device registration and every journey delete paid an ADC resolution plus a metadata-server token
+    fetch before the upload — on the request path, under `_state_lock`.
+    """
+    global _gcs_client
     if not _STATE_BUCKET:
         return None
     from google.cloud import storage
 
-    return storage.Client().bucket(_STATE_BUCKET).blob(_STATE_BLOB)
+    with _gcs_client_lock:
+        if _gcs_client is None:
+            _gcs_client = storage.Client()
+    return _gcs_client.bucket(_STATE_BUCKET).blob(_STATE_BLOB)
 
 
 def load_state() -> None:
@@ -273,24 +416,61 @@ def _parse_hhmm(value: str) -> int:
     return int(h) * 60 + int(m)
 
 
-def _dep_p90(call: Any) -> int | None:
-    """Boarding-side p90 delay, preferring the calibrated exceedance stack (as main.py does)."""
-    return call.dep_delay_p90_stack_min if call.dep_delay_p90_stack_min is not None else call.dep_delay_p90_min
+def _typ_delay(pred: Any) -> int | None:
+    """Typical delay off a StopPrediction, preferring the calibrated exceedance-stack p50 and
+    falling back to the raw regression only when the stack has nothing (as main.py does)."""
+    return pred.delay_p50_min if pred.delay_p50_min is not None else pred.delay_typ_min
 
 
-def _dep_typ(call: Any) -> int | None:
-    """Boarding-side typical delay, preferring the calibrated exceedance-stack p50."""
-    return call.dep_delay_p50_stack_min if call.dep_delay_p50_stack_min is not None else call.dep_delay_typ_min
+def journey_key(journey: dict) -> str:
+    """A canonical key for a journey *definition* — what makes two registrations the same trip.
+
+    Two devices that register the same from→to, weekdays and time window get one /impact call and
+    one written message between them, and therefore identical text. Deliberately excludes
+    ``device_id`` and ``journey_id``: those identify a *registration*, and keying the shared work on
+    them is what would duplicate it. (Delivery dedup still keys on ``journey_id`` — see
+    :func:`check_and_notify`.)
+    """
+    return "|".join(
+        [
+            journey["from_stop"],
+            journey["to_stop"],
+            journey["begin"],
+            journey["end"],
+            ",".join(str(d) for d in sorted(journey["days"])),
+        ]
+    )
 
 
-def _expected_dep(call: Any) -> datetime | None:
-    """When the vehicle is expected to actually leave the boarding stop: aimed departure plus the
-    predicted typical delay. Once this has passed the traveller can no longer catch it, so the
-    match is moot — the scored calls stay in the snapshot for as long as their situation is open,
-    which can be many hours past the departures they describe."""
-    if call.aimed_dep is None:
-        return None
-    return call.aimed_dep + timedelta(minutes=max(_dep_typ(call) or 0, 0))
+def journey_windows(journey: dict, now: datetime) -> list[tuple[datetime, datetime]]:
+    """The journey's boarding windows that could still be caught, as UTC instants.
+
+    A registered journey is a recurring Europe/Oslo ``[begin, end]`` window on selected weekdays;
+    ``/impact`` matches an explicit window. Today and tomorrow are both offered because the
+    prediction cache carries near-future departures, so late in the evening the next relevant window
+    is tomorrow's. Windows whose end has already passed are dropped, and only the journey's own
+    weekdays qualify (weekday of the *local* date, matching the PWA's 0=Monday).
+    """
+    days = set(journey["days"])
+    begin_min = _parse_hhmm(journey["begin"])
+    end_min = _parse_hhmm(journey["end"])
+    local_now = now.astimezone(_OSLO)
+    windows: list[tuple[datetime, datetime]] = []
+    for offset in (0, 1):
+        local_date = (local_now + timedelta(days=offset)).date()
+        if local_date.weekday() not in days:
+            continue
+        midnight = datetime.combine(local_date, time(0, 0), tzinfo=_OSLO)
+        start = midnight + timedelta(minutes=begin_min)
+        end = midnight + timedelta(minutes=end_min)
+        # Keep offering a window for a grace period after its end. Dropping it the moment `end`
+        # passes discards exactly the case the alert exists for: a 07:52 train in an 07:00-08:00
+        # window, predicted 45 min late, is still catchable at 08:02. `catchable_after` does the real
+        # per-train filtering downstream, so this only has to be generous enough not to pre-empt it.
+        if end + _WINDOW_CATCH_UP < local_now:
+            continue  # even a heavily delayed train in this window has gone
+        windows.append((start.astimezone(UTC), end.astimezone(UTC)))
+    return windows
 
 
 class Alert(BaseModel):
@@ -298,6 +478,10 @@ class Alert(BaseModel):
 
     situation_number: str = Field(description="SIRI-SX situationNumber of the disruption.")
     summary: str | None = Field(description="Short Norwegian summary of the situation.")
+    description: str | None = Field(
+        default=None,
+        description="The operator's fuller Norwegian explanation of the situation.",
+    )
     operator: str | None = Field(
         default=None,
         description="Ref codespace of the worst affected journey (VYG, RUT, KOL, ...).",
@@ -328,106 +512,112 @@ class Alert(BaseModel):
     alertworthy: bool = Field(
         description="Whether this match crosses the push threshold (a notification is/was sent).",
     )
-
-
-def _severity(call: Any) -> tuple[float, int, float]:
-    """Order matching trains most-severe first by the *alerting* score — the impact probability the
-    push gate reads — then bad-case delay, then cancellation prob as a deterministic tie-break.
-    Ordering by p_cancel instead (as this did until 2026-07-27) could hand the alert's numbers to a
-    train other than the one that crossed the threshold."""
-    return (call.p_impact_dep or 0.0, _dep_p90(call) or 0, call.p_cancel)
+    latest_observation: LatestObservation | None = Field(
+        default=None,
+        description="What has actually been observed on this line so far: {cancelled, at_stop, "
+        "at_stop_name, delayed_min, observed_at}. Null when nothing has been observed yet. See "
+        "/impact's LatestObservation for the full schema and its staleness bound.",
+    )
+    alternative_journey: AlternativeJourney | None = Field(
+        default=None,
+        description="A faster way from from_stop to to_stop than this train, when one exists. "
+        "Found by the poller (the request path deliberately skips the Journey Planner lookup), so "
+        "this is populated once a push has been produced for this journey × situation.",
+    )
+    message: str | None = Field(
+        default=None,
+        description="The written traveller message that was pushed for this journey × situation — "
+        "identical for every device registered on the same journey. Null before a push has been "
+        "produced, or when no message writer was available (the push then carries the "
+        "deterministic wording instead).",
+    )
+    # Internal: the full /impact response this alert was derived from, handed to the message writer
+    # so it sees the complete picture (every situation's text, every line's observation, the
+    # alternative) rather than just the headline numbers. exclude=True keeps it out of the API
+    # response — it is a working reference, not part of the contract.
+    impact: ImpactResponse | None = Field(default=None, exclude=True, repr=False)
 
 
 def match_journey(
-    journey: dict, by_situation: dict[str, list], now: datetime | None = None
+    journey: dict, now: datetime | None = None, *, with_alternative: bool = False
 ) -> list[Alert]:
     """Situations currently hitting `journey`, worst-first — one :class:`Alert` per situation.
 
-    For each situation, group its scored calls by dated journey (jkey). A train matches when it has
-    a boarding call at ``from_stop`` whose aimed departure (in Europe/Oslo) falls on one of the
-    journey's weekdays and inside its ``[begin, end]`` window, whose expected departure (aimed +
-    predicted typical delay) has not yet passed ``now``, AND the same train later calls at
-    ``to_stop`` (a call with higher stop_order — the travel direction). Per situation the worst such
-    train (highest impact probability — see :func:`_severity`) supplies the alert's numbers.
+    The matching itself is ``/impact``'s: this asks the impact provider about each of the journey's
+    boarding windows (``select="worst"`` — if any train in the window is alert-worthy the traveller
+    needs to know) and keeps what is left of varsel's own policy on top of the result:
+
+    * **not yet departed** — handed to the matcher as ``catchable_after=now`` rather than applied
+      here, so a departed train is never a candidate in the first place (a situation stays open, and
+      its scored calls stay in the cache, long after the departures it describes; without this a
+      morning delay would keep alerting all day).
+    * **the per-operator alert gate** — exactly ``/demo``'s ``would_alert``: the calibrated impact
+      probability must exist and cross :func:`threshold_for`. No cancellation-probability fallback
+      (see the module docstring).
 
     ``now`` is injectable for tests; it defaults to the current time.
+
+    `with_alternative` is **off by default**: the Journey Planner lookup is a blocking external call,
+    and a device with 20 registered journeys x 2 windows would fan out ~40 of them on a single
+    request. The poller passes True (the push is where the advice matters); the request path leaves it
+    off and the in-app list shows the cached written message, which already names the alternative.
     """
     if now is None:
         now = datetime.now(UTC)
-    days = set(journey["days"])
-    begin_min = _parse_hhmm(journey["begin"])
-    end_min = _parse_hhmm(journey["end"])
-    from_stop = journey["from_stop"]
-    to_stop = journey["to_stop"]
 
-    alerts: list[Alert] = []
-    for sit_num, calls in by_situation.items():
-        # Group by (operator, jkey): bus ServiceJourney jkeys are not date-scoped, so a single
-        # situation (e.g. a GCO notice fanning across county codespaces) can carry the same jkey for
-        # two different operators' journeys — keying on jkey alone would merge them.
-        by_key: dict[tuple[str, str], list] = {}
-        for c in calls:
-            by_key.setdefault((c.operator, c.jkey), []).append(c)
-
-        matching_boardings: list[Any] = []
-        for group in by_key.values():
-            board = next(
-                (
-                    c
-                    for c in group
-                    if c.stop_place == from_stop and c.aimed_dep is not None
-                ),
-                None,
-            )
-            if board is None:
-                continue
-            local = board.aimed_dep.astimezone(_OSLO)
-            tod = local.hour * 60 + local.minute
-            if local.weekday() not in days or not (begin_min <= tod <= end_min):
-                continue
-            # Departed trains are moot: a situation can stay open (and its scored calls stay in
-            # the snapshot) long after the departures it affects, so without this a morning delay
-            # keeps alerting all day.
-            expected = _expected_dep(board)
-            if expected is not None and expected < now:
-                continue
-            # Direction: the same train must call at to_stop further along the line.
-            if not any(
-                c.stop_place == to_stop and c.stop_order > board.stop_order for c in group
-            ):
-                continue
-            matching_boardings.append(board)
-
-        if not matching_boardings:
-            continue
-        worst = max(matching_boardings, key=_severity)
-        impact = worst.p_impact_dep
-        threshold = threshold_for(worst.operator)
-        # Exactly /demo's would_alert (main._demo_snapshot): the calibrated impact probability must
-        # exist and cross the operator's cut. No p_cancel fallback — see the module docstring.
-        alertworthy = impact is not None and impact >= threshold
-        alerts.append(
-            Alert(
-                situation_number=sit_num,
-                summary=worst.summary,
-                operator=worst.operator,
-                mode=mode_label(worst.operator),
-                line=worst.line,
-                departure_time=worst.aimed_dep,
-                cancel_probability=worst.p_cancel,
-                delay_p50_min=_dep_typ(worst),
-                delay_p90_min=_dep_p90(worst),
-                ge10_probability=worst.p_dep_ge10,
-                impact_probability=impact,
-                alert_threshold=threshold,
-                alertworthy=alertworthy,
-            )
+    # Keep the worst alert per situation across every window (a journey can have a window today and
+    # one tomorrow, and the same situation can reach into both).
+    worst_by_situation: dict[str, Alert] = {}
+    for window_start, window_end in journey_windows(journey, now):
+        impact = _impact(
+            journey, window_start, window_end, catchable_after=now,
+            with_alternative=with_alternative,
         )
-    alerts.sort(
-        key=lambda a: (a.impact_probability or 0.0, a.delay_p90_min or 0, a.cancel_probability),
-        reverse=True,
-    )
+        if impact is None:
+            continue
+        observation_by_line = {
+            line.line: line.latest_observation for line in (impact.lines or [])
+        }
+        for sit in impact.situations or []:
+            dep = sit.departure_prediction
+            threshold = threshold_for(sit.operator)
+            impact_p = dep.impact_probability
+            alert = Alert(
+                situation_number=sit.situation_number,
+                summary=sit.summary,
+                description=sit.description,
+                operator=sit.operator,
+                mode=mode_label(sit.operator),
+                line=sit.line,
+                departure_time=dep.scheduled_time,
+                cancel_probability=dep.cancel_probability,
+                delay_p50_min=_typ_delay(dep),
+                delay_p90_min=dep.delay_p90_min,
+                ge10_probability=dep.ge10_probability,
+                impact_probability=impact_p,
+                alert_threshold=threshold,
+                alertworthy=impact_p is not None and impact_p >= threshold,
+                latest_observation=observation_by_line.get(sit.line),
+                alternative_journey=impact.alternative_journey,
+                impact=impact,
+            )
+            existing = worst_by_situation.get(alert.situation_number)
+            if existing is None or _alert_severity(alert) > _alert_severity(existing):
+                worst_by_situation[alert.situation_number] = alert
+
+    alerts = sorted(worst_by_situation.values(), key=_alert_severity, reverse=True)
     return alerts
+
+
+def _alert_severity(alert: Alert) -> tuple[float, int, float]:
+    """The shared severity order, applied to an Alert.
+
+    Delegates to `impact.severity_key` rather than restating it. Keeping a second copy in sync by
+    comment is what let the two orders drift apart in the first place (main's was cancellation-first
+    while this one was impact-first), and `Alert` carries the same three field names as
+    `StopPrediction`, so the one function serves both.
+    """
+    return severity_key(alert)
 
 
 # ---- Notify ----------------------------------------------------------------------------------
@@ -442,19 +632,19 @@ def _delay_phrase(alert: Alert) -> str | None:
     return f"typisk {p90 or p50} min forsinket"
 
 
-def _notification_payload(journey: dict, alert: Alert) -> dict:
-    """Norwegian Web Push payload for one journey×situation match.
+def _deterministic_body(alert: Alert) -> str:
+    """The template wording: what the push says when no written message is available.
 
     Leads with the number the push gate actually fired on — P(innstilling eller ≥ 10 min
     forsinkelse), worded as on ``/demo`` — then the dominant driver: a likely cancellation, else the
     exceedance-stack delay interval. Cancellation probability alone plus the raw typical-delay
     regression (what this said until 2026-07-27) understates a delay-driven alert badly.
     """
-    from_name = journey.get("from_name") or journey["from_stop"]
-    to_name = journey.get("to_name") or journey["to_stop"]
     # alertworthy alerts always carry an impact probability (the gate requires it); the fallback
     # only matters if this is ever called for a listed-but-not-pushed match.
-    score = alert.impact_probability if alert.impact_probability is not None else alert.cancel_probability
+    score = (
+        alert.impact_probability if alert.impact_probability is not None else alert.cancel_probability
+    )
     lead = (
         f"{round(score * 100)} % sjanse for innstilling eller "
         f"≥ {TROUBLE_DELAY_MIN} min forsinkelse"
@@ -469,10 +659,22 @@ def _notification_payload(journey: dict, alert: Alert) -> dict:
     if alert.departure_time is not None:
         hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
         lead = f"{alert.mode} kl {hhmm}: {lead}"
-    body = f"{alert.summary}\n{lead}" if alert.summary else lead
+    return f"{alert.summary}\n{lead}" if alert.summary else lead
+
+
+def _notification_payload(journey: dict, alert: Alert, message: str | None = None) -> dict:
+    """Norwegian Web Push payload for one journey×situation match.
+
+    `message` is the LLM-written text when one was produced; the deterministic template is used
+    otherwise, so a missing or failing message writer costs wording, never the notification. The
+    title, url and situation_number are unchanged either way — the notification stays recognisable
+    and the service worker's click-through keeps working.
+    """
+    from_name = journey.get("from_name") or journey["from_stop"]
+    to_name = journey.get("to_name") or journey["to_stop"]
     return {
         "title": f"Avvik: {from_name} → {to_name}",
-        "body": body,
+        "body": message or _deterministic_body(alert),
         "url": "/varsel/",
         "situation_number": alert.situation_number,
     }
@@ -489,6 +691,10 @@ def _send_push(subscription: dict, payload: dict) -> str:
             vapid_private_key=_vapid,
             vapid_claims={"sub": _VAPID_SUBJECT},
             ttl=3600,
+            # pywebpush passes this to requests; without it the default is None -- block forever. The
+            # endpoint URL comes from the client, so an unresponsive host would hang the poller
+            # thread and stop ingestion for every other feature (review 2026-07-29).
+            timeout=_PUSH_TIMEOUT_S,
         )
         return "sent"
     except WebPushException as exc:
@@ -551,6 +757,31 @@ def _log_push(
     )
 
 
+def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | None:
+    """The LLM-written body for this journey × situation, or None to use the template wording.
+
+    Wraps :mod:`llm_message` so that nothing it can do — an unconfigured project, an unavailable
+    model, a timeout, an unexpected exception — reaches the notification path. The import is local
+    so a deploy without the Vertex dependencies still serves pushes.
+    """
+    try:
+        import llm_message
+
+        if not llm_message.llm_enabled():
+            return None
+        payload = llm_message.build_payload(journey, alert.impact, alert)
+        return llm_message.write_message(
+            payload, journey_key=journey_key, situation_number=alert.situation_number
+        )
+    except Exception:
+        logger.warning(
+            "Written-message step failed; falling back to the deterministic wording",
+            exc_info=True,
+            extra={"fields": {"event": "llm_message", "result": "error"}},
+        )
+        return None
+
+
 def _drop_device(device_id: str) -> None:
     """Forget a device whose push subscription is gone (404/410). Journeys are kept — the client
     re-attaches its subscription (same device_id) if the user re-enables notifications."""
@@ -578,21 +809,126 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     """Send a push for every registered journey × newly alert-worthy situation.
 
     Called at the end of main's ingestion-change rebuild with the freshly-refreshed per-call
-    snapshot. Deduped via ``_notified`` (one push per journey×situation until that situation leaves
-    the cache); entries for ended situations are pruned so a returning situation re-alerts and the
-    set stays bounded. No-op when push is disabled.
+    snapshot (used here only to prune ``_notified``; the matching itself goes through ``/impact``).
+
+    Two loops, and the split between them is load-bearing:
+
+    1. **Compute, keyed by journey definition.** Journeys are grouped by :func:`journey_key`, so two
+       devices registered on the same trip drive one ``/impact`` call and one written message
+       between them — and therefore receive identical text.
+    2. **Deliver, keyed by registration.** ``_notified`` stays keyed on ``journey_id`` so each
+       device is notified once per situation. Collapsing dedup onto the journey key would mean the
+       first device notified silently suppresses the push for everyone else on the same trip.
+
+    Written messages are capped per cycle (:data:`_MAX_LLM_CALLS_PER_CYCLE`); journeys beyond the cap
+    get the deterministic wording this tick rather than delaying the poller thread. No-op when push
+    is disabled.
     """
     if not push_enabled():
         return
     with _state_lock:
         journeys = list(_journeys.items())
-        # Prune notified entries whose situation is no longer live. In-place update (not `-=`)
-        # so `_notified` stays the module global rather than becoming a function-local.
+        # Prune notified entries and cached messages whose situation is no longer live. In-place
+        # updates (not `-=`) so the module globals stay globals rather than becoming function-locals.
         live = set(by_situation.keys())
         stale = {k for k in _notified if k.split("|", 1)[1] not in live}
         _notified.difference_update(stale)
+        for key in [k for k in _messages if k[1] not in live]:
+            _messages.pop(key, None)
+        for key in [k for k in _alternatives if k[1] not in live]:
+            _alternatives.pop(key, None)
+        for key in [k for k in _message_attempts if k[1] not in live]:
+            _message_attempts.pop(key, None)
         changed = bool(stale)
 
+    # ---- Loop 1: one impact call and one written message per distinct journey definition --------
+    by_journey_key: dict[str, dict] = {}
+    for _jid, journey in journeys:
+        by_journey_key.setdefault(journey_key(journey), journey)
+
+    alerts_by_key: dict[str, list[Alert]] = {}
+    llm_calls = 0
+    # Wall-clock budget, not just a call count. _MAX_LLM_CALLS_PER_CYCLE caps journeys, but one
+    # "call" can be two backend attempts (a refusal or an unparseable reply falls through to the
+    # other backend), so 8 journeys x 2 x _TIMEOUT_S is ~128 s rather than the 64 s the count
+    # suggests. This is the ingestion thread: every second here is a second /disruptions, /journey,
+    # /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1 to finish.
+    llm_deadline = monotonic() + _MAX_LLM_SECONDS_PER_CYCLE
+    for key, journey in by_journey_key.items():
+        try:
+            alerts = match_journey(journey, with_alternative=True)
+        except Exception:
+            # One journey's failure must not stop the remaining journeys being scored or any push
+            # going out. Empty alerts for this key; the next tick retries.
+            logger.warning(
+                "Scoring failed for journey %s; skipping it this cycle",
+                key,
+                exc_info=True,
+                extra={"fields": {"event": "varsel_match_error"}},
+            )
+            alerts_by_key[key] = []
+            continue
+        alerts_by_key[key] = alerts
+        worst = next((a for a in alerts if a.alertworthy), None)
+        if worst is None:
+            continue
+        message_key = _message_key(key, worst)
+        # Record the alternative even if no message gets written (cap reached, LLM disabled): the
+        # in-app list wants it either way.
+        with _state_lock:
+            if worst.alternative_journey is not None:
+                _alternatives[message_key] = worst.alternative_journey
+            already_written = message_key in _messages
+            attempts = _message_attempts.get(message_key, 0)
+        if already_written:
+            continue
+        if attempts >= _MAX_MESSAGE_ATTEMPTS:
+            # Without this the retry never stops. A write that fails for a payload-dependent reason
+            # (a refusal, an over-long reply, an unparseable one) fails again on every 60 s tick for
+            # the situation's whole life -- ~720 Vertex calls that can change nothing, because the
+            # push already went out with the deterministic wording, each one burning a slot from
+            # _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have succeeded now cannot use.
+            continue
+        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() >= llm_deadline:
+            logger.info(
+                "Written-message budget spent this cycle (%d calls / %.0fs); %s gets the "
+                "deterministic wording",
+                llm_calls,
+                _MAX_LLM_SECONDS_PER_CYCLE,
+                key,
+                extra={"fields": {"event": "llm_message", "result": "capped"}},
+            )
+            continue
+        llm_calls += 1
+        # _write_message catches Exception itself, so this is belt and braces for a future edit that
+        # lets one escape. It records an attempt rather than `continue`-ing past the counter, so a
+        # raiser is subject to the same give-up rule as a None. Delivery is unaffected either way:
+        # loop 2 pushes independently and falls back to the deterministic wording.
+        try:
+            message = _write_message(journey, worst, journey_key=key)
+        except Exception:
+            logger.warning(
+                "Written-message step raised for %s; using the deterministic wording",
+                key,
+                exc_info=True,
+                extra={"fields": {"event": "llm_message", "result": "error"}},
+            )
+            message = None
+        with _state_lock:
+            if message:
+                _messages[message_key] = message
+                _message_attempts.pop(message_key, None)
+            else:
+                _message_attempts[message_key] = attempts + 1
+
+    # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
+    # Collect first, then fan out. One broad situation produces one send per registration in a single
+    # cycle, and each send can block for _PUSH_TIMEOUT_S against a client-supplied endpoint (FCM,
+    # Mozilla, Apple). Sequentially that is devices x 10 s of a stalled poller in the bad case --
+    # minutes during which no cache is rebuilt and nobody else is alerted.
+    # Parallel ACROSS devices, sequential WITHIN one: a "gone" result must still stop that device's
+    # remaining alerts for the tick, which only holds if its own sends stay ordered.
+    per_device: dict[str, list[tuple[str, dict, dict, Alert, str]]] = {}
     for jid, journey in journeys:
         device = None
         with _state_lock:
@@ -603,19 +939,38 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 device = dev.get("subscription")
         if device is None:
             continue
-        for alert in match_journey(journey, by_situation):
+        key = journey_key(journey)
+        for alert in alerts_by_key.get(key, []):
             if not alert.alertworthy:
                 continue
-            key = f"{jid}|{alert.situation_number}"
             with _state_lock:
-                if key in _notified:
+                if f"{jid}|{alert.situation_number}" in _notified:
                     continue
-            payload = _notification_payload(journey, alert)
+            per_device.setdefault(journey["device_id"], []).append(
+                (jid, device, journey, alert, key)
+            )
+
+    def _deliver_device(items: list[tuple[str, dict, dict, Alert, str]]) -> list[tuple]:
+        """One device's pending alerts, in order, stopping at a dead subscription."""
+        out = []
+        for jid, device, journey, alert, key in items:
+            with _state_lock:
+                message = _messages.get(_message_key(key, alert))
+            payload = _notification_payload(journey, alert, message)
             result = _send_push(device, payload)
+            out.append((jid, journey, alert, result, payload))
+            if result == "gone":
+                break  # stop this device's remaining alerts this tick
+        return out
+
+    if per_device:
+        with ThreadPoolExecutor(max_workers=min(_PUSH_WORKERS, len(per_device))) as pool:
+            batches = list(pool.map(_deliver_device, per_device.values()))
+        for jid, journey, alert, result, payload in [r for batch in batches for r in batch]:
             _log_push("alert", result, journey["device_id"], payload, journey_id=jid, alert=alert)
             if result == "sent":
                 with _state_lock:
-                    _notified.add(key)
+                    _notified.add(f"{jid}|{alert.situation_number}")
                 changed = True
             elif result == "gone":
                 if _device_is_fresh(journey["device_id"]):
@@ -627,7 +982,6 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 else:
                     _drop_device(journey["device_id"])
                     changed = True
-                break  # stop this device's remaining alerts this tick either way
 
     if changed:
         _save_state()
@@ -767,10 +1121,22 @@ async def stops() -> list[StopItem]:
 
 
 @router.post("/devices", summary="Register or refresh a device's push subscription")
-async def upsert_device(body: DeviceIn) -> dict:
-    """Store the browser's PushSubscription for this device_id (idempotent upsert)."""
+def upsert_device(body: DeviceIn) -> dict:
+    """Store the browser's PushSubscription for this device_id (idempotent upsert).
+
+    Plain `def`, not `async def`: `_save_state` constructs a GCS client and uploads the blob, which
+    is blocking network I/O. On `async def` that runs on the single-worker event loop and freezes
+    every other route, `/health` included. Same rule as `list_journeys`/`create_journey`/`/impact`.
+    """
     with _state_lock:
         existing = _devices.get(body.device_id)
+        if existing is None and len(_devices) >= _MAX_DEVICES:
+            logger.warning(
+                "Global device cap (%d) reached; refusing a new registration",
+                _MAX_DEVICES,
+                extra={"fields": {"event": "varsel_capacity", "kind": "devices"}},
+            )
+            raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
         _devices[body.device_id] = {
             "subscription": body.subscription,
             "created_ts": existing["created_ts"] if existing else _now_iso(),
@@ -780,15 +1146,45 @@ async def upsert_device(body: DeviceIn) -> dict:
 
 
 @router.delete("/devices/{device_id}", summary="Forget a device's push subscription")
-async def delete_device(device_id: str) -> dict:
-    """Remove a device's subscription (e.g. the user turned notifications off). Journeys are kept."""
+def delete_device(device_id: str) -> dict:
+    """Remove a device's subscription (e.g. the user turned notifications off). Journeys are kept.
+
+    Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
+    """
     with _state_lock:
         _devices.pop(device_id, None)
         _save_state()
     return {"status": "ok"}
 
 
-def _journey_model(jid: str, rec: dict, by_situation: dict[str, list]) -> Journey:
+def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) -> Journey:
+    """A journey plus its live alerts, each annotated with the message that was pushed for it.
+
+    The message is read from :data:`_messages` rather than written here: the list endpoint is a
+    request path, and writing one per request would mean an LLM call per page view. Reading the
+    cached text also means the in-app list says exactly what the push said.
+
+    `alerts` lets the caller supply an already-scored result, so a device with several registrations
+    of the same journey definition runs the matcher once rather than once per registration.
+    """
+    key = journey_key(rec)
+    alerts = match_journey(rec) if alerts is None else alerts
+    with _state_lock:
+        now = datetime.now(UTC)
+        for alert in alerts:
+            # The cache key carries the DEPARTURE, so text only ever appears above the train it was
+            # written about. Both caches live as long as the situation (up to its 12 h window) while
+            # the alert underneath is re-scored every tick and `catchable_after` walks departed
+            # trains out of the result — so keyed on (journey, situation) alone, a message written
+            # at 06:05 about the 07:52 train still headed the card at 08:40, above a freshly
+            # computed line reading 40 % for the 09:12 one.
+            cache_key = _message_key(key, alert)
+            alert.message = _messages.get(cache_key)
+            alt = _alternatives.get(cache_key)
+            # An alternative that has itself departed is worse than none: it advises catching a
+            # train that has already left.
+            if alt is not None and (alt.departure_time is None or alt.departure_time >= now):
+                alert.alternative_journey = alt
     return Journey(
         journey_id=jid,
         from_stop=rec["from_stop"],
@@ -799,27 +1195,42 @@ def _journey_model(jid: str, rec: dict, by_situation: dict[str, list]) -> Journe
         end=rec["end"],
         days=rec["days"],
         created_ts=rec["created_ts"],
-        alerts=match_journey(rec, by_situation),
+        alerts=alerts,
     )
 
 
 @router.get("/journeys", summary="A device's journeys with the disruptions currently hitting them")
-async def list_journeys(
+def list_journeys(
     device_id: str = Query(description="Client-generated device UUID."),
 ) -> JourneysResponse:
     """Every journey registered by this device, each annotated with the situations currently
-    affecting it (the same matcher used for push, but with no dedup — this is the live picture)."""
-    by_situation = _snapshot()
+    affecting it (the same matcher used for push, but with no dedup — this is the live picture).
+
+    Plain ``def`` (NOT ``async def``), as in ``reisevalg.recommendation``: the impact provider can
+    make a blocking Journey Planner call, which must run in the anyio threadpool rather than on the
+    single-worker event loop. The alternative lookup is additionally skipped on this request path —
+    see :func:`match_journey`."""
     with _state_lock:
         mine = [(jid, rec) for jid, rec in _journeys.items() if rec["device_id"] == device_id]
-    journeys = [_journey_model(jid, rec, by_situation) for jid, rec in mine]
+    # Score each distinct journey DEFINITION once, exactly as check_and_notify's loop 1 does. A
+    # device at the 20-journey cap with overlapping registrations would otherwise run the full
+    # matcher up to 20 times per page view, and the PWA polls this every 60 s.
+    by_key: dict[str, list[Alert]] = {}
+    journeys = []
+    for jid, rec in mine:
+        key = journey_key(rec)
+        if key not in by_key:
+            by_key[key] = match_journey(rec)
+        journeys.append(_journey_model(jid, rec, alerts=by_key[key]))
     journeys.sort(key=lambda j: j.created_ts)
     return JourneysResponse(journeys=journeys)
 
 
 @router.post("/journeys", summary="Register a journey for alerts")
-async def create_journey(body: JourneyIn) -> Journey:
-    """Register a from→to journey with a recurring weekday+time window. Capped per device."""
+def create_journey(body: JourneyIn) -> Journey:
+    """Register a from→to journey with a recurring weekday+time window. Capped per device.
+
+    Plain ``def`` for the same reason as :func:`list_journeys`."""
     with _state_lock:
         mine = sum(1 for rec in _journeys.values() if rec["device_id"] == body.device_id)
         if mine >= _MAX_JOURNEYS_PER_DEVICE:
@@ -827,6 +1238,13 @@ async def create_journey(body: JourneyIn) -> Journey:
                 status_code=409,
                 detail=f"Maks {_MAX_JOURNEYS_PER_DEVICE} reiser per enhet.",
             )
+        if len(_journeys) >= _MAX_JOURNEYS:
+            logger.warning(
+                "Global journey cap (%d) reached; refusing a new registration",
+                _MAX_JOURNEYS,
+                extra={"fields": {"event": "varsel_capacity", "kind": "journeys"}},
+            )
+            raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
         jid = uuid.uuid4().hex
         rec = {
             "device_id": body.device_id,
@@ -841,15 +1259,30 @@ async def create_journey(body: JourneyIn) -> Journey:
         }
         _journeys[jid] = rec
         _save_state()
-    return _journey_model(jid, rec, _snapshot())
+    try:
+        return _journey_model(jid, rec)
+    except Exception:
+        # The registration is already committed, so a failure rendering the response would otherwise
+        # burn one of the 20 per-device slots on every retry while the UI shows nothing (review
+        # 2026-07-29). Roll it back and let the client retry cleanly.
+        with _state_lock:
+            _journeys.pop(jid, None)
+            _save_state()
+        logger.exception("Could not render the new journey; rolled the registration back")
+        raise HTTPException(
+            status_code=503, detail="Kunne ikke opprette reisen akkurat nå. Prøv igjen."
+        ) from None
 
 
 @router.delete("/journeys/{journey_id}", summary="Delete a registered journey")
-async def delete_journey(
+def delete_journey(
     journey_id: str,
     device_id: str = Query(description="The owning device; a journey is only deleted by its owner."),
 ) -> dict:
-    """Delete a journey. 404 if it doesn't exist or isn't owned by this device."""
+    """Delete a journey. 404 if it doesn't exist or isn't owned by this device.
+
+    Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
+    """
     with _state_lock:
         rec = _journeys.get(journey_id)
         if rec is None or rec["device_id"] != device_id:
@@ -900,8 +1333,13 @@ async def client_log(body: ClientLogIn, request: Request) -> dict:
 
 
 @router.post("/test", summary="Send a test push to verify delivery")
-async def test_push(body: TestIn) -> dict:
-    """Send a "Varsler er aktivert" push to this device — proves the subscription works."""
+def test_push(body: TestIn) -> dict:
+    """Send a "Varsler er aktivert" push to this device — proves the subscription works.
+
+    Plain `def`: `_send_push` blocks for up to `_PUSH_TIMEOUT_S` (10 s) against a client-supplied
+    push endpoint. On `async def` a slow endpoint freezes the whole event loop for that long, which
+    is enough to fail a liveness probe. See `upsert_device`.
+    """
     if not push_enabled():
         raise HTTPException(status_code=503, detail="Push er ikke konfigurert på tjeneren.")
     with _state_lock:

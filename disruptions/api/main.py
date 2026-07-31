@@ -9,6 +9,10 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# Aliased: the route function below is also called `impact`, and inside its body a bare
+# `impact.` would resolve to that function rather than to this module.
+import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
+import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
@@ -270,52 +274,19 @@ def lookup_alert_profile(category: str, line: str = "*", hour: int = -1) -> dict
 # disruptions.call_predictions_today holds one row per (affected call) of today's situations:
 # a calibrated cancellation probability and typical/p90 delay, at each stop. Cached here indexed
 # by jkey (the dated journey) so /journey is a dict lookup. Guarded by its own lock.
-@dataclass(frozen=True)
-class _CallPred:
-    """One scored call (stop on a journey) within a situation's 12h window."""
-
-    situation_number: str
-    summary: str | None
-    jkey: str
-    operator: str  # ref codespace (== SIRI ref prefix): VYG, GOA, RUT, KOL, SKY, ATB, ...
-    line: str | None
-    stop_place: str
-    stop_name: str | None
-    stop_order: int
-    aimed_dep: datetime | None
-    aimed_arr: datetime | None
-    p_cancel: float
-    dep_delay_typ_min: int | None
-    dep_delay_p90_min: int | None
-    arr_delay_typ_min: int | None
-    arr_delay_p90_min: int | None
-    # Exceedance stacks (2026-07-02): calibrated P(delay >= t | runs) per side, the interval read
-    # off each survival curve, and the alert P(cancelled OR >= 10 min late) per side. The arrival
-    # fields are None at an origin; the departure fields are None at a terminal.
-    p_arr_ge10: float | None
-    p_arr_ge20: float | None
-    arr_delay_p50_stack_min: int | None
-    arr_delay_p90_stack_min: int | None
-    p_impact: float | None
-    p_dep_ge10: float | None
-    p_dep_ge20: float | None
-    dep_delay_p50_stack_min: int | None
-    dep_delay_p90_stack_min: int | None
-    p_impact_dep: float | None
-
 
 _call_pred_lock = threading.Lock()
 # Keyed by (operator, jkey): bus ServiceJourney refs are NOT date-scoped, so the bare jkey collides
 # across operators (SKY:ServiceJourney:12345 and ATB:ServiceJourney:12345 both strip to the same
 # jkey). The operator is the ref codespace prefix, which /journey recovers from the id.
-_call_pred_by_key: dict[tuple[str, str], list[_CallPred]] = {}
+_call_pred_by_key: dict[tuple[str, str], list[impact_engine.CallPred]] = {}
 # jkey -> the set of operators that carry it, so a bare-jkey /journey lookup (no prefix) can still
 # resolve when unambiguous, and 409 when it is not.
 _call_pred_by_jkey_index: dict[str, set[str]] = {}
 # Same scored calls, indexed by situationNumber, so /impact can resolve a passenger's train from
 # (situation, from_stop, at) without a journey ref. situationNumber is publisher-namespaced, so the
 # NSB and bus tables merge here without collision.
-_call_pred_by_situation: dict[str, list[_CallPred]] = {}
+_call_pred_by_situation: dict[str, list[impact_engine.CallPred]] = {}
 _call_pred_refreshed_at: datetime | None = None
 
 # /impact matches the passenger's intended departure (`at`) to the nearest affected departure at
@@ -384,12 +355,13 @@ def maybe_refresh_bus_planned_calls() -> None:
     logger.info("Rebuilt bus planned call source (bus_calls_planned_today)")
 
 
-def _call_pred_from_row(r, operator: str) -> _CallPred:
-    """Map one prediction row (call_predictions_today or _bus_today) to a _CallPred, tagging it
+def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
+    """Map one prediction row (call_predictions_today or _bus_today) to a CallPred, tagging it
     with its operator (the ref codespace)."""
-    return _CallPred(
+    return impact_engine.CallPred(
         situation_number=r.situationNumber,
         summary=r.summary,
+        description=r.description,
         jkey=r.jkey,
         operator=operator,
         line=r.lineRef,
@@ -398,6 +370,9 @@ def _call_pred_from_row(r, operator: str) -> _CallPred:
         stop_order=r.stop_order,
         aimed_dep=r.aimed_dep,
         aimed_arr=r.aimed_arr,
+        et_declared_cancelled=r.et_declared_cancelled,
+        et_dep_delay_min=r.et_dep_delay_min,
+        call_source=r.call_source,
         p_cancel=r.p_cancel,
         dep_delay_typ_min=r.dep_delay_typ_min,
         dep_delay_p90_min=r.dep_delay_p90_min,
@@ -423,8 +398,8 @@ def refresh_call_predictions_cache() -> None:
     NSB rows are tagged with the lineRef codespace ('VYG'); bus rows carry an explicit `operator`
     column. The bus load is isolated so a missing/failing bus table (e.g. before the first bus
     predict runs) never blocks NSB serving."""
-    by_key: dict[tuple[str, str], list[_CallPred]] = {}
-    by_situation: dict[str, list[_CallPred]] = {}
+    by_key: dict[tuple[str, str], list[impact_engine.CallPred]] = {}
+    by_situation: dict[str, list[impact_engine.CallPred]] = {}
     by_jkey_index: dict[str, set[str]] = {}
 
     def _ingest(rows, operator_of: Callable[..., str]) -> None:
@@ -516,6 +491,52 @@ def _varsel_stops() -> list[dict]:
 def _varsel_snapshot() -> dict[str, list]:
     with _call_pred_lock:
         return _call_pred_by_situation
+
+
+def _impact_snapshot() -> tuple[dict[str, list[impact_engine.CallPred]], datetime | None]:
+    """The per-call prediction snapshot, injected into the impact engine via configure().
+
+    The engine owns no state; the poller writes this cache and this is the only reader it gets.
+    """
+    with _call_pred_lock:
+        return _call_pred_by_situation, _call_pred_refreshed_at
+
+
+def _varsel_impact(
+    *,
+    from_stop: str,
+    to_stop: str,
+    window_start: datetime,
+    window_end: datetime,
+    catchable_after: datetime | None = None,
+    with_alternative: bool = False,
+    min_impact: float = 0.0,
+) -> impact_engine.ImpactResponse:
+    """/impact for a registered journey's boarding window, injected into varsel via configure().
+
+    Structurally typed as `varsel.ImpactProvider` since 2026-07-29 — a signature drift here is now a
+    type error rather than a runtime TypeError swallowed by check_and_notify's per-journey guard,
+    which is how this contract broke once and took all push alerting with it while the suite stayed
+    green. The regression test is test_the_real_provider_signature_matches.
+
+    `with_alternative` defaults to False so the /varsel-api request path never makes a blocking
+    Journey Planner call; the poller passes True.
+
+    `select="worst"` rather than /impact's `nearest`: an alert asks "is any train in this window
+    alert-worthy?", not "which train leaves closest to a given minute". Same matcher, same severity
+    order and same response shaping as the HTTP endpoint — that is the point of routing varsel
+    through here instead of letting it keep its own matcher.
+    """
+    return impact_engine.for_trip(
+        from_stop=from_stop,
+        to_stop=to_stop,
+        window_start=window_start,
+        window_end=window_end,
+        select="worst",
+        catchable_after=catchable_after,
+        with_alternative=with_alternative,
+        min_impact=min_impact,
+    )
 
 
 def _reisevalg_call_predictions(journey_ref: str) -> list | None:
@@ -613,7 +634,9 @@ async def lifespan(app: FastAPI):
         logger.exception("Initial impact lookup load failed; will retry on ingestion poll")
     # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
     # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
-    varsel.configure(snapshot_provider=_varsel_snapshot, stops_provider=_varsel_stops)
+    impact_engine.configure(snapshot_provider=_impact_snapshot)
+    varsel.configure(impact_provider=_varsel_impact, stops_provider=_varsel_stops)
+    llm_message.configure(stop_name_provider=_varsel_stops)
     varsel.load_state()
     try:
         refresh_varsel_stops()
@@ -1077,100 +1100,6 @@ class JourneyResponse(BaseModel):
     calls: list[CallPrediction] = Field(description="Affected stops, ordered by stop_order.")
 
 
-class StopPrediction(BaseModel):
-    """Prediction for one stop on one train: chance it is cancelled, plus delay if it runs.
-
-    Serves as both a `departure_prediction` (the boarding stop — `scheduled_time` is the aimed
-    departure and `delay_*` the departure delay, answering "will my train leave, how late?") and an
-    `arrival_prediction` (the alighting stop — `scheduled_time` is the aimed arrival and `delay_*`
-    the arrival delay, answering "will I reach my destination, how late?"). `delay_p90_min` is the
-    conservative "bad case".
-    """
-
-    stop_place: str = Field(description="NSR StopPlace ref of this stop.")
-    stop_name: str | None = Field(description="Human-readable stop name (null if unresolved).")
-    stop_order: int = Field(description="Position of this stop along the journey (1 = origin).")
-    scheduled_time: datetime | None = Field(
-        description="Aimed departure (departure_prediction) or arrival (arrival_prediction), UTC.",
-    )
-    cancel_probability: float = Field(
-        description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1.",
-    )
-    delay_typ_min: int | None = Field(description="Typical delay (min) at this stop if the train runs.")
-    delay_p90_min: int | None = Field(
-        description="Bad-case (p90) delay (min) at this stop, from the calibrated exceedance "
-        "stack for that side when available.",
-    )
-    delay_p50_min: int | None = Field(
-        default=None,
-        description="Median delay (min) from the exceedance stack; with delay_p90_min this forms "
-        "the 'expect X-Y min' interval.",
-    )
-    ge10_probability: float | None = Field(
-        default=None,
-        description="Calibrated P(delay >= 10 min | the train runs) on this side, 0-1.",
-    )
-    impact_probability: float | None = Field(
-        default=None,
-        description="Calibrated P(cancelled OR >= 10 min late) on this side — the recommended "
-        "single alerting score.",
-    )
-
-
-class SituationImpact(BaseModel):
-    """How one situation impacts the passenger's trip, worst-case across the lines it affects."""
-
-    situation_number: str = Field(description="SIRI-SX situationNumber of this situation.")
-    summary: str | None = Field(description="Short Norwegian summary of the situation.")
-    departure_prediction: StopPrediction = Field(
-        description="Worst-case boarding prediction across the lines this situation affects.",
-    )
-    arrival_prediction: StopPrediction | None = Field(
-        description="Worst-case alighting prediction; null when `to_stop` is omitted.",
-    )
-
-
-class LineImpact(BaseModel):
-    """How one line is impacted for the passenger's trip, worst-case across the situations on it.
-
-    The line's train is the one departing `from_stop` nearest `at`; the arrival prediction is that
-    same train at `to_stop`.
-    """
-
-    line: str | None = Field(description="Line ref of the affected train, e.g. 'VYG:Line:R31'.")
-    departure_prediction: StopPrediction = Field(
-        description="Worst-case boarding prediction across the situations affecting this line.",
-    )
-    arrival_prediction: StopPrediction | None = Field(
-        description="Worst-case alighting prediction; null when `to_stop` is omitted or not served.",
-    )
-
-
-class ImpactResponse(BaseModel):
-    """Situations and lines affecting a passenger's intended trip, per-train scored.
-
-    Same per-train model as /journey, but trains are resolved from each situation plus the trip
-    (`from_stop` + intended departure `at`, optional `to_stop`) rather than a journey ref. The
-    underlying unit is a (situation × line) cell — the train on that line departing `from_stop`
-    nearest `at` — exposed two ways: `situations` rolls cells up per situation (worst-case over
-    its lines), `lines` rolls them up per line (worst-case over the situations affecting it), so a
-    line is never listed once per situation. When `situation` is given, `situations` is length 1
-    (or 0 if that situation does not affect the trip) and `lines` is its per-line breakdown.
-    """
-
-    as_of: datetime = Field(description="Server time of the response (UTC).")
-    refreshed_at: datetime | None = Field(
-        description="When the per-call cache was last rebuilt (UTC); null until first refresh.",
-    )
-    from_stop: str = Field(description="The boarding StopPlace ref queried (echoes the request).")
-    to_stop: str | None = Field(description="The alighting StopPlace ref queried, if any.")
-    situations: list[SituationImpact] = Field(
-        description="Situations affecting the trip, most severe first; length 1 when `situation` is given.",
-    )
-    lines: list[LineImpact] = Field(
-        description="Lines affecting the trip, most severe first; each line appears once.",
-    )
-
 
 def _minutes_from_now(onset_ts: datetime, est_min_from_onset: float, now: datetime) -> int:
     """Convert a minutes-from-onset estimate to whole minutes from now.
@@ -1416,7 +1345,7 @@ async def journey(
         )
     # A journey can be touched by several situations; surface the most severe (highest peak
     # cancellation probability across its stops).
-    by_sit: dict[str, list[_CallPred]] = {}
+    by_sit: dict[str, list[impact_engine.CallPred]] = {}
     for r in rows:
         by_sit.setdefault(r.situation_number, []).append(r)
     chosen = max(by_sit.values(), key=lambda rs: max(x.p_cancel for x in rs))
@@ -1464,129 +1393,6 @@ async def journey(
     )
 
 
-@dataclass(frozen=True)
-class _TripCell:
-    """One (situation × line) impact for the passenger's trip: the train on this line departing
-    from_stop nearest `at`, scored at the boarding stop (and the alighting stop if to_stop given)."""
-
-    situation_number: str
-    summary: str | None
-    line: str | None
-    departure: StopPrediction
-    arrival: StopPrediction | None
-
-
-def _departure_prediction(c: _CallPred) -> StopPrediction:
-    """Boarding-stop prediction: cancellation chance + departure delay at this call."""
-    return StopPrediction(
-        stop_place=c.stop_place,
-        stop_name=c.stop_name,
-        stop_order=c.stop_order,
-        scheduled_time=c.aimed_dep,
-        cancel_probability=c.p_cancel,
-        delay_typ_min=c.dep_delay_typ_min,
-        delay_p90_min=(
-            c.dep_delay_p90_stack_min
-            if c.dep_delay_p90_stack_min is not None
-            else c.dep_delay_p90_min
-        ),
-        delay_p50_min=c.dep_delay_p50_stack_min,
-        ge10_probability=c.p_dep_ge10,
-        impact_probability=c.p_impact_dep,
-    )
-
-
-def _arrival_prediction(c: _CallPred) -> StopPrediction:
-    """Alighting-stop prediction: cancellation chance + arrival delay at this call."""
-    return StopPrediction(
-        stop_place=c.stop_place,
-        stop_name=c.stop_name,
-        stop_order=c.stop_order,
-        scheduled_time=c.aimed_arr,
-        cancel_probability=c.p_cancel,
-        delay_typ_min=c.arr_delay_typ_min,
-        delay_p90_min=(
-            c.arr_delay_p90_stack_min
-            if c.arr_delay_p90_stack_min is not None
-            else c.arr_delay_p90_min
-        ),
-        delay_p50_min=c.arr_delay_p50_stack_min,
-        ge10_probability=c.p_arr_ge10,
-        impact_probability=c.p_impact,
-    )
-
-
-def _worst(preds: list[StopPrediction | None]) -> StopPrediction | None:
-    """Most severe prediction: highest cancellation probability, then largest p90 delay.
-
-    None-valued entries (e.g. a train that does not serve the alighting stop) are ignored; returns
-    None only if nothing remains."""
-    present = [p for p in preds if p is not None]
-    if not present:
-        return None
-    return max(present, key=lambda p: (p.cancel_probability, p.delay_p90_min or 0))
-
-
-def _trip_cells(
-    scope: dict[str, list[_CallPred]],
-    from_stop: str,
-    to_stop: str | None,
-    at: datetime,
-) -> list[_TripCell]:
-    """Build one (situation × line) cell for every line with a departure from `from_stop` near `at`.
-
-    Within a situation, lines are resolved independently: the boarding call is the one on that line
-    closest to `at` (and within _IMPACT_AT_TOLERANCE); the arrival call is that same train at
-    `to_stop`. Situations with no qualifying departure are skipped."""
-    cells: list[_TripCell] = []
-    for calls in scope.values():
-        board = [
-            c
-            for c in calls
-            if c.stop_place == from_stop
-            and c.aimed_dep is not None
-            and abs(c.aimed_dep - at) <= _IMPACT_AT_TOLERANCE
-        ]
-        if not board:
-            continue
-        # Per line, keep the boarding call nearest the intended departure.
-        by_line: dict[str | None, _CallPred] = {}
-        for c in board:
-            cur = by_line.get(c.line)
-            if cur is None or abs(c.aimed_dep - at) < abs(cur.aimed_dep - at):
-                by_line[c.line] = c
-        for line, bcall in by_line.items():
-            arrival = None
-            if to_stop is not None:
-                acall = next(
-                    (
-                        c
-                        for c in calls
-                        if c.operator == bcall.operator
-                        and c.jkey == bcall.jkey
-                        and c.stop_place == to_stop
-                        and c.aimed_arr is not None
-                    ),
-                    None,
-                )
-                if acall is not None:
-                    arrival = _arrival_prediction(acall)
-            cells.append(
-                _TripCell(
-                    situation_number=bcall.situation_number,
-                    summary=bcall.summary,
-                    line=line,
-                    departure=_departure_prediction(bcall),
-                    arrival=arrival,
-                )
-            )
-    return cells
-
-
-def _severity_key(p: StopPrediction) -> tuple[float, int]:
-    """Sort key for ordering impacts most-severe first (the departure prediction is always set)."""
-    return (p.cancel_probability, p.delay_p90_min or 0)
-
 
 @app.get(
     "/impact",
@@ -1594,7 +1400,7 @@ def _severity_key(p: StopPrediction) -> tuple[float, int]:
     response_description="Situations and lines affecting the trip, each with departure/arrival predictions.",
     tags=["disruptions"],
 )
-async def impact(
+def impact(
     from_stop: str = Query(
         default=_DEFAULT_FROM_STOP,
         description=(
@@ -1621,7 +1427,7 @@ async def impact(
         default=None,
         description="Optional alighting StopPlace ref (NSR:StopPlace:...) for the arrival prediction.",
     ),
-) -> ImpactResponse:
+) -> impact_engine.ImpactResponse:
     """Per-train impact of one or more situations on a passenger's intended trip.
 
     Resolves, for each affected line, the train departing `from_stop` nearest `at`, and scores it
@@ -1632,58 +1438,24 @@ async def impact(
     The result is exposed two ways: `situations` (one entry per situation, worst-case over its
     lines) and `lines` (one entry per line, worst-case over the situations affecting it). Pass
     `situation` to scope to a single situation. Both lists are empty when nothing affects the trip.
+
+    Plain ``def`` (NOT ``async def``) on purpose, matching ``reisevalg.recommendation``: this may
+    make a blocking Journey Planner call, which must run in the anyio threadpool. On the
+    single-worker event loop it would freeze ``/journey``, ``/varsel-api`` and the ``/health``
+    liveness probe (found in review 2026-07-29 -- it was ``async def`` with a blocking urlopen).
     """
     if at is None:
         at_utc = datetime.now(UTC)
     else:
         at_utc = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
-    with _call_pred_lock:
-        by_situation = _call_pred_by_situation
-        refreshed_at = _call_pred_refreshed_at
-    if situation is not None:
-        calls = by_situation.get(situation)
-        scope = {situation: calls} if calls else {}
-    else:
-        scope = by_situation
-
-    cells = _trip_cells(scope, from_stop, to_stop, at_utc)
-
-    # situations: roll cells up per situation (worst-case over that situation's lines).
-    by_sit: dict[str, list[_TripCell]] = {}
-    for cell in cells:
-        by_sit.setdefault(cell.situation_number, []).append(cell)
-    situations = [
-        SituationImpact(
-            situation_number=sit_num,
-            summary=group[0].summary,
-            departure_prediction=_worst([c.departure for c in group]),
-            arrival_prediction=_worst([c.arrival for c in group]),
-        )
-        for sit_num, group in by_sit.items()
-    ]
-    situations.sort(key=lambda s: _severity_key(s.departure_prediction), reverse=True)
-
-    # lines: roll cells up per line (worst-case over the situations affecting that line).
-    by_line: dict[str | None, list[_TripCell]] = {}
-    for cell in cells:
-        by_line.setdefault(cell.line, []).append(cell)
-    lines = [
-        LineImpact(
-            line=line,
-            departure_prediction=_worst([c.departure for c in group]),
-            arrival_prediction=_worst([c.arrival for c in group]),
-        )
-        for line, group in by_line.items()
-    ]
-    lines.sort(key=lambda x: _severity_key(x.departure_prediction), reverse=True)
-
-    return ImpactResponse(
-        as_of=datetime.now(UTC),
-        refreshed_at=refreshed_at,
+    return impact_engine.for_trip(
         from_stop=from_stop,
         to_stop=to_stop,
-        situations=situations,
-        lines=lines,
+        window_start=at_utc - _IMPACT_AT_TOLERANCE,
+        window_end=at_utc + _IMPACT_AT_TOLERANCE,
+        select="nearest",
+        at=at_utc,
+        situation=situation,
     )
 
 

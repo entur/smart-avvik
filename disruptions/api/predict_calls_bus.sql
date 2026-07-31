@@ -33,6 +33,8 @@ sit AS (
     d.situationNumber,
     SAFE.TIMESTAMP(d.creationTime) AS onset_ts,
     d.summary,
+    -- Carried for serving only (never a feature) -- see the same column in predict_calls.sql.
+    d.description,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -74,6 +76,9 @@ base AS (
     a.operator, a.situationNumber, a.onset_ts, a.summary,
     a.jkey, r.lineRef, r.stop_place, r.stop_name, r.aimed_dep, r.aimed_arr,
     r.call_cancelled AS et_declared_cancelled,
+    -- OBSERVED state, not predicted -- see the same two columns in predict_calls.sql.
+    r.dep_delay_min AS et_dep_delay_min,
+    r.call_source,
     COALESCE(r.aimed_dep, r.aimed_arr) AS call_ts,
     IFNULL(a.status, 'other') AS status,
     IFNULL(a.planned, FALSE)  AS planned,
@@ -301,10 +306,10 @@ bnd_op AS (
 )
 SELECT
   s.operator,
-  s.situationNumber, s.summary, s.onset_ts,
+  s.situationNumber, s.summary, sd.description, s.onset_ts,
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
-  s.et_declared_cancelled,
+  s.et_declared_cancelled, s.et_dep_delay_min, s.call_source,
   ROUND(s.pc_cal, 4) AS p_cancel,
   IF(s.is_terminal, NULL, GREATEST(CAST(ROUND(EXP(s.dep_plog)-1) AS INT64), 0)) AS dep_delay_typ_min,
   IF(s.is_terminal, NULL, COALESCE(dpq_dep.p90_min, dpg_dep.p90_min))            AS dep_delay_p90_min,
@@ -350,6 +355,11 @@ SELECT
   IF(s.is_terminal, NULL, ROUND(s.cd10, 4)) AS p_dep_ge10_h,
   s.lead_bucket AS platt_lead_bucket
 FROM curve AS s
+-- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
+-- join can never fan out the scored calls even if the source ever carries a duplicate.
+LEFT JOIN (
+  SELECT situationNumber, ANY_VALUE(description) AS description FROM sit GROUP BY situationNumber
+) AS sd ON sd.situationNumber = s.situationNumber
 -- dep p90: operator row (clamped to operator bounds), else global '*' row (clamped to '*' bounds)
 LEFT JOIN bnd_op AS bo_dep ON bo_dep.side='dep' AND bo_dep.operator=s.operator
 LEFT JOIN bnd_op AS bg_dep ON bg_dep.side='dep' AND bg_dep.operator='*'

@@ -49,9 +49,22 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
 - The **Avviksvarsel** PWA at `/varsel` (register a journey → Web Push when a live disruption is
   predicted to hit it; rail + the trained bus operators, per-operator alert thresholds) lives in
   `demo/avviksvarsel/` (React + Vite + Entur Linje). Its
-  API is `/varsel-api` (see `disruptions/api/varsel.py`); the matcher runs in the poller's refresh
-  cycle. Install steps for phones are in `demo/avviksvarsel/README.md`. Two extra env vars beyond
-  the base deploy:
+  API is `/varsel-api` (see `disruptions/api/varsel.py`), which runs in the poller's refresh cycle.
+  **It does not match on its own — it calls `/impact`** through an injected in-process provider
+  (`main._varsel_impact`, structurally typed as `varsel.ImpactProvider`), so there is one matcher and
+  one severity order behind both surfaces; varsel keeps only its own policy on top (drop trains that
+  can no longer be caught, plus the per-operator alert gate). The matcher itself lives in
+  `disruptions/api/impact.py` — extracted from `main.py` so `varsel` can *type* that contract rather
+  than hold it as `Callable[..., Any]`; it broke silently once and took all push alerting with it
+  while the test suite stayed green. `main` owns the prediction cache and injects a reader via
+  `impact.configure()`. Note `main.py` imports it as `impact_engine`: the `/impact` route function is
+  itself named `impact`, and a bare `impact.` inside that function would resolve to the route.
+  Work is shared per journey *definition* (`varsel.journey_key`): two
+  devices watching the same trip drive one `/impact` call and one written message and see identical
+  text, while push dedup stays keyed on `journey_id` so each device is still notified once.
+  **`to_stop` narrows `/impact`**: only trains that actually reach it are returned, so a caller
+  passing it sees fewer situations than one that does not.
+  Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
     `push_enabled=false`); the journey list still works. Regenerate with
@@ -59,6 +72,27 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
+  - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_LOCATION` /
+    `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` — the push text is written by an LLM on Vertex AI
+    (`disruptions/api/llm_message.py`) from the enriched `/impact` payload. No API keys: both
+    backends use the runtime SA's ADC (`roles/aiplatform.user`, already granted for `AI.CLASSIFY`).
+    `VARSEL_LLM_PROVIDER=auto` tries **Claude Sonnet 5** and latches to **Gemini** for the process
+    lifetime if the project cannot serve Anthropic publisher models — those need Vertex **Model
+    Garden enablement on top of the IAM role**, so check `jsonPayload.provider` on
+    `event="llm_message"` rather than assuming which one answered. Every failure path (unset,
+    unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
+    wording, so a push is never lost to an LLM problem. **Off in prd** (`VARSEL_LLM_ENABLED=false`)
+    until validated in dev. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
+    `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
+    2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
+    available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
+    `VERTEX_GEMINI_LOCATION` when their regional availability diverges. The backend latch expires
+    after 30 min (`llm_message._LATCH_TTL`), so enabling Model Garden takes effect without a
+    redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
+    destination and departure time); records carry a hashed `journey_digest`, and
+    `VARSEL_LLM_LOG_PROMPTS=true` puts the full prompt/reply at DEBUG.
+  - `/impact` also returns `alternative_journey` when `to_stop` is given — a faster way there from
+    the Journey Planner (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no credentials).
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)

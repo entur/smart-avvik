@@ -12,9 +12,42 @@ export interface StopItem {
   n_calls: number; // scheduled calls today — traffic signal for ranking picker matches
 }
 
+// What has actually been observed on the line, as opposed to predicted. `observed_at` is the aimed
+// time of that call — the observation can be up to an hour old (the planned source is rebuilt on a
+// TTL), so it is shown with its time rather than as "now".
+export interface LatestObservation {
+  cancelled: boolean;
+  at_stop: string | null;
+  at_stop_name: string | null;
+  delayed_min: number | null; // 0 when on time or early; null when not recorded
+  observed_at: string | null;
+}
+
+export interface AlternativeLeg {
+  mode: string | null;
+  line: string | null;
+  public_code: string | null;
+  from_name: string | null;
+  to_name: string | null;
+  start_time: string | null;
+  end_time: string | null;
+}
+
+// A faster way from from_stop to to_stop than the affected train, from the Journey Planner.
+export interface AlternativeJourney {
+  departure_time: string | null;
+  arrival_time: string | null;
+  duration_min: number | null;
+  minutes_saved: number;
+  legs: AlternativeLeg[];
+}
+
+// Every field added after `alertworthy` is optional, so a PWA build can be newer or older than the
+// API it talks to without breaking during a rollout.
 export interface Alert {
   situation_number: string;
   summary: string | null;
+  description?: string | null; // the operator's fuller explanation
   operator: string | null;
   mode: string; // 'Tog' | 'Buss' — vehicle noun for the UI
   line: string | null;
@@ -26,6 +59,11 @@ export interface Alert {
   impact_probability: number | null; // P(innstilling eller >= 10 min forsinkelse) — the alert score
   alert_threshold: number; // the operator's cut applied to impact_probability
   alertworthy: boolean; // impact_probability >= alert_threshold, i.e. a push is/was sent
+  latest_observation?: LatestObservation | null;
+  alternative_journey?: AlternativeJourney | null;
+  // The written message that was pushed for this journey × situation — identical for every device
+  // on the same journey. Null until a push has been produced for it.
+  message?: string | null;
 }
 
 export interface Journey {
