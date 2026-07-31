@@ -111,7 +111,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     otherwise. The view holds the grouping shared by the nightly job and the API, so the two cannot
     drift apart.
   - Outcomes come from `data/queries/label_varsel_decisions.sql` (scheduled query
-    `varsel-label-daily`, 04:00 UTC, ~$0.08/run), joining `last_recorded` on
+    `varsel-label-daily`, 04:00 UTC, ~$0.01/run measured), joining `last_recorded` on
     `(operator, jkey, call_date, stop_order)`. It must **not** remap `dataSource='VYG'` to `'NSB'`
     the way `extend_demo_recent_daily.sql` does — varsel records the codespace from the line ref
     (`VYG`), so remapping would silently join zero rail rows. Backfill by hand with
