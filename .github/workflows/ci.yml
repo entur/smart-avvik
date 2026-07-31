@@ -6,7 +6,7 @@
 #
 # Pipeline:
 #   1. Lint (parallel)   -- Dockerfile (hadolint) and Helm chart per environment
-#   2. Test              -- ruff lint in a uv-managed environment
+#   2. Test              -- ruff lint + the API test suites, in a uv-managed environment
 #   3. Docker build      -- build the image from disruptions/api
 #   4. Docker scan/push  -- scan for vulnerabilities and push to the registry (parallel)
 #
@@ -60,6 +60,26 @@ jobs:
         run: uv sync
       - name: Lint with ruff
         run: uv run ruff check .
+      # Each suite runs as its OWN process, deliberately. They are hermetic (the BigQuery client is
+      # stubbed before main is imported; no network) but they are NOT collection-safe together: the
+      # /varsel-api suite sets VAPID env vars at import time, and a single shared interpreter lets
+      # module-import order leak between files (measured: a bare `pytest` over the directory fails
+      # 16 of 18 checks in test_varsel_api.py). Until this job existed, none of these ran in CI at
+      # all and every green tick was lint-only.
+      - name: Run API test suites
+        working-directory: disruptions/api
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # Globbed, not a hardcoded list: a literal list means adding a suite and forgetting this
+          # line gives a green build that never ran it -- the same silent gap this job exists to fix.
+          for suite in test_*.py; do
+            echo "::group::$suite"
+            uv run --with fastapi --with httpx --with pydantic \
+                   --with google-cloud-bigquery --with google-cloud-storage \
+                   --with pywebpush python "$suite"
+            echo "::endgroup::"
+          done
 
   # --- Docker Build, Scan, and Push ---
   # Only runs after all lints and tests pass to avoid wasting resources on broken builds

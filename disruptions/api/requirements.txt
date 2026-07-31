@@ -11,3 +11,9 @@ tzdata>=2026.3
 # subscription/journey state in a GCS blob so it survives redeploys.
 pywebpush>=2.3.0
 google-cloud-storage>=3.13.0
+# Avviksvarsel push text (llm_message.py): Claude Sonnet 5 on Vertex AI, with Gemini on Vertex as
+# the fallback when the project cannot serve Anthropic publisher models. Both authenticate with the
+# runtime SA's ADC (roles/aiplatform.user, already granted for AI.CLASSIFY) -- no API keys. Neither
+# import happens until a message is actually written, so an un-provisioned deploy still serves.
+anthropic[vertex]>=0.69.0
+google-genai>=1.0.0

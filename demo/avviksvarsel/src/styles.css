@@ -198,8 +198,22 @@ body {
   font-weight: 600;
 }
 
+/* The written message replaces the summary when present — it is what the push said, so it gets the
+   same prominence plus room to breathe over one or two sentences. */
+.av-alert-message {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
 .av-alert-detail {
   display: block;
+}
+
+.av-alert-observed {
+  display: block;
+  margin-top: 0.25rem;
+  opacity: 0.8;
 }
 
 /* ---- add-journey form ---- */
