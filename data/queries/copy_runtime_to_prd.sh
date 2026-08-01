@@ -25,6 +25,15 @@
 # NOT copied: the *_today tables (rail_calls_today, *_planned_today,
 # disruptions_*_initial_today, predictions_today, call_predictions_*_today) —
 # the poller CREATE OR REPLACEs those in prd within one refresh cycle.
+#
+# ALSO NOT copied, for the opposite reason — varsel_decisions and
+# varsel_decision_outcomes (the Avviksvarsel alert-decision log and its nightly
+# labels), plus the varsel_decision_groups view over them. Each environment
+# records its OWN decisions, and `bq cp -f` overwrites: listing them here would
+# replace prd's real alerting history with dev's. The app creates the table and
+# view itself on startup (disruptions/api/create_varsel_decisions.sql), and
+# data/queries/label_varsel_decisions.sh labels each environment separately.
+# Same reasoning as svv_baselines.
 set -euo pipefail
 
 SRC_PROJECT="ent-kixavvik-dev"

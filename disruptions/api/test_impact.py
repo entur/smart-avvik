@@ -333,6 +333,37 @@ def test_impact_response_carries_the_new_fields():
     assert resp.alternative_journey is None
 
 
+def test_situation_carries_the_jkey_of_the_train_the_numbers_describe():
+    """The rollup must publish the WORST cell's jkey, not the first cell's.
+
+    Without this the recorded decision would name one train and quote another's numbers, and every
+    realized-outcome join built on it would be silently wrong rather than visibly missing.
+    """
+    scope = _scope(
+        S1=_train("r10", 8, line="VYG:Line:R10", p_cancel=0.9, p_impact_dep=0.91)
+        + _train("r11", 8, 5, line="VYG:Line:R11", p_cancel=0.1, p_impact_dep=0.99)
+    )
+    resp = impact._impact_response(
+        _cells(scope), from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
+    )
+    sit = resp.situations[0]
+    # r10 is first in the group but r11 is the worst, so a group[0] read would return "r10".
+    assert sit.jkey == "r11"
+    assert (sit.line, sit.departure_prediction.impact_probability) == ("VYG:Line:R11", 0.99)
+
+
+def test_situation_jkey_is_absent_rather_than_wrong_when_unknown():
+    """A cell with no journey ref yields a null jkey, so a consumer can tell "unknown" from a
+    value it could otherwise mistake for a real train."""
+    import dataclasses
+
+    cells = [dataclasses.replace(c, jkey=None) for c in _cells(_scope(S1=_train("j1", 8)))]
+    resp = impact._impact_response(
+        cells, from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
+    )
+    assert resp.situations[0].jkey is None
+
+
 def test_real_http_route_satisfies_the_togpuls_contract():
     """Drive the actual `@app.get("/impact")` route, not just the helpers.
 

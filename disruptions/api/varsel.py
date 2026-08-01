@@ -491,6 +491,29 @@ class Alert(BaseModel):
     departure_time: datetime | None = Field(
         description="Aimed departure from the boarding stop of the worst affected train (UTC).",
     )
+    # Identity of the matched train, carried so a recorded decision can be joined back to what
+    # actually happened. The grain that works for BOTH families is (operator, jkey, call_date,
+    # stop_order): rail refs are date-scoped and unique on their own, but bus ServiceJourney jkeys
+    # repeat every operating day (demo_journeys.sql:11-15). Without these an alert can only be
+    # matched to ET on (operator, line, departure_time), which is a guess, not a key.
+    jkey: str | None = Field(
+        default=None,
+        description="Journey key of the worst affected train — the SIRI-ET "
+        "`datedVehicleJourneyRef` minus its codespace prefix. Identifies the DEPARTURE side.",
+    )
+    stop_place: str | None = Field(
+        default=None,
+        description="StopPlace ref of the boarding call the numbers describe.",
+    )
+    stop_order: int | None = Field(
+        default=None,
+        description="Position of that boarding call on the journey — the rest of the ET join key.",
+    )
+    decided_at: datetime | None = Field(
+        default=None,
+        description="When this match was evaluated (UTC). With `departure_time` it gives the lead "
+        "time the decision was made at, which is the axis alerting quality varies along most.",
+    )
     cancel_probability: float = Field(description="Calibrated P(the train is cancelled), 0-1.")
     delay_p50_min: int | None = Field(
         description="Median departure delay (min) if it runs, from the calibrated exceedance stack "
@@ -590,6 +613,10 @@ def match_journey(
                 mode=mode_label(sit.operator),
                 line=sit.line,
                 departure_time=dep.scheduled_time,
+                jkey=sit.jkey,
+                stop_place=dep.stop_place,
+                stop_order=dep.stop_order,
+                decided_at=now,
                 cancel_probability=dep.cancel_probability,
                 delay_p50_min=_typ_delay(dep),
                 delay_p90_min=dep.delay_p90_min,
@@ -782,6 +809,60 @@ def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | No
         return None
 
 
+def _record_decisions(
+    by_journey_key: dict[str, dict],
+    alerts_by_key: dict[str, list[Alert]],
+    journeys: list[tuple[str, dict]],
+    pushed_keys: set[tuple[str, str]],
+) -> None:
+    """Append this cycle's alert decisions to the decision log.
+
+    Records **every** matched situation, not just the alert-worthy ones: a journey we decided not
+    to alert on is exactly the evidence a miss is made of, and it exists nowhere else.
+
+    Runs after delivery so `pushed` reflects what actually reached a device rather than what was
+    queued. Like every other dependency in this cycle it fails open — the import is local so a
+    deploy without the module still pushes, and :func:`decisions.record` never raises.
+    """
+    try:
+        import decisions
+        from llm_message import key_digest
+
+        if not decisions.enabled():
+            return
+        device_counts: dict[str, set[str]] = {}
+        for _jid, journey in journeys:
+            device_counts.setdefault(journey_key(journey), set()).add(journey["device_id"])
+
+        rows = []
+        for key, journey in by_journey_key.items():
+            digest = key_digest(key)
+            n_devices = len(device_counts.get(key, ()))
+            for alert in alerts_by_key.get(key, []):
+                with _state_lock:
+                    written = _messages.get(_message_key(key, alert))
+                # Record what was actually SENT, not just what the LLM wrote. `_messages` only ever
+                # holds LLM output, so storing it raw left every deterministic push with a NULL
+                # message — and prd runs with VARSEL_LLM_ENABLED=false, so /historikk there would
+                # have shown no message text at all. Fall back to the same deterministic body
+                # _notification_payload puts in the push, and say which one it was.
+                message = written or _deterministic_body(alert)
+                rows.append(
+                    decisions.build_row(
+                        journey,
+                        alert,
+                        journey_digest=digest,
+                        n_devices=n_devices,
+                        pushed=(key, alert.situation_number) in pushed_keys,
+                        message=message,
+                        message_source="llm" if written else "deterministic",
+                    )
+                )
+        decisions.record(rows)
+    except Exception:
+        logger.warning("Could not record alert decisions this cycle", exc_info=True)
+
+
 def _drop_device(device_id: str) -> None:
     """Forget a device whose push subscription is gone (404/410). Journeys are kept — the client
     re-attaches its subscription (same device_id) if the user re-enables notifications."""
@@ -821,11 +902,16 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
        first device notified silently suppresses the push for everyone else on the same trip.
 
     Written messages are capped per cycle (:data:`_MAX_LLM_CALLS_PER_CYCLE`); journeys beyond the cap
-    get the deterministic wording this tick rather than delaying the poller thread. No-op when push
-    is disabled.
+    get the deterministic wording this tick rather than delaying the poller thread.
+
+    **Scoring and recording run even when push is disabled**; only delivery is gated. The decision
+    log's guarantee is "every decision, not every push", and an early return here quietly broke it:
+    an environment without VAPID keys recorded nothing at all, so /historikk looked like a broken
+    deployment rather than an un-provisioned one. The LLM stays gated on push, though — writing
+    traveller-facing prose nobody can receive is spend with no reader, and the deterministic body
+    already captures what the decision was.
     """
-    if not push_enabled():
-        return
+    push_on = push_enabled()
     with _state_lock:
         journeys = list(_journeys.items())
         # Prune notified entries and cached messages whose situation is no longer live. In-place
@@ -870,7 +956,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             continue
         alerts_by_key[key] = alerts
         worst = next((a for a in alerts if a.alertworthy), None)
-        if worst is None:
+        if worst is None or not push_on:
+            # No message writing without push: the text exists to be delivered, and the decision is
+            # recorded with the deterministic wording either way.
             continue
         message_key = _message_key(key, worst)
         # Record the alternative even if no message gets written (cap reached, LLM disabled): the
@@ -929,7 +1017,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # Parallel ACROSS devices, sequential WITHIN one: a "gone" result must still stop that device's
     # remaining alerts for the tick, which only holds if its own sends stay ordered.
     per_device: dict[str, list[tuple[str, dict, dict, Alert, str]]] = {}
-    for jid, journey in journeys:
+    for jid, journey in journeys if push_on else []:
         device = None
         with _state_lock:
             if jid not in _journeys:  # deleted while iterating
@@ -963,6 +1051,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 break  # stop this device's remaining alerts this tick
         return out
 
+    pushed_keys: set[tuple[str, str]] = set()
     if per_device:
         with ThreadPoolExecutor(max_workers=min(_PUSH_WORKERS, len(per_device))) as pool:
             batches = list(pool.map(_deliver_device, per_device.values()))
@@ -971,6 +1060,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             if result == "sent":
                 with _state_lock:
                     _notified.add(f"{jid}|{alert.situation_number}")
+                pushed_keys.add((journey_key(journey), alert.situation_number))
                 changed = True
             elif result == "gone":
                 if _device_is_fresh(journey["device_id"]):
@@ -982,6 +1072,8 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 else:
                     _drop_device(journey["device_id"])
                     changed = True
+
+    _record_decisions(by_journey_key, alerts_by_key, journeys, pushed_keys)
 
     if changed:
         _save_state()

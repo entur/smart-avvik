@@ -184,6 +184,22 @@ def test_basic_match():
     assert a.alertworthy is True
 
 
+def test_alert_carries_the_et_join_key():
+    """An alert has to name the train it is about, or a recorded decision can never be checked
+    against what actually happened.
+
+    The grain is (operator, jkey, call_date, stop_order): rail refs are date-scoped and unique on
+    their own, but bus ServiceJourney jkeys repeat every operating day, so the stop and the date
+    are not optional extras. `decided_at` is what turns a row into a lead-time observation.
+    """
+    alerts = match(_journey(), {"S1": _train(MON_0800, jkey="j-77", p_impact_dep=0.9)})
+    a = alerts[0]
+    assert (a.jkey, a.operator, a.stop_place, a.stop_order) == ("j-77", "VYG", "A", 1)
+    assert a.decided_at == NOW
+    # The boarding call, not the alighting one — the side the alert fires on.
+    assert a.departure_time == MON_0800
+
+
 def test_direction_reverse_no_match():
     # Same stops but to_stop (B) comes BEFORE from_stop (A) on this train — wrong direction.
     calls = [

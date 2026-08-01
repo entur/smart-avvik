@@ -21,9 +21,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
 path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
-node stage builds the `/demo` and `/varsel` front-ends (from `demo/reisedemo` +
-`demo/avviksvarsel`, which is why the context is the repo root, not `disruptions/api`), and its
-python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
+node stage builds the `/demo`, `/varsel` and `/historikk` front-ends (from
+`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk`, which is why the context is the
+repo root, not `disruptions/api`), and its python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
 
 ```sh
 git push origin main                         # builds the image (ci.yml) and deploys to dev (cd.yml)
@@ -35,8 +35,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   and unshared caches.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
-  app's `npm ci && npm run build`, and Vite writes into `disruptions/api/{demo,varsel}_static/`
-  (both gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
+  app's `npm ci && npm run build`, and Vite writes into
+  `disruptions/api/{demo,varsel,historikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
   its marimo snapshots run BigQuery under a developer's ADC, so they can't be built in the
   image/CI — they are rendered offline by `disruptions/api/export_eval.sh` and **committed** under
   `disruptions/api/eval_static/`, shipped as-is. Refresh them by running that script, then commit
@@ -93,6 +93,53 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `VARSEL_LLM_LOG_PROMPTS=true` puts the full prompt/reply at DEBUG.
   - `/impact` also returns `alternative_journey` when `to_stop` is given — a faster way there from
     the Journey Planner (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no credentials).
+
+- The **Varselhistorikk** page at `/historikk` (`demo/varselhistorikk/`, React + Vite + Entur
+  Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered
+  journey, the message that was sent, and — once the journey has run — a hit / false alarm / miss /
+  correct-reject verdict. Its API is `/historikk-api` (`disruptions/api/historikk.py`).
+  - **Every decision is logged, not every push.** `varsel.check_and_notify` appends one row per
+    (journey definition x situation x departure) per refresh cycle to `disruptions.varsel_decisions`
+    via `disruptions/api/decisions.py`, *including* matches that stayed below the alert threshold.
+    Without those, a `miss` leaves no trace and only precision is measurable. Repeats across cycles
+    are intentional — they are the lead-time series. Writing fails open: a BigQuery problem never
+    blocks a push.
+  - Both tables and the `varsel_decision_groups` view are created by the app at startup
+    (`create_varsel_decisions.sql`, `CREATE TABLE IF NOT EXISTS` — **never** `CREATE OR REPLACE`;
+    their contents cannot be rebuilt). The outcomes table is created there too, not by the nightly
+    job: `/historikk` queries it on every request and would 503 until the first nightly run
+    otherwise. The view holds the grouping shared by the nightly job and the API, so the two cannot
+    drift apart.
+  - Outcomes come from `data/queries/label_varsel_decisions.sql` (scheduled query
+    `varsel-label-daily`, 04:00 UTC, ~$0.01/run measured; **registered in dev, not prd** —
+    register it per environment with the `bq mk --transfer_config` recipe in
+    `label_varsel_decisions.sh`, which needs `--service_account_name` or it blocks on an
+    interactive OAuth prompt), joining `last_recorded` on
+    `(operator, jkey, call_date, stop_order)`. It must **not** remap `dataSource='VYG'` to `'NSB'`
+    the way `extend_demo_recent_daily.sql` does — varsel records the codespace from the line ref
+    (`VYG`), so remapping would silently join zero rail rows. Backfill by hand with
+    `data/queries/label_varsel_decisions.sh [project]`.
+  - **An unmatched join is `NULL`, never "no trouble".** `last_recorded`'s rail slice runs 10-17 %
+    thin, so some calls never resolve; counting them as correct rejections would manufacture
+    precision. The API keeps `venter` (too recent to label) distinct from `ukjent` (labelled, no
+    call found) for the same reason.
+  - Recall on this page is recall **among SX-flagged calls on registered journeys** — the models
+    never score a call no SX message flagged — and the UI says so next to the number.
+  - Privacy, in two layers. The *table* is keyed on the journey **definition**
+    (`journey_digest`, the same `llm_message.key_digest` used in the LLM audit log, so the two
+    join) plus a device count — no `device_id`, no `journey_id`, no time window or weekday pattern.
+    The *API* redacts further: `journey_digest`, `from_stop` and `to_stop` are **not** served,
+    because `/historikk-api` is unauthenticated on a public host and those three next to
+    `departure_time` and `n_devices` would publish "somebody commutes A→B at 07:15". `Decision` is
+    `extra="forbid"` so a future SELECT that re-adds a redacted column fails loudly instead of
+    quietly publishing it. The page identifies a decision by its **train**, not by whose trip it was.
+  - `venter` vs `ukjent` tracks the labelling job's 10-day retry window, on both surfaces: an
+    unresolved row inside the window is still being retried (`venter`); past it, the attempts have
+    given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
+    page shows the per-row state next to the count.
+  - Neither table is in `copy_runtime_to_prd.sh`: each environment records its own decisions and
+    `bq cp -f` overwrites. Note `VARSEL_LLM_ENABLED=false` in prd, so prd rows carry the
+    deterministic wording; dev is where the LLM-written messages are.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)

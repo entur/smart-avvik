@@ -507,6 +507,225 @@ def test_journey_listing_omits_the_internal_impact_reference():
     assert "impact" not in alerts[0]
 
 
+# ---- the alert-decision log -------------------------------------------------------------------
+# A situation that matches the same journey but scores well under every operator's threshold, so a
+# cycle produces one alerting and one non-alerting decision.
+SNAPSHOT_MIXED = {
+    "S1": SNAPSHOT["S1"],
+    "S2": [
+        FakeCall("t2", "A", 1, DEP + timedelta(minutes=10), situation_number="S2",
+                 line="VYG:Line:R11", summary="Kort innstilling", p_cancel=0.02,
+                 p_impact_dep=0.10),
+        FakeCall("t2", "B", 5, None, situation_number="S2", line="VYG:Line:R11",
+                 aimed_arr=DEP + timedelta(minutes=50)),
+    ],
+}
+
+
+class _FakeBQ:
+    """Enough of google.cloud.bigquery.Client for the decision log; records what was inserted."""
+
+    def __init__(self, insert_error: Exception | None = None, query_error: Exception | None = None):
+        self.rows: list[dict] = []
+        self.insert_error = insert_error
+        self.query_error = query_error
+        self.queries = 0
+
+    def query(self, sql, **kw):  # the CREATE TABLE IF NOT EXISTS
+        self.queries += 1
+        if self.query_error is not None:
+            raise self.query_error
+
+        class _Job:
+            # `timeout=` is passed by decisions.ensure_table; the real client accepts it and this
+            # fake must too, or the DDL "fails" here and the backoff silences every later test.
+            def result(self, timeout=None):
+                return None
+
+        return _Job()
+
+    def insert_rows_json(self, table, rows):
+        if self.insert_error is not None:
+            raise self.insert_error
+        self.rows.extend(rows)
+        return []
+
+
+def _use_decision_log(monkeypatch, insert_error=None, query_error=None) -> _FakeBQ:
+    import decisions
+
+    fake = _FakeBQ(insert_error, query_error)
+    monkeypatch.setattr(decisions, "_bq_client", fake)
+    monkeypatch.setattr(decisions, "_table_ready", False)
+    # The retry backoff is module state that would otherwise leak between tests.
+    monkeypatch.setattr(decisions, "_ensure_failed_at", None)
+    return fake
+
+
+def test_decisions_record_non_alerting_matches_too(monkeypatch):
+    """The recall half of the confusion matrix only exists if we write down what we did NOT alert on.
+
+    Recording pushes alone can never produce a `miss`: a journey we stayed silent about leaves no
+    trace, so every precision figure would be measured against a population we hand-picked.
+    """
+    _reset_state()
+    _use_snapshot(SNAPSHOT_MIXED)
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT_MIXED)
+
+    by_situation = {r["situation_number"]: r for r in log.rows}
+    assert set(by_situation) == {"S1", "S2"}
+    assert by_situation["S1"]["alertworthy"] is True
+    assert by_situation["S2"]["alertworthy"] is False
+
+
+def test_decision_row_carries_the_et_join_key(monkeypatch):
+    """Without (operator, jkey, call_date, stop_order) the row can never be checked against ET."""
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = log.rows[0]
+    assert (row["operator"], row["jkey"], row["stop_order"]) == ("VYG", "t1", 1)
+    assert row["call_date"] == DEP.astimezone(_OSLO).date().isoformat()
+    assert row["departure_time"] is not None and row["decided_at"] is not None
+    # Lead time is the axis alerting quality varies along most, so it must be recoverable.
+    assert row["minutes_to_departure"] > 0
+
+
+def test_decision_row_records_delivery_and_device_count(monkeypatch):
+    _reset_state()
+    _use_snapshot(SNAPSHOT_MIXED)
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    _register("dev-second12")  # same journey definition, second device
+    varsel.check_and_notify(SNAPSHOT_MIXED)
+
+    by_situation = {r["situation_number"]: r for r in log.rows}
+    # One row per journey DEFINITION, not per device -- two devices on one trip is still one row.
+    assert len(log.rows) == 2
+    assert by_situation["S1"]["pushed"] is True
+    assert by_situation["S2"]["pushed"] is False
+    assert by_situation["S1"]["n_devices"] == 2
+
+
+def test_decision_row_holds_no_device_or_journey_identifier(monkeypatch):
+    """The log is a record of what was said about a train, not of where a person commutes.
+
+    Keyed on the journey definition plus a count; the traveller's window and weekday pattern are
+    deliberately absent, matching why llm_message logs a digest instead of the key.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = log.rows[0]
+    assert DEVICE not in json.dumps(row)
+    assert not {"device_id", "journey_id", "begin", "end", "days"} & set(row)
+    # The digest is what makes a row joinable to its event="llm_message" log line.
+    import llm_message
+
+    key = varsel.journey_key(next(iter(varsel._journeys.values())))
+    assert row["journey_digest"] == llm_message.key_digest(key)
+
+
+def test_decision_write_failure_never_blocks_a_push(monkeypatch):
+    """A traveller's alert must not depend on the observability that watches it."""
+    _reset_state()
+    _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)  # must not raise
+    assert len(sent) == 1
+
+
+def test_decisions_are_not_recorded_without_a_client(monkeypatch):
+    """No BigQuery client (tests, a failed build) disables recording rather than erroring."""
+    import decisions
+
+    _reset_state()
+    monkeypatch.setattr(decisions, "_bq_client", None)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)  # must not raise
+    assert decisions.enabled() is False
+
+
+def test_decision_row_stores_the_text_that_was_actually_sent(monkeypatch):
+    """prd runs with the LLM off, so a row must carry the deterministic body, not NULL.
+
+    Storing only LLM output left every deterministic push with no message at all -- which is the
+    normal case in prd (VARSEL_LLM_ENABLED=false), so /historikk there would have shown a decision
+    log with nothing said in it.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: None)  # LLM unavailable
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_source"] == "deterministic"
+    # The same wording the push carried, not an empty column.
+    assert "90 % sjanse for innstilling" in row["message"]
+
+
+def test_decision_row_labels_a_written_message_as_llm(monkeypatch):
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: "Toget er innstilt.")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert (row["message"], row["message_source"]) == ("Toget er innstilt.", "llm")
+
+
+def test_decisions_are_recorded_even_when_push_is_disabled(monkeypatch):
+    """"Every decision, not every push" has to hold when push itself is off.
+
+    An early return on `push_enabled()` meant an environment without VAPID keys recorded nothing,
+    so /historikk looked like a broken deployment rather than an un-provisioned one.
+    """
+    _reset_state()
+    _register(DEVICE)  # register while push is still on, so a journey exists
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert sent == [], "push is disabled, so nothing may be delivered"
+    assert [r["situation_number"] for r in log.rows] == ["S1"]
+    assert log.rows[0]["pushed"] is False
+
+
+def test_ensure_table_backs_off_after_a_failure(monkeypatch):
+    """A permanently failing DDL must not re-issue a BigQuery job every 60 s poller tick."""
+    import decisions
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch, query_error=RuntimeError("permission denied"))
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert log.queries == 1, "the failed CREATE must not be retried on the very next cycle"
+    assert decisions._ensure_failed_at is not None
+    assert log.rows == [], "no rows are written while the table is not known to exist"
+
+
 def test_journey_handlers_are_not_coroutines():
     """They reach the impact provider, which can make a blocking Journey Planner call, so FastAPI
     must run them in the anyio threadpool. As `async def` they would block the single-worker event
