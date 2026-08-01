@@ -21,9 +21,14 @@
 # ---------------------------------------------------------------------------------------------
 # REGISTERING THE SCHEDULE (one-off, per project — nothing in CI or Helm does this)
 #
-# The scheduled query embeds a COPY of the SQL text, so editing the .sql in git changes nothing
-# until the config is updated. That is the trap worth knowing about: the file here and the job
-# actually running can silently diverge.
+# ALREADY REGISTERED IN DEV as "varsel-label-daily" (2026-08-01, first run SUCCEEDED). prd is not,
+# and should not be until its IAM is confirmed — see below.
+#
+# --service_account_name is REQUIRED, not optional polish. Without it `bq mk` tries to register the
+# job against your personal credentials and blocks on an interactive OAuth consent prompt, which
+# fails outright in any non-interactive shell. Running as the application SA also means the
+# schedule does not break when the person who created it changes teams. demo-recent-daily is owned
+# by the same SA.
 #
 #   bq mk --transfer_config \
 #     --project_id=ent-kixavvik-dev \
@@ -31,26 +36,34 @@
 #     --data_source=scheduled_query \
 #     --display_name="varsel-label-daily" \
 #     --schedule="every day 04:00" \
+#     --service_account_name="application@ent-kixavvik-dev.iam.gserviceaccount.com" \
 #     --params="$(python3 -c 'import json;print(json.dumps({"query":open("data/queries/label_varsel_decisions.sql").read()}))')"
 #
-# Re-register after editing the SQL (same --params, `bq ls --transfer_config --transfer_location=EU`
-# gives the resource name):
+# Creating the config fires one run immediately, so a mistake surfaces at once rather than at 04:00.
+#
+# The config embeds a COPY of the SQL text, so editing the .sql in git changes nothing until the
+# config is updated. That is the trap worth knowing about: the file here and the job actually
+# running can silently diverge. Re-register after any edit
+# (`bq ls --transfer_config --transfer_location=EU` gives the resource name):
 #
 #   bq update --transfer_config --params="$(python3 -c 'import json;print(json.dumps({"query":open("data/queries/label_varsel_decisions.sql").read()}))')" <config resource name>
+#
+# Validate the SQL BEFORE re-registering: data/queries/validate_varsel_sql.sh
 #
 # No --target_dataset / destination table: this is a multi-statement script that does its own
 # DELETE + INSERT, like copy_demo_to_prd_daily.sql.
 #
-# For prd, add --service_account_name=<the application@ent-kixavvik-prd SA> so it does not run as
-# whoever registered it (that is what demo-copy-daily does), and note two ordering constraints:
+# Two ordering constraints, both of which bite prd rather than dev:
 #   1. The app must have started at least once in that project first — the outcomes table is
 #      created at startup (disruptions/api/create_varsel_decisions.sql), not by this job.
 #   2. prd's SA reading ent-data-sharing-ext-prd is UNVERIFIED — prd is fed by free copies and has
 #      never scanned SIRI history. Confirm it before registering there, or the job fails silently
 #      every night. Same class as the 2026-07-09 AI.CLASSIFY gap: API enablement != IAM role.
+#      (Dev is proven: its application SA already reads last_recorded for demo-recent-daily.)
 #
-# Force a run without waiting for 04:00:
+# Force a run without waiting for 04:00, and check it:
 #   bq mk --transfer_run --run_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" <config resource name>
+#   bq ls --transfer_run <config resource name>
 # ---------------------------------------------------------------------------------------------
 set -euo pipefail
 
