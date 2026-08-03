@@ -1,5 +1,5 @@
 import type { DemoJourney, DemoSide, DemoSnapshot } from './api';
-import { fmtInterval, fmtPct, fmtTime } from './format';
+import { fmtInterval, fmtPct, fmtTime, varselDriver } from './format';
 
 // One matching journey: departure (boarding stop) on the left, arrival on the right.
 
@@ -49,14 +49,33 @@ function SnapshotRow({
     );
   }
   const verdict = snap.verdict ? VERDICT[snap.verdict] : null;
+  // Of the two figures, the one the traveller's push actually quoted — marked in the Varsle badge's
+  // own pink so the eye connects "we alerted" to "and this is what we said". The other figure fed
+  // the alert score just as much; it simply did not make it into the notification's one line.
+  const driver = varselDriver(snap);
+  const DRIVER_HINT = 'Dette tallet stod i varselteksten';
   return (
     <tr>
       <td>{label}</td>
       <td className="num">
         <span className="meter" style={{ ['--p' as string]: snap.cancel_probability }} />
-        {fmtPct(snap.cancel_probability)}
+        {driver === 'cancel' ? (
+          <span className="varsel-driver" title={DRIVER_HINT}>
+            {fmtPct(snap.cancel_probability)}
+          </span>
+        ) : (
+          fmtPct(snap.cancel_probability)
+        )}
       </td>
-      <td className="num">{fmtInterval(snap.delay_p50_min, snap.delay_p90_min)}</td>
+      <td className="num">
+        {driver === 'delay' ? (
+          <span className="varsel-driver" title={DRIVER_HINT}>
+            {fmtInterval(snap.delay_p50_min, snap.delay_p90_min)}
+          </span>
+        ) : (
+          fmtInterval(snap.delay_p50_min, snap.delay_p90_min)
+        )}
+      </td>
       <td>{snap.would_alert ? <span className="alert-badge">Varsle</span> : <span className="no-alert">–</span>}</td>
       <td>
         {verdict && (

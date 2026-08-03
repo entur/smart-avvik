@@ -7,7 +7,7 @@ import {
   type DemoMeta,
   type DemoSide,
 } from './api';
-import { fmtDate, fmtDateTime, fromLocalInput, toLocalInput } from './format';
+import { CANCEL_LIKELY, fmtDate, fmtDateTime, fromLocalInput, toLocalInput } from './format';
 import JourneyCard from './JourneyCard';
 import StopCombobox from './StopCombobox';
 
@@ -271,9 +271,13 @@ export default function App() {
             <span>
               <span className="verdict verdict-false">!</span> falsk alarm (varslet, gikk fint)
             </span>
+            <span>
+              <span className="varsel-driver">42 %</span> tallet varselet nevnte
+            </span>
             <span className="legend-note">
               Forsinkelse vises som typisk–verstefall (p50–p90). «Trøbbel» = innstilt eller ≥ 10
-              min forsinket.
+              min forsinket. Varselteksten nevner bare den ene av de to: innstillings­sannsynligheten
+              når den er over {Math.round(CANCEL_LIKELY * 100)} %, ellers forsinkelsen.
             </span>
           </footer>
         </section>
