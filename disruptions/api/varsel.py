@@ -655,8 +655,8 @@ def _delay_phrase(alert: Alert) -> str | None:
     if not p50 and not p90:
         return None
     if p50 and p90 and p90 > p50:
-        return f"typisk {p50}–{p90} min forsinket"
-    return f"typisk {p90 or p50} min forsinket"
+        return f"Typisk {p50}–{p90} min forsinket"
+    return f"Typisk {p90 or p50} min forsinket"
 
 
 def _deterministic_body(alert: Alert) -> str:
@@ -672,21 +672,15 @@ def _deterministic_body(alert: Alert) -> str:
     score = (
         alert.impact_probability if alert.impact_probability is not None else alert.cancel_probability
     )
-    lead = (
-        f"{round(score * 100)} % sjanse for innstilling eller "
-        f"≥ {TROUBLE_DELAY_MIN} min forsinkelse"
-    )
     detail = (
-        "mest sannsynlig innstilt"
+        f"{round(alert.cancel_probability * 100)} % sjanse for innstilling"
         if alert.cancel_probability >= _CANCEL_LIKELY
         else _delay_phrase(alert)
     )
-    if detail:
-        lead = f"{lead} — {detail}"
     if alert.departure_time is not None:
         hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-        lead = f"{alert.mode} kl {hhmm}: {lead}"
-    return f"{alert.summary}\n{lead}" if alert.summary else lead
+        detail = f"{alert.mode} kl {hhmm}: {detail}"
+    return f"{alert.summary}\n{detail}"
 
 
 def _notification_payload(journey: dict, alert: Alert, message: str | None = None) -> dict:
