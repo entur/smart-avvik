@@ -104,3 +104,23 @@ export function fmtInterval(p50: number | null, p90: number | null): string {
   if (p50 !== null && p90 !== null && p50 !== p90) return `${p50}–${p90} min`;
   return `${p90 ?? p50} min`;
 }
+
+// Mirrors varsel.py's _CANCEL_LIKELY. Above this cancellation probability the /varsel push states the
+// cancellation; below it, the delay interval. Only used to mark which figure the push quoted.
+export const CANCEL_LIKELY = 0.5;
+
+/** Which figure the /varsel push text would have quoted for this snapshot, or null if it would not
+ *  have quoted one. Mirrors varsel.py's `_deterministic_body`: the cancellation probability above
+ *  CANCEL_LIKELY, otherwise the delay interval — and neither when no delay figure is known (the
+ *  falsy check, not a null check, matches `_delay_phrase`, which also treats 0 as absent). Returns
+ *  null unless the snapshot actually crosses the alert threshold: with no push there is no text. */
+export function varselDriver(snap: {
+  cancel_probability: number;
+  delay_p50_min: number | null;
+  delay_p90_min: number | null;
+  would_alert: boolean;
+}): 'cancel' | 'delay' | null {
+  if (!snap.would_alert) return null;
+  if (snap.cancel_probability >= CANCEL_LIKELY) return 'cancel';
+  return snap.delay_p50_min || snap.delay_p90_min ? 'delay' : null;
+}

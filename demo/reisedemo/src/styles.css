@@ -488,6 +488,19 @@ button.primary:disabled {
   color: var(--text-faint);
 }
 
+/* The one figure of the two that the /varsel push text quoted. Deliberately the same pink as
+   .alert-badge above: the badge says a notification went out, this says what it said. Kept to a
+   background rather than a colour change so it reads as a highlight even where the row is dense,
+   and paired with a title + a legend entry so the meaning is never carried by colour alone. */
+.varsel-driver {
+  font-weight: 700;
+  color: var(--bad);
+  background: var(--bad-soft);
+  border-radius: 5px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+
 .verdict {
   display: inline-flex;
   align-items: center;
