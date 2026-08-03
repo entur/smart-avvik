@@ -46,6 +46,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   from static tables built by `data/queries/create_demo_predictions.sql` — re-run that query
   after model/calibration retrains. `data/queries/refresh_demo_recent.sh` extends the tables
   with the last ~25 days straight from SIRI-ET/SX (run before a partner demo; ~$2).
+  Non-prod deployments label the masthead and tab title (`Reiseprediksjon under avvik (dev)`) from
+  `GET /demo-api/config` — a partner shown dev numbers as if they were prd is the failure it
+  prevents. All three front-ends do this from the same `deployment.environment_label()`, each
+  through its own `*-api/config` endpoint, kept off the data endpoints because those can fail while
+  the page shell still renders. `disruptions/api/test_demo_api.py` covers the `/demo` one.
 - The **Avviksvarsel** PWA at `/varsel` (register a journey → Web Push when a live disruption is
   predicted to hit it; rail + the trained bus operators, per-operator alert thresholds) lives in
   `demo/avviksvarsel/` (React + Vite + Entur Linje). Its
@@ -72,6 +77,20 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
+  - Non-prod deployments label themselves in the PWA header and tab title —
+    `Avviksvarsel (dev)` — and in the **push title** (`[dev] Avvik: …`, prefixed because phones
+    truncate on the right), because dev and prd installs are otherwise identical on a phone and in
+    the notification tray (the manifest name and icons are baked into the one image every
+    environment shares). The tag goes in the title only, never the body, so the wording
+    `/historikk` records is the same text in every environment.
+    `/varsel-api/config` serves the name. The one derivation lives in
+    `disruptions/api/deployment.py` (`environment_label()`), shared with `/historikk`: it reads the
+    `GOOGLE_CLOUD_PROJECT` suffix, so no cosmetic per-environment variable has to be remembered —
+    that one is already mandatory everywhere, since the unqualified `disruptions.*` refs resolve
+    through it. `KIX_ENVIRONMENT` overrides it locally. `prd` — and an unreadable project — stay
+    unlabelled: a stray `(dev)` on the traveller-facing host is worse than none on a deployment we
+    control. Note the `/varsel-api` tests pin `KIX_ENVIRONMENT=prd` at import, or a developer with
+    `GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev` exported fails the push-title assertions.
   - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_LOCATION` /
     `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` — the push text is written by an LLM on Vertex AI
     (`disruptions/api/llm_message.py`) from the enriched `/impact` payload. No API keys: both
@@ -98,6 +117,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered
   journey, the message that was sent, and — once the journey has run — a hit / false alarm / miss /
   correct-reject verdict. Its API is `/historikk-api` (`disruptions/api/historikk.py`).
+  - Non-prod deployments label the heading and tab title (`Varselhistorikk (dev)`) from
+    `GET /historikk-api/config`, sharing `deployment.environment_label()` with `/varsel`. It is its
+    own endpoint, not a field on `/summary`, because both data endpoints 503 when the decision log
+    cannot be read — precisely when "is this dev or prd?" matters — and it touches no BigQuery.
   - **Every decision is logged, not every push.** `varsel.check_and_notify` appends one row per
     (journey definition x situation x departure) per refresh cycle to `disruptions.varsel_decisions`
     via `disruptions/api/decisions.py`, *including* matches that stayed below the alert threshold.

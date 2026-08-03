@@ -29,9 +29,15 @@ os.environ.update(
     VAPID_PUBLIC_KEY=_PUB,
     VAPID_SUBJECT="mailto:test@entur.org",
     VARSEL_STATE_PATH=_STATE_PATH,
+    # Pin the environment label off (see deployment.environment_label): notification titles carry it on
+    # non-prod, so a developer with GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev exported -- routine in this
+    # repo -- would otherwise fail the title assertions below. The tests that DO exercise labelling
+    # set it themselves via _deployed_as.
+    KIX_ENVIRONMENT="prd",
 )
 
 import json
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import alternatives
@@ -133,6 +139,49 @@ def test_config_reports_push_enabled():
     assert body["vapid_public_key"] == _PUB
 
 
+@contextmanager
+def _deployed_as(project: str | None, override: str | None = None):
+    """Run the body as if the app were deployed in `project` (ambient env, if any, restored after)."""
+    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "KIX_ENVIRONMENT")}
+    for key, value in (("GOOGLE_CLOUD_PROJECT", project), ("KIX_ENVIRONMENT", override)):
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _environment():
+    return client.get("/varsel-api/config").json()["environment"]
+
+
+def test_config_names_the_non_prod_environment():
+    """The PWA shows this behind its title: dev and prd sit side by side on one phone and are
+    otherwise identical, down to the home-screen name (one image, one manifest, every environment)."""
+    with _deployed_as("ent-kixavvik-dev"):
+        assert _environment() == "dev"
+    with _deployed_as("ent-kixavvik-tst"):
+        assert _environment() == "tst"
+    with _deployed_as("ent-kixavvik-prd", override="local"):
+        assert _environment() == "local"  # KIX_ENVIRONMENT wins, for local runs
+
+
+def test_config_leaves_production_unlabelled():
+    """prd is the public, traveller-facing host, so it carries no environment token -- and neither
+    does a deployment whose project we cannot read: guessing risks a stray label in prd."""
+    with _deployed_as("ent-kixavvik-prd"):
+        assert _environment() is None
+    with _deployed_as(None):
+        assert _environment() is None
+
+
 def test_stops():
     r = client.get("/varsel-api/stops")
     assert r.status_code == 200
@@ -212,6 +261,24 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     varsel.check_and_notify({})
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 2
+
+
+def test_push_titles_carry_the_environment_on_non_prod(monkeypatch):
+    """Both push kinds, alert and test: a dev push and a prd push arrive in the same tray under the
+    same app name (one manifest, every environment), so the title is the only place that can say
+    which deployment sent it. Prefixed, because phones truncate titles on the right."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register_matching_journey()
+    with _deployed_as("ent-kixavvik-dev"):
+        varsel.check_and_notify(SNAPSHOT)
+        assert client.post("/varsel-api/test", json={"device_id": DEVICE}).status_code == 200
+    assert [p["title"] for p in sent] == [
+        "[dev] Avvik: Oslo S → Lillehammer",
+        "[dev] Varsler er aktivert",
+    ]
+    assert "[dev]" not in sent[0]["body"]  # the tag belongs in the title, not in the wording
 
 
 def _register_matching_journey():

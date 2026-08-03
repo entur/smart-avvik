@@ -3,6 +3,9 @@
 export interface Config {
   push_enabled: boolean;
   vapid_public_key: string | null;
+  // Which deployment answered: 'dev' | 'tst' on non-prod, null in prd. Optional so an older API
+  // (or a local stub) simply reads as production instead of breaking the app.
+  environment?: string | null;
 }
 
 export interface StopItem {

@@ -29,6 +29,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -141,6 +142,15 @@ class DecisionsResponse(BaseModel):
     decisions: list[Decision] = Field(description="Matching decisions, newest departure first.")
 
 
+class ConfigResponse(BaseModel):
+    """What the page needs to describe itself, independent of the decision log."""
+
+    environment: str | None = Field(
+        description='Non-prod environment name ("dev", "tst") for the page to show in its title; '
+        "null in prd.",
+    )
+
+
 class Summary(BaseModel):
     """Alerting performance over the window — counts first, rates second, coverage always."""
 
@@ -232,6 +242,17 @@ def _query(sql: str, params: list, cache_key: tuple):
 
 
 router = APIRouter(prefix="/historikk-api", tags=["historikk"])
+
+
+@router.get("/config", summary="Which deployment is serving this page")
+def config() -> ConfigResponse:
+    """The environment name the page appends to its title, or null in prd.
+
+    Its own endpoint rather than a field on ``/summary`` deliberately: both data endpoints 503 when
+    the decision log cannot be read (no client, tables not written to yet), which is exactly when
+    knowing whether you are looking at dev or prd matters most. This one touches no BigQuery.
+    """
+    return ConfigResponse(environment=environment_label())
 
 
 @router.get(

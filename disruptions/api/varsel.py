@@ -78,6 +78,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from alternatives import AlternativeJourney
+from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query, Request
 from impact import ImpactResponse, LatestObservation, severity_key
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -682,6 +683,19 @@ def _deterministic_body(alert: Alert) -> str:
     return "\n".join(part for part in (alert.summary, detail) if part)
 
 
+def _tag_environment(title: str) -> str:
+    """Prefix a notification title with its environment on non-prod deployments, e.g. "[dev] ".
+
+    The OS names the sending app from the manifest, which is identical in every environment, so a
+    dev push and a prd push are indistinguishable in the tray unless the title says which. Leading,
+    not trailing: phones truncate the title on the right, exactly where a suffix would be lost.
+    Nothing is added in prd (see :func:`deployment.environment_label`), so real travellers see the
+    plain title.
+    """
+    env = environment_label()
+    return f"[{env}] {title}" if env else title
+
+
 def _notification_payload(journey: dict, alert: Alert, message: str | None = None) -> dict:
     """Norwegian Web Push payload for one journey×situation match.
 
@@ -693,7 +707,7 @@ def _notification_payload(journey: dict, alert: Alert, message: str | None = Non
     from_name = journey.get("from_name") or journey["from_stop"]
     to_name = journey.get("to_name") or journey["to_stop"]
     return {
-        "title": f"Avvik: {from_name} → {to_name}",
+        "title": _tag_environment(f"Avvik: {from_name} → {to_name}"),
         "body": message or _deterministic_body(alert),
         "url": "/varsel/",
         "situation_number": alert.situation_number,
@@ -1080,6 +1094,9 @@ class ConfigResponse(BaseModel):
     vapid_public_key: str | None = Field(
         description="VAPID application server key (base64url) for pushManager.subscribe; null if disabled.",
     )
+    environment: str | None = Field(
+        description='Non-prod environment name ("dev", "tst") for the PWA to show in its title; null in prd.',
+    )
 
 
 class StopItem(BaseModel):
@@ -1183,10 +1200,11 @@ router = APIRouter(prefix="/varsel-api", tags=["varsel"])
 @router.get("/config", summary="Push capability + VAPID public key")
 async def config() -> ConfigResponse:
     """Whether the server can send Web Push, and (if so) the application server key the PWA passes
-    to ``pushManager.subscribe``."""
+    to ``pushManager.subscribe`` -- plus which environment is answering."""
     return ConfigResponse(
         push_enabled=push_enabled(),
         vapid_public_key=_VAPID_PUBLIC_KEY if push_enabled() else None,
+        environment=environment_label(),
     )
 
 
@@ -1433,7 +1451,7 @@ def test_push(body: TestIn) -> dict:
     if subscription is None:
         raise HTTPException(status_code=404, detail="Enheten har ingen aktiv varsel-abonnement.")
     payload = {
-        "title": "Varsler er aktivert",
+        "title": _tag_environment("Varsler er aktivert"),
         "body": "Du vil nå få beskjed når et avvik kan ramme en av dine reiser.",
         "url": "/varsel/",
     }
