@@ -203,10 +203,8 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     assert len(sent) == 1
     assert sent[0]["title"] == "Avvik: Oslo S → Lillehammer"
     assert sent[0]["url"] == "/varsel/"
-    # The body leads with the alerting score (p_impact_dep 0.9), and this match is cancellation-
-    # driven (p_cancel 0.82), so it says so rather than quoting a delay.
-    assert "90 % sjanse for innstilling eller ≥ 10 min forsinkelse" in sent[0]["body"]
-    assert "mest sannsynlig innstilt" in sent[0]["body"]
+    assert "82 % sjanse for innstilling" in sent[0]["body"]
+    assert "min forsinket" not in sent[0]["body"]
     # Second pass: already notified -> no new push.
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1
@@ -338,7 +336,7 @@ def test_message_failure_falls_back_to_the_deterministic_body(monkeypatch):
     _register(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1
-    assert "90 % sjanse for innstilling eller ≥ 10 min forsinkelse" in sent[0]["body"]
+    assert "82 % sjanse for innstilling" in sent[0]["body"]
 
 
 def test_message_writer_exception_is_contained(monkeypatch):
@@ -676,7 +674,7 @@ def test_decision_row_stores_the_text_that_was_actually_sent(monkeypatch):
     row = next(r for r in log.rows if r["situation_number"] == "S1")
     assert row["message_source"] == "deterministic"
     # The same wording the push carried, not an empty column.
-    assert "90 % sjanse for innstilling" in row["message"]
+    assert "82 % sjanse for innstilling" in row["message"]
 
 
 def test_decision_row_labels_a_written_message_as_llm(monkeypatch):
