@@ -1,8 +1,40 @@
-// Time/number helpers. All display is Europe/Oslo; the demo window (Apr–Jun 2026) is
-// entirely CEST, so the datetime-local <-> UTC conversion can use a fixed +02:00 offset
-// instead of pulling in a tz library.
+// Time/number helpers. All display is Europe/Oslo. The datetime-local <-> UTC
+// conversion reads the zone's real offset out of Intl at the instant in question,
+// so it stays correct across the CET/CEST switch without a tz library.
 
-const OSLO_OFFSET = '+02:00';
+// Wall-clock fields for Europe/Oslo. hourCycle 'h23' so midnight is "00", not "24".
+const osloParts = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'Europe/Oslo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+});
+
+function osloWallClock(instant: number): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of osloParts.formatToParts(new Date(instant))) {
+    if (part.type !== 'literal') out[part.type] = part.value;
+  }
+  return out;
+}
+
+/** Europe/Oslo's offset from UTC, in ms, at a given instant (+1h CET, +2h CEST). */
+function osloOffsetMs(instant: number): number {
+  const p = osloWallClock(instant);
+  const wallAsUtc = Date.UTC(
+    Number(p.year),
+    Number(p.month) - 1,
+    Number(p.day),
+    Number(p.hour),
+    Number(p.minute),
+    Number(p.second),
+  );
+  return wallAsUtc - Math.floor(instant / 1000) * 1000;
+}
 
 const timeFmt = new Intl.DateTimeFormat('nb-NO', {
   timeZone: 'Europe/Oslo',
@@ -43,14 +75,22 @@ export function fmtDate(iso: string): string {
 
 /** UTC instant -> value for a datetime-local input, expressed in Oslo wall time. */
 export function toLocalInput(iso: string): string {
-  const d = new Date(iso);
-  const oslo = new Date(d.getTime() + 2 * 3600_000); // CEST
-  return oslo.toISOString().slice(0, 16);
+  const p = osloWallClock(new Date(iso).getTime());
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
 }
 
 /** datetime-local value (Oslo wall time) -> UTC ISO instant. */
 export function fromLocalInput(value: string): string {
-  return new Date(`${value}:00${OSLO_OFFSET}`).toISOString();
+  const [date, time] = value.split('T');
+  const [y, mo, d] = date.split('-').map(Number);
+  const [h, mi] = time.split(':').map(Number);
+  const wallAsUtc = Date.UTC(y, mo - 1, d, h, mi);
+  // The offset has to be sampled at the instant we are solving for, so guess with
+  // the offset at the naive reading, then resample. One correction settles every
+  // wall time except the hour that repeats when the clocks go back, where either
+  // answer is defensible.
+  const guess = wallAsUtc - osloOffsetMs(wallAsUtc);
+  return new Date(wallAsUtc - osloOffsetMs(guess)).toISOString();
 }
 
 /** 0.42 -> "42 %". */
