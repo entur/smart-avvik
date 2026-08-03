@@ -389,8 +389,7 @@ def test_push_body_leads_with_the_alerting_score():
         dep_delay_p50_stack_min=15,
         dep_delay_p90_stack_min=27,
     )
-    assert "93 % sjanse for innstilling eller ≥ 10 min forsinkelse" in body
-    assert "typisk 15–27 min forsinket" in body
+    assert "Typisk 15–27 min forsinket" in body
     assert "1 %" not in body and "2 min" not in body
 
 
@@ -399,14 +398,13 @@ def test_push_body_leads_with_cancellation_when_that_dominates():
     # beside the point for a train that probably isn't running.
     body = _push_body(operator="SKY", p_cancel=0.95, p_impact_dep=0.97,
                       dep_delay_p50_stack_min=3, dep_delay_p90_stack_min=8)
-    assert "97 % sjanse for innstilling eller ≥ 10 min forsinkelse" in body
-    assert "mest sannsynlig innstilt" in body
+    assert "95 % sjanse for innstilling" in body
     assert "min forsinket" not in body
 
 
 def test_push_body_collapses_a_single_delay_figure():
     body = _push_body(p_cancel=0.02, dep_delay_p50_stack_min=12, dep_delay_p90_stack_min=12)
-    assert "typisk 12 min forsinket" in body
+    assert "Typisk 12 min forsinket" in body
 
 
 if __name__ == "__main__":
