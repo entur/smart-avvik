@@ -661,17 +661,9 @@ def _delay_phrase(alert: Alert) -> str | None:
 
 def _deterministic_body(alert: Alert) -> str:
     """The template wording: what the push says when no written message is available.
-
-    Leads with the number the push gate actually fired on — P(innstilling eller ≥ 10 min
-    forsinkelse), worded as on ``/demo`` — then the dominant driver: a likely cancellation, else the
-    exceedance-stack delay interval. Cancellation probability alone plus the raw typical-delay
-    regression (what this said until 2026-07-27) understates a delay-driven alert badly.
     """
     # alertworthy alerts always carry an impact probability (the gate requires it); the fallback
     # only matters if this is ever called for a listed-but-not-pushed match.
-    score = (
-        alert.impact_probability if alert.impact_probability is not None else alert.cancel_probability
-    )
     detail = (
         f"{round(alert.cancel_probability * 100)} % sjanse for innstilling"
         if alert.cancel_probability >= _CANCEL_LIKELY
