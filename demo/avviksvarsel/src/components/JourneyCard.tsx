@@ -36,7 +36,6 @@ function AlertLine({ alert }: { alert: Alert }) {
       ? `${fmtPct(alert.cancel_probability)} sjanse for innstilling`
       : fmtDelay(alert.delay_p50_min, alert.delay_p90_min);
   if (driver) parts.push(driver);
-  if (!alert.alertworthy) parts.push(`under varslingsterskelen (${fmtPct(alert.alert_threshold)})`);
   const observation = alert.latest_observation ? observationText(alert.latest_observation) : null;
   return (
     <SmallAlertBox variant={alert.alertworthy ? 'negative' : 'warning'} width="fluid">
