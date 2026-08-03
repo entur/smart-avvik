@@ -407,6 +407,35 @@ def test_push_body_collapses_a_single_delay_figure():
     assert "Typisk 12 min forsinket" in body
 
 
+def test_push_body_drops_the_detail_when_neither_driver_is_known():
+    """A pushed alert can have no driver figure at all, and the body must not say "None".
+
+    The gate reads impact_probability off the exceedance head, not off these columns, so p_cancel
+    under _CANCEL_LIKELY with every delay figure NULL is a reachable combination -- and it used to
+    f-string a Python None straight into the notification ("Tog kl 08:00: None").
+    """
+    body = _push_body(
+        p_cancel=0.02,
+        p_impact_dep=0.93,  # still over the alert bar: this is a pushed alert, not a listed one
+        dep_delay_typ_min=None,  # _typ_delay falls back to this, so it has to go too
+        dep_delay_p50_stack_min=None,
+        dep_delay_p90_stack_min=None,
+        dep_delay_p90_min=None,
+    )
+    assert "None" not in body
+    assert "sjanse for innstilling" not in body and "forsinket" not in body
+    # What survives is the summary and the train, so the push still says what and when.
+    assert body == "Signalfeil\nTog kl 08:00"
+
+
+def test_push_body_omits_a_missing_summary():
+    """`summary` is nullable (an SX situation need not carry Norwegian text) -- the same
+    unguarded interpolation rendered it as "None" on the body's first line."""
+    body = _push_body(summary=None, p_cancel=0.95)
+    assert "None" not in body
+    assert body == "Tog kl 08:00: 95 % sjanse for innstilling"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

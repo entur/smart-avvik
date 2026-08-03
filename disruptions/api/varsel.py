@@ -661,9 +661,15 @@ def _delay_phrase(alert: Alert) -> str | None:
 
 def _deterministic_body(alert: Alert) -> str:
     """The template wording: what the push says when no written message is available.
+
+    Every part is optional, so the body is assembled from the ones that exist rather than
+    interpolated blind. A pushed alert is gated on `impact_probability`, which comes off the
+    exceedance head and not off these columns: `p_cancel` can sit under `_CANCEL_LIKELY` while both
+    delay percentiles are NULL, and `summary` is nullable too. Interpolating either unguarded put the
+    literal string "None" in a notification body. Dropping the part is the honest fallback -- with a
+    departure time present (the matcher needs one, so in practice there always is) the reader still
+    gets which train, and the payload title still names the journey.
     """
-    # alertworthy alerts always carry an impact probability (the gate requires it); the fallback
-    # only matters if this is ever called for a listed-but-not-pushed match.
     detail = (
         f"{round(alert.cancel_probability * 100)} % sjanse for innstilling"
         if alert.cancel_probability >= _CANCEL_LIKELY
@@ -671,8 +677,9 @@ def _deterministic_body(alert: Alert) -> str:
     )
     if alert.departure_time is not None:
         hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-        detail = f"{alert.mode} kl {hhmm}: {detail}"
-    return f"{alert.summary}\n{detail}"
+        train = f"{alert.mode} kl {hhmm}"
+        detail = f"{train}: {detail}" if detail else train
+    return "\n".join(part for part in (alert.summary, detail) if part)
 
 
 def _notification_payload(journey: dict, alert: Alert, message: str | None = None) -> dict:
