@@ -69,7 +69,6 @@ export default function App() {
   // Initial load: config, stops, journeys. Register the service worker up front so enabling
   // push later is a single tap.
   useEffect(() => {
-    document.title = 'Entur Avviksvarsel';
     if (isPushSupported()) void registerServiceWorker().catch(() => undefined);
     (async () => {
       try {
@@ -105,6 +104,15 @@ export default function App() {
     };
   }, [refreshJourneys]);
 
+  // Which deployment this is, e.g. " (dev)" — empty in prd. The installed app's home-screen name and
+  // icon come from the manifest, which is baked into the one image every environment shares, so the
+  // server's answer is the only thing that can tell a dev install from a prd one on the same phone.
+  const envSuffix = config?.environment ? ` (${config.environment})` : '';
+
+  useEffect(() => {
+    document.title = `Entur Avviksvarsel${envSuffix}`;
+  }, [envSuffix]);
+
   const handleCreate = useCallback(
     async (journey: NewJourney) => {
       const created = await createJourney(deviceId, journey);
@@ -129,7 +137,7 @@ export default function App() {
         <div className="av-header-inner">
           <Logo />
           <Heading1 as="h1" margin="none" className="av-header-title">
-            Avviksvarsel
+            Avviksvarsel{envSuffix}
           </Heading1>
         </div>
       </Contrast>

@@ -68,6 +68,13 @@ export interface Summary {
   n_hit_with_30min_notice: number;
 }
 
+/** Which deployment answered. Its own endpoint because it must survive a decision log that cannot
+ *  be read — see the config route in disruptions/api/historikk.py. */
+export interface Config {
+  /** 'dev' | 'tst' on non-prod, null in prd. */
+  environment: string | null;
+}
+
 export interface Filters {
   fromDate?: string;
   toDate?: string;
@@ -93,6 +100,10 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
   return params.toString();
+}
+
+export function fetchConfig(): Promise<Config> {
+  return get('/historikk-api/config');
 }
 
 export function fetchDecisions(filters: Filters): Promise<DecisionsResponse> {

@@ -32,6 +32,13 @@ export interface DemoMeta {
   highlights: DemoHighlight[];
 }
 
+/** Which deployment answered. Its own endpoint because it must survive a demo dataset that cannot
+ *  be read — see demo_config in disruptions/api/main.py. */
+export interface DemoConfig {
+  /** 'dev' | 'tst' on non-prod, null in prd. */
+  environment: string | null;
+}
+
 export interface DemoSnapshot {
   cancel_probability: number;
   ge10_probability: number | null;
@@ -89,6 +96,10 @@ async function get<T>(url: string): Promise<T> {
     throw new Error(body?.detail ?? `${res.status} ${res.statusText}`);
   }
   return res.json();
+}
+
+export function fetchConfig(): Promise<DemoConfig> {
+  return get('/demo-api/config');
 }
 
 export function fetchMeta(): Promise<DemoMeta> {

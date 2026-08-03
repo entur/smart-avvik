@@ -10,6 +10,8 @@ and we could not find the train". Both would otherwise turn missing data into fl
 Run: uv run --with fastapi --with httpx --with pydantic python test_historikk.py  (or under pytest)
 """
 
+import os
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
@@ -272,6 +274,47 @@ def test_missing_tables_report_unavailable_not_a_traceback():
     r = client.get("/historikk-api/decisions")
     assert r.status_code == 503
     assert "decision log" in r.json()["detail"].lower()
+
+
+@contextmanager
+def _deployed_as(project: str | None):
+    """Run the body as if the app were deployed in `project` (ambient env restored afterwards)."""
+    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "KIX_ENVIRONMENT")}
+    os.environ.pop("KIX_ENVIRONMENT", None)  # a local override would mask the project
+    if project is None:
+        os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+    else:
+        os.environ["GOOGLE_CLOUD_PROJECT"] = project
+    try:
+        yield
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_config_names_the_non_prod_environment():
+    """The page shows this behind its title: dev and prd serve the same page on near-identical
+    hosts, so nothing else says which environment's numbers you are reading."""
+    with _deployed_as("ent-kixavvik-dev"):
+        assert client.get("/historikk-api/config").json()["environment"] == "dev"
+    with _deployed_as("ent-kixavvik-prd"):
+        assert client.get("/historikk-api/config").json()["environment"] is None
+
+
+def test_config_survives_an_unreadable_decision_log():
+    """Why it is its own endpoint and not a field on /summary: when the log cannot be read, knowing
+    which environment you are on is what tells a broken deployment from a fresh one."""
+    _reset([], error=RuntimeError("404 Not found: Table disruptions.varsel_decisions"))
+    with _deployed_as("ent-kixavvik-dev"):
+        assert client.get("/historikk-api/summary").status_code == 503
+        queries_so_far = len(fake.calls)
+        r = client.get("/historikk-api/config")
+    assert r.status_code == 200
+    assert r.json()["environment"] == "dev"
+    assert len(fake.calls) == queries_so_far, "/config must not query BigQuery"
 
 
 def test_results_are_cached_between_identical_requests():

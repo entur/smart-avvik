@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import {
+  fetchConfig,
   fetchJourneys,
   fetchMeta,
   type DemoHighlight,
@@ -68,8 +69,20 @@ export default function App() {
   const [result, setResult] = useState<DemoJourneysResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [environment, setEnvironment] = useState<string | null>(null);
+
+  // Which deployment this is, e.g. " (dev)" — empty in prd. All three deployments serve this page
+  // from the same image on near-identical hosts, and a partner being shown dev numbers as if they
+  // were prod is the failure this prevents. Fetched apart from the dataset metadata, which can fail
+  // on its own; a failed config fetch reads as prd rather than breaking the page.
+  const envSuffix = environment ? ` (${environment})` : '';
 
   useEffect(() => {
+    document.title = `Reiseprediksjon under avvik${envSuffix} — demo`;
+  }, [envSuffix]);
+
+  useEffect(() => {
+    fetchConfig().then((c) => setEnvironment(c.environment), () => undefined);
     fetchMeta().then(setMeta, (e) => setMetaError(String(e.message ?? e)));
     // Shareable links: /demo/?from=NSR:StopPlace:694&to=...&start=2026-04-14T19:30&end=...
     // (start/end in Oslo wall time, as in the inputs). Searches on load when complete.
@@ -125,7 +138,7 @@ export default function App() {
   return (
     <div className="page">
       <header className="masthead">
-        <h1>Reiseprediksjon under avvik</h1>
+        <h1>Reiseprediksjon under avvik{envSuffix}</h1>
         <p>
           Hvor godt treffer prediksjonene for forsinkelser og innstillinger? Velg en strekning og
           et tidsrom fra evalueringsperioden, og sammenlign det modellene meldte — idet

@@ -4,7 +4,7 @@ import { Loader } from '@entur/loader';
 import { Heading1, Paragraph } from '@entur/typography';
 import DecisionCard from './components/DecisionCard';
 import SummaryStrip from './components/SummaryStrip';
-import { fetchDecisions, fetchSummary } from './api';
+import { fetchConfig, fetchDecisions, fetchSummary } from './api';
 import type { Decision, Filters, Summary, Verdict } from './api';
 import { VERDICT_LABEL, isoDaysAgo } from './format';
 
@@ -35,6 +35,23 @@ export default function App() {
   const [operators, setOperators] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [environment, setEnvironment] = useState<string | null>(null);
+
+  // Which deployment this is, e.g. " (dev)" — empty in prd. dev and prd serve the same page on
+  // near-identical hosts, so nothing on it says which numbers you are reading. Fetched on its own,
+  // outside the filter effect: it never changes, and it must still show up when the decision log
+  // below it is unreadable. A failed fetch reads as prd rather than breaking the page.
+  useEffect(() => {
+    void fetchConfig()
+      .then((c) => setEnvironment(c.environment))
+      .catch(() => undefined);
+  }, []);
+
+  const envSuffix = environment ? ` (${environment})` : '';
+
+  useEffect(() => {
+    document.title = `Varselhistorikk${envSuffix}`;
+  }, [envSuffix]);
 
   useEffect(() => {
     // `cancelled` is the stale-response guard, the same shape avviksvarsel's VarselStatus uses.
@@ -79,7 +96,7 @@ export default function App() {
   return (
     <main className="vh-page">
       <header className="vh-header">
-        <Heading1>Varselhistorikk</Heading1>
+        <Heading1>Varselhistorikk{envSuffix}</Heading1>
         <Paragraph className="vh-intro">
           Hver avgjørelse Avviksvarsel har tatt om en registrert reise — også de vi valgte å tie om
           — og hvordan det faktisk gikk. Avgjørelser uten varsel er tatt med med vilje: uten dem

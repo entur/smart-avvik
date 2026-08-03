@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 # Aliased: the route function below is also called `impact`, and inside its body a bare
 # `impact.` would resolve to that function rather than to this module.
 import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
+import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
 import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
@@ -1592,6 +1593,15 @@ class DemoMeta(BaseModel):
     highlights: list[DemoHighlight] = Field(description="One-click example scenarios, worst first.")
 
 
+class DemoConfig(BaseModel):
+    """What the demo UI needs to describe itself, independent of the demo dataset."""
+
+    environment: str | None = Field(
+        description='Non-prod environment name ("dev", "tst") for the page to show in its title; '
+        "null in prd.",
+    )
+
+
 class DemoSnapshot(BaseModel):
     """The prediction as it stood at one ask time, plus how it compares to the outcome."""
 
@@ -1783,6 +1793,22 @@ def get_demo_meta() -> DemoMeta:
     with _demo_meta_lock:
         _demo_meta_cache = (time.monotonic(), meta)
     return meta
+
+
+@app.get(
+    "/demo-api/config",
+    summary="Which deployment is serving this page",
+    response_description="The environment name for the page title; null in prd.",
+    tags=["demo"],
+)
+async def demo_config() -> DemoConfig:
+    """The environment name the demo page appends to its title, or null in prd.
+
+    Separate from `/demo-api/meta` on purpose: meta reads the demo tables and can fail (a fresh
+    environment has none copied in), and the page still renders its masthead in that state — which
+    is exactly when it matters whether a partner is looking at dev or prd. This touches no BigQuery.
+    """
+    return DemoConfig(environment=deployment.environment_label())
 
 
 @app.get(
