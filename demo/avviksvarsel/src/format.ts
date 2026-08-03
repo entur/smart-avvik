@@ -42,15 +42,15 @@ export function formatDays(days: number[]): string {
     .join(', ');
 }
 
-// Mirrors varsel.py: an alert counts as trouble at >= 10 min late, and above a 50 % cancellation
-// probability the wording leads with the cancellation instead of the delay interval.
-export const TROUBLE_DELAY_MIN = 10;
+// Mirrors varsel.py's _CANCEL_LIKELY: above a 50 % cancellation probability the wording states the
+// cancellation instead of the delay interval.
 export const CANCEL_LIKELY = 0.5;
 
-/** Delay phrasing for an alert from the exceedance-stack interval: "typisk 15–27 min forsinket"
- *  (collapsed when p50 and p90 coincide, omitted when neither is known). */
+/** Delay phrasing from the exceedance-stack interval: "Typisk 15–27 min forsinket" (collapsed when
+ *  p50 and p90 coincide, omitted when neither is known). Word-for-word varsel.py's `_delay_phrase`,
+ *  capital T included, so the card and the push it describes cannot read differently. */
 export function fmtDelay(p50: number | null, p90: number | null): string | null {
   if (!p50 && !p90) return null;
-  if (p50 && p90 && p90 > p50) return `typisk ${p50}–${p90} min forsinket`;
-  return `typisk ${p90 ?? p50} min forsinket`;
+  if (p50 && p90 && p90 > p50) return `Typisk ${p50}–${p90} min forsinket`;
+  return `Typisk ${p90 ?? p50} min forsinket`;
 }

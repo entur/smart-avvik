@@ -3,7 +3,7 @@ import { DeleteIcon } from '@entur/icons';
 import { SmallAlertBox } from '@entur/alert';
 import { Paragraph, SmallText } from '@entur/typography';
 import type { Alert, Journey } from '../api';
-import { CANCEL_LIKELY, TROUBLE_DELAY_MIN, fmtDelay, fmtPct, fmtTime, formatDays } from '../format';
+import { CANCEL_LIKELY, fmtDelay, fmtPct, fmtTime, formatDays } from '../format';
 
 // "Sist observert: Asker, 18 min forsinket (kl 07:42)" — what has actually happened on the line, as
 // opposed to what is predicted. Shown with its time because the observation can be up to an hour
@@ -21,19 +21,19 @@ function observationText(obs: NonNullable<Alert['latest_observation']>): string 
 }
 
 // One situation hitting the journey. When a written message exists it leads — it is what the phone's
-// notification said, so the list should not contradict it. The probability line stays underneath as
-// the detail: the alerting score the push gate reads (P(innstilling eller >= 10 min forsinkelse), the
-// same quantity and wording /demo shows) followed by the dominant driver. A match below the
-// operator's threshold is listed but not pushed, and says so.
+// notification said, so the list should not contradict it. The detail line underneath follows the
+// push word for word (varsel.py's `_deterministic_body`): whichever driver dominates, either the
+// cancellation probability or the typical delay interval, and nothing else. It deliberately does NOT
+// show `impact_probability`, the composite alerting score: the push quotes p_cancel, so putting the
+// score here printed two different percentages for the same train in the same alert box, one line
+// apart. `impact_probability` is still what the gate gets compared against, which is why the
+// below-threshold note below is phrased as a threshold rather than restated as a probability.
 function AlertLine({ alert }: { alert: Alert }) {
   const parts: string[] = [];
   if (alert.departure_time) parts.push(`${alert.mode ?? 'Tog'} kl ${fmtTime(alert.departure_time)}`);
-  parts.push(
-    `${fmtPct(alert.impact_probability ?? alert.cancel_probability)} sjanse for innstilling eller ≥ ${TROUBLE_DELAY_MIN} min forsinkelse`,
-  );
   const driver =
     alert.cancel_probability >= CANCEL_LIKELY
-      ? 'mest sannsynlig innstilt'
+      ? `${fmtPct(alert.cancel_probability)} sjanse for innstilling`
       : fmtDelay(alert.delay_p50_min, alert.delay_p90_min);
   if (driver) parts.push(driver);
   if (!alert.alertworthy) parts.push(`under varslingsterskelen (${fmtPct(alert.alert_threshold)})`);
