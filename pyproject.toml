@@ -31,6 +31,25 @@ dev = [
     "mypy>=2.3.0",
     "ruff>=0.16.0",
 ]
+# The /disruptions API's runtime deps that are not already in [project.dependencies]. What ships in
+# the image is installed from disruptions/api/requirements.txt -- this group is not it. They are
+# listed again here so a plain `uv sync` yields an environment that can import and run the API and
+# its test suites, in an IDE as much as on the command line. Only `py_vapid` and `cryptography` are
+# imported at module level (varsel.py, test_varsel_api.py) and both arrive with pywebpush; the rest
+# are imported lazily inside functions, so they are here for the IDE and for exercising those paths.
+# No tzdata: that entry in requirements.txt exists because python:*-slim ships without an IANA
+# database, which a dev machine has. Keep the versions in step with requirements.txt.
+api = [
+    "pywebpush>=2.3.0",
+    "google-cloud-storage>=3.13.0",
+    "anthropic[vertex]>=0.69.0",
+    "google-genai>=1.0.0",
+]
+
+[tool.uv]
+# `api` is a *default* group, so `uv sync` on its own is enough: an IDE pointed at .venv resolves
+# the API's imports and runs disruptions/api/test_*.py without anyone remembering an extra flag.
+default-groups = ["dev", "api"]
 
 # ruff 0.16 widened its default rule set well beyond E/F (B, UP, SIM, PLR, I, C4, RUF, ...).
 # The defaults are adopted as-is; the two exemptions below are rules that misfire on a
