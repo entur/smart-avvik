@@ -82,6 +82,9 @@ export interface Journey {
   days: number[];
   created_ts: string;
   alerts: Alert[];
+  // Something about the registration itself, not about today's traffic: currently only "no planned
+  // trip connects these stops today", which means this journey cannot produce an alert.
+  warning: string | null;
 }
 
 export interface NewJourney {

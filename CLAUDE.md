@@ -82,6 +82,18 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `topographicPlaceRef`, `KVE:` codespace only. The registry read fails open: no registry means no
   grouping and no counties, exactly as before it existed. It is readable from both environments (the
   dataset grants `allAuthenticatedUsers` READER) and costs ~3 MB per refresh.
+  **A registration nothing can ever alert on says so** (2026-08-04): `POST /varsel-api/journeys`
+  asks whether any planned trip today runs between the two places (`main._varsel_connectivity` over
+  `{rail,bus}_calls_planned_today`, every ref of both places, MIN/MAX per side so a circular route is
+  handled). varsel only alerts on a **direct** trip, so a pair no single trip connects yields no alert
+  however bad the day gets — and the old symptom was the reassuring "ingen aktive avvik akkurat nå".
+  It **never blocks**: the verdict rides on `Journey.warning`, shown on the card in place of that
+  line, with a sharper text naming both stops when the pair is served *the other way* (a likely
+  swap). Weekend-only and seasonal routes are why a refusal would be wrong, and why the poller
+  re-asks every 6 h (`varsel.recheck_service`) and clears the caveat when service appears; a match
+  also suppresses it. `None` from the provider means "could not establish" — an outage, a timeout, the
+  30/min rate limit that exists because the endpoint is unauthenticated — and never becomes a
+  warning. Answers are cached 10 min.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
