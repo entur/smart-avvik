@@ -86,6 +86,44 @@ _VARSEL_STOPS_BUS_QUERY = """
     WHERE stop_place IS NOT NULL
     GROUP BY stop_place
 """
+# The National Stop Register, which is what tells us that two StopPlaces are ONE physical place:
+# co-located refs (a station's rail and bus sides, a ferry berth registered twice) share a
+# `parentRef`. Measured 2026-08-03 over the 22 481 stops in the picker: 1 573 names were offered
+# more than once, and 422 of the 427 same-name pairs within 300 m share a parent — so the parent is
+# the registry's own notion of "same place", not a distance heuristic of ours. Without this the
+# picker offered visually identical rows (two "Nyvoll ferjekai"), and choosing the wrong one failed
+# in the most reassuring way available: `to_stop` narrowing dropped every situation and the card
+# said "ingen aktive avvik akkurat nå".
+#
+# `topographicPlaceRef` carries the municipality number, whose first two digits are the county —
+# the disambiguator for the same-name stops that are NOT the same place (1 260 of those groups lie
+# over 20 km apart). Only the `KVE:` codespace is Kartverket's Norwegian numbering; `LAN:` (Sweden)
+# and `WOF:` refs are left unlabelled rather than mapped through a table that does not describe
+# them. Readable by any authenticated principal (the dataset grants allAuthenticatedUsers READER),
+# so this works in prd as well as dev.
+_VARSEL_STOP_PLACES_QUERY = """
+    SELECT id,
+           COALESCE(ANY_VALUE(parentRef.ref), id) AS place_id,
+           IF(STARTS_WITH(ANY_VALUE(topographicPlaceRef.ref), 'KVE:'),
+              SUBSTR(ANY_VALUE(topographicPlaceRef.ref), -4, 2), NULL) AS county_no
+    FROM `ent-data-sharing-ext-prd.national_stop_registry.stop_places_last_version`
+    GROUP BY id
+"""
+# Municipality-number prefix -> county name. NSR carries both the current numbering and pre-2020
+# codes (Kambo is 0104, not 3103), so both generations are mapped, each to the county that exists
+# today. 30 / 38 / 54 are the 2020-2023 merged counties, kept under their own names because a stop
+# numbered 30xx cannot be resolved to one of Viken's successors from the prefix alone. Anything not
+# listed gets no label, which is the pre-existing behaviour rather than a guess.
+_COUNTY_BY_MUNICIPALITY_PREFIX: dict[str, str] = {
+    "01": "Østfold", "02": "Akershus", "03": "Oslo", "04": "Innlandet", "05": "Innlandet",
+    "06": "Buskerud", "07": "Vestfold", "08": "Telemark", "09": "Agder", "10": "Agder",
+    "11": "Rogaland", "12": "Vestland", "14": "Vestland", "15": "Møre og Romsdal",
+    "16": "Trøndelag", "17": "Trøndelag", "18": "Nordland", "19": "Troms", "20": "Finnmark",
+    "30": "Viken", "31": "Østfold", "32": "Akershus", "33": "Buskerud", "34": "Innlandet",
+    "38": "Vestfold og Telemark", "39": "Vestfold", "40": "Telemark", "42": "Agder",
+    "46": "Vestland", "50": "Trøndelag", "54": "Troms og Finnmark", "55": "Troms",
+    "56": "Finnmark",
+}
 
 # Hour-of-day in the impact lookup is Europe/Oslo local time (matches the table build),
 # so resolve "now" to the Oslo hour when looking up a profile.
@@ -449,12 +487,43 @@ _varsel_stops_lock = threading.Lock()
 _varsel_stops_cache: list[dict] = []
 
 
+def _varsel_stop_places() -> dict[str, tuple[str, str | None]]:
+    """NSR ref -> (place_id, county name). Empty when the registry cannot be read.
+
+    Fails open like every other sub-query here: no registry means no grouping and no county
+    labels, which is what the picker did before this existed — not an empty stop list.
+    """
+    places: dict[str, tuple[str, str | None]] = {}
+    try:
+        for r in bq_client.query(_VARSEL_STOP_PLACES_QUERY).result():
+            places[r.id] = (
+                r.place_id,
+                _COUNTY_BY_MUNICIPALITY_PREFIX.get(r.county_no) if r.county_no else None,
+            )
+    except Exception:
+        logger.exception(
+            "The national stop registry could not be read; stops keep their own place ids "
+            "(same-named stops will be offered separately and carry no county)"
+        )
+    return places
+
+
 def refresh_varsel_stops() -> None:
     """Reload the stop picker list from the rail AND bus planned call sources (tiny scans).
 
     Each source is queried independently and merged by stop_place, so a missing/failing bus table
     never drops the rail stops (and vice versa). The merge sums call counts and ORs the mode
-    flags — a stop served by both families gets mode "Tog/Buss"."""
+    flags — a stop served by both families gets mode "Tog/Buss".
+
+    Co-located refs are then collapsed to ONE picker row: same NSR parent place AND the same name
+    means one physical stop registered more than once (a station's rail and bus sides, a ferry berth
+    with two refs), and offering both is how a traveller ends up watching a quay their trip never
+    calls at. The row keeps the busiest ref, sums the calls, and the refs it absorbed become
+    aliases — `varsel` rewrites registrations onto the primary so both surfaces agree on one ref per
+    place. Grouping needs the name as well as the parent: a parent can hold genuinely different
+    stops (Oslo S and Jernbanetorget), and merging those would answer a search for one with the
+    other.
+    """
     merged: dict[str, dict] = {}
     for q in (_VARSEL_STOPS_QUERY, _VARSEL_STOPS_BUS_QUERY):
         try:
@@ -470,20 +539,49 @@ def refresh_varsel_stops() -> None:
                 e["has_bus"] = e["has_bus"] or r.has_bus
         except Exception:
             logger.exception("A varsel stops sub-query failed; continuing with the other source(s)")
-    stops = [
-        {
-            "stop_place": e["stop_place"],
-            "stop_name": e["stop_name"],
-            "n_calls": e["n_calls"],
-            "mode": "Tog/Buss" if e["has_rail"] and e["has_bus"]
-            else ("Tog" if e["has_rail"] else "Buss"),
-        }
-        for e in merged.values()
-    ]
+
+    places = _varsel_stop_places()
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for e in merged.values():
+        place_id, county = places.get(e["stop_place"], (e["stop_place"], None))
+        e["place_id"] = place_id
+        e["region"] = county
+        name = (e["stop_name"] or "").strip().casefold()
+        # An unnamed stop is never merged: its name cannot be shown to disambiguate it either, so
+        # collapsing it into a neighbour would hide a ref behind a row nobody can read.
+        key = (place_id, name) if name else (e["stop_place"], "")
+        groups.setdefault(key, []).append(e)
+
+    stops: list[dict] = []
+    aliases: dict[str, str] = {}
+    for members in groups.values():
+        # Busiest ref wins, ties broken on the ref itself so the primary does not flip between
+        # refreshes (a flipping primary would rewrite registrations back and forth).
+        primary, *rest = sorted(members, key=lambda e: (-e["n_calls"], e["stop_place"]))
+        has_rail = any(e["has_rail"] for e in members)
+        has_bus = any(e["has_bus"] for e in members)
+        stops.append(
+            {
+                "stop_place": primary["stop_place"],
+                "stop_name": primary["stop_name"],
+                "n_calls": sum(e["n_calls"] for e in members),
+                "mode": "Tog/Buss" if has_rail and has_bus else ("Tog" if has_rail else "Buss"),
+                "place_id": primary["place_id"],
+                "region": primary["region"],
+            }
+        )
+        for e in rest:
+            aliases[e["stop_place"]] = primary["stop_place"]
+
     with _varsel_stops_lock:
         global _varsel_stops_cache
         _varsel_stops_cache = stops
-    logger.info("Refreshed varsel stops: %d", len(stops))
+    varsel.set_stop_aliases(aliases)
+    logger.info(
+        "Refreshed varsel stops: %d rows (%d refs collapsed onto a co-located primary)",
+        len(stops),
+        len(aliases),
+    )
 
 
 def _varsel_stops() -> list[dict]:
