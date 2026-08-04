@@ -13,6 +13,8 @@ export interface StopItem {
   stop_name: string | null;
   mode: string; // 'Tog' | 'Buss' | 'Tog/Buss' — which families serve the stop today
   n_calls: number; // scheduled calls today — traffic signal for ranking picker matches
+  place_id: string; // the physical place; refs sharing one are the same stop registered twice
+  region: string | null; // county — shown when a name belongs to more than one place
 }
 
 // What has actually been observed on the line, as opposed to predicted. `observed_at` is the aimed
