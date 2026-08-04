@@ -69,7 +69,7 @@ import os
 import re
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -239,8 +239,25 @@ class ImpactProvider(Protocol):
     ) -> ImpactResponse: ...
 
 
+class ConnectivityProvider(Protocol):
+    """main's "does a planned trip run between these stops today" lookup.
+
+    A Protocol for the same reason as :class:`ImpactProvider`: it is a cross-module contract, and the
+    consequence of drift is quiet. A TypeError here would be caught by the registration path's own
+    guard and every journey would register unchecked, which looks exactly like a healthy deploy.
+
+    Returns (from→to runs, to→from runs), or None when the question could not be answered — an
+    outage, a timeout, the rate limit. None is not "no service".
+    """
+
+    def __call__(
+        self, from_refs: Sequence[str], to_refs: Sequence[str]
+    ) -> tuple[bool, bool] | None: ...
+
+
 _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
+_connectivity_provider: ConnectivityProvider | None = None
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -251,11 +268,17 @@ def configure(
     *,
     impact_provider: ImpactProvider,
     stops_provider: Callable[[], list[dict]],
+    connectivity_provider: ConnectivityProvider | None = None,
 ) -> None:
-    """Wire in main.py's /impact provider and stop list (called once at startup)."""
-    global _impact_provider, _stops_provider
+    """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
+
+    `connectivity_provider` is optional: without it, registrations are simply not checked, which is
+    what every deploy did before the check existed.
+    """
+    global _impact_provider, _stops_provider, _connectivity_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
+    _connectivity_provider = connectivity_provider
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -322,6 +345,110 @@ def _canonicalize_journeys() -> None:
             old_to,
             canonical_stop(old_to),
             extra={"fields": {"event": "varsel_stop_alias", "result": "rewritten"}},
+        )
+
+
+# Shown on the card of a journey no planned trip connects today. Deliberately a warning and never a
+# rejection, in both shapes below: a route that runs only at weekends, or seasonally, is legitimately
+# absent from today's timetable, and even "served only the other way" can be a pair whose return leg
+# runs on different days. Refusing would make the app wrong about journeys the traveller knows exist,
+# and an unregisterable journey is worse than a registered one carrying a caveat. What both texts do
+# say is the consequence, so "no alerts ever" is never mistaken for "no disruptions".
+_NO_SERVICE_WARNING = (
+    "Vi fant ingen direkteavganger mellom disse stoppene i dag. Sjekk at du valgte riktige "
+    "stoppesteder — varsler krever en direkteavgang."
+)
+
+
+def _service_warning(rec: dict) -> str | None:
+    """The caveat to show for this registration, or None when there is nothing to say."""
+    if not rec.get("no_direct_service"):
+        return None
+    if rec.get("service_reverse_only"):
+        # The stops ARE connected, just not this way round — near-proof of a swap, and worth saying
+        # precisely rather than hiding inside the generic wording.
+        return (
+            f"Vi fant ingen direkteavganger fra {rec.get('from_name') or rec['from_stop']} til "
+            f"{rec.get('to_name') or rec['to_stop']} i dag, men det går avganger motsatt vei. "
+            "Har fra og til byttet plass?"
+        )
+    return _NO_SERVICE_WARNING
+# How long a "no service" verdict stands before the poller asks again. Hours, not days: a route can
+# start running later the same day (a weekend-only ferry registered on a Friday evening), and until
+# the verdict is refreshed the card carries a warning that has stopped being true.
+_SERVICE_RECHECK = timedelta(hours=6)
+
+
+def _service_check_due(rec: dict, now: datetime) -> bool:
+    """Whether this journey's "no service" verdict is old enough to re-ask.
+
+    Wall-clock, not `monotonic()`: the stamp is written into the persisted state file, and a monotonic
+    reading means nothing after a restart — it would read as far in the future and suppress the
+    re-check for the life of the registration. An absent or unparseable stamp is due now.
+    """
+    try:
+        return now - datetime.fromisoformat(rec["service_checked_ts"]) >= _SERVICE_RECHECK
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _service_verdict(from_stop: str, to_stop: str) -> tuple[bool, bool] | None:
+    """Ask the injected provider about every ref of both places. None when unavailable."""
+    if _connectivity_provider is None:
+        return None
+    try:
+        return _connectivity_provider(place_refs(from_stop), place_refs(to_stop))
+    except Exception:
+        # Same rule as the provider's own failure path: an unanswerable question never blocks a
+        # registration, and never becomes a warning either.
+        logger.warning(
+            "Planned-service check raised for %s -> %s; registering without it",
+            from_stop,
+            to_stop,
+            exc_info=True,
+            extra={"fields": {"event": "varsel_service_check", "result": "error"}},
+        )
+        return None
+
+
+def recheck_service() -> None:
+    """Re-ask about journeys flagged as having no direct service, and clear the ones that now do.
+
+    Called from the poller's refresh cycle. Bounded by design: only flagged journeys are re-asked, and
+    each at most once per :data:`_SERVICE_RECHECK_S`, so this costs nothing on a healthy list.
+    """
+    now = datetime.now(UTC)
+    with _state_lock:
+        due = [
+            (jid, rec["from_stop"], rec["to_stop"])
+            for jid, rec in _journeys.items()
+            if rec.get("no_direct_service") and _service_check_due(rec, now)
+        ]
+    if not due:
+        return
+    cleared = 0
+    for jid, from_stop, to_stop in due:
+        verdict = _service_verdict(from_stop, to_stop)
+        if verdict is None:
+            continue
+        with _state_lock:
+            rec = _journeys.get(jid)
+            if rec is None:  # deleted while we were asking
+                continue
+            rec["service_checked_ts"] = _now_iso()
+            if verdict[0]:
+                rec.pop("no_direct_service", None)
+                rec.pop("service_reverse_only", None)
+                cleared += 1
+            else:
+                rec["service_reverse_only"] = verdict[1]
+    if cleared:
+        with _state_lock:
+            _save_state()
+        logger.info(
+            "Planned service appeared for %d journey(s); warning cleared",
+            cleared,
+            extra={"fields": {"event": "varsel_service_check", "result": "cleared"}},
         )
 
 
@@ -1312,6 +1439,14 @@ class Journey(BaseModel):
     days: list[int] = Field(description="0=Monday … 6=Sunday.")
     created_ts: str
     alerts: list[Alert] = Field(description="Situations currently affecting this journey, worst first.")
+    warning: str | None = Field(
+        default=None,
+        description=(
+            "Something about the registration itself that the traveller should see — currently only "
+            "'no planned trip connects these stops today', which means this journey cannot produce "
+            "an alert. NULL when there is nothing to say."
+        ),
+    )
 
 
 class JourneysResponse(BaseModel):
@@ -1442,6 +1577,9 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
         days=rec["days"],
         created_ts=rec["created_ts"],
         alerts=alerts,
+        # Suppressed while something is actually matching: a card cannot credibly say "we found no
+        # departures between these stops" directly above a disruption on one of them.
+        warning=None if alerts else _service_warning(rec),
     )
 
 
@@ -1490,6 +1628,12 @@ def create_journey(body: JourneyIn) -> Journey:
         raise HTTPException(
             status_code=422, detail="Fra- og til-stoppet er samme stoppested."
         )
+    # Can any trip today carry this traveller from A to B at all? varsel only alerts on a DIRECT trip
+    # (`to_stop` narrowing keeps only trains that reach the alighting stop), so a pair no single trip
+    # connects cannot produce an alert however bad the day gets — and saying so is the whole point:
+    # what this replaces is a card reading "ingen aktive avvik akkurat nå" for the journey's whole
+    # life. The verdict never blocks the registration; it is carried as a warning (_service_warning).
+    verdict = _service_verdict(from_stop, to_stop)
     with _state_lock:
         mine = sum(1 for rec in _journeys.values() if rec["device_id"] == body.device_id)
         if mine >= _MAX_JOURNEYS_PER_DEVICE:
@@ -1505,7 +1649,9 @@ def create_journey(body: JourneyIn) -> Journey:
             )
             raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
         jid = uuid.uuid4().hex
-        rec = {
+        # Annotated: inferred from the literal alone the value type is `list[int] | str | None`, and
+        # the service-check fields added below (a bool, a timestamp) then read as type errors.
+        rec: dict[str, Any] = {
             "device_id": body.device_id,
             "from_stop": from_stop,
             "from_name": body.from_name,
@@ -1516,6 +1662,11 @@ def create_journey(body: JourneyIn) -> Journey:
             "days": body.days,
             "created_ts": _now_iso(),
         }
+        if verdict is not None:
+            rec["service_checked_ts"] = _now_iso()
+            if not verdict[0]:
+                rec["no_direct_service"] = True
+                rec["service_reverse_only"] = verdict[1]
         _journeys[jid] = rec
         _save_state()
     try:
