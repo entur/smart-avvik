@@ -69,6 +69,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   text, while push dedup stays keyed on `journey_id` so each device is still notified once.
   **`to_stop` narrows `/impact`**: only trains that actually reach it are returned, so a caller
   passing it sees fewer situations than one that does not.
+  **One picker row per physical place** (2026-08-03): `/varsel-api/stops` collapses stop refs that
+  the National Stop Register groups under the same `parentRef` *and* that share a name — a station's
+  rail and bus sides, a ferry berth registered twice. Before that the picker offered two identical
+  rows ("Nyvoll ferjekai" 57120 / 57070) and picking the wrong one made `to_stop` narrowing drop
+  every situation, so the journey card said "ingen aktive avvik akkurat nå" forever. Three parts,
+  and all three are needed: the row keeps the busiest ref, `varsel.create_journey` **canonicalizes**
+  submitted refs (a stale client can still name a collapsed one), and `match_journey` asks `/impact`
+  about **every** ref of the place (`varsel.place_refs`) because each feed records its calls on its
+  own ref — matching only the canonical one would just move the silent miss down a layer. Names that
+  belong to several *different* places (~1 300 of them: "Sentrum", "Kirken") get a county suffix from
+  `topographicPlaceRef`, `KVE:` codespace only. The registry read fails open: no registry means no
+  grouping and no counties, exactly as before it existed. It is readable from both environments (the
+  dataset grants `allAuthenticatedUsers` READER) and costs ~3 MB per refresh.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports

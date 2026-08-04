@@ -171,6 +171,95 @@ def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", situatio
     ]
 
 
+def _twin(dep, ref, **board_kw):
+    """A train boarding at `ref` (a co-located twin of A) and alighting at B."""
+    return [
+        FakeCall(jkey="t-twin", stop_place=ref, stop_order=1, aimed_dep=dep, **board_kw),
+        FakeCall(jkey="t-twin", stop_place="B", stop_order=5, aimed_dep=None,
+                 aimed_arr=dep + timedelta(minutes=40)),
+    ]
+
+
+def test_a_situation_on_a_twin_ref_of_the_boarding_stop_matches():
+    """The picker offers one row per physical place, but each feed records its calls on its own ref
+    (rail at the station ref, bus at the bus-side ref). If the matcher only asked about the ref that
+    won the picker row, merging the rows would hide the other side's traffic — the same silence the
+    merge exists to remove."""
+    journey = _journey()
+    snapshot = {"S1": _twin(MON_0800, "A2", p_cancel=0.8, p_impact_dep=0.9)}
+    assert not match(journey, snapshot), "control: an unrelated ref must not match"
+    varsel.set_stop_aliases({"A2": "A"})
+    try:
+        alerts = match(journey, snapshot)
+    finally:
+        varsel.set_stop_aliases({})
+    assert [a.situation_number for a in alerts] == ["S1"]
+    assert alerts[0].alertworthy is True
+
+
+def test_a_journey_left_on_a_collapsed_ref_still_sees_its_own_stop():
+    """A registration can sit on a non-primary ref: made before the rewrite existed, or left alone
+    by it. Asking about the place must include the ref the traveller actually picked — an earlier
+    cut of place_refs filtered that one out, which is precisely the stop their trip calls at."""
+    journey = _journey()
+    journey["from_stop"] = "A2"
+    varsel.set_stop_aliases({"A2": "A"})
+    try:
+        assert varsel.place_refs("A2") == ("A", "A2")
+        alerts = match(journey, {"S1": _twin(MON_0800, "A2", p_cancel=0.8, p_impact_dep=0.9)})
+    finally:
+        varsel.set_stop_aliases({})
+    assert [a.situation_number for a in alerts] == ["S1"]
+
+
+def test_one_situation_seen_through_two_refs_is_one_alert():
+    """Both refs of a place are asked about, so the same situation can come back twice. The worst
+    reading is what a traveller needs; two cards for one disruption is what they do not."""
+    snapshot = {
+        "S1": [
+            *_train(MON_0800, jkey="t1", p_cancel=0.30, p_impact_dep=0.55),
+            *_twin(MON_0800 + timedelta(minutes=5), "A2", p_cancel=0.80, p_impact_dep=0.95),
+        ]
+    }
+    varsel.set_stop_aliases({"A2": "A"})
+    try:
+        alerts = match(_journey(), snapshot)
+    finally:
+        varsel.set_stop_aliases({})
+    assert len(alerts) == 1
+    assert alerts[0].impact_probability == 0.95, "the worse of the two readings survives"
+
+
+def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
+    """The alternative is a property of the trip ("a faster way from here to there"), and the lookup
+    is a blocking external call. Asking it per ref pair would multiply it by the number of refs."""
+    _snapshot.clear()
+    _snapshot.update({"S1": _twin(MON_0800, "A2", p_cancel=0.8, p_impact_dep=0.9)})
+    asked = []
+
+    def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
+                 with_alternative=False, min_impact=0.0):
+        asked.append((from_stop, with_alternative))
+        return impact.for_trip(
+            from_stop=from_stop, to_stop=to_stop, window_start=window_start,
+            window_end=window_end, select="worst", catchable_after=catchable_after,
+            with_alternative=False, min_impact=min_impact,
+        )
+
+    varsel.configure(impact_provider=provider, stops_provider=list)
+    varsel.set_stop_aliases({"A2": "A"})
+    try:
+        varsel.match_journey(_journey(), NOW, with_alternative=True)
+    finally:
+        varsel.set_stop_aliases({})
+    # Two windows are in scope (today and tomorrow), each asking both refs of the boarding place.
+    windows = len(varsel.journey_windows(_journey(), NOW))
+    assert [ref for ref, _ in asked] == ["A", "A2"] * windows
+    assert [flag for _, flag in asked] == [True, False] * windows, (
+        "the lookup runs once per window, on the canonical ref only"
+    )
+
+
 def test_basic_match():
     alerts = match(_journey(), {"S1": _train(MON_0800, p_cancel=0.8, p_impact_dep=0.9)})
     assert len(alerts) == 1

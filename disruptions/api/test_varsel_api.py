@@ -128,6 +128,7 @@ def _reset_state():
         varsel._messages.clear()
         varsel._alternatives.clear()
         varsel._message_attempts.clear()
+    varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
 
@@ -189,6 +190,95 @@ def test_stops():
     assert {s["stop_place"] for s in body} == {"A", "B"}
     assert {s["mode"] for s in body} == {"Tog/Buss", "Tog"}
     assert all(s["n_calls"] > 0 for s in body)
+    # A provider row without the grouping fields (an un-refreshed cache, or a deploy whose stop
+    # registry read failed) still yields a usable place id: itself.
+    assert all(s["place_id"] == s["stop_place"] and s["region"] is None for s in body)
+
+
+def test_stops_pass_through_place_and_region(monkeypatch):
+    """The picker appends the county only where a name belongs to more than one place, so both
+    fields have to survive the hop."""
+    monkeypatch.setattr(
+        varsel,
+        "_stops_provider",
+        lambda: [{"stop_place": "A", "stop_name": "Sentrum", "mode": "Buss", "n_calls": 9,
+                  "place_id": "parent-1", "region": "Trøndelag"}],
+    )
+    body = client.get("/varsel-api/stops").json()
+    assert body[0]["place_id"] == "parent-1"
+    assert body[0]["region"] == "Trøndelag"
+
+
+def test_registration_is_canonicalized_onto_the_primary_stop():
+    """A ref the server has collapsed must not be stored: the trip does not call there, and the
+    journey would report "no active disruptions" for its whole life. The client may hold a stale
+    stop list, and anything can POST to this API."""
+    _reset_state()
+    varsel.set_stop_aliases({"A2": "A"})
+    r = client.post(
+        "/varsel-api/journeys",
+        json={"device_id": DEVICE, "from_stop": "A2", "from_name": "Oslo S", "to_stop": "B",
+              "to_name": "Lillehammer", "begin": "00:00", "end": "23:59",
+              "days": [0, 1, 2, 3, 4, 5, 6]},
+    )
+    assert r.status_code == 200, r.text
+    created = r.json()
+    assert created["from_stop"] == "A", "stored on the primary ref, not the one that was posted"
+    # And therefore it matches: this is the whole point of rewriting it.
+    assert [a["situation_number"] for a in created["alerts"]] == ["S1"]
+
+
+def test_existing_journeys_are_rewritten_when_the_registry_lands():
+    """Registrations made before the grouping existed are on whichever twin the traveller picked.
+    They are healed on the next stop refresh rather than left as permanent silence."""
+    _reset_state()
+    r = client.post(
+        "/varsel-api/journeys",
+        json={"device_id": DEVICE, "from_stop": "A2", "from_name": "Nyvoll", "to_stop": "B",
+              "to_name": "Lillehammer", "begin": "00:00", "end": "23:59",
+              "days": [0, 1, 2, 3, 4, 5, 6]},
+    )
+    jid = r.json()["journey_id"]
+    assert r.json()["alerts"] == [], "the wrong-twin registration matches nothing (the bug)"
+
+    varsel.set_stop_aliases({"A2": "A"})  # as refresh_varsel_stops does after reading the registry
+
+    with varsel._state_lock:
+        assert varsel._journeys[jid]["from_stop"] == "A"
+    listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert [a["situation_number"] for a in listed[0]["alerts"]] == ["S1"]
+
+
+def test_a_journey_whose_ends_are_one_place_is_refused():
+    """Two refs for one physical place look like two stops in an older list; after canonicalization
+    they are the same stop, which JourneyIn's from != to check ran too early to see."""
+    _reset_state()
+    varsel.set_stop_aliases({"B2": "A"})
+    r = client.post(
+        "/varsel-api/journeys",
+        json={"device_id": DEVICE, "from_stop": "A", "from_name": "Oslo S", "to_stop": "B2",
+              "to_name": "Oslo S", "begin": "00:00", "end": "23:59",
+              "days": [0, 1, 2, 3, 4, 5, 6]},
+    )
+    assert r.status_code == 422, r.text
+    with varsel._state_lock:
+        assert varsel._journeys == {}
+
+
+def test_a_stored_journey_is_not_collapsed_into_itself():
+    """If both ends of an existing registration resolve to one place, rewriting it would store a
+    record the API rejects. It is left alone and logged instead."""
+    _reset_state()
+    r = client.post(
+        "/varsel-api/journeys",
+        json={"device_id": DEVICE, "from_stop": "A", "from_name": "Oslo S", "to_stop": "B",
+              "to_name": "Lillehammer", "begin": "00:00", "end": "23:59",
+              "days": [0, 1, 2, 3, 4, 5, 6]},
+    )
+    jid = r.json()["journey_id"]
+    varsel.set_stop_aliases({"B": "A"})
+    with varsel._state_lock:
+        assert (varsel._journeys[jid]["from_stop"], varsel._journeys[jid]["to_stop"]) == ("A", "B")
 
 
 def test_journey_crud_and_live_match():
