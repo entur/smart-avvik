@@ -249,6 +249,185 @@ def test_existing_journeys_are_rewritten_when_the_registry_lands():
     assert [a["situation_number"] for a in listed[0]["alerts"]] == ["S1"]
 
 
+def _use_connectivity(verdict, seen=None):
+    """Install a connectivity provider returning `verdict`, recording the refs it was asked about."""
+
+    def provider(from_refs, to_refs):
+        if seen is not None:
+            seen.append((tuple(from_refs), tuple(to_refs)))
+        return verdict
+
+    varsel.configure(
+        impact_provider=_impact_provider, stops_provider=lambda: STOPS,
+        connectivity_provider=provider,
+    )
+
+
+def _no_connectivity():
+    varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
+
+
+_JOURNEY = {"device_id": DEVICE, "from_stop": "A", "from_name": "Oslo S", "to_stop": "B",
+            "to_name": "Lillehammer", "begin": "00:00", "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6]}
+
+
+def test_a_pair_served_only_the_other_way_says_so_by_name():
+    """Near-proof that from and to were swapped: the two stops ARE connected, just not in the
+    direction asked for — so the caveat names both stops and asks the question outright, instead of
+    the generic wording. Still not a refusal: a return leg can run on different days from the outward
+    one, and an unregisterable journey would be worse than a registered one with a caveat."""
+    _reset_state()
+    _use_snapshot({})
+    _use_connectivity((False, True))
+    try:
+        r = client.post("/varsel-api/journeys", json=_JOURNEY)
+    finally:
+        _no_connectivity()
+        _use_snapshot(SNAPSHOT)
+    assert r.status_code == 200, r.text
+    warning = r.json()["warning"] or ""
+    assert "motsatt vei" in warning
+    assert "Oslo S" in warning and "Lillehammer" in warning
+    with varsel._state_lock:
+        assert len(varsel._journeys) == 1, "warned, not refused"
+
+
+def test_a_pair_served_neither_way_registers_with_a_warning():
+    """NOT refused: a weekend-only or seasonal route is legitimately absent from today's timetable,
+    and refusing it would make the app wrong about a journey the traveller knows exists. The warning
+    is what the old silence lacked."""
+    _reset_state()
+    _use_snapshot({})  # nothing matching, so the card would otherwise say "ingen aktive avvik"
+    _use_connectivity((False, False))
+    try:
+        r = client.post("/varsel-api/journeys", json=_JOURNEY)
+        assert r.status_code == 200, r.text
+        assert "ingen direkteavganger" in (r.json()["warning"] or "")
+        listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    finally:
+        _no_connectivity()
+        _use_snapshot(SNAPSHOT)
+    assert "ingen direkteavganger" in (listed[0]["warning"] or ""), "it persists on the card"
+
+
+def test_a_served_pair_carries_no_warning():
+    _reset_state()
+    _use_connectivity((True, False))
+    try:
+        r = client.post("/varsel-api/journeys", json=_JOURNEY)
+    finally:
+        _no_connectivity()
+    assert r.status_code == 200, r.text
+    assert r.json()["warning"] is None
+    with varsel._state_lock:
+        assert "no_direct_service" not in next(iter(varsel._journeys.values()))
+
+
+def test_the_check_asks_about_every_ref_of_both_places():
+    """Same reason match_journey does: each feed records its calls on its own ref, so checking only
+    the canonical one would report "no service" for a trip that plainly exists — the validation would
+    then invent the very failure it exists to catch."""
+    _reset_state()
+    seen: list = []
+    varsel.set_stop_aliases({"A2": "A"})
+    _use_connectivity((True, False), seen)
+    try:
+        client.post("/varsel-api/journeys", json=_JOURNEY)
+    finally:
+        _no_connectivity()
+        varsel.set_stop_aliases({})
+    assert seen == [(("A", "A2"), ("B",))]
+
+
+def test_an_unavailable_check_never_blocks_a_registration():
+    """None means "could not establish", not "no service": a BigQuery outage, a timeout or the rate
+    limit must not stop a traveller registering, nor put a warning on a healthy journey."""
+    _reset_state()
+    _use_connectivity(None)
+    try:
+        r = client.post("/varsel-api/journeys", json=_JOURNEY)
+    finally:
+        _no_connectivity()
+    assert r.status_code == 200, r.text
+    assert r.json()["warning"] is None
+    with varsel._state_lock:
+        rec = next(iter(varsel._journeys.values()))
+    assert "no_direct_service" not in rec and "service_checked_ts" not in rec
+
+
+def test_a_raising_check_never_blocks_a_registration():
+    _reset_state()
+
+    def boom(from_refs, to_refs):
+        raise RuntimeError("BigQuery is down")
+
+    varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS,
+                     connectivity_provider=boom)
+    try:
+        r = client.post("/varsel-api/journeys", json=_JOURNEY)
+    finally:
+        _no_connectivity()
+    assert r.status_code == 200, r.text
+    assert r.json()["warning"] is None
+
+
+def test_the_warning_yields_to_an_actual_alert():
+    """A card cannot say "we found no departures between these stops" directly above a disruption on
+    one of them. Whatever the timetable said, a match is the stronger evidence."""
+    _reset_state()
+    _use_connectivity((False, False))
+    try:
+        r = client.post("/varsel-api/journeys", json=_JOURNEY)
+    finally:
+        _no_connectivity()
+    assert len(r.json()["alerts"]) == 1, "the synthetic situation still matches"
+    assert r.json()["warning"] is None
+
+
+def test_service_that_appears_later_clears_the_warning():
+    """The weekend route registered on a Friday. Re-checked on the poller's cycle, not left to carry a
+    warning that has stopped being true."""
+    _reset_state()
+    _use_snapshot({})
+    _use_connectivity((False, False))
+    try:
+        client.post("/varsel-api/journeys", json=_JOURNEY)
+        with varsel._state_lock:
+            jid = next(iter(varsel._journeys))
+            assert varsel._journeys[jid]["no_direct_service"] is True
+            # Backdate the stamp: the re-check is due once per _SERVICE_RECHECK, not every cycle.
+            varsel._journeys[jid]["service_checked_ts"] = (
+                datetime.now(UTC) - varsel._SERVICE_RECHECK - timedelta(minutes=1)
+            ).isoformat()
+        _use_connectivity((True, False))
+        varsel.recheck_service()
+        with varsel._state_lock:
+            assert "no_direct_service" not in varsel._journeys[jid]
+        listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    finally:
+        _no_connectivity()
+        _use_snapshot(SNAPSHOT)
+    assert listed[0]["warning"] is None
+
+
+def test_a_fresh_verdict_is_not_re_asked_every_cycle():
+    """The poller runs this on every refresh; without the interval it would issue a BigQuery query per
+    flagged journey per cycle, forever."""
+    _reset_state()
+    seen: list = []
+    _use_connectivity((False, False))
+    try:
+        client.post("/varsel-api/journeys", json=_JOURNEY)
+        _use_connectivity((True, False), seen)
+        varsel.recheck_service()
+    finally:
+        _no_connectivity()
+    assert seen == [], "the verdict is minutes old; nothing to re-ask"
+    with varsel._state_lock:
+        assert next(iter(varsel._journeys.values()))["no_direct_service"] is True
+
+
 def test_a_journey_whose_ends_are_one_place_is_refused():
     """Two refs for one physical place look like two stops in an older list; after canonicalization
     they are the same stop, which JourneyIn's from != to check ran too early to see."""

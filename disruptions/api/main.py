@@ -2,11 +2,12 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 # Aliased: the route function below is also called `impact`, and inside its body a bare
@@ -589,6 +590,118 @@ def _varsel_stops() -> list[dict]:
         return _varsel_stops_cache
 
 
+# Does any planned trip today run from one of these stops to one of those, and does any run the other
+# way? Asked when a journey is registered, because varsel can only ever alert on a DIRECT trip
+# (`to_stop` narrowing keeps only trains that reach the alighting stop), so a pair no single trip
+# connects is a registration that cannot produce an alert however bad the day gets. Answering "no"
+# out loud is the point: the failure it replaces was a card reading "ingen aktive avvik akkurat nå"
+# for the rest of the journey's life.
+#
+# MIN and MAX per side rather than a plain join on stop_order: a circular route calls at the same
+# stop twice, and "is there a boarding call before an alighting call" is then a question about the
+# earliest boarding and the latest alighting — with the mirror image for the other direction.
+_VARSEL_CONNECTIVITY_QUERY = """
+    WITH calls AS (
+        SELECT jkey, stop_place, stop_order FROM `disruptions.rail_calls_planned_today`
+        WHERE stop_place IN UNNEST(@from_refs) OR stop_place IN UNNEST(@to_refs)
+        UNION ALL
+        SELECT jkey, stop_place, stop_order FROM `disruptions.bus_calls_planned_today`
+        WHERE stop_place IN UNNEST(@from_refs) OR stop_place IN UNNEST(@to_refs)
+    ),
+    board AS (
+        SELECT jkey, MIN(stop_order) AS first_ord, MAX(stop_order) AS last_ord
+        FROM calls WHERE stop_place IN UNNEST(@from_refs) GROUP BY jkey
+    ),
+    alight AS (
+        SELECT jkey, MIN(stop_order) AS first_ord, MAX(stop_order) AS last_ord
+        FROM calls WHERE stop_place IN UNNEST(@to_refs) GROUP BY jkey
+    )
+    SELECT
+        COUNTIF(b.first_ord < a.last_ord) > 0 AS forward,
+        COUNTIF(a.first_ord < b.last_ord) > 0 AS reverse
+    FROM board AS b JOIN alight AS a USING (jkey)
+"""
+# Answers are cached: the planned tables are rebuilt on their own TTL, so re-asking about the same
+# pair within a few minutes cannot change the verdict, and a client retrying a rejected registration
+# must not cost a query each time.
+_CONNECTIVITY_TTL_S = 10 * 60
+_CONNECTIVITY_CACHE_MAX = 512
+# A ceiling on how often DISTINCT pairs may be asked about. /varsel-api is unauthenticated, and the
+# cache cannot bound the cost of a caller that keeps inventing pairs. Past the ceiling the check
+# reports "unknown" and registration proceeds unvalidated — the same degradation as a BigQuery
+# outage, which is the right way for a guard-rail to fail.
+_CONNECTIVITY_MAX_PER_MIN = 30
+# This one runs on a request path, so it gets an explicit ceiling rather than "wait forever": a slow
+# BigQuery is not a reason for a traveller's registration to hang.
+_CONNECTIVITY_TIMEOUT_S = 20.0
+_connectivity_lock = threading.Lock()
+_connectivity_cache: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[float, tuple[bool, bool]]] = {}
+_connectivity_calls: list[float] = []
+
+
+def _varsel_connectivity(
+    from_refs: Sequence[str], to_refs: Sequence[str]
+) -> tuple[bool, bool] | None:
+    """(runs from→to today, runs to→from today), or None when it could not be established.
+
+    Takes every ref of each place (varsel.place_refs), not just the canonical one: each feed records
+    its calls on its own ref, so asking about one ref of a merged stop would report "no service" for
+    a trip that plainly exists.
+    """
+    key = (tuple(sorted(from_refs)), tuple(sorted(to_refs)))
+    now = monotonic()
+    with _connectivity_lock:
+        hit = _connectivity_cache.get(key)
+        if hit is not None and now - hit[0] < _CONNECTIVITY_TTL_S:
+            return hit[1]
+        _connectivity_calls[:] = [t for t in _connectivity_calls if now - t < 60]
+        if len(_connectivity_calls) >= _CONNECTIVITY_MAX_PER_MIN:
+            logger.warning(
+                "Connectivity checks rate-limited (%d/min); registering without the check",
+                _CONNECTIVITY_MAX_PER_MIN,
+                extra={"fields": {"event": "varsel_service_check", "result": "rate_limited"}},
+            )
+            return None
+        _connectivity_calls.append(now)
+    try:
+        job = bq_client.query(
+            _VARSEL_CONNECTIVITY_QUERY,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("from_refs", "STRING", list(from_refs)),
+                    bigquery.ArrayQueryParameter("to_refs", "STRING", list(to_refs)),
+                ]
+            ),
+        )
+        row = next(iter(job.result(timeout=_CONNECTIVITY_TIMEOUT_S)), None)
+    except Exception:
+        # Never blocks a registration: an unanswerable question is not evidence of no service.
+        logger.warning(
+            "Could not check planned service between %s and %s; registering without the check",
+            from_refs,
+            to_refs,
+            exc_info=True,
+            extra={"fields": {"event": "varsel_service_check", "result": "error"}},
+        )
+        return None
+    verdict = (bool(row.forward), bool(row.reverse)) if row is not None else (False, False)
+    with _connectivity_lock:
+        if len(_connectivity_cache) >= _CONNECTIVITY_CACHE_MAX:
+            oldest = min(_connectivity_cache, key=lambda k: _connectivity_cache[k][0])
+            _connectivity_cache.pop(oldest, None)
+        _connectivity_cache[key] = (now, verdict)
+    logger.info(
+        "Planned service %s -> %s: forward=%s reverse=%s",
+        from_refs[0] if from_refs else "?",
+        to_refs[0] if to_refs else "?",
+        verdict[0],
+        verdict[1],
+        extra={"fields": {"event": "varsel_service_check", "result": "ok",
+                          "forward": verdict[0], "reverse": verdict[1]}},
+    )
+    return verdict
+
+
 def _varsel_snapshot() -> dict[str, list]:
     with _call_pred_lock:
         return _call_pred_by_situation
@@ -715,6 +828,13 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
         refresh_varsel_stops()
     except Exception:
         logger.exception("Varsel stops refresh failed; /varsel-api/stops may be stale or empty")
+    # Journeys flagged "no direct service" at registration: ask again, and drop the warning from any
+    # that a later timetable does connect (a weekend route registered on a Friday). Costs nothing
+    # when nothing is flagged, and its own failure must not touch the alerting below.
+    try:
+        varsel.recheck_service()
+    except Exception:
+        logger.exception("Varsel service re-check failed; existing warnings stand")
     # Registered-journey push alerts: match every journey against the fresh snapshot and push any
     # newly alert-worthy hit. Isolated (like the other steps) so a push failure never breaks the
     # feed rebuild. No-op when VAPID is unconfigured.
@@ -736,7 +856,11 @@ async def lifespan(app: FastAPI):
     # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
     # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
     impact_engine.configure(snapshot_provider=_impact_snapshot)
-    varsel.configure(impact_provider=_varsel_impact, stops_provider=_varsel_stops)
+    varsel.configure(
+        impact_provider=_varsel_impact,
+        stops_provider=_varsel_stops,
+        connectivity_provider=_varsel_connectivity,
+    )
     llm_message.configure(stop_name_provider=_varsel_stops)
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody
