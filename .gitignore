@@ -32,5 +32,8 @@ disruptions/api/varsel_state.json
 # Helm dependency archives (re-fetched by `helm dependency update`; Chart.lock is committed)
 helm/**/charts/
 
-# understand-anything knowledge graph (generated tool output; also keeps ruff off it)
-.ua/
+# Understand Anything temp files
+.ua/.trash-*/
+.ua/intermediate/
+.ua/tmp/
+.ua/diff-overlay.json
