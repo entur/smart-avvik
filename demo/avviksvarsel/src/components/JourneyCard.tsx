@@ -81,7 +81,14 @@ export default function JourneyCard({
         </span>
       </div>
 
-      {journey.alerts.length === 0 ? (
+      {/* The warning replaces "ingen aktive avvik" rather than joining it: it is the reason there are
+          none, and the reassuring line on its own is what let a journey watching the wrong stop look
+          healthy for days. The server only sends it when nothing is matching. */}
+      {journey.warning ? (
+        <SmallAlertBox variant="warning" width="fluid">
+          {journey.warning}
+        </SmallAlertBox>
+      ) : journey.alerts.length === 0 ? (
         <SmallText className="av-muted">Ingen aktive avvik akkurat nå.</SmallText>
       ) : (
         <div className="av-alerts" aria-live="polite">
