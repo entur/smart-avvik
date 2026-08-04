@@ -27,7 +27,30 @@ function modeIcons(mode: string) {
   return icons;
 }
 
-function rankItems(pool: StopItem[], query: string): Item[] {
+// Names that belong to more than one physical place ("Sentrum", "Kirken", ~1 300 of them). Those
+// rows get their county appended, because a bare name repeated in a list is a coin flip: picking the
+// wrong one registers a stop the traveller's trip never calls at, and the journey then reports
+// "ingen aktive avvik akkurat nå" forever. Co-located refs are already merged server-side, so what
+// is left here really is several different stops that happen to share a name.
+function ambiguousNames(stops: StopItem[]): Set<string> {
+  const places = new Map<string, Set<string>>();
+  for (const s of stops) {
+    const name = (s.stop_name ?? '').trim().toLowerCase();
+    if (!name) continue;
+    let seen = places.get(name);
+    if (!seen) places.set(name, (seen = new Set()));
+    seen.add(s.place_id ?? s.stop_place);
+  }
+  return new Set([...places].filter(([, refs]) => refs.size > 1).map(([name]) => name));
+}
+
+function stopLabel(s: StopItem, ambiguous: Set<string>): string {
+  const name = s.stop_name ?? s.stop_place;
+  const key = (s.stop_name ?? '').trim().toLowerCase();
+  return s.region && ambiguous.has(key) ? `${name} (${s.region})` : name;
+}
+
+function rankItems(pool: StopItem[], query: string, ambiguous: Set<string>): Item[] {
   const q = query.trim().toLowerCase();
   const scored: { s: StopItem; rank: number }[] = [];
   for (const s of pool) {
@@ -43,12 +66,24 @@ function rankItems(pool: StopItem[], query: string): Item[] {
     scored.push({ s, rank });
   }
   scored.sort((a, b) => a.rank - b.rank || b.s.n_calls - a.s.n_calls);
-  return scored.slice(0, MAX_SHOWN).map(({ s }) => ({
-    value: s.stop_place,
-    label: s.stop_name ?? s.stop_place,
-    icons: modeIcons(s.mode),
-    itemKey: s.stop_place,
-  }));
+  // One row per place, defensively: the server already collapses co-located refs, but an older
+  // deploy (or an unreadable stop registry, which makes it fall back to one place per ref) would
+  // otherwise put the duplicate rows straight back into the picker.
+  const items: Item[] = [];
+  const seen = new Set<string>();
+  for (const { s } of scored) {
+    const place = s.place_id ?? s.stop_place;
+    if (seen.has(place)) continue;
+    seen.add(place);
+    items.push({
+      value: s.stop_place,
+      label: stopLabel(s, ambiguous),
+      icons: modeIcons(s.mode),
+      itemKey: s.stop_place,
+    });
+    if (items.length >= MAX_SHOWN) break;
+  }
+  return items;
 }
 
 export default function AddJourneyModal({
@@ -67,8 +102,16 @@ export default function AddJourneyModal({
     () => (mode === 'alle' ? stops : stops.filter((s) => s.mode.toLowerCase().includes(mode))),
     [stops, mode],
   );
+  // Ambiguity is a property of the whole list, not of the current facet: a name stays labelled the
+  // same way whether or not the Tog/Buss filter happens to hide its twin.
+  const ambiguous = useMemo(() => ambiguousNames(stops), [stops]);
   // New resolver identity per pool change → the dropdowns re-resolve when the facet toggles.
-  const items = useMemo(() => (text: string) => rankItems(pool, text), [pool]);
+  const items = useMemo(() => (text: string) => rankItems(pool, text, ambiguous), [pool, ambiguous]);
+  const nameByRef = useMemo(
+    () => new Map(stops.map((s) => [s.stop_place, s.stop_name ?? s.stop_place])),
+    [stops],
+  );
+  const plainName = (item: Item) => nameByRef.get(item.value) ?? item.label;
 
   const [from, setFrom] = useState<Item | null>(null);
   const [to, setTo] = useState<Item | null>(null);
@@ -115,11 +158,14 @@ export default function AddJourneyModal({
     setSaving(true);
     setError(null);
     try {
+      // The plain registry name, not the picker label: the label may carry a county suffix added
+      // only to tell two same-named stops apart, and this name is what the journey card and the
+      // written push text show.
       await onCreate({
         from_stop: from!.value,
-        from_name: from!.label,
+        from_name: plainName(from!),
         to_stop: to!.value,
-        to_name: to!.label,
+        to_name: plainName(to!),
         begin,
         end,
         days,

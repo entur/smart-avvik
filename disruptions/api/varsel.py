@@ -241,6 +241,10 @@ class ImpactProvider(Protocol):
 
 _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
+# Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
+# until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
+# case every ref is its own place, exactly as before this map existed.
+_stop_aliases: dict[str, str] = {}
 
 
 def configure(
@@ -254,14 +258,103 @@ def configure(
     _stops_provider = stops_provider
 
 
+def set_stop_aliases(aliases: dict[str, str]) -> None:
+    """Publish "this ref is really that ref" for co-located stops, and heal what is stored.
+
+    Called by main.refresh_varsel_stops on every stop-list rebuild with the refs it collapsed onto a
+    primary. Rewriting what is stored is about identity, not about matching (:func:`place_refs` is
+    what makes every ref of a place visible to the matcher): two devices that picked different refs
+    for the same place must land on ONE `journey_key`, or the same physical trip earns two /impact
+    calls, two written messages and two rows in the decision log.
+
+    Replaced wholesale (never mutated in place) so readers on the request path need no lock.
+    """
+    global _stop_aliases
+    _stop_aliases = dict(aliases)
+    if aliases:
+        _canonicalize_journeys()
+
+
+def canonical_stop(ref: str) -> str:
+    """The primary ref for `ref`'s physical place — `ref` itself unless it was collapsed."""
+    return _stop_aliases.get(ref, ref)
+
+
+def _canonicalize_journeys() -> None:
+    """Rewrite stored registrations onto canonical stop refs.
+
+    Runs on each stop-list rebuild because the alias map can only be built after the registry is
+    read, which is long after `load_state`. Idempotent: a canonical journey is left untouched, so
+    this settles after one pass and does not rewrite state on every refresh.
+    """
+    changed: list[tuple[str, str, str]] = []
+    with _state_lock:
+        for jid, rec in _journeys.items():
+            new_from = canonical_stop(rec["from_stop"])
+            new_to = canonical_stop(rec["to_stop"])
+            if (new_from, new_to) == (rec["from_stop"], rec["to_stop"]):
+                continue
+            if new_from == new_to:
+                # Both ends collapse to one place: the journey never had a trip to match and
+                # rewriting it would store a from == to record the API itself rejects. Left as it
+                # was, and said out loud, because silently keeping it is how the original bug hid.
+                logger.warning(
+                    "Journey %s has both ends on one physical place (%s / %s -> %s); leaving it "
+                    "un-canonicalized, it cannot match a trip",
+                    jid,
+                    rec["from_stop"],
+                    rec["to_stop"],
+                    new_from,
+                    extra={"fields": {"event": "varsel_stop_alias", "result": "degenerate"}},
+                )
+                continue
+            changed.append((jid, rec["from_stop"], rec["to_stop"]))
+            rec["from_stop"] = new_from
+            rec["to_stop"] = new_to
+        if changed:
+            _save_state()
+    for jid, old_from, old_to in changed:
+        logger.info(
+            "Rewrote journey %s onto canonical stops (%s -> %s, %s -> %s)",
+            jid,
+            old_from,
+            canonical_stop(old_from),
+            old_to,
+            canonical_stop(old_to),
+            extra={"fields": {"event": "varsel_stop_alias", "result": "rewritten"}},
+        )
+
+
+def place_refs(ref: str) -> tuple[str, ...]:
+    """Every stop ref standing for `ref`'s physical place — the canonical one first.
+
+    The picker offers one row per place, but the call sources still key each call on the ref its own
+    feed used: rail calls at Lysaker are recorded on the station ref and bus calls on the bus-side
+    ref. Matching only the canonical ref would therefore hide one side's traffic behind a merged row
+    — the same silent miss the merge exists to remove, moved one layer down.
+    """
+    primary = canonical_stop(ref)
+    # Filtered against the PRIMARY, not against `ref`: filtering against `ref` dropped the caller's
+    # own ref whenever it was one of the collapsed ones (a registration made before the rewrite ran,
+    # or one the rewrite deliberately left alone), asking about every ref of the place except the one
+    # the traveller actually picked. The alias map never holds the primary as a key, so nothing here
+    # can duplicate it.
+    return (primary, *sorted(a for a, p in _stop_aliases.items() if p == primary))
+
+
 def _impact(
     journey: dict,
     window_start: datetime,
     window_end: datetime,
     catchable_after: datetime | None = None,
     with_alternative: bool = False,
+    from_stop: str | None = None,
+    to_stop: str | None = None,
 ) -> ImpactResponse | None:
     """One /impact call for a journey's boarding window, or None when unconfigured.
+
+    `from_stop`/`to_stop` override the journey's own refs so :func:`match_journey` can ask about the
+    other refs of the same physical place (see :func:`place_refs`).
 
     `min_impact` is the *default* alert threshold rather than a per-operator one: the operator is a
     property of the matched train, which is only known after the call. It is the floor of the
@@ -271,8 +364,8 @@ def _impact(
     if _impact_provider is None:
         return None
     return _impact_provider(
-        from_stop=journey["from_stop"],
-        to_stop=journey["to_stop"],
+        from_stop=from_stop or journey["from_stop"],
+        to_stop=to_stop or journey["to_stop"],
         window_start=window_start,
         window_end=window_end,
         catchable_after=catchable_after,
@@ -592,49 +685,79 @@ def match_journey(
     # Keep the worst alert per situation across every window (a journey can have a window today and
     # one tomorrow, and the same situation can reach into both).
     worst_by_situation: dict[str, Alert] = {}
+    # Ref pairs, not one pair: a stop the registry groups with others is asked about under each of
+    # its refs, because each feed records its calls on its own (see place_refs). Almost every place
+    # has a single ref, so this is one pass in the ordinary case. The alternative-journey lookup runs
+    # only for the canonical pair — it is a blocking external call and the answer ("a faster way from
+    # here to there") does not vary by which ref of one place the question named.
+    ref_pairs = [
+        (f, t)
+        for f in place_refs(journey["from_stop"])
+        for t in place_refs(journey["to_stop"])
+    ]
+    alternative = None
     for window_start, window_end in journey_windows(journey, now):
-        impact = _impact(
-            journey, window_start, window_end, catchable_after=now,
-            with_alternative=with_alternative,
-        )
-        if impact is None:
-            continue
-        observation_by_line = {
-            line.line: line.latest_observation for line in (impact.lines or [])
-        }
-        for sit in impact.situations or []:
-            dep = sit.departure_prediction
-            threshold = threshold_for(sit.operator)
-            impact_p = dep.impact_probability
-            alert = Alert(
-                situation_number=sit.situation_number,
-                summary=sit.summary,
-                description=sit.description,
-                operator=sit.operator,
-                mode=mode_label(sit.operator),
-                line=sit.line,
-                departure_time=dep.scheduled_time,
-                jkey=sit.jkey,
-                stop_place=dep.stop_place,
-                stop_order=dep.stop_order,
-                decided_at=now,
-                cancel_probability=dep.cancel_probability,
-                delay_p50_min=_typ_delay(dep),
-                delay_p90_min=dep.delay_p90_min,
-                ge10_probability=dep.ge10_probability,
-                impact_probability=impact_p,
-                alert_threshold=threshold,
-                alertworthy=impact_p is not None and impact_p >= threshold,
-                latest_observation=observation_by_line.get(sit.line),
-                alternative_journey=impact.alternative_journey,
-                impact=impact,
+        for pair_index, (from_ref, to_ref) in enumerate(ref_pairs):
+            impact = _impact(
+                journey, window_start, window_end, catchable_after=now,
+                with_alternative=with_alternative and pair_index == 0,
+                from_stop=from_ref, to_stop=to_ref,
             )
-            existing = worst_by_situation.get(alert.situation_number)
-            if existing is None or _alert_severity(alert) > _alert_severity(existing):
-                worst_by_situation[alert.situation_number] = alert
+            if impact is None:
+                continue
+            alternative = alternative or impact.alternative_journey
+            _collect_alerts(impact, worst_by_situation, now=now)
+
+    # The alternative is a property of the trip, not of the situation that won: an alert whose worst
+    # reading came from a non-canonical ref (asked without the lookup) still gets the advice.
+    for alert in worst_by_situation.values():
+        if alert.alternative_journey is None:
+            alert.alternative_journey = alternative
 
     alerts = sorted(worst_by_situation.values(), key=_alert_severity, reverse=True)
     return alerts
+
+
+def _collect_alerts(
+    impact: ImpactResponse, worst_by_situation: dict[str, "Alert"], *, now: datetime
+) -> None:
+    """Fold one /impact response into the worst-per-situation accumulator.
+
+    Extracted from :func:`match_journey` when that grew a second loop (one pass per stop ref of the
+    journey's endpoints): the accumulator is what makes the extra passes safe, since two refs of one
+    place can return the same situation and only the worst reading of it survives.
+    """
+    observation_by_line = {line.line: line.latest_observation for line in (impact.lines or [])}
+    for sit in impact.situations or []:
+        dep = sit.departure_prediction
+        threshold = threshold_for(sit.operator)
+        impact_p = dep.impact_probability
+        alert = Alert(
+            situation_number=sit.situation_number,
+            summary=sit.summary,
+            description=sit.description,
+            operator=sit.operator,
+            mode=mode_label(sit.operator),
+            line=sit.line,
+            departure_time=dep.scheduled_time,
+            jkey=sit.jkey,
+            stop_place=dep.stop_place,
+            stop_order=dep.stop_order,
+            decided_at=now,
+            cancel_probability=dep.cancel_probability,
+            delay_p50_min=_typ_delay(dep),
+            delay_p90_min=dep.delay_p90_min,
+            ge10_probability=dep.ge10_probability,
+            impact_probability=impact_p,
+            alert_threshold=threshold,
+            alertworthy=impact_p is not None and impact_p >= threshold,
+            latest_observation=observation_by_line.get(sit.line),
+            alternative_journey=impact.alternative_journey,
+            impact=impact,
+        )
+        existing = worst_by_situation.get(alert.situation_number)
+        if existing is None or _alert_severity(alert) > _alert_severity(existing):
+            worst_by_situation[alert.situation_number] = alert
 
 
 def _alert_severity(alert: Alert) -> tuple[float, int, float]:
@@ -1100,12 +1223,30 @@ class ConfigResponse(BaseModel):
 
 
 class StopItem(BaseModel):
-    """A stop offered in the from/to pickers."""
+    """A stop offered in the from/to pickers.
+
+    One row per physical place: refs the registry groups under the same parent place, under the same
+    name, are collapsed by main.refresh_varsel_stops and only the busiest one is offered here.
+    """
 
     stop_place: str = Field(description="NSR StopPlace ref.")
     stop_name: str | None = Field(description="Human-readable stop name.")
     mode: str = Field(description='Families serving the stop today: "Tog", "Buss" or "Tog/Buss".')
     n_calls: int = Field(description="Scheduled calls at the stop today; pickers rank matches by it.")
+    place_id: str = Field(
+        description=(
+            "The physical place this row stands for (NSR parent StopPlace, else the ref itself). "
+            "Clients may de-duplicate on it; the server has already done so."
+        )
+    )
+    region: str | None = Field(
+        default=None,
+        description=(
+            "County, from the registry's municipality number. Pickers append it when a name is "
+            "offered by more than one place; NULL when the registry does not place the stop in a "
+            "Norwegian county."
+        ),
+    )
 
 
 class DeviceIn(BaseModel):
@@ -1218,6 +1359,8 @@ async def stops() -> list[StopItem]:
             stop_name=r.get("stop_name"),
             mode=r.get("mode", "Tog"),
             n_calls=r.get("n_calls", 0),
+            place_id=r.get("place_id") or r["stop_place"],
+            region=r.get("region"),
         )
         for r in rows
     ]
@@ -1333,7 +1476,20 @@ def list_journeys(
 def create_journey(body: JourneyIn) -> Journey:
     """Register a from→to journey with a recurring weekday+time window. Capped per device.
 
+    Stop refs are canonicalized first: a client holding a stale stop list — or posting straight to
+    the API — can still name a ref that was collapsed onto a co-located primary, and storing it
+    would recreate exactly the failure the collapse exists to prevent (a watched quay the trip never
+    calls at, reported as "ingen aktive avvik akkurat nå").
+
     Plain ``def`` for the same reason as :func:`list_journeys`."""
+    from_stop = canonical_stop(body.from_stop)
+    to_stop = canonical_stop(body.to_stop)
+    if from_stop == to_stop:
+        # Reachable without the client doing anything odd: two refs for one physical place look like
+        # two stops in an older stop list. JourneyIn's from != to check ran before canonicalization.
+        raise HTTPException(
+            status_code=422, detail="Fra- og til-stoppet er samme stoppested."
+        )
     with _state_lock:
         mine = sum(1 for rec in _journeys.values() if rec["device_id"] == body.device_id)
         if mine >= _MAX_JOURNEYS_PER_DEVICE:
@@ -1351,9 +1507,9 @@ def create_journey(body: JourneyIn) -> Journey:
         jid = uuid.uuid4().hex
         rec = {
             "device_id": body.device_id,
-            "from_stop": body.from_stop,
+            "from_stop": from_stop,
             "from_name": body.from_name,
-            "to_stop": body.to_stop,
+            "to_stop": to_stop,
             "to_name": body.to_name,
             "begin": body.begin,
             "end": body.end,
