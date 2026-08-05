@@ -863,7 +863,7 @@ def match_journey(
         if alert.alternative_journey is None:
             alert.alternative_journey = alternative
 
-    alerts = sorted(worst_by_situation.values(), key=_alert_severity, reverse=True)
+    alerts = sorted(worst_by_situation.values(), key=_alert_rank, reverse=True)
     return alerts
 
 
@@ -919,6 +919,73 @@ def _alert_severity(alert: Alert) -> tuple[float, int, float]:
     `StopPrediction`, so the one function serves both.
     """
     return severity_key(alert)
+
+
+def _alert_rank(alert: Alert) -> tuple:
+    """The full worst-first order: severity, then situation number as a deterministic tie-break.
+
+    The tie-break stopped being a formality on 2026-08-05. A call ET has declared cancelled scores
+    exactly (1.0, 0, 1.0), so every situation about one cancelled train ties on all three
+    components, and which of them headed the card — and therefore which situation the written
+    message was cached under — came down to dict iteration order and could flip between refreshes.
+    """
+    return (_alert_severity(alert), alert.situation_number)
+
+
+def _train_key(alert: Alert) -> tuple | None:
+    """What makes two alerts the same departure in the traveller's eyes.
+
+    The boarding call's ET join key when the match carried one — `(operator, jkey, stop_place,
+    stop_order)` is the grain the decision log and the nightly labelling job already agree on —
+    falling back to `(operator, line, departure_time)` when there is no journey ref. `None` means
+    "cannot tell which train this is", and an alert that cannot be identified is never merged with
+    another: showing one card too many is a much smaller error than hiding an unrelated disruption.
+    """
+    if alert.departure_time is None:
+        return None
+    if alert.jkey:
+        return (alert.operator, alert.jkey, alert.stop_place, alert.stop_order)
+    if alert.line:
+        return (alert.operator, alert.line, alert.departure_time)
+    return None
+
+
+def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
+    """Collapse alerts about the SAME departure to the most severe one, order preserved.
+
+    ``/impact`` already rolls its `lines` up so a line is never listed once per situation; this is
+    that same rule one level out, where the unit is the traveller's train rather than the line.
+
+    Operators routinely publish several SX messages about one disruption. On 2026-08-05 Vy sent both
+    "Ta neste tog" and "Innstilt Drammen–Skøyen" for the same cancelled 15:03 from Asker, and the
+    card showed two boxes quoting **two different percentages for one train** (91 % and 87 %),
+    because each situation scores the same call independently. `JourneyCard` already refuses to
+    print two percentages inside one box; nothing stopped two boxes. The lock screen had the same
+    defect one worse: two pushes about a single departure.
+
+    **Traveller-facing only.** `check_and_notify` hands `_record_decisions` the uncollapsed list, so
+    a decision row is still written per situation — those rows are the lead-time series, and a
+    situation suppressed on the card is still a decision that was made about it.
+
+    The survivor is the most severe by :func:`_alert_rank`, which is also the order `match_journey`
+    returns, so the alert that survives is the one loop 1 wrote the message for and cached under.
+    """
+    winner_at: dict[tuple, int] = {}
+    out: list[Alert] = []
+    for alert in alerts:
+        key = _train_key(alert)
+        if key is None:
+            out.append(alert)
+            continue
+        pos = winner_at.get(key)
+        if pos is None:
+            winner_at[key] = len(out)
+            out.append(alert)
+        elif _alert_rank(alert) > _alert_rank(out[pos]):
+            # Keep the first-seen POSITION: the incoming list is already worst-first, so replacing
+            # in place preserves that ordering while the tie-break decides which situation shows.
+            out[pos] = alert
+    return out
 
 
 # ---- Notify ----------------------------------------------------------------------------------
@@ -1496,7 +1563,11 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         if device is None:
             continue
         key = journey_key(journey)
-        for alert in alerts_by_key.get(key, []):
+        # One push per train, not per SX message. Two situations about one cancelled departure used
+        # to mean two notifications a minute apart, saying the same thing with different percentages
+        # (2026-08-05). `_notified` still keys on the surviving situation_number, so the suppressed
+        # one simply never notifies -- and `_record_decisions` below still sees both.
+        for alert in one_alert_per_train(alerts_by_key.get(key, [])):
             if not alert.alertworthy:
                 continue
             with _state_lock:
@@ -1765,7 +1836,11 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
     of the same journey definition runs the matcher once rather than once per registration.
     """
     key = journey_key(rec)
-    alerts = match_journey(rec) if alerts is None else alerts
+    # One card per train, not per SX message -- see one_alert_per_train. Collapsed here rather than
+    # in match_journey because the matcher also feeds the decision log, which must keep every
+    # situation. `alerts` may be shared across several registrations of the same definition, so this
+    # builds a new list and never mutates the caller's.
+    alerts = one_alert_per_train(match_journey(rec) if alerts is None else alerts)
     with _state_lock:
         now = datetime.now(UTC)
         for alert in alerts:

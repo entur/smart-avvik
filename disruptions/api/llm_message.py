@@ -138,6 +138,9 @@ det innstillingen som er hovedpoenget, ikke forsinkelsen.
 - `innstilling_prosent` er bare med i det tilfellet, og er da sjansen for innstilling i prosent.
 - Hvis `siste_observasjon` finnes, nevn den med tidspunktet sitt – det er en observasjon fra et \
 tidligere tidspunkt, ikke nødvendigvis situasjonen akkurat nå.
+- Rådet skal handle om DENNE reisen, fra `reise.fra` til `reise.til`. Stedsnavn inni `situasjoner` \
+sier hvor på linja avviket gjelder – de er ikke den reisendes reisevei. Skriv aldri et råd som \
+«ta neste tog mellom X og Y» med stedsnavn derfra.
 - Hvis `alternativ_reise` finnes, er det det mest nyttige rådet.
 - Ingen innledning, ingen overskrift, ingen emoji, ingen anførselstegn rundt svaret.
 - Maks 300 tegn.
