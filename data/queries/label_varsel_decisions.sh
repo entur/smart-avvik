@@ -21,8 +21,15 @@
 # ---------------------------------------------------------------------------------------------
 # REGISTERING THE SCHEDULE (one-off, per project — nothing in CI or Helm does this)
 #
-# ALREADY REGISTERED IN DEV as "varsel-label-daily" (2026-08-01, first run SUCCEEDED). prd is not,
-# and should not be until its IAM is confirmed — see below.
+# ALREADY REGISTERED IN BOTH ENVIRONMENTS as "varsel-label-daily", first run SUCCEEDED in each:
+#   dev  2026-08-01, projects/305411154596/locations/europe/transferConfigs/6a735413-0000-2192-b918-14223bba7f62
+#   prd  2026-08-05, projects/925999097557/locations/europe/transferConfigs/6a766b6c-0000-294f-93f0-9898fbd2fc35
+#
+# prd was held back for four days on "can its SA read ent-data-sharing-ext-prd?" — prd is fed by
+# free copies and had never scanned SIRI history. The dataset ACL answers it: realtime_siri_et
+# grants READER to allAuthenticatedUsers, the same pattern as the NSR registry. Checking the ACL
+# first would have unblocked it immediately; the AI.CLASSIFY lesson (API enablement != IAM role)
+# says to confirm functionally anyway, and creating the config fires one run that does exactly that.
 #
 # --service_account_name is REQUIRED, not optional polish. Without it `bq mk` tries to register the
 # job against your personal credentials and blocks on an interactive OAuth consent prompt, which
@@ -50,16 +57,19 @@
 #
 # Validate the SQL BEFORE re-registering: data/queries/validate_varsel_sql.sh
 #
+# BOTH configs, always. Adding a column to varsel_decision_outcomes and updating only one leaves the
+# other environment's job broken every night until someone notices — and a schema change is what
+# makes the copies diverge in the first place. The ALTER and both updates are ONE operation.
+#
 # No --target_dataset / destination table: this is a multi-statement script that does its own
 # DELETE + INSERT, like copy_demo_to_prd_daily.sql.
 #
-# Two ordering constraints, both of which bite prd rather than dev:
-#   1. The app must have started at least once in that project first — the outcomes table is
-#      created at startup (disruptions/api/create_varsel_decisions.sql), not by this job.
-#   2. prd's SA reading ent-data-sharing-ext-prd is UNVERIFIED — prd is fed by free copies and has
-#      never scanned SIRI history. Confirm it before registering there, or the job fails silently
-#      every night. Same class as the 2026-07-09 AI.CLASSIFY gap: API enablement != IAM role.
-#      (Dev is proven: its application SA already reads last_recorded for demo-recent-daily.)
+# One ordering constraint, for any NEW environment: the app must have started there at least once
+# first — the outcomes table is created at startup (disruptions/api/create_varsel_decisions.sql),
+# not by this job.
+#
+# And one clock. The window is 10 days, so a decision not labelled within 10 days of its operating
+# day is unknown forever. Registering late costs exactly the decisions that aged out meanwhile.
 #
 # Force a run without waiting for 04:00, and check it:
 #   bq mk --transfer_run --run_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" <config resource name>
