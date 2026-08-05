@@ -116,6 +116,23 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   innstilt (kl 15:15)" at 14:28 — then the model repeated it, the prompt having told it the timestamp
   is in the past. `_impact_response` takes `now` once and passes it down, so `as_of` and the cut
   cannot straddle two instants.
+  **One card and one push per train, not per SX message** (2026-08-05): operators publish several
+  situations about one disruption — Vy sent both "Ta neste tog" and "Innstilt Drammen–Skøyen" for
+  the same cancelled 15:03 — and each scores the same call independently, so the card showed two
+  boxes quoting **91 % and 87 % for one train**. `varsel.one_alert_per_train` collapses on the
+  boarding call (`(operator, jkey, stop_place, stop_order)`, falling back to `(operator, line,
+  departure_time)`; an alert identifying no train is never merged) and is applied in
+  `_journey_model` and in `check_and_notify`'s delivery loop — **not** in `match_journey`, which
+  also feeds the decision log, where every situation must keep its row. The survivor is the most
+  severe by `_alert_rank`, which is `match_journey`'s own order: severity, then `situation_number`.
+  That tie-break is load-bearing now rather than cosmetic — a declared cancellation scores exactly
+  (1.0, 0, 1.0), so all its situations tie, and an unstable winner would flip both the card's
+  wording and which situation the written message is cached under on every 60 s refresh.
+  **The advice is about the traveller's trip, not the SX message's geography** (2026-08-05): asked
+  about an Asker→Lillestrøm registration, the model answered "Du bør ta neste tog mellom Drammen og
+  Skøyen" — the cancelled *segment*, straight out of the situation text. A prompt rule now scopes
+  the advice to `reise.fra`/`reise.til` and says place names inside `situasjoner` are where on the
+  line the disruption applies, not the traveller's route.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports

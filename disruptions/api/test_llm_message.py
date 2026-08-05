@@ -188,6 +188,14 @@ def test_a_declared_cancellation_is_stated_not_scored():
     assert payload["situasjoner"][0]["sammendrag"] == "Signalfeil ved Asker"
 
 
+def test_the_prompt_scopes_the_advice_to_the_traveller_s_own_trip():
+    """2026-08-05: for an Asker→Lillestrøm registration the model wrote "Du bør ta neste tog mellom
+    Drammen og Skøyen" — the SX message's own geography, which names the cancelled *segment*, not
+    where this traveller is going. The situation text is context; `reise` is the trip."""
+    assert "reise.fra" in llm_message._SYSTEM_PROMPT
+    assert "reise.til" in llm_message._SYSTEM_PROMPT
+
+
 def test_the_prompt_tells_the_model_a_declared_cancellation_is_a_fact():
     """The payload key is only half of it: the model has to be told what it means. Nothing else
     stops a reply reading "det er stor sjanse for at toget blir innstilt" from `innstilt: true`."""

@@ -859,6 +859,75 @@ SNAPSHOT_MIXED = {
 }
 
 
+# The 2026-08-05 report: two SX messages about ONE departure. Same journey (t1), same boarding call,
+# scored independently under each situation -- which is exactly why the two readings differ (0.90 vs
+# 0.87) and why the card showed "91 %" and "87 %" for one train, one box apart.
+SNAPSHOT_TWO_NOTICES = {
+    "S1": SNAPSHOT["S1"],
+    "S2": [
+        FakeCall("t1", "A", 1, DEP, situation_number="S2", summary="Innstilt Drammen–Skøyen",
+                 p_cancel=0.78, p_impact_dep=0.87),
+        FakeCall("t1", "B", 5, None, situation_number="S2", summary="Innstilt Drammen–Skøyen",
+                 aimed_arr=DEP + timedelta(minutes=40)),
+    ],
+}
+
+
+def test_two_notices_about_one_train_are_one_card():
+    """One departure, one box. Both situations are real and both hit this trip, but the traveller
+    has one train to catch -- and two boxes meant two different percentages for it."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT_TWO_NOTICES)
+    _register(DEVICE)
+
+    alerts = client.get(
+        "/varsel-api/journeys", params={"device_id": DEVICE}
+    ).json()["journeys"][0]["alerts"]
+    assert len(alerts) == 1
+    # The survivor is the more severe reading, not whichever situation was iterated first.
+    assert alerts[0]["situation_number"] == "S1"
+    assert alerts[0]["impact_probability"] == 0.9
+
+
+def test_two_notices_about_two_different_trains_stay_two_cards():
+    """The collapse is per departure, not per journey: two trains is still two things to know."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT_MIXED)  # t1 under S1, t2 under S2
+    _register(DEVICE)
+
+    alerts = client.get(
+        "/varsel-api/journeys", params={"device_id": DEVICE}
+    ).json()["journeys"][0]["alerts"]
+    assert {a["situation_number"] for a in alerts} == {"S1", "S2"}
+
+
+def test_two_notices_about_one_train_are_one_push(monkeypatch):
+    """Same defect on the lock screen, one worse: two notifications a minute apart saying the same
+    thing about one departure with different numbers."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT_TWO_NOTICES)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
+
+    assert len(sent) == 1
+
+
+def test_the_suppressed_notice_is_still_recorded(monkeypatch):
+    """Collapsing is a presentation rule and must not reach the log: "every decision, not every
+    push". A situation hidden on the card is still a decision that was made about it, and its row is
+    part of the lead-time series the labelling job scores."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT_TWO_NOTICES)
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
+
+    assert {r["situation_number"] for r in log.rows} == {"S1", "S2"}
+
+
 class _FakeBQ:
     """Enough of google.cloud.bigquery.Client for the decision log; records what was inserted."""
 
