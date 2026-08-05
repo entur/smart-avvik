@@ -283,6 +283,89 @@ def test_latest_observation_ignores_estimated_calls():
     assert obs is None
 
 
+def _observation_of(calls, *, now):
+    return impact._latest_observation(
+        [impact.TripCell(
+            situation_number="S1", summary=None, description=None, line="VYG:Line:R10",
+            operator="VYG", jkey="j1", departure=impact._departure_prediction(calls[0]),
+            arrival=None, calls=calls,
+        )],
+        now=now,
+    )
+
+
+def test_latest_observation_ignores_a_cancellation_declared_for_a_future_call():
+    """The 2026-08-05 report: a cancellation announced ahead of the train is not a sighting.
+
+    Vy cancelled RE10 80323 Drammen-Skøyen at 13:54; every call up to Lysaker 15:15 came back from
+    ET flagged cancelled, all of them still upcoming. `_latest_observation` takes the FURTHEST-along
+    observed call, so it picked the most distant one and the card read "Sist observert: Lysaker
+    stasjon, innstilt (kl 15:15)" at 14:28 -- 47 minutes into the future.
+    """
+    now = _at(14, 28)
+    calls = [
+        FakeCall(jkey="j1", stop_place=A, stop_order=2, aimed_dep=_at(15, 3), stop_name="Asker",
+                 call_source="estimated", et_declared_cancelled=True),
+        FakeCall(jkey="j1", stop_place=B, stop_order=4, aimed_dep=_at(15, 15), stop_name="Lysaker",
+                 call_source="estimated", et_declared_cancelled=True),
+    ]
+    assert _observation_of(calls, now=now) is None
+
+
+def test_latest_observation_keeps_a_cancellation_whose_time_has_passed():
+    """Once the call's own time is behind us it IS an observation: that stop went unserved."""
+    now = _at(15, 20)
+    calls = [
+        FakeCall(jkey="j1", stop_place=A, stop_order=2, aimed_dep=_at(15, 3), stop_name="Asker",
+                 call_source="estimated", et_declared_cancelled=True),
+        FakeCall(jkey="j1", stop_place=B, stop_order=4, aimed_dep=_at(15, 15), stop_name="Lysaker",
+                 call_source="estimated", et_declared_cancelled=True),
+        # Still upcoming, so it must not win the "furthest along" pick even now.
+        FakeCall(jkey="j1", stop_place=C, stop_order=6, aimed_dep=_at(15, 45), stop_name="Oslo S",
+                 call_source="estimated", et_declared_cancelled=True),
+    ]
+    obs = _observation_of(calls, now=now)
+    assert (obs.at_stop_name, obs.cancelled, obs.observed_at) == ("Lysaker", True, _at(15, 15))
+
+
+# ---- declared cancellations are facts, not forecasts -------------------------------------------
+def _cancelled_call(**kw):
+    return FakeCall(jkey="j1", stop_place=A, stop_order=2, aimed_dep=_at(15, 3), stop_name="Asker",
+                    call_source="estimated", et_declared_cancelled=True,
+                    p_cancel=0.57, p_impact_dep=0.61, **kw)
+
+
+def test_declared_cancellation_is_served_as_a_certainty_not_a_probability():
+    """The other half of the 2026-08-05 report. The cancellation of the 15:03 from Asker was in our
+    own cache, and the card still quoted the model: "91 % sjanse for innstilling" for a departure
+    entur.no no longer offered. Every conditional figure goes with it -- they meant "if it runs"."""
+    dep = impact._departure_prediction(_cancelled_call())
+    assert dep.cancelled is True
+    assert (dep.cancel_probability, dep.impact_probability) == (1.0, 1.0)
+    assert (dep.delay_typ_min, dep.delay_p50_min, dep.delay_p90_min, dep.ge10_probability) == (
+        None, None, None, None,
+    )
+    assert dep.scheduled_time == _at(15, 3)  # still the train it is about
+
+
+def test_declared_cancellation_clears_the_alert_gate_a_low_score_would_have_missed():
+    """At 14:17 the same known-cancelled call scored 0.57 -- under the 0.65 push gate -- so nobody
+    was told about a train we already knew was gone. The certainty is what closes that miss."""
+    assert impact._departure_prediction(_cancelled_call()).impact_probability >= 0.65
+
+
+def test_worst_selection_prefers_a_known_cancelled_train_over_a_high_forecast():
+    """`select='worst'` must land on the train that is certainly gone, not the one merely likely to
+    be late: `_call_severity` restates the ordering for speed and has to agree with the prediction."""
+    scope = _scope(S1=(
+        _train("forecast", 15, 13, p_cancel=0.4, p_impact_dep=0.99)
+        + _train("cancelled", 15, 3, et_declared_cancelled=True, p_cancel=0.57, p_impact_dep=0.61)
+    ))
+    cells = _cells(scope, select="worst", at=_at(15))
+    assert [c.jkey for c in cells] == ["cancelled"]
+    assert cells[0].departure.cancelled is True
+
+
 # ---- response contract ------------------------------------------------------------------------
 def test_impact_response_shape_matches_the_togpuls_contract():
     """togpuls/clients/disruptions.py reads exactly two things: a `situations` list, and a

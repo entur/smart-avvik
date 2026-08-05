@@ -23,7 +23,7 @@
 -- a train, not of where a person commutes. from_stop/to_stop are public StopPlace refs; the
 -- traveller's time window and weekday pattern are not stored.
 --
--- llm_payload is the exception that proves the rule: it embeds the same origin, destination and
+-- message_input is the exception that proves the rule: it embeds the same origin, destination and
 -- departure time in one blob, which is why /historikk-api serves neither it nor from_stop/to_stop.
 -- The table is the audit record; the public page is not.
 --
@@ -52,8 +52,9 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   minutes_to_departure  INT64     OPTIONS(description="departure_time - decided_at, in minutes: the lead time this decision was made at."),
 
   -- The prediction the decision was made on.
-  impact_probability    FLOAT64   OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score."),
-  cancel_probability    FLOAT64   OPTIONS(description="Calibrated P(the train is cancelled)."),
+  et_cancelled          BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled, so the two probabilities below are 1.0 by construction and this decision is a certainty rather than a prediction. Exclude these rows before quoting model precision."),
+  impact_probability    FLOAT64   OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score; exactly 1.0 when et_cancelled."),
+  cancel_probability    FLOAT64   OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled."),
   ge10_probability      FLOAT64   OPTIONS(description="Calibrated P(>= 10 min late | it runs)."),
   delay_p50_min         INT64     OPTIONS(description="Median departure delay (min) from the exceedance stack."),
   delay_p90_min         INT64     OPTIONS(description="Bad-case (p90) departure delay (min)."),
@@ -70,7 +71,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   obs_delayed_min       INT64     OPTIONS(description="Minutes late at that stop; null if not recorded."),
   obs_observed_at       TIMESTAMP OPTIONS(description="Aimed time of the observed call (UTC) — how old the observation was when quoted."),
 
-  -- The faster alternative offered, if any. Flat here, in full inside llm_payload.
+  -- The faster alternative offered, if any. Flat here, in full inside message_input.
   has_alternative       BOOL      OPTIONS(description="Whether the Journey Planner lookup produced a faster way to to_stop."),
   alt_minutes_saved     INT64     OPTIONS(description="How much earlier it arrives than the disrupted train's predicted arrival."),
   alt_departure_time    TIMESTAMP OPTIONS(description="Expected departure of the alternative (UTC)."),
@@ -84,17 +85,46 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   llm_provider          STRING    OPTIONS(description="Backend that wrote the message: 'claude' | 'gemini'. Null when none did."),
   llm_model             STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
   prompt_version        STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force — a prompt edit invalidates comparisons across rows, and nothing else records it."),
-  -- The model's INPUT, verbatim: llm_message.build_payload serialized by llm_message.payload_json,
-  -- the same bytes the model was sent. Written for every decision, including the sub-threshold ones
-  -- no message was ever written for. Contains stop NAMES and the departure time, which is the
-  -- quasi-identifying trio /historikk-api deliberately redacts -- it must stay out of the API's
-  -- SELECT (Decision is extra="forbid", which fails loudly if a future edit adds it).
-  llm_payload           STRING    OPTIONS(description="Exact JSON handed to the model (or that would have been, when no message was written)."),
+  -- The writer's INPUT, verbatim: llm_message.build_message_input serialized by
+  -- llm_message.message_input_json, the same bytes the model was sent -- and, when no model wrote
+  -- anything, the same document the deterministic wording beside it was assembled from. Written for
+  -- every decision, including the sub-threshold ones no message was ever written for. Contains stop
+  -- NAMES and the departure time, which is the quasi-identifying trio /historikk-api deliberately
+  -- redacts -- it must stay out of the API's SELECT (Decision is extra="forbid", which fails loudly
+  -- if a future edit adds it).
+  message_input         STRING    OPTIONS(description="Exact JSON every message about this decision was written from (the model's prompt; the template's source when no model wrote one)."),
   snapshot_refreshed_at TIMESTAMP OPTIONS(description="When the per-call prediction cache behind this decision was last rebuilt (UTC) — how stale the numbers were.")
 )
 PARTITION BY DATE(decided_at)
 CLUSTER BY operator, situation_number
 OPTIONS(description="Append-only log of Avviksvarsel alert decisions. Labelled with realized outcomes by data/queries/label_varsel_decisions.sql. Never CREATE OR REPLACE; never copied dev->prd.");
+
+
+-- llm_payload -> message_input, for tables written before the object had three consumers.
+--
+-- It was named for the LLM prompt when that was all it fed; it is now also what the deterministic
+-- template words the push from, so the column name says input rather than payload. RENAME preserves
+-- the rows -- the alternative, adding a second column, would leave the recorded inputs split across
+-- two names with no way to tell which decisions used which.
+--
+-- Guarded by INFORMATION_SCHEMA rather than by `RENAME COLUMN IF EXISTS`, which is NOT idempotent
+-- here: measured 2026-08-05, once the rename has happened the same statement fails with "Column
+-- already exists: message_input" -- BigQuery rejects the TARGET name before it ever considers the
+-- IF EXISTS on the source. This file runs on every startup, and decisions.ensure_table treats any
+-- failure in it as "table not ready" and stops recording decisions entirely, so a statement that
+-- works exactly once is a decision log that dies on the second deploy.
+--
+-- MUST stay ahead of the ADD COLUMN block below: adding message_input first would leave the rename
+-- with nowhere to go and split the recorded inputs across two columns. The EXECUTE IMMEDIATE keeps
+-- it one statement with no inner semicolon, which is what validate_varsel_sql.sh's splitter (and
+-- therefore its per-statement dry run) needs. Verified against a table with an active streaming
+-- buffer -- the live table always has one.
+EXECUTE IMMEDIATE IF(
+  EXISTS (SELECT 1 FROM `disruptions.INFORMATION_SCHEMA.COLUMNS`
+          WHERE table_name = "varsel_decisions" AND column_name = "llm_payload"),
+  "ALTER TABLE `disruptions.varsel_decisions` RENAME COLUMN llm_payload TO message_input",
+  "SELECT 1"
+);
 
 
 -- Schema additions for tables created before those columns existed.
@@ -119,7 +149,8 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS llm_provider       STRING    OPTIONS(description="Backend that wrote the message: 'claude' | 'gemini'. Null when none did."),
   ADD COLUMN IF NOT EXISTS llm_model          STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
   ADD COLUMN IF NOT EXISTS prompt_version     STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force."),
-  ADD COLUMN IF NOT EXISTS llm_payload        STRING    OPTIONS(description="Exact JSON handed to the model (or that would have been, when no message was written).");
+  ADD COLUMN IF NOT EXISTS message_input      STRING    OPTIONS(description="Exact JSON every message about this decision was written from (the model's prompt; the template's source when no model wrote one)."),
+  ADD COLUMN IF NOT EXISTS et_cancelled       BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled, so impact_probability/cancel_probability are 1.0 by construction and this decision is a certainty rather than a prediction. Exclude these rows before quoting model precision.");
 
 
 -- The labelled counterpart: one row per decision subject, joined to what actually happened.

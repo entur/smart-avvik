@@ -31,8 +31,12 @@ function observationText(obs: NonNullable<Alert['latest_observation']>): string 
 function AlertLine({ alert }: { alert: Alert }) {
   const parts: string[] = [];
   if (alert.departure_time) parts.push(`${alert.mode ?? 'Tog'} kl ${fmtTime(alert.departure_time)}`);
-  const driver =
-    alert.cancel_probability >= CANCEL_LIKELY
+  // A departure ET has already declared cancelled is stated, never scored: "91 % sjanse for
+  // innstilling" for a train the journey planner no longer offers sends the traveller looking for
+  // it (2026-08-05). Word for word varsel.py's `_deterministic_body`, like the two below it.
+  const driver = alert.cancelled
+    ? 'Innstilt'
+    : alert.cancel_probability >= CANCEL_LIKELY
       ? `${fmtPct(alert.cancel_probability)} sjanse for innstilling`
       : fmtDelay(alert.delay_p50_min, alert.delay_p90_min);
   if (driver) parts.push(driver);
