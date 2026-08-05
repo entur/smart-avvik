@@ -48,7 +48,61 @@ check() {
   fi
 }
 
-check "create_varsel_decisions.sql" "$API/create_varsel_decisions.sql"
+# A multi-statement file needs every statement checked, one at a time.
+#
+# BigQuery dry-runs a SCRIPT lazily: it reports `numChildJobs: 1` and validates only the FIRST
+# statement, because a later one may depend on what an earlier one creates. So the whole-file check
+# below passes on the CREATE TABLE alone, and a broken ALTER or view definition after it dry-runs
+# perfectly clean -- then fails at app startup, which is the one place this script exists to
+# prevent. Measured 2026-08-05, while adding the llm_payload columns.
+check_each_statement() {
+  local label="$1" file="$2"
+  local dir; dir="$(mktemp -d)"
+  # Splitting on ";" needs a real tokenizer, not a sed: these files carry semicolons inside column
+  # descriptions ("Minutes late at that stop; null if not recorded.") and apostrophes inside SQL
+  # comments ("the traveller's time window"), each of which breaks the naive version differently.
+  python3 - "$file" "$dir" <<'PY'
+import pathlib, sys
+
+sql = pathlib.Path(sys.argv[1]).read_text()
+out = pathlib.Path(sys.argv[2])
+statements, buf, quote, comment = [], [], None, False
+i = 0
+while i < len(sql):
+    ch = sql[i]
+    if comment:
+        if ch == "\n":
+            comment = False
+    elif quote:
+        if ch == quote:
+            quote = None
+    elif ch in "\"'`":
+        quote = ch
+    elif sql.startswith("--", i):
+        comment = True
+    elif ch == ";":
+        statements.append("".join(buf) + ";")
+        buf = []
+        i += 1
+        continue
+    buf.append(ch)
+    i += 1
+if "".join(buf).strip():
+    statements.append("".join(buf))
+for n, stmt in enumerate(s for s in statements if s.strip().strip(";")):
+    (out / f"{n:02d}.sql").write_text(stmt)
+PY
+  local n=0
+  for stmt in "$dir"/*.sql; do
+    n=$((n + 1))
+    # Name the statement by its first non-comment line, so a failure says which one.
+    local first; first=$(grep -m1 -vE '^\s*(--|$)' "$stmt" | cut -c1-46)
+    check "$label [$n] ${first}" "$stmt"
+  done
+  rm -rf "$dir"
+}
+
+check_each_statement "create_varsel_decisions.sql" "$API/create_varsel_decisions.sql"
 check "label_varsel_decisions.sql"  "$ROOT/queries/label_varsel_decisions.sql"
 check "historikk_decisions.sql"     "$API/historikk_decisions.sql" "${DECISION_PARAMS[@]}"
 check "historikk_summary.sql"       "$API/historikk_summary.sql"   "${SUMMARY_PARAMS[@]}"

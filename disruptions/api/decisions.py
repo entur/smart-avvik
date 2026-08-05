@@ -28,6 +28,14 @@ Design notes
   by design and the labelling job writes a *separate* outcomes table.
 * **Privacy.** `journey_digest` (shared with :func:`llm_message.key_digest` so the two records
   join) plus a device count. No device_id, no journey_id, no time window, no weekday pattern.
+  `llm_payload` is the one field that carries origin, destination and departure time together — it
+  is what the model was shown, so it cannot be redacted here without defeating the purpose — which
+  is why `/historikk-api` serves neither it nor `from_stop`/`to_stop`.
+* **Everything the model saw, for every decision.** The row records the LLM's input, not just its
+  output: the payload verbatim, the observation and alternative quoted inside it, which backend
+  answered, and `message_status` — why the stored wording has the source it does. A deterministic
+  row can mean the LLM is off, the cycle hit its cap, the retry gave up or the model refused, and
+  those are four different problems that used to look identical once written down.
 """
 
 from __future__ import annotations
@@ -110,6 +118,53 @@ def _oslo_date(when: datetime | None):
     return when.astimezone(_OSLO).date() if when is not None else None
 
 
+def _iso(when: datetime | None) -> str | None:
+    return when.isoformat() if when is not None else None
+
+
+def _alternative_fields(alert: Alert) -> dict:
+    """The faster-journey suggestion as flat columns: present?, how much better, when, which lines.
+
+    The full object is in `llm_payload`; these exist so "how often do we actually offer one, and is
+    it any good?" is a GROUP BY rather than a JSON scrape. Measured 2026-08-04, the answer today is
+    "effectively never" — which is only visible because it is recorded.
+    """
+    alt = getattr(alert, "alternative_journey", None)
+    if alt is None:
+        return {"has_alternative": False}
+    legs = [leg for leg in (getattr(alt, "legs", None) or []) if getattr(leg, "mode", None) != "foot"]
+    return {
+        "has_alternative": True,
+        "alt_minutes_saved": getattr(alt, "minutes_saved", None),
+        "alt_departure_time": _iso(getattr(alt, "departure_time", None)),
+        "alt_arrival_time": _iso(getattr(alt, "arrival_time", None)),
+        "alt_lines": ", ".join(
+            str(getattr(leg, "public_code", None) or getattr(leg, "line", None) or getattr(leg, "mode", ""))
+            for leg in legs
+        )
+        or None,
+    }
+
+
+def _observation_fields(alert: Alert) -> dict:
+    """What had actually been observed on the line — the one payload item the model is told to quote.
+
+    Stored flat as well as inside `llm_payload` because this is the claim a traveller-facing message
+    makes about the real world ("kl. 17:40 var avgangen innstilt ved …"), and checking it against
+    what happened is the whole point of the log. `obs_observed_at` carries the observation's own age:
+    the source is rebuilt on a 60/120-minute TTL, so "latest" can be an hour old.
+    """
+    obs = getattr(alert, "latest_observation", None)
+    if obs is None:
+        return {}
+    return {
+        "obs_cancelled": getattr(obs, "cancelled", None),
+        "obs_stop_name": getattr(obs, "at_stop_name", None) or getattr(obs, "at_stop", None),
+        "obs_delayed_min": getattr(obs, "delayed_min", None),
+        "obs_observed_at": _iso(getattr(obs, "observed_at", None)),
+    }
+
+
 def build_row(
     journey: dict,
     alert: Alert,
@@ -119,6 +174,11 @@ def build_row(
     pushed: bool,
     message: str | None,
     message_source: str,
+    llm_payload: str | None = None,
+    llm_provider: str | None = None,
+    llm_model: str | None = None,
+    message_status: str | None = None,
+    prompt_version: str | None = None,
 ) -> dict:
     """One decision as a BigQuery row.
 
@@ -129,6 +189,15 @@ def build_row(
     `message` is the text that was actually sent — the written one when an LLM produced it, and
     otherwise the same deterministic body the push carried. `message_source` says which, because
     the two are indistinguishable once stored, and prd runs with the LLM off.
+
+    `llm_payload` is the exact JSON document the message was (or would have been) written from —
+    verbatim, not a reconstruction, so it stays faithful as `llm_message.build_payload` evolves.
+    It is the only field here that records the model's *input*; everything else describes the
+    decision. Note it is this cycle's input: when `message_status` is `ok_cached` the text beside it
+    was written from an earlier cycle's payload, whose figures were fresher then than these are now.
+
+    The keyword arguments default to None so a caller that has no LLM context — a test, a future
+    surface — still produces a valid row rather than needing to fake provenance it does not have.
     """
     departure = getattr(alert, "departure_time", None)
     decided_at = getattr(alert, "decided_at", None) or datetime.now(tz=_OSLO)
@@ -137,6 +206,13 @@ def build_row(
         minutes_to_departure = int((departure - decided_at).total_seconds() // 60)
     impact = getattr(alert, "impact", None)
     return {
+        **_observation_fields(alert),
+        **_alternative_fields(alert),
+        "llm_payload": llm_payload,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "message_status": message_status,
+        "prompt_version": prompt_version,
         "decided_at": decided_at.isoformat(),
         "journey_digest": journey_digest,
         "from_stop": journey.get("from_stop"),

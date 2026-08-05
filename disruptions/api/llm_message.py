@@ -46,6 +46,7 @@ import os
 import re
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -138,6 +139,38 @@ _RESPONSE_SCHEMA = {
     "required": ["melding"],
     "additionalProperties": False,
 }
+
+# Fingerprint of the instructions above, recorded next to every decision. Derived rather than
+# hand-bumped: a prompt edit is exactly the kind of change nobody remembers to version, and a
+# stored message whose prompt is unknown cannot be compared with one written under a later brief.
+PROMPT_VERSION = hashlib.sha256(_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:8]
+
+
+def payload_json(payload: dict) -> str:
+    """The exact JSON document handed to the model for `payload`.
+
+    One serializer, used by the writer and by the decision log, so what is recorded is byte-identical
+    to what was sent (or would have been sent). Two `json.dumps` calls with drifting keyword
+    arguments would produce a log that merely resembles the prompt.
+    """
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
+@dataclass(frozen=True)
+class MessageResult:
+    """What the writer produced, and which backend produced it.
+
+    `status` is the one thing the stored message cannot be reverse-engineered from: 'ok', 'disabled',
+    'unavailable' (no backend could be tried), 'error' (transient failure), 'rejected' (a reply that
+    was empty, a refusal, or over-length) or 'ungrounded' (a reply quoting figures absent from the
+    payload). The deterministic wording is used for every one of these, and until they were recorded
+    they were indistinguishable in the log.
+    """
+
+    text: str | None
+    provider: str | None = None
+    model: str | None = None
+    status: str = "unavailable"
 
 
 # ---- Backends --------------------------------------------------------------------------------
@@ -281,6 +314,11 @@ def _gemini_write(payload_json: str) -> str:
 _BACKENDS = {"claude": _claude_write, "gemini": _gemini_write}
 # Preference order for "auto": Sonnet 5 first, Gemini as the fallback the user asked for.
 _AUTO_ORDER = ("claude", "gemini")
+
+
+def _model_of(name: str) -> str:
+    """The model id a backend name resolves to, for the log record and the decision row."""
+    return _CLAUDE_MODEL if name == "claude" else _GEMINI_MODEL
 
 
 def llm_enabled() -> bool:
@@ -564,18 +602,34 @@ def _is_grounded(text: str, payload_json: str) -> bool:
 def write_message(payload: dict, *, journey_key: str = "", situation_number: str = "") -> str | None:
     """A short Norwegian message for this payload, or None when no backend could produce one.
 
+    The text only — see :func:`write_message_detailed` for which backend wrote it and why a caller
+    got None. Kept as the simple entry point because most callers only need the string.
+    """
+    return write_message_detailed(
+        payload, journey_key=journey_key, situation_number=situation_number
+    ).text
+
+
+def write_message_detailed(
+    payload: dict, *, journey_key: str = "", situation_number: str = ""
+) -> MessageResult:
+    """A short Norwegian message for this payload, with the provenance of the attempt.
+
     Never raises. On a configuration-class failure the offending backend is latched off for the
-    process lifetime and the next one is tried; on a transient failure this returns None and the
+    process lifetime and the next one is tried; on a transient failure this reports `error` and the
     next poller cycle tries again.
     """
     global _active, _active_at
     if not llm_enabled():
-        return None
-    payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        return MessageResult(None, status="disabled")
+    prompt = payload_json(payload)
+    # Why the LAST attempt failed. Overwritten per backend, so with `auto` this reports the verdict
+    # on the backend that actually got to answer rather than on the one that was latched off.
+    status = "unavailable"
 
     for name in _candidates():
         try:
-            raw = _BACKENDS[name](payload_json)
+            raw = _BACKENDS[name](prompt)
         except _ConfigurationError:
             logger.exception(
                 "LLM backend %s cannot serve this project; latching it off for this process",
@@ -594,10 +648,10 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                 exc_info=True,
                 extra={"fields": {"event": "llm_message", "provider": name, "result": "error"}},
             )
-            return None
+            return MessageResult(None, provider=name, model=_model_of(name), status="error")
 
         message = _extract_message(raw)
-        if message and not _is_grounded(message, payload_json):
+        if message and not _is_grounded(message, prompt):
             logger.warning(
                 "%s invented a figure that is not in the payload; using the deterministic wording",
                 name,
@@ -611,6 +665,7 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                 },
             )
             message = None
+            status = "ungrounded"
         with _lock:
             # Pin the backend only when it actually produced something. Pinning on any non-exception
             # return meant a Claude 400 or refusal (which now return "" rather than latching) stuck
@@ -626,6 +681,9 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                     "fields": {"event": "llm_message", "provider": name, "result": "rejected"}
                 },
             )
+            # An ungrounded reply is not the same failure as an empty or over-long one, and the
+            # distinction is the point of recording this at all — do not flatten it here.
+            status = status if status == "ungrounded" else "rejected"
             continue
         # What was said to a traveller stays reconstructible at INFO: the message, which model wrote
         # it, and the situation. The PROMPT does not -- `journey_key` is literally
@@ -643,7 +701,7 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                 "fields": {
                     "event": "llm_message",
                     "provider": name,
-                    "model": _CLAUDE_MODEL if name == "claude" else _GEMINI_MODEL,
+                    "model": _model_of(name),
                     "result": "ok",
                     "journey_digest": key_digest(journey_key),
                     "situation_number": situation_number,
@@ -662,10 +720,10 @@ def write_message(payload: dict, *, journey_key: str = "", situation_number: str
                         "provider": name,
                         "journey_digest": key_digest(journey_key),
                         "situation_number": situation_number,
-                        "payload": payload_json,
+                        "payload": prompt,
                         "reply": raw,
                     }
                 },
             )
-        return message
-    return None
+        return MessageResult(message, provider=name, model=_model_of(name), status="ok")
+    return MessageResult(None, status=status)

@@ -514,6 +514,91 @@ def test_successful_backend_becomes_sticky():
         llm_message._BACKENDS["claude"] = llm_message._claude_write
 
 
+# ---- provenance: which backend answered, and why one did not ----------------------------------
+def test_a_written_message_reports_its_backend_and_model():
+    """The decision log stores which model wrote a traveller's message. Cloud Logging already had
+    it, but only at INFO for successes and only for the log retention window — the row outlives it.
+    """
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget kan bli forsinket."}'
+    try:
+        result = llm_message.write_message_detailed(build_payload(JOURNEY, FakeImpact(), FakeAlert()))
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.text == "Toget kan bli forsinket."
+    assert result.status == "ok"
+    assert result.provider == "claude"
+    assert result.model == llm_message._CLAUDE_MODEL
+
+
+def test_each_failure_mode_is_named_rather_than_collapsed_to_none():
+    """Every one of these ends as the same deterministic wording, so the stored message cannot tell
+    them apart. A refusal is a prompt problem, a transient error is not, and `disabled` is neither.
+    """
+    _reset(enabled=False)
+    assert llm_message.write_message_detailed({"a": 1}).status == "disabled"
+
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = lambda body: ""  # a refusal / empty reply
+    try:
+        assert llm_message.write_message_detailed({"a": 1}).status == "rejected"
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+
+    def boom(body):
+        raise TimeoutError("vertex timed out")
+
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = boom
+    try:
+        result = llm_message.write_message_detailed({"a": 1})
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.status == "error"
+    assert result.text is None
+
+
+def test_an_ungrounded_reply_is_not_recorded_as_a_plain_rejection():
+    """A model quoting a figure that is not in the payload is a grounding failure, not an empty
+    reply. Flattening the two would hide the only failure mode that reaches a lock screen if the
+    guard is ever loosened.
+    """
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Det er 47 % sjanse for innstilling."}'
+    try:
+        result = llm_message.write_message_detailed(build_payload(JOURNEY, FakeImpact(), FakeAlert()))
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.text is None
+    assert result.status == "ungrounded"
+
+
+def test_the_logged_payload_is_byte_identical_to_what_the_model_got():
+    """One serializer for the prompt and for the decision log. Two json.dumps calls with drifting
+    keyword arguments would produce a record that merely resembles the prompt.
+    """
+    sent = {}
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = lambda body: sent.setdefault("body", body) or '{"melding":"ok"}'
+    payload = build_payload(JOURNEY, FakeImpact(alternative_journey=FakeAlternative()), FakeAlert())
+    try:
+        write_message(payload)
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert llm_message.payload_json(payload) == sent["body"]
+
+
+def test_the_prompt_version_tracks_the_prompt_text():
+    """Derived, not hand-bumped: a prompt edit is exactly what nobody remembers to version, and a
+    stored message whose brief is unknown cannot be compared with one written under a later brief.
+    """
+    before = llm_message.PROMPT_VERSION
+    assert len(before) == 8
+    import hashlib
+
+    assert before == hashlib.sha256(llm_message._SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:8]
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
