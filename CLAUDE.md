@@ -152,9 +152,30 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Without those, a `miss` leaves no trace and only precision is measurable. Repeats across cycles
     are intentional — they are the lead-time series. Writing fails open: a BigQuery problem never
     blocks a push.
+  - **The row records the model's input, not just its output** (2026-08-05). `llm_payload` is the
+    exact JSON `llm_message.build_payload` produced, serialized by the shared
+    `llm_message.payload_json` so it is byte-identical to the prompt — written for **every**
+    decision, including the sub-threshold ones no message is written for (~83 % of rows, and the
+    ones a miss is made of). Flat alongside it: the observation the prompt tells the model to quote
+    (`obs_*`) and the faster alternative (`has_alternative`, `alt_*`), so "how often do we offer
+    one?" is a GROUP BY. `message_status` says why the stored wording has the source it does —
+    `ok` / `ok_cached` / `not_alertworthy` / `not_selected` / `push_disabled` / `llm_disabled` /
+    `capped` / `attempts_exhausted` / `rejected` / `ungrounded` / `error` — because a cap, an
+    exhausted retry, a refusal and prd's `VARSEL_LLM_ENABLED=false` all store the same
+    deterministic text. `llm_provider`/`llm_model` outlive the Cloud Logging retention that used to
+    be the only record, and `prompt_version` (SHA-256[:8] of the system prompt, derived so nobody
+    has to remember to bump it) keeps rows written under different briefs comparable.
+    `llm_payload` carries origin, destination and departure time together — the trio
+    `/historikk-api` redacts — so it must never enter the API's SELECT; `Decision` is
+    `extra="forbid"`, which fails loudly if it does.
   - Both tables and the `varsel_decision_groups` view are created by the app at startup
     (`create_varsel_decisions.sql`, `CREATE TABLE IF NOT EXISTS` — **never** `CREATE OR REPLACE`;
-    their contents cannot be rebuilt). The outcomes table is created there too, not by the nightly
+    their contents cannot be rebuilt). Because `IF NOT EXISTS` does nothing to an existing table,
+    a new column also needs an `ALTER TABLE … ADD COLUMN IF NOT EXISTS` in that same file — without
+    it the write path just logs "N of M rows rejected by BigQuery" every cycle. Note
+    `validate_varsel_sql.sh` checks that file **statement by statement**: a dry run of a
+    multi-statement script validates only the first one (`numChildJobs: 1`), so a broken ALTER
+    would otherwise pass the validator and fail at startup. The outcomes table is created there too, not by the nightly
     job: `/historikk` queries it on every request and would 503 until the first nightly run
     otherwise. The view holds the grouping shared by the nightly job and the API, so the two cannot
     drift apart.

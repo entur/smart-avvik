@@ -128,6 +128,7 @@ def _reset_state():
         varsel._messages.clear()
         varsel._alternatives.clear()
         varsel._message_attempts.clear()
+        varsel._message_meta.clear()
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
@@ -1042,6 +1043,121 @@ def test_decisions_are_recorded_even_when_push_is_disabled(monkeypatch):
     assert sent == [], "push is disabled, so nothing may be delivered"
     assert [r["situation_number"] for r in log.rows] == ["S1"]
     assert log.rows[0]["pushed"] is False
+
+
+def test_every_decision_records_the_llm_input_even_below_the_threshold(monkeypatch):
+    """The model's input is logged for decisions no message was ever written for.
+
+    Those are the majority of rows -- and the ones a miss is made of. Building the payload only when
+    the writer runs left "what did the model see?" unanswerable for exactly them.
+    """
+    _reset_state()
+    _use_snapshot(
+        {
+            "S1": [
+                FakeCall("t1", "A", 1, DEP, p_cancel=0.02, p_impact_dep=0.10),
+                FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+            ]
+        }
+    )
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(_active_snapshot["value"])
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["alertworthy"] is False, "0.10 must not cross the gate -- the point of this row"
+    assert row["message_status"] == "not_alertworthy"
+    payload = json.loads(row["llm_payload"])
+    assert "reise" in payload and payload["sannsynlighet_prosent"] == 10
+    assert row["prompt_version"], "the brief in force must be identifiable afterwards"
+
+
+def test_decision_row_records_which_backend_wrote_the_message(monkeypatch):
+    """Cloud Logging has this at INFO for successes only, and only for its retention window; the row
+    outlives both. Exercises the real _write_message so the wiring is covered, not a fake's opinion.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(llm_message, "llm_enabled", lambda: True)
+    monkeypatch.setattr(llm_message, "build_payload", lambda *a, **k: {"reise": {"fra": "A"}})
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda *a, **k: llm_message.MessageResult(
+            "Toget er innstilt.", provider="gemini", model="gemini-3.5-flash", status="ok"
+        ),
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert (row["message"], row["message_source"]) == ("Toget er innstilt.", "llm")
+    assert (row["llm_provider"], row["llm_model"]) == ("gemini", "gemini-3.5-flash")
+    assert row["message_status"] == "ok"
+
+
+def test_a_capped_cycle_is_distinguishable_from_a_disabled_llm(monkeypatch):
+    """Both store the deterministic wording. One is a budget the poller imposed on itself and will
+    lift next tick; the other is how prd is configured. Told apart only by message_status.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(llm_message, "llm_enabled", lambda: True)
+    monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 0)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_source"] == "deterministic"
+    assert row["message_status"] == "capped"
+
+
+def test_a_deployment_with_the_llm_off_says_so(monkeypatch):
+    """The prd configuration. Same deterministic wording as a cap or a refusal, different cause --
+    and a separate test from the cap because the cap is checked FIRST, so one cycle cannot show both.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(llm_message, "llm_enabled", lambda: False)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_source"] == "deterministic"
+    assert row["message_status"] == "llm_disabled"
+    assert row["llm_provider"] is None
+
+
+def test_a_broken_payload_costs_its_own_column_not_the_cycle(monkeypatch):
+    """One journey's awkward payload must not take the whole cycle's decision log with it -- the
+    same rule alternatives.py learned when a malformed reply silently dropped every alert.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+
+    def boom(*a, **k):
+        raise ValueError("unserialisable")
+
+    monkeypatch.setattr(llm_message, "build_payload", boom)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["llm_payload"] is None
+    assert row["message"], "the decision itself is still recorded in full"
 
 
 def test_ensure_table_backs_off_after_a_failure(monkeypatch):
