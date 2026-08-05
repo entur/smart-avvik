@@ -114,6 +114,12 @@ class Decision(BaseModel):
     final_delay_p50_min: int | None = Field(description="Median predicted departure delay (min).")
     final_delay_p90_min: int | None = Field(description="Bad-case predicted departure delay (min).")
     alert_threshold: float | None = Field(description="The operator's threshold applied here.")
+    et_cancelled: bool | None = Field(
+        description="SIRI-ET had already declared this boarding call cancelled when the decision "
+        "the verdict judges was made, so the probabilities beside it are 1.0 by construction: we "
+        "relayed a fact rather than predicted one. Null for decisions taken before 2026-08-05, "
+        "which cannot be placed in either segment after the fact.",
+    )
     pushed_any: bool | None = Field(description="Whether a Web Push was actually delivered.")
     n_devices: int | None = Field(description="How many registrations shared this journey.")
     message: str | None = Field(description="The message text the traveller was sent.")
@@ -151,8 +157,40 @@ class ConfigResponse(BaseModel):
     )
 
 
+class Segment(BaseModel):
+    """One half of the window, split on whether the app relayed a fact or predicted one.
+
+    Same four verdicts, same arithmetic, over a subset of the same rows — so a caller can put the
+    two side by side and see what the blended figure is actually made of.
+    """
+
+    n_hit: int = Field(description="Alerted, and trouble came.")
+    n_false_alarm: int = Field(description="Alerted, no trouble.")
+    n_miss: int = Field(description="Did not alert, trouble came.")
+    n_correct_reject: int = Field(description="Did not alert, no trouble.")
+    precision: float | None = Field(
+        description="hit / (hit + false_alarm) within this segment. Null when it alerted nothing.",
+    )
+    recall: float | None = Field(
+        description="hit / (hit + miss) within this segment, with the same caveat as the blended "
+        "figure: among SX-flagged calls on registered journeys only.",
+    )
+
+
 class Summary(BaseModel):
-    """Alerting performance over the window — counts first, rates second, coverage always."""
+    """Alerting performance over the window — counts first, rates second, coverage always.
+
+    The headline figures are **blended**: every labelled decision, whether the app forecast the
+    trouble or relayed a cancellation SIRI-ET had already declared. That is the honest answer to
+    "can a traveller trust what this app tells them", which is what the page is for, and relaying
+    what ET already knows is most of the value — nobody carries the ET feed on their phone.
+
+    It is not the answer to "did the models see it coming", because a declared cancellation is
+    served at probability 1.0 by construction: a gimme. `predicted` and `relayed` are the same
+    window split on exactly that, and are the reason the blended figure can be quoted at all — on
+    its own it moves with the **mix** of the two populations, and so can swing with nothing about
+    the app having changed.
+    """
 
     from_date: date = Field(description="Window start (operating day, Europe/Oslo).")
     to_date: date = Field(description="Window end, inclusive.")
@@ -177,6 +215,19 @@ class Summary(BaseModel):
         description="Median minutes of warning on the alerts that were right.",
     )
     n_hit_with_30min_notice: int = Field(description="Correct alerts sent 30+ min before departure.")
+
+    predicted: Segment = Field(
+        description="Decisions where ET had NOT declared the cancellation when we decided — the "
+        "models' own skill. Tune a threshold on this, not on the blended figure.",
+    )
+    relayed: Segment = Field(
+        description="Decisions where ET had ALREADY declared it: the app repeated a published fact. "
+        "Real value to the traveller, no evidence about the models.",
+    )
+    n_unsegmented: int = Field(
+        description="Labelled decisions taken before the flag existed (2026-08-05), in neither "
+        "segment. While this dominates, the split describes only a slice of the window.",
+    )
 
 
 def _checked_operator(operator: str | None) -> str | None:
@@ -334,6 +385,19 @@ def summary(
     ]
     rows = _query(_SUMMARY_QUERY, params, ("summary", start, end, operator))
     row = dict(rows[0]) if rows else {}
+
+    def segment(suffix: str) -> Segment:
+        """One split of the window. Counts default to 0; rates stay None — a rate over nothing is
+        not zero, and rendering it as 0 % would read as "we got everything wrong"."""
+        return Segment(
+            n_hit=row.get(f"n_hit_{suffix}") or 0,
+            n_false_alarm=row.get(f"n_false_alarm_{suffix}") or 0,
+            n_miss=row.get(f"n_miss_{suffix}") or 0,
+            n_correct_reject=row.get(f"n_correct_reject_{suffix}") or 0,
+            precision=row.get(f"precision_{suffix}"),
+            recall=row.get(f"recall_{suffix}"),
+        )
+
     return Summary(
         from_date=start,
         to_date=end,
@@ -347,4 +411,7 @@ def summary(
         recall=row.get("recall"),
         median_lead_min_on_hits=row.get("median_lead_min_on_hits"),
         n_hit_with_30min_notice=row.get("n_hit_with_30min_notice") or 0,
+        predicted=segment("predicted"),
+        relayed=segment("relayed"),
+        n_unsegmented=row.get("n_unsegmented") or 0,
     )
