@@ -140,9 +140,10 @@ def test_no_alternative_is_recorded_as_false_not_null():
 
 
 def test_a_certainty_is_marked_as_one():
-    """A decision on a call ET had already declared cancelled is a guaranteed `hit` that says
-    nothing about the models: both probabilities are 1.0 by construction. Unmarked, those rows would
-    let /historikk count Vy's own cancellations as the models' precision (2026-08-05).
+    """A decision on a call ET had already declared cancelled relayed a fact rather than predicting
+    one, and both probabilities are 1.0 by construction. It is a real hit for the traveller and a
+    gimme for the models, so the log has to be segmentable on it: unmarked, the two populations are
+    indistinguishable afterwards and one precision figure is quoted for both (2026-08-05).
     """
     class Alert(FakeAlert):
         cancelled = True
@@ -154,7 +155,7 @@ def test_a_certainty_is_marked_as_one():
 
 def test_an_ordinary_prediction_is_not_marked_a_certainty():
     """False, not NULL: "we predicted this" has to be distinguishable from "this row predates the
-    column", or the whole precision figure has to be thrown away rather than filtered."""
+    column", or the whole precision figure has to be thrown away rather than segmented."""
     assert _row()["et_cancelled"] is False
 
 

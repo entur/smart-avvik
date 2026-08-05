@@ -104,10 +104,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   that is certainly gone. Two symptoms, one cause: Vy cancelled RE10 80323 Drammen–Skøyen and the
   card offered "91 % sjanse for innstilling" for a 15:03 from Asker that entur.no no longer listed —
   and the *first* cycle scored that same known-cancelled call at 0.57, under the gate, so nobody was
-  told at all. `decisions.et_cancelled` marks such rows: both probabilities are 1.0 by construction,
-  so counting them would let /historikk report Vy's cancellations as the models' precision. Note
-  `/journey` still serves the model's probability for a known-cancelled call — same defect, separate
-  contract, not yet fixed.
+  told at all. `decisions.et_cancelled` marks such rows so the log can be **segmented, not
+  filtered**: the app relayed a known fact instead of forecasting one, which makes the row a real
+  hit for the traveller and a gimme for the models, and one precision figure cannot mean both.
+  *Service* quality — was the traveller told the truth? — includes them, and should: relaying what
+  ET already knows is most of the value, since nobody carries the ET feed on their phone, and in the
+  reported case it was ~40 min of usable warning. *Model* skill — did we see it coming? — excludes
+  them. Distrust either quoted alone: the **mix** of the two populations moves the headline with
+  nothing about the app having changed. `/historikk` does not split on it yet. Also worth watching
+  `et_cancelled AND verdict='false_alarm'` — a *reinstated* train now gets a flat "Innstilt" where
+  the old wording hedged at 87 %, so a confidently wrong message replaces a soft one; the labelling
+  job scores it correctly, but if reinstatements turn out to be common the certainty should go back
+  to hedging for departures still some way off. Note `/journey` still serves the model's probability
+  for a known-cancelled call — same defect, separate contract, not yet fixed.
   **An observation is in the past** (2026-08-05): a declared cancellation is routinely published for
   calls the train has not reached — announcing it ahead of time is the point — so `impact._is_observed`
   admits one only once its own time has passed, while a `recorded` call is an observation by
