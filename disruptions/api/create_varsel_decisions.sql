@@ -52,9 +52,9 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   minutes_to_departure  INT64     OPTIONS(description="departure_time - decided_at, in minutes: the lead time this decision was made at."),
 
   -- The prediction the decision was made on.
-  et_cancelled          BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled, so the two probabilities below are 1.0 by construction and this decision is a certainty rather than a prediction. Exclude these rows before quoting model precision."),
-  impact_probability    FLOAT64   OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score; exactly 1.0 when et_cancelled."),
-  cancel_probability    FLOAT64   OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled."),
+  et_cancelled          BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed."),
+  impact_probability    FLOAT64   OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score; exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction."),
+  cancel_probability    FLOAT64   OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction."),
   ge10_probability      FLOAT64   OPTIONS(description="Calibrated P(>= 10 min late | it runs)."),
   delay_p50_min         INT64     OPTIONS(description="Median departure delay (min) from the exceedance stack."),
   delay_p90_min         INT64     OPTIONS(description="Bad-case (p90) departure delay (min)."),
@@ -150,7 +150,31 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS llm_model          STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
   ADD COLUMN IF NOT EXISTS prompt_version     STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force."),
   ADD COLUMN IF NOT EXISTS message_input      STRING    OPTIONS(description="Exact JSON every message about this decision was written from (the model's prompt; the template's source when no model wrote one)."),
-  ADD COLUMN IF NOT EXISTS et_cancelled       BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled, so impact_probability/cancel_probability are 1.0 by construction and this decision is a certainty rather than a prediction. Exclude these rows before quoting model precision.");
+  ADD COLUMN IF NOT EXISTS et_cancelled       BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed.");
+
+
+-- Descriptions for columns that ALREADY exist.
+--
+-- Neither statement above can do this. CREATE TABLE IF NOT EXISTS does nothing at all where the
+-- table exists, and ADD COLUMN IF NOT EXISTS does nothing where the column exists -- so an edited
+-- OPTIONS(description=...) reaches a fresh environment and NO existing one. Measured 2026-08-05:
+-- dev's `impact_probability` still carried its pre-et_cancelled text hours after the deploy that
+-- reworded it, and `et_cancelled` itself was frozen with the description it was born with. The
+-- file and the table then disagree, and the table is what anyone reads in the console or in
+-- `bq show --schema` -- which for THESE three columns is the difference between segmenting the
+-- precision figure and quoting it whole.
+--
+-- SET OPTIONS is idempotent and free (metadata only, no rewrite), so it runs at every startup like
+-- the block above. One statement per column: BigQuery allows a single ALTER COLUMN action per
+-- ALTER TABLE. Descriptions are duplicated from the definitions above; keep them in step.
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN et_cancelled SET OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN impact_probability SET OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score; exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN cancel_probability SET OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
 
 
 -- The labelled counterpart: one row per decision subject, joined to what actually happened.
