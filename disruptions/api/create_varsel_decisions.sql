@@ -23,6 +23,10 @@
 -- a train, not of where a person commutes. from_stop/to_stop are public StopPlace refs; the
 -- traveller's time window and weekday pattern are not stored.
 --
+-- llm_payload is the exception that proves the rule: it embeds the same origin, destination and
+-- departure time in one blob, which is why /historikk-api serves neither it nor from_stop/to_stop.
+-- The table is the audit record; the public page is not.
+--
 -- Cost: negligible. Streaming inserts of a handful of rows per poller cycle.
 CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
 (
@@ -58,14 +62,64 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   pushed                BOOL      OPTIONS(description="Whether a Web Push was actually delivered for this decision in this cycle."),
   n_devices             INT64     OPTIONS(description="How many registrations share this journey definition."),
 
+  -- What had actually been OBSERVED on the line when we decided (as opposed to predicted). The
+  -- system prompt tells the model to quote this with its timestamp, so it is the factual claim a
+  -- traveller-facing message makes; obs_observed_at is its age (the source has a 60/120 min TTL).
+  obs_cancelled         BOOL      OPTIONS(description="ET had declared the latest observed call on this line cancelled."),
+  obs_stop_name         STRING    OPTIONS(description="Where that observation was made (name, falling back to the StopPlace ref)."),
+  obs_delayed_min       INT64     OPTIONS(description="Minutes late at that stop; null if not recorded."),
+  obs_observed_at       TIMESTAMP OPTIONS(description="Aimed time of the observed call (UTC) — how old the observation was when quoted."),
+
+  -- The faster alternative offered, if any. Flat here, in full inside llm_payload.
+  has_alternative       BOOL      OPTIONS(description="Whether the Journey Planner lookup produced a faster way to to_stop."),
+  alt_minutes_saved     INT64     OPTIONS(description="How much earlier it arrives than the disrupted train's predicted arrival."),
+  alt_departure_time    TIMESTAMP OPTIONS(description="Expected departure of the alternative (UTC)."),
+  alt_arrival_time      TIMESTAMP OPTIONS(description="Expected arrival of the alternative (UTC)."),
+  alt_lines             STRING    OPTIONS(description="Its transit legs as shown to the traveller, e.g. 'R11, 100'; walking legs omitted."),
+
   -- What the traveller was told.
   message               STRING    OPTIONS(description="The message body sent (or that would have been sent)."),
   message_source        STRING    OPTIONS(description="'llm' when written by the model, 'deterministic' for the template fallback."),
+  message_status        STRING    OPTIONS(description="Why that source: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | rejected | ungrounded | error | unavailable. Without it every failure mode looks like the same deterministic row."),
+  llm_provider          STRING    OPTIONS(description="Backend that wrote the message: 'claude' | 'gemini'. Null when none did."),
+  llm_model             STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
+  prompt_version        STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force — a prompt edit invalidates comparisons across rows, and nothing else records it."),
+  -- The model's INPUT, verbatim: llm_message.build_payload serialized by llm_message.payload_json,
+  -- the same bytes the model was sent. Written for every decision, including the sub-threshold ones
+  -- no message was ever written for. Contains stop NAMES and the departure time, which is the
+  -- quasi-identifying trio /historikk-api deliberately redacts -- it must stay out of the API's
+  -- SELECT (Decision is extra="forbid", which fails loudly if a future edit adds it).
+  llm_payload           STRING    OPTIONS(description="Exact JSON handed to the model (or that would have been, when no message was written)."),
   snapshot_refreshed_at TIMESTAMP OPTIONS(description="When the per-call prediction cache behind this decision was last rebuilt (UTC) — how stale the numbers were.")
 )
 PARTITION BY DATE(decided_at)
 CLUSTER BY operator, situation_number
 OPTIONS(description="Append-only log of Avviksvarsel alert decisions. Labelled with realized outcomes by data/queries/label_varsel_decisions.sql. Never CREATE OR REPLACE; never copied dev->prd.");
+
+
+-- Schema additions for tables created before those columns existed.
+--
+-- Necessary because the statement above is IF NOT EXISTS: where the table already exists it does
+-- nothing at all, so a new column in that definition would silently never appear -- and the write
+-- path would then log "N of M rows rejected by BigQuery" on every poller cycle. ADD COLUMN IF NOT
+-- EXISTS is idempotent and free, so this runs unremarkably at every startup, in both environments,
+-- and needs no operator step. Adding a nullable column never rewrites existing rows: rows written
+-- before this landed keep NULLs, which read correctly as "not recorded then", not "no payload".
+ALTER TABLE `disruptions.varsel_decisions`
+  ADD COLUMN IF NOT EXISTS obs_cancelled      BOOL      OPTIONS(description="ET had declared the latest observed call on this line cancelled."),
+  ADD COLUMN IF NOT EXISTS obs_stop_name      STRING    OPTIONS(description="Where that observation was made (name, falling back to the StopPlace ref)."),
+  ADD COLUMN IF NOT EXISTS obs_delayed_min    INT64     OPTIONS(description="Minutes late at that stop; null if not recorded."),
+  ADD COLUMN IF NOT EXISTS obs_observed_at    TIMESTAMP OPTIONS(description="Aimed time of the observed call (UTC) — how old the observation was when quoted."),
+  ADD COLUMN IF NOT EXISTS has_alternative    BOOL      OPTIONS(description="Whether the Journey Planner lookup produced a faster way to to_stop."),
+  ADD COLUMN IF NOT EXISTS alt_minutes_saved  INT64     OPTIONS(description="How much earlier it arrives than the disrupted train's predicted arrival."),
+  ADD COLUMN IF NOT EXISTS alt_departure_time TIMESTAMP OPTIONS(description="Expected departure of the alternative (UTC)."),
+  ADD COLUMN IF NOT EXISTS alt_arrival_time   TIMESTAMP OPTIONS(description="Expected arrival of the alternative (UTC)."),
+  ADD COLUMN IF NOT EXISTS alt_lines          STRING    OPTIONS(description="Its transit legs as shown to the traveller, e.g. 'R11, 100'; walking legs omitted."),
+  ADD COLUMN IF NOT EXISTS message_status     STRING    OPTIONS(description="Why the message has the source it does: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | rejected | ungrounded | error | unavailable."),
+  ADD COLUMN IF NOT EXISTS llm_provider       STRING    OPTIONS(description="Backend that wrote the message: 'claude' | 'gemini'. Null when none did."),
+  ADD COLUMN IF NOT EXISTS llm_model          STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
+  ADD COLUMN IF NOT EXISTS prompt_version     STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force."),
+  ADD COLUMN IF NOT EXISTS llm_payload        STRING    OPTIONS(description="Exact JSON handed to the model (or that would have been, when no message was written).");
 
 
 -- The labelled counterpart: one row per decision subject, joined to what actually happened.

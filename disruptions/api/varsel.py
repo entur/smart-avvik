@@ -534,6 +534,11 @@ _alternatives: dict[tuple[str, str, str], AlternativeJourney] = {}
 # Same key, same lifecycle: how many times writing this message has failed, so a payload the LLM
 # cannot handle is not retried on every tick for the situation's whole life.
 _message_attempts: dict[tuple[str, str, str], int] = {}
+# Same key, same lifecycle: how this journey x situation's message came about —
+# {"status": ..., "provider": ..., "model": ...}. Written here rather than derived at record time
+# because only this loop can tell a per-cycle cap from an exhausted retry from a model that refused,
+# and once the deterministic wording is stored all three look identical. See decisions.build_row.
+_message_meta: dict[tuple[str, str, str], dict[str, str | None]] = {}
 
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
@@ -1041,12 +1046,37 @@ def _log_push(
     )
 
 
+def _remember_message_meta(
+    message_key: tuple[str, str, str],
+    *,
+    status: str,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
+    """Note how this journey × situation's message came about, for the decision log.
+
+    `provider`/`model` are only overwritten when the caller knows them, so a later cycle that merely
+    reuses a cached message (status ``ok_cached``) does not erase which backend actually wrote it.
+    """
+    with _state_lock:
+        meta = _message_meta.setdefault(message_key, {})
+        meta["status"] = status
+        if provider is not None:
+            meta["provider"] = provider
+        if model is not None:
+            meta["model"] = model
+
+
 def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | None:
     """The LLM-written body for this journey × situation, or None to use the template wording.
 
     Wraps :mod:`llm_message` so that nothing it can do — an unconfigured project, an unavailable
     model, a timeout, an unexpected exception — reaches the notification path. The import is local
     so a deploy without the Vertex dependencies still serves pushes.
+
+    Also records the attempt's provenance (which backend answered, and why it did not) under the
+    message key: it is knowable only here, and the stored message cannot be reverse-engineered into
+    it — every failure mode ends up as the same deterministic wording.
     """
     try:
         import llm_message
@@ -1054,9 +1084,16 @@ def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | No
         if not llm_message.llm_enabled():
             return None
         payload = llm_message.build_payload(journey, alert.impact, alert)
-        return llm_message.write_message(
+        result = llm_message.write_message_detailed(
             payload, journey_key=journey_key, situation_number=alert.situation_number
         )
+        _remember_message_meta(
+            _message_key(journey_key, alert),
+            status=result.status,
+            provider=result.provider,
+            model=result.model,
+        )
+        return result.text
     except Exception:
         logger.warning(
             "Written-message step failed; falling back to the deterministic wording",
@@ -1066,11 +1103,39 @@ def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | No
         return None
 
 
+def _llm_input(journey: dict, alert: Alert) -> str | None:
+    """The exact JSON that was (or would have been) handed to the model for this decision.
+
+    Built for **every** decision, including the sub-threshold ones the writer is never asked about:
+    "what did the model see?" is unanswerable for a row that has no payload, and those rows are the
+    majority. Cheap enough to do unconditionally — `build_payload` is pure apart from an in-memory
+    stop-name lookup, and the alert already carries the `/impact` response it reads.
+
+    Guarded on its own rather than inside the caller's blanket try: one journey with an awkward
+    payload must cost that journey's payload, not the whole cycle's decision log.
+    """
+    try:
+        import llm_message
+
+        return llm_message.payload_json(
+            llm_message.build_payload(journey, alert.impact, alert)
+        )
+    except Exception:
+        logger.warning(
+            "Could not build the LLM input for a decision; recording it without one",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_decision_write", "result": "no_payload"}},
+        )
+        return None
+
+
 def _record_decisions(
     by_journey_key: dict[str, dict],
     alerts_by_key: dict[str, list[Alert]],
     journeys: list[tuple[str, dict]],
     pushed_keys: set[tuple[str, str]],
+    *,
+    push_on: bool,
 ) -> None:
     """Append this cycle's alert decisions to the decision log.
 
@@ -1083,10 +1148,12 @@ def _record_decisions(
     """
     try:
         import decisions
+        import llm_message
         from llm_message import key_digest
 
         if not decisions.enabled():
             return
+        llm_on = llm_message.llm_enabled()
         device_counts: dict[str, set[str]] = {}
         for _jid, journey in journeys:
             device_counts.setdefault(journey_key(journey), set()).add(journey["device_id"])
@@ -1096,8 +1163,24 @@ def _record_decisions(
             digest = key_digest(key)
             n_devices = len(device_counts.get(key, ()))
             for alert in alerts_by_key.get(key, []):
+                message_key = _message_key(key, alert)
                 with _state_lock:
-                    written = _messages.get(_message_key(key, alert))
+                    written = _messages.get(message_key)
+                    meta = dict(_message_meta.get(message_key) or {})
+                # No meta means the writer was never reached for this alert, and why is knowable
+                # from the state that decided it: below the threshold, push (and with it the writer)
+                # switched off, the LLM switched off — or alert-worthy but not the worst situation
+                # for this journey, which is the one the message is written about.
+                status = meta.get("status")
+                if status is None:
+                    if not alert.alertworthy:
+                        status = "not_alertworthy"
+                    elif not push_on:
+                        status = "push_disabled"
+                    elif not llm_on:
+                        status = "llm_disabled"
+                    else:
+                        status = "not_selected"
                 # Record what was actually SENT, not just what the LLM wrote. `_messages` only ever
                 # holds LLM output, so storing it raw left every deterministic push with a NULL
                 # message — and prd runs with VARSEL_LLM_ENABLED=false, so /historikk there would
@@ -1113,6 +1196,11 @@ def _record_decisions(
                         pushed=(key, alert.situation_number) in pushed_keys,
                         message=message,
                         message_source="llm" if written else "deterministic",
+                        llm_payload=_llm_input(journey, alert),
+                        llm_provider=meta.get("provider"),
+                        llm_model=meta.get("model"),
+                        message_status=status,
+                        prompt_version=llm_message.PROMPT_VERSION,
                     )
                 )
         decisions.record(rows)
@@ -1182,6 +1270,8 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             _alternatives.pop(key, None)
         for key in [k for k in _message_attempts if k[1] not in live]:
             _message_attempts.pop(key, None)
+        for key in [k for k in _message_meta if k[1] not in live]:
+            _message_meta.pop(key, None)
         changed = bool(stale)
 
     # ---- Loop 1: one impact call and one written message per distinct journey definition --------
@@ -1226,6 +1316,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             already_written = message_key in _messages
             attempts = _message_attempts.get(message_key, 0)
         if already_written:
+            # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row carries
+            # text written against an earlier cycle's payload, not the one recorded beside it.
+            _remember_message_meta(message_key, status="ok_cached")
             continue
         if attempts >= _MAX_MESSAGE_ATTEMPTS:
             # Without this the retry never stops. A write that fails for a payload-dependent reason
@@ -1233,6 +1326,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             # the situation's whole life -- ~720 Vertex calls that can change nothing, because the
             # push already went out with the deterministic wording, each one burning a slot from
             # _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have succeeded now cannot use.
+            _remember_message_meta(message_key, status="attempts_exhausted")
             continue
         if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() >= llm_deadline:
             logger.info(
@@ -1243,6 +1337,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 key,
                 extra={"fields": {"event": "llm_message", "result": "capped"}},
             )
+            _remember_message_meta(message_key, status="capped")
             continue
         llm_calls += 1
         # _write_message catches Exception itself, so this is belt and braces for a future edit that
@@ -1259,6 +1354,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 extra={"fields": {"event": "llm_message", "result": "error"}},
             )
             message = None
+            _remember_message_meta(message_key, status="error")
         with _state_lock:
             if message:
                 _messages[message_key] = message
@@ -1330,7 +1426,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                     _drop_device(journey["device_id"])
                     changed = True
 
-    _record_decisions(by_journey_key, alerts_by_key, journeys, pushed_keys)
+    _record_decisions(by_journey_key, alerts_by_key, journeys, pushed_keys, push_on=push_on)
 
     if changed:
         _save_state()
