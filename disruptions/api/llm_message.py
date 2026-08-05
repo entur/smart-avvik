@@ -7,6 +7,12 @@ module hands the enriched ``/impact`` payload to a model and uses its reply as t
 
 Design notes
 ------------
+* **One message input, three consumers.** :func:`build_message_input` produces the document this
+  module prompts the model with — and the same object is what ``varsel._deterministic_body`` words
+  the fallback push from and what the decision log stores as ``message_input``. It used to be built
+  separately for each: the model got one, and the log got a second one rebuilt afterwards that
+  merely resembled it. One object means the recorded input is the input, and that enriching the
+  template wording is a matter of reading a field that is already there.
 * **The model writes prose; it does not decide anything.** Whether to alert at all stays with
   ``varsel``'s calibrated per-operator gate. The model is given the numbers our code already
   selected and is asked to phrase them — so a bad reply degrades the wording, never the decision.
@@ -119,12 +125,17 @@ konkret råd om hva den reisende bør gjøre.
 Regler:
 - Bruk KUN tall, tider, stoppesteder og linjenavn som finnes i dataene. Du skal aldri gjette, \
 regne ut nye tall eller finne på detaljer.
+- `innstilt: true` betyr at avgangen ALLEREDE ER INNSTILT – det er et faktum, ikke en \
+sannsynlighet. Skriv at toget/bussen ER innstilt, aldri «kan bli» eller «sjanse for». I det \
+tilfellet finnes verken `sannsynlighet_prosent` eller `forsinkelse_min` i dataene, og du skal \
+ikke nevne noen prosent eller forsinkelse i det hele tatt – bare innstillingen og rådet.
 - Sannsynligheten i `sannsynlighet_prosent` er sjansen for innstilling ELLER minst 10 minutter \
 forsinkelse. Omtal den slik, ikke som «forsinkelse».
 - `forsinkelse_min` (`typisk` og `verstefall`) er et ANSLAG som bare gjelder HVIS avgangen faktisk \
 kjører. Skriv «kan bli … forsinket», aldri «er … forsinket».
 - `mest_sannsynlig_innstilt: true` betyr at innstilling er det mest sannsynlige utfallet – da er \
 det innstillingen som er hovedpoenget, ikke forsinkelsen.
+- `innstilling_prosent` er bare med i det tilfellet, og er da sjansen for innstilling i prosent.
 - Hvis `siste_observasjon` finnes, nevn den med tidspunktet sitt – det er en observasjon fra et \
 tidligere tidspunkt, ikke nødvendigvis situasjonen akkurat nå.
 - Hvis `alternativ_reise` finnes, er det det mest nyttige rådet.
@@ -146,14 +157,14 @@ _RESPONSE_SCHEMA = {
 PROMPT_VERSION = hashlib.sha256(_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:8]
 
 
-def payload_json(payload: dict) -> str:
-    """The exact JSON document handed to the model for `payload`.
+def message_input_json(message_input: dict) -> str:
+    """The exact JSON document handed to the model for `message_input`.
 
     One serializer, used by the writer and by the decision log, so what is recorded is byte-identical
     to what was sent (or would have been sent). Two `json.dumps` calls with drifting keyword
     arguments would produce a log that merely resembles the prompt.
     """
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return json.dumps(message_input, ensure_ascii=False, sort_keys=True, default=str)
 
 
 @dataclass(frozen=True)
@@ -199,7 +210,7 @@ def _claude_client() -> Any:
     )
 
 
-def _claude_write(payload_json: str) -> str:
+def _claude_write(input_json: str) -> str:
     """One Claude Sonnet 5 call on Vertex.
 
     Adaptive thinking at `low` effort: a two-sentence notification does not need depth, and low
@@ -219,7 +230,7 @@ def _claude_write(payload_json: str) -> str:
                 "effort": "low",
                 "format": {"type": "json_schema", "schema": _RESPONSE_SCHEMA},
             },
-            messages=[{"role": "user", "content": f"<reisedata>\n{payload_json}\n</reisedata>"}],
+            messages=[{"role": "user", "content": f"<reisedata>\n{input_json}\n</reisedata>"}],
         )
     except (NotFoundError, PermissionDeniedError) as exc:
         raise _ConfigurationError(
@@ -256,7 +267,7 @@ def _claude_write(payload_json: str) -> str:
     return "".join(block.text for block in response.content if block.type == "text")
 
 
-def _gemini_write(payload_json: str) -> str:
+def _gemini_write(input_json: str) -> str:
     """One Gemini call on Vertex — the fallback when this project cannot serve Sonnet 5.
 
     ``thinking_budget: 0`` is load-bearing, not a tuning choice. Gemini 3.5 Flash thinks by default
@@ -277,7 +288,7 @@ def _gemini_write(payload_json: str) -> str:
     try:
         response = client.models.generate_content(
             model=_GEMINI_MODEL,
-            contents=f"<reisedata>\n{payload_json}\n</reisedata>",
+            contents=f"<reisedata>\n{input_json}\n</reisedata>",
             config={
                 "system_instruction": _SYSTEM_PROMPT,
                 "max_output_tokens": _MAX_TOKENS,
@@ -378,6 +389,10 @@ _NAME_MAX_CHARS = 80
 # Ceiling on how many situations and lines are described. A journey caught by a network-wide event
 # can match many at once, and without a bound both the prompt and the logged payload grow with it.
 _MAX_PAYLOAD_ITEMS = 6
+# At or above this, cancellation is the outcome to lead with rather than a delay. Restated as
+# `varsel._CANCEL_LIKELY`, which has to hold the same bar without importing this module — see the
+# note there.
+_CANCEL_LIKELY = 0.5
 
 
 def _bounded_text(value: object, limit: int = _TEXT_MAX_CHARS) -> str | None:
@@ -438,8 +453,14 @@ def _canonical_stop_name(stop_place: object) -> str | None:
     return None
 
 
-def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
-    """The trimmed, pre-rounded view of one journey × situation handed to the model.
+def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
+    """The trimmed, pre-rounded view of one journey × situation every message is written from.
+
+    Three consumers, one document: the model is prompted with it, ``varsel._deterministic_body``
+    words the template fallback from it when no model wrote anything, and the decision log stores it
+    as ``message_input``. So a figure that belongs in a message belongs *here* — adding it to the
+    template alone would leave the model unable to say it, and adding it to the prompt alone would
+    leave it unrecorded.
 
     `impact` and `alert` are duck-typed (an ``ImpactResponse`` and a ``varsel.Alert``) so this module
     imports neither ``main`` nor ``varsel``. Every figure here is one our own code already chose:
@@ -494,6 +515,13 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
         for sit in all_situations[:_MAX_PAYLOAD_ITEMS]
     ]
 
+    cancel_p = getattr(alert, "cancel_probability", 0.0) or 0.0
+    # ET has already declared this departure cancelled (impact.StopPrediction.cancelled). That is a
+    # fact about the timetable, and it replaces every conditional figure rather than joining them:
+    # `sannsynlighet_prosent` and `innstilling_prosent` would restate a certainty as a guess, and
+    # `forsinkelse_min` only ever meant "if it runs". Handing the model both is how a cancelled
+    # 15:03 from Asker became "91 % sjanse for innstilling" (2026-08-05).
+    certain_cancelled = bool(getattr(alert, "cancelled", False))
     payload: dict[str, Any] = {
         "reise": {
             # Server-side names only — see the note above _canonical_stop_name. The fallback is the
@@ -505,17 +533,40 @@ def build_payload(journey: dict, impact: Any, alert: Any) -> dict:
         },
         "transportmiddel": getattr(alert, "mode", None),
         "avgang_kl": _hhmm(getattr(alert, "departure_time", None)),
-        "sannsynlighet_prosent": _pct(getattr(alert, "impact_probability", None)),
-        "mest_sannsynlig_innstilt": (getattr(alert, "cancel_probability", 0.0) or 0.0) >= 0.5,
-        "forsinkelse_min": {
-            "typisk": getattr(alert, "delay_p50_min", None),
-            "verstefall": getattr(alert, "delay_p90_min", None),
-        },
         "situasjoner": [s for s in situations if s["sammendrag"] or s["beskrivelse"]],
         "linjer": lines,
     }
+    if certain_cancelled:
+        payload["innstilt"] = True
+    else:
+        payload["sannsynlighet_prosent"] = _pct(getattr(alert, "impact_probability", None))
+        payload["mest_sannsynlig_innstilt"] = cancel_p >= _CANCEL_LIKELY
+        payload["forsinkelse_min"] = {
+            "typisk": getattr(alert, "delay_p50_min", None),
+            "verstefall": getattr(alert, "delay_p90_min", None),
+        }
+        # The cancellation percentage is present only when cancellation is the headline — the same
+        # bar the template wording uses to lead with it, which is why the key's presence is what
+        # `varsel._deterministic_body` branches on. Deliberately not carried below the bar: quoting a
+        # low p_cancel next to the alerting probability is exactly the 2026-07-27 regression, where a
+        # 93 % impact alert read "1 % sjanse for innstilling".
+        if payload["mest_sannsynlig_innstilt"]:
+            payload["innstilling_prosent"] = _pct(cancel_p)
 
-    alt = getattr(impact, "alternative_journey", None)
+    # The ALERT's alternative first, the response's only as a fallback. They differ, and the alert's
+    # is the right one: varsel asks the Journey Planner once per window, on the canonical stop ref
+    # (match_journey's `pair_index == 0`), then back-fills the answer onto every alert -- "the
+    # alternative is a property of the trip, not of the situation that won". So when the worst
+    # reading of a situation arrives from a collapsed ref (a station's bus side, a ferry berth's
+    # second registration -- see varsel.place_refs), the response carried on that alert was asked
+    # with with_alternative=False and has none, while the alert itself does. Reading only the
+    # response left exactly those decisions recorded as `has_alternative = true` with alt_lines and
+    # minutes saved, next to a message input with no `alternativ_reise` at all: the one advice worth
+    # giving, withheld from both the model and the template. The fallback keeps the duck-typed
+    # contract intact for callers holding a response but no alert field.
+    alt = getattr(alert, "alternative_journey", None) or getattr(
+        impact, "alternative_journey", None
+    )
     if alt is not None:
         payload["alternativ_reise"] = {
             "avgang_kl": _hhmm(alt.departure_time),
@@ -576,8 +627,8 @@ _FREE_NUMBERS = frozenset({"1", "2", "10"})
 _NUMBER_RE = re.compile(r"\d{1,2}:\d{2}|\d+")
 
 
-def _is_grounded(text: str, payload_json: str) -> bool:
-    """True when every figure in the reply also appears in the payload.
+def _is_grounded(text: str, input_json: str) -> bool:
+    """True when every figure in the reply also appears in the message input.
 
     The prompt forbids inventing numbers, but a prompt is not an enforcement mechanism and this text
     reaches a lock screen as authoritative transit advice, under Entur's name, after the alert gate
@@ -587,7 +638,7 @@ def _is_grounded(text: str, payload_json: str) -> bool:
     Percentages are allowed +/-1 because the prompt rounds them, and `_FREE_NUMBERS` covers the
     small counts ("ett av to tog") and the 10-minute bar the impact definition is stated in.
     """
-    present = set(_NUMBER_RE.findall(payload_json))
+    present = set(_NUMBER_RE.findall(input_json))
     for token in _NUMBER_RE.findall(text):
         if token in present or token in _FREE_NUMBERS:
             continue
@@ -599,21 +650,27 @@ def _is_grounded(text: str, payload_json: str) -> bool:
     return True
 
 
-def write_message(payload: dict, *, journey_key: str = "", situation_number: str = "") -> str | None:
-    """A short Norwegian message for this payload, or None when no backend could produce one.
+def write_message(
+    message_input: dict, *, journey_key: str = "", situation_number: str = ""
+) -> str | None:
+    """A short Norwegian message for this message input, or None when no backend could produce one.
 
     The text only — see :func:`write_message_detailed` for which backend wrote it and why a caller
     got None. Kept as the simple entry point because most callers only need the string.
     """
     return write_message_detailed(
-        payload, journey_key=journey_key, situation_number=situation_number
+        message_input, journey_key=journey_key, situation_number=situation_number
     ).text
 
 
 def write_message_detailed(
-    payload: dict, *, journey_key: str = "", situation_number: str = ""
+    message_input: dict, *, journey_key: str = "", situation_number: str = ""
 ) -> MessageResult:
-    """A short Norwegian message for this payload, with the provenance of the attempt.
+    """A short Norwegian message for this message input, with the provenance of the attempt.
+
+    Takes the document :func:`build_message_input` already produced rather than building its own, so
+    the prompt, the fallback wording and the recorded ``message_input`` are all the same object
+    rather than three rebuilds of it.
 
     Never raises. On a configuration-class failure the offending backend is latched off for the
     process lifetime and the next one is tried; on a transient failure this reports `error` and the
@@ -622,7 +679,7 @@ def write_message_detailed(
     global _active, _active_at
     if not llm_enabled():
         return MessageResult(None, status="disabled")
-    prompt = payload_json(payload)
+    prompt = message_input_json(message_input)
     # Why the LAST attempt failed. Overwritten per backend, so with `auto` this reports the verdict
     # on the backend that actually got to answer rather than on the one that was latched off.
     status = "unavailable"
@@ -720,7 +777,7 @@ def write_message_detailed(
                         "provider": name,
                         "journey_digest": key_digest(journey_key),
                         "situation_number": situation_number,
-                        "payload": prompt,
+                        "message_input": prompt,
                         "reply": raw,
                     }
                 },

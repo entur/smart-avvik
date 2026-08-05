@@ -600,7 +600,7 @@ def test_same_journey_on_two_devices_shares_one_impact_call_and_one_message(monk
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
     written = []
 
-    def fake_write(journey, alert, *, journey_key):
+    def fake_write(alert, *, journey_key, message_input):
         written.append(journey_key)
         return "Signalfeil ved Asker. Ta R10 kl 08:14 i stedet."
 
@@ -682,7 +682,7 @@ def test_message_writer_exception_is_contained(monkeypatch):
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
 
-    def boom(journey, alert, *, journey_key):
+    def boom(alert, *, journey_key, message_input):
         raise RuntimeError("Vertex exploded")
 
     monkeypatch.setattr(varsel, "_write_message", boom)
@@ -704,7 +704,9 @@ def test_llm_call_cap_is_respected(monkeypatch):
     monkeypatch.setattr(
         varsel,
         "_write_message",
-        lambda journey, alert, *, journey_key: written.append(journey_key) or "Skrevet melding.",
+        lambda alert, *, journey_key, message_input: (
+            written.append(journey_key) or "Skrevet melding."
+        ),
     )
 
     _register("dev-first-0001")
@@ -1045,10 +1047,10 @@ def test_decisions_are_recorded_even_when_push_is_disabled(monkeypatch):
     assert log.rows[0]["pushed"] is False
 
 
-def test_every_decision_records_the_llm_input_even_below_the_threshold(monkeypatch):
-    """The model's input is logged for decisions no message was ever written for.
+def test_every_decision_records_the_message_input_even_below_the_threshold(monkeypatch):
+    """The writer's input is logged for decisions no message was ever written for.
 
-    Those are the majority of rows -- and the ones a miss is made of. Building the payload only when
+    Those are the majority of rows -- and the ones a miss is made of. Building the input only when
     the writer runs left "what did the model see?" unanswerable for exactly them.
     """
     _reset_state()
@@ -1068,9 +1070,77 @@ def test_every_decision_records_the_llm_input_even_below_the_threshold(monkeypat
     row = next(r for r in log.rows if r["situation_number"] == "S1")
     assert row["alertworthy"] is False, "0.10 must not cross the gate -- the point of this row"
     assert row["message_status"] == "not_alertworthy"
-    payload = json.loads(row["llm_payload"])
+    payload = json.loads(row["message_input"])
     assert "reise" in payload and payload["sannsynlighet_prosent"] == 10
     assert row["prompt_version"], "the brief in force must be identifiable afterwards"
+
+
+def test_the_recorded_input_is_the_object_the_model_was_prompted_with(monkeypatch):
+    """One build per decision, shared by the prompt and the row -- not two that resemble each other.
+
+    The row used to hold an input rebuilt *after* the message was written: same code, but a second
+    pass, so nothing tied the recorded document to the one the model actually saw. Assert identity,
+    not equality -- equality is what a rebuild would also give you on a good day.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(llm_message, "llm_enabled", lambda: True)
+
+    built, prompted = [], []
+    real_build = llm_message.build_message_input
+
+    def counting(journey, impact, alert):
+        built.append(real_build(journey, impact, alert))
+        return built[-1]
+
+    monkeypatch.setattr(llm_message, "build_message_input", counting)
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda message_input, **kw: prompted.append(message_input)
+        or llm_message.MessageResult("Toget er innstilt.", provider="gemini", model="g", status="ok"),
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(built) == 1, "one build per journey definition x situation, not one per consumer"
+    assert prompted[0] is built[0], "the model must be prompted with the object that was built"
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_input"] == llm_message.message_input_json(built[0])
+
+
+def test_the_deterministic_wording_is_written_from_the_message_input(monkeypatch):
+    """The template reads the same document the model is prompted with.
+
+    That is the point of routing it through the input: a figure added for the model is available to
+    the fallback wording too, instead of the two drifting apart as one is enriched and the other
+    keeps reaching past it to the Alert.
+    """
+    import llm_message
+
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: None)  # no model wrote anything
+    monkeypatch.setattr(
+        llm_message,
+        "build_message_input",
+        lambda *a, **k: {
+            "transportmiddel": "Buss",
+            "avgang_kl": "09:30",
+            "situasjoner": [{"sammendrag": "Veiarbeid"}],
+            "forsinkelse_min": {"typisk": 4, "verstefall": 9},
+        },
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    # Every part of this body came out of the input above -- none of it off the (rail, 82 %-cancel)
+    # alert the snapshot actually produced.
+    assert sent[0]["body"] == "Veiarbeid\nBuss kl 09:30: Typisk 4–9 min forsinket"
 
 
 def test_decision_row_records_which_backend_wrote_the_message(monkeypatch):
@@ -1083,7 +1153,7 @@ def test_decision_row_records_which_backend_wrote_the_message(monkeypatch):
     log = _use_decision_log(monkeypatch)
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     monkeypatch.setattr(llm_message, "llm_enabled", lambda: True)
-    monkeypatch.setattr(llm_message, "build_payload", lambda *a, **k: {"reise": {"fra": "A"}})
+    monkeypatch.setattr(llm_message, "build_message_input", lambda *a, **k: {"reise": {"fra": "A"}})
     monkeypatch.setattr(
         llm_message,
         "write_message_detailed",
@@ -1138,26 +1208,32 @@ def test_a_deployment_with_the_llm_off_says_so(monkeypatch):
     assert row["llm_provider"] is None
 
 
-def test_a_broken_payload_costs_its_own_column_not_the_cycle(monkeypatch):
-    """One journey's awkward payload must not take the whole cycle's decision log with it -- the
+def test_a_broken_message_input_costs_its_own_column_not_the_cycle(monkeypatch):
+    """One journey's awkward input must not take the whole cycle's decision log with it -- the
     same rule alternatives.py learned when a malformed reply silently dropped every alert.
+
+    The input now backs the wording too, so this pins both halves: the column is NULL (nothing was
+    built, and the row must not claim otherwise) *and* the push still says something, from the
+    alert's own figures.
     """
     import llm_message
 
     _reset_state()
     log = _use_decision_log(monkeypatch)
-    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
 
     def boom(*a, **k):
         raise ValueError("unserialisable")
 
-    monkeypatch.setattr(llm_message, "build_payload", boom)
+    monkeypatch.setattr(llm_message, "build_message_input", boom)
     _register(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
 
     row = next(r for r in log.rows if r["situation_number"] == "S1")
-    assert row["llm_payload"] is None
+    assert row["message_input"] is None
     assert row["message"], "the decision itself is still recorded in full"
+    assert "82 % sjanse for innstilling" in sent[0]["body"], "and the push still carries a body"
 
 
 def test_ensure_table_backs_off_after_a_failure(monkeypatch):
@@ -1228,6 +1304,56 @@ def test_listing_surfaces_the_alternative_the_poller_found(monkeypatch):
     alerts = r.json()["journeys"][0]["alerts"]
     assert alerts and alerts[0]["alternative_journey"] is not None
     assert alerts[0]["alternative_journey"]["minutes_saved"] == 12
+
+
+def test_an_alternative_found_on_the_canonical_ref_reaches_a_collapsed_refs_alert(monkeypatch):
+    """The two records of "is there a faster way?" must not disagree.
+
+    varsel asks the Journey Planner once per window, on the CANONICAL stop ref (match_journey's
+    `pair_index == 0`), and back-fills the answer onto every alert. So when a situation's worst
+    reading arrives from a collapsed ref -- a station's bus side, a ferry berth registered twice --
+    that alert's own /impact response was asked with with_alternative=False and carries none.
+    Building the message input off the response recorded the decision with has_alternative=true and
+    alt_lines filled in, beside an input with no `alternativ_reise`: the advice worth giving,
+    withheld from the model and from the template both.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: None)
+    varsel.set_stop_aliases({"A2": "A"})  # place_refs("A") == ("A", "A2")
+
+    fake_alt = alternatives.AlternativeJourney(
+        departure_time=DEP, arrival_time=DEP + timedelta(minutes=25),
+        duration_min=25, minutes_saved=17,
+        legs=[alternatives.AlternativeLeg(mode="rail", line="VYG:Line:R10", public_code="R10",
+                                          from_name="Oslo S", to_name="Lillehammer")],
+    )
+    monkeypatch.setattr(impact.alternatives, "find_faster", lambda *a, **k: fake_alt)
+
+    # One situation, two trains: the canonical ref boards the milder one (so that pass matches, and
+    # is the one that spends the Journey Planner call), the collapsed ref the worse one -- which is
+    # the reading that wins, and therefore the response the alert carries.
+    _use_snapshot(
+        {
+            "S1": [
+                FakeCall("mild", "A", 1, DEP, p_cancel=0.20, p_impact_dep=0.70),
+                FakeCall("mild", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+                FakeCall("worst", "A2", 1, DEP, p_cancel=0.82, p_impact_dep=0.95),
+                FakeCall("worst", "B", 5, None, aimed_arr=DEP + timedelta(minutes=45)),
+            ]
+        }
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(_active_snapshot["value"])
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["jkey"] == "worst", "the collapsed ref's train must be the one that won"
+    assert row["has_alternative"] is True
+    payload = json.loads(row["message_input"])
+    assert payload["alternativ_reise"]["minutter_spart"] == 17, (
+        "the flat columns and the input the message was written from must agree"
+    )
 
 
 def test_departed_train_produces_no_alerts(monkeypatch):

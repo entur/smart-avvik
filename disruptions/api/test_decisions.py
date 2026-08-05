@@ -139,10 +139,29 @@ def test_no_alternative_is_recorded_as_false_not_null():
     assert "alt_minutes_saved" not in _row()
 
 
-def test_the_payload_is_stored_verbatim():
-    """Verbatim, not reconstructed: the row must stay faithful as build_payload evolves."""
-    row = _row(llm_payload='{"reise": {"fra": "Oslo S"}}')
-    assert row["llm_payload"] == '{"reise": {"fra": "Oslo S"}}'
+def test_a_certainty_is_marked_as_one():
+    """A decision on a call ET had already declared cancelled is a guaranteed `hit` that says
+    nothing about the models: both probabilities are 1.0 by construction. Unmarked, those rows would
+    let /historikk count Vy's own cancellations as the models' precision (2026-08-05).
+    """
+    class Alert(FakeAlert):
+        cancelled = True
+        impact_probability = 1.0
+        cancel_probability = 1.0
+
+    assert _row(Alert())["et_cancelled"] is True
+
+
+def test_an_ordinary_prediction_is_not_marked_a_certainty():
+    """False, not NULL: "we predicted this" has to be distinguishable from "this row predates the
+    column", or the whole precision figure has to be thrown away rather than filtered."""
+    assert _row()["et_cancelled"] is False
+
+
+def test_the_message_input_is_stored_verbatim():
+    """Verbatim, not reconstructed: the row must stay faithful as build_message_input evolves."""
+    row = _row(message_input='{"reise": {"fra": "Oslo S"}}')
+    assert row["message_input"] == '{"reise": {"fra": "Oslo S"}}'
 
 
 # ---- why the wording has the source it does ---------------------------------------------------
@@ -160,7 +179,7 @@ def test_a_row_without_llm_context_is_still_valid():
     surface — produces a valid row rather than inventing provenance.
     """
     row = _row()
-    assert row["llm_payload"] is None
+    assert row["message_input"] is None
     assert row["message_status"] is None
     assert row["decided_at"] == DECIDED.isoformat()
 
@@ -168,10 +187,10 @@ def test_a_row_without_llm_context_is_still_valid():
 # ---- the columns the /historikk API must never serve -------------------------------------------
 def test_the_row_still_carries_no_device_or_journey_id():
     """The privacy rule the table was designed around: a record of what was said about a train, not
-    of where a person commutes. llm_payload does carry origin/destination/time — which is why the
+    of where a person commutes. message_input does carry origin/destination/time — which is why the
     API redacts it, and why this check exists next to it.
     """
-    row = _row(llm_payload='{"reise": {"fra": "Oslo S", "til": "Drammen"}}')
+    row = _row(message_input='{"reise": {"fra": "Oslo S", "til": "Drammen"}}')
     assert "device_id" not in row
     assert "journey_id" not in row
 
