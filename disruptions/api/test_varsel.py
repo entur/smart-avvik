@@ -530,6 +530,48 @@ def test_push_body_drops_the_detail_when_neither_driver_is_known():
     assert body == "Signalfeil\nTog kl 08:00"
 
 
+# ---- one card per train ------------------------------------------------------------------------
+def _alert(situation, *, jkey="t1", p_impact=0.9, line="VYG:Line:R10", dep=MON_0800,
+           operator="VYG", p_cancel=0.8, **kw):
+    return Alert(
+        situation_number=situation, summary=situation, line=line, operator=operator, jkey=jkey,
+        stop_place="A", stop_order=1, departure_time=dep, cancel_probability=p_cancel,
+        delay_p50_min=None, delay_p90_min=None, impact_probability=p_impact,
+        alert_threshold=0.65, alertworthy=True, **kw,
+    )
+
+
+def test_two_notices_about_one_departure_collapse_to_the_worst():
+    kept = varsel.one_alert_per_train([_alert("S1", p_impact=0.9), _alert("S2", p_impact=0.87)])
+    assert [a.situation_number for a in kept] == ["S1"]
+
+
+def test_alerts_about_different_departures_are_kept_apart():
+    """Same line, different train; and same train ref under a different operator (bus
+    ServiceJourney jkeys repeat across codespaces, which is why operator is in the key)."""
+    later = _alert("S2", jkey="t2", dep=MON_0800 + timedelta(minutes=30))
+    other_operator = _alert("S3", operator="RUT")
+    kept = varsel.one_alert_per_train([_alert("S1"), later, other_operator])
+    assert [a.situation_number for a in kept] == ["S1", "S2", "S3"]
+
+
+def test_an_unidentifiable_alert_is_never_merged():
+    """No jkey and no line means we cannot say which train this is. One card too many is a far
+    smaller error than silently hiding an unrelated disruption."""
+    anon = [_alert("S1", jkey=None, line=None), _alert("S2", jkey=None, line=None)]
+    assert len(varsel.one_alert_per_train(anon)) == 2
+
+
+def test_the_survivor_of_a_tie_does_not_depend_on_input_order():
+    """Every reading of a declared cancellation is (1.0, 0, 1.0), so ties are now the normal case --
+    and an unstable winner would flip the card's wording, and which situation the written message
+    was cached under, on every 60 s refresh."""
+    a = _alert("S1", p_impact=1.0, p_cancel=1.0, cancelled=True)
+    b = _alert("S2", p_impact=1.0, p_cancel=1.0, cancelled=True)
+    assert varsel.one_alert_per_train([a, b])[0].situation_number == "S2"
+    assert varsel.one_alert_per_train([b, a])[0].situation_number == "S2"
+
+
 def test_push_body_states_a_declared_cancellation_instead_of_scoring_it():
     """The 2026-08-05 report. ET had already cancelled the 15:03 from Asker, and the push (and the
     card wording it) still said "91 % sjanse for innstilling" for a train the journey planner had
