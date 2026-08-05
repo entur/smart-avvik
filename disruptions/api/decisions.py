@@ -234,9 +234,12 @@ def build_row(
         "minutes_to_departure": minutes_to_departure,
         # Whether the two probabilities beside this are a prediction at all. When ET has already
         # declared the boarding call cancelled they are both 1.0 by construction
-        # (impact._cancelled_prediction), and such a row is a guaranteed `hit` that says nothing
-        # about the models. Without the flag there is no way to tell those rows apart afterwards,
-        # and /historikk's precision would quietly count Vy's own cancellations as its own skill.
+        # (impact._cancelled_prediction): the app relayed a known fact instead of forecasting one.
+        # Recorded so the log can be SEGMENTED, not filtered -- such a row is a real hit for the
+        # traveller (relaying what ET knows is most of the value; nobody reads the ET feed on their
+        # phone) and a gimme for the models, and one precision figure cannot mean both. Unmarked,
+        # the two populations are indistinguishable afterwards and the headline number drifts with
+        # the mix between them rather than with anything about the app.
         "et_cancelled": bool(getattr(alert, "cancelled", False)),
         "impact_probability": getattr(alert, "impact_probability", None),
         "cancel_probability": getattr(alert, "cancel_probability", None),
