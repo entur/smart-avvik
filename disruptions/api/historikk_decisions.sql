@@ -33,7 +33,7 @@ SELECT
   o.n_decisions, o.first_decided_at, o.last_decided_at,
   o.ever_alerted, o.first_alert_at, o.alert_lead_min,
   o.max_impact_probability, o.final_impact_probability, o.final_cancel_probability,
-  o.final_delay_p50_min, o.final_delay_p90_min, o.alert_threshold,
+  o.final_delay_p50_min, o.final_delay_p90_min, o.alert_threshold, o.et_cancelled,
   o.pushed_any, o.n_devices, o.message, o.message_source,
   o.actual_cancelled, o.actual_dep_delay_min, o.actual_trouble, o.verdict,
   -- An unresolved row is only permanently unknown once it has aged out of the labelling job's
@@ -59,7 +59,7 @@ SELECT
   g.ever_alerted, g.first_alert_at,
   TIMESTAMP_DIFF(g.departure_time, g.first_alert_at, MINUTE) AS alert_lead_min,
   g.max_impact_probability, g.final_impact_probability, g.final_cancel_probability,
-  g.final_delay_p50_min, g.final_delay_p90_min, g.alert_threshold,
+  g.final_delay_p50_min, g.final_delay_p90_min, g.alert_threshold, g.et_cancelled,
   g.pushed_any, g.n_devices, g.message, g.message_source,
   CAST(NULL AS BOOL)   AS actual_cancelled,
   CAST(NULL AS INT64)  AS actual_dep_delay_min,

@@ -129,6 +129,60 @@ body {
 .vh-count--neutral { background: #e3e6f5; }
 .vh-count--muted { background: var(--colors-greys-grey10, #ededed); color: #6b6b6b; }
 
+/* The split under the blended precision. Visually subordinate to the tiles on purpose: it explains
+   the headline figure rather than competing with it. */
+.vh-split {
+  margin-top: 1.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--colors-greys-grey10, #ededed);
+}
+
+.vh-split-head {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.vh-split-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--colors-greys-grey05, #f5f5f5);
+}
+
+.vh-split-label {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.vh-split-help {
+  margin: 0.1rem 0 0;
+  color: var(--colors-greys-grey60, #6b6b6b);
+  max-width: 34rem;
+}
+
+.vh-split-figure {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.vh-split-value {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.vh-split-hint,
+.vh-split-note {
+  margin: 0.1rem 0 0;
+  color: var(--colors-greys-grey60, #6b6b6b);
+}
+
+.vh-split-note {
+  margin-top: 0.5rem;
+}
+
 .vh-caveat {
   margin: 1rem 0 0;
   font-size: 0.8125rem;
@@ -173,6 +227,25 @@ body {
 
 .vh-mode { font-weight: 600; }
 .vh-line { color: var(--colors-greys-grey60, #6b6b6b); }
+
+.vh-card-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+/* Not a verdict — a note about what kind of decision this was. Outlined rather than filled so it
+   cannot be mistaken for the outcome chip beside it. */
+.vh-tag {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--colors-greys-grey30, #c5c5c5);
+  border-radius: 1rem;
+  color: var(--colors-greys-grey60, #6b6b6b);
+  white-space: nowrap;
+  cursor: help;
+}
 
 .vh-badge {
   font-size: 0.75rem;

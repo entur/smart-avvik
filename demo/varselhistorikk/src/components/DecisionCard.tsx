@@ -46,7 +46,20 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
             {fmtDate(decision.call_date)} kl. {fmtTime(decision.departure_time)}
           </span>
         </div>
-        <VerdictBadge decision={decision} />
+        <div className="vh-card-badges">
+          {/* Which side of the split this row is on. Without it the segmented rates at the top
+              cannot be traced back to any particular decision, and a "100 %" chip beside a train
+              looks like model skill rather than a repeated ET announcement. */}
+          {decision.et_cancelled ? (
+            <span
+              className="vh-tag"
+              title="Avgangen var allerede meldt innstilt i sanntidsdata (SIRI-ET) da vi bestemte oss. Sannsynlighetene er 1,0 per definisjon — vi videreformidlet et faktum."
+            >
+              Alt meldt i ET
+            </span>
+          ) : null}
+          <VerdictBadge decision={decision} />
+        </div>
       </header>
 
       {decision.summary ? (
