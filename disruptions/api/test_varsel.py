@@ -21,7 +21,14 @@ _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 import impact
 import main
 import varsel
-from varsel import _OSLO, _notification_payload
+from varsel import (
+    _OSLO,
+    Alert,
+    _deterministic_body,
+    _message_input,
+    _message_input_from_alert,
+    _notification_payload,
+)
 
 
 @dataclass
@@ -460,11 +467,17 @@ def test_operator_collision_not_merged():
 
 
 def _push_body(**board_kw) -> str:
-    """The Web Push body for the single match produced by a train with these boarding numbers."""
+    """The Web Push body for the single match produced by a train with these boarding numbers.
+
+    Through the real message input, not the alert directly: the deterministic wording is assembled
+    from the same document the model is prompted with, so these checks have to run over it.
+    """
     journey = _journey()
     alerts = match(journey, {"S1": _train(MON_0800, **board_kw)})
     assert len(alerts) == 1
-    return _notification_payload(journey, alerts[0])["body"]
+    message_input = _message_input(journey, alerts[0])
+    assert message_input is not None, "the wording's source must actually be buildable"
+    return _notification_payload(journey, alerts[0], message_input=message_input)["body"]
 
 
 def test_push_body_leads_with_the_alerting_score():
@@ -515,6 +528,27 @@ def test_push_body_drops_the_detail_when_neither_driver_is_known():
     assert "sjanse for innstilling" not in body and "forsinket" not in body
     # What survives is the summary and the train, so the push still says what and when.
     assert body == "Signalfeil\nTog kl 08:00"
+
+
+def test_push_body_states_a_declared_cancellation_instead_of_scoring_it():
+    """The 2026-08-05 report. ET had already cancelled the 15:03 from Asker, and the push (and the
+    card wording it) still said "91 % sjanse for innstilling" for a train the journey planner had
+    stopped offering -- so the traveller went looking for a departure that did not exist."""
+    body = _push_body(et_declared_cancelled=True, p_cancel=0.57, p_impact_dep=0.61)
+    assert body == "Signalfeil\nTog kl 08:00: Innstilt"
+    assert "%" not in body and "forsinket" not in body
+
+
+def test_the_wording_falls_back_to_the_certainty_when_the_message_input_cannot_be_built():
+    """`_message_input_from_alert` is the last-resort wording source, so it has to carry the same
+    distinction -- otherwise an llm_message failure turns a cancellation back into a percentage."""
+    alert = Alert(
+        situation_number="S1", summary="Signalfeil", line="VYG:Line:R10",
+        departure_time=MON_0800, cancelled=True, cancel_probability=1.0,
+        delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
+    )
+    body = _deterministic_body(_message_input_from_alert(alert))
+    assert body == "Signalfeil\nTog kl 08:00: Innstilt"
 
 
 def test_push_body_omits_a_missing_summary():

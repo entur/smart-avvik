@@ -94,6 +94,28 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   also suppresses it. `None` from the provider means "could not establish" — an outage, a timeout, the
   30/min rate limit that exists because the endpoint is unauthenticated — and never becomes a
   warning. Answers are cached 10 min.
+  **What ET already knows is a fact, not a forecast** (2026-08-05): when a call carries
+  `et_declared_cancelled`, `impact._cancelled_prediction` serves `cancel_probability` /
+  `impact_probability` of **1.0**, `cancelled=True` and **null delay figures** (every one of them
+  meant "if it runs"), and every wording states it — `Innstilt` in `varsel._deterministic_body` and
+  on the card, `innstilt: true` in the message input with the probability and delay keys *removed*
+  so the model cannot hedge a certainty. `_call_severity` restates the same rule (it is the matcher's
+  hot loop and cannot afford to build a `StopPrediction`), so `select="worst"` lands on the train
+  that is certainly gone. Two symptoms, one cause: Vy cancelled RE10 80323 Drammen–Skøyen and the
+  card offered "91 % sjanse for innstilling" for a 15:03 from Asker that entur.no no longer listed —
+  and the *first* cycle scored that same known-cancelled call at 0.57, under the gate, so nobody was
+  told at all. `decisions.et_cancelled` marks such rows: both probabilities are 1.0 by construction,
+  so counting them would let /historikk report Vy's cancellations as the models' precision. Note
+  `/journey` still serves the model's probability for a known-cancelled call — same defect, separate
+  contract, not yet fixed.
+  **An observation is in the past** (2026-08-05): a declared cancellation is routinely published for
+  calls the train has not reached — announcing it ahead of time is the point — so `impact._is_observed`
+  admits one only once its own time has passed, while a `recorded` call is an observation by
+  construction. Without that cut `_latest_observation`, which takes the *furthest-along* observed
+  call, chose the most distant announcement and the card read "Sist observert: Lysaker stasjon,
+  innstilt (kl 15:15)" at 14:28 — then the model repeated it, the prompt having told it the timestamp
+  is in the past. `_impact_response` takes `now` once and passes it down, so `as_of` and the cut
+  cannot straddle two instants.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
@@ -137,6 +159,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `VARSEL_LLM_LOG_PROMPTS=true` puts the full prompt/reply at DEBUG.
   - `/impact` also returns `alternative_journey` when `to_stop` is given — a faster way there from
     the Journey Planner (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no credentials).
+    The lookup runs **once per window, on the canonical stop ref** (`match_journey`'s
+    `pair_index == 0`), and `match_journey` then back-fills the answer onto every alert — "the
+    alternative is a property of the trip, not of the situation that won". So an alert whose worst
+    reading came from a *collapsed* ref carries an alternative its own `/impact` response does not,
+    and anything reading it must take it off the **Alert**, never off `alert.impact`
+    (`llm_message.build_message_input`, fixed 2026-08-05: reading the response recorded those
+    decisions as `has_alternative = true` with `alt_lines`, beside a `message_input` with no
+    `alternativ_reise` — the advice withheld from the model and the template both).
 
 - The **Varselhistorikk** page at `/historikk` (`demo/varselhistorikk/`, React + Vite + Entur
   Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered
@@ -152,11 +182,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Without those, a `miss` leaves no trace and only precision is measurable. Repeats across cycles
     are intentional — they are the lead-time series. Writing fails open: a BigQuery problem never
     blocks a push.
-  - **The row records the model's input, not just its output** (2026-08-05). `llm_payload` is the
-    exact JSON `llm_message.build_payload` produced, serialized by the shared
-    `llm_message.payload_json` so it is byte-identical to the prompt — written for **every**
+  - **The row records the writer's input, not just its output** (2026-08-05). `message_input` is the
+    exact JSON `llm_message.build_message_input` produced, serialized by the shared
+    `llm_message.message_input_json` so it is byte-identical to the prompt — written for **every**
     decision, including the sub-threshold ones no message is written for (~83 % of rows, and the
-    ones a miss is made of). Flat alongside it: the observation the prompt tells the model to quote
+    ones a miss is made of). **One document, three consumers**: the model is prompted with it,
+    `varsel._deterministic_body` words the template fallback from it, and the row stores it — the
+    same object, built once per decision in `check_and_notify`'s first loop, not rebuilt per
+    consumer. It was `llm_payload` until 2026-08-05, when the recorded copy was a *second* build
+    made after the message had already been written; a figure the wording needs therefore belongs in
+    `build_message_input` (that is why `innstilling_prosent` is there, carried only when
+    cancellation leads — quoting a low p_cancel is the 2026-07-27 regression). The rename migration
+    in `create_varsel_decisions.sql` is guarded by `INFORMATION_SCHEMA`, **not** by
+    `RENAME COLUMN IF EXISTS`: measured 2026-08-05, that form fails on the *second* run
+    ("Column already exists"), which in a file re-run at every startup means the decision log dies
+    on the next deploy. Flat alongside it: the observation the prompt tells the model to quote
     (`obs_*`) and the faster alternative (`has_alternative`, `alt_*`), so "how often do we offer
     one?" is a GROUP BY. `message_status` says why the stored wording has the source it does —
     `ok` / `ok_cached` / `not_alertworthy` / `not_selected` / `push_disabled` / `llm_disabled` /
@@ -165,7 +205,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     deterministic text. `llm_provider`/`llm_model` outlive the Cloud Logging retention that used to
     be the only record, and `prompt_version` (SHA-256[:8] of the system prompt, derived so nobody
     has to remember to bump it) keeps rows written under different briefs comparable.
-    `llm_payload` carries origin, destination and departure time together — the trio
+    `message_input` carries origin, destination and departure time together — the trio
     `/historikk-api` redacts — so it must never enter the API's SELECT; `Decision` is
     `extra="forbid"`, which fails loudly if it does.
   - Both tables and the `varsel_decision_groups` view are created by the app at startup
