@@ -101,8 +101,16 @@ class StopPrediction(BaseModel):
     scheduled_time: datetime | None = Field(
         description="Aimed departure (departure_prediction) or arrival (arrival_prediction), UTC.",
     )
+    cancelled: bool = Field(
+        default=False,
+        description="ET has ALREADY declared this call cancelled — a fact about the timetable, not "
+        "a model output. When true the train does not serve this stop, `cancel_probability` and "
+        "`impact_probability` are 1.0, and every delay field is null (they all mean 'if it runs'). "
+        "A traveller-facing wording must state the cancellation, never quote a probability for it.",
+    )
     cancel_probability: float = Field(
-        description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1.",
+        description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1; "
+        "exactly 1.0 when `cancelled` says ET has already declared it.",
     )
     delay_typ_min: int | None = Field(description="Typical delay (min) at this stop if the train runs.")
     delay_p90_min: int | None = Field(
@@ -270,8 +278,47 @@ class TripCell:
     line_calls: tuple = ()
 
 
+def _certainly_cancelled(c: CallPred) -> bool:
+    """ET has already declared this call cancelled: it is a fact about the timetable, not a forecast.
+
+    The one place the distinction is named, so the three readers of it — the two predictions below,
+    and `_call_severity`'s cheap restatement of their ordering — cannot drift apart.
+    """
+    return bool(c.et_declared_cancelled)
+
+
+def _cancelled_prediction(c: CallPred, scheduled: datetime | None) -> StopPrediction:
+    """The prediction for a call ET has already declared cancelled.
+
+    Certainty *replaces* the model's scores rather than sitting beside them. The train does not
+    serve this stop, so P(cancelled) is 1, the alerting score is 1, and every delay figure is
+    dropped — each one means "if it runs", and this one does not.
+
+    Both halves of that mattered on 2026-08-05, when Vy cancelled RE10 80323 Drammen–Skøyen: the
+    cancellation of the 15:03 from Asker was sitting in our own cache as `et_declared_cancelled`,
+    and the card still read "91 % sjanse for innstilling" for a departure the journey planner had
+    already stopped offering. Worse, the first cycle scored the same known-cancelled call at 0.57 —
+    *below* the alert gate — so a traveller was not told about a train we knew was gone.
+    """
+    return StopPrediction(
+        stop_place=c.stop_place,
+        stop_name=c.stop_name,
+        stop_order=c.stop_order,
+        scheduled_time=scheduled,
+        cancelled=True,
+        cancel_probability=1.0,
+        delay_typ_min=None,
+        delay_p90_min=None,
+        delay_p50_min=None,
+        ge10_probability=None,
+        impact_probability=1.0,
+    )
+
+
 def _departure_prediction(c: CallPred) -> StopPrediction:
     """Boarding-stop prediction: cancellation chance + departure delay at this call."""
+    if _certainly_cancelled(c):
+        return _cancelled_prediction(c, c.aimed_dep)
     return StopPrediction(
         stop_place=c.stop_place,
         stop_name=c.stop_name,
@@ -292,6 +339,8 @@ def _departure_prediction(c: CallPred) -> StopPrediction:
 
 def _arrival_prediction(c: CallPred) -> StopPrediction:
     """Alighting-stop prediction: cancellation chance + arrival delay at this call."""
+    if _certainly_cancelled(c):
+        return _cancelled_prediction(c, c.aimed_arr)
     return StopPrediction(
         stop_place=c.stop_place,
         stop_name=c.stop_name,
@@ -335,7 +384,16 @@ def _worst(preds: list[StopPrediction | None]) -> StopPrediction | None:
 
 
 def _call_severity(c: CallPred) -> tuple[float, int, float]:
-    """:func:`severity_key` on a raw boarding call, for the `worst` selection strategy."""
+    """:func:`severity_key` on a raw boarding call, for the `worst` selection strategy.
+
+    Deliberately not `severity_key(_departure_prediction(c))`: this runs once per candidate call in
+    the matcher's inner loop, and building a pydantic model there is what the 2026-07-29 O(calls x
+    lines) fix was about. The cost of the shortcut is that it has to restate the certainty rule —
+    a call ET has already declared cancelled scores exactly what `_cancelled_prediction` gives it,
+    so a known-cancelled train outranks any forecast and is the one the alert is about.
+    """
+    if _certainly_cancelled(c):
+        return (1.0, 0, 1.0)
     p90 = (
         c.dep_delay_p90_stack_min
         if c.dep_delay_p90_stack_min is not None
@@ -482,23 +540,46 @@ def _trip_cells(
     return cells
 
 
-def _is_observed(c: CallPred) -> bool:
-    """True when ET has told us something about this call rather than us predicting it: the vehicle
-    has served the stop ('recorded'), or ET has already declared the call cancelled."""
-    return c.call_source == "recorded" or bool(c.et_declared_cancelled)
-
-
 def _call_ts(c: CallPred) -> datetime | None:
     return c.aimed_dep or c.aimed_arr
 
 
-def _latest_observation(cells: list[TripCell]) -> LatestObservation | None:
+def _is_observed(c: CallPred, now: datetime) -> bool:
+    """True when ET has told us something about this call rather than us predicting it.
+
+    Two ways that happens, and only one of them is time-free. A `recorded` call is one the vehicle
+    has actually served, so it is an observation by construction. A declared cancellation is not:
+    operators publish it for calls the train has NOT reached yet — announcing "innstilt
+    Drammen–Skøyen" ahead of time is the entire point of the message — so it becomes an observation
+    only once its own time has passed.
+
+    Without that cut, an announcement was rendered as a sighting. On 2026-08-05 the card read
+    "Sist observert: Lysaker stasjon, innstilt (kl 15:15)" at 14:28 — a stop 47 minutes in the
+    future, chosen precisely *because* `_latest_observation` takes the furthest-along call. The
+    model then repeated it, having been told by the prompt that the timestamp is in the past.
+
+    An upcoming cancellation is not lost by this; it is reported where a fact about the future
+    belongs, as a certainty on the prediction itself (:func:`_cancelled_prediction`).
+    """
+    if c.call_source == "recorded":
+        return True
+    ts = _call_ts(c)
+    return bool(c.et_declared_cancelled) and ts is not None and ts <= now
+
+
+def _latest_observation(cells: list[TripCell], *, now: datetime | None = None) -> LatestObservation | None:
     """The furthest-along observed call across `cells`, or None when nothing has been observed.
 
     Prefers an observation on the traveller's own selected train — "your train is 18 min late at
     Asker" is more actionable than the same fact about a different service — and falls back to the
     line as a whole, which is what matters when their own train has not started yet.
+
+    `now` is the cut that keeps an observation in the past (see :func:`_is_observed`); it defaults to
+    the current time and is passed explicitly by :func:`_impact_response` so one response cannot
+    straddle two instants.
     """
+    if now is None:
+        now = datetime.now(UTC)
     own = [c for cell in cells for c in cell.calls]
     line = [c for cell in cells for c in cell.line_calls]
     for pool in (own, line):
@@ -508,7 +589,7 @@ def _latest_observation(cells: list[TripCell]) -> LatestObservation | None:
         observed = [
             c
             for c in pool
-            if _is_observed(c)
+            if _is_observed(c, now)
             and _call_ts(c) is not None
             and (c.et_dep_delay_min is not None or c.et_declared_cancelled)
         ]
@@ -536,12 +617,18 @@ def _impact_response(
     to_stop: str | None,
     refreshed_at: datetime | None,
     alternative_journey: AlternativeJourney | None,
+    now: datetime | None = None,
 ) -> ImpactResponse:
     """Roll trip cells up into the two views the response exposes.
 
     Extracted from the endpoint so /varsel-api gets the same shaping (and the same severity order)
     through the in-process provider that an HTTP caller gets.
+
+    `now` is read twice — as the response's `as_of` and as the cut that keeps a `latest_observation`
+    in the past — so it is taken once here rather than sampled per use.
     """
+    if now is None:
+        now = datetime.now(UTC)
     # situations: roll cells up per situation (worst-case over that situation's lines).
     by_sit: dict[str, list[TripCell]] = {}
     for cell in cells:
@@ -578,14 +665,14 @@ def _impact_response(
             operator=group[0].operator,
             departure_prediction=_worst([c.departure for c in group]),
             arrival_prediction=_worst([c.arrival for c in group]),
-            latest_observation=_latest_observation(group),
+            latest_observation=_latest_observation(group, now=now),
         )
         for line, group in by_line.items()
     ]
     lines.sort(key=lambda x: severity_key(x.departure_prediction), reverse=True)
 
     return ImpactResponse(
-        as_of=datetime.now(UTC),
+        as_of=now,
         refreshed_at=refreshed_at,
         from_stop=from_stop,
         to_stop=to_stop,
@@ -647,6 +734,7 @@ def for_trip(
     """
     if _snapshot_provider is None:
         raise RuntimeError("impact.configure(snapshot_provider=...) was never called")
+    now = datetime.now(UTC)
     by_situation, refreshed_at = _snapshot_provider()
     if situation is not None:
         calls = by_situation.get(situation)
@@ -675,7 +763,7 @@ def for_trip(
             # past instant returns "alternatives" that have already left.
             worst_dep = _worst([c.departure for c in cells])
             anchor = (worst_dep.scheduled_time if worst_dep else None) or window_start
-            depart_after = max(anchor, datetime.now(UTC))
+            depart_after = max(anchor, now)
             alternative = alternatives.find_faster(
                 from_stop,
                 to_stop,
@@ -691,5 +779,6 @@ def for_trip(
         to_stop=to_stop,
         refreshed_at=refreshed_at,
         alternative_journey=alternative,
+        now=now,
     )
 

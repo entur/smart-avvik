@@ -28,14 +28,17 @@ Design notes
   by design and the labelling job writes a *separate* outcomes table.
 * **Privacy.** `journey_digest` (shared with :func:`llm_message.key_digest` so the two records
   join) plus a device count. No device_id, no journey_id, no time window, no weekday pattern.
-  `llm_payload` is the one field that carries origin, destination and departure time together — it
-  is what the model was shown, so it cannot be redacted here without defeating the purpose — which
+  `message_input` is the one field that carries origin, destination and departure time together — it
+  is what the writer was shown, so it cannot be redacted here without defeating the purpose — which
   is why `/historikk-api` serves neither it nor `from_stop`/`to_stop`.
-* **Everything the model saw, for every decision.** The row records the LLM's input, not just its
-  output: the payload verbatim, the observation and alternative quoted inside it, which backend
+* **Everything the writer saw, for every decision.** The row records the input, not just its
+  output: the document verbatim, the observation and alternative quoted inside it, which backend
   answered, and `message_status` — why the stored wording has the source it does. A deterministic
   row can mean the LLM is off, the cycle hit its cap, the retry gave up or the model refused, and
   those are four different problems that used to look identical once written down.
+  `message_input` is the same object the message was actually written from
+  (`llm_message.build_message_input`, serialized by `llm_message.message_input_json`) — the model's
+  prompt and, when no model wrote anything, the deterministic template's source too.
 """
 
 from __future__ import annotations
@@ -125,7 +128,7 @@ def _iso(when: datetime | None) -> str | None:
 def _alternative_fields(alert: Alert) -> dict:
     """The faster-journey suggestion as flat columns: present?, how much better, when, which lines.
 
-    The full object is in `llm_payload`; these exist so "how often do we actually offer one, and is
+    The full object is in `message_input`; these exist so "how often do we actually offer one, and is
     it any good?" is a GROUP BY rather than a JSON scrape. Measured 2026-08-04, the answer today is
     "effectively never" — which is only visible because it is recorded.
     """
@@ -149,7 +152,7 @@ def _alternative_fields(alert: Alert) -> dict:
 def _observation_fields(alert: Alert) -> dict:
     """What had actually been observed on the line — the one payload item the model is told to quote.
 
-    Stored flat as well as inside `llm_payload` because this is the claim a traveller-facing message
+    Stored flat as well as inside `message_input` because this is the claim a traveller-facing message
     makes about the real world ("kl. 17:40 var avgangen innstilt ved …"), and checking it against
     what happened is the whole point of the log. `obs_observed_at` carries the observation's own age:
     the source is rebuilt on a 60/120-minute TTL, so "latest" can be an hour old.
@@ -174,7 +177,7 @@ def build_row(
     pushed: bool,
     message: str | None,
     message_source: str,
-    llm_payload: str | None = None,
+    message_input: str | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
     message_status: str | None = None,
@@ -190,11 +193,11 @@ def build_row(
     otherwise the same deterministic body the push carried. `message_source` says which, because
     the two are indistinguishable once stored, and prd runs with the LLM off.
 
-    `llm_payload` is the exact JSON document the message was (or would have been) written from —
-    verbatim, not a reconstruction, so it stays faithful as `llm_message.build_payload` evolves.
-    It is the only field here that records the model's *input*; everything else describes the
-    decision. Note it is this cycle's input: when `message_status` is `ok_cached` the text beside it
-    was written from an earlier cycle's payload, whose figures were fresher then than these are now.
+    `message_input` is the exact JSON document the message was (or would have been) written from —
+    verbatim, not a reconstruction, so it stays faithful as `llm_message.build_message_input`
+    evolves. It is the only field here that records the writer's *input*; everything else describes
+    the decision. Note it is this cycle's input: when `message_status` is `ok_cached` the text beside
+    it was written from an earlier cycle's input, whose figures were fresher then than these are now.
 
     The keyword arguments default to None so a caller that has no LLM context — a test, a future
     surface — still produces a valid row rather than needing to fake provenance it does not have.
@@ -208,7 +211,7 @@ def build_row(
     return {
         **_observation_fields(alert),
         **_alternative_fields(alert),
-        "llm_payload": llm_payload,
+        "message_input": message_input,
         "llm_provider": llm_provider,
         "llm_model": llm_model,
         "message_status": message_status,
@@ -229,6 +232,12 @@ def build_row(
         "stop_order": getattr(alert, "stop_order", None),
         "departure_time": departure.isoformat() if departure is not None else None,
         "minutes_to_departure": minutes_to_departure,
+        # Whether the two probabilities beside this are a prediction at all. When ET has already
+        # declared the boarding call cancelled they are both 1.0 by construction
+        # (impact._cancelled_prediction), and such a row is a guaranteed `hit` that says nothing
+        # about the models. Without the flag there is no way to tell those rows apart afterwards,
+        # and /historikk's precision would quietly count Vy's own cancellations as its own skill.
+        "et_cancelled": bool(getattr(alert, "cancelled", False)),
         "impact_probability": getattr(alert, "impact_probability", None),
         "cancel_probability": getattr(alert, "cancel_probability", None),
         "ge10_probability": getattr(alert, "ge10_probability", None),

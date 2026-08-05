@@ -35,6 +35,12 @@ Design notes
   Gemini fallback) from the enriched ``/impact`` payload — the situation's own words, what has been
   observed on the line, and any faster alternative. It phrases the alert; it never decides it. Every
   failure path falls back to :func:`_deterministic_body`, the previous template wording.
+* **One message input per decision, built once** (:func:`_message_input`, from
+  ``llm_message.build_message_input``). The model is prompted with it, :func:`_deterministic_body`
+  words the fallback from it, and the decision log records it — so the row says what the writer was
+  actually shown, and a figure added for one of the three is available to all of them. It is built
+  for *every* matched situation, not just the alert-worthy ones, because a decision with no
+  recorded input cannot be re-examined and those rows are the majority.
 * **Push gate** — a match is *pushed* only when the worst matching train crosses the same
   production alert threshold used by ``/demo`` and eval (``P(cancelled OR ≥10 min late) ≥ 0.65``,
   per-operator cuts in :data:`_OPERATOR_ALERT_THRESHOLD`), so trivial flags don't spam the phone.
@@ -98,6 +104,11 @@ TROUBLE_DELAY_MIN = 10
 # Above this cancellation probability the wording leads with "mest sannsynlig innstilt" instead of
 # the delay interval: when the train probably isn't running, a predicted delay is beside the point
 # (bus alerts are mostly cancellation-driven, rail alerts mostly delay-driven).
+#
+# The bar itself now lives in `llm_message._CANCEL_LIKELY`, which decides whether the message input
+# carries `innstilling_prosent` at all -- and that key's presence is what _deterministic_body reads.
+# Restated here, not imported, because the only caller left is _message_input_from_alert, whose whole
+# job is to produce a usable input when llm_message is the thing that failed.
 _CANCEL_LIKELY = 0.5
 
 # Per-operator alert threshold overrides (default _ALERT_THRESHOLD). The pooled bus family is
@@ -740,6 +751,12 @@ class Alert(BaseModel):
         description="When this match was evaluated (UTC). With `departure_time` it gives the lead "
         "time the decision was made at, which is the axis alerting quality varies along most.",
     )
+    cancelled: bool = Field(
+        default=False,
+        description="ET has ALREADY declared this boarding call cancelled — the train is not "
+        "running, as a fact rather than a prediction. The wording states it ('Innstilt') instead of "
+        "quoting `cancel_probability`, which is then 1.0 by construction.",
+    )
     cancel_probability: float = Field(description="Calibrated P(the train is cancelled), 0-1.")
     delay_p50_min: int | None = Field(
         description="Median departure delay (min) if it runs, from the calibrated exceedance stack "
@@ -876,6 +893,7 @@ def _collect_alerts(
             stop_place=dep.stop_place,
             stop_order=dep.stop_order,
             decided_at=now,
+            cancelled=dep.cancelled,
             cancel_probability=dep.cancel_probability,
             delay_p50_min=_typ_delay(dep),
             delay_p90_min=dep.delay_p90_min,
@@ -904,10 +922,11 @@ def _alert_severity(alert: Alert) -> tuple[float, int, float]:
 
 
 # ---- Notify ----------------------------------------------------------------------------------
-def _delay_phrase(alert: Alert) -> str | None:
+def _delay_phrase(message_input: dict) -> str | None:
     """"typisk 15–27 min forsinket" from the exceedance-stack interval (p50–p90, /demo's delay
     column); collapsed to one number when they coincide, None when neither is known."""
-    p50, p90 = alert.delay_p50_min, alert.delay_p90_min
+    delay = message_input.get("forsinkelse_min") or {}
+    p50, p90 = delay.get("typisk"), delay.get("verstefall")
     if not p50 and not p90:
         return None
     if p50 and p90 and p90 > p50:
@@ -915,27 +934,44 @@ def _delay_phrase(alert: Alert) -> str | None:
     return f"Typisk {p90 or p50} min forsinket"
 
 
-def _deterministic_body(alert: Alert) -> str:
+def _deterministic_body(message_input: dict) -> str:
     """The template wording: what the push says when no written message is available.
+
+    Written from the same message input the model is prompted with (llm_message.build_message_input)
+    rather than from the Alert directly, so the two wordings are always built from one set of facts.
+    Adding a figure to the input is what makes it sayable by both; before this, enriching the
+    template meant reaching past the document the model had already been handed.
 
     Every part is optional, so the body is assembled from the ones that exist rather than
     interpolated blind. A pushed alert is gated on `impact_probability`, which comes off the
-    exceedance head and not off these columns: `p_cancel` can sit under `_CANCEL_LIKELY` while both
-    delay percentiles are NULL, and `summary` is nullable too. Interpolating either unguarded put the
-    literal string "None" in a notification body. Dropping the part is the honest fallback -- with a
-    departure time present (the matcher needs one, so in practice there always is) the reader still
-    gets which train, and the payload title still names the journey.
+    exceedance head and not off these columns: `p_cancel` can sit under the cancellation bar (so the
+    input carries no `innstilling_prosent`) while both delay percentiles are NULL, and `sammendrag`
+    is nullable too. Interpolating either unguarded put the literal string "None" in a notification
+    body. Dropping the part is the honest fallback -- with a departure time present (the matcher
+    needs one, so in practice there always is) the reader still gets which train, and the payload
+    title still names the journey.
     """
-    detail = (
-        f"{round(alert.cancel_probability * 100)} % sjanse for innstilling"
-        if alert.cancel_probability >= _CANCEL_LIKELY
-        else _delay_phrase(alert)
-    )
-    if alert.departure_time is not None:
-        hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-        train = f"{alert.mode} kl {hhmm}"
+    situations = message_input.get("situasjoner") or []
+    summary = situations[0].get("sammendrag") if situations else None
+    # `innstilling_prosent` is in the input only when cancellation is the most likely outcome, which
+    # is exactly when the wording should lead with it -- see llm_message.build_message_input.
+    cancel_pct = message_input.get("innstilling_prosent")
+    if message_input.get("innstilt"):
+        # ET has already declared this departure cancelled. State it. A probability here would be
+        # both wrong and unhelpful: the train is not in the journey planner any more, so "91 %
+        # sjanse for innstilling" sends the traveller looking for a departure that does not exist
+        # (2026-08-05). The input carries no delay figures in this case either -- they meant
+        # "if it runs".
+        detail = "Innstilt"
+    elif cancel_pct is not None:
+        detail = f"{cancel_pct} % sjanse for innstilling"
+    else:
+        detail = _delay_phrase(message_input)
+    hhmm = message_input.get("avgang_kl")
+    if hhmm:
+        train = f"{message_input.get('transportmiddel')} kl {hhmm}"
         detail = f"{train}: {detail}" if detail else train
-    return "\n".join(part for part in (alert.summary, detail) if part)
+    return "\n".join(part for part in (summary, detail) if part)
 
 
 def _tag_environment(title: str) -> str:
@@ -951,19 +987,25 @@ def _tag_environment(title: str) -> str:
     return f"[{env}] {title}" if env else title
 
 
-def _notification_payload(journey: dict, alert: Alert, message: str | None = None) -> dict:
+def _notification_payload(
+    journey: dict, alert: Alert, message: str | None = None, *, message_input: dict | None = None
+) -> dict:
     """Norwegian Web Push payload for one journey×situation match.
 
     `message` is the LLM-written text when one was produced; the deterministic template is used
     otherwise, so a missing or failing message writer costs wording, never the notification. The
     title, url and situation_number are unchanged either way — the notification stays recognisable
     and the service worker's click-through keeps working.
+
+    `message_input` is this decision's message input (see :func:`_message_input`); `None` means it
+    could not be built, and the template falls back to reconstructing the little of it the wording
+    needs from the alert — a push must not be lost to a payload problem.
     """
     from_name = journey.get("from_name") or journey["from_stop"]
     to_name = journey.get("to_name") or journey["to_stop"]
     return {
         "title": _tag_environment(f"Avvik: {from_name} → {to_name}"),
-        "body": message or _deterministic_body(alert),
+        "body": message or _deterministic_body(message_input or _message_input_from_alert(alert)),
         "url": "/varsel/",
         "situation_number": alert.situation_number,
     }
@@ -1067,8 +1109,13 @@ def _remember_message_meta(
             meta["model"] = model
 
 
-def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | None:
+def _write_message(alert: Alert, *, journey_key: str, message_input: dict | None) -> str | None:
     """The LLM-written body for this journey × situation, or None to use the template wording.
+
+    Takes the message input this cycle already built rather than building its own, so what the model
+    is prompted with is the same object the decision log records and the template wording is
+    assembled from. `None` means it could not be built — there is nothing to prompt with, and the
+    caller falls back the same way it does for every other failure here.
 
     Wraps :mod:`llm_message` so that nothing it can do — an unconfigured project, an unavailable
     model, a timeout, an unexpected exception — reaches the notification path. The import is local
@@ -1078,14 +1125,15 @@ def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | No
     message key: it is knowable only here, and the stored message cannot be reverse-engineered into
     it — every failure mode ends up as the same deterministic wording.
     """
+    if message_input is None:
+        return None  # _message_input already logged why
     try:
         import llm_message
 
         if not llm_message.llm_enabled():
             return None
-        payload = llm_message.build_payload(journey, alert.impact, alert)
         result = llm_message.write_message_detailed(
-            payload, journey_key=journey_key, situation_number=alert.situation_number
+            message_input, journey_key=journey_key, situation_number=alert.situation_number
         )
         _remember_message_meta(
             _message_key(journey_key, alert),
@@ -1103,28 +1151,81 @@ def _write_message(journey: dict, alert: Alert, *, journey_key: str) -> str | No
         return None
 
 
-def _llm_input(journey: dict, alert: Alert) -> str | None:
-    """The exact JSON that was (or would have been) handed to the model for this decision.
+def _message_input(journey: dict, alert: Alert) -> dict | None:
+    """Everything a message about this decision is written from — see build_message_input.
 
     Built for **every** decision, including the sub-threshold ones the writer is never asked about:
-    "what did the model see?" is unanswerable for a row that has no payload, and those rows are the
-    majority. Cheap enough to do unconditionally — `build_payload` is pure apart from an in-memory
-    stop-name lookup, and the alert already carries the `/impact` response it reads.
+    "what did the model see?" is unanswerable for a row that has no input, and those rows are the
+    majority. Cheap enough to do unconditionally — `build_message_input` is pure apart from an
+    in-memory stop-name lookup, and the alert already carries the `/impact` response it reads.
 
     Guarded on its own rather than inside the caller's blanket try: one journey with an awkward
-    payload must cost that journey's payload, not the whole cycle's decision log.
+    payload must cost that journey's input, not the whole cycle's decision log. `None` is recorded
+    as a NULL `message_input`, because a row must not claim the writer was shown a document that was
+    never built.
     """
     try:
         import llm_message
 
-        return llm_message.payload_json(
-            llm_message.build_payload(journey, alert.impact, alert)
-        )
+        return llm_message.build_message_input(journey, alert.impact, alert)
     except Exception:
         logger.warning(
-            "Could not build the LLM input for a decision; recording it without one",
+            "Could not build the message input for a decision; recording it without one",
             exc_info=True,
-            extra={"fields": {"event": "varsel_decision_write", "result": "no_payload"}},
+            extra={"fields": {"event": "varsel_decision_write", "result": "no_message_input"}},
+        )
+        return None
+
+
+def _message_input_from_alert(alert: Alert) -> dict:
+    """The alert's own figures in the message-input shape — a last resort for the *wording* only.
+
+    The message input now backs the push itself and not just the prompt and the log, so "could not
+    build it" may no longer mean "no wording". This restates the handful of keys
+    :func:`_deterministic_body` reads, straight off the Alert, using nothing from
+    :mod:`llm_message` — which is the module that has just failed when this is reached.
+
+    Never recorded and never prompted with: it was not what any writer was shown, and a decision row
+    claiming otherwise would be worse than one with a NULL input.
+    """
+    body: dict[str, Any] = {
+        "transportmiddel": alert.mode,
+        "avgang_kl": (
+            alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
+            if alert.departure_time is not None
+            else None
+        ),
+        "situasjoner": [{"sammendrag": alert.summary}],
+    }
+    # Same three-way split as build_message_input, for the same reason: a declared cancellation is
+    # not a probability, and the conditional figures below it do not apply once the train is gone.
+    if alert.cancelled:
+        body["innstilt"] = True
+        return body
+    body["forsinkelse_min"] = {"typisk": alert.delay_p50_min, "verstefall": alert.delay_p90_min}
+    if alert.cancel_probability >= _CANCEL_LIKELY:
+        body["innstilling_prosent"] = round(alert.cancel_probability * 100)
+    return body
+
+
+def _message_input_json(message_input: dict | None) -> str | None:
+    """This decision's message input as the exact bytes the model was (or would have been) sent.
+
+    The same serializer the writer uses, so the recorded column is byte-identical to the prompt
+    rather than a document that merely resembles it. Guarded for the same reason
+    :func:`_message_input` is: a value that will not serialize costs its own column, not the cycle.
+    """
+    if message_input is None:
+        return None
+    try:
+        import llm_message
+
+        return llm_message.message_input_json(message_input)
+    except Exception:
+        logger.warning(
+            "Could not serialize the message input for a decision; recording it without one",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_decision_write", "result": "no_message_input"}},
         )
         return None
 
@@ -1134,6 +1235,7 @@ def _record_decisions(
     alerts_by_key: dict[str, list[Alert]],
     journeys: list[tuple[str, dict]],
     pushed_keys: set[tuple[str, str]],
+    message_inputs: dict[tuple[str, str, str], dict | None],
     *,
     push_on: bool,
 ) -> None:
@@ -1185,8 +1287,12 @@ def _record_decisions(
                 # holds LLM output, so storing it raw left every deterministic push with a NULL
                 # message — and prd runs with VARSEL_LLM_ENABLED=false, so /historikk there would
                 # have shown no message text at all. Fall back to the same deterministic body
-                # _notification_payload puts in the push, and say which one it was.
-                message = written or _deterministic_body(alert)
+                # _notification_payload puts in the push -- from the same input, so the two agree by
+                # construction rather than by two template copies -- and say which one it was.
+                message_input = message_inputs.get(message_key)
+                message = written or _deterministic_body(
+                    message_input or _message_input_from_alert(alert)
+                )
                 rows.append(
                     decisions.build_row(
                         journey,
@@ -1196,7 +1302,7 @@ def _record_decisions(
                         pushed=(key, alert.situation_number) in pushed_keys,
                         message=message,
                         message_source="llm" if written else "deterministic",
-                        llm_payload=_llm_input(journey, alert),
+                        message_input=_message_input_json(message_input),
                         llm_provider=meta.get("provider"),
                         llm_model=meta.get("model"),
                         message_status=status,
@@ -1280,6 +1386,11 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         by_journey_key.setdefault(journey_key(journey), journey)
 
     alerts_by_key: dict[str, list[Alert]] = {}
+    # What every message about this cycle's decisions is written from, one per journey definition x
+    # situation. Built here, before any wording exists, so the prompt, the deterministic fallback and
+    # the recorded row all read the same document rather than three separate builds of it. Local to
+    # the cycle: unlike `_messages` it describes this tick's numbers and must not outlive them.
+    message_inputs: dict[tuple[str, str, str], dict | None] = {}
     llm_calls = 0
     # Wall-clock budget, not just a call count. _MAX_LLM_CALLS_PER_CYCLE caps journeys, but one
     # "call" can be two backend attempts (a refusal or an unparseable reply falls through to the
@@ -1302,6 +1413,8 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             alerts_by_key[key] = []
             continue
         alerts_by_key[key] = alerts
+        for alert in alerts:
+            message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
         worst = next((a for a in alerts if a.alertworthy), None)
         if worst is None or not push_on:
             # No message writing without push: the text exists to be delivered, and the decision is
@@ -1345,7 +1458,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         # raiser is subject to the same give-up rule as a None. Delivery is unaffected either way:
         # loop 2 pushes independently and falls back to the deterministic wording.
         try:
-            message = _write_message(journey, worst, journey_key=key)
+            message = _write_message(
+                worst, journey_key=key, message_input=message_inputs.get(message_key)
+            )
         except Exception:
             logger.warning(
                 "Written-message step raised for %s; using the deterministic wording",
@@ -1395,9 +1510,12 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         """One device's pending alerts, in order, stopping at a dead subscription."""
         out = []
         for jid, device, journey, alert, key in items:
+            message_key = _message_key(key, alert)
             with _state_lock:
-                message = _messages.get(_message_key(key, alert))
-            payload = _notification_payload(journey, alert, message)
+                message = _messages.get(message_key)
+            payload = _notification_payload(
+                journey, alert, message, message_input=message_inputs.get(message_key)
+            )
             result = _send_push(device, payload)
             out.append((jid, journey, alert, result, payload))
             if result == "gone":
@@ -1426,7 +1544,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                     _drop_device(journey["device_id"])
                     changed = True
 
-    _record_decisions(by_journey_key, alerts_by_key, journeys, pushed_keys, push_on=push_on)
+    _record_decisions(
+        by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
+    )
 
     if changed:
         _save_state()
