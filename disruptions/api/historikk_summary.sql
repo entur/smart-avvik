@@ -12,9 +12,18 @@
 -- SX message flagged, and only on journeys somebody registered, so trouble that never produced an
 -- SX message is invisible to this table. It is recall among SX-flagged calls on registered
 -- journeys. The UI states this next to the number.
+--
+-- The same window is ALSO reported split two ways, because one figure cannot answer both questions
+-- the page is asked. A decision on a call SIRI-ET had already declared cancelled relayed a fact:
+-- both probabilities were 1.0 by construction, and the verdict is a gimme for the models but a real
+-- hit for the traveller, who is not carrying the ET feed on their phone. So:
+--   * blended  — did the app tell the truth? Includes the relayed ones, and should.
+--   * predicted — did we see it coming? Excludes them.
+-- Neither is quoted alone. The blended figure moves with the MIX of the two populations, so it can
+-- swing with nothing about the app having changed; the page shows the mix beside it for that reason.
 WITH labelled AS (
   SELECT
-    verdict, alert_lead_min, actual_trouble,
+    verdict, alert_lead_min, actual_trouble, et_cancelled,
     -- Same split as historikk_decisions.sql: an unresolved row inside the labelling job's 10-day
     -- retry window is still waiting, not permanently unknown. Keeping the two in step matters --
     -- the page shows this count next to the per-row state, and they must tell the same story.
@@ -71,5 +80,47 @@ SELECT
   -- parse -- which would have made this whole endpoint a permanent 503.
   APPROX_QUANTILES(IF(verdict = 'hit', alert_lead_min, NULL), 2 IGNORE NULLS)[SAFE_OFFSET(1)]
     AS median_lead_min_on_hits,
-  COUNTIF(verdict = 'hit' AND alert_lead_min >= 30) AS n_hit_with_30min_notice
+  COUNTIF(verdict = 'hit' AND alert_lead_min >= 30) AS n_hit_with_30min_notice,
+
+  -- ---- the same rows, segmented ---------------------------------------------------------------
+  -- Nothing is dropped: every labelled verdict above lands in exactly one of the three buckets
+  -- below. `IS FALSE` / `IS TRUE` rather than `=` so the NULLs fall through to n_unsegmented
+  -- instead of silently vanishing from both segments -- `et_cancelled = FALSE` is NULL, not TRUE,
+  -- for a row that predates the column, and COUNTIF counts only TRUE.
+  --
+  -- MODEL SKILL: the trouble we actually forecast. What a threshold should be tuned on.
+  COUNTIF(et_cancelled IS FALSE AND verdict = 'hit')            AS n_hit_predicted,
+  COUNTIF(et_cancelled IS FALSE AND verdict = 'false_alarm')    AS n_false_alarm_predicted,
+  COUNTIF(et_cancelled IS FALSE AND verdict = 'miss')           AS n_miss_predicted,
+  COUNTIF(et_cancelled IS FALSE AND verdict = 'correct_reject') AS n_correct_reject_predicted,
+  SAFE_DIVIDE(
+    COUNTIF(et_cancelled IS FALSE AND verdict = 'hit'),
+    COUNTIF(et_cancelled IS FALSE AND verdict IN ('hit', 'false_alarm'))
+  ) AS precision_predicted,
+  SAFE_DIVIDE(
+    COUNTIF(et_cancelled IS FALSE AND verdict = 'hit'),
+    COUNTIF(et_cancelled IS FALSE AND verdict IN ('hit', 'miss'))
+  ) AS recall_predicted,
+
+  -- RELAYED: ET had already declared the cancellation when we decided. Precision here should sit at
+  -- or near 1 — we are repeating a published fact — and anything below it is worth looking at: a
+  -- reinstated train, which now gets a flat "Innstilt" where the old wording hedged. A miss in this
+  -- segment is not a model failure at all but a plumbing one: the feed told us and we said nothing.
+  COUNTIF(et_cancelled IS TRUE AND verdict = 'hit')            AS n_hit_relayed,
+  COUNTIF(et_cancelled IS TRUE AND verdict = 'false_alarm')    AS n_false_alarm_relayed,
+  COUNTIF(et_cancelled IS TRUE AND verdict = 'miss')           AS n_miss_relayed,
+  COUNTIF(et_cancelled IS TRUE AND verdict = 'correct_reject') AS n_correct_reject_relayed,
+  SAFE_DIVIDE(
+    COUNTIF(et_cancelled IS TRUE AND verdict = 'hit'),
+    COUNTIF(et_cancelled IS TRUE AND verdict IN ('hit', 'false_alarm'))
+  ) AS precision_relayed,
+  SAFE_DIVIDE(
+    COUNTIF(et_cancelled IS TRUE AND verdict = 'hit'),
+    COUNTIF(et_cancelled IS TRUE AND verdict IN ('hit', 'miss'))
+  ) AS recall_relayed,
+
+  -- Decided before the flag existed (2026-08-05), so which segment they belong to is unrecoverable.
+  -- Reported, not assigned: defaulting them to "predicted" would be right for most and would hide
+  -- exactly the rows worth finding — the ones where ET had already published and we stayed quiet.
+  COUNTIF(et_cancelled IS NULL AND verdict IS NOT NULL) AS n_unsegmented
 FROM labelled
