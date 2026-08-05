@@ -65,7 +65,25 @@ WHERE actual_trouble IS NULL
                     AND DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);
 
 
-INSERT INTO `disruptions.varsel_decision_outcomes`
+-- The column list is explicit on purpose. Without it the INSERT maps POSITIONALLY onto whatever
+-- order the outcomes table happens to hold -- and that order differs between an environment created
+-- fresh (the CREATE TABLE's order) and one upgraded by ALTER ADD COLUMN (appended at the end). A
+-- column added in the middle of the CREATE would therefore write correct rows in one environment
+-- and silently shifted ones in the other, with no error anywhere. Keep it in step with
+-- disruptions/api/create_varsel_decisions.sql; a name that does not exist there fails loudly, which
+-- is the point.
+INSERT INTO `disruptions.varsel_decision_outcomes` (
+  journey_digest, from_stop, to_stop,
+  situation_number, summary, description,
+  operator, line, mode, jkey, call_date, stop_place, stop_order, departure_time,
+  n_decisions, first_decided_at, last_decided_at,
+  ever_alerted, first_alert_at, alert_lead_min,
+  max_impact_probability, final_impact_probability, final_cancel_probability,
+  final_delay_p50_min, final_delay_p90_min, alert_threshold,
+  pushed_any, n_devices, message, message_source,
+  actual_cancelled, actual_dep_delay_min, actual_trouble, verdict, labelled_at,
+  et_cancelled
+)
 WITH
 -- The decision subjects to label. The grouping itself lives in the
 -- disruptions.varsel_decision_groups view (disruptions/api/create_varsel_decisions.sql) because
@@ -160,7 +178,11 @@ SELECT
     WHEN NOT ever_alerted AND actual_trouble   THEN 'miss'
     ELSE 'correct_reject'
   END AS verdict,
-  CURRENT_TIMESTAMP() AS labelled_at
+  CURRENT_TIMESTAMP() AS labelled_at,
+  -- Carried straight from the view, which decides what it means (relayed fact vs prediction, taken
+  -- at the cycle the verdict judges). Resolving it here instead would put a second definition of
+  -- the split next to the one /historikk-api reads, and the two would drift.
+  et_cancelled
 FROM labelled AS l
 -- Idempotent, but only for subjects that actually RESOLVED. A subject labelled while ET had not yet
 -- caught up carries actual_trouble = NULL; skipping it here too would freeze that "unknown" forever,

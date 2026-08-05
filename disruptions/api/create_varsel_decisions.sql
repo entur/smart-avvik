@@ -219,11 +219,24 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
   actual_dep_delay_min   INT64   OPTIONS(description="Realized departure delay in minutes; null if the call was never operated."),
   actual_trouble         BOOL    OPTIONS(description="cancelled OR >= 10 min late. NULL = unknown (no realized call found), NOT 'no trouble'."),
   verdict                STRING  OPTIONS(description="'hit' | 'false_alarm' | 'miss' | 'correct_reject'; NULL when the outcome is unknown."),
-  labelled_at            TIMESTAMP
+  labelled_at            TIMESTAMP,
+  -- New columns go LAST here, matching where ALTER ADD COLUMN puts them on an existing table.
+  -- Otherwise a fresh environment and an upgraded one hold the same columns in different orders,
+  -- and anything positional -- label_varsel_decisions.sql's INSERT was exactly that until it grew
+  -- an explicit column list -- writes each environment's data into a different column.
+  et_cancelled           BOOL    OPTIONS(description="ET had already declared this boarding call cancelled at the point this verdict judges (the first alerting cycle if we alerted, any cycle if we did not): we RELAYED a known fact rather than predicting one. Segment on it, do not filter: service quality includes these and should, model skill excludes them as gimmes. NULL = the decision predates the column and belongs to neither segment.")
 )
 PARTITION BY call_date
 CLUSTER BY operator, verdict
 OPTIONS(description="Avviksvarsel alert decisions joined to realized SIRI-ET outcomes. Built nightly by data/queries/label_varsel_decisions.sql. Never copied dev->prd — each environment labels its own decisions.");
+
+
+-- Same reason as the ADD COLUMN block above the decision log: the CREATE is IF NOT EXISTS, so a
+-- column added to that definition never reaches an environment whose outcomes table already exists.
+-- Here the symptom would be the nightly job failing outright rather than dropping rows, since its
+-- INSERT names the column.
+ALTER TABLE `disruptions.varsel_decision_outcomes`
+  ADD COLUMN IF NOT EXISTS et_cancelled BOOL OPTIONS(description="ET had already declared this boarding call cancelled at the point this verdict judges (the first alerting cycle if we alerted, any cycle if we did not): we RELAYED a known fact rather than predicting one. Segment on it, do not filter: service quality includes these and should, model skill excludes them as gimmes. NULL = the decision predates the column and belongs to neither segment.");
 
 
 -- One row per decision SUBJECT: a journey definition's view of one situation on one train.
@@ -261,6 +274,25 @@ SELECT
   MAX(decided_at)            AS last_decided_at,
   LOGICAL_OR(alertworthy)    AS ever_alerted,
   MIN(IF(alertworthy, decided_at, NULL)) AS first_alert_at,
+  -- Was this a relayed fact or a prediction? The split /historikk reports beside its blended
+  -- precision, and the reason the per-cycle column exists at all.
+  --
+  -- Taken AT THE POINT THE VERDICT JUDGES: the first alerting cycle where we alerted, any cycle
+  -- where we did not. Emphatically NOT a plain LOGICAL_OR over the subject, which would be
+  -- backwards -- a cancellation is routinely declared AFTER we alerted, since alerting before ET
+  -- publishes is the whole point of the app, so LOGICAL_OR would file the stack's best wins
+  -- (predicted 10:00, ET confirms 14:17, train cancelled) as gimmes and hand the model's credit to
+  -- the feed. The fallback covers the other side: a subject we stayed silent on has no alerting
+  -- cycle, and there "ET declared it at some point and we said nothing anyway" is exactly the miss
+  -- worth separating out.
+  --
+  -- NULL where no cycle recorded it -- rows written before 2026-08-05, which is all of them today.
+  -- The API keeps those out of BOTH segments rather than defaulting them to FALSE: most were
+  -- predictions, but the ones that were not are precisely the misses this column was added to find.
+  COALESCE(
+    ARRAY_AGG(IF(alertworthy, et_cancelled, NULL) IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)],
+    LOGICAL_OR(et_cancelled)
+  ) AS et_cancelled,
   MAX(impact_probability)    AS max_impact_probability,
   LOGICAL_OR(pushed)         AS pushed_any,
   MAX(n_devices)             AS n_devices,

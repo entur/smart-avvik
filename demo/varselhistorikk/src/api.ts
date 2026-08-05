@@ -30,6 +30,9 @@ export interface Decision {
   final_delay_p50_min: number | null;
   final_delay_p90_min: number | null;
   alert_threshold: number | null;
+  /** ET had already declared the boarding call cancelled when we decided — the probabilities are
+   *  1.0 by construction. Null for decisions taken before the flag existed. */
+  et_cancelled: boolean | null;
   pushed_any: boolean | null;
   n_devices: number | null;
   message: string | null;
@@ -50,6 +53,17 @@ export interface DecisionsResponse {
   decisions: Decision[];
 }
 
+/** One half of the window: the same four verdicts over a subset of the same decisions. */
+export interface Segment {
+  n_hit: number;
+  n_false_alarm: number;
+  n_miss: number;
+  n_correct_reject: number;
+  /** Null when this segment alerted nothing — not 0, which would read as "all wrong". */
+  precision: number | null;
+  recall: number | null;
+}
+
 export interface Summary {
   from_date: string;
   to_date: string;
@@ -66,6 +80,16 @@ export interface Summary {
   recall: number | null;
   median_lead_min_on_hits: number | null;
   n_hit_with_30min_notice: number;
+
+  /** The headline figures above are BLENDED — forecasts and relayed ET cancellations together —
+   *  which is the honest answer to "can the app be trusted". These two split them, because a
+   *  declared cancellation is served at probability 1.0 by construction and says nothing about
+   *  whether the models saw anything coming. Quoted alone the blended number moves with the mix. */
+  predicted: Segment;
+  relayed: Segment;
+  /** Decided before the flag existed; in neither segment. While this dominates, the split covers
+   *  only a slice of the window. */
+  n_unsegmented: number;
 }
 
 /** Which deployment answered. Its own endpoint because it must survive a decision log that cannot

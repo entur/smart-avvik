@@ -111,7 +111,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   ET already knows is most of the value, since nobody carries the ET feed on their phone, and in the
   reported case it was ~40 min of usable warning. *Model* skill — did we see it coming? — excludes
   them. Distrust either quoted alone: the **mix** of the two populations moves the headline with
-  nothing about the app having changed. `/historikk` does not split on it yet. Also worth watching
+  nothing about the app having changed. `/historikk` shows both (see its section below). Also worth watching
   `et_cancelled AND verdict='false_alarm'` — a *reinstated* train now gets a flat "Innstilt" where
   the old wording hedged at 87 %, so a confidently wrong message replaces a soft one; the labelling
   job scores it correctly, but if reinstatements turn out to be common the certainty should go back
@@ -260,6 +260,29 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     call found) for the same reason.
   - Recall on this page is recall **among SX-flagged calls on registered journeys** — the models
     never score a call no SX message flagged — and the UI says so next to the number.
+  - **The headline precision is blended, and the page shows what it is made of** (2026-08-05).
+    `/summary` keeps its existing top-level figures over *every* labelled decision — that is the
+    honest answer to "could a traveller trust what we sent", and relaying an ET-declared
+    cancellation is most of the app's value rather than a cheat — and adds `predicted` / `relayed`
+    segments plus `n_unsegmented` beside them. Segment, never filter: quoted alone the blended
+    number moves with the **mix**, so it can swing with nothing about the app having changed.
+    `predicted` is what a threshold should be tuned on; a `miss` inside `relayed` is not a model
+    failure at all but a plumbing one (the feed told us and we said nothing — the 0.57 case).
+    Three things this rests on, all of them easy to get backwards:
+    - The per-subject flag lives in `varsel_decision_groups`, resolved **at the cycle the verdict
+      judges** — the first alerting cycle where we alerted, `LOGICAL_OR` where we did not. A plain
+      `LOGICAL_OR` would be exactly backwards: a cancellation is routinely declared *after* we
+      alerted (beating ET is the point), so it would file the stack's best wins as gimmes.
+    - `NULL` is a **third bucket** (`n_unsegmented`), not a default to `predicted`. Rows written
+      before 2026-08-05 carry no flag, and 83 of dev's 83 labelled rows are in it today, so the
+      split describes only a slice of the window until the log turns over. Defaulting them would
+      bury exactly the rows worth finding.
+    - Adding a column to `varsel_decision_outcomes` **breaks the registered scheduled query** until
+      it is re-registered: `label_varsel_decisions.sql`'s INSERT was positional, and the transfer
+      config holds a *copy* of the SQL. Measured 2026-08-05 — the old text dry-ran as "Inserted row
+      has wrong column count; Has 35, expected 36". The INSERT now names its columns, and new
+      columns still go **last** in the CREATE so a fresh environment and an ALTERed one agree on
+      order. Applying the DDL and updating the config are one operation, not two.
   - Privacy, in two layers. The *table* is keyed on the journey **definition**
     (`journey_digest`, the same `llm_message.key_digest` used in the LLM audit log, so the two
     join) plus a device count — no `device_id`, no `journey_id`, no time window or weekday pattern.

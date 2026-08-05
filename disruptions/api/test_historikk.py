@@ -49,6 +49,7 @@ def _row(**overrides) -> dict:
         "final_delay_p50_min": 15,
         "final_delay_p90_min": 40,
         "alert_threshold": 0.65,
+        "et_cancelled": False,
         "pushed_any": True,
         "n_devices": 2,
         "message": "Toget ditt 08:15 er rammet av signalfeil ved Asker.",
@@ -222,9 +223,9 @@ def test_response_carries_no_traveller_journey_identifiers():
         "departure_time", "n_decisions", "first_decided_at", "last_decided_at",
         "ever_alerted", "first_alert_at", "alert_lead_min",
         "max_impact_probability", "final_impact_probability", "final_cancel_probability",
-        "final_delay_p50_min", "final_delay_p90_min", "alert_threshold", "pushed_any",
-        "n_devices", "message", "message_source", "actual_cancelled", "actual_dep_delay_min",
-        "actual_trouble", "verdict", "outcome_state",
+        "final_delay_p50_min", "final_delay_p90_min", "alert_threshold", "et_cancelled",
+        "pushed_any", "n_devices", "message", "message_source", "actual_cancelled",
+        "actual_dep_delay_min", "actual_trouble", "verdict", "outcome_state",
     }
 
 
@@ -261,12 +262,71 @@ def test_summary_reports_counts_rates_and_coverage():
     assert s["median_lead_min_on_hits"] == 42
 
 
+def test_summary_splits_relayed_certainties_from_predicted_ones():
+    """The blended precision is a mixture, and the page has to be able to say of what.
+
+    A decision on a call ET had already declared cancelled is served at probability 1.0 by
+    construction: a real hit for the traveller, a gimme for the models. Quoted alone the blended
+    figure therefore moves with the MIX of the two populations — more relayed certainties in a
+    window raises it with nothing about the app having changed.
+    """
+    _reset([{
+        "n_hit": 10, "n_false_alarm": 2, "n_miss": 3, "n_correct_reject": 40,
+        "precision": 10 / 12, "recall": 10 / 13,
+        "n_hit_predicted": 6, "n_false_alarm_predicted": 2, "n_miss_predicted": 3,
+        "n_correct_reject_predicted": 40, "precision_predicted": 0.75, "recall_predicted": 6 / 9,
+        "n_hit_relayed": 4, "n_false_alarm_relayed": 0, "n_miss_relayed": 0,
+        "n_correct_reject_relayed": 0, "precision_relayed": 1.0, "recall_relayed": 1.0,
+        "n_unsegmented": 0,
+    }])
+    s = client.get("/historikk-api/summary").json()
+    # The headline stays blended — it answers "was the traveller told the truth", which is the
+    # question the page exists for.
+    assert s["precision"] == 10 / 12
+    # And it lies between the two segments it is a mixture of, which is exactly the point.
+    assert s["predicted"]["precision"] == 0.75
+    assert s["relayed"]["precision"] == 1.0
+    assert s["predicted"]["precision"] < s["precision"] < s["relayed"]["precision"]
+    # Nothing is dropped by the split: every labelled verdict lands in one segment or the other.
+    assert s["predicted"]["n_hit"] + s["relayed"]["n_hit"] == s["n_hit"]
+    assert s["predicted"]["n_miss"] + s["relayed"]["n_miss"] == s["n_miss"]
+
+
+def test_decisions_from_before_the_flag_join_neither_segment():
+    """Unassignable is its own bucket, the same rule as `ukjent` vs `correct_reject`.
+
+    Rows written before 2026-08-05 carry no flag, and which segment they belong to cannot be
+    recovered. Defaulting them to 'predicted' would be right for most of them and would bury the
+    ones worth finding: decisions where ET had already published and we alerted anyway — or did not.
+    """
+    _reset([{"n_hit": 9, "n_false_alarm": 1, "precision": 0.9, "n_unsegmented": 10}])
+    s = client.get("/historikk-api/summary").json()
+    assert s["n_unsegmented"] == 10
+    assert s["predicted"]["n_hit"] == 0 and s["relayed"]["n_hit"] == 0
+    # None, not 0.0: a rate over no decisions is unknown, and 0 % would read as "we got them wrong".
+    assert s["predicted"]["precision"] is None and s["relayed"]["precision"] is None
+
+
+def test_a_relayed_certainty_is_marked_on_the_row():
+    """The segmented rates above must be traceable to individual decisions, or a reader cannot
+    check them. Also what keeps a 100 % chip beside a train from reading as model skill."""
+    _reset([_row(et_cancelled=True, final_cancel_probability=1.0, max_impact_probability=1.0)])
+    d = client.get("/historikk-api/decisions").json()["decisions"][0]
+    assert d["et_cancelled"] is True
+
+    _reset([_row(et_cancelled=None)])
+    assert client.get("/historikk-api/decisions").json()["decisions"][0]["et_cancelled"] is None
+
+
 def test_summary_survives_an_empty_window():
     """A new environment has recorded nothing yet; that is zeroes, not a 500."""
     _reset([])
     s = client.get("/historikk-api/summary").json()
     assert s["n_hit"] == 0 and s["n_unknown"] == 0
     assert s["precision"] is None and s["recall"] is None
+    assert s["n_unsegmented"] == 0
+    assert s["predicted"]["n_hit"] == 0 and s["predicted"]["precision"] is None
+    assert s["relayed"]["n_hit"] == 0 and s["relayed"]["precision"] is None
 
 
 def test_missing_tables_report_unavailable_not_a_traceback():
