@@ -22,6 +22,11 @@ beats the disrupted train's predicted arrival by at least 3 minutes" — almost 
 fires least in the case that matters most: a cancelled train, where nothing arrives earlier than a
 train that is not running at all.
 
+> **Correction, 2026-08-06 (after implementation).** "Almost never fires" is unsupported. The
+> column it would be measured from (`has_alternative`) was not written until 2026-08-05, so no
+> measurement of the old rule existed when this was written. The one now taken puts it at **26 %**.
+> The case for this plan rests on the cancelled-train argument below, not on the rate. See **A6**.
+
 This plan replaces that rule with the traveller's actual question ("what still gets me there in
 time, and how late can I leave?"), makes the candidates cancellation- and delay-aware by scoring
 them against our own per-call models, and returns `departure_prediction` / `arrival_prediction` for
@@ -928,7 +933,7 @@ situation's 12-hour life.
 | SQL | `data/queries/validate_varsel_sql.sh` — statement by statement; needs live ADC (A6). |
 | JP contract | One live curl of each anchor (`arriveBy` true and false), date recorded in the module note, plus the `includeRealtimeCancellations` determination from U2 step 2. |
 | **JP reach + latency probe** | `arriveBy ∈ {true, false} × numTripPatterns ∈ {6, 10}`, `searchWindow` unset, on one dense corridor (Oslo S → Drammen) and one sparse (Oslo S → Bergen). Record p50/p95 latency, payload bytes, **pattern count and departure span** — reach is the thing KTD2 got wrong the first time, so it is measured, not derived. The measured p50 sets the load model; a p95 above 2.5 s (within `_HTTP_TIMEOUT_S = 3.0`) reverts `numTripPatterns` to 6 and re-probes. Failure is an input, not a veto. |
-| **Offer-rate replay** | Replay the last ~30 days of `varsel_decisions` rows — which carry `from_stop`, `to_stop` and `departure_time` in the table even though `/historikk-api` redacts them — through `fetch_candidates` + `select_best` offline, and record the resulting offer rate and in-time share beside the "effectively never" baseline. **This is the only gate that can fail for the reason the plan exists.** Every other gate is a unit test over payloads the implementer writes, so all eleven requirements could pass while the production offer rate stays near zero. |
+| **Offer-rate replay** | Replay the last ~30 days of `varsel_decisions` rows — which carry `from_stop`, `to_stop` and `departure_time` in the table even though `/historikk-api` redacts them — through `fetch_candidates` + `select_best` offline, and record the resulting offer rate and in-time share beside the baseline. **This is the only gate that can fail for the reason the plan exists.** Every other gate is a unit test over payloads the implementer writes, so all eleven requirements could pass while the production offer rate stays near zero. **Not run — and re-scoped 2026-08-06 (A6).** Two obstacles the plan did not anticipate: the baseline is now ~27 %, not ~0 %; and dev's log holds **9 journeys over 9 stop pairs in 6 days, with 2 cancelled subjects**, so a replay cannot answer the cancelled-train question at any level of care — the population is not in the table. A replay also has to re-anchor historical `departure_time` values onto a future weekday, because the Journey Planner does not answer about the past. Deploying to dev and letting `alt_status` accumulate measures the same thing with no methodology to argue about; `data/queries/alternative_offer_rate.sql` is the query either way. |
 
 No BigQuery spend beyond the replay's own scan. No model retraining, no `copy_runtime_to_prd.sh`
 run, no scheduled-query re-registration.
@@ -1010,6 +1015,32 @@ Recorded because this plan was written headless (LFG pipeline) with no confirmat
   `decisions._alternative_fields`' docstring (2026-08-04). It could **not** be re-measured during
   planning: `bq` returned `Reauthentication failed` (expired ADC), which also blocks the SQL gate and
   the offer-rate replay until re-auth.
+
+  **RESOLVED 2026-08-06, and the assumption did not hold — the baseline never existed.**
+  `has_alternative` has only been written since 2026-08-05 (`decisions._alternative_fields`, commit
+  fa27085). All 673 rows before that carry NULL, so the figure A6 inherited cannot have come from
+  this column. Per alerting *subject* (journey x situation x departure), in dev:
+
+  | Era | Cancelled | Subjects | Measurable | Offered | Rate |
+  |-----|-----------|---------:|-----------:|--------:|-----:|
+  | 08-01..08-04 | no | 83 | 0 | — | *no measurement exists* |
+  | 08-05..08-06 | no | 48 | 48 | 13 | 27.1 % |
+  | 08-05..08-06 | yes | 2 | 2 | 0 | 0.0 % |
+
+  Those 50 measurable subjects were written under the OLD rule (this plan had not deployed), so
+  **26 % is the only measurement of the old rule that has ever been taken**, and the Goal Capsule's
+  "almost never fires" is an unsupported claim rather than a stale finding. The replay's comparison
+  is therefore `26 % -> X`.
+
+  This does not weaken the case for the new rule — that case is the cancelled train, where the
+  fallback tier is unreachable under the old rule by construction. But the case now rests entirely
+  on that argument, because the *evidence* is 2 cancelled subjects.
+
+  A first pass at this correction reported the uninstrumented era as `0.0 %` and concluded the rate
+  had jumped on 08-05. It had not; NULL had been counted as "no offer". Recording the mistake
+  because the plan states the same rule twice elsewhere (`n_unsegmented`, `alt_status`) and it was
+  still made here. Query: `data/queries/alternative_offer_rate.sql`, which now reports
+  `uninstrumented` beside the rate so the shape cannot recur.
 
 ---
 

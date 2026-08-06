@@ -75,8 +75,24 @@ Two Verification Contract gates from the plan were not run and remain open:
   latency sweep.
 - **The offer-rate replay** — replaying ~30 days of `varsel_decisions` through
   `fetch_candidates` + `select_best` offline and recording the offer rate beside the
-  "effectively never" baseline. The plan calls this *"the only gate that can fail for the reason
+  baseline. The plan calls this *"the only gate that can fail for the reason
   the plan exists"*; every other gate is a unit test over payloads we wrote ourselves.
+
+  **Still not run, and re-scoped 2026-08-06.** The baseline was measured instead
+  (`data/queries/alternative_offer_rate.sql`) and turns out never to have existed:
+  `has_alternative` was not written until 2026-08-05, so the 83 subjects before that are NULL, not
+  zero. The old rule's only measurement is **26 %** (13 of 50 subjects), not "effectively never".
+  The replay's comparison is `26 % -> X`.
+
+  More limiting: dev's log holds 9 journeys over 9 stop pairs in 6 days, with **2** cancelled
+  subjects — so no replay, however careful, can answer the question this feature exists for.
+  Letting `alt_status` accumulate in dev after deploy measures it properly; see plan A6.
+
+  Worth keeping as a method note: the first attempt at this correction reported the uninstrumented
+  era as 0 % and inferred a jump that never happened. `LOGICAL_OR` over NULL is NULL and `COUNTIF`
+  drops it, so "never instrumented" renders as "never offered" in any naive rate. This repo already
+  states that rule twice — `n_unsegmented` on `/historikk`, and `alt_status`'s whole reason for
+  existing — and it was still got wrong while writing about it.
 
 ## Documentation drift
 

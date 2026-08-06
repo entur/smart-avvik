@@ -19,7 +19,13 @@ Design notes
   an earlier train. Only when nothing arrives in time does it fall back to the earliest arrival —
   which is the case where a replacement legitimately arrives *later* than the train it replaces, so
   ``minutes_saved`` is signed and may be zero or negative. The rule this replaced (earliest arrival,
-  at least three minutes faster) measurably almost never fired.
+  at least three minutes faster) was long described as firing "effectively never"; measured for the
+  first time on 2026-08-06 it fires on **26 %** of alerting subjects, and the earlier claim turns
+  out to rest on no measurement at all. The rate is not the argument for this rule either way — the
+  argument is the cancelled train, where "arrives earlier than a train that is not running" is
+  barely a question, and where the fallback tier is unreachable under the old rule by construction.
+  Re-derive with ``data/queries/alternative_offer_rate.sql``; see
+  :func:`decisions._alternative_fields` for the reading and its caveats.
 * **The disrupted train competes under the same rules, and usually wins.** It is passed in as
   ``original`` and ranked alongside the candidates; when it wins, there is no alternative to offer.
   Because its arrival is aimed **plus** a non-negative predicted delay while the deadline is that
@@ -424,7 +430,8 @@ class AlternativeJourney(BaseModel):
         "the disrupted train's predicted arrival; zero or negative is a legitimate answer in the "
         "fallback tier, where a replacement for a cancelled train is worth offering even though it "
         "gets the traveller there later than the timetable promised. Nothing is dropped for being "
-        "'not fast enough' (the rule that did, and measurably almost never fired, is gone); the one "
+        "'not fast enough' (the rule that did is gone; measured 2026-08-06 it offered on 26 % of "
+        "alerting subjects, see `data/queries/alternative_offer_rate.sql`); the one "
         "gate this figure feeds is the materiality check on a train that is in no real trouble.",
     )
     arrives_before_original: bool = Field(
