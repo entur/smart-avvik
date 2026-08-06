@@ -183,8 +183,22 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
     destination and departure time); records carry a hashed `journey_digest`, and
     `VARSEL_LLM_LOG_PROMPTS=true` puts the full prompt/reply at DEBUG.
-  - `/impact` also returns `alternative_journey` when `to_stop` is given — a faster way there from
-    the Journey Planner (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no credentials).
+  - `/impact` also returns `alternative_journey` when `to_stop` is given — the **best remaining way
+    there**, not a faster one (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no
+    credentials). Two tiers, and the second is why "faster" is the wrong word: prefer the **latest**
+    departure that still arrives before the disrupted train's *aimed* arrival (the traveller's own
+    deadline) among trains not yet departed; when nothing gets there in time, fall back to the
+    **earliest arrival** among those still catchable — which for a cancelled train legitimately
+    lands *later* than the timetable promised, so `minutes_saved` is signed and
+    `arrives_before_original` is what says whether they still make it. A candidate already declared
+    cancelled is never offered; one that would itself trip the alert gate is a soft preference
+    (`at_risk` says so out loud when it wins anyway). The traveller's **own train competes** under
+    the same rules: when it wins, `alternative_journey` is null and `original_is_best` is true —
+    distinct from a null with `original_is_best` false, which means nothing could be established.
+    Both the fallback query and the reconciliation of the original's arrival are decided on **what
+    the selection could use**, never on what the query returned (2026-08-06: a reply full of
+    departures past the traveller's window answered "yes, something came back" and suppressed the
+    only tier that could still help somebody whose train was cancelled).
     The lookup runs **once per window, on the canonical stop ref** (`match_journey`'s
     `pair_index == 0`), and `match_journey` then back-fills the answer onto every alert — "the
     alternative is a property of the trip, not of the situation that won". So an alert whose worst
@@ -223,8 +237,15 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `RENAME COLUMN IF EXISTS`: measured 2026-08-05, that form fails on the *second* run
     ("Column already exists"), which in a file re-run at every startup means the decision log dies
     on the next deploy. Flat alongside it: the observation the prompt tells the model to quote
-    (`obs_*`) and the faster alternative (`has_alternative`, `alt_*`), so "how often do we offer
-    one?" is a GROUP BY. `message_status` says why the stored wording has the source it does —
+    (`obs_*`) and the alternative offered (`has_alternative`, `alt_*` — a *replacement*, not
+    necessarily a faster one), so "how often do we offer one?" is a GROUP BY. `alt_status` is what
+    gives that rate a denominator: `offered` / `none_found` / `suppressed` (the selection ran and
+    kept the traveller on their own train) / `not_worth_lookup` (none was issued), written on
+    **every** decision including the ~83 % that are sub-threshold, so the 2026-08-06 selection
+    change — which moves the numerator sharply — cannot be mistaken for a change in behaviour.
+    `alt_arrives_before_original`, `alt_at_risk` and `alt_scored` qualify the offer, and
+    `alt_operator` / `alt_jkey` / `alt_stop_order` are the recommendation's own ET join key, so
+    "take this instead" can eventually be labelled the way every other decision here already is. `message_status` says why the stored wording has the source it does —
     `ok` / `ok_cached` / `not_alertworthy` / `not_selected` / `push_disabled` / `llm_disabled` /
     `capped` / `attempts_exhausted` / `rejected` / `ungrounded` / `error` — because a cap, an
     exhausted retry, a refusal and prd's `VARSEL_LLM_ENABLED=false` all store the same

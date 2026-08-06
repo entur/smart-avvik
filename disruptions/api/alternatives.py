@@ -570,12 +570,23 @@ class _KeyedTTLCache:
         *,
         label: str | None = None,
         gate: Callable[[], bool] | None = None,
+        outcome: dict[str, Any] | None = None,
     ) -> Any:
         """The cached value for `key`, refreshing it through `fetch` when it is stale.
 
         `label` is what the failure log names this key by. The key itself is NEVER logged: it
         carries the traveller's origin and destination, and the only caller passes the pair digest
         here for exactly that reason.
+
+        `outcome`, when passed, is filled with `{"served": "hit" | "fetch" | "stale"}` — WHERE the
+        returned value came from, which the value alone cannot tell you. `"stale"` covers every path
+        that wanted a refresh and could not get one (single-flight, cooldown, a refused gate, a
+        raising fetch) yet still had a previous value to hand back. The caller needs that apart from
+        the value because a served-stale reply is NOT an answer: `fetch_candidates` reported one as
+        answered, so during a Journey Planner outage `impact._best_remaining_journey` believed the
+        first query had replied and bought a SECOND blocking call on the ingestion thread — a
+        degraded Journey Planner costing twice what a healthy one does, exactly when it could least
+        afford it.
 
         `gate` is consulted at the one instant this class knows a fetch is about to be issued —
         after the cache, the single-flight check and the cooldown have all declined to answer, and
@@ -585,16 +596,26 @@ class _KeyedTTLCache:
         the previous value if there is one, exactly like the cooldown does. It runs under this
         lock, so the claim and the decision to fetch cannot straddle another thread's claim.
         """
+        def served(kind: str) -> None:
+            if outcome is not None:
+                outcome["served"] = kind
+
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None and now - entry[1] < self._ttl:
+                # A live entry IS an answer — the reply is inside its TTL, which is what the TTL
+                # means. Only a value handed back because a refresh could not happen is "stale".
+                served("hit")
                 return entry[0]
             if key in self._refreshing:  # another caller is already fetching this key
+                served("stale")
                 return entry[0] if entry else None
             failed_at = self._failed_at.get(key)
             if failed_at is not None and now - failed_at < self._failure_cooldown:
+                served("stale")
                 return entry[0] if entry else None
             if gate is not None and not gate():
+                served("stale")
                 return entry[0] if entry else None
             self._refreshing.add(key)
         try:
@@ -611,6 +632,7 @@ class _KeyedTTLCache:
                 self._refreshing.discard(key)
                 self._expire_failures(now)
                 entry = self._entries.get(key)
+            served("stale")
             return entry[0] if entry else None
         with self._lock:
             self._entries[key] = (value, now)
@@ -630,6 +652,7 @@ class _KeyedTTLCache:
                 oldest = sorted(self._entries.items(), key=lambda kv: kv[1][1])[:100]
                 for k, _ in oldest:
                     self._entries.pop(k, None)
+        served("fetch")
         return value
 
     def _expire_failures(self, now: datetime) -> None:
@@ -1123,8 +1146,21 @@ def fetch_candidates(
         # cannot contain a train in tomorrow's window, so it buys nothing at any price.
         return []
     digest = pair_digest(from_stop, to_stop)
-    quantum = int(date_time.timestamp() // _DATE_TIME_QUANTUM.total_seconds())
-    key = (from_stop, to_stop, arrive_by, quantum)
+    if arrive_by:
+        # The EXACT deadline, never a bucket (2026-08-06). An `arriveBy` reply is anchored on the
+        # time it was asked about and structurally cannot contain a journey arriving after it, so
+        # two travellers sharing a 30-minute bucket shared a reply that was a valid answer for only
+        # the earlier of them: the later one was handed a pool anchored up to 29 minutes early,
+        # which cannot hold the LATEST in-time departure the primary rule exists to find. The
+        # non-empty pool then also suppressed the depart-after query that would have contained it.
+        # Bucketing costs nothing here anyway — this anchor is the disrupted train's AIMED arrival,
+        # already stable across the poller's refreshes, so the exact value hits the cache just as
+        # often. The quantum below is for the fallback query, whose anchor is `now` and therefore
+        # moves every cycle; that is the case :data:`_DATE_TIME_QUANTUM` was introduced for.
+        anchor = int(date_time.timestamp())
+    else:
+        anchor = int(date_time.timestamp() // _DATE_TIME_QUANTUM.total_seconds())
+    key = (from_stop, to_stop, arrive_by, anchor)
     # Set by the two closures below, which run at most once each and only inside `_cache.get`. A
     # dict rather than `nonlocal` so the closures stay readable next to what they record.
     state: dict[str, Any] = {"fetched": False, "throttled": False, "ms": None, "bytes": None}
@@ -1147,7 +1183,8 @@ def fetch_candidates(
             state["ms"] = round((perf_counter() - started) * 1000)
             state["bytes"] = getattr(_response, "bytes", None)
 
-    patterns = _cache.get(key, fetch, now, label=digest, gate=gate)
+    cache_outcome: dict[str, Any] = {}
+    patterns = _cache.get(key, fetch, now, label=digest, gate=gate, outcome=cache_outcome)
     _log_lookup(
         pair_digest=digest,
         arrive_by=arrive_by,
@@ -1162,7 +1199,18 @@ def fetch_candidates(
     # another thread's in-flight refresh with nothing stored yet. A throttled lookup counts as
     # unanswered too even when a previous value is served: re-asking on another anchor would only be
     # refused by the same spent budget, one more log line poorer.
-    answered(patterns is not None and not state["throttled"])
+    #
+    # `served == "stale"` is the same judgement for the case a non-None value hides (2026-08-06):
+    # the refresh failed, was single-flighted, or was inside the post-failure cooldown, and the
+    # PREVIOUS value came back. It is worth serving — stale advice beats none — but it is not the
+    # Journey Planner having answered this question, and treating it as one is what let one outage
+    # buy two blocking calls per journey. `not state["throttled"]` is kept beside it deliberately:
+    # a test double for `_cache` that ignores `outcome` still reports a refused gate correctly.
+    answered(
+        patterns is not None
+        and not state["throttled"]
+        and cache_outcome.get("served") != "stale"
+    )
     if not patterns:
         return []
     # "Fail open, ALWAYS" has to cover parsing, not just fetching. Until 2026-07-29 only the fetch

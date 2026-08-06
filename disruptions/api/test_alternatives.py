@@ -962,6 +962,43 @@ def test_a_lookup_that_obtained_no_reply_is_told_apart_from_an_empty_one():
     finally:
         alternatives._fetch_trip_patterns = original
 
+    # A SERVED-STALE reply is a non-answer too, and this is the one the value cannot reveal: the
+    # cache hands back the previous patterns, so `patterns` is a full non-empty list and every
+    # earlier check here passes. During an outage that made `impact._best_remaining_journey` believe
+    # the first query had replied and buy the second blocking call anyway — the exact cost this
+    # whole distinction exists to avoid, surviving in the one case that lasts longest.
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    try:
+        outcome = {}
+        primed = fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=False, date_time=when, now=CAND_NOW, outcome=outcome
+        )
+        assert primed and outcome["answered"] is True, "the entry is primed by a real reply"
+
+        def raising_now(*a, **k):
+            calls.append(1)
+            raise RuntimeError("JP down")
+
+        alternatives._fetch_trip_patterns = raising_now
+        stale_at = CAND_NOW + alternatives._TTL + timedelta(seconds=1)
+        outcome = {}
+        got = fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=False, date_time=when, now=stale_at, outcome=outcome
+        )
+        assert got == primed, "stale advice still beats none — this must keep failing open"
+        assert outcome["answered"] is False, "but a value we could not refresh is not a reply"
+
+        # And again from inside the post-failure cooldown, where no fetch is even attempted.
+        outcome = {}
+        assert fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=False, date_time=when,
+            now=stale_at + timedelta(seconds=30), outcome=outcome,
+        ) == primed
+        assert outcome["answered"] is False, "the cooldown serves the same non-answer"
+    finally:
+        alternatives._fetch_trip_patterns = original
+
     # And a throttled lookup is a non-answer too: re-asking on another anchor would only be refused
     # by the same spent budget.
     calls = []
@@ -1098,17 +1135,30 @@ def test_an_anchor_that_moves_with_now_still_shares_the_key():
         alternatives._fetch_trip_patterns = original
 
 
-def test_deadlines_forty_minutes_apart_are_different_questions():
-    """The quantum is coarse, not absent: two travellers with deadlines 40 minutes apart must not
-    be answered from one JP reply, because the later one's usable departures are not in it."""
+def test_two_deadlines_are_two_questions_however_close_together():
+    """An `arriveBy` reply is anchored on the time it was asked about and structurally cannot hold a
+    journey arriving after it — so bucketing this anchor served one traveller's answer to another.
+
+    The later of two travellers inside one 30-minute bucket got a pool anchored up to 29 minutes
+    early, which cannot contain the LATEST in-time departure the primary rule exists to find; the
+    non-empty pool then also suppressed the depart-after query that would have contained it. There
+    is nothing to trade away by dropping the bucket here: this anchor is the disrupted train's AIMED
+    arrival, which does not move between the poller's refreshes, so the exact value hits the cache
+    just as often. One minute apart, because 29 was the real gap and 1 is the rule.
+    """
     calls = []
     original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
     try:
         early = CAND_NOW + timedelta(minutes=20)
-        late = early + timedelta(minutes=40)
+        late = early + timedelta(minutes=1)
+        assert _old_bucket(early) == _old_bucket(late), "must share the bucket to prove anything"
         fetch_candidates(CAND_FROM, CAND_TO, arrive_by=True, date_time=early, now=CAND_NOW)
         fetch_candidates(CAND_FROM, CAND_TO, arrive_by=True, date_time=late, now=CAND_NOW)
-        assert len(calls) == 2
+        assert len(calls) == 2, "the later deadline is a question the earlier reply cannot answer"
+
+        # The same deadline twice IS one question — the poller re-asks it every 60 s.
+        fetch_candidates(CAND_FROM, CAND_TO, arrive_by=True, date_time=early, now=CAND_NOW)
+        assert len(calls) == 2, "an unchanged deadline must still hit the cache"
     finally:
         alternatives._fetch_trip_patterns = original
 

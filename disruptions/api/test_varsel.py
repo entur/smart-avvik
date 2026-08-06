@@ -933,14 +933,42 @@ def test_a_sub_minute_realtime_nudge_is_the_same_advice():
 
 def test_the_same_alternative_re_scored_keeps_the_written_message():
     """`ok_cached` has to stay reachable: re-writing on every tick is exactly what the per-cycle LLM
-    budget exists to prevent. `at_risk` and the two prediction blocks are re-scored against the live
-    cache every 60 s, so they must not count as "a different alternative" — while the fresh reading
-    of them still replaces the stored copy, so the card shows this tick's flags."""
+    budget exists to prevent. The two prediction blocks carry continuous probabilities re-scored
+    against the live cache every 60 s, so they must not count as "a different alternative" — while
+    the fresh reading of them still replaces the stored copy, so the card shows this tick's numbers.
+    """
+    rescored = _alternative(
+        departure_prediction=alternatives.AlternativePrediction(scored=False, delay_p50_min=4),
+    )
     alt, message, _ = _reconcile_cycle(
+        cached=_alternative(), fresh=rescored, message="Ta R11 kl 08:24 i stedet."
+    )
+    assert message == "Ta R11 kl 08:24 i stedet.", "the wording quotes none of those figures"
+    assert alt.departure_prediction is not None, "the stored copy must still be refreshed"
+
+
+def test_an_alternative_that_became_risky_drops_the_written_message():
+    """The one re-scored field the wording DOES state out loud, so it cannot be treated as noise.
+
+    `at_risk` earns "(kan også bli rammet)" and the model is told to hedge on it. Left out of the
+    identity, `_reconcile_caches` stored the rescored journey and kept the text written when the
+    flag was false — so the traveller was still being promised a clean escape after it stopped being
+    one. A boolean flips at most once or twice in a situation's life, so paying a re-write for it
+    cannot reintroduce the per-tick churn the minute-rounding above exists to stop.
+    """
+    _, dropped, _ = _reconcile_cycle(
         cached=_alternative(), fresh=_alternative(at_risk=True), message="Ta R11 kl 08:24 i stedet."
     )
-    assert message == "Ta R11 kl 08:24 i stedet."
-    assert alt.at_risk is True, "the stored copy must still be refreshed"
+    assert dropped is None, "a clean escape that stopped being one is different advice"
+
+    # The same for the other flag a wording states: arriving after the planned time is the caveat
+    # `_alternative_phrase` adds, and it must not survive on a journey that now arrives in time.
+    _, dropped, _ = _reconcile_cycle(
+        cached=_alternative(**_LATE_ALTERNATIVE),
+        fresh=_alternative(**{**_LATE_ALTERNATIVE, "arrives_before_original": True}),
+        message="Ta R11 kl 09:35 i stedet, du er framme 30 min etter planen.",
+    )
+    assert dropped is None, "'later than you planned' must not outlive being true"
 
 
 if __name__ == "__main__":

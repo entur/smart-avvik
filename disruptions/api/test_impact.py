@@ -1113,8 +1113,8 @@ def test_a_first_query_that_obtained_no_reply_does_not_buy_a_second_one():
 
 
 def test_the_stay_put_verdict_needs_the_selections_own_pool():
-    """`original_is_best` was derived from `_usable`'s pool, which applies no window bound and never
-    holds the original at all — so it claimed "the traveller should keep their train" for cases the
+    """`original_is_best` was derived from a local pre-filter that applied no window bound and never
+    held the original at all — so it claimed "the traveller should keep their train" for cases the
     selection never compared. Here the traveller's train is cancelled (dropped from the pool) and
     every candidate departs past the window's catch-up grace (dropped too): the selection saw an
     empty pool and established nothing.
@@ -1124,16 +1124,40 @@ def test_the_stay_put_verdict_needs_the_selections_own_pool():
     the worst answer this endpoint can give.
     """
     now = datetime.now(UTC)
-    # Departs inside `_usable`'s cut (it is in the future) but far beyond window_end + 90 min grace.
+    # In the future, so the old pre-filter counted it — but far beyond window_end + 90 min grace,
+    # so the selection drops it. That gap is the whole finding below.
     too_far = _live_candidate(now, dep_min=250, arr_min=300)
     jp = _JourneyPlanner([too_far])
     resp = _for_trip(
         _scope(S1=_live_train(now, "gone", dep_min=10, arr_min=50, et_declared_cancelled=True)),
         jp, now=now,
     )
-    assert len(jp.calls) == 1, "the first query answered, so no fallback"
     assert resp.alternative_journey is None
     assert resp.original_is_best is False, "nothing was compared, so nothing may be claimed"
+
+
+def test_a_reply_the_selection_cannot_use_still_earns_the_fallback():
+    """The reply was "full" and the pool was empty, and the fallback was decided on the first one.
+
+    The old rule asked "did the query come back with anything?" — a reply consisting entirely of
+    departures beyond the traveller's own window answers YES, so no depart-after query was issued
+    and the traveller was told there was no alternative. The population that hits this is the one
+    that needs it most: somebody whose train is cancelled, for whom the depart-after query is the
+    only tier that can still answer. The question is now "did anything survive the selection?".
+    """
+    now = datetime.now(UTC)
+    unusable = _live_candidate(now, dep_min=250, arr_min=300)  # past window_end + 90 min grace
+    rescue = _live_candidate(now, dep_min=15, arr_min=75)      # later than aimed, still catchable
+    jp = _JourneyPlanner([unusable], [rescue])
+    resp = _for_trip(
+        _scope(S1=_live_train(now, "gone", dep_min=10, arr_min=50, et_declared_cancelled=True)),
+        jp, now=now,
+    )
+    assert [c["arrive_by"] for c in jp.calls] == [True, False], "the fallback must be asked"
+    assert resp.alternative_journey is not None, "and its answer must reach the traveller"
+    assert resp.alternative_journey.arrives_before_original is False, (
+        "later than they planned, which is the honest answer for a cancelled train"
+    )
 
 
 def test_the_selection_failure_log_carries_a_digest_not_the_travellers_stops():
