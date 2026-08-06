@@ -1181,6 +1181,7 @@ def _best_remaining_journey(
     to_stop: str,
     window_end: datetime,
     now: datetime,
+    path: alternatives.FetchPath = "request",
 ) -> tuple[AlternativeJourney | None, bool, tuple[str | None, str] | None]:
     """Fetch, score and choose: the best remaining way to `to_stop`, or "stay put".
 
@@ -1225,14 +1226,14 @@ def _best_remaining_journey(
         return [s.candidate for s in scored if _usable(s.candidate, affected_refs=affected_refs, now=now)]
 
     by_deadline = alternatives.fetch_candidates(
-        from_stop, to_stop, arrive_by=True, date_time=deadline, now=now
+        from_stop, to_stop, arrive_by=True, date_time=deadline, now=now, path=path
     )
     _reconcile_original_arrival(original, by_deadline, subject=subject)
     pool = scored_pool(by_deadline)
     if not pool:
         pool = scored_pool(
             alternatives.fetch_candidates(
-                from_stop, to_stop, arrive_by=False, date_time=now, now=now
+                from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path
             )
         )
 
@@ -1263,6 +1264,7 @@ def for_trip(
     catchable_after: datetime | None = None,
     with_alternative: bool = True,
     min_impact: float = 0.0,
+    path: alternatives.FetchPath = "request",
 ) -> ImpactResponse:
     """Score a trip against the live per-call cache and shape the /impact response.
 
@@ -1275,6 +1277,12 @@ def for_trip(
     situation that crossed that gate — without this, every disruption-touched journey-window paid a
     blocking 3 s HTTPS round trip on the ingestion thread to compute a value that was then discarded.
     The HTTP endpoint leaves it at 0.0: a caller who asked for `to_stop` wants the answer regardless.
+
+    `path` says which budget a Journey Planner fetch is charged to (see
+    `alternatives._FETCH_MAX_PER_MIN`). It defaults to `"request"` — the conservative side — so an
+    unwired caller can never spend the poller's reservation. `main._varsel_impact` passes
+    `"poller"`; the public `/impact` route leaves the default, which is the whole point of the
+    split: an unauthenticated caller inventing stop pairs must not be able to starve the push cycle.
     """
     if _snapshot_provider is None:
         raise RuntimeError("impact.configure(snapshot_provider=...) was never called")
@@ -1311,7 +1319,12 @@ def for_trip(
         # A bad alternative must cost the alternative and nothing else.
         try:
             alternative, original_is_best, subject = _best_remaining_journey(
-                cells, from_stop=from_stop, to_stop=to_stop, window_end=window_end, now=now
+                cells,
+                from_stop=from_stop,
+                to_stop=to_stop,
+                window_end=window_end,
+                now=now,
+                path=path,
             )
         except Exception:
             logger.warning(

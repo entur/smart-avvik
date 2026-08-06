@@ -777,6 +777,12 @@ def _varsel_impact(
         catchable_after=catchable_after,
         with_alternative=with_alternative,
         min_impact=min_impact,
+        # Charge this provider's Journey Planner fetches to the poller's reserved budget, not the
+        # public one. Only `check_and_notify` ever passes `with_alternative=True` — the
+        # /varsel-api request path leaves it False and issues no fetch at all — so a flat "poller"
+        # is exact here, and it is what stops an unauthenticated caller flooding /impact from
+        # starving the push cycle it shares this module-global cache with.
+        path="poller",
     )
 
 

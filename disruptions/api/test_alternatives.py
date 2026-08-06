@@ -14,6 +14,7 @@ Run: uv run --with pydantic python test_alternatives.py  (or under pytest)
 """
 
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 
 import alternatives
@@ -369,10 +370,8 @@ def test_a_stop_ref_that_could_escape_the_graphql_literal_is_refused_before_any_
     `fetch_candidates` is the only entry point now; it carried the guard from the day it was
     written, and the second copy that used to sit on the lookup it replaced went with that function.
     """
-    original_trip = alternatives._fetch_trip_patterns
     attempts = []
-    alternatives._fetch_trip_patterns = lambda *a, **k: attempts.append(1) or _recorded_patterns()
-    alternatives._cache = _KeyedTTLCache(timedelta(minutes=2), timedelta(minutes=2))
+    original_trip = _install_fetch(lambda *a, **k: attempts.append(1) or _recorded_patterns())
     try:
         for ref in HOSTILE_STOP_REFS:
             for pair in ((ref, TO), (FROM, ref)):
@@ -673,11 +672,49 @@ def test_a_malformed_pattern_is_skipped_not_fatal():
 
 # ---- fetch_candidates -------------------------------------------------------------------------
 def _install_fetch(fake):
-    """Swap the network call and reset the cache; returns the original for the finally block."""
+    """Swap the network call and reset the cache AND the fetch budget; returns the original.
+
+    The budget reset is not housekeeping: the ceiling counts per minute against the caller's `now`,
+    and this suite pins `now` to two fixed instants, so without it every fetch in the file would
+    accumulate into one notional minute and a test added later would be throttled by the tests
+    before it — which reads as an unrelated failure. The cache is built with the module's own TTL
+    rather than a test-local one so "a repeat inside the TTL" here means what it means in prd.
+    """
     original = alternatives._fetch_trip_patterns
     alternatives._fetch_trip_patterns = fake
-    alternatives._cache = _KeyedTTLCache(timedelta(minutes=2), timedelta(minutes=2))
+    alternatives._cache = _KeyedTTLCache(alternatives._TTL, alternatives._FAILURE_COOLDOWN)
+    alternatives._fetch_calls = {"request": [], "poller": []}
     return original
+
+
+class _LogCapture(logging.Handler):
+    """Every record this module emits, kept so the privacy assertion can read all of them."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _capture_logs():
+    handler = _LogCapture()
+    alternatives.logger.addHandler(handler)
+    alternatives.logger.setLevel(logging.DEBUG)
+    return handler
+
+
+def _fields(record) -> dict:
+    return getattr(record, "fields", {}) or {}
+
+
+def _rendered(record) -> str:
+    """Everything a log backend could publish from one record: message, structured fields, trace."""
+    parts = [record.getMessage(), repr(_fields(record))]
+    if record.exc_info:
+        parts.append(logging.Formatter().formatException(record.exc_info))
+    return " ".join(parts)
 
 
 def test_fetch_candidates_passes_the_callers_stops_through_unchanged():
@@ -839,6 +876,250 @@ def test_alternative_prediction_defaults_to_not_scored_with_null_probabilities()
     # which `from __future__ import annotations` does not defer — pydantic resolves field
     # annotations when the class is built.
     assert alternatives.AlternativePrediction.__module__ == "alternatives"
+
+
+# ---- Cycle-stable key, fetch ceiling, observability --------------------------------------------
+# Measured in prd 2026-08-06 (08:45-10:45 CEST): the ingestion rebuild that drives this lookup fires
+# every ~4.8 minutes, not once a minute. Four minutes is therefore "the same poller cycle's worth of
+# time" — inside the real cadence, and the interval every test below is written around.
+CYCLE = timedelta(minutes=4)
+
+
+def test_two_lookups_a_cycle_apart_share_one_fetch():
+    """The regression test for the defect this unit exists to fix.
+
+    The TTL was two minutes and the cadence is ~4.8, so the entry had ALWAYS expired by the time the
+    next cycle asked: every poller lookup was a cold 3 s HTTPS call on the thread that also rebuilds
+    every BigQuery cache, in a service pinned to one replica.
+    """
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    try:
+        deadline = CAND_NOW + timedelta(minutes=45)
+        first = fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=True, date_time=deadline, now=CAND_NOW
+        )
+        second = fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=True, date_time=deadline, now=CAND_NOW + CYCLE
+        )
+        assert len(calls) == 1, "one JP call per stop pair and deadline per cycle, not one per cycle"
+        assert first and second == first
+    finally:
+        alternatives._fetch_trip_patterns = original
+
+
+def _old_bucket(when: datetime) -> int:
+    """The five-minute departure bucket the key used before this unit."""
+    return int(when.timestamp() // 300)
+
+
+def test_an_anchor_that_moves_with_now_still_shares_the_key():
+    """And this is the half that raising the TTL alone would not have fixed.
+
+    `impact._best_remaining_journey`'s fallback query is anchored on `now`, so consecutive cycles
+    asked about travel times ~4.8 minutes apart. Against a five-minute bucket they collided about
+    4 % of the time — every lookup a cold fetch whatever the TTL said. The times below straddle a
+    five-minute boundary on purpose: this is exactly the case that used to re-fetch.
+    """
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    try:
+        first_at = datetime(2026, 8, 6, 9, 3, tzinfo=UTC)
+        second_at = first_at + CYCLE
+        assert _old_bucket(first_at) != _old_bucket(second_at), "must straddle the old boundary"
+        fetch_candidates(CAND_FROM, CAND_TO, arrive_by=False, date_time=first_at, now=first_at)
+        fetch_candidates(CAND_FROM, CAND_TO, arrive_by=False, date_time=second_at, now=second_at)
+        assert len(calls) == 1, "a moving anchor inside one half hour is one question, not two"
+    finally:
+        alternatives._fetch_trip_patterns = original
+
+
+def test_deadlines_forty_minutes_apart_are_different_questions():
+    """The quantum is coarse, not absent: two travellers with deadlines 40 minutes apart must not
+    be answered from one JP reply, because the later one's usable departures are not in it."""
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    try:
+        early = CAND_NOW + timedelta(minutes=20)
+        late = early + timedelta(minutes=40)
+        fetch_candidates(CAND_FROM, CAND_TO, arrive_by=True, date_time=early, now=CAND_NOW)
+        fetch_candidates(CAND_FROM, CAND_TO, arrive_by=True, date_time=late, now=CAND_NOW)
+        assert len(calls) == 2
+    finally:
+        alternatives._fetch_trip_patterns = original
+
+
+def _fill_budget(calls, *, path, now, first=9000):
+    """Spend `path`'s whole minute on distinct stop pairs, as a caller inventing `at` values would."""
+    for i in range(alternatives._FETCH_MAX_PER_MIN):
+        got = fetch_candidates(
+            CAND_FROM, f"NSR:StopPlace:{first + i}", arrive_by=False,
+            date_time=now, now=now, path=path,
+        )
+        assert got, "every lookup inside the budget is answered"
+    assert len(calls) == alternatives._FETCH_MAX_PER_MIN
+
+
+def test_past_the_ceiling_no_request_is_issued_and_the_window_rolls():
+    """/impact is public and unauthenticated, runs `plain def` in the ~40-slot anyio threadpool and
+    turns one inbound request into a blocking 3 s outbound call — and a caller varying `at` defeats
+    the cache by construction, because every value is a new key. Past the ceiling the answer
+    degrades (`alternative_journey: null`), not the pod.
+    """
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    handler = _capture_logs()
+    try:
+        _fill_budget(calls, path="request", now=CAND_NOW)
+        blocked = fetch_candidates(
+            CAND_FROM, "NSR:StopPlace:9999", arrive_by=False, date_time=CAND_NOW, now=CAND_NOW
+        )
+        assert blocked == [], "past the ceiling there is simply no alternative to offer"
+        assert len(calls) == alternatives._FETCH_MAX_PER_MIN, "and no request was issued"
+
+        rolled = fetch_candidates(
+            CAND_FROM, "NSR:StopPlace:9998", arrive_by=False,
+            date_time=CAND_NOW, now=CAND_NOW + timedelta(seconds=61),
+        )
+        assert rolled, "once the trailing minute rolls the budget is available again"
+        assert len(calls) == alternatives._FETCH_MAX_PER_MIN + 1
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_trip_patterns = original
+
+
+def test_request_traffic_cannot_consume_the_pollers_share():
+    """The reservation. One shared counter would let an anonymous caller starve the alternatives out
+    of every push notification without tripping anything — the same failure a global circuit breaker
+    would have, which is why there is no breaker here either.
+    """
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    handler = _capture_logs()
+    try:
+        _fill_budget(calls, path="request", now=CAND_NOW)
+        assert fetch_candidates(
+            CAND_FROM, "NSR:StopPlace:9999", arrive_by=False, date_time=CAND_NOW, now=CAND_NOW
+        ) == [], "the request path is spent"
+        assert fetch_candidates(
+            CAND_FROM, "NSR:StopPlace:9999", arrive_by=False,
+            date_time=CAND_NOW, now=CAND_NOW, path="poller",
+        ), "the poller's share is reserved and was never at risk"
+        assert len(calls) == alternatives._FETCH_MAX_PER_MIN + 1
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_trip_patterns = original
+
+
+def test_the_default_path_is_the_conservative_one():
+    """An unwired caller must be treated as request traffic: spending the poller's reserved share by
+    default would make the reservation meaningless the moment a new call site forgot the argument."""
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    handler = _capture_logs()
+    try:
+        _fill_budget(calls, path="request", now=CAND_NOW)
+        assert fetch_candidates(
+            CAND_FROM, "NSR:StopPlace:9999", arrive_by=False, date_time=CAND_NOW, now=CAND_NOW
+        ) == [], "the default spends the request budget, which is exhausted"
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_trip_patterns = original
+
+
+def test_a_successful_fetch_is_logged_with_a_digest_not_the_stop_refs():
+    """This module logged only `alternatives_error`, and dev recorded none in 24 h — so a JP that is
+    2.9 s slow but healthy was invisible, and "watch the error volume" could not have detected the
+    fetch rate this unit changes.
+    """
+    original = _install_fetch(lambda *a, **k: _recorded_patterns())
+    handler = _capture_logs()
+    try:
+        when = CAND_NOW + timedelta(minutes=20)
+        fetch_candidates(CAND_FROM, CAND_TO, arrive_by=False, date_time=when, now=CAND_NOW)
+        events = [r for r in handler.records if _fields(r).get("event") == "alternatives_fetch"]
+        assert len(events) == 1
+        got = _fields(events[0])
+        assert got["duration_ms"] is not None, "the whole point is that a slow JP is visible"
+        assert got["n_patterns"] == 4
+        assert got["arrive_by"] is False and got["path"] == "request"
+        assert got["cache_hit"] is False and got["throttled"] is False
+        assert got["pair_digest"] and got["pair_digest"] not in (CAND_FROM, CAND_TO)
+        assert got["pair_digest"] == alternatives._pair_digest(CAND_FROM, CAND_TO)
+
+        # The same lookup a cycle later is a hit, and says so — otherwise the cache-key rewrite
+        # this unit is built on could not be measured in prd at all.
+        fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=False, date_time=when, now=CAND_NOW + CYCLE
+        )
+        hit = _fields(
+            [r for r in handler.records if _fields(r).get("event") == "alternatives_fetch"][-1]
+        )
+        assert hit["cache_hit"] is True and hit["duration_ms"] is None
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_trip_patterns = original
+
+
+def test_no_log_record_from_this_module_carries_a_raw_stop_ref():
+    """On the poller path the two stop refs ARE a registered traveller's own journey, and a
+    per-cycle success log of origin + destination beside a departure time is exactly the trio
+    `/historikk-api` refuses to serve. Every path is walked, not just the happy one: the two
+    `alternatives_error` warnings used to interpolate the whole cache key, which is the pair.
+    """
+    def boom(*a, **k):
+        raise RuntimeError("JP down")
+
+    class Exploding(list):
+        def __iter__(self):
+            raise TypeError("boom")
+
+    # A pattern the parser cannot survive at all: `line.id` of 5 fails AlternativeLeg validation,
+    # which is the raise `parse_candidates` catches per pattern. (A pattern with no arrival is
+    # merely dropped, silently, and would not exercise the warning.)
+    unparseable_leg = [
+        {"expectedEndTime": "2026-08-06T12:00:00+02:00", "legs": [{"line": {"id": 5}}]}
+    ]
+    when = CAND_NOW + timedelta(minutes=20)
+    paths = {
+        "a successful fetch": (lambda *a, **k: _recorded_patterns(), CAND_TO),
+        "the fetch raising": (boom, CAND_TO),
+        "an unparseable reply": (lambda *a, **k: Exploding([1]), CAND_TO),
+        "one bad pattern": (lambda *a, **k: list(unparseable_leg), CAND_TO),
+        "a refused stop ref": (lambda *a, **k: _recorded_patterns(), "NSR:Line:337"),
+    }
+    handler = _capture_logs()
+    original = alternatives._fetch_trip_patterns
+    try:
+        for label, (fake, to_stop) in paths.items():
+            _install_fetch(fake)
+            fetch_candidates(CAND_FROM, to_stop, arrive_by=False, date_time=when, now=CAND_NOW)
+            fetch_candidates(  # ... and again, for the cache-hit record
+                CAND_FROM, to_stop, arrive_by=False, date_time=when, now=CAND_NOW
+            )
+            assert handler.records, f"{label} must leave a trace of some kind"
+        # And the throttled path, which logs a refusal of its own.
+        calls = []
+        _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+        _fill_budget(calls, path="request", now=CAND_NOW)
+        fetch_candidates(CAND_FROM, CAND_TO, arrive_by=False, date_time=when, now=CAND_NOW)
+
+        # Self-check: a path that stops logging stops being covered, silently, unless this holds.
+        seen = {(_fields(r).get("event"), _fields(r).get("reason")) for r in handler.records}
+        for expected in (
+            ("alternatives_fetch", None),
+            ("alternatives_error", None),  # the fetch raised / the reply was uninterpretable
+            ("alternatives_error", "bad_pattern"),
+            ("alternatives_error", "bad_stop_ref"),
+            ("alternatives_error", "rate_limited"),
+        ):
+            assert expected in seen, f"{expected} was never logged, so it was never checked"
+        for record in handler.records:
+            text = _rendered(record)
+            assert "NSR:" not in text, f"{record.getMessage()!r} publishes a stop ref: {text}"
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_trip_patterns = original
 
 
 # ---- Recorded Journey Planner reply -----------------------------------------------------------
