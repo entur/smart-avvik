@@ -513,15 +513,53 @@ def test_operator_collision_not_merged():
     assert alerts[0].cancel_probability == 0.8  # SKY's train, not ATB's boarding-only 0.99
 
 
-def _push_body(**board_kw) -> str:
+def _alternative(**kw) -> alternatives.AlternativeJourney:
+    """A Journey Planner answer in the shape `select_best` returns it.
+
+    Departs 08:24 and arrives 09:05 by default — the in-time case. The selection rule has its own
+    hermetic suite; these checks are about what the traveller is told, so the answer is handed in
+    rather than searched for.
+    """
+    fields = {
+        "departure_time": MON_0800 + timedelta(minutes=24),
+        "arrival_time": MON_0800 + timedelta(minutes=65),
+        "duration_min": 41,
+        "minutes_saved": 12,
+        "arrives_before_original": True,
+        "at_risk": False,
+        "legs": [
+            alternatives.AlternativeLeg(
+                mode="rail", line="VYG:Line:R11", public_code="R11",
+                from_name="Oslo S", to_name="Drammen",
+            )
+        ],
+    }
+    return alternatives.AlternativeJourney(**{**fields, **kw})
+
+
+# 09:35 — half an hour past what the disrupted train promised. The routine shape now that the
+# fallback tier offers a replacement for a cancelled train rather than nothing at all.
+_LATE_ALTERNATIVE = {
+    "minutes_saved": -18,
+    "arrives_before_original": False,
+    "arrival_time": MON_0800 + timedelta(minutes=95),
+}
+
+
+def _push_body(alternative: alternatives.AlternativeJourney | None = None, **board_kw) -> str:
     """The Web Push body for the single match produced by a train with these boarding numbers.
 
     Through the real message input, not the alert directly: the deterministic wording is assembled
     from the same document the model is prompted with, so these checks have to run over it.
+
+    `alternative` is set on the matched alert, which is where the real cycle puts it: varsel asks
+    the Journey Planner once per window and back-fills the answer onto every alert.
     """
     journey = _journey()
     alerts = match(journey, {"S1": _train(MON_0800, **board_kw)})
     assert len(alerts) == 1
+    if alternative is not None:
+        alerts[0].alternative_journey = alternative
     message_input = _message_input(journey, alerts[0])
     assert message_input is not None, "the wording's source must actually be buildable"
     return _notification_payload(journey, alerts[0], message_input=message_input)["body"]
@@ -646,6 +684,95 @@ def test_push_body_omits_a_missing_summary():
     body = _push_body(summary=None, p_cancel=0.95)
     assert "None" not in body
     assert body == "Tog kl 08:00: 95 % sjanse for innstilling"
+
+
+# ---- the alternative, in the wording prd actually ships ---------------------------------------
+# VARSEL_LLM_ENABLED=false in prd, so these strings -- not the model's -- are what real travellers
+# read. A caveat that reaches only the prompt reaches nobody.
+_DELAYED = {"p_cancel": 0.02, "p_impact_dep": 0.93,
+            "dep_delay_p50_stack_min": 15, "dep_delay_p90_stack_min": 27}
+
+
+def test_push_body_without_an_alternative_is_unchanged():
+    """The regression guard for this whole change: when nothing was found, the body is exactly the
+    two lines it has always been. Pinned, not asserted `in`, so an unconditional clause shows up."""
+    assert _push_body(**_DELAYED) == "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket"
+
+
+def test_push_body_names_an_in_time_alternative():
+    body = _push_body(_alternative(), **_DELAYED)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ kl 08:24, framme kl 09:05"
+    )
+
+
+def test_push_body_says_when_the_alternative_arrives_after_the_planned_arrival():
+    """The case this change exists for. The old rule effectively never found an alternative; the new
+    one routinely offers the next possibility rather than a faster one, and a body that named a
+    departure time without saying that tells the traveller they still make their appointment."""
+    body = _push_body(_alternative(**_LATE_ALTERNATIVE), **_DELAYED)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+    )
+    assert "spart" not in body, "a negative saving is not a saving"
+
+
+def test_push_body_hedges_an_alternative_that_is_itself_at_risk():
+    """Offered because nothing safer reached the destination in time -- so it must not read as a
+    clean escape."""
+    body = _push_body(_alternative(at_risk=True), **_DELAYED)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ kl 08:24, framme kl 09:05 (kan også bli rammet)"
+    )
+
+
+def test_push_body_leads_with_a_declared_cancellation_even_with_an_alternative():
+    """The cancellation is the fact; the alternative is the advice that follows it. And no
+    probability anywhere -- the 2026-08-05 report, which an extra clause must not reopen."""
+    body = _push_body(_alternative(**_LATE_ALTERNATIVE), et_declared_cancelled=True,
+                      p_cancel=0.57, p_impact_dep=0.61)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Innstilt\n"
+        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+    )
+    assert "%" not in body and "sjanse" not in body
+
+
+def test_the_last_resort_wording_names_the_alternative_for_a_cancelled_train():
+    """`_message_input_from_alert` returns early on a declared cancellation, so an alternative
+    appended after that branch would be dropped for exactly the case this change exists to serve:
+    the push would say "Innstilt" and name no replacement."""
+    alert = Alert(
+        situation_number="S1", summary="Signalfeil", line="VYG:Line:R10",
+        departure_time=MON_0800, cancelled=True, cancel_probability=1.0,
+        delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
+        alternative_journey=_alternative(**_LATE_ALTERNATIVE),
+    )
+    body = _deterministic_body(_message_input_from_alert(alert))
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Innstilt\n"
+        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+    )
+
+
+def test_the_last_resort_wording_quotes_a_real_saving_but_never_a_negative_one():
+    """The same `minutter_spart` discipline as the message input: the key exists only when it is
+    the figure worth quoting, so the two wording sources cannot disagree about it."""
+    def input_for(**alt_kw):
+        return _message_input_from_alert(Alert(
+            situation_number="S1", summary="Signalfeil", line="VYG:Line:R10",
+            departure_time=MON_0800, cancel_probability=0.02, impact_probability=0.93,
+            delay_p50_min=15, delay_p90_min=27, alert_threshold=0.65, alertworthy=True,
+            alternative_journey=_alternative(**alt_kw),
+        ))
+
+    assert input_for()["alternativ_reise"]["minutter_spart"] == 12
+    late = input_for(**_LATE_ALTERNATIVE)["alternativ_reise"]
+    assert "minutter_spart" not in late
+    assert late["ankommer_i_tide"] is False
 
 
 if __name__ == "__main__":

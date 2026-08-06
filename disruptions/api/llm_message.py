@@ -142,6 +142,11 @@ tidligere tidspunkt, ikke nødvendigvis situasjonen akkurat nå.
 sier hvor på linja avviket gjelder – de er ikke den reisendes reisevei. Skriv aldri et råd som \
 «ta neste tog mellom X og Y» med stedsnavn derfra.
 - Hvis `alternativ_reise` finnes, er det det mest nyttige rådet.
+- `alternativ_reise.ankommer_i_tide: false` betyr at alternativet er FRAMME ETTER den planlagte \
+ankomsten – det er den neste muligheten, ikke en tidsbesparelse. Skriv da aldri at den reisende \
+rekker fram i tide, og aldri noe om spart tid; si heller at dette er neste mulighet. \
+`alternativ_reise.egen_risiko: true` betyr at også alternativet kan bli rammet – omtal det da som \
+det beste vi finner, ikke som en trygg løsning.
 - Ingen innledning, ingen overskrift, ingen emoji, ingen anførselstegn rundt svaret.
 - Maks 300 tegn.
 
@@ -571,10 +576,17 @@ def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
         impact, "alternative_journey", None
     )
     if alt is not None:
-        payload["alternativ_reise"] = {
+        alternative: dict[str, Any] = {
             "avgang_kl": _hhmm(alt.departure_time),
             "ankomst_kl": _hhmm(alt.arrival_time),
-            "minutter_spart": alt.minutes_saved,
+            # Two flags rather than one signed number, because they answer different questions and a
+            # reader must not have to infer either. `arrives_before_original` compares arrival times;
+            # `minutes_saved` is a rounded difference, so an alternative can arrive first and still
+            # round to a zero saving. `at_risk` says the suggestion is itself over its operator's
+            # gate or on a line a live situation touches — offered because nothing safer reached the
+            # destination in time, which a wording presenting it as a clean escape would get wrong.
+            "ankommer_i_tide": bool(alt.arrives_before_original),
+            "egen_risiko": bool(alt.at_risk),
             "reisevei": [
                 {
                     "transportmiddel": _bounded_text(leg.mode, _NAME_MAX_CHARS),
@@ -586,6 +598,17 @@ def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
                 if leg.mode != "foot"
             ],
         }
+        # Carried only when there IS a saving — the same discipline `innstilling_prosent` follows
+        # above, and for the same reason: a figure in this document is a figure that can reach a
+        # lock screen. `minutes_saved` is signed and, since the selection rule gained its fallback
+        # tier, routinely zero or negative (a replacement for a cancelled train legitimately lands
+        # after the timetable promised). Handing that over would put "spart -18 minutter" one prompt
+        # away — the 2026-07-27 regression in a new costume. `ankommer_i_tide` states that case as
+        # the fact it is instead.
+        saved = alt.minutes_saved
+        if saved is not None and saved > 0:
+            alternative["minutter_spart"] = saved
+        payload["alternativ_reise"] = alternative
     return payload
 
 

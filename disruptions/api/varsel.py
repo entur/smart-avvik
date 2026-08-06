@@ -989,6 +989,44 @@ def _delay_phrase(message_input: dict) -> str | None:
     return f"Typisk {p90 or p50} min forsinket"
 
 
+def _alternative_phrase(message_input: dict) -> str | None:
+    """"Alternativ kl 08:24, framme kl 09:05" — the escape route, with the caveats it comes with.
+
+    This is the wording prd actually ships (`VARSEL_LLM_ENABLED=false` there), so a caveat that
+    reaches only the prompt reaches nobody. Two of them are stated rather than implied:
+
+    * `ankommer_i_tide: false` — the alternative is framme AFTER the traveller's planned arrival.
+      Routine, not exotic: since the selection rule gained its fallback tier the offer for a
+      cancelled train is regularly the next possibility rather than a faster one, and a clause that
+      named a departure time without saying so would tell that traveller they still make their
+      appointment. Read as `is False`, not falsily: an input built before this key existed (a
+      replayed decision row, `_message_input_from_alert` from an older process) says *nothing* about
+      which side of the deadline this lands on, and asserting lateness from silence is a fabrication.
+    * `egen_risiko` — the replacement is itself predicted to be in trouble. It is offered because
+      nothing safer reached the destination in time, so it must not read as a clean escape.
+
+    `minutter_spart` is deliberately not quoted. It is in the input only when positive (see
+    `llm_message.build_message_input`), the two times already say it, and one figure per line is the
+    register this template keeps.
+
+    Same "assemble from the parts that exist" discipline as the rest of the body: the Journey Planner
+    can answer without a readable departure or arrival time, and an alternative naming neither is not
+    advice — it is dropped rather than rendered as "Alternativ kl None".
+    """
+    alt = message_input.get("alternativ_reise") or {}
+    departure, arrival = alt.get("avgang_kl"), alt.get("ankomst_kl")
+    if not departure and not arrival:
+        return None
+    phrase = f"Alternativ kl {departure}" if departure else "Alternativ"
+    if arrival:
+        phrase += f", framme kl {arrival}" if departure else f" framme kl {arrival}"
+    if alt.get("ankommer_i_tide") is False:
+        phrase += " – senere enn planlagt ankomst"
+    if alt.get("egen_risiko"):
+        phrase += " (kan også bli rammet)"
+    return phrase
+
+
 def _deterministic_body(message_input: dict) -> str:
     """The template wording: what the push says when no written message is available.
 
@@ -1026,7 +1064,11 @@ def _deterministic_body(message_input: dict) -> str:
     if hhmm:
         train = f"{message_input.get('transportmiddel')} kl {hhmm}"
         detail = f"{train}: {detail}" if detail else train
-    return "\n".join(part for part in (summary, detail) if part)
+    # The alternative comes LAST, after the cancellation or the delay: what has happened to the
+    # traveller's own train is the news, and the replacement is the advice that follows from it.
+    return "\n".join(
+        part for part in (summary, detail, _alternative_phrase(message_input)) if part
+    )
 
 
 def _tag_environment(title: str) -> str:
@@ -1232,6 +1274,12 @@ def _message_input(journey: dict, alert: Alert) -> dict | None:
         return None
 
 
+def _local_hhmm(value: datetime | None) -> str | None:
+    """"08:24" in Europe/Oslo, or None. Mirrors `llm_message._hhmm` without importing it — that is
+    the module :func:`_message_input_from_alert` is standing in for."""
+    return value.astimezone(_OSLO).strftime("%H:%M") if value is not None else None
+
+
 def _message_input_from_alert(alert: Alert) -> dict:
     """The alert's own figures in the message-input shape — a last resort for the *wording* only.
 
@@ -1245,13 +1293,25 @@ def _message_input_from_alert(alert: Alert) -> dict:
     """
     body: dict[str, Any] = {
         "transportmiddel": alert.mode,
-        "avgang_kl": (
-            alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-            if alert.departure_time is not None
-            else None
-        ),
+        "avgang_kl": _local_hhmm(alert.departure_time),
         "situasjoner": [{"sammendrag": alert.summary}],
     }
+    # BEFORE the cancellation branch, not after it. That branch returns, and a declared cancellation
+    # is exactly the case where naming a replacement matters most -- appending this at the end of the
+    # function would produce a push reading "Innstilt" and naming nothing to take instead. The keys
+    # mirror build_message_input's, including that `minutter_spart` exists only when there is a
+    # saving: the two wording sources must not disagree about whether this journey is faster.
+    alt = alert.alternative_journey
+    if alt is not None:
+        alternative: dict[str, Any] = {
+            "avgang_kl": _local_hhmm(alt.departure_time),
+            "ankomst_kl": _local_hhmm(alt.arrival_time),
+            "ankommer_i_tide": alt.arrives_before_original,
+            "egen_risiko": alt.at_risk,
+        }
+        if alt.minutes_saved > 0:
+            alternative["minutter_spart"] = alt.minutes_saved
+        body["alternativ_reise"] = alternative
     # Same three-way split as build_message_input, for the same reason: a declared cancellation is
     # not a probability, and the conditional figures below it do not apply once the train is gone.
     if alert.cancelled:
