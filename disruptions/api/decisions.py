@@ -184,6 +184,35 @@ def _alternative_fields(alert: Alert) -> dict:
     sharply, which is exactly why `alt_status` is written on every row: an offer rate whose
     denominator shifts under it measures the change in the log, not the change in the advice.
 
+    **Measured 2026-08-06 in dev, and the paragraph above does not survive it.** `has_alternative`
+    has only been WRITTEN since 2026-08-05 — this function is what writes it, and it was added in
+    fa27085 that day. Every one of the 673 rows before that carries NULL. So "measured 2026-08-04"
+    cannot have come from this column, and the 0 % it reports is the absence of instrumentation, not
+    the absence of offers. Grouping the log into SUBJECTS (journey x situation x departure, since
+    the poller re-decides each one ~10 times):
+
+        08-01..08-04   83 subjects   0 measurable            no measurement exists
+        08-05..08-06   50 subjects  50 measurable, 13 offered        26.0 %
+
+    That 26 % is the old earliest-arrival-and-three-minutes-faster rule, since the 2026-08-06
+    selection rule had not deployed when those rows were written. It is the ONLY measurement of it
+    there has ever been. **"Effectively never" was never measured; treat it as a claim, not a
+    finding.**
+
+    The trap here is worth more than the figure, because it caught two readers in a row. NULL is a
+    third bucket, never a default: `LOGICAL_OR(has_alternative)` over uninstrumented rows is NULL,
+    `COUNTIF` does not count it, and 83 subjects with no data render as 83 subjects with no offer.
+    That is the same rule `/historikk` states for `n_unsegmented` and the same one `alt_status`
+    exists to enforce — and it was still got backwards while writing a correction about it.
+
+    Caveats travel with the figures: dev only, 9 registered journeys over 9 stop pairs, and n=50
+    (so roughly +/-12 points). The cancelled-train case — the one the new rule exists for — has
+    **2** subjects, neither offered. That is not evidence for the rule; it is the absence of enough
+    data to test it, and the honest reason to let `alt_status` accumulate after deploy.
+
+    The query is `data/queries/alternative_offer_rate.sql`; re-run it rather than quoting this
+    block, which is a snapshot and will go stale exactly the way its predecessor did.
+
     Three things about the offer itself that the old columns cannot express, because the journey they
     describe is no longer necessarily a faster one:
 

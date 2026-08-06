@@ -1532,9 +1532,11 @@ def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
     rather than the winning one. Both caches live as long as the SITUATION (up to its 12 h window)
     while the alerts underneath are re-scored every tick, and the commonest way an alternative goes
     stale is the disruption easing off until nothing crosses the gate — which takes that return and
-    never reached any pop. Nothing cleared an entry at all before 2026-08-06, because under the old
-    selection rule an alternative was found "effectively never"; now it is routine, and so is its
-    opposite. A card could keep advising a superseded escape for hours.
+    never reached any pop. Nothing cleared an entry at all before 2026-08-06, on the belief that an
+    alternative was rare enough for a stale one not to be worth the code. That belief was never
+    measured, and when it finally was (2026-08-06, 26 % of alerting subjects under the OLD rule —
+    `data/queries/alternative_offer_rate.sql`) it did not hold, so this was likely already biting
+    before the selection rule changed. A card could keep advising a superseded escape for hours.
 
     Four fresh readings, and telling them apart is the whole job:
 

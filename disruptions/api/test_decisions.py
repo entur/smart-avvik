@@ -272,8 +272,13 @@ def test_an_alternative_missing_the_new_fields_records_null_not_an_error():
 
 def test_no_alternative_is_recorded_as_false_not_null():
     """NULL would be ambiguous between "we looked and found nothing" and "this predates the column".
-    Measured 2026-08-04 under the old rule the answer was "effectively never", which only means
-    something if absence is explicit.
+
+    That ambiguity is not hypothetical, and this pin is why it stays bounded. The 673 rows written
+    before `_alternative_fields` existed (2026-08-05) carry NULL, and on 2026-08-06 a reader counted
+    them as "no alternative offered" — producing a 0 % baseline for the old rule out of rows that
+    had never been instrumented, and a two-day "jump" that never happened. Every row this function
+    writes from here on says FALSE when it means FALSE, so the ambiguous population can only be the
+    one that predates it.
     """
     assert _row()["has_alternative"] is False
     assert "alt_minutes_saved" not in _row()

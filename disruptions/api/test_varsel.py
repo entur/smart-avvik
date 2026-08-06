@@ -719,9 +719,11 @@ def test_push_body_names_an_in_time_alternative():
 
 
 def test_push_body_says_when_the_alternative_arrives_after_the_planned_arrival():
-    """The case this change exists for. The old rule effectively never found an alternative; the new
-    one routinely offers the next possibility rather than a faster one, and a body that named a
-    departure time without saying that tells the traveller they still make their appointment."""
+    """The case this change exists for: the new rule routinely offers the next possibility rather
+    than a faster one, so a body that named a departure time without saying so would tell the
+    traveller they still make their appointment. Under the old rule this shape was unreachable —
+    a journey arriving after the disrupted train could never clear "at least three minutes
+    faster" — which is the part of the old baseline that no measurement can revise."""
     body = _push_body(_alternative(**_LATE_ALTERNATIVE), **_DELAYED)
     assert body == (
         "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
@@ -789,9 +791,10 @@ def test_the_last_resort_wording_quotes_a_real_saving_but_never_a_negative_one()
 # ---- the caches the poller carries between cycles ----------------------------------------------
 # `_alternatives` and `_messages` outlive the tick that filled them (they are pruned when the
 # SITUATION ends, up to 12 h later) while the alerts underneath are re-scored every 60 s. Nothing
-# ever cleared an entry before 2026-08-06, because under the old selection rule an alternative was
-# found "effectively never". Both outcomes are routine now, and one of them -- "stay on your own
-# train" -- is advice that contradicts what may already be cached.
+# ever cleared an entry before 2026-08-06, on the belief that an alternative was rare enough for a
+# stale one not to be worth the code -- a belief measured for the first time on 2026-08-06 and found
+# wrong (26 % of alerting subjects under the OLD rule). Both outcomes are routine, and one of them
+# -- "stay on your own train" -- is advice that contradicts what may already be cached.
 _RECONCILE_KEY = "A|B|07:00|09:00|0,1,2,3,4"
 
 
