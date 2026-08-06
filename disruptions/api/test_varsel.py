@@ -775,6 +775,127 @@ def test_the_last_resort_wording_quotes_a_real_saving_but_never_a_negative_one()
     assert late["ankommer_i_tide"] is False
 
 
+# ---- the caches the poller carries between cycles ----------------------------------------------
+# `_alternatives` and `_messages` outlive the tick that filled them (they are pruned when the
+# SITUATION ends, up to 12 h later) while the alerts underneath are re-scored every 60 s. Nothing
+# ever cleared an entry before 2026-08-06, because under the old selection rule an alternative was
+# found "effectively never". Both outcomes are routine now, and one of them -- "stay on your own
+# train" -- is advice that contradicts what may already be cached.
+_RECONCILE_KEY = "A|B|07:00|09:00|0,1,2,3,4"
+
+
+def _reconcile_cycle(*, cached=None, fresh=None, original_is_best=False, alertworthy=True,
+                     message=None, now=NOW):
+    """One reconciliation over a single freshly-matched alert; returns what survived in the caches.
+
+    The alert comes out of the real matcher (so `impact` is a real ImpactResponse and the verdict is
+    set the way `/impact` sets it), and the cached state is planted under the same message key the
+    poller would have used.
+    """
+    alerts = match(_journey(), {"S1": _train(MON_0800, p_impact_dep=0.9 if alertworthy else 0.1)})
+    assert len(alerts) == 1 and alerts[0].alertworthy is alertworthy
+    alert = alerts[0]
+    alert.alternative_journey = fresh
+    if original_is_best:
+        # What impact.for_trip records when select_best returned None over a real pool: the
+        # traveller's own train won. `alternative_subject` must name THIS train, or match_journey
+        # strips the verdict as a claim about somebody else's.
+        alert.impact = alert.impact.model_copy(
+            update={"original_is_best": True, "alternative_subject": (alert.operator, alert.jkey)}
+        )
+    key = varsel._message_key(_RECONCILE_KEY, alert)
+    for cache in (varsel._alternatives, varsel._messages, varsel._message_meta):
+        cache.clear()
+    if cached is not None:
+        varsel._alternatives[key] = cached
+    if message is not None:
+        varsel._messages[key] = message
+        varsel._message_meta[key] = {"status": "ok", "provider": "vertex-anthropic"}
+    try:
+        varsel._reconcile_caches(_RECONCILE_KEY, alerts, now)
+        return varsel._alternatives.get(key), varsel._messages.get(key), varsel._message_meta.get(key)
+    finally:
+        for cache in (varsel._alternatives, varsel._messages, varsel._message_meta):
+            cache.clear()
+
+
+def test_a_selection_that_chose_the_travellers_own_train_clears_the_cached_alternative():
+    """The new outcome this whole change introduced. `original_is_best` is a VERDICT — the selection
+    ran, over a real pool, and decided the traveller should stay put — so it supersedes whatever was
+    cached, and the text written from that cached answer with it."""
+    alt, message, meta = _reconcile_cycle(
+        cached=_alternative(), message="Ta R11 kl 08:24 i stedet.", original_is_best=True
+    )
+    assert alt is None
+    assert message is None, "the wording naming it must not outlive the alternative"
+    assert meta is None, "a dropped message's provenance would file the next row as ok_cached"
+
+
+def test_a_cycle_that_never_looked_keeps_the_cached_alternative():
+    """A null alternative with no verdict means "we did not establish it" — a collapsed stop ref is
+    asked without the lookup on purpose, and an outage or the fetch budget skip it too. Clearing on
+    silence would make the card offer an escape route on alternate ticks and none in between."""
+    alt, message, _ = _reconcile_cycle(cached=_alternative(), message="Ta R11 kl 08:24 i stedet.")
+    assert alt is not None and alt.departure_time == MON_0800 + timedelta(minutes=24)
+    assert message == "Ta R11 kl 08:24 i stedet."
+
+
+def test_a_match_that_fell_below_the_gate_drops_both_caches():
+    """The commonest way this advice goes stale: the disruption eases off until nothing crosses the
+    threshold. That path takes check_and_notify's early return, so before 2026-08-06 it reached no
+    pop at all and the card kept last hour's escape route beside this tick's mild numbers."""
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(), message="Ta R11 kl 08:24 i stedet.", alertworthy=False
+    )
+    assert alt is None and message is None
+
+
+def test_an_alternative_departing_exactly_now_is_no_longer_catchable():
+    """One rule, one operator: `select_best` pools on `> now` (a departure exactly at `now` is not
+    offered), and the card read `>= now` — so for one second it advised a train the selection rule
+    had already refused to choose."""
+    assert varsel._still_catchable(_alternative(departure_time=NOW), NOW) is False
+    assert varsel._still_catchable(_alternative(departure_time=NOW + timedelta(seconds=1)), NOW)
+    # And an unreadable departure is kept: "we cannot tell whether it has left" is not "it has left".
+    assert varsel._still_catchable(_alternative(departure_time=None), NOW)
+
+
+def test_a_cached_alternative_that_has_departed_is_dropped_with_its_wording():
+    """Kept-on-silence has one exception. A stale alternative is worse than none — it advises
+    catching a train that has already left — and so is the message that named its departure time."""
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(departure_time=NOW), message="Ta R11 kl 06:00 i stedet."
+    )
+    assert alt is None and message is None
+
+
+def test_a_different_alternative_invalidates_the_message_written_from_the_old_one():
+    """A written message now quotes a specific departure time, and it is reused for the situation's
+    whole life (`ok_cached`). Offering a new alternative under the old wording would advise one train
+    on the card and another in the text."""
+    fresh = _alternative(
+        departure_time=MON_0800 + timedelta(minutes=40),
+        arrival_time=MON_0800 + timedelta(minutes=80),
+    )
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(), fresh=fresh, message="Ta R11 kl 08:24 i stedet."
+    )
+    assert alt.departure_time == fresh.departure_time
+    assert message is None
+
+
+def test_the_same_alternative_re_scored_keeps_the_written_message():
+    """`ok_cached` has to stay reachable: re-writing on every tick is exactly what the per-cycle LLM
+    budget exists to prevent. `at_risk` and the two prediction blocks are re-scored against the live
+    cache every 60 s, so they must not count as "a different alternative" — while the fresh reading
+    of them still replaces the stored copy, so the card shows this tick's flags."""
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(), fresh=_alternative(at_risk=True), message="Ta R11 kl 08:24 i stedet."
+    )
+    assert message == "Ta R11 kl 08:24 i stedet."
+    assert alt.at_risk is True, "the stored copy must still be refreshed"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:
