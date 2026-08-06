@@ -495,6 +495,33 @@ def _message_key(key: str, alert: "Alert") -> tuple[str, str, str]:
     return (key, alert.situation_number, dep)
 
 
+def _still_catchable(alt: AlternativeJourney | None, now: datetime) -> bool:
+    """Whether a cached alternative can still be boarded at `now` — one rule, both readers.
+
+    Strictly ``>``, which is :func:`alternatives.select_best`'s own pool rule ("a departure exactly
+    at `now` is not offered"). :func:`_journey_model` applied ``>=`` instead, so for one second the
+    card could offer a departure the selection rule had already refused to choose. Two operators for
+    one boundary is how the two drift.
+
+    An alternative with no readable departure time is kept: the Journey Planner can answer without
+    one, and "we cannot tell whether it has left" is not "it has left".
+    """
+    if alt is None:
+        return False
+    return alt.departure_time is None or alt.departure_time > now
+
+
+def _alternative_identity(alt: AlternativeJourney) -> tuple:
+    """What makes two alternatives the same advice: the two times any wording actually quotes.
+
+    Deliberately NOT the whole model. `at_risk` and both `*_prediction` blocks are re-scored against
+    the live prediction cache on every cycle, so comparing those would invalidate the written message
+    on nearly every tick — turning ``ok_cached`` into a per-cycle LLM call, which is exactly what
+    :data:`_MAX_LLM_CALLS_PER_CYCLE` and :data:`_MAX_LLM_SECONDS_PER_CYCLE` exist to prevent.
+    """
+    return (alt.departure_time, alt.arrival_time)
+
+
 # ---- State: devices, journeys, notified ------------------------------------------------------
 # Re-entrant lock: mutations call _save_state while already holding it.
 _state_lock = threading.RLock()
@@ -506,10 +533,15 @@ _notified: set[str] = set()  # {"journey_id|situationNumber"} — dedup, pruned 
 # journey × situation rather than one per device. In-memory only: a redeploy re-writes messages
 # rather than restoring stale advice from before the restart.
 _messages: dict[tuple[str, str, str], str] = {}
-# Same key, same lifecycle: the alternative the poller found for that journey x situation. Cached
-# rather than recomputed because the request path deliberately does NOT call the Journey Planner
-# (see match_journey) -- without this the field would be structurally null on the only endpoint that
+# Same key: the alternative the poller found for that journey x situation. Cached rather than
+# recomputed because the request path deliberately does NOT call the Journey Planner (see
+# match_journey) -- without this the field would be structurally null on the only endpoint that
 # serves it, which is how it shipped until review on 2026-07-29.
+#
+# The situation's end is the OUTER bound of both these caches' lives, not their whole lifecycle:
+# _reconcile_caches drops an entry as soon as this cycle's match supersedes it (see its docstring).
+# A 12 h-long situation would otherwise keep advising an escape route chosen against numbers from
+# hours ago -- including one the selection rule has since decided against.
 _alternatives: dict[tuple[str, str, str], AlternativeJourney] = {}
 # Same key, same lifecycle: how many times writing this message has failed, so a payload the LLM
 # cannot handle is not retried on every tick for the situation's whole life.
@@ -1452,6 +1484,83 @@ def _device_is_fresh(device_id: str) -> bool:
     return datetime.now(UTC) - created < _SUBSCRIPTION_GRACE
 
 
+def _forget_message(message_key: tuple[str, str, str]) -> None:
+    """Drop the cached wording for this journey × situation × departure, and its provenance with it.
+
+    Both or neither. `_message_meta` is what :func:`_record_decisions` reports as `message_status`,
+    so a message dropped without its meta files the next cycle's deterministic row as ``ok_cached`` —
+    a row claiming to carry text that no longer exists.
+
+    The failure count is deliberately NOT cleared: it bounds retries for a payload the writer cannot
+    handle, and restarting that budget every time an alternative moved would re-open the ~720
+    calls-per-situation hole :data:`_MAX_MESSAGE_ATTEMPTS` was added to close.
+    """
+    with _state_lock:
+        _messages.pop(message_key, None)
+        _message_meta.pop(message_key, None)
+
+
+def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
+    """Bring `_alternatives` and `_messages` into line with this cycle's fresh match.
+
+    Called BEFORE the "nothing is alert-worthy / push is off" early return, and over EVERY alert
+    rather than the winning one. Both caches live as long as the SITUATION (up to its 12 h window)
+    while the alerts underneath are re-scored every tick, and the commonest way an alternative goes
+    stale is the disruption easing off until nothing crosses the gate — which takes that return and
+    never reached any pop. Nothing cleared an entry at all before 2026-08-06, because under the old
+    selection rule an alternative was found "effectively never"; now it is routine, and so is its
+    opposite. A card could keep advising a superseded escape for hours.
+
+    Four fresh readings, and telling them apart is the whole job:
+
+    * **an alternative** — cache it. If it names a different journey than the cached text was written
+      from, that text advises a train we no longer recommend, so it goes with it (a written message
+      now quotes a specific departure time).
+    * **not alert-worthy** — the situation eased off below the gate. There is no advice to carry, so
+      neither cache keeps any: the alert still shows on the card, and it must not show last hour's
+      wording and escape route beside this tick's mild numbers.
+    * **"stay on your own train"** — a VERDICT (`ImpactResponse.original_is_best`, new with the
+      2026-08-06 selection rule): the selection ran, over a real pool, and chose the traveller's own
+      train. It supersedes a cached alternative and any wording built on one.
+    * **nothing established** — no lookup ran for this train this cycle. A collapsed stop ref is
+      asked without one on purpose (`match_journey`'s `pair_index == 0`), and the impact gate, a
+      Journey Planner outage or the fetch budget can each skip it. Silence is not a verdict: the
+      cached answer is kept, or the card would flap between offering an alternative and offering
+      none on alternate ticks. The one exception is an alternative that has itself departed — worse
+      than none, since it advises catching a train that has already left.
+
+    The two middle cases are distinguishable only because `original_is_best` is carried separately
+    from `alternative_journey`; a null alternative alone means both "we chose your train" and "we did
+    not look", and clearing on the second is the flap.
+    """
+    with _state_lock:
+        for alert in alerts:
+            message_key = _message_key(key, alert)
+            if not alert.alertworthy:
+                _alternatives.pop(message_key, None)
+                _forget_message(message_key)
+                continue
+            fresh = alert.alternative_journey
+            if fresh is not None:
+                cached = _alternatives.get(message_key)
+                # Stored unconditionally (the card should show this tick's `at_risk` and this tick's
+                # scoring of the replacement), but the wording is only dropped when the advice
+                # itself changed -- see _alternative_identity.
+                if cached is None or _alternative_identity(cached) != _alternative_identity(fresh):
+                    _forget_message(message_key)
+                _alternatives[message_key] = fresh
+                continue
+            # getattr, like every other read off the impact response in this module: it is duck-typed
+            # (a synthetic provider need not carry the newest field), and this runs on the ingestion
+            # thread outside the per-journey guard, where an AttributeError would cost the cycle.
+            chose_original = bool(getattr(alert.impact, "original_is_best", False))
+            # A verdict supersedes the cached answer outright; silence does not, and only a cached
+            # alternative that has itself departed is dropped without one.
+            superseded = chose_original or not _still_catchable(_alternatives.get(message_key), now)
+            if superseded and _alternatives.pop(message_key, None) is not None:
+                _forget_message(message_key)
+
+
 def check_and_notify(by_situation: dict[str, list]) -> None:
     """Send a push for every registered journey × newly alert-worthy situation.
 
@@ -1513,6 +1622,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # suggests. This is the ingestion thread: every second here is a second /disruptions, /journey,
     # /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1 to finish.
     llm_deadline = monotonic() + _MAX_LLM_SECONDS_PER_CYCLE
+    # One instant for the whole cycle, so "has this alternative departed?" cannot be answered
+    # differently for two journeys scored a few seconds apart.
+    cycle_now = datetime.now(UTC)
     for key, journey in by_journey_key.items():
         try:
             alerts = match_journey(journey, with_alternative=True)
@@ -1530,17 +1642,18 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         alerts_by_key[key] = alerts
         for alert in alerts:
             message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
+        # ABOVE the early return, and over every alert: a superseded alternative most often goes
+        # stale precisely when nothing is alert-worthy any more, which is the case that returns.
+        # This is also what records a freshly found alternative, whether or not a message follows
+        # it (cap reached, LLM disabled, push off) -- the in-app list wants it either way.
+        _reconcile_caches(key, alerts, cycle_now)
         worst = next((a for a in alerts if a.alertworthy), None)
         if worst is None or not push_on:
             # No message writing without push: the text exists to be delivered, and the decision is
             # recorded with the deterministic wording either way.
             continue
         message_key = _message_key(key, worst)
-        # Record the alternative even if no message gets written (cap reached, LLM disabled): the
-        # in-app list wants it either way.
         with _state_lock:
-            if worst.alternative_journey is not None:
-                _alternatives[message_key] = worst.alternative_journey
             already_written = message_key in _messages
             attempts = _message_attempts.get(message_key, 0)
         if already_written:
@@ -1902,8 +2015,9 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
             alert.message = _messages.get(cache_key)
             alt = _alternatives.get(cache_key)
             # An alternative that has itself departed is worse than none: it advises catching a
-            # train that has already left.
-            if alt is not None and (alt.departure_time is None or alt.departure_time >= now):
+            # train that has already left. The boundary lives in one place (_still_catchable) --
+            # this read used `>=` while the selection rule pools on `>`.
+            if _still_catchable(alt, now):
                 alert.alternative_journey = alt
     return Journey(
         journey_id=jid,
