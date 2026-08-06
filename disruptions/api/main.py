@@ -717,6 +717,32 @@ def _impact_snapshot() -> tuple[dict[str, list[impact_engine.CallPred]], datetim
         return _call_pred_by_situation, _call_pred_refreshed_at
 
 
+def _impact_journey_calls(operator: str | None, jkey: str) -> list[impact_engine.CallPred] | None:
+    """The scored calls of ONE journey, or None when no live situation touches it.
+
+    The second reader injected into the impact engine (beside `_impact_snapshot`), over the same
+    poller-owned rows indexed the other way. It is how the engine asks what we know about a train
+    the Journey Planner offered as an alternative — a question the by-situation snapshot can only
+    answer by scanning it. Mirrors `_reisevalg_call_predictions`' resolution over this same index.
+
+    **A codespace that misses is a miss, not an invitation to guess.** `_reisevalg_call_predictions`
+    falls back to the bare-jkey index when the prefixed lookup finds nothing; that is safe there
+    because its input is one journey ref the caller already believes in. Here the ref comes from the
+    Journey Planner and always carries a codespace, so falling back would mean answering "VYG's
+    ServiceJourney:123 is not in the cache" with ATB's — bus ServiceJourney refs are not
+    date-scoped, and that collision is exactly what keying on (operator, jkey) exists to prevent.
+    The bare-jkey path is therefore reached only when the ref carries no codespace at all, and even
+    then only when a single operator claims it (the same rule /journey applies before its 409).
+    """
+    with _call_pred_lock:
+        if operator is not None:
+            rows = _call_pred_by_key.get((operator, jkey))
+        else:
+            ops = _call_pred_by_jkey_index.get(jkey, set())
+            rows = _call_pred_by_key.get((next(iter(ops)), jkey)) if len(ops) == 1 else None
+    return list(rows) if rows else None
+
+
 def _varsel_impact(
     *,
     from_stop: str,
@@ -856,7 +882,9 @@ async def lifespan(app: FastAPI):
         logger.exception("Initial impact lookup load failed; will retry on ingestion poll")
     # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
     # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
-    impact_engine.configure(snapshot_provider=_impact_snapshot)
+    impact_engine.configure(
+        snapshot_provider=_impact_snapshot, call_lookup=_impact_journey_calls
+    )
     varsel.configure(
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
