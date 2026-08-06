@@ -887,6 +887,7 @@ def _observed_delay_min(aimed: datetime | None, expected: datetime | None) -> in
 def _alternative_prediction(
     *,
     pred: StopPrediction | None,
+    call: CallPred | None,
     stop_place: str | None,
     aimed: datetime | None,
     expected: datetime | None,
@@ -899,6 +900,14 @@ def _alternative_prediction(
     safety that nothing established, which is the fact-vs-forecast confusion this codebase spent
     2026-08-05 removing. `scored` says which of the two it is without a reader having to infer it
     from the absence of a number.
+
+    `call` is the `CallPred` `pred` was built from, passed alongside because a `StopPrediction`
+    keeps the stop but drops the journey: the identity `(operator, jkey, stop_order)` is what lets
+    the nightly labelling job join a *recommendation* to what actually happened to it, the same way
+    it already joins the disrupted train. It is read off the resolved call and off nothing else —
+    the JP leg's line codespace is not the ET operator, and `risky` below refuses to gate on it for
+    exactly that reason. The two arguments are therefore null together, which is what makes
+    "`operator`/`jkey`/`stop_order` are null exactly when `scored` is False" true by construction.
 
     The times are JP's own (the pattern's endpoints, so a walk to the platform is included — it is
     part of the trip the traveller takes, and JP publishes an aimed time only at that level). When
@@ -916,6 +925,9 @@ def _alternative_prediction(
         cancel_probability=pred.cancel_probability if pred is not None else None,
         impact_probability=pred.impact_probability if pred is not None else None,
         scored=pred is not None,
+        operator=call.operator if call is not None else None,
+        jkey=call.jkey if call is not None else None,
+        stop_order=call.stop_order if call is not None else None,
     )
 
 
@@ -962,6 +974,10 @@ def _score_candidate(
 
     departure = _alternative_prediction(
         pred=_departure_prediction(board) if board is not None else None,
+        # The resolved call itself, not just its numbers: it carries (operator, jkey, stop_order),
+        # the key the nightly labelling job joins realized outcomes on. Keeping only the
+        # probabilities is what left the recommendation unlabellable.
+        call=board,
         stop_place=cand.board_stop_place,
         aimed=cand.aimed_departure_time,
         expected=cand.departure_time,
@@ -970,6 +986,7 @@ def _score_candidate(
     arrival = (
         _alternative_prediction(
             pred=_arrival_prediction(alight),
+            call=alight,
             stop_place=cand.alight_stop_place,
             aimed=cand.aimed_arrival_time,
             expected=cand.arrival_time,

@@ -249,6 +249,21 @@ class AlternativePrediction(BaseModel):
     renders a null as reassurance ("ingen risiko") is wrong; the honest reading is "nothing flagged
     it", which is the ordinary case for the great majority of departures.
 
+    ``operator`` / ``jkey`` / ``stop_order`` are the call's **identity**, and they are here for one
+    reason: without them "take this instead" is the only traveller-facing claim in this repo that
+    nothing can ever score. Every alert decision gets a nightly hit / false-alarm / miss verdict from
+    ``data/queries/label_varsel_decisions.sql``, which joins realized ET outcomes on
+    ``(operator, jkey, call_date, stop_order)`` — the same grain the decision log
+    (``decisions.build_row``) and ``varsel_decision_groups`` already agree on. The decision row
+    carried that key for the *disrupted* train and not for the recommended one, so the advice could
+    not be labelled: ``impact._score_candidate`` resolved the boarding :class:`impact.CallPred`,
+    which has all three, and then kept only its numbers. These three carry it through.
+
+    They are ``None`` **exactly when** ``scored`` is False, because an unscored candidate resolved no
+    call — and the identity comes off the resolved call, never off the Journey Planner. Two thirds of
+    a join key joins to nothing, and JP's line codespace is not the operator the ET tables key on
+    (which is precisely why ``impact._score_candidate`` refuses to gate ``risky`` on it either).
+
     Lives in this module rather than in ``impact``, even though ``impact.score_candidates`` is its
     only constructor: ``impact`` imports ``alternatives`` (``from alternatives import
     AlternativeJourney``), and ``AlternativeJourney`` carries a ``departure_prediction`` of this
@@ -293,6 +308,26 @@ class AlternativePrediction(BaseModel):
         description="True when the prediction cache had this call, so the probabilities above are "
         "model output. False means they are null because nothing scored it — the flag exists so a "
         "reader never has to infer 'not scored' from 'no number'.",
+    )
+    # The join key back to realized outcomes. Set from the resolved CallPred and from nothing else;
+    # null whenever `scored` is False. See the class docstring.
+    operator: str | None = Field(
+        default=None,
+        description="Ref codespace of the resolved call's journey (VYG, GOA, RUT, ...) — the ET "
+        "join key's first part, taken from the prediction cache and NEVER from the Journey "
+        "Planner's line codespace. Null exactly when `scored` is False.",
+    )
+    jkey: str | None = Field(
+        default=None,
+        description="The resolved call's journey ref minus its codespace — dated for rail, plain "
+        "ServiceJourney for bus, whichever form the cache holds. Null exactly when `scored` is "
+        "False.",
+    )
+    stop_order: int | None = Field(
+        default=None,
+        description="Position of the resolved call along its journey (1 = origin). Completes "
+        "(operator, jkey, call_date, stop_order), the grain label_varsel_decisions.sql joins "
+        "last_recorded on. Null exactly when `scored` is False.",
     )
 
 

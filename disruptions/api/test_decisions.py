@@ -37,6 +37,10 @@ class FakeLeg:
 class FakeAlternativePrediction:
     stop_place = "NSR:StopPlace:337"
     scored = True
+    # The boarding call's identity, as impact._score_candidate reads it off the resolved CallPred.
+    operator = "VYG"
+    jkey = "DatedServiceJourney:2_OSL-DRM_26-08-04"
+    stop_order = 3
 
 
 class FakeAlternative:
@@ -168,6 +172,57 @@ def test_whether_the_alternative_was_scored_reads_through_the_prediction():
     assert _row(Alert())["alt_scored"] is True
 
 
+def test_the_recommended_trains_identity_is_recorded_so_the_advice_can_be_labelled():
+    """Every other decision in this table gets a nightly verdict; this one could not.
+
+    `data/queries/label_varsel_decisions.sql` joins realized ET outcomes on
+    `(operator, jkey, call_date, stop_order)`, and the row carried that key for the DISRUPTED train
+    only — so "take this instead" was the single traveller-facing claim in this repo that nothing
+    could ever score. The values come from the boarding call `impact._score_candidate` resolved,
+    read through the departure prediction the same way `alt_scored` is.
+
+    The operating day is deliberately not a fourth column: `DATE(alt_departure_time, 'Europe/Oslo')`
+    already is it.
+    """
+    class Alert(FakeAlert):
+        alternative_journey = FakeAlternative()
+
+    row = _row(Alert())
+    assert row["alt_operator"] == "VYG"
+    assert row["alt_jkey"] == "DatedServiceJourney:2_OSL-DRM_26-08-04"
+    assert row["alt_stop_order"] == 3
+
+
+def test_an_unscored_alternative_names_no_train_rather_than_guessing_one():
+    """The ordinary case — the prediction cache only holds journeys a live situation touches — and
+    NULL is the honest answer there, not a gap to be filled.
+
+    The temptation is right there in the row beside it: `alt_lines` carries "R11", whose ref would
+    yield an operator in one line of code. It would be the Journey Planner's codespace, which
+    `impact._score_candidate` refuses to gate on for the same reason, and a join key that is two
+    thirds real joins to nothing — producing rows that read as a train we could not find rather than
+    as a train we never scored.
+    """
+    class Unscored(FakeAlternativePrediction):
+        scored = False
+        operator = None
+        jkey = None
+        stop_order = None
+
+    class Unlabelled(FakeAlternative):
+        departure_prediction = Unscored()
+
+    class Alert(FakeAlert):
+        alternative_journey = Unlabelled()
+
+    row = _row(Alert())
+    assert row["alt_scored"] is False
+    assert row["alt_operator"] is None
+    assert row["alt_jkey"] is None
+    assert row["alt_stop_order"] is None
+    assert row["alt_lines"] == "R11", "the line was recorded; the join key was not invented from it"
+
+
 def test_an_alternative_that_arrives_later_is_recorded_as_it_is():
     """The fallback tier offers the best remaining way there, not a faster one.
 
@@ -210,6 +265,8 @@ def test_an_alternative_missing_the_new_fields_records_null_not_an_error():
     assert row["alt_arrives_before_original"] is None
     assert row["alt_at_risk"] is None
     assert row["alt_scored"] is None
+    # Read through the same absent departure prediction: a nested attribute access would raise here.
+    assert (row["alt_operator"], row["alt_jkey"], row["alt_stop_order"]) == (None, None, None)
     assert row["has_alternative"] is True
 
 
@@ -335,6 +392,10 @@ def test_every_recorded_field_is_a_column_of_the_decision_table():
         alternative_journey = FakeAlternative()
 
     recorded = set(_row(Alert())) | set(_row())
+    assert {"alt_operator", "alt_jkey", "alt_stop_order"} <= recorded, (
+        "the fixture alert must still exercise the branch that writes the recommendation's join "
+        "key, or this guard silently stops covering those columns"
+    )
     missing = recorded - _created_columns("disruptions.varsel_decisions")
     assert not missing, f"recorded but never created: {sorted(missing)}"
 
