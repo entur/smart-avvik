@@ -43,7 +43,7 @@ Design notes
   recorded input cannot be re-examined and those rows are the majority.
 * **Push gate** — a match is *pushed* only when the worst matching train crosses the same
   production alert threshold used by ``/demo`` and eval (``P(cancelled OR ≥10 min late) ≥ 0.65``,
-  per-operator cuts in :data:`_OPERATOR_ALERT_THRESHOLD`), so trivial flags don't spam the phone.
+  per-operator cuts in :mod:`alert_policy`), so trivial flags don't spam the phone.
   The gate is literally ``/demo``'s ``would_alert`` (main._demo_snapshot): the calibrated impact
   probability and nothing else — no cancellation-probability fallback (measured 2026-07-27: in
   ``call_predictions_{,bus_}today`` ``p_impact_dep`` is NULL only where ``aimed_dep`` is NULL,
@@ -83,6 +83,12 @@ from time import monotonic
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
+# The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
+# it back from here would be a cycle — see alert_policy's docstring). Bound at module level rather
+# than reached through `alert_policy.`, so `varsel.threshold_for` / `varsel.TROUBLE_DELAY_MIN` keep
+# resolving for the callers that already read them off this module. TROUBLE_DELAY_MIN is such a
+# re-export and nothing else: it is /demo's realized-outcome bar, not something varsel reads.
+from alert_policy import TROUBLE_DELAY_MIN, min_threshold, threshold_for  # noqa: F401
 from alternatives import AlternativeJourney
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -93,14 +99,6 @@ logger = logging.getLogger(__name__)
 
 _OSLO = ZoneInfo("Europe/Oslo")
 
-# Push a match only when the worst matching train's impact probability crosses this — the same
-# operating threshold as /demo and eval/impact_eval.py (>=91 % precision at every ask horizon).
-_ALERT_THRESHOLD = 0.65
-# A journey counts as "trouble" when cancelled or >= this many minutes late — the event the impact
-# probability predicts. Public because /demo scores its realized outcomes against the same bar
-# (main._DEMO_TROUBLE_DELAY_MIN), as it takes its threshold from threshold_for(): one definition of
-# "trouble" behind both surfaces.
-TROUBLE_DELAY_MIN = 10
 # Above this cancellation probability the wording leads with "mest sannsynlig innstilt" instead of
 # the delay interval: when the train probably isn't running, a predicted delay is beside the point
 # (bus alerts are mostly cancellation-driven, rail alerts mostly delay-driven).
@@ -110,33 +108,6 @@ TROUBLE_DELAY_MIN = 10
 # Restated here, not imported, because the only caller left is _message_input_from_alert, whose whole
 # job is to produce a usable input when llm_message is the thing that failed.
 _CANCEL_LIKELY = 0.5
-
-# Per-operator alert threshold overrides (default _ALERT_THRESHOLD). The pooled bus family is
-# calibrated per operator, but a single 0.65 cut under-/over-alerts several operators; these
-# values align every operator at ~90 % pooled precision on the serving-matched holdout
-# (eval/tune_alert_thresholds.py, tuned 2026-07-07 — re-run after retrains/platt refits).
-# GOA/TRO/ATB run conservative → lower cut buys recall (GOA .81→.87, ATB .65→.79) at the bar;
-# RUT/KOL/FIN/NOR/MOR sit below the bar at 0.65 → higher cut restores precision (MOR .80→.96).
-# SOF/SKY stay on the default (already at/near the bar); OST and GCO have too little holdout
-# evidence to override (OST: ~6 alerts at any >=90 % cut). NSB is the rail family (0.65
-# validated at ~91 % in eval/impact_eval.py) and is deliberately absent.
-_OPERATOR_ALERT_THRESHOLD: dict[str, float] = {
-    "ATB": 0.55,
-    "FIN": 0.75,
-    "GOA": 0.50,
-    "KOL": 0.75,
-    "MOR": 0.90,
-    "NOR": 0.80,
-    "RUT": 0.75,
-    "TRO": 0.55,
-}
-
-
-def threshold_for(operator: str | None) -> float:
-    """The alerting threshold for an operator (None -> the default). Shared by the varsel
-    matcher and the /demo verdicts so both surfaces apply the same operating point."""
-    return _OPERATOR_ALERT_THRESHOLD.get(operator or "", _ALERT_THRESHOLD)
-
 
 # Rail codespaces (operator == ref codespace). vehicleMode is NULL for most bus producers, so the
 # vehicle noun is derived from the codespace, not the feed; everything not rail is labelled "Buss".
@@ -494,8 +465,8 @@ def _impact(
     `from_stop`/`to_stop` override the journey's own refs so :func:`match_journey` can ask about the
     other refs of the same physical place (see :func:`place_refs`).
 
-    `min_impact` is the *default* alert threshold rather than a per-operator one: the operator is a
-    property of the matched train, which is only known after the call. It is the floor of the
+    `min_impact` is :func:`alert_policy.min_threshold` rather than a per-operator cut: the operator
+    is a property of the matched train, which is only known after the call. It is the floor of the
     per-operator cuts (GOA 0.50), so no alert-worthy journey is ever denied an alternative — it just
     means a few sub-threshold-for-their-operator trips still pay the lookup.
     """
@@ -508,9 +479,7 @@ def _impact(
         window_end=window_end,
         catchable_after=catchable_after,
         with_alternative=with_alternative,
-        min_impact=min(_OPERATOR_ALERT_THRESHOLD.values(), default=_ALERT_THRESHOLD)
-        if with_alternative
-        else 0.0,
+        min_impact=min_threshold() if with_alternative else 0.0,
     )
 
 

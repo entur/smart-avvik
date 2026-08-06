@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 # Aliased: the route function below is also called `impact`, and inside its body a bare
 # `impact.` would resolve to that function rather than to this module.
+import alert_policy  # sibling module: the shared alert gate (thresholds, the "trouble" bar)
 import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
 import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
@@ -1758,12 +1759,14 @@ async def alert_profile(
 # The UI at /demo (demo/reisedemo, built into demo_static/) consumes these endpoints.
 
 # The alert decision shown in the demo: flag when P(cancelled OR >= 10 min late) crosses the
-# operator's live alerting threshold (varsel.threshold_for — the per-operator cuts tuned at
+# operator's live alerting threshold (alert_policy.threshold_for — the per-operator cuts tuned at
 # ~90 % precision by eval/tune_alert_thresholds.py, 0.65 default), so the demo's verdicts
 # replay exactly what the varsel push pipeline would have decided.
 # Realized outcome counts as "trouble" when the call was cancelled or >= 10 min late — the
-# same event the impact probability predicts, so it comes from varsel (single definition).
-_DEMO_TROUBLE_DELAY_MIN = varsel.TROUBLE_DELAY_MIN
+# same event the impact probability predicts, so it comes from alert_policy (single definition).
+# Taken from the policy module directly rather than through varsel: /demo needs the gate, not the
+# push surface that happens to be its other reader.
+_DEMO_TROUBLE_DELAY_MIN = alert_policy.TROUBLE_DELAY_MIN
 
 # The demo tables are near-static snapshots (extend_demo_recent.sql refreshes them on
 # demand), so their metadata (stop picker, scenario list, date window) is cached with a
@@ -2008,7 +2011,7 @@ def get_demo_meta() -> DemoMeta:
     meta = DemoMeta(
         window_start=window.window_start,
         window_end=window.window_end,
-        alert_threshold=varsel.threshold_for(None),
+        alert_threshold=alert_policy.threshold_for(None),
         stops=stops,
         highlights=highlights,
     )
@@ -2097,7 +2100,7 @@ async def demo_journeys(
                 category=r.category,
                 onset=r.onset_ts,
             )
-        threshold = varsel.threshold_for(r.operator)
+        threshold = alert_policy.threshold_for(r.operator)
         journeys.append(
             DemoJourney(
                 journey_ref=f"{r.operator}:{r.jkey}",
