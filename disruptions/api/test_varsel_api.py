@@ -100,8 +100,8 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
         select="worst",
         catchable_after=catchable_after,
         # Passed THROUGH, not hard-coded: hard-coding False made the suite blind to a Journey Planner
-        # call reappearing on the request path. alternatives.find_faster is stubbed in the tests that
-        # care, so nothing here reaches the network either way.
+        # call reappearing on the request path. alternatives.fetch_candidates is stubbed in the tests
+        # that care, so nothing here reaches the network either way.
         with_alternative=with_alternative,
         min_impact=min_impact,
     )
@@ -109,11 +109,17 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
 
 varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
 
-# Suite-wide: this provider calls the REAL impact.for_trip, which calls alternatives.find_faster
-# whenever with_alternative=True. Individual tests stubbing find_faster is not enough — any test that
-# exercises the poller path without stubbing it would issue a live HTTPS request to api.entur.io from
-# CI and eat the 3 s timeout, failing open so nobody would notice. Make it structurally impossible.
-impact.alternatives.find_faster = lambda *a, **k: None
+# Suite-wide: this provider calls the REAL impact.for_trip, which calls
+# alternatives.fetch_candidates whenever with_alternative=True. Individual tests stubbing it are not
+# enough — any test that exercises the poller path without stubbing it would issue a live HTTPS
+# request to api.entur.io from CI and eat the 3 s timeout, failing open so nobody would notice. Make
+# it structurally impossible.
+#
+# This stub names a function, so re-pointing the call chain under it silently disarms it — which is
+# exactly what happened when the single-call lookup became fetch -> score -> select. The second line
+# of defence does not depend on anyone remembering: alternatives._post_json refuses to open a socket
+# from a test process at all (test_a_forgotten_stub_cannot_reach_the_network pins it).
+impact.alternatives.fetch_candidates = lambda *a, **k: []
 
 app = FastAPI()
 app.include_router(varsel.router)
@@ -1338,7 +1344,7 @@ def test_request_path_does_not_call_the_journey_planner(monkeypatch):
     import alternatives
 
     calls = []
-    monkeypatch.setattr(alternatives, "find_faster", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(alternatives, "fetch_candidates", lambda *a, **k: calls.append(1) or [])
     _register(DEVICE)
     calls.clear()
     r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
@@ -1398,7 +1404,10 @@ def test_an_alternative_found_on_the_canonical_ref_reaches_a_collapsed_refs_aler
         legs=[alternatives.AlternativeLeg(mode="rail", line="VYG:Line:R10", public_code="R10",
                                           from_name="Oslo S", to_name="Lillehammer")],
     )
-    monkeypatch.setattr(impact.alternatives, "find_faster", lambda *a, **k: fake_alt)
+    # The selection rule has its own tests; what this one is about is the back-fill, so the whole
+    # fetch -> score -> select chain is short-circuited to one known answer.
+    monkeypatch.setattr(impact.alternatives, "fetch_candidates", lambda *a, **k: [])
+    monkeypatch.setattr(impact.alternatives, "select_best", lambda *a, **k: fake_alt)
 
     # One situation, two trains: the canonical ref boards the milder one (so that pass matches, and
     # is the one that spends the Journey Planner call), the collapsed ref the worse one -- which is
