@@ -6,9 +6,11 @@ BigQuery or the network.
 
 Covers the window matcher (edges, direction, per-line selection strategy, operator/jkey carry),
 the severity ordering fix (impact probability first, not cancellation probability),
-latest_observation resolution, and the /impact response contract togpuls depends on.
+latest_observation resolution, the scoring of Journey Planner alternatives against the per-call
+index, and the /impact response contract togpuls depends on.
 """
 
+import logging
 from datetime import UTC, datetime, timedelta
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
@@ -16,14 +18,20 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import alternatives
 import impact
 import main
 from test_varsel import FakeCall
 
 # The engine reads its snapshot through an injected provider (main owns the cache). These tests
-# drive it directly, so they own the provider too.
+# drive it directly, so they own the provider too. The second reader — the (operator, jkey) index
+# alternative-scoring resolves through — is owned here the same way.
 _snapshot: dict = {}
-impact.configure(snapshot_provider=lambda: (_snapshot, None))
+_index: dict[tuple[str | None, str], list] = {}
+impact.configure(
+    snapshot_provider=lambda: (_snapshot, None),
+    call_lookup=lambda operator, jkey: _index.get((operator, jkey)),
+)
 
 A, B, C = "NSR:StopPlace:A", "NSR:StopPlace:B", "NSR:StopPlace:C"
 
@@ -364,6 +372,353 @@ def test_worst_selection_prefers_a_known_cancelled_train_over_a_high_forecast():
     cells = _cells(scope, select="worst", at=_at(15))
     assert [c.jkey for c in cells] == ["cancelled"]
     assert cells[0].departure.cancelled is True
+
+
+# ---- scoring Journey Planner alternatives ------------------------------------------------------
+ALT_REF = ("VYG", "DatedServiceJourney:alt")
+
+
+def _candidate(
+    *,
+    refs=(ALT_REF,),
+    lines=("VYG:Line:R11",),
+    board=A,
+    alight=B,
+    dep_h=9,
+    dep_mi=0,
+    delay_min=0,
+    cancelled=False,
+    ordinal=0,
+):
+    """A Journey Planner candidate, as `alternatives.parse_candidates` would have built it."""
+    aimed_dep = _at(dep_h, dep_mi)
+    aimed_arr = aimed_dep + timedelta(minutes=40)
+    shift = timedelta(minutes=delay_min)
+    return alternatives.AlternativeCandidate(
+        departure_time=aimed_dep + shift,
+        arrival_time=aimed_arr + shift,
+        aimed_departure_time=aimed_dep,
+        aimed_arrival_time=aimed_arr,
+        duration_min=40,
+        legs=[alternatives.AlternativeLeg(mode="rail", line=line) for line in lines],
+        transit_refs=list(refs),
+        lines=list(lines),
+        board_stop_place=board,
+        alight_stop_place=alight,
+        cancelled=cancelled,
+        ordinal=ordinal,
+    )
+
+
+def _scored(candidates, *, affected_refs=frozenset(), affected_lines=frozenset(), index=None):
+    """Score `candidates` against `index` (installed for the call and torn down after)."""
+    _index.clear()
+    _index.update(index or {})
+    try:
+        return impact.score_candidates(
+            candidates, affected_refs=set(affected_refs), affected_lines=set(affected_lines)
+        )
+    finally:
+        _index.clear()
+
+
+def _alt_call(**kw):
+    """A scored call on the alternative's own journey (jkey/operator from ALT_REF by default)."""
+    kw.setdefault("jkey", ALT_REF[1])
+    kw.setdefault("operator", ALT_REF[0])
+    kw.setdefault("line", "VYG:Line:R11")
+    return FakeCall(**kw)
+
+
+def test_a_candidate_in_the_index_is_scored_from_the_cache():
+    """Both ends: the boarding call's departure-side numbers and the alighting call's arrival ones."""
+    index = {
+        ALT_REF: [
+            _alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), stop_name="Oslo S",
+                      p_cancel=0.12, p_impact_dep=0.33),
+            # A terminal call: no departure from it, so the departure-side figures are structurally
+            # null and the arrival side is the only one that says anything.
+            _alt_call(stop_place=B, stop_order=5, aimed_dep=None, stop_name="Drammen",
+                      aimed_arr=_at(9, 40), p_cancel=0.12, p_impact_dep=None, p_impact=0.41),
+        ]
+    }
+    score = _scored([_candidate()], index=index)[0]
+    dep = score.departure_prediction
+    assert dep.scored is True
+    assert (dep.cancel_probability, dep.impact_probability) == (0.12, 0.33)
+    assert (dep.stop_place, dep.stop_name) == (A, "Oslo S")
+    arr = score.arrival_prediction
+    assert arr is not None and arr.scored is True
+    assert (arr.stop_place, arr.impact_probability) == (B, 0.41)
+    assert score.candidate.risky is False, "0.33 is under VYG's 0.65 gate"
+
+
+def test_a_candidate_absent_from_the_index_is_unscored_with_null_probabilities():
+    """The COMMON case, and not a failure: the cache only holds journeys a live situation touches.
+
+    Null, never 0.0 — a zero would assert a calibrated certainty of safety that nothing established,
+    the fact-vs-forecast confusion this codebase spent 2026-08-05 removing.
+    """
+    score = _scored([_candidate()], index={})[0]
+    dep = score.departure_prediction
+    assert dep.scored is False
+    assert dep.cancel_probability is None and dep.impact_probability is None
+    assert dep.cancel_probability != 0.0 and dep.impact_probability != 0.0
+    assert dep.stop_place == A, "the JP-only shape still says which stop it is about"
+    assert score.arrival_prediction is None
+
+
+def test_operator_collision_scores_each_candidate_against_its_own_journey():
+    """Bus ServiceJourney jkeys are not date-scoped, so two operators can share one.
+
+    Mirrors test_operator_collision_keeps_journeys_separate on the scoring path: keying on the jkey
+    alone would let one operator's alert-worthy train make the other's clean one look doomed.
+    """
+    jkey = "ServiceJourney:shared"
+    index = {
+        ("SKY", jkey): [FakeCall(jkey=jkey, operator="SKY", line="SKY:Line:1", stop_place=A,
+                                 stop_order=1, aimed_dep=_at(9), p_impact_dep=0.05)],
+        ("ATB", jkey): [FakeCall(jkey=jkey, operator="ATB", line="ATB:Line:2", stop_place=A,
+                                 stop_order=1, aimed_dep=_at(9), p_impact_dep=0.95)],
+    }
+    sky, atb = _scored(
+        [
+            _candidate(refs=(("SKY", jkey),), lines=("SKY:Line:1",)),
+            _candidate(refs=(("ATB", jkey),), lines=("ATB:Line:2",), ordinal=1),
+        ],
+        index=index,
+    )
+    assert sky.departure_prediction.impact_probability == 0.05
+    assert atb.departure_prediction.impact_probability == 0.95
+    assert (sky.candidate.risky, atb.candidate.risky) == (False, True)
+
+
+def test_a_declared_cancellation_beats_the_journey_planners_own_flag():
+    """JP's default search excludes realtime-cancelled departures, so its per-leg flag is
+    belt-and-braces: our ET cache is the working guard. A candidate JP reports as running, which we
+    already know is cancelled, must not be recommended."""
+    index = {
+        ALT_REF: [
+            _alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), et_declared_cancelled=True,
+                      p_cancel=0.57, p_impact_dep=0.61)
+        ]
+    }
+    score = _scored([_candidate(cancelled=False, delay_min=3)], index=index)[0]
+    dep = score.departure_prediction
+    assert dep.cancelled is True
+    assert (dep.cancel_probability, dep.impact_probability) == (1.0, 1.0)
+    assert dep.delay_min is None, "every delay figure means 'if it runs', and this one does not"
+    assert score.candidate.cancelled is True
+    assert score.candidate.risky is True
+
+
+def test_a_risky_second_leg_makes_a_multi_leg_candidate_risky():
+    """`risky` reads EVERY transit leg, so a connection about to be cancelled is not scored safe.
+
+    Only the first leg's boarding stop is knowable from a JP pattern, so a single-leg resolution
+    would leave every multi-leg candidate structurally unable to look risky.
+    """
+    leg2 = ("RUT", "ServiceJourney:leg2")
+    index = {
+        ALT_REF: [_alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), p_impact_dep=0.04)],
+        leg2: [FakeCall(jkey=leg2[1], operator="RUT", line="RUT:Line:31", stop_place=C,
+                        stop_order=2, aimed_dep=_at(9, 30), p_impact_dep=0.92)],
+    }
+    score = _scored(
+        [_candidate(refs=(ALT_REF, leg2), lines=("VYG:Line:R11", "RUT:Line:31"))], index=index
+    )[0]
+    assert score.candidate.risky is True
+    assert score.departure_prediction.impact_probability == 0.04, (
+        "the departure prediction is still the FIRST leg's boarding call"
+    )
+
+
+def test_risky_uses_the_found_calls_operator_threshold():
+    """Same 0.55, two answers: GOA alerts at 0.50, VYG at 0.65. The gate is the found call's
+    operator, never the Journey Planner's codespace."""
+    verdicts = {}
+    for operator, expected in (("GOA", True), ("VYG", False)):
+        jkey = f"DatedServiceJourney:{operator}"
+        index = {
+            (operator, jkey): [FakeCall(jkey=jkey, operator=operator, line=f"{operator}:Line:1",
+                                        stop_place=A, stop_order=1, aimed_dep=_at(9),
+                                        p_impact_dep=0.55)]
+        }
+        score = _scored(
+            [_candidate(refs=((operator, jkey),), lines=(f"{operator}:Line:1",))], index=index
+        )[0]
+        verdicts[operator] = score.candidate.risky
+        assert score.candidate.risky is expected, f"{operator} at 0.55 -> risky={expected}"
+    assert verdicts["GOA"] != verdicts["VYG"]
+
+
+def test_an_unscored_leg_on_an_affected_line_is_risky():
+    """Where we have no score, line membership is the only signal there is — and an unknown train on
+    the disrupted line must not beat a scored clean one."""
+    score = _scored(
+        [_candidate(lines=("VYG:Line:R10",))], affected_lines={"VYG:Line:R10"}, index={}
+    )[0]
+    assert score.candidate.risky is True
+    assert score.departure_prediction.scored is False
+
+
+def test_a_scored_clean_leg_on_an_affected_line_is_not_risky():
+    """The other half of the asymmetry, and the whole of the mitigation.
+
+    Marking every affected-line leg risky regardless of score reinstates the whole-line veto in all
+    but name — it is what threw away "ta neste tog", the operator's own advice in the 2026-08-05 Vy
+    RE10 case. A next train our own models score at 0.02 must not lose to one we know nothing about.
+    """
+    index = {
+        ALT_REF: [
+            _alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), line="VYG:Line:R10",
+                      p_impact_dep=0.02)
+        ]
+    }
+    score = _scored(
+        [_candidate(lines=("VYG:Line:R10",))], affected_lines={"VYG:Line:R10"}, index=index
+    )[0]
+    assert score.candidate.risky is False
+    assert score.departure_prediction.impact_probability == 0.02
+
+
+def test_a_call_touched_by_two_situations_resolves_to_the_worse():
+    """One call carries one row per situation that touches it; the cache holds both."""
+    index = {
+        ALT_REF: [
+            _alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), situation_number="S1",
+                      p_impact_dep=0.20),
+            _alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), situation_number="S2",
+                      p_impact_dep=0.88),
+        ]
+    }
+    score = _scored([_candidate()], index=index)[0]
+    assert score.departure_prediction.impact_probability == 0.88
+
+
+def test_delay_min_is_observed_and_clamped_at_zero():
+    """expected - aimed, from the Journey Planner's own times; an early vehicle is not late."""
+    late, early = _scored([_candidate(delay_min=7), _candidate(delay_min=-2, ordinal=1)], index={})
+    assert late.departure_prediction.delay_min == 7
+    assert early.departure_prediction.delay_min == 0
+
+
+def test_arrival_prediction_is_null_when_no_alighting_call_resolves():
+    """It never borrows the departure's numbers: "when do I get there" answered with the departure's
+    delay would be a fabricated figure."""
+    index = {ALT_REF: [_alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), p_impact_dep=0.3)]}
+    score = _scored([_candidate(alight=C)], index=index)[0]
+    assert score.departure_prediction.scored is True
+    assert score.arrival_prediction is None
+
+
+def test_scoring_never_scans_the_snapshot():
+    """The injected (operator, jkey) reader is the only access path. Scanning the by-situation
+    snapshot instead would be O(situations x calls) per lookup, on the ingestion thread, over data
+    main already indexes."""
+    scans = []
+    original = impact._snapshot_provider
+    impact._snapshot_provider = lambda: scans.append(1) or ({}, None)
+    try:
+        index = {ALT_REF: [_alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9))]}
+        score = _scored([_candidate()], index=index)[0]
+    finally:
+        impact._snapshot_provider = original
+    assert scans == [], "score_candidates must never read the by-situation snapshot"
+    assert score.departure_prediction.scored is True, "...and must still resolve through the index"
+
+
+class _Recorder(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def test_scoring_without_a_reader_is_unscored_logged_once_and_never_raises():
+    """A missing lookup must be VISIBLE but harmless: `for_trip` wraps this path in a fail-open
+    guard, so raising (the way a missing snapshot_provider does) would be swallowed and leave a
+    wiring fault indistinguishable from "the Journey Planner had nothing"."""
+    recorder = _Recorder()
+    original, warned = impact._call_lookup, impact._warned_no_call_lookup
+    impact._call_lookup, impact._warned_no_call_lookup = None, False
+    impact.logger.addHandler(recorder)
+    try:
+        first = impact.score_candidates(
+            [_candidate(), _candidate(ordinal=1)], affected_refs=set(), affected_lines=set()
+        )
+        second = impact.score_candidates([_candidate()], affected_refs=set(), affected_lines=set())
+    finally:
+        impact.logger.removeHandler(recorder)
+        impact._call_lookup, impact._warned_no_call_lookup = original, warned
+    assert [s.departure_prediction.scored for s in first + second] == [False, False, False]
+    unwired = [r for r in recorder.records if getattr(r, "fields", {}).get("event") == "impact_scoring_unwired"]
+    assert len(unwired) == 1, f"expected one warning for the whole process, got {len(unwired)}"
+
+
+def test_a_candidate_that_raises_is_dropped_and_the_rest_still_score():
+    """Third fail-open boundary on this path (the fetch and the parse have their own): one
+    uninterpretable candidate costs that candidate, not every alternative for the trip."""
+
+    class _Exploding:
+        ordinal = 7
+
+        def __getattr__(self, name):
+            raise RuntimeError("boom")
+
+    index = {ALT_REF: [_alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9))]}
+    scored = _scored([_candidate(), _Exploding(), _candidate(ordinal=2)], index=index)
+    assert [s.candidate.ordinal for s in scored] == [0, 2]
+    assert all(s.departure_prediction.scored for s in scored)
+
+
+def test_the_real_call_lookup_resolves_through_mains_index():
+    """Wire main._impact_journey_calls itself, not a hand-written double — the same reason
+    test_varsel's test_the_real_provider_signature_matches exists: this is a cross-module contract,
+    and a suite that only ever drives a double cannot see it break.
+
+    Also pins the collision rule: a codespace that misses is a MISS. Answering "VYG's
+    ServiceJourney:1 is not in the cache" with ATB's row is exactly what keying on
+    (operator, jkey) exists to prevent.
+    """
+    jkey = "ServiceJourney:1"
+    call = FakeCall(jkey=jkey, operator="ATB", line="ATB:Line:2", stop_place=A, stop_order=1,
+                    aimed_dep=_at(9), p_impact_dep=0.77)
+    original_key, original_index = main._call_pred_by_key, main._call_pred_by_jkey_index
+    original_lookup = impact._call_lookup
+    main._call_pred_by_key = {("ATB", jkey): [call]}
+    main._call_pred_by_jkey_index = {jkey: {"ATB"}}
+    impact._call_lookup = main._impact_journey_calls
+    try:
+        hit = impact.score_candidates(
+            [_candidate(refs=(("ATB", jkey),), lines=("ATB:Line:2",))],
+            affected_refs=set(), affected_lines=set(),
+        )[0]
+        wrong_codespace = impact.score_candidates(
+            [_candidate(refs=(("VYG", jkey),), lines=("VYG:Line:R11",))],
+            affected_refs=set(), affected_lines=set(),
+        )[0]
+        unprefixed = impact.score_candidates(
+            [_candidate(refs=((None, jkey),), lines=("ATB:Line:2",))],
+            affected_refs=set(), affected_lines=set(),
+        )[0]
+    finally:
+        main._call_pred_by_key, main._call_pred_by_jkey_index = original_key, original_index
+        impact._call_lookup = original_lookup
+    assert hit.departure_prediction.impact_probability == 0.77
+    assert wrong_codespace.departure_prediction.scored is False
+    assert unprefixed.departure_prediction.impact_probability == 0.77, (
+        "a ref with no codespace at all may still resolve when a single operator claims the jkey"
+    )
+
+
+def test_an_unresolved_leg_riding_an_affected_journey_is_risky():
+    """`affected_refs` is the sharper of the two unscored fallbacks: the journey itself is known to
+    be touched by a live situation, which says more than its line does."""
+    score = _scored([_candidate()], affected_refs={ALT_REF}, index={})[0]
+    assert score.candidate.risky is True
 
 
 # ---- response contract ------------------------------------------------------------------------
