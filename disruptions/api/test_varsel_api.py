@@ -1588,6 +1588,32 @@ def test_a_message_whose_alternative_has_departed_is_replaced(monkeypatch):
     assert _listed_alert()["message"] == "Melding 2."
 
 
+def test_a_failing_cache_reconciliation_costs_the_cache_not_the_cycle(monkeypatch):
+    """`_reconcile_caches` was called bare, outside the per-journey guard around `match_journey`.
+
+    A raise there unwound out of check_and_notify entirely: the remaining journeys were never
+    scored, loop 2 never ran (NO pushes at all for the cycle) and `_record_decisions` never ran (no
+    rows either) -- a strictly larger blast radius than the 2026-07-29 incident this file's
+    defence-in-depth exists to prevent. What it touches is duck-typed (a provider's impact response,
+    a cached alternative, an aware/naive datetime comparison), so "it cannot raise" is an assumption
+    about somebody else's object. Keeping one cycle's stale cache is the smaller failure by far.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+
+    def boom(*a, **k):
+        raise AttributeError("'ImpactResponse' object has no attribute 'original_is_best'")
+
+    monkeypatch.setattr(varsel, "_reconcile_caches", boom)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)  # must not raise
+
+    assert len(sent) == 1, "the traveller is still told"
+    assert [r["situation_number"] for r in log.rows] == ["S1"], "and the decision is still recorded"
+
+
 def test_departed_train_produces_no_alerts(monkeypatch):
     _reset_state()
     sent = []

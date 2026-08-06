@@ -81,7 +81,7 @@ def _original(*, predicted_min, dep_min=5, cancelled=False, risky=False):
 
 
 def _best(candidates, original, *, predicted=None, deadline=DEADLINE, now=NOW,
-          window_end=WINDOW_END, affected=(AFFECTED, AFFECTED_BUS)):
+          window_end=WINDOW_END, affected=(AFFECTED, AFFECTED_BUS), outcome=None):
     """`select_best` with the scenario's anchors. `original_predicted_arrival` defaults to the
     original's own arrival, which is the invariant the caller maintains."""
     if predicted is None:
@@ -94,6 +94,7 @@ def _best(candidates, original, *, predicted=None, deadline=DEADLINE, now=NOW,
         now=now,
         window_end=window_end,
         affected_refs=set(affected),
+        outcome=outcome,
     )
 
 
@@ -120,10 +121,14 @@ def test_when_nothing_arrives_in_time_the_earliest_arrival_wins():
     assert got.arrival_time == NOW + timedelta(minutes=70)
     assert got.departure_time == NOW + timedelta(minutes=20), "latest-departure is tier 1's rule"
     assert got.minutes_saved == 30
-    # It arrives after the DEADLINE (+60) but before the disrupted train's predicted arrival
-    # (+100). The flag is about the train the traveller has, not about their appointment — the two
-    # anchors are different times and reading it off the wrong one inverts it in exactly this case.
-    assert got.arrives_before_original is True
+    # It saves 30 minutes on the disrupted train's predicted arrival (+100) and STILL lands after
+    # the traveller's planned one (+60). Both facts are true and they are carried by different
+    # fields on purpose: `minutes_saved` answers "is this better than what I have?" against the
+    # predicted arrival, `arrives_before_original` answers "do I still make my appointment?"
+    # against the aimed one. Read off the predicted arrival (until 2026-08-06) this said True, and
+    # every wording built on it — the template's caveat, the prompt's on-time rule — fell silent
+    # for a traveller arriving 10 minutes late.
+    assert got.arrives_before_original is False
 
 
 def test_a_replacement_arriving_later_than_the_original_would_is_still_offered():
@@ -188,6 +193,63 @@ def test_the_synthesized_original_survives_that_same_exclusion():
     switches = _best([rival], _original(predicted_min=120, risky=True))
     assert stays is None, "the original arrives first, so it is in the pool and it won"
     assert switches is not None, "and when it arrives later the very same candidate is offered"
+
+
+def test_a_safe_journey_arriving_long_after_the_original_cannot_displace_it():
+    """R6 is a preference among RIVALS and must never demote the baseline.
+
+    The original's `risky` is set from `impact_probability >= threshold` — the very gate that made
+    this trip alert-worthy — so on every push path the disrupted train is risky by construction.
+    Partitioning it out of the "safe" group therefore excluded it from every push, and the fallback
+    tier (which has no arrival constraint) then handed the win to the earliest-arriving SAFE
+    candidate however much later it arrived. The materiality gate cannot catch that either: the same
+    flag releases it.
+    """
+    got = _best([_cand(10, 200)], _original(predicted_min=85, risky=True))
+    assert got is None, "arriving 115 minutes later than the train you already have is not advice"
+    # A/B on the one thing under test: the same safe rival, arriving before the disrupted train.
+    better = _best([_cand(10, 70)], _original(predicted_min=85, risky=True))
+    assert better is not None and better.minutes_saved == 15
+
+
+def test_the_original_still_competes_once_its_aimed_departure_has_passed():
+    """Its `departure_time` is the AIMED departure (`impact._original_candidate`) while its
+    catchability was settled upstream against the EXPECTED one (`catchable_after`). A train aimed
+    08:00, predicted 30 minutes late and still perfectly boardable at 08:05 was being deleted from
+    its own replacement contest — so "stay put" became unreachable exactly for the delayed trains
+    this feature exists to advise on.
+
+    Both rivals here are risky, so the risk partition cannot decide it: the pool membership is.
+    """
+    got = _best([_cand(10, 100, risky=True)], _original(predicted_min=85, dep_min=-5, risky=True))
+    assert got is None, "the traveller's own train arrives first and is still catchable"
+    beaten = _best([_cand(10, 60, risky=True)], _original(predicted_min=85, dep_min=-5, risky=True))
+    assert beaten is not None and beaten.minutes_saved == 25, "and it still loses when it should"
+
+
+def test_the_stay_put_verdict_is_only_claimed_after_a_real_contest():
+    """`original_is_best` is a VERDICT the caller publishes and `varsel._reconcile_caches` acts on:
+    it evicts a cached alternative and the wording written from it. So it may only be True when this
+    function actually compared the traveller's train against something. A pool holding the original
+    alone — a Journey Planner outage, a spent fetch budget, every candidate past the window bound —
+    is silence, and eviction on silence is how the card flaps between offering an escape and not.
+    """
+    verdict: dict = {}
+    assert _best([_cand(10, 80)], _original(predicted_min=70), outcome=verdict) is None
+    assert verdict["original_is_best"] is True, "it won, over a rival that was really there"
+
+    verdict = {}
+    assert _best([], _original(predicted_min=70), outcome=verdict) is None
+    assert verdict["original_is_best"] is False, "nothing was established; nothing is claimed"
+
+    # And the materiality gate is a stay-put answer too, not an absence of one.
+    verdict = {}
+    assert _best([_cand(10, 61)], _original(predicted_min=62), outcome=verdict) is None
+    assert verdict["original_is_best"] is True
+
+    verdict = {}
+    assert _best([_cand(10, 45)], _original(predicted_min=90), outcome=verdict) is not None
+    assert verdict["original_is_best"] is False, "an offer is the opposite of staying put"
 
 
 def test_a_candidate_departing_past_the_window_grace_is_excluded():
@@ -302,6 +364,24 @@ def test_a_candidate_that_cannot_be_ranked_is_dropped_not_fatal():
         assert _best([broken], _original(predicted_min=90)) is None
 
 
+def test_an_alternative_that_lands_after_the_appointment_is_never_flagged_as_in_time():
+    """`arrives_before_original` is read by three consumers and every one of them talks about the
+    PLANNED arrival: the message input's `ankommer_i_tide`, the template's
+    " – senere enn planlagt ankomst" (rendered only when it is False), and the prompt rule that
+    forbids claiming an on-time arrival unless it is True.
+
+    Aimed 09:00, predicted 09:40, alternative 09:25. Measured against the delayed train the
+    alternative "arrives before the original" and the caveat disappears — for a traveller who gets
+    there 25 minutes after they were due, with a model free to write "du rekker fram i tide".
+    """
+    got = _best([_cand(25, 85)], _original(predicted_min=100, risky=True))  # DEADLINE is +60
+    assert got is not None and got.minutes_saved == 15, "it IS better than the train they have"
+    assert got.arrives_before_original is False, "and it is still 25 minutes past the appointment"
+    # The other side of the same boundary: inside the deadline, the caveat must not fire.
+    in_time = _best([_cand(25, 59)], _original(predicted_min=100, risky=True))
+    assert in_time is not None and in_time.arrives_before_original is True
+
+
 def test_the_chosen_journey_carries_what_the_traveller_has_to_recognise():
     got = _best([_cand(10, 45)], _original(predicted_min=90))
     assert [(leg.mode, leg.public_code, leg.from_name, leg.to_name) for leg in got.legs] == [
@@ -355,6 +435,10 @@ def test_cache_failure_cooldown_suppresses_further_fetches():
 HOSTILE_STOP_REFS = [
     'NSR:StopPlace:1"} ) { id } } evil { ',  # closes the literal and opens a new selection
     "NSR:StopPlace:1\nfoo",
+    # A ref that is otherwise perfect but ends in a newline. `re.match` with an anchored `$` accepts
+    # it -- Python's `$` also matches immediately BEFORE a single trailing newline -- so this shape
+    # passed the guard until 2026-08-06. `re.fullmatch` closes it for free.
+    "NSR:StopPlace:337\n",
     "A",
     "",
     "NSR:Line:337",  # a real ref shape, but not a stop
@@ -837,6 +921,86 @@ def test_fetch_candidates_fails_open_on_every_failure_path():
             alternatives._fetch_trip_patterns = original
 
 
+def test_a_lookup_that_obtained_no_reply_is_told_apart_from_an_empty_one():
+    """Fail-open collapses every non-answer into the same `[]` an answered-but-empty search
+    produces, and `impact._best_remaining_journey` reads that as "nothing available" and issues a
+    SECOND blocking 3 s query. So a Journey Planner outage cost two calls per lookup on the
+    ingestion thread instead of one, precisely when it could least afford it. The distinction
+    already existed inside `_KeyedTTLCache.get` (None = no reply obtained, [] = a real empty one)
+    and was being thrown away here.
+    """
+    when = CAND_NOW + timedelta(minutes=30)
+
+    def raising(*a, **k):
+        raise RuntimeError("JP down")
+
+    unanswered = {
+        "the fetch raises": (raising, CAND_TO),
+        "a refused stop ref": (lambda *a, **k: _recorded_patterns(), "NSR:Line:337"),
+    }
+    for label, (fake, to_stop) in unanswered.items():
+        original = _install_fetch(fake)
+        try:
+            outcome: dict = {}
+            got = fetch_candidates(
+                CAND_FROM, to_stop, arrive_by=False, date_time=when, now=CAND_NOW, outcome=outcome
+            )
+            assert got == [], f"{label} still fails open"
+            assert outcome["answered"] is False, f"{label} is not an answer"
+        finally:
+            alternatives._fetch_trip_patterns = original
+
+    # A real, empty reply IS an answer: the fallback query asks a different question (depart-after
+    # rather than arrive-by) and is exactly what should follow it.
+    original = _install_fetch(lambda *a, **k: [])
+    try:
+        outcome = {}
+        assert fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=False, date_time=when, now=CAND_NOW, outcome=outcome
+        ) == []
+        assert outcome["answered"] is True
+    finally:
+        alternatives._fetch_trip_patterns = original
+
+    # And a throttled lookup is a non-answer too: re-asking on another anchor would only be refused
+    # by the same spent budget.
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    handler = _capture_logs()
+    try:
+        _fill_budget(calls, path="request", now=CAND_NOW)
+        outcome = {}
+        fetch_candidates(
+            CAND_FROM, "NSR:StopPlace:9999", arrive_by=False, date_time=CAND_NOW, now=CAND_NOW,
+            outcome=outcome,
+        )
+        assert outcome["answered"] is False
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_trip_patterns = original
+
+
+def test_the_pair_digest_cannot_be_reversed_from_the_public_stop_refs():
+    """It labels an INFO record that now fires on every lookup, cache hits included — once or twice
+    per registered journey per poller cycle. NSR refs are public and enumerable (~60k StopPlaces,
+    from a register this app reads itself), so an unsalted SHA-256 over `from|to` is a rainbow table
+    away from publishing each traveller's origin, destination and — from the timestamps — their
+    travel window, to anyone with Cloud Logging read access.
+
+    A process-lifetime salt keeps every observability question answerable (all the records about one
+    pair still carry one label within a pod's life) and takes the reversal away.
+    """
+    from llm_message import key_digest
+
+    digest = alternatives.pair_digest(CAND_FROM, CAND_TO)
+    assert digest == alternatives.pair_digest(CAND_FROM, CAND_TO), "stable within the process"
+    assert digest != alternatives.pair_digest(CAND_TO, CAND_FROM), "and direction still matters"
+    assert digest != key_digest(f"{CAND_FROM}|{CAND_TO}"), (
+        "the preimage must not be two public strings anybody can enumerate"
+    )
+    assert CAND_FROM not in digest and CAND_TO not in digest
+
+
 def test_fetch_candidates_contains_a_parsing_failure():
     """Fail open covers parsing, not just fetching — and the guard has to sit around the parse of
     the whole reply, not only around each pattern."""
@@ -1045,7 +1209,7 @@ def test_a_successful_fetch_is_logged_with_a_digest_not_the_stop_refs():
         assert got["arrive_by"] is False and got["path"] == "request"
         assert got["cache_hit"] is False and got["throttled"] is False
         assert got["pair_digest"] and got["pair_digest"] not in (CAND_FROM, CAND_TO)
-        assert got["pair_digest"] == alternatives._pair_digest(CAND_FROM, CAND_TO)
+        assert got["pair_digest"] == alternatives.pair_digest(CAND_FROM, CAND_TO)
 
         # The same lookup a cycle later is a hit, and says so — otherwise the cache-key rewrite
         # this unit is built on could not be measured in prd at all.
