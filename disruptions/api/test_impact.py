@@ -472,6 +472,41 @@ def test_a_candidate_absent_from_the_index_is_unscored_with_null_probabilities()
     assert score.arrival_prediction is None
 
 
+def test_the_resolved_call_carries_its_identity_so_the_advice_can_be_labelled():
+    """`(operator, jkey, stop_order)` is the grain label_varsel_decisions.sql joins realized ET
+    outcomes on. Scoring resolves exactly that call; keeping only its numbers is what left "take
+    this instead" the one traveller-facing claim nothing could ever score.
+
+    Both ends, and each from its OWN call — the alighting prediction must not inherit the boarding
+    call's stop_order, or a recommendation would be labelled against the wrong stop.
+    """
+    index = {
+        ALT_REF: [
+            _alt_call(stop_place=A, stop_order=4, aimed_dep=_at(9), p_impact_dep=0.11),
+            _alt_call(stop_place=B, stop_order=9, aimed_dep=None, aimed_arr=_at(9, 40),
+                      p_impact_dep=None, p_impact=0.14),
+        ]
+    }
+    score = _scored([_candidate()], index=index)[0]
+    dep = score.departure_prediction
+    assert (dep.operator, dep.jkey, dep.stop_order) == (ALT_REF[0], ALT_REF[1], 4)
+    arr = score.arrival_prediction
+    assert (arr.operator, arr.jkey, arr.stop_order) == (ALT_REF[0], ALT_REF[1], 9)
+
+
+def test_an_unscored_candidate_names_no_train_rather_than_guessing_from_the_codespace():
+    """Null identity, not a reconstruction. The Journey Planner's own refs are right there on the
+    candidate, and the codespace they carry is JP's — the same one `risky` refuses to gate on. Two
+    thirds of a join key joins to nothing, and a filled column that never matches reads as a train
+    we could not find rather than as a train we never scored.
+    """
+    score = _scored([_candidate()], index={})[0]
+    dep = score.departure_prediction
+    assert dep.scored is False
+    assert (dep.operator, dep.jkey, dep.stop_order) == (None, None, None)
+    assert score.candidate.transit_refs[0] == ALT_REF, "the ref was available and deliberately unused"
+
+
 def test_operator_collision_scores_each_candidate_against_its_own_journey():
     """Bus ServiceJourney jkeys are not date-scoped, so two operators can share one.
 
@@ -1053,6 +1088,10 @@ def test_the_chosen_alternative_carries_what_we_know_about_its_own_boarding():
     dep = alt.departure_prediction
     assert dep is not None and dep.stop_place == A and dep.stop_name == "Oslo S"
     assert dep.scored is True and dep.impact_probability == 0.11
+    # The identity survives selection too, which is the only reason `decisions` can record it: the
+    # winner reaches the response as an AlternativeJourney, and nothing downstream could join it
+    # back to the CandidateScore the scorer returned.
+    assert (dep.operator, dep.jkey, dep.stop_order) == ("VYG", ALT_JKEY, 1)
     assert alt.at_risk is False, "0.11 is far under VYG's gate"
     assert alt.arrives_before_original is (alt.arrival_time < now + timedelta(minutes=90)), (
         "the flag must agree with the arrival comparison it summarises"

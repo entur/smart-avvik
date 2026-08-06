@@ -199,17 +199,23 @@ def _alternative_fields(alert: Alert) -> dict:
       `getattr(alt, "scored", None)` would ship a column of permanent NULLs that reads as
       "unscored", which is precisely the fact-vs-absence confusion the flag exists to prevent.
 
-    What is still **not** recorded, and cannot be from here: the boarding call identity of the
-    journey we recommended — `(operator, jkey, stop_order)`, the grain
-    `data/queries/label_varsel_decisions.sql` joins `last_recorded` on. `impact._score_candidate`
-    resolves exactly that call and then keeps only its numbers: `AlternativePrediction` carries the
-    stop place and the probabilities, `AlternativeJourney` carries neither journey ref nor stop
-    order, and `alternatives.select_best` answers with the journey rather than with the candidate
-    that won, so there is no join back to it. Until one of those carries the ref, "take this
-    instead" is the only traveller-facing claim in this repo that nothing can ever label. Reading an
-    operator off a leg's line codespace would not fix it: that is the JP codespace, which
-    `impact._score_candidate` explicitly refuses to gate on, and two thirds of a join key joins to
-    nothing.
+    `alt_operator` / `alt_jkey` / `alt_stop_order` are what make the advice **scoreable**. Every
+    other decision this log records gets a nightly hit / false-alarm / miss verdict from
+    `data/queries/label_varsel_decisions.sql`, which joins realized ET outcomes on
+    `(operator, jkey, call_date, stop_order)`; the row carried that key for the disrupted train and
+    not for the one we told the traveller to take instead, so "take this instead" was the only
+    traveller-facing claim in this repo that nothing could ever label. They come off the boarding
+    `CallPred` `impact._score_candidate` resolved, through `AlternativePrediction` — the same nested
+    read as `alt_scored`, and for the same reason: `AlternativeJourney` carries no journey ref, and a
+    flat `getattr(alt, "jkey", None)` would ship a column of permanent NULLs. The fourth part of the
+    key is not a column of its own: the operating day is `DATE(alt_departure_time, "Europe/Oslo")`,
+    exact except where an access walk straddles midnight.
+
+    They are NULL whenever `alt_scored` is False, which is the ordinary case — the prediction cache
+    only holds journeys a live situation touches — and that is the honest answer rather than a gap.
+    An operator read off a leg's line codespace would fill the column and join to nothing: that is
+    the JP codespace, which `impact._score_candidate` explicitly refuses to gate on, and two thirds
+    of a join key is not a join key.
     """
     alt = getattr(alert, "alternative_journey", None)
     fields: dict = {
@@ -229,6 +235,9 @@ def _alternative_fields(alert: Alert) -> dict:
             "alt_arrives_before_original": getattr(alt, "arrives_before_original", None),
             "alt_at_risk": getattr(alt, "at_risk", None),
             "alt_scored": getattr(departure, "scored", None),
+            "alt_operator": getattr(departure, "operator", None),
+            "alt_jkey": getattr(departure, "jkey", None),
+            "alt_stop_order": getattr(departure, "stop_order", None),
             "alt_lines": ", ".join(
                 str(
                     getattr(leg, "public_code", None)
