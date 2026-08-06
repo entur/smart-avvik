@@ -13,15 +13,25 @@ Design notes
   `arrive_by=True` as "be there by", and the two are separate requests because a depart-after search
   cannot contain a journey that leaves earlier and still gets there in time. Selection reads
   candidates; it never re-parses patterns.
-* **The bar is the disrupted train, not the timetable.** A pattern qualifies only when its expected
-  arrival at ``to_stop`` beats ``reference_arrival`` — the matched train's *predicted* arrival
-  (aimed + predicted delay). A pattern that is faster than the timetable but slower than what the
-  passenger already has is not an alternative.
-* **Patterns that ride the disruption are excluded.** A pattern is dropped when any transit leg runs
-  the affected journey (matched on the service-journey ref, stripped of its codespace, which covers
-  both the rail ``DatedServiceJourney`` refs and the bus ``ServiceJourney`` refs our cache keys on)
-  or the affected line. Recommending the same disrupted line back to the traveller is worse than
-  saying nothing.
+* **The bar is the traveller's appointment, not the fastest possible trip.** :func:`select_best`
+  keeps the **latest-departing** journey that still arrives before the disrupted train's *aimed*
+  arrival: somebody who will make their appointment either way would rather leave later than run for
+  an earlier train. Only when nothing arrives in time does it fall back to the earliest arrival —
+  which is the case where a replacement legitimately arrives *later* than the train it replaces, so
+  ``minutes_saved`` is signed and may be zero or negative. The rule this replaced (earliest arrival,
+  at least three minutes faster) measurably almost never fired.
+* **The disrupted train competes under the same rules, and usually wins.** It is passed in as
+  ``original`` and ranked alongside the candidates; when it wins, there is no alternative to offer.
+  Because its arrival is aimed **plus** a non-negative predicted delay while the deadline is that
+  same aimed arrival, it can never sit in the in-time tier — which is why a *materiality* gate sits
+  on top (see ``_MIN_MATERIAL_MINUTES``), or a two-minute delay would produce "abandon your train".
+* **Candidates that ride the disruption are excluded, the original is not.** A candidate is dropped
+  when any of its ``transit_refs`` is one of the affected ``(operator, jkey)`` pairs — JP's reply
+  contains the disrupted train's own pattern, and it would win outright. The synthesized
+  ``original`` rides an affected journey *by construction*, so it is exempt; dropping it would make
+  the "stay put" answer unreachable. Riding an affected *line* is no longer a hard exclusion: it
+  feeds ``AlternativeCandidate.risky``, which the selector treats as a preference (a safe journey
+  arriving two hours late must not beat a slightly risky one that gets the traveller there on time).
 * **Fail open, always.** Every failure path — timeout, GraphQL ``errors``, an empty
   ``tripPatterns``, a malformed payload — yields ``None``. This sits on the poller thread behind a
   push notification; it must never be the reason an alert does not go out.
@@ -57,9 +67,28 @@ _TTL = timedelta(minutes=2)
 _FAILURE_COOLDOWN = timedelta(minutes=2)
 # Departure-time cache bucket: requests within the same bucket share one JP answer.
 _DEPART_BUCKET = timedelta(minutes=5)
-# Only propose an alternative that saves at least this much — shaving a minute off is noise, and
-# quoting it as advice would cost more trust than it buys.
-_MIN_MINUTES_SAVED = 3
+# The materiality gate on "stay put". Inherited from the deleted `_MIN_MINUTES_SAVED`, which used to
+# be a filter over every candidate; it is now applied at exactly ONE place — to the winner, and only
+# when the disrupted train is neither cancelled nor itself alert-worthy.
+#
+# Why the gate has to exist at all. The R3 deadline is the original's *aimed* arrival, while the
+# original's own arrival is that aimed time PLUS a non-negative predicted delay. So the original can
+# never sit in the in-time tier, and any earlier-arriving train beats it there — meaning "the
+# traveller should stay on the train they have" would be unreachable for every delay-driven alert.
+# Rail alerts are mostly delay-driven, so without this gate the systematic advice becomes "abandon
+# your train and run for an earlier one" — including when the delay is two minutes. Do not
+# "simplify" it away: it is not a duplicate of the tier logic, it is the reason the tier logic is
+# safe to state so simply.
+_MIN_MATERIAL_MINUTES = 3
+# Mirrors `varsel._WINDOW_CATCH_UP` (90 min): how long past a registered window's end a train from
+# that window can still be worth offering, sized above the p90 delays the exceedance stack produces.
+# It is duplicated rather than imported because `varsel` imports THIS module (`from alternatives
+# import AlternativeJourney`), so importing back is a cycle. `select_best` takes it as a parameter so
+# a caller that can see both may pass the real constant and keep the two from drifting.
+_CATCH_UP_GRACE = timedelta(minutes=90)
+# Legacy: the filter `select_best` replaced, still read by `_legacy_to_alternative` on `find_faster`'s
+# path. Deleted together with `find_faster` when its callers are re-pointed at `select_best`.
+_LEGACY_MIN_MINUTES_SAVED = 3
 # How far ahead of `now` a requested travel time may sit before the lookup is skipped entirely.
 # Stated in hours rather than as a ratio of anything: a registration for tomorrow morning refreshes
 # on every poller cycle from the moment it is created, and the Journey Planner query it would issue
@@ -194,17 +223,37 @@ class AlternativeLeg(BaseModel):
 
 
 class AlternativeJourney(BaseModel):
-    """A journey from `from_stop` to `to_stop` that arrives before the disrupted train would.
+    """The journey :func:`select_best` chose over the disrupted train.
 
-    Sourced from the Journey Planner, so it reflects the *published* real-time picture — it is not
-    scored by our per-call models and carries no cancellation or delay probability of its own.
+    Sourced from the Journey Planner, so its times reflect the *published* real-time picture.
+
+    It is **not** necessarily faster than the train it replaces: when nothing arrives before the
+    disrupted train's aimed arrival, the fallback tier offers the earliest arrival there is, and a
+    replacement for a cancelled train legitimately gets the traveller there later than the timetable
+    promised. `minutes_saved` is signed for exactly that reason, and `arrives_before_original` says
+    which side of zero it fell on without a reader having to know the sign convention.
     """
 
     departure_time: datetime | None = Field(description="Expected departure from `from_stop`.")
     arrival_time: datetime | None = Field(description="Expected arrival at `to_stop`.")
     duration_min: int | None = Field(default=None, description="Total journey time in minutes.")
     minutes_saved: int = Field(
-        description="Minutes earlier this arrives than the disrupted train's predicted arrival.",
+        description="SIGNED minutes earlier this arrives than the disrupted train's predicted "
+        "arrival. Zero or negative is a legitimate answer in the fallback tier — a replacement for "
+        "a cancelled train is still worth offering when it arrives later than the train would have.",
+    )
+    arrives_before_original: bool = Field(
+        default=False,
+        description="This arrives strictly before the disrupted train's predicted arrival. False "
+        "means the traveller gets there later than the disrupted train was expected to — which "
+        "only happens when that train is cancelled or in enough trouble to be worth escaping.",
+    )
+    at_risk: bool = Field(
+        default=False,
+        description="This journey is itself predicted to be in trouble (over its operator's alert "
+        "gate, or running on a line a live situation touches). It is offered anyway because "
+        "nothing safer reached the destination in time — a wording that presents it as a clean "
+        "escape would be wrong.",
     )
     legs: list[AlternativeLeg] = Field(
         default_factory=list, description="The legs to travel, in order."
@@ -512,7 +561,13 @@ def split_codespace(ref: str | None) -> tuple[str | None, str] | None:
     return (None, ref)
 
 
-def _rides_the_disruption(
+# ---- Legacy selection (dies with `find_faster`) -----------------------------------------------
+# Everything down to `find_faster` is the rule `select_best` replaces: the earliest-arriving pattern
+# that beat the disrupted train's predicted arrival by at least three minutes. It is kept, private
+# and renamed, only because `impact.for_trip` still calls `find_faster`; deleting it in the same
+# change would silently stop every alternative being offered until those callers are re-pointed.
+# When `find_faster` goes, these three go with it.
+def _legacy_rides_the_disruption(
     pattern: dict, excluded_jkeys: set[str], excluded_lines: set[str]
 ) -> bool:
     legs = pattern.get("legs")
@@ -529,12 +584,12 @@ def _rides_the_disruption(
     return False
 
 
-def _to_alternative(pattern: dict, reference_arrival: datetime) -> AlternativeJourney | None:
+def _legacy_to_alternative(pattern: dict, reference_arrival: datetime) -> AlternativeJourney | None:
     arrival = _parse_ts(pattern.get("expectedEndTime"))
     if arrival is None:
         return None
     saved = round((reference_arrival - arrival).total_seconds() / 60)
-    if saved < _MIN_MINUTES_SAVED:
+    if saved < _LEGACY_MIN_MINUTES_SAVED:
         return None
     duration = pattern.get("duration")
     if not isinstance(duration, int | float):
@@ -547,6 +602,7 @@ def _to_alternative(pattern: dict, reference_arrival: datetime) -> AlternativeJo
         arrival_time=arrival,
         duration_min=round(duration / 60) if duration else None,
         minutes_saved=saved,
+        arrives_before_original=True,  # the legacy filter admitted nothing else
         legs=[
             AlternativeLeg(
                 mode=leg.get("mode"),
@@ -563,7 +619,7 @@ def _to_alternative(pattern: dict, reference_arrival: datetime) -> AlternativeJo
     )
 
 
-def select_faster(
+def _legacy_select_faster(
     patterns: Iterable[dict],
     *,
     reference_arrival: datetime,
@@ -572,15 +628,15 @@ def select_faster(
 ) -> AlternativeJourney | None:
     """The earliest-arriving pattern that beats `reference_arrival` and avoids the disruption.
 
-    Pure — no I/O — so the selection rules are testable against a recorded JP payload.
+    Superseded by :func:`select_best`; still reached from :func:`find_faster`, and deleted with it.
     """
     best: AlternativeJourney | None = None
     for pattern in patterns:
         if not isinstance(pattern, dict):
             continue
-        if _rides_the_disruption(pattern, excluded_jkeys, excluded_lines):
+        if _legacy_rides_the_disruption(pattern, excluded_jkeys, excluded_lines):
             continue
-        candidate = _to_alternative(pattern, reference_arrival)
+        candidate = _legacy_to_alternative(pattern, reference_arrival)
         if candidate is None:
             continue
         if best is None or (
@@ -606,7 +662,10 @@ def find_faster(
 
     `reference_arrival` is the bar to beat — the disrupted train's predicted arrival at `to_stop`.
     `depart_after` is when the traveller can realistically leave. Returns None on any failure, on
-    an empty result, and when nothing saves at least `_MIN_MINUTES_SAVED` minutes.
+    an empty result, and when nothing saves at least `_LEGACY_MIN_MINUTES_SAVED` minutes.
+
+    Superseded by `fetch_candidates` + `select_best`; still the live path until its callers are
+    re-pointed, at which point this and the three `_legacy_*` helpers are deleted together.
     """
     if not (_is_stop_ref(from_stop) and _is_stop_ref(to_stop)):
         # Both refs are spliced into the GraphQL document as string literals, and both originate in
@@ -631,7 +690,7 @@ def find_faster(
     # varsel.check_and_notify -- where the per-journey guard turned it into every alert for that
     # journey being silently dropped for the cycle. A bad alternative must cost the alternative only.
     try:
-        return select_faster(
+        return _legacy_select_faster(
             patterns,
             reference_arrival=reference_arrival,
             excluded_jkeys=excluded_jkeys,
@@ -850,3 +909,143 @@ def fetch_candidates(
             extra={"fields": {"event": "alternatives_error"}},
         )
         return []
+
+
+# ---- Selection -------------------------------------------------------------------------------
+def select_best(
+    candidates: Iterable[AlternativeCandidate],
+    *,
+    original: AlternativeCandidate | None,
+    original_arrival_time: datetime,
+    original_predicted_arrival: datetime,
+    now: datetime,
+    window_end: datetime,
+    affected_refs: set[tuple[str | None, str]],
+    catch_up_grace: timedelta = _CATCH_UP_GRACE,
+) -> AlternativeJourney | None:
+    """What the traveller should take instead of the disrupted train, or None to stay put.
+
+    Pure — no I/O — so the rule is exercised against recorded payloads rather than the network.
+
+    The two anchors are different times and must not be collapsed. `original_arrival_time` is the
+    disrupted train's **aimed** arrival: the traveller's deadline, and the bar an alternative has to
+    clear to count as "still in time". `original_predicted_arrival` is what we actually expect of
+    that train (aimed + predicted delay): the bar `minutes_saved` and the materiality gate measure
+    against. Passing the predicted time as the deadline would let a delayed train move the
+    traveller's appointment.
+
+    The rule, in order:
+
+    1. **Pool.** Drop anything cancelled; anything whose departure has passed (`> now`, strictly, so
+       a departure exactly at `now` is not offered) or falls beyond `window_end + catch_up_grace`;
+       and any NON-original candidate riding one of `affected_refs`. That last exclusion carries the
+       reply's copy of the disrupted train itself — the caller synthesizes `original` from our own
+       scoring rather than reading it out of JP, so JP's own pattern for the same train is still in
+       the list as `is_original=False` and would win outright. The original is exempt precisely
+       because it rides an affected journey by construction; dropping it would make "stay put"
+       unreachable.
+    2. **Tiers, arrival-feasibility outside risk-avoidance.** Within each tier the safe candidates
+       are consulted before the full pool. Nested the other way, a *safe* journey arriving two hours
+       late would beat a slightly risky one that still gets the traveller there on time.
+    3. **Ties** break on earlier arrival, then on `ordinal` (JP's own reply order), then in favour of
+       the original. Not cosmetic: this runs again on every refresh, and an unstable winner would
+       flip both the card's wording and which situation the written message is cached under.
+    4. **The original competes.** If it wins, there is nothing to offer — plus the materiality gate
+       described on `_MIN_MATERIAL_MINUTES`, without which "stay put" is unreachable for every
+       delay-driven alert.
+
+    `window_end` and `affected_refs` are required, not optional: without the first there is no upper
+    bound on how far past the traveller's own window a suggestion may reach, and without the second
+    the disrupted train wins its own replacement contest.
+    """
+    affected = set(affected_refs or ())
+
+    def is_original(cand: AlternativeCandidate) -> bool:
+        # Identity as well as the flag: the caller sets `is_original`, and a caller that forgets
+        # would silently lose R7 — "stay put" would stop being an answer this function can give.
+        return cand.is_original or cand is original
+
+    pool_source = list(candidates)
+    if original is not None and not any(cand is original for cand in pool_source):
+        pool_source.append(original)
+
+    last_departure = window_end + catch_up_grace
+    pool: list[AlternativeCandidate] = []
+    for cand in pool_source:
+        if cand.cancelled:
+            continue
+        if cand.arrival_time is None:
+            continue  # nothing downstream can rank it, and every comparison below reads it
+        if cand.departure_time is not None:
+            if cand.departure_time <= now or cand.departure_time > last_departure:
+                continue
+        elif not is_original(cand):
+            # A suggestion whose departure we cannot read may already have left. The original is
+            # exempt: its catchability was established upstream (`catchable_after`), and it is the
+            # baseline rather than a suggestion.
+            continue
+        if not is_original(cand) and any(ref in affected for ref in cand.transit_refs):
+            continue
+        pool.append(cand)
+    if not pool:
+        return None
+
+    def in_time(group: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
+        return [cand for cand in group if cand.arrival_time < original_arrival_time]
+
+    def whenever(group: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
+        return group
+
+    def latest_departing(group: list[AlternativeCandidate]) -> AlternativeCandidate:
+        return min(
+            group,
+            key=lambda cand: (
+                -cand.departure_time.timestamp() if cand.departure_time else float("inf"),
+                cand.arrival_time.timestamp(),
+                cand.ordinal,
+                0 if is_original(cand) else 1,
+            ),
+        )
+
+    def earliest_arriving(group: list[AlternativeCandidate]) -> AlternativeCandidate:
+        return min(
+            group,
+            key=lambda cand: (
+                cand.arrival_time.timestamp(),
+                cand.ordinal,
+                0 if is_original(cand) else 1,
+            ),
+        )
+
+    safe = [cand for cand in pool if not cand.risky]
+    winner: AlternativeCandidate | None = None
+    for tier, pick in ((in_time, latest_departing), (whenever, earliest_arriving)):
+        for group in (safe, pool):
+            subset = tier(group)
+            if subset:
+                winner = pick(subset)
+                break
+        if winner is not None:
+            break
+    if winner is None or is_original(winner):
+        return None
+
+    saved = round((original_predicted_arrival - winner.arrival_time).total_seconds() / 60)
+    # The materiality gate. When the disrupted train is neither cancelled nor over its own alert
+    # gate, staying on it is a perfectly good outcome and switching has to earn itself — see
+    # `_MIN_MATERIAL_MINUTES`, without which a two-minute delay reads as "run for the earlier
+    # train". It reads the same rounded figure the wording quotes, so an offer and the minutes it
+    # advertises always agree. An absent original is treated as "not in trouble": nothing
+    # established that it is, and inventing trouble is how noise gets sent.
+    in_real_trouble = original is not None and (original.cancelled or original.risky)
+    if not in_real_trouble and saved < _MIN_MATERIAL_MINUTES:
+        return None
+    return AlternativeJourney(
+        departure_time=winner.departure_time,
+        arrival_time=winner.arrival_time,
+        duration_min=winner.duration_min,
+        minutes_saved=saved,
+        arrives_before_original=winner.arrival_time < original_predicted_arrival,
+        at_risk=winner.risky,
+        legs=list(winner.legs),
+    )
