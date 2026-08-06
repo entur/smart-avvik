@@ -19,11 +19,14 @@ from datetime import UTC, datetime, timedelta
 import alternatives
 from alternatives import (
     _TRIP_QUERY,
+    AlternativeCandidate,
+    AlternativeLeg,
     _KeyedTTLCache,
+    _legacy_select_faster,
     fetch_candidates,
     find_faster,
     parse_candidates,
-    select_faster,
+    select_best,
     split_codespace,
 )
 
@@ -57,12 +60,16 @@ def _pattern(arrive_min, *, dep_min=0, line="VYG:Line:R11", dsj="VYG:DatedServic
 
 
 def _select(patterns, jkeys=frozenset(), lines=frozenset()):
-    return select_faster(
+    return _legacy_select_faster(
         patterns, reference_arrival=REF, excluded_jkeys=set(jkeys), excluded_lines=set(lines)
     )
 
 
-# ---- selection --------------------------------------------------------------------------------
+# ---- legacy selection (dies with `find_faster`) ------------------------------------------------
+# The rule `select_best` replaced: earliest arrival, at least three minutes faster, hard exclusion on
+# the affected journey and line. It still ships — `impact.for_trip` calls `find_faster` — so it stays
+# covered until its callers are re-pointed, and these tests are deleted together with it. Successors
+# for each of them live in the `select_best` section below.
 def test_picks_the_earliest_arriving_pattern_that_beats_the_reference():
     got = _select([_pattern(-5), _pattern(-25), _pattern(-12)])
     assert got is not None
@@ -159,6 +166,284 @@ def test_legs_are_summarised_in_order():
         ("rail", "R11", "Oslo S", "Drammen")
     ]
     assert got.duration_min == 20
+
+
+# ---- select_best: the selection rule ------------------------------------------------------------
+# Every scenario below sits on one clock, so the numbers can be read off the offsets:
+#
+#   NOW      +0    the instant the selection runs
+#   original +5    the disrupted train's departure — still catchable, or it would not be in the pool
+#   WINDOW_END +30 the end of the traveller's registered window; + 90 min catch-up grace
+#   DEADLINE +60   the disrupted train's AIMED arrival: the bar for "still in time"
+#   (last offerable departure: +120)
+#
+# The train's PREDICTED arrival is stated per test and is a different anchor from DEADLINE — it is
+# aimed + a non-negative delay, which is exactly why it can never sit in the in-time tier.
+NOW = datetime(2026, 8, 6, 9, 0, tzinfo=UTC)
+DEADLINE = NOW + timedelta(minutes=60)
+WINDOW_END = NOW + timedelta(minutes=30)
+# The disrupted train's own (operator, jkey) — the pair the caller passes as `affected_refs`.
+AFFECTED = ("VYG", "DatedServiceJourney:81613_DRM-DAL_26-08-06")
+AFFECTED_BUS = ("RUT", "ServiceJourney:fe362750909c4c05aec47f2891ee3a5d")
+
+
+def _cand(dep_min, arr_min, *, ordinal=0, risky=False, cancelled=False, refs=(),
+          is_original=False, line="VYG:Line:R11"):
+    """One candidate departing at NOW+`dep_min` and arriving at NOW+`arr_min`."""
+    return AlternativeCandidate(
+        departure_time=NOW + timedelta(minutes=dep_min),
+        arrival_time=NOW + timedelta(minutes=arr_min),
+        duration_min=arr_min - dep_min,
+        legs=[
+            AlternativeLeg(mode="rail", line=line, public_code="R11", from_name="Oslo S",
+                           to_name="Asker stasjon")
+        ],
+        transit_refs=list(refs),
+        lines=[line],
+        cancelled=cancelled,
+        ordinal=ordinal,
+        is_original=is_original,
+        risky=risky,
+    )
+
+
+def _original(*, predicted_min, dep_min=5, cancelled=False, risky=False):
+    """The disrupted train as the caller synthesizes it: `is_original`, and riding an affected
+    journey by construction — which is the whole reason the affected-refs drop has to exempt it."""
+    return _cand(dep_min, predicted_min, refs=[AFFECTED], is_original=True,
+                 cancelled=cancelled, risky=risky)
+
+
+def _best(candidates, original, *, predicted=None, deadline=DEADLINE, now=NOW,
+          window_end=WINDOW_END, affected=(AFFECTED, AFFECTED_BUS)):
+    """`select_best` with the scenario's anchors. `original_predicted_arrival` defaults to the
+    original's own arrival, which is the invariant the caller maintains."""
+    if predicted is None:
+        predicted = original.arrival_time if original is not None else deadline
+    return select_best(
+        candidates,
+        original=original,
+        original_arrival_time=deadline,
+        original_predicted_arrival=predicted,
+        now=now,
+        window_end=window_end,
+        affected_refs=set(affected),
+    )
+
+
+def test_the_latest_departing_journey_that_still_arrives_in_time_wins():
+    """R3. NOT the earliest arrival: a traveller who makes their appointment either way would
+    rather leave later than run for the first train out."""
+    got = _best(
+        [_cand(5, 40, ordinal=0), _cand(15, 50, ordinal=1), _cand(10, 45, ordinal=2)],
+        _original(predicted_min=90),
+    )
+    assert got is not None
+    assert got.departure_time == NOW + timedelta(minutes=15)
+    assert got.arrival_time == NOW + timedelta(minutes=50), "the +40 arrival must NOT win"
+    assert got.minutes_saved == 40
+
+
+def test_when_nothing_arrives_in_time_the_earliest_arrival_wins():
+    """R4. The deadline is already lost, so the only remaining question is how late."""
+    got = _best(
+        [_cand(5, 80, ordinal=0), _cand(20, 70, ordinal=1), _cand(30, 75, ordinal=2)],
+        _original(predicted_min=100),
+    )
+    assert got is not None
+    assert got.arrival_time == NOW + timedelta(minutes=70)
+    assert got.departure_time == NOW + timedelta(minutes=20), "latest-departure is tier 1's rule"
+    assert got.minutes_saved == 30
+    # It arrives after the DEADLINE (+60) but before the disrupted train's predicted arrival
+    # (+100). The flag is about the train the traveller has, not about their appointment — the two
+    # anchors are different times and reading it off the wrong one inverts it in exactly this case.
+    assert got.arrives_before_original is True
+
+
+def test_a_replacement_arriving_later_than_the_original_would_is_still_offered():
+    """The fallback tier's whole point. A replacement for a cancelled train legitimately arrives
+    after the train it replaces — `minutes_saved` is signed, and this is the sign that matters."""
+    got = _best([_cand(10, 75)], _original(predicted_min=60, cancelled=True))
+    assert got is not None
+    assert got.minutes_saved == -15
+    assert got.arrives_before_original is False
+
+
+def test_a_cancelled_candidate_is_never_chosen():
+    """R5. The one that would win tier 1 outright is the one that is not running."""
+    got = _best(
+        [_cand(20, 55, cancelled=True, ordinal=0), _cand(10, 45, ordinal=1)],
+        _original(predicted_min=90),
+    )
+    assert got is not None
+    assert got.departure_time == NOW + timedelta(minutes=10)
+
+
+def test_a_cancelled_original_cannot_suppress_the_alternative():
+    """Today's headline failure: the old rule demanded a candidate beat the disrupted train's
+    predicted arrival by 3 minutes, so a cancelled train — whose replacement is always later —
+    got no alternative at all, which is precisely when the traveller needs one."""
+    got = _best(
+        [_cand(10, 70, ordinal=0), _cand(25, 85, ordinal=1)],
+        _original(predicted_min=60, cancelled=True),
+    )
+    assert got is not None, "a later, slower journey is the honest answer here"
+    assert got.arrival_time == NOW + timedelta(minutes=70)
+    assert got.minutes_saved == -10
+
+
+def test_the_disrupted_trains_own_pattern_is_not_offered_back():
+    """JP's reply contains the disrupted train itself — the caller synthesizes `original` from our
+    own scoring rather than reading it out of JP, so that pattern is in the list as
+    `is_original=False` and would win outright. Both ref forms have to catch it: rail jkeys are
+    DatedServiceJourney refs, bus jkeys plain ServiceJourney ones.
+    """
+    for label, ref in (("rail", AFFECTED), ("bus", AFFECTED_BUS)):
+        got = _best(
+            [_cand(20, 55, refs=[ref], ordinal=0), _cand(10, 45, ordinal=1)],
+            _original(predicted_min=90),
+        )
+        assert got is not None
+        assert got.departure_time == NOW + timedelta(minutes=10), f"the {label} ref must be dropped"
+
+    # Matched on the (operator, jkey) PAIR, not the jkey alone: bus ServiceJourney refs are not
+    # date-scoped, so one jkey can name two operators' journeys (the reason U2 kept both halves).
+    other_operator = _cand(20, 55, refs=[("GOA", AFFECTED_BUS[1])], ordinal=0)
+    got = _best([other_operator, _cand(10, 45, ordinal=1)], _original(predicted_min=90))
+    assert got.departure_time == NOW + timedelta(minutes=20), "a different operator is not affected"
+
+
+def test_the_synthesized_original_survives_that_same_exclusion():
+    """It rides an affected journey by construction, so applying the drop to it would make "stay
+    put" unreachable and no alternative could ever be suppressed. A/B on the one thing under test:
+    same pool, same rules, only the original's arrival moves."""
+    rival = _cand(10, 80, risky=True)  # risky, so R6 cannot hand it the tier before ranking
+    stays = _best([rival], _original(predicted_min=60, risky=True))
+    switches = _best([rival], _original(predicted_min=120, risky=True))
+    assert stays is None, "the original arrives first, so it is in the pool and it won"
+    assert switches is not None, "and when it arrives later the very same candidate is offered"
+
+
+def test_a_candidate_departing_past_the_window_grace_is_excluded():
+    """The traveller registered a window; a suggestion 20 minutes beyond its end plus the catch-up
+    grace is not the trip they signed up for, however well it would score."""
+    got = _best(
+        [_cand(140, 170, ordinal=0), _cand(60, 150, ordinal=1)],
+        _original(predicted_min=200),
+        deadline=NOW + timedelta(minutes=180),
+    )
+    assert got is not None
+    assert got.departure_time == NOW + timedelta(minutes=60), "+140 is past +30 window +90 grace"
+
+
+def test_a_safe_journey_is_preferred_to_a_risky_one_in_the_same_tier():
+    """R6 as a preference: both arrive in time, so take the one not heading for trouble itself —
+    even though the risky one departs later and would win tier 1 on its own."""
+    got = _best(
+        [_cand(20, 55, risky=True, ordinal=0), _cand(10, 50, ordinal=1)],
+        _original(predicted_min=90),
+    )
+    assert got is not None
+    assert got.departure_time == NOW + timedelta(minutes=10)
+    assert got.at_risk is False
+
+
+def test_a_risky_journey_beats_a_safe_one_that_arrives_far_too_late():
+    """R6 is a preference, not a veto — and arrival-feasibility is the OUTER loop. Nested the other
+    way, a safe journey arriving an hour and a half late would beat a slightly risky one that still
+    gets the traveller there on time."""
+    got = _best(
+        [_cand(20, 55, risky=True, ordinal=0), _cand(40, 150, ordinal=1)],
+        _original(predicted_min=90),
+    )
+    assert got is not None
+    assert got.arrival_time == NOW + timedelta(minutes=55)
+    assert got.at_risk is True, "and the caller is told what it is offering"
+
+
+def test_the_original_winning_means_there_is_nothing_to_offer():
+    """R7. Delayed, but still the first arrival on the board."""
+    assert _best(
+        [_cand(10, 80, ordinal=0), _cand(20, 90, ordinal=1)], _original(predicted_min=70)
+    ) is None
+    # And with the materiality gate out of the way — an alert-worthy original, where any way
+    # through would be worth offering — R7 is what stops us recommending the traveller's own train
+    # back to them. Both candidates are risky so R6 cannot hand the tier to one of them first.
+    assert _best(
+        [_cand(10, 80, risky=True, ordinal=0), _cand(20, 90, risky=True, ordinal=1)],
+        _original(predicted_min=70, risky=True),
+    ) is None
+
+
+def test_a_marginal_gain_over_a_slightly_late_train_is_not_advice():
+    """The materiality gate. The deadline is the original's AIMED arrival while its own arrival is
+    aimed + delay, so it can never sit in the in-time tier and any earlier train beats it — without
+    this gate a two-minute delay would produce "abandon your train and run for an earlier one",
+    which for delay-driven rail alerts would be the systematic advice."""
+    assert _best([_cand(10, 61)], _original(predicted_min=62)) is None
+    got = _best([_cand(10, 61)], _original(predicted_min=100))
+    assert got is not None, "40 minutes late is worth escaping; two minutes is not"
+    assert got.minutes_saved == 39
+
+
+def test_the_materiality_gate_is_bypassed_when_the_original_is_in_real_trouble():
+    """Cancelled or over its own alert gate: any way through is worth offering, however slim."""
+    cancelled = _best([_cand(10, 61)], _original(predicted_min=62, cancelled=True))
+    assert cancelled is not None and cancelled.minutes_saved == 1
+    alertworthy = _best([_cand(10, 61)], _original(predicted_min=62, risky=True))
+    assert alertworthy is not None and alertworthy.minutes_saved == 1
+
+
+def test_a_tie_is_broken_deterministically():
+    """This runs again on every refresh (~5 min). An unstable winner would flip both the card's
+    wording and which situation the written message is cached under — the same stability concern
+    `varsel._alert_rank` documents for tied cancellations."""
+    tied_original = _original(predicted_min=70, risky=True)
+    tied = _cand(10, 70, ordinal=3, risky=True)
+    assert _best([tied], tied_original) is None
+    assert _best([tied], tied_original) is None, "twice, identically"
+
+    # Between two non-originals tying on arrival, JP's reply order decides — and decides the same
+    # way whatever order the caller happened to hand them over in.
+    a, b = _cand(10, 70, ordinal=1), _cand(12, 70, ordinal=0)
+    for pool in ([a, b], [b, a]):
+        got = _best(pool, _original(predicted_min=90))
+        assert got.departure_time == NOW + timedelta(minutes=12), "ordinal 0 wins, in either order"
+
+
+def test_a_candidate_departing_exactly_now_is_not_offered():
+    """`> now`, not `>=`: a departure the traveller is standing at is not a plan."""
+    assert _best([_cand(0, 20)], _original(predicted_min=90)) is None
+    got = _best([_cand(1, 20)], _original(predicted_min=90))
+    assert got is not None and got.departure_time == NOW + timedelta(minutes=1)
+
+
+def test_an_empty_candidate_list_yields_no_alternative():
+    assert _best([], _original(predicted_min=90)) is None
+    assert _best([], _original(predicted_min=90, cancelled=True)) is None, "and no pool at all"
+    assert _best([], None) is None
+
+
+def test_a_candidate_that_cannot_be_ranked_is_dropped_not_fatal():
+    """Nothing downstream can rank an arrival that is not there, and a departure we cannot read may
+    already have gone. One unusable candidate costs that one suggestion."""
+    no_arrival = _cand(10, 40).model_copy(update={"arrival_time": None})
+    no_departure = _cand(10, 40).model_copy(update={"departure_time": None})
+    for broken in (no_arrival, no_departure):
+        got = _best([broken, _cand(12, 45, ordinal=1)], _original(predicted_min=90))
+        assert got is not None
+        assert got.departure_time == NOW + timedelta(minutes=12)
+        assert _best([broken], _original(predicted_min=90)) is None
+
+
+def test_the_chosen_journey_carries_what_the_traveller_has_to_recognise():
+    got = _best([_cand(10, 45)], _original(predicted_min=90))
+    assert [(leg.mode, leg.public_code, leg.from_name, leg.to_name) for leg in got.legs] == [
+        ("rail", "R11", "Oslo S", "Asker stasjon")
+    ]
+    assert got.duration_min == 35
+    assert got.arrives_before_original is True
+    assert got.at_risk is False
 
 
 # ---- cache / fail-open ------------------------------------------------------------------------
