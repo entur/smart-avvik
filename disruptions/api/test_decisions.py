@@ -8,6 +8,7 @@ Run: uv run --with pydantic python test_decisions.py  (or under pytest)
 """
 
 import os
+import re
 from datetime import UTC, datetime, timedelta
 
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
@@ -33,16 +34,31 @@ class FakeLeg:
         self.line = line
 
 
+class FakeAlternativePrediction:
+    stop_place = "NSR:StopPlace:337"
+    scored = True
+
+
 class FakeAlternative:
     departure_time = DEP + timedelta(minutes=9)
     arrival_time = DEP + timedelta(minutes=38)
     minutes_saved = 11
+    arrives_before_original = True
+    at_risk = False
+    departure_prediction = FakeAlternativePrediction()
 
     def __init__(self):
         self.legs = [FakeLeg(), FakeLeg(mode="foot", public_code=None, line=None)]
 
 
 class FakeImpactResponse:
+    """The /impact response an alert was derived from — no lookup ran for this one.
+
+    `original_is_best` and `alternative_subject` are absent rather than False/None on purpose: this
+    module reads every field with getattr, and the default shape is what a response that never
+    reached the Journey Planner looks like from here.
+    """
+
     refreshed_at = DECIDED - timedelta(seconds=30)
 
 
@@ -118,25 +134,223 @@ def test_the_alternative_offered_is_recorded_flat():
     """`has_alternative` exists so "how often do we actually offer one?" is a GROUP BY. Walking legs
     are dropped from alt_lines the same way the payload drops them — a traveller reads "R11", not
     "foot, R11, foot".
+
+    The three flags beside it exist because the offer is no longer necessarily a faster journey:
+    whether it actually arrives first, whether it is itself in trouble, and whether our models ever
+    scored it are three different qualifications on one recommendation, and a row that records the
+    suggestion without them cannot say what was really advertised.
     """
     class Alert(FakeAlert):
         alternative_journey = FakeAlternative()
 
     row = _row(Alert())
     assert row["has_alternative"] is True
+    assert row["alt_status"] == "offered"
     assert row["alt_minutes_saved"] == 11
     assert row["alt_departure_time"] == FakeAlternative.departure_time.isoformat()
     assert row["alt_arrival_time"] == FakeAlternative.arrival_time.isoformat()
     assert row["alt_lines"] == "R11"
+    assert row["alt_arrives_before_original"] is True
+    assert row["alt_at_risk"] is False
+
+
+def test_whether_the_alternative_was_scored_reads_through_the_prediction():
+    """`scored` lives on AlternativePrediction, not on AlternativeJourney.
+
+    A flat `getattr(alt, "scored", None)` would type-check, pass any "is it recorded?" assertion
+    that accepts None, and ship a column of permanent NULLs — which reads as "nothing scored it",
+    the exact opposite of the truth for the rows where our own models did have the boarding call.
+    So this asserts True, not "not missing".
+    """
+    class Alert(FakeAlert):
+        alternative_journey = FakeAlternative()
+
+    assert _row(Alert())["alt_scored"] is True
+
+
+def test_an_alternative_that_arrives_later_is_recorded_as_it_is():
+    """The fallback tier offers the best remaining way there, not a faster one.
+
+    For a cancelled train that legitimately arrives after the timetable promised, so `minutes_saved`
+    is signed. Clamping it at zero, or dropping the row, would erase precisely the case the new
+    selection rule exists to serve — and would make the offer look better than it was.
+    """
+    class Slower(FakeAlternative):
+        minutes_saved = -14
+        arrives_before_original = False
+        at_risk = True
+
+    class Alert(FakeAlert):
+        alternative_journey = Slower()
+
+    row = _row(Alert())
+    assert row["alt_minutes_saved"] == -14
+    assert row["alt_arrives_before_original"] is False
+    assert row["alt_at_risk"] is True
+    assert row["alt_status"] == "offered"
+
+
+def test_an_alternative_missing_the_new_fields_records_null_not_an_error():
+    """This module reads the Alert by duck typing, on the poller thread, behind a push.
+
+    A journey object from an older shape — or a renamed field — must cost the columns it describes
+    and nothing else. Attribute access would raise here and take the whole cycle's decision log with
+    it (it fails open, so the symptom would be silence, not a stack trace).
+    """
+    class Bare:
+        departure_time = DEP + timedelta(minutes=9)
+        arrival_time = DEP + timedelta(minutes=38)
+        minutes_saved = 4
+        legs = ()
+
+    class Alert(FakeAlert):
+        alternative_journey = Bare()
+
+    row = _row(Alert())
+    assert row["alt_arrives_before_original"] is None
+    assert row["alt_at_risk"] is None
+    assert row["alt_scored"] is None
+    assert row["has_alternative"] is True
 
 
 def test_no_alternative_is_recorded_as_false_not_null():
     """NULL would be ambiguous between "we looked and found nothing" and "this predates the column".
-    The measured answer today is "effectively never", which only means something if absence is
-    explicit.
+    Measured 2026-08-04 under the old rule the answer was "effectively never", which only means
+    something if absence is explicit.
     """
     assert _row()["has_alternative"] is False
     assert "alt_minutes_saved" not in _row()
+
+
+# ---- what became of the lookup ------------------------------------------------------------------
+def test_every_decision_says_what_became_of_the_alternative_lookup():
+    """`alt_status` is written on every row, including the ~83 % that never reach the lookup gate.
+
+    Those are most of the denominator: an offer rate computed without them counts only the decisions
+    a lookup was issued for, and the 2026-08-06 selection change moves the numerator sharply. A
+    figure whose denominator shifts underneath it measures the log, not the advice.
+    """
+    class Alert(FakeAlert):
+        alertworthy = False
+        impact_probability = 0.11
+
+    assert _row(Alert())["alt_status"] == "not_worth_lookup"
+    assert _row()["alt_status"] == "not_worth_lookup"
+
+
+def test_a_lookup_that_found_nothing_is_not_a_lookup_that_never_ran():
+    """The distinction the column exists for. Both rows carry no alternative and are identical in
+    every other column, and only one of them is evidence about the selection rule.
+
+    `alternative_subject` is set by `impact._best_remaining_journey` once it is past its early
+    returns, so its presence is the honest marker that a query actually went out.
+    """
+    class Looked(FakeImpactResponse):
+        alternative_subject = ("VYG", "DatedServiceJourney:1_OSL-DRM_26-08-04")
+
+    class Alert(FakeAlert):
+        impact = Looked()
+
+    assert _row(Alert())["alt_status"] == "none_found"
+    assert _row(Alert())["has_alternative"] is False
+
+
+def test_staying_on_your_own_train_is_a_verdict_not_an_absence():
+    """"Bli sittende" is a claim; "vi vet ikke" is not, and both leave the same empty column.
+
+    `original_is_best` is only ever True when a real pool was compared against, so recording it
+    separately is what keeps a deliberate silence out of the "nothing was found" bucket.
+    """
+    class StayPut(FakeImpactResponse):
+        original_is_best = True
+        alternative_subject = ("VYG", "DatedServiceJourney:1_OSL-DRM_26-08-04")
+
+    class Alert(FakeAlert):
+        impact = StayPut()
+
+    assert _row(Alert())["alt_status"] == "suppressed"
+
+
+def test_a_backfilled_alternative_is_read_off_the_alert_not_the_response():
+    """`match_journey` back-fills one trip's lookup onto every alert it produced.
+
+    So an alert whose worst reading came from a collapsed stop ref carries advice its OWN /impact
+    response does not — reading the response instead recorded `has_alternative=true` beside a
+    message input with no `alternativ_reise` (fixed 2026-08-05, and the same trap one column over).
+    """
+    class Alert(FakeAlert):
+        alternative_journey = FakeAlternative()
+        impact = FakeImpactResponse()  # no subject: this response issued no lookup
+
+    row = _row(Alert())
+    assert row["alt_status"] == "offered"
+    assert row["alt_departure_time"] == FakeAlternative.departure_time.isoformat()
+
+
+# ---- the row and the table have to agree ---------------------------------------------------------
+_TYPES = "STRING|BOOL|INT64|FLOAT64|TIMESTAMP|DATE"
+
+
+def _created_columns(table: str) -> set[str]:
+    """Columns the CREATE TABLE statement for `table` defines, read from the DDL the app runs."""
+    body = re.search(
+        rf"CREATE TABLE IF NOT EXISTS `{table}`\s*\((.*?)\)\s*PARTITION BY",
+        decisions._CREATE_TABLE_SQL,
+        re.DOTALL,
+    )
+    assert body is not None, f"no CREATE TABLE found for {table}"
+    return set(re.findall(rf"^\s*(\w+)\s+(?:{_TYPES})\b", body.group(1), re.MULTILINE))
+
+
+def _added_columns(table: str) -> set[str]:
+    """Columns the ALTER ... ADD COLUMN IF NOT EXISTS block adds to an existing `table`.
+
+    Statements are separated on their line-initial keyword, NOT on ';': the descriptions in this
+    file carry semicolons of their own ("Minutes late at that stop; null if not recorded."), which
+    is why validate_varsel_sql.sh splits with a quote-aware tokenizer rather than a sed. The
+    scoping matters — there is a second ADD COLUMN block, on the outcomes table.
+    """
+    added: set[str] = set()
+    for statement in re.split(r"^(?=CREATE |ALTER |EXECUTE )", decisions._CREATE_TABLE_SQL, flags=re.MULTILINE):
+        if statement.startswith(f"ALTER TABLE `{table}`") and "ADD COLUMN" in statement:
+            # Anchored to the line and followed by a type, so the prose about ADD COLUMN in the
+            # comments around these statements is not read as a column named "does".
+            added.update(
+                re.findall(
+                    rf"^\s*ADD COLUMN IF NOT EXISTS\s+(\w+)\s+(?:{_TYPES})\b", statement, re.MULTILINE
+                )
+            )
+    return added
+
+
+def test_every_recorded_field_is_a_column_of_the_decision_table():
+    """The silent failure this guards: `decisions.py` writes a column the DDL never added.
+
+    `insert_rows_json` does not raise for it — it returns per-row errors — so the whole cycle's
+    decisions vanish and the only trace is "N of M rows rejected by BigQuery" once a minute. Every
+    field any branch of build_row can produce is checked, not just the ones a default alert carries.
+    """
+    class Alert(FakeAlert):
+        latest_observation = FakeObservation()
+        alternative_journey = FakeAlternative()
+
+    recorded = set(_row(Alert())) | set(_row())
+    missing = recorded - _created_columns("disruptions.varsel_decisions")
+    assert not missing, f"recorded but never created: {sorted(missing)}"
+
+
+def test_a_new_column_reaches_the_environments_that_already_have_the_table():
+    """CREATE TABLE IF NOT EXISTS does nothing where the table exists, so a column added only to the
+    definition never appears in dev or prd — and every write is then rejected for it.
+
+    Checked for the whole alternative block rather than the four new columns alone: the rule is the
+    file's, not this change's.
+    """
+    created = _created_columns("disruptions.varsel_decisions")
+    added = _added_columns("disruptions.varsel_decisions")
+    alt_columns = {name for name in created if name.startswith("alt_") or name == "has_alternative"}
+    assert alt_columns <= added, f"in the CREATE but not in any ALTER: {sorted(alt_columns - added)}"
+    assert added <= created, f"added but never created: {sorted(added - created)}"
 
 
 def test_a_certainty_is_marked_as_one():

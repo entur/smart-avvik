@@ -71,9 +71,13 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   obs_delayed_min       INT64     OPTIONS(description="Minutes late at that stop; null if not recorded."),
   obs_observed_at       TIMESTAMP OPTIONS(description="Aimed time of the observed call (UTC) — how old the observation was when quoted."),
 
-  -- The faster alternative offered, if any. Flat here, in full inside message_input.
-  has_alternative       BOOL      OPTIONS(description="Whether the Journey Planner lookup produced a faster way to to_stop."),
-  alt_minutes_saved     INT64     OPTIONS(description="How much earlier it arrives than the disrupted train's predicted arrival."),
+  -- The alternative journey offered, if any. Flat here, in full inside message_input. NOT
+  -- necessarily a faster one since 2026-08-06: when nothing arrives before the disrupted train's
+  -- aimed arrival, the fallback tier offers the earliest arrival there is, which for a cancelled
+  -- train legitimately lands later than the timetable promised. alt_status (last in this table) is
+  -- what makes the absence of an offer readable at all.
+  has_alternative       BOOL      OPTIONS(description="Whether a replacement journey was offered to the traveller. NOT 'a faster way': the fallback tier legitimately arrives later than the disrupted train was due (see alt_arrives_before_original). FALSE covers three unlike states — a lookup that found nothing, a selection that kept the traveller on their own train, and no lookup at all — which is what alt_status separates."),
+  alt_minutes_saved     INT64     OPTIONS(description="SIGNED minutes earlier this arrives than the disrupted train's PREDICTED arrival. Negative is a legitimate answer, not a bad row: a replacement for a cancelled train is worth offering even when it gets the traveller there later. Informational — nothing is dropped for being too slow."),
   alt_departure_time    TIMESTAMP OPTIONS(description="Expected departure of the alternative (UTC)."),
   alt_arrival_time      TIMESTAMP OPTIONS(description="Expected arrival of the alternative (UTC)."),
   alt_lines             STRING    OPTIONS(description="Its transit legs as shown to the traveller, e.g. 'R11, 100'; walking legs omitted."),
@@ -93,7 +97,15 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   -- redacts -- it must stay out of the API's SELECT (Decision is extra="forbid", which fails loudly
   -- if a future edit adds it).
   message_input         STRING    OPTIONS(description="Exact JSON every message about this decision was written from (the model's prompt; the template's source when no model wrote one)."),
-  snapshot_refreshed_at TIMESTAMP OPTIONS(description="When the per-call prediction cache behind this decision was last rebuilt (UTC) — how stale the numbers were.")
+  snapshot_refreshed_at TIMESTAMP OPTIONS(description="When the per-call prediction cache behind this decision was last rebuilt (UTC) — how stale the numbers were."),
+  -- New columns go LAST, matching where ALTER ADD COLUMN puts them on an existing table (the rule
+  -- stated at the outcomes table below, and it applies to this one just as much): otherwise a fresh
+  -- environment and an upgraded one hold the same columns in different orders, and anything
+  -- positional writes each environment's data into a different column.
+  alt_status            STRING    OPTIONS(description="What became of the alternative-journey lookup, recorded on EVERY decision including the ~83 % that are sub-threshold: offered | none_found | suppressed (the selection ran and kept the traveller on their own train) | not_worth_lookup (no lookup was issued — the impact gate, or a reading taken from a non-canonical stop ref). Reserved but not yet written, because impact.for_trip does not record them and they are indistinguishable from 'no lookup' downstream: beyond_horizon | error. Without this an offer rate has no denominator across the 2026-08-06 selection change, which moves the numerator sharply — the same trap et_cancelled exists to avoid. NULL = written before the column."),
+  alt_arrives_before_original BOOL OPTIONS(description="The offered journey arrives strictly before the disrupted train's PREDICTED arrival. FALSE is the fallback tier: nothing got there in time, and the traveller is better off late than stranded. Read alt_minutes_saved with this, never alone."),
+  alt_at_risk           BOOL      OPTIONS(description="The offered journey is itself predicted to be in trouble (over its operator's alert gate, or on a line a live situation touches). Offered anyway because nothing safer reached the destination in time — these are the rows where a wording that promises a clean escape would be wrong."),
+  alt_scored            BOOL      OPTIONS(description="The prediction cache held the offered journey's boarding call, so its probabilities are model output. FALSE means nothing scored it — the ordinary case, and NOT 'no risk'.")
 )
 PARTITION BY DATE(decided_at)
 CLUSTER BY operator, situation_number
@@ -140,8 +152,8 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS obs_stop_name      STRING    OPTIONS(description="Where that observation was made (name, falling back to the StopPlace ref)."),
   ADD COLUMN IF NOT EXISTS obs_delayed_min    INT64     OPTIONS(description="Minutes late at that stop; null if not recorded."),
   ADD COLUMN IF NOT EXISTS obs_observed_at    TIMESTAMP OPTIONS(description="Aimed time of the observed call (UTC) — how old the observation was when quoted."),
-  ADD COLUMN IF NOT EXISTS has_alternative    BOOL      OPTIONS(description="Whether the Journey Planner lookup produced a faster way to to_stop."),
-  ADD COLUMN IF NOT EXISTS alt_minutes_saved  INT64     OPTIONS(description="How much earlier it arrives than the disrupted train's predicted arrival."),
+  ADD COLUMN IF NOT EXISTS has_alternative    BOOL      OPTIONS(description="Whether a replacement journey was offered to the traveller. NOT 'a faster way': the fallback tier legitimately arrives later than the disrupted train was due (see alt_arrives_before_original). FALSE covers three unlike states — a lookup that found nothing, a selection that kept the traveller on their own train, and no lookup at all — which is what alt_status separates."),
+  ADD COLUMN IF NOT EXISTS alt_minutes_saved  INT64     OPTIONS(description="SIGNED minutes earlier this arrives than the disrupted train's PREDICTED arrival. Negative is a legitimate answer, not a bad row: a replacement for a cancelled train is worth offering even when it gets the traveller there later. Informational — nothing is dropped for being too slow."),
   ADD COLUMN IF NOT EXISTS alt_departure_time TIMESTAMP OPTIONS(description="Expected departure of the alternative (UTC)."),
   ADD COLUMN IF NOT EXISTS alt_arrival_time   TIMESTAMP OPTIONS(description="Expected arrival of the alternative (UTC)."),
   ADD COLUMN IF NOT EXISTS alt_lines          STRING    OPTIONS(description="Its transit legs as shown to the traveller, e.g. 'R11, 100'; walking legs omitted."),
@@ -150,7 +162,11 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS llm_model          STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
   ADD COLUMN IF NOT EXISTS prompt_version     STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force."),
   ADD COLUMN IF NOT EXISTS message_input      STRING    OPTIONS(description="Exact JSON every message about this decision was written from (the model's prompt; the template's source when no model wrote one)."),
-  ADD COLUMN IF NOT EXISTS et_cancelled       BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed.");
+  ADD COLUMN IF NOT EXISTS et_cancelled       BOOL      OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed."),
+  ADD COLUMN IF NOT EXISTS alt_status         STRING    OPTIONS(description="What became of the alternative-journey lookup, recorded on EVERY decision including the ~83 % that are sub-threshold: offered | none_found | suppressed (the selection ran and kept the traveller on their own train) | not_worth_lookup (no lookup was issued — the impact gate, or a reading taken from a non-canonical stop ref). Reserved but not yet written, because impact.for_trip does not record them and they are indistinguishable from 'no lookup' downstream: beyond_horizon | error. Without this an offer rate has no denominator across the 2026-08-06 selection change, which moves the numerator sharply — the same trap et_cancelled exists to avoid. NULL = written before the column."),
+  ADD COLUMN IF NOT EXISTS alt_arrives_before_original BOOL OPTIONS(description="The offered journey arrives strictly before the disrupted train's PREDICTED arrival. FALSE is the fallback tier: nothing got there in time, and the traveller is better off late than stranded. Read alt_minutes_saved with this, never alone."),
+  ADD COLUMN IF NOT EXISTS alt_at_risk        BOOL      OPTIONS(description="The offered journey is itself predicted to be in trouble (over its operator's alert gate, or on a line a live situation touches). Offered anyway because nothing safer reached the destination in time — these are the rows where a wording that promises a clean escape would be wrong."),
+  ADD COLUMN IF NOT EXISTS alt_scored         BOOL      OPTIONS(description="The prediction cache held the offered journey's boarding call, so its probabilities are model output. FALSE means nothing scored it — the ordinary case, and NOT 'no risk'.");
 
 
 -- Descriptions for columns that ALREADY exist.
@@ -175,6 +191,17 @@ ALTER TABLE `disruptions.varsel_decisions`
 
 ALTER TABLE `disruptions.varsel_decisions`
   ALTER COLUMN cancel_probability SET OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
+
+-- These two are the 2026-08-06 case: the columns did not change, their MEANING did. The selection
+-- rule no longer looks for a faster journey — it looks for the best remaining way there — so
+-- "produced a faster way to to_stop" and "how much earlier it arrives" are both now false on the
+-- face of them, and alt_minutes_saved is signed. Existing rows keep their values; what has to reach
+-- dev and prd is the reading, and only these statements can carry it to a table that already exists.
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN has_alternative SET OPTIONS(description="Whether a replacement journey was offered to the traveller. NOT 'a faster way': the fallback tier legitimately arrives later than the disrupted train was due (see alt_arrives_before_original). FALSE covers three unlike states — a lookup that found nothing, a selection that kept the traveller on their own train, and no lookup at all — which is what alt_status separates.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN alt_minutes_saved SET OPTIONS(description="SIGNED minutes earlier this arrives than the disrupted train's PREDICTED arrival. Negative is a legitimate answer, not a bad row: a replacement for a cancelled train is worth offering even when it gets the traveller there later. Informational — nothing is dropped for being too slow.");
 
 
 -- The labelled counterpart: one row per decision subject, joined to what actually happened.
@@ -253,6 +280,14 @@ ALTER TABLE `disruptions.varsel_decision_outcomes`
 -- Deliberately unfiltered by date: consumers add their own predicate, which pushes down into the
 -- underlying partitioned table. Rows with a NULL jkey are kept — they can never be joined to a
 -- realized outcome, but they are still decisions and belong on the page, marked unknown.
+--
+-- Adding a column to the TABLE above is free; adding one HERE is not, and the asymmetry is easy to
+-- get backwards. label_varsel_decisions.sql does `SELECT *` over this view, and the registered
+-- varsel-label-daily scheduled query holds a COPY of that SQL in each environment — so a column
+-- added here changes the shape that copy sees, and the fix is an operator step in two projects
+-- rather than an edit. Because this SELECT names every column explicitly, the four alt_* columns
+-- added to varsel_decisions on 2026-08-06 reach the log without touching the nightly job at all.
+-- That is the whole reason they were added there and not projected here.
 CREATE OR REPLACE VIEW `disruptions.varsel_decision_groups` AS
 SELECT
   journey_digest,

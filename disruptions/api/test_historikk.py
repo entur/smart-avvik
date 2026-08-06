@@ -22,6 +22,7 @@ _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 import historikk
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 DEP = datetime(2026, 7, 30, 6, 15, tzinfo=UTC)
 
@@ -227,6 +228,34 @@ def test_response_carries_no_traveller_journey_identifiers():
         "pushed_any", "n_devices", "message", "message_source", "actual_cancelled",
         "actual_dep_delay_min", "actual_trouble", "verdict", "outcome_state",
     }
+
+
+def test_the_alternative_columns_are_not_published():
+    """`varsel_decisions` grew alt_status and three flags about the journey we recommended
+    (2026-08-06). None of them belongs on this page, and the check is not about privacy alone.
+
+    `Decision` is `extra="forbid"` precisely so the SQL and the model cannot drift apart column by
+    column: a future SELECT that picks up a new column fails loudly here instead of quietly widening
+    what an unauthenticated public host serves. This asserts both halves — the response does not
+    carry them, and the model refuses one if a query ever starts returning it.
+    """
+    _reset([_row()])
+    d = client.get("/historikk-api/decisions").json()["decisions"][0]
+    assert not {
+        "alt_status", "has_alternative", "alt_minutes_saved", "alt_arrives_before_original",
+        "alt_at_risk", "alt_scored", "alt_lines", "message_input",
+    } & set(d)
+
+    try:
+        historikk.Decision(**_row(), alt_status="offered")
+        raise AssertionError("Decision must stay extra='forbid' — it is what keeps the SELECT honest")
+    except ValidationError:
+        pass
+
+    # The outcomes table has no alternative columns at all, so neither query can serve one by
+    # accident; if that ever changes, the model above is the second line of defence, not the first.
+    assert "alt_" not in historikk._DECISIONS_QUERY
+    assert "alt_" not in historikk._SUMMARY_QUERY
 
 
 def test_cache_is_bounded():
