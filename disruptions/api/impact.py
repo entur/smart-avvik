@@ -18,28 +18,55 @@ main injects a reader via `configure()`, the same pattern reisevalg/varsel/llm_m
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
+import alert_policy
 import alternatives
-from alternatives import AlternativeJourney
+from alternatives import AlternativeCandidate, AlternativeJourney, AlternativePrediction
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("impact")
 
 # Injected by main.lifespan: returns (snapshot_by_situation, refreshed_at).
 _snapshot_provider: Callable[[], tuple[dict[str, list[CallPred]], datetime | None]] | None = None
+# Injected alongside it: (operator, jkey) -> that journey's scored calls, or None when no live
+# situation touches it. The SAME rows as the snapshot, indexed the other way -- see `configure`.
+_call_lookup: Callable[[str | None, str], list[CallPred] | None] | None = None
+# Whether the "no call lookup wired" warning has been emitted yet. Once per process, not once per
+# candidate per refresh: the condition is a startup wiring fault, not a per-trip event.
+_warned_no_call_lookup = False
 
 
 def configure(
     *,
     snapshot_provider: Callable[[], tuple[dict[str, list[CallPred]], datetime | None]],
+    call_lookup: Callable[[str | None, str], list[CallPred] | None] | None = None,
 ) -> None:
-    """Wire in the per-call prediction snapshot reader. Called once from main.lifespan."""
-    global _snapshot_provider
+    """Wire in main's per-call prediction caches. Called once from main.lifespan.
+
+    Two readers over the same poller-owned rows, indexed the two ways the two questions need:
+
+    * `snapshot_provider` -> `{situationNumber: [CallPred]}`, which is how the matcher finds the
+      traveller's train from a live situation.
+    * `call_lookup` -> the calls of ONE journey, keyed `(operator, jkey)`, which is how
+      :func:`score_candidates` asks "what do we know about this *other* train the Journey Planner
+      just offered?". Scanning the snapshot for that would be O(situations x calls) per lookup, on
+      the ingestion thread, over data main already indexes (`main._call_pred_by_key`).
+
+    `call_lookup` is keyword-only with a None default because three test suites configure the
+    snapshot alone. A None lookup leaves every candidate unscored and says so ONCE at WARNING,
+    rather than raising the way a missing `snapshot_provider` does: `score_candidates` runs inside
+    `for_trip`'s fail-open guard, which would swallow the exception and make a wiring fault
+    indistinguishable from "the Journey Planner had nothing to offer" — the exact class of silent
+    contract break this module was extracted to prevent.
+    """
+    global _snapshot_provider, _call_lookup, _warned_no_call_lookup
     _snapshot_provider = snapshot_provider
+    _call_lookup = call_lookup
+    _warned_no_call_lookup = False  # re-arm: a re-wiring deserves its own warning
 
 
 @dataclass(frozen=True)
@@ -249,10 +276,34 @@ class ImpactResponse(BaseModel):
     )
     alternative_journey: AlternativeJourney | None = Field(
         default=None,
-        description="A faster way from `from_stop` to `to_stop` than the worst affected train's "
-        "predicted arrival, from the Journey Planner. Null when `to_stop` is omitted, when nothing "
-        "is faster, or when the Journey Planner is unavailable. One per trip, not per line — the "
-        "traveller picks one way to get there.",
+        description="The best remaining way from `from_stop` to `to_stop`, from the Journey "
+        "Planner — NOT necessarily a faster one. When nothing arrives before the worst affected "
+        "train's aimed arrival, the fallback tier offers the earliest arrival there is, which for "
+        "a cancelled train legitimately lands after the timetable promised; `minutes_saved` is "
+        "signed and `arrives_before_original` says which. Null when `to_stop` is omitted, when the "
+        "Journey Planner is unavailable, and — the reading that changed — when the traveller's own "
+        "train is still the best option (`original_is_best` distinguishes that from 'we did not "
+        "look'). One per trip, not per line: the traveller picks one way to get there.",
+    )
+    # Internal working state, kept off the wire (exclude=True) the way varsel.Alert.impact is.
+    original_is_best: bool = Field(
+        default=False,
+        exclude=True,
+        repr=False,
+        description="A VERDICT, not the absence of one: the selection ran and chose the "
+        "traveller's own train over everything the Journey Planner offered. `alternative_journey` "
+        "is null in this case and also when no lookup ran at all (no `to_stop`, below the impact "
+        "gate, a Journey Planner outage), and those two must not be worded alike — 'bli sittende' "
+        "is a claim, 'vi vet ikke' is not.",
+    )
+    alternative_subject: tuple[str | None, str] | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="The (operator, jkey) of the train `original_is_best` is a claim about — the "
+        "worst affected train across this whole response. A caller that back-fills one trip's "
+        "lookup onto several alerts (varsel.match_journey) needs it: 'stay put' about a train two "
+        "minutes late says nothing about a cancelled one on another ref of the same place.",
     )
 
 
@@ -618,6 +669,8 @@ def _impact_response(
     refreshed_at: datetime | None,
     alternative_journey: AlternativeJourney | None,
     now: datetime | None = None,
+    original_is_best: bool = False,
+    alternative_subject: tuple[str | None, str] | None = None,
 ) -> ImpactResponse:
     """Roll trip cells up into the two views the response exposes.
 
@@ -639,8 +692,10 @@ def _impact_response(
         # latest_observation (and, for /varsel, its per-operator alerting threshold).
         # `_worst` is max-by-severity_key over the same group in the same order, so worst_cell IS
         # the cell behind departure_prediction -- which is what makes carrying its jkey honest
-        # rather than approximate. Keep the two selections in step if either ever changes.
-        worst_cell = max(group, key=lambda c: severity_key(c.departure))
+        # rather than approximate. Shares `_worst_cell` with the alternative lookup so "the worst
+        # train" cannot come to mean two things: this used to be an inline `max` kept in step by
+        # the comment above, which is exactly the arrangement that lets two copies drift.
+        worst_cell = _worst_cell(group)
         situations.append(
             SituationImpact(
                 situation_number=sit_num,
@@ -679,6 +734,8 @@ def _impact_response(
         situations=situations,
         lines=lines,
         alternative_journey=alternative_journey,
+        original_is_best=original_is_best,
+        alternative_subject=alternative_subject,
     )
 
 
@@ -688,6 +745,13 @@ def _worth_an_alternative(cells: list[TripCell], min_impact: float) -> bool:
     The lookup is a blocking 3 s HTTPS call on the poller thread that also rebuilds every BigQuery
     cache, and the poller discards the result unless the situation crosses the operator alert gate.
     Computing it for every disruption-touched journey-window was pure waste at the ~95th percentile.
+
+    **This gate is already wide enough; do not widen it again.** `varsel` passes
+    `alert_policy.min_threshold()` (0.50 — GOA's cut, the floor of the whole per-operator table), so
+    every trip that could possibly earn a push is at or above it, and an ET-declared cancellation
+    scores exactly 1.0. A trip that reaches this gate and gets no alternative is a *selection*
+    outcome, not a screening one, and lowering the number here would only buy blocking round trips
+    for journeys nobody is ever told about.
     """
     if min_impact <= 0.0:
         return True
@@ -695,16 +759,518 @@ def _worth_an_alternative(cells: list[TripCell], min_impact: float) -> bool:
     return worst is not None and (worst.impact_probability or 0.0) >= min_impact
 
 
-def _reference_arrival(cells: list[TripCell]) -> datetime | None:
-    """The predicted arrival at `to_stop` of the worst affected train — the bar an alternative has
-    to beat. Aimed arrival plus the predicted arrival delay, since the aimed time is not what the
-    traveller will actually experience."""
-    arrivals = [c.arrival for c in cells if c.arrival is not None]
-    worst = _worst(arrivals)
-    if worst is None or worst.scheduled_time is None:
+def _worst_cell(cells: list[TripCell]) -> TripCell | None:
+    """The cell the trip's headline numbers come from: the worst affected train, by DEPARTURE.
+
+    One cell, read four ways (aimed departure, aimed arrival, predicted arrival, and the flags that
+    decide whether the traveller is in real trouble) — which is the whole point of it being a
+    function rather than four independent `_worst` calls.
+
+    `SituationImpact.jkey` already documents why: `arrival_prediction` is picked worst-first over
+    arrivals **independently and may come from a different train**. Under the rule this replaced,
+    that only shifted a filter — the reference arrival was a bar an alternative had to beat, and a
+    bar in the wrong place cost at most a suggestion. Under `select_best` the same time is the
+    traveller's *deadline*, and it is what decides which candidate wins: a worst-arrival train
+    running on some other line would push the deadline hours out and hand the answer to whatever
+    departs last before it.
+
+    Same key and same order as `_impact_response`'s per-situation rollup, so "the worst train" means
+    one thing across the response.
+    """
+    if not cells:
         return None
-    delay = worst.delay_p50_min if worst.delay_p50_min is not None else worst.delay_typ_min
-    return worst.scheduled_time + timedelta(minutes=max(delay or 0, 0))
+    return max(cells, key=lambda c: severity_key(c.departure))
+
+
+def _predicted_arrival(cell: TripCell) -> datetime | None:
+    """When `cell`'s train is actually expected at `to_stop`: aimed arrival plus its predicted delay.
+
+    Distinct from the aimed arrival, and the two must not be collapsed. The aimed time is the
+    traveller's deadline (`select_best`'s `original_arrival_time`); this one is what we expect of
+    the train they have (`original_predicted_arrival`), and what `minutes_saved` measures against.
+    Passing the predicted time as the deadline would let a delayed train move the appointment.
+    """
+    arrival = cell.arrival
+    if arrival is None or arrival.scheduled_time is None:
+        return None
+    delay = arrival.delay_p50_min if arrival.delay_p50_min is not None else arrival.delay_typ_min
+    return arrival.scheduled_time + timedelta(minutes=max(delay or 0, 0))
+
+
+# ---- Scoring Journey Planner candidates -------------------------------------------------------
+# The Journey Planner tells us what a traveller *could* take instead. It does not know what our own
+# models think of those trips, and offering a replacement that is itself about to be alerted on is
+# worse than saying nothing. This section answers two questions per candidate — "is it already
+# gone?" and "would we alert on it?" — from the same per-call predictions that scored the disrupted
+# train, plus the same operator gate `varsel` pushes on (`alert_policy`).
+
+
+@dataclass(frozen=True)
+class CandidateScore:
+    """One Journey Planner candidate after scoring, with what we know about the two ends it is
+    ridden between.
+
+    `candidate` is the SAME object that was passed in: `risky` and `cancelled` are annotated in
+    place rather than returned on a copy. That is deliberate — `alternatives.select_best` recognises
+    the disrupted train by identity (`cand is original`), so handing selection copies would let the
+    original be appended to the pool a second time and beat its own replacement.
+
+    `arrival_prediction` is None whenever no alighting call resolved. It never borrows the
+    departure's numbers: "when will I get there" answered with the departure's delay would be a
+    fabricated figure, and the JP-only shape already exists for "we do not know".
+    """
+
+    candidate: AlternativeCandidate
+    departure_prediction: AlternativePrediction
+    arrival_prediction: AlternativePrediction | None
+
+
+def _lookup_journey_calls(operator: str | None, jkey: str) -> list[CallPred]:
+    """Scored calls of one journey, or `[]` — including when nothing is wired up.
+
+    The empty list is the ordinary answer, not a failure: the prediction cache only holds calls
+    belonging to journeys a live situation touches, so the great majority of alternatives are simply
+    unscored. An unwired lookup returns the same thing but says so once, because "nobody called
+    configure" and "no situation touches this train" must not look alike in the logs.
+    """
+    global _warned_no_call_lookup
+    if _call_lookup is None:
+        if not _warned_no_call_lookup:
+            _warned_no_call_lookup = True
+            logger.warning(
+                "impact.configure(call_lookup=...) was never called; every Journey Planner "
+                "alternative will be offered unscored",
+                extra={"fields": {"event": "impact_scoring_unwired"}},
+            )
+        return []
+    return list(_call_lookup(operator, jkey) or ())
+
+
+def _worst_call(calls: Iterable[CallPred]) -> CallPred | None:
+    """The most severe of several scored rows for one call, or None when there are none.
+
+    One call carries one row per situation that touches it, so a train caught by two messages
+    appears twice with two scores. Taking the worst is the same choice `_trip_cells` makes, by the
+    same key.
+    """
+    present = list(calls)
+    return max(present, key=_call_severity) if present else None
+
+
+def _alert_score(c: CallPred) -> float:
+    """How alert-worthy one call is, on the scale `alert_policy.threshold_for` cuts.
+
+    Both sides, because a candidate is ridden *to* its alighting stop as much as *from* its boarding
+    one: `p_impact_dep` is structurally None at a terminal and `p_impact` is None at an origin, so
+    reading one side alone would score a candidate's destination call at zero. The operating point
+    is the same on either side (eval/impact_eval.py: 0.65 -> ~91 % precision, arrival and departure
+    alike), which is what makes one gate legitimate over both.
+
+    A call ET has already declared cancelled scores 1.0 — the certainty rule
+    :func:`_cancelled_prediction` states and :func:`_call_severity` restates, restated once more
+    here so a known-cancelled alternative can never read as safe.
+    """
+    if _certainly_cancelled(c):
+        return 1.0
+    return max(c.p_impact_dep or 0.0, c.p_impact or 0.0)
+
+
+def _observed_delay_min(aimed: datetime | None, expected: datetime | None) -> int | None:
+    """Expected minus aimed, in minutes, clamped at 0 — a vehicle running early is not late.
+
+    Both times are the Journey Planner's, so this is an OBSERVATION of the published realtime
+    picture and never a forecast; the forecast lives in the probabilities beside it.
+    """
+    if aimed is None or expected is None:
+        return None
+    return max(round((expected - aimed).total_seconds() / 60), 0)
+
+
+def _alternative_prediction(
+    *,
+    pred: StopPrediction | None,
+    call: CallPred | None,
+    stop_place: str | None,
+    aimed: datetime | None,
+    expected: datetime | None,
+    jp_cancelled: bool,
+) -> AlternativePrediction:
+    """Fuse what JP observed about one end of a candidate with what our models forecast for it.
+
+    `pred` is None when the prediction cache had no row for that call — the ordinary case. Its
+    probabilities then stay **null**, never 0.0: a zero would assert a calibrated certainty of
+    safety that nothing established, which is the fact-vs-forecast confusion this codebase spent
+    2026-08-05 removing. `scored` says which of the two it is without a reader having to infer it
+    from the absence of a number.
+
+    `call` is the `CallPred` `pred` was built from, passed alongside because a `StopPrediction`
+    keeps the stop but drops the journey: the identity `(operator, jkey, stop_order)` is what lets
+    the nightly labelling job join a *recommendation* to what actually happened to it, the same way
+    it already joins the disrupted train. It is read off the resolved call and off nothing else —
+    the JP leg's line codespace is not the ET operator, and `risky` below refuses to gate on it for
+    exactly that reason. The two arguments are therefore null together, which is what makes
+    "`operator`/`jkey`/`stop_order` are null exactly when `scored` is False" true by construction.
+
+    The times are JP's own (the pattern's endpoints, so a walk to the platform is included — it is
+    part of the trip the traveller takes, and JP publishes an aimed time only at that level). When
+    the call is cancelled the delay goes with it: every delay figure means "if it runs", and
+    "innstilt, 3 min forsinket" is the wording that rule exists to prevent.
+    """
+    cancelled = bool(jp_cancelled) or bool(pred is not None and pred.cancelled)
+    return AlternativePrediction(
+        stop_place=pred.stop_place if pred is not None else stop_place,
+        stop_name=pred.stop_name if pred is not None else None,
+        scheduled_time=aimed,
+        expected_time=expected,
+        delay_min=None if cancelled else _observed_delay_min(aimed, expected),
+        cancelled=cancelled,
+        cancel_probability=pred.cancel_probability if pred is not None else None,
+        impact_probability=pred.impact_probability if pred is not None else None,
+        scored=pred is not None,
+        operator=call.operator if call is not None else None,
+        jkey=call.jkey if call is not None else None,
+        stop_order=call.stop_order if call is not None else None,
+    )
+
+
+def _score_candidate(
+    cand: AlternativeCandidate,
+    *,
+    affected_refs: set[tuple[str | None, str]],
+    affected_lines: set[str],
+) -> CandidateScore:
+    """Resolve one candidate against the per-call index and annotate it in place."""
+    # Every transit ref, not just the first: a two-leg suggestion whose connection is about to be
+    # cancelled must not be scored as safe. A leg contributes both its dated and its plain
+    # service-journey ref (which form the cache holds depends on the family), so at most one of the
+    # two resolves and the other lands in `unresolved` harmlessly — it is never in `affected_refs`
+    # either, since those carry the cache's own key form.
+    resolved: list[CallPred] = []
+    unresolved: list[tuple[str | None, str]] = []
+    for operator, jkey in cand.transit_refs:
+        calls = _lookup_journey_calls(operator, jkey)
+        if calls:
+            resolved.extend(calls)
+        else:
+            unresolved.append((operator, jkey))
+
+    board = None
+    if cand.board_stop_place is not None:
+        board = _worst_call(c for c in resolved if c.stop_place == cand.board_stop_place)
+    alight = None
+    if cand.alight_stop_place is not None:
+        alight = _worst_call(
+            c
+            for c in resolved
+            # No aimed arrival means an origin-side row, whose arrival figures are structurally
+            # null — it would answer "when do I get there" with a column of Nones.
+            if c.stop_place == cand.alight_stop_place and c.aimed_arr is not None
+            # Direction, and only within one journey: on a multi-leg trip the two ends belong to
+            # different journeys and their stop_orders are not comparable at all.
+            and not (
+                board is not None
+                and (c.operator, c.jkey) == (board.operator, board.jkey)
+                and c.stop_order <= board.stop_order
+            )
+        )
+
+    departure = _alternative_prediction(
+        pred=_departure_prediction(board) if board is not None else None,
+        # The resolved call itself, not just its numbers: it carries (operator, jkey, stop_order),
+        # the key the nightly labelling job joins realized outcomes on. Keeping only the
+        # probabilities is what left the recommendation unlabellable.
+        call=board,
+        stop_place=cand.board_stop_place,
+        aimed=cand.aimed_departure_time,
+        expected=cand.departure_time,
+        jp_cancelled=cand.cancelled,
+    )
+    arrival = (
+        _alternative_prediction(
+            pred=_arrival_prediction(alight),
+            call=alight,
+            stop_place=cand.alight_stop_place,
+            aimed=cand.aimed_arrival_time,
+            expected=cand.arrival_time,
+            jp_cancelled=cand.cancelled,
+        )
+        if alight is not None
+        else None
+    )
+
+    # Score first where we have one; fall back to line membership only where we do not. The
+    # asymmetry is the whole point, and both halves of it are load-bearing:
+    #
+    # * Marking every leg on an affected LINE risky regardless of its score would reinstate the
+    #   whole-line veto this change exists to remove — it is what threw away "ta neste tog", the
+    #   operator's own advice in the 2026-08-05 Vy RE10 case. A next train our own models score at
+    #   0.02 would lose to a candidate we know nothing about.
+    # * Marking unscored legs safe would fail the other way: an unknown sibling on the disrupted
+    #   line would beat a scored clean one.
+    #
+    # The gate is the FOUND CALL's operator, never the JP codespace: `threshold_for` is calibrated
+    # per operator against that operator's own predictions.
+    risky = any(_alert_score(c) >= alert_policy.threshold_for(c.operator) for c in resolved)
+    if not risky:
+        # A leg is identified here by its line ref, which is the one key both the candidate and a
+        # CallPred carry (JP legs expose no service-journey ref through `AlternativeLeg`). A line no
+        # resolved call sits on is a leg nothing scored.
+        scored_lines = {c.line for c in resolved if c.line}
+        risky = any(
+            line in affected_lines for line in cand.lines if line not in scored_lines
+        ) or any(ref in affected_refs for ref in unresolved)
+
+    # Cancelled is about the two ends the traveller actually uses, plus JP's own flag. A partial
+    # cancellation somewhere else on a journey we ride makes it RISKY (via `_alert_score`, which
+    # scores a declared cancellation at 1.0) rather than unusable — dropping it outright would veto
+    # the very "take the next train" advice the operator is publishing.
+    cand.cancelled = cand.cancelled or departure.cancelled or bool(arrival and arrival.cancelled)
+    cand.risky = cand.risky or risky
+    # Annotated in place as well as returned. `alternatives.select_best` answers with an
+    # `AlternativeJourney`, not with the candidate that won, so nothing downstream can join the
+    # winner back to its `CandidateScore` — identity is the only key and the journey does not carry
+    # it. Riding on the candidate is what lets the chosen journey publish its own numbers.
+    cand.departure_prediction = departure
+    cand.arrival_prediction = arrival
+    return CandidateScore(candidate=cand, departure_prediction=departure, arrival_prediction=arrival)
+
+
+def score_candidates(
+    candidates: Iterable[AlternativeCandidate],
+    *,
+    affected_refs: set[tuple[str | None, str]],
+    affected_lines: set[str],
+) -> list[CandidateScore]:
+    """Score Journey Planner candidates against the live per-call predictions.
+
+    Answers, per candidate: is it already cancelled, would we alert on it (`risky`), and what do our
+    models say about its boarding and alighting calls. `risky` and `cancelled` are written back onto
+    each candidate — that is what `alternatives.select_best` reads — while the two predictions come
+    back on the returned :class:`CandidateScore` for the winner to carry into the response.
+
+    `affected_refs` and `affected_lines` are what the live situations touch, passed explicitly the
+    way `for_trip` already passes them to the alternative lookup. They only ever decide the
+    *unscored* legs: a leg we did score is judged by its score, however affected its line is.
+
+    Fail open per candidate. This is the third boundary on this path — `alternatives` guards the
+    fetch inside its TTL cache and the parse after it — and it needs its own for the same reason:
+    one uninterpretable candidate must cost that candidate, not every alternative for the trip.
+    """
+    refs = set(affected_refs or ())
+    lines = set(affected_lines or ())
+    scored: list[CandidateScore] = []
+    for cand in candidates:
+        try:
+            scored.append(_score_candidate(cand, affected_refs=refs, affected_lines=lines))
+        except Exception:
+            logger.warning(
+                "Could not score a Journey Planner candidate (#%s); dropping it",
+                getattr(cand, "ordinal", "?"),
+                exc_info=True,
+                extra={"fields": {"event": "alternatives_error", "reason": "scoring_failed"}},
+            )
+    return scored
+
+
+def _original_candidate(
+    cell: TripCell,
+    *,
+    from_stop: str,
+    to_stop: str,
+    deadline: datetime,
+    predicted_arrival: datetime,
+) -> AlternativeCandidate:
+    """The disrupted train, expressed as a candidate so it can compete for its own replacement.
+
+    Synthesized from our own scoring rather than read out of JP's reply, because JP knows only the
+    published realtime picture and this train's whole problem is what we predict about it. Every
+    field comes from ONE cell (:func:`_worst_cell`) — see the note there on why mixing cells breaks
+    the deadline.
+
+    `risky` is the operator's own alert gate applied to the boarding call: the same question
+    `score_candidates` asks of every rival, so "is the traveller in real trouble" is decided by one
+    rule on both sides of the comparison. With `cancelled` it is what releases `select_best`'s
+    materiality gate — a train that is merely two minutes late has to be beaten by three minutes
+    before we tell anyone to abandon it; a cancelled one does not.
+    """
+    return AlternativeCandidate(
+        # The AIMED departure: what the traveller has in their calendar, and the time the rival
+        # candidates' own departures are compared against. Its expected departure is not used —
+        # `catchable_after` upstream already established that this train can still be caught.
+        departure_time=cell.departure.scheduled_time,
+        aimed_departure_time=cell.departure.scheduled_time,
+        # The PREDICTED arrival: aimed plus the delay we forecast. The aimed arrival is the
+        # deadline, and is passed to `select_best` separately.
+        arrival_time=predicted_arrival,
+        aimed_arrival_time=deadline,
+        cancelled=cell.departure.cancelled,
+        risky=(cell.departure.impact_probability or 0.0)
+        >= alert_policy.threshold_for(cell.operator),
+        is_original=True,
+        transit_refs=[(cell.operator, cell.jkey)] if cell.jkey else [],
+        lines=[cell.line] if cell.line else [],
+        board_stop_place=from_stop,
+        alight_stop_place=to_stop,
+        # Out of JP's 0-based band, so the original never shares a tie-break rank with a real
+        # pattern. `select_best` breaks ties in the original's favour anyway; this keeps the two
+        # from having to agree.
+        ordinal=-1,
+    )
+
+
+def _reconcile_original_arrival(
+    original: AlternativeCandidate,
+    candidates: Iterable[AlternativeCandidate],
+    *,
+    subject: tuple[str | None, str] | None,
+) -> None:
+    """Take the LATER of JP's expectation for the disrupted train and our own prediction of it.
+
+    JP's reply routinely contains the disrupted train's own pattern (it is a legitimate way to get
+    there, and the trip search does not know we are alerting on it). That gives two readings of one
+    arrival: our p50 exceedance stack, and the operator's published realtime picture. They disagree.
+
+    Resolved pessimistically, and only in that direction. This time is what every rival is measured
+    against, so an optimistic reading of it is what produces "stay put" — and the cost of being
+    wrong is asymmetric: telling a traveller their train is fine when it is not strands them, while
+    offering an alternative to a train that turns out fine costs them a choice they can decline.
+    """
+    if subject is None or original.arrival_time is None:
+        return
+    own = next(
+        (c for c in candidates if not c.is_original and subject in c.transit_refs), None
+    )
+    if own is None or own.arrival_time is None:
+        return
+    if abs((own.arrival_time - original.arrival_time).total_seconds()) >= 60:
+        logger.info(
+            "The Journey Planner and our own models disagree about the disrupted train's arrival",
+            extra={
+                "fields": {
+                    "event": "alternative_original_arrival",
+                    "jp_expected": own.arrival_time.isoformat(),
+                    "predicted": original.arrival_time.isoformat(),
+                    "operator": subject[0],
+                    "jkey": subject[1],
+                }
+            },
+        )
+    original.arrival_time = max(own.arrival_time, original.arrival_time)
+
+
+def _best_remaining_journey(
+    cells: list[TripCell],
+    *,
+    from_stop: str,
+    to_stop: str,
+    window_end: datetime,
+    now: datetime,
+    path: alternatives.FetchPath = "request",
+) -> tuple[AlternativeJourney | None, bool, tuple[str | None, str] | None]:
+    """Fetch, score and choose: the best remaining way to `to_stop`, or "stay put".
+
+    Returns `(journey, original_is_best, subject)`. The middle value is a VERDICT and is only ever
+    True when a real pool was compared against: a null journey with `original_is_best=False` means
+    nothing could be established, and the two must not be worded alike downstream.
+
+    **Two queries, in this order, and the second one only when the first came back empty.**
+    Query 1 is anchored on the traveller's *deadline* (`arriveBy` the disrupted train's aimed
+    arrival), because a depart-after search cannot contain a journey that leaves earlier and still
+    gets there in time — and leaving earlier is what actually rescues somebody whose train is
+    cancelled. Query 2 anchors on `now` and is the fallback for the case where nothing arrives in
+    time at all, which is both the least pleasant answer and the one the traveller most needs.
+    """
+    cell = _worst_cell(cells)
+    if cell is None or cell.arrival is None:
+        return None, False, None
+    deadline = cell.arrival.scheduled_time
+    predicted_arrival = _predicted_arrival(cell)
+    if deadline is None or predicted_arrival is None:
+        return None, False, None
+    if not alternatives.within_lookahead(deadline, now):
+        # Checked here as well as inside `fetch_candidates`: the fallback query is anchored at
+        # `now`, so it clears the horizon guard on its own and would fire for a trip hours away.
+        return None, False, None
+
+    subject = (cell.operator, cell.jkey) if cell.jkey else None
+    affected_refs = {(c.operator, c.jkey) for c in cells if c.jkey}
+    affected_lines = {c.line for c in cells if c.line}
+    original = _original_candidate(
+        cell,
+        from_stop=from_stop,
+        to_stop=to_stop,
+        deadline=deadline,
+        predicted_arrival=predicted_arrival,
+    )
+
+    def scored_pool(candidates: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
+        """Annotate every candidate with what we know of it, and filter nothing.
+
+        `select_best` owns the pool cuts, all of them (2026-08-06). This used to pre-filter through
+        a local `_usable` predicate that was *nearly* the same rule — it applied no window bound —
+        and that one-cut divergence is what made the fallback unreachable: a candidate that passed
+        here and died there left `select_best` with an empty rival pool while this function had
+        already recorded the query as having produced something. Two filters that must agree is a
+        bug waiting to be re-introduced, so now there is one.
+        """
+        scored = score_candidates(
+            candidates, affected_refs=affected_refs, affected_lines=affected_lines
+        )
+        return [s.candidate for s in scored]
+
+    def select(pool: list[AlternativeCandidate], outcome: dict[str, Any]) -> AlternativeJourney | None:
+        return alternatives.select_best(
+            pool,
+            original=original,
+            original_arrival_time=deadline,
+            # The reconciled figure, not the raw prediction: whichever of the two readings is later.
+            # Read at call time, so a second pass sees what the fallback reply taught us.
+            original_predicted_arrival=original.arrival_time,
+            now=now,
+            window_end=window_end,
+            affected_refs=affected_refs,
+            outcome=outcome,
+        )
+
+    # `answered` distinguishes "JP replied, and had nothing" from "no reply was obtained" — an
+    # outage, the post-failure cooldown, a spent fetch budget, or a served-stale value. Only the
+    # first is a reason to ask the second question: firing the fallback on a non-answer bought a
+    # SECOND blocking 3 s call on the ingestion thread, so a degraded Journey Planner cost twice
+    # what a healthy one does, exactly when it could least afford it. Defaults to True when the key
+    # is absent, which is what a stub that ignores the out-dict leaves behind.
+    first_query: dict[str, Any] = {}
+    by_deadline = alternatives.fetch_candidates(
+        from_stop, to_stop, arrive_by=True, date_time=deadline, now=now, path=path,
+        outcome=first_query,
+    )
+    _reconcile_original_arrival(original, by_deadline, subject=subject)
+
+    # The verdict comes back from the selection itself, never derived here from the pool: this
+    # function's list never contains the original at all, so "the original won" could be published
+    # for a comparison `select_best` never made.
+    selection: dict[str, Any] = {}
+    best = select(scored_pool(by_deadline), selection)
+
+    # **The fallback is decided on what selection could USE, not on what the query returned**
+    # (2026-08-06). Asking "did the reply contain anything" was the wrong question: a reply full of
+    # departures beyond the traveller's own window is a full answer to that question and an empty
+    # one to the real question, and the traveller — often somebody whose train is cancelled — was
+    # told there was no alternative while a catchable later journey existed. `original_is_best` is
+    # the one result that must NOT trigger it: a genuine stay-put verdict means something WAS in
+    # time (the original itself), so the fallback tier has nothing to add.
+    if best is None and not selection.get("original_is_best") and first_query.get("answered", True):
+        fallback = alternatives.fetch_candidates(
+            from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path
+        )
+        # Reconciled against this reply too. The fallback runs precisely when nothing arrives in
+        # time, which is when the disrupted train is worst off — so leaving its arrival at our
+        # optimistic p50 here would rank it ahead of the rivals it is being compared against, in
+        # the one branch where being wrong strands somebody.
+        _reconcile_original_arrival(original, fallback, subject=subject)
+        selection = {}
+        best = select(scored_pool(fallback), selection)
+
+    return best, bool(selection.get("original_is_best")), subject
 
 
 def for_trip(
@@ -719,6 +1285,7 @@ def for_trip(
     catchable_after: datetime | None = None,
     with_alternative: bool = True,
     min_impact: float = 0.0,
+    path: alternatives.FetchPath = "request",
 ) -> ImpactResponse:
     """Score a trip against the live per-call cache and shape the /impact response.
 
@@ -731,6 +1298,12 @@ def for_trip(
     situation that crossed that gate — without this, every disruption-touched journey-window paid a
     blocking 3 s HTTPS round trip on the ingestion thread to compute a value that was then discarded.
     The HTTP endpoint leaves it at 0.0: a caller who asked for `to_stop` wants the answer regardless.
+
+    `path` says which budget a Journey Planner fetch is charged to (see
+    `alternatives._FETCH_MAX_PER_MIN`). It defaults to `"request"` — the conservative side — so an
+    unwired caller can never spend the poller's reservation. `main._varsel_impact` passes
+    `"poller"`; the public `/impact` route leaves the default, which is the whole point of the
+    split: an unauthenticated caller inventing stop pairs must not be able to starve the push cycle.
     """
     if _snapshot_provider is None:
         raise RuntimeError("impact.configure(snapshot_provider=...) was never called")
@@ -753,25 +1326,47 @@ def for_trip(
         catchable_after=catchable_after,
     )
 
-    alternative = None
+    alternative: AlternativeJourney | None = None
+    original_is_best = False
+    subject: tuple[str | None, str] | None = None
     if with_alternative and to_stop is not None and cells and _worth_an_alternative(cells, min_impact):
-        reference = _reference_arrival(cells)
-        if reference is not None:
-            # Leave from the worst affected train's aimed departure onwards: an "alternative" that
-            # left before the traveller could get to the platform is not one.
-            # Anchor on the train the alert is about, never earlier than now: planning from a
-            # past instant returns "alternatives" that have already left.
-            worst_dep = _worst([c.departure for c in cells])
-            anchor = (worst_dep.scheduled_time if worst_dep else None) or window_start
-            depart_after = max(anchor, now)
-            alternative = alternatives.find_faster(
-                from_stop,
-                to_stop,
-                reference_arrival=reference,
-                depart_after=depart_after,
-                excluded_jkeys={c.jkey for c in cells if c.jkey},
-                excluded_lines={c.line for c in cells if c.line},
+        # ONE guard around fetch, scoring AND selection. Not bookkeeping: this module fails open,
+        # and everything below it runs on the poller thread inside varsel.check_and_notify's
+        # per-journey try/except. On 2026-07-29 a single malformed Journey Planner pattern raised
+        # out of the lookup, through main._impact_for_trip, and into that guard — which turned "the
+        # alternative could not be computed" into "every alert for this journey is silently dropped
+        # for the cycle". The guard that caught it lived inside the function this replaced, and this
+        # path adds two more raise sources (`score_candidates`, `select_best`) on top of the fetch.
+        # A bad alternative must cost the alternative and nothing else.
+        try:
+            alternative, original_is_best, subject = _best_remaining_journey(
+                cells,
+                from_stop=from_stop,
+                to_stop=to_stop,
+                window_end=window_end,
+                now=now,
+                path=path,
             )
+        except Exception:
+            # The digest, never the pair. On the poller path these two refs ARE a registered
+            # traveller's own journey — the trio `/historikk-api` refuses to serve and `llm_message`
+            # keeps out of Cloud Logging by default — and this record is emitted from the same
+            # cycle, beside a departure time. `alternatives` scrubbed the identical exposure from
+            # its own cache-failure log; this one, one module over, kept interpolating both refs.
+            digest = alternatives.pair_digest(from_stop, to_stop)
+            logger.warning(
+                "Could not choose an alternative for %s; offering none",
+                digest,
+                exc_info=True,
+                extra={
+                    "fields": {
+                        "event": "alternatives_error",
+                        "reason": "selection_failed",
+                        "pair_digest": digest,
+                    }
+                },
+            )
+            alternative, original_is_best, subject = None, False, None
 
     return _impact_response(
         cells,
@@ -780,5 +1375,7 @@ def for_trip(
         refreshed_at=refreshed_at,
         alternative_journey=alternative,
         now=now,
+        original_is_best=original_is_best,
+        alternative_subject=subject,
     )
 

@@ -39,6 +39,10 @@ Design notes
   `message_input` is the same object the message was actually written from
   (`llm_message.build_message_input`, serialized by `llm_message.message_input_json`) — the model's
   prompt and, when no model wrote anything, the deterministic template's source too.
+  `alt_status` is that same idea for the advice: a row without an alternative can mean the lookup
+  found nothing, that it kept the traveller on the train they have, or that no lookup was issued at
+  all — and since most rows are sub-threshold, the last of those is most of any offer rate's
+  denominator.
 """
 
 from __future__ import annotations
@@ -125,28 +129,156 @@ def _iso(when: datetime | None) -> str | None:
     return when.isoformat() if when is not None else None
 
 
+def _alternative_status(alert: Alert) -> str:
+    """What became of the alternative-journey lookup for this decision.
+
+    The same shape as `message_status` beside it, and for the same reason: a single boolean cannot
+    separate **"a lookup ran and found nothing"** from **"no lookup was ever issued"**, and roughly
+    83 % of the rows in this table are sub-threshold decisions that never issue one. Without the
+    distinction an offer rate has no defined denominator across the 2026-08-06 selection change,
+    which measurably moves the numerator — the same trap `et_cancelled` was added to avoid, one
+    column over.
+
+    Written on **every** row, alert-worthy or not. The four values this function can establish:
+
+    * ``offered`` — the row carries an alternative. Read off the **Alert**, never off
+      ``alert.impact``: `varsel.match_journey` back-fills one trip's lookup onto every alert it
+      produced, so an alert whose worst reading came from a collapsed stop ref carries advice its
+      own `/impact` response does not (the 2026-08-05 `llm_message` fix, which recorded
+      `has_alternative=true` beside a message input with no `alternativ_reise`).
+    * ``suppressed`` — `impact.original_is_best`: the selection ran against a real pool and kept the
+      traveller on the train they already have. A verdict, not an absence.
+    * ``none_found`` — `impact.alternative_subject` is set, so the lookup ran to completion, and it
+      produced neither an offer nor a "stay put".
+    * ``not_worth_lookup`` — nothing above: no lookup was issued for this response. The impact gate
+      (`impact._worth_an_alternative`) is the reason for the overwhelming majority; a reading taken
+      from a non-canonical stop ref, where `match_journey` deliberately skips the blocking call, also
+      lands here.
+
+    Two of the vocabulary's values are deliberately **never written**: ``beyond_horizon`` and
+    ``error``. `impact.for_trip` records neither, and its `except` branch resets the response to
+    exactly the three values an un-attempted lookup leaves behind, so both are indistinguishable
+    from "no lookup" by the time it reaches this module. They could only be guessed — from a
+    departure more than `alternatives._MAX_LOOKAHEAD_HOURS` out, say — and a reconstruction of
+    another module's control flow in a column that reads as an observation is how a log stops being
+    evidence. They stay reserved in the column description so a later unit that plumbs the reason
+    through can fill them in without a vocabulary change.
+    """
+    if getattr(alert, "alternative_journey", None) is not None:
+        return "offered"
+    impact = getattr(alert, "impact", None)
+    if getattr(impact, "original_is_best", False):
+        return "suppressed"
+    if getattr(impact, "alternative_subject", None) is not None:
+        return "none_found"
+    return "not_worth_lookup"
+
+
 def _alternative_fields(alert: Alert) -> dict:
-    """The faster-journey suggestion as flat columns: present?, how much better, when, which lines.
+    """The suggested journey as flat columns: was one offered, how it compares, when, which lines.
 
     The full object is in `message_input`; these exist so "how often do we actually offer one, and is
-    it any good?" is a GROUP BY rather than a JSON scrape. Measured 2026-08-04, the answer today is
-    "effectively never" — which is only visible because it is recorded.
+    it any good?" is a GROUP BY rather than a JSON scrape. Measured 2026-08-04 under the old
+    earliest-arrival-and-at-least-three-minutes-faster rule, the answer was "effectively never" —
+    which is only visible because it was recorded. The 2026-08-06 selection rule moves that rate
+    sharply, which is exactly why `alt_status` is written on every row: an offer rate whose
+    denominator shifts under it measures the change in the log, not the change in the advice.
+
+    **Measured 2026-08-06 in dev, and the paragraph above does not survive it.** `has_alternative`
+    has only been WRITTEN since 2026-08-05 — this function is what writes it, and it was added in
+    fa27085 that day. Every one of the 673 rows before that carries NULL. So "measured 2026-08-04"
+    cannot have come from this column, and the 0 % it reports is the absence of instrumentation, not
+    the absence of offers. Grouping the log into SUBJECTS (journey x situation x departure, since
+    the poller re-decides each one ~10 times):
+
+        08-01..08-04   83 subjects   0 measurable            no measurement exists
+        08-05..08-06   50 subjects  50 measurable, 13 offered        26.0 %
+
+    That 26 % is the old earliest-arrival-and-three-minutes-faster rule, since the 2026-08-06
+    selection rule had not deployed when those rows were written. It is the ONLY measurement of it
+    there has ever been. **"Effectively never" was never measured; treat it as a claim, not a
+    finding.**
+
+    The trap here is worth more than the figure, because it caught two readers in a row. NULL is a
+    third bucket, never a default: `LOGICAL_OR(has_alternative)` over uninstrumented rows is NULL,
+    `COUNTIF` does not count it, and 83 subjects with no data render as 83 subjects with no offer.
+    That is the same rule `/historikk` states for `n_unsegmented` and the same one `alt_status`
+    exists to enforce — and it was still got backwards while writing a correction about it.
+
+    Caveats travel with the figures: dev only, 9 registered journeys over 9 stop pairs, and n=50
+    (so roughly +/-12 points). The cancelled-train case — the one the new rule exists for — has
+    **2** subjects, neither offered. That is not evidence for the rule; it is the absence of enough
+    data to test it, and the honest reason to let `alt_status` accumulate after deploy.
+
+    The query is `data/queries/alternative_offer_rate.sql`; re-run it rather than quoting this
+    block, which is a snapshot and will go stale exactly the way its predecessor did.
+
+    Three things about the offer itself that the old columns cannot express, because the journey they
+    describe is no longer necessarily a faster one:
+
+    * `alt_arrives_before_original` — the fallback tier legitimately arrives *later* than the
+      timetable promised, which is worth offering to somebody whose train is cancelled and misleading
+      to count as a saving. `alt_minutes_saved` is signed for the same reason and is recorded as it
+      comes: a negative value is an answer, not a row to drop.
+    * `alt_at_risk` — we offered a journey our own models flag, because nothing safer got there in
+      time. A wording that presents it as a clean escape would be wrong, so the log has to be able to
+      find those rows.
+    * `alt_scored` — whether the prediction cache had the alternative's boarding call at all. It
+      lives on `AlternativePrediction`, **not** on `AlternativeJourney`: a flat
+      `getattr(alt, "scored", None)` would ship a column of permanent NULLs that reads as
+      "unscored", which is precisely the fact-vs-absence confusion the flag exists to prevent.
+
+    `alt_operator` / `alt_jkey` / `alt_stop_order` are what make the advice **scoreable**. Every
+    other decision this log records gets a nightly hit / false-alarm / miss verdict from
+    `data/queries/label_varsel_decisions.sql`, which joins realized ET outcomes on
+    `(operator, jkey, call_date, stop_order)`; the row carried that key for the disrupted train and
+    not for the one we told the traveller to take instead, so "take this instead" was the only
+    traveller-facing claim in this repo that nothing could ever label. They come off the boarding
+    `CallPred` `impact._score_candidate` resolved, through `AlternativePrediction` — the same nested
+    read as `alt_scored`, and for the same reason: `AlternativeJourney` carries no journey ref, and a
+    flat `getattr(alt, "jkey", None)` would ship a column of permanent NULLs. The fourth part of the
+    key is not a column of its own: the operating day is `DATE(alt_departure_time, "Europe/Oslo")`,
+    exact except where an access walk straddles midnight.
+
+    They are NULL whenever `alt_scored` is False, which is the ordinary case — the prediction cache
+    only holds journeys a live situation touches — and that is the honest answer rather than a gap.
+    An operator read off a leg's line codespace would fill the column and join to nothing: that is
+    the JP codespace, which `impact._score_candidate` explicitly refuses to gate on, and two thirds
+    of a join key is not a join key.
     """
     alt = getattr(alert, "alternative_journey", None)
-    if alt is None:
-        return {"has_alternative": False}
-    legs = [leg for leg in (getattr(alt, "legs", None) or []) if getattr(leg, "mode", None) != "foot"]
-    return {
-        "has_alternative": True,
-        "alt_minutes_saved": getattr(alt, "minutes_saved", None),
-        "alt_departure_time": _iso(getattr(alt, "departure_time", None)),
-        "alt_arrival_time": _iso(getattr(alt, "arrival_time", None)),
-        "alt_lines": ", ".join(
-            str(getattr(leg, "public_code", None) or getattr(leg, "line", None) or getattr(leg, "mode", ""))
-            for leg in legs
-        )
-        or None,
+    fields: dict = {
+        "has_alternative": alt is not None,
+        "alt_status": _alternative_status(alert),
     }
+    if alt is None:
+        return fields
+    legs = [leg for leg in (getattr(alt, "legs", None) or []) if getattr(leg, "mode", None) != "foot"]
+    # Through the departure prediction, never off the journey — see the docstring.
+    departure = getattr(alt, "departure_prediction", None)
+    fields.update(
+        {
+            "alt_minutes_saved": getattr(alt, "minutes_saved", None),
+            "alt_departure_time": _iso(getattr(alt, "departure_time", None)),
+            "alt_arrival_time": _iso(getattr(alt, "arrival_time", None)),
+            "alt_arrives_before_original": getattr(alt, "arrives_before_original", None),
+            "alt_at_risk": getattr(alt, "at_risk", None),
+            "alt_scored": getattr(departure, "scored", None),
+            "alt_operator": getattr(departure, "operator", None),
+            "alt_jkey": getattr(departure, "jkey", None),
+            "alt_stop_order": getattr(departure, "stop_order", None),
+            "alt_lines": ", ".join(
+                str(
+                    getattr(leg, "public_code", None)
+                    or getattr(leg, "line", None)
+                    or getattr(leg, "mode", "")
+                )
+                for leg in legs
+            )
+            or None,
+        }
+    )
+    return fields
 
 
 def _observation_fields(alert: Alert) -> dict:

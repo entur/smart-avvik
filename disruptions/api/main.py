@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 # Aliased: the route function below is also called `impact`, and inside its body a bare
 # `impact.` would resolve to that function rather than to this module.
+import alert_policy  # sibling module: the shared alert gate (thresholds, the "trouble" bar)
 import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
 import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
@@ -716,6 +717,32 @@ def _impact_snapshot() -> tuple[dict[str, list[impact_engine.CallPred]], datetim
         return _call_pred_by_situation, _call_pred_refreshed_at
 
 
+def _impact_journey_calls(operator: str | None, jkey: str) -> list[impact_engine.CallPred] | None:
+    """The scored calls of ONE journey, or None when no live situation touches it.
+
+    The second reader injected into the impact engine (beside `_impact_snapshot`), over the same
+    poller-owned rows indexed the other way. It is how the engine asks what we know about a train
+    the Journey Planner offered as an alternative — a question the by-situation snapshot can only
+    answer by scanning it. Mirrors `_reisevalg_call_predictions`' resolution over this same index.
+
+    **A codespace that misses is a miss, not an invitation to guess.** `_reisevalg_call_predictions`
+    falls back to the bare-jkey index when the prefixed lookup finds nothing; that is safe there
+    because its input is one journey ref the caller already believes in. Here the ref comes from the
+    Journey Planner and always carries a codespace, so falling back would mean answering "VYG's
+    ServiceJourney:123 is not in the cache" with ATB's — bus ServiceJourney refs are not
+    date-scoped, and that collision is exactly what keying on (operator, jkey) exists to prevent.
+    The bare-jkey path is therefore reached only when the ref carries no codespace at all, and even
+    then only when a single operator claims it (the same rule /journey applies before its 409).
+    """
+    with _call_pred_lock:
+        if operator is not None:
+            rows = _call_pred_by_key.get((operator, jkey))
+        else:
+            ops = _call_pred_by_jkey_index.get(jkey, set())
+            rows = _call_pred_by_key.get((next(iter(ops)), jkey)) if len(ops) == 1 else None
+    return list(rows) if rows else None
+
+
 def _varsel_impact(
     *,
     from_stop: str,
@@ -750,6 +777,12 @@ def _varsel_impact(
         catchable_after=catchable_after,
         with_alternative=with_alternative,
         min_impact=min_impact,
+        # Charge this provider's Journey Planner fetches to the poller's reserved budget, not the
+        # public one. Only `check_and_notify` ever passes `with_alternative=True` — the
+        # /varsel-api request path leaves it False and issues no fetch at all — so a flat "poller"
+        # is exact here, and it is what stops an unauthenticated caller flooding /impact from
+        # starving the push cycle it shares this module-global cache with.
+        path="poller",
     )
 
 
@@ -855,7 +888,9 @@ async def lifespan(app: FastAPI):
         logger.exception("Initial impact lookup load failed; will retry on ingestion poll")
     # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
     # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
-    impact_engine.configure(snapshot_provider=_impact_snapshot)
+    impact_engine.configure(
+        snapshot_provider=_impact_snapshot, call_lookup=_impact_journey_calls
+    )
     varsel.configure(
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
@@ -1758,12 +1793,14 @@ async def alert_profile(
 # The UI at /demo (demo/reisedemo, built into demo_static/) consumes these endpoints.
 
 # The alert decision shown in the demo: flag when P(cancelled OR >= 10 min late) crosses the
-# operator's live alerting threshold (varsel.threshold_for — the per-operator cuts tuned at
+# operator's live alerting threshold (alert_policy.threshold_for — the per-operator cuts tuned at
 # ~90 % precision by eval/tune_alert_thresholds.py, 0.65 default), so the demo's verdicts
 # replay exactly what the varsel push pipeline would have decided.
 # Realized outcome counts as "trouble" when the call was cancelled or >= 10 min late — the
-# same event the impact probability predicts, so it comes from varsel (single definition).
-_DEMO_TROUBLE_DELAY_MIN = varsel.TROUBLE_DELAY_MIN
+# same event the impact probability predicts, so it comes from alert_policy (single definition).
+# Taken from the policy module directly rather than through varsel: /demo needs the gate, not the
+# push surface that happens to be its other reader.
+_DEMO_TROUBLE_DELAY_MIN = alert_policy.TROUBLE_DELAY_MIN
 
 # The demo tables are near-static snapshots (extend_demo_recent.sql refreshes them on
 # demand), so their metadata (stop picker, scenario list, date window) is cached with a
@@ -2008,7 +2045,7 @@ def get_demo_meta() -> DemoMeta:
     meta = DemoMeta(
         window_start=window.window_start,
         window_end=window.window_end,
-        alert_threshold=varsel.threshold_for(None),
+        alert_threshold=alert_policy.threshold_for(None),
         stops=stops,
         highlights=highlights,
     )
@@ -2097,7 +2134,7 @@ async def demo_journeys(
                 category=r.category,
                 onset=r.onset_ts,
             )
-        threshold = varsel.threshold_for(r.operator)
+        threshold = alert_policy.threshold_for(r.operator)
         journeys.append(
             DemoJourney(
                 journey_ref=f"{r.operator}:{r.jkey}",
