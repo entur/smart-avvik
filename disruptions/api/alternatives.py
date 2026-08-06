@@ -7,6 +7,12 @@ Entur Journey Planner (JP) v3 GraphQL API.
 
 Design notes
 ------------
+* **Fetching and choosing are separate.** :func:`fetch_candidates` asks JP and parses the reply into
+  :class:`AlternativeCandidate` records — everything JP offered, in JP's order, ranked by nobody. It
+  takes both anchors: `arrive_by=False` reads `date_time` as "leave no earlier than",
+  `arrive_by=True` as "be there by", and the two are separate requests because a depart-after search
+  cannot contain a journey that leaves earlier and still gets there in time. Selection reads
+  candidates; it never re-parses patterns.
 * **The bar is the disrupted train, not the timetable.** A pattern qualifies only when its expected
   arrival at ``to_stop`` beats ``reference_arrival`` — the matched train's *predicted* arrival
   (aimed + predicted delay). A pattern that is faster than the timetable but slower than what the
@@ -54,6 +60,13 @@ _DEPART_BUCKET = timedelta(minutes=5)
 # Only propose an alternative that saves at least this much — shaving a minute off is noise, and
 # quoting it as advice would cost more trust than it buys.
 _MIN_MINUTES_SAVED = 3
+# How far ahead of `now` a requested travel time may sit before the lookup is skipped entirely.
+# Stated in hours rather than as a ratio of anything: a registration for tomorrow morning refreshes
+# on every poller cycle from the moment it is created, and the Journey Planner query it would issue
+# is the single most expensive call on that path. A tomorrow-window lookup cannot contain a train in
+# tomorrow's window anyway — by the time the traveller could act on it, the answer has been
+# recomputed many times over.
+_MAX_LOOKAHEAD_HOURS = 6
 # An NSR stop reference, e.g. NSR:StopPlace:337 or NSR:Quay:11274. Deliberately excludes the quote
 # and brace characters that would let a value escape the GraphQL string literal it is spliced into.
 _STOP_REF = re.compile(r"^[A-Za-z]{2,10}:(StopPlace|Quay):[A-Za-z0-9_-]{1,40}$")
@@ -62,24 +75,68 @@ _STOP_REF = re.compile(r"^[A-Za-z]{2,10}:(StopPlace|Quay):[A-Za-z0-9_-]{1,40}$")
 def _is_stop_ref(value: str) -> bool:
     """True when `value` is shaped like an NSR stop reference."""
     return bool(_STOP_REF.match(value or ""))
-# How many patterns to ask JP for. Enough that a few can be filtered out (wrong line, too slow)
-# and something still survives.
-_NUM_TRIP_PATTERNS = 6
+# How many patterns to ask JP for. A post-filter, NOT a reach control -- see the measurement table
+# below. JP's own default is 12; asking for 10 leaves room to drop patterns (wrong line, rides the
+# disruption, cancelled) and still have something to offer.
+_NUM_TRIP_PATTERNS = 10
 
-# Verified live with curl 2026-07-29 (Oslo S -> Drammen and Oslo S -> Stavanger), following the
-# same in-file convention as reisevalg.py's two JP queries -- a brace slip in one of those cost a
-# fix commit (PR #22), so the document is checked against the real endpoint before the parser is
-# written, and the date says when.
+# Verified live with curl 2026-08-06 (Oslo S -> Rosenholm, Oslo S -> Drammen, Oslo S -> Drøbak
+# torg, both `arriveBy` values), following the same in-file convention as reisevalg.py's two JP
+# queries -- a brace slip in one of those cost a fix commit (PR #22), so the document is checked
+# against the real endpoint before the parser is written, and the date says when. The parser is
+# additionally pinned in test_alternatives.py against a payload recorded from that same curl.
+#
+# Reach is governed by `searchWindow` and OTP2's dynamic default, NOT by the pattern count.
+# Measured 2026-08-06, Oslo S (NSR:StopPlace:337) -> Rosenholm stasjon (NSR:StopPlace:60),
+# dateTime 11:00 local:
+#
+#   | query                                     | patterns | departure span |
+#   |-------------------------------------------|----------|----------------|
+#   | numTripPatterns: 10, searchWindow unset   |    7     | 11:16-14:16    |
+#   | numTripPatterns: 10, searchWindow: 120    |    4     | 11:16-12:46    |
+#   | numTripPatterns: 10, searchWindow: 60     |    2     | 11:16-11:46    |
+#   | numTripPatterns:  3, searchWindow: 120    |    3     | 11:16-12:16    |
+#
+# So clamping `searchWindow` SHRINKS the candidate pool below what the unclamped query already
+# gets, and the count only binds once it drops below what the window returned anyway (row 4). This
+# reversed an earlier design decision -- setting a searchWindow looked like the way to widen the
+# search and does the opposite -- so it is recorded here rather than re-derived. The schema is
+# explicit about the count too: numTripPatterns "reduce[s] the number of trip patterns AFTER the
+# OTP travel search is done in a post-filtering process". `searchWindow` is deliberately UNSET.
+# (An earlier reading the same day gave 5 / 11:16-13:16 for row 1: the dynamic window is
+# density-aware and recomputed per request, so the counts are not constants. The ordering is.)
+#
+# `includeRealtimeCancellations` stays at its schema default (false). Determined by A/B curl
+# 2026-08-06 against a real partial cancellation (TRO:ServiceJourney:250_260324131500087_1032 had
+# its Rødskjer call cancelled; routing Rødskjer -> Harstad Byterminal over it):
+#   * default        -> 0 tripPatterns. The cancelled departure is excluded from the search.
+#   * flag set true  -> 1 tripPattern, fromEstimatedCall.cancellation == true.
+# So JP's own `cancellation: true` does NOT surface by default -- the default already excludes
+# cancelled departures. Our own ET cache is therefore the working guard against recommending a
+# train that is not running; reading `cancellation` off the estimated calls below is
+# belt-and-braces, and earns its keep only if this flag is ever flipped on or OTP's realtime
+# picture lags our ET one at the margin. Do not read `candidate.cancelled` as the primary signal.
 #
 # Modes a traveller on a disrupted public-transport trip could actually switch to. Air is
 # deliberately absent (JP will happily route Oslo -> Stavanger by plane otherwise), and every
 # access/egress/direct mode is foot so the fallback is never "drive" or "cycle for two hours".
+#
+# `estimatedCalls` and `intermediateEstimatedCalls` are FORBIDDEN in this document. They are a
+# one-word edit away and would be a two-order-of-magnitude change in payload size: a 30-call Bergen
+# train times 10 patterns is ~300 call objects per reply, on the poller thread, behind a 3 s
+# timeout. What this module needs from a leg is its two endpoints, and `fromEstimatedCall` /
+# `toEstimatedCall` give exactly those.
+#
+# `realtime` (on the leg and on `fromEstimatedCall`) is selected but not mapped onto a model field
+# here: it says whether `expectedDepartureTime` is a real prediction or just a copy of the aimed
+# time, which is what tells the scoring layer whether an "on time" reading means anything.
 _TRIP_QUERY = """
 {
   trip(
     from: {place: "%(from_stop)s"}
     to: {place: "%(to_stop)s"}
     dateTime: "%(date_time)s"
+    arriveBy: %(arrive_by)s
     numTripPatterns: %(num)d
     modes: {
       accessMode: foot
@@ -98,16 +155,23 @@ _TRIP_QUERY = """
     tripPatterns {
       expectedStartTime
       expectedEndTime
+      aimedStartTime
+      aimedEndTime
       duration
       legs {
         mode
+        realtime
         expectedStartTime
         expectedEndTime
+        aimedStartTime
+        aimedEndTime
         line { id publicCode }
         serviceJourney { id }
         datedServiceJourney { id }
-        fromPlace { name }
-        toPlace { name }
+        fromPlace { name quay { stopPlace { id } } }
+        toPlace { name quay { stopPlace { id } } }
+        fromEstimatedCall { cancellation realtime aimedDepartureTime expectedDepartureTime }
+        toEstimatedCall { cancellation aimedArrivalTime expectedArrivalTime }
       }
     }
   }
@@ -144,6 +208,138 @@ class AlternativeJourney(BaseModel):
     )
     legs: list[AlternativeLeg] = Field(
         default_factory=list, description="The legs to travel, in order."
+    )
+
+
+class AlternativePrediction(BaseModel):
+    """What we know and what we forecast about the alternative's own boarding call.
+
+    Two different questions live side by side here and must not be blended:
+
+    * ``delay_min`` (with ``scheduled_time`` / ``expected_time`` / ``cancelled``) is the Journey
+      Planner's **observed** realtime picture — what the feed already says about this departure.
+    * ``cancel_probability`` / ``impact_probability`` are **our** forecast, from the same per-call
+      models that scored the disrupted train. They are the answer to "is the trip we are about to
+      recommend heading for trouble itself?", not to "is it late right now".
+
+    A null probability means **the models never scored this call** — no live situation touches this
+    journey, so it is absent from the prediction cache. It never means "zero risk". A wording that
+    renders a null as reassurance ("ingen risiko") is wrong; the honest reading is "nothing flagged
+    it", which is the ordinary case for the great majority of departures.
+
+    Lives in this module rather than in ``impact``, even though ``impact.score_candidates`` is its
+    only constructor: ``impact`` imports ``alternatives`` (``from alternatives import
+    AlternativeJourney``), and ``AlternativeJourney`` carries a ``departure_prediction`` of this
+    type. Defining it in ``impact`` would need the reverse import. ``from __future__ import
+    annotations`` does not rescue that — pydantic resolves field annotations when the class is
+    built, so the cycle is an ImportError at startup, not a deferred one.
+    """
+
+    stop_place: str | None = Field(
+        default=None, description="NSR StopPlace ref of the alternative's boarding stop."
+    )
+    stop_name: str | None = Field(default=None, description="Human-readable boarding stop name.")
+    scheduled_time: datetime | None = Field(
+        default=None, description="Aimed (timetabled) departure from the boarding stop."
+    )
+    expected_time: datetime | None = Field(
+        default=None, description="Expected departure per the Journey Planner's realtime picture."
+    )
+    delay_min: int | None = Field(
+        default=None,
+        description="OBSERVED delay in minutes (expected minus aimed), clamped at 0 — a vehicle "
+        "running early is not 'delayed -2 min'. This is JP's figure, never a forecast.",
+    )
+    cancelled: bool = Field(
+        default=False,
+        description="The Journey Planner's estimated call for this boarding is flagged cancelled.",
+    )
+    cancel_probability: float | None = Field(
+        default=None,
+        description="OUR calibrated P(this boarding is cancelled), 0-1. Null = not scored (no live "
+        "situation touches this journey), NOT zero risk.",
+    )
+    impact_probability: float | None = Field(
+        default=None,
+        description="OUR calibrated P(cancelled OR materially late) for this boarding, 0-1. "
+        "Null = not scored, NOT zero risk.",
+    )
+    scored: bool = Field(
+        default=False,
+        description="True when the prediction cache had this call, so the probabilities above are "
+        "model output. False means they are null because nothing scored it — the flag exists so a "
+        "reader never has to infer 'not scored' from 'no number'.",
+    )
+
+
+class AlternativeCandidate(BaseModel):
+    """One parsed `tripPattern` from a Journey Planner reply, before any selection has happened.
+
+    Deliberately a *record of what JP said*, not a recommendation: every field is either read
+    straight off the pattern or derived from it, and the two caller-set flags at the bottom are the
+    only places anything else writes. Selection reads these; it does not re-parse patterns.
+
+    Aimed and expected are both kept because they answer different questions — aimed is the trip a
+    traveller would recognise from the timetable, expected is when it will actually happen — and
+    collapsing them loses the delay.
+    """
+
+    departure_time: datetime | None = Field(
+        default=None, description="EXPECTED departure from the origin (realtime)."
+    )
+    arrival_time: datetime | None = Field(
+        default=None, description="EXPECTED arrival at the destination (realtime)."
+    )
+    aimed_departure_time: datetime | None = Field(
+        default=None, description="AIMED (timetabled) departure from the origin."
+    )
+    aimed_arrival_time: datetime | None = Field(
+        default=None, description="AIMED (timetabled) arrival at the destination."
+    )
+    duration_min: int | None = Field(default=None, description="Total journey time in minutes.")
+    legs: list[AlternativeLeg] = Field(
+        default_factory=list, description="The legs to travel, in order (foot legs included)."
+    )
+    cancelled: bool = Field(
+        default=False,
+        description="Any transit leg's boarding or alighting estimated call is flagged cancelled "
+        "by JP. Belt-and-braces only — the trip search excludes cancelled departures by default "
+        "(see the note on `includeRealtimeCancellations`), so our ET cache is the real guard.",
+    )
+    transit_refs: list[tuple[str | None, str]] = Field(
+        default_factory=list,
+        description="Ordered (operator, jkey) pairs for the transit legs — foot legs excluded. "
+        "BOTH halves of each ref are kept: the prediction cache is keyed on (operator, jkey), and "
+        "bus ServiceJourney refs are not date-scoped, so a jkey alone can collide across "
+        "operators. A leg contributes BOTH its dated and its plain service-journey ref where JP "
+        "gives both, because which form the cache holds depends on the family — rail jkeys are "
+        "DatedServiceJourney refs, bus jkeys are plain ServiceJourney refs — so a lookup has to be "
+        "able to try either. Deduplicated, first occurrence wins.",
+    )
+    lines: list[str] = Field(
+        default_factory=list, description="Ordered line refs of the transit legs, e.g. 'VYG:Line:R11'."
+    )
+    board_stop_place: str | None = Field(
+        default=None,
+        description="NSR StopPlace where the FIRST transit leg is boarded — not where the walk "
+        "from the origin starts. Null when no leg exposes a quay.",
+    )
+    alight_stop_place: str | None = Field(
+        default=None, description="NSR StopPlace where the LAST transit leg is left."
+    )
+    ordinal: int = Field(
+        default=0,
+        description="Position of this pattern in the Journey Planner's reply (0-based). JP returns "
+        "patterns in its own preference order; keeping it makes a tie-break deterministic instead "
+        "of dependent on dict iteration.",
+    )
+    is_original: bool = Field(
+        default=False,
+        description="Caller-set: this candidate IS the disrupted journey the traveller already has.",
+    )
+    risky: bool = Field(
+        default=False,
+        description="Caller-set: this candidate is itself predicted to be in trouble.",
     )
 
 
@@ -243,16 +439,29 @@ def _post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
     return body
 
 
-def _fetch_patterns(from_stop: str, to_stop: str, depart_after: datetime) -> list[dict]:
+def _fetch_trip_patterns(
+    from_stop: str, to_stop: str, date_time: datetime, *, arrive_by: bool
+) -> list[dict]:
+    """Ask JP for trip patterns anchored either at departure or at arrival.
+
+    `arrive_by=False` reads `date_time` as "leave no earlier than"; `arrive_by=True` reads it as
+    "be there by". The two anchors answer different questions and are separate requests — a single
+    depart-after search cannot contain a journey that leaves earlier and still gets there in time.
+    """
     query = _TRIP_QUERY % {
         "from_stop": from_stop,
         "to_stop": to_stop,
-        "date_time": depart_after.isoformat(),
+        "date_time": date_time.isoformat(),
+        "arrive_by": "true" if arrive_by else "false",
         "num": _NUM_TRIP_PATTERNS,
     }
     data = _post_json(_JP_URL, {"query": query}, headers={"ET-Client-Name": _ET_CLIENT_NAME})
     trip = (data.get("data") or {}).get("trip") or {}
     return trip.get("tripPatterns") or []
+
+
+def _fetch_patterns(from_stop: str, to_stop: str, depart_after: datetime) -> list[dict]:
+    return _fetch_trip_patterns(from_stop, to_stop, depart_after, arrive_by=False)
 
 
 # ---- Parsing / selection ---------------------------------------------------------------------
@@ -278,6 +487,29 @@ def _strip_codespace(ref: str | None) -> str | None:
         return None
     _, sep, rest = ref.partition(":")
     return rest if sep else ref
+
+
+def split_codespace(ref: str | None) -> tuple[str | None, str] | None:
+    """'VYG:DatedServiceJourney:81613_X' -> ('VYG', 'DatedServiceJourney:81613_X').
+
+    The codespace-preserving sibling of :func:`_strip_codespace`, which throws the prefix away.
+    Both halves are needed because the prediction cache is keyed on ``(operator, jkey)``: bus
+    ``ServiceJourney`` refs carry no date, so one jkey can name two operators' journeys and keying
+    on the jkey alone silently merges them. (``main`` does this same split inline for ``/journey``'s
+    path parameter; this is the reusable form, placed where ``transit_refs`` is built.)
+
+    A NeTEx ref is ``<Codespace>:<Type>:<Value>``, so the codespace is only real when what follows
+    the first colon still contains one — ``'DatedServiceJourney:x'`` has no codespace and must not
+    yield an operator of ``'DatedServiceJourney'``. Returns ``None`` for an empty or non-string ref
+    and ``(None, ref)`` when no codespace can be read, so a caller never has to distinguish
+    "absent" from "unprefixed" by string inspection.
+    """
+    if not ref or not isinstance(ref, str):
+        return None
+    head, sep, rest = ref.partition(":")
+    if sep and ":" in rest:
+        return (head, rest)
+    return (None, ref)
 
 
 def _rides_the_disruption(
@@ -413,3 +645,208 @@ def find_faster(
             extra={"fields": {"event": "alternatives_error"}},
         )
         return None
+
+
+# ---- Candidates ------------------------------------------------------------------------------
+def _as_dict(value: Any) -> dict:
+    """`value` if it is a dict, else an empty one.
+
+    `(node.get("x") or {}).get("y")` is the idiom this module already used, and it is safe only
+    while every non-null value really is an object. It is not: a malformed reply can put a string
+    where JP puts a node, and `"oops".get` is an AttributeError that costs the whole pattern. The
+    parser's contract is that a broken *field* degrades to null; only a broken *arrival time* drops
+    the candidate.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+def _stop_place_ref(place: Any) -> str | None:
+    """`fromPlace`/`toPlace` -> its NSR StopPlace ref, or None.
+
+    JP nests it two levels down (`quay { stopPlace { id } }`) and any level can be null — a leg
+    that starts at a street address or a coordinate has no quay at all, and every foot leg in a
+    real reply is a candidate for that. A missing level is None here, never an exception.
+    """
+    if not isinstance(place, dict):
+        return None
+    ref = _as_dict(_as_dict(place.get("quay")).get("stopPlace")).get("id")
+    return ref if isinstance(ref, str) and ref else None
+
+
+def _leg_is_cancelled(leg: dict) -> bool:
+    """True when JP flags either end of this leg's estimated calls as cancelled."""
+    return any(
+        _as_dict(leg.get(key)).get("cancellation") is True
+        for key in ("fromEstimatedCall", "toEstimatedCall")
+    )
+
+
+def _to_candidate(pattern: dict, ordinal: int) -> AlternativeCandidate | None:
+    """Parse one `tripPattern` into an `AlternativeCandidate`, or None if it is unusable.
+
+    "Unusable" is narrow on purpose: only a pattern with no comparable expected arrival is dropped,
+    because nothing downstream can rank it. Everything else degrades to a null field. A pattern is
+    a suggestion, and a suggestion with a missing line ref is still a suggestion.
+    """
+    if not isinstance(pattern, dict):
+        return None
+    arrival = _parse_ts(pattern.get("expectedEndTime"))
+    if arrival is None:
+        return None
+    duration = pattern.get("duration")
+    if not isinstance(duration, int | float) or isinstance(duration, bool):
+        duration = None  # JP sends seconds; anything else is malformed, not a reason to crash
+    raw_legs = pattern.get("legs")
+    if not isinstance(raw_legs, list):
+        raw_legs = []
+    legs = [leg for leg in raw_legs if isinstance(leg, dict)]
+
+    transit_refs: list[tuple[str | None, str]] = []
+    lines: list[str] = []
+    board_stop_place: str | None = None
+    alight_stop_place: str | None = None
+    cancelled = False
+    seen_refs: set[tuple[str | None, str]] = set()
+    for leg in legs:
+        # A foot leg has no service journey and no estimated calls; it is part of the itinerary a
+        # traveller walks, never something the prediction cache can score or a situation can hit.
+        # Both ref forms are collected, not the first that is present: JP gives a bus leg BOTH a
+        # DatedServiceJourney and a ServiceJourney id, and our bus cache keys on the plain one
+        # while rail keys on the dated one. Preferring either form would silently miss one family.
+        refs = [
+            _as_dict(leg.get(key)).get("id")
+            for key in ("datedServiceJourney", "serviceJourney")
+        ]
+        refs = [ref for ref in refs if isinstance(ref, str) and ref]
+        if not refs:
+            continue
+        for ref in refs:
+            split = split_codespace(ref)
+            if split is not None and split not in seen_refs:
+                seen_refs.add(split)
+                transit_refs.append(split)
+        line_id = _as_dict(leg.get("line")).get("id")
+        if isinstance(line_id, str) and line_id:
+            lines.append(line_id)
+        if board_stop_place is None:
+            board_stop_place = _stop_place_ref(leg.get("fromPlace"))
+        alight = _stop_place_ref(leg.get("toPlace"))
+        if alight is not None:
+            alight_stop_place = alight
+        cancelled = cancelled or _leg_is_cancelled(leg)
+
+    return AlternativeCandidate(
+        departure_time=_parse_ts(pattern.get("expectedStartTime")),
+        arrival_time=arrival,
+        aimed_departure_time=_parse_ts(pattern.get("aimedStartTime")),
+        aimed_arrival_time=_parse_ts(pattern.get("aimedEndTime")),
+        duration_min=round(duration / 60) if duration else None,
+        legs=[
+            AlternativeLeg(
+                mode=leg.get("mode") if isinstance(leg.get("mode"), str) else None,
+                line=_as_dict(leg.get("line")).get("id"),
+                public_code=_as_dict(leg.get("line")).get("publicCode"),
+                from_name=_as_dict(leg.get("fromPlace")).get("name"),
+                to_name=_as_dict(leg.get("toPlace")).get("name"),
+                start_time=_parse_ts(leg.get("expectedStartTime")),
+                end_time=_parse_ts(leg.get("expectedEndTime")),
+            )
+            for leg in legs
+        ],
+        cancelled=cancelled,
+        transit_refs=transit_refs,
+        lines=lines,
+        board_stop_place=board_stop_place,
+        alight_stop_place=alight_stop_place,
+        ordinal=ordinal,
+    )
+
+
+def parse_candidates(patterns: Iterable[Any]) -> list[AlternativeCandidate]:
+    """Parse a JP `tripPatterns` list into candidates, in reply order.
+
+    Pure — no I/O — so the parser can be pinned against a recorded payload. A pattern that cannot be
+    parsed is skipped individually rather than failing the batch: one malformed entry must cost that
+    one suggestion, never the whole reply.
+    """
+    out: list[AlternativeCandidate] = []
+    for ordinal, pattern in enumerate(patterns):
+        try:
+            candidate = _to_candidate(pattern, ordinal)
+        except Exception:
+            logger.warning(
+                "Skipping an uninterpretable Journey Planner trip pattern (#%d)",
+                ordinal,
+                exc_info=True,
+                extra={"fields": {"event": "alternatives_error", "reason": "bad_pattern"}},
+            )
+            continue
+        if candidate is not None:
+            out.append(candidate)
+    return out
+
+
+def fetch_candidates(
+    from_stop: str,
+    to_stop: str,
+    *,
+    arrive_by: bool,
+    date_time: datetime,
+    now: datetime,
+) -> list[AlternativeCandidate]:
+    """Journey Planner candidates from `from_stop` to `to_stop`, in JP's reply order.
+
+    `date_time` is read as "leave no earlier than" when `arrive_by` is False and as "be there by"
+    when it is True. `now` is passed in and never defaulted internally, so the caller's single
+    sampled instant governs the horizon cut and the cache alike — `impact.for_trip` already samples
+    `now` once precisely so `as_of` and the observation cut cannot straddle two instants, and this
+    lookup must sit on that same instant.
+
+    Selection is somebody else's job. This returns everything JP offered, parsed; it does not rank,
+    filter by usefulness, or decide anything.
+
+    Fail open, ALWAYS: a refused stop ref, a lookup too far ahead, an outage, a GraphQL `errors`
+    envelope, an empty reply, or an uninterpretable one all yield `[]`. This sits on the poller
+    thread behind a push notification and must never be the reason an alert does not go out.
+    """
+    if not (_is_stop_ref(from_stop) and _is_stop_ref(to_stop)):
+        # Both refs are spliced into the GraphQL document as string literals, and both originate in
+        # unauthenticated input (/impact's query params, JourneyIn's fields) validated only as short
+        # strings. Nothing reaches here today with a quote in it -- the refs have matched real
+        # stop_places in the prediction cache first -- but that containment is an accident of an
+        # unrelated code path, and the sibling reisevalg module was already bitten once by
+        # hand-built GraphQL (PR #22). Refuse the shape here, where the assumption lives, and
+        # BEFORE any fetch.
+        logger.warning(
+            "Refusing a Journey Planner lookup for a non-NSR stop ref",
+            extra={"fields": {"event": "alternatives_error", "reason": "bad_stop_ref"}},
+        )
+        return []
+    if date_time - now > timedelta(hours=_MAX_LOOKAHEAD_HOURS):
+        # A registration for tomorrow morning is re-examined on every poller cycle from the moment
+        # it is created, and this is the most expensive call on that path. A lookup that far ahead
+        # cannot contain a train in tomorrow's window, so it buys nothing at any price.
+        return []
+    bucket = int(date_time.timestamp() // _DEPART_BUCKET.total_seconds())
+    key = (from_stop, to_stop, arrive_by, bucket)
+    patterns = _cache.get(
+        key,
+        lambda: _fetch_trip_patterns(from_stop, to_stop, date_time, arrive_by=arrive_by),
+        now,
+    )
+    if not patterns:
+        return []
+    # "Fail open, ALWAYS" has to cover parsing, not just fetching. Until 2026-07-29 only the fetch
+    # was guarded, so one malformed pattern raised out of here, through main._impact_for_trip, into
+    # varsel.check_and_notify -- where the per-journey guard turned it into every alert for that
+    # journey being silently dropped for the cycle. A bad alternative must cost the alternative only.
+    try:
+        return parse_candidates(patterns)
+    except Exception:
+        logger.warning(
+            "Could not interpret the Journey Planner reply for %s; offering no candidates",
+            key,
+            exc_info=True,
+            extra={"fields": {"event": "alternatives_error"}},
+        )
+        return []
