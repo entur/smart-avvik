@@ -512,23 +512,39 @@ def _still_catchable(alt: AlternativeJourney | None, now: datetime) -> bool:
 
 
 def _alternative_identity(alt: AlternativeJourney) -> tuple:
-    """What makes two alternatives the same advice: the two times any wording actually quotes.
+    """What makes two alternatives the same advice: everything a wording actually states.
 
-    Deliberately NOT the whole model. `at_risk` and both `*_prediction` blocks are re-scored against
-    the live prediction cache on every cycle, so comparing those would invalidate the written message
-    on nearly every tick — turning ``ok_cached`` into a per-cycle LLM call, which is exactly what
-    :data:`_MAX_LLM_CALLS_PER_CYCLE` and :data:`_MAX_LLM_SECONDS_PER_CYCLE` exist to prevent.
+    Not the whole model — both `*_prediction` blocks carry continuous probabilities re-scored
+    against the live prediction cache on every cycle, so comparing those would invalidate the
+    written message on nearly every tick, turning ``ok_cached`` into a per-cycle LLM call. That is
+    exactly what :data:`_MAX_LLM_CALLS_PER_CYCLE` and :data:`_MAX_LLM_SECONDS_PER_CYCLE` exist to
+    prevent.
 
-    Compared AT THE MINUTE, for the same reason (2026-08-06). Both times are Journey Planner
-    *expected* times carried at second precision, while every wording renders ``%H:%M``: a realtime
-    nudge from 08:24:12 to 08:24:41 changed the identity, dropped the message and spent an LLM call
-    to produce byte-identical prose — roughly every other cycle per alerting journey, out of the
-    budget of 8. The resolution of the comparison has to be the resolution of the advice.
+    The two BOOLEANS are here, though, and the two times are not the whole story (2026-08-06).
+    `at_risk` and `arrives_before_original` are each stated out loud — "(kan også bli rammet)",
+    and the caveat that the traveller arrives later than they planned — so an alternative whose
+    times round the same but whose `at_risk` has flipped false → true is NOT the same advice. It
+    was treated as such: `_reconcile_caches` stored the rescored journey and kept the message
+    written when the flag was false, so the cached text promised a clean escape that had stopped
+    existing. They cost nothing to include: a boolean flips at most once or twice in a situation's
+    life, where a probability moves every cycle, so this cannot reintroduce the flapping the
+    minute-rounding below exists to stop.
+
+    The times are compared AT THE MINUTE, for that same reason. Both are Journey Planner *expected*
+    times carried at second precision, while every wording renders ``%H:%M``: a realtime nudge from
+    08:24:12 to 08:24:41 changed the identity, dropped the message and spent an LLM call to produce
+    byte-identical prose — roughly every other cycle per alerting journey, out of the budget of 8.
+    The resolution of the comparison has to be the resolution of the advice.
     """
     def minute(ts: datetime | None) -> datetime | None:
         return ts.replace(second=0, microsecond=0) if ts is not None else None
 
-    return (minute(alt.departure_time), minute(alt.arrival_time))
+    return (
+        minute(alt.departure_time),
+        minute(alt.arrival_time),
+        alt.at_risk,
+        alt.arrives_before_original,
+    )
 
 
 # ---- State: devices, journeys, notified ------------------------------------------------------

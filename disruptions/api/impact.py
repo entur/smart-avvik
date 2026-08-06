@@ -1118,24 +1118,6 @@ def _original_candidate(
     )
 
 
-def _usable(cand: AlternativeCandidate, *, affected_refs: set[tuple[str | None, str]], now: datetime) -> bool:
-    """Whether `cand` is a live option at all — the cut that decides if a SECOND query is needed.
-
-    Deliberately a subset of `select_best`'s own pool filter, not a copy of it. What it has to
-    answer is narrower: "did this query come back with anything the traveller could actually take?"
-    A reply consisting solely of the disrupted train's own pattern, or of departures that have
-    already gone, is an empty answer wearing a full one — and it is exactly the case the
-    depart-after fallback exists to rescue. The window bound stays in `select_best` alone: a
-    candidate that reaches too far past the traveller's window is still evidence that the query
-    answered, and re-asking would not produce an earlier one that this query missed.
-    """
-    if cand.cancelled or cand.arrival_time is None:
-        return False
-    if cand.departure_time is None or cand.departure_time <= now:
-        return False
-    return not any(ref in affected_refs for ref in cand.transit_refs)
-
-
 def _reconcile_original_arrival(
     original: AlternativeCandidate,
     candidates: Iterable[AlternativeCandidate],
@@ -1222,46 +1204,72 @@ def _best_remaining_journey(
     )
 
     def scored_pool(candidates: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
+        """Annotate every candidate with what we know of it, and filter nothing.
+
+        `select_best` owns the pool cuts, all of them (2026-08-06). This used to pre-filter through
+        a local `_usable` predicate that was *nearly* the same rule — it applied no window bound —
+        and that one-cut divergence is what made the fallback unreachable: a candidate that passed
+        here and died there left `select_best` with an empty rival pool while this function had
+        already recorded the query as having produced something. Two filters that must agree is a
+        bug waiting to be re-introduced, so now there is one.
+        """
         scored = score_candidates(
             candidates, affected_refs=affected_refs, affected_lines=affected_lines
         )
-        return [s.candidate for s in scored if _usable(s.candidate, affected_refs=affected_refs, now=now)]
+        return [s.candidate for s in scored]
+
+    def select(pool: list[AlternativeCandidate], outcome: dict[str, Any]) -> AlternativeJourney | None:
+        return alternatives.select_best(
+            pool,
+            original=original,
+            original_arrival_time=deadline,
+            # The reconciled figure, not the raw prediction: whichever of the two readings is later.
+            # Read at call time, so a second pass sees what the fallback reply taught us.
+            original_predicted_arrival=original.arrival_time,
+            now=now,
+            window_end=window_end,
+            affected_refs=affected_refs,
+            outcome=outcome,
+        )
 
     # `answered` distinguishes "JP replied, and had nothing" from "no reply was obtained" — an
-    # outage, the post-failure cooldown, a spent fetch budget. Only the first is a reason to ask the
-    # second question: firing the fallback on a non-answer bought a SECOND blocking 3 s call on the
-    # ingestion thread, so a degraded Journey Planner cost twice what a healthy one does, exactly
-    # when it could least afford it. Defaults to True when the key is absent, which is what a stub
-    # that ignores the out-dict leaves behind.
+    # outage, the post-failure cooldown, a spent fetch budget, or a served-stale value. Only the
+    # first is a reason to ask the second question: firing the fallback on a non-answer bought a
+    # SECOND blocking 3 s call on the ingestion thread, so a degraded Journey Planner cost twice
+    # what a healthy one does, exactly when it could least afford it. Defaults to True when the key
+    # is absent, which is what a stub that ignores the out-dict leaves behind.
     first_query: dict[str, Any] = {}
     by_deadline = alternatives.fetch_candidates(
         from_stop, to_stop, arrive_by=True, date_time=deadline, now=now, path=path,
         outcome=first_query,
     )
     _reconcile_original_arrival(original, by_deadline, subject=subject)
-    pool = scored_pool(by_deadline)
-    if not pool and first_query.get("answered", True):
-        pool = scored_pool(
-            alternatives.fetch_candidates(
-                from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path
-            )
-        )
 
-    # The verdict comes back from the selection itself, never derived here from `pool`: that list is
-    # `_usable`'s cut, which applies no window bound and never contains the original at all, so
-    # "the original won" could be published for a comparison `select_best` never made.
+    # The verdict comes back from the selection itself, never derived here from the pool: this
+    # function's list never contains the original at all, so "the original won" could be published
+    # for a comparison `select_best` never made.
     selection: dict[str, Any] = {}
-    best = alternatives.select_best(
-        pool,
-        original=original,
-        original_arrival_time=deadline,
-        # The reconciled figure, not the raw prediction: whichever of the two readings is later.
-        original_predicted_arrival=original.arrival_time,
-        now=now,
-        window_end=window_end,
-        affected_refs=affected_refs,
-        outcome=selection,
-    )
+    best = select(scored_pool(by_deadline), selection)
+
+    # **The fallback is decided on what selection could USE, not on what the query returned**
+    # (2026-08-06). Asking "did the reply contain anything" was the wrong question: a reply full of
+    # departures beyond the traveller's own window is a full answer to that question and an empty
+    # one to the real question, and the traveller — often somebody whose train is cancelled — was
+    # told there was no alternative while a catchable later journey existed. `original_is_best` is
+    # the one result that must NOT trigger it: a genuine stay-put verdict means something WAS in
+    # time (the original itself), so the fallback tier has nothing to add.
+    if best is None and not selection.get("original_is_best") and first_query.get("answered", True):
+        fallback = alternatives.fetch_candidates(
+            from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path
+        )
+        # Reconciled against this reply too. The fallback runs precisely when nothing arrives in
+        # time, which is when the disrupted train is worst off — so leaving its arrival at our
+        # optimistic p50 here would rank it ahead of the rivals it is being compared against, in
+        # the one branch where being wrong strands somebody.
+        _reconcile_original_arrival(original, fallback, subject=subject)
+        selection = {}
+        best = select(scored_pool(fallback), selection)
+
     return best, bool(selection.get("original_is_best")), subject
 
 
