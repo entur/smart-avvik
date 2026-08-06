@@ -11,13 +11,14 @@ thresholds, and the notification wording.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
 from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import alternatives
 import impact
 import main
 import varsel
@@ -151,12 +152,12 @@ def test_the_real_provider_signature_matches():
         alerts = varsel.match_journey(_journey(), NOW)
         assert alerts, "the real provider must answer the matcher"
         # And the poller's path, which additionally asks for an alternative.
-        original = impact.alternatives.find_faster
-        impact.alternatives.find_faster = lambda *a, **k: None  # no network
+        original = impact.alternatives.fetch_candidates
+        impact.alternatives.fetch_candidates = lambda *a, **k: []  # no network
         try:
             assert varsel.match_journey(_journey(), NOW, with_alternative=True)
         finally:
-            impact.alternatives.find_faster = original
+            impact.alternatives.fetch_candidates = original
     finally:
         install({})  # restore the double for the remaining tests
 
@@ -265,6 +266,52 @@ def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
     assert [flag for _, flag in asked] == [True, False] * windows, (
         "the lookup runs once per window, on the canonical ref only"
     )
+
+
+def test_a_stay_put_verdict_reaches_only_the_train_it_is_about():
+    """`None` from the lookup used to mean "nothing was faster" — a fact about the TRIP, safe to
+    back-fill onto every alert. It now also means "the traveller's own train is still the best
+    option", which is a claim about ONE train.
+
+    The lookup runs once per window, on the canonical ref pair, about that pair's worst train. Every
+    other alert on the trip may be about a different and far worse train: a milder situation the
+    same pass returned, or — the case the ref merge exists for — a cancelled departure that only the
+    collapsed ref records. Shared unqualified, a two-minute delay's "bli sittende" gets published
+    above a train that is not running.
+    """
+    live = datetime.now(UTC)
+    snapshot = {
+        # Canonical ref (A), and the worst departure on it: the verdict is about this train.
+        "S1": _train(MON_0800, jkey="subject", p_impact_dep=0.90),
+        # Canonical ref too, milder — same pass, same response object, different train.
+        "S2": _train(MON_0800, jkey="bystander", situation="S2", p_impact_dep=0.70),
+        # Only the collapsed ref records this one, so it is asked about in its own pass, without
+        # the lookup. It is also the worst of the three.
+        "S3": _twin(MON_0800, "A2", situation_number="S3", p_impact_dep=0.95),
+    }
+    candidate = alternatives.AlternativeCandidate(
+        departure_time=live + timedelta(minutes=15),
+        arrival_time=live + timedelta(minutes=55),
+        transit_refs=[("VYG", "DatedServiceJourney:other")],
+        lines=["VYG:Line:R11"],
+        board_stop_place="A",
+        alight_stop_place="B",
+    )
+    install(snapshot)
+    varsel.set_stop_aliases({"A2": "A"})
+    fetch, select = alternatives.fetch_candidates, alternatives.select_best
+    # A real pool, and a selection that answers "stay put" over it — which is what makes the verdict
+    # a verdict rather than the silence of an empty Journey Planner reply.
+    alternatives.fetch_candidates = lambda *a, **k: [candidate]
+    alternatives.select_best = lambda *a, **k: None
+    try:
+        alerts = varsel.match_journey(_journey(), NOW, with_alternative=True)
+    finally:
+        alternatives.fetch_candidates, alternatives.select_best = fetch, select
+        varsel.set_stop_aliases({})
+
+    verdicts = {a.jkey: a.impact.original_is_best for a in alerts}
+    assert verdicts == {"subject": True, "bystander": False, "t-twin": False}, verdicts
 
 
 def test_basic_match():

@@ -828,9 +828,28 @@ def match_journey(
 
     # The alternative is a property of the trip, not of the situation that won: an alert whose worst
     # reading came from a non-canonical ref (asked without the lookup) still gets the advice.
+    #
+    # The "stay put" VERDICT is not, and must not ride along with it. The lookup runs once per
+    # window, on the canonical ref pair, and its verdict is a claim about that pair's worst train.
+    # It used to be safe to share, because a null alternative only ever meant "nothing was faster" —
+    # a fact about the trip. It now also means "the traveller's own train is still the best option",
+    # which is a fact about ONE train, and the train a collapsed-ref alert is about may be a
+    # different and far worse one (that is the whole reason the collapsed ref is asked separately).
+    # Shared unqualified, a two-minute delay's "bli sittende" would be published above a cancelled
+    # departure. So the verdict is cleared wherever it is not about this alert's own train, leaving
+    # the honest "we did not establish that" behind — see impact.ImpactResponse.alternative_subject.
     for alert in worst_by_situation.values():
         if alert.alternative_journey is None:
             alert.alternative_journey = alternative
+        verdict = alert.impact
+        if (
+            verdict is not None
+            and verdict.original_is_best
+            and (alert.operator, alert.jkey) != verdict.alternative_subject
+        ):
+            # A copy, not an in-place clear: one response object is shared by every alert it
+            # produced, and clearing it would take the verdict away from the alert it IS about.
+            alert.impact = verdict.model_copy(update={"original_is_best": False})
 
     alerts = sorted(worst_by_situation.values(), key=_alert_rank, reverse=True)
     return alerts

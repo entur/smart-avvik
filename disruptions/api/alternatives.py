@@ -44,7 +44,9 @@ Design notes
 
 import json
 import logging
+import os
 import re
+import sys
 import threading
 import urllib.request
 from collections.abc import Callable, Iterable
@@ -86,9 +88,6 @@ _MIN_MATERIAL_MINUTES = 3
 # import AlternativeJourney`), so importing back is a cycle. `select_best` takes it as a parameter so
 # a caller that can see both may pass the real constant and keep the two from drifting.
 _CATCH_UP_GRACE = timedelta(minutes=90)
-# Legacy: the filter `select_best` replaced, still read by `_legacy_to_alternative` on `find_faster`'s
-# path. Deleted together with `find_faster` when its callers are re-pointed at `select_best`.
-_LEGACY_MIN_MINUTES_SAVED = 3
 # How far ahead of `now` a requested travel time may sit before the lookup is skipped entirely.
 # Stated in hours rather than as a ratio of anything: a registration for tomorrow morning refreshes
 # on every poller cycle from the moment it is created, and the Journey Planner query it would issue
@@ -104,6 +103,18 @@ _STOP_REF = re.compile(r"^[A-Za-z]{2,10}:(StopPlace|Quay):[A-Za-z0-9_-]{1,40}$")
 def _is_stop_ref(value: str) -> bool:
     """True when `value` is shaped like an NSR stop reference."""
     return bool(_STOP_REF.match(value or ""))
+
+
+def within_lookahead(date_time: datetime, now: datetime) -> bool:
+    """Whether a travel time is near enough that asking the Journey Planner about it buys anything.
+
+    Public because the caller has to make the same cut *before* it decides to ask a second time.
+    :func:`fetch_candidates` refuses a too-distant `date_time` by returning `[]`, which is
+    indistinguishable from "JP had nothing" — so a caller whose fallback query is anchored at `now`
+    would sail past the horizon guard and issue exactly the expensive call the horizon exists to
+    prevent, for a trip nobody can act on for hours. See :data:`_MAX_LOOKAHEAD_HOURS`.
+    """
+    return date_time - now <= timedelta(hours=_MAX_LOOKAHEAD_HOURS)
 # How many patterns to ask JP for. A post-filter, NOT a reach control -- see the measurement table
 # below. JP's own default is 12; asking for 10 leaves room to drop patterns (wrong line, rides the
 # disruption, cancelled) and still have something to offer.
@@ -222,44 +233,6 @@ class AlternativeLeg(BaseModel):
     end_time: datetime | None = Field(default=None, description="Expected end of the leg.")
 
 
-class AlternativeJourney(BaseModel):
-    """The journey :func:`select_best` chose over the disrupted train.
-
-    Sourced from the Journey Planner, so its times reflect the *published* real-time picture.
-
-    It is **not** necessarily faster than the train it replaces: when nothing arrives before the
-    disrupted train's aimed arrival, the fallback tier offers the earliest arrival there is, and a
-    replacement for a cancelled train legitimately gets the traveller there later than the timetable
-    promised. `minutes_saved` is signed for exactly that reason, and `arrives_before_original` says
-    which side of zero it fell on without a reader having to know the sign convention.
-    """
-
-    departure_time: datetime | None = Field(description="Expected departure from `from_stop`.")
-    arrival_time: datetime | None = Field(description="Expected arrival at `to_stop`.")
-    duration_min: int | None = Field(default=None, description="Total journey time in minutes.")
-    minutes_saved: int = Field(
-        description="SIGNED minutes earlier this arrives than the disrupted train's predicted "
-        "arrival. Zero or negative is a legitimate answer in the fallback tier — a replacement for "
-        "a cancelled train is still worth offering when it arrives later than the train would have.",
-    )
-    arrives_before_original: bool = Field(
-        default=False,
-        description="This arrives strictly before the disrupted train's predicted arrival. False "
-        "means the traveller gets there later than the disrupted train was expected to — which "
-        "only happens when that train is cancelled or in enough trouble to be worth escaping.",
-    )
-    at_risk: bool = Field(
-        default=False,
-        description="This journey is itself predicted to be in trouble (over its operator's alert "
-        "gate, or running on a line a live situation touches). It is offered anyway because "
-        "nothing safer reached the destination in time — a wording that presents it as a clean "
-        "escape would be wrong.",
-    )
-    legs: list[AlternativeLeg] = Field(
-        default_factory=list, description="The legs to travel, in order."
-    )
-
-
 class AlternativePrediction(BaseModel):
     """What we know and what we forecast about the alternative's own boarding call.
 
@@ -281,7 +254,9 @@ class AlternativePrediction(BaseModel):
     AlternativeJourney``), and ``AlternativeJourney`` carries a ``departure_prediction`` of this
     type. Defining it in ``impact`` would need the reverse import. ``from __future__ import
     annotations`` does not rescue that — pydantic resolves field annotations when the class is
-    built, so the cycle is an ImportError at startup, not a deferred one.
+    built, so the cycle is an ImportError at startup, not a deferred one. It is declared ABOVE
+    :class:`AlternativeJourney` for the same reason, one file down: that class annotates two fields
+    with this type, and pydantic needs the name bound by the time the class body is evaluated.
     """
 
     stop_place: str | None = Field(
@@ -318,6 +293,60 @@ class AlternativePrediction(BaseModel):
         description="True when the prediction cache had this call, so the probabilities above are "
         "model output. False means they are null because nothing scored it — the flag exists so a "
         "reader never has to infer 'not scored' from 'no number'.",
+    )
+
+
+class AlternativeJourney(BaseModel):
+    """The journey :func:`select_best` chose over the disrupted train.
+
+    Sourced from the Journey Planner, so its times reflect the *published* real-time picture.
+
+    It is **not** necessarily faster than the train it replaces: when nothing arrives before the
+    disrupted train's aimed arrival, the fallback tier offers the earliest arrival there is, and a
+    replacement for a cancelled train legitimately gets the traveller there later than the timetable
+    promised. `minutes_saved` is signed for exactly that reason, and `arrives_before_original` says
+    which side of zero it fell on without a reader having to know the sign convention.
+    """
+
+    departure_time: datetime | None = Field(description="Expected departure from `from_stop`.")
+    arrival_time: datetime | None = Field(description="Expected arrival at `to_stop`.")
+    duration_min: int | None = Field(default=None, description="Total journey time in minutes.")
+    minutes_saved: int = Field(
+        description="SIGNED, and INFORMATIONAL — never a filter. Minutes earlier this arrives than "
+        "the disrupted train's predicted arrival; zero or negative is a legitimate answer in the "
+        "fallback tier, where a replacement for a cancelled train is worth offering even though it "
+        "gets the traveller there later than the timetable promised. Nothing is dropped for being "
+        "'not fast enough' (the rule that did, and measurably almost never fired, is gone); the one "
+        "gate this figure feeds is the materiality check on a train that is in no real trouble.",
+    )
+    arrives_before_original: bool = Field(
+        default=False,
+        description="This arrives strictly before the disrupted train's predicted arrival. False "
+        "means the traveller gets there later than the disrupted train was expected to — which "
+        "only happens when that train is cancelled or in enough trouble to be worth escaping.",
+    )
+    at_risk: bool = Field(
+        default=False,
+        description="This journey is itself predicted to be in trouble (over its operator's alert "
+        "gate, or running on a line a live situation touches). It is offered anyway because "
+        "nothing safer reached the destination in time — a wording that presents it as a clean "
+        "escape would be wrong.",
+    )
+    legs: list[AlternativeLeg] = Field(
+        default_factory=list, description="The legs to travel, in order."
+    )
+    departure_prediction: AlternativePrediction | None = Field(
+        default=None,
+        description="What JP observed and what our models forecast about boarding THIS journey — "
+        "the same two-questions-side-by-side shape /impact publishes for the disrupted train. Null "
+        "when the winner carried no scored boarding call (nothing resolved a stop to attach it to).",
+    )
+    arrival_prediction: AlternativePrediction | None = Field(
+        default=None,
+        description="The same for the alighting call. Null far more often than its departure "
+        "sibling: a multi-leg suggestion's last leg is frequently absent from the prediction cache, "
+        "and this is never borrowed from the departure — 'when do I get there' answered with the "
+        "departure's delay would be a fabricated figure.",
     )
 
 
@@ -389,6 +418,18 @@ class AlternativeCandidate(BaseModel):
     risky: bool = Field(
         default=False,
         description="Caller-set: this candidate is itself predicted to be in trouble.",
+    )
+    departure_prediction: AlternativePrediction | None = Field(
+        default=None,
+        description="Caller-set by `impact.score_candidates`: what JP observed and what our models "
+        "forecast about this candidate's boarding call. It rides on the candidate, and not only on "
+        "the `CandidateScore` the scorer returns, because :func:`select_best` answers with an "
+        "`AlternativeJourney` rather than with the candidate that won — so the only join a caller "
+        "could use to attach the winner's own numbers afterwards is identity, which the journey "
+        "does not carry. Annotating in place is the same convention `risky` and `cancelled` use.",
+    )
+    arrival_prediction: AlternativePrediction | None = Field(
+        default=None, description="Caller-set: the same for this candidate's alighting call."
     )
 
 
@@ -466,13 +507,53 @@ _cache = _KeyedTTLCache(_TTL, _FAILURE_COOLDOWN)
 
 
 # ---- HTTP ------------------------------------------------------------------------------------
+# Egress guard. A test process must never reach api.entur.io, and the failure mode when it does is
+# invisible: this whole module fails OPEN, so a live request from CI eats the 3 s timeout, logs a
+# warning nobody reads, and the assertion under it still passes. That is not hypothetical — the
+# /varsel-api suite carries a module-level stub of the lookup precisely because one unstubbed test
+# would have done it, and the stub had to name the function, so re-pointing the call chain silently
+# disarmed it. This guard does not depend on anyone remembering to stub anything.
+#
+# Opt-in, because "allowed" is the state that has to be asserted rather than assumed:
+#   * KIX_ALLOW_JP_NETWORK truthy  -> always allowed (a deliberate live check against the real JP)
+#   * KIX_ALLOW_JP_NETWORK falsy   -> always blocked
+#   * unset -> allowed only outside a test process.
+# The last line is what keeps the deployment safe: requiring the flag in prd would mean a forgotten
+# Helm value silently costs every alternative, fail-open, forever — trading a loud test failure for
+# a silent production one, which is the wrong direction. Detection covers both ways the suites run:
+# `pytest` (CI runs each suite standalone, but a developer does not) and `python test_x.py`.
+_ALLOW_NETWORK_ENV = "KIX_ALLOW_JP_NETWORK"
+
+
+def _in_a_test_process() -> bool:
+    if "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ:
+        return True
+    argv0 = os.path.basename(sys.argv[0] if sys.argv else "")
+    return argv0.startswith("test_") and argv0.endswith(".py")
+
+
+def _network_allowed() -> bool:
+    """Whether this process may dial the Journey Planner at all. See the note above."""
+    flag = os.environ.get(_ALLOW_NETWORK_ENV)
+    if flag is not None:
+        return flag.strip().lower() in ("1", "true", "yes", "on")
+    return not _in_a_test_process()
+
+
 def _post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
     """POST JSON and parse the reply, treating a GraphQL error envelope as a failure.
 
     JP answers HTTP 200 with an ``errors`` array on a bad query, so raising here routes those
     responses through the cache's failure path instead of parsing them into "no alternative" and
     caching that as a fresh success. Same guard as ``reisevalg._post_json``.
+
+    Raises before opening a socket when :func:`_network_allowed` says no — see the note above it.
     """
+    if not _network_allowed():
+        raise RuntimeError(
+            "Refusing a live Journey Planner request from a test process: stub "
+            f"alternatives.fetch_candidates (or set {_ALLOW_NETWORK_ENV}=1 to allow it)"
+        )
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -509,18 +590,14 @@ def _fetch_trip_patterns(
     return trip.get("tripPatterns") or []
 
 
-def _fetch_patterns(from_stop: str, to_stop: str, depart_after: datetime) -> list[dict]:
-    return _fetch_trip_patterns(from_stop, to_stop, depart_after, arrive_by=False)
-
-
 # ---- Parsing / selection ---------------------------------------------------------------------
 def _parse_ts(value: str | None) -> datetime | None:
     """Parse a JP timestamp, rejecting anything we cannot safely compare.
 
     A *naive* timestamp is treated as malformed rather than coerced: JP always returns an offset, and
-    silently assuming one would make the comparison against `reference_arrival` (which is UTC-aware)
-    either raise or be wrong by up to two hours. Verified 2026-07-29 that a naive value used to raise
-    TypeError all the way out of find_faster."""
+    silently assuming one would make the comparison against the disrupted train's arrival (which is
+    UTC-aware) either raise or be wrong by up to two hours. Verified 2026-07-29 that a naive value
+    used to raise TypeError all the way out of the lookup."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -559,151 +636,6 @@ def split_codespace(ref: str | None) -> tuple[str | None, str] | None:
     if sep and ":" in rest:
         return (head, rest)
     return (None, ref)
-
-
-# ---- Legacy selection (dies with `find_faster`) -----------------------------------------------
-# Everything down to `find_faster` is the rule `select_best` replaces: the earliest-arriving pattern
-# that beat the disrupted train's predicted arrival by at least three minutes. It is kept, private
-# and renamed, only because `impact.for_trip` still calls `find_faster`; deleting it in the same
-# change would silently stop every alternative being offered until those callers are re-pointed.
-# When `find_faster` goes, these three go with it.
-def _legacy_rides_the_disruption(
-    pattern: dict, excluded_jkeys: set[str], excluded_lines: set[str]
-) -> bool:
-    legs = pattern.get("legs")
-    for leg in legs if isinstance(legs, list) else ():
-        if not isinstance(leg, dict):
-            continue
-        line_id = (leg.get("line") or {}).get("id")
-        if line_id and line_id in excluded_lines:
-            return True
-        for key in ("datedServiceJourney", "serviceJourney"):
-            ref = _strip_codespace((leg.get(key) or {}).get("id"))
-            if ref and ref in excluded_jkeys:
-                return True
-    return False
-
-
-def _legacy_to_alternative(pattern: dict, reference_arrival: datetime) -> AlternativeJourney | None:
-    arrival = _parse_ts(pattern.get("expectedEndTime"))
-    if arrival is None:
-        return None
-    saved = round((reference_arrival - arrival).total_seconds() / 60)
-    if saved < _LEGACY_MIN_MINUTES_SAVED:
-        return None
-    duration = pattern.get("duration")
-    if not isinstance(duration, int | float):
-        duration = None  # JP sends seconds; anything else is malformed, not a reason to crash
-    legs = pattern.get("legs")
-    if not isinstance(legs, list):
-        legs = []
-    return AlternativeJourney(
-        departure_time=_parse_ts(pattern.get("expectedStartTime")),
-        arrival_time=arrival,
-        duration_min=round(duration / 60) if duration else None,
-        minutes_saved=saved,
-        arrives_before_original=True,  # the legacy filter admitted nothing else
-        legs=[
-            AlternativeLeg(
-                mode=leg.get("mode"),
-                line=(leg.get("line") or {}).get("id"),
-                public_code=(leg.get("line") or {}).get("publicCode"),
-                from_name=(leg.get("fromPlace") or {}).get("name"),
-                to_name=(leg.get("toPlace") or {}).get("name"),
-                start_time=_parse_ts(leg.get("expectedStartTime")),
-                end_time=_parse_ts(leg.get("expectedEndTime")),
-            )
-            for leg in legs
-            if isinstance(leg, dict)
-        ],
-    )
-
-
-def _legacy_select_faster(
-    patterns: Iterable[dict],
-    *,
-    reference_arrival: datetime,
-    excluded_jkeys: set[str],
-    excluded_lines: set[str],
-) -> AlternativeJourney | None:
-    """The earliest-arriving pattern that beats `reference_arrival` and avoids the disruption.
-
-    Superseded by :func:`select_best`; still reached from :func:`find_faster`, and deleted with it.
-    """
-    best: AlternativeJourney | None = None
-    for pattern in patterns:
-        if not isinstance(pattern, dict):
-            continue
-        if _legacy_rides_the_disruption(pattern, excluded_jkeys, excluded_lines):
-            continue
-        candidate = _legacy_to_alternative(pattern, reference_arrival)
-        if candidate is None:
-            continue
-        if best is None or (
-            candidate.arrival_time is not None
-            and best.arrival_time is not None
-            and candidate.arrival_time < best.arrival_time
-        ):
-            best = candidate
-    return best
-
-
-def find_faster(
-    from_stop: str,
-    to_stop: str,
-    *,
-    reference_arrival: datetime,
-    depart_after: datetime,
-    excluded_jkeys: set[str],
-    excluded_lines: set[str],
-    now: datetime | None = None,
-) -> AlternativeJourney | None:
-    """A faster way from `from_stop` to `to_stop`, or None.
-
-    `reference_arrival` is the bar to beat — the disrupted train's predicted arrival at `to_stop`.
-    `depart_after` is when the traveller can realistically leave. Returns None on any failure, on
-    an empty result, and when nothing saves at least `_LEGACY_MIN_MINUTES_SAVED` minutes.
-
-    Superseded by `fetch_candidates` + `select_best`; still the live path until its callers are
-    re-pointed, at which point this and the three `_legacy_*` helpers are deleted together.
-    """
-    if not (_is_stop_ref(from_stop) and _is_stop_ref(to_stop)):
-        # Both refs are spliced into the GraphQL document as string literals, and both originate in
-        # unauthenticated input (/impact's query params, JourneyIn's fields) validated only as short
-        # strings. Nothing reaches here today with a quote in it -- find_faster is only called once
-        # the refs have matched real stop_places in the prediction cache -- but that containment is
-        # an accident of an unrelated code path, and the sibling reisevalg module was already bitten
-        # once by hand-built GraphQL (PR #22). Refuse the shape here, where the assumption lives.
-        logger.warning(
-            "Refusing a Journey Planner lookup for a non-NSR stop ref",
-            extra={"fields": {"event": "alternatives_error", "reason": "bad_stop_ref"}},
-        )
-        return None
-    now = now or datetime.now(depart_after.tzinfo)
-    bucket = int(depart_after.timestamp() // _DEPART_BUCKET.total_seconds())
-    key = (from_stop, to_stop, bucket)
-    patterns = _cache.get(key, lambda: _fetch_patterns(from_stop, to_stop, depart_after), now)
-    if not patterns:
-        return None
-    # "Fail open, ALWAYS" has to cover parsing, not just fetching. Until 2026-07-29 only the fetch
-    # was guarded, so one malformed pattern raised out of here, through main._impact_for_trip, into
-    # varsel.check_and_notify -- where the per-journey guard turned it into every alert for that
-    # journey being silently dropped for the cycle. A bad alternative must cost the alternative only.
-    try:
-        return _legacy_select_faster(
-            patterns,
-            reference_arrival=reference_arrival,
-            excluded_jkeys=excluded_jkeys,
-            excluded_lines=excluded_lines,
-        )
-    except Exception:
-        logger.warning(
-            "Could not interpret the Journey Planner reply for %s; offering no alternative",
-            key,
-            exc_info=True,
-            extra={"fields": {"event": "alternatives_error"}},
-        )
-        return None
 
 
 # ---- Candidates ------------------------------------------------------------------------------
@@ -881,7 +813,7 @@ def fetch_candidates(
             extra={"fields": {"event": "alternatives_error", "reason": "bad_stop_ref"}},
         )
         return []
-    if date_time - now > timedelta(hours=_MAX_LOOKAHEAD_HOURS):
+    if not within_lookahead(date_time, now):
         # A registration for tomorrow morning is re-examined on every poller cycle from the moment
         # it is created, and this is the most expensive call on that path. A lookup that far ahead
         # cannot contain a train in tomorrow's window, so it buys nothing at any price.
@@ -1048,4 +980,9 @@ def select_best(
         arrives_before_original=winner.arrival_time < original_predicted_arrival,
         at_risk=winner.risky,
         legs=list(winner.legs),
+        # Carried off the winning candidate, where `impact.score_candidates` annotated them. This
+        # function answers with a journey rather than with the candidate that won, so a caller
+        # cannot attach the winner's own numbers afterwards — there is no join back.
+        departure_prediction=winner.departure_prediction,
+        arrival_prediction=winner.arrival_prediction,
     )
