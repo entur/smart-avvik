@@ -518,8 +518,17 @@ def _alternative_identity(alt: AlternativeJourney) -> tuple:
     the live prediction cache on every cycle, so comparing those would invalidate the written message
     on nearly every tick — turning ``ok_cached`` into a per-cycle LLM call, which is exactly what
     :data:`_MAX_LLM_CALLS_PER_CYCLE` and :data:`_MAX_LLM_SECONDS_PER_CYCLE` exist to prevent.
+
+    Compared AT THE MINUTE, for the same reason (2026-08-06). Both times are Journey Planner
+    *expected* times carried at second precision, while every wording renders ``%H:%M``: a realtime
+    nudge from 08:24:12 to 08:24:41 changed the identity, dropped the message and spent an LLM call
+    to produce byte-identical prose — roughly every other cycle per alerting journey, out of the
+    budget of 8. The resolution of the comparison has to be the resolution of the advice.
     """
-    return (alt.departure_time, alt.arrival_time)
+    def minute(ts: datetime | None) -> datetime | None:
+        return ts.replace(second=0, microsecond=0) if ts is not None else None
+
+    return (minute(alt.departure_time), minute(alt.arrival_time))
 
 
 # ---- State: devices, journeys, notified ------------------------------------------------------
@@ -1646,7 +1655,25 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         # stale precisely when nothing is alert-worthy any more, which is the case that returns.
         # This is also what records a freshly found alternative, whether or not a message follows
         # it (cap reached, LLM disabled, push off) -- the in-app list wants it either way.
-        _reconcile_caches(key, alerts, cycle_now)
+        #
+        # Guarded like the match above it, and for a strictly bigger blast radius than the
+        # 2026-07-29 incident that guard exists for: called bare, a raise here unwinds out of
+        # check_and_notify entirely, so the remaining journeys are never scored, loop 2 never runs
+        # (no pushes at all this cycle) and _record_decisions never runs (no rows either). What it
+        # touches is duck-typed -- an impact response from an injected provider, a cached
+        # AlternativeJourney, an aware/naive datetime comparison -- so "it cannot raise" is an
+        # assumption about somebody else's object. Keeping one cycle's stale cache is the smaller
+        # failure by a wide margin.
+        try:
+            _reconcile_caches(key, alerts, cycle_now)
+        except Exception:
+            logger.warning(
+                "Cache reconciliation failed for journey %s; keeping this cycle's cached "
+                "alternatives and messages",
+                key,
+                exc_info=True,
+                extra={"fields": {"event": "varsel_reconcile_error"}},
+            )
         worst = next((a for a in alerts if a.alertworthy), None)
         if worst is None or not push_on:
             # No message writing without push: the text exists to be delivered, and the decision is

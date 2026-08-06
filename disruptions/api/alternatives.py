@@ -29,7 +29,9 @@ Design notes
   when any of its ``transit_refs`` is one of the affected ``(operator, jkey)`` pairs — JP's reply
   contains the disrupted train's own pattern, and it would win outright. The synthesized
   ``original`` rides an affected journey *by construction*, so it is exempt; dropping it would make
-  the "stay put" answer unreachable. Riding an affected *line* is no longer a hard exclusion: it
+  the "stay put" answer unreachable. That exemption covers **every** rival-cut — the departure
+  window and the risk partition too, both of which excluded the baseline in practice; see
+  :func:`select_best`. Riding an affected *line* is no longer a hard exclusion: it
   feeds ``AlternativeCandidate.risky``, which the selector treats as a preference (a safe journey
   arriving two hours late must not beat a slightly risky one that gets the traveller there on time).
 * **Fail open, always.** Every failure path — timeout, GraphQL ``errors``, an empty
@@ -68,6 +70,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import urllib.request
@@ -151,12 +154,23 @@ _CATCH_UP_GRACE = timedelta(minutes=90)
 _MAX_LOOKAHEAD_HOURS = 6
 # An NSR stop reference, e.g. NSR:StopPlace:337 or NSR:Quay:11274. Deliberately excludes the quote
 # and brace characters that would let a value escape the GraphQL string literal it is spliced into.
+# Matched with `fullmatch` — see `_is_stop_ref` for why `$` alone is not enough.
 _STOP_REF = re.compile(r"^[A-Za-z]{2,10}:(StopPlace|Quay):[A-Za-z0-9_-]{1,40}$")
+# Salt for `pair_digest`, minted per process. See that function: without it the digest is a
+# reversible pseudonym over a small public keyspace, and the logs it labels are per-cycle.
+_PAIR_SALT = secrets.token_hex(16)
 
 
 def _is_stop_ref(value: str) -> bool:
-    """True when `value` is shaped like an NSR stop reference."""
-    return bool(_STOP_REF.match(value or ""))
+    """True when `value` is shaped like an NSR stop reference.
+
+    `fullmatch`, not `match`: Python's `$` also matches immediately BEFORE a single trailing
+    newline, so `"NSR:StopPlace:337\\n"` satisfied the anchored pattern above. Nothing exploitable
+    followed today — the ref matches no cached call, and a raw newline inside a GraphQL string
+    literal fails closed at the endpoint — but this guard exists precisely so the next reader does
+    not have to re-derive that, and `fullmatch` closes it for free.
+    """
+    return bool(_STOP_REF.fullmatch(value or ""))
 
 
 def within_lookahead(date_time: datetime, now: datetime) -> bool:
@@ -393,8 +407,13 @@ class AlternativeJourney(BaseModel):
     It is **not** necessarily faster than the train it replaces: when nothing arrives before the
     disrupted train's aimed arrival, the fallback tier offers the earliest arrival there is, and a
     replacement for a cancelled train legitimately gets the traveller there later than the timetable
-    promised. `minutes_saved` is signed for exactly that reason, and `arrives_before_original` says
-    which side of zero it fell on without a reader having to know the sign convention.
+    promised. `minutes_saved` is signed for exactly that reason, and `arrives_before_original`
+    answers the traveller's other question — do I still get there when I planned to?
+
+    The two are measured against DIFFERENT anchors and that is deliberate: `minutes_saved` against
+    the disrupted train's predicted arrival ("is this better than what I have?"),
+    `arrives_before_original` against its aimed one ("do I still make my appointment?"). Collapsing
+    them onto one anchor silences the caveat in the case that needs it most.
     """
 
     departure_time: datetime | None = Field(description="Expected departure from `from_stop`.")
@@ -410,9 +429,12 @@ class AlternativeJourney(BaseModel):
     )
     arrives_before_original: bool = Field(
         default=False,
-        description="This arrives strictly before the disrupted train's predicted arrival. False "
-        "means the traveller gets there later than the disrupted train was expected to — which "
-        "only happens when that train is cancelled or in enough trouble to be worth escaping.",
+        description="This arrives strictly before the traveller's PLANNED arrival — the disrupted "
+        "train's aimed time, i.e. the appointment they registered around. False means they get "
+        "there later than the timetable promised, which is a legitimate answer for a cancelled or "
+        "badly delayed train and is what every wording built on this flag says out loud. NOT "
+        "measured against the disrupted train's predicted arrival: that is `minutes_saved`'s "
+        "anchor, and reading this one off it made a 25-minutes-late arrival report as in time.",
     )
     at_risk: bool = Field(
         default=False,
@@ -675,18 +697,29 @@ def _reserve_fetch(path: str, now: datetime) -> bool:
         return True
 
 
-def _pair_digest(from_stop: str, to_stop: str) -> str:
-    """A short stable label for a stop pair, for logs that must not carry the pair itself.
+def pair_digest(from_stop: str, to_stop: str) -> str:
+    """A short label for a stop pair, for logs that must not carry the pair itself.
 
     On the poller path these two refs ARE a registered traveller's own journey, and a per-cycle
     success log of origin + destination beside a departure time is precisely the trio
-    `/historikk-api` refuses to serve and `llm_message` keeps out of Cloud Logging by default. Same
-    helper as the LLM audit log's and the decision log's `journey_digest`
-    (:func:`llm_message.key_digest`) — one implementation, so records about one journey stay
-    joinable across all three rather than agreeing by comment. The import is safe: `llm_message`
-    imports nothing from this package, while `impact` and `varsel` both import THIS module.
+    `/historikk-api` refuses to serve and `llm_message` keeps out of Cloud Logging by default.
+
+    **Salted per process, and that is not optional here** (2026-08-06). An unsalted SHA-256 over two
+    NSR refs is a reversible pseudonym, not an anonymisation: stop refs are public and enumerable
+    (~60k StopPlaces, from a register this app reads on every refresh), so a rainbow table over
+    plausible pairs is a few seconds' work — and `event="alternatives_fetch"` now fires on every
+    lookup including cache hits, once or twice per registered journey per ~4.8 min cycle. Anyone
+    with Cloud Logging read access could otherwise recover each traveller's origin and destination,
+    and their travel window from the timestamps. A process-lifetime random preserves everything the
+    observability actually needs — correlating records about one pair within one pod's life — and
+    nothing else.
+
+    Deliberately NOT joinable with the decision log's `journey_digest`, and it never was: every
+    other :func:`llm_message.key_digest` call site hashes the full `varsel.journey_key`
+    (`from|to|begin|end|days`), a different preimage entirely. The shared helper is an
+    implementation detail, not a join key. Nothing reads this value except a human reading logs.
     """
-    return key_digest(f"{from_stop}|{to_stop}")
+    return key_digest(f"{_PAIR_SALT}|{from_stop}|{to_stop}")
 
 
 # Response size is measured where the socket is read (`_post_json`) and reported where the fetch is
@@ -1004,7 +1037,7 @@ def _log_lookup(
     the error volume" could not have detected a fetch rate this unit exists to change. Cache hits
     are logged too, or the hit rate the cache key was rewritten for would be unmeasurable.
 
-    Carries `pair_digest`, never either stop ref — see :func:`_pair_digest`.
+    Carries the digest, never either stop ref — see :func:`pair_digest`.
     """
     logger.info(
         "Journey Planner alternative lookup (%s)",
@@ -1033,6 +1066,7 @@ def fetch_candidates(
     date_time: datetime,
     now: datetime,
     path: FetchPath = _REQUEST_PATH,
+    outcome: dict[str, Any] | None = None,
 ) -> list[AlternativeCandidate]:
     """Journey Planner candidates from `from_stop` to `to_stop`, in JP's reply order.
 
@@ -1047,6 +1081,16 @@ def fetch_candidates(
     defaults to `"request"`, the conservative reading — an unwired caller is then throttled by the
     public budget rather than silently spending the poller's. See :data:`_FETCH_MAX_PER_MIN`.
 
+    `outcome`, when passed, is filled with `{"answered": bool}`: **was a reply obtained at all**, as
+    distinct from "the reply was empty". Fail-open collapses timeout, GraphQL `errors`, cooldown,
+    single-flight, throttle and refused ref into the same `[]` an answered-but-empty search
+    produces, and a caller that reads that as "nothing available" pays for a SECOND blocking 3 s
+    query on the ingestion thread — so a Journey Planner outage cost two calls per lookup instead of
+    one (fixed 2026-08-06). The distinction already existed one layer down and was thrown away:
+    `_KeyedTTLCache.get` returns `None` for "no reply obtained" and `[]` only for a genuinely empty
+    one. An out-parameter rather than a richer return type on purpose: four suites stub this
+    function wholesale, and an unstubbed or legacy caller must keep the plain-list contract.
+
     Selection is somebody else's job. This returns everything JP offered, parsed; it does not rank,
     filter by usefulness, or decide anything.
 
@@ -1055,6 +1099,11 @@ def fetch_candidates(
     on the poller thread behind a push notification and must never be the reason an alert does not
     go out.
     """
+    def answered(value: bool) -> None:
+        if outcome is not None:
+            outcome["answered"] = value
+
+    answered(False)  # nothing has replied yet; every early return below is a non-answer
     if not (_is_stop_ref(from_stop) and _is_stop_ref(to_stop)):
         # Both refs are spliced into the GraphQL document as string literals, and both originate in
         # unauthenticated input (/impact's query params, JourneyIn's fields) validated only as short
@@ -1073,7 +1122,7 @@ def fetch_candidates(
         # it is created, and this is the most expensive call on that path. A lookup that far ahead
         # cannot contain a train in tomorrow's window, so it buys nothing at any price.
         return []
-    digest = _pair_digest(from_stop, to_stop)
+    digest = pair_digest(from_stop, to_stop)
     quantum = int(date_time.timestamp() // _DATE_TIME_QUANTUM.total_seconds())
     key = (from_stop, to_stop, arrive_by, quantum)
     # Set by the two closures below, which run at most once each and only inside `_cache.get`. A
@@ -1109,6 +1158,11 @@ def fetch_candidates(
         response_bytes=state["bytes"],
         n_patterns=_pattern_count(patterns),
     )
+    # `None` is the cache saying "no reply was obtained" — an outage, the post-failure cooldown, or
+    # another thread's in-flight refresh with nothing stored yet. A throttled lookup counts as
+    # unanswered too even when a previous value is served: re-asking on another anchor would only be
+    # refused by the same spent budget, one more log line poorer.
+    answered(patterns is not None and not state["throttled"])
     if not patterns:
         return []
     # "Fail open, ALWAYS" has to cover parsing, not just fetching. Until 2026-07-29 only the fetch
@@ -1138,6 +1192,7 @@ def select_best(
     window_end: datetime,
     affected_refs: set[tuple[str | None, str]],
     catch_up_grace: timedelta = _CATCH_UP_GRACE,
+    outcome: dict[str, Any] | None = None,
 ) -> AlternativeJourney | None:
     """What the traveller should take instead of the disrupted train, or None to stay put.
 
@@ -1152,23 +1207,48 @@ def select_best(
 
     The rule, in order:
 
-    1. **Pool.** Drop anything cancelled; anything whose departure has passed (`> now`, strictly, so
-       a departure exactly at `now` is not offered) or falls beyond `window_end + catch_up_grace`;
-       and any NON-original candidate riding one of `affected_refs`. That last exclusion carries the
-       reply's copy of the disrupted train itself — the caller synthesizes `original` from our own
-       scoring rather than reading it out of JP, so JP's own pattern for the same train is still in
-       the list as `is_original=False` and would win outright. The original is exempt precisely
-       because it rides an affected journey by construction; dropping it would make "stay put"
-       unreachable.
-    2. **Tiers, arrival-feasibility outside risk-avoidance.** Within each tier the safe candidates
-       are consulted before the full pool. Nested the other way, a *safe* journey arriving two hours
-       late would beat a slightly risky one that still gets the traveller there on time.
+    1. **Pool.** Drop anything cancelled and anything nothing can rank (no arrival time). Of the
+       RIVALS additionally drop those whose departure has passed (`> now`, strictly, so a departure
+       exactly at `now` is not offered), those beyond `window_end + catch_up_grace`, those with no
+       readable departure at all, and any riding one of `affected_refs`. That last exclusion carries
+       the reply's copy of the disrupted train itself — the caller synthesizes `original` from our
+       own scoring rather than reading it out of JP, so JP's own pattern for the same train is still
+       in the list as `is_original=False` and would win outright.
+
+       **Every one of those cuts is about rivals, and the original is exempt from all of them**
+       (2026-08-06). It rides an affected journey by construction, and its `departure_time` is the
+       AIMED departure while its catchability was settled upstream against the EXPECTED one
+       (`impact._original_candidate`, `catchable_after`) — so a train aimed 08:00, predicted 30 min
+       late and still perfectly catchable at 08:05 was being deleted from its own replacement
+       contest. Dropping the baseline does not make "stay put" less likely; it makes it
+       *unreachable*, and hands the answer to whatever the pool happens to contain.
+    2. **Tiers, arrival-feasibility outside risk-avoidance.** Within each tier the safe RIVALS are
+       consulted before the full pool. Nested the other way, a *safe* journey arriving two hours late
+       would beat a slightly risky one that still gets the traveller there on time.
+
+       The original never belongs to the risk partition either, for a sharper reason: its `risky` is
+       set from `impact_probability >= threshold` — the very gate that made this trip alert-worthy —
+       so on every push path the baseline is risky by construction. Partitioning it out left the
+       fallback tier (which has no arrival constraint) handing the win to the earliest-arriving
+       *safe* candidate however much later it arrived; the materiality gate could not catch it
+       either, because `in_real_trouble` is released by that same flag. It instead joins whichever
+       group is being ranked, and creates none of its own: with no safe rival there is nothing to
+       prefer, so the whole pool is ranked at once and the original competes there.
     3. **Ties** break on earlier arrival, then on `ordinal` (JP's own reply order), then in favour of
        the original. Not cosmetic: this runs again on every refresh, and an unstable winner would
        flip both the card's wording and which situation the written message is cached under.
     4. **The original competes.** If it wins, there is nothing to offer — plus the materiality gate
        described on `_MIN_MATERIAL_MINUTES`, without which "stay put" is unreachable for every
        delay-driven alert.
+
+    `outcome`, when passed, is filled with `{"original_is_best": bool}` — the VERDICT behind
+    `ImpactResponse.original_is_best`, published here rather than inferred by the caller. It is True
+    only when the original was in this function's own pool, at least one rival was there with it,
+    and the comparison still came out in the original's favour (it won, or the materiality gate kept
+    the traveller on it). A `None` return with a False verdict means "nothing was established" —
+    silence, not endorsement — and the two must not be worded alike: `varsel._reconcile_caches`
+    evicts a cached alternative on the verdict, so a caller deriving it from its own pre-filtered
+    pool would evict on a comparison that never happened.
 
     `window_end` and `affected_refs` are required, not optional: without the first there is no upper
     bound on how far past the traveller's own window a suggestion may reach, and without the second
@@ -1185,6 +1265,9 @@ def select_best(
     if original is not None and not any(cand is original for cand in pool_source):
         pool_source.append(original)
 
+    if outcome is not None:
+        outcome["original_is_best"] = False  # no comparison has happened yet
+
     last_departure = window_end + catch_up_grace
     pool: list[AlternativeCandidate] = []
     for cand in pool_source:
@@ -1192,19 +1275,23 @@ def select_best(
             continue
         if cand.arrival_time is None:
             continue  # nothing downstream can rank it, and every comparison below reads it
-        if cand.departure_time is not None:
-            if cand.departure_time <= now or cand.departure_time > last_departure:
-                continue
-        elif not is_original(cand):
-            # A suggestion whose departure we cannot read may already have left. The original is
-            # exempt: its catchability was established upstream (`catchable_after`), and it is the
-            # baseline rather than a suggestion.
+        if is_original(cand):
+            # The baseline, not a suggestion: exempt from every remaining cut. See rule 1 — its
+            # departure is the AIMED one and its catchability was settled upstream, so a delayed
+            # train the traveller can still board must not be deleted from its own contest.
+            pool.append(cand)
             continue
-        if not is_original(cand) and any(ref in affected for ref in cand.transit_refs):
+        if cand.departure_time is None or cand.departure_time <= now:
+            continue  # a suggestion whose departure we cannot read may already have left
+        if cand.departure_time > last_departure:
+            continue
+        if any(ref in affected for ref in cand.transit_refs):
             continue
         pool.append(cand)
     if not pool:
         return None
+    originals = [cand for cand in pool if is_original(cand)]
+    rivals = [cand for cand in pool if not is_original(cand)]
 
     def in_time(group: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
         return [cand for cand in group if cand.arrival_time < original_arrival_time]
@@ -1233,10 +1320,26 @@ def select_best(
             ),
         )
 
-    safe = [cand for cand in pool if not cand.risky]
+    def record_stay_put() -> None:
+        """Record "the traveller should keep the train they have" — a verdict, when one was earned.
+
+        Claimed only when the original was actually in the pool AND had a rival to beat. A pool of
+        one is not a comparison: an unanswered Journey Planner leaves the original alone in it, and
+        reporting that as "we chose your train" would evict a cached alternative downstream on
+        strength of a contest that never took place.
+        """
+        if outcome is not None:
+            outcome["original_is_best"] = bool(originals) and bool(rivals)
+
+    # R6 partitions the RIVALS by risk. The original is not a rival (its `risky` IS the alert gate,
+    # so it is set on every push) and joins whichever group is ranked; with no safe rival there is
+    # no preference to express, so the pool is ranked whole rather than "safe" meaning "the baseline
+    # alone" and winning the fallback tier outright.
+    safe_rivals = [cand for cand in rivals if not cand.risky]
+    groups = ([safe_rivals + originals] if safe_rivals else []) + [pool]
     winner: AlternativeCandidate | None = None
     for tier, pick in ((in_time, latest_departing), (whenever, earliest_arriving)):
-        for group in (safe, pool):
+        for group in groups:
             subset = tier(group)
             if subset:
                 winner = pick(subset)
@@ -1244,6 +1347,7 @@ def select_best(
         if winner is not None:
             break
     if winner is None or is_original(winner):
+        record_stay_put()
         return None
 
     saved = round((original_predicted_arrival - winner.arrival_time).total_seconds() / 60)
@@ -1255,13 +1359,22 @@ def select_best(
     # established that it is, and inventing trouble is how noise gets sent.
     in_real_trouble = original is not None and (original.cancelled or original.risky)
     if not in_real_trouble and saved < _MIN_MATERIAL_MINUTES:
+        record_stay_put()
         return None
     return AlternativeJourney(
         departure_time=winner.departure_time,
         arrival_time=winner.arrival_time,
         duration_min=winner.duration_min,
         minutes_saved=saved,
-        arrives_before_original=winner.arrival_time < original_predicted_arrival,
+        # Against the traveller's DEADLINE (the aimed arrival), not against the delayed train's
+        # predicted one — `minutes_saved` above is the other anchor, deliberately. Every consumer of
+        # this flag talks about the scheduled arrival: `ankommer_i_tide` in the message input, the
+        # template's " – senere enn planlagt ankomst", and the prompt rule that forbids claiming an
+        # on-time arrival. Read off the predicted arrival (until 2026-08-06) it said True for an
+        # alternative arriving 25 minutes after the traveller was due, whenever their own train was
+        # predicted later still — so the push said nothing and the model was free to write "du
+        # rekker fram i tide" to somebody who does not.
+        arrives_before_original=winner.arrival_time < original_arrival_time,
         at_risk=winner.risky,
         legs=list(winner.legs),
         # Carried off the winning candidate, where `impact.score_candidates` annotated them. This

@@ -21,7 +21,7 @@ import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 import alert_policy
 import alternatives
@@ -692,8 +692,10 @@ def _impact_response(
         # latest_observation (and, for /varsel, its per-operator alerting threshold).
         # `_worst` is max-by-severity_key over the same group in the same order, so worst_cell IS
         # the cell behind departure_prediction -- which is what makes carrying its jkey honest
-        # rather than approximate. Keep the two selections in step if either ever changes.
-        worst_cell = max(group, key=lambda c: severity_key(c.departure))
+        # rather than approximate. Shares `_worst_cell` with the alternative lookup so "the worst
+        # train" cannot come to mean two things: this used to be an inline `max` kept in step by
+        # the comment above, which is exactly the arrangement that lets two copies drift.
+        worst_cell = _worst_cell(group)
         situations.append(
             SituationImpact(
                 situation_number=sit_num,
@@ -1225,18 +1227,30 @@ def _best_remaining_journey(
         )
         return [s.candidate for s in scored if _usable(s.candidate, affected_refs=affected_refs, now=now)]
 
+    # `answered` distinguishes "JP replied, and had nothing" from "no reply was obtained" — an
+    # outage, the post-failure cooldown, a spent fetch budget. Only the first is a reason to ask the
+    # second question: firing the fallback on a non-answer bought a SECOND blocking 3 s call on the
+    # ingestion thread, so a degraded Journey Planner cost twice what a healthy one does, exactly
+    # when it could least afford it. Defaults to True when the key is absent, which is what a stub
+    # that ignores the out-dict leaves behind.
+    first_query: dict[str, Any] = {}
     by_deadline = alternatives.fetch_candidates(
-        from_stop, to_stop, arrive_by=True, date_time=deadline, now=now, path=path
+        from_stop, to_stop, arrive_by=True, date_time=deadline, now=now, path=path,
+        outcome=first_query,
     )
     _reconcile_original_arrival(original, by_deadline, subject=subject)
     pool = scored_pool(by_deadline)
-    if not pool:
+    if not pool and first_query.get("answered", True):
         pool = scored_pool(
             alternatives.fetch_candidates(
                 from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path
             )
         )
 
+    # The verdict comes back from the selection itself, never derived here from `pool`: that list is
+    # `_usable`'s cut, which applies no window bound and never contains the original at all, so
+    # "the original won" could be published for a comparison `select_best` never made.
+    selection: dict[str, Any] = {}
     best = alternatives.select_best(
         pool,
         original=original,
@@ -1246,10 +1260,9 @@ def _best_remaining_journey(
         now=now,
         window_end=window_end,
         affected_refs=affected_refs,
+        outcome=selection,
     )
-    # "The original won" is only a claim when it had something to win against. An empty pool means
-    # the Journey Planner offered nothing usable, which is silence rather than endorsement.
-    return best, best is None and bool(pool), subject
+    return best, bool(selection.get("original_is_best")), subject
 
 
 def for_trip(
@@ -1327,12 +1340,23 @@ def for_trip(
                 path=path,
             )
         except Exception:
+            # The digest, never the pair. On the poller path these two refs ARE a registered
+            # traveller's own journey — the trio `/historikk-api` refuses to serve and `llm_message`
+            # keeps out of Cloud Logging by default — and this record is emitted from the same
+            # cycle, beside a departure time. `alternatives` scrubbed the identical exposure from
+            # its own cache-failure log; this one, one module over, kept interpolating both refs.
+            digest = alternatives.pair_digest(from_stop, to_stop)
             logger.warning(
-                "Could not choose an alternative for %s -> %s; offering none",
-                from_stop,
-                to_stop,
+                "Could not choose an alternative for %s; offering none",
+                digest,
                 exc_info=True,
-                extra={"fields": {"event": "alternatives_error", "reason": "selection_failed"}},
+                extra={
+                    "fields": {
+                        "event": "alternatives_error",
+                        "reason": "selection_failed",
+                        "pair_digest": digest,
+                    }
+                },
             )
             alternative, original_is_best, subject = None, False, None
 

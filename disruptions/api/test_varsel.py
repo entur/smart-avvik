@@ -300,10 +300,21 @@ def test_a_stay_put_verdict_reaches_only_the_train_it_is_about():
     install(snapshot)
     varsel.set_stop_aliases({"A2": "A"})
     fetch, select = alternatives.fetch_candidates, alternatives.select_best
+
+    def stay_put(*a, outcome=None, **k):
+        """A selection that compared a real pool and kept the traveller on their own train.
+
+        The verdict rides on `select_best`'s out-parameter, not on its `None` return: the two are
+        different answers ("we chose your train" vs "nothing was established") and the caller must
+        never infer the first from the second.
+        """
+        if outcome is not None:
+            outcome["original_is_best"] = True
+
     # A real pool, and a selection that answers "stay put" over it — which is what makes the verdict
     # a verdict rather than the silence of an empty Journey Planner reply.
     alternatives.fetch_candidates = lambda *a, **k: [candidate]
-    alternatives.select_best = lambda *a, **k: None
+    alternatives.select_best = stay_put
     try:
         alerts = varsel.match_journey(_journey(), NOW, with_alternative=True)
     finally:
@@ -882,6 +893,42 @@ def test_a_different_alternative_invalidates_the_message_written_from_the_old_on
     )
     assert alt.departure_time == fresh.departure_time
     assert message is None
+
+
+def test_a_sub_minute_realtime_nudge_is_the_same_advice():
+    """Both times are Journey Planner EXPECTED times at second precision, and every wording renders
+    `%H:%M`. So a realtime nudge from 08:24:12 to 08:24:41 changed the identity, dropped the message
+    and spent an LLM call producing byte-identical prose — roughly every other cycle per alerting
+    journey, out of a budget of 8 for the whole tick.
+
+    The comparison has to run at the resolution of the advice, not at the resolution of the feed.
+    """
+    cached = _alternative(
+        departure_time=MON_0800 + timedelta(minutes=24, seconds=12),
+        arrival_time=MON_0800 + timedelta(minutes=65, seconds=3),
+    )
+    nudged = _alternative(
+        departure_time=MON_0800 + timedelta(minutes=24, seconds=41),
+        arrival_time=MON_0800 + timedelta(minutes=65, seconds=50),
+    )
+    alt, message, meta = _reconcile_cycle(
+        cached=cached, fresh=nudged, message="Ta R11 kl 08:24 i stedet."
+    )
+    assert message == "Ta R11 kl 08:24 i stedet.", "08:24 is still 08:24; nothing to re-write"
+    assert meta is not None, "and its provenance stays with it, or the next row lies about it"
+    assert alt.departure_time == nudged.departure_time, "the stored copy is still refreshed"
+
+    # A change the wording WOULD quote differently still discards it — the point is the resolution,
+    # not that the check got weaker.
+    _, dropped, _ = _reconcile_cycle(
+        cached=cached,
+        fresh=_alternative(
+            departure_time=MON_0800 + timedelta(minutes=25),
+            arrival_time=MON_0800 + timedelta(minutes=65, seconds=3),
+        ),
+        message="Ta R11 kl 08:24 i stedet.",
+    )
+    assert dropped is None, "08:24 -> 08:25 is different advice"
 
 
 def test_the_same_alternative_re_scored_keeps_the_written_message():

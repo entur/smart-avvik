@@ -809,18 +809,27 @@ class _JourneyPlanner:
 
     A queue rather than one canned answer, because the two-query rule is the thing several of these
     tests are about — "how many times were you asked, and with which anchor" is the assertion.
+
+    `answered` is the real function's out-parameter: False says no reply was obtained at all (an
+    outage, the post-failure cooldown, a spent fetch budget), as distinct from a reply that came
+    back empty. It defaults to True, because that is what the real lookup reports for every reply it
+    actually got — including an empty one.
     """
 
-    def __init__(self, *replies, raises=False):
+    def __init__(self, *replies, raises=False, answered=True):
         self.replies = [list(r) for r in replies]
         self.raises = raises
+        self.answered = answered
         self.calls: list[dict] = []
 
-    def __call__(self, from_stop, to_stop, *, arrive_by, date_time, now, path="request"):
+    def __call__(self, from_stop, to_stop, *, arrive_by, date_time, now, path="request",
+                 outcome=None):
         self.calls.append(
             {"from_stop": from_stop, "to_stop": to_stop, "arrive_by": arrive_by,
              "date_time": date_time, "now": now, "path": path}
         )
+        if outcome is not None:
+            outcome["answered"] = self.answered
         if self.raises:
             raise RuntimeError("JP down")
         index = len(self.calls) - 1
@@ -1079,6 +1088,98 @@ def test_an_empty_first_query_falls_back_to_a_depart_after_search():
         assert resp.alternative_journey is not None, f"{label}: the fallback must be used"
 
 
+def test_a_first_query_that_obtained_no_reply_does_not_buy_a_second_one():
+    """The fallback exists for "JP answered, and had nothing", not for "JP did not answer".
+
+    Every non-answer — timeout, GraphQL `errors`, the post-failure cooldown, single-flight, a spent
+    fetch budget, a refused ref — fails open to the same `[]` an answered-but-empty search returns.
+    Reading that as "nothing available" issued a SECOND blocking 3 s query on the ingestion thread,
+    so a degraded Journey Planner cost twice what a healthy one does.
+    """
+    now = datetime.now(UTC)
+    scope = _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93))
+
+    silent = _JourneyPlanner([], answered=False)
+    resp = _for_trip(scope, silent, now=now)
+    assert len(silent.calls) == 1, "an unanswered query is not evidence that nothing is available"
+    assert resp.alternative_journey is None
+    assert resp.original_is_best is False, "and silence is still not a stay-put verdict"
+
+    # The contrast, on the same scope: an answered-but-empty first query DOES earn the fallback.
+    answered = _JourneyPlanner([], [_live_candidate(now, dep_min=15, arr_min=45)])
+    resp = _for_trip(scope, answered, now=now)
+    assert [c["arrive_by"] for c in answered.calls] == [True, False]
+    assert resp.alternative_journey is not None
+
+
+def test_the_stay_put_verdict_needs_the_selections_own_pool():
+    """`original_is_best` was derived from `_usable`'s pool, which applies no window bound and never
+    holds the original at all — so it claimed "the traveller should keep their train" for cases the
+    selection never compared. Here the traveller's train is cancelled (dropped from the pool) and
+    every candidate departs past the window's catch-up grace (dropped too): the selection saw an
+    empty pool and established nothing.
+
+    `varsel._reconcile_caches` acts on this verdict — it evicts a cached alternative and the wording
+    written from it — so a false one is not cosmetic. And "stay on the train ET has cancelled" is
+    the worst answer this endpoint can give.
+    """
+    now = datetime.now(UTC)
+    # Departs inside `_usable`'s cut (it is in the future) but far beyond window_end + 90 min grace.
+    too_far = _live_candidate(now, dep_min=250, arr_min=300)
+    jp = _JourneyPlanner([too_far])
+    resp = _for_trip(
+        _scope(S1=_live_train(now, "gone", dep_min=10, arr_min=50, et_declared_cancelled=True)),
+        jp, now=now,
+    )
+    assert len(jp.calls) == 1, "the first query answered, so no fallback"
+    assert resp.alternative_journey is None
+    assert resp.original_is_best is False, "nothing was compared, so nothing may be claimed"
+
+
+def test_the_selection_failure_log_carries_a_digest_not_the_travellers_stops():
+    """On the poller path `from_stop` and `to_stop` ARE a registered traveller's own journey — the
+    pair `/historikk-api` refuses to serve and `llm_message` keeps out of Cloud Logging by default.
+    The same change scrubbed the identical exposure one module over (`_KeyedTTLCache.get` logs a
+    digest label now); this record, in the guard around the whole lookup, kept interpolating both.
+    """
+    now = datetime.now(UTC)
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    handler = _Capture()
+    impact.logger.addHandler(handler)
+    original = alternatives.select_best
+    alternatives.select_best = boom
+    try:
+        resp = _for_trip(
+            _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93)),
+            _JourneyPlanner([_live_candidate(now, dep_min=15, arr_min=45)]),
+            now=now,
+        )
+    finally:
+        alternatives.select_best = original
+        impact.logger.removeHandler(handler)
+
+    assert resp.alternative_journey is None, "it still fails open"
+    failures = [r for r in records if getattr(r, "fields", {}).get("reason") == "selection_failed"]
+    assert failures, "the failure must still be visible"
+    for record in failures:
+        fields = getattr(record, "fields", {})
+        # Everything a log backend could publish from one record, the stack trace included.
+        text = " ".join(
+            [record.getMessage(), repr(fields)]
+            + ([logging.Formatter().formatException(record.exc_info)] if record.exc_info else [])
+        )
+        assert A not in text and B not in text, f"the record publishes a stop ref: {text}"
+        assert fields["pair_digest"], "and it must still be correlatable"
+
+
 def test_the_lookup_gate_admits_everything_that_could_earn_a_push():
     """varsel passes `alert_policy.min_threshold()`, the floor of the per-operator table, so a trip
     sitting exactly on it still gets a lookup — the requirement is met by fixing selection, not by
@@ -1138,7 +1239,9 @@ def test_the_chosen_alternative_carries_what_we_know_about_its_own_boarding():
     # back to the CandidateScore the scorer returned.
     assert (dep.operator, dep.jkey, dep.stop_order) == ("VYG", ALT_JKEY, 1)
     assert alt.at_risk is False, "0.11 is far under VYG's gate"
-    assert alt.arrives_before_original is (alt.arrival_time < now + timedelta(minutes=90)), (
+    # Against the AIMED arrival (+50), which is the traveller's appointment — not against the
+    # predicted one (+90), which is `minutes_saved`'s anchor and a different question.
+    assert alt.arrives_before_original is (alt.arrival_time < now + timedelta(minutes=50)), (
         "the flag must agree with the arrival comparison it summarises"
     )
 
