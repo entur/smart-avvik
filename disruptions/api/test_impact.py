@@ -816,10 +816,10 @@ class _JourneyPlanner:
         self.raises = raises
         self.calls: list[dict] = []
 
-    def __call__(self, from_stop, to_stop, *, arrive_by, date_time, now):
+    def __call__(self, from_stop, to_stop, *, arrive_by, date_time, now, path="request"):
         self.calls.append(
             {"from_stop": from_stop, "to_stop": to_stop, "arrive_by": arrive_by,
-             "date_time": date_time, "now": now}
+             "date_time": date_time, "now": now, "path": path}
         )
         if self.raises:
             raise RuntimeError("JP down")
@@ -848,6 +848,51 @@ def _for_trip(scope, jp, *, now, to_stop=B, min_impact=0.0, window_min=(-5, 120)
     finally:
         alternatives.fetch_candidates = original
         _index.clear()
+
+
+def test_the_public_endpoint_cannot_spend_the_pollers_fetch_budget():
+    """`for_trip` charges its fetches to the caller's own budget, defaulting to the public one.
+
+    `alternatives` keeps two per-minute fetch tallies so an unauthenticated caller flooding
+    `/impact` with invented stop pairs cannot starve the push cycle it shares one module-global
+    cache with. That reservation is inert unless the path actually reaches `fetch_candidates`, and
+    an unwired `path` fails open in the wrong direction — silently, since both budgets refill every
+    minute and nothing else would ever notice. Hence a test on the argument itself.
+
+    The default is the conservative side: a caller that says nothing is treated as public.
+    """
+    now = datetime.now(UTC)
+    scope = _scope(
+        S1=_live_train(
+            now, "late", dep_min=10, arr_min=50,
+            p_impact_dep=0.90, arr_delay_p50_stack_min=40,
+        )
+    )
+
+    jp = _JourneyPlanner([_live_candidate(now, dep_min=15, arr_min=45)])
+    _for_trip(scope, jp, now=now)
+    assert [c["path"] for c in jp.calls] == ["request"], "an unwired caller is charged publicly"
+
+    poller = _JourneyPlanner([_live_candidate(now, dep_min=15, arr_min=45)])
+    _snapshot.clear()
+    _snapshot.update(scope)
+    original = alternatives.fetch_candidates
+    alternatives.fetch_candidates = poller
+    try:
+        impact.for_trip(
+            from_stop=A,
+            to_stop=B,
+            window_start=now - timedelta(minutes=5),
+            window_end=now + timedelta(minutes=120),
+            select="worst",
+            with_alternative=True,
+            path="poller",
+        )
+    finally:
+        alternatives.fetch_candidates = original
+    assert [c["path"] for c in poller.calls] == ["poller"], (
+        "main._varsel_impact passes this; without it the poller competes with the public endpoint"
+    )
 
 
 def test_a_cancelled_train_is_offered_a_replacement_that_arrives_late():

@@ -37,9 +37,31 @@ Design notes
   push notification; it must never be the reason an alert does not go out.
 * **Keyed TTL cache with single-flight and a failure cooldown**, mirroring
   ``reisevalg._TTLCache``'s semantics (fetch outside the lock, swap under it, a failed fetch serves
-  the previous value rather than caching a miss as fresh) but keyed per ``(from, to, departure
-  bucket)`` rather than holding one value. Air legs are excluded by restricting
-  ``transportModes``; ``directMode: foot`` keeps JP from proposing a two-hour walk.
+  the previous value rather than caching a miss as fresh) but keyed per
+  ``(from, to, arrive_by, quantized date_time)`` rather than holding one value. Air legs are
+  excluded by restricting ``transportModes``; ``directMode: foot`` keeps JP from proposing a
+  two-hour walk.
+* **The key is cycle-stable, and that is what makes the TTL worth anything.** This is a blocking
+  3 s HTTPS call on the ingestion thread that also rebuilds every BigQuery cache, in a service
+  pinned to one replica, so a cold fetch per cycle delays ``/disruptions``, ``/journey``, ``/demo``
+  and ``/reisevalg`` alike. The caller anchors one of its two queries on a moving ``now``; with the
+  old five-minute bucket two cycles ~4.8 min apart shared a key about 4 % of the time, so **every**
+  poller lookup was a cold fetch no matter how long the TTL was. See :data:`_DATE_TIME_QUANTUM` —
+  the quantum comes first, the TTL second.
+* **Bounded, per path.** ``/impact`` is unauthenticated on a public host and turns one inbound
+  request into one outbound JP call, so :data:`_FETCH_MAX_PER_MIN` caps how many *distinct keys*
+  may be fetched per minute — counted separately for the request path and the poller path, so
+  request traffic can never eat the poller's share. Past the ceiling this module yields no
+  candidates (``alternative_journey: null``) rather than the pod degrading. There is deliberately
+  **no global circuit breaker**: one module-global cache serves both paths, so a global breaker
+  would let request-path failures — or a caller tripping it on purpose — suppress the alternatives
+  in push alerts. The per-key cooldown is the whole of the back-off.
+* **Observable without publishing the traveller's trip.** Every lookup logs
+  ``event="alternatives_fetch"`` (duration, bytes, pattern count, anchor, cache hit/miss) and every
+  failure logs ``event="alternatives_error"``, both carrying a ``pair_digest`` and **never** the
+  stop refs: on the poller path those two refs are a registered traveller's own journey, and a
+  per-cycle success log of origin + destination + departure time is exactly the trio
+  ``/historikk-api`` refuses to serve.
 """
 
 import json
@@ -51,8 +73,10 @@ import threading
 import urllib.request
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
-from typing import Any
+from time import perf_counter
+from typing import Any, Literal
 
+from llm_message import key_digest
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -61,14 +85,44 @@ _JP_URL = "https://api.entur.io/journey-planner/v3/graphql"
 _ET_CLIENT_NAME = "entur-kixavvik"
 _HTTP_TIMEOUT_S = 3.0
 
-# How long a (from, to, departure-bucket) answer is reused. Short: the alternatives a traveller has
-# do shift as the timetable moves, but not second to second, and this call sits on the poller tick.
-_TTL = timedelta(minutes=2)
+# How long a (from, to, arrive_by, date-time quantum) answer is reused. Sized ABOVE the ingestion
+# cadence, not below it: measured in prd 2026-08-06 (08:45-10:45 CEST) the poller's rebuild fires
+# every ~4.8 minutes, so at the old two minutes the TTL had always expired by the next cycle and
+# every poller lookup was a cold 3 s HTTPS call on the thread that also rebuilds every BigQuery
+# cache. Ten minutes clears the cadence with room to spare without being tuned to it — the cadence
+# is set by how often an upstream SIRI-SX ingestion timestamp changes, a property of somebody else's
+# write rate, so nothing here may depend on it more tightly than an order of magnitude.
+_TTL = timedelta(minutes=10)
 # After a failure, suppress new fetches for this long (still serving any previous value) so a
-# degraded JP is not hammered once per poller cycle.
-_FAILURE_COOLDOWN = timedelta(minutes=2)
-# Departure-time cache bucket: requests within the same bucket share one JP answer.
-_DEPART_BUCKET = timedelta(minutes=5)
+# degraded JP is not hammered once per poller cycle. It has to clear the same cadence for the same
+# reason: at two minutes this cooldown had ALWAYS expired before the next cycle asked again, so the
+# sentence above described a suppression that never once happened.
+_FAILURE_COOLDOWN = timedelta(minutes=10)
+# Cache-key quantum for `date_time`: lookups whose travel time falls in the same half hour share one
+# JP answer. COARSE on purpose, and this is the half of the fix that is easy to leave out — raising
+# the TTL alone changes nothing. `impact._best_remaining_journey`'s fallback query is anchored on a
+# moving `now`, so with the old five-minute bucket two cycles ~4.8 minutes apart landed in the same
+# bucket about 4 % of the time: the key, not the TTL, was what made every poller lookup a cold
+# fetch. At 30 minutes consecutive cycles share a key ~84 % of the time.
+#
+# Thirty minutes is safe because the fetch anchor is not what decides feasibility — `select_best`
+# is. A shared answer was computed for some other instant inside the same half hour: for
+# `arrive_by=False` it may contain departures already gone (dropped, `departure_time <= now`) and
+# still contains the later ones, since OTP's dynamic search window reaches ~3 h past the anchor; for
+# `arrive_by=True` it may contain arrivals too late for this caller's deadline (dropped, the in-time
+# tier compares against `original_arrival_time`). Both directions cost the selector candidates it
+# re-checks anyway; neither can smuggle in one it would not have checked.
+_DATE_TIME_QUANTUM = timedelta(minutes=30)
+# A ceiling on how many DISTINCT keys may be fetched per minute, per path. Modelled on
+# `main._CONNECTIVITY_MAX_PER_MIN`, which exists for the identical problem: /impact is public and
+# unauthenticated, has no rate limit of its own, runs `plain def` in the ~40-slot anyio threadpool,
+# and turns one inbound request into a blocking 3 s outbound call — and the cache cannot bound the
+# cost of a caller that keeps inventing `at` values, because every one of them is a new key. Past
+# the ceiling `fetch_candidates` yields no candidates, so /impact degrades to
+# `alternative_journey: null` instead of the pod degrading and taking /journey, /demo-api and
+# /reisevalg-api down with it.
+_FETCH_MAX_PER_MIN = 30
+_RATE_WINDOW = timedelta(minutes=1)
 # The materiality gate on "stay put". Inherited from the deleted `_MIN_MINUTES_SAVED`, which used to
 # be a filter over every candidate; it is now applied at exactly ONE place — to the winner, and only
 # when the disrupted train is neither cancelled nor itself alert-worthy.
@@ -486,7 +540,29 @@ class _KeyedTTLCache:
         self._refreshing: set[Any] = set()
         self._failed_at: dict[Any, datetime] = {}
 
-    def get(self, key: Any, fetch: Callable[[], Any], now: datetime) -> Any:
+    def get(
+        self,
+        key: Any,
+        fetch: Callable[[], Any],
+        now: datetime,
+        *,
+        label: str | None = None,
+        gate: Callable[[], bool] | None = None,
+    ) -> Any:
+        """The cached value for `key`, refreshing it through `fetch` when it is stale.
+
+        `label` is what the failure log names this key by. The key itself is NEVER logged: it
+        carries the traveller's origin and destination, and the only caller passes the pair digest
+        here for exactly that reason.
+
+        `gate` is consulted at the one instant this class knows a fetch is about to be issued —
+        after the cache, the single-flight check and the cooldown have all declined to answer, and
+        before anything is claimed. That placement is the whole point: a cache hit must not spend
+        the caller's fetch budget, and a refusal must NOT mark the key failed, or a throttled key
+        would then be suppressed for the entire cooldown on top of the throttle. A refusal serves
+        the previous value if there is one, exactly like the cooldown does. It runs under this
+        lock, so the claim and the decision to fetch cannot straddle another thread's claim.
+        """
         with self._lock:
             entry = self._entries.get(key)
             if entry is not None and now - entry[1] < self._ttl:
@@ -496,15 +572,17 @@ class _KeyedTTLCache:
             failed_at = self._failed_at.get(key)
             if failed_at is not None and now - failed_at < self._failure_cooldown:
                 return entry[0] if entry else None
+            if gate is not None and not gate():
+                return entry[0] if entry else None
             self._refreshing.add(key)
         try:
             value = fetch()
         except Exception:
             logger.warning(
                 "Journey Planner alternative lookup failed for %s; serving previous value",
-                key,
+                label or "an unlabelled key",
                 exc_info=True,
-                extra={"fields": {"event": "alternatives_error"}},
+                extra={"fields": {"event": "alternatives_error", "pair_digest": label or ""}},
             )
             with self._lock:
                 self._failed_at[key] = now
@@ -517,7 +595,15 @@ class _KeyedTTLCache:
             self._failed_at.pop(key, None)
             self._refreshing.discard(key)
             self._expire_failures(now)
-            # Keep the cache bounded: stop pairs are user-chosen, so this is unbounded in principle.
+            # Keep the cache bounded. The reasoning changed with the key, so it is restated rather
+            # than inherited: the old key embedded a five-minute WALL-CLOCK bucket, so a single
+            # stop pair minted up to 288 entries a day whether anyone asked again or not, and the
+            # cap was mostly holding back the clock. The key now grows with traffic — 48 half-hour
+            # quanta a day per (pair, anchor) — and stop pairs are still user-chosen, so it is
+            # still unbounded in principle. What bounds the hostile case is `_FETCH_MAX_PER_MIN`
+            # above: entries can only be minted as fast as fetches are allowed. Eviction is
+            # oldest-written-first, so a caller churning pairs can evict the poller's entries; the
+            # cost of that is one refetch inside the poller's own reserved budget, never an alert.
             if len(self._entries) > 500:
                 oldest = sorted(self._entries.items(), key=lambda kv: kv[1][1])[:100]
                 for k, _ in oldest:
@@ -528,10 +614,13 @@ class _KeyedTTLCache:
         """Drop failure marks that can no longer suppress a fetch. Caller holds the lock.
 
         `_entries` is capped but `_failed_at` was not, and it only ever shed a key on a later
-        *success* for that same key. The key embeds a 5-minute wall-clock bucket, so it grows with
-        time rather than with traffic: a stop pair mints up to 288 keys a day whether anyone asks
-        again or not, and on a long-lived single pod that never comes back. Runs on the failure path
-        too — during a total Journey Planner outage the success path never executes.
+        *success* for that same key. When this was written the key embedded a 5-minute wall-clock
+        bucket, so it grew with time rather than with traffic — a stop pair minted up to 288 keys a
+        day whether anyone asked again or not, and on a long-lived single pod that never came back.
+        The quantum is now 30 minutes and no longer moves with `now` on its own, which slows that
+        down but does not stop it: a caller inventing stop pairs still mints a mark per refused
+        fetch. Runs on the failure path too — during a total Journey Planner outage the success path
+        never executes.
         """
         stale = [k for k, t in self._failed_at.items() if now - t >= self._failure_cooldown]
         for k in stale:
@@ -539,6 +628,75 @@ class _KeyedTTLCache:
 
 
 _cache = _KeyedTTLCache(_TTL, _FAILURE_COOLDOWN)
+
+# ---- Fetch budget ----------------------------------------------------------------------------
+# Two tallies, never one. The poller's share is RESERVED: request traffic spends only the request
+# path's budget, so an anonymous caller inventing `at` values cannot starve the alternatives out of
+# every push notification. That starvation is also why there is no global circuit breaker here —
+# `_cache` is one module global shared by the public endpoint and the poller, so a breaker tripped
+# by request-path failures (or tripped deliberately) would suppress the poller's lookups too. The
+# per-key cooldown inside `_KeyedTTLCache` is the only back-off.
+_REQUEST_PATH = "request"
+_POLLER_PATH = "poller"
+FetchPath = Literal["request", "poller"]
+_budget_lock = threading.Lock()
+_fetch_calls: dict[str, list[datetime]] = {_REQUEST_PATH: [], _POLLER_PATH: []}
+
+
+def _reserve_fetch(path: str, now: datetime) -> bool:
+    """Claim one of `path`'s fetches for the trailing minute, or refuse.
+
+    Time is the caller's `now` rather than a clock read here, for the same reason every other
+    decision in this module takes it: `impact.for_trip` samples one instant per response, and a
+    ceiling that sampled its own would be untestable without sleeping.
+
+    Called from inside `_KeyedTTLCache.get`'s lock (see its `gate` parameter). Nothing takes these
+    two locks in the other order.
+    """
+    with _budget_lock:
+        calls = _fetch_calls.setdefault(path, [])
+        calls[:] = [t for t in calls if now - t < _RATE_WINDOW]
+        if len(calls) >= _FETCH_MAX_PER_MIN:
+            logger.warning(
+                "Journey Planner lookups rate-limited on the %s path (%d/min); offering no "
+                "alternative",
+                path,
+                _FETCH_MAX_PER_MIN,
+                extra={
+                    "fields": {
+                        "event": "alternatives_error",
+                        "reason": "rate_limited",
+                        "path": path,
+                    }
+                },
+            )
+            return False
+        calls.append(now)
+        return True
+
+
+def _pair_digest(from_stop: str, to_stop: str) -> str:
+    """A short stable label for a stop pair, for logs that must not carry the pair itself.
+
+    On the poller path these two refs ARE a registered traveller's own journey, and a per-cycle
+    success log of origin + destination beside a departure time is precisely the trio
+    `/historikk-api` refuses to serve and `llm_message` keeps out of Cloud Logging by default. Same
+    helper as the LLM audit log's and the decision log's `journey_digest`
+    (:func:`llm_message.key_digest`) — one implementation, so records about one journey stay
+    joinable across all three rather than agreeing by comment. The import is safe: `llm_message`
+    imports nothing from this package, while `impact` and `varsel` both import THIS module.
+    """
+    return key_digest(f"{from_stop}|{to_stop}")
+
+
+# Response size is measured where the socket is read (`_post_json`) and reported where the fetch is
+# accounted for (`fetch_candidates`), and the two are separated by `_fetch_trip_patterns` — which
+# four other suites swap wholesale, so threading a stats argument through it would break a stub
+# contract this module does not own. A thread-local carries it instead: the fetch runs on the
+# calling thread (outside the cache lock), so the poller and each request thread read their own last
+# measurement, and a stubbed fetch simply leaves it unset — logging `bytes: null` rather than a
+# number nothing measured.
+_response = threading.local()
 
 
 # ---- HTTP ------------------------------------------------------------------------------------
@@ -596,7 +754,10 @@ def _post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
+        raw = resp.read()
+    # Recorded before parsing, so a reply too broken to decode still reports how big it was.
+    _response.bytes = len(raw)
+    body = json.loads(raw.decode("utf-8"))
     if isinstance(body, dict) and (
         body.get("errors") or "data" not in body or body.get("data") is None
     ):
@@ -812,6 +973,58 @@ def parse_candidates(patterns: Iterable[Any]) -> list[AlternativeCandidate]:
     return out
 
 
+def _pattern_count(patterns: Any) -> int | None:
+    """How many trip patterns came back, or None when that cannot be read off the value.
+
+    Never raises and never iterates: a malformed reply can put a string or an object where JP puts
+    a list, and this runs on the logging path, which must not be able to cost a lookup.
+    """
+    if patterns is None:
+        return 0
+    if isinstance(patterns, list | tuple):
+        return len(patterns)
+    return None
+
+
+def _log_lookup(
+    *,
+    pair_digest: str,
+    arrive_by: bool,
+    path: str,
+    fetched: bool,
+    throttled: bool,
+    duration_ms: int | None,
+    response_bytes: int | None,
+    n_patterns: int | None,
+) -> None:
+    """Record one lookup under `event="alternatives_fetch"`.
+
+    This module logged only failures until 2026-08-06, and dev recorded none in 24 h — so a
+    Journey Planner that is 2.9 s slow but perfectly healthy was completely invisible, and "watch
+    the error volume" could not have detected a fetch rate this unit exists to change. Cache hits
+    are logged too, or the hit rate the cache key was rewritten for would be unmeasurable.
+
+    Carries `pair_digest`, never either stop ref — see :func:`_pair_digest`.
+    """
+    logger.info(
+        "Journey Planner alternative lookup (%s)",
+        "fetch" if fetched else ("throttled" if throttled else "cache"),
+        extra={
+            "fields": {
+                "event": "alternatives_fetch",
+                "pair_digest": pair_digest,
+                "arrive_by": arrive_by,
+                "path": path,
+                "cache_hit": not fetched and not throttled,
+                "throttled": throttled,
+                "duration_ms": duration_ms,
+                "bytes": response_bytes,
+                "n_patterns": n_patterns,
+            }
+        },
+    )
+
+
 def fetch_candidates(
     from_stop: str,
     to_stop: str,
@@ -819,21 +1032,28 @@ def fetch_candidates(
     arrive_by: bool,
     date_time: datetime,
     now: datetime,
+    path: FetchPath = _REQUEST_PATH,
 ) -> list[AlternativeCandidate]:
     """Journey Planner candidates from `from_stop` to `to_stop`, in JP's reply order.
 
     `date_time` is read as "leave no earlier than" when `arrive_by` is False and as "be there by"
     when it is True. `now` is passed in and never defaulted internally, so the caller's single
-    sampled instant governs the horizon cut and the cache alike — `impact.for_trip` already samples
-    `now` once precisely so `as_of` and the observation cut cannot straddle two instants, and this
-    lookup must sit on that same instant.
+    sampled instant governs the horizon cut, the cache and the fetch ceiling alike —
+    `impact.for_trip` already samples `now` once precisely so `as_of` and the observation cut cannot
+    straddle two instants, and this lookup must sit on that same instant.
+
+    `path` says which side of the reserved budget this lookup spends: `"poller"` for the refresh
+    cycle behind push alerting, `"request"` for anything serving an inbound HTTP request. It
+    defaults to `"request"`, the conservative reading — an unwired caller is then throttled by the
+    public budget rather than silently spending the poller's. See :data:`_FETCH_MAX_PER_MIN`.
 
     Selection is somebody else's job. This returns everything JP offered, parsed; it does not rank,
     filter by usefulness, or decide anything.
 
-    Fail open, ALWAYS: a refused stop ref, a lookup too far ahead, an outage, a GraphQL `errors`
-    envelope, an empty reply, or an uninterpretable one all yield `[]`. This sits on the poller
-    thread behind a push notification and must never be the reason an alert does not go out.
+    Fail open, ALWAYS: a refused stop ref, a lookup too far ahead, a throttled path, an outage, a
+    GraphQL `errors` envelope, an empty reply, or an uninterpretable one all yield `[]`. This sits
+    on the poller thread behind a push notification and must never be the reason an alert does not
+    go out.
     """
     if not (_is_stop_ref(from_stop) and _is_stop_ref(to_stop)):
         # Both refs are spliced into the GraphQL document as string literals, and both originate in
@@ -853,12 +1073,41 @@ def fetch_candidates(
         # it is created, and this is the most expensive call on that path. A lookup that far ahead
         # cannot contain a train in tomorrow's window, so it buys nothing at any price.
         return []
-    bucket = int(date_time.timestamp() // _DEPART_BUCKET.total_seconds())
-    key = (from_stop, to_stop, arrive_by, bucket)
-    patterns = _cache.get(
-        key,
-        lambda: _fetch_trip_patterns(from_stop, to_stop, date_time, arrive_by=arrive_by),
-        now,
+    digest = _pair_digest(from_stop, to_stop)
+    quantum = int(date_time.timestamp() // _DATE_TIME_QUANTUM.total_seconds())
+    key = (from_stop, to_stop, arrive_by, quantum)
+    # Set by the two closures below, which run at most once each and only inside `_cache.get`. A
+    # dict rather than `nonlocal` so the closures stay readable next to what they record.
+    state: dict[str, Any] = {"fetched": False, "throttled": False, "ms": None, "bytes": None}
+
+    def gate() -> bool:
+        if _reserve_fetch(path, now):
+            return True
+        state["throttled"] = True
+        return False
+
+    def fetch() -> list[dict]:
+        state["fetched"] = True
+        _response.bytes = None
+        started = perf_counter()
+        try:
+            return _fetch_trip_patterns(from_stop, to_stop, date_time, arrive_by=arrive_by)
+        finally:
+            # In `finally` so a timeout — the reading this log exists to make visible — is timed
+            # too, even though the cache turns it into a warning and a served-stale value.
+            state["ms"] = round((perf_counter() - started) * 1000)
+            state["bytes"] = getattr(_response, "bytes", None)
+
+    patterns = _cache.get(key, fetch, now, label=digest, gate=gate)
+    _log_lookup(
+        pair_digest=digest,
+        arrive_by=arrive_by,
+        path=path,
+        fetched=bool(state["fetched"]),
+        throttled=bool(state["throttled"]),
+        duration_ms=state["ms"],
+        response_bytes=state["bytes"],
+        n_patterns=_pattern_count(patterns),
     )
     if not patterns:
         return []
@@ -871,9 +1120,9 @@ def fetch_candidates(
     except Exception:
         logger.warning(
             "Could not interpret the Journey Planner reply for %s; offering no candidates",
-            key,
+            digest,
             exc_info=True,
-            extra={"fields": {"event": "alternatives_error"}},
+            extra={"fields": {"event": "alternatives_error", "pair_digest": digest}},
         )
         return []
 
