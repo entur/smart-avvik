@@ -91,8 +91,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
     destination and departure time); records carry a hashed `journey_digest`, and
     `VARSEL_LLM_LOG_PROMPTS=true` puts the full prompt/reply at DEBUG.
-  - `/impact` also returns `alternative_journey` when `to_stop` is given — a faster way there from
-    the Journey Planner (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no credentials).
+  - `/impact` also returns `alternative_journey` when `to_stop` is given — the **best remaining way
+    there**, not a faster one (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no
+    credentials). Prefer the latest departure still arriving before the disrupted train's aimed
+    arrival; failing that, the earliest arrival among trains not yet departed — which for a
+    cancelled train legitimately lands later than the timetable promised, so `minutes_saved` is
+    signed and `arrives_before_original` says whether the traveller still makes it. The traveller's
+    own train competes: when it wins, the field is null with `original_is_best` true.
 
 - The **Varselhistorikk** page at `/historikk` (`demo/varselhistorikk/`, React + Vite + Entur
   Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered

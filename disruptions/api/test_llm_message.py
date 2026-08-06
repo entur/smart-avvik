@@ -57,10 +57,20 @@ class FakeLeg:
 
 
 class FakeAlternative:
-    def __init__(self, legs=None):
+    """Duck-types alternatives.AlternativeJourney for the fields the payload reads.
+
+    `minutes_saved` is SIGNED and `arrives_before_original` is a separate answer, so both are
+    settable independently — a fake that derived one from the other could not exercise the case
+    this payload exists to word correctly.
+    """
+
+    def __init__(self, legs=None, minutes_saved=14, arrives_before_original=True, at_risk=False,
+                 arrival_time=None):
         self.departure_time = DEP + timedelta(minutes=12)
-        self.arrival_time = DEP + timedelta(minutes=45)
-        self.minutes_saved = 14
+        self.arrival_time = arrival_time or DEP + timedelta(minutes=45)
+        self.minutes_saved = minutes_saved
+        self.arrives_before_original = arrives_before_original
+        self.at_risk = at_risk
         self.legs = legs if legs is not None else [FakeLeg(), FakeLeg(mode="foot", public_code=None)]
 
 
@@ -230,6 +240,83 @@ def test_payload_alternative_drops_walking_legs():
     alt = payload["alternativ_reise"]
     assert alt["minutter_spart"] == 14
     assert [leg["transportmiddel"] for leg in alt["reisevei"]] == ["rail"]
+
+
+def test_a_saving_is_carried_only_when_there_is_one():
+    """12 minutes earlier is a figure worth quoting. 18 minutes later is not "spart -18 minutter".
+
+    The same discipline `innstilling_prosent` follows: a figure is in the document only when it is
+    the one worth quoting, because a figure the model can see is a figure it can put on a lock
+    screen. Since the selection rule gained its fallback tier the negative case is routine rather
+    than exotic — a replacement for a cancelled train legitimately lands after the timetable
+    promised — so the key's absence is what keeps the 2026-07-27 regression from returning in a new
+    costume. `ankommer_i_tide` carries that case instead, as a fact rather than a negative saving.
+    """
+    earlier = build_message_input(
+        JOURNEY, FakeImpact(alternative_journey=FakeAlternative(minutes_saved=12)), FakeAlert()
+    )
+    assert earlier["alternativ_reise"]["minutter_spart"] == 12
+
+    later = build_message_input(
+        JOURNEY,
+        FakeImpact(
+            alternative_journey=FakeAlternative(minutes_saved=-18, arrives_before_original=False)
+        ),
+        FakeAlert(),
+    )
+    assert "minutter_spart" not in later["alternativ_reise"]
+    assert later["alternativ_reise"]["ankommer_i_tide"] is False
+    assert "-18" not in json.dumps(later, ensure_ascii=False)
+
+
+def test_a_zero_saving_is_not_a_saving():
+    """Rounding lands exactly on zero often enough to matter, and "spart 0 minutter" is noise."""
+    payload = build_message_input(
+        JOURNEY, FakeImpact(alternative_journey=FakeAlternative(minutes_saved=0)), FakeAlert()
+    )
+    assert "minutter_spart" not in payload["alternativ_reise"]
+
+
+def test_arriving_in_time_does_not_depend_on_the_sign_of_the_saving():
+    """Two flags, two questions — and the payload must not derive one from the other.
+
+    `arrives_before_original` is a comparison of arrival times; `minutes_saved` is a rounded
+    difference. An alternative can arrive first and still round to a zero saving, and a wording that
+    inferred "kommer for sent" from a non-positive saving would tell that traveller the opposite of
+    the truth.
+    """
+    payload = build_message_input(
+        JOURNEY,
+        FakeImpact(
+            alternative_journey=FakeAlternative(minutes_saved=0, arrives_before_original=True)
+        ),
+        FakeAlert(),
+    )
+    alt = payload["alternativ_reise"]
+    assert alt["ankommer_i_tide"] is True
+    assert "minutter_spart" not in alt
+
+
+def test_an_alternative_that_is_itself_at_risk_says_so():
+    """`at_risk` means the suggestion is over its own operator's gate, or on a line a live
+    situation touches. It is offered because nothing safer arrived in time — so a wording that
+    presents it as a clean escape would be wrong, and the writer needs the flag to avoid that."""
+    risky = build_message_input(
+        JOURNEY, FakeImpact(alternative_journey=FakeAlternative(at_risk=True)), FakeAlert()
+    )
+    assert risky["alternativ_reise"]["egen_risiko"] is True
+    safe = build_message_input(
+        JOURNEY, FakeImpact(alternative_journey=FakeAlternative()), FakeAlert()
+    )
+    assert safe["alternativ_reise"]["egen_risiko"] is False
+
+
+def test_the_prompt_tells_the_model_a_late_alternative_is_not_a_saving():
+    """The payload keys are only half of it — an undocumented boolean is one the model guesses at,
+    and "du rekker fram i tide" about a journey that arrives 18 minutes late is the guess that
+    costs a traveller an appointment."""
+    assert "ankommer_i_tide" in llm_message._SYSTEM_PROMPT
+    assert "egen_risiko" in llm_message._SYSTEM_PROMPT
 
 
 def test_the_alternative_comes_from_the_alert_when_its_response_has_none():
@@ -655,12 +742,17 @@ def test_the_logged_payload_is_byte_identical_to_what_the_model_got():
     sent = {}
     _reset(provider="claude")
     llm_message._BACKENDS["claude"] = lambda body: sent.setdefault("body", body) or '{"melding":"ok"}'
-    payload = build_message_input(JOURNEY, FakeImpact(alternative_journey=FakeAlternative()), FakeAlert())
+    # A LATE alternative, so the keys that are only conditionally present are exercised: the bytes
+    # the decision row stores have to show the same absent `minutter_spart` the model was shown.
+    late = FakeAlternative(minutes_saved=-18, arrives_before_original=False, at_risk=True)
+    payload = build_message_input(JOURNEY, FakeImpact(alternative_journey=late), FakeAlert())
     try:
         write_message(payload)
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
     assert llm_message.message_input_json(payload) == sent["body"]
+    assert '"ankommer_i_tide": false' in sent["body"]
+    assert "minutter_spart" not in sent["body"]
 
 
 def test_the_prompt_version_tracks_the_prompt_text():

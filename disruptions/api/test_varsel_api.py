@@ -100,8 +100,8 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
         select="worst",
         catchable_after=catchable_after,
         # Passed THROUGH, not hard-coded: hard-coding False made the suite blind to a Journey Planner
-        # call reappearing on the request path. alternatives.find_faster is stubbed in the tests that
-        # care, so nothing here reaches the network either way.
+        # call reappearing on the request path. alternatives.fetch_candidates is stubbed in the tests
+        # that care, so nothing here reaches the network either way.
         with_alternative=with_alternative,
         min_impact=min_impact,
     )
@@ -109,11 +109,17 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
 
 varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
 
-# Suite-wide: this provider calls the REAL impact.for_trip, which calls alternatives.find_faster
-# whenever with_alternative=True. Individual tests stubbing find_faster is not enough — any test that
-# exercises the poller path without stubbing it would issue a live HTTPS request to api.entur.io from
-# CI and eat the 3 s timeout, failing open so nobody would notice. Make it structurally impossible.
-impact.alternatives.find_faster = lambda *a, **k: None
+# Suite-wide: this provider calls the REAL impact.for_trip, which calls
+# alternatives.fetch_candidates whenever with_alternative=True. Individual tests stubbing it are not
+# enough — any test that exercises the poller path without stubbing it would issue a live HTTPS
+# request to api.entur.io from CI and eat the 3 s timeout, failing open so nobody would notice. Make
+# it structurally impossible.
+#
+# This stub names a function, so re-pointing the call chain under it silently disarms it — which is
+# exactly what happened when the single-call lookup became fetch -> score -> select. The second line
+# of defence does not depend on anyone remembering: alternatives._post_json refuses to open a socket
+# from a test process at all (test_a_forgotten_stub_cannot_reach_the_network pins it).
+impact.alternatives.fetch_candidates = lambda *a, **k: []
 
 app = FastAPI()
 app.include_router(varsel.router)
@@ -1338,7 +1344,7 @@ def test_request_path_does_not_call_the_journey_planner(monkeypatch):
     import alternatives
 
     calls = []
-    monkeypatch.setattr(alternatives, "find_faster", lambda *a, **k: calls.append(1))
+    monkeypatch.setattr(alternatives, "fetch_candidates", lambda *a, **k: calls.append(1) or [])
     _register(DEVICE)
     calls.clear()
     r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
@@ -1398,7 +1404,10 @@ def test_an_alternative_found_on_the_canonical_ref_reaches_a_collapsed_refs_aler
         legs=[alternatives.AlternativeLeg(mode="rail", line="VYG:Line:R10", public_code="R10",
                                           from_name="Oslo S", to_name="Lillehammer")],
     )
-    monkeypatch.setattr(impact.alternatives, "find_faster", lambda *a, **k: fake_alt)
+    # The selection rule has its own tests; what this one is about is the back-fill, so the whole
+    # fetch -> score -> select chain is short-circuited to one known answer.
+    monkeypatch.setattr(impact.alternatives, "fetch_candidates", lambda *a, **k: [])
+    monkeypatch.setattr(impact.alternatives, "select_best", lambda *a, **k: fake_alt)
 
     # One situation, two trains: the canonical ref boards the milder one (so that pass matches, and
     # is the one that spends the Journey Planner call), the collapsed ref the worse one -- which is
@@ -1423,6 +1432,186 @@ def test_an_alternative_found_on_the_canonical_ref_reaches_a_collapsed_refs_aler
     assert payload["alternativ_reise"]["minutter_spart"] == 17, (
         "the flat columns and the input the message was written from must agree"
     )
+
+
+# ---- a superseded alternative stops being served ----------------------------------------------
+# Both poller caches are pruned when the SITUATION ends, which can be 12 h after the tick that
+# filled them, while the alerts underneath are re-scored every 60 s. Until 2026-08-06 nothing
+# cleared an entry any earlier, because the old selection rule found an alternative "effectively
+# never"; both answers are routine now, and one of them ("stay on your own train") contradicts what
+# may already be cached and quoted in a written message.
+
+# The train SNAPSHOT describes. A verdict must NAME it, or match_journey strips it as a claim about
+# somebody else's train (an alert whose worst reading came from a collapsed ref).
+_ALT_SUBJECT = ("VYG", "t1")
+
+# Same train, same departure -- so the same message key -- but eased off well under every gate.
+SNAPSHOT_EASED = {
+    "S1": [
+        FakeCall("t1", "A", 1, DEP, p_cancel=0.06, p_impact_dep=0.30),
+        FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+    ]
+}
+
+
+def _selection_outcome(monkeypatch, value):
+    """Drive /impact's alternative selection to a known `(journey, original_is_best, subject)`.
+
+    Replaces fetch -> score -> select wholesale: the rule has its own hermetic suite, and what these
+    checks are about is what the poller does with each of the three answers it can come back with.
+    Returns a mutable holder so a test can change the answer between cycles.
+    """
+    outcome = {"value": value}
+    monkeypatch.setattr(impact, "_best_remaining_journey", lambda cells, **kw: outcome["value"])
+    return outcome
+
+
+def _numbered_messages(monkeypatch):
+    """A writer that returns a different text each time, so a reused message is distinguishable from
+    a re-written one (both are non-null, which is why counting calls alone is not enough)."""
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda *a, **k: written.append(1) or f"Melding {len(written)}.",
+    )
+    return written
+
+
+def _listed_alert():
+    r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    assert r.status_code == 200, r.text
+    alerts = r.json()["journeys"][0]["alerts"]
+    assert alerts, "the synthetic snapshot should keep producing a match"
+    return alerts[0]
+
+
+def _some_alternative(minutes_out=5):
+    return alternatives.AlternativeJourney(
+        departure_time=DEP + timedelta(minutes=minutes_out),
+        arrival_time=DEP + timedelta(minutes=minutes_out + 30),
+        duration_min=30, minutes_saved=10, legs=[],
+    )
+
+
+def test_an_alternative_the_selection_has_decided_against_stops_being_offered(monkeypatch):
+    """`original_is_best` is the answer that did not meaningfully exist before this change: the
+    selection ran, over a real pool, and chose the traveller's own train. Nothing in the caching
+    layer had ever been built to clear an alternative, so the card kept offering a superseded escape
+    route -- now beside advice that says the opposite."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _numbered_messages(monkeypatch)
+    outcome = _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    alert = _listed_alert()
+    assert alert["alternative_journey"] is not None
+    assert alert["message"] == "Melding 1."
+
+    outcome["value"] = (None, True, _ALT_SUBJECT)  # "bli sittende" -- your own train is still best
+    varsel.check_and_notify(SNAPSHOT)
+    alert = _listed_alert()
+    assert alert["alternative_journey"] is None, (
+        "the card must stop advising an alternative the selection has since decided against"
+    )
+    assert alert["message"] == "Melding 2.", (
+        "the text was written from that alternative and names its departure time"
+    )
+    assert len(written) == 2
+
+
+def test_a_match_that_eased_below_the_gate_carries_neither_cache(monkeypatch):
+    """The commonest way this goes stale, and the one the old code could not reach: when nothing is
+    alert-worthy any more, check_and_notify takes its early return -- which sat ABOVE every pop."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _numbered_messages(monkeypatch)
+    _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert _listed_alert()["alternative_journey"] is not None
+
+    _use_snapshot(SNAPSHOT_EASED)
+    varsel.check_and_notify(SNAPSHOT_EASED)
+    alert = _listed_alert()
+    assert alert["alertworthy"] is False
+    assert alert["alternative_journey"] is None
+    assert alert["message"] is None, (
+        "last hour's wording must not head a card showing this tick's mild numbers"
+    )
+
+
+def test_an_unchanged_alternative_does_not_re_write_the_message(monkeypatch):
+    """Invalidation must not become a per-cycle LLM call: `ok_cached` is what keeps a 12 h situation
+    inside _MAX_LLM_CALLS_PER_CYCLE. The alternative is re-selected every tick and the winner is
+    stable by construction (select_best's tie-break), so an unchanged answer must reuse the text."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _numbered_messages(monkeypatch)
+    _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(written) == 1, "an unchanged alternative must not cost a second write"
+    assert _listed_alert()["message"] == "Melding 1."
+    key = next(iter(varsel._messages))
+    assert varsel._message_meta[key]["status"] == "ok_cached"
+
+
+def test_a_message_whose_alternative_has_departed_is_replaced(monkeypatch):
+    """A cached text names a specific departure time and is reused for the situation's whole life.
+    Once that train has gone the text is advice to catch something that has already left -- so the
+    alternative and the wording built on it go together, and the next cycle writes a fresh one."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _numbered_messages(monkeypatch)
+    outcome = _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    # Time passes: the offered train leaves, and this cycle establishes nothing new (a Journey
+    # Planner outage, the fetch budget, a collapsed ref -- all of them land here).
+    key = next(iter(varsel._alternatives))
+    varsel._alternatives[key] = alternatives.AlternativeJourney(
+        departure_time=datetime.now(UTC) - timedelta(minutes=1),
+        arrival_time=datetime.now(UTC) + timedelta(minutes=25),
+        duration_min=26, minutes_saved=5, legs=[],
+    )
+    outcome["value"] = (None, False, _ALT_SUBJECT)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert key not in varsel._alternatives
+    assert len(written) == 2, "the text naming the departed train must not be reused"
+    assert _listed_alert()["message"] == "Melding 2."
+
+
+def test_a_failing_cache_reconciliation_costs_the_cache_not_the_cycle(monkeypatch):
+    """`_reconcile_caches` was called bare, outside the per-journey guard around `match_journey`.
+
+    A raise there unwound out of check_and_notify entirely: the remaining journeys were never
+    scored, loop 2 never ran (NO pushes at all for the cycle) and `_record_decisions` never ran (no
+    rows either) -- a strictly larger blast radius than the 2026-07-29 incident this file's
+    defence-in-depth exists to prevent. What it touches is duck-typed (a provider's impact response,
+    a cached alternative, an aware/naive datetime comparison), so "it cannot raise" is an assumption
+    about somebody else's object. Keeping one cycle's stale cache is the smaller failure by far.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+
+    def boom(*a, **k):
+        raise AttributeError("'ImpactResponse' object has no attribute 'original_is_best'")
+
+    monkeypatch.setattr(varsel, "_reconcile_caches", boom)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)  # must not raise
+
+    assert len(sent) == 1, "the traveller is still told"
+    assert [r["situation_number"] for r in log.rows] == ["S1"], "and the decision is still recorded"
 
 
 def test_departed_train_produces_no_alerts(monkeypatch):

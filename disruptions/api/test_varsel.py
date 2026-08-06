@@ -11,13 +11,14 @@ thresholds, and the notification wording.
 """
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
 from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import alternatives
 import impact
 import main
 import varsel
@@ -151,12 +152,12 @@ def test_the_real_provider_signature_matches():
         alerts = varsel.match_journey(_journey(), NOW)
         assert alerts, "the real provider must answer the matcher"
         # And the poller's path, which additionally asks for an alternative.
-        original = impact.alternatives.find_faster
-        impact.alternatives.find_faster = lambda *a, **k: None  # no network
+        original = impact.alternatives.fetch_candidates
+        impact.alternatives.fetch_candidates = lambda *a, **k: []  # no network
         try:
             assert varsel.match_journey(_journey(), NOW, with_alternative=True)
         finally:
-            impact.alternatives.find_faster = original
+            impact.alternatives.fetch_candidates = original
     finally:
         install({})  # restore the double for the remaining tests
 
@@ -265,6 +266,63 @@ def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
     assert [flag for _, flag in asked] == [True, False] * windows, (
         "the lookup runs once per window, on the canonical ref only"
     )
+
+
+def test_a_stay_put_verdict_reaches_only_the_train_it_is_about():
+    """`None` from the lookup used to mean "nothing was faster" — a fact about the TRIP, safe to
+    back-fill onto every alert. It now also means "the traveller's own train is still the best
+    option", which is a claim about ONE train.
+
+    The lookup runs once per window, on the canonical ref pair, about that pair's worst train. Every
+    other alert on the trip may be about a different and far worse train: a milder situation the
+    same pass returned, or — the case the ref merge exists for — a cancelled departure that only the
+    collapsed ref records. Shared unqualified, a two-minute delay's "bli sittende" gets published
+    above a train that is not running.
+    """
+    live = datetime.now(UTC)
+    snapshot = {
+        # Canonical ref (A), and the worst departure on it: the verdict is about this train.
+        "S1": _train(MON_0800, jkey="subject", p_impact_dep=0.90),
+        # Canonical ref too, milder — same pass, same response object, different train.
+        "S2": _train(MON_0800, jkey="bystander", situation="S2", p_impact_dep=0.70),
+        # Only the collapsed ref records this one, so it is asked about in its own pass, without
+        # the lookup. It is also the worst of the three.
+        "S3": _twin(MON_0800, "A2", situation_number="S3", p_impact_dep=0.95),
+    }
+    candidate = alternatives.AlternativeCandidate(
+        departure_time=live + timedelta(minutes=15),
+        arrival_time=live + timedelta(minutes=55),
+        transit_refs=[("VYG", "DatedServiceJourney:other")],
+        lines=["VYG:Line:R11"],
+        board_stop_place="A",
+        alight_stop_place="B",
+    )
+    install(snapshot)
+    varsel.set_stop_aliases({"A2": "A"})
+    fetch, select = alternatives.fetch_candidates, alternatives.select_best
+
+    def stay_put(*a, outcome=None, **k):
+        """A selection that compared a real pool and kept the traveller on their own train.
+
+        The verdict rides on `select_best`'s out-parameter, not on its `None` return: the two are
+        different answers ("we chose your train" vs "nothing was established") and the caller must
+        never infer the first from the second.
+        """
+        if outcome is not None:
+            outcome["original_is_best"] = True
+
+    # A real pool, and a selection that answers "stay put" over it — which is what makes the verdict
+    # a verdict rather than the silence of an empty Journey Planner reply.
+    alternatives.fetch_candidates = lambda *a, **k: [candidate]
+    alternatives.select_best = stay_put
+    try:
+        alerts = varsel.match_journey(_journey(), NOW, with_alternative=True)
+    finally:
+        alternatives.fetch_candidates, alternatives.select_best = fetch, select
+        varsel.set_stop_aliases({})
+
+    verdicts = {a.jkey: a.impact.original_is_best for a in alerts}
+    assert verdicts == {"subject": True, "bystander": False, "t-twin": False}, verdicts
 
 
 def test_basic_match():
@@ -466,15 +524,53 @@ def test_operator_collision_not_merged():
     assert alerts[0].cancel_probability == 0.8  # SKY's train, not ATB's boarding-only 0.99
 
 
-def _push_body(**board_kw) -> str:
+def _alternative(**kw) -> alternatives.AlternativeJourney:
+    """A Journey Planner answer in the shape `select_best` returns it.
+
+    Departs 08:24 and arrives 09:05 by default — the in-time case. The selection rule has its own
+    hermetic suite; these checks are about what the traveller is told, so the answer is handed in
+    rather than searched for.
+    """
+    fields = {
+        "departure_time": MON_0800 + timedelta(minutes=24),
+        "arrival_time": MON_0800 + timedelta(minutes=65),
+        "duration_min": 41,
+        "minutes_saved": 12,
+        "arrives_before_original": True,
+        "at_risk": False,
+        "legs": [
+            alternatives.AlternativeLeg(
+                mode="rail", line="VYG:Line:R11", public_code="R11",
+                from_name="Oslo S", to_name="Drammen",
+            )
+        ],
+    }
+    return alternatives.AlternativeJourney(**{**fields, **kw})
+
+
+# 09:35 — half an hour past what the disrupted train promised. The routine shape now that the
+# fallback tier offers a replacement for a cancelled train rather than nothing at all.
+_LATE_ALTERNATIVE = {
+    "minutes_saved": -18,
+    "arrives_before_original": False,
+    "arrival_time": MON_0800 + timedelta(minutes=95),
+}
+
+
+def _push_body(alternative: alternatives.AlternativeJourney | None = None, **board_kw) -> str:
     """The Web Push body for the single match produced by a train with these boarding numbers.
 
     Through the real message input, not the alert directly: the deterministic wording is assembled
     from the same document the model is prompted with, so these checks have to run over it.
+
+    `alternative` is set on the matched alert, which is where the real cycle puts it: varsel asks
+    the Journey Planner once per window and back-fills the answer onto every alert.
     """
     journey = _journey()
     alerts = match(journey, {"S1": _train(MON_0800, **board_kw)})
     assert len(alerts) == 1
+    if alternative is not None:
+        alerts[0].alternative_journey = alternative
     message_input = _message_input(journey, alerts[0])
     assert message_input is not None, "the wording's source must actually be buildable"
     return _notification_payload(journey, alerts[0], message_input=message_input)["body"]
@@ -599,6 +695,283 @@ def test_push_body_omits_a_missing_summary():
     body = _push_body(summary=None, p_cancel=0.95)
     assert "None" not in body
     assert body == "Tog kl 08:00: 95 % sjanse for innstilling"
+
+
+# ---- the alternative, in the wording prd actually ships ---------------------------------------
+# VARSEL_LLM_ENABLED=false in prd, so these strings -- not the model's -- are what real travellers
+# read. A caveat that reaches only the prompt reaches nobody.
+_DELAYED = {"p_cancel": 0.02, "p_impact_dep": 0.93,
+            "dep_delay_p50_stack_min": 15, "dep_delay_p90_stack_min": 27}
+
+
+def test_push_body_without_an_alternative_is_unchanged():
+    """The regression guard for this whole change: when nothing was found, the body is exactly the
+    two lines it has always been. Pinned, not asserted `in`, so an unconditional clause shows up."""
+    assert _push_body(**_DELAYED) == "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket"
+
+
+def test_push_body_names_an_in_time_alternative():
+    body = _push_body(_alternative(), **_DELAYED)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ kl 08:24, framme kl 09:05"
+    )
+
+
+def test_push_body_says_when_the_alternative_arrives_after_the_planned_arrival():
+    """The case this change exists for: the new rule routinely offers the next possibility rather
+    than a faster one, so a body that named a departure time without saying so would tell the
+    traveller they still make their appointment. Under the old rule this shape was unreachable —
+    a journey arriving after the disrupted train could never clear "at least three minutes
+    faster" — which is the part of the old baseline that no measurement can revise."""
+    body = _push_body(_alternative(**_LATE_ALTERNATIVE), **_DELAYED)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+    )
+    assert "spart" not in body, "a negative saving is not a saving"
+
+
+def test_push_body_hedges_an_alternative_that_is_itself_at_risk():
+    """Offered because nothing safer reached the destination in time -- so it must not read as a
+    clean escape."""
+    body = _push_body(_alternative(at_risk=True), **_DELAYED)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ kl 08:24, framme kl 09:05 (kan også bli rammet)"
+    )
+
+
+def test_push_body_leads_with_a_declared_cancellation_even_with_an_alternative():
+    """The cancellation is the fact; the alternative is the advice that follows it. And no
+    probability anywhere -- the 2026-08-05 report, which an extra clause must not reopen."""
+    body = _push_body(_alternative(**_LATE_ALTERNATIVE), et_declared_cancelled=True,
+                      p_cancel=0.57, p_impact_dep=0.61)
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Innstilt\n"
+        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+    )
+    assert "%" not in body and "sjanse" not in body
+
+
+def test_the_last_resort_wording_names_the_alternative_for_a_cancelled_train():
+    """`_message_input_from_alert` returns early on a declared cancellation, so an alternative
+    appended after that branch would be dropped for exactly the case this change exists to serve:
+    the push would say "Innstilt" and name no replacement."""
+    alert = Alert(
+        situation_number="S1", summary="Signalfeil", line="VYG:Line:R10",
+        departure_time=MON_0800, cancelled=True, cancel_probability=1.0,
+        delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
+        alternative_journey=_alternative(**_LATE_ALTERNATIVE),
+    )
+    body = _deterministic_body(_message_input_from_alert(alert))
+    assert body == (
+        "Signalfeil\nTog kl 08:00: Innstilt\n"
+        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+    )
+
+
+def test_the_last_resort_wording_quotes_a_real_saving_but_never_a_negative_one():
+    """The same `minutter_spart` discipline as the message input: the key exists only when it is
+    the figure worth quoting, so the two wording sources cannot disagree about it."""
+    def input_for(**alt_kw):
+        return _message_input_from_alert(Alert(
+            situation_number="S1", summary="Signalfeil", line="VYG:Line:R10",
+            departure_time=MON_0800, cancel_probability=0.02, impact_probability=0.93,
+            delay_p50_min=15, delay_p90_min=27, alert_threshold=0.65, alertworthy=True,
+            alternative_journey=_alternative(**alt_kw),
+        ))
+
+    assert input_for()["alternativ_reise"]["minutter_spart"] == 12
+    late = input_for(**_LATE_ALTERNATIVE)["alternativ_reise"]
+    assert "minutter_spart" not in late
+    assert late["ankommer_i_tide"] is False
+
+
+# ---- the caches the poller carries between cycles ----------------------------------------------
+# `_alternatives` and `_messages` outlive the tick that filled them (they are pruned when the
+# SITUATION ends, up to 12 h later) while the alerts underneath are re-scored every 60 s. Nothing
+# ever cleared an entry before 2026-08-06, on the belief that an alternative was rare enough for a
+# stale one not to be worth the code -- a belief measured for the first time on 2026-08-06 and found
+# wrong (26 % of alerting subjects under the OLD rule). Both outcomes are routine, and one of them
+# -- "stay on your own train" -- is advice that contradicts what may already be cached.
+_RECONCILE_KEY = "A|B|07:00|09:00|0,1,2,3,4"
+
+
+def _reconcile_cycle(*, cached=None, fresh=None, original_is_best=False, alertworthy=True,
+                     message=None, now=NOW):
+    """One reconciliation over a single freshly-matched alert; returns what survived in the caches.
+
+    The alert comes out of the real matcher (so `impact` is a real ImpactResponse and the verdict is
+    set the way `/impact` sets it), and the cached state is planted under the same message key the
+    poller would have used.
+    """
+    alerts = match(_journey(), {"S1": _train(MON_0800, p_impact_dep=0.9 if alertworthy else 0.1)})
+    assert len(alerts) == 1 and alerts[0].alertworthy is alertworthy
+    alert = alerts[0]
+    alert.alternative_journey = fresh
+    if original_is_best:
+        # What impact.for_trip records when select_best returned None over a real pool: the
+        # traveller's own train won. `alternative_subject` must name THIS train, or match_journey
+        # strips the verdict as a claim about somebody else's.
+        alert.impact = alert.impact.model_copy(
+            update={"original_is_best": True, "alternative_subject": (alert.operator, alert.jkey)}
+        )
+    key = varsel._message_key(_RECONCILE_KEY, alert)
+    for cache in (varsel._alternatives, varsel._messages, varsel._message_meta):
+        cache.clear()
+    if cached is not None:
+        varsel._alternatives[key] = cached
+    if message is not None:
+        varsel._messages[key] = message
+        varsel._message_meta[key] = {"status": "ok", "provider": "vertex-anthropic"}
+    try:
+        varsel._reconcile_caches(_RECONCILE_KEY, alerts, now)
+        return varsel._alternatives.get(key), varsel._messages.get(key), varsel._message_meta.get(key)
+    finally:
+        for cache in (varsel._alternatives, varsel._messages, varsel._message_meta):
+            cache.clear()
+
+
+def test_a_selection_that_chose_the_travellers_own_train_clears_the_cached_alternative():
+    """The new outcome this whole change introduced. `original_is_best` is a VERDICT — the selection
+    ran, over a real pool, and decided the traveller should stay put — so it supersedes whatever was
+    cached, and the text written from that cached answer with it."""
+    alt, message, meta = _reconcile_cycle(
+        cached=_alternative(), message="Ta R11 kl 08:24 i stedet.", original_is_best=True
+    )
+    assert alt is None
+    assert message is None, "the wording naming it must not outlive the alternative"
+    assert meta is None, "a dropped message's provenance would file the next row as ok_cached"
+
+
+def test_a_cycle_that_never_looked_keeps_the_cached_alternative():
+    """A null alternative with no verdict means "we did not establish it" — a collapsed stop ref is
+    asked without the lookup on purpose, and an outage or the fetch budget skip it too. Clearing on
+    silence would make the card offer an escape route on alternate ticks and none in between."""
+    alt, message, _ = _reconcile_cycle(cached=_alternative(), message="Ta R11 kl 08:24 i stedet.")
+    assert alt is not None and alt.departure_time == MON_0800 + timedelta(minutes=24)
+    assert message == "Ta R11 kl 08:24 i stedet."
+
+
+def test_a_match_that_fell_below_the_gate_drops_both_caches():
+    """The commonest way this advice goes stale: the disruption eases off until nothing crosses the
+    threshold. That path takes check_and_notify's early return, so before 2026-08-06 it reached no
+    pop at all and the card kept last hour's escape route beside this tick's mild numbers."""
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(), message="Ta R11 kl 08:24 i stedet.", alertworthy=False
+    )
+    assert alt is None and message is None
+
+
+def test_an_alternative_departing_exactly_now_is_no_longer_catchable():
+    """One rule, one operator: `select_best` pools on `> now` (a departure exactly at `now` is not
+    offered), and the card read `>= now` — so for one second it advised a train the selection rule
+    had already refused to choose."""
+    assert varsel._still_catchable(_alternative(departure_time=NOW), NOW) is False
+    assert varsel._still_catchable(_alternative(departure_time=NOW + timedelta(seconds=1)), NOW)
+    # And an unreadable departure is kept: "we cannot tell whether it has left" is not "it has left".
+    assert varsel._still_catchable(_alternative(departure_time=None), NOW)
+
+
+def test_a_cached_alternative_that_has_departed_is_dropped_with_its_wording():
+    """Kept-on-silence has one exception. A stale alternative is worse than none — it advises
+    catching a train that has already left — and so is the message that named its departure time."""
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(departure_time=NOW), message="Ta R11 kl 06:00 i stedet."
+    )
+    assert alt is None and message is None
+
+
+def test_a_different_alternative_invalidates_the_message_written_from_the_old_one():
+    """A written message now quotes a specific departure time, and it is reused for the situation's
+    whole life (`ok_cached`). Offering a new alternative under the old wording would advise one train
+    on the card and another in the text."""
+    fresh = _alternative(
+        departure_time=MON_0800 + timedelta(minutes=40),
+        arrival_time=MON_0800 + timedelta(minutes=80),
+    )
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(), fresh=fresh, message="Ta R11 kl 08:24 i stedet."
+    )
+    assert alt.departure_time == fresh.departure_time
+    assert message is None
+
+
+def test_a_sub_minute_realtime_nudge_is_the_same_advice():
+    """Both times are Journey Planner EXPECTED times at second precision, and every wording renders
+    `%H:%M`. So a realtime nudge from 08:24:12 to 08:24:41 changed the identity, dropped the message
+    and spent an LLM call producing byte-identical prose — roughly every other cycle per alerting
+    journey, out of a budget of 8 for the whole tick.
+
+    The comparison has to run at the resolution of the advice, not at the resolution of the feed.
+    """
+    cached = _alternative(
+        departure_time=MON_0800 + timedelta(minutes=24, seconds=12),
+        arrival_time=MON_0800 + timedelta(minutes=65, seconds=3),
+    )
+    nudged = _alternative(
+        departure_time=MON_0800 + timedelta(minutes=24, seconds=41),
+        arrival_time=MON_0800 + timedelta(minutes=65, seconds=50),
+    )
+    alt, message, meta = _reconcile_cycle(
+        cached=cached, fresh=nudged, message="Ta R11 kl 08:24 i stedet."
+    )
+    assert message == "Ta R11 kl 08:24 i stedet.", "08:24 is still 08:24; nothing to re-write"
+    assert meta is not None, "and its provenance stays with it, or the next row lies about it"
+    assert alt.departure_time == nudged.departure_time, "the stored copy is still refreshed"
+
+    # A change the wording WOULD quote differently still discards it — the point is the resolution,
+    # not that the check got weaker.
+    _, dropped, _ = _reconcile_cycle(
+        cached=cached,
+        fresh=_alternative(
+            departure_time=MON_0800 + timedelta(minutes=25),
+            arrival_time=MON_0800 + timedelta(minutes=65, seconds=3),
+        ),
+        message="Ta R11 kl 08:24 i stedet.",
+    )
+    assert dropped is None, "08:24 -> 08:25 is different advice"
+
+
+def test_the_same_alternative_re_scored_keeps_the_written_message():
+    """`ok_cached` has to stay reachable: re-writing on every tick is exactly what the per-cycle LLM
+    budget exists to prevent. The two prediction blocks carry continuous probabilities re-scored
+    against the live cache every 60 s, so they must not count as "a different alternative" — while
+    the fresh reading of them still replaces the stored copy, so the card shows this tick's numbers.
+    """
+    rescored = _alternative(
+        departure_prediction=alternatives.AlternativePrediction(scored=False, delay_p50_min=4),
+    )
+    alt, message, _ = _reconcile_cycle(
+        cached=_alternative(), fresh=rescored, message="Ta R11 kl 08:24 i stedet."
+    )
+    assert message == "Ta R11 kl 08:24 i stedet.", "the wording quotes none of those figures"
+    assert alt.departure_prediction is not None, "the stored copy must still be refreshed"
+
+
+def test_an_alternative_that_became_risky_drops_the_written_message():
+    """The one re-scored field the wording DOES state out loud, so it cannot be treated as noise.
+
+    `at_risk` earns "(kan også bli rammet)" and the model is told to hedge on it. Left out of the
+    identity, `_reconcile_caches` stored the rescored journey and kept the text written when the
+    flag was false — so the traveller was still being promised a clean escape after it stopped being
+    one. A boolean flips at most once or twice in a situation's life, so paying a re-write for it
+    cannot reintroduce the per-tick churn the minute-rounding above exists to stop.
+    """
+    _, dropped, _ = _reconcile_cycle(
+        cached=_alternative(), fresh=_alternative(at_risk=True), message="Ta R11 kl 08:24 i stedet."
+    )
+    assert dropped is None, "a clean escape that stopped being one is different advice"
+
+    # The same for the other flag a wording states: arriving after the planned time is the caveat
+    # `_alternative_phrase` adds, and it must not survive on a journey that now arrives in time.
+    _, dropped, _ = _reconcile_cycle(
+        cached=_alternative(**_LATE_ALTERNATIVE),
+        fresh=_alternative(**{**_LATE_ALTERNATIVE, "arrives_before_original": True}),
+        message="Ta R11 kl 09:35 i stedet, du er framme 30 min etter planen.",
+    )
+    assert dropped is None, "'later than you planned' must not outlive being true"
 
 
 if __name__ == "__main__":
