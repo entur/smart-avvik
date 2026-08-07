@@ -43,6 +43,15 @@ Design notes
   found nothing, that it kept the traveller on the train they have, or that no lookup was issued at
   all — and since most rows are sub-threshold, the last of those is most of any offer rate's
   denominator.
+* **Both wordings, not just the one that went out** (2026-08-07). `VARSEL_LLM_ENABLED` used to
+  decide whether a written wording *existed*; it now decides only which of the two is *sent*
+  (`llm_message.generation_enabled` vs `delivery_enabled`). So the row carries `message_llm` and
+  `message_deterministic` side by side, and `message`/`message_source` describe **delivery** rather
+  than availability: with delivery off — prd, today — an LLM wording exists that the push did not
+  carry, and `message_source = 'deterministic' AND message_llm IS NOT NULL` is exactly that
+  withheld-by-policy population. Recording only what was sent would leave the deployment whose
+  pushes reach real travellers with nothing to compare its own wording against, which is the whole
+  reason the flag was split.
 """
 
 from __future__ import annotations
@@ -309,6 +318,8 @@ def build_row(
     pushed: bool,
     message: str | None,
     message_source: str,
+    message_llm: str | None = None,
+    message_deterministic: str | None = None,
     message_input: str | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
@@ -321,9 +332,20 @@ def build_row(
     the annotation is resolved only by a type checker (see the TYPE_CHECKING import above), which
     is what keeps a renamed `Alert` field from silently becoming a column of NULLs.
 
-    `message` is the text that was actually sent — the written one when an LLM produced it, and
-    otherwise the same deterministic body the push carried. `message_source` says which, because
-    the two are indistinguishable once stored, and prd runs with the LLM off.
+    `message` is the text that was actually sent (or that would have been, where nothing was
+    delivered) and `message_source` says which of the two wordings that was. Since 2026-08-07 those
+    describe **delivery**, not availability: `message_llm` and `message_deterministic` carry the two
+    candidate wordings beside them, both written for every alert-worthy decision, because
+    `VARSEL_LLM_ENABLED` now selects which one goes out instead of deciding whether one is written
+    at all. Keying `message_source` off "did an LLM write anything" would therefore badge a template
+    push as the model's — on the page, and permanently in `varsel_decision_outcomes` once the
+    nightly job copies the pair there — so the caller must choose it on what it delivered.
+
+    `message_deterministic` is written on **every** decision, including the ~83 % sub-threshold ones
+    no wording is ever sent for; `message_llm` only where a model produced one. That asymmetry is
+    what dates a row: a NULL `message_llm` means either "no model wording exists" or "written before
+    the column did", while `message_deterministic IS NOT NULL` marks the row as post-change. The
+    same NULL-is-a-third-bucket rule `/historikk` states for `n_unsegmented`.
 
     `message_input` is the exact JSON document the message was (or would have been) written from —
     verbatim, not a reconstruction, so it stays faithful as `llm_message.build_message_input`
@@ -384,6 +406,11 @@ def build_row(
         "n_devices": n_devices,
         "message": message,
         "message_source": message_source,
+        # The two candidate wordings, recorded whether or not they were the one delivered. Reading
+        # either as "what the traveller was told" is the mistake to avoid: that is `message`, and
+        # which of these it equals is `message_source`.
+        "message_llm": message_llm,
+        "message_deterministic": message_deterministic,
         "snapshot_refreshed_at": (
             impact.refreshed_at.isoformat()
             if impact is not None and getattr(impact, "refreshed_at", None) is not None

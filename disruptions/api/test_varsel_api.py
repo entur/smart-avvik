@@ -1129,6 +1129,10 @@ def test_decision_row_stores_the_text_that_was_actually_sent(monkeypatch):
     assert row["message_source"] == "deterministic"
     # The same wording the push carried, not an empty column.
     assert "82 % sjanse for innstilling" in row["message"]
+    # Nothing was written, so the LLM column is NULL and `message` is the template one -- the third
+    # of the three delivery states, and the only one where the pair collapses to a single wording.
+    assert row["message_llm"] is None
+    assert row["message"] == row["message_deterministic"]
 
 
 def test_decision_row_labels_a_written_message_as_llm(monkeypatch):
@@ -1141,6 +1145,11 @@ def test_decision_row_labels_a_written_message_as_llm(monkeypatch):
 
     row = next(r for r in log.rows if r["situation_number"] == "S1")
     assert (row["message"], row["message_source"]) == ("Toget er innstilt.", "llm")
+    # Delivery is on (the suite pins VARSEL_LLM_ENABLED=true), so the sent text IS the written one --
+    # and the template wording is recorded anyway, which is what makes the two comparable on rows
+    # where the model's version is the one that went out.
+    assert row["message_llm"] == "Toget er innstilt."
+    assert "82 % sjanse for innstilling" in row["message_deterministic"]
 
 
 def test_decisions_are_recorded_even_when_push_is_disabled(monkeypatch):
@@ -1188,6 +1197,12 @@ def test_every_decision_records_the_message_input_even_below_the_threshold(monke
     payload = json.loads(row["message_input"])
     assert "reise" in payload and payload["sannsynlighet_prosent"] == 10
     assert row["prompt_version"], "the brief in force must be identifiable afterwards"
+    # The wording columns follow the same rule as the input, and for the same reason. No model is
+    # asked about a sub-threshold decision, so message_llm is NULL -- but message_deterministic is
+    # written for every decision, which is what dates the row as post-2026-08-07. A NULL there means
+    # "before the column existed", never "no wording", and these rows are ~83 % of the table.
+    assert row["message_llm"] is None
+    assert row["message_deterministic"] == row["message"]
 
 
 def test_the_recorded_input_is_the_object_the_model_was_prompted_with(monkeypatch):
@@ -1391,6 +1406,52 @@ def test_delivery_off_still_writes_the_wording_but_pushes_the_template(monkeypat
     )
 
 
+def test_a_withheld_wording_is_recorded_beside_the_one_that_was_sent(monkeypatch):
+    """Delivery off: both wordings are on the row, and `message`/`message_source` describe the SEND.
+
+    The discriminator the two columns exist for. Until 2026-08-07 the row stored `written or
+    deterministic` and labelled it `llm` whenever anything had been written -- which was harmless
+    only because a wording was written exactly when it was sent. With generation and delivery split
+    that is wrong three ways at once: /historikk would badge a template push "Skrevet av modellen",
+    `label_varsel_decisions.sql` copies the pair into `varsel_decision_outcomes` where it is
+    immutable once labelled, and "written but withheld by policy" -- `message_source =
+    'deterministic' AND message_llm IS NOT NULL` -- could never match a single row, which is
+    precisely the population prd's rollout is measured on.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
+    monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda *a, **k: llm_message.MessageResult(
+            "Toget ditt er innstilt. Ta R11 kl 08:24.", provider="gemini", model="g", status="ok"
+        ),
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_llm"] == "Toget ditt er innstilt. Ta R11 kl 08:24.", (
+        "the model's wording is recorded even though nobody received it"
+    )
+    assert row["message_source"] == "deterministic", (
+        "message_source says what was SENT, not that a wording exists"
+    )
+    assert row["message"] == row["message_deterministic"] == sent[0]["body"], (
+        "and `message` is the text the push actually carried, to the character"
+    )
+    # The write itself went fine, and the row says so: `message_status` describes the WRITER, so it
+    # can never be the column that tells a withheld wording from a missing one. That distinction is
+    # the message_llm/message_source pair above and nothing else.
+    assert (row["message_status"], row["llm_provider"]) == ("ok", "gemini")
+
+
 def test_delivery_off_survives_a_writer_that_raises(monkeypatch):
     """A backend failure must cost nothing at all when its output was never going to be sent.
 
@@ -1511,6 +1572,10 @@ def test_a_broken_message_input_costs_its_own_column_not_the_cycle(monkeypatch):
     assert row["message_input"] is None
     assert row["message"], "the decision itself is still recorded in full"
     assert "82 % sjanse for innstilling" in sent[0]["body"], "and the push still carries a body"
+    # The degraded wording is recorded as a WORDING and never as an input: it came from
+    # `_message_input_from_alert`, which no writer was ever shown, so message_deterministic is
+    # populated (it is what the push said) beside a NULL message_input (nothing was built).
+    assert row["message_deterministic"] == sent[0]["body"]
 
 
 def test_ensure_table_backs_off_after_a_failure(monkeypatch):
