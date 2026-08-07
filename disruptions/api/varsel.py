@@ -1474,6 +1474,12 @@ def _record_decisions(
     Runs after delivery so `pushed` reflects what actually reached a device rather than what was
     queued. Like every other dependency in this cycle it fails open — the import is local so a
     deploy without the module still pushes, and :func:`decisions.record` never raises.
+
+    Records **both** wordings (2026-08-07): `message_llm` is the raw cache read, `message_deterministic`
+    is this cycle's template body, and `message`/`message_source` say which of the two the traveller
+    actually got. Those are different questions now that ``VARSEL_LLM_ENABLED`` only selects the
+    wording — prd writes one and sends the other — and the pair on one row is the only way that
+    deployment's own pushes can be compared against what the model would have said.
     """
     try:
         import decisions
@@ -1486,6 +1492,10 @@ def _record_decisions(
         # which wording the traveller is sent, and a row whose writer ran perfectly well must not
         # file itself as "llm_disabled" merely because prd delivers the deterministic text.
         generation_on = llm_message.generation_enabled()
+        # Read ONCE for the whole cycle, like the gate above it: every row written here describes
+        # the same tick's deliveries, and a flag re-read per alert could label two rows from one
+        # cycle as having sent different wordings.
+        delivery_on = llm_message.delivery_enabled()
         device_counts: dict[str, set[str]] = {}
         for _jid, journey in journeys:
             device_counts.setdefault(journey_key(journey), set()).add(journey["device_id"])
@@ -1496,10 +1506,11 @@ def _record_decisions(
             n_devices = len(device_counts.get(key, ()))
             for alert in alerts_by_key.get(key, []):
                 message_key = _message_key(key, alert)
-                # Read RAW, deliberately not through `_deliverable_message`: the log records what
-                # was WRITTEN, not what was sent. Since 2026-08-07 those differ by design — prd
-                # writes a wording and delivers the deterministic one — and gating this read would
-                # throw away exactly the half of the pair the comparison exists for.
+                # Read RAW, deliberately not through `_deliverable_message`: this is the half of the
+                # pair recorded as `message_llm`, which is what was WRITTEN whether or not it was
+                # sent. Since 2026-08-07 those differ by design — prd writes a wording and delivers
+                # the deterministic one — and gating this read would throw away exactly the column
+                # the comparison exists for. What was sent is decided below, on `delivery_on`.
                 with _state_lock:
                     written = _messages.get(message_key)
                     meta = dict(_message_meta.get(message_key) or {})
@@ -1521,16 +1532,26 @@ def _record_decisions(
                         status = "llm_disabled"
                     else:
                         status = "not_selected"
-                # Record what was actually SENT, not just what the LLM wrote. `_messages` only ever
-                # holds LLM output, so storing it raw left every deterministic push with a NULL
-                # message — and prd runs with VARSEL_LLM_ENABLED=false, so /historikk there would
-                # have shown no message text at all. Fall back to the same deterministic body
-                # _notification_payload puts in the push -- from the same input, so the two agree by
-                # construction rather than by two template copies -- and say which one it was.
+                # BOTH wordings, on every row -- and `message`/`message_source` describing which one
+                # was DELIVERED. The deterministic body is built unconditionally (not as a fallback)
+                # from the same input `_notification_payload` words the push from, so the recorded
+                # pair agrees with the push by construction rather than through a second template
+                # copy; it is what dates a row as written after 2026-08-07, since a NULL `written`
+                # cannot (it also means "the column did not exist yet").
+                #
+                # The choice is made on `delivery_on`, NEVER on "a wording exists". Since 2026-08-07
+                # those are different questions: with delivery off the cache holds an LLM wording the
+                # push did not carry, and `written or deterministic` would file a template push as
+                # `llm` -- on the /historikk card, and permanently in `varsel_decision_outcomes`,
+                # which the nightly job copies the pair into and never revises. It would also leave
+                # "written but withheld" (`message_source='deterministic' AND message_llm IS NOT
+                # NULL`) matching no row at all, which is the population prd's rollout is judged on.
                 message_input = message_inputs.get(message_key)
-                message = written or _deterministic_body(
+                deterministic = _deterministic_body(
                     message_input or _message_input_from_alert(alert)
                 )
+                delivered = written if delivery_on else None
+                message = delivered or deterministic
                 rows.append(
                     decisions.build_row(
                         journey,
@@ -1539,7 +1560,9 @@ def _record_decisions(
                         n_devices=n_devices,
                         pushed=(key, alert.situation_number) in pushed_keys,
                         message=message,
-                        message_source="llm" if written else "deterministic",
+                        message_source="llm" if delivered else "deterministic",
+                        message_llm=written,
+                        message_deterministic=deterministic,
                         message_input=_message_input_json(message_input),
                         llm_provider=meta.get("provider"),
                         llm_model=meta.get("model"),

@@ -416,6 +416,11 @@ def test_a_new_column_reaches_the_environments_that_already_have_the_table():
     added = _added_columns("disruptions.varsel_decisions")
     alt_columns = {name for name in created if name.startswith("alt_") or name == "has_alternative"}
     assert alt_columns <= added, f"in the CREATE but not in any ALTER: {sorted(alt_columns - added)}"
+    # The 2026-08-07 pair, pinned by name: dev's and prd's decision tables both already exist, so
+    # these two reach a live environment through the ALTER block or not at all — and the symptom of
+    # not at all is every row of every cycle rejected by BigQuery, logged once a minute and nowhere
+    # else. "message_deterministic IS NOT NULL dates a post-change row" rests on this too.
+    assert {"message_llm", "message_deterministic"} <= added
     assert added <= created, f"added but never created: {sorted(added - created)}"
 
 
@@ -458,11 +463,38 @@ def test_message_provenance_is_recorded():
 def test_a_row_without_llm_context_is_still_valid():
     """The keyword arguments default to None so a caller with no LLM context — a test, a future
     surface — produces a valid row rather than inventing provenance.
+
+    The two wording columns are in that contract too: a caller that passes neither still writes the
+    columns, as NULLs, rather than a row BigQuery rejects for a missing field.
     """
     row = _row()
     assert row["message_input"] is None
     assert row["message_status"] is None
+    assert (row["message_llm"], row["message_deterministic"]) == (None, None)
     assert row["decided_at"] == DECIDED.isoformat()
+
+
+def test_both_wordings_are_recorded_beside_the_one_that_was_sent():
+    """`message` answers "what did the traveller get"; these two answer "what was it chosen between".
+
+    Separate questions since 2026-08-07, when VARSEL_LLM_ENABLED became a send-time selector instead
+    of deciding whether a wording was written at all: a delivery-off deployment (prd) writes the
+    model's text and pushes the template, so the row must hold both or the comparison the split
+    exists for can only ever be made on dev's traffic.
+
+    The row below is exactly that case, and it is what makes the R7 read work: "written, withheld by
+    policy" is `message_source = 'deterministic' AND message_llm IS NOT NULL`, which no row could
+    match while `message_source` was keyed off whether an LLM wording existed.
+    """
+    row = _row(
+        message="Signalfeil\nTog kl 08:12: 62 % sjanse for innstilling",
+        message_source="deterministic",
+        message_llm="Toget ditt kan bli innstilt. Vurder å reise tidligere.",
+        message_deterministic="Signalfeil\nTog kl 08:12: 62 % sjanse for innstilling",
+    )
+    assert row["message_llm"] == "Toget ditt kan bli innstilt. Vurder å reise tidligere."
+    assert row["message"] == row["message_deterministic"]
+    assert row["message_source"] == "deterministic", "the source describes the SEND, not the cache"
 
 
 # ---- the columns the /historikk API must never serve -------------------------------------------
