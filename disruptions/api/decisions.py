@@ -72,7 +72,17 @@ _OSLO = ZoneInfo("Europe/Oslo")
 
 TABLE = "disruptions.varsel_decisions"
 
-_CREATE_TABLE_SQL = (Path(__file__).parent / "create_varsel_decisions.sql").read_text()
+_DDL_PATH = Path(__file__).parent / "create_varsel_decisions.sql"
+
+# The DDL file is two halves, split on this marker: structure above, column descriptions below.
+# Both are idempotent and both run at every startup, but only the first decides whether the log is
+# usable -- see ensure_table. The marker lives in the SQL as a comment, so a reader of either file
+# sees the same boundary; `partition` means a file without it degrades to "all structural", which is
+# the safe direction (a description failure would then block again, rather than a structural failure
+# being ignored).
+_BEST_EFFORT_MARKER = "-- BEST-EFFORT SECTION"
+_ALL_DDL_SQL = _DDL_PATH.read_text()
+_STRUCTURE_SQL, _, _DESCRIPTIONS_SQL = _ALL_DDL_SQL.partition(_BEST_EFFORT_MARKER)
 
 # Injected by main.lifespan; None disables recording entirely (tests, and any deploy where the
 # client could not be built).
@@ -108,6 +118,17 @@ def ensure_table() -> bool:
     Done from the app rather than a provisioning script because prd is an isolated project fed by
     free BigQuery copies and nobody runs build scripts against it — the table would simply not
     exist there. `CREATE TABLE IF NOT EXISTS` never touches an existing table's contents.
+
+    Run as TWO jobs, and only the first one decides readiness. The second carries reworded column
+    descriptions to tables that already exist, and it is the half that can fail for a reason having
+    nothing to do with whether a row can be written: BigQuery caps table-metadata updates at 5 per
+    10 seconds per table, and that block only ever grows — every reworded description adds a
+    permanent `ALTER COLUMN ... SET OPTIONS`. Measured 2026-08-07 against dev, the file reliably
+    returned "Exceeded rate limits: too many table update operations for this table" once it reached
+    seven of them. Sending the whole file as one job made that a decision-log outage: any failure
+    left `_table_ready` False, so `record()` wrote nothing at all and a *documentation* edit silently
+    took down the log on the next deploy. Structure first, then descriptions, and a failure in the
+    descriptions is logged and forgiven.
     """
     global _table_ready, _ensure_failed_at
     if _bq_client is None:
@@ -117,7 +138,7 @@ def ensure_table() -> bool:
     if _ensure_failed_at is not None and monotonic() - _ensure_failed_at < _ENSURE_RETRY_S:
         return False
     try:
-        _bq_client.query(_CREATE_TABLE_SQL).result(timeout=_ENSURE_TIMEOUT_S)
+        _bq_client.query(_STRUCTURE_SQL).result(timeout=_ENSURE_TIMEOUT_S)
         _table_ready = True
         _ensure_failed_at = None
         logger.info("Decision log ready (%s)", TABLE)
@@ -126,6 +147,22 @@ def ensure_table() -> bool:
         # keep working without it. Backed off rather than retried every tick.
         _ensure_failed_at = monotonic()
         logger.warning("Could not ensure %s; decisions will not be recorded", TABLE, exc_info=True)
+        return False
+    if _DESCRIPTIONS_SQL.strip():
+        try:
+            _bq_client.query(_BEST_EFFORT_MARKER + _DESCRIPTIONS_SQL).result(
+                timeout=_ENSURE_TIMEOUT_S
+            )
+        except Exception:
+            # The table is already usable; what failed is documentation. Say so at warning level so
+            # a persistently stale `bq show --schema` is discoverable, and carry on recording.
+            logger.warning(
+                "Could not refresh %s column descriptions; the schema comments may be stale. "
+                "Decisions are still being recorded.",
+                TABLE,
+                exc_info=True,
+                extra={"fields": {"event": "varsel_decision_write", "result": "stale_descriptions"}},
+            )
     return _table_ready
 
 

@@ -357,7 +357,7 @@ def _created_columns(table: str) -> set[str]:
     """Columns the CREATE TABLE statement for `table` defines, read from the DDL the app runs."""
     body = re.search(
         rf"CREATE TABLE IF NOT EXISTS `{table}`\s*\((.*?)\)\s*PARTITION BY",
-        decisions._CREATE_TABLE_SQL,
+        decisions._ALL_DDL_SQL,
         re.DOTALL,
     )
     assert body is not None, f"no CREATE TABLE found for {table}"
@@ -373,7 +373,7 @@ def _added_columns(table: str) -> set[str]:
     scoping matters — there is a second ADD COLUMN block, on the outcomes table.
     """
     added: set[str] = set()
-    for statement in re.split(r"^(?=CREATE |ALTER |EXECUTE )", decisions._CREATE_TABLE_SQL, flags=re.MULTILINE):
+    for statement in re.split(r"^(?=CREATE |ALTER |EXECUTE )", decisions._ALL_DDL_SQL, flags=re.MULTILINE):
         if statement.startswith(f"ALTER TABLE `{table}`") and "ADD COLUMN" in statement:
             # Anchored to the line and followed by a type, so the prose about ADD COLUMN in the
             # comments around these statements is not read as a column named "does".
@@ -506,6 +506,86 @@ def test_the_row_still_carries_no_device_or_journey_id():
     row = _row(message_input='{"reise": {"fra": "Oslo S", "til": "Drammen"}}')
     assert "device_id" not in row
     assert "journey_id" not in row
+
+
+# ---- the DDL is two halves, and only one of them can stop the log --------------------------------
+class _FakeQueryJob:
+    def __init__(self, fail: bool):
+        self._fail = fail
+
+    def result(self, timeout=None):
+        if self._fail:
+            raise RuntimeError(
+                "Exceeded rate limits: too many table update operations for this table"
+            )
+
+
+class _HalfFailingClient:
+    """A client that serves the structural DDL and fails the description refresh.
+
+    Modelled on the real 2026-08-07 failure: BigQuery caps table-metadata updates at 5 per 10 s per
+    table, and the SET OPTIONS block trips it while every CREATE/ADD COLUMN above succeeds.
+    """
+
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def query(self, sql):
+        self.queries.append(sql)
+        return _FakeQueryJob(fail=sql.lstrip().startswith(decisions._BEST_EFFORT_MARKER))
+
+
+def _with_client(client):
+    decisions._bq_client = client
+    decisions._table_ready = False
+    decisions._ensure_failed_at = None
+
+
+def test_the_ddl_splits_structure_from_descriptions():
+    """The marker has to actually partition the file, or the split silently becomes a no-op."""
+    assert decisions._BEST_EFFORT_MARKER in decisions._ALL_DDL_SQL
+    assert "CREATE TABLE IF NOT EXISTS" in decisions._STRUCTURE_SQL
+    assert "ALTER COLUMN" not in decisions._STRUCTURE_SQL, (
+        "a SET OPTIONS statement above the marker still spends a metadata slot on the blocking half"
+    )
+    assert "ALTER COLUMN" in decisions._DESCRIPTIONS_SQL
+
+
+def test_a_failed_description_refresh_does_not_stop_the_log():
+    """The 2026-08-07 outage, pinned.
+
+    ensure_table used to send the whole file as ONE job, so the rate-limited SET OPTIONS block left
+    _table_ready False and record() wrote nothing — a cosmetic description edit taking down the
+    entire alert-decision log on the next deploy.
+    """
+    client = _HalfFailingClient()
+    _with_client(client)
+    try:
+        assert decisions.ensure_table() is True, "structure succeeded; the table is usable"
+        assert decisions._ensure_failed_at is None, "a description failure must not arm the backoff"
+        assert len(client.queries) == 2, "structure and descriptions are separate jobs"
+        assert not client.queries[0].lstrip().startswith(decisions._BEST_EFFORT_MARKER)
+    finally:
+        _with_client(None)
+
+
+def test_a_failed_structural_ddl_still_stops_the_log():
+    """The forgiveness is scoped to descriptions — a missing table must still block recording."""
+
+    class _AllFailingClient(_HalfFailingClient):
+        def query(self, sql):
+            self.queries.append(sql)
+            return _FakeQueryJob(fail=True)
+
+    client = _AllFailingClient()
+    _with_client(client)
+    try:
+        assert decisions.ensure_table() is False
+        assert decisions._ensure_failed_at is not None, "a structural failure arms the backoff"
+        assert len(client.queries) == 1, "the description half is not attempted after structure fails"
+        assert decisions.record([{"situation_number": "x"}]) == 0
+    finally:
+        _with_client(None)
 
 
 def _run():
