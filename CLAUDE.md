@@ -173,8 +173,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Garden enablement on top of the IAM role**, so check `jsonPayload.provider` on
     `event="llm_message"` rather than assuming which one answered. Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
-    wording, so a push is never lost to an LLM problem. **Off in prd** (`VARSEL_LLM_ENABLED=false`)
-    until validated in dev. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
+    wording, so a push is never lost to an LLM problem.
+    **Writing a wording and sending it are two switches** (2026-08-07): `VARSEL_LLM_PROVIDER=off`
+    stops a model being *asked*; `VARSEL_LLM_ENABLED=false` still asks and records the answer but
+    *sends* the deterministic wording. `llm_message.generation_enabled()` and `delivery_enabled()`
+    are the two gates — the old conflated `llm_enabled()` is gone. Delivery is enforced in exactly
+    one place, `varsel._deliverable_message`, which the push body and the in-app journey card both
+    read through; the card is the one that would otherwise silently start showing prose the push did
+    not carry. `_messages` has two other readers (`check_and_notify`'s cache probe,
+    `_record_decisions`' fill of `message_llm`) that stay ungated on purpose: the log records what
+    was *written*, whether or not it was sent. **prd currently has both switches off** — the
+    delivery one until the wording is validated in dev, the provider one until the residency
+    question is answered (a prd call would send the traveller's origin, destination and departure
+    time to a `global`, non-region-bound endpoint; the `AI.CLASSIFY` precedent covers
+    operator-authored SX text, not a commute). Enabling each is a separate one-value prd deploy.
+    Prompts and replies are logged under `jsonPayload.event="llm_message"`.
     `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
     2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
     available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
@@ -248,8 +261,27 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     "take this instead" can eventually be labelled the way every other decision here already is. `message_status` says why the stored wording has the source it does —
     `ok` / `ok_cached` / `not_alertworthy` / `not_selected` / `push_disabled` / `llm_disabled` /
     `capped` / `attempts_exhausted` / `rejected` / `ungrounded` / `error` — because a cap, an
-    exhausted retry, a refusal and prd's `VARSEL_LLM_ENABLED=false` all store the same
-    deterministic text. `llm_provider`/`llm_model` outlive the Cloud Logging retention that used to
+    exhausted retry and a refusal all store the same deterministic text. Two of those values changed
+    meaning on 2026-08-07 and the schema descriptions carry the new reading: `llm_disabled` now means
+    no backend could be **asked** (`VARSEL_LLM_PROVIDER=off`, no project, everything latched), never
+    "this deployment sends the template"; and `attempts_exhausted` means no backend was reachable for
+    three cycles rather than "the model was asked and failed" — `_write_message` returns `None`
+    without calling anything on several paths and the caller spends an attempt on any `None`
+    (measured in prd 2026-08-07, where generation had never run: 753 rows `llm_disabled` and 693
+    `attempts_exhausted` across the same 11 subjects).
+    **Both wordings are recorded, and `message` is the one that was *delivered*** (2026-08-07):
+    `message_llm` and `message_deterministic` sit beside `message`/`message_source`, so the two
+    writers can be compared on the same decision — which is impossible while a flag decides that only
+    one of them exists. The sent wording is chosen on `delivery_enabled()`, never on "an LLM wording
+    exists": `written or deterministic` would file a template push as `llm` on the `/historikk` card
+    *and* permanently in `varsel_decision_outcomes`, and would leave "written but withheld"
+    (`message_source='deterministic' AND message_llm IS NOT NULL`) matching no row at all — the one
+    population prd's rollout is judged on. `message_deterministic` is written on **every** decision,
+    so its presence is what dates a row as post-change; `message_llm` cannot, since NULL there also
+    means the column did not exist yet (the `n_unsegmented` third-bucket rule, one column over). The
+    side-by-side is `data/queries/message_wording_comparison.sql`; filter `message_status = 'ok'` for
+    a same-input pair, because under `ok_cached` the model's text came from an earlier cycle's input
+    than the template's did. `llm_provider`/`llm_model` outlive the Cloud Logging retention that used to
     be the only record, and `prompt_version` (SHA-256[:8] of the system prompt, derived so nobody
     has to remember to bump it) keeps rows written under different briefs comparable.
     `message_input` carries origin, destination and departure time together — the trio
@@ -259,7 +291,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     (`create_varsel_decisions.sql`, `CREATE TABLE IF NOT EXISTS` — **never** `CREATE OR REPLACE`;
     their contents cannot be rebuilt). Because `IF NOT EXISTS` does nothing to an existing table,
     a new column also needs an `ALTER TABLE … ADD COLUMN IF NOT EXISTS` in that same file — without
-    it the write path just logs "N of M rows rejected by BigQuery" every cycle. Note
+    it the write path just logs "N of M rows rejected by BigQuery" every cycle.
+    **That file is two halves and `ensure_table` runs them as separate jobs** (2026-08-07): structure
+    above the `-- BEST-EFFORT SECTION` marker decides readiness, the `ALTER COLUMN … SET OPTIONS`
+    description refresh below it is best-effort and a failure there is logged and forgiven. BigQuery
+    caps table-metadata updates at **5 per 10 s per table** and that block only ever grows — every
+    reworded description adds a permanent statement. At seven of them it reliably returned "Exceeded
+    rate limits: too many table update operations for this table", and since `ensure_table` treats
+    any failure as "table not ready", one whole-file job meant a *cosmetic description edit* silently
+    stopped the decision log recording anything at all. Prune statements whose text has demonstrably
+    reached both dev and prd; a fresh environment reads its descriptions from the `CREATE` bodies.
+    Note
     `validate_varsel_sql.sh` checks that file **statement by statement**: a dry run of a
     multi-statement script validates only the first one (`numChildJobs: 1`), so a broken ALTER
     would otherwise pass the validator and fail at startup. The outcomes table is created there too, not by the nightly
@@ -319,8 +361,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
     page shows the per-row state next to the count.
   - Neither table is in `copy_runtime_to_prd.sh`: each environment records its own decisions and
-    `bq cp -f` overwrites. Note `VARSEL_LLM_ENABLED=false` in prd, so prd rows carry the
-    deterministic wording; dev is where the LLM-written messages are.
+    `bq cp -f` overwrites. **dev is where the comparison lives.** prd has `VARSEL_LLM_PROVIDER=off`
+    *and* `VARSEL_LLM_ENABLED=false`, so its rows carry a deterministic `message` and a NULL
+    `message_llm` — no model is asked there yet. dev has both switches on, so its rows carry a
+    written wording, a template wording and a delivered one. Turning prd's provider on is what makes
+    prd rows comparable; that is a separate deploy, gated on the residency question in
+    `values-kub-ent-prd.yaml`.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)
