@@ -198,27 +198,30 @@ stored wording has the source it does. What is missing is the second wording on 
   `VARSEL_LLM_ENABLED=false` is giving up. Adding a third flag to express what two already express
   was rejected. Note it is a Helm values edit plus a dispatch-only `prd` deploy, not a runtime
   toggle — mean time to revert is a deploy cycle.
-- KTD9. **`prd` ships with `VARSEL_LLM_PROVIDER: off`; enabling generation there is a separate
-  one-value deploy.** `prd` already carries `VARSEL_LLM_PROVIDER: auto`, so without this the deploy
-  that splits the gates is also `prd`'s first-ever Vertex call — on a single always-on pod, with no
-  verified intermediate state, and the plan's own stop condition ("the LLM cannot be reached from
-  `prd`") can only fire after that deploy, protecting nothing during implementation. Staging it
-  costs nothing the plan needs: `dev` runs generation and delivery, so the same-row pairing KD1
-  exists for is available there the day this lands. Shipping generation to `prd` in the same change
-  was rejected because it couples a mechanism change to an unanswered data-residency question
-  (KTD10) and to a latency change on the environment where lead time is the product. Does **not**
-  weaken KD1 or KD2 — the flag semantics are unchanged, only when `prd` starts generating.
-- KTD10. **What `prd` will send to Vertex, and where, is decided on the record before generation is
-  enabled there.** The prompt carries the traveller's origin, destination and departure time
-  (`llm_message.build_message_input`) — the same quasi-identifying trio `journey_digest` hashing,
-  `VARSEL_LLM_LOG_PROMPTS=false` and the `/historikk` redaction contract all exist to contain — and
-  `prd` pins `VERTEX_LOCATION: global`, which is not region-bound. The existing
-  `roles/aiplatform.user` precedent does not cover this: `AI.CLASSIFY` in `update_categories.sql`
-  sends operator-authored SX text, not a real traveller's commute. Inheriting `global` by silence
-  was rejected — the project treats this trio as sensitive everywhere else, so the residency call
-  belongs where its other decisions live. The measured constraint is real (`gemini-3.5-flash` 404s
-  at `europe-west1`, 2026-07-29), so if no EU region serves the configured models the answer may
-  legitimately be `global` as an accepted exception with a named owner — recorded, not assumed.
+- KTD9. **`prd` generates from day one: `VARSEL_LLM_PROVIDER: auto` with
+  `VARSEL_LLM_ENABLED: "false"`.** (session-settled: user-directed — chosen over staging generation
+  behind a second deploy: the comparison is only worth having on real journeys, and `prd`'s are the
+  real ones.) Writing but not delivering is exactly the state the gate split exists to make
+  possible, so `prd` records a `message_llm` beside its delivered template wording from the first
+  cycle. A staged rollout — shipping `prd` with the provider off and flipping it later — was
+  considered and rejected: it would have left the population the rollout decision is actually judged
+  on (`message_source='deterministic' AND message_llm IS NOT NULL`) empty in `prd` for as long as
+  the second deploy took. The residual risks are real and accepted rather than absent: this is
+  `prd`'s first Vertex call (KTD10), and it adds LLM wall clock ahead of the delivery loop (see
+  Risks). Every failure path already falls back to the template, so the cost of a bad call is a NULL
+  column, never a lost push. Governs R1.
+- KTD10. **`prd` sends the traveller's origin, destination and departure time to Vertex at
+  `global`, and that is recorded rather than inherited.** The prompt carries the same
+  quasi-identifying trio `journey_digest` hashing, `VARSEL_LLM_LOG_PROMPTS=false` and the
+  `/historikk` redaction contract all exist to contain (`llm_message.build_message_input`), and
+  `VERTEX_LOCATION: global` is not region-bound. The existing `roles/aiplatform.user` precedent does
+  not cover it: `AI.CLASSIFY` in `update_categories.sql` sends operator-authored SX text, not a real
+  traveller's commute. The decision to proceed was taken on 2026-08-07 with that in view; what is
+  rejected is proceeding *silently*, so the fact and its reasoning sit beside the value in
+  `values-kub-ent-prd.yaml` where anyone changing it will read them. The measured constraint on the
+  alternative is real — `gemini-3.5-flash` 404s at `europe-west1` (2026-07-29) — so pinning an EU
+  region may require a per-model override or a different model; the code needs no change for it, and
+  `VARSEL_LLM_PROVIDER=off` stops the egress outright if a data-processing record later demands it.
   Governs R1.
 - KTD6. **`message_status` keeps its vocabulary; two values change meaning and are re-documented in
   place.** `llm_disabled` now means *generation* is off (provider `off`, no project, every backend
@@ -238,13 +241,15 @@ afterwards.
   where push is on.
 - Generation is not extended to sub-threshold decisions. Doing so would multiply Vertex calls by
   roughly six for wordings no traveller ever sees.
-- The comparison window opens in `dev`, not `prd`. `dev` runs generation and delivery, so it
-  produces paired rows immediately; `prd` produces them once KTD9's follow-up deploy lands. Volume
-  is thin either way — measured 2026-08-07, `dev` produced 7 subjects at `message_status = 'ok'`
-  over three days — so "non-zero" is the post-deploy smoke check, not evidence.
+- Both environments produce paired rows from the first cycle after deploy, and they answer different
+  questions: `dev` delivers the model's wording, `prd` withholds it. Volume is thin either way —
+  measured 2026-08-07, `dev` produced 7 subjects at `message_status = 'ok'` over three days — so
+  "non-zero" is the post-deploy smoke check, not evidence.
 - `prd` keeps `VARSEL_LLM_ENABLED: "false"`, which after this change means "write it, do not send
   it". The runtime SA already holds `roles/aiplatform.user` (granted for `AI.CLASSIFY`, verified
-  2026-07-09), so no new grant is needed when KTD9's follow-up enables generation there.
+  2026-07-09), so no new grant is needed. Whether `prd`'s project has Vertex Model Garden enablement
+  for Anthropic publisher models is unverified — expect the backend to latch to Gemini, and read
+  `jsonPayload.provider` on `event="llm_message"` rather than assuming Sonnet 5 answered.
 - Spend is bounded by the existing per-cycle caps and the per-situation `_messages` cache — a few
   short calls per disruption, not per cycle. Wall clock is bounded but not free; see the Risks
   table.
@@ -587,24 +592,27 @@ calling Vertex in the same deploy that splits the gates.
    `ok_cached` caveat.
 4. Correct the comment in `values-kub-ent-dev.yaml:25` — `VARSEL_LLM_ENABLED=false` no longer falls
    back "everywhere", only on delivery.
-5. Set `VARSEL_LLM_PROVIDER: off` in `values-kub-ent-prd.yaml` (KTD9), and **rewrite** — not append
-   to — the comment block above `VARSEL_LLM_ENABLED` there. It currently reads "LLM-written push
-   text is OFF in prd … the other three vars are set so enabling it is a one-value change", which
-   under the new semantics is actively misleading: the flag no longer stops generation, and the
-   one-value change is now `VARSEL_LLM_PROVIDER`. State both switches and which one this file is
-   using.
-6. Record the residency decision (KTD10) beside `VERTEX_LOCATION` in the `prd` values file: what the
-   prompt carries, which endpoint serves it, and either a regional value or `global` named as an
-   accepted exception with an owner. This is a **blocker for enabling generation in `prd`**, not for
-   merging U1-U5 — with `VARSEL_LLM_PROVIDER: off` shipped, no traveller data leaves `prd`.
+5. **Rewrite** — not append to — the comment block above `VARSEL_LLM_ENABLED` in
+   `values-kub-ent-prd.yaml`. It currently reads "LLM-written push text is OFF in prd … the other
+   three vars are set so enabling it is a one-value change", which under the new semantics is
+   actively misleading: the flag no longer stops generation. State both switches, and state that
+   `prd` deliberately runs them apart — `VARSEL_LLM_PROVIDER: auto` with
+   `VARSEL_LLM_ENABLED: "false"` is write-but-do-not-send, the combination the split exists for
+   (KTD9). `VARSEL_LLM_PROVIDER: auto` is already the value there; the comment is what changes.
+6. Record the egress fact (KTD10) beside `VERTEX_LOCATION` in the `prd` values file: what the prompt
+   carries, which endpoint serves it, that `AI.CLASSIFY` is not the same data class, and that
+   proceeding was decided rather than inherited. Name the two levers — pin a region, or
+   `VARSEL_LLM_PROVIDER=off` — so a later residency requirement has an obvious answer that needs no
+   code change.
 
-**Test scenarios:** `Test expectation: none -- documentation and Helm values; the one behavioral
-value (VARSEL_LLM_PROVIDER: off in prd) is verified by helm-lint and by prd emitting no
-event="llm_message" records after deploy.`
+**Test scenarios:** `Test expectation: none -- documentation and Helm comments; no values change
+behaviour on its own. prd's generation is verified after deploy by event="llm_message" records
+appearing and a non-zero message_llm count, with message_source still 'deterministic'.`
 
 **Verification:** the `helm-lint` job passes for all three environments (comment-only edits must not
 disturb YAML structure); no line in `CLAUDE.md` still describes `VARSEL_LLM_ENABLED` as disabling
-the LLM path; and `values-kub-ent-prd.yaml` carries `VARSEL_LLM_PROVIDER: off`.
+the LLM path; and `values-kub-ent-prd.yaml` carries `VARSEL_LLM_PROVIDER: auto` beside
+`VARSEL_LLM_ENABLED: "false"`.
 
 ---
 
@@ -661,7 +669,8 @@ Gates: lint clean, every suite exits zero, the DDL dry run reports no failures, 
 - U4: the file exists, joins `varsel_decision_groups` for its grain, and each of its two queries
   dry-runs clean against `dev`.
 - U5: `CLAUDE.md` and both Helm values files describe the flag as a delivery switch, and `prd`
-  carries `VARSEL_LLM_PROVIDER: off`.
+  carries `VARSEL_LLM_PROVIDER: auto` with `VARSEL_LLM_ENABLED: "false"` — writing but not
+  delivering — with the egress fact recorded beside `VERTEX_LOCATION`.
 
 ---
 
@@ -669,9 +678,9 @@ Gates: lint clean, every suite exits zero, the DDL dry run reports no failures, 
 
 | Risk | Why it matters | Mitigation |
 |---|---|---|
-| `prd` sends traveller origin, destination and departure time to Vertex | The prompt carries the quasi-identifying trio the rest of the system works to contain, and `prd` pins a non-region-bound endpoint. The `AI.CLASSIFY` precedent covers operator-authored SX text, not a commute. | KTD10 makes the residency call explicit, and KTD9 ships `prd` with generation off so nothing egresses until that call is made. Neither blocks merging U1-U5. |
-| `prd` starts calling Vertex for the first time | A permission or Model Garden gap surfaces on the traveller-facing path rather than in `dev`. | Staged: KTD9 defers it to a separate one-value deploy, after `dev` has shown paired rows. Every failure path already falls back to the deterministic wording, and `prd` delivers that wording regardless — so a `prd` LLM failure costs a NULL `message_llm`, never a lost push. Confirm via `jsonPayload.event="llm_message"` and a non-zero `message_llm` count. |
-| Generation delays the pushes it does not write for | `check_and_notify` writes in loop 1 and delivers in loop 2, on the single poller thread, so a cycle spending its full `_MAX_LLM_SECONDS_PER_CYCLE` (30 s) delays the traveller's push *and* the next rebuild of `/disruptions`, `/journey`, `/demo` and `/reisevalg`. On the environment where lead time is the product, that is spent writing text the environment will not deliver. R5 covers content, not timing. | The deadline is already the ceiling. `dev` absorbs it first (KTD9), and the post-deploy check includes cycle duration, not just row counts — if the ingestion-change interval moves materially, `VARSEL_LLM_PROVIDER=off` reverts it. |
+| `prd` sends traveller origin, destination and departure time to Vertex | The prompt carries the quasi-identifying trio the rest of the system works to contain, and `prd` pins a non-region-bound endpoint. The `AI.CLASSIFY` precedent covers operator-authored SX text, not a commute. | **Accepted, not mitigated** (KTD9, KTD10). Recorded beside the value in `values-kub-ent-prd.yaml` so it is discoverable by anyone changing it. `VARSEL_LLM_PROVIDER=off` stops the egress outright if a data-processing record later requires EU residency; pinning a region needs no code change. |
+| `prd` starts calling Vertex for the first time | A permission or Model Garden gap surfaces on the traveller-facing path rather than in `dev`. | Every failure path already falls back to the deterministic wording, and `prd` delivers that wording regardless — so a `prd` LLM failure costs a NULL `message_llm`, never a lost push. Confirm after deploy via `jsonPayload.event="llm_message"` and a non-zero `message_llm` count; a Model Garden gap shows up as `provider=gemini`, not as an outage. |
+| Generation delays the pushes it does not write for | `check_and_notify` writes in loop 1 and delivers in loop 2, on the single poller thread, so a cycle spending its full `_MAX_LLM_SECONDS_PER_CYCLE` (30 s) delays the traveller's push *and* the next rebuild of `/disruptions`, `/journey`, `/demo` and `/reisevalg`. In `prd` that is time spent writing text `prd` will not deliver, on the environment where lead time is the product. R5 covers content, not timing. | The deadline is already the ceiling, and the per-situation `_messages` cache means one write per disruption rather than per cycle. The post-deploy check includes `prd` cycle duration, not just row counts — if the ingestion-change interval moves materially, `VARSEL_LLM_PROVIDER=off` reverts it in one value. |
 | The card leaks LLM prose in `prd` | `_journey_model` is the least obvious of the three `_messages` readers, and the failure is silent — the card would say something the push did not. | KTD2 puts the rule in one function; U2's execution note writes that test first; the Definition of Done requires all three readers be accounted for. |
 | A comparison run on `ok_cached` rows | The two wordings then come from different cycles' inputs, so the comparison measures staleness, not the writers. | Stated in both column descriptions (U3) and in the query header (U4); the query filters on `message_status = 'ok'`. |
 | A broken `ALTER` in `create_varsel_decisions.sql` | `decisions.ensure_table` treats any failure in that file as "table not ready" and stops recording decisions entirely. | `validate_varsel_sql.sh` is a required gate for U3; it splits the file and dry-runs each statement, which a whole-file dry run does not. |
