@@ -34,8 +34,9 @@
 --
 --   3. `message_deterministic IS NOT NULL` DATES THE ROW. A NULL `message_llm` means either "no
 --      model wording" or "written before the column existed", and the log holds many of the latter
---      (measured 2026-08-07: 932 prd and 561 dev rows in one week carry a NULL `message_status`
---      from the previous column addition). Pre-change rows are reported as their own bucket below,
+--      (every row written before this change: measured 2026-08-07 in dev, 4010 of 4010 rows have a
+--      NULL `message_deterministic`, because nothing has written the column yet). Pre-change rows
+--      are reported as their own bucket below,
 --      never folded into a generation-failure rate. Same third-bucket rule `/historikk` states for
 --      `n_unsegmented`, and it has already been got backwards twice in this repo.
 --
@@ -46,9 +47,16 @@
 --      generation had never run: 753 rows at `llm_disabled` and 693 at `attempts_exhausted` across
 --      the same 11 subjects.
 --
---   5. SEGMENT ON `et_cancelled`, NEVER FILTER. A declared cancellation strips every probability
---      from the payload, so both writers have a much narrower job and the wordings converge.
---      Blending those subjects with delay alerts flatters the template.
+--   5. SEGMENT ON `et_cancelled`, NEVER FILTER, AND TAKE THE SEGMENT FROM THE VIEW. A declared
+--      cancellation strips every probability from the payload, so both writers have a much narrower
+--      job and the wordings converge; blending those subjects with delay alerts flatters the
+--      template. Critically, the segment is NOT `LOGICAL_OR(et_cancelled)` over the subject's
+--      cycles: `varsel_decision_groups` resolves it at the cycle the verdict judges (the first
+--      alerting cycle where we alerted, `LOGICAL_OR` where we did not), and the view's own header
+--      records why a plain `LOGICAL_OR` is exactly backwards — a cancellation is routinely declared
+--      AFTER we alerted, since beating the feed is the point, so it would file the stack's best wins
+--      as gimmes. This query joins the view and reads `et_cancelled` from it, so the split here and
+--      the one `/historikk` reports cannot drift. NULL stays its own row, never defaulted to FALSE.
 --
 -- Also worth pinning before drawing a conclusion: `prompt_version` (a prompt edit mid-window makes
 -- rows incomparable -- that is what the column is for) and `llm_provider` (dev has been answering
@@ -67,8 +75,7 @@ WITH cycles AS (
     message_deterministic,
     message_source,
     prompt_version,
-    llm_provider,
-    COALESCE(et_cancelled, FALSE) AS et_cancelled
+    llm_provider
   FROM `disruptions.varsel_decisions`
   WHERE decided_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
 ),
@@ -77,7 +84,6 @@ subjects AS (
     -- The subject grain, matching varsel_decision_groups. journey_digest is carried to group and
     -- join on; it is never projected past this CTE.
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
-    LOGICAL_OR(et_cancelled)                                      AS was_cancelled,
     -- Post-change is decided on the deterministic column, per trap 3.
     LOGICAL_OR(message_deterministic IS NOT NULL)                 AS instrumented,
     LOGICAL_OR(message_status = 'ok' AND message_llm IS NOT NULL) AS has_same_input_pair,
@@ -88,7 +94,8 @@ subjects AS (
   GROUP BY 1, 2, 3, 4, 5, 6
 )
 SELECT
-  was_cancelled,
+  -- From the VIEW, never re-derived here (trap 5). NULL is its own row.
+  g.et_cancelled                      AS was_cancelled,
   COUNT(*)                            AS subjects,
   -- Reported beside the rates, never inside them: these predate the columns and carry no evidence
   -- either way.
@@ -103,7 +110,9 @@ SELECT
   -- it is the population the rollout decision is judged on.
   COUNTIF(has_any_llm_wording AND NOT ever_delivered_llm) AS written_but_withheld,
   ROUND(AVG(n_cycles), 1)             AS avg_cycles_per_subject
-FROM subjects
+FROM subjects AS s
+JOIN `disruptions.varsel_decision_groups` AS g
+  USING (journey_digest, operator, jkey, call_date, stop_order, situation_number)
 GROUP BY was_cancelled
 ORDER BY was_cancelled;
 

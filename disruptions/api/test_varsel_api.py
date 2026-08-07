@@ -42,6 +42,13 @@ os.environ.update(
     # monkeypatch llm_message.delivery_enabled themselves, which also states the case they are about
     # instead of leaving it to the ambient environment.
     VARSEL_LLM_ENABLED="true",
+    # And pin the GENERATION side on, which needs a project: `llm_message.generation_enabled()` is
+    # False without one, and since 2026-08-07 `check_and_notify` checks it BEFORE reaching the
+    # writer (so that a cycle asking no backend does not spend a retry attempt). Unpinned, every
+    # test that stubs `_write_message` would silently never reach its stub and assert against a
+    # deployment that cannot write at all. No client is ever constructed from this value here --
+    # the backends are stubbed -- so a placeholder project is enough.
+    GOOGLE_CLOUD_PROJECT=os.environ.get("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test"),
 )
 
 import json
@@ -143,6 +150,19 @@ def _reset_state():
         varsel._alternatives.clear()
         varsel._message_attempts.clear()
         varsel._message_meta.clear()
+    # llm_message's backend latch is PROCESS-global and survives a monkeypatch undo, so a test that
+    # drives both backends into `_latched_off` (the 404/configuration path) silently disables
+    # generation for every test that runs after it. That was invisible until 2026-08-07, when
+    # `check_and_notify` began consulting `generation_enabled()` before reaching the writer -- at
+    # which point the leak turned into "the writer is never called" in unrelated tests, which reads
+    # exactly like the give-up bug those tests exist to pin. Clear it here, like test_llm_message's
+    # own `_reset` does.
+    import llm_message
+
+    with llm_message._lock:
+        llm_message._latched_off.clear()
+        llm_message._active = None
+        llm_message._active_at = None
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
@@ -762,6 +782,74 @@ def test_a_message_that_cannot_be_written_is_not_retried_forever(monkeypatch):
         f"got {len(attempts)}"
     )
     assert len(sent) == 1, "the push still went out once, with the deterministic wording"
+
+
+def test_generation_being_off_does_not_spend_the_retry_budget(monkeypatch):
+    """A cycle that asks no backend must not cost a retry.
+
+    `_write_message` returns None on several paths that never reach a model — generation switched
+    off, or every backend latched off after a 404 — and the caller spends an attempt on any None. So
+    three such cycles used to exhaust a situation permanently: when `llm_message._LATCH_TTL` expired
+    30 minutes later and a backend came back, the situation was already at `_MAX_MESSAGE_ATTEMPTS`
+    and was never offered to the writer again for its whole life. In prd that silently thins the
+    written-but-withheld population the rollout is judged on.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+
+    monkeypatch.setattr(varsel, "_generation_enabled", lambda: False)
+    for _ in range(5):  # five cycles with nothing to ask
+        varsel.check_and_notify(SNAPSHOT)
+    assert not varsel._message_attempts, "no backend was reached, so no attempt may be spent"
+
+    # The backend comes back. The situation must still be offered to the writer.
+    written = []
+    monkeypatch.setattr(varsel, "_generation_enabled", lambda: True)
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda *a, **k: written.append(1) or "Toget er innstilt."
+    )
+    varsel.check_and_notify(SNAPSHOT)
+    assert written, "a recovered backend must still get to write this situation's wording"
+
+
+def test_a_cached_wording_is_recorded_beside_a_fresh_template(monkeypatch):
+    """The `ok_cached` trap, pinned: the two wordings on that row describe different cycles.
+
+    `message_llm` is reused from the cycle that wrote it, while `message_deterministic` is rebuilt
+    from THIS cycle's input every time. So on an `ok_cached` row the pair is not a same-input
+    comparison, which is why message_wording_comparison.sql filters on `message_status = 'ok'`.
+    Documented in three places and, until now, asserted in none.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda message_input, **kw: llm_message.MessageResult(
+            "Skrevet i forrige syklus.", provider="gemini", model="g", status="ok"
+        ),
+    )
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    first = [r for r in log.rows if r["message_status"] == "ok"]
+    assert first, "the first cycle writes the wording"
+
+    varsel.check_and_notify(SNAPSHOT)  # same live situation, wording served from cache
+    cached = [r for r in log.rows if r["message_status"] == "ok_cached"]
+    assert cached, "the second cycle reuses it rather than re-asking"
+    row = cached[-1]
+    assert row["message_llm"] == "Skrevet i forrige syklus.", (
+        "the cached row still records the model's wording"
+    )
+    assert row["message_deterministic"], "and a template wording rebuilt this cycle beside it"
+    assert row["message_deterministic"] != row["message_llm"], (
+        "the two describe different cycles' inputs -- the reason 'ok' is the same-input filter"
+    )
 
 
 def test_a_written_message_clears_the_failure_count(monkeypatch):
