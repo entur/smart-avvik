@@ -81,8 +81,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Garden enablement on top of the IAM role**, so check `jsonPayload.provider` on
     `event="llm_message"` rather than assuming which one answered. Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
-    wording, so a push is never lost to an LLM problem. **Off in prd** (`VARSEL_LLM_ENABLED=false`)
-    until validated in dev. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
+    wording, so a push is never lost to an LLM problem.
+    **Writing a wording and sending it are two switches** (2026-08-07): `VARSEL_LLM_PROVIDER=off`
+    stops a model being *asked*; `VARSEL_LLM_ENABLED=false` still asks and records the answer but
+    *sends* the deterministic wording. prd runs them apart — `auto` with `ENABLED=false` — so it
+    writes a `message_llm` on every alert-worthy decision and delivers the template. Know what that
+    sends: the traveller's origin, destination and departure time, to a `global`, non-region-bound
+    endpoint, which is not what the `AI.CLASSIFY` IAM precedent covers. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
     `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
     2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
     available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
@@ -143,8 +148,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
     page shows the per-row state next to the count.
   - Neither table is in `copy_runtime_to_prd.sh`: each environment records its own decisions and
-    `bq cp -f` overwrites. Note `VARSEL_LLM_ENABLED=false` in prd, so prd rows carry the
-    deterministic wording; dev is where the LLM-written messages are.
+    `bq cp -f` overwrites. Both environments record BOTH wordings and differ in what was sent:
+    dev delivers the model's (`message_source='llm'`), prd withholds it
+    (`message_source='deterministic'` beside a non-null `message_llm`) — the population prd's
+    rollout decision is judged on.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)

@@ -78,7 +78,16 @@ _PROVIDER = os.environ.get("VARSEL_LLM_PROVIDER", "auto").strip().lower()
 # asked, and both wordings are recorded on the decision row, which is the only way prd's own pushes
 # can be compared against what the model would have written. What stops a backend being called at
 # all is `generation_enabled()`: VARSEL_LLM_PROVIDER=off, no project, or every backend latched off.
-_ENABLED = os.environ.get("VARSEL_LLM_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+#
+# Parsed as an ALLOW-LIST, not a deny-list, and that is the load-bearing part. It used to be
+# `not in ("false", "0", "no")`, so every value outside that list — "off", "", "disabled", a typo —
+# read as TRUE. While this flag gated generation that was merely surprising; now it decides whether
+# unvalidated model prose reaches a real traveller's lock screen, so the failure has to be the safe
+# direction. An operator reaching for "off" during an incident (the word this codebase uses for the
+# *other* switch, VARSEL_LLM_PROVIDER) would otherwise have turned delivery ON while the egress they
+# meant to stop carried on.
+_TRUTHY = ("true", "1", "yes", "on")
+_ENABLED = os.environ.get("VARSEL_LLM_ENABLED", "true").strip().lower() in _TRUTHY
 _PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
 # Location defaults to "global", NOT to the region the rest of the stack runs in: measured
 # 2026-07-29 against ent-kixavvik-dev, gemini-3.5-flash serves at `global` and 404s at
@@ -365,7 +374,12 @@ def generation_enabled() -> bool:
     deploy degrades at the point of use rather than failing at import (the same shape as
     ``varsel.push_enabled`` and the ``AI.CLASSIFY`` try/except).
     """
-    if _PROVIDER == "off" or not _PROJECT:
+    # An unrecognised provider is OFF, not "auto". `_candidates()` falls back to the auto order for
+    # anything it does not know, so before this guard `VARSEL_LLM_PROVIDER=none` (or a typo) read as
+    # "try every backend" — the opposite of what an operator setting it meant, and the same
+    # fail-open shape `_ENABLED` had. This switch is the egress kill switch for prd, so an
+    # unrecognised value must stop the call rather than make it.
+    if _PROVIDER not in ("auto", *_BACKENDS) or not _PROJECT:
         return False
     return bool(_candidates())
 

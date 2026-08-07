@@ -95,6 +95,10 @@ _table_ready = False
 # llm_message._LATCH_TTL: back off, but expire so a fixed grant takes effect without a redeploy.
 _ENSURE_RETRY_S = 15 * 60
 _ensure_failed_at: float | None = None
+# Same backoff, separate state: the description refresh succeeds and fails independently of the
+# structural DDL, and only the structural half decides whether a row can be written at all.
+_descriptions_done = False
+_descriptions_failed_at: float | None = None
 
 # The DDL runs on the startup path of a single always-on pod. Every other bq call in this app is
 # unbounded, but this one is new and sits in front of the poller thread, so it gets an explicit
@@ -137,33 +141,56 @@ def ensure_table() -> bool:
         return True
     if _ensure_failed_at is not None and monotonic() - _ensure_failed_at < _ENSURE_RETRY_S:
         return False
-    try:
-        _bq_client.query(_STRUCTURE_SQL).result(timeout=_ENSURE_TIMEOUT_S)
-        _table_ready = True
-        _ensure_failed_at = None
-        logger.info("Decision log ready (%s)", TABLE)
-    except Exception:
-        # Not fatal: recording is an observability feature, and the alerting path it observes must
-        # keep working without it. Backed off rather than retried every tick.
-        _ensure_failed_at = monotonic()
-        logger.warning("Could not ensure %s; decisions will not be recorded", TABLE, exc_info=True)
-        return False
-    if _DESCRIPTIONS_SQL.strip():
+    if not _table_ready:
         try:
-            _bq_client.query(_BEST_EFFORT_MARKER + _DESCRIPTIONS_SQL).result(
-                timeout=_ENSURE_TIMEOUT_S
-            )
+            _bq_client.query(_STRUCTURE_SQL).result(timeout=_ENSURE_TIMEOUT_S)
+            _table_ready = True
+            _ensure_failed_at = None
+            logger.info("Decision log ready (%s)", TABLE)
         except Exception:
-            # The table is already usable; what failed is documentation. Say so at warning level so
-            # a persistently stale `bq show --schema` is discoverable, and carry on recording.
+            # Not fatal: recording is an observability feature, and the alerting path it observes
+            # must keep working without it. Backed off rather than retried every tick.
+            _ensure_failed_at = monotonic()
             logger.warning(
-                "Could not refresh %s column descriptions; the schema comments may be stale. "
-                "Decisions are still being recorded.",
-                TABLE,
-                exc_info=True,
-                extra={"fields": {"event": "varsel_decision_write", "result": "stale_descriptions"}},
+                "Could not ensure %s; decisions will not be recorded", TABLE, exc_info=True
             )
+            return False
+    _refresh_descriptions()
     return _table_ready
+
+
+def _refresh_descriptions() -> None:
+    """Carry reworded column descriptions to tables that already exist. Never raises.
+
+    Its own retry state rather than riding on ``_table_ready``, because the two have different
+    success conditions and the descriptions half is the one that fails. It is rate-limit-prone by
+    construction — BigQuery caps table-metadata updates at 5 per 10 s per table and the block has
+    more statements than that — and ``ensure_table`` returns early once the table is ready, so
+    piggy-backing gave this exactly one attempt per process. On a pod that redeploys by manual
+    dispatch (prd) a single transient burst then left `bq show --schema` stale for the pod's whole
+    life, which is the opposite of what this block exists for. Backed off on the same ``_ENSURE_RETRY_S``
+    as the structural half so a later poller tick — well past the 10 s quota window — lands it.
+    """
+    global _descriptions_done, _descriptions_failed_at
+    if _descriptions_done or not _DESCRIPTIONS_SQL.strip():
+        return
+    if _descriptions_failed_at is not None and monotonic() - _descriptions_failed_at < _ENSURE_RETRY_S:
+        return
+    try:
+        _bq_client.query(_BEST_EFFORT_MARKER + _DESCRIPTIONS_SQL).result(timeout=_ENSURE_TIMEOUT_S)
+        _descriptions_done = True
+        _descriptions_failed_at = None
+    except Exception:
+        # The table is already usable; what failed is documentation. Say so at warning level so a
+        # persistently stale `bq show --schema` is discoverable, and carry on recording.
+        _descriptions_failed_at = monotonic()
+        logger.warning(
+            "Could not refresh %s column descriptions; the schema comments may be stale. "
+            "Decisions are still being recorded and this will be retried.",
+            TABLE,
+            exc_info=True,
+            extra={"fields": {"event": "varsel_decision_write", "result": "stale_descriptions"}},
+        )
 
 
 def _oslo_date(when: datetime | None):

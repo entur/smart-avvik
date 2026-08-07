@@ -151,6 +151,17 @@ _MAX_MESSAGE_ATTEMPTS = 3
 # one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
 # worst case. Journeys past the budget take the deterministic wording and are re-tried next tick.
 _MAX_LLM_SECONDS_PER_CYCLE = 30.0
+# What one more "call" can cost before it returns: two backend attempts at llm_message._TIMEOUT_S.
+# Restated here rather than imported, like _CANCEL_LIKELY above and for the same reason -- this is
+# consulted on the poller thread before llm_message is necessarily importable, and the value has to
+# bound the budget even when reading that module is what failed.
+#
+# It exists because the deadline used to be checked but not RESERVED: `monotonic() >= llm_deadline`
+# is a pre-check, so a call could start with a millisecond left and still run its full worst case.
+# The reachable overshoot was ~46 s against a documented 30 s ceiling -- 53 % over, on the single
+# poller thread that also feeds /disruptions, /journey, /demo and /reisevalg, and ahead of the
+# delivery loop that pushes to travellers.
+_WORST_CASE_CALL_S = 2 * 8.0
 # Web Push sends are independent, I/O-bound, and each can block for _PUSH_TIMEOUT_S against a
 # client-supplied endpoint. Sequential delivery meant one sick push service stalled the whole poller
 # -- and with it every cache rebuild -- for devices x 10 s. Fan them out instead.
@@ -1360,6 +1371,30 @@ def _deliverable_message(message_key: tuple[str, str, str]) -> str | None:
         return _messages.get(message_key)
 
 
+def _generation_enabled() -> bool:
+    """Whether a backend can be asked for a wording at all — see ``llm_message.generation_enabled``.
+
+    Wrapped rather than called directly for the same reason as :func:`_deliverable_message`: the
+    local import keeps a deploy without the Vertex dependencies pushing, and a failure here must read
+    as "no wording", never as an exception on the poller thread.
+
+    Answering False costs the cycle nothing and is the honest answer when the module cannot even be
+    imported — but note the caller must not spend a retry attempt on it, because no backend was
+    reached. See the give-up note in :func:`check_and_notify`.
+    """
+    try:
+        import llm_message
+
+        return llm_message.generation_enabled()
+    except Exception:
+        logger.warning(
+            "Could not read the message-generation switch; using the deterministic wording",
+            exc_info=True,
+            extra={"fields": {"event": "llm_message", "result": "error"}},
+        )
+        return False
+
+
 def _message_input(journey: dict, alert: Alert) -> dict | None:
     """Everything a message about this decision is written from — see build_message_input.
 
@@ -1547,9 +1582,27 @@ def _record_decisions(
                 # "written but withheld" (`message_source='deterministic' AND message_llm IS NOT
                 # NULL`) matching no row at all, which is the population prd's rollout is judged on.
                 message_input = message_inputs.get(message_key)
-                deterministic = _deterministic_body(
-                    message_input or _message_input_from_alert(alert)
-                )
+                # Guarded per alert, not inside the cycle-wide try below -- the same rule
+                # `_message_input` states for itself: one journey with an awkward payload must cost
+                # that journey's row, not the whole cycle's decision log. This became load-bearing on
+                # 2026-08-07: the wording used to be built only when no model text existed
+                # (`written or _deterministic_body(...)`), and is now built for EVERY alert, so a
+                # raise here reaches rows that previously skipped the call. Dropping the cycle would
+                # break the log's one guarantee -- every decision, not every push -- and a miss
+                # leaves no other trace.
+                try:
+                    deterministic = _deterministic_body(
+                        message_input or _message_input_from_alert(alert)
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not word a decision for %s/%s; recording the rest of the cycle",
+                        key,
+                        getattr(alert, "situation_number", None),
+                        exc_info=True,
+                        extra={"fields": {"event": "varsel_decision_write", "result": "no_wording"}},
+                    )
+                    continue
                 delivered = written if delivery_on else None
                 message = delivered or deterministic
                 rows.append(
@@ -1796,8 +1849,22 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             continue
         message_key = _message_key(key, worst)
         with _state_lock:
+            # Read RAW, deliberately not through `_deliverable_message`: this asks whether a wording
+            # was already WRITTEN for this situation, which is a generation-side question. Gating it
+            # on delivery would make the writer re-run every cycle wherever delivery is off (prd
+            # today) — burning the cycle budget re-writing text that is already cached.
             already_written = message_key in _messages
             attempts = _message_attempts.get(message_key, 0)
+        # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A `None`
+        # from `_write_message` costs an attempt (see the bottom of this loop), but several of its
+        # paths never call a backend at all — this one, where no backend can be asked. So three
+        # cycles with generation off used to exhaust a situation permanently: when the 30-minute
+        # `llm_message._LATCH_TTL` expired and a backend came back, the situation was already at
+        # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h life.
+        # That thins exactly the written-but-withheld population prd's rollout is judged on.
+        if not _generation_enabled():
+            _remember_message_meta(message_key, status="llm_disabled")
+            continue
         if already_written:
             # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row carries
             # text written against an earlier cycle's payload, not the one recorded beside it.
@@ -1811,7 +1878,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             # _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have succeeded now cannot use.
             _remember_message_meta(message_key, status="attempts_exhausted")
             continue
-        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() >= llm_deadline:
+        # Reserve the worst case rather than merely checking the clock, so the budget is a ceiling on
+        # when the pass ENDS and not on when its last call starts (see _WORST_CASE_CALL_S).
+        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() + _WORST_CASE_CALL_S >= llm_deadline:
             logger.info(
                 "Written-message budget spent this cycle (%d calls / %.0fs); %s gets the "
                 "deterministic wording",

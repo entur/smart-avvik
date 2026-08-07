@@ -111,6 +111,31 @@ def _reset(provider="auto", enabled=True):
 
 
 # ---- gates ------------------------------------------------------------------------------------
+def test_both_switches_are_allow_lists_not_deny_lists():
+    """The values an operator actually reaches for must fail CLOSED.
+
+    `VARSEL_LLM_ENABLED` was parsed as `not in ("false","0","no")`, so "off" — the word this codebase
+    uses for the OTHER switch — read as True. Following prd's own incident comment would then have
+    turned delivery ON, pushing unvalidated model prose to real travellers, while the egress it meant
+    to stop carried on. `VARSEL_LLM_PROVIDER` had the mirror bug: anything unrecognised fell through
+    to the auto order, so a typo'd kill switch started every backend instead of stopping them.
+    """
+    for value in ("off", "", "disabled", "nope", "FALSE ", "0"):
+        llm_message._ENABLED = value.strip().lower() in llm_message._TRUTHY
+        assert llm_message.delivery_enabled() is False, f"{value!r} must not enable delivery"
+    for value in ("true", "TRUE", "1", "yes", "on"):
+        llm_message._ENABLED = value.strip().lower() in llm_message._TRUTHY
+        assert llm_message.delivery_enabled() is True, f"{value!r} must enable delivery"
+
+    for value in ("off", "none", "disabled", "gemni"):
+        _reset(provider=value)
+        assert llm_message.generation_enabled() is False, f"{value!r} must not enable generation"
+    for value in ("auto", "claude", "gemini"):
+        _reset(provider=value)
+        assert llm_message.generation_enabled() is True, f"{value!r} must enable generation"
+
+
+
 def test_generation_stays_on_when_delivery_is_off():
     """The case the whole dual-message change turns on.
 
