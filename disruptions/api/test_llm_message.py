@@ -169,6 +169,55 @@ def test_delivery_is_on_when_the_flag_is_unset():
     assert result.stdout.strip() == "True"
 
 
+def _location_in_fresh_interpreter(**overrides: str | None) -> tuple[str, str]:
+    """(gemini, claude) locations as resolved at import, in a child process.
+
+    The locations are module-scope env expressions like `_ENABLED`, so they cannot be exercised by
+    assigning to them — that would test the assignment, not the default.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in ("VERTEX_LOCATION", "VERTEX_GEMINI_LOCATION")}
+    env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
+    for key, value in overrides.items():
+        if value is not None:
+            env[key] = value
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import llm_message as L; print(L._GEMINI_LOCATION, L._CLAUDE_LOCATION)"],
+        cwd=_API_DIR, env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    gemini, claude = result.stdout.split()
+    return gemini, claude
+
+
+def test_gemini_defaults_to_the_eu_multi_region():
+    """Residency is the default, not a value someone has to remember.
+
+    Every deployment sets VERTEX_GEMINI_LOCATION explicitly, so nothing in production depends on
+    this — which is exactly why it needs pinning: an environment that *forgot* the variable would
+    send real journeys to `global`, where Vertex documents that "you can't control or know which
+    region your ML processing requests are sent to", and would look identical in every log. Claude
+    keeps the old `global` default; it is not served in these projects, and the two backends have
+    genuinely different regional availability.
+    """
+    assert _location_in_fresh_interpreter() == ("eu", "global")
+
+
+def test_an_explicit_vertex_location_still_moves_both_backends():
+    """Only the final fallback is per-model; the override chain is unchanged.
+
+    Someone pinning VERTEX_LOCATION to move the whole stack must not find Gemini silently staying
+    behind in the EU — that would be a second, invisible location to reason about. The per-model
+    VERTEX_GEMINI_LOCATION remains the way to diverge them, and still wins.
+    """
+    assert _location_in_fresh_interpreter(VERTEX_LOCATION="us-central1") == (
+        "us-central1", "us-central1",
+    )
+    assert _location_in_fresh_interpreter(
+        VERTEX_LOCATION="us-central1", VERTEX_GEMINI_LOCATION="eu"
+    ) == ("eu", "us-central1")
+
+
 def test_provider_off_stops_generation_whatever_delivery_says():
     """VARSEL_LLM_PROVIDER=off is the switch that means "do not call a model at all", so it must
     hold with the delivery flag on as well as off — and `status="disabled"` is now that verdict
