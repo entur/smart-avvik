@@ -192,10 +192,25 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `VARSEL_LLM_PROVIDER=off` stops the egress if that changes. Enabling delivery in prd is a
     separate one-value deploy. Prompts and replies are logged under
     `jsonPayload.event="llm_message"`.
-    `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
-    2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
-    available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
-    `VERTEX_GEMINI_LOCATION` when their regional availability diverges. The backend latch expires
+    **There are three location shapes, not two** (2026-08-07): `global`, a single region, and the
+    **EU multi-region** endpoint (`aiplatform.eu.rep.googleapis.com`, `location="eu"`) — and only the
+    third both serves the model and confines processing, which is why `VERTEX_GEMINI_LOCATION` is
+    **`eu` in every environment and in the code default**. Vertex documents multi-region endpoints as
+    keeping ML processing "within a specific jurisdictional boundary" and `global` as the opposite:
+    "you can't control or know which region your ML processing requests are sent to". It also anchors
+    Google's abuse-monitoring retention, which holds a logged prompt "in the same region or
+    multi-region selected by the customer" — at `global`, that clause binds to nothing. A single
+    region is **not** the fallback it looks like: measured 2026-08-07 in both projects,
+    `gemini-3.5-flash` 404s at `europe-west1`, `europe-north1` and `europe-west4` alike (only
+    `gemini-2.5-flash*` serve there), so pinning a region costs a model generation while `eu` costs
+    nothing — measured from inside the dev cluster, median 1.51 s vs 1.38 s at `global`. Private
+    Google Access is **not** in that path, which had to be checked in-cluster rather than from a
+    laptop because the Vertex docs warn PGA breaks multi-region endpoints. `VERTEX_LOCATION` still
+    defaults to `global` and still governs Claude, which is not served in these projects at all; an
+    explicit `VERTEX_LOCATION` moves both backends, so only the final fallback is per-model. What
+    this does **not** settle: whether a commute pattern is "Fortrolig" under Entur's classification,
+    for which "Google Gemini on Cloud" is approved for neither — that is a DPIA question, and
+    `VARSEL_LLM_PROVIDER=off` remains the egress kill switch. The backend latch expires
     after 30 min (`llm_message._LATCH_TTL`), so enabling Model Garden takes effect without a
     redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
     destination and departure time); records carry a hashed `journey_digest`, and

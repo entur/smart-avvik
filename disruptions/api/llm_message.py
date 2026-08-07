@@ -90,13 +90,30 @@ _TRUTHY = ("true", "1", "yes", "on")
 _ENABLED = os.environ.get("VARSEL_LLM_ENABLED", "true").strip().lower() in _TRUTHY
 _PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
 # Location defaults to "global", NOT to the region the rest of the stack runs in: measured
-# 2026-07-29 against ent-kixavvik-dev, gemini-3.5-flash serves at `global` and 404s at
-# europe-west1, so a region-pinned default silently breaks the backend. Per-backend overrides exist
-# because regional availability differs per model — Anthropic models, when enabled, are typically
-# served from a narrower set of regions than Gemini.
-_LOCATION = os.environ.get("VERTEX_LOCATION", "global")
+# 2026-07-29 and re-measured 2026-08-07 against ent-kixavvik-dev, gemini-3.5-flash serves at
+# `global` and 404s at europe-west1, europe-north1 and europe-west4 alike, so a SINGLE-REGION
+# default silently breaks the backend. Per-backend overrides exist because availability differs per
+# model — Anthropic models, when enabled, are served from a narrower set of regions than Gemini.
+_LOCATION_ENV = os.environ.get("VERTEX_LOCATION")
+_LOCATION = _LOCATION_ENV or "global"
 _CLAUDE_LOCATION = os.environ.get("VERTEX_CLAUDE_LOCATION") or _LOCATION
-_GEMINI_LOCATION = os.environ.get("VERTEX_GEMINI_LOCATION") or _LOCATION
+# Gemini falls back to the EU MULTI-REGION endpoint (aiplatform.eu.rep.googleapis.com) rather than
+# to `global`. That is a third option beside "global" and a single region, and the only one that
+# both serves this model and confines processing: Vertex documents multi-region endpoints as keeping
+# "machine learning processing of Customer Data ... within a specific jurisdictional boundary", and
+# documents `global` as the opposite — "you can't control or know which region your ML processing
+# requests are sent to". The prompt carries the traveller's origin, destination and departure time,
+# so that distinction is the whole point. It also anchors Google's abuse-monitoring retention, which
+# holds any logged prompt "in the same region or multi-region selected by the customer for their
+# project" — at `global` that clause binds to nothing.
+#
+# A DEFAULT and not only a Helm value, because the failure is silent: an environment that forgot the
+# variable would process real journeys outside the EU and look identical in every log. An explicit
+# VERTEX_LOCATION still moves both backends, so the override chain is unchanged; only the final
+# fallback moved. Verified 2026-08-07 in dev and prd, and from inside the dev cluster with the
+# runtime SA — Private Google Access is not in the path there, which matters because the Vertex docs
+# warn that PGA breaks multi-region endpoints.
+_GEMINI_LOCATION = os.environ.get("VERTEX_GEMINI_LOCATION") or _LOCATION_ENV or "eu"
 _CLAUDE_MODEL = os.environ.get("VERTEX_CLAUDE_MODEL", "claude-sonnet-5")
 # Verified live in ent-kixavvik-dev 2026-07-29 (location=global).
 _GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.5-flash")
