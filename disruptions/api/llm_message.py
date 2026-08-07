@@ -26,6 +26,14 @@ Design notes
 * **Fail open, always.** No credentials, an unsupported model, a timeout, an empty or over-long
   reply — every path returns ``None`` and the caller falls back to the deterministic wording. A push
   must never be lost to an LLM problem.
+* **Writing a wording and sending it are separate switches.** :func:`generation_enabled` answers
+  "could a backend be asked here" — a provider other than ``off``, a GCP project, at least one
+  backend not latched off. :func:`delivery_enabled` reads ``VARSEL_LLM_ENABLED`` alone and answers
+  only "is a written wording what the traveller receives". They were one function until 2026-08-07,
+  and the conflation had a cost: prd runs ``VARSEL_LLM_ENABLED=false``, so the deployment whose
+  pushes actually reach travellers wrote nothing, and the decision log could not show what the model
+  *would* have said beside what was sent. Both wordings are now written for every alert-worthy
+  decision and both are recorded; the flag picks which one goes out.
 * **The payload is fenced, pre-rounded, and scoped to one alert.** SX free text is
   publisher-authored and reaches the prompt verbatim, so every string in the payload — not just the
   situation text — is stripped of angle brackets and length-capped, and the whole document travels
@@ -65,16 +73,47 @@ _OSLO = ZoneInfo("Europe/Oslo")
 # "auto" (default) tries Claude and latches to Gemini if this project cannot serve it; "claude" and
 # "gemini" pin one backend; "off" disables the LLM path entirely (deterministic wording only).
 _PROVIDER = os.environ.get("VARSEL_LLM_PROVIDER", "auto").strip().lower()
-_ENABLED = os.environ.get("VARSEL_LLM_ENABLED", "true").strip().lower() not in ("false", "0", "no")
+# VARSEL_LLM_ENABLED is a DELIVERY switch, not a master switch (split out of the old combined gate
+# on 2026-08-07). False means the traveller gets the deterministic wording — the model is still
+# asked, and both wordings are recorded on the decision row, which is the only way prd's own pushes
+# can be compared against what the model would have written. What stops a backend being called at
+# all is `generation_enabled()`: VARSEL_LLM_PROVIDER=off, no project, or every backend latched off.
+#
+# Parsed as an ALLOW-LIST, not a deny-list, and that is the load-bearing part. It used to be
+# `not in ("false", "0", "no")`, so every value outside that list — "off", "", "disabled", a typo —
+# read as TRUE. While this flag gated generation that was merely surprising; now it decides whether
+# unvalidated model prose reaches a real traveller's lock screen, so the failure has to be the safe
+# direction. An operator reaching for "off" during an incident (the word this codebase uses for the
+# *other* switch, VARSEL_LLM_PROVIDER) would otherwise have turned delivery ON while the egress they
+# meant to stop carried on.
+_TRUTHY = ("true", "1", "yes", "on")
+_ENABLED = os.environ.get("VARSEL_LLM_ENABLED", "true").strip().lower() in _TRUTHY
 _PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
 # Location defaults to "global", NOT to the region the rest of the stack runs in: measured
-# 2026-07-29 against ent-kixavvik-dev, gemini-3.5-flash serves at `global` and 404s at
-# europe-west1, so a region-pinned default silently breaks the backend. Per-backend overrides exist
-# because regional availability differs per model — Anthropic models, when enabled, are typically
-# served from a narrower set of regions than Gemini.
-_LOCATION = os.environ.get("VERTEX_LOCATION", "global")
+# 2026-07-29 and re-measured 2026-08-07 against ent-kixavvik-dev, gemini-3.5-flash serves at
+# `global` and 404s at europe-west1, europe-north1 and europe-west4 alike, so a SINGLE-REGION
+# default silently breaks the backend. Per-backend overrides exist because availability differs per
+# model — Anthropic models, when enabled, are served from a narrower set of regions than Gemini.
+_LOCATION_ENV = os.environ.get("VERTEX_LOCATION")
+_LOCATION = _LOCATION_ENV or "global"
 _CLAUDE_LOCATION = os.environ.get("VERTEX_CLAUDE_LOCATION") or _LOCATION
-_GEMINI_LOCATION = os.environ.get("VERTEX_GEMINI_LOCATION") or _LOCATION
+# Gemini falls back to the EU MULTI-REGION endpoint (aiplatform.eu.rep.googleapis.com) rather than
+# to `global`. That is a third option beside "global" and a single region, and the only one that
+# both serves this model and confines processing: Vertex documents multi-region endpoints as keeping
+# "machine learning processing of Customer Data ... within a specific jurisdictional boundary", and
+# documents `global` as the opposite — "you can't control or know which region your ML processing
+# requests are sent to". The prompt carries the traveller's origin, destination and departure time,
+# so that distinction is the whole point. It also anchors Google's abuse-monitoring retention, which
+# holds any logged prompt "in the same region or multi-region selected by the customer for their
+# project" — at `global` that clause binds to nothing.
+#
+# A DEFAULT and not only a Helm value, because the failure is silent: an environment that forgot the
+# variable would process real journeys outside the EU and look identical in every log. An explicit
+# VERTEX_LOCATION still moves both backends, so the override chain is unchanged; only the final
+# fallback moved. Verified 2026-08-07 in dev and prd, and from inside the dev cluster with the
+# runtime SA — Private Google Access is not in the path there, which matters because the Vertex docs
+# warn that PGA breaks multi-region endpoints.
+_GEMINI_LOCATION = os.environ.get("VERTEX_GEMINI_LOCATION") or _LOCATION_ENV or "eu"
 _CLAUDE_MODEL = os.environ.get("VERTEX_CLAUDE_MODEL", "claude-sonnet-5")
 # Verified live in ent-kixavvik-dev 2026-07-29 (location=global).
 _GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.5-flash")
@@ -340,16 +379,40 @@ def _model_of(name: str) -> str:
     return _CLAUDE_MODEL if name == "claude" else _GEMINI_MODEL
 
 
-def llm_enabled() -> bool:
-    """True when a message could be written: not switched off, and a GCP project is configured.
+def generation_enabled() -> bool:
+    """True when a wording could be written: a provider, a GCP project, and a backend left to try.
+
+    Says nothing about whether the wording will be *sent* — that is :func:`delivery_enabled`, and
+    keeping the two apart is the point. This is the gate ``write_message_detailed`` returns
+    ``status="disabled"`` from, so that status now means "no backend could be asked", never "this
+    deployment sends the deterministic wording".
 
     Deliberately does not construct a client — that happens on first use, so an un-provisioned
     deploy degrades at the point of use rather than failing at import (the same shape as
     ``varsel.push_enabled`` and the ``AI.CLASSIFY`` try/except).
     """
-    if not _ENABLED or _PROVIDER == "off" or not _PROJECT:
+    # An unrecognised provider is OFF, not "auto". `_candidates()` falls back to the auto order for
+    # anything it does not know, so before this guard `VARSEL_LLM_PROVIDER=none` (or a typo) read as
+    # "try every backend" — the opposite of what an operator setting it meant, and the same
+    # fail-open shape `_ENABLED` had. This switch is the egress kill switch for prd, so an
+    # unrecognised value must stop the call rather than make it.
+    if _PROVIDER not in ("auto", *_BACKENDS) or not _PROJECT:
         return False
     return bool(_candidates())
+
+
+def delivery_enabled() -> bool:
+    """True when a written wording is what the traveller receives — ``VARSEL_LLM_ENABLED`` alone.
+
+    Reads no other state on purpose. A project that cannot serve a model, or both backends latched
+    off after a 404, is a *generation* problem: it surfaces as a missing wording at the point of use
+    and the deterministic text takes over there. It is not a statement about which wording this
+    deployment has decided to send, and folding it in here would make the send-time choice depend on
+    Vertex availability — exactly the coupling the 2026-08-07 split removed.
+
+    Non-constructing for the same reason as :func:`generation_enabled`.
+    """
+    return _ENABLED
 
 
 def _candidates(now: datetime | None = None) -> tuple[str, ...]:
@@ -701,9 +764,13 @@ def write_message_detailed(
     Never raises. On a configuration-class failure the offending backend is latched off for the
     process lifetime and the next one is tried; on a transient failure this reports `error` and the
     next poller cycle tries again.
+
+    Gated on :func:`generation_enabled` only: whether the traveller is *sent* this wording is the
+    caller's decision (``delivery_enabled``), taken after the fact, so a deployment that ships the
+    deterministic text still writes and records what the model would have said.
     """
     global _active, _active_at
-    if not llm_enabled():
+    if not generation_enabled():
         return MessageResult(None, status="disabled")
     prompt = message_input_json(message_input)
     # Why the LAST attempt failed. Overwritten per backend, so with `auto` this reports the verdict

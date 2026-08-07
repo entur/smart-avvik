@@ -69,8 +69,11 @@ export interface Alert {
   alertworthy: boolean; // impact_probability >= alert_threshold, i.e. a push is/was sent
   latest_observation?: LatestObservation | null;
   alternative_journey?: AlternativeJourney | null;
-  // The written message that was pushed for this journey × situation — identical for every device
-  // on the same journey. Null until a push has been produced for it.
+  // The model-written message for this journey × situation — identical for every device on the
+  // same journey, and always the same text the push carried. Null in three cases: no wording has
+  // been produced yet, none could be, or this deployment writes one but delivers the deterministic
+  // wording instead (VARSEL_LLM_ENABLED=false, which is prd today). Render the fallback for null;
+  // it is the ordinary state, not an error.
   message?: string | null;
 }
 

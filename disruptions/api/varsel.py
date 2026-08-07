@@ -35,6 +35,12 @@ Design notes
   Gemini fallback) from the enriched ``/impact`` payload — the situation's own words, what has been
   observed on the line, and any faster alternative. It phrases the alert; it never decides it. Every
   failure path falls back to :func:`_deterministic_body`, the previous template wording.
+* **Writing that text and sending it are two switches** (2026-08-07). A wording is written whenever
+  a backend can be tried (``llm_message.generation_enabled``); ``VARSEL_LLM_ENABLED``
+  (``llm_message.delivery_enabled``, read through :func:`_deliverable_message`) decides only which
+  of the two already-written wordings the traveller receives — on the push body and the in-app card
+  alike. prd delivers the deterministic one, so it now writes the model's version too and records
+  both: the only way the two can be compared on the traffic that actually matters.
 * **One message input per decision, built once** (:func:`_message_input`, from
   ``llm_message.build_message_input``). The model is prompted with it, :func:`_deterministic_body`
   words the fallback from it, and the decision log records it — so the row says what the writer was
@@ -145,6 +151,17 @@ _MAX_MESSAGE_ATTEMPTS = 3
 # one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
 # worst case. Journeys past the budget take the deterministic wording and are re-tried next tick.
 _MAX_LLM_SECONDS_PER_CYCLE = 30.0
+# What one more "call" can cost before it returns: two backend attempts at llm_message._TIMEOUT_S.
+# Restated here rather than imported, like _CANCEL_LIKELY above and for the same reason -- this is
+# consulted on the poller thread before llm_message is necessarily importable, and the value has to
+# bound the budget even when reading that module is what failed.
+#
+# It exists because the deadline used to be checked but not RESERVED: `monotonic() >= llm_deadline`
+# is a pre-check, so a call could start with a millisecond left and still run its full worst case.
+# The reachable overshoot was ~46 s against a documented 30 s ceiling -- 53 % over, on the single
+# poller thread that also feeds /disruptions, /journey, /demo and /reisevalg, and ahead of the
+# delivery loop that pushes to travellers.
+_WORST_CASE_CALL_S = 2 * 8.0
 # Web Push sends are independent, I/O-bound, and each can block for _PUSH_TIMEOUT_S against a
 # client-supplied endpoint. Sequential delivery meant one sick push service stalled the whole poller
 # -- and with it every cache rebuild -- for devices x 10 s. Fan them out instead.
@@ -820,8 +837,11 @@ class Alert(BaseModel):
         default=None,
         description="The written traveller message that was pushed for this journey × situation — "
         "identical for every device registered on the same journey. Null before a push has been "
-        "produced, or when no message writer was available (the push then carries the "
-        "deterministic wording instead).",
+        "produced, when no message writer was available, or when this deployment does not deliver "
+        "written wordings (VARSEL_LLM_ENABLED=false — the ordinary production case, not a failure: "
+        "a message may well have been written and recorded). In every one of those cases the push "
+        "carries the deterministic wording, and this field says so by being null rather than by "
+        "repeating it: the card shows exactly what the notification showed.",
     )
     # Internal: the full /impact response this alert was derived from, handed to the message writer
     # so it sees the complete picture (every situation's text, every line's observation, the
@@ -1278,13 +1298,20 @@ def _write_message(alert: Alert, *, journey_key: str, message_input: dict | None
     Also records the attempt's provenance (which backend answered, and why it did not) under the
     message key: it is knowable only here, and the stored message cannot be reverse-engineered into
     it — every failure mode ends up as the same deterministic wording.
+
+    Gated on ``generation_enabled`` — "could a backend be asked at all" — and NOT on
+    ``VARSEL_LLM_ENABLED``, which since 2026-08-07 says only which of the two wordings the traveller
+    receives (:func:`_deliverable_message`). Writing in an environment that does not send the result
+    is the point: prd runs with delivery off, and the recorded pair is the only way its own pushes
+    can be compared against what the model would have said. The per-cycle budgets in
+    :func:`check_and_notify` bound what that costs; nothing here widened them.
     """
     if message_input is None:
         return None  # _message_input already logged why
     try:
         import llm_message
 
-        if not llm_message.llm_enabled():
+        if not llm_message.generation_enabled():
             return None
         result = llm_message.write_message_detailed(
             message_input, journey_key=journey_key, situation_number=alert.situation_number
@@ -1303,6 +1330,69 @@ def _write_message(alert: Alert, *, journey_key: str, message_input: dict | None
             extra={"fields": {"event": "llm_message", "result": "error"}},
         )
         return None
+
+
+def _deliverable_message(message_key: tuple[str, str, str]) -> str | None:
+    """The written wording this journey × situation × departure may actually be SHOWN, or None.
+
+    The single reader of `_messages` on the traveller's side, and the reason it is one function
+    rather than a check at each call site. Since 2026-08-07 a wording is written whenever a backend
+    can be tried (:func:`_write_message`), so the cache holds LLM prose in environments that have
+    decided not to send it — prd, today. Two surfaces carry that text: the Web Push body
+    (`_deliver_device`) and the in-app journey card (`_journey_model`). Gating them separately is
+    how they drift: the card is the one an implementer forgets, and the drift is silent, because a
+    card quoting a wording the push beside it does not is not a crash and not a failing assertion.
+    `llm_message.delivery_enabled()` therefore owns the answer, and both surfaces read it here.
+
+    `None` is the state both surfaces already handle — `_notification_payload` falls back to the
+    deterministic body, and `Alert.message = None` is what the PWA has always rendered before a
+    message exists — so delivery-off needs no change on either side.
+
+    NOT used by :func:`_record_decisions`: the log records what was WRITTEN, whether or not it was
+    sent, which is the whole point of writing it in an environment that does not deliver it.
+
+    Local import and a blanket swallow, the same shape as :func:`_write_message`: a deploy without
+    the Vertex dependencies must still push, and this now sits on the delivery path where an
+    ImportError would cost the notification itself rather than just its wording.
+    """
+    try:
+        import llm_message
+
+        if not llm_message.delivery_enabled():
+            return None
+    except Exception:
+        logger.warning(
+            "Could not read the message-delivery switch; sending the deterministic wording",
+            exc_info=True,
+            extra={"fields": {"event": "llm_message", "result": "error"}},
+        )
+        return None
+    with _state_lock:
+        return _messages.get(message_key)
+
+
+def _generation_enabled() -> bool:
+    """Whether a backend can be asked for a wording at all — see ``llm_message.generation_enabled``.
+
+    Wrapped rather than called directly for the same reason as :func:`_deliverable_message`: the
+    local import keeps a deploy without the Vertex dependencies pushing, and a failure here must read
+    as "no wording", never as an exception on the poller thread.
+
+    Answering False costs the cycle nothing and is the honest answer when the module cannot even be
+    imported — but note the caller must not spend a retry attempt on it, because no backend was
+    reached. See the give-up note in :func:`check_and_notify`.
+    """
+    try:
+        import llm_message
+
+        return llm_message.generation_enabled()
+    except Exception:
+        logger.warning(
+            "Could not read the message-generation switch; using the deterministic wording",
+            exc_info=True,
+            extra={"fields": {"event": "llm_message", "result": "error"}},
+        )
+        return False
 
 
 def _message_input(journey: dict, alert: Alert) -> dict | None:
@@ -1419,6 +1509,12 @@ def _record_decisions(
     Runs after delivery so `pushed` reflects what actually reached a device rather than what was
     queued. Like every other dependency in this cycle it fails open — the import is local so a
     deploy without the module still pushes, and :func:`decisions.record` never raises.
+
+    Records **both** wordings (2026-08-07): `message_llm` is the raw cache read, `message_deterministic`
+    is this cycle's template body, and `message`/`message_source` say which of the two the traveller
+    actually got. Those are different questions now that ``VARSEL_LLM_ENABLED`` only selects the
+    wording — prd writes one and sends the other — and the pair on one row is the only way that
+    deployment's own pushes can be compared against what the model would have said.
     """
     try:
         import decisions
@@ -1427,7 +1523,14 @@ def _record_decisions(
 
         if not decisions.enabled():
             return
-        llm_on = llm_message.llm_enabled()
+        # The GENERATION gate, not VARSEL_LLM_ENABLED: since 2026-08-07 the latter decides only
+        # which wording the traveller is sent, and a row whose writer ran perfectly well must not
+        # file itself as "llm_disabled" merely because prd delivers the deterministic text.
+        generation_on = llm_message.generation_enabled()
+        # Read ONCE for the whole cycle, like the gate above it: every row written here describes
+        # the same tick's deliveries, and a flag re-read per alert could label two rows from one
+        # cycle as having sent different wordings.
+        delivery_on = llm_message.delivery_enabled()
         device_counts: dict[str, set[str]] = {}
         for _jid, journey in journeys:
             device_counts.setdefault(journey_key(journey), set()).add(journey["device_id"])
@@ -1438,33 +1541,70 @@ def _record_decisions(
             n_devices = len(device_counts.get(key, ()))
             for alert in alerts_by_key.get(key, []):
                 message_key = _message_key(key, alert)
+                # Read RAW, deliberately not through `_deliverable_message`: this is the half of the
+                # pair recorded as `message_llm`, which is what was WRITTEN whether or not it was
+                # sent. Since 2026-08-07 those differ by design — prd writes a wording and delivers
+                # the deterministic one — and gating this read would throw away exactly the column
+                # the comparison exists for. What was sent is decided below, on `delivery_on`.
                 with _state_lock:
                     written = _messages.get(message_key)
                     meta = dict(_message_meta.get(message_key) or {})
                 # No meta means the writer was never reached for this alert, and why is knowable
                 # from the state that decided it: below the threshold, push (and with it the writer)
-                # switched off, the LLM switched off — or alert-worthy but not the worst situation
-                # for this journey, which is the one the message is written about.
+                # switched off, no backend available to ask — or alert-worthy but not the worst
+                # situation for this journey, which is the one the message is written about.
                 status = meta.get("status")
                 if status is None:
                     if not alert.alertworthy:
                         status = "not_alertworthy"
                     elif not push_on:
                         status = "push_disabled"
-                    elif not llm_on:
+                    elif not generation_on:
+                        # Kept as "llm_disabled" -- the value is an established column in
+                        # `varsel_decisions` and rows written before 2026-08-07 use it -- but it now
+                        # means "no backend could be asked" (VARSEL_LLM_PROVIDER=off, no project,
+                        # every backend latched off), never "this deployment sends the template".
                         status = "llm_disabled"
                     else:
                         status = "not_selected"
-                # Record what was actually SENT, not just what the LLM wrote. `_messages` only ever
-                # holds LLM output, so storing it raw left every deterministic push with a NULL
-                # message — and prd runs with VARSEL_LLM_ENABLED=false, so /historikk there would
-                # have shown no message text at all. Fall back to the same deterministic body
-                # _notification_payload puts in the push -- from the same input, so the two agree by
-                # construction rather than by two template copies -- and say which one it was.
+                # BOTH wordings, on every row -- and `message`/`message_source` describing which one
+                # was DELIVERED. The deterministic body is built unconditionally (not as a fallback)
+                # from the same input `_notification_payload` words the push from, so the recorded
+                # pair agrees with the push by construction rather than through a second template
+                # copy; it is what dates a row as written after 2026-08-07, since a NULL `written`
+                # cannot (it also means "the column did not exist yet").
+                #
+                # The choice is made on `delivery_on`, NEVER on "a wording exists". Since 2026-08-07
+                # those are different questions: with delivery off the cache holds an LLM wording the
+                # push did not carry, and `written or deterministic` would file a template push as
+                # `llm` -- on the /historikk card, and permanently in `varsel_decision_outcomes`,
+                # which the nightly job copies the pair into and never revises. It would also leave
+                # "written but withheld" (`message_source='deterministic' AND message_llm IS NOT
+                # NULL`) matching no row at all, which is the population prd's rollout is judged on.
                 message_input = message_inputs.get(message_key)
-                message = written or _deterministic_body(
-                    message_input or _message_input_from_alert(alert)
-                )
+                # Guarded per alert, not inside the cycle-wide try below -- the same rule
+                # `_message_input` states for itself: one journey with an awkward payload must cost
+                # that journey's row, not the whole cycle's decision log. This became load-bearing on
+                # 2026-08-07: the wording used to be built only when no model text existed
+                # (`written or _deterministic_body(...)`), and is now built for EVERY alert, so a
+                # raise here reaches rows that previously skipped the call. Dropping the cycle would
+                # break the log's one guarantee -- every decision, not every push -- and a miss
+                # leaves no other trace.
+                try:
+                    deterministic = _deterministic_body(
+                        message_input or _message_input_from_alert(alert)
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not word a decision for %s/%s; recording the rest of the cycle",
+                        key,
+                        getattr(alert, "situation_number", None),
+                        exc_info=True,
+                        extra={"fields": {"event": "varsel_decision_write", "result": "no_wording"}},
+                    )
+                    continue
+                delivered = written if delivery_on else None
+                message = delivered or deterministic
                 rows.append(
                     decisions.build_row(
                         journey,
@@ -1473,7 +1613,9 @@ def _record_decisions(
                         n_devices=n_devices,
                         pushed=(key, alert.situation_number) in pushed_keys,
                         message=message,
-                        message_source="llm" if written else "deterministic",
+                        message_source="llm" if delivered else "deterministic",
+                        message_llm=written,
+                        message_deterministic=deterministic,
                         message_input=_message_input_json(message_input),
                         llm_provider=meta.get("provider"),
                         llm_model=meta.get("model"),
@@ -1610,8 +1752,16 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     log's guarantee is "every decision, not every push", and an early return here quietly broke it:
     an environment without VAPID keys recorded nothing at all, so /historikk looked like a broken
     deployment rather than an un-provisioned one. The LLM stays gated on push, though — writing
-    traveller-facing prose nobody can receive is spend with no reader, and the deterministic body
-    already captures what the decision was.
+    traveller-facing prose nobody can receive at all is spend with no reader, and the deterministic
+    body already captures what the decision was.
+
+    **Writing a wording and sending it are separate switches** (2026-08-07). A message is written
+    whenever a backend can be tried (``llm_message.generation_enabled``); ``VARSEL_LLM_ENABLED``
+    decides only which of the two wordings the traveller receives, on both surfaces, through
+    :func:`_deliverable_message`. So prd — delivery off — writes the model's version, pushes the
+    deterministic one, and records both, which is the only way the two can be compared on prd's own
+    traffic instead of on dev's. Note "gated on push" above is still true and is the wider gate:
+    push off means no write at all, delivery off means write but send the template.
     """
     push_on = push_enabled()
     with _state_lock:
@@ -1699,8 +1849,22 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             continue
         message_key = _message_key(key, worst)
         with _state_lock:
+            # Read RAW, deliberately not through `_deliverable_message`: this asks whether a wording
+            # was already WRITTEN for this situation, which is a generation-side question. Gating it
+            # on delivery would make the writer re-run every cycle wherever delivery is off (prd
+            # today) — burning the cycle budget re-writing text that is already cached.
             already_written = message_key in _messages
             attempts = _message_attempts.get(message_key, 0)
+        # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A `None`
+        # from `_write_message` costs an attempt (see the bottom of this loop), but several of its
+        # paths never call a backend at all — this one, where no backend can be asked. So three
+        # cycles with generation off used to exhaust a situation permanently: when the 30-minute
+        # `llm_message._LATCH_TTL` expired and a backend came back, the situation was already at
+        # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h life.
+        # That thins exactly the written-but-withheld population prd's rollout is judged on.
+        if not _generation_enabled():
+            _remember_message_meta(message_key, status="llm_disabled")
+            continue
         if already_written:
             # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row carries
             # text written against an earlier cycle's payload, not the one recorded beside it.
@@ -1714,7 +1878,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             # _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have succeeded now cannot use.
             _remember_message_meta(message_key, status="attempts_exhausted")
             continue
-        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() >= llm_deadline:
+        # Reserve the worst case rather than merely checking the clock, so the budget is a ceiling on
+        # when the pass ENDS and not on when its last call starts (see _WORST_CASE_CALL_S).
+        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() + _WORST_CASE_CALL_S >= llm_deadline:
             logger.info(
                 "Written-message budget spent this cycle (%d calls / %.0fs); %s gets the "
                 "deterministic wording",
@@ -1788,8 +1954,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         out = []
         for jid, device, journey, alert, key in items:
             message_key = _message_key(key, alert)
-            with _state_lock:
-                message = _messages.get(message_key)
+            # The written wording only if this deployment delivers it; otherwise None, and
+            # _notification_payload words the push from the same message input the model was shown.
+            message = _deliverable_message(message_key)
             payload = _notification_payload(
                 journey, alert, message, message_input=message_inputs.get(message_key)
             )
@@ -2036,7 +2203,9 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
 
     The message is read from :data:`_messages` rather than written here: the list endpoint is a
     request path, and writing one per request would mean an LLM call per page view. Reading the
-    cached text also means the in-app list says exactly what the push said.
+    cached text also means the in-app list says exactly what the push said — which since 2026-08-07
+    requires reading it through :func:`_deliverable_message`, because the cache now holds wordings
+    this deployment may have decided not to deliver.
 
     `alerts` lets the caller supply an already-scored result, so a device with several registrations
     of the same journey definition runs the matcher once rather than once per registration.
@@ -2057,7 +2226,11 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
             # at 06:05 about the 07:52 train still headed the card at 08:40, above a freshly
             # computed line reading 40 % for the 09:12 one.
             cache_key = _message_key(key, alert)
-            alert.message = _messages.get(cache_key)
+            # Through the delivery gate, exactly as the push body is: the card must never quote a
+            # wording the notification beside it did not carry. Only the message is gated -- the
+            # alternative below is advice the traveller gets either way, worded by whichever
+            # template or model wrote the text above it.
+            alert.message = _deliverable_message(cache_key)
             alt = _alternatives.get(cache_key)
             # An alternative that has itself departed is worse than none: it advises catching a
             # train that has already left. The boundary lives in one place (_still_catchable) --

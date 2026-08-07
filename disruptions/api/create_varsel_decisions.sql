@@ -82,10 +82,14 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   alt_arrival_time      TIMESTAMP OPTIONS(description="Expected arrival of the alternative (UTC)."),
   alt_lines             STRING    OPTIONS(description="Its transit legs as shown to the traveller, e.g. 'R11, 100'; walking legs omitted."),
 
-  -- What the traveller was told.
+  -- What the traveller was told. Since 2026-08-07 these two describe DELIVERY, not availability:
+  -- both candidate wordings are written for every alert-worthy decision and both are recorded last
+  -- in this table (message_llm / message_deterministic), and VARSEL_LLM_ENABLED picks which one is
+  -- sent. Read `message` as the text that reached the phone and `message_source` as which wording
+  -- that was -- never as "did a model write one", which is `message_llm IS NOT NULL`.
   message               STRING    OPTIONS(description="The message body sent (or that would have been sent)."),
-  message_source        STRING    OPTIONS(description="'llm' when written by the model, 'deterministic' for the template fallback."),
-  message_status        STRING    OPTIONS(description="Why that source: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | rejected | ungrounded | error | unavailable. Without it every failure mode looks like the same deterministic row."),
+  message_source        STRING    OPTIONS(description="Which wording was SENT: 'llm' when the model's text went out, 'deterministic' for the template. Since 2026-08-07 it says nothing about which wordings EXIST — both are written for every alert-worthy decision and recorded in message_llm/message_deterministic, and VARSEL_LLM_ENABLED selects the one delivered. So 'deterministic' now covers two unlike states: no model wording exists, and one exists and was withheld by policy (prd's setting today). Separate them with message_llm IS NOT NULL, never with this column alone."),
+  message_status        STRING    OPTIONS(description="Why that source: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | rejected | ungrounded | error | unavailable. Without it every failure mode looks like the same deterministic row. NOTE llm_disabled changed meaning on 2026-08-07 when generation and delivery became separate switches: it now means no backend could be ASKED (VARSEL_LLM_PROVIDER=off, no GCP project, every backend latched off after a 404), never 'this deployment sends the template' — that case is message_source='deterministic' with a non-null message_llm, and it carries status ok. Rows written before that date use the old, conflated reading."),
   llm_provider          STRING    OPTIONS(description="Backend that wrote the message: 'claude' | 'gemini'. Null when none did."),
   llm_model             STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
   prompt_version        STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force — a prompt edit invalidates comparisons across rows, and nothing else records it."),
@@ -114,7 +118,15 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   -- DATE(alt_departure_time, "Europe/Oslo"), exact except where an access walk straddles midnight.
   alt_operator          STRING    OPTIONS(description="Ref codespace of the offered journey's boarding call (VYG, GOA, RUT, ...), from the prediction cache and never from the Journey Planner's line codespace — a JP codespace would fill the column and join to nothing. NULL exactly when alt_scored is FALSE."),
   alt_jkey              STRING    OPTIONS(description="Journey ref of the offered journey's boarding call, minus its codespace (dated for rail, plain ServiceJourney for bus). NULL exactly when alt_scored is FALSE."),
-  alt_stop_order        INT64     OPTIONS(description="Position of that boarding call along the offered journey (1 = origin). Completes the join key with alt_operator, alt_jkey and DATE(alt_departure_time, 'Europe/Oslo'). NULL exactly when alt_scored is FALSE.")
+  alt_stop_order        INT64     OPTIONS(description="Position of that boarding call along the offered journey (1 = origin). Completes the join key with alt_operator, alt_jkey and DATE(alt_departure_time, 'Europe/Oslo'). NULL exactly when alt_scored is FALSE."),
+  -- Both wordings, side by side, since 2026-08-07. VARSEL_LLM_ENABLED used to decide whether a
+  -- written wording EXISTED, so the deployment whose pushes reach real travellers (prd, with it
+  -- false) produced none and there was nothing to compare its own text against. It is now a
+  -- send-time selector: both wordings are produced for every alert-worthy decision, `message` above
+  -- is whichever one went out, and these two are what it was chosen between -- so the two can be
+  -- read against each other on the traffic of the environment that actually pushes.
+  message_llm           STRING    OPTIONS(description="The wording the model wrote for this decision, whether or not it was the one sent. NULL means no model wording exists for this row — below the alert gate, push off, generation off, capped, retries exhausted, refused, ungrounded (message_status says which) — OR the row predates this column, which message_deterministic is what distinguishes. 'Written but withheld by policy' is exactly message_source='deterministic' AND message_llm IS NOT NULL. Caveat when message_status='ok_cached': this text was written from an EARLIER cycle's message_input while message_deterministic beside it is THIS cycle's, so any same-input comparison of the two must filter on message_status='ok'."),
+  message_deterministic STRING    OPTIONS(description="The template wording (varsel._deterministic_body) for this decision, computed on EVERY decision from 2026-08-07 — including the ~83 % sub-threshold rows nothing is ever sent for — whether or not it was the one delivered. Its presence is what DATES a row as post-change: message_llm cannot, since a NULL there means either 'no model wording' or 'written before the column existed', and the log holds many of the latter -- every row written before this change, which at deploy time is the whole table (measured 2026-08-07 in dev: 4010 of 4010 rows have a NULL message_deterministic, because nothing has written the column yet). NULL therefore reads as 'not recorded then', never 'no wording' — the same third-bucket rule /historikk states for n_unsegmented. Written from the same message_input the model was prompted with, or from the alert's own figures when that could not be built, which is why this can be non-null beside a NULL message_input. Under message_status='ok_cached' it describes a different cycle's input than message_llm does.")
 )
 PARTITION BY DATE(decided_at)
 CLUSTER BY operator, situation_number
@@ -166,7 +178,7 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS alt_departure_time TIMESTAMP OPTIONS(description="Expected departure of the alternative (UTC)."),
   ADD COLUMN IF NOT EXISTS alt_arrival_time   TIMESTAMP OPTIONS(description="Expected arrival of the alternative (UTC)."),
   ADD COLUMN IF NOT EXISTS alt_lines          STRING    OPTIONS(description="Its transit legs as shown to the traveller, e.g. 'R11, 100'; walking legs omitted."),
-  ADD COLUMN IF NOT EXISTS message_status     STRING    OPTIONS(description="Why the message has the source it does: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | rejected | ungrounded | error | unavailable."),
+  ADD COLUMN IF NOT EXISTS message_status     STRING    OPTIONS(description="Why that source: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | rejected | ungrounded | error | unavailable. Without it every failure mode looks like the same deterministic row. NOTE llm_disabled changed meaning on 2026-08-07 when generation and delivery became separate switches: it now means no backend could be ASKED (VARSEL_LLM_PROVIDER=off, no GCP project, every backend latched off after a 404), never 'this deployment sends the template' — that case is message_source='deterministic' with a non-null message_llm, and it carries status ok. Rows written before that date use the old, conflated reading."),
   ADD COLUMN IF NOT EXISTS llm_provider       STRING    OPTIONS(description="Backend that wrote the message: 'claude' | 'gemini'. Null when none did."),
   ADD COLUMN IF NOT EXISTS llm_model          STRING    OPTIONS(description="Model id behind that backend, e.g. 'claude-sonnet-5'."),
   ADD COLUMN IF NOT EXISTS prompt_version     STRING    OPTIONS(description="SHA-256[:8] of the system prompt in force."),
@@ -178,42 +190,10 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS alt_scored         BOOL      OPTIONS(description="The prediction cache held the offered journey's boarding call, so its probabilities are model output. FALSE means nothing scored it — the ordinary case, and NOT 'no risk'."),
   ADD COLUMN IF NOT EXISTS alt_operator       STRING    OPTIONS(description="Ref codespace of the offered journey's boarding call (VYG, GOA, RUT, ...), from the prediction cache and never from the Journey Planner's line codespace — a JP codespace would fill the column and join to nothing. NULL exactly when alt_scored is FALSE."),
   ADD COLUMN IF NOT EXISTS alt_jkey           STRING    OPTIONS(description="Journey ref of the offered journey's boarding call, minus its codespace (dated for rail, plain ServiceJourney for bus). NULL exactly when alt_scored is FALSE."),
-  ADD COLUMN IF NOT EXISTS alt_stop_order     INT64     OPTIONS(description="Position of that boarding call along the offered journey (1 = origin). Completes the join key with alt_operator, alt_jkey and DATE(alt_departure_time, 'Europe/Oslo'). NULL exactly when alt_scored is FALSE.");
+  ADD COLUMN IF NOT EXISTS alt_stop_order     INT64     OPTIONS(description="Position of that boarding call along the offered journey (1 = origin). Completes the join key with alt_operator, alt_jkey and DATE(alt_departure_time, 'Europe/Oslo'). NULL exactly when alt_scored is FALSE."),
+  ADD COLUMN IF NOT EXISTS message_llm        STRING    OPTIONS(description="The wording the model wrote for this decision, whether or not it was the one sent. NULL means no model wording exists for this row — below the alert gate, push off, generation off, capped, retries exhausted, refused, ungrounded (message_status says which) — OR the row predates this column, which message_deterministic is what distinguishes. 'Written but withheld by policy' is exactly message_source='deterministic' AND message_llm IS NOT NULL. Caveat when message_status='ok_cached': this text was written from an EARLIER cycle's message_input while message_deterministic beside it is THIS cycle's, so any same-input comparison of the two must filter on message_status='ok'."),
+  ADD COLUMN IF NOT EXISTS message_deterministic STRING OPTIONS(description="The template wording (varsel._deterministic_body) for this decision, computed on EVERY decision from 2026-08-07 — including the ~83 % sub-threshold rows nothing is ever sent for — whether or not it was the one delivered. Its presence is what DATES a row as post-change: message_llm cannot, since a NULL there means either 'no model wording' or 'written before the column existed', and the log holds many of the latter -- every row written before this change, which at deploy time is the whole table (measured 2026-08-07 in dev: 4010 of 4010 rows have a NULL message_deterministic, because nothing has written the column yet). NULL therefore reads as 'not recorded then', never 'no wording' — the same third-bucket rule /historikk states for n_unsegmented. Written from the same message_input the model was prompted with, or from the alert's own figures when that could not be built, which is why this can be non-null beside a NULL message_input. Under message_status='ok_cached' it describes a different cycle's input than message_llm does.");
 
-
--- Descriptions for columns that ALREADY exist.
---
--- Neither statement above can do this. CREATE TABLE IF NOT EXISTS does nothing at all where the
--- table exists, and ADD COLUMN IF NOT EXISTS does nothing where the column exists -- so an edited
--- OPTIONS(description=...) reaches a fresh environment and NO existing one. Measured 2026-08-05:
--- dev's `impact_probability` still carried its pre-et_cancelled text hours after the deploy that
--- reworded it, and `et_cancelled` itself was frozen with the description it was born with. The
--- file and the table then disagree, and the table is what anyone reads in the console or in
--- `bq show --schema` -- which for THESE three columns is the difference between segmenting the
--- precision figure and quoting it whole.
---
--- SET OPTIONS is idempotent and free (metadata only, no rewrite), so it runs at every startup like
--- the block above. One statement per column: BigQuery allows a single ALTER COLUMN action per
--- ALTER TABLE. Descriptions are duplicated from the definitions above; keep them in step.
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN et_cancelled SET OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN impact_probability SET OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score; exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN cancel_probability SET OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
-
--- These two are the 2026-08-06 case: the columns did not change, their MEANING did. The selection
--- rule no longer looks for a faster journey — it looks for the best remaining way there — so
--- "produced a faster way to to_stop" and "how much earlier it arrives" are both now false on the
--- face of them, and alt_minutes_saved is signed. Existing rows keep their values; what has to reach
--- dev and prd is the reading, and only these statements can carry it to a table that already exists.
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN has_alternative SET OPTIONS(description="Whether a replacement journey was offered to the traveller. NOT 'a faster way': the fallback tier legitimately arrives later than the disrupted train was due (see alt_arrives_before_original). FALSE covers three unlike states — a lookup that found nothing, a selection that kept the traveller on their own train, and no lookup at all — which is what alt_status separates.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN alt_minutes_saved SET OPTIONS(description="SIGNED minutes earlier this arrives than the disrupted train's PREDICTED arrival. Negative is a legitimate answer, not a bad row: a replacement for a cancelled train is worth offering even when it gets the traveller there later. Informational — nothing is dropped for being too slow.");
 
 
 -- The labelled counterpart: one row per decision subject, joined to what actually happened.
@@ -252,7 +232,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
   pushed_any             BOOL    OPTIONS(description="Whether a Web Push was actually delivered for this decision."),
   n_devices              INT64,
   message                STRING  OPTIONS(description="The last message text produced for this decision."),
-  message_source         STRING  OPTIONS(description="'llm' or 'deterministic'."),
+  message_source         STRING  OPTIONS(description="Which wording was SENT: 'llm' or 'deterministic'. Since 2026-08-07 'deterministic' covers two unlike states — no model wording existed, and one existed and was withheld by policy (prd's setting). This table cannot separate them: varsel_decisions.message_llm is what does, and it is not copied here."),
 
   actual_cancelled       BOOL    OPTIONS(description="ET declared the boarding call cancelled."),
   actual_dep_delay_min   INT64   OPTIONS(description="Realized departure delay in minutes; null if the call was never operated."),
@@ -355,3 +335,82 @@ SELECT
   ARRAY_AGG(message_source IGNORE NULLS ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS message_source
 FROM `disruptions.varsel_decisions`
 GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number;
+
+
+-- ==============================================================================================
+-- BEST-EFFORT SECTION -- everything below this marker is documentation, not structure.
+--
+-- decisions.ensure_table() splits this file HERE and runs the two halves as separate jobs. The
+-- half above must succeed for the decision log to be usable; a failure below is logged and the
+-- table is still marked ready. That split is not tidiness, it is the fix for an outage this file
+-- caused on 2026-08-07: BigQuery caps table-metadata updates at 5 per 10 seconds per table, and
+-- the SET OPTIONS block below had grown to 7 statements which, with the ADD COLUMN block above,
+-- reliably exceeded it ("Exceeded rate limits: too many table update operations for this table").
+-- ensure_table treats ANY failure in this file as "table not ready" and returns False, so
+-- decisions.record() then writes nothing at all -- a cosmetic description update would have
+-- silently taken down the entire alert-decision log on the next deploy.
+--
+-- The block only ever grows: every reworded description adds a permanent statement, because a
+-- fresh environment gets its text from the CREATE bodies above and only an EXISTING table needs
+-- carrying. Statements here whose text has demonstrably reached both dev and prd are dead weight
+-- and can be pruned; until someone verifies that, the split is what keeps the cost bounded.
+-- ==============================================================================================
+
+-- Descriptions for columns that ALREADY exist.
+--
+-- Neither statement above can do this. CREATE TABLE IF NOT EXISTS does nothing at all where the
+-- table exists, and ADD COLUMN IF NOT EXISTS does nothing where the column exists -- so an edited
+-- OPTIONS(description=...) reaches a fresh environment and NO existing one. Measured 2026-08-05:
+-- dev's `impact_probability` still carried its pre-et_cancelled text hours after the deploy that
+-- reworded it, and `et_cancelled` itself was frozen with the description it was born with. The
+-- file and the table then disagree, and the table is what anyone reads in the console or in
+-- `bq show --schema` -- which for THESE three columns is the difference between segmenting the
+-- precision figure and quoting it whole.
+--
+-- SET OPTIONS is idempotent and free (metadata only, no rewrite), so it runs at every startup like
+-- the block above. One statement per column: BigQuery allows a single ALTER COLUMN action per
+-- ALTER TABLE. Descriptions are duplicated from the definitions above; keep them in step.
+-- NEWEST FIRST in this block, which is the opposite of the "new things go last" rule the CREATE and
+-- ADD COLUMN blocks above follow -- and the inversion is deliberate. BigQuery caps table-metadata
+-- updates at 5 per 10 s per table and this block has 7 statements, so when the cap bites it truncates
+-- the TAIL. Ordering newest-last would therefore drop exactly the descriptions that have not reached
+-- an environment yet, while re-applying five that already landed: the failure would be silent and
+-- perfectly counterproductive. Newest-first means a truncated run loses only re-applications.
+--
+-- The real fix is to prune: a statement here exists solely to carry reworded text to a table that
+-- already exists, so once it has reached dev AND prd it is dead weight (a fresh environment reads
+-- its descriptions from the CREATE body). Verify with `bq show --schema` in both projects, then
+-- delete rather than letting the block grow past the cap again.
+
+-- These two are the 2026-08-07 case: neither column changed, one value in
+-- each did. Splitting VARSEL_LLM_ENABLED into a generation gate and a delivery selector left
+-- message_source='deterministic' covering a second, new state — a model wording that exists and was
+-- withheld — and moved llm_disabled from "the flag is false" to "no backend could be asked at all".
+-- Both readings have to reach a dev and a prd table that already exist, and only SET OPTIONS can
+-- carry them there. The values themselves are unchanged, so no row is rewritten and no consumer
+-- (varsel_decision_groups, label_varsel_decisions.sql, /historikk-api) needs touching.
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN message_source SET OPTIONS(description="Which wording was SENT: 'llm' when the model's text went out, 'deterministic' for the template. Since 2026-08-07 it says nothing about which wordings EXIST — both are written for every alert-worthy decision and recorded in message_llm/message_deterministic, and VARSEL_LLM_ENABLED selects the one delivered. So 'deterministic' now covers two unlike states: no model wording exists, and one exists and was withheld by policy (prd's setting today). Separate them with message_llm IS NOT NULL, never with this column alone.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN message_status SET OPTIONS(description="Why that source: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | rejected | ungrounded | error | unavailable. Without it every failure mode looks like the same deterministic row. NOTE llm_disabled changed meaning on 2026-08-07 when generation and delivery became separate switches: it now means no backend could be ASKED (VARSEL_LLM_PROVIDER=off, no GCP project, every backend latched off after a 404), never 'this deployment sends the template' — that case is message_source='deterministic' with a non-null message_llm, and it carries status ok. Rows written before that date use the old, conflated reading.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN et_cancelled SET OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN impact_probability SET OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score; exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN cancel_probability SET OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
+
+-- These two are the 2026-08-06 case: the columns did not change, their MEANING did. The selection
+-- rule no longer looks for a faster journey — it looks for the best remaining way there — so
+-- "produced a faster way to to_stop" and "how much earlier it arrives" are both now false on the
+-- face of them, and alt_minutes_saved is signed. Existing rows keep their values; what has to reach
+-- dev and prd is the reading, and only these statements can carry it to a table that already exists.
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN has_alternative SET OPTIONS(description="Whether a replacement journey was offered to the traveller. NOT 'a faster way': the fallback tier legitimately arrives later than the disrupted train was due (see alt_arrives_before_original). FALSE covers three unlike states — a lookup that found nothing, a selection that kept the traveller on their own train, and no lookup at all — which is what alt_status separates.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN alt_minutes_saved SET OPTIONS(description="SIGNED minutes earlier this arrives than the disrupted train's PREDICTED arrival. Negative is a legitimate answer, not a bad row: a replacement for a cancelled train is worth offering even when it gets the traveller there later. Informational — nothing is dropped for being too slow.");

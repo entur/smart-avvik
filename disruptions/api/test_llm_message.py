@@ -1,17 +1,22 @@
 """Checks for the LLM message provider — stubbed backends, no Vertex calls, no network.
 
-Covers the enable/disable gates, the payload guardrails (the dep_delay_typ_min exclusion that
-regressed once before, the injection fence), reply extraction and the length cap, and the
-fail-open + backend-latching behaviour that keeps a push going out when the LLM cannot help.
+Covers the two independent gates (can a wording be written / is a written wording what gets sent),
+the payload guardrails (the dep_delay_typ_min exclusion that regressed once before, the injection
+fence), reply extraction and the length cap, and the fail-open + backend-latching behaviour that
+keeps a push going out when the LLM cannot help.
 
 Run: uv run --with pydantic python test_llm_message.py  (or under pytest)
 """
 
 import json
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
+
+_API_DIR = os.path.dirname(os.path.abspath(__file__))
 
 import llm_message
 from llm_message import (
@@ -106,26 +111,162 @@ def _reset(provider="auto", enabled=True):
 
 
 # ---- gates ------------------------------------------------------------------------------------
-def test_disabled_by_flag():
+def test_both_switches_are_allow_lists_not_deny_lists():
+    """The values an operator actually reaches for must fail CLOSED.
+
+    `VARSEL_LLM_ENABLED` was parsed as `not in ("false","0","no")`, so "off" — the word this codebase
+    uses for the OTHER switch — read as True. Following prd's own incident comment would then have
+    turned delivery ON, pushing unvalidated model prose to real travellers, while the egress it meant
+    to stop carried on. `VARSEL_LLM_PROVIDER` had the mirror bug: anything unrecognised fell through
+    to the auto order, so a typo'd kill switch started every backend instead of stopping them.
+    """
+    for value in ("off", "", "disabled", "nope", "FALSE ", "0"):
+        llm_message._ENABLED = value.strip().lower() in llm_message._TRUTHY
+        assert llm_message.delivery_enabled() is False, f"{value!r} must not enable delivery"
+    for value in ("true", "TRUE", "1", "yes", "on"):
+        llm_message._ENABLED = value.strip().lower() in llm_message._TRUTHY
+        assert llm_message.delivery_enabled() is True, f"{value!r} must enable delivery"
+
+    for value in ("off", "none", "disabled", "gemni"):
+        _reset(provider=value)
+        assert llm_message.generation_enabled() is False, f"{value!r} must not enable generation"
+    for value in ("auto", "claude", "gemini"):
+        _reset(provider=value)
+        assert llm_message.generation_enabled() is True, f"{value!r} must enable generation"
+
+
+
+def test_generation_stays_on_when_delivery_is_off():
+    """The case the whole dual-message change turns on.
+
+    prd runs VARSEL_LLM_ENABLED=false. Until 2026-08-07 that also stopped the wording being
+    *written*, so the deployment whose pushes matter most had nothing to compare them against. The
+    flag now decides only which of two already-written wordings the traveller receives.
+    """
     _reset(enabled=False)
-    assert llm_message.llm_enabled() is False
-    assert write_message({"a": 1}) is None
+    assert llm_message.generation_enabled() is True
+    assert llm_message.delivery_enabled() is False
 
 
-def test_disabled_by_provider_off():
-    _reset(provider="off")
-    assert llm_message.llm_enabled() is False
+def test_delivery_is_on_when_the_flag_is_unset():
+    """The documented default, read in a FRESH interpreter.
+
+    `_ENABLED` is parsed once at import and every other test here assigns it directly, so nothing in
+    this process can tell whether an unset VARSEL_LLM_ENABLED still means "send the model's
+    wording" — the default only exists in the env expression at module scope.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "VARSEL_LLM_ENABLED"}
+    env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
+    result = subprocess.run(
+        [sys.executable, "-c", "import llm_message; print(llm_message.delivery_enabled())"],
+        cwd=_API_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "True"
 
 
-def test_disabled_without_a_project():
+def _location_in_fresh_interpreter(**overrides: str | None) -> tuple[str, str]:
+    """(gemini, claude) locations as resolved at import, in a child process.
+
+    The locations are module-scope env expressions like `_ENABLED`, so they cannot be exercised by
+    assigning to them — that would test the assignment, not the default.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in ("VERTEX_LOCATION", "VERTEX_GEMINI_LOCATION")}
+    env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
+    for key, value in overrides.items():
+        if value is not None:
+            env[key] = value
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import llm_message as L; print(L._GEMINI_LOCATION, L._CLAUDE_LOCATION)"],
+        cwd=_API_DIR, env=env, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    gemini, claude = result.stdout.split()
+    return gemini, claude
+
+
+def test_gemini_defaults_to_the_eu_multi_region():
+    """Residency is the default, not a value someone has to remember.
+
+    Every deployment sets VERTEX_GEMINI_LOCATION explicitly, so nothing in production depends on
+    this — which is exactly why it needs pinning: an environment that *forgot* the variable would
+    send real journeys to `global`, where Vertex documents that "you can't control or know which
+    region your ML processing requests are sent to", and would look identical in every log. Claude
+    keeps the old `global` default; it is not served in these projects, and the two backends have
+    genuinely different regional availability.
+    """
+    assert _location_in_fresh_interpreter() == ("eu", "global")
+
+
+def test_an_explicit_vertex_location_still_moves_both_backends():
+    """Only the final fallback is per-model; the override chain is unchanged.
+
+    Someone pinning VERTEX_LOCATION to move the whole stack must not find Gemini silently staying
+    behind in the EU — that would be a second, invisible location to reason about. The per-model
+    VERTEX_GEMINI_LOCATION remains the way to diverge them, and still wins.
+    """
+    assert _location_in_fresh_interpreter(VERTEX_LOCATION="us-central1") == (
+        "us-central1", "us-central1",
+    )
+    assert _location_in_fresh_interpreter(
+        VERTEX_LOCATION="us-central1", VERTEX_GEMINI_LOCATION="eu"
+    ) == ("eu", "us-central1")
+
+
+def test_provider_off_stops_generation_whatever_delivery_says():
+    """VARSEL_LLM_PROVIDER=off is the switch that means "do not call a model at all", so it must
+    hold with the delivery flag on as well as off — and `status="disabled"` is now that verdict
+    about generation rather than a statement about what this deployment sends.
+    """
+    _reset(provider="off", enabled=True)
+    assert llm_message.generation_enabled() is False
+    calls = []
+    llm_message._BACKENDS["claude"] = lambda body: calls.append(body) or '{"melding":"x"}'
+    try:
+        result = llm_message.write_message_detailed({"a": 1})
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.status == "disabled"
+    assert result.text is None
+    assert calls == [], "provider=off must not reach a backend"
+
+    _reset(provider="off", enabled=False)
+    assert llm_message.generation_enabled() is False
+
+
+def test_generation_is_off_without_a_project():
     _reset()
     llm_message._PROJECT = None
-    assert llm_message.llm_enabled() is False
+    assert llm_message.generation_enabled() is False
 
 
-def test_enabled_by_default_with_a_project():
+def test_both_gates_are_on_by_default_with_a_project():
     _reset()
-    assert llm_message.llm_enabled() is True
+    assert llm_message.generation_enabled() is True
+    assert llm_message.delivery_enabled() is True
+
+
+def test_a_wording_is_written_even_when_delivery_is_off():
+    """Delivery policy must never reach the writer.
+
+    Replaces the old `test_disabled_by_flag`, which asserted the opposite — and which would have
+    kept passing after the split for a reason that has nothing to do with the gate: `anthropic` is
+    not in this suite's dependency set, so an un-stubbed backend raises ImportError and the result
+    is `error`/None either way. Stub the backend and the question becomes answerable.
+    """
+    _reset(provider="claude", enabled=False)
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
+    try:
+        result = llm_message.write_message_detailed({"a": 1})
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.status == "ok"
+    assert result.text == "Toget er innstilt."
 
 
 # ---- payload guardrails -----------------------------------------------------------------------
@@ -642,7 +783,9 @@ def test_all_backends_unavailable_returns_none():
     llm_message._BACKENDS.update(claude=dead, gemini=dead)
     try:
         assert write_message({"a": 1}) is None
-        assert llm_message.llm_enabled() is False, "with both latched off there is nothing to try"
+        assert llm_message.generation_enabled() is False, (
+            "with both latched off there is nothing to try"
+        )
     finally:
         llm_message._BACKENDS.update(claude=llm_message._claude_write, gemini=llm_message._gemini_write)
 
@@ -695,9 +838,11 @@ def test_a_written_message_reports_its_backend_and_model():
 
 def test_each_failure_mode_is_named_rather_than_collapsed_to_none():
     """Every one of these ends as the same deterministic wording, so the stored message cannot tell
-    them apart. A refusal is a prompt problem, a transient error is not, and `disabled` is neither.
+    them apart. A refusal is a prompt problem, a transient error is not, and `disabled` is neither —
+    it means no backend could be tried at all (provider=off, or no project), which since the
+    2026-08-07 gate split is the only thing that still suppresses a written wording.
     """
-    _reset(enabled=False)
+    _reset(provider="off")
     assert llm_message.write_message_detailed({"a": 1}).status == "disabled"
 
     _reset(provider="claude")

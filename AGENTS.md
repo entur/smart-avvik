@@ -81,12 +81,29 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Garden enablement on top of the IAM role**, so check `jsonPayload.provider` on
     `event="llm_message"` rather than assuming which one answered. Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
-    wording, so a push is never lost to an LLM problem. **Off in prd** (`VARSEL_LLM_ENABLED=false`)
-    until validated in dev. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
-    `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
-    2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
-    available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
-    `VERTEX_GEMINI_LOCATION` when their regional availability diverges. The backend latch expires
+    wording, so a push is never lost to an LLM problem.
+    **Writing a wording and sending it are two switches** (2026-08-07): `VARSEL_LLM_PROVIDER=off`
+    stops a model being *asked*; `VARSEL_LLM_ENABLED=false` still asks and records the answer but
+    *sends* the deterministic wording. prd runs them apart — `auto` with `ENABLED=false` — so it
+    writes a `message_llm` on every alert-worthy decision and delivers the template. Know what that
+    sends: the traveller's origin, destination and departure time, which is not what the
+    `AI.CLASSIFY` IAM precedent covers. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
+    **There are three location shapes, not two** (2026-08-07): `global`, a single region, and the
+    **EU multi-region** endpoint (`aiplatform.eu.rep.googleapis.com`, `location="eu"`) — and only the
+    third both serves the model and confines processing, which is why `VERTEX_GEMINI_LOCATION` is
+    **`eu` in every environment and in the code default**. Vertex documents multi-region endpoints as
+    keeping ML processing "within a specific jurisdictional boundary" and `global` as the opposite:
+    "you can't control or know which region your ML processing requests are sent to" — which also
+    leaves Google's abuse-monitoring retention ("the same region or multi-region selected by the
+    customer") bound to nothing. A single region is **not** the fallback it looks like: measured
+    2026-08-07 in both projects, `gemini-3.5-flash` 404s at `europe-west1`, `europe-north1` and
+    `europe-west4` alike, so pinning a region costs a model generation while `eu` costs nothing
+    (median 1.51 s vs 1.38 s, from inside the dev cluster; Private Google Access is not in that path,
+    which the Vertex docs warn would break multi-region endpoints). `VERTEX_LOCATION` still defaults
+    to `global` and governs Claude, unavailable in these projects; an explicit `VERTEX_LOCATION`
+    moves both. Not settled by this: whether a commute pattern is "Fortrolig" under Entur's
+    classification — a DPIA question, with `VARSEL_LLM_PROVIDER=off` as the kill switch.
+    The backend latch expires
     after 30 min (`llm_message._LATCH_TTL`), so enabling Model Garden takes effect without a
     redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
     destination and departure time); records carry a hashed `journey_digest`, and
@@ -143,8 +160,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
     page shows the per-row state next to the count.
   - Neither table is in `copy_runtime_to_prd.sh`: each environment records its own decisions and
-    `bq cp -f` overwrites. Note `VARSEL_LLM_ENABLED=false` in prd, so prd rows carry the
-    deterministic wording; dev is where the LLM-written messages are.
+    `bq cp -f` overwrites. Both environments record BOTH wordings and differ in what was sent:
+    dev delivers the model's (`message_source='llm'`), prd withholds it
+    (`message_source='deterministic'` beside a non-null `message_llm`) — the population prd's
+    rollout decision is judged on.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)

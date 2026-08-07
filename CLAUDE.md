@@ -173,12 +173,44 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Garden enablement on top of the IAM role**, so check `jsonPayload.provider` on
     `event="llm_message"` rather than assuming which one answered. Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
-    wording, so a push is never lost to an LLM problem. **Off in prd** (`VARSEL_LLM_ENABLED=false`)
-    until validated in dev. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
-    `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
-    2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
-    available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
-    `VERTEX_GEMINI_LOCATION` when their regional availability diverges. The backend latch expires
+    wording, so a push is never lost to an LLM problem.
+    **Writing a wording and sending it are two switches** (2026-08-07): `VARSEL_LLM_PROVIDER=off`
+    stops a model being *asked*; `VARSEL_LLM_ENABLED=false` still asks and records the answer but
+    *sends* the deterministic wording. `llm_message.generation_enabled()` and `delivery_enabled()`
+    are the two gates — the old conflated `llm_enabled()` is gone. Delivery is enforced in exactly
+    one place, `varsel._deliverable_message`, which the push body and the in-app journey card both
+    read through; the card is the one that would otherwise silently start showing prose the push did
+    not carry. `_messages` has two other readers (`check_and_notify`'s cache probe,
+    `_record_decisions`' fill of `message_llm`) that stay ungated on purpose: the log records what
+    was *written*, whether or not it was sent. **prd runs the two switches apart**:
+    `VARSEL_LLM_PROVIDER=auto` (it writes a wording for every alert-worthy decision) with
+    `VARSEL_LLM_ENABLED=false` (travellers still get the template). That is the combination the
+    split exists for — it is what makes prd's real journeys comparable at all. Know what it sends:
+    the prompt carries the traveller's origin, destination and departure time to a `global`,
+    non-region-bound endpoint, which is *not* what the `AI.CLASSIFY` precedent covers
+    (operator-authored SX text); decided with that in view on 2026-08-07, and
+    `VARSEL_LLM_PROVIDER=off` stops the egress if that changes. Enabling delivery in prd is a
+    separate one-value deploy. Prompts and replies are logged under
+    `jsonPayload.event="llm_message"`.
+    **There are three location shapes, not two** (2026-08-07): `global`, a single region, and the
+    **EU multi-region** endpoint (`aiplatform.eu.rep.googleapis.com`, `location="eu"`) — and only the
+    third both serves the model and confines processing, which is why `VERTEX_GEMINI_LOCATION` is
+    **`eu` in every environment and in the code default**. Vertex documents multi-region endpoints as
+    keeping ML processing "within a specific jurisdictional boundary" and `global` as the opposite:
+    "you can't control or know which region your ML processing requests are sent to". It also anchors
+    Google's abuse-monitoring retention, which holds a logged prompt "in the same region or
+    multi-region selected by the customer" — at `global`, that clause binds to nothing. A single
+    region is **not** the fallback it looks like: measured 2026-08-07 in both projects,
+    `gemini-3.5-flash` 404s at `europe-west1`, `europe-north1` and `europe-west4` alike (only
+    `gemini-2.5-flash*` serve there), so pinning a region costs a model generation while `eu` costs
+    nothing — measured from inside the dev cluster, median 1.51 s vs 1.38 s at `global`. Private
+    Google Access is **not** in that path, which had to be checked in-cluster rather than from a
+    laptop because the Vertex docs warn PGA breaks multi-region endpoints. `VERTEX_LOCATION` still
+    defaults to `global` and still governs Claude, which is not served in these projects at all; an
+    explicit `VERTEX_LOCATION` moves both backends, so only the final fallback is per-model. What
+    this does **not** settle: whether a commute pattern is "Fortrolig" under Entur's classification,
+    for which "Google Gemini on Cloud" is approved for neither — that is a DPIA question, and
+    `VARSEL_LLM_PROVIDER=off` remains the egress kill switch. The backend latch expires
     after 30 min (`llm_message._LATCH_TTL`), so enabling Model Garden takes effect without a
     redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
     destination and departure time); records carry a hashed `journey_digest`, and
@@ -248,8 +280,27 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     "take this instead" can eventually be labelled the way every other decision here already is. `message_status` says why the stored wording has the source it does —
     `ok` / `ok_cached` / `not_alertworthy` / `not_selected` / `push_disabled` / `llm_disabled` /
     `capped` / `attempts_exhausted` / `rejected` / `ungrounded` / `error` — because a cap, an
-    exhausted retry, a refusal and prd's `VARSEL_LLM_ENABLED=false` all store the same
-    deterministic text. `llm_provider`/`llm_model` outlive the Cloud Logging retention that used to
+    exhausted retry and a refusal all store the same deterministic text. Two of those values changed
+    meaning on 2026-08-07 and the schema descriptions carry the new reading: `llm_disabled` now means
+    no backend could be **asked** (`VARSEL_LLM_PROVIDER=off`, no project, everything latched), never
+    "this deployment sends the template"; and `attempts_exhausted` means no backend was reachable for
+    three cycles rather than "the model was asked and failed" — `_write_message` returns `None`
+    without calling anything on several paths and the caller spends an attempt on any `None`
+    (measured in prd 2026-08-07, where generation had never run: 753 rows `llm_disabled` and 693
+    `attempts_exhausted` across the same 11 subjects).
+    **Both wordings are recorded, and `message` is the one that was *delivered*** (2026-08-07):
+    `message_llm` and `message_deterministic` sit beside `message`/`message_source`, so the two
+    writers can be compared on the same decision — which is impossible while a flag decides that only
+    one of them exists. The sent wording is chosen on `delivery_enabled()`, never on "an LLM wording
+    exists": `written or deterministic` would file a template push as `llm` on the `/historikk` card
+    *and* permanently in `varsel_decision_outcomes`, and would leave "written but withheld"
+    (`message_source='deterministic' AND message_llm IS NOT NULL`) matching no row at all — the one
+    population prd's rollout is judged on. `message_deterministic` is written on **every** decision,
+    so its presence is what dates a row as post-change; `message_llm` cannot, since NULL there also
+    means the column did not exist yet (the `n_unsegmented` third-bucket rule, one column over). The
+    side-by-side is `data/queries/message_wording_comparison.sql`; filter `message_status = 'ok'` for
+    a same-input pair, because under `ok_cached` the model's text came from an earlier cycle's input
+    than the template's did. `llm_provider`/`llm_model` outlive the Cloud Logging retention that used to
     be the only record, and `prompt_version` (SHA-256[:8] of the system prompt, derived so nobody
     has to remember to bump it) keeps rows written under different briefs comparable.
     `message_input` carries origin, destination and departure time together — the trio
@@ -259,7 +310,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     (`create_varsel_decisions.sql`, `CREATE TABLE IF NOT EXISTS` — **never** `CREATE OR REPLACE`;
     their contents cannot be rebuilt). Because `IF NOT EXISTS` does nothing to an existing table,
     a new column also needs an `ALTER TABLE … ADD COLUMN IF NOT EXISTS` in that same file — without
-    it the write path just logs "N of M rows rejected by BigQuery" every cycle. Note
+    it the write path just logs "N of M rows rejected by BigQuery" every cycle.
+    **That file is two halves and `ensure_table` runs them as separate jobs** (2026-08-07): structure
+    above the `-- BEST-EFFORT SECTION` marker decides readiness, the `ALTER COLUMN … SET OPTIONS`
+    description refresh below it is best-effort and a failure there is logged and forgiven. BigQuery
+    caps table-metadata updates at **5 per 10 s per table** and that block only ever grows — every
+    reworded description adds a permanent statement. At seven of them it reliably returned "Exceeded
+    rate limits: too many table update operations for this table", and since `ensure_table` treats
+    any failure as "table not ready", one whole-file job meant a *cosmetic description edit* silently
+    stopped the decision log recording anything at all. Prune statements whose text has demonstrably
+    reached both dev and prd; a fresh environment reads its descriptions from the `CREATE` bodies.
+    Note
     `validate_varsel_sql.sh` checks that file **statement by statement**: a dry run of a
     multi-statement script validates only the first one (`numChildJobs: 1`), so a broken ALTER
     would otherwise pass the validator and fail at startup. The outcomes table is created there too, not by the nightly
@@ -319,8 +380,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
     page shows the per-row state next to the count.
   - Neither table is in `copy_runtime_to_prd.sh`: each environment records its own decisions and
-    `bq cp -f` overwrites. Note `VARSEL_LLM_ENABLED=false` in prd, so prd rows carry the
-    deterministic wording; dev is where the LLM-written messages are.
+    `bq cp -f` overwrites. **Both environments record pairs, and they differ in what was sent.**
+    dev has both switches on, so its rows carry a written wording, a template wording, and the
+    written one delivered (`message_source='llm'`). prd generates but does not deliver
+    (`VARSEL_LLM_PROVIDER=auto`, `VARSEL_LLM_ENABLED=false`), so its rows carry both wordings with
+    the template delivered — `message_source='deterministic' AND message_llm IS NOT NULL`, the
+    "written but withheld" population the prd rollout decision is judged on. prd's pairs are the
+    ones that matter: real travellers, real journeys.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)

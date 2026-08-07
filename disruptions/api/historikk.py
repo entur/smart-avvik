@@ -123,7 +123,11 @@ class Decision(BaseModel):
     pushed_any: bool | None = Field(description="Whether a Web Push was actually delivered.")
     n_devices: int | None = Field(description="How many registrations shared this journey.")
     message: str | None = Field(description="The message text the traveller was sent.")
-    message_source: str | None = Field(description="'llm' or 'deterministic'.")
+    message_source: str | None = Field(
+        description="Which wording was sent: 'llm' or 'deterministic'. Since 2026-08-07 both are "
+        "written for every alert-worthy decision and a deployment chooses which one it delivers, so "
+        "'deterministic' means the traveller got the template — not that no model wording exists.",
+    )
 
     actual_cancelled: bool | None = Field(description="ET declared the boarding call cancelled.")
     actual_dep_delay_min: int | None = Field(description="Realized departure delay (min).")
