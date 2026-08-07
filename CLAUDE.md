@@ -182,12 +182,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     read through; the card is the one that would otherwise silently start showing prose the push did
     not carry. `_messages` has two other readers (`check_and_notify`'s cache probe,
     `_record_decisions`' fill of `message_llm`) that stay ungated on purpose: the log records what
-    was *written*, whether or not it was sent. **prd currently has both switches off** — the
-    delivery one until the wording is validated in dev, the provider one until the residency
-    question is answered (a prd call would send the traveller's origin, destination and departure
-    time to a `global`, non-region-bound endpoint; the `AI.CLASSIFY` precedent covers
-    operator-authored SX text, not a commute). Enabling each is a separate one-value prd deploy.
-    Prompts and replies are logged under `jsonPayload.event="llm_message"`.
+    was *written*, whether or not it was sent. **prd runs the two switches apart**:
+    `VARSEL_LLM_PROVIDER=auto` (it writes a wording for every alert-worthy decision) with
+    `VARSEL_LLM_ENABLED=false` (travellers still get the template). That is the combination the
+    split exists for — it is what makes prd's real journeys comparable at all. Know what it sends:
+    the prompt carries the traveller's origin, destination and departure time to a `global`,
+    non-region-bound endpoint, which is *not* what the `AI.CLASSIFY` precedent covers
+    (operator-authored SX text); decided with that in view on 2026-08-07, and
+    `VARSEL_LLM_PROVIDER=off` stops the egress if that changes. Enabling delivery in prd is a
+    separate one-value deploy. Prompts and replies are logged under
+    `jsonPayload.event="llm_message"`.
     `VERTEX_LOCATION` defaults to **`global`**, not to the stack's `europe-west1`: measured
     2026-07-29, `gemini-3.5-flash` serves at `global` and 404s regionally, and Sonnet 5 is not
     available in `ent-kixavvik-dev` at all. Override per model with `VERTEX_CLAUDE_LOCATION` /
@@ -361,12 +365,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
     page shows the per-row state next to the count.
   - Neither table is in `copy_runtime_to_prd.sh`: each environment records its own decisions and
-    `bq cp -f` overwrites. **dev is where the comparison lives.** prd has `VARSEL_LLM_PROVIDER=off`
-    *and* `VARSEL_LLM_ENABLED=false`, so its rows carry a deterministic `message` and a NULL
-    `message_llm` — no model is asked there yet. dev has both switches on, so its rows carry a
-    written wording, a template wording and a delivered one. Turning prd's provider on is what makes
-    prd rows comparable; that is a separate deploy, gated on the residency question in
-    `values-kub-ent-prd.yaml`.
+    `bq cp -f` overwrites. **Both environments record pairs, and they differ in what was sent.**
+    dev has both switches on, so its rows carry a written wording, a template wording, and the
+    written one delivered (`message_source='llm'`). prd generates but does not deliver
+    (`VARSEL_LLM_PROVIDER=auto`, `VARSEL_LLM_ENABLED=false`), so its rows carry both wordings with
+    the template delivered — `message_source='deterministic' AND message_llm IS NOT NULL`, the
+    "written but withheld" population the prd rollout decision is judged on. prd's pairs are the
+    ones that matter: real travellers, real journeys.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)
