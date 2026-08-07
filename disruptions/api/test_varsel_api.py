@@ -34,6 +34,21 @@ os.environ.update(
     # repo -- would otherwise fail the title assertions below. The tests that DO exercise labelling
     # set it themselves via _deployed_as.
     KIX_ENVIRONMENT="prd",
+    # Pin the DELIVERY switch on, for the same class of reason (llm_message reads it at import).
+    # Since 2026-08-07 it decides which of the two written wordings the push and the card carry, so
+    # a developer with VARSEL_LLM_ENABLED=false exported -- prd's own setting, and exactly what
+    # somebody reproducing prd behaviour locally would export -- would otherwise fail every
+    # assertion that a written message reaches a traveller. The tests that exercise delivery-off
+    # monkeypatch llm_message.delivery_enabled themselves, which also states the case they are about
+    # instead of leaving it to the ambient environment.
+    VARSEL_LLM_ENABLED="true",
+    # And pin the GENERATION side on, which needs a project: `llm_message.generation_enabled()` is
+    # False without one, and since 2026-08-07 `check_and_notify` checks it BEFORE reaching the
+    # writer (so that a cycle asking no backend does not spend a retry attempt). Unpinned, every
+    # test that stubs `_write_message` would silently never reach its stub and assert against a
+    # deployment that cannot write at all. No client is ever constructed from this value here --
+    # the backends are stubbed -- so a placeholder project is enough.
+    GOOGLE_CLOUD_PROJECT=os.environ.get("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test"),
 )
 
 import json
@@ -135,6 +150,19 @@ def _reset_state():
         varsel._alternatives.clear()
         varsel._message_attempts.clear()
         varsel._message_meta.clear()
+    # llm_message's backend latch is PROCESS-global and survives a monkeypatch undo, so a test that
+    # drives both backends into `_latched_off` (the 404/configuration path) silently disables
+    # generation for every test that runs after it. That was invisible until 2026-08-07, when
+    # `check_and_notify` began consulting `generation_enabled()` before reaching the writer -- at
+    # which point the leak turned into "the writer is never called" in unrelated tests, which reads
+    # exactly like the give-up bug those tests exist to pin. Clear it here, like test_llm_message's
+    # own `_reset` does.
+    import llm_message
+
+    with llm_message._lock:
+        llm_message._latched_off.clear()
+        llm_message._active = None
+        llm_message._active_at = None
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
@@ -756,6 +784,74 @@ def test_a_message_that_cannot_be_written_is_not_retried_forever(monkeypatch):
     assert len(sent) == 1, "the push still went out once, with the deterministic wording"
 
 
+def test_generation_being_off_does_not_spend_the_retry_budget(monkeypatch):
+    """A cycle that asks no backend must not cost a retry.
+
+    `_write_message` returns None on several paths that never reach a model — generation switched
+    off, or every backend latched off after a 404 — and the caller spends an attempt on any None. So
+    three such cycles used to exhaust a situation permanently: when `llm_message._LATCH_TTL` expired
+    30 minutes later and a backend came back, the situation was already at `_MAX_MESSAGE_ATTEMPTS`
+    and was never offered to the writer again for its whole life. In prd that silently thins the
+    written-but-withheld population the rollout is judged on.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+
+    monkeypatch.setattr(varsel, "_generation_enabled", lambda: False)
+    for _ in range(5):  # five cycles with nothing to ask
+        varsel.check_and_notify(SNAPSHOT)
+    assert not varsel._message_attempts, "no backend was reached, so no attempt may be spent"
+
+    # The backend comes back. The situation must still be offered to the writer.
+    written = []
+    monkeypatch.setattr(varsel, "_generation_enabled", lambda: True)
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda *a, **k: written.append(1) or "Toget er innstilt."
+    )
+    varsel.check_and_notify(SNAPSHOT)
+    assert written, "a recovered backend must still get to write this situation's wording"
+
+
+def test_a_cached_wording_is_recorded_beside_a_fresh_template(monkeypatch):
+    """The `ok_cached` trap, pinned: the two wordings on that row describe different cycles.
+
+    `message_llm` is reused from the cycle that wrote it, while `message_deterministic` is rebuilt
+    from THIS cycle's input every time. So on an `ok_cached` row the pair is not a same-input
+    comparison, which is why message_wording_comparison.sql filters on `message_status = 'ok'`.
+    Documented in three places and, until now, asserted in none.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda message_input, **kw: llm_message.MessageResult(
+            "Skrevet i forrige syklus.", provider="gemini", model="g", status="ok"
+        ),
+    )
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    first = [r for r in log.rows if r["message_status"] == "ok"]
+    assert first, "the first cycle writes the wording"
+
+    varsel.check_and_notify(SNAPSHOT)  # same live situation, wording served from cache
+    cached = [r for r in log.rows if r["message_status"] == "ok_cached"]
+    assert cached, "the second cycle reuses it rather than re-asking"
+    row = cached[-1]
+    assert row["message_llm"] == "Skrevet i forrige syklus.", (
+        "the cached row still records the model's wording"
+    )
+    assert row["message_deterministic"], "and a template wording rebuilt this cycle beside it"
+    assert row["message_deterministic"] != row["message_llm"], (
+        "the two describe different cycles' inputs -- the reason 'ok' is the same-input filter"
+    )
+
+
 def test_a_written_message_clears_the_failure_count(monkeypatch):
     """The give-up counter must not leak across a recovery: a transient failure followed by a
     success has to leave the journey able to be re-written for the next situation.
@@ -838,6 +934,38 @@ def test_journey_listing_carries_the_pushed_message(monkeypatch):
     assert r.status_code == 200
     alerts = r.json()["journeys"][0]["alerts"]
     assert alerts and alerts[0]["message"] == "Toget er mest sannsynlig innstilt."
+
+
+def test_the_journey_card_honours_the_delivery_switch(monkeypatch):
+    """The card is the OTHER traveller-facing surface, and the one an implementer forgets.
+
+    Since 2026-08-07 the wording is written whenever a backend can be tried, and VARSEL_LLM_ENABLED
+    only decides which of the two already-written wordings the traveller gets. Gate the push and
+    not this read and prd's card silently starts showing LLM prose the push it sits beside does not
+    carry -- a difference nobody would see in a test, because the push assertions would all still
+    hold. `message: null` is the state the PWA already renders (it is what "no message yet" has
+    always looked like), so delivery-off needs no frontend change.
+    """
+    import llm_message
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda *a, **k: "Toget er mest sannsynlig innstilt."
+    )
+    monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert varsel._messages, (
+        "generation does not depend on delivery any more: the wording is still written and cached, "
+        "which is what U3 records beside the sent one"
+    )
+    alerts = client.get("/varsel-api/journeys", params={"device_id": DEVICE}).json()[
+        "journeys"][0]["alerts"]
+    assert alerts and alerts[0]["message"] is None, (
+        "with delivery off the card must not show a wording the push did not carry"
+    )
 
 
 def test_journey_listing_omits_the_internal_impact_reference():
@@ -1089,6 +1217,10 @@ def test_decision_row_stores_the_text_that_was_actually_sent(monkeypatch):
     assert row["message_source"] == "deterministic"
     # The same wording the push carried, not an empty column.
     assert "82 % sjanse for innstilling" in row["message"]
+    # Nothing was written, so the LLM column is NULL and `message` is the template one -- the third
+    # of the three delivery states, and the only one where the pair collapses to a single wording.
+    assert row["message_llm"] is None
+    assert row["message"] == row["message_deterministic"]
 
 
 def test_decision_row_labels_a_written_message_as_llm(monkeypatch):
@@ -1101,6 +1233,11 @@ def test_decision_row_labels_a_written_message_as_llm(monkeypatch):
 
     row = next(r for r in log.rows if r["situation_number"] == "S1")
     assert (row["message"], row["message_source"]) == ("Toget er innstilt.", "llm")
+    # Delivery is on (the suite pins VARSEL_LLM_ENABLED=true), so the sent text IS the written one --
+    # and the template wording is recorded anyway, which is what makes the two comparable on rows
+    # where the model's version is the one that went out.
+    assert row["message_llm"] == "Toget er innstilt."
+    assert "82 % sjanse for innstilling" in row["message_deterministic"]
 
 
 def test_decisions_are_recorded_even_when_push_is_disabled(monkeypatch):
@@ -1148,6 +1285,12 @@ def test_every_decision_records_the_message_input_even_below_the_threshold(monke
     payload = json.loads(row["message_input"])
     assert "reise" in payload and payload["sannsynlighet_prosent"] == 10
     assert row["prompt_version"], "the brief in force must be identifiable afterwards"
+    # The wording columns follow the same rule as the input, and for the same reason. No model is
+    # asked about a sub-threshold decision, so message_llm is NULL -- but message_deterministic is
+    # written for every decision, which is what dates the row as post-2026-08-07. A NULL there means
+    # "before the column existed", never "no wording", and these rows are ~83 % of the table.
+    assert row["message_llm"] is None
+    assert row["message_deterministic"] == row["message"]
 
 
 def test_the_recorded_input_is_the_object_the_model_was_prompted_with(monkeypatch):
@@ -1162,7 +1305,9 @@ def test_the_recorded_input_is_the_object_the_model_was_prompted_with(monkeypatc
     _reset_state()
     log = _use_decision_log(monkeypatch)
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
-    monkeypatch.setattr(llm_message, "llm_enabled", lambda: True)
+    # The GENERATION gate: what decides whether the writer runs at all. Delivery is a separate
+    # switch and does not belong here -- this test is about what the model was shown.
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
 
     built, prompted = [], []
     real_build = llm_message.build_message_input
@@ -1227,7 +1372,7 @@ def test_decision_row_records_which_backend_wrote_the_message(monkeypatch):
     _reset_state()
     log = _use_decision_log(monkeypatch)
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
-    monkeypatch.setattr(llm_message, "llm_enabled", lambda: True)
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
     monkeypatch.setattr(llm_message, "build_message_input", lambda *a, **k: {"reise": {"fra": "A"}})
     monkeypatch.setattr(
         llm_message,
@@ -1247,14 +1392,15 @@ def test_decision_row_records_which_backend_wrote_the_message(monkeypatch):
 
 def test_a_capped_cycle_is_distinguishable_from_a_disabled_llm(monkeypatch):
     """Both store the deterministic wording. One is a budget the poller imposed on itself and will
-    lift next tick; the other is how prd is configured. Told apart only by message_status.
+    lift next tick; the other is a deployment with no backend it can ask at all. Told apart only by
+    message_status.
     """
     import llm_message
 
     _reset_state()
     log = _use_decision_log(monkeypatch)
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
-    monkeypatch.setattr(llm_message, "llm_enabled", lambda: True)
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
     monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 0)
     _register(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
@@ -1264,23 +1410,228 @@ def test_a_capped_cycle_is_distinguishable_from_a_disabled_llm(monkeypatch):
     assert row["message_status"] == "capped"
 
 
-def test_a_deployment_with_the_llm_off_says_so(monkeypatch):
-    """The prd configuration. Same deterministic wording as a cap or a refusal, different cause --
-    and a separate test from the cap because the cap is checked FIRST, so one cycle cannot show both.
+# ---- the two switches: writing a wording vs sending it ----------------------------------------
+# Split on 2026-08-07. Until then one flag did both, so prd -- VARSEL_LLM_ENABLED=false -- never
+# wrote a message and there was nothing to compare its own pushes against. The single old test
+# below has two successors, one per gate, and both are needed: they now describe opposite halves of
+# what used to be one setting, and keeping only one of them would leave a whole gate unexercised.
+
+
+def test_a_deployment_that_can_ask_no_backend_says_so(monkeypatch):
+    """VARSEL_LLM_PROVIDER=off, no GCP project, or every backend latched off after a 404.
+
+    Same deterministic wording as a cap or a refusal, different cause -- and a separate test from
+    the cap because the cap is checked FIRST, so one cycle cannot show both. The status value is
+    still `llm_disabled` (rows written before the split use it), but what it now means is "nothing
+    could be asked", never "this deployment sends the template".
     """
     import llm_message
 
     _reset_state()
     log = _use_decision_log(monkeypatch)
-    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
-    monkeypatch.setattr(llm_message, "llm_enabled", lambda: False)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: False)
+
+    def never(*a, **k):
+        raise AssertionError("no backend may be called when generation is off")
+
+    monkeypatch.setattr(llm_message, "write_message_detailed", never)
     _register(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
 
+    assert varsel._messages == {}, "nothing was written, so nothing may be cached"
+    assert "82 % sjanse for innstilling" in sent[0]["body"], "the push carries the template wording"
+    alerts = client.get("/varsel-api/journeys", params={"device_id": DEVICE}).json()[
+        "journeys"][0]["alerts"]
+    assert alerts[0]["message"] is None, "and the card has no written wording to show either"
     row = next(r for r in log.rows if r["situation_number"] == "S1")
     assert row["message_source"] == "deterministic"
     assert row["message_status"] == "llm_disabled"
     assert row["llm_provider"] is None
+
+
+def test_delivery_off_still_writes_the_wording_but_pushes_the_template(monkeypatch):
+    """prd's configuration: the model is asked, the traveller gets the deterministic wording.
+
+    This is the whole point of the split. VARSEL_LLM_ENABLED=false used to mean the writer never
+    ran, so prd's own traffic produced no LLM wording to compare its pushes against and the
+    comparison could only ever be made on dev's handful of journeys. Now both exist for every
+    alerting decision, and only the send is gated.
+
+    The push body is asserted byte-identical to `_deterministic_body` over the very object the model
+    was prompted with -- not merely "contains 82 %" -- because R5 is that no LLM outcome may change
+    a single character of what a delivery-off deployment sends.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
+    monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
+    prompted = []
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda message_input, **kw: prompted.append(message_input)
+        or llm_message.MessageResult(
+            "Toget ditt er innstilt. Ta R11 kl 08:24.", provider="gemini", model="g", status="ok"
+        ),
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(prompted) == 1, "the writer runs even though nothing it produces will be sent"
+    assert list(varsel._messages.values()) == ["Toget ditt er innstilt. Ta R11 kl 08:24."]
+    assert sent[0]["body"] == varsel._deterministic_body(prompted[0]), (
+        "with delivery off the push must be the template wording, to the character"
+    )
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_status"] == "ok", (
+        "the write succeeded; that a different wording was sent is not a message_status"
+    )
+
+
+def test_a_withheld_wording_is_recorded_beside_the_one_that_was_sent(monkeypatch):
+    """Delivery off: both wordings are on the row, and `message`/`message_source` describe the SEND.
+
+    The discriminator the two columns exist for. Until 2026-08-07 the row stored `written or
+    deterministic` and labelled it `llm` whenever anything had been written -- which was harmless
+    only because a wording was written exactly when it was sent. With generation and delivery split
+    that is wrong three ways at once: /historikk would badge a template push "Skrevet av modellen",
+    `label_varsel_decisions.sql` copies the pair into `varsel_decision_outcomes` where it is
+    immutable once labelled, and "written but withheld by policy" -- `message_source =
+    'deterministic' AND message_llm IS NOT NULL` -- could never match a single row, which is
+    precisely the population prd's rollout is measured on.
+    """
+    import llm_message
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
+    monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda *a, **k: llm_message.MessageResult(
+            "Toget ditt er innstilt. Ta R11 kl 08:24.", provider="gemini", model="g", status="ok"
+        ),
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_llm"] == "Toget ditt er innstilt. Ta R11 kl 08:24.", (
+        "the model's wording is recorded even though nobody received it"
+    )
+    assert row["message_source"] == "deterministic", (
+        "message_source says what was SENT, not that a wording exists"
+    )
+    assert row["message"] == row["message_deterministic"] == sent[0]["body"], (
+        "and `message` is the text the push actually carried, to the character"
+    )
+    # The write itself went fine, and the row says so: `message_status` describes the WRITER, so it
+    # can never be the column that tells a withheld wording from a missing one. That distinction is
+    # the message_llm/message_source pair above and nothing else.
+    assert (row["message_status"], row["llm_provider"]) == ("ok", "gemini")
+
+
+def test_delivery_off_survives_a_writer_that_raises(monkeypatch):
+    """A backend failure must cost nothing at all when its output was never going to be sent.
+
+    The write now happens on a path prd runs every cycle, so this is no longer a dev-only risk: a
+    raise here would take the push with it for a wording nobody would have read.
+    """
+    import llm_message
+
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
+    monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
+
+    def boom(*a, **k):
+        raise RuntimeError("Vertex exploded")
+
+    monkeypatch.setattr(llm_message, "write_message_detailed", boom)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(sent) == 1, "a failed write must not cost the notification"
+    assert "82 % sjanse for innstilling" in sent[0]["body"]
+
+
+def test_the_write_budgets_are_unchanged_by_the_delivery_switch(monkeypatch):
+    """The three things that suppress a write still suppress it when delivery is off.
+
+    Turning the flag into a send-time selector widens WHEN the writer runs, and the risk is that it
+    widens the budgets with it -- prd would then start spending Vertex calls it never spent before,
+    on wordings it does not send. Cap, give-up counter and the "no message writing without push"
+    rule are asserted here against a delivery-off deployment, since that is the one about to be
+    enabled.
+    """
+    import llm_message
+
+    monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    writes = []
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: writes.append(1) or None)
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 0)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert writes == [], "the per-cycle cap still bounds writes"
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 8)
+    _register(DEVICE)
+    for _ in range(10):  # ten poller ticks on one live situation, every write failing
+        varsel.check_and_notify(SNAPSHOT)
+    assert len(writes) == varsel._MAX_MESSAGE_ATTEMPTS, (
+        f"the give-up counter still stops at {varsel._MAX_MESSAGE_ATTEMPTS}, got {len(writes)}"
+    )
+
+    writes.clear()
+    _reset_state()
+    _register(DEVICE)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    varsel.check_and_notify(SNAPSHOT)
+    assert writes == [], "no message writing without push -- text exists to be delivered"
+
+
+def test_two_devices_share_one_write_with_delivery_off(monkeypatch):
+    """R6 does not depend on which wording is sent: one write, and identical text on both devices.
+
+    Worth pinning separately because the delivery gate sits inside the per-device delivery loop --
+    the one place a per-device decision could creep back in and give two travellers on one trip two
+    different texts.
+    """
+    import llm_message
+
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, *, journey_key, message_input: (
+            written.append(journey_key) or "Skrevet melding."
+        ),
+    )
+    _register("dev-first-0001")
+    _register("dev-second-002")
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, "one written message per journey definition, not per device"
+    assert len(sent) == 2 and sent[0]["body"] == sent[1]["body"]
+    assert sent[0]["body"] != "Skrevet melding.", "delivery is off; the template is what goes out"
 
 
 def test_a_broken_message_input_costs_its_own_column_not_the_cycle(monkeypatch):
@@ -1309,6 +1660,10 @@ def test_a_broken_message_input_costs_its_own_column_not_the_cycle(monkeypatch):
     assert row["message_input"] is None
     assert row["message"], "the decision itself is still recorded in full"
     assert "82 % sjanse for innstilling" in sent[0]["body"], "and the push still carries a body"
+    # The degraded wording is recorded as a WORDING and never as an input: it came from
+    # `_message_input_from_alert`, which no writer was ever shown, so message_deterministic is
+    # populated (it is what the push said) beside a NULL message_input (nothing was built).
+    assert row["message_deterministic"] == sent[0]["body"]
 
 
 def test_ensure_table_backs_off_after_a_failure(monkeypatch):

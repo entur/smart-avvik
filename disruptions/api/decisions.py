@@ -43,6 +43,15 @@ Design notes
   found nothing, that it kept the traveller on the train they have, or that no lookup was issued at
   all — and since most rows are sub-threshold, the last of those is most of any offer rate's
   denominator.
+* **Both wordings, not just the one that went out** (2026-08-07). `VARSEL_LLM_ENABLED` used to
+  decide whether a written wording *existed*; it now decides only which of the two is *sent*
+  (`llm_message.generation_enabled` vs `delivery_enabled`). So the row carries `message_llm` and
+  `message_deterministic` side by side, and `message`/`message_source` describe **delivery** rather
+  than availability: with delivery off — prd, today — an LLM wording exists that the push did not
+  carry, and `message_source = 'deterministic' AND message_llm IS NOT NULL` is exactly that
+  withheld-by-policy population. Recording only what was sent would leave the deployment whose
+  pushes reach real travellers with nothing to compare its own wording against, which is the whole
+  reason the flag was split.
 """
 
 from __future__ import annotations
@@ -63,7 +72,17 @@ _OSLO = ZoneInfo("Europe/Oslo")
 
 TABLE = "disruptions.varsel_decisions"
 
-_CREATE_TABLE_SQL = (Path(__file__).parent / "create_varsel_decisions.sql").read_text()
+_DDL_PATH = Path(__file__).parent / "create_varsel_decisions.sql"
+
+# The DDL file is two halves, split on this marker: structure above, column descriptions below.
+# Both are idempotent and both run at every startup, but only the first decides whether the log is
+# usable -- see ensure_table. The marker lives in the SQL as a comment, so a reader of either file
+# sees the same boundary; `partition` means a file without it degrades to "all structural", which is
+# the safe direction (a description failure would then block again, rather than a structural failure
+# being ignored).
+_BEST_EFFORT_MARKER = "-- BEST-EFFORT SECTION"
+_ALL_DDL_SQL = _DDL_PATH.read_text()
+_STRUCTURE_SQL, _, _DESCRIPTIONS_SQL = _ALL_DDL_SQL.partition(_BEST_EFFORT_MARKER)
 
 # Injected by main.lifespan; None disables recording entirely (tests, and any deploy where the
 # client could not be built).
@@ -76,6 +95,10 @@ _table_ready = False
 # llm_message._LATCH_TTL: back off, but expire so a fixed grant takes effect without a redeploy.
 _ENSURE_RETRY_S = 15 * 60
 _ensure_failed_at: float | None = None
+# Same backoff, separate state: the description refresh succeeds and fails independently of the
+# structural DDL, and only the structural half decides whether a row can be written at all.
+_descriptions_done = False
+_descriptions_failed_at: float | None = None
 
 # The DDL runs on the startup path of a single always-on pod. Every other bq call in this app is
 # unbounded, but this one is new and sits in front of the poller thread, so it gets an explicit
@@ -99,6 +122,17 @@ def ensure_table() -> bool:
     Done from the app rather than a provisioning script because prd is an isolated project fed by
     free BigQuery copies and nobody runs build scripts against it — the table would simply not
     exist there. `CREATE TABLE IF NOT EXISTS` never touches an existing table's contents.
+
+    Run as TWO jobs, and only the first one decides readiness. The second carries reworded column
+    descriptions to tables that already exist, and it is the half that can fail for a reason having
+    nothing to do with whether a row can be written: BigQuery caps table-metadata updates at 5 per
+    10 seconds per table, and that block only ever grows — every reworded description adds a
+    permanent `ALTER COLUMN ... SET OPTIONS`. Measured 2026-08-07 against dev, the file reliably
+    returned "Exceeded rate limits: too many table update operations for this table" once it reached
+    seven of them. Sending the whole file as one job made that a decision-log outage: any failure
+    left `_table_ready` False, so `record()` wrote nothing at all and a *documentation* edit silently
+    took down the log on the next deploy. Structure first, then descriptions, and a failure in the
+    descriptions is logged and forgiven.
     """
     global _table_ready, _ensure_failed_at
     if _bq_client is None:
@@ -107,17 +141,56 @@ def ensure_table() -> bool:
         return True
     if _ensure_failed_at is not None and monotonic() - _ensure_failed_at < _ENSURE_RETRY_S:
         return False
-    try:
-        _bq_client.query(_CREATE_TABLE_SQL).result(timeout=_ENSURE_TIMEOUT_S)
-        _table_ready = True
-        _ensure_failed_at = None
-        logger.info("Decision log ready (%s)", TABLE)
-    except Exception:
-        # Not fatal: recording is an observability feature, and the alerting path it observes must
-        # keep working without it. Backed off rather than retried every tick.
-        _ensure_failed_at = monotonic()
-        logger.warning("Could not ensure %s; decisions will not be recorded", TABLE, exc_info=True)
+    if not _table_ready:
+        try:
+            _bq_client.query(_STRUCTURE_SQL).result(timeout=_ENSURE_TIMEOUT_S)
+            _table_ready = True
+            _ensure_failed_at = None
+            logger.info("Decision log ready (%s)", TABLE)
+        except Exception:
+            # Not fatal: recording is an observability feature, and the alerting path it observes
+            # must keep working without it. Backed off rather than retried every tick.
+            _ensure_failed_at = monotonic()
+            logger.warning(
+                "Could not ensure %s; decisions will not be recorded", TABLE, exc_info=True
+            )
+            return False
+    _refresh_descriptions()
     return _table_ready
+
+
+def _refresh_descriptions() -> None:
+    """Carry reworded column descriptions to tables that already exist. Never raises.
+
+    Its own retry state rather than riding on ``_table_ready``, because the two have different
+    success conditions and the descriptions half is the one that fails. It is rate-limit-prone by
+    construction — BigQuery caps table-metadata updates at 5 per 10 s per table and the block has
+    more statements than that — and ``ensure_table`` returns early once the table is ready, so
+    piggy-backing gave this exactly one attempt per process. On a pod that redeploys by manual
+    dispatch (prd) a single transient burst then left `bq show --schema` stale for the pod's whole
+    life, which is the opposite of what this block exists for. Backed off on the same ``_ENSURE_RETRY_S``
+    as the structural half so a later poller tick — well past the 10 s quota window — lands it.
+    """
+    global _descriptions_done, _descriptions_failed_at
+    if _descriptions_done or not _DESCRIPTIONS_SQL.strip():
+        return
+    if _descriptions_failed_at is not None and monotonic() - _descriptions_failed_at < _ENSURE_RETRY_S:
+        return
+    try:
+        _bq_client.query(_BEST_EFFORT_MARKER + _DESCRIPTIONS_SQL).result(timeout=_ENSURE_TIMEOUT_S)
+        _descriptions_done = True
+        _descriptions_failed_at = None
+    except Exception:
+        # The table is already usable; what failed is documentation. Say so at warning level so a
+        # persistently stale `bq show --schema` is discoverable, and carry on recording.
+        _descriptions_failed_at = monotonic()
+        logger.warning(
+            "Could not refresh %s column descriptions; the schema comments may be stale. "
+            "Decisions are still being recorded and this will be retried.",
+            TABLE,
+            exc_info=True,
+            extra={"fields": {"event": "varsel_decision_write", "result": "stale_descriptions"}},
+        )
 
 
 def _oslo_date(when: datetime | None):
@@ -309,6 +382,8 @@ def build_row(
     pushed: bool,
     message: str | None,
     message_source: str,
+    message_llm: str | None = None,
+    message_deterministic: str | None = None,
     message_input: str | None = None,
     llm_provider: str | None = None,
     llm_model: str | None = None,
@@ -321,9 +396,20 @@ def build_row(
     the annotation is resolved only by a type checker (see the TYPE_CHECKING import above), which
     is what keeps a renamed `Alert` field from silently becoming a column of NULLs.
 
-    `message` is the text that was actually sent — the written one when an LLM produced it, and
-    otherwise the same deterministic body the push carried. `message_source` says which, because
-    the two are indistinguishable once stored, and prd runs with the LLM off.
+    `message` is the text that was actually sent (or that would have been, where nothing was
+    delivered) and `message_source` says which of the two wordings that was. Since 2026-08-07 those
+    describe **delivery**, not availability: `message_llm` and `message_deterministic` carry the two
+    candidate wordings beside them, both written for every alert-worthy decision, because
+    `VARSEL_LLM_ENABLED` now selects which one goes out instead of deciding whether one is written
+    at all. Keying `message_source` off "did an LLM write anything" would therefore badge a template
+    push as the model's — on the page, and permanently in `varsel_decision_outcomes` once the
+    nightly job copies the pair there — so the caller must choose it on what it delivered.
+
+    `message_deterministic` is written on **every** decision, including the ~83 % sub-threshold ones
+    no wording is ever sent for; `message_llm` only where a model produced one. That asymmetry is
+    what dates a row: a NULL `message_llm` means either "no model wording exists" or "written before
+    the column did", while `message_deterministic IS NOT NULL` marks the row as post-change. The
+    same NULL-is-a-third-bucket rule `/historikk` states for `n_unsegmented`.
 
     `message_input` is the exact JSON document the message was (or would have been) written from —
     verbatim, not a reconstruction, so it stays faithful as `llm_message.build_message_input`
@@ -384,6 +470,11 @@ def build_row(
         "n_devices": n_devices,
         "message": message,
         "message_source": message_source,
+        # The two candidate wordings, recorded whether or not they were the one delivered. Reading
+        # either as "what the traveller was told" is the mistake to avoid: that is `message`, and
+        # which of these it equals is `message_source`.
+        "message_llm": message_llm,
+        "message_deterministic": message_deterministic,
         "snapshot_refreshed_at": (
             impact.refreshed_at.isoformat()
             if impact is not None and getattr(impact, "refreshed_at", None) is not None
