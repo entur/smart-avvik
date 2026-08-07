@@ -551,6 +551,45 @@ def test_the_ddl_splits_structure_from_descriptions():
     assert "ALTER COLUMN" in decisions._DESCRIPTIONS_SQL
 
 
+def test_the_marker_appears_exactly_once():
+    """`str.partition` splits on the FIRST occurrence, so a second marker would move the boundary
+    and quietly drop structural statements into the forgiven half."""
+    assert decisions._ALL_DDL_SQL.count(decisions._BEST_EFFORT_MARKER) == 1
+
+
+def test_no_column_description_exceeds_bigquerys_1024_char_cap():
+    """The 2026-08-07 prd outage, pinned — the second one this file has caused.
+
+    BigQuery rejects a field description over 1024 characters, and `CREATE TABLE IF NOT EXISTS`
+    validates the DDL even when the table already exists, so an over-long description 400s the
+    structure job on EVERY startup and ensure_table then reports the table as not ready. Decisions
+    stop being recorded in every environment at once, silently, while pushes keep going out.
+
+    Prose in this file is load-bearing documentation and keeps growing, no .sql here is executed by
+    any test, and CI has no GCP credentials — so nothing but this check stands between a wordsmithing
+    edit and a dead decision log. It cost 1040 characters to find that out.
+    """
+    # Both forms carry the cap: the typed column in a CREATE body, and the ALTER COLUMN refresh
+    # below the marker. The second only fails a forgiven job, but a description that can never be
+    # applied is still a description nobody will ever read.
+    patterns = (
+        (
+            r'(\w+)\s+(?:STRING|BOOL|INT64|FLOAT64|NUMERIC|TIMESTAMP|DATE)\s+'
+            r'OPTIONS\s*\(\s*description\s*=\s*"((?:[^"\\]|\\.)*)"'
+        ),
+        r'ALTER COLUMN\s+(\w+)\s+SET OPTIONS\s*\(\s*description\s*=\s*"((?:[^"\\]|\\.)*)"',
+    )
+    found, over = 0, []
+    for pattern in patterns:
+        for name, desc in re.findall(pattern, decisions._ALL_DDL_SQL, re.DOTALL):
+            found += 1
+            if len(desc) > 1024:
+                over.append((name, len(desc)))
+    # Guard the guard: a regex that silently matches nothing would pass forever.
+    assert found > 20, f"description scan matched only {found} columns — the pattern has drifted"
+    assert not over, f"descriptions over BigQuery's 1024-char cap: {over}"
+
+
 def test_a_failed_description_refresh_does_not_stop_the_log():
     """The 2026-08-07 outage, pinned.
 
