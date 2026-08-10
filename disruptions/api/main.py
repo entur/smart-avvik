@@ -341,6 +341,54 @@ _IMPACT_AT_TOLERANCE = timedelta(minutes=90)
 # Default boarding stop for /impact when the caller omits from_stop: Oslo S, the busiest hub.
 _DEFAULT_FROM_STOP = "NSR:StopPlace:337"  # Oslo S
 
+# `rail_calls_today` is today's ET *actuals* slice, and it was the single most expensive thing the
+# poller did: CREATE OR REPLACE over the whole day-so-far, so one rebuild costs 0.02 GB just after
+# midnight and 3.4 GB by 23:00 (measured 2026-08-08). Ungated it ran on every SX ingestion change
+# -- 474 times that day, 543 GB, 53 % of the environment's scanned bytes.
+#
+# Two reasons that cadence bought nothing. The poller wakes on the wrong feed: it polls SIRI-SX
+# ingestion (a disruption *text* being published) while this table reads SIRI-ET (a train actually
+# passing a stop) -- the two advance independently. And nothing live reads it: `/journey`,
+# `/impact` and every varsel push score against `rail_calls_planned_today` (predict_calls.sql), not
+# this table. Its only consumers are retrospective -- the `actual_*` columns in predict.sql and the
+# impact label in disruptions_today.sql -- both measured over an onset + 12 h window that a quarter
+# of an hour cannot move.
+#
+# The ET source is DAY-partitioned and unclustered, so there is no cheap incremental read to reach
+# for; running it less often is the only lever. Cost is linear in rebuild count (~1.7 GB per run
+# averaged over a day), so 15 min takes it from ~522 GB/day to ~163 GB/day per environment.
+_rail_calls_lock = threading.Lock()
+_rail_calls_refreshed_at: datetime | None = None
+_RAIL_CALLS_TTL = timedelta(minutes=15)
+
+
+def maybe_refresh_rail_calls() -> None:
+    """Rebuild disruptions.rail_calls_today if it is stale (older than _RAIL_CALLS_TTL).
+
+    The actuals-side sibling of maybe_refresh_planned_calls. Always runs on first call
+    (refreshed_at is None).
+
+    The date check is not redundant with the TTL: the table holds one UTC day (the SQL prunes on
+    `DATE(_PARTITIONTIME) = CURRENT_DATE()`), so at midnight its contents become *yesterday's*
+    until the next rebuild. Without it a tick at 00:05 would be served a stale day for the rest of
+    the TTL. Forcing the rollover rebuild is close to free -- just after midnight is the cheapest
+    moment of the day to run this query."""
+    global _rail_calls_refreshed_at
+    now = datetime.now(UTC)
+    with _rail_calls_lock:
+        fresh = (
+            _rail_calls_refreshed_at is not None
+            and now - _rail_calls_refreshed_at < _RAIL_CALLS_TTL
+            and _rail_calls_refreshed_at.date() == now.date()
+        )
+    if fresh:
+        return
+    bq_client.query(_RAIL_CALLS_QUERY).result()
+    with _rail_calls_lock:
+        _rail_calls_refreshed_at = now
+    logger.info("Rebuilt actuals call source (rail_calls_today)")
+
+
 # The planned call source is an ~8 GB ET partition scan, but the published schedule barely moves
 # hour-to-hour -- so rebuild it at most once per TTL, not on every ingestion. The per-call
 # predictions themselves (which DO change as situations evolve) are cheap and rebuilt every tick.
@@ -355,7 +403,7 @@ def maybe_refresh_planned_calls() -> None:
     """Rebuild disruptions.rail_calls_planned_today if it is stale (older than _PLANNED_TTL).
 
     Time-gated because it scans today's ET partition (~8 GB); the schedule is stable enough that
-    a 10-minute cadence is plenty. Always runs on first call (refreshed_at is None)."""
+    the hourly cadence above is plenty. Always runs on first call (refreshed_at is None)."""
     global _planned_refreshed_at
     now = datetime.now(UTC)
     with _planned_lock:
@@ -805,7 +853,10 @@ def _reisevalg_call_predictions(journey_ref: str) -> list | None:
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
-    bq_client.query(_RAIL_CALLS_QUERY).result()
+    # Actuals scan, gated on its own TTL — see maybe_refresh_rail_calls. The two queries below
+    # read the table it builds and still run every tick; they just read actuals that are at most
+    # _RAIL_CALLS_TTL old, which is what their onset + 12 h windows already tolerate.
+    maybe_refresh_rail_calls()
     bq_client.query(_DISRUPTIONS_QUERY).result()
     # AI.CLASSIFY (Gemini) categorisation of any *new* free text. Isolated so a failure here
     # never kills the rebuild: predict.sql LEFT JOINs disruptions.categories and falls back to
