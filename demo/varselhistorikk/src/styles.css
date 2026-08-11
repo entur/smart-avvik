@@ -1,9 +1,24 @@
 /* Varselhistorikk — an internal tuning surface, so it leans on Linje tokens rather than the
-   brand-neutral styling /demo uses. Layout only; colours come from @entur/tokens. */
+   brand-neutral styling /demo uses. Layout only; colours come from @entur/tokens.
+
+   COLOURS COME FROM --basecolors-*, NOT --colors-greys-*. The legacy grey scale is a LIGHTNESS
+   ramp — grey10 is #2a2a2a (near-black) and grey90 is #f8f8f8 — the opposite direction from the
+   Tailwind-style convention it looks like. This file was written against the guess, so every
+   `var(--colors-greys-grey10, #ededed)` resolved to near-black and every
+   `var(--colors-greys-grey60, #6b6b6b)` to #d1d3d3: muted chips rendered charcoal, and the hint
+   text under every figure sat at roughly 1.4:1 against white. The fallbacks beside them said what
+   was meant, and not one of them was ever used, because the token does exist — it just means
+   something else.
+
+   The replacements are role-named for that reason: `stroke-subdued` cannot be inverted by guessing
+   which end of a scale is dark. They are also the only ones that are theme-aware — the legacy greys
+   are defined once in :root with no [data-color-mode='dark'] variant, so the indirection bought
+   nothing at all. Fallbacks are kept, and each one is that site's ORIGINAL intent, so a broken token
+   chain degrades to the page as designed rather than back to this bug. */
 
 body {
   margin: 0;
-  background: var(--colors-greys-grey05, #f5f5f5);
+  background: var(--basecolors-frame-tint, #f5f5f5);
   color: var(--colors-brand-blue, #181c56);
 }
 
@@ -32,7 +47,7 @@ body {
 
 .vh-filter-group {
   display: inline-flex;
-  border: 1px solid var(--colors-greys-grey30, #c5c5c5);
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
   border-radius: 0.25rem;
   overflow: hidden;
   background: #fff;
@@ -62,7 +77,7 @@ body {
 .vh-select select {
   font: inherit;
   padding: 0.45rem 0.5rem;
-  border: 1px solid var(--colors-greys-grey30, #c5c5c5);
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
   border-radius: 0.25rem;
   background: #fff;
   color: inherit;
@@ -106,7 +121,7 @@ body {
 
 .vh-tile-hint {
   margin: 0.15rem 0 0;
-  color: var(--colors-greys-grey60, #6b6b6b);
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
 .vh-verdict-counts {
@@ -120,21 +135,23 @@ body {
   font-size: 0.8rem;
   padding: 0.2rem 0.6rem;
   border-radius: 1rem;
-  background: var(--colors-greys-grey10, #ededed);
+  background: var(--basecolors-frame-subdued, #ededed);
 }
 
 .vh-count--success { background: #c9f0d2; }
 .vh-count--warning { background: #ffe9c2; }
 .vh-count--negative { background: #ffd4d4; }
 .vh-count--neutral { background: #e3e6f5; }
-.vh-count--muted { background: var(--colors-greys-grey10, #ededed); color: #6b6b6b; }
+/* No colour override: the four chips above carry their meaning in the fill and inherit the
+   page's text colour, and subdued-on-subdued lands at 4.0:1 — under AA for 0.8rem text. */
+.vh-count--muted { background: var(--basecolors-frame-subdued, #ededed); }
 
 /* The split under the blended precision. Visually subordinate to the tiles on purpose: it explains
    the headline figure rather than competing with it. */
 .vh-split {
   margin-top: 1.25rem;
   padding-top: 0.75rem;
-  border-top: 1px solid var(--colors-greys-grey10, #ededed);
+  border-top: 1px solid var(--basecolors-frame-subdued, #ededed);
 }
 
 .vh-split-head {
@@ -149,7 +166,7 @@ body {
   align-items: baseline;
   gap: 1rem;
   padding: 0.5rem 0;
-  border-bottom: 1px solid var(--colors-greys-grey05, #f5f5f5);
+  border-bottom: 1px solid var(--basecolors-frame-tint, #f5f5f5);
 }
 
 .vh-split-label {
@@ -159,7 +176,7 @@ body {
 
 .vh-split-help {
   margin: 0.1rem 0 0;
-  color: var(--colors-greys-grey60, #6b6b6b);
+  color: var(--basecolors-text-subdued, #6b6b6b);
   max-width: 34rem;
 }
 
@@ -189,7 +206,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   font-size: 0.7rem;
-  color: var(--colors-greys-grey60, #6b6b6b);
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
 .vh-split-value {
@@ -201,7 +218,7 @@ body {
 .vh-split-hint,
 .vh-split-note {
   margin: 0.1rem 0 0;
-  color: var(--colors-greys-grey60, #6b6b6b);
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
 .vh-split-note {
@@ -211,8 +228,8 @@ body {
 .vh-caveat {
   margin: 1rem 0 0;
   font-size: 0.8125rem;
-  color: var(--colors-greys-grey60, #6b6b6b);
-  border-left: 3px solid var(--colors-greys-grey30, #c5c5c5);
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  border-left: 3px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
   padding-left: 0.75rem;
 }
 
@@ -230,11 +247,15 @@ body {
   transition: opacity 0.15s ease-in;
 }
 
+/* `stroke-subdued`, a step stronger than the hairlines elsewhere, because this 4px edge is the only
+   thing distinguishing a decision we merely recorded from one we acted on. At the hairline weight it
+   disappears against the card, and "we stayed quiet" then looks like a rendering gap rather than a
+   state. */
 .vh-card {
   background: #fff;
   border-radius: 0.5rem;
   padding: 1rem 1.25rem;
-  border-left: 4px solid var(--colors-greys-grey30, #c5c5c5);
+  border-left: 4px solid var(--basecolors-stroke-subdued, #c5c5c5);
 }
 
 /* A decision we acted on reads differently from one we merely recorded. */
@@ -258,7 +279,7 @@ body {
 }
 
 .vh-mode { font-weight: 600; }
-.vh-line { color: var(--colors-greys-grey60, #6b6b6b); }
+.vh-line { color: var(--basecolors-text-subdued, #6b6b6b); }
 
 .vh-card-badges {
   display: inline-flex;
@@ -272,9 +293,9 @@ body {
 .vh-tag {
   font-size: 0.7rem;
   padding: 0.15rem 0.5rem;
-  border: 1px solid var(--colors-greys-grey30, #c5c5c5);
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
   border-radius: 1rem;
-  color: var(--colors-greys-grey60, #6b6b6b);
+  color: var(--basecolors-text-subdued, #6b6b6b);
   white-space: nowrap;
   cursor: help;
 }
@@ -292,8 +313,7 @@ body {
 .vh-badge--negative { background: #ffd4d4; }
 .vh-badge--neutral { background: #e3e6f5; }
 .vh-badge--muted {
-  background: var(--colors-greys-grey10, #ededed);
-  color: #6b6b6b;
+  background: var(--basecolors-frame-subdued, #ededed);
   cursor: help;
 }
 
@@ -319,7 +339,7 @@ body {
 .vh-message {
   margin: 0.75rem 0;
   padding: 0.65rem 0.9rem;
-  background: var(--colors-greys-grey05, #f5f5f5);
+  background: var(--basecolors-frame-tint, #f5f5f5);
   border-radius: 0.25rem;
   font-style: italic;
 }
@@ -327,7 +347,7 @@ body {
 .vh-message-source {
   margin: 0.35rem 0 0;
   font-style: normal;
-  color: var(--colors-greys-grey60, #6b6b6b);
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
 .vh-facts {
@@ -341,7 +361,7 @@ body {
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--colors-greys-grey60, #6b6b6b);
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
 .vh-facts dd {
