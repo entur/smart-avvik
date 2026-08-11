@@ -62,10 +62,13 @@ export interface Segment {
   /** Null when this segment alerted nothing — not 0, which would read as "all wrong". */
   precision: number | null;
   recall: number | null;
-  /** Median minutes from first alert to the AIMED departure, over this segment's hits. Exact for a
-   *  cancellation; understates the warning for a delayed train, which left later than aimed. */
+  /** Median minutes from first alert to the AIMED departure, over this segment's hit TRAINS — not
+   *  its hit rows, which are per situation. Exact for a cancellation; understates the warning for
+   *  a delayed train, which left later than aimed. */
   median_lead_min_on_hits: number | null;
+  /** Per train, like the median. Its denominator is n_hit_trains, never n_hit. */
   n_hit_with_30min_notice: number;
+  n_hit_trains: number;
 }
 
 export interface Summary {
@@ -82,8 +85,10 @@ export interface Summary {
   precision: number | null;
   /** Among SX-flagged calls on registered journeys — not true recall. */
   recall: number | null;
+  /** Per TRAIN, unlike every other figure here — see the Segment field of the same name. */
   median_lead_min_on_hits: number | null;
   n_hit_with_30min_notice: number;
+  n_hit_trains: number;
 
   /** The headline figures above are BLENDED — forecasts and relayed ET cancellations together —
    *  which is the honest answer to "can the app be trusted". These two split them, because a
