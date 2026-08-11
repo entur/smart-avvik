@@ -144,6 +144,7 @@ body {
 
 .vh-split-row {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: baseline;
   gap: 1rem;
@@ -162,9 +163,26 @@ body {
   max-width: 34rem;
 }
 
+/* Two rates per segment, side by side. They are labelled because two bare percentages next to each
+   other are ambiguous — and reading the coverage figure as a precision is exactly the misreading
+   this whole section exists to stop. */
+.vh-split-figures {
+  display: flex;
+  gap: 1.5rem;
+}
+
 .vh-split-figure {
   text-align: right;
   white-space: nowrap;
+  min-width: 6.5rem;
+}
+
+.vh-split-figure-label {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+  color: var(--colors-greys-grey60, #6b6b6b);
 }
 
 .vh-split-value {

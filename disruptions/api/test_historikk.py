@@ -161,6 +161,37 @@ def test_alerted_only_filter_is_passed_through():
     assert fake.calls[0][1]["alerted_only"] is True
 
 
+def test_resolved_only_asks_for_the_judged_population():
+    """"Alle med fasit" is its own flag, not a fifth verdict.
+
+    It must reach the query as `resolved_only` and leave `verdict` unset: the two narrow different
+    ways round, and routing it through `verdict` would both fail validation and, if it did not,
+    mean something else entirely.
+    """
+    _reset([_row()])
+    client.get("/historikk-api/decisions", params={"resolved_only": "true"})
+    params = fake.calls[0][1]
+    assert params["resolved_only"] is True
+    assert params["verdict"] is None
+
+    # Default off: the page opens on everything, including the decisions still awaiting a verdict.
+    _reset([_row()])
+    client.get("/historikk-api/decisions")
+    assert fake.calls[0][1]["resolved_only"] is False
+
+
+def test_resolved_only_does_not_share_a_cache_entry_with_the_unfiltered_window():
+    """The narrower answer must not be served to a caller who asked for everything.
+
+    Same window, same operator — only this flag differs, so it has to be part of the cache key or
+    whichever request lands first decides what both callers see for the next two minutes.
+    """
+    _reset([_row()])
+    client.get("/historikk-api/decisions")
+    client.get("/historikk-api/decisions", params={"resolved_only": "true"})
+    assert len(fake.calls) == 2
+
+
 def test_verdict_filter_is_validated():
     _reset([_row()])
     assert client.get("/historikk-api/decisions", params={"verdict": "hit"}).status_code == 200

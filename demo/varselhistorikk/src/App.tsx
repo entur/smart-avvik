@@ -8,10 +8,18 @@ import { fetchConfig, fetchDecisions, fetchSummary } from './api';
 import type { Decision, Filters, Summary, Verdict } from './api';
 import { VERDICT_LABEL, isoDaysAgo } from './format';
 
-// Built from VERDICT_LABEL rather than retyped, so the filter and the badges can never disagree
-// about what a verdict is called.
-const VERDICT_OPTIONS: Array<{ value: Verdict | ''; label: string }> = [
+/** What the "Utfall" dropdown can be set to: no filter, the judged population as a whole, or one
+ *  verdict within it. 'med-fasit' is not a verdict and deliberately does not look like one — it
+ *  maps to its own API flag, so `verdict` stays exactly the four values the log records. */
+type UtfallFilter = Verdict | '' | 'med-fasit';
+
+// The four verdicts are built from VERDICT_LABEL rather than retyped, so the filter and the badges
+// can never disagree about what a verdict is called. "Alle med fasit" sits second because it is a
+// widening of what follows it, not a fifth sibling: it is every decision the nightly job has an
+// answer for, dropping the ones still waiting and the ones whose train was never found.
+const UTFALL_OPTIONS: Array<{ value: UtfallFilter; label: string }> = [
   { value: '', label: 'Alle utfall' },
+  { value: 'med-fasit', label: 'Alle med fasit' },
   ...(Object.entries(VERDICT_LABEL) as Array<[Verdict, string]>).map(([value, label]) => ({
     value,
     label,
@@ -26,7 +34,7 @@ const WINDOW_OPTIONS = [
 
 export default function App() {
   const [days, setDays] = useState(14);
-  const [verdict, setVerdict] = useState<Verdict | ''>('');
+  const [utfall, setUtfall] = useState<UtfallFilter>('');
   const [alertedOnly, setAlertedOnly] = useState(false);
   const [operator, setOperator] = useState('');
 
@@ -60,11 +68,15 @@ export default function App() {
     // results for a filter the user already moved off. On this page that is not just untidy — a
     // stale list beside a fresh summary makes the two disagree about the same window.
     let cancelled = false;
+    // One dropdown, two API flags: "Alle med fasit" is the judged population, a verdict is one
+    // slice of it. Sending both would be redundant, and sending `verdict='med-fasit'` would be a
+    // 400 — the API validates it against the four verdicts the log actually records.
     const filters: Filters = {
       fromDate: isoDaysAgo(days),
       operator: operator || undefined,
-      verdict: verdict || undefined,
+      verdict: utfall && utfall !== 'med-fasit' ? utfall : undefined,
       alertedOnly,
+      resolvedOnly: utfall === 'med-fasit',
     };
     setLoading(true);
     setError(null);
@@ -98,7 +110,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [days, operator, verdict, alertedOnly]);
+  }, [days, operator, utfall, alertedOnly]);
 
   return (
     <main className="vh-page">
@@ -127,8 +139,8 @@ export default function App() {
 
         <label className="vh-select">
           <span>Utfall</span>
-          <select value={verdict} onChange={(e) => setVerdict(e.target.value as Verdict | '')}>
-            {VERDICT_OPTIONS.map((o) => (
+          <select value={utfall} onChange={(e) => setUtfall(e.target.value as UtfallFilter)}>
+            {UTFALL_OPTIONS.map((o) => (
               <option key={o.value} value={o.value}>
                 {o.label}
               </option>

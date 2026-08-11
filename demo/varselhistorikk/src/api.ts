@@ -105,6 +105,9 @@ export interface Filters {
   operator?: string;
   verdict?: Verdict;
   alertedOnly?: boolean;
+  /** Only decisions whose outcome is known — 'avklart', i.e. everything except 'venter' and
+   *  'ukjent'. Wider than picking a single verdict, which narrows within this same population. */
+  resolvedOnly?: boolean;
 }
 
 async function get<T>(url: string): Promise<T> {
@@ -123,6 +126,7 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.operator) params.set('operator', filters.operator);
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
+  if (filters.resolvedOnly) params.set('resolved_only', 'true');
   return params.toString();
 }
 
@@ -135,8 +139,8 @@ export function fetchDecisions(filters: Filters): Promise<DecisionsResponse> {
 }
 
 export function fetchSummary(filters: Filters): Promise<Summary> {
-  // The summary describes the whole window, so the verdict/alerted filters — which narrow the
-  // list — deliberately do not apply to it. Filtering to hits would make precision read 100 %.
+  // The summary describes the whole window, so the verdict/alerted/resolved filters — which narrow
+  // the list — deliberately do not apply to it. Filtering to hits would make precision read 100 %.
   const { fromDate, toDate, operator } = filters;
   return get(`/historikk-api/summary?${query({ fromDate, toDate, operator })}`);
 }

@@ -329,6 +329,12 @@ def decisions(
         description="Only decisions that crossed the threshold. Leave off to see the decisions we "
         "did NOT alert on — the ones a miss is made of.",
     ),
+    resolved_only: bool = Query(
+        default=False,
+        description="Only decisions whose realized outcome is known (outcome_state 'avklart'), "
+        "dropping 'venter' and 'ukjent'. Composes with `verdict`, which narrows further: this is "
+        "the whole judged population, that is one verdict within it.",
+    ),
     limit: int = Query(default=200, ge=1, le=_MAX_LIMIT, description="Maximum rows to return."),
 ) -> DecisionsResponse:
     """Every alert decision in the window, whether or not it produced a push.
@@ -350,9 +356,10 @@ def decisions(
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
+        bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
         bigquery.ScalarQueryParameter("limit", "INT64", limit),
     ]
-    key = ("decisions", start, end, operator, verdict, alerted_only, limit)
+    key = ("decisions", start, end, operator, verdict, alerted_only, resolved_only, limit)
     rows = _query(_DECISIONS_QUERY, params, key)
     return DecisionsResponse(
         from_date=start,
