@@ -355,24 +355,35 @@ def test_summary_splits_relayed_certainties_from_predicted_ones():
 def test_lead_time_is_reported_per_segment_not_only_blended():
     """The blended varslingstid is the relayed population wearing the whole page's name.
 
-    Measured over 14 days of prd on 2026-08-11: 89 min blended, out of 134 relayed and 6 predicted,
-    because 445 of 514 hits were cancellations ET had already published. A reader who takes the
-    blended figure for the models' own warning time is wrong by two hours, in the flattering
-    direction — so each segment carries its own, and the page shows all three.
+    Measured over 14 days of prd on 2026-08-11: 145 min blended, out of 177 relayed and 15
+    predicted, because 133 of the 156 hit trains were cancellations ET had already published. A
+    reader who takes the blended figure for the models' own warning time is wrong by hours, in the
+    flattering direction — so each segment carries its own, and the page shows all three.
+
+    Counted per TRAIN, unlike everything else here: `n_hit_trains` is its denominator, and it must
+    not be confused with `n_hit`, which counts situations. The two differ by more than a factor of
+    three in this window.
     """
     _reset([{
-        "n_hit": 514, "median_lead_min_on_hits": 89, "n_hit_with_30min_notice": 347,
-        "n_hit_predicted": 59, "median_lead_min_on_hits_predicted": 6,
-        "n_hit_with_30min_notice_predicted": 16,
-        "n_hit_relayed": 445, "median_lead_min_on_hits_relayed": 134,
-        "n_hit_with_30min_notice_relayed": 326,
+        "n_hit": 514, "median_lead_min_on_hits": 145, "n_hit_with_30min_notice": 124,
+        "n_hit_trains": 156,
+        "n_hit_predicted": 59, "median_lead_min_on_hits_predicted": 15,
+        "n_hit_with_30min_notice_predicted": 5, "n_hit_trains_predicted": 19,
+        "n_hit_relayed": 445, "median_lead_min_on_hits_relayed": 177,
+        "n_hit_with_30min_notice_relayed": 116, "n_hit_trains_relayed": 133,
     }])
     s = client.get("/historikk-api/summary").json()
-    assert s["median_lead_min_on_hits"] == 89
-    assert s["predicted"]["median_lead_min_on_hits"] == 6
-    assert s["relayed"]["median_lead_min_on_hits"] == 134
-    assert s["predicted"]["n_hit_with_30min_notice"] == 16
-    assert s["relayed"]["n_hit_with_30min_notice"] == 326
+    assert s["median_lead_min_on_hits"] == 145
+    assert s["predicted"]["median_lead_min_on_hits"] == 15
+    assert s["relayed"]["median_lead_min_on_hits"] == 177
+    assert s["predicted"]["n_hit_with_30min_notice"] == 5
+    assert s["relayed"]["n_hit_with_30min_notice"] == 116
+    # The lead figures are per train and the verdict counts are per situation. Serving the train
+    # denominator is what keeps "5" beside "59" from reading as the same population.
+    assert s["n_hit_trains"] == 156
+    assert s["predicted"]["n_hit_trains"] == 19
+    assert s["relayed"]["n_hit_trains"] == 133
+    assert s["n_hit"] == 514
 
 
 def test_a_negative_lead_survives_and_a_segment_without_hits_has_none():

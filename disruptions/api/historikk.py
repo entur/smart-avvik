@@ -182,16 +182,27 @@ class Segment(BaseModel):
     median_lead_min_on_hits: int | None = Field(
         default=None,
         description="Median minutes between the first alert and the AIMED departure, over this "
-        "segment's hits. Exact for a cancellation; understates the usable warning for a delayed "
-        "train, which left later than aimed. Negative when the first alert followed the aimed "
-        "departure — still deliverable, because an alert is dropped by the train's predicted "
-        "departure, not its aimed one. Null when the segment has no hits. This is the figure that "
-        "splits hardest: 6 min predicted against 134 relayed, measured over 14 days of prd on "
-        "2026-08-11.",
+        "segment's hit TRAINS — not its hit rows. The traveller gets one alert per train however "
+        "many SX messages sit behind it, and counting per situation lets a duplicate published "
+        "after the train has gone drag the median below what anybody experienced (89 vs 145 min "
+        "blended, measured over 14 days of prd on 2026-08-11). Exact for a cancellation; "
+        "understates the usable warning for a delayed train, which left later than aimed. Negative "
+        "when the first alert followed the aimed departure — still deliverable, because an alert "
+        "is dropped by the train's predicted departure, not its aimed one. Null when the segment "
+        "has no hits. This is the figure that splits hardest: 15 min predicted against 177 "
+        "relayed.",
     )
     n_hit_with_30min_notice: int = Field(
         default=0,
-        description="Hits in this segment alerted 30+ min before the aimed departure.",
+        description="Hit trains in this segment alerted 30+ min before the aimed departure. "
+        "Per train, like the median beside it — read it against n_hit_trains, not n_hit.",
+    )
+    n_hit_trains: int = Field(
+        default=0,
+        description="Distinct trains behind this segment's hits, collapsed on varsel's own "
+        "one_alert_per_train key. The denominator for the two lead-time figures, and the reason "
+        "they can be shown next to counts of situations without the two being confused: 19 "
+        "predicted trains against 133 relayed, out of 156, over 14 days of prd on 2026-08-11.",
     )
 
 
@@ -230,9 +241,21 @@ class Summary(BaseModel):
         "no trouble was observed.",
     )
     median_lead_min_on_hits: int | None = Field(
-        description="Median minutes of warning on the alerts that were right.",
+        description="Median minutes of warning on the TRAINS we got right — the only figure here "
+        "on that grain, since every other one counts decisions and a decision is per situation. "
+        "The traveller gets one alert per train, so a second SX message about the same disruption "
+        "landing after it has gone must not pull this down: 89 min per situation against 145 per "
+        "train, measured over 14 days of prd on 2026-08-11.",
     )
-    n_hit_with_30min_notice: int = Field(description="Correct alerts sent 30+ min before departure.")
+    n_hit_with_30min_notice: int = Field(
+        description="Trains alerted 30+ min before departure. Per train, like the median beside "
+        "it — its denominator is n_hit_trains, never n_hit.",
+    )
+    n_hit_trains: int = Field(
+        default=0,
+        description="Distinct trains behind the hits, collapsed on varsel's one_alert_per_train "
+        "key: 156 out of 514 hit rows over 14 days of prd on 2026-08-11.",
+    )
 
     predicted: Segment = Field(
         description="Decisions where ET had NOT declared the cancellation when we decided — the "
@@ -423,6 +446,7 @@ def summary(
             recall=row.get(f"recall_{suffix}"),
             median_lead_min_on_hits=row.get(f"median_lead_min_on_hits_{suffix}"),
             n_hit_with_30min_notice=row.get(f"n_hit_with_30min_notice_{suffix}") or 0,
+            n_hit_trains=row.get(f"n_hit_trains_{suffix}") or 0,
         )
 
     return Summary(
@@ -438,6 +462,7 @@ def summary(
         recall=row.get("recall"),
         median_lead_min_on_hits=row.get("median_lead_min_on_hits"),
         n_hit_with_30min_notice=row.get("n_hit_with_30min_notice") or 0,
+        n_hit_trains=row.get("n_hit_trains") or 0,
         predicted=segment("predicted"),
         relayed=segment("relayed"),
         n_unsegmented=row.get("n_unsegmented") or 0,
