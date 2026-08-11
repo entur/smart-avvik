@@ -7,6 +7,16 @@
 --
 -- precision = hit / (hit + false_alarm)   — of the alerts we sent, how many were right.
 -- recall    = hit / (hit + miss)          — of the trouble we could see, how much we caught.
+-- lead      = departure - first alert     — how much warning the traveller got, in minutes.
+--
+-- What lead is measured AGAINST: the AIMED departure. So it is exact for a cancellation, where no
+-- train ever leaves, and UNDERSTATES the usable warning for a delayed one. It goes negative when
+-- the first alert lands after the aimed departure, and that is not automatically too late: an
+-- alert is dropped by the train's PREDICTED departure (varsel's `catchable_after`), so one running
+-- 45 min late is still worth sending at aimed+10. Measured 2026-08-11 over 14 days of prd, 11 of
+-- 514 hits had a negative lead, and 7 of those still reached the traveller a median 24 min before
+-- the train actually left. They stay in the median: dropping them would flatter it, and the four
+-- that were cancellations really were too late.
 --
 -- What recall here does NOT mean: true recall over all disruptions. The models only score calls an
 -- SX message flagged, and only on journeys somebody registered, so trouble that never produced an
@@ -101,6 +111,14 @@ SELECT
     COUNTIF(et_cancelled IS FALSE AND verdict = 'hit'),
     COUNTIF(et_cancelled IS FALSE AND verdict IN ('hit', 'miss'))
   ) AS recall_predicted,
+  -- Lead time splits harder than either rate does, which is why it is segmented at all: measured
+  -- 2026-08-11 over 14 days of prd, the median hit here gave 6 minutes of warning against the
+  -- relayed segment's 134. The blended figure is the relayed one wearing the whole page's name.
+  APPROX_QUANTILES(
+    IF(et_cancelled IS FALSE AND verdict = 'hit', alert_lead_min, NULL), 2 IGNORE NULLS
+  )[SAFE_OFFSET(1)] AS median_lead_min_on_hits_predicted,
+  COUNTIF(et_cancelled IS FALSE AND verdict = 'hit' AND alert_lead_min >= 30)
+    AS n_hit_with_30min_notice_predicted,
 
   -- RELAYED: ET had already declared the cancellation when we decided. Precision here should sit at
   -- or near 1 — we are repeating a published fact — and anything below it is worth looking at: a
@@ -118,6 +136,13 @@ SELECT
     COUNTIF(et_cancelled IS TRUE AND verdict = 'hit'),
     COUNTIF(et_cancelled IS TRUE AND verdict IN ('hit', 'miss'))
   ) AS recall_relayed,
+  -- Hours, not minutes, and legitimately so: a situation is scored over a 12 h window, so a
+  -- cancellation ET declares the evening before is alerted on as soon as it enters that window.
+  APPROX_QUANTILES(
+    IF(et_cancelled IS TRUE AND verdict = 'hit', alert_lead_min, NULL), 2 IGNORE NULLS
+  )[SAFE_OFFSET(1)] AS median_lead_min_on_hits_relayed,
+  COUNTIF(et_cancelled IS TRUE AND verdict = 'hit' AND alert_lead_min >= 30)
+    AS n_hit_with_30min_notice_relayed,
 
   -- Decided before the flag existed (2026-08-05), so which segment they belong to is unrecoverable.
   -- Reported, not assigned: defaulting them to "predicted" would be right for most and would hide

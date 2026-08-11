@@ -163,18 +163,25 @@ body {
   max-width: 34rem;
 }
 
-/* Two rates per segment, side by side. They are labelled because two bare percentages next to each
+/* Three figures per segment, side by side. They are labelled because bare numbers next to each
    other are ambiguous — and reading the coverage figure as a precision is exactly the misreading
-   this whole section exists to stop. */
+   this whole section exists to stop.
+
+   `margin-left: auto` keeps the trio against the right edge once the row wraps, which at the
+   page's content width it always does: the help text alone is 34rem. A fixed basis rather than a
+   min-width is what makes the two segments' columns line up with each other — sized off the
+   longest hint the figures carry ("445 av 445 varsler"), since a wider one would push its own
+   column out of step with the row above it. */
 .vh-split-figures {
   display: flex;
-  gap: 1.5rem;
+  gap: 1rem;
+  margin-left: auto;
 }
 
 .vh-split-figure {
+  flex: 0 0 8rem;
   text-align: right;
   white-space: nowrap;
-  min-width: 6.5rem;
 }
 
 .vh-split-figure-label {
