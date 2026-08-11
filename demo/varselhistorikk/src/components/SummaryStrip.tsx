@@ -29,9 +29,12 @@ function Tile({ label, value, hint }: { label: string; value: string; hint?: str
  *  `predicted` segment, the one a threshold is actually tuned on, where they diverge most.
  *
  *  Lead time is here because it splits hardest of the three, and the blended tile above hides it
- *  completely: measured over 14 days of prd, the median predicted hit warned the traveller 6
- *  minutes ahead against the relayed segment's 134. A reader who takes the tile's figure for the
- *  models' warning time is wrong by two hours, in the flattering direction.
+ *  completely: measured over 14 days of prd, the median predicted train warned the traveller 15
+ *  minutes ahead against the relayed segment's 177. A reader who takes the tile's figure for the
+ *  models' warning time is wrong by hours, in the flattering direction.
+ *
+ *  It is also the only figure on this page counted per DEPARTURE rather than per situation, which
+ *  is why its hint names its own denominator instead of borrowing the one above it.
  *
  *  The counts are not decoration: "100 %" over two alerts and "100 %" over two hundred are
  *  different claims, and one of these two segments is usually the small one. Which one is small
@@ -62,11 +65,13 @@ function SplitRow({ label, help, segment }: { label: string; help: string; segme
             {segment.n_hit} av {troubles} avvik
           </SubParagraph>
         </div>
+        {/* Counted per departure, not per varsel, so the hint names its own denominator — a bare
+            "5 med 30+ min" beside "59 av 97 varsler" invites subtracting one from the other. */}
         <div className="vh-split-figure">
           <SubParagraph className="vh-split-figure-label">Varslingstid</SubParagraph>
           <div className="vh-split-value">{fmtMin(segment.median_lead_min_on_hits)}</div>
           <SubParagraph className="vh-split-hint">
-            {segment.n_hit_with_30min_notice} med 30+ min
+            {segment.n_hit_with_30min_notice} av {segment.n_hit_trains} avganger
           </SubParagraph>
         </div>
       </div>
@@ -146,7 +151,7 @@ export default function SummaryStrip({ summary }: { summary: Summary }) {
         <Tile
           label="Varslingstid"
           value={fmtMin(summary.median_lead_min_on_hits)}
-          hint={`${summary.n_hit_with_30min_notice} varsler kom 30+ min før avgang`}
+          hint={`${summary.n_hit_with_30min_notice} av ${summary.n_hit_trains} avganger fikk 30+ min`}
         />
         <Tile
           label="Avgjørelser"
@@ -172,9 +177,11 @@ export default function SummaryStrip({ summary }: { summary: Summary }) {
         «Dekning» måles blant avganger som faktisk ble flagget av en SX-melding, på reiser noen har
         registrert. Et avvik som aldri ble meldt, ser vi ikke — så dette er ikke dekning over alle
         avvik. «Ukjent» betyr at vi ikke fant igjen avgangen i sanntidsdata; den telles bevisst ikke
-        som «riktig stille». Alle de tre samlede tallene blander to ulike populasjoner og flytter
-        seg med blandingsforholdet mellom dem — varslingstiden aller mest, siden en innstilling ofte
-        er meldt i sanntidsdata timer før avgang. Les dem sammen med oppdelingen over.
+        som «riktig stille». «Varslingstid» telles per avgang, ikke per melding: operatørene sender
+        ofte flere meldinger om samme tog, og den reisende får ett varsel. Alle de tre samlede
+        tallene blander to ulike populasjoner og flytter seg med blandingsforholdet mellom dem —
+        varslingstiden aller mest, siden en innstilling ofte er meldt i sanntidsdata timer før
+        avgang. Les dem sammen med oppdelingen over.
       </Paragraph>
     </section>
   );

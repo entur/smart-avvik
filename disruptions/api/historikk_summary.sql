@@ -7,16 +7,18 @@
 --
 -- precision = hit / (hit + false_alarm)   — of the alerts we sent, how many were right.
 -- recall    = hit / (hit + miss)          — of the trouble we could see, how much we caught.
--- lead      = departure - first alert     — how much warning the traveller got, in minutes.
+-- lead      = departure - first alert     — how much warning the traveller got, in minutes,
+--                                           counted per TRAIN rather than per situation.
 --
 -- What lead is measured AGAINST: the AIMED departure. So it is exact for a cancellation, where no
 -- train ever leaves, and UNDERSTATES the usable warning for a delayed one. It goes negative when
 -- the first alert lands after the aimed departure, and that is not automatically too late: an
 -- alert is dropped by the train's PREDICTED departure (varsel's `catchable_after`), so one running
--- 45 min late is still worth sending at aimed+10. Measured 2026-08-11 over 14 days of prd, 11 of
--- 514 hits had a negative lead, and 7 of those still reached the traveller a median 24 min before
--- the train actually left. They stay in the median: dropping them would flatter it, and the four
--- that were cancellations really were too late.
+-- 45 min late is still worth sending at aimed+10. Measured 2026-08-11 over 14 days of prd, 4 of
+-- 156 trains had a negative lead, and most still reached the traveller before the train actually
+-- left. They stay in the median: dropping them would flatter it, and the one that was a
+-- cancellation really was too late -- by two minutes, on a call the app had no chance to score
+-- earlier, so there is nothing behind it to fix.
 --
 -- What recall here does NOT mean: true recall over all disruptions. The models only score calls an
 -- SX message flagged, and only on journeys somebody registered, so trouble that never produced an
@@ -63,6 +65,49 @@ unlabelled AS (
         AND o.stop_order       = g.stop_order
         AND o.situation_number = g.situation_number
     )
+),
+-- Lead time is the one figure here that belongs to the TRAIN, not to the situation, and the rest
+-- of this file deliberately does not. Every other number answers "of the decisions we took, how
+-- many were right", and a decision is per situation. This one answers "how much warning did the
+-- traveller get", and the traveller gets ONE alert per train however many SX messages sit behind
+-- it -- varsel.one_alert_per_train collapses them for both the push and the card.
+--
+-- Measured 2026-08-11 over 14 days of prd, the difference is not cosmetic: 514 hit rows are 156
+-- trains, 136 of which carry more than one situation. Operators publish repeatedly about one
+-- disruption, and a duplicate message that lands after the train has gone contributes a row with a
+-- NEGATIVE lead beside the row that alerted two hours early. Taking the median over rows therefore
+-- UNDERSTATES the warning: 89 min per situation against 145 per train, and the predicted segment
+-- reads 6 against 15. The four rows that looked like "we alerted after departure on a cancelled
+-- train" were three trains, two of which had been alerted 117 and 109 min ahead under a different
+-- situation about the same cancellation.
+--
+-- Read the predicted segment's median with its denominator in view: those 156 trains are 133
+-- relayed against 19 predicted, so the figure the threshold is judged on rests on a couple of
+-- dozen trains a fortnight. That is why n_hit_trains is served beside it.
+hits_per_train AS (
+  SELECT
+    -- The alert the traveller actually got -- the earliest one -- and the segment IT belonged to,
+    -- rather than a LOGICAL_OR across situations that could file a train under a segment no alert
+    -- of it was ever in. NULL leads sort last under DESC, so one can only win if they all are.
+    ARRAY_AGG(STRUCT(alert_lead_min, et_cancelled) ORDER BY alert_lead_min DESC LIMIT 1)[OFFSET(0)]
+      AS first_alert
+  FROM `disruptions.varsel_decision_outcomes`
+  WHERE call_date BETWEEN @from_date AND @to_date
+    AND (@operator IS NULL OR operator = @operator)
+    AND verdict = 'hit'
+  GROUP BY
+    -- varsel.one_alert_per_train's key, in its own order of preference: the boarding call, then
+    -- (operator, line, departure_time) when no journey ref names the train, and failing both the
+    -- row stays on its own -- an alert identifying no train is never merged with another.
+    -- call_date is in the first form because bus ServiceJourney jkeys repeat every operating day;
+    -- rail's DatedServiceJourney refs are date-scoped already, so it costs nothing there.
+    CASE
+      WHEN jkey IS NOT NULL THEN FORMAT('call|%t|%t|%t|%t|%t',
+                                        operator, jkey, call_date, stop_place, stop_order)
+      WHEN line IS NOT NULL AND departure_time IS NOT NULL
+        THEN FORMAT('line|%t|%t|%t', operator, line, departure_time)
+      ELSE FORMAT('sit|%t', situation_number)
+    END
 )
 SELECT
   COUNTIF(verdict = 'hit')            AS n_hit,
@@ -83,14 +128,20 @@ SELECT
     COUNTIF(verdict = 'hit'),
     COUNTIF(verdict = 'hit') + COUNTIF(verdict = 'miss')
   ) AS recall,
-  -- Lead time on the alerts that were right: how much warning a traveller who needed it actually
-  -- got. Median rather than mean — a single alert fired days ahead would otherwise flatter it.
+  -- Lead time on the trains we got right: how much warning a traveller who needed it actually got.
+  -- Median rather than mean — a single alert fired days ahead would otherwise flatter it. Counted
+  -- per TRAIN (see hits_per_train), so these two are the only figures here on that grain; the UI
+  -- says "avganger" beside them where the rest of the page says "varsler".
   -- IGNORE NULLS goes after the quantile count, not after the expression: BigQuery's signature is
   -- APPROX_QUANTILES(expression, number [{IGNORE|RESPECT} NULLS]), and the other order does not
   -- parse -- which would have made this whole endpoint a permanent 503.
-  APPROX_QUANTILES(IF(verdict = 'hit', alert_lead_min, NULL), 2 IGNORE NULLS)[SAFE_OFFSET(1)]
-    AS median_lead_min_on_hits,
-  COUNTIF(verdict = 'hit' AND alert_lead_min >= 30) AS n_hit_with_30min_notice,
+  (SELECT APPROX_QUANTILES(first_alert.alert_lead_min, 2 IGNORE NULLS)[SAFE_OFFSET(1)]
+   FROM hits_per_train) AS median_lead_min_on_hits,
+  (SELECT COUNTIF(first_alert.alert_lead_min >= 30)
+   FROM hits_per_train) AS n_hit_with_30min_notice,
+  -- The denominator those two are over. Without it the page would show "5" beside a "59" drawn
+  -- from the same segment and mean two different things by them.
+  (SELECT COUNT(*) FROM hits_per_train) AS n_hit_trains,
 
   -- ---- the same rows, segmented ---------------------------------------------------------------
   -- Nothing is dropped: every labelled verdict above lands in exactly one of the three buckets
@@ -112,13 +163,14 @@ SELECT
     COUNTIF(et_cancelled IS FALSE AND verdict IN ('hit', 'miss'))
   ) AS recall_predicted,
   -- Lead time splits harder than either rate does, which is why it is segmented at all: measured
-  -- 2026-08-11 over 14 days of prd, the median hit here gave 6 minutes of warning against the
-  -- relayed segment's 134. The blended figure is the relayed one wearing the whole page's name.
-  APPROX_QUANTILES(
-    IF(et_cancelled IS FALSE AND verdict = 'hit', alert_lead_min, NULL), 2 IGNORE NULLS
-  )[SAFE_OFFSET(1)] AS median_lead_min_on_hits_predicted,
-  COUNTIF(et_cancelled IS FALSE AND verdict = 'hit' AND alert_lead_min >= 30)
-    AS n_hit_with_30min_notice_predicted,
+  -- 2026-08-11 over 14 days of prd, the median train here gave 15 minutes of warning against the
+  -- relayed segment's 177. The blended figure is the relayed one wearing the whole page's name.
+  (SELECT APPROX_QUANTILES(
+     IF(first_alert.et_cancelled IS FALSE, first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+   )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_predicted,
+  (SELECT COUNTIF(first_alert.et_cancelled IS FALSE AND first_alert.alert_lead_min >= 30)
+   FROM hits_per_train) AS n_hit_with_30min_notice_predicted,
+  (SELECT COUNTIF(first_alert.et_cancelled IS FALSE) FROM hits_per_train) AS n_hit_trains_predicted,
 
   -- RELAYED: ET had already declared the cancellation when we decided. Precision here should sit at
   -- or near 1 — we are repeating a published fact — and anything below it is worth looking at: a
@@ -138,11 +190,12 @@ SELECT
   ) AS recall_relayed,
   -- Hours, not minutes, and legitimately so: a situation is scored over a 12 h window, so a
   -- cancellation ET declares the evening before is alerted on as soon as it enters that window.
-  APPROX_QUANTILES(
-    IF(et_cancelled IS TRUE AND verdict = 'hit', alert_lead_min, NULL), 2 IGNORE NULLS
-  )[SAFE_OFFSET(1)] AS median_lead_min_on_hits_relayed,
-  COUNTIF(et_cancelled IS TRUE AND verdict = 'hit' AND alert_lead_min >= 30)
-    AS n_hit_with_30min_notice_relayed,
+  (SELECT APPROX_QUANTILES(
+     IF(first_alert.et_cancelled IS TRUE, first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+   )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_relayed,
+  (SELECT COUNTIF(first_alert.et_cancelled IS TRUE AND first_alert.alert_lead_min >= 30)
+   FROM hits_per_train) AS n_hit_with_30min_notice_relayed,
+  (SELECT COUNTIF(first_alert.et_cancelled IS TRUE) FROM hits_per_train) AS n_hit_trains_relayed,
 
   -- Decided before the flag existed (2026-08-05), so which segment they belong to is unrecoverable.
   -- Reported, not assigned: defaulting them to "predicted" would be right for most and would hide
