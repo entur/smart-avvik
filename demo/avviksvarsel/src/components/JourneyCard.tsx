@@ -101,8 +101,18 @@ export default function JourneyCard({
               ? '1 aktivt avvik kan ramme denne reisen:'
               : `${journey.alerts.length} aktive avvik kan ramme denne reisen:`}
           </Paragraph>
+          {/* Keyed on the TRAIN, not on the situation. one_alert_per_train collapses several SX
+              messages about one departure, but the converse is ordinary: one situation covers a
+              line for hours, so two catchable departures on it are two alerts sharing a
+              situation_number. Keyed on that alone they are duplicates, and React then cannot pair
+              old children with new ones across the 60 s refresh — a list that shrinks (a train
+              walks out of `catchable_after`) leaves the orphan line on the card. Same defect found
+              on /historikk 2026-08-11. */}
           {journey.alerts.map((a) => (
-            <AlertLine key={a.situation_number} alert={a} />
+            <AlertLine
+              key={`${a.situation_number}|${a.line}|${a.departure_time}`}
+              alert={a}
+            />
           ))}
         </div>
       )}
