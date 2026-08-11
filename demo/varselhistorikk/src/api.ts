@@ -62,6 +62,10 @@ export interface Segment {
   /** Null when this segment alerted nothing — not 0, which would read as "all wrong". */
   precision: number | null;
   recall: number | null;
+  /** Median minutes from first alert to the AIMED departure, over this segment's hits. Exact for a
+   *  cancellation; understates the warning for a delayed train, which left later than aimed. */
+  median_lead_min_on_hits: number | null;
+  n_hit_with_30min_notice: number;
 }
 
 export interface Summary {

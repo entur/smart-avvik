@@ -352,6 +352,45 @@ def test_summary_splits_relayed_certainties_from_predicted_ones():
     assert s["predicted"]["n_miss"] + s["relayed"]["n_miss"] == s["n_miss"]
 
 
+def test_lead_time_is_reported_per_segment_not_only_blended():
+    """The blended varslingstid is the relayed population wearing the whole page's name.
+
+    Measured over 14 days of prd on 2026-08-11: 89 min blended, out of 134 relayed and 6 predicted,
+    because 445 of 514 hits were cancellations ET had already published. A reader who takes the
+    blended figure for the models' own warning time is wrong by two hours, in the flattering
+    direction — so each segment carries its own, and the page shows all three.
+    """
+    _reset([{
+        "n_hit": 514, "median_lead_min_on_hits": 89, "n_hit_with_30min_notice": 347,
+        "n_hit_predicted": 59, "median_lead_min_on_hits_predicted": 6,
+        "n_hit_with_30min_notice_predicted": 16,
+        "n_hit_relayed": 445, "median_lead_min_on_hits_relayed": 134,
+        "n_hit_with_30min_notice_relayed": 326,
+    }])
+    s = client.get("/historikk-api/summary").json()
+    assert s["median_lead_min_on_hits"] == 89
+    assert s["predicted"]["median_lead_min_on_hits"] == 6
+    assert s["relayed"]["median_lead_min_on_hits"] == 134
+    assert s["predicted"]["n_hit_with_30min_notice"] == 16
+    assert s["relayed"]["n_hit_with_30min_notice"] == 326
+
+
+def test_a_negative_lead_survives_and_a_segment_without_hits_has_none():
+    """Two ways this figure could quietly lie, and neither is hypothetical.
+
+    A negative median is REAL: the first alert followed the aimed departure, which is still
+    deliverable because an alert is dropped by the train's predicted departure, not its aimed one.
+    Flooring it at 0 would hide the one segment where it happens. And a segment with no hits has no
+    lead time at all — 0 min there would read as "we alerted exactly at departure", which is the
+    opposite of "we never alerted", the same trap `precision` avoids by staying null.
+    """
+    _reset([{"n_hit_predicted": 3, "median_lead_min_on_hits_predicted": -4}])
+    s = client.get("/historikk-api/summary").json()
+    assert s["predicted"]["median_lead_min_on_hits"] == -4
+    assert s["relayed"]["median_lead_min_on_hits"] is None
+    assert s["relayed"]["n_hit_with_30min_notice"] == 0
+
+
 def test_decisions_from_before_the_flag_join_neither_segment():
     """Unassignable is its own bucket, the same rule as `ukjent` vs `correct_reject`.
 
