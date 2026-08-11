@@ -179,6 +179,20 @@ class Segment(BaseModel):
         description="hit / (hit + miss) within this segment, with the same caveat as the blended "
         "figure: among SX-flagged calls on registered journeys only.",
     )
+    median_lead_min_on_hits: int | None = Field(
+        default=None,
+        description="Median minutes between the first alert and the AIMED departure, over this "
+        "segment's hits. Exact for a cancellation; understates the usable warning for a delayed "
+        "train, which left later than aimed. Negative when the first alert followed the aimed "
+        "departure — still deliverable, because an alert is dropped by the train's predicted "
+        "departure, not its aimed one. Null when the segment has no hits. This is the figure that "
+        "splits hardest: 6 min predicted against 134 relayed, measured over 14 days of prd on "
+        "2026-08-11.",
+    )
+    n_hit_with_30min_notice: int = Field(
+        default=0,
+        description="Hits in this segment alerted 30+ min before the aimed departure.",
+    )
 
 
 class Summary(BaseModel):
@@ -407,6 +421,8 @@ def summary(
             n_correct_reject=row.get(f"n_correct_reject_{suffix}") or 0,
             precision=row.get(f"precision_{suffix}"),
             recall=row.get(f"recall_{suffix}"),
+            median_lead_min_on_hits=row.get(f"median_lead_min_on_hits_{suffix}"),
+            n_hit_with_30min_notice=row.get(f"n_hit_with_30min_notice_{suffix}") or 0,
         )
 
     return Summary(
