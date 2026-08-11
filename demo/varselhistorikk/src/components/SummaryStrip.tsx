@@ -21,39 +21,59 @@ function Tile({ label, value, hint }: { label: string; value: string; hint?: str
   );
 }
 
-/** One side of the split, with its counts beside its rate.
+/** One side of the split, with its counts beside each rate.
+ *
+ *  Both rates, not just precision: they answer different questions and routinely move in opposite
+ *  directions, since a threshold raised until precision looks respectable buys it straight out of
+ *  recall. A segment showing only the first would hide exactly that trade — and it is the
+ *  `predicted` segment, the one a threshold is actually tuned on, where the two diverge most.
  *
  *  The counts are not decoration: "100 %" over two alerts and "100 %" over two hundred are
  *  different claims, and one of these two segments is usually the small one. Which one is small
- *  moves the blended figure at the top all on its own. */
+ *  moves the blended figures at the top all on its own. Each rate carries its OWN denominator —
+ *  alerts sent for precision, disruptions that arrived for recall — because they are different
+ *  populations of the same segment, and a single count under both would fit neither. */
 function SplitRow({ label, help, segment }: { label: string; help: string; segment: Segment }) {
   const alerts = segment.n_hit + segment.n_false_alarm;
+  const troubles = segment.n_hit + segment.n_miss;
   return (
     <div className="vh-split-row">
       <div>
         <div className="vh-split-label">{label}</div>
         <SubParagraph className="vh-split-help">{help}</SubParagraph>
       </div>
-      <div className="vh-split-figure">
-        <div className="vh-split-value">{fmtPct(segment.precision)}</div>
-        <SubParagraph className="vh-split-hint">
-          {segment.n_hit} av {alerts} varsler
-          {segment.n_miss > 0 ? ` · ${segment.n_miss} bom` : ''}
-        </SubParagraph>
+      <div className="vh-split-figures">
+        <div className="vh-split-figure">
+          <SubParagraph className="vh-split-figure-label">Presisjon</SubParagraph>
+          <div className="vh-split-value">{fmtPct(segment.precision)}</div>
+          <SubParagraph className="vh-split-hint">
+            {segment.n_hit} av {alerts} varsler
+          </SubParagraph>
+        </div>
+        <div className="vh-split-figure">
+          <SubParagraph className="vh-split-figure-label">Dekning</SubParagraph>
+          <div className="vh-split-value">{fmtPct(segment.recall)}</div>
+          <SubParagraph className="vh-split-hint">
+            {segment.n_hit} av {troubles} avvik
+          </SubParagraph>
+        </div>
       </div>
     </div>
   );
 }
 
-/** The blended precision, and what it is made of.
+/** The blended rates, and what they are made of.
  *
  *  Deliberately in this order. The headline stays blended because that is the question the page
  *  exists to answer — could a traveller trust what we sent? — and relaying a cancellation ET has
  *  already published is most of the app's value, not a cheat: nobody carries the ET feed on their
  *  phone. But the two populations behave nothing alike (a declared cancellation is scored 1.0 by
- *  construction), so the blended number moves with the MIX and can swing without the app having
- *  changed. Showing it without showing the mix is the misreading this section prevents. */
-function PrecisionSplit({ summary }: { summary: Summary }) {
+ *  construction, and cannot be missed), so the blended numbers move with the MIX and can swing
+ *  without the app having changed. Showing them without showing the mix is the misreading this
+ *  section prevents. It applies to both: the relayed segment carries perfect recall by
+ *  construction too, so the headline coverage figure is diluted the same way the headline
+ *  precision is. */
+function SegmentSplit({ summary }: { summary: Summary }) {
   const { predicted, relayed } = summary;
   const segmented =
     predicted.n_hit + predicted.n_false_alarm + predicted.n_miss + predicted.n_correct_reject +
@@ -61,7 +81,7 @@ function PrecisionSplit({ summary }: { summary: Summary }) {
 
   return (
     <section className="vh-split">
-      <Heading4 className="vh-split-head">Hva den samlede presisjonen består av</Heading4>
+      <Heading4 className="vh-split-head">Hva de samlede tallene består av</Heading4>
 
       {segmented === 0 ? (
         // Two empty rows of dashes would look like a broken query rather than like a young column.
@@ -86,8 +106,8 @@ function PrecisionSplit({ summary }: { summary: Summary }) {
 
       {summary.n_unsegmented > 0 ? (
         <SubParagraph className="vh-split-note">
-          {summary.n_unsegmented} avgjørelser er fra før vi begynte å skille, og telles bare i den
-          samlede presisjonen.
+          {summary.n_unsegmented} avgjørelser er fra før vi begynte å skille, og telles bare i de
+          samlede tallene.
         </SubParagraph>
       ) : null}
     </section>
@@ -132,7 +152,7 @@ export default function SummaryStrip({ summary }: { summary: Summary }) {
         <span className="vh-count vh-count--muted">Venter {summary.n_pending}</span>
       </div>
 
-      <PrecisionSplit summary={summary} />
+      <SegmentSplit summary={summary} />
 
       {/* Stated on the page, not just in the API docs: the number is easy to over-read, and
           whoever tunes a threshold on the strength of it needs to know what it is not. */}
@@ -140,8 +160,8 @@ export default function SummaryStrip({ summary }: { summary: Summary }) {
         «Dekning» måles blant avganger som faktisk ble flagget av en SX-melding, på reiser noen har
         registrert. Et avvik som aldri ble meldt, ser vi ikke — så dette er ikke dekning over alle
         avvik. «Ukjent» betyr at vi ikke fant igjen avgangen i sanntidsdata; den telles bevisst ikke
-        som «riktig stille». Den samlede presisjonen blander to ulike populasjoner, og flytter seg
-        med blandingsforholdet mellom dem — les den sammen med oppdelingen over.
+        som «riktig stille». Både samlet presisjon og samlet dekning blander to ulike populasjoner,
+        og flytter seg med blandingsforholdet mellom dem — les dem sammen med oppdelingen over.
       </Paragraph>
     </section>
   );
