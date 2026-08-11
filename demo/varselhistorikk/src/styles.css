@@ -198,6 +198,13 @@ body {
   gap: 0.75rem;
 }
 
+/* Rows that belong to the filter the user just moved off. Faded rather than hidden, so the page
+   keeps its height while the new window loads. */
+.vh-list.is-stale {
+  opacity: 0.45;
+  transition: opacity 0.15s ease-in;
+}
+
 .vh-card {
   background: #fff;
   border-radius: 0.5rem;
