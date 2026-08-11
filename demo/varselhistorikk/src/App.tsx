@@ -83,7 +83,14 @@ export default function App() {
           setOperators([...new Set(d.decisions.map((x) => x.operator).filter(Boolean))] as string[]);
         }
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e));
+          // Drop what is on screen. The rows that failed to refresh answer the PREVIOUS filter, and
+          // left under the error box they read as the current one — the same misreading the stale
+          // cards below caused, arrived at from the other direction.
+          setDecisions([]);
+          setSummary(null);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -174,12 +181,23 @@ export default function App() {
         </SmallAlertBox>
       ) : null}
 
-      <section className="vh-list">
-        {decisions.map((d) => (
-          <DecisionCard
-            key={`${d.situation_number}-${d.line}-${d.call_date}-${d.departure_time}`}
-            decision={d}
-          />
+      {/* Dimmed while a fetch is in flight: the list is deliberately left up rather than blanked
+          (a filter change should not make the page jump), but a cold query runs ~2 s and the rows
+          still standing are the OLD filter's. Without the cue, ticking a filter looks like it did
+          nothing at all. */}
+      <section className={`vh-list ${loading ? 'is-stale' : ''}`}>
+        {/* Keyed on position, not on content, because nothing served here identifies a decision
+            uniquely. The row's real grain is (journey_digest, operator, jkey, call_date,
+            stop_order, situation_number), and the first two of those are exactly what the API
+            redacts — so two journeys registered over the same train, or one situation matched at
+            two stops, are distinct decisions that look identical from out here. Measured
+            2026-08-11 in prd: 200 rows shared 152 content keys. Duplicate keys are not cosmetic
+            here — React cannot pair old children with new ones, so a list that SHRINKS leaves the
+            orphans in the DOM: ticking "bare der vi varslet" left the filtered-out "Varslet ikke"
+            cards on screen and grew the list to 248. The index is safe because the list is
+            replaced wholesale from a server-ordered response and DecisionCard holds no state. */}
+        {decisions.map((d, i) => (
+          <DecisionCard key={i} decision={d} />
         ))}
       </section>
     </main>
