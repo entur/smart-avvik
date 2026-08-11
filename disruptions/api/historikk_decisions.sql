@@ -49,6 +49,12 @@ WHERE o.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR o.operator = @operator)
   AND (@verdict  IS NULL OR o.verdict  = @verdict)
   AND (NOT @alerted_only OR o.ever_alerted)
+  -- "With ground truth" is the OUTCOME being known, which is what outcome_state calls 'avklart' --
+  -- deliberately not `verdict IS NOT NULL`. The two differ by one row shape: an outcome that
+  -- resolved while `ever_alerted` was NULL is judged by nobody (label_varsel_decisions.sql refuses
+  -- to guess) yet plainly has a realized call behind it. Filtering on the verdict would leave those
+  -- reachable from no filter setting at all, which is how a population disappears.
+  AND (NOT @resolved_only OR o.actual_trouble IS NOT NULL)
 
 UNION ALL
 
@@ -75,6 +81,9 @@ WHERE g.call_date BETWEEN @from_date AND @to_date
   -- silently returning them as if they matched.
   AND @verdict IS NULL
   AND (NOT @alerted_only OR g.ever_alerted)
+  -- Same reasoning one step further: every row on this side is unlabelled by construction — that is
+  -- what makes it this side of the UNION — so none of them has ground truth yet.
+  AND NOT @resolved_only
   AND NOT EXISTS (
     SELECT 1
     FROM `disruptions.varsel_decision_outcomes` AS o
