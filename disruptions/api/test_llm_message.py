@@ -461,10 +461,10 @@ def test_the_prompt_tells_the_model_a_late_alternative_is_not_a_saving():
 
 
 def test_the_alternative_comes_from_the_alert_when_its_response_has_none():
-    """varsel asks the Journey Planner once per window, on the canonical stop ref, then back-fills
-    the answer onto every alert. An alert whose worst reading came from a collapsed ref therefore
-    carries an alternative its own /impact response does not -- and reading only the response left
-    that decision recorded as having one while the message it was written from never mentioned it.
+    """varsel asks the Journey Planner on the canonical stop ref only, then back-fills the answer
+    onto an alert about the same train seen through a collapsed ref. That alert therefore carries an
+    alternative its own /impact response does not -- and reading only the response left that decision
+    recorded as having one while the message it was written from never mentioned it.
     """
     class AlertWithAlternative(FakeAlert):
         alternative_journey = FakeAlternative()
