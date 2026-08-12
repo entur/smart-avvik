@@ -624,17 +624,18 @@ def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
         if payload["mest_sannsynlig_innstilt"]:
             payload["innstilling_prosent"] = _pct(cancel_p)
 
-    # The ALERT's alternative first, the response's only as a fallback. They differ, and the alert's
-    # is the right one: varsel asks the Journey Planner once per window, on the canonical stop ref
-    # (match_journey's `pair_index == 0`), then back-fills the answer onto every alert -- "the
-    # alternative is a property of the trip, not of the situation that won". So when the worst
-    # reading of a situation arrives from a collapsed ref (a station's bus side, a ferry berth's
-    # second registration -- see varsel.place_refs), the response carried on that alert was asked
-    # with with_alternative=False and has none, while the alert itself does. Reading only the
-    # response left exactly those decisions recorded as `has_alternative = true` with alt_lines and
-    # minutes saved, next to a message input with no `alternativ_reise` at all: the one advice worth
-    # giving, withheld from both the model and the template. The fallback keeps the duck-typed
-    # contract intact for callers holding a response but no alert field.
+    # The ALERT's alternative first, the response's only as a fallback -- and the order still matters
+    # even though the two now agree by construction. An alternative is chosen against ONE train's
+    # aimed arrival, so it belongs to that train (impact._alternatives_by_situation, 2026-08-12);
+    # `varsel._collect_alerts` therefore projects each situation's own answer onto both the alert and
+    # the response copy the alert carries, and `match_journey` back-fills a collapsed ref's reading
+    # only from a lookup about the same train. `impact.alternative_journey` is the WORST train's
+    # answer, which is the right headline for a caller holding nothing else and the wrong advice for
+    # a wording about a milder situation -- so the fallback stays last, for callers holding a
+    # response but no alert field. Reading the response FIRST is what recorded decisions as
+    # `has_alternative = true` with alt_lines and minutes saved next to a message input with no
+    # `alternativ_reise` at all: the one advice worth giving, withheld from the model and the
+    # template both.
     alt = getattr(alert, "alternative_journey", None) or getattr(
         impact, "alternative_journey", None
     )

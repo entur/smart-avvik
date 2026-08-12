@@ -215,18 +215,25 @@ def _alternative_status(alert: Alert) -> str:
     Written on **every** row, alert-worthy or not. The four values this function can establish:
 
     * ``offered`` — the row carries an alternative. Read off the **Alert**, never off
-      ``alert.impact``: `varsel.match_journey` back-fills one trip's lookup onto every alert it
-      produced, so an alert whose worst reading came from a collapsed stop ref carries advice its
-      own `/impact` response does not (the 2026-08-05 `llm_message` fix, which recorded
-      `has_alternative=true` beside a message input with no `alternativ_reise`).
+      ``alert.impact``: the two agree since 2026-08-12 (`varsel._collect_alerts` projects each
+      situation's own lookup onto the response copy the alert carries), but the Alert is the field
+      the wording is actually built from, and reading the response is what once recorded
+      `has_alternative=true` beside a message input with no `alternativ_reise`.
     * ``suppressed`` — `impact.original_is_best`: the selection ran against a real pool and kept the
       traveller on the train they already have. A verdict, not an absence.
     * ``none_found`` — `impact.alternative_subject` is set, so the lookup ran to completion, and it
       produced neither an offer nor a "stay put".
-    * ``not_worth_lookup`` — nothing above: no lookup was issued for this response. The impact gate
-      (`impact._worth_an_alternative`) is the reason for the overwhelming majority; a reading taken
-      from a non-canonical stop ref, where `match_journey` deliberately skips the blocking call, also
-      lands here.
+    * ``not_worth_lookup`` — nothing above: no lookup was issued for **this train**. The impact gate
+      (`impact._worth_an_alternative`) is the reason for the overwhelming majority; the 6 h horizon
+      (`alternatives.within_lookahead`) and the per-response lookup cap
+      (`impact._MAX_ALTERNATIVE_LOOKUPS`) also land here, as does a reading taken from a
+      non-canonical stop ref about a train the canonical pass never looked up.
+
+    The grain of all four changed on 2026-08-12 without the vocabulary changing: they used to
+    describe one lookup per journey-window, back-filled onto every alert in it, and now describe a
+    lookup per train. Expect `not_worth_lookup` to grow against `offered` at long lead times — that
+    is the horizon guard finally reaching the trains that used to inherit a nearer train's answer,
+    not a drop in what the Journey Planner can find.
 
     Two of the vocabulary's values are deliberately **never written**: ``beyond_horizon`` and
     ``error``. `impact.for_trip` records neither, and its `except` branch resets the response to

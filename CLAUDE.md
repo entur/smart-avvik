@@ -231,14 +231,30 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     the selection could use**, never on what the query returned (2026-08-06: a reply full of
     departures past the traveller's window answered "yes, something came back" and suppressed the
     only tier that could still help somebody whose train was cancelled).
-    The lookup runs **once per window, on the canonical stop ref** (`match_journey`'s
-    `pair_index == 0`), and `match_journey` then back-fills the answer onto every alert — "the
-    alternative is a property of the trip, not of the situation that won". So an alert whose worst
-    reading came from a *collapsed* ref carries an alternative its own `/impact` response does not,
-    and anything reading it must take it off the **Alert**, never off `alert.impact`
-    (`llm_message.build_message_input`, fixed 2026-08-05: reading the response recorded those
-    decisions as `has_alternative = true` with `alt_lines`, beside a `message_input` with no
-    `alternativ_reise` — the advice withheld from the model and the template both).
+    **The lookup runs once per disrupted TRAIN** (`impact._alternatives_by_situation`, 2026-08-12).
+    The deadline that decides the winner is that train's own aimed arrival, so the answer is a claim
+    about one train and about nothing else — it was one lookup per journey *window* until then, and
+    a window is not a train: in prd one registered journey's 00:31 cycle alerted on thirteen
+    cancelled L1 departures between 05:59 and 11:59, and all thirteen wordings offered the 05:45,
+    which was the correct answer for the first of them. Three things bound the cost, and all three
+    are needed, because a lookup is a blocking ~3 s call on the ingestion thread: the impact gate
+    (now per situation), the 6 h horizon (`alternatives.within_lookahead`, now applied to the train
+    being advised rather than only to the window's worst — this is the cut that makes the 11:59 case
+    answer "nothing" instead of "the 05:45"), and `_MAX_ALTERNATIVE_LOOKUPS` (3, spent on the
+    soonest departures, logged when it binds). Several situations about one train share one lookup.
+    Still **once per stop ref**, on the canonical one (`match_journey`'s `pair_index == 0`): which
+    ref of a place the question names does not change the answer, so `match_journey` back-fills onto
+    an alert whose worst reading came from a *collapsed* ref — but **only when it is about the same
+    train**, and then the whole outcome transfers (journey, `original_is_best`, `alternative_subject`)
+    rather than just the journey. Such an alert therefore carries an alternative its own `/impact`
+    response does not, and anything reading it must take it off the **Alert**, never off
+    `alert.impact` (`llm_message.build_message_input`, fixed 2026-08-05: reading the response
+    recorded those decisions as `has_alternative = true` with `alt_lines`, beside a `message_input`
+    with no `alternativ_reise` — the advice withheld from the model and the template both). The two
+    now agree by construction — `_collect_alerts` projects each situation's own outcome onto the
+    response copy its alert carries — but the Alert is still the field the wording is built from.
+    Expect `alt_status = 'not_worth_lookup'` to grow against `offered` at long lead times: that is
+    the horizon finally reaching the trains that used to inherit a nearer train's answer.
 
 - The **Varselhistorikk** page at `/historikk` (`demo/varselhistorikk/`, React + Vite + Entur
   Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered

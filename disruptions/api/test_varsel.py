@@ -179,11 +179,11 @@ def _train(dep, jkey="t1", board_order=1, dest_order=5, operator="VYG", situatio
     ]
 
 
-def _twin(dep, ref, **board_kw):
+def _twin(dep, ref, jkey="t-twin", **board_kw):
     """A train boarding at `ref` (a co-located twin of A) and alighting at B."""
     return [
-        FakeCall(jkey="t-twin", stop_place=ref, stop_order=1, aimed_dep=dep, **board_kw),
-        FakeCall(jkey="t-twin", stop_place="B", stop_order=5, aimed_dep=None,
+        FakeCall(jkey=jkey, stop_place=ref, stop_order=1, aimed_dep=dep, **board_kw),
+        FakeCall(jkey=jkey, stop_place="B", stop_order=5, aimed_dep=None,
                  aimed_arr=dep + timedelta(minutes=40)),
     ]
 
@@ -239,8 +239,10 @@ def test_one_situation_seen_through_two_refs_is_one_alert():
 
 
 def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
-    """The alternative is a property of the trip ("a faster way from here to there"), and the lookup
-    is a blocking external call. Asking it per ref pair would multiply it by the number of refs."""
+    """A lookup is a blocking external call, and asking it per ref pair would multiply it by the
+    number of refs a place collapses. Which ref of one place the question names does not change the
+    answer — the trains and the deadlines are the same — so the extra passes buy nothing. (Which
+    TRAIN it is about does change it; that is `_alternatives_by_situation`'s axis, not this one.)"""
     _snapshot.clear()
     _snapshot.update({"S1": _twin(MON_0800, "A2", p_cancel=0.8, p_impact_dep=0.9)})
     asked = []
@@ -268,16 +270,33 @@ def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
     )
 
 
+def _live_candidate(now):
+    """A Journey Planner reply good enough to be a real pool, for tests about verdicts not offers."""
+    return alternatives.AlternativeCandidate(
+        departure_time=now + timedelta(minutes=15),
+        arrival_time=now + timedelta(minutes=55),
+        transit_refs=[("VYG", "DatedServiceJourney:other")],
+        lines=["VYG:Line:R11"],
+        board_stop_place="A",
+        alight_stop_place="B",
+    )
+
+
+def _subject_jkey(original):
+    """Which train a `select_best` call is deciding for, off the synthesized original candidate."""
+    return original.transit_refs[0][1] if original and original.transit_refs else None
+
+
 def test_a_stay_put_verdict_reaches_only_the_train_it_is_about():
     """`None` from the lookup used to mean "nothing was faster" — a fact about the TRIP, safe to
     back-fill onto every alert. It now also means "the traveller's own train is still the best
     option", which is a claim about ONE train.
 
-    The lookup runs once per window, on the canonical ref pair, about that pair's worst train. Every
-    other alert on the trip may be about a different and far worse train: a milder situation the
-    same pass returned, or — the case the ref merge exists for — a cancelled departure that only the
-    collapsed ref records. Shared unqualified, a two-minute delay's "bli sittende" gets published
-    above a train that is not running.
+    Since 2026-08-12 each train is looked up for itself, so the risk this guards has moved: it is no
+    longer that one lookup is shared, but that the three per-train fields are projected onto the
+    wrong alert on the way out (`_collect_alerts`'s model_copy, `match_journey`'s back-fill). The
+    three alerts below are deliberately in three different states, and telling them apart is the
+    whole point — a verdict, a lookup that found nothing, and no lookup at all.
     """
     live = datetime.now(UTC)
     snapshot = {
@@ -289,32 +308,25 @@ def test_a_stay_put_verdict_reaches_only_the_train_it_is_about():
         # the lookup. It is also the worst of the three.
         "S3": _twin(MON_0800, "A2", situation_number="S3", p_impact_dep=0.95),
     }
-    candidate = alternatives.AlternativeCandidate(
-        departure_time=live + timedelta(minutes=15),
-        arrival_time=live + timedelta(minutes=55),
-        transit_refs=[("VYG", "DatedServiceJourney:other")],
-        lines=["VYG:Line:R11"],
-        board_stop_place="A",
-        alight_stop_place="B",
-    )
     install(snapshot)
     varsel.set_stop_aliases({"A2": "A"})
     fetch, select = alternatives.fetch_candidates, alternatives.select_best
 
-    def stay_put(*a, outcome=None, **k):
-        """A selection that compared a real pool and kept the traveller on their own train.
+    def stay_put_for_the_subject_only(*a, original=None, outcome=None, **k):
+        """Stay-put for `subject`; for anyone else, a pool that yielded nothing.
 
         The verdict rides on `select_best`'s out-parameter, not on its `None` return: the two are
         different answers ("we chose your train" vs "nothing was established") and the caller must
-        never infer the first from the second.
+        never infer the first from the second. Answering per train is what makes this test able to
+        tell a projected verdict from an inherited one.
         """
         if outcome is not None:
-            outcome["original_is_best"] = True
+            outcome["original_is_best"] = _subject_jkey(original) == "subject"
 
     # A real pool, and a selection that answers "stay put" over it — which is what makes the verdict
     # a verdict rather than the silence of an empty Journey Planner reply.
-    alternatives.fetch_candidates = lambda *a, **k: [candidate]
-    alternatives.select_best = stay_put
+    alternatives.fetch_candidates = lambda *a, **k: [_live_candidate(live)]
+    alternatives.select_best = stay_put_for_the_subject_only
     try:
         alerts = varsel.match_journey(_journey(), NOW, with_alternative=True)
     finally:
@@ -323,6 +335,100 @@ def test_a_stay_put_verdict_reaches_only_the_train_it_is_about():
 
     verdicts = {a.jkey: a.impact.original_is_best for a in alerts}
     assert verdicts == {"subject": True, "bystander": False, "t-twin": False}, verdicts
+    # And the two Falses are not the same False. `bystander` was looked up and nothing was
+    # established; `t-twin` was never looked up at all — `decisions._alternative_status` writes
+    # `none_found` for the first and `not_worth_lookup` for the second, and the column is only worth
+    # having while they stay distinguishable.
+    looked_up = {a.jkey: a.impact.alternative_subject for a in alerts}
+    assert looked_up == {
+        "subject": ("VYG", "subject"),
+        "bystander": ("VYG", "bystander"),
+        "t-twin": None,
+    }, looked_up
+
+
+def test_one_trains_alternative_is_never_published_for_another():
+    """The prd defect of 2026-08-12, at the surface that shipped it.
+
+    A registered window is a *window*, and during a mass cancellation it can hold a train an hour
+    from now and another six hours out. The Journey Planner answer is selected against one train's
+    aimed arrival, so it is an answer about that train — and the traveller whose 11:59 was cancelled
+    was told to catch the 05:45, because a single lookup anchored on the window's earliest departure
+    was stamped on all thirteen alerts.
+    """
+    live = datetime.now(UTC)
+    # A wide registered window, which is what makes two trains this far apart one journey's problem.
+    journey = _journey(begin="06:00", end="13:00")
+    snapshot = {
+        "S1": _train(_oslo(2026, 7, 6, 6, 30), jkey="soon", p_impact_dep=0.95),
+        "S2": _train(_oslo(2026, 7, 6, 12, 30), jkey="later", situation="S2", p_impact_dep=0.95),
+    }
+
+    def offer_for(*a, original=None, outcome=None, **k):
+        """One distinguishable offer per train, so an inherited answer is visible as such."""
+        minutes = 15 if _subject_jkey(original) == "soon" else 375
+        return _alternative(
+            departure_time=live + timedelta(minutes=minutes),
+            arrival_time=live + timedelta(minutes=minutes + 40),
+        )
+
+    install(snapshot)
+    fetch, select = alternatives.fetch_candidates, alternatives.select_best
+    alternatives.fetch_candidates = lambda *a, **k: [_live_candidate(live)]
+    alternatives.select_best = offer_for
+    try:
+        alerts = varsel.match_journey(journey, NOW, with_alternative=True)
+    finally:
+        alternatives.fetch_candidates, alternatives.select_best = fetch, select
+
+    offered = {
+        a.jkey: round((a.alternative_journey.departure_time - live).total_seconds() / 60)
+        for a in alerts
+        if a.alternative_journey is not None
+    }
+    assert offered == {"soon": 15, "later": 375}, offered
+
+
+def test_a_collapsed_refs_alert_inherits_a_lookup_only_for_its_own_train():
+    """What is left of the back-fill, and the line it must not cross.
+
+    The lookup runs on the canonical ref pair only, so a situation whose worst reading arrives from a
+    collapsed ref carries a response that was asked without one. When that reading is about a train
+    the canonical pass DID look up — the same train, so the same deadline and the same answer — the
+    outcome transfers whole. When it is about a different train, nothing transfers: that is the case
+    the collapsed ref is asked separately for in the first place.
+    """
+    live = datetime.now(UTC)
+    snapshot = {
+        # Canonical ref: this pass looks the train up.
+        "S1": _train(MON_0800, jkey="shared", p_impact_dep=0.90),
+        # Collapsed ref, SAME train — a second situation about it, recorded on the other side of the
+        # station. Its own pass runs without a lookup, and the answer for `shared` is its answer.
+        "S2": _twin(MON_0800, "A2", jkey="shared", situation_number="S2", p_impact_dep=0.95),
+        # Collapsed ref, DIFFERENT train. Nobody established anything about this one.
+        "S3": _twin(MON_0800, "A2", jkey="stranger", situation_number="S3", p_impact_dep=0.95),
+    }
+    offer = _alternative(
+        departure_time=live + timedelta(minutes=15),
+        arrival_time=live + timedelta(minutes=55),
+    )
+    install(snapshot)
+    varsel.set_stop_aliases({"A2": "A"})
+    fetch, select = alternatives.fetch_candidates, alternatives.select_best
+    alternatives.fetch_candidates = lambda *a, **k: [_live_candidate(live)]
+    alternatives.select_best = lambda *a, **k: offer
+    try:
+        alerts = varsel.match_journey(_journey(), NOW, with_alternative=True)
+    finally:
+        alternatives.fetch_candidates, alternatives.select_best = fetch, select
+        varsel.set_stop_aliases({})
+
+    carried = {a.jkey: a.alternative_journey is not None for a in alerts}
+    assert carried == {"shared": True, "stranger": False}, carried
+    # And the transfer carries the whole outcome, not just the journey: `alt_status` reads the
+    # subject off `alert.impact` to tell `none_found` from `not_worth_lookup`.
+    subjects = {a.jkey: a.impact.alternative_subject for a in alerts}
+    assert subjects == {"shared": ("VYG", "shared"), "stranger": None}, subjects
 
 
 def test_basic_match():
@@ -563,8 +669,8 @@ def _push_body(alternative: alternatives.AlternativeJourney | None = None, **boa
     Through the real message input, not the alert directly: the deterministic wording is assembled
     from the same document the model is prompted with, so these checks have to run over it.
 
-    `alternative` is set on the matched alert, which is where the real cycle puts it: varsel asks
-    the Journey Planner once per window and back-fills the answer onto every alert.
+    `alternative` is set on the matched alert, which is where the real cycle puts it: the lookup is
+    per disrupted train, and `_collect_alerts` projects each train's answer onto its own alert.
     """
     journey = _journey()
     alerts = match(journey, {"S1": _train(MON_0800, **board_kw)})

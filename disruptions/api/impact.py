@@ -21,7 +21,7 @@ import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import alert_policy
 import alternatives
@@ -219,6 +219,32 @@ class SituationImpact(BaseModel):
     arrival_prediction: StopPrediction | None = Field(
         description="Worst-case alighting prediction; null when `to_stop` is omitted.",
     )
+    alternative_journey: AlternativeJourney | None = Field(
+        default=None,
+        description="The best remaining way to `to_stop` given THIS situation's train is in "
+        "trouble — same tiers and same caveats as the response-level field, but selected against "
+        "this train's own aimed arrival. That deadline is what picks the winner, which is why the "
+        "answer belongs to one train and not to the trip: on 2026-08-12 a single lookup anchored on "
+        "an 05:59 departure was published beside twelve other trains from the same window, and the "
+        "traveller whose train left at 11:59 was advised to catch the 05:45. Null when no lookup ran "
+        "for this train — see `alternative_subject`.",
+    )
+    # Internal working state, kept off the wire (exclude=True) like the response-level pair below.
+    original_is_best: bool = Field(
+        default=False,
+        exclude=True,
+        repr=False,
+        description="The selection ran for this train and kept the traveller on it. A verdict, not "
+        "the absence of one.",
+    )
+    alternative_subject: tuple[str | None, str] | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="The (operator, jkey) the two fields above are claims about — this situation's "
+        "own worst train. Set iff a lookup ran to completion for it, which is what separates "
+        "`none_found` from `not_worth_lookup` in the decision log.",
+    )
 
 
 class LineImpact(BaseModel):
@@ -283,7 +309,11 @@ class ImpactResponse(BaseModel):
         "signed and `arrives_before_original` says which. Null when `to_stop` is omitted, when the "
         "Journey Planner is unavailable, and — the reading that changed — when the traveller's own "
         "train is still the best option (`original_is_best` distinguishes that from 'we did not "
-        "look'). One per trip, not per line: the traveller picks one way to get there.",
+        "look'). This is the WORST affected train's answer, echoed from `situations[0]`; a response "
+        "covering several disrupted trains carries one per train down there, because the deadline "
+        "that selects an alternative is the disrupted train's own aimed arrival. Read the per-"
+        "situation field whenever you are speaking about a particular train — this one is null "
+        "whenever the worst train got no lookup, even if a milder one did.",
     )
     # Internal working state, kept off the wire (exclude=True) the way varsel.Alert.impact is.
     original_is_best: bool = Field(
@@ -661,16 +691,36 @@ def _latest_observation(cells: list[TripCell], *, now: datetime | None = None) -
     return None
 
 
+class AlternativeOutcome(NamedTuple):
+    """What one train's Journey Planner lookup concluded — the whole answer, or its absence.
+
+    Three values that a single `AlternativeJourney | None` cannot carry: an offer, a "stay on the
+    train you have" VERDICT, and "no lookup ran". `subject` is the (operator, jkey) the other two
+    are claims about, and its being set is what says a lookup ran to completion at all
+    (`decisions._alternative_status` reads exactly that distinction).
+
+    Kept as one value because the three travel together everywhere they go — response, situation,
+    alert, decision row — and three parallel fields threaded through four modules is how one of them
+    ends up back-filled without the other two.
+    """
+
+    journey: AlternativeJourney | None = None
+    original_is_best: bool = False
+    subject: tuple[str | None, str] | None = None
+
+
+# "No lookup ran for this train." Not the same as an empty answer — see AlternativeOutcome.
+NO_ALTERNATIVE = AlternativeOutcome()
+
+
 def _impact_response(
     cells: list[TripCell],
     *,
     from_stop: str,
     to_stop: str | None,
     refreshed_at: datetime | None,
-    alternative_journey: AlternativeJourney | None,
+    alternatives_by_situation: dict[str, AlternativeOutcome] | None = None,
     now: datetime | None = None,
-    original_is_best: bool = False,
-    alternative_subject: tuple[str | None, str] | None = None,
 ) -> ImpactResponse:
     """Roll trip cells up into the two views the response exposes.
 
@@ -679,6 +729,10 @@ def _impact_response(
 
     `now` is read twice — as the response's `as_of` and as the cut that keeps a `latest_observation`
     in the past — so it is taken once here rather than sampled per use.
+
+    `alternatives_by_situation` is keyed by situationNumber, one entry per lookup that ran. It is
+    applied here rather than merged by the caller so the per-situation fields and the response-level
+    echo cannot disagree: the echo is literally `situations[0]`'s, after the sort.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -696,6 +750,7 @@ def _impact_response(
         # train" cannot come to mean two things: this used to be an inline `max` kept in step by
         # the comment above, which is exactly the arrangement that lets two copies drift.
         worst_cell = _worst_cell(group)
+        outcome = (alternatives_by_situation or {}).get(sit_num, NO_ALTERNATIVE)
         situations.append(
             SituationImpact(
                 situation_number=sit_num,
@@ -706,6 +761,9 @@ def _impact_response(
                 jkey=worst_cell.jkey,
                 departure_prediction=_worst([c.departure for c in group]),
                 arrival_prediction=_worst([c.arrival for c in group]),
+                alternative_journey=outcome.journey,
+                original_is_best=outcome.original_is_best,
+                alternative_subject=outcome.subject,
             )
         )
     situations.sort(key=lambda s: severity_key(s.departure_prediction), reverse=True)
@@ -726,6 +784,11 @@ def _impact_response(
     ]
     lines.sort(key=lambda x: severity_key(x.departure_prediction), reverse=True)
 
+    # The response-level trio is the worst affected train's, which is `situations[0]` now that the
+    # sort has run — never a merge across situations. A caller holding the response alone (the HTTP
+    # endpoint, a duck-typed provider) then reads a coherent set of three about one identified train
+    # instead of an offer from one train beside a verdict from another.
+    headline = situations[0] if situations else None
     return ImpactResponse(
         as_of=now,
         refreshed_at=refreshed_at,
@@ -733,14 +796,18 @@ def _impact_response(
         to_stop=to_stop,
         situations=situations,
         lines=lines,
-        alternative_journey=alternative_journey,
-        original_is_best=original_is_best,
-        alternative_subject=alternative_subject,
+        alternative_journey=headline.alternative_journey if headline else None,
+        original_is_best=bool(headline and headline.original_is_best),
+        alternative_subject=headline.alternative_subject if headline else None,
     )
 
 
 def _worth_an_alternative(cells: list[TripCell], min_impact: float) -> bool:
-    """Whether this trip looks bad enough to spend a Journey Planner round trip on.
+    """Whether these cells look bad enough to spend a Journey Planner round trip on.
+
+    Asked per SITUATION since 2026-08-12, over that situation's own cells, because the lookup it
+    guards is per train. Over the whole window it screened nothing useful: one alert-worthy train
+    bought a lookup that was then published beside every other train in the window.
 
     The lookup is a blocking 3 s HTTPS call on the poller thread that also rebuilds every BigQuery
     cache, and the poller discards the result unless the situation crosses the operator alert gate.
@@ -1161,16 +1228,22 @@ def _reconcile_original_arrival(
 def _best_remaining_journey(
     cells: list[TripCell],
     *,
+    affected: list[TripCell],
     from_stop: str,
     to_stop: str,
     window_end: datetime,
     now: datetime,
     path: alternatives.FetchPath = "request",
-) -> tuple[AlternativeJourney | None, bool, tuple[str | None, str] | None]:
+) -> AlternativeOutcome:
     """Fetch, score and choose: the best remaining way to `to_stop`, or "stay put".
 
-    Returns `(journey, original_is_best, subject)`. The middle value is a VERDICT and is only ever
-    True when a real pool was compared against: a null journey with `original_is_best=False` means
+    `cells` are the cells of ONE situation — they decide the subject train and, through its aimed
+    arrival, the deadline the whole selection turns on. `affected` is every cell on the trip, and is
+    only the risk set: a candidate riding some *other* situation's disrupted line is at risk too, and
+    narrowing that to the subject's own situation would present it as a clean escape.
+
+    Returns an :class:`AlternativeOutcome`. `original_is_best` is a VERDICT and is only ever True
+    when a real pool was compared against: a null journey with `original_is_best=False` means
     nothing could be established, and the two must not be worded alike downstream.
 
     **Two queries, in this order, and the second one only when the first came back empty.**
@@ -1182,19 +1255,22 @@ def _best_remaining_journey(
     """
     cell = _worst_cell(cells)
     if cell is None or cell.arrival is None:
-        return None, False, None
+        return NO_ALTERNATIVE
     deadline = cell.arrival.scheduled_time
     predicted_arrival = _predicted_arrival(cell)
     if deadline is None or predicted_arrival is None:
-        return None, False, None
+        return NO_ALTERNATIVE
     if not alternatives.within_lookahead(deadline, now):
         # Checked here as well as inside `fetch_candidates`: the fallback query is anchored at
         # `now`, so it clears the horizon guard on its own and would fire for a trip hours away.
-        return None, False, None
+        # Per train since 2026-08-12, which is most of what makes the horizon mean anything again:
+        # under one lookup per window it was the WORST train that had to be near, and every other
+        # train in the window inherited the answer however far off it was.
+        return NO_ALTERNATIVE
 
     subject = (cell.operator, cell.jkey) if cell.jkey else None
-    affected_refs = {(c.operator, c.jkey) for c in cells if c.jkey}
-    affected_lines = {c.line for c in cells if c.line}
+    affected_refs = {(c.operator, c.jkey) for c in affected if c.jkey}
+    affected_lines = {c.line for c in affected if c.line}
     original = _original_candidate(
         cell,
         from_stop=from_stop,
@@ -1270,7 +1346,156 @@ def _best_remaining_journey(
         selection = {}
         best = select(scored_pool(fallback), selection)
 
-    return best, bool(selection.get("original_is_best")), subject
+    return AlternativeOutcome(best, bool(selection.get("original_is_best")), subject)
+
+
+# How many Journey Planner lookups one /impact call may issue. The unit is a train, and the reason
+# there is a ceiling at all is that a wide registered window during a mass cancellation has no
+# natural one: the 2026-08-12 incident put thirteen alert-worthy departures in a single window, and
+# thirteen sequential ~3 s blocking calls on the ingestion thread is a cycle spent on advice for
+# trains the traveller will have decided about long before. Three covers the next departure and the
+# two behind it, which is the horizon somebody standing on a platform acts on; the rest are answered
+# honestly with "we did not establish that" rather than with another train's answer.
+#
+# One number for both paths, deliberately. The public `/impact` route can now spend three lookups on
+# a request where it used to spend one, and its window (`at` ± 90 min) is wide enough to hold three
+# disrupted trains during exactly the event that would hit it hardest. Two things already bound that
+# and neither needed changing: `alternatives._FETCH_MAX_PER_MIN` is charged per path, so a flood
+# degrades to `alternative_journey: null` rather than piling blocking calls into the threadpool, and
+# the 30-minute cache quantum means deadlines in the same half hour share one fetch. A second,
+# lower cap for the request path would also need a second ordering rule (the response-level field is
+# the WORST train's, while the budget is spent soonest-first), and two code paths through a
+# fail-open external call is a worse trade than the latency. Revisit it with a measurement, not with
+# this reasoning.
+_MAX_ALTERNATIVE_LOOKUPS = 3
+
+
+def _alternatives_by_situation(
+    cells: list[TripCell],
+    *,
+    from_stop: str,
+    to_stop: str,
+    window_end: datetime,
+    now: datetime,
+    min_impact: float,
+    path: alternatives.FetchPath,
+) -> dict[str, AlternativeOutcome]:
+    """One lookup per disrupted TRAIN, keyed back to the situations that describe it.
+
+    The alternative is not a property of the trip. `select_best`'s in-time tier is "the latest
+    departure that still arrives before the disrupted train's *aimed* arrival", so the winner is
+    chosen against one train's deadline and is an answer about that train only. Shared across a
+    window it is not merely imprecise, it is wrong in the direction that strands people: measured in
+    prd on 2026-08-12, one registered journey's 00:31 cycle scored thirteen cancelled L1 departures
+    between 05:59 and 11:59, and every one of the thirteen messages offered the 05:45 — correct for
+    the earliest train, six hours early for the last.
+
+    Three things bound the cost, which is why this can be per train at all. A lookup is a blocking
+    ~3 s HTTPS call on the poller's ingestion thread, so all three matter:
+
+    * **The impact gate**, per situation now rather than over the whole window. A window is worth a
+      lookup only for the trains in it that could actually earn a push.
+    * **The horizon** (`alternatives.within_lookahead`, 6 h), applied inside
+      :func:`_best_remaining_journey` to each train's own deadline. Under one-lookup-per-window it
+      only ever screened the worst train; every other train inherited the answer at any distance.
+      This is the cut that makes the 11:59 case above return nothing instead of returning the 05:45.
+    * **One lookup per train, not per situation.** Operators publish several situations about one
+      disruption (`varsel.one_alert_per_train` exists for the same reason), and they share a
+      deadline, so they share an answer.
+
+    Past :data:`_MAX_ALTERNATIVE_LOOKUPS` the remaining trains get :data:`NO_ALTERNATIVE` — "we did
+    not establish that", which every wording downstream already handles — and the cap is logged
+    rather than silent, because a suppressed offer is otherwise indistinguishable from a trip that
+    had none.
+    """
+    by_sit: dict[str, list[TripCell]] = {}
+    for cell in cells:
+        by_sit.setdefault(cell.situation_number, []).append(cell)
+
+    # Soonest departure first, worst first within a departure. Under a mass cancellation every
+    # situation ties at impact 1.0, so severity alone would spend the budget arbitrarily — and the
+    # train the traveller can still act on is the next one, not whichever the dict happened to hold
+    # first.
+    def order(item: tuple[str, list[TripCell]]) -> tuple:
+        cell = _worst_cell(item[1])
+        departure = cell.departure.scheduled_time if cell is not None else None
+        return (
+            departure is None,  # unknown departure last, never in the middle of the budget
+            departure or now,
+            tuple(-v for v in severity_key(cell.departure)) if cell is not None else (),
+        )
+
+    eligible = [
+        (sit_num, group)
+        for sit_num, group in sorted(by_sit.items(), key=order)
+        if _worth_an_alternative(group, min_impact)
+    ]
+
+    outcomes: dict[str, AlternativeOutcome] = {}
+    by_train: dict[tuple[str | None, str], AlternativeOutcome] = {}
+    spent = 0
+    for sit_num, group in eligible:
+        cell = _worst_cell(group)
+        train = (cell.operator, cell.jkey) if cell is not None and cell.jkey else None
+        if train is not None and train in by_train:
+            outcomes[sit_num] = by_train[train]
+            continue
+        if spent >= _MAX_ALTERNATIVE_LOOKUPS:
+            logger.info(
+                "Alternative lookups capped for %s; %d situation(s) left unanswered",
+                alternatives.pair_digest(from_stop, to_stop),
+                len(eligible) - len(outcomes),
+                extra={
+                    "fields": {
+                        "event": "alternatives_capped",
+                        "pair_digest": alternatives.pair_digest(from_stop, to_stop),
+                        "looked_up": spent,
+                        "eligible": len(eligible),
+                    }
+                },
+            )
+            break
+        spent += 1
+        try:
+            outcome = _best_remaining_journey(
+                group,
+                affected=cells,
+                from_stop=from_stop,
+                to_stop=to_stop,
+                window_end=window_end,
+                now=now,
+                path=path,
+            )
+        except Exception:
+            # Per train, so a malformed Journey Planner pattern costs one train's advice rather than
+            # the trip's. This module fails open and everything below it runs on the poller thread
+            # inside varsel.check_and_notify's per-journey guard: on 2026-07-29 a single bad pattern
+            # raised out of the lookup, through main._impact_for_trip, and into that guard — turning
+            # "the alternative could not be computed" into "every alert for this journey is silently
+            # dropped for the cycle".
+            #
+            # The digest, never the pair. On the poller path these two refs ARE a registered
+            # traveller's own journey — the trio `/historikk-api` refuses to serve and `llm_message`
+            # keeps out of Cloud Logging by default — and this record is emitted from the same
+            # cycle, beside a departure time.
+            digest = alternatives.pair_digest(from_stop, to_stop)
+            logger.warning(
+                "Could not choose an alternative for %s; offering none",
+                digest,
+                exc_info=True,
+                extra={
+                    "fields": {
+                        "event": "alternatives_error",
+                        "reason": "selection_failed",
+                        "pair_digest": digest,
+                    }
+                },
+            )
+            outcome = NO_ALTERNATIVE
+        outcomes[sit_num] = outcome
+        if train is not None:
+            by_train[train] = outcome
+    return outcomes
 
 
 def for_trip(
@@ -1326,56 +1551,26 @@ def for_trip(
         catchable_after=catchable_after,
     )
 
-    alternative: AlternativeJourney | None = None
-    original_is_best = False
-    subject: tuple[str | None, str] | None = None
-    if with_alternative and to_stop is not None and cells and _worth_an_alternative(cells, min_impact):
-        # ONE guard around fetch, scoring AND selection. Not bookkeeping: this module fails open,
-        # and everything below it runs on the poller thread inside varsel.check_and_notify's
-        # per-journey try/except. On 2026-07-29 a single malformed Journey Planner pattern raised
-        # out of the lookup, through main._impact_for_trip, and into that guard — which turned "the
-        # alternative could not be computed" into "every alert for this journey is silently dropped
-        # for the cycle". The guard that caught it lived inside the function this replaced, and this
-        # path adds two more raise sources (`score_candidates`, `select_best`) on top of the fetch.
-        # A bad alternative must cost the alternative and nothing else.
-        try:
-            alternative, original_is_best, subject = _best_remaining_journey(
-                cells,
-                from_stop=from_stop,
-                to_stop=to_stop,
-                window_end=window_end,
-                now=now,
-                path=path,
-            )
-        except Exception:
-            # The digest, never the pair. On the poller path these two refs ARE a registered
-            # traveller's own journey — the trio `/historikk-api` refuses to serve and `llm_message`
-            # keeps out of Cloud Logging by default — and this record is emitted from the same
-            # cycle, beside a departure time. `alternatives` scrubbed the identical exposure from
-            # its own cache-failure log; this one, one module over, kept interpolating both refs.
-            digest = alternatives.pair_digest(from_stop, to_stop)
-            logger.warning(
-                "Could not choose an alternative for %s; offering none",
-                digest,
-                exc_info=True,
-                extra={
-                    "fields": {
-                        "event": "alternatives_error",
-                        "reason": "selection_failed",
-                        "pair_digest": digest,
-                    }
-                },
-            )
-            alternative, original_is_best, subject = None, False, None
+    # One lookup per disrupted train, not one per trip — the guard against a raising Journey Planner
+    # pattern lives per train inside, so a bad answer costs one train's advice and nothing else.
+    alternatives_by_situation: dict[str, AlternativeOutcome] = {}
+    if with_alternative and to_stop is not None and cells:
+        alternatives_by_situation = _alternatives_by_situation(
+            cells,
+            from_stop=from_stop,
+            to_stop=to_stop,
+            window_end=window_end,
+            now=now,
+            min_impact=min_impact,
+            path=path,
+        )
 
     return _impact_response(
         cells,
         from_stop=from_stop,
         to_stop=to_stop,
         refreshed_at=refreshed_at,
-        alternative_journey=alternative,
+        alternatives_by_situation=alternatives_by_situation,
         now=now,
-        original_is_best=original_is_best,
-        alternative_subject=subject,
     )
 
