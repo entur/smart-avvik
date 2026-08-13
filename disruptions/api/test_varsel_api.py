@@ -1737,15 +1737,20 @@ def test_listing_surfaces_the_alternative_the_poller_found(monkeypatch):
 
 
 def test_an_alternative_found_on_the_canonical_ref_reaches_a_collapsed_refs_alert(monkeypatch):
-    """The two records of "is there a faster way?" must not disagree.
+    """The two records of "is there a faster way?" must not disagree — and only for the same train.
 
-    varsel asks the Journey Planner once per window, on the CANONICAL stop ref (match_journey's
-    `pair_index == 0`), and back-fills the answer onto every alert. So when a situation's worst
-    reading arrives from a collapsed ref -- a station's bus side, a ferry berth registered twice --
-    that alert's own /impact response was asked with with_alternative=False and carries none.
-    Building the message input off the response recorded the decision with has_alternative=true and
-    alt_lines filled in, beside an input with no `alternativ_reise`: the advice worth giving,
-    withheld from the model and from the template both.
+    varsel asks the Journey Planner on the CANONICAL stop ref only (match_journey's
+    `pair_index == 0`), so when a situation's worst reading arrives from a collapsed ref -- a
+    station's bus side, a ferry berth registered twice -- that alert's own /impact response was asked
+    with with_alternative=False and carries none. Building the message input off the response
+    recorded the decision with has_alternative=true and alt_lines filled in, beside an input with no
+    `alternativ_reise`: the advice worth giving, withheld from the model and from the template both.
+
+    What changed on 2026-08-12 is which alerts the answer may reach. An alternative is selected
+    against ONE train's aimed arrival, so it transfers to a collapsed ref's reading of **that same
+    train** -- same deadline, same answer -- and to nothing else. The second situation below is the
+    other case, and it used to inherit too: a different train, recorded only on the collapsed ref,
+    which is the reason that ref is asked about separately at all.
     """
     _reset_state()
     log = _use_decision_log(monkeypatch)
@@ -1764,28 +1769,45 @@ def test_an_alternative_found_on_the_canonical_ref_reaches_a_collapsed_refs_aler
     monkeypatch.setattr(impact.alternatives, "fetch_candidates", lambda *a, **k: [])
     monkeypatch.setattr(impact.alternatives, "select_best", lambda *a, **k: fake_alt)
 
-    # One situation, two trains: the canonical ref boards the milder one (so that pass matches, and
-    # is the one that spends the Journey Planner call), the collapsed ref the worse one -- which is
-    # the reading that wins, and therefore the response the alert carries.
+    # S1: ONE train, recorded on both refs of the place -- the ordinary shape of a station whose two
+    # sides each publish their own call. The canonical ref carries the milder reading and spends the
+    # Journey Planner call; the collapsed ref's reading is worse, so it is the one that wins and the
+    # response the alert carries has no lookup on it. Same train, so the answer transfers.
+    # S2: a train only the collapsed ref records. Nobody ever looked it up.
     _use_snapshot(
         {
             "S1": [
-                FakeCall("mild", "A", 1, DEP, p_cancel=0.20, p_impact_dep=0.70),
-                FakeCall("mild", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
-                FakeCall("worst", "A2", 1, DEP, p_cancel=0.82, p_impact_dep=0.95),
-                FakeCall("worst", "B", 5, None, aimed_arr=DEP + timedelta(minutes=45)),
-            ]
+                FakeCall("t1", "A", 1, DEP, p_cancel=0.20, p_impact_dep=0.70),
+                FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+                FakeCall("t1", "A2", 1, DEP, p_cancel=0.82, p_impact_dep=0.95),
+            ],
+            "S2": [
+                FakeCall("stranger", "A2", 1, DEP, p_cancel=0.82, p_impact_dep=0.95,
+                         situation_number="S2"),
+                FakeCall("stranger", "B", 5, None, aimed_arr=DEP + timedelta(minutes=45),
+                         situation_number="S2"),
+            ],
         }
     )
     _register(DEVICE)
     varsel.check_and_notify(_active_snapshot["value"])
 
     row = next(r for r in log.rows if r["situation_number"] == "S1")
-    assert row["jkey"] == "worst", "the collapsed ref's train must be the one that won"
+    assert row["jkey"] == "t1"
+    assert row["stop_place"] == "A2", "the collapsed ref's reading must be the one that won"
     assert row["has_alternative"] is True
     payload = json.loads(row["message_input"])
     assert payload["alternativ_reise"]["minutter_spart"] == 17, (
         "the flat columns and the input the message was written from must agree"
+    )
+
+    stranger = next(r for r in log.rows if r["situation_number"] == "S2")
+    assert stranger["jkey"] == "stranger"
+    assert stranger["has_alternative"] is False, (
+        "a train nobody looked up must not inherit another train's escape route"
+    )
+    assert stranger["alt_status"] == "not_worth_lookup", (
+        "and it is recorded as never asked, not as asked-and-empty"
     )
 
 
@@ -1815,9 +1837,17 @@ def _selection_outcome(monkeypatch, value):
     Replaces fetch -> score -> select wholesale: the rule has its own hermetic suite, and what these
     checks are about is what the poller does with each of the three answers it can come back with.
     Returns a mutable holder so a test can change the answer between cycles.
+
+    The tuple is widened to an `impact.AlternativeOutcome` here rather than at every call site: the
+    three values travel together from the lookup all the way to the decision row, and the field order
+    is the same one these tests have always written.
     """
     outcome = {"value": value}
-    monkeypatch.setattr(impact, "_best_remaining_journey", lambda cells, **kw: outcome["value"])
+    monkeypatch.setattr(
+        impact,
+        "_best_remaining_journey",
+        lambda cells, **kw: impact.AlternativeOutcome(*outcome["value"]),
+    )
     return outcome
 
 

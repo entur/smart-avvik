@@ -98,7 +98,7 @@ from alert_policy import TROUBLE_DELAY_MIN, min_threshold, threshold_for  # noqa
 from alternatives import AlternativeJourney
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query, Request
-from impact import ImpactResponse, LatestObservation, severity_key
+from impact import AlternativeOutcome, ImpactResponse, LatestObservation, severity_key
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -890,7 +890,8 @@ def match_journey(
         for f in place_refs(journey["from_stop"])
         for t in place_refs(journey["to_stop"])
     ]
-    alternative = None
+    # Every lookup this pass completed, keyed by the TRAIN it was about. See the back-fill below.
+    by_train: dict[tuple[str | None, str], AlternativeOutcome] = {}
     for window_start, window_end in journey_windows(journey, now):
         for pair_index, (from_ref, to_ref) in enumerate(ref_pairs):
             impact = _impact(
@@ -900,33 +901,54 @@ def match_journey(
             )
             if impact is None:
                 continue
-            alternative = alternative or impact.alternative_journey
+            for sit in impact.situations or []:
+                # getattr, like every other read off the impact response in this module: it is
+                # duck-typed, and a synthetic provider need not carry the newest fields.
+                subject = getattr(sit, "alternative_subject", None)
+                if subject is not None:
+                    by_train.setdefault(
+                        subject,
+                        AlternativeOutcome(
+                            getattr(sit, "alternative_journey", None),
+                            bool(getattr(sit, "original_is_best", False)),
+                            subject,
+                        ),
+                    )
             _collect_alerts(impact, worst_by_situation, now=now)
 
-    # The alternative is a property of the trip, not of the situation that won: an alert whose worst
-    # reading came from a non-canonical ref (asked without the lookup) still gets the advice.
+    # **An alternative belongs to a train, and is back-filled onto alerts about THAT train only**
+    # (2026-08-12). It used to be shared across the whole trip, on the reading that "a faster way
+    # from here to there" is a property of the pair — but `select_best`'s in-time tier picks the
+    # latest departure that still arrives before *the disrupted train's* aimed arrival, so the answer
+    # is chosen against one train's deadline and is a claim about that train. Shared across a window
+    # it strands people: in prd on 2026-08-12 one journey's 00:31 cycle alerted on thirteen cancelled
+    # L1 departures between 05:59 and 11:59 and offered every one of them the 05:45.
     #
-    # The "stay put" VERDICT is not, and must not ride along with it. The lookup runs once per
-    # window, on the canonical ref pair, and its verdict is a claim about that pair's worst train.
-    # It used to be safe to share, because a null alternative only ever meant "nothing was faster" —
-    # a fact about the trip. It now also means "the traveller's own train is still the best option",
-    # which is a fact about ONE train, and the train a collapsed-ref alert is about may be a
-    # different and far worse one (that is the whole reason the collapsed ref is asked separately).
-    # Shared unqualified, a two-minute delay's "bli sittende" would be published above a cancelled
-    # departure. So the verdict is cleared wherever it is not about this alert's own train, leaving
-    # the honest "we did not establish that" behind — see impact.ImpactResponse.alternative_subject.
+    # What the back-fill still exists for is narrower and unchanged: the lookup runs on the canonical
+    # ref pair only (`pair_index == 0`), so a situation whose worst reading arrives from a collapsed
+    # ref — a station's bus side, a ferry berth's second registration — carries a response that was
+    # asked with `with_alternative=False`. When that reading is about a train the canonical pass DID
+    # look up, the whole outcome transfers: same train, same deadline, same answer. When it is about
+    # a different train (which is the reason the collapsed ref is asked separately at all), nothing
+    # transfers, and the honest "we did not establish that" stays.
     for alert in worst_by_situation.values():
-        if alert.alternative_journey is None:
-            alert.alternative_journey = alternative
-        verdict = alert.impact
-        if (
-            verdict is not None
-            and verdict.original_is_best
-            and (alert.operator, alert.jkey) != verdict.alternative_subject
-        ):
-            # A copy, not an in-place clear: one response object is shared by every alert it
-            # produced, and clearing it would take the verdict away from the alert it IS about.
-            alert.impact = verdict.model_copy(update={"original_is_best": False})
+        if alert.jkey is None or getattr(alert.impact, "alternative_subject", None) is not None:
+            continue  # no train to key on, or this alert's own pass already answered for it
+        known = by_train.get((alert.operator, alert.jkey))
+        if known is None:
+            continue
+        alert.alternative_journey = known.journey
+        if alert.impact is not None:
+            # A copy, not an in-place write: one response object is shared by every alert it
+            # produced, and `alert.impact` is what `decisions._alternative_status` and
+            # `_reconcile_caches` read this train's verdict off.
+            alert.impact = alert.impact.model_copy(
+                update={
+                    "alternative_journey": known.journey,
+                    "original_is_best": known.original_is_best,
+                    "alternative_subject": known.subject,
+                }
+            )
 
     alerts = sorted(worst_by_situation.values(), key=_alert_rank, reverse=True)
     return alerts
@@ -967,8 +989,20 @@ def _collect_alerts(
             alert_threshold=threshold,
             alertworthy=impact_p is not None and impact_p >= threshold,
             latest_observation=observation_by_line.get(sit.line),
-            alternative_journey=impact.alternative_journey,
-            impact=impact,
+            alternative_journey=getattr(sit, "alternative_journey", None),
+            # This situation's own lookup, projected onto the response the alert carries: the three
+            # alternative fields are the only ones that differ per situation, and every reader
+            # downstream (`decisions._alternative_status`, `_reconcile_caches`,
+            # `llm_message.build_message_input`) reaches for them through `alert.impact`. Projecting
+            # here rather than leaving them to read the response's headline is what keeps a milder
+            # situation from inheriting the worst train's advice — the whole 2026-08-12 fix.
+            impact=impact.model_copy(
+                update={
+                    "alternative_journey": getattr(sit, "alternative_journey", None),
+                    "original_is_best": bool(getattr(sit, "original_is_best", False)),
+                    "alternative_subject": getattr(sit, "alternative_subject", None),
+                }
+            ),
         )
         existing = worst_by_situation.get(alert.situation_number)
         if existing is None or _alert_severity(alert) > _alert_severity(existing):
