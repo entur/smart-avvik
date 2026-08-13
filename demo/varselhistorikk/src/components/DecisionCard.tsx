@@ -10,6 +10,7 @@ import {
   fmtOutcome,
   fmtPct,
   fmtTime,
+  fmtWhen,
 } from '../format';
 
 /** The verdict badge, or an explicit "no verdict yet / ever" marker.
@@ -42,9 +43,25 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
         <div>
           <span className="vh-mode">{decision.mode ?? 'Tog'}</span>
           <span className="vh-line">{decision.line ?? '–'}</span>
-          <span className="vh-when">
-            {fmtDate(decision.call_date)} kl. {fmtTime(decision.departure_time)}
-          </span>
+          {/* Two times, each labelled. They were one unlabelled timestamp until 2026-08-13, and it
+              was read as when the message arrived — it is the departure, and the alert had gone out
+              eleven hours earlier.
+
+              The scheduled time is what the passenger calls this train, so it stays in the header
+              whatever the realized departure turns out to be; the realized side belongs under
+              "Faktisk", where it cannot be mistaken for the train's identity. */}
+          <div className="vh-times">
+            <span className="vh-when">
+              <span className="vh-time-label">Rutetid</span>
+              {fmtDate(decision.call_date)} kl. {fmtTime(decision.departure_time)}
+            </span>
+            {alerted && decision.first_alert_at ? (
+              <span className="vh-when">
+                <span className="vh-time-label">Varslet</span>
+                {fmtWhen(decision.first_alert_at, decision.call_date)}
+              </span>
+            ) : null}
+          </div>
         </div>
         <div className="vh-card-badges">
           {/* Which side of the split this row is on. Without it the segmented rates at the top

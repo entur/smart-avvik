@@ -24,6 +24,32 @@ export function fmtDate(iso: string | null): string {
   return iso ? dateFmt.format(new Date(iso)) : '–';
 }
 
+const osloDayFmt = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/Oslo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+/** ISO instant -> the Europe/Oslo calendar day it falls on, as '2026-08-12' — the shape
+ *  `call_date` already arrives in, so the two compare directly. */
+function osloDay(iso: string): string {
+  return osloDayFmt.format(new Date(iso));
+}
+
+/** An instant read against an operating day: "kl. 00:31" when it falls on that day, and
+ *  "11. aug. kl. 23:31" when it does not.
+ *
+ *  The date appears precisely when it differs. An alert sent the evening before is the case a bare
+ *  clock time would misrepresent, and it is not rare: a wide registered window is scored from local
+ *  midnight, so leads of ten hours and more are ordinary. */
+export function fmtWhen(iso: string | null, day: string | null): string {
+  if (!iso) return '–';
+  return day !== null && osloDay(iso) === day
+    ? `kl. ${fmtTime(iso)}`
+    : `${fmtDate(iso)} kl. ${fmtTime(iso)}`;
+}
+
 /** 0.93 -> "93 %"; null -> "–". */
 export function fmtPct(p: number | null): string {
   return p === null || p === undefined ? '–' : `${Math.round(p * 100)} %`;
