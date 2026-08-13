@@ -275,11 +275,31 @@ body {
 .vh-line,
 .vh-when {
   font-size: 0.875rem;
-  margin-right: 0.6rem;
 }
 
-.vh-mode { font-weight: 600; }
+.vh-mode { font-weight: 600; margin-right: 0.6rem; }
 .vh-line { color: var(--basecolors-text-subdued, #6b6b6b); }
+
+/* The timetabled departure and the moment we alerted, side by side on their own line. They wrap
+   onto separate lines on a narrow screen rather than shrinking, because a time that is read as the
+   wrong one is worse than a taller card. */
+.vh-times {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.9rem;
+  margin-top: 0.15rem;
+}
+
+/* "Sist vurdert" carries the earlier looks in a tooltip. Matches .vh-tag and the muted badge,
+   the page's other two hoverables. */
+.vh-when[title] { cursor: help; }
+
+/* The label carries the whole meaning here, so it is subdued but never hidden: the times stay
+   readable at a glance while the words keep them apart. */
+.vh-time-label {
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  margin-right: 0.3rem;
+}
 
 .vh-card-badges {
   display: inline-flex;
