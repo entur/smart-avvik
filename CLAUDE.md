@@ -41,6 +41,27 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   image/CI — they are rendered offline by `disruptions/api/export_eval.sh` and **committed** under
   `disruptions/api/eval_static/`, shipped as-is. Refresh them by running that script, then commit
   and push.
+  **A deploy only reaches a browser that re-asks for `index.html`** (2026-08-13): Starlette's
+  `StaticFiles` sends `ETag`/`Last-Modified` and no `Cache-Control`, and a response with neither
+  `Cache-Control` nor `Expires` is *heuristically* cacheable — the browser invents a lifetime and
+  may not revalidate at all. Harmless for a hashed asset, fatal for `index.html`, which keeps its
+  name across every deploy while the bundle its `<script src>` names does not. Measured on prd
+  2026-08-11, minutes after a deploy: the server served `index-BA3KKIi9.js` while a 40-minute-old
+  `index.html` still ran `index-N5X3j20f.js` — the pre-fix bundle, carrying the bug that deploy had
+  just fixed. It reads exactly like a failed deploy, so it costs an hour in CI and Helm before
+  anyone thinks to check what the browser actually loaded; **when a fix looks absent from a healthy
+  deployment, compare the `<script src>` against what the server serves before debugging anything
+  else.** All four mounts therefore use `main._VersionedStaticFiles`, never `StaticFiles`:
+  `assets/` (Vite writes only content-hashed names there) is `immutable` for a year, everything
+  else — `index.html`, the PWA's manifest/service worker/icons, `/eval`'s notebooks — is
+  `no-cache`, which means "ask first", not "do not store". Two things this got wrong first and
+  `test_static_cache.py` caught: the header must be set on the response `file_response` **returns**
+  (it decides "not modified" internally, and a 304 without `Cache-Control` re-enters heuristic
+  caching on the very request meant to prevent it), and the mount root must be **resolved** —
+  Starlette passes a realpath while `directory` stays as given, so comparing them unresolved
+  matched nothing and sent every asset down the `no-cache` branch. That second one does not
+  reproduce in the container, where `/app` has no symlinks. Note the fix cannot repair caches that
+  already exist: it protects the *next* deploy, not the last one.
 - The partner demo UI at `/demo` (predictions vs realized outcomes for a chosen trip) lives in
   `demo/reisedemo/` (React + Vite). Its data is served by the `/demo-api` endpoints
   from static tables built by `data/queries/create_demo_predictions.sql` — re-run that query
