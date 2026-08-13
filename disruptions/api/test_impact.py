@@ -1233,6 +1233,157 @@ def test_a_deadline_beyond_the_lookahead_horizon_costs_no_query_at_all():
     assert resp.alternative_journey is None and resp.original_is_best is False
 
 
+class _PerDeadlinePlanner:
+    """A `fetch_candidates` double that answers by ANCHOR rather than by call order.
+
+    The queue-based `_JourneyPlanner` above cannot express the question these tests ask — "what did
+    you offer the 06:00 train, and what did you offer the 12:00 one" — because its replies are keyed
+    on the order the queries happened to arrive in, which is the very thing under test.
+    """
+
+    def __init__(self, by_offset_min, now):
+        self.by_offset_min = by_offset_min  # deadline offset from `now` (min) -> candidates
+        self.now = now
+        self.calls: list[dict] = []
+
+    def __call__(self, from_stop, to_stop, *, arrive_by, date_time, now, path="request",
+                 outcome=None):
+        self.calls.append({"arrive_by": arrive_by, "date_time": date_time})
+        if outcome is not None:
+            outcome["answered"] = True
+        if not arrive_by:
+            return []  # the fallback tier is not what these tests are about
+        offset = round((date_time - self.now).total_seconds() / 60)
+        return list(self.by_offset_min.get(offset, []))
+
+    def deadlines(self):
+        """The anchors of the deadline queries, as minutes from `now`, in the order asked."""
+        return [
+            round((c["date_time"] - self.now).total_seconds() / 60)
+            for c in self.calls
+            if c["arrive_by"]
+        ]
+
+
+def test_each_disrupted_train_is_answered_against_its_own_deadline():
+    """The regression behind the 2026-08-12 fix, at the layer that caused it.
+
+    `select_best`'s in-time tier is "the latest departure that still arrives before the disrupted
+    train's AIMED arrival", so the winner is chosen against one train's deadline. One lookup per
+    window therefore answered every train in it with the worst train's answer — measured in prd, a
+    registered journey whose 00:31 cycle alerted on thirteen cancelled L1 departures between 05:59
+    and 11:59 offered all thirteen the 05:45.
+    """
+    now = datetime.now(UTC)
+    jp = _PerDeadlinePlanner(
+        {
+            50: [_live_candidate(now, dep_min=5, arr_min=45)],
+            230: [_live_candidate(now, dep_min=180, arr_min=225)],
+        },
+        now,
+    )
+    resp = _for_trip(
+        _scope(
+            SOON=_live_train(now, "soon", dep_min=10, arr_min=50, p_impact_dep=0.93,
+                             situation_number="SOON"),
+            LATER=_live_train(now, "later", dep_min=190, arr_min=230, p_impact_dep=0.91,
+                              line="VYG:Line:R12", situation_number="LATER"),
+        ),
+        jp, now=now, window_min=(-5, 300),
+    )
+    assert sorted(jp.deadlines()) == [50, 230], "one deadline query per train, its own"
+    offered = {
+        s.jkey: round((s.alternative_journey.departure_time - now).total_seconds() / 60)
+        for s in resp.situations
+        if s.alternative_journey is not None
+    }
+    assert offered == {"soon": 5, "later": 180}, offered
+    assert {s.jkey: s.alternative_subject for s in resp.situations} == {
+        "soon": ("VYG", "soon"),
+        "later": ("VYG", "later"),
+    }, "each answer names the train it is an answer about"
+
+
+def test_a_train_past_the_horizon_gets_nothing_rather_than_a_nearer_trains_answer():
+    """The prd symptom itself: an 11:59 departure told to catch the 05:45.
+
+    The horizon guard was always there; under one lookup per window it only ever screened the WORST
+    train, and every other train in the window inherited that train's answer however far off it was.
+    Per train, it finally applies to the train being advised — and "we did not establish that" is the
+    honest answer for a departure nobody can act on for hours.
+    """
+    now = datetime.now(UTC)
+    jp = _PerDeadlinePlanner({50: [_live_candidate(now, dep_min=5, arr_min=45)]}, now)
+    resp = _for_trip(
+        _scope(
+            SOON=_live_train(now, "soon", dep_min=10, arr_min=50, p_impact_dep=0.93,
+                             situation_number="SOON"),
+            FAR=_live_train(now, "far", dep_min=420, arr_min=460, p_impact_dep=0.99,
+                            line="VYG:Line:R12", situation_number="FAR"),
+        ),
+        jp, now=now, window_min=(-5, 500),
+    )
+    assert jp.deadlines() == [50], "7 h out is past the lookahead, and no query is issued for it"
+    far = next(s for s in resp.situations if s.jkey == "far")
+    soon = next(s for s in resp.situations if s.jkey == "soon")
+    assert soon.alternative_journey is not None, "the near train still gets its answer"
+    assert far.alternative_journey is None, "and the far one is not handed that answer"
+    assert far.alternative_subject is None, (
+        "nor is it recorded as a lookup that ran — `not_worth_lookup`, not `none_found`"
+    )
+
+
+def test_several_situations_about_one_train_share_a_single_lookup():
+    """Operators publish several situations about one disruption (varsel.one_alert_per_train exists
+    for the same reason). They name one train, so they share a deadline and an answer — per TRAIN is
+    what bounds the cost, and per situation would multiply a blocking 3 s call by however many
+    messages the operator felt like sending."""
+    now = datetime.now(UTC)
+    jp = _PerDeadlinePlanner({50: [_live_candidate(now, dep_min=5, arr_min=45)]}, now)
+    resp = _for_trip(
+        _scope(
+            S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93,
+                           situation_number="S1"),
+            S2=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93,
+                           situation_number="S2", summary="Ta neste tog"),
+        ),
+        jp, now=now,
+    )
+    assert jp.deadlines() == [50], "one train, one query"
+    assert len(resp.situations) == 2
+    assert all(s.alternative_journey is not None for s in resp.situations), (
+        "and both situations carry it"
+    )
+
+
+def test_the_lookup_budget_goes_to_the_soonest_departures():
+    """A wide window during a mass cancellation has no natural bound on how many trains are
+    alert-worthy, and each lookup is a blocking ~3 s call on the ingestion thread. The cap spends the
+    budget on the next departures — the ones somebody on a platform can still act on — and answers
+    the rest with silence rather than with a neighbour's answer."""
+    now = datetime.now(UTC)
+    trains = {
+        f"S{i}": _live_train(now, f"j{i}", dep_min=10 + i * 30, arr_min=50 + i * 30,
+                             p_impact_dep=0.93, line=f"VYG:Line:R{i}",
+                             situation_number=f"S{i}")
+        for i in range(5)
+    }
+    jp = _PerDeadlinePlanner(
+        {50 + i * 30: [_live_candidate(now, dep_min=5 + i * 30, arr_min=45 + i * 30)]
+         for i in range(5)},
+        now,
+    )
+    resp = _for_trip(_scope(**trains), jp, now=now, window_min=(-5, 300))
+    assert jp.deadlines() == [50, 80, 110], (
+        "the three soonest deadlines, in order, and nothing past the cap"
+    )
+    answered = {s.jkey for s in resp.situations if s.alternative_subject is not None}
+    assert answered == {"j0", "j1", "j2"}, answered
+    assert all(
+        s.alternative_journey is None for s in resp.situations if s.jkey in {"j3", "j4"}
+    ), "the trains past the cap are told nothing, not told the 06:00 train's answer"
+
+
 def test_the_chosen_alternative_carries_what_we_know_about_its_own_boarding():
     """The winner publishes its own numbers — JP's observed picture beside our forecast for it.
 
@@ -1341,7 +1492,7 @@ def test_impact_response_shape_matches_the_togpuls_contract():
     scope = _scope(S1=_train("j1", 8))
     cells = _cells(scope)
     resp = impact._impact_response(
-        cells, from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
+        cells, from_stop=A, to_stop=B, refreshed_at=None
     )
     payload = resp.model_dump(mode="json")
     assert isinstance(payload["situations"], list) and payload["situations"]
@@ -1377,7 +1528,7 @@ def test_no_journey_planner_call_without_a_to_stop():
 def test_impact_response_carries_the_new_fields():
     scope = _scope(S1=_train("j1", 8, operator="RUT", description="Buss for tog"))
     resp = impact._impact_response(
-        _cells(scope), from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
+        _cells(scope), from_stop=A, to_stop=B, refreshed_at=None
     )
     assert resp.situations[0].description == "Buss for tog"
     assert resp.lines[0].operator == "RUT"
@@ -1395,7 +1546,7 @@ def test_situation_carries_the_jkey_of_the_train_the_numbers_describe():
         + _train("r11", 8, 5, line="VYG:Line:R11", p_cancel=0.1, p_impact_dep=0.99)
     )
     resp = impact._impact_response(
-        _cells(scope), from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
+        _cells(scope), from_stop=A, to_stop=B, refreshed_at=None
     )
     sit = resp.situations[0]
     # r10 is first in the group but r11 is the worst, so a group[0] read would return "r10".
@@ -1410,7 +1561,7 @@ def test_situation_jkey_is_absent_rather_than_wrong_when_unknown():
 
     cells = [dataclasses.replace(c, jkey=None) for c in _cells(_scope(S1=_train("j1", 8)))]
     resp = impact._impact_response(
-        cells, from_stop=A, to_stop=B, refreshed_at=None, alternative_journey=None
+        cells, from_stop=A, to_stop=B, refreshed_at=None
     )
     assert resp.situations[0].jkey is None
 
