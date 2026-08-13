@@ -6,6 +6,7 @@ import {
   VERDICT_LABEL,
   VERDICT_VARIANT,
   fmtDate,
+  fmtLooks,
   fmtMin,
   fmtOutcome,
   fmtPct,
@@ -59,6 +60,16 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
               <span className="vh-when">
                 <span className="vh-time-label">Varslet</span>
                 {fmtWhen(decision.first_alert_at, decision.call_date)}
+              </span>
+            ) : decision.last_decided_at ? (
+              /* A decision we stayed quiet on has no alert time, and its header would otherwise
+                 say nothing at all about when it was taken. The last look is the one that stood —
+                 the closest we came to the departure and still said nothing — which is the fact a
+                 miss turns on. The earlier looks are in the tooltip rather than the header: how
+                 long we had been watching is context, not the decision. */
+              <span className="vh-when" title={fmtLooks(decision)}>
+                <span className="vh-time-label">Sist vurdert</span>
+                {fmtWhen(decision.last_decided_at, decision.call_date)}
               </span>
             ) : null}
           </div>

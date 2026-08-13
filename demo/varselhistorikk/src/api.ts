@@ -21,6 +21,10 @@ export interface Decision {
   departure_time: string | null;
 
   n_decisions: number | null;
+  first_decided_at: string | null;
+  /** The closest look before departure. On a decision we never alerted on this is the one that
+   *  stood — the last time we scored the train and still said nothing. */
+  last_decided_at: string | null;
   ever_alerted: boolean | null;
   first_alert_at: string | null;
   alert_lead_min: number | null;
