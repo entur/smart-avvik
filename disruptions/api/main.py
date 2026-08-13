@@ -1043,14 +1043,85 @@ app.include_router(reisevalg.router)
 # before the /historikk static mount, like the two above.
 app.include_router(historikk.router)
 
+# --- How long a browser may keep a static file ----------------------------------------------
+#
+# Starlette's StaticFiles sends ETag and Last-Modified but no Cache-Control, and a response with
+# neither Cache-Control nor Expires is *heuristically* cacheable: the browser is free to invent a
+# freshness lifetime (commonly a tenth of the age since Last-Modified) and skip revalidating
+# entirely. For a content-hashed asset that is harmless — a new build has a new filename. For
+# index.html it is the whole deployment: the file keeps its name and its <script src> is the only
+# thing that names the current bundle, so a stale copy pins the browser to the OLD bundle and the
+# deploy never reaches that user.
+#
+# Not hypothetical. Measured on prd 2026-08-11, minutes after a deploy: the server was serving
+# index-BA3KKIi9.js while a browser whose index.html was 40 minutes old was still running
+# index-N5X3j20f.js — the pre-fix bundle, with the very bug the deploy had just fixed. It reads
+# exactly like a failed deploy, which is the expensive part.
+#
+# So the two kinds of file get opposite treatment, and the split is the filename, not the type:
+#   assets/  — Vite writes ONLY content-hashed names here, so the bytes behind a URL never change.
+#              A year, `immutable`, never revalidated. This is where the payload is.
+#   anything else — index.html, the PWA's manifest, service worker and icons, /eval's notebooks.
+#              `no-cache` does not mean "do not store": it means "ask first". The ETag is already
+#              there, so the usual answer is a 304 with no body.
+_IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_REVALIDATE_CACHE_CONTROL = "no-cache"
+
+
+class _VersionedStaticFiles(StaticFiles):
+    """StaticFiles that says how long each file may be kept.
+
+    Use this for every static mount rather than StaticFiles itself; a mount added with the plain
+    class silently reverts to heuristic caching, which fails in the one direction nobody checks —
+    the page keeps working, it is just the wrong version of it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Resolved once, and it has to be resolved at all: StaticFiles hands file_response the
+        # REALPATH of the file (it resolves symlinks before serving, so a client cannot escape the
+        # mount) while `directory` stays exactly as it was passed in. Compare the two unresolved
+        # and nothing ever matches — every file, assets included, quietly takes the cautious
+        # branch below and the immutable half of this simply never happens. That is precisely how
+        # it failed when first written: caught by the tests on macOS, where a temp dir under
+        # /var/... resolves to /private/var/..., and it would NOT have shown up in the container.
+        self._root = Path(self.directory).resolve()
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        # Set on the RESPONSE, deliberately, rather than before the super() call. The base method
+        # decides on the spot whether this is a 304 and, if so, returns a NotModifiedResponse built
+        # from the headers it had at that moment — so a header added earlier would have to survive
+        # that copy (it would: cache-control is in NOT_MODIFIED_HEADERS), while one added here lands
+        # on either kind of response. A revalidation that answered without Cache-Control would
+        # re-enter heuristic caching on every 304 and quietly undo all of this.
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["cache-control"] = self._cache_control(full_path)
+        return response
+
+    def _cache_control(self, full_path) -> str:
+        """`immutable` only for a file whose name can never mean different bytes."""
+        try:
+            relative = Path(full_path).resolve().relative_to(self._root)
+        except ValueError:
+            # Not under the mount root at all (a symlink out, an odd path). Unknown provenance is
+            # not a reason to promise a year of immutability.
+            return _REVALIDATE_CACHE_CONTROL
+        if relative.parts[:1] == ("assets",):
+            return _IMMUTABLE_CACHE_CONTROL
+        return _REVALIDATE_CACHE_CONTROL
+
+
 # Pre-rendered marimo eval notebooks, served read-only at /eval (index at /eval/,
 # each notebook at /eval/<name>.html). They are static snapshots built offline by
 # export_eval.sh — outputs baked in — so serving them costs no BigQuery and starts no
 # kernel. The directory is generated (absent in a fresh checkout until exported), so
 # mount it only when present rather than failing startup.
+#
+# Every file here keeps its name across a re-export, so none of it is immutable — which is what
+# _VersionedStaticFiles concludes on its own, there being no assets/ directory.
 _EVAL_STATIC_DIR = Path(__file__).parent / "eval_static"
 if _EVAL_STATIC_DIR.is_dir():
-    app.mount("/eval", StaticFiles(directory=_EVAL_STATIC_DIR, html=True), name="eval")
+    app.mount("/eval", _VersionedStaticFiles(directory=_EVAL_STATIC_DIR, html=True), name="eval")
     logger.info("Mounted static eval notebooks at /eval from %s", _EVAL_STATIC_DIR)
 else:
     logger.info("No eval_static/ directory; /eval not mounted (run export_eval.sh to build it)")
@@ -1060,7 +1131,7 @@ else:
 # served by the /demo-api endpoints below.
 _DEMO_STATIC_DIR = Path(__file__).parent / "demo_static"
 if _DEMO_STATIC_DIR.is_dir():
-    app.mount("/demo", StaticFiles(directory=_DEMO_STATIC_DIR, html=True), name="demo")
+    app.mount("/demo", _VersionedStaticFiles(directory=_DEMO_STATIC_DIR, html=True), name="demo")
     logger.info("Mounted demo UI at /demo from %s", _DEMO_STATIC_DIR)
 else:
     logger.info("No demo_static/ directory; /demo not mounted (run demo/reisedemo/build.sh)")
@@ -1070,7 +1141,7 @@ else:
 # this directory and are served at /varsel/. Its data + push endpoints are /varsel-api (above).
 _VARSEL_STATIC_DIR = Path(__file__).parent / "varsel_static"
 if _VARSEL_STATIC_DIR.is_dir():
-    app.mount("/varsel", StaticFiles(directory=_VARSEL_STATIC_DIR, html=True), name="varsel")
+    app.mount("/varsel", _VersionedStaticFiles(directory=_VARSEL_STATIC_DIR, html=True), name="varsel")
     logger.info("Mounted avviksvarsel PWA at /varsel from %s", _VARSEL_STATIC_DIR)
 else:
     logger.info("No varsel_static/ directory; /varsel not mounted (run demo/avviksvarsel/build.sh)")
@@ -1081,7 +1152,7 @@ else:
 _HISTORIKK_STATIC_DIR = Path(__file__).parent / "historikk_static"
 if _HISTORIKK_STATIC_DIR.is_dir():
     app.mount(
-        "/historikk", StaticFiles(directory=_HISTORIKK_STATIC_DIR, html=True), name="historikk"
+        "/historikk", _VersionedStaticFiles(directory=_HISTORIKK_STATIC_DIR, html=True), name="historikk"
     )
     logger.info("Mounted varselhistorikk UI at /historikk from %s", _HISTORIKK_STATIC_DIR)
 else:
