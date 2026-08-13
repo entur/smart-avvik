@@ -100,6 +100,19 @@ export const OUTCOME_STATE_HELP: Record<OutcomeState, string> = {
     'som «riktig stille» — da ville manglende data sett ut som en riktig avgjørelse.',
 };
 
+/** The tooltip behind "Sist vurdert": how many cycles scored this train, and when the first and
+ *  last of them did. Undefined for a single look, where the time on the card is the whole story.
+ *
+ *  It repeats the last look on purpose. A `title` on a non-interactive element becomes that
+ *  element's accessible NAME rather than its description, so anything the tooltip leaves out is
+ *  not merely unannounced — it is replaced. */
+export function fmtLooks(d: Decision): string | undefined {
+  if (!d.n_decisions || d.n_decisions < 2 || !d.first_decided_at) return undefined;
+  const first = fmtWhen(d.first_decided_at, d.call_date);
+  const last = fmtWhen(d.last_decided_at, d.call_date);
+  return `Vurdert ${d.n_decisions} ganger — første gang ${first}, sist ${last}.`;
+}
+
 /** Realized outcome as a short phrase. Never claims "gikk fint" when the outcome is unknown. */
 export function fmtOutcome(d: Decision): string {
   if (d.actual_trouble === null) return OUTCOME_STATE_LABEL[d.outcome_state];
