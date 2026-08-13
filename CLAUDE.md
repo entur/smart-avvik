@@ -34,6 +34,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   one background poller thread and an in-process cache, so more replicas mean duplicate pollers
   and unshared caches.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
+- **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
+  2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket
+  `ent-gcs-tfa-kixavvik`). Add the group to `disruptions_readers` in `terraform/env/<env>.tfvars`;
+  `.github/workflows/terraform.yml` plans on the PR and applies to dev on merge (tst/prd are
+  dispatch-only, as in `cd.yml`). Grant to a **group**, never a person — reading a group's
+  membership needs permissions an ordinary developer does not have, so a per-person list rots
+  silently. Two traps, both spelled out in `terraform/bigquery_iam.tf`: the resource must stay
+  `google_bigquery_dataset_iam_member` (the `_iam_binding`/`_iam_policy` forms are authoritative and
+  would silently drop `application@ent-kixavvik-prd`, which `copy_runtime_to_prd.sh` reads through),
+  and the dataset itself is **not** a Terraform resource — the app creates it at startup and CTASes
+  into it, so `dataset_id` stays a literal string.
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
   app's `npm ci && npm run build`, and Vite writes into
   `disruptions/api/{demo,varsel,historikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
