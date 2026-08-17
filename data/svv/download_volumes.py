@@ -44,7 +44,9 @@ HERE = Path(__file__).parent
 OUTDIR = HERE / "volumes"
 
 API = "https://trafikkdata-api.atlas.vegvesen.no/"
-USER_AGENT = "entur-kixavvik-feasibility thomas.oldervoll@gmail.com"
+# Contact address per SVV's terms — the API is keyless, so this is their only way to reach whoever
+# is running a client. Kept in step with `_TRAFIKKDATA_USER_AGENT` in disruptions/api/reisevalg.py.
+USER_AGENT = "entur-kixavvik-feasibility thomas.oldervoll@entur.org"
 
 # Europe/Oslo local window, matching the rail_calls window (2024-06-01..2026-05-31).
 WINDOW_FROM = "2024-06-01T00:00:00+02:00"
