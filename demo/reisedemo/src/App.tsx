@@ -174,7 +174,7 @@ export default function App() {
               </option>
               {meta.highlights.map((h, i) => (
                 <option key={h.situation_number} value={i}>
-                  {fmtDateTime(h.window_start)} — [{h.mode}] {h.summary ?? h.situation_number} (
+                  {fmtDateTime(h.window_start)} — [{h.operator}] {h.summary ?? h.situation_number} (
                   {h.n_cancelled} innstilte, {h.n_delayed10} forsinkede)
                 </option>
               ))}
