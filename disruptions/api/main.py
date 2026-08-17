@@ -58,11 +58,17 @@ _DEMO_STOPS_QUERY = """
     FROM `disruptions.demo_stops`
     ORDER BY n_calls DESC
 """
+# Most recent scenario first: the demo tables gain days daily, and a partner is more convinced by
+# last week's disruption than by a worse one from the spring holdout. Which situations make the
+# list is still decided by realized impact (demo_highlights' per-operator cap + LIMIT 40, see
+# create_demo_predictions.sql) -- this orders that set, it does not pick it. Sorted on the
+# timestamp the dropdown actually shows (window_start), with impact as the tie-break so a busy
+# day still leads with its worst.
 _DEMO_HIGHLIGHTS_QUERY = """
     SELECT situationNumber, operator, summary, category, onset_ts, n_cancelled, n_delayed10,
            window_start, window_end, from_stop, from_name, to_stop, to_name
     FROM `disruptions.demo_highlights`
-    ORDER BY n_cancelled + n_delayed10 DESC
+    ORDER BY window_start DESC, n_cancelled + n_delayed10 DESC
 """
 _DEMO_WINDOW_QUERY = """
     SELECT MIN(call_date) AS window_start, MAX(call_date) AS window_end
@@ -1971,7 +1977,10 @@ class DemoMeta(BaseModel):
         "carries its operator's actual threshold.",
     )
     stops: list[DemoStop] = Field(description="Stops offered in the from/to pickers.")
-    highlights: list[DemoHighlight] = Field(description="One-click example scenarios, worst first.")
+    highlights: list[DemoHighlight] = Field(
+        description="One-click example scenarios, most recent first (they are selected by "
+        "realized impact, then ordered by date).",
+    )
 
 
 class DemoConfig(BaseModel):
