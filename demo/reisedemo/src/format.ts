@@ -42,12 +42,13 @@ const timeFmt = new Intl.DateTimeFormat('nb-NO', {
   minute: '2-digit',
 });
 
-const dateTimeFmt = new Intl.DateTimeFormat('nb-NO', {
+// Date and time are formatted apart and joined with a space: asking nb-NO for both in one
+// formatter puts a comma between them ("14. apr., 18:16"), which is noise in the scenario
+// dropdown's one-line label. Composed rather than string-surgery on the locale's output.
+const dayMonthFmt = new Intl.DateTimeFormat('nb-NO', {
   timeZone: 'Europe/Oslo',
   day: 'numeric',
   month: 'short',
-  hour: '2-digit',
-  minute: '2-digit',
 });
 
 const dateFmt = new Intl.DateTimeFormat('nb-NO', {
@@ -63,9 +64,10 @@ export function fmtTime(iso: string): string {
   return timeFmt.format(new Date(iso));
 }
 
-/** "14. apr., 18:16" in Oslo time. */
+/** "14. apr. 18:16" in Oslo time. */
 export function fmtDateTime(iso: string): string {
-  return dateTimeFmt.format(new Date(iso));
+  const at = new Date(iso);
+  return `${dayMonthFmt.format(at)} ${timeFmt.format(at)}`;
 }
 
 /** "tirsdag 14. april 2026" in Oslo time. */
