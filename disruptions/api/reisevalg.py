@@ -61,6 +61,7 @@ from enum import Enum
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from entur_api import ET_CLIENT_NAME
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
@@ -141,10 +142,16 @@ _COVERAGE_MIN_PCT = 50.0
 _VOLUME_WINDOW_H = 6
 
 _HTTP_TIMEOUT_S = 3.0
-_ET_CLIENT_NAME = "entur-kixavvik"
 _JP_URL = "https://api.entur.io/journey-planner/v3/graphql"
 _TRAFIKKDATA_URL = "https://trafikkdata-api.atlas.vegvesen.no/"
-_TRAFIKKDATA_USER_AGENT = "entur-kixavvik thomas.oldervoll@gmail.com"
+# The contact address is required, not decorative: Trafikkdata is open and keyless (NLOD), so the
+# User-Agent is the *only* way Statens vegvesen can identify this client or reach whoever runs it,
+# and their terms ask for a descriptive one. Same `<client> <contact>` shape as the ET-Client-Name
+# convention on the Entur side (see entur_api.py) — SVV just has no separate header for the name
+# half. A team alias, deliberately, not whoever wrote this: an address that stops being read when
+# one person moves on leaves SVV with no way to reach us, which is the whole point of sending it.
+# `data/svv/download_volumes.py` carries its own copy for the offline backfill; change both together.
+_TRAFIKKDATA_USER_AGENT = "entur-kixavvik Team-KI-eksperimentering@entur.org"
 
 # Journey Planner departure-board query — verified live with curl 2026-07-11. The board (not
 # `trip`) is deliberate: estimatedCalls carries cancellation state for cancelled and running
@@ -619,7 +626,7 @@ def parse_board(data: dict) -> list[Departure]:
 
 def _default_board_fetcher() -> list[Departure]:
     data = _post_json(
-        _JP_URL, {"query": _JP_BOARD_QUERY}, headers={"ET-Client-Name": _ET_CLIENT_NAME}
+        _JP_URL, {"query": _JP_BOARD_QUERY}, headers={"ET-Client-Name": ET_CLIENT_NAME}
     )
     return parse_board(data)
 
@@ -627,7 +634,7 @@ def _default_board_fetcher() -> list[Departure]:
 def _default_car_fetcher() -> float:
     """Free-flow car minutes Lier -> Oslo S from JP car routing (near-static, cached hours)."""
     data = _post_json(
-        _JP_URL, {"query": _JP_CAR_QUERY}, headers={"ET-Client-Name": _ET_CLIENT_NAME}
+        _JP_URL, {"query": _JP_CAR_QUERY}, headers={"ET-Client-Name": ET_CLIENT_NAME}
     )
     patterns = ((data.get("data") or {}).get("trip") or {}).get("tripPatterns") or []
     durations = [p.get("duration") for p in patterns if p.get("duration")]

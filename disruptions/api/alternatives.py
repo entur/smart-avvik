@@ -85,13 +85,13 @@ from datetime import datetime, timedelta
 from time import perf_counter
 from typing import Any, Literal
 
+from entur_api import ET_CLIENT_NAME
 from llm_message import key_digest
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 _JP_URL = "https://api.entur.io/journey-planner/v3/graphql"
-_ET_CLIENT_NAME = "entur-kixavvik"
 _HTTP_TIMEOUT_S = 3.0
 
 # How long a (from, to, arrive_by, date-time quantum) answer is reused. Sized ABOVE the ingestion
@@ -844,7 +844,7 @@ def _fetch_trip_patterns(
         "arrive_by": "true" if arrive_by else "false",
         "num": _NUM_TRIP_PATTERNS,
     }
-    data = _post_json(_JP_URL, {"query": query}, headers={"ET-Client-Name": _ET_CLIENT_NAME})
+    data = _post_json(_JP_URL, {"query": query}, headers={"ET-Client-Name": ET_CLIENT_NAME})
     trip = (data.get("data") or {}).get("trip") or {}
     return trip.get("tripPatterns") or []
 

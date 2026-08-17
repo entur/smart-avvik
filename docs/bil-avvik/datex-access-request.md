@@ -17,8 +17,9 @@ contact purposes, not licensing.)
 ## What to fill in
 
 - **Organisation:** Entur AS (org. nr. 917 422 575)
-- **Contact:** the Entur owner of this experiment (Team KI-eksperimentering);
-  technical contact e-mail: thomas.oldervoll@gmail.com
+- **Contact:** Team KI-eksperimentering, the Entur owner of this experiment;
+  technical contact e-mail: Team-KI-eksperimentering@entur.org (a team alias,
+  so access outlives whoever submits the request)
 - **Purpose (suggested text):**
 
   > Entur AS (the Norwegian national public-transport journey planner) is
