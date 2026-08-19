@@ -271,35 +271,55 @@ body {
   flex-wrap: wrap;
 }
 
-.vh-mode,
-.vh-line,
-.vh-when {
-  font-size: 0.875rem;
+/* Mode, line pill, departure and last look on one line. Aligned on the BASELINE, not centred: the
+   pill is the tallest item here, and centring against it lifts the two times off the line the mode
+   word sits on. Wraps rather than shrinks on a narrow screen — a time read as the wrong one is
+   worse than a taller card. */
+.vh-train {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 0.55rem;
 }
 
-.vh-mode { font-weight: 600; margin-right: 0.6rem; }
-.vh-line { color: var(--basecolors-text-subdued, #6b6b6b); }
+.vh-mode {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
 
-/* The timetabled departure and the moment we alerted, side by side on their own line. They wrap
-   onto separate lines on a narrow screen rather than shrinking, because a time that is read as the
-   wrong one is worse than a taller card. */
-.vh-times {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0 0.9rem;
-  margin-top: 0.15rem;
+/* The line as a pill, the shape /demo uses — translated to Linje tokens rather than copied, since
+   this page takes its colours from @entur/tokens. Brand blue is what `body` already sets the text
+   to, so the pill is that colour inverted, exactly as /demo inverts its own --text. */
+.vh-line {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  background: var(--colors-brand-blue, #181c56);
+  color: #fff;
+  border-radius: 0.375rem;
+  padding: 0.1rem 0.45rem;
+}
+
+/* The departure is the train's identity, so it is the one thing in the header set solid. Tabular
+   figures keep the colon in the same place down a list of cards. */
+.vh-departure {
+  font-size: 0.9375rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The second time is context, not identity — when the alert went, or when we last looked and said
+   nothing. Italic and subdued so it cannot compete with the departure beside it now that the two
+   share a line; the label inside it is plain text and carries the distinction. */
+.vh-when {
+  font-size: 0.875rem;
+  font-style: italic;
+  font-weight: 400;
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
 /* "Sist vurdert" carries the earlier looks in a tooltip. Matches .vh-tag and the muted badge,
    the page's other two hoverables. */
 .vh-when[title] { cursor: help; }
-
-/* The label carries the whole meaning here, so it is subdued but never hidden: the times stay
-   readable at a glance while the words keep them apart. */
-.vh-time-label {
-  color: var(--basecolors-text-subdued, #6b6b6b);
-  margin-right: 0.3rem;
-}
 
 .vh-card-badges {
   display: inline-flex;
