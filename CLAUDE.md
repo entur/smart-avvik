@@ -515,5 +515,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
 - All SQL targets BigQuery Standard SQL; legacy SQL is not used.
 - Text fields are filtered to Norwegian (`language IS NULL OR UPPER(language) = 'NO'`) — preserve this when adding queries against SX data.
 - The two-year partition window (`_PARTITIONTIME >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR)`) is the standard lookback for training queries.
+- `disruptions.training_calls` has held **two populations** since 2026-08-19: the (situation x
+  call) rows it always had, and one row per rail call **no SX message named** (5.9 M of them, 86 %
+  of the table), told apart by `has_situation`. Anything that fits, evaluates or reports on that
+  table must say which population it means. `WHERE is_eval = TRUE` used to *mean* "the flagged
+  holdout" and no longer does, so a Platt fit that omits `AND has_situation` re-centres production
+  alerting onto a base rate 47x lower — no error, no schema change, the alerts just stop firing.
+  The rationale, the filler values and their measurements are in the headers of
+  `create_training_calls.sql`, `train_call_models.sql` and the two calibration files.
+  **Serving carries `has_situation` before the models expect it**, never the other way round:
+  `ML.PREDICT` ignores an input column the model does not know, but a model whose contract names a
+  column its input lacks fails the whole scoring job, which on `predict_calls.sql` means the
+  poller stops producing predictions.
 - Consider cost before running BigQuery operations. Ask for permission before running anything more expensive than $10.
 - In docs/kix-docs, references to R1, R2 etc refers to the documents docs/kix-docs/docs/Context/r1-entur-rolle-og-mandat.md, docs/kix-docs/docs/Context/r2-entur-teknisk-deep-dive.md etc.
