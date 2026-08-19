@@ -34,6 +34,24 @@
 -- (<45 -> the standard 30-min layers, then 1.5x-horizon boundaries 90/180/360, beyond 6 h ->
 -- plan) and picks every layer -- alerts, ge-stack columns and intervals -- from that bucket.
 --
+-- POPULATION: these 36 layers are the FLAGGED population's, and they stay that way without a
+-- filter. training_calls gained unflagged rows on 2026-08-19 (has_situation, see
+-- create_training_calls.sql), but leadtime_eval.sql reaches them through
+-- `JOIN callkeys USING (situationNumber, ...)` and an unflagged row's situationNumber is NULL,
+-- which never matches -- verified 2026-08-19: 262 647 flagged holdout rows in, zero unflagged.
+-- So unlike create_cancel_calibration.sql and create_exceedance_calibration.sql, this file needed
+-- no defensive predicate. Do not read that as "the split does not apply here":
+--
+-- A NO-SX SERVING PATH NEEDS ITS OWN 36. Every layer here exists so one fixed threshold means the
+-- same thing at every ask horizon, and the unflagged population's probabilities decay with the
+-- horizon for the same reason (own_prev_delay and line_now_* go stale) while sitting on a base
+-- rate ~12x lower. Serving no-SX calls through these layers would be the shared-layer mistake one
+-- file over, just per horizon. The build is mostly mechanical -- for an unflagged call "lead"
+-- collapses to minutes-until-call, which predict_calls.sql already buckets on -- but
+-- leadtime_eval.sql's re-anchoring is keyed on the SITUATION, so it needs a second branch that
+-- recovers call_ts straight from rail_calls on (jkey, stop_order, call_date). Not built: nothing
+-- serves no-SX scores yet, and 36 layers nobody reads would go stale before they were used.
+--
 -- Run EACH statement as its own bq job (file + --nosynchronous_mode + bq wait).
 
 CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.leadtime_scored` AS

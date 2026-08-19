@@ -16,6 +16,33 @@
 --
 -- The two delay columns MUST be excepted from every classifier: dep_delay_pos/arr_delay_pos are
 -- NULL exactly when call_cancelled is TRUE, i.e. a perfect leak of the cancellation label.
+--
+-- has_situation IS A FEATURE OF EVERY HEAD (2026-08-19), including the two regressors whose
+-- contract is otherwise frozen. It is excepted NOWHERE, deliberately: training_calls now carries
+-- the ~5.9 M rail calls no SX message named (86 % of the table), and the flag is the only thing
+-- that tells a head which population a row is from. Take it out and the SX columns' fillers
+-- become indistinguishable from real values -- which is the exact defect this change exists to
+-- remove, reintroduced silently. A head trained without it will still build and still score.
+--
+-- THE DILUTION GATE PASSED, WHICH IS NOT WHAT THE BUS PRECEDENT PREDICTED. Pooling 63 % foreign
+-- rows into the NSB models cost 0.005 AUC and forced the two-family split
+-- (docs/pooled-models-bus/LEARNINGS.md); here the foreign share is 86 % and the cost is zero --
+-- flagged-holdout AUC 0.9603 before and 0.9603 after, precision at the 0.65 gate 0.944 -> 0.941.
+-- The difference is that this pool arrives WITH a column naming it, so the trees spend one split
+-- and then fit each population separately, instead of averaging two regimes into one. Read that
+-- as the rule: pool a population you can name, split one you cannot.
+--
+-- A DEDICATED NO-SX FAMILY WAS MEASURED AND IS NOT WORTH IT -- don't re-propose it. Trained on
+-- the unflagged calls alone with only the 11 features that exist without a situation, it scored
+-- AUC 0.8902 on the unflagged holdout against the pooled model's 0.8875: inside the noise on
+-- 1 590 positives, in exchange for a second model family, a second feature contract and a second
+-- thing to retrain. The pooled head wins on everything that is not a rounding error.
+--
+-- SIZE, at 7.24 M rows (5.5x the pre-2026-08-19 table). Measured on the promotion run: the
+-- cancellation classifier below billed 285 GB (~$1.78) and took 81 min WITHOUT global explain;
+-- the ten 50-iteration heads are ~40 GB / ~15 min each. Turn enable_global_explain back on only
+-- for a run whose attributions you intend to read -- at this size the explain phase, not the
+-- training, is what makes a retrain an overnight job (5.4 h at the OLD size).
 
 -- 1. Cancellation classifier --------------------------------------------------------------
 -- Contract: ALL feature columns incl. the 2026-07-02 category/text/propagation set. Measured
