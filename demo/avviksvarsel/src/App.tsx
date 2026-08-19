@@ -19,6 +19,7 @@ import {
   type StopItem,
 } from './api';
 import { isPushSupported, registerServiceWorker } from './push';
+import type { Brand } from './brand';
 import VarselStatus from './components/VarselStatus';
 import JourneyCard from './components/JourneyCard';
 import AddJourneyModal from './components/AddJourneyModal';
@@ -39,7 +40,7 @@ function getDeviceId(): string {
 
 const REFRESH_MS = 60_000;
 
-export default function App() {
+export default function App({ brand }: { brand: Brand }) {
   const deviceId = useRef(getDeviceId()).current;
   const [config, setConfig] = useState<Config | null>(null);
   const [stops, setStops] = useState<StopItem[]>([]);
@@ -110,8 +111,8 @@ export default function App() {
   const envSuffix = config?.environment ? ` (${config.environment})` : '';
 
   useEffect(() => {
-    document.title = `Entur Avviksvarsel${envSuffix}`;
-  }, [envSuffix]);
+    document.title = `${brand.documentTitle}${envSuffix}`;
+  }, [brand, envSuffix]);
 
   const handleCreate = useCallback(
     async (journey: NewJourney) => {
@@ -135,9 +136,12 @@ export default function App() {
 
       <Contrast as="header" className="av-header">
         <div className="av-header-inner">
-          <Logo />
+          {/* The Entur mark is the loudest piece of branding on the page, so an unbranded
+              variant drops it outright rather than substituting a neutral one. */}
+          {brand.showEnturLogo && <Logo />}
           <Heading1 as="h1" margin="none" className="av-header-title">
-            Avviksvarsel{envSuffix}
+            {brand.heading}
+            {envSuffix}
           </Heading1>
         </div>
       </Contrast>
@@ -153,7 +157,7 @@ export default function App() {
           </div>
         ) : (
           <>
-            {config && <VarselStatus config={config} deviceId={deviceId} />}
+            {config && <VarselStatus config={config} deviceId={deviceId} brand={brand} />}
 
             {error && (
               <SmallAlertBox variant="negative" width="fluid">

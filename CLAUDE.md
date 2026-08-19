@@ -174,6 +174,43 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Skøyen" — the cancelled *segment*, straight out of the situation text. A prompt rule now scopes
   the advice to `reise.fra`/`reise.til` and says place names inside `situasjoner` are where on the
   line the disruption applies, not the traveller's route.
+  **`?brand=none` renders the app unbranded** (2026-08-19), for showing the concept to an audience
+  that should not read it as an Entur product; no parameter — or an unrecognised one — renders
+  Entur exactly as before. A brand is four things, and leaving any one out still reads as Entur:
+  colour, **typeface** (Nationale is Entur's proprietary face, bundled by `@entur/typography` and
+  set on `:root`), the `<Logo/>`, and the PWA/notification identity. The last one is why this is
+  not a CSS-only change: the page reskins itself from the query parameter, but a NOTIFICATION is
+  drawn by the OS from what the server sends, so `brand` rides on the device record
+  (`varsel.DeviceIn.brand` → `_devices[id]["brand"]` → `_notification_payload`'s `icon`/`url` →
+  `sw.js`). Records written before this have no `brand` key and mean `entur`, which is what
+  `normalize_brand` exists for — an unknown slug indexed straight into `_BRAND_ASSETS` would
+  KeyError on the poller thread and take the whole cycle's alerting with it. Push **wording** is
+  deliberately brand-independent: it is what `/historikk` records, and text that varied by variant
+  would split every wording comparison along a second axis.
+  **The colour sheet is generated, and has to be** (`demo/avviksvarsel/scripts/make_brand_css.py`
+  → the committed `src/brands/none.generated.css`): Linje's components do **not** read the design
+  tokens at runtime — each package's `dist/styles.css` defines its own `--components-<pkg>-*` with
+  literal hex (~3 100 across the packages `/varsel` imports) and reads those, plus ~120
+  declarations that skip variables entirely, 31 of them the focus ring — so overriding
+  `--lavender-90` reskins nothing. Colours are moved in **OKLCh** at constant perceptual lightness,
+  which is what keeps a reskin from quietly breaking the contrast Entur tuned the ramps for. Two
+  traps, both of which shipped and were caught in the browser rather than by a test, and both
+  written up in the script: non-root rules must be scoped inside **`:where()`** (zero specificity)
+  or the uniform +1 class flattens Linje's own hierarchy — `.eds-h1{color}` then beat
+  `.eds-contrast .eds-h1{color:#fff}` and painted the masthead heading the same near-black as the
+  band behind it; and Linje writes **CSS fallback pairs** (`color:#181c56;
+  color:var(--primary-text-color)`), so emitting only the changed half leaves the legacy literal
+  last and resolves to a value no browser was ever meant to use. And one class of Entur colour the
+  generator **cannot** see at all, because it is not in a stylesheet: `@entur/icons` bakes the
+  transport marks' colour into the component MARKUP (`<svg class="eds-icon__train"
+  color="#00367f"><path fill="#00367F">`), so they leaked through into the stop picker, where every
+  row carries one — neutralised in the hand-written `src/brands/none.css` via `svg.eds-icon[color]`,
+  which matches exactly the icons that hardcode a brand colour. If a component ever looks
+  un-reskinned, check its markup before assuming the generator missed a rule. Re-run the script
+  after upgrading Linje — `--check` fails on a stale sheet. Adding an operator brand is an entry in `src/brand.ts`
+  plus a `Brand` in that script; note `none` is a *removal* needing no assets, while `vy`/`goa`
+  would need their artwork and permission to serve it, and that token overrides carry colour and
+  logo but not design language.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports

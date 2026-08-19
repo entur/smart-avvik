@@ -567,6 +567,138 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     assert len(sent) == 2
 
 
+# ---- brand ------------------------------------------------------------------------------------
+# ?brand=none renders /varsel unbranded. The PAGE reskins itself, but a NOTIFICATION is drawn by
+# the OS from what the server sends, so the brand has to survive registration and come back out in
+# the payload — otherwise an unbranded install shows the Entur mark in the tray and taps through to
+# the Entur-styled page, which is the whole thing the variant exists to avoid.
+
+
+def _register_journey(device: str) -> None:
+    client.post(
+        "/varsel-api/journeys",
+        json={
+            "device_id": device,
+            "from_stop": "A",
+            "from_name": "Oslo S",
+            "to_stop": "B",
+            "to_name": "Lillehammer",
+            "begin": "00:00",
+            "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+    )
+
+
+def test_an_unbranded_device_is_pushed_its_own_icon_and_url(monkeypatch):
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post(
+        "/varsel-api/devices",
+        json={"device_id": DEVICE, "subscription": SUBSCRIPTION, "brand": "none"},
+    )
+    _register_journey(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+    assert sent[0]["icon"] == "/varsel/icons/pwa-192-none.png"
+    # Tapping through has to land back on the unbranded page, or the notification is neutral and
+    # the app it opens is not.
+    assert sent[0]["url"] == "/varsel/?brand=none"
+    # The WORDING is brand-independent on purpose: it is what /historikk records, and text that
+    # varied by variant would split every wording comparison along a second axis.
+    assert sent[0]["title"] == "Avvik: Oslo S → Lillehammer"
+    assert "82 % sjanse for innstilling" in sent[0]["body"]
+
+
+def test_a_device_that_never_named_a_brand_is_entur(monkeypatch):
+    """The default is load-bearing, not cosmetic: every device registered before brands existed has
+    a state record with no `brand` key at all, and prd's state blob survives the deploy that adds
+    this. Those must keep getting the Entur icon rather than a missing one."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    # Simulate a record written before the field existed, which is what a restored blob looks like.
+    with varsel._state_lock:
+        varsel._devices[DEVICE].pop("brand", None)
+    _register_journey(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+    assert sent[0]["icon"] == "/varsel/icons/pwa-192.png"
+    assert sent[0]["url"] == "/varsel/"
+
+
+def test_a_brand_this_server_cannot_draw_falls_back_rather_than_404ing(monkeypatch):
+    """A newer PWA build naming a brand this deployment has not shipped yet must still get a
+    working notification: an unknown slug picked straight out of _BRAND_ASSETS would KeyError on
+    the poller thread and take the whole cycle's alerting with it."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    res = client.post(
+        "/varsel-api/devices",
+        json={"device_id": DEVICE, "subscription": SUBSCRIPTION, "brand": "vy"},
+    )
+    assert res.status_code == 200
+    _register_journey(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+    assert sent[0]["icon"] == "/varsel/icons/pwa-192.png"
+
+
+def test_reopening_under_another_brand_moves_the_devices_notifications(monkeypatch):
+    """Registration is an upsert, and the brand rides along — a traveller who installed the Entur
+    variant and later opens ?brand=none should not keep being notified in the old one."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post(
+        "/varsel-api/devices",
+        json={"device_id": DEVICE, "subscription": SUBSCRIPTION, "brand": "entur"},
+    )
+    created = varsel._devices[DEVICE]["created_ts"]
+    client.post(
+        "/varsel-api/devices",
+        json={"device_id": DEVICE, "subscription": SUBSCRIPTION, "brand": "none"},
+    )
+    assert varsel._devices[DEVICE]["brand"] == "none"
+    assert varsel._devices[DEVICE]["created_ts"] == created, "an upsert must not reset the age"
+    _register_journey(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent[0]["icon"] == "/varsel/icons/pwa-192-none.png"
+
+
+def test_the_test_push_carries_the_brand_too(monkeypatch):
+    """The test push is how a traveller confirms the install works, so it is the first notification
+    they ever see — showing the Entur mark there would give the variant away immediately."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post(
+        "/varsel-api/devices",
+        json={"device_id": DEVICE, "subscription": SUBSCRIPTION, "brand": "none"},
+    )
+    assert client.post("/varsel-api/test", json={"device_id": DEVICE}).status_code == 200
+    assert sent[0]["icon"] == "/varsel/icons/pwa-192-none.png"
+    assert sent[0]["url"] == "/varsel/?brand=none"
+
+
+def test_the_brand_survives_a_state_reload():
+    """State is persisted to a blob and restored after a redeploy; a brand that did not survive it
+    would silently revert every unbranded install to Entur on the next deploy."""
+    _reset_state()
+    client.post(
+        "/varsel-api/devices",
+        json={"device_id": DEVICE, "subscription": SUBSCRIPTION, "brand": "none"},
+    )
+    blob = varsel._serialize_state()
+    with varsel._state_lock:
+        varsel._devices.clear()
+    varsel._apply_state(blob)
+    assert varsel._devices[DEVICE]["brand"] == "none"
+
+
 def test_push_titles_carry_the_environment_on_non_prod(monkeypatch):
     """Both push kinds, alert and test: a dev push and a prd push arrive in the same tray under the
     same app name (one manifest, every environment), so the title is the only place that can say
