@@ -66,6 +66,9 @@ class FakeCall:
     arr_delay_p90_stack_min: int | None = None
     p_arr_ge10: float | None = None
     p_impact: float | None = None
+    # Whether an SX message named this call. Defaults True, matching CallPred: every case written
+    # before the no-SX population existed is about a train a situation pointed at.
+    has_situation: bool = True
 
 
 def _journey(begin="07:00", end="09:00", days=(0, 1, 2, 3, 4)):
@@ -793,6 +796,46 @@ def test_the_wording_falls_back_to_the_certainty_when_the_message_input_cannot_b
     )
     body = _deterministic_body(_message_input_from_alert(alert))
     assert body == "Signalfeil\nTog kl 08:00: Innstilt"
+
+
+def test_a_no_sx_alert_says_there_is_no_message_instead_of_quoting_one():
+    """A train nobody published about still gets a wording, and the wording must not pretend to be
+    relaying somebody.
+
+    `summary` on a no-SX alert is a placeholder this codebase wrote ("Mulig avvik - ingen melding
+    fra operatoren"). Left in `situasjoner` it reaches the model in the field the prompt documents
+    as the OPERATOR'S OWN WORDS, and a model told to relay what the operator said will relay it.
+    Both writers therefore see the absence as its own fact instead.
+    """
+    alert = Alert(
+        situation_number="KIX:NoSituation:VYG:DSJ:1", summary="Mulig avvik", line="VYG:Line:R10",
+        departure_time=MON_0800, has_situation=False,
+        cancel_probability=0.1, delay_p50_min=12, delay_p90_min=25,
+        alert_threshold=0.65, alertworthy=True,
+    )
+    message_input = _message_input_from_alert(alert)
+    assert message_input["ingen_melding"] is True
+    assert message_input["situasjoner"] == []
+
+    body = _deterministic_body(message_input)
+    assert body.startswith("Ingen melding fra operatøren")
+    # The placeholder must not survive into what the traveller reads.
+    assert "Mulig avvik" not in body
+    # ...and the train is still named: dropping the summary must not drop the news with it.
+    assert "Tog kl 08:00" in body
+
+
+def test_a_flagged_alert_is_untouched_by_the_no_sx_branch():
+    """The default is the flagged population, and it has to stay byte-identical: every existing
+    wording case is about a train a situation named."""
+    alert = Alert(
+        situation_number="S1", summary="Signalfeil", line="VYG:Line:R10",
+        departure_time=MON_0800, cancel_probability=1.0, cancelled=True,
+        delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
+    )
+    message_input = _message_input_from_alert(alert)
+    assert "ingen_melding" not in message_input
+    assert _deterministic_body(message_input) == "Signalfeil\nTog kl 08:00: Innstilt"
 
 
 def test_push_body_omits_a_missing_summary():

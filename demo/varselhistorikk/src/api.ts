@@ -94,12 +94,17 @@ export interface Summary {
   n_hit_with_30min_notice: number;
   n_hit_trains: number;
 
-  /** The headline figures above are BLENDED — forecasts and relayed ET cancellations together —
-   *  which is the honest answer to "can the app be trusted". These two split them, because a
+  /** The headline figures above are BLENDED — forecasts, relayed ET cancellations and decisions
+   *  about trains nobody published anything about, together — which is the honest answer to "can
+   *  the app be trusted". These three split them, because the populations behave nothing alike: a
    *  declared cancellation is served at probability 1.0 by construction and says nothing about
-   *  whether the models saw anything coming. Quoted alone the blended number moves with the mix. */
+   *  whether the models saw anything coming, while a no-SX decision is taken with strictly less
+   *  information than either. Quoted alone the blended number moves with the mix. */
   predicted: Segment;
   relayed: Segment;
+  /** No SX message named the train at all; the models read real-time data alone. Absent from
+   *  responses served before 2026-08-20, hence optional. */
+  no_sx?: Segment;
   /** Decided before the flag existed; in neither segment. While this dominates, the split covers
    *  only a slice of the window. */
   n_unsegmented: number;

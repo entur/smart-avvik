@@ -4,6 +4,14 @@
 -- to predict_calls.sql (keep the two in sync); the call source, situation window, and the
 -- LIVE-OBSERVABLE state features (below) are what differ.
 --
+-- TWO BRANCHES OF predict_calls.sql ARE DELIBERATELY NOT SYNCED HERE, and the reason is the same
+-- for both: this file is the SX path, and both of those exist to reach calls no SX message named.
+--   * the ET-cancellation relay -- carries a flat 1.0 and consults no model
+--   * the scored no-SX branch   -- has_situation = FALSE rows, calibrated by their own layers
+-- What IS synced, and has to be, is `has_situation` itself: the heads have taken it as a feature
+-- since 2026-08-19, and a model whose contract names a column its input lacks fails the whole
+-- scoring job. It is constant TRUE here because every row this file produces came from a situation.
+--
 -- STATE FEATURES UNDER THE LIVE INFORMATION CONSTRAINT (2026-07-02, see
 -- docs/model-hardening/LEARNINGS.md): training computes line_pre_*/net_pre_*/line_now_*/
 -- own_prev_delay from realized history. Live, they come from rail_calls_planned_today's

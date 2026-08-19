@@ -527,5 +527,25 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `ML.PREDICT` ignores an input column the model does not know, but a model whose contract names a
   column its input lacks fails the whole scoring job, which on `predict_calls.sql` means the
   poller stops producing predictions.
+- **`predict_calls.sql` has three branches and they partition the timetable** (2026-08-20):
+  `base` (a situation named the call), `nosx` (none did — scored, `has_situation = FALSE`) and
+  `et_only` (none did and ET has declared it cancelled — relayed, no model). No call is in two, and
+  the cancelled ones are deliberately not scored because `impact._cancelled_prediction` would
+  replace every figure with the certainty anyway. The flagged half's calibration is untouched: it
+  still reads the same live `ML.WEIGHTS` blocks, while the no-SX half joins the materialized
+  `nosx_platt_weights` (45 rows, `gen_nosx_platt_weights.py`). **That table is a snapshot** — a
+  Platt refit that does not rebuild it serves last quarter's calibration, silently.
+- **A no-SX alert is cut HIGHER than a published one — 0.85, not 0.65** (`alert_policy`), which is
+  the opposite of what a 12x-lower base rate suggests. Without a message the only signal is the last
+  hour of observation (`own_prev_delay`, `line_now_*`), so the probability decays with the ask
+  horizon far faster: measured out of sample, precision at 0.65 is 0.844 for a call inside 45 min,
+  0.712 one bucket out, and beyond ~2 h the layer collapses to the base rate and fires nothing at
+  all at any threshold. 0.85 holds the near buckets to the bar the flagged family clears at 0.65.
+  The second reason is not statistical: this alert reaches the traveller with **no explanation**,
+  because there is no operator text to attach — so both wordings state the absence rather than
+  quoting the placeholder summary the SQL writes (`ingen_melding` in the message input).
+  `/historikk` segments these as a third provenance beside `predicted`/`relayed`, discriminated on
+  the `KIX:NoSituation:` prefix rather than a new column — **adding a column to
+  `varsel_decision_outcomes` breaks the registered scheduled query** until it is re-registered.
 - Consider cost before running BigQuery operations. Ask for permission before running anything more expensive than $10.
 - In docs/kix-docs, references to R1, R2 etc refers to the documents docs/kix-docs/docs/Context/r1-entur-rolle-og-mandat.md, docs/kix-docs/docs/Context/r2-entur-teknisk-deep-dive.md etc.
