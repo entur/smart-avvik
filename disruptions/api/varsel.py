@@ -1195,8 +1195,33 @@ def _tag_environment(title: str) -> str:
     return f"[{env}] {title}" if env else title
 
 
+# Which /varsel variant a device installed, and the two things a notification has to carry to look
+# like it. The page reskins itself from `?brand=`, but a NOTIFICATION is drawn by the OS from what
+# the server sends: an unbranded install would otherwise show the Entur mark in the tray, and
+# tapping it would land back on the Entur-styled page. `url` is also what the manifest's start_url
+# says, so the two agree on where the app lives.
+#
+# DEFAULT_BRAND is what an absent or unrecognised value means, including every device registered
+# before this existed — those records have no `brand` key at all.
+DEFAULT_BRAND = "entur"
+_BRAND_ASSETS: dict[str, dict[str, str]] = {
+    "entur": {"icon": "/varsel/icons/pwa-192.png", "url": "/varsel/"},
+    "none": {"icon": "/varsel/icons/pwa-192-none.png", "url": "/varsel/?brand=none"},
+}
+
+
+def normalize_brand(brand: str | None) -> str:
+    """A client-supplied brand slug, reduced to one this server can actually draw."""
+    return brand if brand in _BRAND_ASSETS else DEFAULT_BRAND
+
+
 def _notification_payload(
-    journey: dict, alert: Alert, message: str | None = None, *, message_input: dict | None = None
+    journey: dict,
+    alert: Alert,
+    message: str | None = None,
+    *,
+    message_input: dict | None = None,
+    brand: str = DEFAULT_BRAND,
 ) -> dict:
     """Norwegian Web Push payload for one journey×situation match.
 
@@ -1208,13 +1233,19 @@ def _notification_payload(
     `message_input` is this decision's message input (see :func:`_message_input`); `None` means it
     could not be built, and the template falls back to reconstructing the little of it the wording
     needs from the alert — a push must not be lost to a payload problem.
+
+    `brand` only ever moves the icon and the click-through url. The WORDING is deliberately
+    identical across brands: it is what `/historikk` records, and a text that varied by variant
+    would split every wording comparison in the decision log along a second axis.
     """
     from_name = journey.get("from_name") or journey["from_stop"]
     to_name = journey.get("to_name") or journey["to_stop"]
+    assets = _BRAND_ASSETS[normalize_brand(brand)]
     return {
         "title": _tag_environment(f"Avvik: {from_name} → {to_name}"),
         "body": message or _deterministic_body(message_input or _message_input_from_alert(alert)),
-        "url": "/varsel/",
+        "url": assets["url"],
+        "icon": assets["icon"],
         "situation_number": alert.situation_number,
     }
 
@@ -1957,15 +1988,17 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # minutes during which no cache is rebuilt and nobody else is alerted.
     # Parallel ACROSS devices, sequential WITHIN one: a "gone" result must still stop that device's
     # remaining alerts for the tick, which only holds if its own sends stay ordered.
-    per_device: dict[str, list[tuple[str, dict, dict, Alert, str]]] = {}
+    per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str]]] = {}
     for jid, journey in journeys if push_on else []:
         device = None
+        brand = DEFAULT_BRAND
         with _state_lock:
             if jid not in _journeys:  # deleted while iterating
                 continue
             dev = _devices.get(journey["device_id"])
             if dev is not None:
                 device = dev.get("subscription")
+                brand = normalize_brand(dev.get("brand"))
         if device is None:
             continue
         key = journey_key(journey)
@@ -1980,19 +2013,23 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 if f"{jid}|{alert.situation_number}" in _notified:
                     continue
             per_device.setdefault(journey["device_id"], []).append(
-                (jid, device, journey, alert, key)
+                (jid, device, journey, alert, key, brand)
             )
 
-    def _deliver_device(items: list[tuple[str, dict, dict, Alert, str]]) -> list[tuple]:
+    def _deliver_device(items: list[tuple[str, dict, dict, Alert, str, str]]) -> list[tuple]:
         """One device's pending alerts, in order, stopping at a dead subscription."""
         out = []
-        for jid, device, journey, alert, key in items:
+        for jid, device, journey, alert, key, brand in items:
             message_key = _message_key(key, alert)
             # The written wording only if this deployment delivers it; otherwise None, and
             # _notification_payload words the push from the same message input the model was shown.
             message = _deliverable_message(message_key)
             payload = _notification_payload(
-                journey, alert, message, message_input=message_inputs.get(message_key)
+                journey,
+                alert,
+                message,
+                message_input=message_inputs.get(message_key),
+                brand=brand,
             )
             result = _send_push(device, payload)
             out.append((jid, journey, alert, result, payload))
@@ -2075,6 +2112,15 @@ class DeviceIn(BaseModel):
 
     device_id: str = Field(min_length=8, max_length=100, description="Client-generated UUID.")
     subscription: dict = Field(description="The PushSubscription JSON (endpoint + keys).")
+    brand: str | None = Field(
+        default=None,
+        max_length=24,
+        description=(
+            "Which /varsel variant this install came from ('entur', 'none'). Decides the icon on "
+            "the notification and where tapping it lands. Optional: absent — an older PWA build, "
+            "or a device registered before brands existed — means 'entur'."
+        ),
+    )
 
     @field_validator("subscription")
     @classmethod
@@ -2215,6 +2261,9 @@ def upsert_device(body: DeviceIn) -> dict:
         _devices[body.device_id] = {
             "subscription": body.subscription,
             "created_ts": existing["created_ts"] if existing else _now_iso(),
+            # Refreshed on every registration, so a device that reopens the app under a different
+            # ?brand= has its notifications follow it rather than keeping the brand it first used.
+            "brand": normalize_brand(body.brand),
         }
         _save_state()
     return {"status": "ok"}
@@ -2460,12 +2509,17 @@ def test_push(body: TestIn) -> dict:
     with _state_lock:
         dev = _devices.get(body.device_id)
         subscription = dev.get("subscription") if dev else None
+        # Read the brand under the same lock as the subscription, so the test push cannot describe
+        # one registration's subscription with another's icon.
+        brand = normalize_brand(dev.get("brand") if dev else None)
     if subscription is None:
         raise HTTPException(status_code=404, detail="Enheten har ingen aktiv varsel-abonnement.")
+    assets = _BRAND_ASSETS[brand]
     payload = {
         "title": _tag_environment("Varsler er aktivert"),
         "body": "Du vil nå få beskjed når et avvik kan ramme en av dine reiser.",
-        "url": "/varsel/",
+        "url": assets["url"],
+        "icon": assets["icon"],
     }
     result = _send_push(subscription, payload)
     _log_push("test", result, body.device_id, payload)

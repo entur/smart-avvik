@@ -202,8 +202,15 @@ export function deleteJourney(journeyId: string, deviceId: string): Promise<void
   );
 }
 
-export function registerDevice(deviceId: string, subscription: unknown): Promise<void> {
-  return request('/varsel-api/devices', jsonPost({ device_id: deviceId, subscription }));
+// `brand` is what the notification is drawn in: the server has no other way to know which variant
+// this install came from, and a neutral install showing the Entur mark in the notification tray is
+// exactly the giveaway ?brand=none exists to avoid. An older API ignores the extra field.
+export function registerDevice(
+  deviceId: string,
+  subscription: unknown,
+  brand: string,
+): Promise<void> {
+  return request('/varsel-api/devices', jsonPost({ device_id: deviceId, subscription, brand }));
 }
 
 export function deleteDevice(deviceId: string): Promise<void> {

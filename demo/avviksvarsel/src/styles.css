@@ -1,9 +1,16 @@
 /* App-level layout for the Avviksvarsel PWA. Brand colours come from Entur Linje tokens
    (imported in main.tsx); this file only adds phone-first layout and a few token-driven accents —
-   no hardcoded hex. */
+   no hardcoded hex. Staying token-driven is what lets ?brand=none reskin this file for free: the
+   brand sheet redefines the tokens, and anything written as a literal here would survive it and
+   leave one Entur-coloured detail behind (see src/brands/none.css). */
 
 * {
   box-sizing: border-box;
+}
+
+:root {
+  /* Not a Linje token, so brands override it explicitly. Entur navy at low alpha. */
+  --av-card-shadow: 0 1px 3px rgb(24 28 86 / 0.06);
 }
 
 body {
@@ -60,7 +67,7 @@ body {
   border: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
   border-radius: var(--border-radiuses-large, 0.5rem);
   padding: 1rem 1.125rem;
-  box-shadow: 0 1px 3px rgb(24 28 86 / 0.06);
+  box-shadow: var(--av-card-shadow);
 }
 
 .av-status {

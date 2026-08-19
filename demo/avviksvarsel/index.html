@@ -5,8 +5,29 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="robots" content="noindex" />
     <title>Entur Avviksvarsel</title>
+
+    <!-- Brand, ahead of everything else. `?brand=none` renders the unbranded variant; no parameter
+         renders Entur, which is what the rest of this file is written for. Set from an inline
+         script rather than from the React bundle because it has to be in place before FIRST PAINT
+         — every rule in src/brands/*.css keys on this attribute, so applying it later would show
+         the Entur palette and then swap it. src/brand.ts re-applies it (and corrects a slug no
+         brand exists for) once the bundle runs. -->
+    <script>
+      (function () {
+        try {
+          var requested = new URLSearchParams(location.search).get('brand');
+          document.documentElement.dataset.brand = /^[a-z][a-z0-9-]{0,23}$/.test(requested || '')
+            ? requested
+            : 'entur';
+        } catch (e) {
+          document.documentElement.dataset.brand = 'entur';
+        }
+      })();
+    </script>
     <meta name="description" content="Få varsel når et avvik kan ramme kollektivreisene dine." />
 
+    <!-- Entur is the default brand, so its assets are the ones written literally here: they load
+         without waiting for the bundle. src/brand.ts repoints all of them for another brand. -->
     <!-- Favicon (Entur logo mark; see scripts/make_icons.py) -->
     <link rel="icon" href="/varsel/favicon.svg" type="image/svg+xml" />
     <link rel="icon" href="/varsel/favicon-32.png" sizes="32x32" type="image/png" />

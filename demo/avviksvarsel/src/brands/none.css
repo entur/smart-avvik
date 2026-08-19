@@ -1,0 +1,75 @@
+/* Brand "none" — the unbranded variant of /varsel, selected with ?brand=none.
+ *
+ * Two halves, and this is the hand-written one:
+ *
+ *   none.generated.css  every COLOUR Linje ships, recoloured. Machine-written, because Linje's
+ *                       components do not read the design tokens at runtime — they bake literal
+ *                       hex into ~3 100 `--components-*` variables — so there is no small set of
+ *                       token overrides that would do it. See scripts/make_brand_css.py.
+ *   this file           everything that is not a colour, plus the app's own accents.
+ *
+ * Both are scoped `:root[data-brand='none']`, which outranks Linje's `:root` and
+ * `[data-color-mode=…]` blocks (0,2,0 vs 0,1,0). No parameter means no attribute means Entur, so
+ * the default page cannot be affected by anything in here.
+ */
+
+@import './none.generated.css';
+
+/* ---- typeface -------------------------------------------------------------------------------
+ * Nationale is Entur's PROPRIETARY brand typeface, bundled by @entur/typography and applied on
+ * :root — so a page that only changed colour would still be recognisably Entur, and arguably more
+ * so than the palette. Linje sets it in exactly two places, both in that one :root block: the
+ * `--eds-font-family` variable and a direct `font-family`. Overriding both here covers the whole
+ * app through inheritance.
+ *
+ * The stack is /demo's, minus its leading 'Inter' — /demo names a font it never loads, so it only
+ * applies for readers who happen to have it installed locally. Not worth copying forward.
+ */
+:root[data-brand='none'] {
+  --eds-font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-family: var(--eds-font-family);
+}
+
+/* ---- the app's own accents ------------------------------------------------------------------
+ * styles.css is otherwise token-driven, so the generated sheet reaches it for free. These are the
+ * values that are not a Linje token to begin with.
+ */
+:root[data-brand='none'] {
+  /* Entur's card shadow is tinted with the brand navy; this is /demo's neutral slate. */
+  --av-card-shadow: 0 1px 2px rgb(26 32 39 / 0.05);
+}
+
+/* Without the Entur logo the masthead is a heading on its own, so it no longer needs to reserve
+   the row for a mark sitting beside it. */
+:root[data-brand='none'] .av-header-inner {
+  gap: 0;
+}
+
+/* ---- transport-mode icons -------------------------------------------------------------------
+ * The one class of Entur colour the generator CANNOT see. @entur/icons ships the transport marks
+ * with their colour baked into the COMPONENT MARKUP rather than a stylesheet —
+ *
+ *     <svg class="eds-icon eds-icon__train" color="#00367f"><path fill="#00367F" …>
+ *     <svg class="eds-icon eds-icon__bus"   color="#c5044e"><g   fill="#C5044E" …>
+ *
+ * — so scripts/make_brand_css.py, which walks `dist/styles.css`, never encounters them. They leak
+ * straight through a colour reskin, and on a near-monochrome page they are the most saturated
+ * thing on screen: found in the stop picker, where every row carries one.
+ *
+ * `[color]` is the selector because it identifies exactly the icons that hardcode a brand colour
+ * and nothing else — an icon drawn in `currentColor` (AddIcon, DeleteIcon, the alert marks) has no
+ * such attribute and is left alone. It also catches any transport mark added later without this
+ * file having to list them. A CSS `fill` beats an SVG presentation attribute, so this reaches the
+ * markup the generator cannot.
+ *
+ * They go MONOCHROME rather than to a recoloured mode palette. Entur's mode colours are design
+ * language, not just pigment, and the glyphs already tell a bus from a train — which is how /demo
+ * distinguishes modes too (a plain text tag, no colour). Nothing is lost but the giveaway.
+ */
+:root[data-brand='none'] svg.eds-icon[color] {
+  color: inherit;
+}
+
+:root[data-brand='none'] svg.eds-icon[color] * {
+  fill: currentColor;
+}
