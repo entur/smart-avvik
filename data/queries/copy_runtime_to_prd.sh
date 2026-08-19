@@ -51,10 +51,17 @@ for fam in "" "_pooled_all"; do
     for thr in 5 10 20 40; do MODELS+=("${side}_ge${thr}_clf$fam"); done
   done
 done
-# rail platt calibrators: 9 heads x {base, lead60, lead120, lead240, plan}
+# rail platt calibrators: 9 heads x {base, lead60, lead120, lead240, plan}, x TWO POPULATIONS
+# since 2026-08-20. The _nosx half calibrates calls no SX message named (see the no-SX branch in
+# predict_calls.sql). They are NOT optional for prd: predict_calls.sql joins nosx_platt_weights
+# unconditionally, and that table is built FROM these 45 models -- a prd deployment of that query
+# without them dies inside the per-call try/except in main.py, which does not break the /disruptions
+# feed but does leave /journey and every varsel push serving stale or empty predictions. So this
+# copy must run BEFORE promoting an image that contains the no-SX branch, not after.
 for head in cancel arr_ge5 arr_ge10 arr_ge20 arr_ge40 dep_ge5 dep_ge10 dep_ge20 dep_ge40; do
   for variant in "" "_lead60" "_lead120" "_lead240" "_plan"; do
     MODELS+=("${head}_platt${variant}")
+    MODELS+=("${head}_platt_nosx${variant}")
   done
 done
 
@@ -66,6 +73,7 @@ TABLES=(
   delay_p90_calib
   delay_p90_calib_pooled_all
   pooled_all_platt_weights
+  nosx_platt_weights       # flattened no-SX platt coefficients; predict_calls.sql joins it directly
   demo_stops demo_highlights demo_calls demo_predictions
 )
 
