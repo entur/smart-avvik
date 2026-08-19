@@ -378,6 +378,111 @@ def test_worst_selection_prefers_a_known_cancelled_train_over_a_high_forecast():
     assert cells[0].departure.cancelled is True
 
 
+# ---- ET-declared cancellations that no situation named (the relay rows) -------------------------
+RELAY_SIT = "KIX:ETCancellation:DatedServiceJourney:relay"
+
+
+def _relay_call(**kw):
+    """One call shaped as predict_calls*.sql's ET-cancellation relay emits it.
+
+    Not the same thing as `_cancelled_call` above, which is a SCORED call that ET later also
+    declared cancelled. A relay row was never scored: it exists because ET declared a cancellation
+    and no SX situation named the call, so every conditional figure on it is NULL -- including the
+    alerting score on whichever side the call does not have. Nothing may read one of those as a zero
+    and conclude the train is fine; the certainty is carried entirely by `et_declared_cancelled`.
+    """
+    fields = {
+        "jkey": "DatedServiceJourney:relay",
+        "situation_number": RELAY_SIT,
+        "summary": "Innstilt Drammen–Skøyen",
+        "description": "Avgangen er markert innstilt i operatørens sanntidsdata.",
+        "stop_place": A,
+        "stop_order": 1,
+        "stop_name": "Asker",
+        "aimed_dep": _at(15, 3),
+        "aimed_arr": None,
+        "call_source": "estimated",
+        "et_declared_cancelled": True,
+        "p_cancel": 1.0,
+        "p_impact_dep": 1.0,
+        "p_impact": None,  # an origin has no arrival, so no arrival-side score exists
+        "p_dep_ge10": None,
+        "p_arr_ge10": None,
+        "dep_delay_typ_min": None,
+        "dep_delay_p90_min": None,
+        "dep_delay_p50_stack_min": None,
+        "dep_delay_p90_stack_min": None,
+    }
+    fields.update(kw)
+    return FakeCall(**fields)
+
+
+def _relay_journey():
+    """A relay journey: boarding at A (an origin -- departure side only) and alighting at B (a
+    terminal -- arrival side only). Between them the two sides cover every NULL the shape allows."""
+    return [
+        _relay_call(),
+        _relay_call(
+            stop_place=B,
+            stop_order=5,
+            stop_name="Skøyen",
+            aimed_dep=None,
+            aimed_arr=_at(15, 43),
+            p_impact_dep=None,
+            p_impact=1.0,
+        ),
+    ]
+
+
+def test_relay_row_alerts_on_the_certainty_alone():
+    """A row with no prediction on it still clears every gate, because "this train is cancelled" is
+    not a prediction. Both orderings have to reach that verdict without touching a NULL figure."""
+    call = _relay_call()
+    assert impact._alert_score(call) == 1.0
+    assert impact._call_severity(call) == (1.0, 0, 1.0)
+
+
+def test_relay_row_is_worded_as_a_cancellation_and_quotes_no_delay():
+    dep = impact._departure_prediction(_relay_call())
+    assert (dep.cancelled, dep.cancel_probability, dep.impact_probability) == (True, 1.0, 1.0)
+    assert (dep.delay_typ_min, dep.delay_p50_min, dep.delay_p90_min, dep.ge10_probability) == (
+        None, None, None, None,
+    )
+    assert dep.scheduled_time == _at(15, 3)  # still the train it is about
+
+
+def test_relay_row_expected_departure_survives_all_null_delays():
+    """`_expected_departure` is aimed time plus the predicted typical delay, and decides whether a
+    train is still catchable. A relay row carries no such figure; treating the absence as zero is
+    the honest reading -- the train is not leaving late, it is not leaving."""
+    assert impact._expected_departure(_relay_call()) == _at(15, 3)
+
+
+def test_relay_situation_reaches_the_traveller_like_a_scored_one():
+    """End to end through the matcher: one cell, under the relay's own synthetic situation number,
+    with a cancelled departure that clears the widest alternative-lookup gate there is."""
+    cells = _cells({RELAY_SIT: _relay_journey()}, at=_at(15))
+    assert len(cells) == 1
+    assert cells[0].situation_number == RELAY_SIT
+    assert cells[0].departure.cancelled is True
+    assert cells[0].departure.impact_probability == 1.0
+    assert impact._worth_an_alternative(cells, alert_policy.min_threshold()) is True
+
+
+def test_relay_situation_outranks_a_scored_forecast_for_the_same_traveller():
+    """Two situations in the window, one scored high and one a relay. `select='worst'` must land on
+    the train that is certainly gone -- the relay carries no p_impact_dep to compare, so an
+    ordering that reached for the figure instead of the fact would rank it last."""
+    scope = {
+        "S1": _train("forecast", 15, 13, p_cancel=0.4, p_impact_dep=0.99),
+        RELAY_SIT: _relay_journey(),
+    }
+    cells = _cells(scope, select="worst", at=_at(15))
+    worst = impact._worst_cell(cells)
+    assert worst is not None
+    assert worst.situation_number == RELAY_SIT
+
+
 # ---- scoring Journey Planner alternatives ------------------------------------------------------
 ALT_REF = ("VYG", "DatedServiceJourney:alt")
 
