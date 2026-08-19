@@ -123,8 +123,29 @@ export function fmtOutcome(d: Decision): string {
   return 'I rute';
 }
 
-/** The affected train as one line: "Tog VYG:Line:R11". The registered journey's own from/to are
- *  deliberately not served by this public API, so a decision is identified by its train. */
-export function fmtTrain(d: Decision): string {
-  return [d.mode ?? 'Tog', d.line].filter(Boolean).join(' ');
+/** The line ref reduced to what a traveller calls it: "VYG:Line:L2" -> "L2". The codespace and the
+ *  `Line` literal name the publisher, not the train, and they push the times off the header's first
+ *  line for no reader's benefit. Same reduction /demo does, so the two pages name a line alike.
+ *
+ *  The registered journey's own from/to are deliberately not served by this public API, so a
+ *  decision is identified by its train — which makes this most of its name, and the reason a
+ *  missing line still renders as the page's "–" rather than collapsing the pill away. */
+export function lineCode(line: string | null): string {
+  if (!line) return '–';
+  const parts = line.split(':');
+  return parts[parts.length - 1];
+}
+
+/** The scheduled departure as the header shows it: "10:16" when the train runs today, and
+ *  "18. aug. 10:16" when it does not.
+ *
+ *  Unlabelled and first, where a timetable puts it — so the date has to carry itself, and it
+ *  appears precisely when it differs from the reader's own day. That is the rule fmtWhen already
+ *  applies to the time one field over, and it is not decoration here: the default window on this
+ *  page is fourteen days, so most cards in a full list are not today's. */
+export function fmtDeparture(d: Decision): string {
+  if (!d.departure_time) return '–';
+  const day = d.call_date ?? osloDay(d.departure_time);
+  const time = fmtTime(d.departure_time);
+  return day === osloDayFmt.format(new Date()) ? time : `${fmtDate(day)} ${time}`;
 }
