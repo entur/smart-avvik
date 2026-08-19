@@ -53,11 +53,27 @@ for fam in "" "_pooled_all"; do
 done
 # rail platt calibrators: 9 heads x {base, lead60, lead120, lead240, plan}, x TWO POPULATIONS
 # since 2026-08-20. The _nosx half calibrates calls no SX message named (see the no-SX branch in
-# predict_calls.sql). They are NOT optional for prd: predict_calls.sql joins nosx_platt_weights
-# unconditionally, and that table is built FROM these 45 models -- a prd deployment of that query
-# without them dies inside the per-call try/except in main.py, which does not break the /disruptions
-# feed but does leave /journey and every varsel push serving stale or empty predictions. So this
-# copy must run BEFORE promoting an image that contains the no-SX branch, not after.
+# predict_calls.sql).
+#
+# PROMOTING THIS TO PRD IS A THREE-STEP SEQUENCE, and both of the obvious two-step orders break it.
+# The dependency runs both ways: the retrained HEADS require `has_situation` in their input, which
+# only an image carrying PR #60 supplies; and the new QUERY joins `nosx_platt_weights`, which only
+# this script creates. So copy-then-deploy leaves prd's old image feeding models a column it does
+# not produce, and deploy-then-copy leaves prd's new query joining a table that does not exist.
+# Either way the per-call scoring query dies inside main.py's try/except -- the /disruptions feed
+# survives, but /journey and every varsel push serve stale or empty predictions until the other half
+# lands. The window is avoidable, and this is how:
+#
+#   1. Create an EMPTY `nosx_platt_weights` in prd first. The no-SX rows then lose their INNER JOIN
+#      and drop out, which is exactly the pre-2026-08-20 behaviour -- no alerts missed that were
+#      being sent before, and the flagged path untouched.
+#   2. Deploy the image. has_situation is now supplied (prd's old heads ignore an input column they
+#      do not know), and the query's no-SX branch resolves against the empty table.
+#   3. Run this script. New heads land into a serving path that already feeds them has_situation,
+#      the 45 _nosx models arrive, and the real weights table replaces the empty one -- at which
+#      point no-SX alerting switches on.
+#
+# Each step is independently safe, which is the property the two-step orders lack.
 for head in cancel arr_ge5 arr_ge10 arr_ge20 arr_ge40 dep_ge5 dep_ge10 dep_ge20 dep_ge40; do
   for variant in "" "_lead60" "_lead120" "_lead240" "_plan"; do
     MODELS+=("${head}_platt${variant}")
