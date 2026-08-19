@@ -161,6 +161,17 @@ calls AS (
     IFNULL(ln.line_now_delay, -1)   AS line_now_delay,
     IFNULL(ln.line_now_cancel, -1)  AS line_now_cancel,
     IFNULL(o.own_prev_delay, -1)    AS own_prev_delay,
+    -- Every row this file scores comes from a situation, so the flag is constant TRUE here. It
+    -- is carried anyway because training_calls has carried the column since 2026-08-19 (see
+    -- create_training_calls.sql): the heads are retrained WITH it, and a model that expects a
+    -- feature its input does not supply fails the whole scoring job, which on this file means the
+    -- poller stops producing predictions. THE ORDER IS THEREFORE FIXED: this column ships FIRST,
+    -- the retrained models second. The reverse order breaks serving; this order cannot, because
+    -- ML.PREDICT ignores an input column the model does not know (verified against the shipped
+    -- call_cancel_clf, 2026-08-19). It also stops being cosmetic the moment this file learns to
+    -- score calls no situation named -- then it is what tells the model which population a row
+    -- is from, and it is the only thing that does.
+    TRUE                            AS has_situation,
     -- ask-horizon bucket: which platt layer calibrates this call's scores (see header)
     CASE
       WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 45  THEN '30'

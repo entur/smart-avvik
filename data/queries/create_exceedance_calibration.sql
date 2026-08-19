@@ -19,6 +19,21 @@
 -- monotonicity (GREATEST cascade -- independent per-threshold fits can cross) before deriving
 -- each side's interval and impact probability.
 --
+-- ONE LAYER PER POPULATION (2026-08-19). training_calls now carries unflagged calls as well
+-- (has_situation, see create_training_calls.sql), so every fit below gains `AND has_situation`
+-- and every one of them gains a `_nosx` twin fit on the complement. Same reasoning as
+-- create_cancel_calibration.sql, and the same trap: `WHERE is_eval = TRUE` used to MEAN "the
+-- flagged holdout" and now does not, so dropping the added predicate silently re-centers
+-- production's delay probabilities onto a population whose >=10 base rate is 2.0 % against the
+-- flagged holdout's 7.6 %. Nothing errors; the alerts just stop firing.
+--
+-- The exceedance heads depend on SX far less than the cancellation head does (~30 % of
+-- attribution vs ~50 %), because their top features -- own_prev_delay and line_now_delay -- are
+-- call-anchored and observable with no message at all. That is why the split matters MORE here
+-- than it looks: the ranking survives the missing situation, so the only thing standing between
+-- a no-SX delay probability and a usable one is the level, which is exactly what a Platt layer
+-- sets and exactly what one shared layer would get wrong.
+--
 -- Run EACH statement as its own bq job (cumulative --maximum_bytes_billed kills later ones).
 
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt`
@@ -31,7 +46,7 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.arr_ge5_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND arr_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND arr_delay_pos IS NOT NULL))
 );
 
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt`
@@ -44,7 +59,7 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.arr_ge10_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND arr_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND arr_delay_pos IS NOT NULL))
 );
 
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt`
@@ -57,7 +72,7 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.arr_ge20_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND arr_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND arr_delay_pos IS NOT NULL))
 );
 
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt`
@@ -70,7 +85,7 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.arr_ge40_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND arr_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND arr_delay_pos IS NOT NULL))
 );
 
 -- Departure side (boarding stop) ------------------------------------------------------------
@@ -85,7 +100,7 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.dep_ge5_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND dep_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND dep_delay_pos IS NOT NULL))
 );
 
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`
@@ -98,7 +113,7 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.dep_ge10_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND dep_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND dep_delay_pos IS NOT NULL))
 );
 
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt`
@@ -111,7 +126,7 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.dep_ge20_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND dep_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND dep_delay_pos IS NOT NULL))
 );
 
 CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt`
@@ -124,5 +139,115 @@ FROM (
     (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
   FROM ML.PREDICT(MODEL `disruptions.dep_ge40_clf`,
     (SELECT * FROM `disruptions.training_calls`
-     WHERE is_eval = TRUE AND dep_delay_pos IS NOT NULL))
+     WHERE is_eval = TRUE AND has_situation AND dep_delay_pos IS NOT NULL))
+);
+
+-- ---------------------------------------------------------------------------------------------
+-- The no-SX twins: same recipe, same holdout, the other population. A call nobody published
+-- about still has an upstream delay and a line state, so these are real fits on real signal --
+-- what they must NOT inherit is the flagged population's level.
+-- ---------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT arr_delay_pos >= 5 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.arr_ge5_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND arr_delay_pos IS NOT NULL))
+);
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT arr_delay_pos >= 10 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.arr_ge10_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND arr_delay_pos IS NOT NULL))
+);
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT arr_delay_pos >= 20 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.arr_ge20_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND arr_delay_pos IS NOT NULL))
+);
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT arr_delay_pos >= 40 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.arr_ge40_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND arr_delay_pos IS NOT NULL))
+);
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT dep_delay_pos >= 5 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge5_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND dep_delay_pos IS NOT NULL))
+);
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT dep_delay_pos >= 10 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge10_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND dep_delay_pos IS NOT NULL))
+);
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT dep_delay_pos >= 20 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge20_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND dep_delay_pos IS NOT NULL))
+);
+
+CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_nosx`
+OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
+SELECT
+  LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
+  y
+FROM (
+  SELECT dep_delay_pos >= 40 AS y,
+    (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
+  FROM ML.PREDICT(MODEL `disruptions.dep_ge40_clf`,
+    (SELECT * FROM `disruptions.training_calls`
+     WHERE is_eval = TRUE AND NOT has_situation AND dep_delay_pos IS NOT NULL))
 );
