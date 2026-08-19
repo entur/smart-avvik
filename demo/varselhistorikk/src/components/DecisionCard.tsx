@@ -5,13 +5,13 @@ import {
   OUTCOME_STATE_LABEL,
   VERDICT_LABEL,
   VERDICT_VARIANT,
-  fmtDate,
+  fmtDeparture,
   fmtLooks,
   fmtMin,
   fmtOutcome,
   fmtPct,
-  fmtTime,
   fmtWhen,
+  lineCode,
 } from '../format';
 
 /** The verdict badge, or an explicit "no verdict yet / ever" marker.
@@ -41,38 +41,37 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
   return (
     <article className={`vh-card ${alerted ? 'vh-card--alerted' : ''}`}>
       <header className="vh-card-head">
-        <div>
-          <span className="vh-mode">{decision.mode ?? 'Tog'}</span>
-          <span className="vh-line">{decision.line ?? '–'}</span>
-          {/* Two times, each labelled. They were one unlabelled timestamp until 2026-08-13, and it
-              was read as when the message arrived — it is the departure, and the alert had gone out
-              eleven hours earlier.
+        {/* One line, in timetable order: mode, line, when it leaves, and when we last had an
+            opinion about it.
 
-              The scheduled time is what the passenger calls this train, so it stays in the header
-              whatever the realized departure turns out to be; the realized side belongs under
-              "Faktisk", where it cannot be mistaken for the train's identity. */}
-          <div className="vh-times">
+            Both times were labelled and stacked until 2026-08-19, because before that they were one
+            unlabelled timestamp and it was read as when the message arrived — it is the departure,
+            and the alert had gone out eleven hours earlier. Only ONE of them is unlabelled now, and
+            it is the departure: leftmost, heaviest, sitting against the line pill exactly where a
+            timetable puts it, with the second time still naming itself. That is what keeps the old
+            misreading from coming back with the label.
+
+            The scheduled time is what the passenger calls this train, so it stays in the header
+            whatever the realized departure turns out to be; the realized side belongs under
+            "Faktisk", where it cannot be mistaken for the train's identity. */}
+        <div className="vh-train">
+          <span className="vh-mode">{decision.mode ?? 'Tog'}</span>
+          <span className="vh-line">{lineCode(decision.line)}</span>
+          <span className="vh-departure">{fmtDeparture(decision)}</span>
+          {alerted && decision.first_alert_at ? (
             <span className="vh-when">
-              <span className="vh-time-label">Rutetid</span>
-              {fmtDate(decision.call_date)} kl. {fmtTime(decision.departure_time)}
+              Varsel {fmtWhen(decision.first_alert_at, decision.call_date)}
             </span>
-            {alerted && decision.first_alert_at ? (
-              <span className="vh-when">
-                <span className="vh-time-label">Varslet</span>
-                {fmtWhen(decision.first_alert_at, decision.call_date)}
-              </span>
-            ) : decision.last_decided_at ? (
-              /* A decision we stayed quiet on has no alert time, and its header would otherwise
-                 say nothing at all about when it was taken. The last look is the one that stood —
-                 the closest we came to the departure and still said nothing — which is the fact a
-                 miss turns on. The earlier looks are in the tooltip rather than the header: how
-                 long we had been watching is context, not the decision. */
-              <span className="vh-when" title={fmtLooks(decision)}>
-                <span className="vh-time-label">Sist vurdert</span>
-                {fmtWhen(decision.last_decided_at, decision.call_date)}
-              </span>
-            ) : null}
-          </div>
+          ) : decision.last_decided_at ? (
+            /* A decision we stayed quiet on has no alert time, and its header would otherwise
+               say nothing at all about when it was taken. The last look is the one that stood —
+               the closest we came to the departure and still said nothing — which is the fact a
+               miss turns on. The earlier looks are in the tooltip rather than the header: how
+               long we had been watching is context, not the decision. */
+            <span className="vh-when" title={fmtLooks(decision)}>
+              Sist vurdert {fmtWhen(decision.last_decided_at, decision.call_date)}
+            </span>
+          ) : null}
         </div>
         <div className="vh-card-badges">
           {/* Which side of the split this row is on. Without it the segmented rates at the top
