@@ -31,9 +31,19 @@
 --     eval/impact_eval.py, the arr side + remaining heads A/B-checked the same way.
 --     p_arr_ge10_h / p_dep_ge10_h expose the alert ge10 terms; platt_lead_bucket the bucket.
 --
+-- PLUS, since 2026-08-19, one row per call ET has ALREADY DECLARED CANCELLED that no situation
+-- named. Those consult no model -- a declared cancellation is a fact about the timetable, not a
+-- forecast -- and are the reason varsel stops being blind to a train it can already see is gone.
+-- See the `et_cancelled` / `covered` / `et_only` CTEs and the UNION ALL that closes the file.
+--
 -- Cheap: reads the small materialized rail_calls_planned_today + today's situations + ML.PREDICT
 -- (no ET scan here -- that cost is in rail_calls_planned_today.sql, rebuilt on a TTL by main.py).
 -- Keep the feature block + scoring tail in sync with data/queries/predict_calls_today.sql.
+-- The ET-cancellation relay below is deliberately NOT part of that sync: it is a serving
+-- concern (it exists so varsel and /impact see a train ET already knows is gone), and its
+-- rows carry a flat 1.0 rather than a model output. In an evaluation query they would be
+-- free correct answers nobody predicted -- the same reason /historikk segments them out of
+-- model skill.
 CREATE OR REPLACE TABLE `disruptions.call_predictions_today` AS
 WITH
 cat AS (
@@ -557,6 +567,64 @@ scored AS (
   JOIN wdh   ON wdh.lead_bucket   = c.lead_bucket
   JOIN wd20h ON wd20h.lead_bucket = c.lead_bucket
   JOIN wd40h ON wd40h.lead_bucket = c.lead_bucket
+),
+-- ---- ET-DECLARED CANCELLATIONS THAT NO SITUATION NAMED ----------------------------------------
+-- Everything above scores calls an SX situation pointed at. A cancellation ET has ALREADY DECLARED
+-- needs neither a situation nor a model: `impact._cancelled_prediction` replaces every score with
+-- the certainty (p_cancel 1.0, alerting score 1.0, every delay figure dropped -- each one meant "if
+-- it runs") the moment `et_declared_cancelled` is set, and `_call_severity`/`_alert_score` restate
+-- it. So these rows carry that certainty directly and consult no model at all: the row RELAYS a
+-- fact instead of predicting one, which is also how `decisions.et_cancelled` segments it on
+-- /historikk. Without them varsel is blind to a train it can already see is gone -- measured in dev
+-- on 2026-08-19: 90 declared-cancelled rail calls, 70 named by a situation and 20 not.
+--
+-- ANTI-JOINED PER CALL, never per journey. A situation's reach is 12 h from ITS onset, so one
+-- journey can have some calls named and others not; and a second row for a call the models already
+-- scored would put two boxes about one train on the card. `varsel.one_alert_per_train` would
+-- collapse those, but leaning on it here would be wrong -- it deliberately does not reach the
+-- decision log, where every situation keeps its own row.
+--
+-- ONE SYNTHETIC SITUATION PER JOURNEY, because `situationNumber` is the identity every consumer
+-- keys on: /impact renders one card per situation, `impact._alternatives_by_situation` spends one
+-- replacement lookup per situation, varsel dedups pushes on (journey, situationNumber) and
+-- `varsel_decisions` CLUSTERs on it. Per journey is the one grain that makes all four right. The
+-- `KIX:` prefix keeps it clear of the publisher namespaces (`ENT:`, `NSB:`) so it can never collide
+-- with a real SX ref; the cost is that GET /situation/{id} has nothing to render for one, which is
+-- the honest answer -- there is no SX message behind it.
+et_cancelled AS (
+  SELECT
+    r.jkey, r.lineRef, r.stop_place, r.stop_name, r.stop_order,
+    r.aimed_dep, r.aimed_arr, r.dep_delay_min, r.call_source,
+    -- The cancelled stretch, for the summary. Computed over EVERY cancelled call of the journey
+    -- rather than over what the anti-join below happens to leave, so the headline describes the
+    -- disruption and not the leftovers. IGNORE NULLS because stop_name arrives through a LEFT JOIN
+    -- in the planned source and one missing name should not blank the headline.
+    FIRST_VALUE(r.stop_name IGNORE NULLS) OVER seg AS seg_from,
+    LAST_VALUE(r.stop_name IGNORE NULLS)  OVER seg AS seg_to
+  FROM `disruptions.rail_calls_planned_today` AS r
+  WHERE r.call_cancelled
+    AND (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
+  WINDOW seg AS (
+    PARTITION BY r.jkey ORDER BY r.stop_order
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  )
+),
+covered AS (
+  SELECT DISTINCT jkey, stop_order FROM base
+),
+et_only AS (
+  SELECT e.*
+  FROM et_cancelled AS e
+  LEFT JOIN covered AS c ON c.jkey = e.jkey AND c.stop_order = e.stop_order
+  WHERE c.jkey IS NULL
+    -- The same 12 h reach forward that a situation's window has, and one hour back so a call whose
+    -- time has only just passed still answers /impact for somebody on the platform and can still be
+    -- the trip's `latest_observation` (impact._is_observed admits a declared cancellation only once
+    -- its own time has passed). The SX path already carries past calls -- its window opens at an
+    -- onset that is itself in the past -- so this is a narrower lookback than what is served today,
+    -- not a new kind of row.
+    AND TIMESTAMP_DIFF(COALESCE(e.aimed_dep, e.aimed_arr), CURRENT_TIMESTAMP(), MINUTE)
+        BETWEEN -60 AND 720
 )
 SELECT
   s.situationNumber, s.summary, sd.description, s.onset_ts,
@@ -647,4 +715,60 @@ LEFT JOIN `disruptions.delay_p90_calib` AS dpq
   ON dpq.side = 'dep' AND dpq.plog_bucket = LEAST(GREATEST(ROUND(s.dep_plog,1), bd.lo), bd.hi)
 LEFT JOIN bounds AS ba ON ba.side = 'arr'
 LEFT JOIN `disruptions.delay_p90_calib` AS apq
-  ON apq.side = 'arr' AND apq.plog_bucket = LEAST(GREATEST(ROUND(s.arr_plog,1), ba.lo), ba.hi);
+  ON apq.side = 'arr' AND apq.plog_bucket = LEAST(GREATEST(ROUND(s.arr_plog,1), ba.lo), ba.hi)
+
+UNION ALL
+-- The ET-declared cancellations no situation named (see `et_only` above). Certainty in place of
+-- every model score, and NULL for every figure whose meaning was "if it runs" -- the exact shape
+-- `impact._cancelled_prediction` would impose on a scored row anyway, written here so nothing has
+-- to be un-predicted downstream. Column order is the contract: this list must stay in step with
+-- the SELECT above it, which is what a UNION ALL checks by name-independent position.
+SELECT
+  CONCAT('KIX:ETCancellation:', e.jkey) AS situationNumber,
+  CASE
+    WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Innstilt avgang'
+    WHEN e.seg_from = e.seg_to                  THEN CONCAT('Innstilt fra ', e.seg_from)
+    ELSE CONCAT('Innstilt ', e.seg_from, '–', e.seg_to)
+  END AS summary,
+  'Avgangen er markert innstilt i operatørens sanntidsdata.' AS description,
+  -- No SX message means no creationTime, so there is no onset to state and nothing to measure from.
+  -- NULL rather than CURRENT_TIMESTAMP(), which would be the build time -- not when anybody declared
+  -- anything, and different on every rebuild. Nothing reads either column off this table (checked
+  -- 2026-08-19); they are here for parity with the situation-derived rows above.
+  CAST(NULL AS TIMESTAMP) AS onset_ts,
+  e.jkey, e.lineRef, e.stop_place, e.stop_name, e.stop_order,
+  e.aimed_dep, e.aimed_arr,
+  (e.aimed_dep IS NULL) AS is_terminal,
+  (e.aimed_arr IS NULL) AS is_origin,
+  CAST(NULL AS INT64)   AS min_from_onset,
+  TRUE                  AS et_declared_cancelled,
+  e.dep_delay_min       AS et_dep_delay_min,
+  e.call_source,
+  1.0                   AS p_cancel,
+  CAST(NULL AS INT64)   AS dep_delay_typ_min,
+  CAST(NULL AS INT64)   AS dep_delay_p90_min,
+  CAST(NULL AS INT64)   AS arr_delay_typ_min,
+  CAST(NULL AS INT64)   AS arr_delay_p90_min,
+  CAST(NULL AS FLOAT64) AS p_arr_ge5,
+  CAST(NULL AS FLOAT64) AS p_arr_ge10,
+  CAST(NULL AS FLOAT64) AS p_arr_ge20,
+  CAST(NULL AS FLOAT64) AS p_arr_ge40,
+  CAST(NULL AS INT64)   AS arr_delay_p50_stack_min,
+  CAST(NULL AS INT64)   AS arr_delay_p90_stack_min,
+  -- The alerting scores, and the only two figures that are not NULL: 1.0, on the side that exists.
+  -- An origin has no arrival and a terminal has no departure, so the per-side NULLing is the same
+  -- rule the scored branch applies -- `impact._alert_score` reads both sides and takes the max.
+  IF(e.aimed_arr IS NULL, NULL, 1.0) AS p_impact,
+  CAST(NULL AS FLOAT64) AS p_dep_ge5,
+  CAST(NULL AS FLOAT64) AS p_dep_ge10,
+  CAST(NULL AS FLOAT64) AS p_dep_ge20,
+  CAST(NULL AS FLOAT64) AS p_dep_ge40,
+  CAST(NULL AS INT64)   AS dep_delay_p50_stack_min,
+  CAST(NULL AS INT64)   AS dep_delay_p90_stack_min,
+  IF(e.aimed_dep IS NULL, NULL, 1.0) AS p_impact_dep,
+  CAST(NULL AS FLOAT64) AS p_arr_ge10_h,
+  CAST(NULL AS FLOAT64) AS p_dep_ge10_h,
+  -- No model was scored, so no platt layer calibrated anything. Naming a bucket here would claim a
+  -- calibration that never ran.
+  CAST(NULL AS STRING)  AS platt_lead_bucket
+FROM et_only AS e;
