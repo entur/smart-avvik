@@ -1,8 +1,14 @@
 /* Avviksvarsel service worker (scope /varsel/).
  *
  * Two jobs only — there is no offline/caching layer (the app is a thin online client):
- *   push              show the notification the server pushed (title/body/url in the payload)
- *   notificationclick focus an already-open app window, or open /varsel/
+ *   push              show the notification the server pushed (title/body/url/icon in the payload)
+ *   notificationclick focus an already-open app window, or open the url the payload named
+ *
+ * ONE service worker serves every brand: the scope is /varsel/, and ?brand= is a query parameter
+ * inside it. So the brand cannot be baked in here — it rides on the payload, which the server
+ * builds from the brand the device registered under (see varsel.py's _brand_assets). Both fields
+ * fall back to the Entur defaults, so a payload from an older API still shows a correct
+ * notification rather than a broken icon.
  */
 
 self.addEventListener('install', () => self.skipWaiting());
@@ -18,7 +24,8 @@ self.addEventListener('push', (event) => {
   const title = data.title || 'Avviksvarsel';
   const options = {
     body: data.body || '',
-    icon: '/varsel/icons/pwa-192.png',
+    icon: data.icon || '/varsel/icons/pwa-192.png',
+    // Not branded: Android draws the badge as a silhouette, so it has no colour to carry.
     badge: '/varsel/icons/badge-72.png',
     lang: 'nb',
     // Same situation replaces its previous notification instead of stacking.

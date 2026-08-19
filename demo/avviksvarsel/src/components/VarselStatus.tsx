@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { PrimaryButton, SecondaryButton, TertiaryButton } from '@entur/button';
 import { SmallAlertBox } from '@entur/alert';
 import { Paragraph, SubParagraph } from '@entur/typography';
+import type { Brand } from '../brand';
 import type { Config } from '../api';
 import { deleteDevice, registerDevice, sendTestPush } from '../api';
 import { disablePush, enablePush, getExistingSubscription, isIOS, isPushSupported, isStandalone } from '../push';
@@ -43,7 +44,15 @@ function ShareGlyph() {
   );
 }
 
-export default function VarselStatus({ config, deviceId }: { config: Config; deviceId: string }) {
+export default function VarselStatus({
+  config,
+  deviceId,
+  brand,
+}: {
+  config: Config;
+  deviceId: string;
+  brand: Brand;
+}) {
   const [state, setState] = useState<State>(() => computeState(config));
   const [subscribed, setSubscribed] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -59,12 +68,14 @@ export default function VarselStatus({ config, deviceId }: { config: Config; dev
     getExistingSubscription().then((sub) => {
       if (cancelled) return;
       setSubscribed(Boolean(sub));
-      if (sub) void registerDevice(deviceId, sub.toJSON()).catch(() => undefined);
+      // Re-registering also refreshes the stored brand, so opening the app under a different
+      // ?brand= moves this device's notifications with it rather than stranding them.
+      if (sub) void registerDevice(deviceId, sub.toJSON(), brand.id).catch(() => undefined);
     });
     return () => {
       cancelled = true;
     };
-  }, [state, deviceId]);
+  }, [state, deviceId, brand]);
 
   const enable = useCallback(async () => {
     setBusy(true);
@@ -72,7 +83,7 @@ export default function VarselStatus({ config, deviceId }: { config: Config; dev
     setNotice(null);
     try {
       const subscription = await enablePush(config.vapid_public_key!);
-      await registerDevice(deviceId, subscription);
+      await registerDevice(deviceId, subscription, brand.id);
       setSubscribed(true);
       setState('granted');
       setNotice('Varsler er slått på.');
@@ -82,7 +93,7 @@ export default function VarselStatus({ config, deviceId }: { config: Config; dev
     } finally {
       setBusy(false);
     }
-  }, [config, deviceId]);
+  }, [config, deviceId, brand]);
 
   const test = useCallback(async () => {
     setBusy(true);
