@@ -110,6 +110,12 @@ class CallPred:
     dep_delay_p50_stack_min: int | None
     dep_delay_p90_stack_min: int | None
     p_impact_dep: float | None
+    # Whether an SX message named this call at all. FALSE rows are scored by the same heads through
+    # the same features, but against their own Platt layers and their own base rate, so the number
+    # in `p_impact_dep` is not the same object as a flagged row's at the same nominal value -- which
+    # is why the alert gate takes it (`alert_policy.threshold_for`) rather than assuming one scale.
+    # Defaults TRUE: the bus family has no such column, and every row it produces is SX-derived.
+    has_situation: bool = True
 
 
 class StopPrediction(BaseModel):
@@ -218,6 +224,14 @@ class SituationImpact(BaseModel):
     )
     arrival_prediction: StopPrediction | None = Field(
         description="Worst-case alighting prediction; null when `to_stop` is omitted.",
+    )
+    has_situation: bool = Field(
+        default=True,
+        description="False when no SX message named this train at all and the numbers above are a "
+        "prediction from real-time data alone (`situation_number` is then a synthetic "
+        "`KIX:NoSituation:<jkey>`, and there is no operator text behind `summary`). Such rows are "
+        "scored by the same models but calibrated against their own base rate, so they are cut at "
+        "their own alerting threshold — see `alert_policy.threshold_for`.",
     )
     alternative_journey: AlternativeJourney | None = Field(
         default=None,
@@ -357,6 +371,10 @@ class TripCell:
     arrival: StopPrediction | None
     calls: tuple = ()
     line_calls: tuple = ()
+    # Carried from the calls this cell was built out of, so the gate can be asked the same question
+    # here as at the call level. A cell mixing populations cannot arise: a situation is either an
+    # SX one or a synthetic per-journey `KIX:` one, never both.
+    has_situation: bool = True
 
 
 def _certainly_cancelled(c: CallPred) -> bool:
@@ -616,6 +634,11 @@ def _trip_cells(
                     # O(calls x lines), on both the /impact request path and every poller journey).
                     calls=tuple(by_journey.get((bcall.operator, bcall.jkey), ())),
                     line_calls=tuple(by_line_all.get(line, ())),
+                    # Off the BOARDING call, which is the one every score on this cell is read
+                    # from. A cell cannot straddle the two populations: cells are built per
+                    # situation, and a situation is either an operator's or a synthetic per-journey
+                    # `KIX:` one.
+                    has_situation=bcall.has_situation,
                 )
             )
     return cells
@@ -761,6 +784,7 @@ def _impact_response(
                 jkey=worst_cell.jkey,
                 departure_prediction=_worst([c.departure for c in group]),
                 arrival_prediction=_worst([c.arrival for c in group]),
+                has_situation=group[0].has_situation,
                 alternative_journey=outcome.journey,
                 original_is_best=outcome.original_is_best,
                 alternative_subject=outcome.subject,
@@ -1077,7 +1101,10 @@ def _score_candidate(
     #
     # The gate is the FOUND CALL's operator, never the JP codespace: `threshold_for` is calibrated
     # per operator against that operator's own predictions.
-    risky = any(_alert_score(c) >= alert_policy.threshold_for(c.operator) for c in resolved)
+    risky = any(
+        _alert_score(c) >= alert_policy.threshold_for(c.operator, has_situation=c.has_situation)
+        for c in resolved
+    )
     if not risky:
         # A leg is identified here by its line ref, which is the one key both the candidate and a
         # CallPred carry (JP legs expose no service-journey ref through `AlternativeLeg`). A line no
@@ -1172,7 +1199,7 @@ def _original_candidate(
         aimed_arrival_time=deadline,
         cancelled=cell.departure.cancelled,
         risky=(cell.departure.impact_probability or 0.0)
-        >= alert_policy.threshold_for(cell.operator),
+        >= alert_policy.threshold_for(cell.operator, has_situation=cell.has_situation),
         is_original=True,
         transit_refs=[(cell.operator, cell.jkey)] if cell.jkey else [],
         lines=[cell.line] if cell.line else [],

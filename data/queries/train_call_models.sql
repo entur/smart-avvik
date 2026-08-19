@@ -39,10 +39,17 @@
 -- thing to retrain. The pooled head wins on everything that is not a rounding error.
 --
 -- SIZE, at 7.24 M rows (5.5x the pre-2026-08-19 table). Measured on the promotion run: the
--- cancellation classifier below billed 285 GB (~$1.78) and took 81 min WITHOUT global explain;
--- the ten 50-iteration heads are ~40 GB / ~15 min each. Turn enable_global_explain back on only
--- for a run whose attributions you intend to read -- at this size the explain phase, not the
--- training, is what makes a retrain an overnight job (5.4 h at the OLD size).
+-- cancellation classifier below billed 285 GB (~$1.78) and took 81 min; the ten 50-iteration
+-- heads are ~40 GB / ~15 min each.
+--
+-- enable_global_explain IS NOW FALSE EVERYWHERE (2026-08-19). It was TRUE, and at the old size
+-- that already made a retrain a 5.4 h job with the explain phase -- not the training -- as the
+-- 5-hour part; at 5.5x the rows it would make one an overnight job nobody schedules, which in
+-- practice means the heads stop being retrained at all. ML.FEATURE_IMPORTANCE needs none of it:
+-- it reads gain and split counts straight off a boosted-tree model however it was trained, and
+-- it is what produced the attributions quoted in this file. Turn the option back on only for a
+-- run that needs Shapley-style per-row explanations specifically, and expect to leave it
+-- overnight.
 
 -- 1. Cancellation classifier --------------------------------------------------------------
 -- Contract: ALL feature columns incl. the 2026-07-02 category/text/propagation set. Measured
@@ -73,7 +80,7 @@ OPTIONS(
   colsample_bytree  = 0.8,
   early_stop        = FALSE,
   data_split_method = 'NO_SPLIT',
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, dep_delay_pos, arr_delay_pos, is_eval)
 FROM `disruptions.training_calls`
@@ -93,7 +100,7 @@ OPTIONS(
   input_label_cols  = ['dep_log'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place,
@@ -111,7 +118,7 @@ OPTIONS(
   input_label_cols  = ['arr_log'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place,
@@ -142,7 +149,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),
@@ -156,7 +163,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),
@@ -170,7 +177,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),
@@ -184,7 +191,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),
@@ -203,7 +210,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),
@@ -217,7 +224,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),
@@ -231,7 +238,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),
@@ -245,7 +252,7 @@ OPTIONS(
   input_label_cols  = ['y_ge'],
   max_iterations    = 50,
   early_stop        = TRUE,
-  enable_global_explain = TRUE
+  enable_global_explain = FALSE
 ) AS
 SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos, arr_delay_pos, is_eval,
                 planned, num_lines, is_terminal, is_origin, stop_place),

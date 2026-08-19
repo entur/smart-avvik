@@ -434,6 +434,81 @@ def _relay_journey():
     ]
 
 
+NOSX_SIT = "KIX:NoSituation:DatedServiceJourney:nosx"
+
+
+def _nosx_call(**kw):
+    """One call shaped as predict_calls.sql's SCORED no-SX branch emits it.
+
+    Distinct from both neighbours above. A relay row carries a certainty and no model output; this
+    one is the opposite -- a full set of model figures with no situation behind them. Its
+    situationNumber is synthetic, its summary is text this codebase wrote rather than an operator's,
+    and `has_situation` is what says so.
+    """
+    fields = {
+        "jkey": "DatedServiceJourney:nosx",
+        "situation_number": NOSX_SIT,
+        "summary": "Mulig avvik – ingen melding fra operatøren",
+        "description": "Ingen situasjonsmelding er publisert for denne avgangen.",
+        "stop_place": A,
+        "stop_order": 1,
+        "stop_name": "Asker",
+        "aimed_dep": _at(15, 3),
+        "aimed_arr": None,
+        "has_situation": False,
+        "et_declared_cancelled": False,
+        "p_cancel": 0.10,
+        "p_impact_dep": 0.62,
+        "p_impact": None,
+        "p_dep_ge10": 0.58,
+    }
+    fields.update(kw)
+    return FakeCall(**fields)
+
+
+def test_a_no_sx_call_is_gated_at_the_no_sx_threshold():
+    """The gate is chosen by POPULATION, not by operator. GOA's tuned 0.50 is a number fitted to
+    predictions calibrated on flagged calls; applying it to a no-SX probability would cut a
+    different distribution at a bar that was never measured against it."""
+    call = _nosx_call(operator="GOA")
+    assert alert_policy.threshold_for(call.operator) == 0.50
+    assert alert_policy.threshold_for(
+        call.operator, has_situation=call.has_situation
+    ) == alert_policy._NOSX_ALERT_THRESHOLD
+
+
+def test_a_no_sx_situation_reports_its_population_to_its_readers():
+    """`/impact` has to say which population a situation came from, or every reader downstream --
+    the alert gate, both wordings, /historikk's segmentation -- is left inferring it from the
+    `KIX:` prefix, which makes a naming convention load-bearing for alerting policy."""
+    _snapshot.clear()
+    _snapshot.update({NOSX_SIT: [_nosx_call()]})
+    resp = impact.for_trip(
+        from_stop=A, to_stop=None,
+        window_start=_at(14, 0), window_end=_at(16, 0), with_alternative=False,
+        select="worst",
+    )
+    (sit,) = resp.situations
+    assert sit.situation_number == NOSX_SIT
+    assert sit.has_situation is False
+
+
+def test_a_flagged_situation_still_reports_itself_as_flagged():
+    """The default has to survive: every situation that predates this population is a flagged one,
+    and a field that silently flipped would move which threshold they are all cut at."""
+    _snapshot.clear()
+    _snapshot.update({RELAY_SIT: [_relay_call()]})
+    resp = impact.for_trip(
+        from_stop=A, to_stop=None,
+        window_start=_at(14, 0), window_end=_at(16, 0), with_alternative=False,
+        select="worst",
+    )
+    (sit,) = resp.situations
+    # A relay row is not scored, but it IS a CallPred like any other and defaults to flagged unless
+    # the serving row said otherwise -- the FakeCall default, matching impact.CallPred's.
+    assert sit.has_situation is True
+
+
 def test_relay_row_alerts_on_the_certainty_alone():
     """A row with no prediction on it still clears every gate, because "this train is cancelled" is
     not a prediction. Both orderings have to reach that verdict without touching a NULL figure."""
