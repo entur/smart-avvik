@@ -149,6 +149,33 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   job scores it correctly, but if reinstatements turn out to be common the certainty should go back
   to hedging for departures still some way off. Note `/journey` still serves the model's probability
   for a known-cancelled call — same defect, separate contract, not yet fixed.
+  **A cancellation ET has declared needs no SX message** (2026-08-19): `predict_calls.sql` and
+  `predict_calls_bus.sql` now UNION in one row per declared-cancelled call that **no situation
+  named**, consulting no model — `impact._cancelled_prediction` was going to replace every score
+  with the certainty anyway. Until then the whole stack was gated on an operator having published
+  SX about the train: measured in dev on 2026-08-19, 90 declared-cancelled rail calls, 70 named by
+  a situation and **20 not**, and on the bus side 3 602 uncovered calls across 706 journeys. The
+  train was gone, our own cache could see it, and the card said "ingen aktive avvik akkurat nå".
+  Three things the shape gets right that are each easy to get backwards. The anti-join is **per
+  call, not per journey**: a situation reaches 12 h from ITS onset, so one journey can have some
+  calls named and others not, and a duplicate row would put two boxes about one train on the card
+  (`varsel.one_alert_per_train` would collapse them, but leaning on it would be wrong — it
+  deliberately does not reach the decision log, where every situation keeps its row). The synthetic
+  `situationNumber` is **one per journey** (`KIX:ETCancellation:<jkey>`, plus operator and call_date
+  on the bus side, where jkeys are date-scoped by neither), because that is the grain /impact
+  renders a card at, `impact._alternatives_by_situation` spends a lookup at, varsel dedups pushes at
+  and `varsel_decisions` CLUSTERs at — and it is stable across cycles, which is what keeps the
+  traveller to one push per cancelled train. And the row carries only **1.0 and NULL**, never a
+  model number: every delay figure meant "if it runs". The `KIX:` prefix keeps it clear of the
+  publisher namespaces (`ENT:`, `NSB:`), at the cost that `GET /situation/{id}` has nothing to
+  render for one — the honest answer, since there is no SX message behind it.
+  **What bounds the relay is `_PLANNED_TTL`, not the poller cadence.** It reads
+  `rail_calls_planned_today` / `bus_calls_planned_today`, each rebuilt at most once per **60 min**
+  (rail) / **120 min** (bus) because each is an ~8 GB / ~12 GB ET partition scan, so a cancellation
+  declared just after a rebuild waits that long to reach anybody. Tightening the rail TTL is the one
+  lever and it costs linearly — ~190 GB/day per environment at 60 min, ~$1.2, doubling at 30 min.
+  Expect the `relayed` segment on `/historikk` to grow sharply against `predicted`: that is the
+  point of the change, and exactly why that headline is segmented rather than quoted blended.
   **An observation is in the past** (2026-08-05): a declared cancellation is routinely published for
   calls the train has not reached — announcing it ahead of time is the point — so `impact._is_observed`
   admits one only once its own time has passed, while a `recorded` call is an observation by
