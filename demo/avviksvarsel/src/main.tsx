@@ -18,8 +18,14 @@ import '@entur/menu/dist/styles.css';
 import '@entur/a11y/dist/styles.css';
 import '@entur/loader/dist/styles.css';
 
+// Brand overrides LAST — they win on specificity (`:root[data-brand=…]`), but only once the rules
+// they override have been defined. Every brand but Entur has a sheet here; Entur is Linje as
+// shipped, so it has none, and a page with no `brand` parameter loads nothing extra.
+import './brands/none.css';
+
 import App from './App';
 import { reportClientError } from './api';
+import { applyBrand, resolveBrand } from './brand';
 import './styles.css';
 
 // Uncaught exceptions and promise rejections are forwarded to the server log (best-effort,
@@ -36,8 +42,13 @@ window.addEventListener('unhandledrejection', (event) => {
   );
 });
 
+// index.html has already set data-brand from the same parameter, so the palette is painted; this
+// repoints the head assets (manifest, favicons, theme colour) that only the registry knows about.
+const brand = resolveBrand();
+applyBrand(brand);
+
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <App />
+    <App brand={brand} />
   </StrictMode>,
 );

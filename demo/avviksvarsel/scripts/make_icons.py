@@ -1,9 +1,14 @@
-"""Generate the Avviksvarsel PWA icons and favicon — the Entur logo mark on Entur Lavender.
+"""Generate the Avviksvarsel PWA icons and favicons — one set per brand.
 
-The home-screen / PWA / favicon artwork is the official Entur "EN" logo (white wordmark + coral
-underline, i.e. @entur/icons' LogoNegativeIcon) on the app's Lavender-90 theme colour, so /varsel
-reads as Entur-branded. The Entur logo paths are pure straight-line geometry, so we render them
-faithfully with Pillow (no SVG toolchain needed) — same approach as before.
+DEFAULT BRAND (Entur). The home-screen / PWA / favicon artwork is the official Entur "EN" logo
+(white wordmark + coral underline, i.e. @entur/icons' LogoNegativeIcon) on the app's Lavender-90
+theme colour, so /varsel reads as Entur-branded. The Entur logo paths are pure straight-line
+geometry, so we render them faithfully with Pillow (no SVG toolchain needed).
+
+BRAND "none" (?brand=none). The unbranded variant needs its own set, or an install made from it
+would sit on the phone under the Entur mark and push a notification carrying it — the two places
+a page-level reskin does not reach. It reuses the bell glyph already drawn here for the Android
+badge, on the petrol accent /demo uses: a notification app, saying nothing about who runs it.
 
 Regenerate with:
     uv run --with pillow python demo/avviksvarsel/scripts/make_icons.py
@@ -14,6 +19,7 @@ Outputs into demo/avviksvarsel/public/:
   favicon.svg (+ favicon-32, favicon-16)                    — browser-tab favicon (vector + PNG).
   icons/badge-72                                            — white bell glyph on transparent, the
       monochrome Android notification badge (a "notification" glyph, not the app icon — left alone).
+  the same six, suffixed `-none`                            — the unbranded set.
 """
 
 import re
@@ -25,6 +31,10 @@ LAVENDER_90 = (24, 28, 86, 255)  # Entur --lavender-90 #181c56
 WHITE = (255, 255, 255, 255)
 CORAL = (255, 89, 89, 255)  # Entur logo underline #FF5959
 TRANSPARENT = (0, 0, 0, 0)
+# The unbranded icon tile. This is /demo's petrol accent rather than the #002c2d the brand sheet
+# recolours the header band to: that one is nearly black, which reads as a smudge at 48 px on a
+# home screen. The tab favicon and the app icon are looked at, not matched against the masthead.
+PETROL = (22, 99, 107, 255)  # /demo --accent #16636b
 SS = 4  # supersample factor for crisp anti-aliased edges
 
 OUT = Path(__file__).resolve().parent.parent / "public"
@@ -143,6 +153,30 @@ def make_bell(path: Path, size: int, *, background, glyph=WHITE) -> None:
     print(f"  wrote {path.relative_to(OUT.parent)} ({size}x{size})")
 
 
+def _bell_svg_paths(box: int) -> str:
+    """The bell glyph as SVG, geometry matching `_draw_bell` on an s x s canvas."""
+    s = float(box)
+    cx, r = s / 2, 0.16 * s
+    dome_cy, flare_bottom, flare_half = 0.40 * s, 0.62 * s, 0.24 * s
+    rim_half, k, c = flare_half + 0.02 * s, 0.045 * s, 0.05 * s
+    return f"""  <path fill="#FFF" d="M{cx - r:.2f} {dome_cy:.2f} a{r:.2f} {r:.2f} 0 0 1 {2 * r:.2f} 0 z"/>
+  <path fill="#FFF" d="M{cx - r:.2f} {dome_cy:.2f} L{cx + r:.2f} {dome_cy:.2f} L{cx + flare_half:.2f} {flare_bottom:.2f} L{cx - flare_half:.2f} {flare_bottom:.2f} z"/>
+  <rect fill="#FFF" x="{cx - rim_half:.2f}" y="{flare_bottom - 0.015 * s:.2f}" width="{2 * rim_half:.2f}" height="{0.66 * s - flare_bottom + 0.015 * s:.2f}" rx="{0.03 * s:.2f}"/>
+  <circle fill="#FFF" cx="{cx:.2f}" cy="{0.20 * s:.2f}" r="{k:.2f}"/>
+  <circle fill="#FFF" cx="{cx:.2f}" cy="{0.72 * s:.2f}" r="{c:.2f}"/>"""
+
+
+def make_bell_favicon_svg(path: Path, *, box: int = 32) -> None:
+    """A crisp vector favicon for the unbranded variant: the bell on a full-bleed petrol tile."""
+    fill = "#{:02x}{:02x}{:02x}".format(*PETROL[:3])
+    path.write_text(
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {box} {box}">\n'
+        f'  <rect width="{box}" height="{box}" fill="{fill}"/>\n'
+        f"{_bell_svg_paths(box)}\n</svg>\n"
+    )
+    print(f"  wrote {path.relative_to(OUT.parent)} (vector)")
+
+
 def make_favicon_svg(path: Path, *, box: int = 32, width_frac: float = 0.72) -> None:
     """A crisp vector favicon: the Entur logo on a full-bleed Lavender tile."""
     sc = width_frac * box / LOGO_W
@@ -163,6 +197,8 @@ def make_favicon_svg(path: Path, *, box: int = 32, width_frac: float = 0.72) -> 
 
 def main() -> None:
     ICONS.mkdir(parents=True, exist_ok=True)
+
+    print("Entur (default brand):")
     # Home-screen / PWA icons (0.58 width keeps the mark inside the Android maskable safe zone).
     make_logo(ICONS / "pwa-192.png", 192, width_frac=0.58)
     make_logo(ICONS / "pwa-512.png", 512, width_frac=0.58)
@@ -172,7 +208,16 @@ def main() -> None:
     make_logo(OUT / "favicon-32.png", 32, width_frac=0.72)
     make_logo(OUT / "favicon-16.png", 16, width_frac=0.72)
     # Notification badge: monochrome white bell on transparent (Android renders it as a mask).
+    # Brand-independent -- Android draws it as a silhouette, so there is no colour to brand.
     make_bell(ICONS / "badge-72.png", 72, background=TRANSPARENT)
+
+    print('brand "none" (unbranded):')
+    for name, size in (("pwa-192", 192), ("pwa-512", 512), ("apple-touch-icon-180", 180)):
+        make_bell(ICONS / f"{name}-none.png", size, background=PETROL)
+    make_bell_favicon_svg(OUT / "favicon-none.svg")
+    make_bell(OUT / "favicon-none-32.png", 32, background=PETROL)
+    make_bell(OUT / "favicon-none-16.png", 16, background=PETROL)
+
     print(f"Icons written to {OUT}")
 
 
