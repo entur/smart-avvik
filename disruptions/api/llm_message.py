@@ -168,10 +168,13 @@ Regler:
 - Bruk KUN tall, tider, stoppesteder og linjenavn som finnes i dataene. Du skal aldri gjette, \
 regne ut nye tall eller finne på detaljer.
 - Omtal avgangen med linje og avgangstid, slik det står på et avgangsskilt: \
-«<transportmiddel> <linje> <avgang_kl>», f.eks. «Tog L1 09:24» eller «Buss 31 09:24». Skriv \
+«<transportmiddel> <linje> <avgang_kl>», f.eks. «tog L1 09:24» eller «buss 31 09:24». Skriv \
 aldri «toget kl. 09:24» eller «bussen din» uten linje – den reisende har som regel flere linjer \
 å velge mellom, og klokkeslettet alene sier ikke hvilket tog det gjelder. Hvis `linje` mangler i \
 dataene, skriv «<transportmiddel> kl <avgang_kl>» og finn aldri på et linjenummer.
+- `transportmiddel` står med stor forbokstav i dataene, men «tog», «buss», «trikk», «T-bane» og \
+«båt» er vanlige substantiv på norsk. Skriv dem med liten forbokstav: «Ta tog L1 09:24», ikke \
+«Ta Tog L1 09:24». Stor forbokstav bare når ordet står først i setningen.
 - `innstilt: true` betyr at avgangen ALLEREDE ER INNSTILT – det er et faktum, ikke en \
 sannsynlighet. Skriv at toget/bussen ER innstilt, aldri «kan bli» eller «sjanse for». I det \
 tilfellet finnes verken `sannsynlighet_prosent` eller `forsinkelse_min` i dataene, og du skal \
@@ -202,7 +205,7 @@ sier hvor på linja avviket gjelder – de er ikke den reisendes reisevei. Skriv
 «ta neste tog mellom X og Y» med stedsnavn derfra.
 - Hvis `alternativ_reise` finnes, er det rådet. Si hvilken avgang den reisende skal ta, på samme \
 form som over: linja i FØRSTE etappe i `alternativ_reise.reisevei` sammen med \
-`alternativ_reise.avgang_kl`, f.eks. «Ta Tog R11 08:24». Senere etapper er bytter underveis – \
+`alternativ_reise.avgang_kl`, f.eks. «Ta tog R11 08:24». Senere etapper er bytter underveis – \
 nevn dem bare hvis det er plass, og aldri i stedet for den første.
 - `alternativ_reise.ankommer_i_tide: false` betyr at alternativet er FRAMME ETTER den planlagte \
 ankomsten. Si det rett ut: dette er neste mulighet, og den er senere enn planlagt ankomst.

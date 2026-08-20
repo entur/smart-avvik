@@ -247,10 +247,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
   - Non-prod deployments label themselves in the PWA header and tab title —
-    `Avviksvarsel (dev)` — and in the **push title** (`[dev] Avvik: …`, prefixed because phones
-    truncate on the right), because dev and prd installs are otherwise identical on a phone and in
-    the notification tray (the manifest name and icons are baked into the one image every
-    environment shares). The tag goes in the title only, never the body, so the wording
+    `Avviksvarsel (dev)` — and in the **push title** (`[dev] Oslo S → Lillehammer`, prefixed
+    because phones truncate on the right), because dev and prd installs are otherwise identical on
+    a phone and in the notification tray (the manifest name and icons are baked into the one image
+    every environment shares). The tag goes in the title only, never the body, so the wording
     `/historikk` records is the same text in every environment.
     `/varsel-api/config` serves the name. The one derivation lives in
     `disruptions/api/deployment.py` (`environment_label()`), shared with `/historikk`: it reads the

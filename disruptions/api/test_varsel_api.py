@@ -554,7 +554,7 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     )
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1
-    assert sent[0]["title"] == "Avvik: Oslo S → Lillehammer"
+    assert sent[0]["title"] == "Oslo S → Lillehammer"
     assert sent[0]["url"] == "/varsel/"
     assert "82 % sjanse for innstilling" in sent[0]["body"]
     assert "min forsinket" not in sent[0]["body"]
@@ -607,7 +607,7 @@ def test_an_unbranded_device_is_pushed_its_own_icon_and_url(monkeypatch):
     assert sent[0]["url"] == "/varsel/?brand=none"
     # The WORDING is brand-independent on purpose: it is what /historikk records, and text that
     # varied by variant would split every wording comparison along a second axis.
-    assert sent[0]["title"] == "Avvik: Oslo S → Lillehammer"
+    assert sent[0]["title"] == "Oslo S → Lillehammer"
     assert "82 % sjanse for innstilling" in sent[0]["body"]
 
 
@@ -711,7 +711,7 @@ def test_push_titles_carry_the_environment_on_non_prod(monkeypatch):
         varsel.check_and_notify(SNAPSHOT)
         assert client.post("/varsel-api/test", json={"device_id": DEVICE}).status_code == 200
     assert [p["title"] for p in sent] == [
-        "[dev] Avvik: Oslo S → Lillehammer",
+        "[dev] Oslo S → Lillehammer",
         "[dev] Varsler er aktivert",
     ]
     assert "[dev]" not in sent[0]["body"]  # the tag belongs in the title, not in the wording

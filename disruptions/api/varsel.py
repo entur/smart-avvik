@@ -62,7 +62,7 @@ Design notes
   the raw ``dep_delay_typ_min`` regression: for today's alert-worthy boardings its median is 2 min
   against the stack p50's 15 min (rail), so quoting it made a 93 %-impact alert read as "1 % sjanse
   for innstilling, typisk 2 min forsinket". An alternative, when there is one, closes the body with
-  the same label over its FIRST transit leg ("Alternativ Tog R11 08:24") — the departure the
+  the same label over its FIRST transit leg ("Alternativ tog R11 08:24") — the departure the
   traveller has to catch, as opposed to a connection further along it.
 * **State** (devices / journeys / notified) is tiny JSON, guarded by a re-entrant lock and written
   through to a local file and — when ``VARSEL_STATE_BUCKET`` is set — a GCS blob, so it survives a
@@ -1124,6 +1124,11 @@ def _train_label(mode: str | None, line: str | None, hhmm: str) -> str:
     like. That is why it takes its parts rather than reading them off the message input: they come
     from the top level for the first and from `alternativ_reise.reisevei[0]` for the second.
 
+    `mode` is passed in RATHER THAN LOOKED UP, and its case comes with it: the first label heads its
+    own line ("Tog R10 08:00: …") while the second sits mid-clause after "Alternativ", where bokmål
+    wants a lower-case common noun. This function cannot know which, so `_LEG_MODE_NOUN` — used only
+    for the second — carries the lower-case form and the alert's own `mode` stays as it is.
+
     Every part is optional, and each missing one costs only itself: `linje` is absent when the ref
     was unknown, and a leg can carry a mode this codebase has no noun for. Inventing either would be
     the one failure worse than saying too little. Note the line-less form keeps "kl" and the line
@@ -1139,18 +1144,26 @@ def _train_label(mode: str | None, line: str | None, hhmm: str) -> str:
 # so this is a complete translation rather than a best effort. Anything outside it yields no noun
 # at all: "Alternativ R11 08:24" says less than it could, while a guessed noun would put the wrong
 # vehicle on a lock screen, and the line and time still identify the departure without one.
+#
+# LOWER CASE, unlike the `mode` on the alert (2026-08-20). These are ordinary bokmål nouns, and this
+# label is the only one that lands mid-clause -- always after "Alternativ", never at the start of a
+# line -- so "Alternativ tog R11 08:24" is what Norwegian orthography asks for and "Alternativ Tog
+# R11 08:24" reads as a proper noun. The alert's own label keeps its capital because it heads its
+# line. Case therefore belongs HERE, at the one call site whose position is fixed, and not in
+# `_train_label`, which cannot know where its caller will put the result. "T-bane" keeps its capital
+# T in every position: it is an abbreviation, not a common noun.
 _LEG_MODE_NOUN = {
-    "rail": "Tog",
-    "bus": "Buss",
-    "coach": "Buss",
-    "tram": "Trikk",
+    "rail": "tog",
+    "bus": "buss",
+    "coach": "buss",
+    "tram": "trikk",
     "metro": "T-bane",
-    "water": "Båt",
+    "water": "båt",
 }
 
 
 def _first_leg_label(alternative: dict, hhmm: str) -> str:
-    """The alternative's first transit leg, labelled like any other departure: "Tog R11 08:24".
+    """The alternative's first transit leg, labelled like any other departure: "tog R11 08:24".
 
     "Alternativ kl 08:24" tells a traveller when to be on a platform but not what to board, which on
     a station with several departures in the same minute is the half of the advice they cannot
@@ -1167,7 +1180,7 @@ def _first_leg_label(alternative: dict, hhmm: str) -> str:
 
 
 def _alternative_phrase(message_input: dict) -> str | None:
-    """"Alternativ Tog R11 08:24, framme kl 09:05" — the escape route, with its caveats.
+    """"Alternativ tog R11 08:24, framme kl 09:05" — the escape route, with its caveats.
 
     This is the wording prd actually ships (`VARSEL_LLM_ENABLED=false` there), so a caveat that
     reaches only the prompt reaches nobody. Two of them are stated rather than implied:
@@ -1320,7 +1333,10 @@ def _notification_payload(
     to_name = journey.get("to_name") or journey["to_stop"]
     assets = _BRAND_ASSETS[normalize_brand(brand)]
     return {
-        "title": _tag_environment(f"Avvik: {from_name} → {to_name}"),
+        # The journey alone, no "Avvik: " prefix (2026-08-20): the app that sent it is already
+        # named beside the title by the OS, the body says what the disruption is, and the two
+        # words cost the stop names room on a lock screen that truncates on the right.
+        "title": _tag_environment(f"{from_name} → {to_name}"),
         "body": message or _deterministic_body(message_input or _message_input_from_alert(alert)),
         "url": assets["url"],
         "icon": assets["icon"],
