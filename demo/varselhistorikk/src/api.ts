@@ -126,6 +126,12 @@ export interface Filters {
   /** Only decisions whose outcome is known — 'avklart', i.e. everything except 'venter' and
    *  'ukjent'. Wider than picking a single verdict, which narrows within this same population. */
   resolvedOnly?: boolean;
+  /** Only decisions an operator published a SIRI-SX message about, dropping the ones this codebase
+   *  minted a situation number for — the no-SX predictions and the ET-cancellation relay. Applied
+   *  in the QUERY rather than over the fetched rows: the list is capped at 200, and in dev the
+   *  no-SX population is most of it, so filtering client-side would show a handful of cards and
+   *  look like an empty window. */
+  sxOnly?: boolean;
 }
 
 async function get<T>(url: string): Promise<T> {
@@ -145,6 +151,7 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
   if (filters.resolvedOnly) params.set('resolved_only', 'true');
+  if (filters.sxOnly) params.set('sx_only', 'true');
   return params.toString();
 }
 

@@ -37,11 +37,14 @@ body {
 }
 
 /* ---- filters ---------------------------------------------------------------------------- */
+/* Centred, not bottom-aligned: the checkbox column is taller than anything else on this row, so
+   sitting everything on a shared bottom edge left it towering over the selects with its head in
+   the whitespace above them. On a common midline the three controls read as one row. */
 .vh-filters {
   display: flex;
   flex-wrap: wrap;
   gap: 1rem;
-  align-items: flex-end;
+  align-items: center;
   margin-bottom: 1.5rem;
 }
 
@@ -83,12 +86,42 @@ body {
   color: inherit;
 }
 
+/* The three narrowings, stacked. A column rather than a row because they COMPOSE -- side by side,
+   at the end of a line of dropdowns, they read as three alternatives to pick between. */
+.vh-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+}
+
+/* Two of the three controls on this row carry no caption, and a caption is what decides how far
+   down its block a control box sits: centring the BLOCKS therefore leaves the uncaptioned ones
+   riding ~10 px above the selects. These get an empty caption line of their own, from the same
+   font-size and line-height a real one would use -- so it tracks the type rather than a magic
+   number -- and every control box lands on one midline. */
+.vh-window,
+.vh-checks {
+  --vh-phantom-caption: '\00a0';
+}
+
+.vh-window {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.vh-window::before,
+.vh-checks::before {
+  content: var(--vh-phantom-caption);
+}
+
 .vh-check {
   display: inline-flex;
   align-items: center;
   gap: 0.4rem;
   font-size: 0.875rem;
-  padding-bottom: 0.5rem;
 }
 
 /* ---- summary ---------------------------------------------------------------------------- */
@@ -154,9 +187,41 @@ body {
   border-top: 1px solid var(--basecolors-frame-subdued, #ededed);
 }
 
+/* The disclosure row. `list-style: none` + the WebKit pseudo-element between them remove the
+   browser's own marker on every engine that ships one, so the caret below is the only one. */
+.vh-split-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  list-style: none;
+  padding: 0.15rem 0;
+}
+
+.vh-split-summary::-webkit-details-marker {
+  display: none;
+}
+
+.vh-split-summary::before {
+  content: '▸';
+  display: inline-block;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  transition: transform 120ms ease;
+}
+
+.vh-split[open] > .vh-split-summary::before {
+  transform: rotate(90deg);
+}
+
+/* The heading keeps its own margins at zero -- the space below the row belongs to the row, and
+   only when there is something under it. */
 .vh-split-head {
-  margin: 0 0 0.5rem;
+  margin: 0;
   font-size: 0.95rem;
+}
+
+.vh-split[open] > .vh-split-summary {
+  margin-bottom: 0.5rem;
 }
 
 .vh-split-row {

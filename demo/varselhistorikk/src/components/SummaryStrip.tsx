@@ -102,8 +102,19 @@ function SegmentSplit({ summary }: { summary: Summary }) {
   const segmented = rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx);
 
   return (
-    <section className="vh-split">
-      <Heading4 className="vh-split-head">Hva de samlede tallene består av</Heading4>
+    // Collapsed by default, and native <details> rather than a useState + aria-expanded button: the
+    // disclosure semantics, the keyboard handling and the "find on page opens it" behaviour come
+    // for free, and this section has no state of its own worth lifting.
+    //
+    // Collapsed is a deliberate default, not a demotion. The blended tiles above are the page's
+    // answer to "could a traveller trust what we sent"; this is the mix they are made of, which is
+    // what you open when a figure moves and you need to know whether the app changed or the
+    // population did. Three sets of three figures unfurled above the first card pushed the actual
+    // decisions off the screen.
+    <details className="vh-split">
+      <summary className="vh-split-summary">
+        <Heading4 className="vh-split-head">Hva de samlede tallene består av</Heading4>
+      </summary>
 
       {segmented === 0 ? (
         // Two empty rows of dashes would look like a broken query rather than like a young column.
@@ -142,7 +153,23 @@ function SegmentSplit({ summary }: { summary: Summary }) {
           samlede tallene.
         </SubParagraph>
       ) : null}
-    </section>
+
+      {/* What the headline figures are NOT -- stated on the page, not just in the API docs, because
+          each of them is easy to over-read and whoever tunes a threshold on one needs the caveat.
+          It sits INSIDE the disclosure, with the split it is about: every sentence here is about
+          the mix, and left below the fold it was a wall of small print between the numbers and the
+          decisions. "Oppdelingen over" is now the rows directly above it. */}
+      <Paragraph className="vh-caveat">
+        «Dekning» måles blant avganger som faktisk ble flagget av en SX-melding, på reiser noen har
+        registrert. Et avvik som aldri ble meldt, ser vi ikke — så dette er ikke dekning over alle
+        avvik. «Ukjent» betyr at vi ikke fant igjen avgangen i sanntidsdata; den telles bevisst ikke
+        som «riktig stille». «Varslingstid» telles per avgang, ikke per melding: operatørene sender
+        ofte flere meldinger om samme tog, og den reisende får ett varsel. Alle de tre samlede
+        tallene blander to ulike populasjoner og flytter seg med blandingsforholdet mellom dem —
+        varslingstiden aller mest, siden en innstilling ofte er meldt i sanntidsdata timer før
+        avgang. Les dem sammen med oppdelingen over.
+      </Paragraph>
+    </details>
   );
 }
 
@@ -185,19 +212,6 @@ export default function SummaryStrip({ summary }: { summary: Summary }) {
       </div>
 
       <SegmentSplit summary={summary} />
-
-      {/* Stated on the page, not just in the API docs: the number is easy to over-read, and
-          whoever tunes a threshold on the strength of it needs to know what it is not. */}
-      <Paragraph className="vh-caveat">
-        «Dekning» måles blant avganger som faktisk ble flagget av en SX-melding, på reiser noen har
-        registrert. Et avvik som aldri ble meldt, ser vi ikke — så dette er ikke dekning over alle
-        avvik. «Ukjent» betyr at vi ikke fant igjen avgangen i sanntidsdata; den telles bevisst ikke
-        som «riktig stille». «Varslingstid» telles per avgang, ikke per melding: operatørene sender
-        ofte flere meldinger om samme tog, og den reisende får ett varsel. Alle de tre samlede
-        tallene blander to ulike populasjoner og flytter seg med blandingsforholdet mellom dem —
-        varslingstiden aller mest, siden en innstilling ofte er meldt i sanntidsdata timer før
-        avgang. Les dem sammen med oppdelingen over.
-      </Paragraph>
     </section>
   );
 }
