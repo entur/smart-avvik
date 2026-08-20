@@ -311,6 +311,18 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     redeploy. The prompt is **not** logged by default (it carries the traveller's origin,
     destination and departure time); records carry a hashed `journey_digest`, and
     `VARSEL_LLM_LOG_PROMPTS=true` puts the full prompt/reply at DEBUG.
+    **The Gemini default is `gemini-3.7-flash`, and moving it moves the thinking parameter with it**
+    (2026-08-20). Two things a model bump here has to re-check, because neither errors. Availability
+    is per model, not per family: 3.7-flash 404s at `europe-west1` and `europe-north1` exactly as
+    3.5-flash did, so `eu` stays the only endpoint that serves it *and* confines processing. And the
+    thinking cap is family-specific — `thinking_level` (`minimal`/`low`/`medium`/`high`) is the 3.x
+    parameter, `thinking_budget` the 2.5 one, and they must not be mixed. `thinking_budget: 0`, which
+    turned thinking off on 3.5-flash, is **silently ignored** by 3.7-flash: measured at `eu`, 92-385
+    thinking tokens per call with it set, drawn from `max_output_tokens` and therefore from the room
+    the answer needs. `thinking_level: "low"` is what the code sends now — 0 thinking tokens and
+    ~2.2 s per call on a real payload, against ~3.3 s for the ignored budget, and no truncation.
+    Not `"minimal"`: 3.7-flash rejects it with `400 Thinking level is unsupported`, and a 400 is
+    deliberately never latched, so it would fail every call on every cycle rather than once.
   - `/impact` also returns `alternative_journey` when `to_stop` is given — the **best remaining way
     there**, not a faster one (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no
     credentials). Two tiers, and the second is why "faster" is the wrong word: prefer the **latest**
