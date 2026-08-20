@@ -1491,8 +1491,54 @@ def test_the_deterministic_wording_is_written_from_the_message_input(monkeypatch
     varsel.check_and_notify(SNAPSHOT)
 
     # Every part of this body came out of the input above -- none of it off the (rail, 82 %-cancel)
-    # alert the snapshot actually produced.
+    # alert the snapshot actually produced. The input carries no `linje`, so the train falls back to
+    # "Buss kl 09:30": less than the reader wants, but nothing that is untrue.
     assert sent[0]["body"] == "Veiarbeid\nBuss kl 09:30: Typisk 4–9 min forsinket"
+
+
+def test_the_push_names_the_train_by_its_line(monkeypatch):
+    """"Tog L1 09:24", not "Tog kl 09:24" — the label a departure board would use.
+
+    A registered journey matches whatever lines run between its two stops, so a time on its own
+    leaves the reader working out which of them left at 09:24, on a lock screen, minutes before they
+    would have to walk to the platform. The line is what makes the notification about *their* train.
+    """
+    import llm_message
+
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: None)  # no model wrote anything
+    monkeypatch.setattr(
+        llm_message,
+        "build_message_input",
+        lambda *a, **k: {
+            "transportmiddel": "Tog",
+            "linje": "L1",
+            "avgang_kl": "09:24",
+            "situasjoner": [{"sammendrag": "Signalfeil"}],
+            "forsinkelse_min": {"typisk": 4, "verstefall": 9},
+        },
+    )
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert sent[0]["body"] == "Signalfeil\nTog L1 09:24: Typisk 4–9 min forsinket"
+
+
+def test_the_wording_falls_back_to_the_alerts_own_line_when_the_input_cannot_be_built():
+    """`_message_input_from_alert` stands in for llm_message on the path where importing it failed,
+    so it has to reduce the line ref itself. A push that loses the line to a payload problem is the
+    failure that fallback exists to prevent, one field further in."""
+    _reset_state()
+    _register(DEVICE)
+    alert = varsel.match_journey(next(iter(varsel._journeys.values())))[0]
+    assert alert.line == "VYG:Line:R10", "the snapshot's own ref, unreduced on the Alert"
+    assert "Tog R10 " in varsel._deterministic_body(varsel._message_input_from_alert(alert))
+    # ...and it names no line rather than inventing one when the alert carries no ref either.
+    unknown = varsel._message_input_from_alert(alert.model_copy(update={"line": None}))
+    assert "linje" not in unknown
+    assert "Tog kl " in varsel._deterministic_body(unknown)
 
 
 def test_decision_row_records_which_backend_wrote_the_message(monkeypatch):
