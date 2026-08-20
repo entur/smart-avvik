@@ -485,6 +485,12 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
         dep_delay_p50_stack_min=r.dep_delay_p50_stack_min,
         dep_delay_p90_stack_min=r.dep_delay_p90_stack_min,
         p_impact_dep=r.p_impact_dep,
+        # getattr, not r.has_situation: call_predictions_bus_today has no such column (the bus
+        # pooled family was not extended to the no-SX population), and neither does a rail table
+        # built by a predict_calls.sql older than 2026-08-19 -- during a rollout the app can outrun
+        # the poller by one cycle. Both cases mean "an SX message named this call", which is what
+        # the default says.
+        has_situation=getattr(r, "has_situation", True),
     )
 
 

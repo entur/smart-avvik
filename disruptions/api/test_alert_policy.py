@@ -41,6 +41,58 @@ def test_min_threshold_is_the_floor_of_the_table():
     assert min_threshold() <= threshold_for(None)
 
 
+def test_no_sx_population_is_cut_at_its_own_threshold():
+    """A call no SX message named is gated on `_NOSX_ALERT_THRESHOLD`, whatever its operator.
+
+    The population is what selects the cut, not the operator, because the operator table is tuned
+    against predictions calibrated on flagged calls. Feeding a no-SX probability into GOA's 0.50
+    would apply a cut fitted to a different distribution.
+    """
+    assert threshold_for("VYG", has_situation=False) == alert_policy._NOSX_ALERT_THRESHOLD
+    # An operator override does NOT win over the population: GOA's 0.50 is a flagged-call number.
+    assert threshold_for("GOA", has_situation=False) == alert_policy._NOSX_ALERT_THRESHOLD
+    assert threshold_for(None, has_situation=False) == alert_policy._NOSX_ALERT_THRESHOLD
+
+
+def test_has_situation_is_keyword_only_and_defaults_to_the_flagged_cut():
+    """Every caller that predates the second population must keep its exact meaning.
+
+    Positional would be worse than merely ugly here: `threshold_for(op, False)` reads as "not
+    something", and the something it turns off is the operator table.
+    """
+    assert threshold_for("GOA") == threshold_for("GOA", has_situation=True) == 0.50
+    try:
+        threshold_for("GOA", False)  # type: ignore[misc]
+    except TypeError:
+        pass
+    else:  # pragma: no cover - only reached if the signature regresses
+        raise AssertionError("has_situation must be keyword-only")
+
+
+def test_no_sx_is_cut_HIGHER_than_a_published_disruption_is():
+    """The direction is the part that is easy to get backwards, so it is pinned rather than left to
+    a comment.
+
+    The intuition says a population with a 12x lower base rate should be cut LOWER, and reasoning
+    from "recover the recall the old broken path had" says so too. Both are wrong. Without a message
+    the only signal is the last hour of observation, so a no-SX probability decays with the ask
+    horizon much faster than a flagged one — measured out of sample, precision at 0.65 falls to
+    0.712 one bucket out and the far buckets fire nothing at all. And the alert reaches the
+    traveller with no explanation attached, because there is none to attach. Both point the same
+    way: a higher bar, not a lower one.
+    """
+    assert alert_policy._NOSX_ALERT_THRESHOLD > alert_policy._ALERT_THRESHOLD
+    assert threshold_for("VYG", has_situation=False) > threshold_for("VYG")
+
+
+def test_no_sx_cut_sits_at_or_above_the_pre_screen_floor():
+    """`min_threshold` gates work that only alert-worthy trips should pay for, and it does not know
+    about this population. That is safe only while the no-SX cut is the higher of the two — below
+    the floor, a no-SX trip could be alert-worthy and still be screened out before anything looked
+    at it. If the cut is ever lowered past 0.50, `min_threshold` has to take the min over both."""
+    assert alert_policy._NOSX_ALERT_THRESHOLD >= min_threshold()
+
+
 def test_varsel_reexports_the_same_gate_not_a_copy():
     # Identity, not equality: a forked table would still compare equal today and drift tomorrow.
     assert varsel.threshold_for is alert_policy.threshold_for

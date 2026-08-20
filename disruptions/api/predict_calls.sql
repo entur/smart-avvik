@@ -121,6 +121,61 @@ base AS (
   WHERE (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
     AND TIMESTAMP_DIFF(COALESCE(r.aimed_dep, r.aimed_arr), a.onset_ts, MINUTE) BETWEEN 0 AND 720
 ),
+-- ---- CALLS NO SITUATION NAMED ----------------------------------------------------------------
+-- The other 3/4 of the timetable. Everything above needs an operator to have published something;
+-- these rows are what a traveller's train looks like when nobody has. The models can read them
+-- because training_calls carries the same population under the same flag since 2026-08-19 -- the
+-- fillers below are that file's, value for value, and they have to be: a serving row that encodes
+-- "no situation" differently from a training row is the train/serve skew this whole change removed.
+--
+-- WHAT PARTITIONS THE THREE BRANCHES OF THIS FILE, so no call is scored twice or missed:
+--   base     a situation named it
+--   nosx     no situation named it and ET has NOT declared it cancelled  -> scored, here
+--   et_only  no situation named it and ET HAS declared it cancelled      -> relayed, at the bottom
+-- The cancelled ones are deliberately not scored: `impact._cancelled_prediction` would overwrite
+-- every figure with the certainty anyway, so a model score for them is work whose only possible
+-- effect is to be discarded.
+--
+-- THE WINDOW IS THE CALL'S OWN CLOCK, not a situation's. `base` measures from an onset that may be
+-- hours old; here there is nothing to measure from, so the same 12 h reach forward and 1 h back is
+-- taken from now -- matching et_only, which faces exactly the same absence.
+nosx_base AS (
+  SELECT
+    CONCAT('KIX:NoSituation:', r.jkey) AS situationNumber,
+    CAST(NULL AS TIMESTAMP) AS onset_ts,
+    'Mulig avvik – ingen melding fra operatøren' AS summary,
+    r.jkey, r.lineRef, r.stop_place, r.stop_name, r.aimed_dep, r.aimed_arr,
+    r.call_cancelled AS et_declared_cancelled,
+    r.dep_delay_min AS et_dep_delay_min,
+    r.call_source,
+    COALESCE(r.aimed_dep, r.aimed_arr) AS call_ts,
+    'none' AS status,
+    FALSE  AS planned,
+    -1 AS num_journeys, -1 AS num_stops, -1 AS num_lines,
+    -1 AS onset_hour, -1 AS onset_dow, -1 AS onset_month,
+    r.stop_order,
+    (r.aimed_dep IS NULL) AS is_terminal,
+    (r.aimed_arr IS NULL) AS is_origin,
+    -1 AS min_from_onset,
+    EXTRACT(HOUR      FROM COALESCE(r.aimed_dep, r.aimed_arr)) AS call_hour,
+    EXTRACT(DAYOFWEEK FROM COALESCE(r.aimed_dep, r.aimed_arr)) AS call_dow,
+    'none' AS category, -1 AS stated_min
+  FROM `disruptions.rail_calls_planned_today` AS r
+  LEFT JOIN (SELECT DISTINCT jkey, stop_order FROM base) AS c
+    ON c.jkey = r.jkey AND c.stop_order = r.stop_order
+  WHERE c.jkey IS NULL
+    AND NOT COALESCE(r.call_cancelled, FALSE)
+    AND (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
+    AND TIMESTAMP_DIFF(COALESCE(r.aimed_dep, r.aimed_arr), CURRENT_TIMESTAMP(), MINUTE)
+        BETWEEN -60 AND 720
+),
+-- One population column, two branches, and the column order is the contract (UNION ALL is
+-- positional). has_situation is set HERE rather than in `calls` so each branch states its own.
+allbase AS (
+  SELECT *, TRUE  AS has_situation FROM base
+  UNION ALL
+  SELECT *, FALSE AS has_situation FROM nosx_base
+),
 observed AS (
   SELECT lineRef, jkey, stop_order, aimed_dep, dep_delay_min, COALESCE(call_cancelled, FALSE) AS call_cancelled
   FROM `disruptions.rail_calls_planned_today`
@@ -161,18 +216,23 @@ linenow AS (
     AND aimed_dep <  CURRENT_TIMESTAMP()
   GROUP BY 1
 ),
+-- Keyed per CALL, not per (situation, call): the join reads only the train's own earlier stops,
+-- so the situation never changed the answer -- and a no-SX row has no situationNumber to join on.
+-- Same re-keying, for the same reason, as create_training_calls.sql. Dropping it would not error;
+-- it would just hand every no-SX row own_prev_delay = -1, silently discarding the single feature
+-- that carries most of the signal when there is no message (attribution 0.46).
 own AS (
-  SELECT t.situationNumber, t.jkey, t.stop_order,
+  SELECT t.jkey, t.stop_order,
          ARRAY_AGG(GREATEST(r2.dep_delay_min, 0) ORDER BY r2.stop_order DESC LIMIT 1)[OFFSET(0)]
            AS own_prev_delay
-  FROM base AS t
+  FROM (SELECT DISTINCT jkey, stop_order, call_ts FROM allbase) AS t
   JOIN observed AS r2
     ON r2.jkey = t.jkey
    AND r2.stop_order < t.stop_order
    AND r2.aimed_dep <= TIMESTAMP_SUB(t.call_ts, INTERVAL 30 MINUTE)
    AND r2.dep_delay_min IS NOT NULL
    AND NOT r2.call_cancelled
-  GROUP BY 1, 2, 3
+  GROUP BY 1, 2
 ),
 calls AS (
   SELECT
@@ -186,17 +246,11 @@ calls AS (
     IFNULL(ln.line_now_delay, -1)   AS line_now_delay,
     IFNULL(ln.line_now_cancel, -1)  AS line_now_cancel,
     IFNULL(o.own_prev_delay, -1)    AS own_prev_delay,
-    -- Every row this file scores comes from a situation, so the flag is constant TRUE here. It
-    -- is carried anyway because training_calls has carried the column since 2026-08-19 (see
-    -- create_training_calls.sql): the heads are retrained WITH it, and a model that expects a
-    -- feature its input does not supply fails the whole scoring job, which on this file means the
-    -- poller stops producing predictions. THE ORDER IS THEREFORE FIXED: this column ships FIRST,
-    -- the retrained models second. The reverse order breaks serving; this order cannot, because
-    -- ML.PREDICT ignores an input column the model does not know (verified against the shipped
-    -- call_cancel_clf, 2026-08-19). It also stops being cosmetic the moment this file learns to
-    -- score calls no situation named -- then it is what tells the model which population a row
-    -- is from, and it is the only thing that does.
-    TRUE                            AS has_situation,
+    -- has_situation is NOT listed here: it already arrives through `b.*` from allbase, and naming
+    -- it again makes ML.PREDICT reject the whole input ("Duplicate columns are not allowed in the
+    -- input data to PREDICT"). It is a real feature of every head, not a passthrough -- the models
+    -- split on it first (attribution #1, one split per iteration), which is what lets one model
+    -- serve both populations.
     -- ask-horizon bucket: which platt layer calibrates this call's scores (see header)
     CASE
       WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 45  THEN '30'
@@ -205,12 +259,12 @@ calls AS (
       WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 360 THEN '240'
       ELSE 'plan'
     END AS lead_bucket
-  FROM base AS b
+  FROM allbase AS b
   LEFT JOIN linepre AS lp ON lp.situationNumber = b.situationNumber AND lp.lineRef = b.lineRef
   LEFT JOIN netpre  AS np ON np.situationNumber = b.situationNumber
   LEFT JOIN linenow AS ln ON ln.lineRef = b.lineRef
   LEFT JOIN own AS o
-    ON o.situationNumber = b.situationNumber AND o.jkey = b.jkey AND o.stop_order = b.stop_order
+    ON o.jkey = b.jkey AND o.stop_order = b.stop_order
 ),
 clf AS (
   SELECT situationNumber, jkey, stop_order,
@@ -311,7 +365,15 @@ wd40 AS (
   FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt`)
 ),
 -- per-ask-horizon platt lookups for the alert path (see header): '30' = the standard layers
+-- POPULATION-AWARE SINCE 2026-08-19. The inline blocks below are the FLAGGED population's layers,
+-- read live from ML.WEIGHTS exactly as before; the no-SX rows take theirs from the materialized
+-- `nosx_platt_weights` (gen_nosx_platt_weights.py). One Platt layer has one intercept, and these
+-- two populations sit ~12x apart on the base rate the intercept sets -- serving both through one
+-- layer is the shared-layer mistake the calibration files exist to prevent, and it would land here
+-- as under-firing alerts rather than as an error. The join below carries has_situation for that
+-- reason; drop it and the query still runs and still returns a number for every row.
 wch AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM w
   UNION ALL
   SELECT '60',
@@ -333,8 +395,13 @@ wch AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.cancel_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'cancel'
 ),
 wdh AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM wd10
   UNION ALL
   SELECT '60',
@@ -356,8 +423,13 @@ wdh AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.dep_ge10_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'dep_ge10'
 ),
 w5h AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM w5
   UNION ALL
   SELECT '60',
@@ -379,8 +451,13 @@ w5h AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.arr_ge5_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'arr_ge5'
 ),
 w10h AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM w10
   UNION ALL
   SELECT '60',
@@ -402,8 +479,13 @@ w10h AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.arr_ge10_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'arr_ge10'
 ),
 w20h AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM w20
   UNION ALL
   SELECT '60',
@@ -425,8 +507,13 @@ w20h AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.arr_ge20_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'arr_ge20'
 ),
 w40h AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM w40
   UNION ALL
   SELECT '60',
@@ -448,8 +535,13 @@ w40h AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.arr_ge40_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'arr_ge40'
 ),
 wd5h AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM wd5
   UNION ALL
   SELECT '60',
@@ -471,8 +563,13 @@ wd5h AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.dep_ge5_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'dep_ge5'
 ),
 wd20h AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM wd20
   UNION ALL
   SELECT '60',
@@ -494,8 +591,13 @@ wd20h AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.dep_ge20_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'dep_ge20'
 ),
 wd40h AS (
+  SELECT lead_bucket, b, a, TRUE AS has_situation FROM (
   SELECT '30' AS lead_bucket, b, a FROM wd40
   UNION ALL
   SELECT '60',
@@ -517,6 +619,10 @@ wd40h AS (
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
   FROM ML.WEIGHTS(MODEL `disruptions.dep_ge40_platt_plan`)
+  )
+  UNION ALL
+  SELECT lead_bucket, b, a, FALSE
+  FROM `disruptions.nosx_platt_weights` WHERE head = 'dep_ge40'
 ),
 bounds AS (
   SELECT side, MIN(plog_bucket) AS lo, MAX(plog_bucket) AS hi
@@ -570,14 +676,14 @@ scored AS (
   JOIN dge10 USING (situationNumber, jkey, stop_order)
   JOIN dge20 USING (situationNumber, jkey, stop_order)
   JOIN dge40 USING (situationNumber, jkey, stop_order)
-  JOIN w5h   ON w5h.lead_bucket   = c.lead_bucket
-  JOIN w10h  ON w10h.lead_bucket  = c.lead_bucket
-  JOIN w20h  ON w20h.lead_bucket  = c.lead_bucket
-  JOIN w40h  ON w40h.lead_bucket  = c.lead_bucket
-  JOIN wd5h  ON wd5h.lead_bucket  = c.lead_bucket
-  JOIN wdh   ON wdh.lead_bucket   = c.lead_bucket
-  JOIN wd20h ON wd20h.lead_bucket = c.lead_bucket
-  JOIN wd40h ON wd40h.lead_bucket = c.lead_bucket
+  JOIN w5h   ON w5h.lead_bucket   = c.lead_bucket AND w5h.has_situation = c.has_situation
+  JOIN w10h  ON w10h.lead_bucket  = c.lead_bucket AND w10h.has_situation = c.has_situation
+  JOIN w20h  ON w20h.lead_bucket  = c.lead_bucket AND w20h.has_situation = c.has_situation
+  JOIN w40h  ON w40h.lead_bucket  = c.lead_bucket AND w40h.has_situation = c.has_situation
+  JOIN wd5h  ON wd5h.lead_bucket  = c.lead_bucket AND wd5h.has_situation = c.has_situation
+  JOIN wdh   ON wdh.lead_bucket   = c.lead_bucket AND wdh.has_situation = c.has_situation
+  JOIN wd20h ON wd20h.lead_bucket = c.lead_bucket AND wd20h.has_situation = c.has_situation
+  JOIN wd40h ON wd40h.lead_bucket = c.lead_bucket AND wd40h.has_situation = c.has_situation
 ),
 -- ---- ET-DECLARED CANCELLATIONS THAT NO SITUATION NAMED ----------------------------------------
 -- Everything above scores calls an SX situation pointed at. A cancellation ET has ALREADY DECLARED
@@ -638,7 +744,13 @@ et_only AS (
         BETWEEN -60 AND 720
 )
 SELECT
-  s.situationNumber, s.summary, sd.description, s.onset_ts,
+  s.situationNumber, s.summary,
+  -- A no-SX row has no operator text to serve, and NULL here would read downstream as "the
+  -- operator published a message with no description". Say what the row actually is instead.
+  IF(s.has_situation, sd.description,
+     'Ingen situasjonsmelding er publisert for denne avgangen. Vurderingen bygger på '
+     || 'sanntidsdata: togets egen forsinkelse oppstrøms og tilstanden på linjen.') AS description,
+  s.onset_ts,
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
   s.et_declared_cancelled, s.et_dep_delay_min, s.call_source,
@@ -711,16 +823,21 @@ SELECT
     1/(1+EXP(-(wdh.b + wdh.a *
       LN(GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_dep10_raw,1-1e-6),1e-6))))))
   , 4)) AS p_dep_ge10_h,
-  s.lead_bucket AS platt_lead_bucket
+  s.lead_bucket AS platt_lead_bucket,
+  -- Which population this row is from, served rather than re-derived downstream. The alert gate,
+  -- the wording and /historikk's segmentation all need it, and inferring it from a
+  -- `situationNumber LIKE 'KIX:%'` prefix would make a naming convention load-bearing for
+  -- alerting policy.
+  s.has_situation
 FROM scored AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
 LEFT JOIN (
   SELECT situationNumber, ANY_VALUE(description) AS description FROM sit GROUP BY situationNumber
 ) AS sd ON sd.situationNumber = s.situationNumber
-JOIN wch  ON wch.lead_bucket  = s.lead_bucket
-JOIN wdh  ON wdh.lead_bucket  = s.lead_bucket
-JOIN w10h ON w10h.lead_bucket = s.lead_bucket
+JOIN wch  ON wch.lead_bucket  = s.lead_bucket AND wch.has_situation = s.has_situation
+JOIN wdh  ON wdh.lead_bucket  = s.lead_bucket AND wdh.has_situation = s.has_situation
+JOIN w10h ON w10h.lead_bucket = s.lead_bucket AND w10h.has_situation = s.has_situation
 LEFT JOIN bounds AS bd ON bd.side = 'dep'
 LEFT JOIN `disruptions.delay_p90_calib` AS dpq
   ON dpq.side = 'dep' AND dpq.plog_bucket = LEAST(GREATEST(ROUND(s.dep_plog,1), bd.lo), bd.hi)
@@ -781,5 +898,11 @@ SELECT
   CAST(NULL AS FLOAT64) AS p_dep_ge10_h,
   -- No model was scored, so no platt layer calibrated anything. Naming a bucket here would claim a
   -- calibration that never ran.
-  CAST(NULL AS STRING)  AS platt_lead_bucket
+  CAST(NULL AS STRING)  AS platt_lead_bucket,
+  -- A relayed cancellation is by definition a call no situation named, so it belongs to the same
+  -- population as the scored no-SX rows even though it consulted no model. /historikk still tells
+  -- the two apart on the situationNumber prefix, which is what segments "relayed a fact" from
+  -- "predicted an outcome"; this column answers the different question of whether an SX message
+  -- existed at all.
+  FALSE                 AS has_situation
 FROM et_only AS e;

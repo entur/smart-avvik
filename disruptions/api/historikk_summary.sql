@@ -31,11 +31,36 @@
 -- hit for the traveller, who is not carrying the ET feed on their phone. So:
 --   * blended  — did the app tell the truth? Includes the relayed ones, and should.
 --   * predicted — did we see it coming? Excludes them.
--- Neither is quoted alone. The blended figure moves with the MIX of the two populations, so it can
+-- Neither is quoted alone. The blended figure moves with the MIX of the populations, so it can
 -- swing with nothing about the app having changed; the page shows the mix beside it for that reason.
+--
+-- A THIRD PROVENANCE SINCE 2026-08-20: a decision about a train NO SX MESSAGE NAMED AT ALL, scored
+-- from real-time data alone (see the no-SX branch in predict_calls.sql). It has to be its own
+-- segment for the same reason the relayed one does, in the opposite direction: those decisions are
+-- taken with strictly less information than any other row here, against a base rate ~12x lower, and
+-- through their own calibration layers. Folded into `predicted` they would drag a number that is
+-- supposed to answer "how good are the models when an operator has published something".
+--
+-- THE DISCRIMINATOR IS THE situationNumber PREFIX, not a new column, and that is a deliberate
+-- avoidance: `varsel_decision_outcomes` already carries situation_number, while ADDING a column to
+-- it breaks the registered scheduled query until it is re-registered (measured 2026-08-05:
+-- "Inserted row has wrong column count; Has 35, expected 36"). The synthetic ids are the same
+-- `KIX:` scheme the ET relay established, one namespace per provenance.
+--
+-- Resolution order matters where they overlap: `relayed` wins. A no-SX call can be declared
+-- cancelled by ET between the cycle that scored it and the cycle the verdict judges, at which point
+-- what the traveller got WAS a relayed fact, whatever produced the first row about that train.
 WITH labelled AS (
   SELECT
     verdict, alert_lead_min, actual_trouble, et_cancelled,
+    -- Derived once here so the eleven COUNTIFs below cannot each spell the rule slightly
+    -- differently. NULL et_cancelled still means "unsegmented", so it is tested first.
+    CASE
+      WHEN et_cancelled IS NULL                                     THEN NULL
+      WHEN et_cancelled IS TRUE                                     THEN 'relayed'
+      WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:')        THEN 'no_sx'
+      ELSE 'predicted'
+    END AS provenance,
     -- Same split as historikk_decisions.sql: an unresolved row inside the labelling job's 10-day
     -- retry window is still waiting, not permanently unknown. Keeping the two in step matters --
     -- the page shows this count next to the per-row state, and they must tell the same story.
@@ -89,7 +114,12 @@ hits_per_train AS (
     -- The alert the traveller actually got -- the earliest one -- and the segment IT belonged to,
     -- rather than a LOGICAL_OR across situations that could file a train under a segment no alert
     -- of it was ever in. NULL leads sort last under DESC, so one can only win if they all are.
-    ARRAY_AGG(STRUCT(alert_lead_min, et_cancelled) ORDER BY alert_lead_min DESC LIMIT 1)[OFFSET(0)]
+    ARRAY_AGG(STRUCT(alert_lead_min, CASE
+      WHEN et_cancelled IS NULL                              THEN NULL
+      WHEN et_cancelled IS TRUE                              THEN 'relayed'
+      WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
+      ELSE 'predicted'
+    END AS provenance) ORDER BY alert_lead_min DESC LIMIT 1)[OFFSET(0)]
       AS first_alert
   FROM `disruptions.varsel_decision_outcomes`
   WHERE call_date BETWEEN @from_date AND @to_date
@@ -150,52 +180,77 @@ SELECT
   -- for a row that predates the column, and COUNTIF counts only TRUE.
   --
   -- MODEL SKILL: the trouble we actually forecast. What a threshold should be tuned on.
-  COUNTIF(et_cancelled IS FALSE AND verdict = 'hit')            AS n_hit_predicted,
-  COUNTIF(et_cancelled IS FALSE AND verdict = 'false_alarm')    AS n_false_alarm_predicted,
-  COUNTIF(et_cancelled IS FALSE AND verdict = 'miss')           AS n_miss_predicted,
-  COUNTIF(et_cancelled IS FALSE AND verdict = 'correct_reject') AS n_correct_reject_predicted,
+  COUNTIF(provenance = 'predicted' AND verdict = 'hit')            AS n_hit_predicted,
+  COUNTIF(provenance = 'predicted' AND verdict = 'false_alarm')    AS n_false_alarm_predicted,
+  COUNTIF(provenance = 'predicted' AND verdict = 'miss')           AS n_miss_predicted,
+  COUNTIF(provenance = 'predicted' AND verdict = 'correct_reject') AS n_correct_reject_predicted,
   SAFE_DIVIDE(
-    COUNTIF(et_cancelled IS FALSE AND verdict = 'hit'),
-    COUNTIF(et_cancelled IS FALSE AND verdict IN ('hit', 'false_alarm'))
+    COUNTIF(provenance = 'predicted' AND verdict = 'hit'),
+    COUNTIF(provenance = 'predicted' AND verdict IN ('hit', 'false_alarm'))
   ) AS precision_predicted,
   SAFE_DIVIDE(
-    COUNTIF(et_cancelled IS FALSE AND verdict = 'hit'),
-    COUNTIF(et_cancelled IS FALSE AND verdict IN ('hit', 'miss'))
+    COUNTIF(provenance = 'predicted' AND verdict = 'hit'),
+    COUNTIF(provenance = 'predicted' AND verdict IN ('hit', 'miss'))
   ) AS recall_predicted,
   -- Lead time splits harder than either rate does, which is why it is segmented at all: measured
   -- 2026-08-11 over 14 days of prd, the median train here gave 15 minutes of warning against the
   -- relayed segment's 177. The blended figure is the relayed one wearing the whole page's name.
   (SELECT APPROX_QUANTILES(
-     IF(first_alert.et_cancelled IS FALSE, first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+     IF(first_alert.provenance = 'predicted', first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
    )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_predicted,
-  (SELECT COUNTIF(first_alert.et_cancelled IS FALSE AND first_alert.alert_lead_min >= 30)
+  (SELECT COUNTIF(first_alert.provenance = 'predicted' AND first_alert.alert_lead_min >= 30)
    FROM hits_per_train) AS n_hit_with_30min_notice_predicted,
-  (SELECT COUNTIF(first_alert.et_cancelled IS FALSE) FROM hits_per_train) AS n_hit_trains_predicted,
+  (SELECT COUNTIF(first_alert.provenance = 'predicted') FROM hits_per_train) AS n_hit_trains_predicted,
 
   -- RELAYED: ET had already declared the cancellation when we decided. Precision here should sit at
   -- or near 1 — we are repeating a published fact — and anything below it is worth looking at: a
   -- reinstated train, which now gets a flat "Innstilt" where the old wording hedged. A miss in this
   -- segment is not a model failure at all but a plumbing one: the feed told us and we said nothing.
-  COUNTIF(et_cancelled IS TRUE AND verdict = 'hit')            AS n_hit_relayed,
-  COUNTIF(et_cancelled IS TRUE AND verdict = 'false_alarm')    AS n_false_alarm_relayed,
-  COUNTIF(et_cancelled IS TRUE AND verdict = 'miss')           AS n_miss_relayed,
-  COUNTIF(et_cancelled IS TRUE AND verdict = 'correct_reject') AS n_correct_reject_relayed,
+  COUNTIF(provenance = 'relayed' AND verdict = 'hit')            AS n_hit_relayed,
+  COUNTIF(provenance = 'relayed' AND verdict = 'false_alarm')    AS n_false_alarm_relayed,
+  COUNTIF(provenance = 'relayed' AND verdict = 'miss')           AS n_miss_relayed,
+  COUNTIF(provenance = 'relayed' AND verdict = 'correct_reject') AS n_correct_reject_relayed,
   SAFE_DIVIDE(
-    COUNTIF(et_cancelled IS TRUE AND verdict = 'hit'),
-    COUNTIF(et_cancelled IS TRUE AND verdict IN ('hit', 'false_alarm'))
+    COUNTIF(provenance = 'relayed' AND verdict = 'hit'),
+    COUNTIF(provenance = 'relayed' AND verdict IN ('hit', 'false_alarm'))
   ) AS precision_relayed,
   SAFE_DIVIDE(
-    COUNTIF(et_cancelled IS TRUE AND verdict = 'hit'),
-    COUNTIF(et_cancelled IS TRUE AND verdict IN ('hit', 'miss'))
+    COUNTIF(provenance = 'relayed' AND verdict = 'hit'),
+    COUNTIF(provenance = 'relayed' AND verdict IN ('hit', 'miss'))
   ) AS recall_relayed,
   -- Hours, not minutes, and legitimately so: a situation is scored over a 12 h window, so a
   -- cancellation ET declares the evening before is alerted on as soon as it enters that window.
   (SELECT APPROX_QUANTILES(
-     IF(first_alert.et_cancelled IS TRUE, first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+     IF(first_alert.provenance = 'relayed', first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
    )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_relayed,
-  (SELECT COUNTIF(first_alert.et_cancelled IS TRUE AND first_alert.alert_lead_min >= 30)
+  (SELECT COUNTIF(first_alert.provenance = 'relayed' AND first_alert.alert_lead_min >= 30)
    FROM hits_per_train) AS n_hit_with_30min_notice_relayed,
-  (SELECT COUNTIF(first_alert.et_cancelled IS TRUE) FROM hits_per_train) AS n_hit_trains_relayed,
+  (SELECT COUNTIF(first_alert.provenance = 'relayed') FROM hits_per_train) AS n_hit_trains_relayed,
+
+  -- NO SX AT ALL: nobody had published anything about this train when we decided, and the numbers
+  -- came from the models reading real-time data alone. Precision here is the honest answer to "can
+  -- we warn people the operator has not warned?", and it is the number the no-SX alert gate is
+  -- tuned against. Expect the volume to be small and the lead times long: these rows are scored
+  -- over the same 12 h forward window as everything else but without a message to wait for, so
+  -- nothing gates how early they can fire.
+  COUNTIF(provenance = 'no_sx' AND verdict = 'hit')            AS n_hit_no_sx,
+  COUNTIF(provenance = 'no_sx' AND verdict = 'false_alarm')    AS n_false_alarm_no_sx,
+  COUNTIF(provenance = 'no_sx' AND verdict = 'miss')           AS n_miss_no_sx,
+  COUNTIF(provenance = 'no_sx' AND verdict = 'correct_reject') AS n_correct_reject_no_sx,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'no_sx' AND verdict = 'hit'),
+    COUNTIF(provenance = 'no_sx' AND verdict IN ('hit', 'false_alarm'))
+  ) AS precision_no_sx,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'no_sx' AND verdict = 'hit'),
+    COUNTIF(provenance = 'no_sx' AND verdict IN ('hit', 'miss'))
+  ) AS recall_no_sx,
+  (SELECT APPROX_QUANTILES(
+     IF(first_alert.provenance = 'no_sx', first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+   )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_no_sx,
+  (SELECT COUNTIF(first_alert.provenance = 'no_sx' AND first_alert.alert_lead_min >= 30)
+   FROM hits_per_train) AS n_hit_with_30min_notice_no_sx,
+  (SELECT COUNTIF(first_alert.provenance = 'no_sx') FROM hits_per_train) AS n_hit_trains_no_sx,
 
   -- Decided before the flag existed (2026-08-05), so which segment they belong to is unrecoverable.
   -- Reported, not assigned: defaulting them to "predicted" would be right for most and would hide
