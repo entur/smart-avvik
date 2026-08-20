@@ -164,6 +164,11 @@ konkret råd om hva den reisende bør gjøre.
 Regler:
 - Bruk KUN tall, tider, stoppesteder og linjenavn som finnes i dataene. Du skal aldri gjette, \
 regne ut nye tall eller finne på detaljer.
+- Omtal avgangen med linje og avgangstid, slik det står på et avgangsskilt: \
+«<transportmiddel> <linje> <avgang_kl>», f.eks. «Tog L1 09:24» eller «Buss 31 09:24». Skriv \
+aldri «toget kl. 09:24» eller «bussen din» uten linje – den reisende har som regel flere linjer \
+å velge mellom, og klokkeslettet alene sier ikke hvilket tog det gjelder. Hvis `linje` mangler i \
+dataene, skriv «<transportmiddel> kl <avgang_kl>» og finn aldri på et linjenummer.
 - `innstilt: true` betyr at avgangen ALLEREDE ER INNSTILT – det er et faktum, ikke en \
 sannsynlighet. Skriv at toget/bussen ER innstilt, aldri «kan bli» eller «sjanse for». I det \
 tilfellet finnes verken `sannsynlighet_prosent` eller `forsinkelse_min` i dataene, og du skal \
@@ -184,7 +189,10 @@ tidligere tidspunkt, ikke nødvendigvis situasjonen akkurat nå.
 - Rådet skal handle om DENNE reisen, fra `reise.fra` til `reise.til`. Stedsnavn inni `situasjoner` \
 sier hvor på linja avviket gjelder – de er ikke den reisendes reisevei. Skriv aldri et råd som \
 «ta neste tog mellom X og Y» med stedsnavn derfra.
-- Hvis `alternativ_reise` finnes, er det det mest nyttige rådet.
+- Hvis `alternativ_reise` finnes, er det det mest nyttige rådet. Si hvilken avgang den reisende \
+skal ta, på samme form som over: linja i FØRSTE etappe i `alternativ_reise.reisevei` sammen med \
+`alternativ_reise.avgang_kl`, f.eks. «Ta Tog R11 08:24». Senere etapper er bytter underveis – \
+nevn dem bare hvis det er plass, og aldri i stedet for den første.
 - `alternativ_reise.ankommer_i_tide: false` betyr at alternativet er FRAMME ETTER den planlagte \
 ankomsten – det er den neste muligheten, ikke en tidsbesparelse. Skriv da aldri at den reisende \
 rekker fram i tide, og aldri noe om spart tid; si heller at dette er neste mulighet. \
@@ -457,6 +465,22 @@ def _pct(value: float | None) -> int | None:
     return round(value * 100) if value is not None else None
 
 
+def line_code(line: str | None) -> str | None:
+    """A line ref reduced to what a traveller calls it: "VYG:Line:L1" -> "L1".
+
+    The codespace and the `Line` middle are ours, not the traveller's — nobody waiting on a platform
+    calls it "VYG:Line:L1". The same reduction `/demo` and `/historikk` already do in their own
+    `lineCode`, so every surface names a line alike.
+
+    Public because it is what makes a wording say *which* train: `varsel` mirrors it (it cannot
+    import this module on the path where this module is what failed) and both wordings are built
+    from the key this produces.
+    """
+    if not line:
+        return None
+    return line.rsplit(":", 1)[-1] or None
+
+
 # Per-field cap on free text entering the prompt.
 _TEXT_MAX_CHARS = 400
 # Names (stops, lines, legs) are short by nature; a long one is a sign of something else.
@@ -611,6 +635,15 @@ def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
         "situasjoner": [s for s in situations if s["sammendrag"] or s["beskrivelse"]],
         "linjer": lines,
     }
+    # The line as it is read off a departure board — "L1", not "VYG:Line:L1". Both wordings name
+    # the train with it ("Tog L1 09:24"), which is what separates a notification about *a* train
+    # from one about *theirs*: a registered journey routinely matches several lines, so a departure
+    # time alone identifies the train only to somebody who already knew which line they meant.
+    # Carried only when it is known, like `innstilling_prosent` and `minutter_spart` below — a
+    # `"linje": null` in the prompt is a key the model can quote and the template must guard.
+    alert_line_code = line_code(_bounded_text(alert_line, _NAME_MAX_CHARS))
+    if alert_line_code:
+        payload["linje"] = alert_line_code
     # NO SX MESSAGE EXISTS FOR THIS TRAIN. `situasjoner` is documented to the model as the
     # OPERATOR'S OWN words, and the no-SX path fills summary/description with text this codebase
     # wrote about itself ("Ingen situasjonsmelding er publisert..."). Leaving that in the list would

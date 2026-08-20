@@ -3,7 +3,7 @@ import { DeleteIcon } from '@entur/icons';
 import { SmallAlertBox } from '@entur/alert';
 import { Paragraph, SmallText } from '@entur/typography';
 import type { Alert, Journey } from '../api';
-import { CANCEL_LIKELY, fmtDelay, fmtPct, fmtTime, formatDays } from '../format';
+import { CANCEL_LIKELY, fmtDelay, fmtPct, fmtTime, formatDays, trainLabel } from '../format';
 
 // "Sist observert: Asker, 18 min forsinket (kl 07:42)" — what has actually happened on the line, as
 // opposed to what is predicted. Shown with its time because the observation can be up to an hour
@@ -30,7 +30,7 @@ function observationText(obs: NonNullable<Alert['latest_observation']>): string 
 // below-threshold note below is phrased as a threshold rather than restated as a probability.
 function AlertLine({ alert }: { alert: Alert }) {
   const parts: string[] = [];
-  if (alert.departure_time) parts.push(`${alert.mode ?? 'Tog'} kl ${fmtTime(alert.departure_time)}`);
+  if (alert.departure_time) parts.push(trainLabel(alert.mode, alert.line, alert.departure_time));
   // A departure ET has already declared cancelled is stated, never scored: "91 % sjanse for
   // innstilling" for a train the journey planner no longer offers sends the traveller looking for
   // it (2026-08-05). Word for word varsel.py's `_deterministic_body`, like the two below it.

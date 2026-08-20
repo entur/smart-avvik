@@ -339,6 +339,60 @@ def test_a_declared_cancellation_is_stated_not_scored():
     assert payload["situasjoner"][0]["sammendrag"] == "Signalfeil ved Asker"
 
 
+def test_the_line_reaches_the_writers_as_a_traveller_reads_it():
+    """"L1", not "VYG:Line:L1" — and at the top level, where both wordings look for it.
+
+    Which train the alert is about is the one thing a notification must not leave the reader to
+    infer: a registered journey routinely matches several lines, so "Tog kl 09:24" identifies the
+    departure only to somebody who already knew which line they meant. The codespace and the `Line`
+    middle are ours, so they are dropped — the same reduction /demo and /historikk make.
+    """
+
+    class OnL1(FakeAlert):
+        line = "VYG:Line:L1"
+
+    payload = build_message_input(JOURNEY, FakeImpact(), OnL1())
+    assert payload["linje"] == "L1"
+    assert payload["transportmiddel"] == "Tog"
+    assert payload["avgang_kl"] == "08:12"
+
+
+def test_an_unknown_line_is_absent_rather_than_null():
+    """A `"linje": null` is a key the model can quote and the template has to guard. FakeAlert
+    carries no line at all, which is the shape an alert has when the ref could not be resolved."""
+    assert "linje" not in build_message_input(JOURNEY, FakeImpact(), FakeAlert())
+
+
+def test_the_prompt_tells_the_model_to_name_the_train_by_its_line():
+    """The brief, not just the payload: a figure being available is not the same as it being used.
+    Without the rule the model wrote "toget kl. 09:24" — a train the reader still has to identify."""
+    prompt = llm_message._SYSTEM_PROMPT
+    assert "<linje>" in prompt and "Tog L1 09:24" in prompt
+    # And the honest degradation when there is no line, spelled out so the model does not fill the
+    # slot with one of its own -- the same discipline as rule one, restated where it can be reached.
+    assert "finn aldri på et linjenummer" in prompt
+
+
+def test_the_prompt_names_the_leg_of_the_alternative_the_traveller_must_catch():
+    """"Ta Tog R11 08:24", not "ta neste tog". `reisevei` holds the whole route, so the rule has to
+    say WHICH leg the departure belongs to — a later one is a connection, not the thing to board."""
+    prompt = llm_message._SYSTEM_PROMPT
+    assert "FØRSTE etappe" in prompt and "Ta Tog R11 08:24" in prompt
+
+
+def test_the_alternatives_legs_reach_the_writers_in_order_with_foot_dropped():
+    """Leg zero has to BE the first transit leg: both wordings label the alternative from it, and a
+    walk to the platform at the head of the list would name no vehicle at all."""
+    impact = FakeImpact(alternative_journey=FakeAlternative(
+        legs=[FakeLeg(mode="foot", public_code=None, line=None),
+              FakeLeg(mode="bus", public_code="31", line="RUT:Line:31"),
+              FakeLeg(mode="rail", public_code="R11", line="VYG:Line:R11")],
+    ))
+    legs = build_message_input(JOURNEY, impact, FakeAlert())["alternativ_reise"]["reisevei"]
+    assert [leg["transportmiddel"] for leg in legs] == ["bus", "rail"], "the walk is dropped"
+    assert legs[0]["linje"] == "31", "the passenger-facing code, not the ref"
+
+
 def test_the_prompt_scopes_the_advice_to_the_traveller_s_own_trip():
     """2026-08-05: for an Asker→Lillestrøm registration the model wrote "Du bør ta neste tog mellom
     Drammen og Skøyen" — the SX message's own geography, which names the cancelled *segment*, not
