@@ -1225,12 +1225,13 @@ def _deterministic_body(message_input: dict) -> str:
     situations = message_input.get("situasjoner") or []
     summary = situations[0].get("sammendrag") if situations else None
     if message_input.get("ingen_melding"):
-        # No operator has published anything about this train; the numbers come from the models
-        # reading real-time data. Say so first. Without this the body would open on whatever detail
-        # line follows and read as though it were quoting somebody -- and the one thing a traveller
-        # needs in order to weigh a warning with no message behind it is that there is no message
-        # behind it.
-        summary = "Ingen melding fra operatøren – varselet bygger på sanntidsdata"
+        # No operator has published anything about this train, so there is no text to quote and
+        # `situasjoner` is empty -- without a headline of our own the body would open on whatever
+        # detail line follows and read as though it were quoting somebody. It says only what the
+        # warning is, not that no message stands behind it (2026-08-20): the caveat ran longer than
+        # the warning, and the same shortening is why the prompt no longer asks for it either, so
+        # the two writers stay comparable on this axis.
+        summary = "Mulig avvik"
 
     # `innstilling_prosent` is in the input only when cancellation is the most likely outcome, which
     # is exactly when the wording should lead with it -- see llm_message.build_message_input.
