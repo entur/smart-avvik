@@ -55,6 +55,13 @@ WHERE o.call_date BETWEEN @from_date AND @to_date
   -- to guess) yet plainly has a realized call behind it. Filtering on the verdict would leave those
   -- reachable from no filter setting at all, which is how a population disappears.
   AND (NOT @resolved_only OR o.actual_trouble IS NOT NULL)
+  -- "Only what an operator published about" -- cut on the NAMESPACE, not on a list of the synthetic
+  -- kinds. Every situation number this codebase mints starts with `KIX:` precisely to stay clear of
+  -- the publisher namespaces (`ENT:`, `NSB:`, ...), so this one predicate covers today's two
+  -- (`KIX:NoSituation:` scored from real-time data, `KIX:ETCancellation:` relayed from the feed)
+  -- and whatever a third turns out to be. Enumerating the prefixes instead would leave a future
+  -- kind quietly included in a population the checkbox promises has operator text behind it.
+  AND (NOT @sx_only OR NOT STARTS_WITH(o.situation_number, 'KIX:'))
 
 UNION ALL
 
@@ -84,6 +91,8 @@ WHERE g.call_date BETWEEN @from_date AND @to_date
   -- Same reasoning one step further: every row on this side is unlabelled by construction — that is
   -- what makes it this side of the UNION — so none of them has ground truth yet.
   AND NOT @resolved_only
+  -- Same cut as the labelled side; see the note there for why it is the namespace and not a list.
+  AND (NOT @sx_only OR NOT STARTS_WITH(g.situation_number, 'KIX:'))
   AND NOT EXISTS (
     SELECT 1
     FROM `disruptions.varsel_decision_outcomes` AS o
