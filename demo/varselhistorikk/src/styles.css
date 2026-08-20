@@ -449,6 +449,10 @@ body {
   font-style: italic;
 }
 
+.vh-message-text {
+  white-space: pre-line;
+}
+
 .vh-message-source {
   margin: 0.35rem 0 0;
   font-style: normal;
