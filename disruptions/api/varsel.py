@@ -1333,7 +1333,10 @@ def _notification_payload(
     to_name = journey.get("to_name") or journey["to_stop"]
     assets = _BRAND_ASSETS[normalize_brand(brand)]
     return {
-        "title": _tag_environment(f"Avvik: {from_name} → {to_name}"),
+        # The journey alone, no "Avvik: " prefix (2026-08-20): the app that sent it is already
+        # named beside the title by the OS, the body says what the disruption is, and the two
+        # words cost the stop names room on a lock screen that truncates on the right.
+        "title": _tag_environment(f"{from_name} → {to_name}"),
         "body": message or _deterministic_body(message_input or _message_input_from_alert(alert)),
         "url": assets["url"],
         "icon": assets["icon"],
