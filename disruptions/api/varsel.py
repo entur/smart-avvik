@@ -767,6 +767,13 @@ class Alert(BaseModel):
         description="Ref codespace of the worst affected journey (VYG, RUT, KOL, ...).",
     )
     mode: str = Field(default="Tog", description="Vehicle noun for the UI: 'Tog' or 'Buss'.")
+    has_situation: bool = Field(
+        default=True,
+        description="False when no SX message named this train and the numbers are a prediction "
+        "from real-time data alone. It changes three things and each matters: which threshold the "
+        "alert was gated at, what the wording may claim (there is no operator text to quote), and "
+        "which segment the decision lands in on /historikk.",
+    )
     line: str | None = Field(description="Line ref of the worst affected vehicle, e.g. 'VYG:Line:R31'.")
     departure_time: datetime | None = Field(
         description="Aimed departure from the boarding stop of the worst affected train (UTC).",
@@ -966,13 +973,14 @@ def _collect_alerts(
     observation_by_line = {line.line: line.latest_observation for line in (impact.lines or [])}
     for sit in impact.situations or []:
         dep = sit.departure_prediction
-        threshold = threshold_for(sit.operator)
+        threshold = threshold_for(sit.operator, has_situation=sit.has_situation)
         impact_p = dep.impact_probability
         alert = Alert(
             situation_number=sit.situation_number,
             summary=sit.summary,
             description=sit.description,
             operator=sit.operator,
+            has_situation=sit.has_situation,
             mode=mode_label(sit.operator),
             line=sit.line,
             departure_time=dep.scheduled_time,
@@ -1157,6 +1165,14 @@ def _deterministic_body(message_input: dict) -> str:
     """
     situations = message_input.get("situasjoner") or []
     summary = situations[0].get("sammendrag") if situations else None
+    if message_input.get("ingen_melding"):
+        # No operator has published anything about this train; the numbers come from the models
+        # reading real-time data. Say so first. Without this the body would open on whatever detail
+        # line follows and read as though it were quoting somebody -- and the one thing a traveller
+        # needs in order to weigh a warning with no message behind it is that there is no message
+        # behind it.
+        summary = "Ingen melding fra operatøren – varselet bygger på sanntidsdata"
+
     # `innstilling_prosent` is in the input only when cancellation is the most likely outcome, which
     # is exactly when the wording should lead with it -- see llm_message.build_message_input.
     cancel_pct = message_input.get("innstilling_prosent")
@@ -1508,6 +1524,13 @@ def _message_input_from_alert(alert: Alert) -> dict:
         "avgang_kl": _local_hhmm(alert.departure_time),
         "situasjoner": [{"sammendrag": alert.summary}],
     }
+    if not alert.has_situation:
+        # Same correction as build_message_input makes, restated here because this path exists for
+        # exactly the moment that one has failed. `alert.summary` on a no-SX alert is text this
+        # codebase wrote, not an operator's; quoting it as though it were is the failure this
+        # fallback would otherwise introduce on the one path with nothing left to catch it.
+        body["ingen_melding"] = True
+        body["situasjoner"] = []
     # BEFORE the cancellation branch, not after it. That branch returns, and a declared cancellation
     # is exactly the case where naming a replacement matters most -- appending this at the end of the
     # function would produce a push reading "Innstilt" and naming nothing to take instead. The keys

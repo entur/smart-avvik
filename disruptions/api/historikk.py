@@ -162,10 +162,13 @@ class ConfigResponse(BaseModel):
 
 
 class Segment(BaseModel):
-    """One half of the window, split on whether the app relayed a fact or predicted one.
+    """One slice of the window, split on where the decision's information came from.
 
     Same four verdicts, same arithmetic, over a subset of the same rows — so a caller can put the
-    two side by side and see what the blended figure is actually made of.
+    slices side by side and see what the blended figure is actually made of. There are three:
+    `predicted` (an SX message existed and the models forecast the outcome), `relayed` (ET had
+    already declared it) and `no_sx` (nobody had published anything; the models read real-time data
+    alone). Every labelled verdict lands in exactly one, or in `n_unsegmented`.
     """
 
     n_hit: int = Field(description="Alerted, and trouble came.")
@@ -265,8 +268,18 @@ class Summary(BaseModel):
         description="Decisions where ET had ALREADY declared it: the app repeated a published fact. "
         "Real value to the traveller, no evidence about the models.",
     )
+    no_sx: Segment = Field(
+        default_factory=lambda: Segment(
+            n_hit=0, n_false_alarm=0, n_miss=0, n_correct_reject=0,
+            precision=None, recall=None, median_lead_min_on_hits=None,
+        ),
+        description="Decisions about a train NO SX message named at all, scored from real-time "
+        "data alone. Strictly less information than either segment above and its own calibration, "
+        "so it is neither the models' skill on published disruptions nor a relayed fact — it is "
+        "the answer to 'can we warn people the operator has not warned?'.",
+    )
     n_unsegmented: int = Field(
-        description="Labelled decisions taken before the flag existed (2026-08-05), in neither "
+        description="Labelled decisions taken before the flag existed (2026-08-05), in no "
         "segment. While this dominates, the split describes only a slice of the window.",
     )
 
@@ -465,5 +478,6 @@ def summary(
         n_hit_trains=row.get("n_hit_trains") or 0,
         predicted=segment("predicted"),
         relayed=segment("relayed"),
+        no_sx=segment("no_sx"),
         n_unsegmented=row.get("n_unsegmented") or 0,
     )

@@ -48,9 +48,55 @@ _OPERATOR_ALERT_THRESHOLD: dict[str, float] = {
 }
 
 
-def threshold_for(operator: str | None) -> float:
+# Rail calls NO SX message named (has_situation = FALSE — see create_training_calls.sql). Scored by
+# the same heads through the same features, but calibrated against their own base rate, which runs
+# ~12x lower: 0.185 % of unflagged holdout calls were cancelled against 8.67 % of flagged ones. That
+# makes the two probabilities different objects even at the same nominal value, which is why this
+# knob exists.
+#
+# IT IS HIGHER THAN THE FLAGGED CUT, NOT LOWER, and the reason is that a no-SX probability decays
+# with the ask horizon far faster than a flagged one. Measured out of sample (layers fit
+# 2026-04-01..05-15, tested on the unseen 05-16..06-19, composite p_impact_dep, per ask-horizon
+# bucket — the shape serving actually applies):
+#
+#             precision at 0.65        alerts / 35 d (no-SX)
+#   bucket    flagged    no-SX
+#   30        0.937      0.844          1 631
+#   60        0.953      0.712            632
+#   120       0.947      0.696            102
+#   240       0.926      —                  2
+#   plan      0.952      —                  0
+#
+# Without a message the ONLY signal is the last hour of observation — own_prev_delay and
+# line_now_*, both of which the `plan` anchoring zeroes out. Six hours ahead there is nothing left
+# to rank on, the layer collapses to the population's base rate, and nothing fires at any
+# threshold. That is the calibration working, not failing.
+#
+# 0.85 is what holds the near buckets to the bar the flagged family clears at 0.65: precision 0.926
+# in the 30 bucket against flagged 0.937, 0.834 at 60, 0.833 at 120, and silence beyond. It costs
+# recall — ~38 alerts/day network-wide against ~68 at 0.65 — and that trade is deliberate rather
+# than merely cautious: this alert reaches the traveller with NO explanation attached, because there
+# is no operator text to attach. A false alarm that cannot say why is worse than one that quotes a
+# real disruption, so it should have to clear a higher bar, not the same one.
+#
+# It looked like it wanted a LOWER cut when the question was "what recovers the cancellation recall
+# the old NULL-encoded path had?" (0.156 at 0.65, which the honest model only reaches near 0.50).
+# That recall was an artifact: the old path over-predicted p_cancel ~5x, and inflation is what
+# pushed rows over a fixed gate. It bought those alerts at 0.423 precision on the "Innstilt"
+# wording — more than half of them wrong. Matching it is not a goal.
+_NOSX_ALERT_THRESHOLD = 0.85
+
+
+def threshold_for(operator: str | None, *, has_situation: bool = True) -> float:
     """The alerting threshold for an operator (None -> the default). Shared by the varsel
-    matcher and the /demo verdicts so both surfaces apply the same operating point."""
+    matcher and the /demo verdicts so both surfaces apply the same operating point.
+
+    ``has_situation=False`` selects the no-SX cut instead. It is keyword-only and defaults to True
+    so every existing caller keeps its exact meaning: a caller that has not been taught about the
+    second population is, by construction, asking about the first.
+    """
+    if not has_situation:
+        return _NOSX_ALERT_THRESHOLD
     return _OPERATOR_ALERT_THRESHOLD.get(operator or "", _ALERT_THRESHOLD)
 
 
@@ -66,5 +112,10 @@ def min_threshold() -> float:
     alternative-journey lookup in :func:`varsel._impact` is a blocking external call). The floor is
     the safe cut for that: no alert-worthy journey is ever denied the work, it only means a few
     trips that are sub-threshold *for their own operator* pay for it anyway.
+
+    The no-SX cut is deliberately NOT folded in: at 0.65 it sits above this floor, so the
+    pre-screen already admits every no-SX alert it needs to. If that cut is ever lowered below the
+    operator floor, this has to take the min over both or the pre-screen starts discarding
+    alert-worthy no-SX trips before anything looks at them.
     """
     return min(_OPERATOR_ALERT_THRESHOLD.values(), default=_ALERT_THRESHOLD)

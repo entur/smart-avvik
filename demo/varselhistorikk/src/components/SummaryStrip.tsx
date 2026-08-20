@@ -87,14 +87,19 @@ function SplitRow({ label, help, segment }: { label: string; help: string; segme
  *  phone. But the two populations behave nothing alike (a declared cancellation is scored 1.0 by
  *  construction, and cannot be missed), so the blended numbers move with the MIX and can swing
  *  without the app having changed. Showing them without showing the mix is the misreading this
- *  section prevents. It applies to both: the relayed segment carries perfect recall by
- *  construction too, so the headline coverage figure is diluted the same way the headline
- *  precision is. */
+ *  section prevents. It applies to every figure, not just precision: the relayed segment carries
+ *  perfect recall by construction too, so the headline coverage figure is diluted the same way.
+ *
+ *  A third row appeared on 2026-08-20 for decisions about trains NO message named at all, scored
+ *  from real-time data alone. It is neither of the other two — strictly less information than the
+ *  forecasts, and nothing published to relay — and it is the row that answers whether we can warn
+ *  people about something the operator has not warned them about. */
+const rowTotal = (s: Segment | undefined) =>
+  s ? s.n_hit + s.n_false_alarm + s.n_miss + s.n_correct_reject : 0;
+
 function SegmentSplit({ summary }: { summary: Summary }) {
-  const { predicted, relayed } = summary;
-  const segmented =
-    predicted.n_hit + predicted.n_false_alarm + predicted.n_miss + predicted.n_correct_reject +
-    relayed.n_hit + relayed.n_false_alarm + relayed.n_miss + relayed.n_correct_reject;
+  const { predicted, relayed, no_sx: noSx } = summary;
+  const segmented = rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx);
 
   return (
     <section className="vh-split">
@@ -118,6 +123,16 @@ function SegmentSplit({ summary }: { summary: Summary }) {
             help="Avgangen var allerede meldt innstilt i sanntidsdata. Ekte verdi for den reisende, men ingen prøve på modellene."
             segment={relayed}
           />
+          {/* Only when it has rows. Until the no-SX path has produced any, an empty third row of
+              dashes would read as a broken segment rather than as one nothing has landed in yet —
+              the same reason the whole section hides itself when nothing is segmented at all. */}
+          {noSx && rowTotal(noSx) > 0 ? (
+            <SplitRow
+              label="Ingen melding fra operatøren"
+              help="Ingen avviksmelding var publisert; vurderingen bygger på sanntidsdata alene. Dette er svaret på om vi kan varsle om noe operatøren ikke har varslet om."
+              segment={noSx}
+            />
+          ) : null}
         </>
       )}
 

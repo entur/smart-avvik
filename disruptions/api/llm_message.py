@@ -175,6 +175,10 @@ kjører. Skriv «kan bli … forsinket», aldri «er … forsinket».
 - `mest_sannsynlig_innstilt: true` betyr at innstilling er det mest sannsynlige utfallet – da er \
 det innstillingen som er hovedpoenget, ikke forsinkelsen.
 - `innstilling_prosent` er bare med i det tilfellet, og er da sjansen for innstilling i prosent.
+- `ingen_melding: true` betyr at operatøren IKKE har publisert noen melding om denne avgangen, og \
+at vurderingen bygger på sanntidsdata alene (togets egen forsinkelse tidligere på ruta og \
+tilstanden på linja). `situasjoner` er da tom. Si tydelig at det ikke foreligger noen melding fra \
+operatøren, og finn aldri på en årsak til avviket – vi vet ikke hvorfor.
 - Hvis `siste_observasjon` finnes, nevn den med tidspunktet sitt – det er en observasjon fra et \
 tidligere tidspunkt, ikke nødvendigvis situasjonen akkurat nå.
 - Rådet skal handle om DENNE reisen, fra `reise.fra` til `reise.til`. Stedsnavn inni `situasjoner` \
@@ -607,6 +611,15 @@ def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
         "situasjoner": [s for s in situations if s["sammendrag"] or s["beskrivelse"]],
         "linjer": lines,
     }
+    # NO SX MESSAGE EXISTS FOR THIS TRAIN. `situasjoner` is documented to the model as the
+    # OPERATOR'S OWN words, and the no-SX path fills summary/description with text this codebase
+    # wrote about itself ("Ingen situasjonsmelding er publisert..."). Leaving that in the list would
+    # hand the model our own placeholder as though an operator had published it -- and the model's
+    # job is to relay what the operator said, so it would relay that. Drop it and state the absence
+    # as its own fact, which is what both writers then have to work with.
+    if not getattr(alert, "has_situation", True):
+        payload["ingen_melding"] = True
+        payload["situasjoner"] = []
     if certain_cancelled:
         payload["innstilt"] = True
     else:
