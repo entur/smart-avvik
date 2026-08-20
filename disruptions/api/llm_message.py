@@ -115,8 +115,11 @@ _CLAUDE_LOCATION = os.environ.get("VERTEX_CLAUDE_LOCATION") or _LOCATION
 # warn that PGA breaks multi-region endpoints.
 _GEMINI_LOCATION = os.environ.get("VERTEX_GEMINI_LOCATION") or _LOCATION_ENV or "eu"
 _CLAUDE_MODEL = os.environ.get("VERTEX_CLAUDE_MODEL", "claude-sonnet-5")
-# Verified live in ent-kixavvik-dev 2026-07-29 (location=global).
-_GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.5-flash")
+# Verified live in ent-kixavvik-dev and ent-kixavvik-prd 2026-08-20 (location=eu). Availability is
+# per MODEL, not per family: gemini-3.7-flash 404s at europe-west1 and europe-north1 exactly as
+# gemini-3.5-flash did, so the EU multi-region above remains the only endpoint that both serves it
+# and confines processing. Re-check that when moving this value, not only that the model answers.
+_GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.7-flash")
 
 # Web Push bodies are truncated by the platform and read on a lock screen. Anything longer than this
 # is a sign the model ignored the brief, so it is rejected rather than silently cut.
@@ -341,11 +344,22 @@ def _claude_write(input_json: str) -> str:
 def _gemini_write(input_json: str) -> str:
     """One Gemini call on Vertex — the fallback when this project cannot serve Sonnet 5.
 
-    ``thinking_budget: 0`` is load-bearing, not a tuning choice. Gemini 3.5 Flash thinks by default
-    and thinking tokens are drawn from ``max_output_tokens``: measured 2026-07-29, a 600-token budget
-    went 573 on thinking and 12 on output, so the reply came back truncated mid-sentence with
-    ``finish_reason=MAX_TOKENS``. A two-sentence notification does not need reasoning; with thinking
-    off the same call answers completely in ~17 tokens.
+    Holding the thinking down is load-bearing, not a tuning choice. These models think by default and
+    thinking tokens come out of ``max_output_tokens``: measured 2026-07-29, an uncapped call against
+    a 600-token ceiling spent 573 tokens thinking and 12 answering, so the reply arrived truncated
+    with ``finish_reason=MAX_TOKENS`` — which this function discards, so the cost of getting it wrong
+    is every wording quietly falling back to the template.
+
+    ``thinking_level`` is the Gemini 3.x parameter and ``thinking_budget`` the 2.5 family's; they are
+    not to be mixed. ``budget: 0`` is what stood here, and it turned thinking off on 3.5 Flash (0
+    thinking tokens, ~1.3 s) but is **silently ignored by 3.7 Flash** — measured 2026-08-20 at ``eu``,
+    92-385 thinking tokens per call with it set. A parameter that reads as "thinking off" and stops
+    turning anything off without erroring is the failure worth naming here.
+
+    ``"low"`` and not ``"minimal"``: 3.7 Flash rejects minimal outright with
+    ``400 Thinking level is unsupported``, and a 400 is deliberately not latched (below), so it would
+    fail every call on every cycle instead of once. Pinning ``VERTEX_GEMINI_MODEL`` to a 2.5 model
+    would 400 the same way, on the other side of the family split.
     """
     from google import genai
     from google.genai import errors as genai_errors
@@ -363,7 +377,7 @@ def _gemini_write(input_json: str) -> str:
             config={
                 "system_instruction": _SYSTEM_PROMPT,
                 "max_output_tokens": _MAX_TOKENS,
-                "thinking_config": {"thinking_budget": 0},
+                "thinking_config": {"thinking_level": "low"},
                 "response_mime_type": "application/json",
                 "response_schema": _RESPONSE_SCHEMA,
             },
