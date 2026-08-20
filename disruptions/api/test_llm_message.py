@@ -367,17 +367,31 @@ def test_the_prompt_tells_the_model_to_name_the_train_by_its_line():
     """The brief, not just the payload: a figure being available is not the same as it being used.
     Without the rule the model wrote "toget kl. 09:24" — a train the reader still has to identify."""
     prompt = llm_message._SYSTEM_PROMPT
-    assert "<linje>" in prompt and "Tog L1 09:24" in prompt
+    assert "<linje>" in prompt and "tog L1 09:24" in prompt
     # And the honest degradation when there is no line, spelled out so the model does not fill the
     # slot with one of its own -- the same discipline as rule one, restated where it can be reached.
     assert "finn aldri på et linjenummer" in prompt
 
 
+def test_the_prompt_keeps_the_vehicle_noun_in_lower_case():
+    """"Ta tog L1 09:24", not "Ta Tog L1 09:24". `transportmiddel` arrives capitalized because it is
+    a LABEL in the payload ("Tog", "Buss"), and a model quoting it verbatim mid-sentence writes a
+    proper noun where bokmål wants an ordinary one. The rule therefore has to name that discrepancy
+    rather than assume the model resolves it — and the prompt's own examples have to obey it, since
+    a demonstrated form outweighs a stated one."""
+    prompt = llm_message._SYSTEM_PROMPT
+    assert "liten forbokstav" in prompt
+    assert "«Ta tog L1 09:24», ikke «Ta Tog L1 09:24»" in prompt
+    # Exactly one capitalized "Tog" left in the whole brief: the counter-example above, labelled as
+    # wrong. Any other would show the model the form the rule forbids.
+    assert prompt.count("Tog") == 1 and "Buss" not in prompt
+
+
 def test_the_prompt_names_the_leg_of_the_alternative_the_traveller_must_catch():
-    """"Ta Tog R11 08:24", not "ta neste tog". `reisevei` holds the whole route, so the rule has to
+    """"Ta tog R11 08:24", not "ta neste tog". `reisevei` holds the whole route, so the rule has to
     say WHICH leg the departure belongs to — a later one is a connection, not the thing to board."""
     prompt = llm_message._SYSTEM_PROMPT
-    assert "FØRSTE etappe" in prompt and "Ta Tog R11 08:24" in prompt
+    assert "FØRSTE etappe" in prompt and "Ta tog R11 08:24" in prompt
 
 
 def test_the_alternatives_legs_reach_the_writers_in_order_with_foot_dropped():
