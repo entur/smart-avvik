@@ -113,7 +113,7 @@ def min_threshold() -> float:
     the safe cut for that: no alert-worthy journey is ever denied the work, it only means a few
     trips that are sub-threshold *for their own operator* pay for it anyway.
 
-    The no-SX cut is deliberately NOT folded in: at 0.65 it sits above this floor, so the
+    The no-SX cut is deliberately NOT folded in: at 0.85 it sits above this floor, so the
     pre-screen already admits every no-SX alert it needs to. If that cut is ever lowered below the
     operator floor, this has to take the min over both or the pre-screen starts discarding
     alert-worthy no-SX trips before anything looks at them.
