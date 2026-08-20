@@ -888,8 +888,24 @@ def test_push_body_names_an_in_time_alternative():
     body = _push_body(_alternative(), **_DELAYED)
     assert body == (
         "Signalfeil\nTog R10 08:00: Typisk 15–27 min forsinket\n"
-        "Alternativ Tog R11 08:24, framme kl 09:05"
+        "Alternativ tog R11 08:24, framme kl 09:05"
     )
+
+
+def test_the_vehicle_noun_is_capitalized_only_where_it_heads_a_line():
+    """"Alternativ tog R11 08:24", not "Alternativ Tog R11 08:24" (2026-08-20).
+
+    Both labels come from `_train_label`, but they land in different places: the traveller's own
+    train heads its own line, where the capital is the sentence's, and the alternative sits
+    mid-clause after "Alternativ", where bokmål wants an ordinary common noun. `_LEG_MODE_NOUN`
+    carries the lower-case form for exactly that reason — the alert's `mode` ("Tog") is a label in
+    the payload, not a spelling. The system prompt asks the model for the same thing, so the two
+    writers stay comparable on this axis rather than differing by orthography.
+    """
+    lines = _push_body(_alternative(), **_DELAYED).splitlines()
+    assert lines[1].startswith("Tog R10 08:00"), "line-initial: the capital is the sentence's"
+    assert lines[2] == "Alternativ tog R11 08:24, framme kl 09:05"
+    assert "Tog R11" not in "\n".join(lines)
 
 
 def test_the_alternative_names_the_leg_the_traveller_has_to_catch():
@@ -909,7 +925,7 @@ def test_the_alternative_names_the_leg_the_traveller_has_to_catch():
                                     from_name="Lysaker", to_name="Drammen"),
     ])
     body = _push_body(walk_then_bus_then_train, **_DELAYED)
-    assert body.endswith("Alternativ Buss 31 08:24, framme kl 09:05"), body
+    assert body.endswith("Alternativ buss 31 08:24, framme kl 09:05"), body
     assert "R11" not in body, "the connection is not the departure they have to catch"
 
 
@@ -934,7 +950,7 @@ def test_push_body_says_when_the_alternative_arrives_after_the_planned_arrival()
     body = _push_body(_alternative(**_LATE_ALTERNATIVE), **_DELAYED)
     assert body == (
         "Signalfeil\nTog R10 08:00: Typisk 15–27 min forsinket\n"
-        "Alternativ Tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+        "Alternativ tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
     )
     assert "spart" not in body, "a negative saving is not a saving"
 
@@ -945,7 +961,7 @@ def test_push_body_hedges_an_alternative_that_is_itself_at_risk():
     body = _push_body(_alternative(at_risk=True), **_DELAYED)
     assert body == (
         "Signalfeil\nTog R10 08:00: Typisk 15–27 min forsinket\n"
-        "Alternativ Tog R11 08:24, framme kl 09:05 (kan også bli rammet)"
+        "Alternativ tog R11 08:24, framme kl 09:05 (kan også bli rammet)"
     )
 
 
@@ -956,7 +972,7 @@ def test_push_body_leads_with_a_declared_cancellation_even_with_an_alternative()
                       p_cancel=0.57, p_impact_dep=0.61)
     assert body == (
         "Signalfeil\nTog R10 08:00: Innstilt\n"
-        "Alternativ Tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+        "Alternativ tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
     )
     assert "%" not in body and "sjanse" not in body
 
@@ -974,7 +990,7 @@ def test_the_last_resort_wording_names_the_alternative_for_a_cancelled_train():
     body = _deterministic_body(_message_input_from_alert(alert))
     assert body == (
         "Signalfeil\nTog R10 08:00: Innstilt\n"
-        "Alternativ Tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+        "Alternativ tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
     )
 
 
