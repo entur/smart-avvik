@@ -143,7 +143,11 @@ nosx_base AS (
   SELECT
     CONCAT('KIX:NoSituation:', r.jkey) AS situationNumber,
     CAST(NULL AS TIMESTAMP) AS onset_ts,
-    'Mulig avvik – ingen melding fra operatøren' AS summary,
+    -- The summary a traveller reads on the card when no wording has been written for this
+    -- alert. Deliberately just the headline: the absence of an operator message is what the
+    -- `description` below is for and what `has_situation` carries, and spelling it out here
+    -- put a caveat longer than the warning itself in front of somebody with a train to catch.
+    'Mulig avvik' AS summary,
     r.jkey, r.lineRef, r.stop_place, r.stop_name, r.aimed_dep, r.aimed_arr,
     r.call_cancelled AS et_declared_cancelled,
     r.dep_delay_min AS et_dep_delay_min,

@@ -798,14 +798,16 @@ def test_the_wording_falls_back_to_the_certainty_when_the_message_input_cannot_b
     assert body == "Signalfeil\nTog R10 08:00: Innstilt"
 
 
-def test_a_no_sx_alert_says_there_is_no_message_instead_of_quoting_one():
+def test_a_no_sx_alert_gets_its_own_headline_instead_of_quoting_one():
     """A train nobody published about still gets a wording, and the wording must not pretend to be
     relaying somebody.
 
-    `summary` on a no-SX alert is a placeholder this codebase wrote ("Mulig avvik - ingen melding
-    fra operatoren"). Left in `situasjoner` it reaches the model in the field the prompt documents
-    as the OPERATOR'S OWN WORDS, and a model told to relay what the operator said will relay it.
-    Both writers therefore see the absence as its own fact instead.
+    `summary` on a no-SX alert is a placeholder this codebase wrote, and left in `situasjoner` it
+    reaches the model in the field the prompt documents as the OPERATOR'S OWN WORDS -- a model told
+    to relay what the operator said will relay it. So the list is emptied and the template writes
+    its own headline. Since 2026-08-20 that headline states the warning ("Mulig avvik") and not the
+    absence behind it: the caveat ran longer than the warning it qualified, and the prompt dropped
+    the matching sentence in the same change.
     """
     alert = Alert(
         situation_number="KIX:NoSituation:VYG:DSJ:1", summary="Mulig avvik", line="VYG:Line:R10",
@@ -818,9 +820,9 @@ def test_a_no_sx_alert_says_there_is_no_message_instead_of_quoting_one():
     assert message_input["situasjoner"] == []
 
     body = _deterministic_body(message_input)
-    assert body.startswith("Ingen melding fra operatøren")
-    # The placeholder must not survive into what the traveller reads.
-    assert "Mulig avvik" not in body
+    assert body.startswith("Mulig avvik")
+    # The wording no longer spends a line on the missing operator message.
+    assert "melding fra operatøren" not in body
     # ...and the train is still named: dropping the summary must not drop the news with it.
     assert "Tog R10 08:00" in body
 

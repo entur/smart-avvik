@@ -36,8 +36,16 @@ function VerdictBadge({ decision }: { decision: Decision }) {
   );
 }
 
+/** Decisions about a train NO SX message named carry a synthetic situation number (predict_calls.sql
+ *  writes `KIX:NoSituation:<jkey>`), and their `summary` is a placeholder this codebase wrote about
+ *  itself rather than anything an operator published. The same prefix is what `historikk_summary.sql`
+ *  segments the third row of rates on, so the card and the strip agree by construction. */
+const isNoSituation = (decision: Decision) =>
+  decision.situation_number?.startsWith('KIX:NoSituation:') ?? false;
+
 export default function DecisionCard({ decision }: { decision: Decision }) {
   const alerted = decision.ever_alerted === true;
+  const noSituation = isNoSituation(decision);
   return (
     <article className={`vh-card ${alerted ? 'vh-card--alerted' : ''}`}>
       <header className="vh-card-head">
@@ -77,6 +85,19 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
           {/* Which side of the split this row is on. Without it the segmented rates at the top
               cannot be traced back to any particular decision, and a "100 %" chip beside a train
               looks like model skill rather than a repeated ET announcement. */}
+          {/* The no-SX population's tag, for the same reason the ET one exists: without it the third
+              row of segmented rates traces back to no particular decision. It names the BASIS —
+              real-time data alone — rather than the absence of an operator message, which is the
+              same shortening the wordings took on 2026-08-20; the fuller explanation is one hover
+              away, where it costs the reader nothing. */}
+          {noSituation ? (
+            <span
+              className="vh-tag"
+              title="Ingen avviksmelding var publisert for denne avgangen. Vurderingen bygger på sanntidsdata alene — togets egen forsinkelse oppstrøms og tilstanden på linjen."
+            >
+              Sanntidsdata alene
+            </span>
+          ) : null}
           {decision.et_cancelled ? (
             <span
               className="vh-tag"
@@ -89,7 +110,12 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
         </div>
       </header>
 
-      {decision.summary ? (
+      {/* The operator's own words about the disruption — so a no-SX row has none, and the line is
+          left out entirely rather than filled with the placeholder the SQL writes. Suppressed here
+          rather than blanked in the query: `varsel_decisions` is a record and keeps what it
+          recorded, including the longer placeholder that rows written before 2026-08-20 carry. The
+          tag above is what says which population the row is in now that this line no longer does. */}
+      {decision.summary && !noSituation ? (
         <Paragraph className="vh-situation">
           <span className="vh-dot" aria-hidden="true" />
           {decision.summary}

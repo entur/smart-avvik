@@ -542,8 +542,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   0.712 one bucket out, and beyond ~2 h the layer collapses to the base rate and fires nothing at
   all at any threshold. 0.85 holds the near buckets to the bar the flagged family clears at 0.65.
   The second reason is not statistical: this alert reaches the traveller with **no explanation**,
-  because there is no operator text to attach — so both wordings state the absence rather than
-  quoting the placeholder summary the SQL writes (`ingen_melding` in the message input).
+  because there is no operator text to attach — `ingen_melding` in the message input, with an empty
+  `situasjoner`, so neither writer can quote the placeholder summary the SQL writes as though an
+  operator had said it. Both writers **stated** that absence until 2026-08-20 and now simply do not
+  mention it: the caveat ("Ingen melding fra operatøren – varselet bygger på sanntidsdata", and the
+  model's own sentence) ran longer than the warning it qualified, so the template heads the body
+  with **`Mulig avvik`** and the prompt asks for the disruption alone — while still forbidding an
+  invented cause, which is the part that was actually load-bearing. Changed in both writers at once,
+  and in `predict_calls.sql`'s `summary` beside them: the card falls back to that summary when no
+  wording has been written, and a wording comparison whose two arms disagree about whether to
+  mention the absence measures the disagreement rather than the writers.
   `/historikk` segments these as a third provenance beside `predicted`/`relayed`, discriminated on
   the `KIX:NoSituation:` prefix rather than a new column — **adding a column to
   `varsel_decision_outcomes` breaks the registered scheduled query** until it is re-registered.

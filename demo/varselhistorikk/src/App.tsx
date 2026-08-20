@@ -8,18 +8,18 @@ import { fetchConfig, fetchDecisions, fetchSummary } from './api';
 import type { Decision, Filters, Summary, Verdict } from './api';
 import { VERDICT_LABEL, isoDaysAgo } from './format';
 
-/** What the "Utfall" dropdown can be set to: no filter, the judged population as a whole, or one
- *  verdict within it. 'med-fasit' is not a verdict and deliberately does not look like one — it
- *  maps to its own API flag, so `verdict` stays exactly the four values the log records. */
-type UtfallFilter = Verdict | '' | 'med-fasit';
+/** What the "Utfall" dropdown can be set to: no filter, or one of the four verdicts. It maps
+ *  one-to-one onto the API's `verdict`, which is exactly the four values the log records.
+ *
+ *  "Alle med fasit" used to sit in here as a fifth option and is now its own checkbox: it is not a
+ *  verdict but a widening of all four, and a dropdown makes every entry look mutually exclusive
+ *  with every other. As a checkbox it also composes visibly with the other two. */
+type UtfallFilter = Verdict | '';
 
 // The four verdicts are built from VERDICT_LABEL rather than retyped, so the filter and the badges
-// can never disagree about what a verdict is called. "Alle med fasit" sits second because it is a
-// widening of what follows it, not a fifth sibling: it is every decision the nightly job has an
-// answer for, dropping the ones still waiting and the ones whose train was never found.
+// can never disagree about what a verdict is called.
 const UTFALL_OPTIONS: Array<{ value: UtfallFilter; label: string }> = [
   { value: '', label: 'Alle utfall' },
-  { value: 'med-fasit', label: 'Alle med fasit' },
   ...(Object.entries(VERDICT_LABEL) as Array<[Verdict, string]>).map(([value, label]) => ({
     value,
     label,
@@ -35,7 +35,12 @@ const WINDOW_OPTIONS = [
 export default function App() {
   const [days, setDays] = useState(14);
   const [utfall, setUtfall] = useState<UtfallFilter>('');
+  // All three narrowings default OFF: the page opens on every decision it has, including the ones
+  // still waiting for a verdict and the ones we stayed quiet on. Each of them is a population, and
+  // a page that hides one by default measures something narrower than it says it does.
+  const [resolvedOnly, setResolvedOnly] = useState(false);
   const [alertedOnly, setAlertedOnly] = useState(false);
+  const [sxOnly, setSxOnly] = useState(false);
   const [operator, setOperator] = useState('');
 
   const [decisions, setDecisions] = useState<Decision[]>([]);
@@ -68,15 +73,16 @@ export default function App() {
     // results for a filter the user already moved off. On this page that is not just untidy — a
     // stale list beside a fresh summary makes the two disagree about the same window.
     let cancelled = false;
-    // One dropdown, two API flags: "Alle med fasit" is the judged population, a verdict is one
-    // slice of it. Sending both would be redundant, and sending `verdict='med-fasit'` would be a
-    // 400 — the API validates it against the four verdicts the log actually records.
+    // Two independent API flags now that "med fasit" is its own checkbox: `resolved_only` is the
+    // judged population, `verdict` is one slice within it. Sending both is not redundant — it is
+    // simply a verdict filter, which the API already narrows to judged rows anyway.
     const filters: Filters = {
       fromDate: isoDaysAgo(days),
       operator: operator || undefined,
-      verdict: utfall && utfall !== 'med-fasit' ? utfall : undefined,
+      verdict: utfall || undefined,
       alertedOnly,
-      resolvedOnly: utfall === 'med-fasit',
+      resolvedOnly,
+      sxOnly,
     };
     setLoading(true);
     setError(null);
@@ -110,7 +116,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [days, operator, utfall, alertedOnly]);
+  }, [days, operator, utfall, resolvedOnly, alertedOnly, sxOnly]);
 
   return (
     <main className="vh-page">
@@ -124,17 +130,23 @@ export default function App() {
       </header>
 
       <div className="vh-filters">
-        <div className="vh-filter-group" role="group" aria-label="Tidsvindu">
-          {WINDOW_OPTIONS.map((w) => (
-            <button
-              key={w.days}
-              type="button"
-              className={`vh-toggle ${days === w.days ? 'is-active' : ''}`}
-              onClick={() => setDays(w.days)}
-            >
-              {w.label}
-            </button>
-          ))}
+        {/* Wrapped, because what decides where a control sits on this row is the caption above it,
+            and this one has none. `.vh-window` gives it the same empty caption line the selects
+            get from "Utfall"/"Operatør", so the button box lands on the selects' midline rather
+            than riding ~10 px above them. */}
+        <div className="vh-window">
+          <div className="vh-filter-group" role="group" aria-label="Tidsvindu">
+            {WINDOW_OPTIONS.map((w) => (
+              <button
+                key={w.days}
+                type="button"
+                className={`vh-toggle ${days === w.days ? 'is-active' : ''}`}
+                onClick={() => setDays(w.days)}
+              >
+                {w.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <label className="vh-select">
@@ -160,14 +172,50 @@ export default function App() {
           </select>
         </label>
 
-        <label className="vh-check">
-          <input
-            type="checkbox"
-            checked={alertedOnly}
-            onChange={(e) => setAlertedOnly(e.target.checked)}
-          />
-          <span>Bare der vi varslet</span>
-        </label>
+        {/* Stacked, and in this order: each one narrows a different axis — is there an answer
+            yet, did we speak, was there a message to speak from — and side by side they read as
+            alternatives to each other rather than as three switches that compose. */}
+        <div className="vh-checks" role="group" aria-label="Avgrensninger">
+          {/* Every decision the nightly job has an answer for, dropping the ones still waiting and
+              the ones whose train was never found. Wider than picking a verdict, which narrows
+              within exactly this population — which is why it was a poor fit for the dropdown it
+              used to live in. */}
+          <label
+            className="vh-check"
+            title="Bare avgjørelser der utfallet er kjent — vi vet hvordan det faktisk gikk. Skjuler dem som venter på fasit og dem vi aldri fant igjen i sanntidsdata."
+          >
+            <input
+              type="checkbox"
+              checked={resolvedOnly}
+              onChange={(e) => setResolvedOnly(e.target.checked)}
+            />
+            <span>Bare med fasit</span>
+          </label>
+
+          <label
+            className="vh-check"
+            title="Bare avgjørelser som krysset terskelen og ble til et varsel. Skjuler dem vi valgte å tie om — som er de eneste sporene en bom etterlater seg."
+          >
+            <input
+              type="checkbox"
+              checked={alertedOnly}
+              onChange={(e) => setAlertedOnly(e.target.checked)}
+            />
+            <span>Bare der vi varslet</span>
+          </label>
+
+          {/* The rows tagged "Sanntidsdata alene" are decisions about trains no operator published
+              anything about, and they outnumber the rest several times over — every planned call in
+              the window is one. On, when the question is about the alerts an operator's own message
+              drove. */}
+          <label
+            className="vh-check"
+            title="Skjuler avgjørelser der ingen avviksmelding var publisert — dem vi selv har laget et situasjonsnummer for (KIX:), både de som er vurdert fra sanntidsdata alene og innstillinger videreformidlet fra ET."
+          >
+            <input type="checkbox" checked={sxOnly} onChange={(e) => setSxOnly(e.target.checked)} />
+            <span>Bare med SIRI-SX-melding</span>
+          </label>
+        </div>
       </div>
 
       {error ? (
