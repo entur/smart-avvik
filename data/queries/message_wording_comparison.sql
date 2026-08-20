@@ -47,7 +47,7 @@
 --      generation had never run: 753 rows at `llm_disabled` and 693 at `attempts_exhausted` across
 --      the same 11 subjects.
 --
---   5. SEGMENT ON `et_cancelled`, NEVER FILTER, AND TAKE THE SEGMENT FROM THE VIEW. A declared
+--   5. SEGMENT ON PROVENANCE, NEVER FILTER, AND TAKE `et_cancelled` FROM THE VIEW. A declared
 --      cancellation strips every probability from the payload, so both writers have a much narrower
 --      job and the wordings converge; blending those subjects with delay alerts flatters the
 --      template. Critically, the segment is NOT `LOGICAL_OR(et_cancelled)` over the subject's
@@ -57,6 +57,19 @@
 --      AFTER we alerted, since beating the feed is the point, so it would file the stack's best wins
 --      as gimmes. This query joins the view and reads `et_cancelled` from it, so the split here and
 --      the one `/historikk` reports cannot drift. NULL stays its own row, never defaulted to FALSE.
+--
+--   6. THERE IS A THIRD PROVENANCE SINCE 2026-08-20, AND IT IS A DIFFERENT WRITING TASK. A call no
+--      SX message named (`situation_number LIKE 'KIX:NoSituation:%'`) reaches both writers with
+--      `ingen_melding: true` and an EMPTY `situasjoner` array: there is no operator text to quote,
+--      and both the prompt and `varsel._deterministic_body` are instructed to state that absence
+--      rather than paper over it. So the two wordings converge for the same structural reason a
+--      declared cancellation makes them converge -- the brief is narrower -- and pooling these
+--      subjects with ordinary delay alerts flatters the template exactly as trap 5 describes.
+--      The three-way split below uses the SAME CASE as `historikk_summary.sql`, `relayed` winning
+--      where a no-SX call was later declared cancelled, so the segments here and the ones the page
+--      reports are the same populations. Expect this segment to be thin or empty for a while: it
+--      cuts at 0.85 rather than 0.65 (`alert_policy._NOSX_ALERT_THRESHOLD`), so it produces far
+--      fewer alert-worthy decisions per day than its share of the timetable suggests.
 --
 -- Also worth pinning before drawing a conclusion: `prompt_version` (a prompt edit mid-window makes
 -- rows incomparable -- that is what the column is for) and `llm_provider` (dev has been answering
@@ -94,8 +107,16 @@ subjects AS (
   GROUP BY 1, 2, 3, 4, 5, 6
 )
 SELECT
-  -- From the VIEW, never re-derived here (trap 5). NULL is its own row.
-  g.et_cancelled                      AS was_cancelled,
+  -- `et_cancelled` comes from the VIEW, never re-derived here (trap 5); the prefix test is the
+  -- same one historikk_summary.sql spells, in the same resolution order -- NULL first (unsegmented),
+  -- then `relayed`, which wins over `no_sx` because a no-SX call declared cancelled between the
+  -- scoring cycle and the judged cycle DID reach the traveller as a relayed fact (trap 6).
+  CASE
+    WHEN g.et_cancelled IS NULL                            THEN NULL
+    WHEN g.et_cancelled IS TRUE                            THEN 'relayed'
+    WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
+    ELSE 'predicted'
+  END                                 AS provenance,
   COUNT(*)                            AS subjects,
   -- Reported beside the rates, never inside them: these predate the columns and carry no evidence
   -- either way.
@@ -113,8 +134,8 @@ SELECT
 FROM subjects AS s
 JOIN `disruptions.varsel_decision_groups` AS g
   USING (journey_digest, operator, jkey, call_date, stop_order, situation_number)
-GROUP BY was_cancelled
-ORDER BY was_cancelled;
+GROUP BY provenance
+ORDER BY provenance;
 
 -- ---------------------------------------------------------------------------------------------
 -- 2. The side-by-side itself: one row per decision subject, both wordings, and the verdict where
@@ -154,6 +175,15 @@ SELECT
   g.summary                       AS situation,
   g.ever_alerted,
   g.et_cancelled,
+  -- Same CASE as query 1 and as historikk_summary.sql. Sort or filter the side-by-side on this
+  -- before reading two texts against each other: a `no_sx` pair and a `predicted` pair were
+  -- written from structurally different inputs (trap 6).
+  CASE
+    WHEN g.et_cancelled IS NULL                            THEN NULL
+    WHEN g.et_cancelled IS TRUE                            THEN 'relayed'
+    WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
+    ELSE 'predicted'
+  END                             AS provenance,
   ROUND(g.max_impact_probability, 3) AS max_impact_probability,
   p.delivered                     AS wording_delivered,
   p.provider,
