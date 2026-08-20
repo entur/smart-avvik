@@ -55,11 +55,15 @@ Design notes
   ``call_predictions_{,bus_}today`` ``p_impact_dep`` is NULL only where ``aimed_dep`` is NULL,
   i.e. at terminals the matcher already skips, so the old fallback could never fire on a boarding).
   The in-app list shows *all* current matches regardless, flagged with ``alertworthy``.
-* **What the push says** — the *alerting* quantity, in ``/demo``'s wording: P(innstilling eller
-  ≥ 10 min forsinkelse), then whichever driver dominates (likely cancellation, or the
-  exceedance-stack delay interval). Never the raw ``dep_delay_typ_min`` regression: for today's
-  alert-worthy boardings its median is 2 min against the stack p50's 15 min (rail), so quoting it
-  made a 93 %-impact alert read as "1 % sjanse for innstilling, typisk 2 min forsinket".
+* **What the push says** — which train (``_train_label``: "Tog L1 09:24", the line included
+  because a journey matches several of them and a time alone does not say which), then the
+  *alerting* quantity in ``/demo``'s wording: P(innstilling eller ≥ 10 min forsinkelse), then
+  whichever driver dominates (likely cancellation, or the exceedance-stack delay interval). Never
+  the raw ``dep_delay_typ_min`` regression: for today's alert-worthy boardings its median is 2 min
+  against the stack p50's 15 min (rail), so quoting it made a 93 %-impact alert read as "1 % sjanse
+  for innstilling, typisk 2 min forsinket". An alternative, when there is one, closes the body with
+  the same label over its FIRST transit leg ("Alternativ Tog R11 08:24") — the departure the
+  traveller has to catch, as opposed to a connection further along it.
 * **State** (devices / journeys / notified) is tiny JSON, guarded by a re-entrant lock and written
   through to a local file and — when ``VARSEL_STATE_BUCKET`` is set — a GCS blob, so it survives a
   redeploy (the container fs is ephemeral). Single always-on instance ⇒ last-write-wins is
@@ -1108,8 +1112,62 @@ def _delay_phrase(message_input: dict) -> str | None:
     return f"Typisk {p90 or p50} min forsinket"
 
 
+def _train_label(mode: str | None, line: str | None, hhmm: str) -> str:
+    """Which departure this is, as a departure board names it: "Tog L1 09:24".
+
+    The line is what makes the label identify *their* train rather than *a* train: a registered
+    journey routinely matches several lines at once, so "Tog kl 09:24" leaves the reader to work out
+    which of them left at 09:24 — on a lock screen, in the minutes before they walk to the platform.
+
+    One label for both departures a body can name — the traveller's own train and the alternative
+    offered instead of it — so the two read alike and a reader comparing them is comparing like with
+    like. That is why it takes its parts rather than reading them off the message input: they come
+    from the top level for the first and from `alternativ_reise.reisevei[0]` for the second.
+
+    Every part is optional, and each missing one costs only itself: `linje` is absent when the ref
+    was unknown, and a leg can carry a mode this codebase has no noun for. Inventing either would be
+    the one failure worse than saying too little. Note the line-less form keeps "kl" and the line
+    form drops it — "Tog 09:24" alone reads as a quantity, "Tog L1 09:24" as a line and a time.
+    """
+    if line:
+        return f"{mode} {line} {hhmm}" if mode else f"{line} {hhmm}"
+    return f"{mode} kl {hhmm}" if mode else f"kl {hhmm}"
+
+
+# The Journey Planner's transport modes in Norwegian. A closed set: `alternatives._TRIP_QUERY`
+# asks for exactly these six (foot legs never reach a wording -- build_message_input drops them),
+# so this is a complete translation rather than a best effort. Anything outside it yields no noun
+# at all: "Alternativ R11 08:24" says less than it could, while a guessed noun would put the wrong
+# vehicle on a lock screen, and the line and time still identify the departure without one.
+_LEG_MODE_NOUN = {
+    "rail": "Tog",
+    "bus": "Buss",
+    "coach": "Buss",
+    "tram": "Trikk",
+    "metro": "T-bane",
+    "water": "Båt",
+}
+
+
+def _first_leg_label(alternative: dict, hhmm: str) -> str:
+    """The alternative's first transit leg, labelled like any other departure: "Tog R11 08:24".
+
+    "Alternativ kl 08:24" tells a traveller when to be on a platform but not what to board, which on
+    a station with several departures in the same minute is the half of the advice they cannot
+    supply themselves. The FIRST leg, because that is the one they have to catch; a later leg's line
+    is a connection they will read off a board once they are moving, and naming it here would put
+    two line numbers in one clause with nothing saying which to board.
+
+    `reisevei` holds the transit legs in order, foot already excluded
+    (llm_message.build_message_input), so leg zero is that first one. An empty or absent list falls
+    through to the time alone — the wording this had before it named any line.
+    """
+    leg = next(iter(alternative.get("reisevei") or []), {})
+    return _train_label(_LEG_MODE_NOUN.get(leg.get("transportmiddel")), leg.get("linje"), hhmm)
+
+
 def _alternative_phrase(message_input: dict) -> str | None:
-    """"Alternativ kl 08:24, framme kl 09:05" — the escape route, with the caveats it comes with.
+    """"Alternativ Tog R11 08:24, framme kl 09:05" — the escape route, with its caveats.
 
     This is the wording prd actually ships (`VARSEL_LLM_ENABLED=false` there), so a caveat that
     reaches only the prompt reaches nobody. Two of them are stated rather than implied:
@@ -1130,13 +1188,14 @@ def _alternative_phrase(message_input: dict) -> str | None:
 
     Same "assemble from the parts that exist" discipline as the rest of the body: the Journey Planner
     can answer without a readable departure or arrival time, and an alternative naming neither is not
-    advice — it is dropped rather than rendered as "Alternativ kl None".
+    advice — it is dropped rather than rendered as "Alternativ kl None". The line and vehicle come
+    from :func:`_first_leg_label` and are each optional in the same way.
     """
     alt = message_input.get("alternativ_reise") or {}
     departure, arrival = alt.get("avgang_kl"), alt.get("ankomst_kl")
     if not departure and not arrival:
         return None
-    phrase = f"Alternativ kl {departure}" if departure else "Alternativ"
+    phrase = f"Alternativ {_first_leg_label(alt, departure)}" if departure else "Alternativ"
     if arrival:
         phrase += f", framme kl {arrival}" if departure else f" framme kl {arrival}"
     if alt.get("ankommer_i_tide") is False:
@@ -1189,7 +1248,9 @@ def _deterministic_body(message_input: dict) -> str:
         detail = _delay_phrase(message_input)
     hhmm = message_input.get("avgang_kl")
     if hhmm:
-        train = f"{message_input.get('transportmiddel')} kl {hhmm}"
+        train = _train_label(
+            message_input.get("transportmiddel"), message_input.get("linje"), hhmm
+        )
         detail = f"{train}: {detail}" if detail else train
     # The alternative comes LAST, after the cancellation or the delay: what has happened to the
     # traveller's own train is the news, and the replacement is the advice that follows from it.
@@ -1508,6 +1569,12 @@ def _local_hhmm(value: datetime | None) -> str | None:
     return value.astimezone(_OSLO).strftime("%H:%M") if value is not None else None
 
 
+def _local_line_code(line: str | None) -> str | None:
+    """"VYG:Line:L1" -> "L1". Mirrors `llm_message.line_code`, and for the same reason as
+    :func:`_local_hhmm`: this runs on the path where importing that module is what failed."""
+    return (line.rsplit(":", 1)[-1] or None) if line else None
+
+
 def _message_input_from_alert(alert: Alert) -> dict:
     """The alert's own figures in the message-input shape — a last resort for the *wording* only.
 
@@ -1524,6 +1591,10 @@ def _message_input_from_alert(alert: Alert) -> dict:
         "avgang_kl": _local_hhmm(alert.departure_time),
         "situasjoner": [{"sammendrag": alert.summary}],
     }
+    # Present only when known, exactly as build_message_input carries it -- _train_label branches on
+    # the key, and the two wording sources must not disagree about whether this train has a line.
+    if line := _local_line_code(alert.line):
+        body["linje"] = line
     if not alert.has_situation:
         # Same correction as build_message_input makes, restated here because this path exists for
         # exactly the moment that one has failed. `alert.summary` on a no-SX alert is text this
@@ -1543,6 +1614,15 @@ def _message_input_from_alert(alert: Alert) -> dict:
             "ankomst_kl": _local_hhmm(alt.arrival_time),
             "ankommer_i_tide": alt.arrives_before_original,
             "egen_risiko": alt.at_risk,
+            # Same shape and same foot filter as build_message_input's, because _alternative_phrase
+            # reads ONE document and takes the vehicle and line it names from leg zero. Omitting the
+            # legs here would leave this path's wording saying "Alternativ kl 08:24" while the very
+            # same offer, worded from a buildable input, named the train to board.
+            "reisevei": [
+                {"transportmiddel": leg.mode, "linje": leg.public_code or leg.line}
+                for leg in (alt.legs or [])
+                if leg.mode != "foot"
+            ],
         }
         if alt.minutes_saved > 0:
             alternative["minutter_spart"] = alt.minutes_saved

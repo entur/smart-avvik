@@ -719,7 +719,7 @@ def test_push_body_drops_the_detail_when_neither_driver_is_known():
 
     The gate reads impact_probability off the exceedance head, not off these columns, so p_cancel
     under _CANCEL_LIKELY with every delay figure NULL is a reachable combination -- and it used to
-    f-string a Python None straight into the notification ("Tog kl 08:00: None").
+    f-string a Python None straight into the notification ("Tog R10 08:00: None").
     """
     body = _push_body(
         p_cancel=0.02,
@@ -732,7 +732,7 @@ def test_push_body_drops_the_detail_when_neither_driver_is_known():
     assert "None" not in body
     assert "sjanse for innstilling" not in body and "forsinket" not in body
     # What survives is the summary and the train, so the push still says what and when.
-    assert body == "Signalfeil\nTog kl 08:00"
+    assert body == "Signalfeil\nTog R10 08:00"
 
 
 # ---- one card per train ------------------------------------------------------------------------
@@ -782,7 +782,7 @@ def test_push_body_states_a_declared_cancellation_instead_of_scoring_it():
     card wording it) still said "91 % sjanse for innstilling" for a train the journey planner had
     stopped offering -- so the traveller went looking for a departure that did not exist."""
     body = _push_body(et_declared_cancelled=True, p_cancel=0.57, p_impact_dep=0.61)
-    assert body == "Signalfeil\nTog kl 08:00: Innstilt"
+    assert body == "Signalfeil\nTog R10 08:00: Innstilt"
     assert "%" not in body and "forsinket" not in body
 
 
@@ -795,7 +795,7 @@ def test_the_wording_falls_back_to_the_certainty_when_the_message_input_cannot_b
         delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
     )
     body = _deterministic_body(_message_input_from_alert(alert))
-    assert body == "Signalfeil\nTog kl 08:00: Innstilt"
+    assert body == "Signalfeil\nTog R10 08:00: Innstilt"
 
 
 def test_a_no_sx_alert_says_there_is_no_message_instead_of_quoting_one():
@@ -822,7 +822,7 @@ def test_a_no_sx_alert_says_there_is_no_message_instead_of_quoting_one():
     # The placeholder must not survive into what the traveller reads.
     assert "Mulig avvik" not in body
     # ...and the train is still named: dropping the summary must not drop the news with it.
-    assert "Tog kl 08:00" in body
+    assert "Tog R10 08:00" in body
 
 
 def test_a_flagged_alert_is_untouched_by_the_no_sx_branch():
@@ -835,7 +835,7 @@ def test_a_flagged_alert_is_untouched_by_the_no_sx_branch():
     )
     message_input = _message_input_from_alert(alert)
     assert "ingen_melding" not in message_input
-    assert _deterministic_body(message_input) == "Signalfeil\nTog kl 08:00: Innstilt"
+    assert _deterministic_body(message_input) == "Signalfeil\nTog R10 08:00: Innstilt"
 
 
 def test_push_body_omits_a_missing_summary():
@@ -843,7 +843,7 @@ def test_push_body_omits_a_missing_summary():
     unguarded interpolation rendered it as "None" on the body's first line."""
     body = _push_body(summary=None, p_cancel=0.95)
     assert "None" not in body
-    assert body == "Tog kl 08:00: 95 % sjanse for innstilling"
+    assert body == "Tog R10 08:00: 95 % sjanse for innstilling"
 
 
 # ---- the alternative, in the wording prd actually ships ---------------------------------------
@@ -856,15 +856,71 @@ _DELAYED = {"p_cancel": 0.02, "p_impact_dep": 0.93,
 def test_push_body_without_an_alternative_is_unchanged():
     """The regression guard for this whole change: when nothing was found, the body is exactly the
     two lines it has always been. Pinned, not asserted `in`, so an unconditional clause shows up."""
-    assert _push_body(**_DELAYED) == "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket"
+    assert _push_body(**_DELAYED) == "Signalfeil\nTog R10 08:00: Typisk 15–27 min forsinket"
+
+
+def test_push_body_names_the_train_by_its_line():
+    """"Tog R10 08:00", not "Tog kl 08:00" — the label a departure board would use.
+
+    A registered journey matches whatever lines run between its two stops, so a time alone leaves
+    the reader working out which of them left at 08:00, on a lock screen, in the minutes before they
+    would have to walk to the platform. Pinned as its own check because every other body assertion
+    here carries the line incidentally: this one is about the label itself.
+    """
+    assert _push_body(**_DELAYED).splitlines()[1].startswith("Tog R10 08:00: ")
+
+
+def test_a_train_with_no_known_line_keeps_the_old_label():
+    """`line` is nullable on the Alert, and the fallback must say less rather than something untrue.
+
+    "Tog 08:00" alone would read as a quantity, so the "kl" stays in exactly this case — and no
+    line is invented to fill the slot, which is the one failure worse than naming none.
+    """
+    journey = _journey()
+    alerts = match(journey, {"S1": _train(MON_0800, line=None, **_DELAYED)})
+    body = _deterministic_body(_message_input(journey, alerts[0]))
+    assert body == "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket"
 
 
 def test_push_body_names_an_in_time_alternative():
     body = _push_body(_alternative(), **_DELAYED)
     assert body == (
-        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
-        "Alternativ kl 08:24, framme kl 09:05"
+        "Signalfeil\nTog R10 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ Tog R11 08:24, framme kl 09:05"
     )
+
+
+def test_the_alternative_names_the_leg_the_traveller_has_to_catch():
+    """The FIRST transit leg, and a foot leg is never it.
+
+    "Alternativ kl 08:24" says when to be on a platform but not what to board, which at a station
+    with several departures in that minute is the half of the advice the traveller cannot supply.
+    A later leg's line is a connection they will read off a board once they are moving; naming it
+    here would put two line numbers in one clause with nothing saying which to board -- and naming
+    the walk to the platform would name no vehicle at all.
+    """
+    walk_then_bus_then_train = _alternative(legs=[
+        alternatives.AlternativeLeg(mode="foot", from_name="Oslo S", to_name="Jernbanetorget"),
+        alternatives.AlternativeLeg(mode="bus", line="RUT:Line:31", public_code="31",
+                                    from_name="Jernbanetorget", to_name="Lysaker"),
+        alternatives.AlternativeLeg(mode="rail", line="VYG:Line:R11", public_code="R11",
+                                    from_name="Lysaker", to_name="Drammen"),
+    ])
+    body = _push_body(walk_then_bus_then_train, **_DELAYED)
+    assert body.endswith("Alternativ Buss 31 08:24, framme kl 09:05"), body
+    assert "R11" not in body, "the connection is not the departure they have to catch"
+
+
+def test_an_alternative_this_codebase_has_no_noun_for_still_names_its_line():
+    """Each missing part costs only itself. A mode outside `_LEG_MODE_NOUN` yields no vehicle noun
+    -- a guessed one would put the wrong vehicle on a lock screen -- while the line and the time
+    still identify the departure, and a leg with neither falls back to the time alone."""
+    unknown_mode = _alternative(legs=[
+        alternatives.AlternativeLeg(mode="funicular", line="X:Line:F1", public_code="F1"),
+    ])
+    assert _push_body(unknown_mode, **_DELAYED).endswith("Alternativ F1 08:24, framme kl 09:05")
+    nameless = _alternative(legs=[alternatives.AlternativeLeg(mode="foot")])
+    assert _push_body(nameless, **_DELAYED).endswith("Alternativ kl 08:24, framme kl 09:05")
 
 
 def test_push_body_says_when_the_alternative_arrives_after_the_planned_arrival():
@@ -875,8 +931,8 @@ def test_push_body_says_when_the_alternative_arrives_after_the_planned_arrival()
     faster" — which is the part of the old baseline that no measurement can revise."""
     body = _push_body(_alternative(**_LATE_ALTERNATIVE), **_DELAYED)
     assert body == (
-        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
-        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+        "Signalfeil\nTog R10 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ Tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
     )
     assert "spart" not in body, "a negative saving is not a saving"
 
@@ -886,8 +942,8 @@ def test_push_body_hedges_an_alternative_that_is_itself_at_risk():
     clean escape."""
     body = _push_body(_alternative(at_risk=True), **_DELAYED)
     assert body == (
-        "Signalfeil\nTog kl 08:00: Typisk 15–27 min forsinket\n"
-        "Alternativ kl 08:24, framme kl 09:05 (kan også bli rammet)"
+        "Signalfeil\nTog R10 08:00: Typisk 15–27 min forsinket\n"
+        "Alternativ Tog R11 08:24, framme kl 09:05 (kan også bli rammet)"
     )
 
 
@@ -897,8 +953,8 @@ def test_push_body_leads_with_a_declared_cancellation_even_with_an_alternative()
     body = _push_body(_alternative(**_LATE_ALTERNATIVE), et_declared_cancelled=True,
                       p_cancel=0.57, p_impact_dep=0.61)
     assert body == (
-        "Signalfeil\nTog kl 08:00: Innstilt\n"
-        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+        "Signalfeil\nTog R10 08:00: Innstilt\n"
+        "Alternativ Tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
     )
     assert "%" not in body and "sjanse" not in body
 
@@ -915,8 +971,8 @@ def test_the_last_resort_wording_names_the_alternative_for_a_cancelled_train():
     )
     body = _deterministic_body(_message_input_from_alert(alert))
     assert body == (
-        "Signalfeil\nTog kl 08:00: Innstilt\n"
-        "Alternativ kl 08:24, framme kl 09:35 – senere enn planlagt ankomst"
+        "Signalfeil\nTog R10 08:00: Innstilt\n"
+        "Alternativ Tog R11 08:24, framme kl 09:35 – senere enn planlagt ankomst"
     )
 
 
