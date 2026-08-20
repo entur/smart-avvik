@@ -448,7 +448,7 @@ def _nosx_call(**kw):
     fields = {
         "jkey": "DatedServiceJourney:nosx",
         "situation_number": NOSX_SIT,
-        "summary": "Mulig avvik – ingen melding fra operatøren",
+        "summary": "Mulig avvik",
         "description": "Ingen situasjonsmelding er publisert for denne avgangen.",
         "stop_place": A,
         "stop_order": 1,

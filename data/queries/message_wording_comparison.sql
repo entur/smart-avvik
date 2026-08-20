@@ -61,10 +61,13 @@
 --   6. THERE IS A THIRD PROVENANCE SINCE 2026-08-20, AND IT IS A DIFFERENT WRITING TASK. A call no
 --      SX message named (`situation_number LIKE 'KIX:NoSituation:%'`) reaches both writers with
 --      `ingen_melding: true` and an EMPTY `situasjoner` array: there is no operator text to quote,
---      and both the prompt and `varsel._deterministic_body` are instructed to state that absence
---      rather than paper over it. So the two wordings converge for the same structural reason a
---      declared cancellation makes them converge -- the brief is narrower -- and pooling these
---      subjects with ordinary delay alerts flatters the template exactly as trap 5 describes.
+--      so both write from the figures alone. Since 2026-08-20 neither one says the message is
+--      missing either -- the template heads the body with "Mulig avvik" and the prompt asks for the
+--      disruption alone -- so the two wordings converge for the same structural reason a declared
+--      cancellation makes them converge (the brief is narrower), and pooling these subjects with
+--      ordinary delay alerts flatters the template exactly as trap 5 describes. Rows written before
+--      that date carry the older, longer wording on BOTH sides; `prompt_version` dates the prompt
+--      half of the change.
 --      The three-way split below uses the SAME CASE as `historikk_summary.sql`, `relayed` winning
 --      where a no-SX call was later declared cancelled, so the segments here and the ones the page
 --      reports are the same populations. Expect this segment to be thin or empty for a while: it
