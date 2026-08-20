@@ -42,6 +42,26 @@ export function formatDays(days: number[]): string {
     .join(', ');
 }
 
+/** The line ref reduced to what a traveller calls it: "VYG:Line:L1" -> "L1". The same reduction
+ *  /demo and /historikk make, so every surface names a line alike — and word-for-word varsel.py's
+ *  `_local_line_code`, which is what the push body is built from.
+ *
+ *  Null when there is no ref to reduce: `_train_label` then falls back to "Tog kl 09:24" rather
+ *  than inventing a line, and this card has to fall back the same way or the two disagree. */
+export function lineCode(line: string | null): string | null {
+  if (!line) return null;
+  const parts = line.split(':');
+  return parts[parts.length - 1] || null;
+}
+
+/** "Tog L1 09:24" — which train the alert is about, as a departure board names it. Word for word
+ *  varsel.py's `_train_label`, "kl"-less line form and all: the card sits under the notification
+ *  this text came from, so a difference between them reads as two different trains. */
+export function trainLabel(mode: string | null, line: string | null, iso: string | null): string {
+  const code = lineCode(line);
+  return code ? `${mode ?? 'Tog'} ${code} ${fmtTime(iso)}` : `${mode ?? 'Tog'} kl ${fmtTime(iso)}`;
+}
+
 // Mirrors varsel.py's _CANCEL_LIKELY: above a 50 % cancellation probability the wording states the
 // cancellation instead of the delay interval.
 export const CANCEL_LIKELY = 0.5;
