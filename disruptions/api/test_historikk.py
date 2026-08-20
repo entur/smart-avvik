@@ -180,6 +180,35 @@ def test_resolved_only_asks_for_the_judged_population():
     assert fake.calls[0][1]["resolved_only"] is False
 
 
+def test_sx_only_is_passed_through_and_defaults_off():
+    """The "Bare med SIRI-SX-melding" checkbox.
+
+    Off by default: decisions about trains no operator published anything about are a real
+    population -- most of the log, since every planned call in the window is one -- and defaulting
+    the page to hiding them is how a population disappears. The cut itself is in the SQL, on the
+    `KIX:` namespace; what has to hold here is that the flag reaches it.
+    """
+    _reset([_row()])
+    client.get("/historikk-api/decisions")
+    assert fake.calls[0][1]["sx_only"] is False
+
+    _reset([_row()])
+    client.get("/historikk-api/decisions", params={"sx_only": "true"})
+    assert fake.calls[0][1]["sx_only"] is True
+
+
+def test_sx_only_does_not_share_a_cache_entry_with_the_unfiltered_window():
+    """Same trap as `resolved_only`: a narrower answer served to a caller who asked for everything.
+
+    Worth its own check rather than trusting the pattern -- the cache key is a positional tuple, so
+    a flag added to the params list and forgotten in the key fails silently, and for two minutes
+    whichever request landed first decides what both callers see."""
+    _reset([_row()])
+    client.get("/historikk-api/decisions")
+    client.get("/historikk-api/decisions", params={"sx_only": "true"})
+    assert len(fake.calls) == 2
+
+
 def test_resolved_only_does_not_share_a_cache_entry_with_the_unfiltered_window():
     """The narrower answer must not be served to a caller who asked for everything.
 

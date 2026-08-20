@@ -385,6 +385,12 @@ def decisions(
         "dropping 'venter' and 'ukjent'. Composes with `verdict`, which narrows further: this is "
         "the whole judged population, that is one verdict within it.",
     ),
+    sx_only: bool = Query(
+        default=False,
+        description="Only decisions about a call an operator published a SIRI-SX message for — "
+        "i.e. drop the rows this codebase minted a situation number for (`KIX:`): the no-SX "
+        "predictions and the ET-cancellation relay, neither of which has operator text behind it.",
+    ),
     limit: int = Query(default=200, ge=1, le=_MAX_LIMIT, description="Maximum rows to return."),
 ) -> DecisionsResponse:
     """Every alert decision in the window, whether or not it produced a push.
@@ -407,9 +413,10 @@ def decisions(
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
+        bigquery.ScalarQueryParameter("sx_only", "BOOL", sx_only),
         bigquery.ScalarQueryParameter("limit", "INT64", limit),
     ]
-    key = ("decisions", start, end, operator, verdict, alerted_only, resolved_only, limit)
+    key = ("decisions", start, end, operator, verdict, alerted_only, resolved_only, sx_only, limit)
     rows = _query(_DECISIONS_QUERY, params, key)
     return DecisionsResponse(
         from_date=start,
