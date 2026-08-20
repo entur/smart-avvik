@@ -126,7 +126,11 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
           is otherwise gone the moment the process restarts. */}
       {alerted && decision.message ? (
         <blockquote className="vh-message">
-          {decision.message}
+          {/* The wording is written as several lines (summary, the train's own news, then the
+              alternative -- see varsel._deterministic_body's "\n".join), and it is quoted here as
+              it was sent. Without pre-line the browser collapses those newlines to spaces and the
+              three parts run together into one sentence that reads as nonsense. */}
+          <span className="vh-message-text">{decision.message}</span>
           <SubParagraph className="vh-message-source">
             {decision.message_source === 'llm' ? 'Skrevet av modellen' : 'Standardformulering'}
             {decision.pushed_any ? '' : ' · ikke levert'}

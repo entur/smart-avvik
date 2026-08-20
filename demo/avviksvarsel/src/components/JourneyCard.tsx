@@ -44,6 +44,10 @@ function AlertLine({ alert }: { alert: Alert }) {
   return (
     <SmallAlertBox variant={alert.alertworthy ? 'negative' : 'warning'} width="fluid">
       {alert.message ? (
+        /* The wording is written as several lines (see varsel._deterministic_body's "\n".join, and
+           the model is asked for the same shape), and the card quotes the text the push carries.
+           Without pre-line the browser collapses those newlines to spaces and the parts run
+           together into one sentence. */
         <span className="av-alert-message">{alert.message}</span>
       ) : (
         alert.summary && <span className="av-alert-summary">{alert.summary}</span>
