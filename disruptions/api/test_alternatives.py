@@ -15,6 +15,8 @@ Run: uv run --with pydantic python test_alternatives.py  (or under pytest)
 
 import json
 import logging
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 
 import alternatives
@@ -1443,6 +1445,160 @@ RECORDED_JP_REPLY = (
 # Pinned so a field added to `_TRIP_QUERY` cannot land without this payload being re-captured --
 # the reply is the only check that the document and the parser still describe the same thing.
 RECORDED_JP_REPLY_BYTES = 7768
+
+
+# ---- Concurrent callers (the poller's matcher fans out, 2026-08-21) ---------------------------
+#
+# Until the matcher was fanned out these paths could not be reached at all: the poller's lookups
+# were strictly sequential, so "another caller is already fetching this key" only ever described the
+# public request path racing itself. Now Oslo-corridor journeys share stop pairs AND are matched
+# concurrently, which makes the collision the common case rather than the exotic one.
+
+
+def _blocking_fetch(gate: threading.Event, calls: list):
+    """A fake JP call that parks until `gate` is set, so a second caller is guaranteed to collide."""
+
+    def fake(*a, **k):
+        calls.append(1)
+        gate.wait(5)
+        return _recorded_patterns()
+
+    return fake
+
+
+def test_a_second_poller_caller_waits_for_the_answer_instead_of_being_told_there_is_none():
+    """The half of the fan-out that is easy to leave out, and silent when you do.
+
+    Both journeys ask about the same stop pair in the same cycle. Sequentially the second took a
+    cache hit; concurrently it finds the key in flight. Serving it "stale" — which for a cold cache
+    is None — means its card offers no replacement train, having spent no fetch and learned nothing.
+    Nothing errors, so the only symptom is alternatives quietly disappearing under load.
+    """
+    gate = threading.Event()
+    calls: list = []
+    original = _install_fetch(_blocking_fetch(gate, calls))
+    try:
+        deadline = CAND_NOW + timedelta(minutes=45)
+        results: dict[str, list] = {}
+
+        def ask(tag: str) -> None:
+            results[tag] = fetch_candidates(
+                CAND_FROM, CAND_TO, arrive_by=True, date_time=deadline,
+                now=CAND_NOW, path="poller",
+            )
+
+        first = threading.Thread(target=ask, args=("first",))
+        first.start()
+        while not calls:  # the first caller has claimed the key and is inside the fetch
+            time.sleep(0.01)
+        second = threading.Thread(target=ask, args=("second",))
+        second.start()
+        time.sleep(0.05)  # give the second caller time to reach the wait
+        gate.set()
+        first.join(5)
+        second.join(5)
+
+        assert len(calls) == 1, "the waiter must not duplicate the fetch"
+        assert results["first"], "the fetching caller got nothing"
+        assert results["second"] == results["first"], (
+            "the waiting caller was served a non-answer instead of the value it waited for"
+        )
+    finally:
+        gate.set()
+        alternatives._fetch_trip_patterns = original
+
+
+def test_a_request_path_caller_still_gives_up_immediately():
+    """The wait is poller-only on purpose: an inbound request holding an anyio threadpool slot to
+    wait on an unrelated request's fetch is how a slow upstream becomes a queue."""
+    gate = threading.Event()
+    calls: list = []
+    original = _install_fetch(_blocking_fetch(gate, calls))
+    try:
+        deadline = CAND_NOW + timedelta(minutes=45)
+        out: dict[str, object] = {}
+
+        def ask_poller() -> None:
+            fetch_candidates(
+                CAND_FROM, CAND_TO, arrive_by=True, date_time=deadline,
+                now=CAND_NOW, path="poller",
+            )
+
+        fetching = threading.Thread(target=ask_poller)
+        fetching.start()
+        while not calls:
+            time.sleep(0.01)
+        started = time.monotonic()
+        out["result"] = fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=True, date_time=deadline, now=CAND_NOW, path="request",
+        )
+        assert time.monotonic() - started < 1.0, "the request path blocked on somebody else's fetch"
+        assert out["result"] == [], "a non-answer is an empty candidate list, as it always was"
+    finally:
+        gate.set()
+        fetching.join(5)
+        alternatives._fetch_trip_patterns = original
+
+
+def test_a_waiter_is_released_when_the_fetch_FAILS_too():
+    """During a Journey Planner outage the success path never runs, so a release that only happened
+    on success would leave every waiter burning its full timeout — once per journey, per cycle."""
+    gate = threading.Event()
+    calls: list = []
+
+    def failing(*a, **k):
+        calls.append(1)
+        gate.wait(5)
+        raise TimeoutError("JP is down")
+
+    original = _install_fetch(failing)
+    try:
+        deadline = CAND_NOW + timedelta(minutes=45)
+
+        def ask() -> None:
+            fetch_candidates(
+                CAND_FROM, CAND_TO, arrive_by=True, date_time=deadline,
+                now=CAND_NOW, path="poller",
+            )
+
+        fetching = threading.Thread(target=ask)
+        fetching.start()
+        while not calls:
+            time.sleep(0.01)
+        waiter = threading.Thread(target=ask)
+        waiter.start()
+        time.sleep(0.05)
+        gate.set()
+        fetching.join(5)
+        started = time.monotonic()
+        waiter.join(5)
+        assert not waiter.is_alive(), "the waiter was never released"
+        assert time.monotonic() - started < 2.0, (
+            "the waiter timed out rather than being woken by the failing fetch"
+        )
+    finally:
+        gate.set()
+        alternatives._fetch_trip_patterns = original
+
+
+def test_the_poller_gets_a_bigger_fetch_ceiling_than_the_public_path():
+    """The two ceilings answer different questions — abuse control vs how much alerting work fits —
+    and shared one constant purely by convenience until 2026-08-21."""
+    assert alternatives._POLLER_FETCH_MAX_PER_MIN > alternatives._FETCH_MAX_PER_MIN
+    original = _install_fetch(lambda *a, **k: _recorded_patterns())
+    try:
+        # Spend exactly the request path's ceiling on the poller path; it must still have room.
+        for i in range(alternatives._FETCH_MAX_PER_MIN):
+            assert alternatives._reserve_fetch("poller", CAND_NOW), f"refused at {i}"
+        assert alternatives._reserve_fetch("poller", CAND_NOW), (
+            "the poller was throttled at the request path's ceiling"
+        )
+        # ...while the request path is refused at its own.
+        for _ in range(alternatives._FETCH_MAX_PER_MIN):
+            alternatives._reserve_fetch("request", CAND_NOW)
+        assert not alternatives._reserve_fetch("request", CAND_NOW)
+    finally:
+        alternatives._fetch_trip_patterns = original
 
 
 def _run():
