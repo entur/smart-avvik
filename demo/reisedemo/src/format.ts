@@ -126,3 +126,10 @@ export function varselDriver(snap: {
   if (snap.cancel_probability >= CANCEL_LIKELY) return 'cancel';
   return snap.delay_p50_min || snap.delay_p90_min ? 'delay' : null;
 }
+
+/** A rate as "91 %", or "–" when nothing was counted. Deliberately not `fmtPct(n / d)`: a
+ *  precision over zero varsler is not 0 %, it is unmeasured, and a search that sent no varsel is
+ *  the common case on a quiet stretch. */
+export function fmtRate(numerator: number, denominator: number): string {
+  return denominator === 0 ? '–' : fmtPct(numerator / denominator);
+}
