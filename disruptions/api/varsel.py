@@ -138,10 +138,30 @@ _AFTER_DEPARTURE_OPERATORS = frozenset({"MOR", "ATB", "OST", "GCO"})
 _MAX_JOURNEYS_PER_DEVICE = 20
 # ...and the service as a whole holds at most this many of each. The per-device cap bounds nothing
 # globally: `device_id` is client-generated and `upsert_device` accepts any value, so without these
-# the poller's per-cycle work is bounded only by how many people install the PWA. Sized for an
-# experiment with a pilot group; raise deliberately after measuring a cycle, not by discovering it.
-_MAX_DEVICES = 500
-_MAX_JOURNEYS = 2000
+# the poller's per-cycle work is bounded only by how many people install the PWA.
+#
+# Raised 10x on 2026-08-21 for a pilot an order of magnitude larger, against a measured cycle rather
+# than a guess -- which is what the old comment here asked for and nobody had done. Measured in prd
+# that evening over three consecutive cycles: the rebuild runs 50-63 s, of which `check_and_notify`
+# -- 44 journey definitions matched, decisions built, 113 rows inserted -- is 1.3-1.7 s, and the
+# cycle PERIOD is ~177 s (p50), set by how often the upstream SIRI-SX ingestion timestamp moves and
+# not by anything here. So the varsel path owns ~3 % of a cycle with ~120 s of headroom, and ten
+# times the journeys is ~13 s of matching, which the period still absorbs. BigQuery owns the other
+# 97 % and does not scale with registrations at all.
+#
+# What does not absorb it linearly is the blocking I/O on this thread -- Journey Planner lookups and
+# LLM writes -- and that is precisely why this cap can move: each is bounded by its OWN per-cycle
+# ceiling (`alternatives._FETCH_MAX_PER_MIN`, `_MAX_LLM_CALLS_PER_CYCLE`), independent of how many
+# people are registered. Raising those is a separate decision from raising this one; do not read a
+# bigger pilot as permission to widen them by the same factor.
+#
+# The old 500 was also the wrong SHAPE of limit for what it protected: it is a hard 503 out of
+# `upsert_device` ("Tjenesten er full"), so it turns away a signup rather than degrading a cycle,
+# while the per-cycle cost it stood in for is bounded elsewhere anyway. Keep it enforced -- an
+# unbounded client-generated key still needs a ceiling -- and keep raising it deliberately after
+# measuring a cycle, not by discovering it in the logs.
+_MAX_DEVICES = 5000
+_MAX_JOURNEYS = 20000
 # Written messages per refresh cycle. The matcher runs on the poller thread, which also rebuilds
 # every other cache, so an unbounded fan-out of LLM calls would stall ingestion. Journeys beyond the
 # cap get the deterministic wording this tick and are picked up on the next one.
@@ -178,7 +198,17 @@ _WORST_CASE_CALL_S = 2 * 8.0
 # Web Push sends are independent, I/O-bound, and each can block for _PUSH_TIMEOUT_S against a
 # client-supplied endpoint. Sequential delivery meant one sick push service stalled the whole poller
 # -- and with it every cache rebuild -- for devices x 10 s. Fan them out instead.
-_PUSH_WORKERS = 8
+#
+# Sized against the WORST case, not the normal one, because the normal one is invisible at any
+# width: a healthy send is ~100-300 ms, so even several hundred devices finish in seconds. What this
+# number actually decides is how long a DEGRADED push service holds the ingestion thread. The pool
+# runs one task per device with pending alerts and each task's sends stay sequential (see
+# `_deliver_device` -- a "gone" result must stop that device's remaining alerts), so the ceiling is
+# ceil(devices / _PUSH_WORKERS) x _PUSH_TIMEOUT_S. At 8 workers a 10x pilot whose endpoints all hang
+# costs ~9 minutes of stalled poller; at 32 it is ~2. The threads are nearly free -- every one is
+# parked in a socket read, not computing -- so this tracks the device cap rather than the machine,
+# and the two were raised together (2026-08-21).
+_PUSH_WORKERS = 32
 # How long past a window's end a train from that window can still be worth alerting about. A train
 # is only ever dropped by its own predicted expected departure (`catchable_after`); this bound just
 # stops journey_windows from discarding the window before that check runs. Sized above the p90 delays
