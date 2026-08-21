@@ -110,12 +110,17 @@ export interface Summary {
   n_unsegmented: number;
 }
 
-/** One entry in the "Fra"/"Til" dropdowns. The ref is the filter value — it is what the decision
- *  log stores — and the name is only for display, so an unresolvable ref still filters correctly. */
+/** One entry in the "Fra"/"Til" dropdowns: one physical PLACE, not one stop ref.
+ *
+ *  A station's rail and bus sides are separate NSR refs sharing a parent, and a registration lands
+ *  on whichever one it was made against — so they are offered as a single row, and the server
+ *  expands the row back to all of its refs when filtering. `ref` is just the row's identity. */
 export interface PlaceOption {
   ref: string;
-  /** Null when no stop list has loaded server-side, or the ref is not in it. Show the ref then. */
+  /** Null when the stop registry could not be read or does not hold the ref. Show the ref then. */
   name: string | null;
+  /** How many stop refs this row stands for; above 1 means co-located refs were merged. */
+  n_refs: number;
 }
 
 /** What the dropdowns can be set to, over the current window.
