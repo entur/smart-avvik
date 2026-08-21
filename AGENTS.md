@@ -190,8 +190,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     reservation is a conservative 2/subject), 24 calls per trailing minute tallied **by caller** the
     way `alternatives._fetch_calls` splits its budget, a 30 s deadline that **reserves** the worst
     case (16 s) inside each worker rather than measuring elapsed time, and a wording cache keyed on
-    subject + replayed cycle + `PROMPT_VERSION`. The route is `async def` because `/impact` and the
-    `/varsel-api` writes are sync `def` and share the anyio worker pool.
+    subject + replayed cycle + `PROMPT_VERSION` (a failure cached 60 s, but `rejected`/`ungrounded`
+    the full 30 min — the payload-vs-transient cut `varsel._message_attempts`/`_message_errors`
+    makes, as a TTL). The route is `async def` because `/impact` and the `/varsel-api` writes are
+    sync `def` and share the anyio worker pool. **The poller's share of that quota grew 8x on
+    2026-08-21** (`_MAX_LLM_CALLS_PER_CYCLE` 8 -> 64, 16-wide) and these four did not: they still
+    hold only because `TILBAKEBLIKK_ENABLED` is `"false"` in prd, the one deployment that reaches
+    for 64. Enabling it there makes the two budgets add, and is where these get re-derived.
   - **The latch is isolated.** `llm_message`'s `_active`/`_active_at`/`_latched_off` and their lock
     now live in a `_LatchState` holder; the module keeps one global instance (every existing caller
     unchanged) and replay takes its own via `new_replay_state()`, seeded one-way. Without it a replay
