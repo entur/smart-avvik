@@ -33,6 +33,22 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
 - **Single always-on instance** (`deployment.forceReplicas: 1` in the Helm chart): the app runs
   one background poller thread and an in-process cache, so more replicas mean duplicate pollers
   and unshared caches.
+- **What the poller cycle costs is now logged, not inferred** (2026-08-21). Every step of
+  `main._rebuild_all` is wrapped in `main._phase`, which emits `event="poller_phase"` with `phase`
+  and `ms`, and the cycle ends with one `event="poller_cycle"` carrying the total and a `phases`
+  breakdown. Before this there was no instrumentation at all and "where does the cycle go?" meant
+  subtracting timestamps of unrelated INFO lines that happen to sit at step boundaries — which
+  reports any step that logs nothing as free. Both are logged from `finally` and neither swallows:
+  a step that fails *slowly* is the most interesting reading there is, and the rebuild's whole
+  isolation model is per-step `try/except`, so a context manager that ate the exception would
+  quietly turn "bus predictions failed, serve NSB-only" into a success
+  (`test_poller_refresh.py` pins this). Baseline measured in prd that evening, ~44 registered
+  journeys: **cycle 50-63 s**, of which `predict_calls_*` ~32-37 s, `disruptions_sql` ~9 s,
+  `varsel_stops` ~6 s and `varsel_notify` **1.3-1.7 s**. The cycle *period* is ~177 s (p50) and is
+  set by how often the upstream SIRI-SX ingestion timestamp moves, not by this work — so there is
+  ~120 s of headroom, and BigQuery owns ~97 % of what is spent. The corollary matters when sizing
+  anything user-facing: **the expensive part of a cycle does not scale with registrations**, and
+  what does — `varsel_notify` — is 3 % of it.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket
