@@ -16,8 +16,16 @@ flatters the system:
   so it reports ``outcome_state = 'venter'``. Folding the two together would make a fresh
   deployment look like a broken one.
 
-Reads only. No import of main (the package rule): main injects the BigQuery client via
-:func:`configure`, the same pattern reisevalg/varsel/llm_message/decisions already use.
+One thing it is deliberate about in the other direction, because it was a reversal: the page's
+from/to filters (2026-08-21) publish the set of registered journey endpoints, which this API
+withheld entirely before then. They are served as a *vocabulary* by :func:`filters` and used as
+predicates; no decision row carries them, so a card still names a train rather than a trip. What
+the change concedes is that a from/to pair can be chosen and the matching departures read off. See
+:class:`FilterOptions` and the header of ``historikk_decisions.sql``; stronger ground than that
+means access control on ``/historikk``, not a smaller SELECT list.
+
+Reads only. No import of main (the package rule): main injects the BigQuery client and the stop-name
+lookup via :func:`configure`, the same pattern reisevalg/varsel/llm_message/decisions already use.
 """
 
 from __future__ import annotations
@@ -25,6 +33,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -37,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 _DECISIONS_QUERY = (Path(__file__).parent / "historikk_decisions.sql").read_text()
 _SUMMARY_QUERY = (Path(__file__).parent / "historikk_summary.sql").read_text()
+_FILTERS_QUERY = (Path(__file__).parent / "historikk_filters.sql").read_text()
 
 # The tables behind this only change once a poller cycle (decisions) and once a night (outcomes),
 # so a short cache keeps a page refresh from costing a BigQuery query. Same shape as main's
@@ -64,12 +74,17 @@ _OPERATORS = frozenset(
 )
 
 _bq_client: Any | None = None
+# The canonical stop list behind /varsel-api/stops (main.refresh_varsel_stops' cache), used to give
+# the from/to dropdowns readable names. Optional on purpose: a ref that cannot be resolved is shown
+# as itself, which is also what a fresh process serves before the first stops refresh lands.
+_stop_name_provider: Callable[[], list[dict]] | None = None
 
 
-def configure(*, bq_client: Any) -> None:
-    """Wire in the BigQuery client. Called once from main.lifespan."""
-    global _bq_client
+def configure(*, bq_client: Any, stop_name_provider: Callable[[], list[dict]] | None = None) -> None:
+    """Wire in the BigQuery client and (optionally) the stop-name lookup. Called from main.lifespan."""
+    global _bq_client, _stop_name_provider
     _bq_client = bq_client
+    _stop_name_provider = stop_name_provider
 
 
 class Decision(BaseModel):
@@ -159,6 +174,48 @@ class ConfigResponse(BaseModel):
         description='Non-prod environment name ("dev", "tst") for the page to show in its title; '
         "null in prd.",
     )
+
+
+class PlaceOption(BaseModel):
+    """One entry in the from/to dropdowns: the stored ref, plus what to call it on screen."""
+
+    ref: str = Field(description="NSR StopPlace ref, as the decision log stores it. The filter value.")
+    name: str | None = Field(
+        description="Registry name for that ref, or null when it cannot be resolved — no stop list "
+        "has loaded yet, or the ref is not in it. Clients fall back to showing the ref.",
+    )
+
+
+class FilterOptions(BaseModel):
+    """What the page's dropdowns can be set to, over one window.
+
+    Its own endpoint rather than something the client derives from ``/decisions``: that response is
+    capped (``limit``, 200 from the UI) and ordered by departure, so options taken from it would
+    quietly omit anything that only ran early in the window — and, once a filter were applied, would
+    shrink to just the selected value and strand the user with no way back.
+
+    This is also the API's allow-list. A value not in these arrays is rejected by ``/decisions`` and
+    ``/summary`` rather than passed through, so a caller cannot mint an unbounded number of cache
+    entries — and BigQuery queries — out of arbitrary strings. Same reasoning as
+    :func:`_checked_operator`, with the vocabulary read from the data instead of hard-coded.
+
+    PRIVACY: ``from_places``/``to_places`` are the registered journeys' own endpoints, which this API
+    withheld entirely before 2026-08-21. They are published here as a *vocabulary* and are still not
+    served per decision, so a card never says whose trip it was and a full listing does not pair an
+    origin with a destination. What this does concede is that the pair can be chosen and the matching
+    departures read off; see the header of ``historikk_decisions.sql``.
+    """
+
+    from_date: date = Field(description="Window start (operating day, Europe/Oslo).")
+    to_date: date = Field(description="Window end, inclusive.")
+    operators: list[str] = Field(description="Codespaces occurring on a decision in the window.")
+    lines: list[str] = Field(
+        description="Line refs occurring in the window, e.g. 'VYG:Line:R11'. Full refs, not the "
+        "short code the page shows: the ref is what the decision log stores and what the filter "
+        "compares against, and two codespaces can share a short code.",
+    )
+    from_places: list[PlaceOption] = Field(description="Registered boarding places, by name.")
+    to_places: list[PlaceOption] = Field(description="Registered alighting places, by name.")
 
 
 class Segment(BaseModel):
@@ -298,6 +355,76 @@ def _checked_operator(operator: str | None) -> str | None:
     return operator
 
 
+def _checked_choice(value: str | None, field: str, allowed: list[str]) -> str | None:
+    """Reject a filter value no decision in the window carries.
+
+    Same job as :func:`_checked_operator` one function up, and for the same reason — the value ends
+    up in the response-cache key on a public endpoint — but the vocabulary here comes from the data
+    rather than a constant, so it is read from :func:`_options` (itself cached) instead of hard-coded.
+
+    A 400 rather than an empty result on purpose: "line R99 does not appear in this window" and "it
+    appears and nothing matched the rest of your filters" are different answers, and a client that
+    cannot tell them apart will show the second when it means the first. The page keeps the two
+    apart by reconciling its selections against ``/filters`` whenever the window moves.
+    """
+    if value is not None and value not in allowed:
+        raise HTTPException(status_code=400, detail=f"Unknown {field}: not present in this window.")
+    return value
+
+
+def _stop_names() -> dict[str, str]:
+    """StopPlace ref -> registry name, from the same list that backs the ``/varsel-api/stops`` picker.
+
+    Fails open to an empty mapping: an unresolved ref is displayed as itself, which is strictly
+    better than a dropdown that fails to render. That is not a rare path — every process serves it
+    until the first ``refresh_varsel_stops`` lands.
+    """
+    if _stop_name_provider is None:
+        return {}
+    try:
+        return {
+            row["stop_place"]: row["stop_name"]
+            for row in _stop_name_provider() or ()
+            if row.get("stop_place") and isinstance(row.get("stop_name"), str) and row["stop_name"].strip()
+        }
+    except Exception:  # a provider hiccup must never take the filters down with it
+        logger.warning("Stop-name lookup failed; filter options will show refs", exc_info=True)
+        return {}
+
+
+def _options(start: date, end: date) -> dict[str, list[str]]:
+    """The distinct filter values in the window, as four lists of strings.
+
+    Keyed on the window alone, so every filter combination on the page shares one cache entry and
+    one BigQuery query — which is what makes it affordable to run this on the validation path of
+    ``/decisions`` and ``/summary`` as well as for the dropdowns themselves.
+    """
+    from google.cloud import bigquery
+
+    params = [
+        bigquery.ScalarQueryParameter("from_date", "DATE", start),
+        bigquery.ScalarQueryParameter("to_date", "DATE", end),
+    ]
+    rows = _query(_FILTERS_QUERY, params, ("filters", start, end))
+    row = dict(rows[0]) if rows else {}
+    return {
+        field: [v for v in (row.get(field) or []) if v]
+        for field in ("operators", "lines", "from_places", "to_places")
+    }
+
+
+def _checked_places(
+    start: date, end: date, line: str | None, from_place: str | None, to_place: str | None
+) -> None:
+    """Validate the three data-driven filters, spending a query only when one is actually set."""
+    if line is None and from_place is None and to_place is None:
+        return
+    opts = _options(start, end)
+    _checked_choice(line, "line", opts["lines"])
+    _checked_choice(from_place, "from_place", opts["from_places"])
+    _checked_choice(to_place, "to_place", opts["to_places"])
+
+
 def _window(from_date: date | None, to_date: date | None) -> tuple[date, date]:
     """Resolve and validate the requested window."""
     today = datetime.now(UTC).date()
@@ -361,6 +488,49 @@ def config() -> ConfigResponse:
 
 
 @router.get(
+    "/filters",
+    summary="The values the page's dropdowns can be set to",
+    response_description="Operators, lines and registered places occurring in the window.",
+)
+def filters(
+    from_date: date | None = Query(default=None, description="Window start (default: 14 days ago)."),
+    to_date: date | None = Query(default=None, description="Window end, inclusive (default: today)."),
+) -> FilterOptions:
+    """Every operator, line, boarding place and alighting place a decision in the window carries.
+
+    Scoped to the same window as the data, not to the whole log, so the dropdowns offer exactly what
+    the page can show and the scan stays pruned on the outcomes partition. The consequence is that a
+    selection can go stale when the window narrows — which is the client's job to reconcile, and the
+    reason the data endpoints answer 400 rather than an empty list for a value that is not here.
+
+    Deliberately *not* narrowed by the other filters: options derived from the current selection
+    shrink to it, and there is then no way back to the rest of the window.
+    """
+    start, end = _window(from_date, to_date)
+    opts = _options(start, end)
+    names = _stop_names()
+    def places(refs: list[str]) -> list[PlaceOption]:
+        # Sorted by what the reader sees. The SQL sorts by ref, which puts "NSR:StopPlace:337" next
+        # to "NSR:StopPlace:338" and their names nowhere near each other.
+        #
+        # Unnamed refs go LAST rather than under their own text: sorting the two kinds together
+        # interleaves them ("Lillestrøm", NSR:StopPlace:3247, ..., "Oslo S"), which reads as a list
+        # that lost its ordering. Behind the named ones they read as what they are — the tail the
+        # registry could not place.
+        options = [PlaceOption(ref=ref, name=names.get(ref)) for ref in refs]
+        return sorted(options, key=lambda o: (o.name is None, (o.name or o.ref).casefold()))
+
+    return FilterOptions(
+        from_date=start,
+        to_date=end,
+        operators=opts["operators"],
+        lines=opts["lines"],
+        from_places=places(opts["from_places"]),
+        to_places=places(opts["to_places"]),
+    )
+
+
+@router.get(
     "/decisions",
     summary="Alert decisions with their realized outcome",
     response_description="Decisions in the window, newest departure first.",
@@ -369,6 +539,20 @@ def decisions(
     from_date: date | None = Query(default=None, description="Window start (default: 14 days ago)."),
     to_date: date | None = Query(default=None, description="Window end, inclusive (default: today)."),
     operator: str | None = Query(default=None, description="Filter to one codespace, e.g. 'VYG'."),
+    line: str | None = Query(
+        default=None,
+        description="Filter to one line REF, e.g. 'VYG:Line:R11' — not the short code the page "
+        "shows, since two codespaces can share one. Values come from /historikk-api/filters.",
+    ),
+    from_place: str | None = Query(
+        default=None,
+        description="Filter to registrations boarding at this StopPlace ref. Values come from "
+        "/historikk-api/filters, which is also the allow-list this is checked against.",
+    ),
+    to_place: str | None = Query(
+        default=None,
+        description="Filter to registrations alighting at this StopPlace ref.",
+    ),
     verdict: str | None = Query(
         default=None,
         description="Filter to 'hit', 'false_alarm', 'miss' or 'correct_reject'. Excludes "
@@ -402,6 +586,7 @@ def decisions(
 
     start, end = _window(from_date, to_date)
     operator = _checked_operator(operator)
+    _checked_places(start, end, line, from_place, to_place)
     if verdict is not None and verdict not in _VERDICTS:
         raise HTTPException(
             status_code=400, detail=f"verdict must be one of {', '.join(_VERDICTS)}."
@@ -410,13 +595,19 @@ def decisions(
         bigquery.ScalarQueryParameter("from_date", "DATE", start),
         bigquery.ScalarQueryParameter("to_date", "DATE", end),
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
+        bigquery.ScalarQueryParameter("line", "STRING", line),
+        bigquery.ScalarQueryParameter("from_place", "STRING", from_place),
+        bigquery.ScalarQueryParameter("to_place", "STRING", to_place),
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
         bigquery.ScalarQueryParameter("sx_only", "BOOL", sx_only),
         bigquery.ScalarQueryParameter("limit", "INT64", limit),
     ]
-    key = ("decisions", start, end, operator, verdict, alerted_only, resolved_only, sx_only, limit)
+    key = (
+        "decisions", start, end, operator, line, from_place, to_place,
+        verdict, alerted_only, resolved_only, sx_only, limit,
+    )
     rows = _query(_DECISIONS_QUERY, params, key)
     return DecisionsResponse(
         from_date=start,
@@ -435,23 +626,41 @@ def summary(
     from_date: date | None = Query(default=None, description="Window start (default: 14 days ago)."),
     to_date: date | None = Query(default=None, description="Window end, inclusive (default: today)."),
     operator: str | None = Query(default=None, description="Filter to one codespace, e.g. 'VYG'."),
+    line: str | None = Query(default=None, description="Filter to one line ref, e.g. 'VYG:Line:R11'."),
+    from_place: str | None = Query(
+        default=None, description="Filter to registrations boarding at this StopPlace ref."
+    ),
+    to_place: str | None = Query(
+        default=None, description="Filter to registrations alighting at this StopPlace ref."
+    ),
 ) -> Summary:
     """Counts and rates over the window, with the unresolved share reported alongside.
 
     `n_unknown` and `n_pending` are part of the contract, not diagnostics: a precision computed
     over a fifth of the decisions is a different claim from one computed over almost all of them,
     and a caller cannot tell which it has without them.
+
+    The four filters it accepts are exactly the ones that narrow the POPULATION — which trains, on
+    whose registered journeys — so these rates describe the same slice the list beside them shows.
+    `verdict`, `alerted_only` and `resolved_only` narrow by OUTCOME instead and are deliberately not
+    accepted here at all: filtering to hits would make precision read 100 %.
     """
     from google.cloud import bigquery
 
     start, end = _window(from_date, to_date)
     operator = _checked_operator(operator)
+    _checked_places(start, end, line, from_place, to_place)
     params = [
         bigquery.ScalarQueryParameter("from_date", "DATE", start),
         bigquery.ScalarQueryParameter("to_date", "DATE", end),
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
+        bigquery.ScalarQueryParameter("line", "STRING", line),
+        bigquery.ScalarQueryParameter("from_place", "STRING", from_place),
+        bigquery.ScalarQueryParameter("to_place", "STRING", to_place),
     ]
-    rows = _query(_SUMMARY_QUERY, params, ("summary", start, end, operator))
+    rows = _query(
+        _SUMMARY_QUERY, params, ("summary", start, end, operator, line, from_place, to_place)
+    )
     row = dict(rows[0]) if rows else {}
 
     def segment(suffix: str) -> Segment:

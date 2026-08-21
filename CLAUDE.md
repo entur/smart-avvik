@@ -491,6 +491,30 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
       has wrong column count; Has 35, expected 36". The INSERT now names its columns, and new
       columns still go **last** in the CREATE so a fresh environment and an ALTERed one agree on
       order. Applying the DDL and updating the config are one operation, not two.
+  - **The from/to filters are a deliberate narrowing of the privacy claim** (2026-08-21). The page
+    has five dropdowns now — Utfall, Operatør, **Linje, Fra, Til** — populated by
+    `GET /historikk-api/filters` (`historikk_filters.sql`) over the whole window, never from the
+    rendered cards: that list is capped at 200 and ordered by departure, so options derived from it
+    would drop a line that only ran early in the window and would shrink to the current selection
+    once one was applied. Three things about it are load-bearing. `/filters` is also the API's
+    **allow-list** — an unknown value is a 400, not an empty page, because the value lands in the
+    response-cache key on a public unauthenticated endpoint and arbitrary strings would mint one
+    cache entry and one BigQuery query apiece (`_checked_operator`'s reasoning, with the vocabulary
+    read from the data); the page therefore fetches the options **before** the data on every filter
+    change and clears a selection the narrowed window no longer contains, or a window change would
+    flash an error the user never caused. The values are **refs** (`VYG:Line:R11`,
+    `NSR:StopPlace:337`), with names only as labels, resolved through the same stop list
+    `/varsel-api/stops` and `llm_message` read (`main._varsel_stops`, injected via
+    `historikk.configure`) and failing open to the bare ref. And **Linje, Fra and Til reach
+    `/summary` too**, exactly as `operator` already did, because they narrow the *population* — the
+    rates must describe the slice the list beside them shows; `verdict`/`alerted_only`/
+    `resolved_only` narrow by *outcome* and still must not, since filtering to hits makes precision
+    read 100 %. What the change concedes is real and is written into the file headers rather than
+    left implicit: `from_stop`/`to_stop` were withheld entirely before this, and a from/to pair can
+    now be chosen and the matching departures read off. What survives is the **per-row** redaction —
+    no decision carries `from_stop`, `to_stop` or `journey_digest`, `Decision` is still
+    `extra="forbid"`, and a listing still does not pair an origin with a destination. Stronger
+    ground than that means access control on `/historikk`, not a shorter SELECT list.
   - Privacy, in two layers. The *table* is keyed on the journey **definition**
     (`journey_digest`, the same `llm_message.key_digest` used in the LLM audit log, so the two
     join) plus a device count — no `device_id`, no `journey_id`, no time window or weekday pattern.
