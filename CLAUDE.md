@@ -715,7 +715,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     not page responsiveness — it is the per-project Vertex quota the **poller** shares: a replay
     burst that eats it makes a real push wording 429, and a 429 is a *transient* failure that returns
     `status="error"` without trying the other backend, so a traveller silently gets the template and
-    nothing on that side says so.
+    nothing on that side says so. **That shared draw grew 8x on 2026-08-21 and this page did not**:
+    `varsel._MAX_LLM_CALLS_PER_CYCLE` went 8 -> 64 and the writing pass went 16-wide
+    (`varsel._LLM_WORKERS`), so the poller can now hold 16 concurrent Vertex calls and sustain
+    ~22/min against the same project where it used to manage ~3. The four numbers below are
+    unchanged, and the reason they still hold is worth stating rather than assuming: the two never
+    run hot in the same pod today, because `TILBAKEBLIKK_ENABLED` is `"false"` in prd and prd is the
+    only deployment whose registrations make the poller reach for 64 (dev has ~3 journeys, tst
+    none). **Answering Q1 and enabling it in prd makes the two budgets add** -- 24/min here on top of
+    the poller's ~22/min, bursting 4 beside its 16 -- so the enabling change is where these four get
+    re-derived, not where they get carried over.
     (1) **12 backend CALLS per request** — calls, not subjects, because under `auto` one subject can
     spend two: an empty or ungrounded reply `continue`s to the next backend, and a prompt edit that
     trips the grounding check or the 300-character cap trips it for every subject at once, which is
@@ -743,11 +752,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     one path only — a first backend returning an empty or ungrounded reply near `_TIMEOUT_S` (8 s)
     and continuing, then a second that times out; a timeout on its own does *not* reach the second
     backend, and prd is the *cheapest* path rather than the worst, because an unserved Claude 404s in
-    well under a second. Pool width 4 (`varsel._PUSH_WORKERS` is the shape at 8; 4 leaves room beside
-    the poller), so the cap costs three rounds, ~7 s typically.
+    well under a second. Pool width 4 -- the shape `varsel`'s three pools use, and deliberately the
+    narrowest of them (`_PUSH_WORKERS` 8, `_MATCH_WORKERS`/`_LLM_WORKERS` 16 each), because those run
+    on the poller thread on a cadence nobody triggers while this one is reachable from a public
+    unauthenticated endpoint -- so the cap costs three rounds, ~7 s typically.
     (4) **A wording cache keyed on subject + replayed `decided_at` + `llm_message.PROMPT_VERSION`**,
     2 000 entries, 30 min, and only 60 s for a failure so a transient Vertex error does not stick a
-    red badge on a card for half an hour after Vertex recovers. Both halves of the key are
+    red badge on a card for half an hour after Vertex recovers. Which failures get which is the same
+    cut `varsel` makes with `_message_attempts` vs `_message_errors` (2026-08-22), arrived at
+    independently and expressed here as a TTL rather than a counter: `rejected` and `ungrounded` keep
+    the **full** 30 min because they are payload-determined -- the same stored `message_input` under
+    the same `PROMPT_VERSION` will be refused again, and re-asking spends a Vertex call to learn
+    nothing -- while `error` says only that the backend was unreachable a minute ago. Do not unify
+    the two lifetimes on the grounds that both are failures. Both halves of the key are
     load-bearing: the prompt version is what makes an edit invalidate the page rather than show
     yesterday's answer under today's brief, and the replayed timestamp is what makes *narrowing the
     window* — which picks a different cycle — correctly miss instead of serving the wider window's
