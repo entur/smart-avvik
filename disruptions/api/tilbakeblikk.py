@@ -773,7 +773,18 @@ def _resolve_window(
     from_minutes = _floor_to_step(from_time) if from_time is not None else 0
     to_minutes = _ceil_to_step(to_time) if to_time is not None else _MINUTES_PER_DAY
     if to_minutes <= from_minutes:
-        raise HTTPException(status_code=400, detail="to_time must be later than from_time.")
+        # Named, because the likeliest way to reach this is a caller who read the page's own
+        # sentence -- "00:00 in «Til kl.» means the rest of the day" -- and sent it literally. The
+        # page implements that by OMITTING the parameter (api.ts), which is the only way to express
+        # the following midnight; a bare "to_time must be later than from_time" would send someone
+        # who supplied no from_time at all looking for the wrong mistake.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "to_time must be later than from_time; omit to_time for the rest of the day "
+                "(a literal 00:00 is the START of the day, never the end)."
+            ),
+        )
 
     return _Window(
         day=day,
