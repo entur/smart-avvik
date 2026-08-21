@@ -3,7 +3,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -862,14 +862,89 @@ def _reisevalg_call_predictions(journey_ref: str) -> list | None:
     return list(rows) if rows else None
 
 
+@contextmanager
+def _phase(name: str, timings: dict[str, int]):
+    """Time one step of the poller's rebuild, recording what it cost whether or not it succeeded.
+
+    There was no instrumentation on this cycle at all until 2026-08-21, and answering "where does
+    the cycle go?" meant subtracting the timestamps of unrelated INFO lines that happen to sit at
+    step boundaries — which only works for the steps that log, and reports a step that logs nothing
+    as free. That was survivable at 44 registered journeys, where the whole varsel path is ~1.5 s of
+    a ~55 s cycle; it stops being survivable at ten times that, where the question becomes which of
+    several growing steps to widen first, and the honest answer has to come from a measurement
+    rather than from whichever step someone happens to suspect.
+
+    **Timed in `finally`, and the exception is re-raised untouched.** A step that fails slowly is
+    the single most interesting reading here — a Journey Planner outage, a BigQuery job that sits
+    at its timeout — and a context manager that only recorded the happy path would go quiet exactly
+    then. Nothing here swallows: every `try/except` around these steps already decides what a
+    failure means for the rebuild, and this must not take that decision away from them, so it
+    cannot be used to make a step tolerant that was not tolerant before.
+
+    `timings` accumulates the whole cycle's breakdown for the one summary line at the end. Keys are
+    stable and machine-readable (`jsonPayload.fields.phase`), so a per-step latency metric or an
+    alert on one step's regression can be built from these without parsing prose.
+    """
+    started = monotonic()
+    result = "ok"
+    try:
+        yield
+    except Exception:
+        result = "error"
+        raise
+    finally:
+        ms = round((monotonic() - started) * 1000)
+        timings[name] = ms
+        logger.info(
+            "Poller phase %s finished in %d ms (%s)",
+            name,
+            ms,
+            result,
+            extra={"fields": {"event": "poller_phase", "phase": name, "ms": ms, "result": result}},
+        )
+
+
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     """Default change handler — logs the new ingestion time."""
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
+    timings: dict[str, int] = {}
+    cycle_started = monotonic()
+    try:
+        _rebuild_all(timings)
+    finally:
+        # In `finally` for the same reason each phase is: a rebuild that dies partway through is
+        # when the breakdown is worth having, and `poll_for_changes` catches whatever comes out of
+        # here and retries on the next tick, so this line is the only record that the cycle ran at
+        # all. `phases` carries only the steps that were reached, which is itself the diagnosis.
+        total_ms = round((monotonic() - cycle_started) * 1000)
+        logger.info(
+            "Poller cycle finished in %.1f s: %s",
+            total_ms / 1000,
+            ", ".join(f"{name} {ms} ms" for name, ms in timings.items()),
+            extra={
+                "fields": {
+                    "event": "poller_cycle",
+                    "ms": total_ms,
+                    "phases": dict(timings),
+                }
+            },
+        )
+
+
+def _rebuild_all(timings: dict[str, int]) -> None:
+    """Every cache the poller rebuilds on an ingestion change, in order, each step timed.
+
+    Split out of :func:`_on_ingestion_change` purely so the cycle-total logging can wrap it in a
+    `try/finally` without indenting the whole body — the step order, the isolation boundaries and
+    what each failure degrades are all exactly as they were.
+    """
     # Actuals scan, gated on its own TTL — see maybe_refresh_rail_calls. The two queries below
     # read the table it builds and still run every tick; they just read actuals that are at most
     # _RAIL_CALLS_TTL old, which is what their onset + 12 h windows already tolerate.
-    maybe_refresh_rail_calls()
-    bq_client.query(_DISRUPTIONS_QUERY).result()
+    with _phase("rail_calls", timings):
+        maybe_refresh_rail_calls()
+    with _phase("disruptions_sql", timings):
+        bq_client.query(_DISRUPTIONS_QUERY).result()
     # AI.CLASSIFY (Gemini) categorisation of any *new* free text. Isolated so a failure here
     # never kills the rebuild: predict.sql LEFT JOINs disruptions.categories and falls back to
     # 'UNKNOWN' (with the global '__ALL__' quantile offsets) for unclassified text, so the feed
@@ -878,64 +953,78 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     # step; until that grant lands the call 403s and we degrade gracefully rather than serving an
     # empty feed.
     try:
-        bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
+        with _phase("categories", timings):
+            bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
     except Exception:
         logger.exception(
             "Category classification (AI.CLASSIFY) failed; serving with existing categories "
             "(new text -> UNKNOWN). Check the SA has roles/aiplatform.user."
         )
-    bq_client.query(_PREDICT_QUERY).result()
-    refresh_disruptions_cache()
+    with _phase("predict_sql", timings):
+        bq_client.query(_PREDICT_QUERY).result()
+    with _phase("disruptions_cache", timings):
+        refresh_disruptions_cache()
     # The impact lookup is a static, offline-built table — reloading it here just keeps it
     # current if it was rebuilt. Isolated so a missing/erroring lookup never breaks the feed.
     try:
-        refresh_impact_lookup()
+        with _phase("impact_lookup", timings):
+            refresh_impact_lookup()
     except Exception:
         logger.exception("Impact lookup refresh failed; serving disruptions without alert profiles")
     # Road-volume baselines for /reisevalg-api — same offline-built-lookup pattern as the impact
     # lookup above. Isolated so a missing/erroring table (it only exists once the reisevalg
     # backtest has run) never breaks the feed; the road side just reports unavailable.
     try:
-        reisevalg.refresh_baselines()
+        with _phase("svv_baselines", timings):
+            reisevalg.refresh_baselines()
     except Exception:
         logger.exception("SVV baselines refresh failed; reisevalg road side may be unavailable")
     # Per-call (per-train) predictions for /journey. Isolated so any failure here never breaks the
     # main /disruptions feed. The planned call source is rebuilt on a TTL (it scans ET); the
     # scoring + cache reload run every tick (cheap: materialized inputs + ML.PREDICT).
     try:
-        maybe_refresh_planned_calls()
-        bq_client.query(_PREDICT_CALLS_QUERY).result()
+        with _phase("rail_planned_calls", timings):
+            maybe_refresh_planned_calls()
+        with _phase("predict_calls_rail", timings):
+            bq_client.query(_PREDICT_CALLS_QUERY).result()
         # Bus/GOA (pooled_all) per-call predictions. Nested + isolated so any bus failure degrades
         # bus only — NSB /journey keeps serving from call_predictions_today. Builds today's bus SX
         # snapshot, refreshes the bus planned source on its own TTL, then scores.
         try:
-            bq_client.query(_DISRUPTIONS_BUS_QUERY).result()
-            maybe_refresh_bus_planned_calls()
-            bq_client.query(_PREDICT_CALLS_BUS_QUERY).result()
+            with _phase("disruptions_bus_sql", timings):
+                bq_client.query(_DISRUPTIONS_BUS_QUERY).result()
+            with _phase("bus_planned_calls", timings):
+                maybe_refresh_bus_planned_calls()
+            with _phase("predict_calls_bus", timings):
+                bq_client.query(_PREDICT_CALLS_BUS_QUERY).result()
         except Exception:
             logger.exception(
                 "Bus per-call predictions failed; /journey + /varsel serve NSB-only this tick"
             )
-        refresh_call_predictions_cache()  # loads whichever of the two tables are present
+        with _phase("call_predictions_cache", timings):
+            refresh_call_predictions_cache()  # loads whichever of the two tables are present
     except Exception:
         logger.exception("Per-call predictions refresh failed; /journey will serve stale or empty")
     # Rail-stop picker list for the avviksvarsel PWA. Isolated so a failure never breaks the feed.
     try:
-        refresh_varsel_stops()
+        with _phase("varsel_stops", timings):
+            refresh_varsel_stops()
     except Exception:
         logger.exception("Varsel stops refresh failed; /varsel-api/stops may be stale or empty")
     # Journeys flagged "no direct service" at registration: ask again, and drop the warning from any
     # that a later timetable does connect (a weekend route registered on a Friday). Costs nothing
     # when nothing is flagged, and its own failure must not touch the alerting below.
     try:
-        varsel.recheck_service()
+        with _phase("varsel_recheck_service", timings):
+            varsel.recheck_service()
     except Exception:
         logger.exception("Varsel service re-check failed; existing warnings stand")
     # Registered-journey push alerts: match every journey against the fresh snapshot and push any
     # newly alert-worthy hit. Isolated (like the other steps) so a push failure never breaks the
     # feed rebuild. No-op when VAPID is unconfigured.
     try:
-        varsel.check_and_notify(_varsel_snapshot())
+        with _phase("varsel_notify", timings):
+            varsel.check_and_notify(_varsel_snapshot())
     except Exception:
         logger.exception("Avviksvarsel notify failed")
 

@@ -1,4 +1,4 @@
-"""Checks for the poller's TTL-gated actuals rebuild (main.maybe_refresh_rail_calls).
+"""Checks for the poller's rebuild cycle: the TTL-gated actuals scan, and the per-step timing.
 
 Hermetic: the BigQuery client is stubbed before main is imported, and the app's lifespan is never
 entered — so no poller starts and nothing here touches BigQuery or the network. The stub records
@@ -9,6 +9,9 @@ rail_calls_today is the most expensive query the poller issues (a CREATE OR REPL
 day-so-far ET partition, 3.4 GB by late evening), so the gate that keeps it from running on every
 SX ingestion change is worth pinning down. The date-rollover case especially: the table holds one
 UTC day, so "fresh" cannot be a pure elapsed-time question.
+
+The second half covers `main._phase` / the `poller_cycle` summary — see the comment above those
+checks for why the properties worth pinning are the exception-handling ones, not the durations.
 
 Run: uv run --with fastapi --with httpx --with pydantic python test_poller_refresh.py
 """
@@ -116,6 +119,108 @@ def test_same_day_inside_ttl_still_skipped():
         datetime(2026, 8, 8, 23, 50, tzinfo=UTC), datetime(2026, 8, 8, 23, 55, tzinfo=UTC)
     )
     assert queries == []
+
+
+# --- main._phase: the cycle's per-step timing (added 2026-08-21) --------------------------------
+#
+# What these pin is not the timing itself (a duration assertion would be a flake) but the two
+# properties that decide whether adding instrumentation was safe. The rebuild's isolation model is
+# built entirely out of `try/except` around individual steps -- each one decides what a failure
+# there degrades -- and `_phase` is now wrapped INSIDE several of those. A context manager that
+# swallowed would silently convert "the bus predictions failed, serve NSB-only" into "the bus
+# predictions succeeded", which no other check in this repo would catch.
+
+
+class _Recorder:
+    """Collects the `extra={"fields": ...}` payloads main.logger is handed."""
+
+    def __init__(self) -> None:
+        self.fields: list[dict] = []
+
+    def info(self, *args, **kwargs) -> None:
+        extra = kwargs.get("extra") or {}
+        self.fields.append(extra.get("fields", {}))
+
+    def __getattr__(self, _name):  # exception/warning/etc. are not under test here
+        return lambda *a, **k: None
+
+
+def _with_recorder(fn):
+    """Run fn() with main.logger stubbed; return (recorded field dicts, raised exception or None)."""
+    recorder = _Recorder()
+    before = main.logger
+    main.logger = recorder
+    try:
+        fn()
+    except Exception as exc:  # noqa: BLE001 - the test decides what to do with it
+        return recorder.fields, exc
+    finally:
+        main.logger = before
+    return recorder.fields, None
+
+
+def test_phase_records_a_successful_step():
+    timings: dict[str, int] = {}
+
+    def run():
+        with main._phase("some_step", timings):
+            pass
+
+    fields, exc = _with_recorder(run)
+    assert exc is None
+    assert "some_step" in timings
+    assert next(f for f in fields if f.get("event") == "poller_phase")["result"] == "ok"
+
+
+def test_phase_does_not_swallow_the_exception():
+    """The whole isolation model of the rebuild depends on this."""
+    timings: dict[str, int] = {}
+
+    def run():
+        with main._phase("failing_step", timings):
+            raise RuntimeError("boom")
+
+    _, exc = _with_recorder(run)
+    assert isinstance(exc, RuntimeError), "a failing step must still reach its own except block"
+
+
+def test_phase_times_a_step_that_failed():
+    """A step that fails SLOWLY is the most interesting reading; it must not go unrecorded."""
+    timings: dict[str, int] = {}
+
+    def run():
+        try:
+            with main._phase("failing_step", timings):
+                raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+
+    fields, _ = _with_recorder(run)
+    assert "failing_step" in timings, "a failed step must still record its duration"
+    phase = next(f for f in fields if f.get("event") == "poller_phase")
+    assert phase["result"] == "error"
+    assert phase["phase"] == "failing_step"
+
+
+def test_the_cycle_summary_is_logged_even_when_the_rebuild_dies():
+    """`poll_for_changes` catches whatever escapes _on_ingestion_change, so this line is the only
+    record that the cycle ran at all -- and a partial `phases` breakdown is itself the diagnosis."""
+    before = main._rebuild_all
+
+    def exploding_rebuild(timings):
+        timings["reached_step"] = 42
+        raise RuntimeError("rebuild died")
+
+    main._rebuild_all = exploding_rebuild
+    try:
+        fields, exc = _with_recorder(lambda: main._on_ingestion_change(None))
+    finally:
+        main._rebuild_all = before
+
+    assert isinstance(exc, RuntimeError), "the failure must still propagate to poll_for_changes"
+    cycle = [f for f in fields if f.get("event") == "poller_cycle"]
+    assert cycle, "no poller_cycle line was logged for a rebuild that died"
+    assert cycle[0]["phases"] == {"reached_step": 42}
 
 
 if __name__ == "__main__":
