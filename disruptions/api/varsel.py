@@ -163,9 +163,24 @@ _MAX_JOURNEYS_PER_DEVICE = 20
 _MAX_DEVICES = 5000
 _MAX_JOURNEYS = 20000
 # Written messages per refresh cycle. The matcher runs on the poller thread, which also rebuilds
-# every other cache, so an unbounded fan-out of LLM calls would stall ingestion. Journeys beyond the
+# every other cache, so an unbounded fan-out of LLM calls would stall ingestion. Trains beyond the
 # cap get the deterministic wording this tick and are picked up on the next one.
-_MAX_LLM_CALLS_PER_CYCLE = 8
+#
+# 8 -> 64 on 2026-08-21, when the writing pass stopped being sequential (see `_LLM_WORKERS`). The
+# old number was a wall-clock budget wearing a count's clothing: 8 calls at ~2.2 s each is ~18 s of
+# a 30 s ceiling, so what it really encoded was "about as many as fit end to end". Concurrency
+# breaks that identity -- 64 calls across 16 workers is ~9 s -- so the count is now a policy choice
+# about how much of a cycle's demand deserves prose, and `_MAX_LLM_SECONDS_PER_CYCLE` is what still
+# bounds the thread.
+#
+# Sized on measured demand, not on what the pool can do. Reconstructing the per-train writing rule
+# over 14 days of prd decisions: distinct trains pushed per cycle, capped at 3 per journey, runs
+# p50 2 / p90 6 / p99 19 / max 22, and only 13 of 250 pushing cycles exceed 8 at all. At 10x
+# registrations that p99 is ~200, which no affordable cap covers -- so 64 is chosen to clear the
+# projected p90 rather than the p99, and the tail deliberately takes the template. Note the cost of
+# raising it is close to zero in aggregate: demand is bursty, not sustained (prd wants ~50 writes a
+# DAY), so this only ever binds on the handful of cycles it exists for.
+_MAX_LLM_CALLS_PER_CYCLE = 64
 # Give-up point for writing one journey × situation's message. Failures are payload-dependent as
 # often as they are transient (a refusal, an over-long or unparseable reply), so a write that failed
 # twice will very likely keep failing for this exact payload — and retrying costs a slot from the
@@ -182,8 +197,28 @@ _MAX_MESSAGE_ATTEMPTS = 3
 _MAX_MESSAGES_PER_JOURNEY = 3
 # Wall-clock ceiling for the whole message-writing pass. The call cap alone does not bound time:
 # one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
-# worst case. Journeys past the budget take the deterministic wording and are re-tried next tick.
+# worst case. Trains past the budget take the deterministic wording and are re-tried next tick.
+#
+# Unchanged at 30 s across the 2026-08-21 fan-out, and that is the point of it: with the calls
+# concurrent, the COUNT no longer implies a duration at all, so this is the only thing left that
+# bounds how long the ingestion thread spends here. The reservation below is still per call and
+# still taken before each one starts (now under `_WriteBudget`'s lock rather than in a single-threaded
+# loop), so the guarantee is the same one it always was -- the pass ENDS by this deadline, it does
+# not merely stop starting calls at it.
 _MAX_LLM_SECONDS_PER_CYCLE = 30.0
+# How many journeys are matched at once, and how many wordings are written at once. Both passes are
+# blocking I/O on the poller thread and nothing else: a match spends its time inside up to
+# `impact._MAX_ALTERNATIVE_LOOKUPS` Journey Planner calls at ~3 s, a write inside a Vertex call at
+# ~2.2 s. So the width buys wall clock almost linearly and costs almost no CPU -- every one of these
+# threads is parked in a socket read.
+#
+# 16 each, sized against the ceilings they drain rather than against the machine: 90 lookups
+# (`alternatives._POLLER_FETCH_MAX_PER_MIN`) is ~17 s at this width instead of ~270 s sequential, and
+# 64 writes is ~9 s instead of ~140 s. Raising a ceiling without raising the matching width just
+# makes the poller block longer, which is the trap the old 8-call LLM cap was quietly protecting
+# against.
+_MATCH_WORKERS = 16
+_LLM_WORKERS = 16
 # What one more "call" can cost before it returns: two backend attempts at llm_message._TIMEOUT_S.
 # Restated here rather than imported, like _CANCEL_LIKELY above and for the same reason -- this is
 # consulted on the poller thread before llm_message is necessarily importable, and the value has to
@@ -1992,6 +2027,48 @@ def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
                 _forget_message(message_key)
 
 
+class _WriteBudget:
+    """This cycle's ceiling on written messages, claimable from several threads at once.
+
+    Two limits behind one `claim()`, because a caller must not be able to satisfy one and ignore the
+    other: a count (:data:`_MAX_LLM_CALLS_PER_CYCLE`, a policy choice about how much of a cycle's
+    demand deserves prose) and a wall clock (:data:`_MAX_LLM_SECONDS_PER_CYCLE`, the ceiling on how
+    long the ingestion thread may spend here).
+
+    **The clock is RESERVED, not checked.** `monotonic() >= deadline` is a pre-check: a call passing
+    it with a millisecond to spare still runs its full worst case afterwards, so the pass overshoots
+    by however long one call can take -- measured at ~46 s against a documented 30 s ceiling before
+    that was fixed. Reserving :data:`_WORST_CASE_CALL_S` up front makes the deadline a ceiling on
+    when the pass ENDS. Concurrency does not weaken that: every thread reserves its own worst case
+    before starting, so whatever is in flight when the deadline nears was already paid for.
+
+    It is exactly this reservation that made the count safe to raise from 8 to 64. Sequentially the
+    two limits were the same limit wearing different clothes -- 8 calls at ~2.2 s is ~18 s of a 30 s
+    budget -- and raising the count alone would simply have moved the binding constraint to the
+    clock, one capped call at a time. Across 16 workers they are genuinely independent.
+
+    `refused` counts what the ceiling cost, so the one summary line per cycle can report it. Each
+    refused train is also recorded durably as `message_status = 'capped'` on its own decision row,
+    which is where the question is actually answered; the log line is for noticing.
+    """
+
+    def __init__(self, max_calls: int, deadline: float) -> None:
+        self._lock = threading.Lock()
+        self._max_calls = max_calls
+        self._deadline = deadline
+        self.claimed = 0
+        self.refused = 0
+
+    def claim(self) -> bool:
+        """Reserve one call, or refuse. Never blocks for longer than the dict operations here."""
+        with self._lock:
+            if self.claimed >= self._max_calls or monotonic() + _WORST_CASE_CALL_S >= self._deadline:
+                self.refused += 1
+                return False
+            self.claimed += 1
+            return True
+
+
 def check_and_notify(by_situation: dict[str, list]) -> None:
     """Send a push for every registered journey × newly alert-worthy situation.
 
@@ -2063,31 +2140,65 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # the recorded row all read the same document rather than three separate builds of it. Local to
     # the cycle: unlike `_messages` it describes this tick's numbers and must not outlive them.
     message_inputs: dict[tuple[str, str, str], dict | None] = {}
-    llm_calls = 0
-    budget_logged = False
-    # Wall-clock budget, not just a call count. _MAX_LLM_CALLS_PER_CYCLE caps journeys, but one
-    # "call" can be two backend attempts (a refusal or an unparseable reply falls through to the
-    # other backend), so 8 journeys x 2 x _TIMEOUT_S is ~128 s rather than the 64 s the count
-    # suggests. This is the ingestion thread: every second here is a second /disruptions, /journey,
-    # /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1 to finish.
-    llm_deadline = monotonic() + _MAX_LLM_SECONDS_PER_CYCLE
+    # Wall-clock budget, not just a call count -- see _WriteBudget for why the deadline is reserved
+    # rather than checked. This is the ingestion thread: every second here is a second /disruptions,
+    # /journey, /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1.
+    budget = _WriteBudget(_MAX_LLM_CALLS_PER_CYCLE, monotonic() + _MAX_LLM_SECONDS_PER_CYCLE)
     # One instant for the whole cycle, so "has this alternative departed?" cannot be answered
     # differently for two journeys scored a few seconds apart.
     cycle_now = datetime.now(UTC)
-    for key, journey in by_journey_key.items():
+
+    # ---- Pass 1a: match every journey, CONCURRENTLY -------------------------------------------
+    #
+    # `match_journey(with_alternative=True)` is the poller's other piece of blocking external I/O:
+    # up to `impact._MAX_ALTERNATIVE_LOOKUPS` Journey Planner calls at ~3 s each, per journey. Run
+    # end to end that is the whole `alternatives._POLLER_FETCH_MAX_PER_MIN` ceiling x 3 s of stalled
+    # ingestion in the bad case, which at ten times today's registrations is minutes, not seconds.
+    # Same reasoning as loop 2's push fan-out, and the threads are equally nearly free -- each is
+    # parked in a socket read.
+    #
+    # Safe to run concurrently because `match_journey` mutates nothing global: it builds its own
+    # `worst_by_situation`/`by_train`, reads the stop-alias map and the prediction cache (both
+    # rebuilt earlier on THIS thread, before check_and_notify is called), and reaches the outside
+    # world only through `alternatives`, which has its own lock, its own single-flight and its own
+    # fetch budget. What the fan-out did change there is that single-flight now has concurrent
+    # callers for the first time, and it had to learn to WAIT rather than shrug -- see
+    # `alternatives._KeyedTTLCache.get`'s `wait_for_refresh`. Without that half, journeys sharing a
+    # stop pair would each be told there is no alternative, which is the regression a fan-out is
+    # expected to cause and would have shipped silently.
+    def _match(item: tuple[str, dict]) -> tuple[str, list[Alert]]:
+        key, journey = item
         try:
-            alerts = match_journey(journey, with_alternative=True)
+            return key, match_journey(journey, with_alternative=True)
         except Exception:
             # One journey's failure must not stop the remaining journeys being scored or any push
-            # going out. Empty alerts for this key; the next tick retries.
+            # going out. Empty alerts for this key; the next tick retries. Caught INSIDE the worker
+            # so it stays this journey's failure -- an exception escaping into `pool.map` surfaces
+            # at the point the results are consumed and would take the whole cycle with it.
             logger.warning(
                 "Scoring failed for journey %s; skipping it this cycle",
                 key,
                 exc_info=True,
                 extra={"fields": {"event": "varsel_match_error"}},
             )
-            alerts_by_key[key] = []
-            continue
+            return key, []
+
+    matched: list[tuple[str, list[Alert]]] = []
+    if by_journey_key:
+        with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(by_journey_key))) as pool:
+            matched = list(pool.map(_match, list(by_journey_key.items())))
+
+    # ---- Pass 1b: reconcile, and decide what to write for -- SEQUENTIALLY ----------------------
+    #
+    # Deliberately not folded into the pass above. Everything here mutates module state
+    # (`_alternatives`, `_messages`, `_message_attempts`, `_message_meta`) or reads it to make a
+    # decision, and doing that on one thread is worth far more than the microseconds it costs: none
+    # of it blocks on anything. The split is behaviour-preserving -- `_reconcile_caches` for one
+    # journey never reads another journey's alerts, and `_pending_pushes` reads `_notified`, which
+    # only loop 2 writes.
+    write_queue: list[tuple[str, Alert, tuple[str, str, str], int]] = []
+    for key, alerts in matched:
+        journey = by_journey_key[key]
         alerts_by_key[key] = alerts
         for alert in alerts:
             message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
@@ -2098,12 +2209,11 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         #
         # Guarded like the match above it, and for a strictly bigger blast radius than the
         # 2026-07-29 incident that guard exists for: called bare, a raise here unwinds out of
-        # check_and_notify entirely, so the remaining journeys are never scored, loop 2 never runs
-        # (no pushes at all this cycle) and _record_decisions never runs (no rows either). What it
-        # touches is duck-typed -- an impact response from an injected provider, a cached
-        # AlternativeJourney, an aware/naive datetime comparison -- so "it cannot raise" is an
-        # assumption about somebody else's object. Keeping one cycle's stale cache is the smaller
-        # failure by a wide margin.
+        # check_and_notify entirely, so loop 2 never runs (no pushes at all this cycle) and
+        # _record_decisions never runs (no rows either). What it touches is duck-typed -- an impact
+        # response from an injected provider, a cached AlternativeJourney, an aware/naive datetime
+        # comparison -- so "it cannot raise" is an assumption about somebody else's object. Keeping
+        # one cycle's stale cache is the smaller failure by a wide margin.
         try:
             _reconcile_caches(key, alerts, cycle_now)
         except Exception:
@@ -2153,13 +2263,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 already_written = message_key in _messages
                 attempts = _message_attempts.get(message_key, 0)
             # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A
-            # `None` from `_write_message` costs an attempt (see the bottom of this loop), but
-            # several of its paths never call a backend at all — this one, where no backend can be
-            # asked. So three cycles with generation off used to exhaust a situation permanently:
-            # when the 30-minute `llm_message._LATCH_TTL` expired and a backend came back, the
-            # situation was already at `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer
-            # again for its whole 12 h life. That thins exactly the written-but-withheld population
-            # prd's rollout is judged on.
+            # `None` from `_write_message` costs an attempt (see pass 1c), but several of its paths
+            # never call a backend at all — this one, where no backend can be asked. So three cycles
+            # with generation off used to exhaust a situation permanently: when the 30-minute
+            # `llm_message._LATCH_TTL` expired and a backend came back, the situation was already at
+            # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h
+            # life. That thins exactly the written-but-withheld population prd's rollout is judged
+            # on.
             if not _generation_enabled():
                 _remember_message_meta(message_key, status="llm_disabled")
                 continue
@@ -2174,56 +2284,93 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 # reason (a refusal, an over-long reply, an unparseable one) fails again on every 60
                 # s tick for the situation's whole life -- ~720 Vertex calls that can change
                 # nothing, because the push already went out with the deterministic wording, each
-                # one burning a slot from _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have
+                # one burning a slot from _MAX_LLM_CALLS_PER_CYCLE that a train which WOULD have
                 # succeeded now cannot use.
                 _remember_message_meta(message_key, status="attempts_exhausted")
                 continue
-            # Reserve the worst case rather than merely checking the clock, so the budget is a
-            # ceiling on when the pass ENDS and not on when its last call starts (see
-            # _WORST_CASE_CALL_S).
-            spent = llm_calls >= _MAX_LLM_CALLS_PER_CYCLE
-            if spent or monotonic() + _WORST_CASE_CALL_S >= llm_deadline:
-                # Logged ONCE per cycle, not once per subject: the budget binds for every remaining
-                # train of every remaining journey, and this used to be at most one line per
-                # journey. Which subjects it cost is recorded durably anyway -- each gets `capped`
-                # below, on its own decision row, which is where the question is actually answered.
-                if not budget_logged:
-                    budget_logged = True
-                    logger.info(
-                        "Written-message budget spent this cycle (%d calls / %.0fs); the remaining "
-                        "trains take the deterministic wording, from %s onwards",
-                        llm_calls,
-                        _MAX_LLM_SECONDS_PER_CYCLE,
-                        key,
-                        extra={"fields": {"event": "llm_message", "result": "capped"}},
-                    )
-                _remember_message_meta(message_key, status="capped")
-                continue
-            llm_calls += 1
-            # _write_message catches Exception itself, so this is belt and braces for a future edit
-            # that lets one escape. It records an attempt rather than `continue`-ing past the
-            # counter, so a raiser is subject to the same give-up rule as a None. Delivery is
-            # unaffected either way: loop 2 pushes independently and falls back to the deterministic
-            # wording.
-            try:
-                message = _write_message(
-                    subject, journey_key=key, message_input=message_inputs.get(message_key)
-                )
-            except Exception:
-                logger.warning(
-                    "Written-message step raised for %s; using the deterministic wording",
-                    key,
-                    exc_info=True,
-                    extra={"fields": {"event": "llm_message", "result": "error"}},
-                )
-                message = None
-                _remember_message_meta(message_key, status="error")
-            with _state_lock:
-                if message:
-                    _messages[message_key] = message
-                    _message_attempts.pop(message_key, None)
-                else:
-                    _message_attempts[message_key] = attempts + 1
+            write_queue.append((key, subject, message_key, attempts))
+
+    # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
+    # until the budget could actually bind across journeys there was nothing to order. The queue
+    # used to be walked in `_journeys` insertion order, so when the cap was reached the trains that
+    # got prose were whichever journeys happened to be registered earliest, every cycle, forever.
+    # That is invisible while ~44 registrations rarely reach a cap of 8 and indefensible at ten
+    # times that: the same handful of travellers would take the whole budget on every busy morning.
+    # Soonest-first is the rule `impact._MAX_ALTERNATIVE_LOOKUPS` already spends its own budget by,
+    # and it is the one that matches what the wording is FOR -- a train leaving in six minutes can
+    # still be acted on, one leaving in three hours will be written for again on a later cycle.
+    #
+    # `.timestamp()` rather than the datetime itself: the key must be total, and comparing an aware
+    # datetime with a naive one raises. Trains with no departure time sort last and keep their
+    # relative order (Python's sort is stable), which is `_pending_pushes`' severity order.
+    write_queue.sort(
+        key=lambda item: (
+            item[1].departure_time is None,
+            item[1].departure_time.timestamp() if item[1].departure_time else 0.0,
+        )
+    )
+
+    # ---- Pass 1c: write the wordings, CONCURRENTLY --------------------------------------------
+    #
+    # The pass this whole restructure exists for. A Vertex call is ~2.2 s and up to
+    # `_MAX_LLM_CALLS_PER_CYCLE` of them run per cycle; sequentially that is the difference between
+    # a budget of 8 (~18 s, all of the ceiling) and one of 64 (~140 s, absurd). Across
+    # `_LLM_WORKERS` it is ~9 s.
+    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int]) -> None:
+        key, subject, message_key, attempts = item
+        # Claimed here rather than filtered above, so the ceiling is spent on calls that actually
+        # START. A pre-filter would hand the budget to the first N in the queue whether or not the
+        # clock still allowed them.
+        if not budget.claim():
+            _remember_message_meta(message_key, status="capped")
+            return
+        # _write_message catches Exception itself, so this is belt and braces for a future edit
+        # that lets one escape. It records an attempt rather than returning past the counter, so a
+        # raiser is subject to the same give-up rule as a None. Delivery is unaffected either way:
+        # loop 2 pushes independently and falls back to the deterministic wording.
+        try:
+            message = _write_message(
+                subject, journey_key=key, message_input=message_inputs.get(message_key)
+            )
+        except Exception:
+            logger.warning(
+                "Written-message step raised for %s; using the deterministic wording",
+                key,
+                exc_info=True,
+                extra={"fields": {"event": "llm_message", "result": "error"}},
+            )
+            message = None
+            _remember_message_meta(message_key, status="error")
+        with _state_lock:
+            if message:
+                _messages[message_key] = message
+                _message_attempts.pop(message_key, None)
+            else:
+                _message_attempts[message_key] = attempts + 1
+
+    if write_queue:
+        with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, len(write_queue))) as pool:
+            list(pool.map(_write_one, write_queue))
+    if budget.refused:
+        # ONCE per cycle, after the fact, and reporting what the ceiling actually cost rather than
+        # which journey happened to hit it first -- with the queue sorted and the calls concurrent,
+        # "from journey X onwards" would name an arbitrary thread's arbitrary moment.
+        logger.info(
+            "Written-message budget spent this cycle: %d written, %d trains capped (%d calls / "
+            "%.0fs ceiling); the capped trains take the deterministic wording",
+            budget.claimed,
+            budget.refused,
+            _MAX_LLM_CALLS_PER_CYCLE,
+            _MAX_LLM_SECONDS_PER_CYCLE,
+            extra={
+                "fields": {
+                    "event": "llm_message",
+                    "result": "capped",
+                    "written": budget.claimed,
+                    "capped": budget.refused,
+                }
+            },
+        )
 
     # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
     # Collect first, then fan out. One broad situation produces one send per registration in a single
