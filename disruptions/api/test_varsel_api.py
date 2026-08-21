@@ -160,13 +160,11 @@ def _reset_state():
     # `check_and_notify` began consulting `generation_enabled()` before reaching the writer -- at
     # which point the leak turned into "the writer is never called" in unrelated tests, which reads
     # exactly like the give-up bug those tests exist to pin. Clear it here, like test_llm_message's
-    # own `_reset` does.
+    # own `_reset` does -- which since 2026-08-21 means replacing the HOLDER the latch lives in, not
+    # rebinding module globals that nothing would read any more.
     import llm_message
 
-    with llm_message._lock:
-        llm_message._latched_off.clear()
-        llm_message._active = None
-        llm_message._active_at = None
+    llm_message._STATE = llm_message._LatchState()
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 

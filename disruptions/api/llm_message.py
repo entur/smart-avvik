@@ -45,6 +45,13 @@ Design notes
   against the exceedance stack's ~15 min, and quoting it is exactly what made a 93 %-impact alert
   read as "1 % sjanse for innstilling, typisk 2 min forsinket" before the 2026-07-27 fix. The
   payload is built from the :class:`varsel.Alert` fields, which do not carry it.
+* **The backend latch belongs to a caller, not to the module.** Which backend is pinned and which
+  are latched off live in a :class:`_LatchState` holder, and the module keeps one global instance
+  that every existing caller works against. ``/tilbakeblikk`` replays stored inputs on a request
+  path and passes its own, because the two callers cannot be allowed to disable each other: a replay
+  burst driving both backends into ``_ConfigurationError`` would otherwise strip model wordings from
+  every real push for the whole ``_LATCH_TTL``, and nothing on the traveller-facing side would say
+  so. The lock moves with the state for the same reason the state moved — see :class:`_LatchState`.
 * **What was said to a traveller is logged** under ``jsonPayload.event = "llm_message"``, next to
   the existing ``event = "push"`` trail — the message, the model that wrote it, and the situation.
   The prompt itself is not: it embeds the traveller's origin, destination and departure time, and
@@ -53,6 +60,7 @@ Design notes
   behind ``VARSEL_LLM_LOG_PROMPTS``.
 """
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -253,12 +261,20 @@ class MessageResult:
     was empty, a refusal, or over-length) or 'ungrounded' (a reply quoting figures absent from the
     payload). The deterministic wording is used for every one of these, and until they were recorded
     they were indistinguishable in the log.
+
+    `discarded` is the reply that was thrown away on the 'rejected' and 'ungrounded' paths, where a
+    model did answer and the answer was refused. It used to survive only in a log warning, which is
+    the wrong place for it: those two statuses are exactly what a prompt edit produces, so somebody
+    iterating on the brief would otherwise get a status badge and no text at the moment they need to
+    read what the model actually wrote. Never delivered and never stored on a decision row — the
+    guards that rejected it have not moved. Callers that do not want it simply ignore the field.
     """
 
     text: str | None
     provider: str | None = None
     model: str | None = None
     status: str = "unavailable"
+    discarded: str | None = None
 
 
 # ---- Backends --------------------------------------------------------------------------------
@@ -266,14 +282,152 @@ class _ConfigurationError(Exception):
     """The backend cannot serve this model in this project — latch away from it, do not retry."""
 
 
-_lock = threading.Lock()
 # How long a backend stays pinned (after a success) or latched off (after a configuration
 # failure) before it is re-tested. Both used to last the process lifetime, which on a single
 # always-on pod means "until the next deploy" -- see _candidates.
 _LATCH_TTL = timedelta(minutes=30)
-_active: str | None = None  # "claude" | "gemini" | None (not yet resolved)
-_active_at: datetime | None = None  # when _active was pinned
-_latched_off: dict[str, datetime] = {}  # backend -> when this project last failed to serve it
+
+
+class _LatchState:
+    """The backend-selection state one caller works against — and the lock that guards it.
+
+    This was four module globals (`_active`, `_active_at`, `_latched_off` and one `_lock`) until
+    2026-08-21, which was right while the poller was the only caller: it asks for at most
+    `_MAX_LLM_CALLS_PER_CYCLE` wordings per cycle, on one thread, and a backend this project cannot
+    serve is a fact about the project rather than about the caller.
+
+    ``/tilbakeblikk`` breaks that assumption. It replays stored message inputs on a public request
+    path, so a prompt edit, an unserved model id or a quota can drive both backends into
+    ``_ConfigurationError`` in a burst — and while the state was shared, that burst reached
+    ``varsel.check_and_notify``: ``generation_enabled()`` reads False for the whole ``_LATCH_TTL``,
+    every real push silently falls back to the template wording, and the poller spends a message
+    attempt per subject on each ``None``. Nothing on the traveller-facing side reports it. Isolation
+    is therefore structural — a holder per caller — rather than a rule somebody has to remember.
+
+    **The lock moves with the state**, and that is not tidiness. Left behind as one module global, a
+    replay pool would hold separate latches but contend on the same mutex as the poller thread that
+    also rebuilds every BigQuery cache: the isolation would read stronger than it is.
+
+    The client cache is opt-in for the same class of reason, in the other direction — see
+    :func:`_backend_client`.
+    """
+
+    def __init__(
+        self, *, seed_from: "_LatchState | None" = None, cache_clients: bool = False
+    ) -> None:
+        self.lock = threading.Lock()
+        self.active: str | None = None  # "claude" | "gemini" | None (not yet resolved)
+        self.active_at: datetime | None = None  # when `active` was pinned
+        self.latched_off: dict[str, datetime] = {}  # backend -> when it last failed to serve us
+        # Seeding is ONE-WAY and a snapshot. One-way, because a failure discovered through a replay
+        # holder says nothing about the live path and must never disable it -- that is the whole
+        # point. Seeded at all, because `active` pins only on success, so a cold holder has no
+        # preference and would re-walk claude-then-gemini on its first call: a wasted round trip and
+        # a spurious `latched_off` record per holder, re-discovering a 404 the poller already paid
+        # for. A copy rather than a shared dict, so a later global latch cannot reach in either.
+        if seed_from is not None:
+            with seed_from.lock:
+                self.latched_off = dict(seed_from.latched_off)
+        self.clients: dict[str, Any] | None = {} if cache_clients else None
+
+    def latch_off(self, name: str, now: datetime) -> None:
+        """Stop trying this backend for `_LATCH_TTL`; drop the pin if it was the pinned one."""
+        with self.lock:
+            self.latched_off[name] = now
+            if self.active == name:
+                self.active = self.active_at = None
+
+    def pin(self, name: str, now: datetime) -> None:
+        """Prefer this backend for `_LATCH_TTL` — called only when it produced a usable message."""
+        with self.lock:
+            self.active, self.active_at = name, now
+
+    def client(self, name: str, build: Callable[[], Any]) -> Any:
+        """This holder's client for a backend: cached when it asked for caching, else freshly built.
+
+        Built under the lock rather than around it: a cold replay pool would otherwise resolve ADC
+        once per worker at the start of a burst and keep whichever client won the race. Only the
+        first call of a holder's life pays for the wait, and the live push path never enters this
+        branch at all.
+        """
+        if self.clients is None:
+            return build()
+        with self.lock:
+            client = self.clients.get(name)
+            if client is None:
+                client = self.clients[name] = build()
+            return client
+
+
+# The module-global holder: what every caller that does not name one works against, and therefore
+# what the poller's push wordings are written against.
+_STATE = _LatchState()
+
+
+def new_replay_state() -> _LatchState:
+    """A holder for a replay caller — its own latch, its own lock, and a per-backend client cache.
+
+    Seeded from the module-global latch (one-way, see :class:`_LatchState`) so it does not re-pay
+    for a configuration failure the poller has already discovered.
+    """
+    return _LatchState(seed_from=_STATE, cache_clients=True)
+
+
+@dataclass(frozen=True)
+class _CallContext:
+    """Which holder the call running on this thread belongs to, and whether it is a replay.
+
+    Ambient rather than an argument because a backend is invoked as ``_BACKENDS[name](prompt)`` — a
+    one-argument contract that every suite in this repo stubs — so threading two more values through
+    it would rewrite every stub for the sake of a client lookup and a log field. A ``ContextVar``
+    rather than a ``threading.local`` (which :mod:`alternatives` uses for its own ambient value)
+    because the reset is token-based: a pooled worker cannot leak one call's context into the next
+    task it picks up.
+    """
+
+    state: _LatchState
+    replay: bool = False
+
+
+_current_call: contextvars.ContextVar[_CallContext | None] = contextvars.ContextVar(
+    "llm_message_call", default=None
+)
+
+
+def _replaying() -> bool:
+    """True while a replay-marked call is running on this thread — for the log records that are
+    emitted deep inside a backend and cannot be handed the flag."""
+    call = _current_call.get()
+    return bool(call and call.replay)
+
+
+def _log_fields(replay: bool, **fields: Any) -> dict[str, Any]:
+    """The ``extra={"fields": ...}`` body for one record, marked when the call is a replay.
+
+    A FIELD on the existing event, never a new event name. Operators are told to read
+    ``jsonPayload.provider`` on ``event="llm_message"`` to learn which backend answered in prd, and
+    a separate event name would quietly drop replay traffic out of every query that already exists —
+    including the ones that would notice a replay burst. The field is *absent* rather than false on
+    a live call, so an existing query keeps matching exactly the records it always did.
+    """
+    return {**fields, **({"replay": True} if replay else {})}
+
+
+def _backend_client(name: str, build: Callable[[], Any]) -> Any:
+    """The Vertex client for this call — freshly built, unless the caller's holder caches clients.
+
+    Both SDKs resolve ADC and fetch a metadata-server token when constructed. At the poller's eight
+    calls per cycle that has never mattered; fanned out over a replay pool on a request path it is
+    an amplifier, so a replay holder keeps one client per backend for its own lifetime.
+
+    The live push path deliberately keeps building one per call, and the asymmetry is the safe
+    direction rather than an oversight: a process-lifetime client there would hold a poisoned
+    connection or a stale credential for every later push wording — precisely the silent,
+    traveller-facing failure class this holder split exists to close — for a saving the poller does
+    not need.
+    """
+    call = _current_call.get()
+    return (call.state if call else _STATE).client(name, build)
 
 
 def _claude_client() -> Any:
@@ -284,6 +438,17 @@ def _claude_client() -> Any:
     # next poller tick is the retry.
     return AnthropicVertex(
         project_id=_PROJECT, region=_CLAUDE_LOCATION, timeout=_TIMEOUT_S, max_retries=0
+    )
+
+
+def _gemini_client() -> Any:
+    from google import genai
+
+    return genai.Client(
+        vertexai=True,
+        project=_PROJECT,
+        location=_GEMINI_LOCATION,
+        http_options={"timeout": int(_TIMEOUT_S * 1000)},  # google-genai takes milliseconds
     )
 
 
@@ -298,7 +463,7 @@ def _claude_write(input_json: str) -> str:
     from anthropic import BadRequestError, NotFoundError, PermissionDeniedError
 
     try:
-        response = _claude_client().messages.create(
+        response = _backend_client("claude", _claude_client).messages.create(
             model=_CLAUDE_MODEL,
             max_tokens=_MAX_TOKENS,
             system=_SYSTEM_PROMPT,
@@ -320,14 +485,22 @@ def _claude_write(input_json: str) -> str:
         logger.warning(
             "Claude rejected the request: %s",
             exc,
-            extra={"fields": {"event": "llm_message", "provider": "claude", "result": "rejected"}},
+            extra={
+                "fields": _log_fields(
+                    _replaying(), event="llm_message", provider="claude", result="rejected"
+                )
+            },
         )
         return ""
     if response.stop_reason == "refusal":
         # Refusal is a function of request CONTENT -- same reasoning as above, do not latch.
         logger.warning(
             "Claude declined this payload (stop_reason=refusal)",
-            extra={"fields": {"event": "llm_message", "provider": "claude", "result": "refusal"}},
+            extra={
+                "fields": _log_fields(
+                    _replaying(), event="llm_message", provider="claude", result="refusal"
+                )
+            },
         )
         return ""
     if response.stop_reason not in (None, "end_turn", "stop_sequence"):
@@ -338,7 +511,11 @@ def _claude_write(input_json: str) -> str:
         logger.warning(
             "Claude reply was not complete (stop_reason=%s)",
             response.stop_reason,
-            extra={"fields": {"event": "llm_message", "provider": "claude", "result": "truncated"}},
+            extra={
+                "fields": _log_fields(
+                    _replaying(), event="llm_message", provider="claude", result="truncated"
+                )
+            },
         )
         return ""
     return "".join(block.text for block in response.content if block.type == "text")
@@ -364,15 +541,9 @@ def _gemini_write(input_json: str) -> str:
     fail every call on every cycle instead of once. Pinning ``VERTEX_GEMINI_MODEL`` to a 2.5 model
     would 400 the same way, on the other side of the family split.
     """
-    from google import genai
     from google.genai import errors as genai_errors
 
-    client = genai.Client(
-        vertexai=True,
-        project=_PROJECT,
-        location=_GEMINI_LOCATION,
-        http_options={"timeout": int(_TIMEOUT_S * 1000)},  # google-genai takes milliseconds
-    )
+    client = _backend_client("gemini", _gemini_client)
     try:
         response = client.models.generate_content(
             model=_GEMINI_MODEL,
@@ -404,7 +575,11 @@ def _gemini_write(input_json: str) -> str:
         logger.warning(
             "Gemini reply did not finish cleanly (%s); discarding it",
             finish,
-            extra={"fields": {"event": "llm_message", "provider": "gemini", "result": "truncated"}},
+            extra={
+                "fields": _log_fields(
+                    _replaying(), event="llm_message", provider="gemini", result="truncated"
+                )
+            },
         )
         return ""
     return response.text or ""
@@ -420,13 +595,17 @@ def _model_of(name: str) -> str:
     return _CLAUDE_MODEL if name == "claude" else _GEMINI_MODEL
 
 
-def generation_enabled() -> bool:
+def generation_enabled(state: _LatchState | None = None) -> bool:
     """True when a wording could be written: a provider, a GCP project, and a backend left to try.
 
     Says nothing about whether the wording will be *sent* — that is :func:`delivery_enabled`, and
     keeping the two apart is the point. This is the gate ``write_message_detailed`` returns
     ``status="disabled"`` from, so that status now means "no backend could be asked", never "this
     deployment sends the deterministic wording".
+
+    ``state`` is the holder whose latch to read, defaulting to the module-global one — so a caller
+    with its own holder asks about *its own* backends, and the poller's answer cannot be changed by
+    what a replay burst discovered (:class:`_LatchState`).
 
     Deliberately does not construct a client — that happens on first use, so an un-provisioned
     deploy degrades at the point of use rather than failing at import (the same shape as
@@ -439,7 +618,7 @@ def generation_enabled() -> bool:
     # unrecognised value must stop the call rather than make it.
     if _PROVIDER not in ("auto", *_BACKENDS) or not _PROJECT:
         return False
-    return bool(_candidates())
+    return bool(_candidates(state=state))
 
 
 def delivery_enabled() -> bool:
@@ -456,14 +635,17 @@ def delivery_enabled() -> bool:
     return _ENABLED
 
 
-def _candidates(now: datetime | None = None) -> tuple[str, ...]:
-    """Backends still worth trying, in preference order.
+def _candidates(now: datetime | None = None, *, state: _LatchState | None = None) -> tuple[str, ...]:
+    """Backends still worth trying for one caller, in preference order.
+
+    `state` is the holder to read, defaulting to the module-global one — so two callers can disagree
+    about which backends are worth trying without either being able to silence the other.
 
     Both kinds of stickiness expire after `_LATCH_TTL`. Neither used to:
 
-    * `_latched_off` was add-only, so a single 404 during a Model Garden rollout disabled the
+    * `latched_off` was add-only, so a single 404 during a Model Garden rollout disabled the
       preferred backend until the next redeploy — on a single always-on pod, potentially weeks.
-    * `_active` pinned the first backend that produced a message, and was cleared only by a
+    * `active` pinned the first backend that produced a message, and was cleared only by a
       configuration error. After Claude succeeded once, every later content-dependent Claude failure
       (a 400, a refusal — the paths that deliberately do NOT latch) went straight to the template
       wording without ever trying Gemini, even though Gemini would have answered.
@@ -471,13 +653,14 @@ def _candidates(now: datetime | None = None) -> tuple[str, ...]:
     Re-testing costs one call per TTL per backend; not re-testing costs every message until a deploy.
     """
     now = now or datetime.now(UTC)
+    state = state or _STATE
     if _PROVIDER in _BACKENDS:
         order: tuple[str, ...] = (_PROVIDER,)
     else:
         order = _AUTO_ORDER
-    with _lock:
-        live_off = {n for n, at in _latched_off.items() if now - at < _LATCH_TTL}
-        pinned = _active if _active_at and now - _active_at < _LATCH_TTL else None
+    with state.lock:
+        live_off = {n for n, at in state.latched_off.items() if now - at < _LATCH_TTL}
+        pinned = state.active if state.active_at and now - state.active_at < _LATCH_TTL else None
         if pinned is not None and pinned not in live_off:
             # The pinned backend first, then the rest as fallbacks for THIS call: a content-dependent
             # failure on the pinned one must still be able to reach the other.
@@ -836,8 +1019,27 @@ def write_message(
     ).text
 
 
+def _call_backend(name: str, prompt: str, state: _LatchState, replay: bool) -> str:
+    """One backend call, with this caller's context ambient for the duration.
+
+    The window is exactly the call: `_backend_client` and the log records emitted inside a backend
+    need the holder and the replay marker, and `_BACKENDS[name](prompt)` cannot carry them (see
+    :class:`_CallContext`).
+    """
+    token = _current_call.set(_CallContext(state=state, replay=replay))
+    try:
+        return _BACKENDS[name](prompt)
+    finally:
+        _current_call.reset(token)
+
+
 def write_message_detailed(
-    message_input: dict, *, journey_key: str = "", situation_number: str = ""
+    message_input: dict,
+    *,
+    journey_key: str = "",
+    situation_number: str = "",
+    state: _LatchState | None = None,
+    replay: bool = False,
 ) -> MessageResult:
     """A short Norwegian message for this message input, with the provenance of the attempt.
 
@@ -845,42 +1047,56 @@ def write_message_detailed(
     the prompt, the fallback wording and the recorded ``message_input`` are all the same object
     rather than three rebuilds of it.
 
-    Never raises. On a configuration-class failure the offending backend is latched off for the
-    process lifetime and the next one is tried; on a transient failure this reports `error` and the
+    Never raises. On a configuration-class failure the offending backend is latched off for
+    ``_LATCH_TTL`` and the next one is tried; on a transient failure this reports `error` and the
     next poller cycle tries again.
 
     Gated on :func:`generation_enabled` only: whether the traveller is *sent* this wording is the
     caller's decision (``delivery_enabled``), taken after the fact, so a deployment that ships the
     deterministic text still writes and records what the model would have said.
+
+    ``state`` names the holder this call latches against and, if it caches clients, borrows one from
+    — the module-global holder when omitted, which is what every push wording uses. ``replay`` marks
+    the audit record and suppresses the ``event="llm_message_prompt"`` DEBUG record: dev sets
+    ``VARSEL_LLM_LOG_PROMPTS`` today, and a replay surface would otherwise write a traveller's
+    origin, destination and departure time to Cloud Logging at page-load volume rather than at the
+    poller's few-per-cycle rate. Neither changes anything for a caller that passes neither.
     """
-    global _active, _active_at
-    if not generation_enabled():
+    state = state or _STATE
+    if not generation_enabled(state):
         return MessageResult(None, status="disabled")
     prompt = message_input_json(message_input)
     # Why the LAST attempt failed. Overwritten per backend, so with `auto` this reports the verdict
     # on the backend that actually got to answer rather than on the one that was latched off.
     status = "unavailable"
+    # The reply that was thrown away, carried out beside the status it explains -- see MessageResult.
+    discarded: str | None = None
 
-    for name in _candidates():
+    for name in _candidates(state=state):
         try:
-            raw = _BACKENDS[name](prompt)
+            raw = _call_backend(name, prompt, state, replay)
         except _ConfigurationError:
             logger.exception(
                 "LLM backend %s cannot serve this project; latching it off for this process",
                 name,
-                extra={"fields": {"event": "llm_message", "provider": name, "result": "latched_off"}},
+                extra={
+                    "fields": _log_fields(
+                        replay, event="llm_message", provider=name, result="latched_off"
+                    )
+                },
             )
-            with _lock:
-                _latched_off[name] = datetime.now(UTC)
-                if _active == name:
-                    _active = _active_at = None
+            state.latch_off(name, datetime.now(UTC))
             continue
         except Exception:
             logger.warning(
                 "LLM backend %s failed transiently; falling back to the deterministic wording",
                 name,
                 exc_info=True,
-                extra={"fields": {"event": "llm_message", "provider": name, "result": "error"}},
+                extra={
+                    "fields": _log_fields(
+                        replay, event="llm_message", provider=name, result="error"
+                    )
+                },
             )
             return MessageResult(None, provider=name, model=_model_of(name), status="error")
 
@@ -890,34 +1106,38 @@ def write_message_detailed(
                 "%s invented a figure that is not in the payload; using the deterministic wording",
                 name,
                 extra={
-                    "fields": {
-                        "event": "llm_message",
-                        "provider": name,
-                        "result": "ungrounded",
-                        "reply": raw,
-                    }
+                    "fields": _log_fields(
+                        replay,
+                        event="llm_message",
+                        provider=name,
+                        result="ungrounded",
+                        reply=raw,
+                    )
                 },
             )
             message = None
             status = "ungrounded"
-        with _lock:
-            # Pin the backend only when it actually produced something. Pinning on any non-exception
-            # return meant a Claude 400 or refusal (which now return "" rather than latching) stuck
-            # _active='claude' forever, so every later push silently used template wording and the
-            # Gemini fallback never ran (review 2026-07-29).
-            if message:
-                _active, _active_at = name, datetime.now(UTC)
-        if not message:
+            discarded = (raw or "").strip() or None
+        # Pin the backend only when it actually produced something. Pinning on any non-exception
+        # return meant a Claude 400 or refusal (which now return "" rather than latching) stuck
+        # `active='claude'` forever, so every later push silently used template wording and the
+        # Gemini fallback never ran (review 2026-07-29).
+        if message:
+            state.pin(name, datetime.now(UTC))
+        else:
             logger.warning(
                 "%s returned nothing usable; trying the next backend",
                 name,
                 extra={
-                    "fields": {"event": "llm_message", "provider": name, "result": "rejected"}
+                    "fields": _log_fields(
+                        replay, event="llm_message", provider=name, result="rejected"
+                    )
                 },
             )
             # An ungrounded reply is not the same failure as an empty or over-long one, and the
             # distinction is the point of recording this at all — do not flatten it here.
             status = status if status == "ungrounded" else "rejected"
+            discarded = discarded or (raw or "").strip() or None
             continue
         # What was said to a traveller stays reconstructible at INFO: the message, which model wrote
         # it, and the situation. The PROMPT does not -- `journey_key` is literally
@@ -932,18 +1152,23 @@ def write_message_detailed(
             situation_number,
             message,
             extra={
-                "fields": {
-                    "event": "llm_message",
-                    "provider": name,
-                    "model": _model_of(name),
-                    "result": "ok",
-                    "journey_digest": key_digest(journey_key),
-                    "situation_number": situation_number,
-                    "message": message,
-                }
+                "fields": _log_fields(
+                    replay,
+                    event="llm_message",
+                    provider=name,
+                    model=_model_of(name),
+                    result="ok",
+                    journey_digest=key_digest(journey_key),
+                    situation_number=situation_number,
+                    message=message,
+                )
             },
         )
-        if _LOG_PROMPTS:
+        # Never on the replay path, whatever VARSEL_LLM_LOG_PROMPTS says. The flag is a debugging
+        # affordance sized for the poller's handful of calls per cycle; a public request path
+        # replaying a day of stored inputs would turn it into bulk publication of origin,
+        # destination and departure time, and nobody setting it would have that in mind.
+        if _LOG_PROMPTS and not replay:
             logger.debug(
                 "LLM prompt/reply for %s/%s",
                 key_digest(journey_key),
@@ -960,4 +1185,4 @@ def write_message_detailed(
                 },
             )
         return MessageResult(message, provider=name, model=_model_of(name), status="ok")
-    return MessageResult(None, status=status)
+    return MessageResult(None, status=status, discarded=discarded)

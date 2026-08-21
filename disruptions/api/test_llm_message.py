@@ -8,7 +8,9 @@ keeps a push going out when the LLM cannot help.
 Run: uv run --with pydantic python test_llm_message.py  (or under pytest)
 """
 
+import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -105,9 +107,11 @@ def _reset(provider="auto", enabled=True):
     llm_message._PROVIDER = provider
     llm_message._ENABLED = enabled
     llm_message._PROJECT = "ent-kixavvik-test"
-    llm_message._active = None
-    llm_message._active_at = None
-    llm_message._latched_off = {}
+    # The latch is a HOLDER now (2026-08-21), not four module globals. Rebinding
+    # `llm_message._active` / `._latched_off` here would leave `_candidates` reading the holder and
+    # every latch assertion below pointed at a name nothing consults — a suite that passes while the
+    # thing it names has stopped existing.
+    llm_message._STATE = llm_message._LatchState()
 
 
 # ---- gates ------------------------------------------------------------------------------------
@@ -701,7 +705,7 @@ def test_a_pinned_backend_still_falls_through_on_a_content_failure():
     llm_message._BACKENDS["gemini"] = lambda body: '{"melding": "Fra Gemini."}'
     try:
         assert write_message(build_message_input(JOURNEY, FakeImpact(), FakeAlert())) == "Fra Claude."
-        assert llm_message._active == "claude"
+        assert llm_message._STATE.active == "claude"
         llm_message._BACKENDS["claude"] = lambda body: ""  # refusal / 400: returns "", no latch
         assert write_message(build_message_input(JOURNEY, FakeImpact(), FakeAlert())) == "Fra Gemini."
     finally:
@@ -714,9 +718,9 @@ def test_a_latched_off_backend_is_retried_after_the_ttl():
     backend until the next redeploy — on a single always-on pod, potentially weeks.
     """
     _reset(provider="auto")
-    llm_message._latched_off = {"claude": datetime.now(UTC) - timedelta(minutes=5)}
+    llm_message._STATE.latched_off = {"claude": datetime.now(UTC) - timedelta(minutes=5)}
     assert "claude" not in llm_message._candidates()
-    llm_message._latched_off = {
+    llm_message._STATE.latched_off = {
         "claude": datetime.now(UTC) - llm_message._LATCH_TTL - timedelta(minutes=1)
     }
     assert "claude" in llm_message._candidates(), "an expired latch must be re-tested"
@@ -812,7 +816,7 @@ def test_transient_failure_returns_none_without_latching():
     llm_message._BACKENDS["claude"] = lambda body: (_ for _ in ()).throw(RuntimeError("timeout"))
     try:
         assert write_message({"a": 1}) is None
-        assert llm_message._latched_off == {}, "a timeout must not disable the backend"
+        assert llm_message._STATE.latched_off == {}, "a timeout must not disable the backend"
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
 
@@ -882,7 +886,7 @@ def test_successful_backend_becomes_sticky():
         write_message({"a": 1})
         write_message({"a": 1})
         assert calls == ["claude", "claude"]
-        assert llm_message._active == "claude"
+        assert llm_message._STATE.active == "claude"
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
 
@@ -977,6 +981,289 @@ def test_the_prompt_version_tracks_the_prompt_text():
     import hashlib
 
     assert before == hashlib.sha256(llm_message._SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:8]
+
+
+# ---- latch isolation: a replay burst must not reach the live push path -------------------------
+def test_a_replay_latch_does_not_reach_the_live_push_path():
+    """The failure this whole holder split exists to prevent, and it is silent where it lands.
+
+    ``/tilbakeblikk`` replays stored inputs on a request path, so a prompt edit, a model id nobody
+    can serve, or a quota can drive both backends into ``_ConfigurationError`` in a burst. While the
+    latch was four module globals that burst reached ``check_and_notify``: ``generation_enabled()``
+    goes False for the whole ``_LATCH_TTL``, every real push falls back to the template wording, and
+    the poller spends an attempt slot per subject on each ``None`` — with nothing on the
+    traveller-facing side saying so. Measured against the pre-split module: after one replay-shaped
+    call with both backends dead, the live path read ``generation_enabled() = False``.
+    """
+    _reset(provider="auto")
+    replay = llm_message.new_replay_state()
+
+    def dead(body):
+        raise _ConfigurationError("model not available in this project")
+
+    llm_message._BACKENDS.update(claude=dead, gemini=dead)
+    try:
+        assert llm_message.write_message_detailed({"a": 1}, state=replay).text is None
+        assert llm_message.generation_enabled(replay) is False, (
+            "the replay caller must still learn what it discovered"
+        )
+        assert llm_message.generation_enabled() is True, (
+            "a replay burst must leave the live push path able to write a wording"
+        )
+        assert llm_message._STATE.latched_off == {}, (
+            "a failure discovered through the replay holder must never propagate back"
+        )
+    finally:
+        llm_message._BACKENDS.update(
+            claude=llm_message._claude_write, gemini=llm_message._gemini_write
+        )
+
+
+def test_the_global_holder_still_latches_for_itself():
+    """The control arm: isolation must not turn into "nothing latches any more".
+
+    A configuration failure the *poller* hits still has to stop that backend being retried on every
+    later message — that is what `_latched_off` is for, and it is worth one call per TTL, not one per
+    push.
+    """
+    _reset(provider="auto")
+
+    def dead(body):
+        raise _ConfigurationError("nope")
+
+    llm_message._BACKENDS.update(claude=dead, gemini=dead)
+    try:
+        assert write_message({"a": 1}) is None
+        assert sorted(llm_message._STATE.latched_off) == ["claude", "gemini"]
+        assert llm_message.generation_enabled() is False
+    finally:
+        llm_message._BACKENDS.update(
+            claude=llm_message._claude_write, gemini=llm_message._gemini_write
+        )
+
+
+def test_a_replay_holder_inherits_what_the_poller_already_paid_for():
+    """The seeding direction, which the isolation assertions above deliberately do not cover.
+
+    Isolation is one-way. `active` pins only on success, so a cold holder starts with no preference
+    and would re-walk claude-then-gemini on its first call — re-discovering a 404 the poller already
+    paid for, once per holder, with a spurious `latched_off` record each time. Copying the latch at
+    construction removes that; copying it as a *snapshot* is what keeps the isolation, so a later
+    global latch must not reach a holder that already exists.
+    """
+    _reset(provider="auto")
+    llm_message._STATE.latched_off = {"claude": datetime.now(UTC)}
+    replay = llm_message.new_replay_state()
+    assert llm_message._candidates(state=replay) == ("gemini",), (
+        "a replay holder must not re-test a backend the poller has already latched off"
+    )
+    llm_message._STATE.latched_off["gemini"] = datetime.now(UTC)
+    assert "gemini" in llm_message._candidates(state=replay), (
+        "the seed is a copy taken at construction, not a live view of the global latch"
+    )
+
+
+def test_each_holder_carries_its_own_lock():
+    """The lock moves WITH the state, or the isolation is nominal.
+
+    Left behind as one module global, a replay pool of four workers would serialize against the
+    poller on it — a separate latch reached through a shared bottleneck, on the thread that also
+    rebuilds every BigQuery cache.
+    """
+    replay = llm_message.new_replay_state()
+    assert replay.lock is not llm_message._STATE.lock
+    assert llm_message.new_replay_state().lock is not replay.lock
+    assert not hasattr(llm_message, "_lock"), (
+        "a surviving module-global lock is one every holder would still contend on"
+    )
+
+
+def test_a_replay_holder_reuses_one_client_per_backend():
+    """The saving is scoped to replay, and the asymmetry is the point.
+
+    Both SDKs resolve ADC and fetch a metadata-server token per construction. At the poller's handful
+    of calls per cycle that is invisible; fanned out over a replay pool it is an amplifier. The live
+    push path keeps building one per call anyway — a process-lifetime client there would hold a
+    poisoned connection or a stale credential for every later push wording, which is the silent
+    traveller-facing failure this whole unit exists to close.
+    """
+    _reset(provider="claude")
+    built = []
+
+    def factory():
+        built.append(1)
+        return object()
+
+    seen = []
+
+    def backend(body):
+        seen.append(llm_message._backend_client("claude", factory))
+        return '{"melding":"Toget er innstilt."}'
+
+    llm_message._BACKENDS["claude"] = backend
+    try:
+        replay = llm_message.new_replay_state()
+        llm_message.write_message_detailed({"a": 1}, state=replay)
+        llm_message.write_message_detailed({"a": 1}, state=replay)
+        assert len(built) == 1, "a replay holder must reuse its client"
+        assert seen[0] is seen[1]
+
+        built.clear()
+        llm_message.write_message_detailed({"a": 1})
+        llm_message.write_message_detailed({"a": 1})
+        assert len(built) == 2, "the live push path must keep building one client per call"
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+
+    # ...and the real backends have to go through the same door, or the cache above is a mechanism
+    # this suite exercises and production never reaches.
+    for backend_fn in (llm_message._claude_write, llm_message._gemini_write):
+        assert "_backend_client" in inspect.getsource(backend_fn), (
+            f"{backend_fn.__name__} builds its own client and bypasses the holder entirely"
+        )
+
+
+# ---- replay is filterable in the audit log ------------------------------------------------------
+class _Collect(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _log_fields_of(call):
+    """The `extra={"fields": ...}` bodies one call emitted, DEBUG included."""
+    handler = _Collect()
+    logger = llm_message.logger
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        call()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    return [r.fields for r in handler.records if isinstance(getattr(r, "fields", None), dict)]
+
+
+def test_a_replay_call_is_marked_on_the_existing_event():
+    """A FIELD on `event="llm_message"`, never a second event name.
+
+    Operators are told to read `jsonPayload.provider` on that event to learn which backend answered
+    in prd. A separate event name for replay would drop this traffic out of every query that already
+    exists — including the ones that would notice a replay burst. And the marker is *absent* on a
+    live call rather than false, so an existing query keeps matching exactly what it always did.
+    """
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
+    try:
+        replayed = _log_fields_of(
+            lambda: llm_message.write_message_detailed(
+                {"a": 1}, state=llm_message.new_replay_state(), replay=True
+            )
+        )
+        live = _log_fields_of(lambda: llm_message.write_message_detailed({"a": 1}))
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+
+    assert [f["event"] for f in replayed] == ["llm_message"]
+    assert replayed[0]["replay"] is True
+    assert replayed[0]["provider"] == "claude", "the existing fields are untouched"
+    assert [f["event"] for f in live] == ["llm_message"]
+    assert "replay" not in live[0], "a live call must not carry the field at all"
+
+
+def test_a_replay_call_never_logs_the_prompt():
+    """dev sets VARSEL_LLM_LOG_PROMPTS today, and the flag was sized for the poller.
+
+    The prompt carries the traveller's origin, destination and departure time. A public request path
+    replaying a day of stored inputs would turn a debugging affordance into bulk publication of it,
+    at page-load volume — so the suppression is unconditional on the replay path rather than another
+    variable somebody has to remember to unset.
+    """
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
+    previous = llm_message._LOG_PROMPTS
+    llm_message._LOG_PROMPTS = True
+    try:
+        replayed = _log_fields_of(
+            lambda: llm_message.write_message_detailed(
+                {"a": 1}, state=llm_message.new_replay_state(), replay=True
+            )
+        )
+        live = _log_fields_of(lambda: llm_message.write_message_detailed({"a": 1}))
+    finally:
+        llm_message._LOG_PROMPTS = previous
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+
+    assert not [f for f in replayed if f["event"] == "llm_message_prompt"]
+    assert [f for f in live if f["event"] == "llm_message_prompt"], (
+        "the poller's own debugging record must still be written when the flag is on"
+    )
+
+
+# ---- the discarded reply comes back with the status ---------------------------------------------
+def test_a_discarded_reply_is_returned_beside_the_status_that_rejected_it():
+    """`ungrounded` and `rejected` are exactly the two statuses a prompt edit produces.
+
+    Both used to leave the reply in a log warning only, so somebody iterating on the brief got a
+    status badge and no text at the moment they most needed to read what the model wrote. Returning
+    it changes nothing about the guards: `text` stays None, so nothing is delivered and nothing is
+    stored on a decision row.
+    """
+    _reset(provider="claude")
+    invented = '{"melding":"Det er 47 % sjanse for innstilling."}'
+    llm_message._BACKENDS["claude"] = lambda body: invented
+    try:
+        result = llm_message.write_message_detailed(
+            build_message_input(JOURNEY, FakeImpact(), FakeAlert())
+        )
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.status == "ungrounded"
+    assert result.text is None, "an ungrounded reply is still not a message"
+    assert "47 %" in result.discarded
+
+    _reset(provider="claude")
+    too_long = json.dumps({"melding": "x" * 301}, ensure_ascii=False)
+    llm_message._BACKENDS["claude"] = lambda body: too_long
+    try:
+        result = llm_message.write_message_detailed({"a": 1})
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.status == "rejected"
+    assert result.text is None
+    assert result.discarded == too_long
+
+
+def test_a_successful_call_discards_nothing():
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
+    try:
+        result = llm_message.write_message_detailed({"a": 1})
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.status == "ok" and result.discarded is None
+
+
+def test_the_default_call_still_works_against_the_global_holder():
+    """Every existing call site passes neither argument, and nothing about them may have moved:
+    the same gate, the same `status="disabled"`, and the pin landing on the module-global holder
+    where `varsel.check_and_notify` reads it through `generation_enabled()`.
+    """
+    _reset(provider="off")
+    assert llm_message.write_message_detailed({"a": 1}).status == "disabled"
+
+    _reset(provider="auto")
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
+    try:
+        result = llm_message.write_message_detailed({"a": 1})
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.status == "ok"
+    assert llm_message._STATE.active == "claude"
 
 
 def _run():
