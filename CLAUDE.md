@@ -558,11 +558,25 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `varsel_decision_outcomes` holds a frozen copy and only unresolved rows are re-labelled — so
     `data/queries/backfill_outcome_pushed_message.sql` re-copies the two columns; **run it once per
     environment** (done in dev 2026-08-21, 738 of 3 888 rows corrected; prd still owes it).
-    Separately and still open: only the journey's **worst** alert is ever offered to the writer
-    (`check_and_notify`'s `worst = next(...)`) while delivery pushes per *train*, so a journey with
-    several disrupted trains pushes the template for all but one — 604 of dev's 844 pushes over 14
-    days, `message_status = 'not_selected'`. That is why so many honestly-quoted cards still read
-    "Standardformulering".
+  - **A wording per TRAIN, and the budget follows the push** (2026-08-21). The writing pass served
+    `next(a for a in alerts if a.alertworthy)` — one train per journey — while loop 2 delivers per
+    train (`one_alert_per_train`), so a journey with several disrupted departures pushed the model's
+    prose for its worst train and the template for every other one: **604 of dev's 844 pushes over
+    14 days, 83 % of everything that reached a lock screen**, filed as `message_status =
+    'not_selected'`. `check_and_notify` now writes for `varsel._pending_pushes` — the collapsed
+    trains a push is **still coming for** — capped by `_MAX_MESSAGES_PER_JOURNEY` (3) on top of the
+    existing per-cycle budget. Not "every alert-worthy train", and the measurement is why: per
+    journey-cycle on dev, alert-worthy trains run p50 3 / p90 12 / max 22, while *pushes* run p90 1
+    / max 18 and 3 610 of 4 099 cycles push nothing at all — the trains are alert-worthy again every
+    tick, but `_notified` means each reaches a phone once, so writing for all of them would spend a
+    bounded budget re-wording trains nobody will be told about again and starve the one that is
+    about to be. "Still coming" is per **registration**, because `_notified` is: a train the first
+    device already heard about is still pending for the second. With nothing pending the journey's
+    worst train is still written for — same one call as before — because the in-app card reads the
+    same wordings and would otherwise decay to the template as soon as `_reconcile_caches` forgot
+    one. `not_selected` survives with a much narrower meaning (a collapsed duplicate situation, a
+    train with no push pending that was not the worst, or one past the cap), so a rate computed
+    across the change is measuring two different things.
   - `venter` vs `ukjent` tracks the labelling job's 10-day retry window, on both surfaces: an
     unresolved row inside the window is still being retried (`venter`); past it, the attempts have
     given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
