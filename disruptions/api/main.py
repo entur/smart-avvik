@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import threading
 import time
@@ -20,6 +21,7 @@ import impact as impact_engine  # sibling module: the /impact matcher, shared wi
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
+import tilbakeblikk  # sibling module: past alert decisions replayed through today's prompt (/tilbakeblikk-api)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -1056,6 +1058,15 @@ async def lifespan(app: FastAPI):
     decisions.configure(bq_client=bq_client)
     decisions.ensure_table()
     historikk.configure(bq_client=bq_client)
+    # /tilbakeblikk reads the same decision log and replays each row's stored message_input through
+    # today's prompt. It is configured unconditionally, even where TILBAKEBLIKK_ENABLED withholds
+    # the router: configure() only stashes two references and starts nothing, so gating it as well
+    # would buy nothing and leave a second place for the two states to drift apart. The template
+    # writer is passed in rather than imported by the module — varsel.py is 147 KB of poller state,
+    # and _deterministic_body is a pure function of the stored input.
+    tilbakeblikk.configure(
+        bq_client=bq_client, deterministic_writer=varsel._deterministic_body
+    )
     varsel.load_state()
     try:
         refresh_varsel_stops()
@@ -1143,6 +1154,40 @@ app.include_router(reisevalg.router)
 # Varselhistorikk API (what Avviksvarsel decided, and whether it turned out right). Registered
 # before the /historikk static mount, like the two above.
 app.include_router(historikk.router)
+
+# --- Whether /tilbakeblikk is served at all --------------------------------------------------
+#
+# One switch decides both halves of the surface — the /tilbakeblikk-api router below and the
+# /tilbakeblikk static mount further down — because half a surface is worse than none: the page
+# would load and every request would 404.
+#
+# It FAILS CLOSED, and that direction is the whole point. /tilbakeblikk regenerates model prose
+# from the stored message_input, and the prompt instructs the model to advise on the traveller's
+# own route, so the text routinely names both ends of a trip. `trafficType: public` is set once in
+# the chart and inherited by every environment, so that would be published next to departure_time
+# and n_devices on an unauthenticated host — the exact inference /historikk's per-row redaction
+# (journey_digest, from_stop, to_stop withheld) exists to prevent. Whether the derived text may be
+# published, and whether the surface should be access-controlled first, is Q1 in
+# docs/plans/2026-08-21-001-feat-tilbakeblikk-message-replay-plan.md and is unanswered. Until it is,
+# prd sets this to "false" (helm/kix-avvik/env/values-kub-ent-prd.yaml) and cd.yml deploys prd by
+# manual dispatch only, so prd exposure is a deliberate act rather than a consequence of merging.
+#
+# Parsing is llm_message._TRUTHY verbatim, reused rather than re-spelled, and for its reason: only
+# true/1/yes/on turn the surface ON, so a misspelling, an empty string or an unset variable
+# withholds it instead of publishing it. "off", "no" and "ture" all read as false.
+_TILBAKEBLIKK_ENABLED = (
+    os.environ.get("TILBAKEBLIKK_ENABLED", "").strip().lower() in llm_message._TRUTHY
+)
+logger.info(
+    "Tilbakeblikk replay surface %s (TILBAKEBLIKK_ENABLED=%r)",
+    "ENABLED" if _TILBAKEBLIKK_ENABLED else "disabled",
+    os.environ.get("TILBAKEBLIKK_ENABLED"),
+)
+
+# Tilbakeblikk API (a window of past alert decisions, replayed through today's prompt). Registered
+# before the /tilbakeblikk static mount, like the three above — and only when the switch is on.
+if _TILBAKEBLIKK_ENABLED:
+    app.include_router(tilbakeblikk.router)
 
 # --- How long a browser may keep a static file ----------------------------------------------
 #
@@ -1260,6 +1305,30 @@ else:
     logger.info(
         "No historikk_static/ directory; /historikk not mounted "
         "(run demo/varselhistorikk/build.sh)"
+    )
+
+# The Tilbakeblikk UI (demo/tilbakeblikk) — the same decisions, replayed through today's prompt.
+# Same generated-directory pattern as the mounts above; its data comes from /tilbakeblikk-api.
+# Guarded by TILBAKEBLIKK_ENABLED as well, so the page and the API it calls appear and disappear
+# together: the bundle is in every image (see the Dockerfile), and only this decides whether it is
+# reachable.
+_TILBAKEBLIKK_STATIC_DIR = Path(__file__).parent / "tilbakeblikk_static"
+if not _TILBAKEBLIKK_ENABLED:
+    # Deliberately not "is not set": unset and "false" are one state here, and a line claiming the
+    # variable is missing would send whoever reads it looking for the wrong thing. The resolution
+    # was already logged in full, with the raw value, where the switch is read.
+    logger.info("TILBAKEBLIKK_ENABLED is off; /tilbakeblikk not mounted")
+elif _TILBAKEBLIKK_STATIC_DIR.is_dir():
+    app.mount(
+        "/tilbakeblikk",
+        _VersionedStaticFiles(directory=_TILBAKEBLIKK_STATIC_DIR, html=True),
+        name="tilbakeblikk",
+    )
+    logger.info("Mounted tilbakeblikk UI at /tilbakeblikk from %s", _TILBAKEBLIKK_STATIC_DIR)
+else:
+    logger.info(
+        "No tilbakeblikk_static/ directory; /tilbakeblikk not mounted "
+        "(run demo/tilbakeblikk/build.sh)"
     )
 
 
