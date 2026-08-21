@@ -379,6 +379,35 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     response copy its alert carries — but the Alert is still the field the wording is built from.
     Expect `alt_status = 'not_worth_lookup'` to grow against `offered` at long lead times: that is
     the horizon finally reaching the trains that used to inherit a nearer train's answer.
+  **The poller's two blocking passes run CONCURRENTLY** (2026-08-21), which is what makes a pilot
+  ten times the size affordable. `check_and_notify`'s loop 1 is now three passes: **1a** matches
+  every journey across `varsel._MATCH_WORKERS` (16) — carrying the Journey Planner lookups with it,
+  since those live inside `match_journey`; **1b** reconciles caches and picks what to write for,
+  sequentially, because it only mutates module state and blocks on nothing; **1c** writes the
+  wordings across `varsel._LLM_WORKERS` (16). Both ceilings moved with the widths and only make
+  sense together — `_MAX_LLM_CALLS_PER_CYCLE` 8 → 64 and `alternatives._POLLER_FETCH_MAX_PER_MIN`
+  30 → 90 (the poller now has its own, split from the public `_FETCH_MAX_PER_MIN`, which is an
+  abuse-control number and was setting the alerting budget only by accident). **Raising a ceiling
+  without the width just makes the poller block longer**, which is what the old cap of 8 was quietly
+  protecting against: 8 calls × ~2.2 s is ~18 s of a 30 s budget, so the count and the clock were
+  one limit wearing two names, and raising the count alone would have moved the binding constraint
+  to the clock one capped call at a time. Three things this rests on. Concurrency reached
+  `alternatives._KeyedTTLCache`'s **single-flight** for the first time and it had to learn to
+  **wait** rather than shrug: a second caller for a key already in flight used to be served "stale"
+  — for a cold cache, `None` — which was harmless while the poller was sequential (A's fetch had
+  finished before B asked) and becomes the common case once journeys sharing a stop pair are matched
+  at the same instant. Without `wait_for_refresh` every journey but the first is told there is no
+  alternative, having spent no fetch and learned nothing; nothing errors, the cards just quietly
+  stop offering a replacement train. The wait is **poller-only** (an inbound request holding an
+  anyio slot to wait on another request's fetch is how a slow upstream becomes a queue) and bounded
+  by the fetch's own timeout, and `_release` fires on the fetch's **failure** path too — during a JP
+  outage the success path never runs. The write budget (`varsel._WriteBudget`) **reserves** its
+  worst case under a lock rather than checking a clock, so the deadline stays a ceiling on when the
+  pass *ends*, exactly as it was single-threaded. And the write queue is now sorted **soonest
+  departure first, across journeys**: it used to be walked in `_journeys` insertion order, which
+  nobody noticed while ~44 registrations rarely reached a cap of 8, but at ten times that the cap
+  binds on every busy morning and would hand the whole budget to whichever travellers registered
+  earliest, every cycle, forever.
 
 - The **Varselhistorikk** page at `/historikk` (`demo/varselhistorikk/`, React + Vite + Entur
   Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered

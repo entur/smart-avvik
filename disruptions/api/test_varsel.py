@@ -10,8 +10,10 @@ Covers direction, window edges, the weekday filter, overnight rejection, the dep
 thresholds, and the notification wording.
 """
 
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
 from google.cloud import bigquery as _bq
@@ -1195,6 +1197,72 @@ def test_an_alternative_that_became_risky_drops_the_written_message():
         message="Ta R11 kl 09:35 i stedet, du er framme 30 min etter planen.",
     )
     assert dropped is None, "'later than you planned' must not outlive being true"
+
+
+# ---- _WriteBudget: the per-cycle ceiling, now claimed from several threads (2026-08-21) --------
+#
+# The budget stopped being a loop counter when the writing pass was fanned out, and a ceiling that
+# several threads can each satisfy is a different object from one a single loop increments. What is
+# pinned here is that neither limit can be overshot by a race, and that the CLOCK limit reserves
+# rather than checks — the property that made raising the count from 8 to 64 safe at all.
+
+
+def test_the_write_budget_never_hands_out_more_than_its_count():
+    budget = varsel._WriteBudget(3, monotonic() + 1000)
+    assert [budget.claim() for _ in range(5)] == [True, True, True, False, False]
+    assert budget.claimed == 3
+    assert budget.refused == 2
+
+
+def test_the_write_budget_holds_its_count_under_concurrent_claims():
+    """The reason it owns a lock. 64 slots and 64 threads racing for them must yield 64, not 65 --
+    a read-then-increment without the lock loses claims exactly when the budget binds, which is the
+    only time anyone is looking."""
+    budget = varsel._WriteBudget(64, monotonic() + 1000)
+    granted: list[bool] = []
+    lock = threading.Lock()
+    start = threading.Event()
+
+    def claim() -> None:
+        start.wait(5)
+        got = budget.claim()
+        with lock:
+            granted.append(got)
+
+    threads = [threading.Thread(target=claim) for _ in range(128)]
+    for t in threads:
+        t.start()
+    start.set()
+    for t in threads:
+        t.join(5)
+    assert sum(granted) == 64, f"handed out {sum(granted)} of 64 slots"
+    assert budget.claimed == 64
+    assert budget.refused == 64
+
+
+def test_the_write_budget_reserves_the_clock_rather_than_checking_it():
+    """A deadline that is merely CHECKED lets a call start with a millisecond to spare and then run
+    its full worst case, so the pass ends late by however long one call takes -- ~46 s against a
+    documented 30 s ceiling, measured, before this was a reservation. With _WORST_CASE_CALL_S of
+    room left the answer must already be no."""
+    just_inside = monotonic() + varsel._WORST_CASE_CALL_S - 0.5
+    budget = varsel._WriteBudget(100, just_inside)
+    assert not budget.claim(), "a call was allowed to start that cannot finish by the deadline"
+    assert budget.refused == 1
+
+    comfortable = monotonic() + varsel._WORST_CASE_CALL_S + 30
+    assert varsel._WriteBudget(100, comfortable).claim()
+
+
+def test_the_two_write_limits_are_independent_after_the_fan_out():
+    """Sequentially the count and the clock were the same limit wearing different clothes (8 calls
+    x ~2.2 s ~= 18 s of a 30 s budget). If a later edit re-couples them -- by sizing the count from
+    the clock again -- raising one silently stops doing anything."""
+    assert varsel._MAX_LLM_CALLS_PER_CYCLE > varsel._MAX_LLM_SECONDS_PER_CYCLE / 2.2, (
+        "the call cap is back below what one cycle's wall clock could serve sequentially; "
+        "the fan-out is what makes them independent"
+    )
+    assert varsel._LLM_WORKERS > 1 and varsel._MATCH_WORKERS > 1
 
 
 if __name__ == "__main__":

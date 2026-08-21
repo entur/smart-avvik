@@ -1265,6 +1265,69 @@ def test_the_writing_budget_follows_the_push_not_the_severity(monkeypatch):
     )
 
 
+# Two disrupted trains where severity and departure DISAGREE: the sooner train is the milder one.
+# Every other multi-train fixture here has the worst train leaving first, so it cannot tell an
+# ordering by severity apart from an ordering by departure — which is the whole question below.
+SNAPSHOT_SOONER_TRAIN_IS_MILDER = {
+    "S3": SNAPSHOT_TWO_DISRUPTED["S3"],  # departs DEP + 20 min, p_impact 0.75
+    "S5": [
+        FakeCall("t5", "A", 1, DEP + timedelta(minutes=45), situation_number="S5",
+                 line="VYG:Line:R12", summary="Signalfeil ved Lysaker", p_cancel=0.88,
+                 p_impact_dep=0.95),
+        FakeCall("t5", "B", 5, None, situation_number="S5", line="VYG:Line:R12",
+                 summary="Signalfeil ved Lysaker", aimed_arr=DEP + timedelta(minutes=90)),
+    ],
+}
+
+
+def test_the_write_budget_goes_to_the_soonest_departure_when_it_binds(monkeypatch):
+    """Soonest first, ACROSS journeys — new on 2026-08-21, because until the budget could actually
+    bind across journeys there was nothing to order.
+
+    The queue used to be walked in `_journeys` insertion order, so a cap spent its slots on whichever
+    journeys were registered earliest, every cycle, forever. Invisible while ~44 registrations rarely
+    reach a cap of 8; indefensible at ten times that, where the same handful of travellers would take
+    the whole budget every busy morning.
+
+    Departure order and severity order disagree here on purpose. S5 is the worse train (0.95 vs
+    0.75) and wins any severity-ordered pick — but it leaves 25 minutes later, so a wording written
+    for it now can be written again on a later cycle, while S3's traveller has to move soon.
+    """
+    _reset_state()
+    _use_snapshot(SNAPSHOT_SOONER_TRAIN_IS_MILDER)
+    written = []
+
+    def fake_write(alert, *, journey_key, message_input):
+        written.append(alert.situation_number)
+        return f"Skrevet om {alert.situation_number}."
+
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", fake_write)
+    monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 1)  # exactly one slot to give away
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT_SOONER_TRAIN_IS_MILDER)
+
+    assert written == ["S3"], (
+        "the single write slot went to the more severe train rather than the sooner one"
+    )
+
+
+def test_the_capped_train_is_still_recorded_as_capped(monkeypatch):
+    """What the ceiling cost has to stay countable on the decision rows, not inferred from a log
+    line — the same reason `alt_status` exists. With the calls concurrent, the refusal now happens
+    on a worker thread, which is exactly where a status write is easy to drop."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT_SOONER_TRAIN_IS_MILDER)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda alert, **kw: "Skrevet.")
+    monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 1)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT_SOONER_TRAIN_IS_MILDER)
+
+    statuses = {k[1]: v.get("status") for k, v in varsel._message_meta.items()}
+    assert statuses.get("S5") == "capped", f"expected S5 capped, got {statuses}"
+
+
 def test_the_suppressed_notice_is_still_recorded(monkeypatch):
     """Collapsing is a presentation rule and must not reach the log: "every decision, not every
     push". A situation hidden on the card is still a decision that was made about it, and its row is

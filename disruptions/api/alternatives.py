@@ -131,7 +131,26 @@ _DATE_TIME_QUANTUM = timedelta(minutes=30)
 # `alternative_journey: null` instead of the pod degrading and taking /journey, /demo-api and
 # /reisevalg-api down with it.
 _FETCH_MAX_PER_MIN = 30
+# ...and the poller gets its own, larger ceiling, because the paragraph above is an argument about
+# the REQUEST path only — a public unauthenticated endpoint turning one inbound call into a blocking
+# outbound one. None of it describes the poller, which issues a bounded number of lookups on its own
+# schedule for journeys somebody deliberately registered. The two shared a constant by convenience,
+# and that convenience was silently setting the alerting budget from an abuse-control number.
+#
+# 90, against a measured cycle (2026-08-21): the rate window is one minute and a cycle's lookups all
+# fire within seconds of each other, ~177 s apart, so this is in practice "per cycle" rather than
+# "per minute" — at 10x today's registrations, p90 is ~80 alerting journeys in a cycle. What makes 90
+# affordable where 30 was the ceiling is that the lookups are no longer sequential: at
+# `varsel._MATCH_WORKERS` = 16 and ~3 s each, 90 of them cost ~17 s of wall clock instead of ~270 s.
+# Raise the two together or not at all — widening this alone just makes the poller thread block
+# longer.
+_POLLER_FETCH_MAX_PER_MIN = 90
 _RATE_WINDOW = timedelta(minutes=1)
+# How long past `_HTTP_TIMEOUT_S` a caller waiting on somebody else's in-flight fetch keeps waiting.
+# Covers the gap between claiming the key and actually issuing the request; past it the waiter gives
+# up with whatever it had, which is exactly the old behaviour. A backstop, not a tuning knob — the
+# fetching thread sets its Event on every exit path (see `_release`), so this should never elapse.
+_REFRESH_WAIT_MARGIN_S = 1.0
 # The materiality gate on "stay put". Inherited from the deleted `_MIN_MINUTES_SAVED`, which used to
 # be a filter over every candidate; it is now applied at exactly ONE place — to the winner, and only
 # when the disrupted train is neither cancelled nor itself alert-worthy.
@@ -566,7 +585,10 @@ class _KeyedTTLCache:
         self._failure_cooldown = failure_cooldown
         self._lock = threading.Lock()
         self._entries: dict[Any, tuple[Any, datetime]] = {}
-        self._refreshing: set[Any] = set()
+        # key -> an Event the fetching thread sets when it is done. A dict of Events rather than the
+        # plain set this was until 2026-08-21, so a concurrent caller for the SAME key can wait for
+        # the answer instead of being told there isn't one. See `wait_for_refresh` in `get`.
+        self._refreshing: dict[Any, threading.Event] = {}
         self._failed_at: dict[Any, datetime] = {}
 
     def get(
@@ -578,6 +600,7 @@ class _KeyedTTLCache:
         label: str | None = None,
         gate: Callable[[], bool] | None = None,
         outcome: dict[str, Any] | None = None,
+        wait_for_refresh: bool = False,
     ) -> Any:
         """The cached value for `key`, refreshing it through `fetch` when it is stale.
 
@@ -602,6 +625,24 @@ class _KeyedTTLCache:
         would then be suppressed for the entire cooldown on top of the throttle. A refusal serves
         the previous value if there is one, exactly like the cooldown does. It runs under this
         lock, so the claim and the decision to fetch cannot straddle another thread's claim.
+
+        `wait_for_refresh` decides what a caller who finds this key already in flight does: give up
+        with whatever it had (the default, and what the request path wants), or **block until the
+        thread that claimed it answers, then read the fresh value** (what the poller wants).
+
+        That distinction did not exist while the poller's lookups were sequential, because they
+        could not collide: journey A's fetch had completed and populated the cache before journey B
+        was asked at all, so B took a cache hit. Fanning the matcher out (2026-08-21) makes them
+        genuinely concurrent, and Oslo-corridor registrations share stop pairs heavily — so without
+        this, "another caller is already fetching this key" would become the common case and every
+        journey but the first would be told there is no alternative, having spent no fetch and
+        learned nothing. That is worse than the sequential behaviour it replaced, which is the kind
+        of regression a fan-out is expected to cause and easy to ship unnoticed: nothing errors, the
+        cards just quietly stop offering a replacement train.
+
+        The wait is bounded by the fetch's own timeout plus a margin, so a waiter can never block
+        longer than doing the fetch itself would have, and a fetching thread that dies without
+        setting its Event costs one timeout rather than a hung poller.
         """
         def served(kind: str) -> None:
             if outcome is not None:
@@ -614,17 +655,38 @@ class _KeyedTTLCache:
                 # means. Only a value handed back because a refresh could not happen is "stale".
                 served("hit")
                 return entry[0]
-            if key in self._refreshing:  # another caller is already fetching this key
+            in_flight = self._refreshing.get(key)  # another caller is already fetching this key
+            if in_flight is not None and not wait_for_refresh:
                 served("stale")
                 return entry[0] if entry else None
-            failed_at = self._failed_at.get(key)
-            if failed_at is not None and now - failed_at < self._failure_cooldown:
-                served("stale")
-                return entry[0] if entry else None
-            if gate is not None and not gate():
-                served("stale")
-                return entry[0] if entry else None
-            self._refreshing.add(key)
+            if in_flight is None:
+                failed_at = self._failed_at.get(key)
+                if failed_at is not None and now - failed_at < self._failure_cooldown:
+                    served("stale")
+                    return entry[0] if entry else None
+                if gate is not None and not gate():
+                    served("stale")
+                    return entry[0] if entry else None
+                self._refreshing[key] = threading.Event()
+
+        if in_flight is not None:
+            # Somebody else claimed this key; wait for their answer rather than duplicating the
+            # fetch or reporting a non-answer. Outside the lock, obviously — the thread we are
+            # waiting on needs it to publish the value. `_expire_failures` runs on both of its exit
+            # paths, so a waiter that wakes to a failure sees the cooldown, not a phantom claim.
+            in_flight.wait(_HTTP_TIMEOUT_S + _REFRESH_WAIT_MARGIN_S)
+            with self._lock:
+                entry = self._entries.get(key)
+            if entry is not None and now - entry[1] < self._ttl:
+                # Their reply, inside its TTL. Note `entry[1]` may be marginally LATER than our own
+                # `now` (they sampled theirs after we sampled ours), which makes the difference
+                # negative and the test true — correct, and worth stating: a value fetched after we
+                # asked is fresher than one fetched before, not staler.
+                served("hit")
+                return entry[0]
+            served("stale")
+            return entry[0] if entry else None
+
         try:
             value = fetch()
         except Exception:
@@ -636,7 +698,7 @@ class _KeyedTTLCache:
             )
             with self._lock:
                 self._failed_at[key] = now
-                self._refreshing.discard(key)
+                self._release(key)
                 self._expire_failures(now)
                 entry = self._entries.get(key)
             served("stale")
@@ -644,7 +706,7 @@ class _KeyedTTLCache:
         with self._lock:
             self._entries[key] = (value, now)
             self._failed_at.pop(key, None)
-            self._refreshing.discard(key)
+            self._release(key)
             self._expire_failures(now)
             # Keep the cache bounded. The reasoning changed with the key, so it is restated rather
             # than inherited: the old key embedded a five-minute WALL-CLOCK bucket, so a single
@@ -661,6 +723,17 @@ class _KeyedTTLCache:
                     self._entries.pop(k, None)
         served("fetch")
         return value
+
+    def _release(self, key: Any) -> None:
+        """Drop this key's in-flight claim and wake anyone waiting on it. Caller holds the lock.
+
+        Both exit paths of the fetch go through here, success and failure alike — a waiter that is
+        never woken burns its whole timeout, and during a Journey Planner outage the failure path is
+        the ONLY one that runs. `Event.set()` does not block, so doing it under the lock is fine.
+        """
+        event = self._refreshing.pop(key, None)
+        if event is not None:
+            event.set()
 
     def _expire_failures(self, now: datetime) -> None:
         """Drop failure marks that can no longer suppress a fetch. Caller holds the lock.
@@ -705,15 +778,16 @@ def _reserve_fetch(path: str, now: datetime) -> bool:
     Called from inside `_KeyedTTLCache.get`'s lock (see its `gate` parameter). Nothing takes these
     two locks in the other order.
     """
+    ceiling = _POLLER_FETCH_MAX_PER_MIN if path == _POLLER_PATH else _FETCH_MAX_PER_MIN
     with _budget_lock:
         calls = _fetch_calls.setdefault(path, [])
         calls[:] = [t for t in calls if now - t < _RATE_WINDOW]
-        if len(calls) >= _FETCH_MAX_PER_MIN:
+        if len(calls) >= ceiling:
             logger.warning(
                 "Journey Planner lookups rate-limited on the %s path (%d/min); offering no "
                 "alternative",
                 path,
-                _FETCH_MAX_PER_MIN,
+                ceiling,
                 extra={
                     "fields": {
                         "event": "alternatives_error",
@@ -1191,7 +1265,21 @@ def fetch_candidates(
             state["bytes"] = getattr(_response, "bytes", None)
 
     cache_outcome: dict[str, Any] = {}
-    patterns = _cache.get(key, fetch, now, label=digest, gate=gate, outcome=cache_outcome)
+    patterns = _cache.get(
+        key,
+        fetch,
+        now,
+        label=digest,
+        gate=gate,
+        outcome=cache_outcome,
+        # Only the poller waits on somebody else's in-flight fetch for this key. Its callers are
+        # concurrent with each other and share stop pairs heavily, so waiting is what keeps a
+        # fan-out from turning "one fetch, N answers" into "one fetch, one answer and N-1 shrugs".
+        # The request path keeps giving up immediately: an inbound HTTP request holding an anyio
+        # threadpool slot to wait on an unrelated request's fetch is how a slow upstream turns into
+        # a queue, and `/impact` already degrades to `alternative_journey: null` gracefully.
+        wait_for_refresh=path == _POLLER_PATH,
+    )
     _log_lookup(
         pair_digest=digest,
         arrive_by=arrive_by,
