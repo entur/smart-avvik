@@ -352,7 +352,12 @@ SELECT
   IFNULL(lp.line_pre_delay, -1)  AS line_pre_delay,
   IFNULL(lp.line_pre_cancel, -1) AS line_pre_cancel,
   IFNULL(np.net_pre_delay, -1)   AS net_pre_delay,
-  IFNULL(np.net_pre_cancel, -1)  AS net_pre_cancel
+  IFNULL(np.net_pre_cancel, -1)  AS net_pre_cancel,
+  -- Every demo row is built from an SX situation, so it is the flagged half of the
+  -- has_situation split the rail heads gained on 2026-08-19 (train_call_models.sql).
+  -- Harmless on the *_pooled_all heads below: ML.PREDICT ignores an input column the
+  -- model does not know, while a model naming a column the input lacks fails the job.
+  TRUE                           AS has_situation
 FROM expanded AS e
 LEFT JOIN linepre AS lp ON lp.situationNumber = e.situationNumber AND lp.lineRef = e.lineRef
 LEFT JOIN netpre  AS np ON np.situationNumber = e.situationNumber AND np.operator = e.operator
