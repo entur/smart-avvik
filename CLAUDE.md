@@ -502,10 +502,26 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     cache entry and one BigQuery query apiece (`_checked_operator`'s reasoning, with the vocabulary
     read from the data); the page therefore fetches the options **before** the data on every filter
     change and clears a selection the narrowed window no longer contains, or a window change would
-    flash an error the user never caused. The values are **refs** (`VYG:Line:R11`,
-    `NSR:StopPlace:337`), with names only as labels, resolved through the same stop list
-    `/varsel-api/stops` and `llm_message` read (`main._varsel_stops`, injected via
-    `historikk.configure`) and failing open to the bare ref. And **Linje, Fra and Til reach
+    flash an error the user never caused. **A from/to option is a PLACE, not a ref**, and getting that
+    wrong shipped a real bug on 2026-08-21: names and grouping came from `main._varsel_stops`, which
+    holds only *today's* timetable and deliberately collapses co-located refs keeping the busiest —
+    so Asker stasjon's bus side (`NSR:StopPlace:3247`, 267 calls) won the collapse and its rail side
+    (`NSR:StopPlace:418`, 264) came back nameless and was offered as a raw ref *beside its own name*.
+    Naming it alone would have been worse: two identical "Asker stasjon" rows, which is exactly the
+    2026-08-03 picker bug. The fix is `varsel`'s own three parts one layer up. Names and parents come
+    from the **National Stop Register** directly (`historikk_stop_places.sql`, ~2 MB, fails open to
+    bare refs — never from the picker cache); refs sharing a parent **and** a name are merged into one
+    row on `refresh_varsel_stops`' exact rule (parent alone would merge Oslo S with Jernbanetorget;
+    an unnamed ref is never merged); and the row **filters on every ref it covers**
+    (`from_place_refs` / `to_place_refs` arrays, `historikk._place_refs`) — matching only the
+    nominated ref hid 659 of Asker's 842 decisions behind the row named after it, which is
+    `varsel.place_refs`' lesson verbatim. **The emptiness test must be
+    `IFNULL(ARRAY_LENGTH(@refs), 0) = 0`**: an empty array from the Python client serializes as
+    `{'arrayValues': []}` and BigQuery reads `ARRAY_LENGTH` of that as **NULL**, so the bare form is
+    NULL on every unfiltered request and the ANDed predicate drops every row — the whole page went to
+    zeros. A dry run validates it and `bq --parameter=refs:ARRAY<STRING>:[]` returns 0 (the CLI
+    encodes empties differently), so neither cheap check catches it and nothing in this repo executes
+    SQL; `test_the_no_filter_array_test_is_null_safe` greps for the bare form instead. And **Linje, Fra and Til reach
     `/summary` too**, exactly as `operator` already did, because they narrow the *population* — the
     rates must describe the slice the list beside them shows; `verdict`/`alerted_only`/
     `resolved_only` narrow by *outcome* and still must not, since filtering to hits makes precision
