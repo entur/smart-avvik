@@ -11,7 +11,13 @@
 -- UNION ALL of the same two sources /historikk-api/decisions reads, and for the same reason: a
 -- decision is visible on the page long before the nightly job can label it, so options taken from
 -- the labelled table alone would not offer today's trains at all. Duplicates across the two are
--- harmless here — every consumer below is a SELECT DISTINCT.
+-- harmless — every consumer below aggregates.
+--
+-- The two place arrays carry a COUNT per ref, and it is not decoration. Refs are grouped into
+-- physical places in the API (historikk._place_groups), and the group has to nominate ONE of them
+-- as the value the client sends back. That pick is "the busiest ref, ties broken on the ref itself"
+-- — the same rule main.refresh_varsel_stops uses for the picker, and for the same reason: a
+-- nomination that flipped between refreshes would invalidate the page's selection under it.
 --
 -- PRIVACY: from_stop/to_stop are the traveller's own registered endpoints, which this API withheld
 -- entirely until the filters were added. They are still NOT served per decision (see the Decision
@@ -34,11 +40,18 @@ WITH universe AS (
   WHERE call_date BETWEEN @from_date AND @to_date
 )
 SELECT
-  ARRAY(SELECT DISTINCT operator  FROM universe WHERE operator  IS NOT NULL ORDER BY operator)  AS operators,
-  ARRAY(SELECT DISTINCT line      FROM universe WHERE line      IS NOT NULL ORDER BY line)      AS lines,
+  ARRAY(SELECT DISTINCT operator FROM universe WHERE operator IS NOT NULL ORDER BY operator) AS operators,
+  ARRAY(SELECT DISTINCT line     FROM universe WHERE line     IS NOT NULL ORDER BY line)     AS lines,
   -- Refs, not names: the ref is what the decision log stores and what the filter predicate compares
-  -- against, so it is the stable identity. The API resolves each to its registry name for display
-  -- (historikk._stop_names), and falls back to the bare ref when the registry cannot place it —
-  -- which is also what happens in every environment where the stop list has not loaded yet.
-  ARRAY(SELECT DISTINCT from_stop FROM universe WHERE from_stop IS NOT NULL ORDER BY from_stop)  AS from_places,
-  ARRAY(SELECT DISTINCT to_stop   FROM universe WHERE to_stop   IS NOT NULL ORDER BY to_stop)    AS to_places
+  -- against, so it is the stable identity. The API resolves each to its National Stop Register name
+  -- for display and groups co-located refs into one option — see historikk._place_groups.
+  ARRAY(
+    SELECT AS STRUCT from_stop AS ref, COUNT(*) AS n
+    FROM universe WHERE from_stop IS NOT NULL
+    GROUP BY from_stop ORDER BY from_stop
+  ) AS from_places,
+  ARRAY(
+    SELECT AS STRUCT to_stop AS ref, COUNT(*) AS n
+    FROM universe WHERE to_stop IS NOT NULL
+    GROUP BY to_stop ORDER BY to_stop
+  ) AS to_places

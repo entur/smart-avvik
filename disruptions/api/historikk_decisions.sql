@@ -63,8 +63,25 @@ WHERE o.call_date BETWEEN @from_date AND @to_date
   -- projection is what keeps the Decision model's extra="forbid" a working guard rather than a
   -- comment. NULL from_stop/to_stop rows are dropped by an active filter, which is right -- a
   -- decision that records no origin cannot be claimed to have started anywhere in particular.
-  AND (@from_place IS NULL OR o.from_stop = @from_place)
-  AND (@to_place   IS NULL OR o.to_stop   = @to_place)
+  --
+  -- An ARRAY of EVERY ref standing for the chosen place, not the one the dropdown nominated, and
+  -- the difference is not cosmetic. A station's rail and bus sides are separate NSR refs and each
+  -- feed records its calls on its own, so a registration made against either one lands here under
+  -- that ref: matching a single ref hid 659 of Asker stasjon's 842 decisions behind the row that
+  -- said "Asker stasjon" (measured on dev, 2026-08-21). This is varsel.place_refs' lesson one layer
+  -- up -- collapsing refs into one row and then matching only the survivor moves the silent miss
+  -- down a layer instead of removing it.
+  --
+  -- Empty means "no filter", since BigQuery has no NULL array parameter.
+  -- IFNULL, and it is load-bearing: an EMPTY array parameter from the Python client serializes as
+  -- {'arrayValues': []}, and BigQuery evaluates ARRAY_LENGTH of that as NULL rather than 0 (measured
+  -- 2026-08-21). So the bare `ARRAY_LENGTH(@refs) = 0` this shipped with was NULL on every
+  -- unfiltered request, the predicate excluded every row, and the whole page went to zeros -- while
+  -- a dry run validated and `bq --parameter=...:ARRAY<STRING>:[]` returned 0, because the CLI
+  -- encodes an empty array differently from the client library. No test caught it: nothing in this
+  -- repo executes SQL.
+  AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR o.from_stop IN UNNEST(@from_place_refs))
+  AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR o.to_stop   IN UNNEST(@to_place_refs))
   AND (NOT @alerted_only OR o.ever_alerted)
   -- "With ground truth" is the OUTCOME being known, which is what outcome_state calls 'avklart' --
   -- deliberately not `verdict IS NOT NULL`. The two differ by one row shape: an outcome that
@@ -102,9 +119,10 @@ FROM `disruptions.varsel_decision_groups` AS g
 WHERE g.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR g.operator = @operator)
   AND (@line     IS NULL OR g.line     = @line)
-  -- Same three as the labelled side; see the note there for why they are filtered but not selected.
-  AND (@from_place IS NULL OR g.from_stop = @from_place)
-  AND (@to_place   IS NULL OR g.to_stop   = @to_place)
+  -- Same three as the labelled side; see the note there for why they are filtered but not selected,
+  -- and why a place is an array of refs rather than one.
+  AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR g.from_stop IN UNNEST(@from_place_refs))
+  AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR g.to_stop   IN UNNEST(@to_place_refs))
   -- Unlabelled rows carry no verdict, so a verdict filter must exclude them all rather than
   -- silently returning them as if they matched.
   AND @verdict IS NULL

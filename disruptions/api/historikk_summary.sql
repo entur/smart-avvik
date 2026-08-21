@@ -47,6 +47,13 @@
 -- "Inserted row has wrong column count; Has 35, expected 36"). The synthetic ids are the same
 -- `KIX:` scheme the ET relay established, one namespace per provenance.
 --
+-- A PLACE IS AN ARRAY OF REFS, never one: a station's rail and bus sides are separate NSR refs and
+-- registrations land on either, so matching the single ref the dropdown nominated would drop most of
+-- the place's decisions out of these rates while the list beside them showed the same gap. See the
+-- long note in historikk_decisions.sql, including why the emptiness test is IFNULL(ARRAY_LENGTH(..))
+-- and not ARRAY_LENGTH(..) -- the bare form reads NULL for an empty client-side array and filters
+-- every row away.
+--
 -- WHICH FILTERS REACH THIS FILE, and why it is not all of them. operator, line, from_place and
 -- to_place narrow the POPULATION -- which trains, on whose registered journeys -- so the rates here
 -- are computed over exactly the decisions the list beside them is showing, and both answer the same
@@ -77,8 +84,8 @@ WITH labelled AS (
   WHERE call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
-    AND (@from_place IS NULL OR from_stop = @from_place)
-    AND (@to_place   IS NULL OR to_stop   = @to_place)
+    AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
+    AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
 ),
 -- Unlabelled groups, split by whether a verdict is still possible. A decision with no journey key
 -- can never be joined to a realized call -- the labelling job skips it permanently -- so it is
@@ -91,8 +98,8 @@ unlabelled AS (
   WHERE g.call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR g.operator = @operator)
     AND (@line     IS NULL OR g.line     = @line)
-    AND (@from_place IS NULL OR g.from_stop = @from_place)
-    AND (@to_place   IS NULL OR g.to_stop   = @to_place)
+    AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR g.from_stop IN UNNEST(@from_place_refs))
+    AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR g.to_stop   IN UNNEST(@to_place_refs))
     AND NOT EXISTS (
       SELECT 1
       FROM `disruptions.varsel_decision_outcomes` AS o
@@ -138,8 +145,8 @@ hits_per_train AS (
   WHERE call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
-    AND (@from_place IS NULL OR from_stop = @from_place)
-    AND (@to_place   IS NULL OR to_stop   = @to_place)
+    AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
+    AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
     AND verdict = 'hit'
   GROUP BY
     -- varsel.one_alert_per_train's key, in its own order of preference: the boarding call, then

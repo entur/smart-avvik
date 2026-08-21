@@ -41,9 +41,20 @@ De fire siste fylles fra `GET /historikk-api/filters` over hele tidsvinduet — 
 skjermen, som er kappet på 200 og sortert på avgang: en linje som bare kjørte tidlig i vinduet ville
 da falle ut av sitt eget filter, og et valgt filter ville krympe lista det kom fra til seg selv.
 
-Verdiene er *refs* (`VYG:Line:R11`, `NSR:StopPlace:337`) — det er dem loggen lagrer og API-et
-sammenligner mot. Navnene er bare etiketter, slått opp i den samme stoppestedslista som
-`/varsel-api/stops`; et stopp uten navn vises som sin egen ref og filtrerer like fullt.
+Linjeverdiene er *refs* (`VYG:Line:R11`) — det er dem loggen lagrer og API-et sammenligner mot.
+
+**Fra/Til er ett fysisk sted per rad, ikke én ref.** En stasjons togside og bussside er to ulike
+NSR-refs under samme `parentRef`, og en registrering havner på den ene eller den andre. De slås
+derfor sammen til én rad — samme regel som `main.refresh_varsel_stops` bruker for velgeren: samme
+forelder *og* samme navn (forelder alene ville slått sammen Oslo S og Jernbanetorget; en ref uten
+navn slås aldri sammen). Raden peker på den travleste av refsene, og **filtrerer på alle sammen**.
+Det siste er poenget: matcher man bare den ene, forsvinner resten i stillhet — 659 av Asker stasjons
+842 avgjørelser lå bak den refen raden *ikke* var oppkalt etter (målt i dev 2026-08-21).
+
+Navn og forelder hentes rett fra Nasjonalt stoppestedsregister (`historikk_stop_places.sql`), ikke
+fra stoppestedslista bak `/varsel-api/stops`: den lista inneholder bare dagens rutetabell og har
+allerede kastet den refen som tapte sammenslåingen. Uten registeret vises refs, og filtrene virker
+like fullt.
 
 `/filters` er også API-ets tillatelsesliste: en verdi som ikke finnes i vinduet gir 400, ikke tom
 liste. Derfor rydder siden i valgene sine hver gang vinduet endres — velger du en linje i 30-dagers­
