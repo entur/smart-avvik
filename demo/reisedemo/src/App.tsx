@@ -6,57 +6,11 @@ import {
   type DemoHighlight,
   type DemoJourneysResponse,
   type DemoMeta,
-  type DemoSide,
 } from './api';
 import { CANCEL_LIKELY, fmtDate, fmtDateTime, fromLocalInput, toLocalInput } from './format';
+import HitSummary from './HitSummary';
 import JourneyCard from './JourneyCard';
 import StopCombobox from './StopCombobox';
-
-// The most informative snapshot before the call: the latest ask time that existed.
-function lastSnapshot(side: DemoSide) {
-  return side.t30 ?? side.t60 ?? side.at_message;
-}
-
-function Stats({ result }: { result: DemoJourneysResponse }) {
-  const affected = result.journeys.filter((j) => j.situation !== null).length;
-  const tallies = { hit: 0, correct_reject: 0, miss: 0, false_alarm: 0 };
-  for (const j of result.journeys) {
-    for (const side of [j.departure, j.arrival]) {
-      const v = lastSnapshot(side)?.verdict;
-      if (v) tallies[v] += 1;
-    }
-  }
-  const right = tallies.hit + tallies.correct_reject;
-  const wrong = tallies.miss + tallies.false_alarm;
-  return (
-    <div className="stats">
-      <span>
-        <strong>{result.count}</strong> reiser
-      </span>
-      <span>
-        <strong>{affected}</strong> med SX-melding
-      </span>
-      {right + wrong > 0 && (
-        <span>
-          siste prediksjon før avgang:{' '}
-          <strong className="stat-good">{right} riktige</strong>
-          {tallies.miss > 0 && (
-            <>
-              {' · '}
-              <strong className="stat-bad">{tallies.miss} bom</strong>
-            </>
-          )}
-          {tallies.false_alarm > 0 && (
-            <>
-              {' · '}
-              <strong className="stat-warn">{tallies.false_alarm} falsk alarm</strong>
-            </>
-          )}
-        </span>
-      )}
-    </div>
-  );
-}
 
 export default function App() {
   const [meta, setMeta] = useState<DemoMeta | null>(null);
@@ -261,7 +215,7 @@ export default function App() {
 
       {result && !error && (
         <section className="results">
-          <Stats result={result} />
+          <HitSummary journeys={result.journeys} />
           {journeys.length === 0 ? (
             <p className="empty">Ingen reiser i valgt tidsrom.</p>
           ) : (
