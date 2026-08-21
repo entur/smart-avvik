@@ -656,6 +656,206 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     "written but withheld" population the prd rollout decision is judged on. prd's pairs are the
     ones that matter: real travellers, real journeys.
 
+- The **Tilbakeblikk** page at `/tilbakeblikk` (`demo/tilbakeblikk/`, React + Vite + Entur Linje) is
+  the prompt-iteration loop: a window of past alert decisions replayed through **today's** prompt,
+  written from the `message_input` already stored on every decision row. `/historikk` answers "what
+  did we send, and was it right"; this one answers "what would today's prompt say about the same
+  disruptions", and nothing is sent to anybody. Its API is `/tilbakeblikk-api`
+  (`disruptions/api/tilbakeblikk.py`) over `tilbakeblikk_{decisions,summary,filters,messages}.sql`.
+  `config`, `filters`, `decisions` and `summary` are BigQuery only; `messages` is the one that calls
+  Vertex — separate endpoints deliberately, so a Vertex outage empties the wordings and leaves every
+  card, filter and statistic on the page intact, where one endpoint would 503 the whole thing. The
+  two lists are aligned **position by position** — nothing served identifies a decision uniquely,
+  since the real grain includes the redacted `journey_digest` — which is why
+  `tilbakeblikk_messages.sql` repeats the decisions query's WHERE and ORDER BY verbatim, full subject
+  key and all. /historikk's logic is **forked, not shared**: only `historikk_stop_places.sql` (it
+  takes `@refs` and has no window of its own) and historikk's operator/verdict/lookback constants
+  are, so a fix to one side must be mirrored to the other — the 2026-08-21 pushed-wording fix is
+  exactly the shape of change that has to be.
+  - **The window is `decided_at`, not `call_date`** — one Oslo day plus a from/to time of day, both
+    ends quantized to 15-minute steps as a half-open `[from, to)`. Two reasons, and the second is
+    free. It is the axis a replay needs (a stretch of real cycles whose recorded inputs can be
+    re-run), and it is the **partition key** of `varsel_decisions`, so these are the first queries in
+    this stack that prune their main input: measured 2026-08-21, `tilbakeblikk_filters.sql` dry-runs
+    at **0 bytes** where `historikk_filters.sql` reports **21 MB**. The pruning predicate spans
+    `@day - 1 day` to `@day + 1 day` because the partition column is a UTC date while the window is
+    an Oslo one, with the exact `@from_ts <= decided_at < @to_ts` applied on top. Quantizing is not
+    cosmetic: every parameter lands in the response-cache key on a public unauthenticated endpoint,
+    and two free-form second-resolution times are on the order of a billion keys a day, each one a
+    cache entry and a BigQuery query of its own. `from`
+    rounds down and `to` rounds up so a narrowed range never drops a minute the caller asked for, and
+    the whole-day default runs 00:00 to the **following** midnight — 23:59:59.999999 is not on the
+    grid and quantizing it down would silently drop the last quarter-hour of every default request.
+    A future day, a day past `historikk._MAX_WINDOW_DAYS`, and a `to_time` at or before `from_time`
+    are all 400s rather than empty pages, for the same key-space reason.
+  - **The outcomes join is bounded separately, on `call_date`**, because that table is partitioned on
+    it and a `decided_at` predicate prunes nothing there — without the explicit bound this read would
+    be strictly *more* expensive than /historikk's while the query overall claimed to be cheaper. The
+    width is **measured, not reasoned to**: `MAX(ABS(DATE_DIFF(call_date, DATE(decided_at,
+    'Europe/Oslo'), DAY)))` over dev's last seven days on 2026-08-21 gives **max = 1, p99.9 = 1 over
+    59 694 rows**, no NULL `call_date`, which agrees with the ~12 h scoring horizon. **Re-measure
+    before widening that horizon.** A too-narrow bound drops outcome rows *silently* — the subjects
+    simply read as unresolved, a state the page renders perfectly happily — and the byte counts
+    `validate_varsel_sql.sh` prints would report that loss as a **cheaper** query, i.e. as success.
+    Cost is not a correctness check here. The bound also lives inside the `ON` and never the `WHERE`:
+    in the `WHERE` it turns the LEFT JOIN into an inner one and drops every unlabelled subject, which
+    on a same-day window is nearly all of them.
+  - **Generation is the gate, delivery is not.** `/messages` asks `llm_message.generation_enabled()`
+    and never `delivery_enabled()` or `varsel._deliverable_message` — the two switches are not
+    interchangeable (generation says whether a wording can be *written*, delivery only what a
+    *traveller* receives), and prd is exactly the deployment that generates without delivering
+    (`VARSEL_LLM_PROVIDER=auto`, `VARSEL_LLM_ENABLED=false`). No environment change was needed to
+    ship this, and a surface that consulted the delivery gate would be **blank in prd for a reason
+    having nothing to do with the feature** — blank precisely where the data is worth looking at.
+    `test_the_delivery_gate_is_never_consulted` pins it. `generation_enabled` is asked **once per
+    request**, not per subject: asked per subject it would flip mid-pass when a configuration error
+    latched a backend off, and half the page would read `disabled` while the other half read `error`
+    for one cause.
+  - **Four bounds on regeneration, every one a number so it can be checked.** What they protect is
+    not page responsiveness — it is the per-project Vertex quota the **poller** shares: a replay
+    burst that eats it makes a real push wording 429, and a 429 is a *transient* failure that returns
+    `status="error"` without trying the other backend, so a traveller silently gets the template and
+    nothing on that side says so.
+    (1) **12 backend CALLS per request** — calls, not subjects, because under `auto` one subject can
+    spend two: an empty or ungrounded reply `continue`s to the next backend, and a prompt edit that
+    trips the grounding check or the 300-character cap trips it for every subject at once, which is
+    exactly the situation somebody uses this page in. The per-subject reservation
+    (`_CALLS_PER_SUBJECT = 2`) is **conservative and never refunded**, and the choice is forced:
+    `write_message_detailed` reports which backend answered but not how many it tried, and the two
+    ways to find out are both wrong (`result.provider` is `None` on exactly the `rejected` and
+    `ungrounded` paths where more than one ran; a counting proxy would have to be installed on a
+    module global the poller calls through). So a happy-path request generates 6 subjects rather than
+    12, which costs a page refresh, where an under-count would spend 24 Vertex calls against a stated
+    ceiling of 12 and cost a traveller their push wording.
+    (2) **24 calls per trailing minute**, one full request's worth inside the deadline so it binds on
+    a second concurrent request rather than never, tallied **by caller** in the shape of
+    `alternatives._fetch_calls`' `{_REQUEST_PATH, _POLLER_PATH}` keying. Be honest about what that
+    does here: the poller does not call this module at all, so its slot is empty by construction —
+    the keying is what makes that structural rather than a fact somebody has to keep true, and what
+    stops a later caller silently drawing replay's allowance down. The coupling it defends against is
+    one layer out, at Vertex.
+    (3) **A 30 s wall-clock deadline that RESERVES the worst case** rather than measuring elapsed
+    time: `monotonic() + 16 s >= deadline` stops a new call being started, the shape
+    `varsel._WORST_CASE_CALL_S` uses. Checking elapsed time would bound when the last call *starts*,
+    not when the pass ends, and
+    the check must run **inside the worker as its task starts**, never at submit time, or every task
+    queues before the deadline is consulted and the bound guarantees nothing. 16 s is reachable by
+    one path only — a first backend returning an empty or ungrounded reply near `_TIMEOUT_S` (8 s)
+    and continuing, then a second that times out; a timeout on its own does *not* reach the second
+    backend, and prd is the *cheapest* path rather than the worst, because an unserved Claude 404s in
+    well under a second. Pool width 4 (`varsel._PUSH_WORKERS` is the shape at 8; 4 leaves room beside
+    the poller), so the cap costs three rounds, ~7 s typically.
+    (4) **A wording cache keyed on subject + replayed `decided_at` + `llm_message.PROMPT_VERSION`**,
+    2 000 entries, 30 min, and only 60 s for a failure so a transient Vertex error does not stick a
+    red badge on a card for half an hour after Vertex recovers. Both halves of the key are
+    load-bearing: the prompt version is what makes an edit invalidate the page rather than show
+    yesterday's answer under today's brief, and the replayed timestamp is what makes *narrowing the
+    window* — which picks a different cycle — correctly miss instead of serving the wider window's
+    wording under a different time. The cache is consulted **before** the budget, which is what makes
+    a whole day reachable: spent per subject rather than per miss, every request would re-serve the
+    same first twelve forever and nothing further down the list could ever be seen.
+    A bound that binds is reported per entry and the request still returns 200 — `capped`,
+    `rate_limited` and `deadline` beside `no_input`, `unreadable_input`, `disabled` and the statuses
+    off `MessageResult` — and `ungrounded`/`rejected` carry the **discarded reply**, since those two
+    are what a prompt edit most plausibly produces and a badge with no text defeats the loop. On top
+    of all four, `maximum_bytes_billed` is set to 2 GiB on every job: at ~11x the whole decision log
+    (181.6 MB in prd, 135 MB in dev, measured 2026-08-21) it will **not** catch a pruning regression —
+    it is a blast-radius bound against a mistyped join reaching a ~10 TiB ET table.
+  - **The latch is isolated, and that is not optional.** `llm_message`'s `_active`, `_active_at`,
+    `_latched_off` and the lock guarding them were four module globals; they now live in a
+    `_LatchState` holder, the module keeps one global instance so **every existing caller is
+    unchanged**, and replay takes its own via `new_replay_state()`. Without it, a replay burst that
+    drove both backends into a `_ConfigurationError` would make `generation_enabled()` read False for
+    the whole `_LATCH_TTL` (30 min) inside `varsel.check_and_notify`: every real push silently falls
+    back to the template *and* the poller spends a message attempt per subject on each `None` —
+    silently, on the side nobody watches. **The lock moves with the state**; left behind, a replay
+    pool would hold separate latches and still contend on the one mutex with the poller thread, and
+    the isolation would read stronger than it is. **Seeding is one-way**: a new holder copies
+    `latched_off` from the global at construction (so it does not re-pay for a 404 the poller already
+    discovered — `active` pins only on success, so a cold holder would re-walk claude-then-gemini
+    every TTL window) and never writes anything back. The replay holder also caches one client per
+    backend, which the live path does not need and a request-path fan-out does. Replay traffic is
+    marked with a `replay` **field** on the existing `event="llm_message"` record rather than a new
+    event name — a new name would quietly drop it out of every query that already exists, including
+    the ones that would notice a burst — and it suppresses the prompt/reply DEBUG record regardless
+    of `VARSEL_LLM_LOG_PROMPTS`, which dev has on and which would otherwise write a traveller's
+    origin, destination and departure time to Cloud Logging at page-load volume. A second record,
+    `event="tilbakeblikk_replay"`, carries the unhashed `journey_digest` so a replay joins both the
+    decision row and the live trail. And the `/messages` route is **`async def`**, which is not a
+    style choice: every other route in this process is a plain `def` and shares the anyio worker pool
+    — `/impact`, the `/varsel-api` device and journey writes, the `/historikk` routes — so a handler
+    that can hold one of those slots for its full 30 s deadline would starve traveller-facing
+    registration from a public unauthenticated endpoint, with no ingress cutoff to reclaim it.
+  - **The privacy split is structural, not a test.** `tilbakeblikk_decisions.sql` carries
+    `message_input` only as a **null test** (`message_input IS NOT NULL AS has_input`) — no CTE in it
+    holds the text — while `tilbakeblikk_messages.sql` names it and only the server ever reads those
+    rows; what leaves the process is the wording generated *from* the input, never the input. A query
+    that does not name a column cannot leak it however the model above it drifts, which is why the
+    split is worth a duplicated query. The rest is /historikk's redaction verbatim: no decision row
+    carries `journey_digest`, `from_stop` or `to_stop`, both `Decision` and `ReplayedMessage` are
+    `extra="forbid"`, and the redacted columns are used as JOIN, WHERE and ORDER BY terms only
+    (ordering by a redacted column is not projecting it). `/filters` publishes place refs as the
+    dropdown vocabulary exactly as /historikk's does — the redaction is per **row**, not per
+    response, or the Fra/Til filters could not exist at all — and it is the API's allow-list, so an
+    unknown value is a 400 rather than one more cache entry and one more BigQuery query.
+  - **`TILBAKEBLIKK_ENABLED` fails closed, and prd is off.** One switch decides both the router and
+    the static mount (half a surface is worse than none: the page would load and every request 404),
+    parsed with `llm_message._TRUTHY` reused verbatim — only `true`/`1`/`yes`/`on` turn it **on**, so
+    a misspelling, an empty string or an unset variable withholds the surface instead of publishing
+    it. dev and tst set `"true"`, prd sets `"false"`. The bundle is built into every image regardless;
+    what varies is the env var, not the artefact. **Q1 is the open question**: the prompt instructs
+    the model to advise on the traveller's own route, so the prose routinely names **both ends of a
+    trip**, and `trafficType: public` is set once in the chart and inherited by every environment —
+    so publishing it beside `departure_time` and `n_devices` is the exact inference the per-row
+    redaction exists to prevent. prd's public `/historikk` shows only template wordings today
+    precisely because prd does not deliver the model's. What resolves it: **access control in front
+    of `/tilbakeblikk`, or a decision that the regenerated text may be published as it stands.** Know
+    the cost of leaving it off: prd holds the journeys that matter — **36 registered against dev's
+    ~3** — so a surface off in prd answers the prompt question on thin data. dev and tst being on is
+    a deliberate acceptance on the team's own registrations under the same Q1, not a sign the question
+    was answered. Turning prd on is a one-value change plus a dispatch-only deploy.
+  - **Two honesty constraints the card carries**, both easy to get backwards. `first_in_window` says
+    whether the replayed cycle is the subject's **first alerting opportunity anywhere** or merely the
+    earliest one this window happens to contain — computed from `MIN(IF(alertworthy, decided_at))`
+    over the whole ±1-day span the query already scans, which costs no extra partition — because
+    without it, narrowing the time picker would silently move a card's claimed send time later. And
+    the per-cycle aggregates (`n_decisions`, `ever_alerted`, `first_alert_at`, `alert_lead_min`, the
+    four `final_*`, `max_impact_probability`, `pushed_any`) are **window-scoped** while the verdict
+    comes whole from the nightly job, so `ever_alerted: false` beside `verdict: 'hit'` is correct
+    rather than a bug — it alerted outside the window the reader chose. The field descriptions say
+    WINDOW-SCOPED and the UI labels them; `alert_lead_min` is recomputed from the window's first
+    alert rather than copied from the outcomes row, so it and `first_alert_at` cannot disagree about
+    which cycle they mean. `/summary`'s `median_lead_min_on_hits` goes the other way — whole-subject,
+    from the nightly job — which is what keeps it comparable with /historikk's.
+  - **What a replay measures, and what it does not.** It measures a **prompt** change, not a
+    `build_message_input` change: the stored document was built by the builder of that day and is
+    replayed byte-identically (`message_input_json(json.loads(s)) == s`), so a figure a newer builder
+    would add is simply not there — a newer prompt that asks the model to quote one gets a reply
+    quoting figures absent from the input, which the grounding check refuses as `ungrounded`, and the
+    status is shown rather than hidden. And each wording is a **single draw from a non-deterministic
+    decoder**,
+    cached per row and prompt version — so a difference between two cards, or between two prompt
+    versions, is confounded with sampling variance, and reloading and seeing the same text is the
+    cache rather than evidence that the model is predictable. The page says both, in prose at the
+    top and not in a tooltip.
+  - `data/queries/validate_varsel_sql.sh` covers all four new files (twelve parameters each against
+    /historikk's eleven — one omitted makes `bq` refuse to parse and the check reports FAILED, so the
+    file goes **unvalidated**; `test_tilbakeblikk.py` greps the script for every `@param` as the cheap
+    half of that guard). A clean dry run still proves neither of the two things that matter most:
+    the CLI encodes an empty ARRAY parameter differently from the Python client, so the
+    `IFNULL(ARRAY_LENGTH(@refs), 0) = 0` rule dry-runs identically either way, and the `call_date`
+    bound above fails silently and *cheaply*.
+  - **A same-day window is almost entirely `venter`**, because verdicts arrive from the 04:00 UTC
+    labelling job the following night and /historikk avoids this by defaulting to 14 days on
+    `call_date` — which this page cannot do, since its question is about a stretch of a specific day.
+    So precision, recall and lead on the default view describe a handful of rows, and `/summary`
+    states that as counts (`n_subjects`, `n_labelled`, `n_pending`, `n_unknown`) *before* the rates
+    rather than showing confident-looking numbers. The blended-plus-segments rule is /historikk's
+    unchanged: `predicted` / `relayed` / `no_sx` beside `n_unsegmented`. `/summary` takes the
+    **population** filters only (day, time range, operator, line, from/to place); `verdict`,
+    `alerted_only` and `resolved_only` narrow by outcome and never reach it — filtering to hits would
+    make precision read 100 % — and `sx_only` is withheld from it on the same grounds.
+
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)
   lives in `disruptions/api/reisevalg.py`. Road signal: SVV Trafikkdata volumes gated to
