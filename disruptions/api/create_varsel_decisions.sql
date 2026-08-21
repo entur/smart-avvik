@@ -231,7 +231,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
   alert_threshold        FLOAT64,
   pushed_any             BOOL    OPTIONS(description="Whether a Web Push was actually delivered for this decision."),
   n_devices              INT64,
-  message                STRING  OPTIONS(description="The last message text produced for this decision."),
+  message                STRING  OPTIONS(description="The wording the traveller was actually PUSHED for this decision, copied from varsel_decision_groups; when none was ever pushed (pushed_any = FALSE) it is the last wording produced instead, which is what /historikk marks 'ikke levert'. Deliberately not 'the last text produced', which it was until 2026-08-21: a wording is cached only while the situation stays above the alert gate (varsel._reconcile_caches), so a subject that eased off records the template on every later cycle and the card quoted text the traveller never received -- 41 % of dev's alerted subjects when it was measured, a tenth of them under the wrong writer's name."),
   message_source         STRING  OPTIONS(description="Which wording was SENT: 'llm' or 'deterministic'. Since 2026-08-07 'deterministic' covers two unlike states — no model wording existed, and one existed and was withheld by policy (prd's setting). This table cannot separate them: varsel_decisions.message_llm is what does, and it is not copied here."),
 
   actual_cancelled       BOOL    OPTIONS(description="ET declared the boarding call cancelled."),
@@ -281,6 +281,18 @@ ALTER TABLE `disruptions.varsel_decision_outcomes`
 -- added to varsel_decisions on 2026-08-06 reach the log without touching the nightly job at all.
 -- That is the whole reason they were added there and not projected here.
 CREATE OR REPLACE VIEW `disruptions.varsel_decision_groups` AS
+-- Wrapped in an outer SELECT for one reason: `message` and `message_source` must come from ONE row
+-- (see `delivered` below), and two separate aggregates picking "the same" row is a promise the
+-- ordering cannot keep. `* EXCEPT` rather than a re-listed projection so a column added to the
+-- inner SELECT still reaches consumers untouched -- it does move message/message_source to the end
+-- of the column order, which is safe because every reader names its columns
+-- (label_varsel_decisions.sql's INSERT, historikk_decisions.sql, historikk_summary.sql) and none
+-- of them is positional.
+SELECT
+  * EXCEPT (delivered),
+  delivered.text   AS message,
+  delivered.source AS message_source
+FROM (
 SELECT
   journey_digest,
   operator,
@@ -329,12 +341,38 @@ SELECT
   ARRAY_AGG(cancel_probability ORDER BY decided_at DESC LIMIT 1)[OFFSET(0)] AS final_cancel_probability,
   ARRAY_AGG(delay_p50_min      ORDER BY decided_at DESC LIMIT 1)[OFFSET(0)] AS final_delay_p50_min,
   ARRAY_AGG(delay_p90_min      ORDER BY decided_at DESC LIMIT 1)[OFFSET(0)] AS final_delay_p90_min,
-  -- The last cycle that actually produced text, so a row shows what was said rather than NULL just
-  -- because the final cycle re-used a cached message.
-  ARRAY_AGG(message        IGNORE NULLS ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS message,
-  ARRAY_AGG(message_source IGNORE NULLS ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS message_source
+  -- THE WORDING THAT WAS PUSHED, falling back to the last one produced when none ever was.
+  --
+  -- The card quotes this as what the traveller was sent, so it has to be that row and not merely
+  -- the most recent one. Those differ routinely, because a wording lives in `_messages` only while
+  -- the situation stays above the gate: `varsel._reconcile_caches` calls `_forget_message` the tick
+  -- a subject eases off below it, so every later cycle records the template again and a plain
+  -- "last cycle with text" showed the template for a subject the model had written and the push had
+  -- carried. Measured on dev 2026-08-21 over 1 790 alerted subjects: 52 quoted the template under
+  -- "Skrevet av modellen" though the push carried the model's prose, 85 quoted the reverse, and 603
+  -- more quoted the right KIND of wording from the wrong cycle -- different percentages, a different
+  -- replacement train. 740 in all: 41 % of the page was text nobody received.
+  --
+  -- Ordered ASC among pushed rows -- the FIRST delivery, which is the one `first_alert_at` and
+  -- `alert_lead_min` beside it describe, so the quoted text and the quoted warning time belong to
+  -- the same cycle. (More than one pushed row is possible: `_notified` is keyed per journey_id, so
+  -- a second device registering the same journey later pushes again.)
+  --
+  -- Both halves skip rows with no text at all, which is what the old IGNORE NULLS was for: a
+  -- pushed row whose message column is NULL (rows written before it was populated) must fall
+  -- through to the second half rather than blank the card.
+  --
+  -- One aggregate, not two: `message` and `message_source` are a pair, and a row showing one
+  -- cycle's text under another cycle's attribution is exactly the defect this fixes.
+  COALESCE(
+    ARRAY_AGG(IF(pushed AND message IS NOT NULL, STRUCT(message AS text, message_source AS source), NULL)
+              IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)],
+    ARRAY_AGG(IF(message IS NOT NULL, STRUCT(message AS text, message_source AS source), NULL)
+              IGNORE NULLS ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+  ) AS delivered
 FROM `disruptions.varsel_decisions`
-GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number;
+GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
+);
 
 
 -- ==============================================================================================
@@ -389,6 +427,11 @@ GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
 -- Both readings have to reach a dev and a prd table that already exist, and only SET OPTIONS can
 -- carry them there. The values themselves are unchanged, so no row is rewritten and no consumer
 -- (varsel_decision_groups, label_varsel_decisions.sql, /historikk-api) needs touching.
+-- The outcomes table's own budget: BigQuery's 5-updates-per-10s cap is PER TABLE, and this is the
+-- only statement against this one, so it does not crowd the varsel_decisions block below it.
+ALTER TABLE `disruptions.varsel_decision_outcomes`
+  ALTER COLUMN message SET OPTIONS(description="The wording the traveller was actually PUSHED for this decision, copied from varsel_decision_groups; when none was ever pushed (pushed_any = FALSE) it is the last wording produced instead, which is what /historikk marks 'ikke levert'. Deliberately not 'the last text produced', which it was until 2026-08-21: a wording is cached only while the situation stays above the alert gate (varsel._reconcile_caches), so a subject that eased off records the template on every later cycle and the card quoted text the traveller never received -- 41 % of dev's alerted subjects when it was measured, a tenth of them under the wrong writer's name.");
+
 ALTER TABLE `disruptions.varsel_decisions`
   ALTER COLUMN message_source SET OPTIONS(description="Which wording was SENT: 'llm' when the model's text went out, 'deterministic' for the template. Since 2026-08-07 it says nothing about which wordings EXIST — both are written for every alert-worthy decision and recorded in message_llm/message_deterministic, and VARSEL_LLM_ENABLED selects the one delivered. So 'deterministic' now covers two unlike states: no model wording exists, and one exists and was withheld by policy (prd's setting today). Separate them with message_llm IS NOT NULL, never with this column alone.");
 
