@@ -149,6 +149,10 @@ def _reset_state():
         varsel._messages.clear()
         varsel._alternatives.clear()
         varsel._message_attempts.clear()
+        # Both retry counters. Forgetting this one leaks a partially-spent transient budget into the
+        # next test, which then gives up early for a reason that has nothing to do with what it is
+        # checking -- it reads as the give-up bug rather than as pollution.
+        varsel._message_errors.clear()
         varsel._message_meta.clear()
     # llm_message's backend latch is PROCESS-global and survives a monkeypatch undo, so a test that
     # drives both backends into `_latched_off` (the 404/configuration path) silently disables
@@ -766,7 +770,7 @@ def test_same_journey_on_two_devices_shares_one_impact_call_and_one_message(monk
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
     written = []
 
-    def fake_write(alert, *, journey_key, message_input):
+    def fake_write(alert, *, journey_key, message_input, **_):
         written.append(journey_key)
         return "Signalfeil ved Asker. Ta R10 kl 08:14 i stedet."
 
@@ -848,7 +852,7 @@ def test_message_writer_exception_is_contained(monkeypatch):
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
 
-    def boom(alert, *, journey_key, message_input):
+    def boom(alert, *, journey_key, message_input, **_):
         raise RuntimeError("Vertex exploded")
 
     monkeypatch.setattr(varsel, "_write_message", boom)
@@ -870,7 +874,7 @@ def test_llm_call_cap_is_respected(monkeypatch):
     monkeypatch.setattr(
         varsel,
         "_write_message",
-        lambda alert, *, journey_key, message_input: (
+        lambda alert, *, journey_key, message_input, **_: (
             written.append(journey_key) or "Skrevet melding."
         ),
     )
@@ -901,9 +905,15 @@ def test_a_message_that_cannot_be_written_is_not_retried_forever(monkeypatch):
         varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent"
     )
     attempts = []
-    monkeypatch.setattr(
-        varsel, "_write_message", lambda *a, **k: attempts.append(1) or None
-    )
+
+    def rejected(*a, outcome=None, **k):
+        # The model WAS asked and what came back was unusable for this input. Since 2026-08-22 the
+        # stub has to say so: a bare None now means "no backend was asked", which charges nothing.
+        attempts.append(1)
+        if outcome is not None:
+            outcome["status"] = "rejected"
+
+    monkeypatch.setattr(varsel, "_write_message", rejected)
     _register(DEVICE)
 
     for _ in range(10):  # ten poller cycles on the same live situation
@@ -914,6 +924,102 @@ def test_a_message_that_cannot_be_written_is_not_retried_forever(monkeypatch):
         f"got {len(attempts)}"
     )
     assert len(sent) == 1, "the push still went out once, with the deterministic wording"
+
+
+def test_a_transient_failure_does_not_spend_the_payload_retry_budget(monkeypatch):
+    """The 2026-08-22 fix, and the measurement that forced it.
+
+    A timeout or a 429 says nothing about the payload, but every `None` used to charge the same
+    counter — so three bad minutes at Vertex retired a subject's wording for the situation's whole
+    12 h life. Measured in prd over the 14 days to 2026-08-21: of the subjects that ever reached
+    `attempts_exhausted`, the statuses preceding it were **290 `error` and zero `rejected` or
+    `ungrounded`**. The budget meant for hopeless payloads was, in practice, spent entirely on
+    transient failures — while 55 % of subjects that hit an error went on to succeed later.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    calls = []
+
+    def transient(*a, outcome=None, **k):
+        calls.append(1)
+        if outcome is not None:
+            outcome["status"] = "error"
+
+    monkeypatch.setattr(varsel, "_write_message", transient)
+    _register(DEVICE)
+
+    for _ in range(6):
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert len(calls) == 6, (
+        f"a transient failure spent the payload budget and stopped the retries after {len(calls)}"
+    )
+
+
+def test_a_transient_failure_is_still_bounded_by_its_own_budget(monkeypatch):
+    """Not charging the payload counter must not mean retrying forever. Each transient failure is a
+    real call and a real slot from `_MAX_LLM_CALLS_PER_CYCLE`, so a subject failing every cycle for
+    12 h would spend ~240 of them — the starvation the give-up rule exists to prevent, just wearing
+    a different hat."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    calls = []
+
+    def transient(*a, outcome=None, **k):
+        calls.append(1)
+        if outcome is not None:
+            outcome["status"] = "error"
+
+    monkeypatch.setattr(varsel, "_write_message", transient)
+    _register(DEVICE)
+
+    for _ in range(varsel._MAX_TRANSIENT_ATTEMPTS + 5):
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert len(calls) == varsel._MAX_TRANSIENT_ATTEMPTS, (
+        f"expected {varsel._MAX_TRANSIENT_ATTEMPTS} transient attempts, got {len(calls)}"
+    )
+    statuses = {k[1]: v.get("status") for k, v in varsel._message_meta.items()}
+    assert statuses.get("S1") == "transient_exhausted", (
+        f"a transient give-up must not be filed as a verdict on the payload: {statuses}"
+    )
+
+
+def test_a_success_clears_the_transient_count(monkeypatch):
+    """A subject that recovers must not still be retired by errors it has demonstrably outlived --
+    which is the 55 % of prd's errored subjects that went on to succeed."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    fail = {"on": True}
+    calls = []
+
+    def flaky(*a, outcome=None, **k):
+        calls.append(1)
+        if fail["on"]:
+            if outcome is not None:
+                outcome["status"] = "error"
+            return None
+        if outcome is not None:
+            outcome["status"] = "ok"
+        return "Skrevet til slutt."
+
+    monkeypatch.setattr(varsel, "_write_message", flaky)
+    _register(DEVICE)
+
+    for _ in range(varsel._MAX_TRANSIENT_ATTEMPTS - 1):
+        varsel.check_and_notify(SNAPSHOT)
+    fail["on"] = False
+    varsel.check_and_notify(SNAPSHOT)  # the cycle that finally works
+
+    assert not varsel._message_errors, "the error count survived a success"
+    # And the subject is genuinely writable again rather than one failure from being retired.
+    with varsel._state_lock:
+        varsel._messages.clear()
+    fail["on"] = True
+    before = len(calls)
+    for _ in range(3):
+        varsel.check_and_notify(SNAPSHOT)
+    assert len(calls) == before + 3, "the budget was not actually reset by the success"
 
 
 def test_generation_being_off_does_not_spend_the_retry_budget(monkeypatch):
@@ -1210,7 +1316,7 @@ def test_every_train_a_cycle_pushes_about_gets_its_own_wording(monkeypatch):
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
 
-    def fake_write(alert, *, journey_key, message_input):
+    def fake_write(alert, *, journey_key, message_input, **_):
         return f"Skrevet om {alert.situation_number}."
 
     monkeypatch.setattr(varsel, "_write_message", fake_write)
@@ -1234,7 +1340,7 @@ def test_the_writing_budget_follows_the_push_not_the_severity(monkeypatch):
     _reset_state()
     written = []
 
-    def fake_write(alert, *, journey_key, message_input):
+    def fake_write(alert, *, journey_key, message_input, **_):
         written.append(alert.situation_number)
         return f"Skrevet om {alert.situation_number}."
 
@@ -1297,7 +1403,7 @@ def test_the_write_budget_goes_to_the_soonest_departure_when_it_binds(monkeypatc
     _use_snapshot(SNAPSHOT_SOONER_TRAIN_IS_MILDER)
     written = []
 
-    def fake_write(alert, *, journey_key, message_input):
+    def fake_write(alert, *, journey_key, message_input, **_):
         written.append(alert.situation_number)
         return f"Skrevet om {alert.situation_number}."
 
@@ -1905,7 +2011,16 @@ def test_the_write_budgets_are_unchanged_by_the_delivery_switch(monkeypatch):
     monkeypatch.setattr(llm_message, "delivery_enabled", lambda: False)
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     writes = []
-    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: writes.append(1) or None)
+
+    def failing_write(*a, outcome=None, **k):
+        # `rejected` rather than a bare None: since 2026-08-22 the give-up counter this test is
+        # about is the PAYLOAD one, and only a status in `_PAYLOAD_FAILURES` charges it. A bare None
+        # now means "no backend was asked", which correctly charges nothing and would retry forever.
+        writes.append(1)
+        if outcome is not None:
+            outcome["status"] = "rejected"
+
+    monkeypatch.setattr(varsel, "_write_message", failing_write)
 
     _reset_state()
     monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 0)
@@ -1947,7 +2062,7 @@ def test_two_devices_share_one_write_with_delivery_off(monkeypatch):
     monkeypatch.setattr(
         varsel,
         "_write_message",
-        lambda alert, *, journey_key, message_input: (
+        lambda alert, *, journey_key, message_input, **_: (
             written.append(journey_key) or "Skrevet melding."
         ),
     )
