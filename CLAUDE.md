@@ -448,15 +448,36 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `alt_operator` / `alt_jkey` / `alt_stop_order` are the recommendation's own ET join key, so
     "take this instead" can eventually be labelled the way every other decision here already is. `message_status` says why the stored wording has the source it does —
     `ok` / `ok_cached` / `not_alertworthy` / `not_selected` / `push_disabled` / `llm_disabled` /
-    `capped` / `attempts_exhausted` / `rejected` / `ungrounded` / `error` — because a cap, an
-    exhausted retry and a refusal all store the same deterministic text. Two of those values changed
-    meaning on 2026-08-07 and the schema descriptions carry the new reading: `llm_disabled` now means
+    `capped` / `attempts_exhausted` / `transient_exhausted` / `rejected` / `ungrounded` / `error` —
+    because a cap, an
+    exhausted retry and a refusal all store the same deterministic text. `llm_disabled` changed
+    meaning on 2026-08-07 and the schema description carries the new reading: it means
     no backend could be **asked** (`VARSEL_LLM_PROVIDER=off`, no project, everything latched), never
-    "this deployment sends the template"; and `attempts_exhausted` means no backend was reachable for
-    three cycles rather than "the model was asked and failed" — `_write_message` returns `None`
-    without calling anything on several paths and the caller spends an attempt on any `None`
-    (measured in prd 2026-08-07, where generation had never run: 753 rows `llm_disabled` and 693
-    `attempts_exhausted` across the same 11 subjects).
+    "this deployment sends the template".
+    **A failed write is charged to one of two budgets, and picking the wrong one retired writable
+    payloads** (2026-08-22). Every `None` used to charge `_message_attempts` — including the several
+    `_write_message` paths that ask no backend at all, and every transient Vertex failure — so three
+    bad minutes retired a subject's wording for the situation's whole 12 h life. It was not a corner
+    case: measured over the 14 days to 2026-08-21, the statuses preceding a first
+    `attempts_exhausted` in prd were **290 `error` and zero `rejected`/`ungrounded`**, while **149 of
+    the 270 subjects that hit an error (55 %) went on to succeed** on a later cycle — the budget for
+    hopeless payloads was in practice spent entirely on the one class of failure it was never meant
+    to bound, and 99 subjects were retired at three. Now three outcomes, three treatments:
+    `_PAYLOAD_FAILURES` (`rejected`, `ungrounded` — the model answered and the answer was unusable
+    for this input) charge `_message_attempts`, cap 3; `_TRANSIENT_FAILURES` (`error`) charge the
+    separate `_message_errors`, cap `_MAX_TRANSIENT_ATTEMPTS` = 12, sized above the worst run
+    observed (p50 2, max 9) and giving `transient_exhausted` on the row; and **a status naming
+    neither means no backend was asked, so it charges nothing** — that third bucket is the whole
+    defect, and it must not fall through to a default. A success clears both. `_write_message`
+    reports which via an `outcome` out-parameter, the same shape and for the same reason as
+    `alternatives.fetch_candidates` (25 suites stub it wholesale, so the `str | None` return has to
+    survive). Two traps a similar change will hit again: a new module-level cache needs adding to
+    **both** `check_and_notify`'s stale sweep and the test suite's `_reset_state` (a leaked
+    half-spent budget reads exactly like the give-up bug), and a reworded column description is
+    capped by BigQuery at **1024 characters** — `validate_varsel_sql.sh` is the only thing that
+    catches it, since nothing in this repo executes SQL. Note a
+    pre-2026-08-22 `attempts_exhausted` should be read as transient unless proven otherwise, so no
+    rate spanning that date means anything.
     **Both wordings are recorded, and `message` is the one that was *delivered*** (2026-08-07):
     `message_llm` and `message_deterministic` sit beside `message`/`message_source`, so the two
     writers can be compared on the same decision — which is impossible while a flag decides that only
