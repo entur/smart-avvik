@@ -28,6 +28,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import time as _time
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
@@ -1496,6 +1498,153 @@ def test_the_new_query_files_are_registered_in_the_validator():
                 f"{filename} uses @{param}, which the validator does not supply — the dry run would "
                 f"fail to parse and the file would go unvalidated"
             )
+
+
+# --- The TILBAKEBLIKK_ENABLED gate (KTD9, R17) ------------------------------------------------
+#
+# main.py reads the variable and builds `app` at IMPORT, so the gate cannot be exercised by
+# assigning to main._TILBAKEBLIKK_ENABLED — that would test the assignment, not the resolution.
+# Each case therefore imports main in a FRESH interpreter with the environment it is about, the
+# pattern test_llm_message.py uses for the same reason (`_ENABLED`, the Vertex locations).
+
+_API_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Printed as one JSON line so the parent asserts on structure rather than on grep.
+#
+# The API half is probed by ASKING for the endpoint rather than by reading app.routes: this FastAPI
+# version keeps an included router as one opaque `_IncludedRouter` entry whose `path` is None, so a
+# scan of app.routes finds no /tilbakeblikk-api route even when the router is registered — it would
+# have "passed" identically with the gate removed. /config needs neither BigQuery nor the lifespan,
+# which is what makes 404-vs-200 a clean read on registration alone.
+#
+# The mount half stays structural, because the question there is not "does something answer" but
+# which class answers: a plain StaticFiles would put index.html back under heuristic caching.
+_GATE_PROBE = """
+import json
+
+from google.cloud import bigquery
+bigquery.Client = lambda *a, **k: None
+
+import main
+from fastapi.testclient import TestClient
+from starlette.staticfiles import StaticFiles
+
+mounts = {
+    route.path: (
+        type(route.app).__name__,
+        isinstance(route.app, main._VersionedStaticFiles),
+    )
+    for route in main.app.routes
+    if isinstance(getattr(route, "app", None), StaticFiles)
+}
+client = TestClient(main.app)
+print(json.dumps({
+    "resolved": main._TILBAKEBLIKK_ENABLED,
+    "config_status": client.get("/tilbakeblikk-api/config").status_code,
+    "historikk_config_status": client.get("/historikk-api/config").status_code,
+    "mounts": mounts,
+}))
+"""
+
+
+@contextmanager
+def _tilbakeblikk_static_present():
+    """Make sure tilbakeblikk_static/ exists for the duration of one check.
+
+    The mount is guarded on the directory existing, and that directory is generated at image-build
+    time — absent in a fresh checkout and in CI. Without this the "flag on -> mounted" assertion
+    would pass by not running, on exactly the machine where nobody would look. Created only when
+    missing and removed only when created, so a real local build is never touched.
+    """
+    path = Path(_API_DIR) / "tilbakeblikk_static"
+    created = not path.exists()
+    if created:
+        path.mkdir()
+    try:
+        yield path
+    finally:
+        if created:
+            path.rmdir()
+
+
+def _gate(value: str | None) -> dict:
+    """Resolve the gate in a child interpreter; `None` means the variable is unset."""
+    env = {k: v for k, v in os.environ.items() if k != "TILBAKEBLIKK_ENABLED"}
+    env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
+    if value is not None:
+        env["TILBAKEBLIKK_ENABLED"] = value
+    result = subprocess.run(
+        [sys.executable, "-c", _GATE_PROBE],
+        cwd=_API_DIR,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_the_surface_is_withheld_when_the_flag_is_off():
+    """Both halves go together: no /tilbakeblikk-api routes and no /tilbakeblikk mount.
+
+    Gating only one of them would be worse than gating neither — the page would load and every
+    request behind it would 404, which reads as a broken deployment rather than as a switch.
+
+    /historikk-api is asserted present in the same run as a control: it proves the probe sees the
+    routers at all, so "no tilbakeblikk routes" means withheld and not "import failed quietly".
+    """
+    with _tilbakeblikk_static_present():
+        state = _gate("false")
+    assert state["resolved"] is False
+    assert state["config_status"] == 404, "/tilbakeblikk-api/config answered although the flag is off"
+    assert "/tilbakeblikk" not in state["mounts"]
+    assert state["historikk_config_status"] == 200, "the probe did not see the other routers either"
+
+
+def test_the_surface_is_served_when_the_flag_is_on():
+    """The other direction, and the mount must be the caching subclass.
+
+    test_static_cache.py already asserts that for every mount that exists, but it is vacuous where
+    the generated directories are absent — so this pins /tilbakeblikk's own mount with the
+    directory guaranteed to be there.
+    """
+    with _tilbakeblikk_static_present():
+        state = _gate("true")
+    assert state["resolved"] is True
+    assert state["config_status"] == 200, "/tilbakeblikk-api/config is not registered"
+    assert "/tilbakeblikk" in state["mounts"], "the UI is not mounted although the flag is on"
+    type_name, is_versioned = state["mounts"]["/tilbakeblikk"]
+    assert is_versioned, f"/tilbakeblikk is mounted with {type_name}, not _VersionedStaticFiles"
+
+
+def test_an_unset_or_misspelled_flag_fails_closed():
+    """The direction that matters, asserted rather than assumed (KTD9).
+
+    This surface regenerates model prose that names both ends of a traveller's trip, and every
+    environment inherits `trafficType: public` from the chart — so a value nobody recognises must
+    WITHHOLD the page, never publish it. The parsing is llm_message._TRUTHY verbatim, which is why
+    "off", "no" and a typo all land on the same answer as unset.
+    """
+    for value in (None, "", "ture", "yes please", "off", "no", "0", "enabled", " "):
+        with _tilbakeblikk_static_present():
+            state = _gate(value)
+        assert state["resolved"] is False, f"{value!r} turned the surface ON"
+        assert state["config_status"] == 404, f"{value!r} registered the router"
+        assert "/tilbakeblikk" not in state["mounts"], f"{value!r} registered the mount"
+
+
+def test_the_flag_accepts_exactly_the_four_values_llm_message_does():
+    """One parsing rule, reused rather than re-spelled.
+
+    Two switches that both mean "on" but disagree about what counts as on is the kind of drift
+    nobody notices until a deploy sets one of them to "yes" and gets two different answers.
+    """
+    assert llm_message._TRUTHY == ("true", "1", "yes", "on")
+    for value in ("true", "TRUE", " On ", "1", "yes"):
+        with _tilbakeblikk_static_present():
+            state = _gate(value)
+        assert state["resolved"] is True, f"{value!r} did not turn the surface on"
 
 
 def _run():
