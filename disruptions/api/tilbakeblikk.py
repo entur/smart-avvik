@@ -820,7 +820,7 @@ def _place_registry(refs: list[str]) -> dict[str, tuple[str | None, str]]:
     return out
 
 
-def _place_groups(counted: list[dict]) -> list[dict]:
+def _place_groups(counted: list[dict], registry: dict[str, tuple[str | None, str]]) -> list[dict]:
     """Collapse `[{ref, n}]` into one entry per physical place, busiest ref first within each.
 
     The grouping rule is main.refresh_varsel_stops', deliberately copied rather than approximated:
@@ -829,11 +829,22 @@ def _place_groups(counted: list[dict]) -> list[dict]:
     ref is never merged either — its name cannot be shown to tell it from its neighbour, so folding
     it in would hide a ref behind a row nobody can read.
 
+    The registry is fetched by the CALLER and handed in, rather than looked up here. This function
+    is called twice per window — once for the from-dropdown, once for the to-dropdown — and looking
+    the refs up itself meant two sequential BigQuery jobs against the same registry table whose cache
+    entries could never share, because the from-refs and the to-refs are different sets even where
+    they overlap (a station that is both a common boarding and a common alighting place). One job
+    per window is not merely cheaper: :func:`_options` runs inside ``_message_rows`` on
+    ``/messages``, AFTER the request deadline clock has started, so a second round trip is taken
+    straight out of the budget that rations the replay's Vertex calls. Grouping is unaffected — the
+    lookup is per ref (``historikk_stop_places.sql`` is ``WHERE id IN UNNEST(@refs) GROUP BY id``),
+    so a union answers each ref exactly as a narrower ask did, and the extra keys belong to refs this
+    call never looks up.
+
     Returns dicts of {ref, name, refs}: `ref` is the busiest member (ties on the ref itself, so the
     nomination cannot flip between refreshes and invalidate the page's selection under it), and
     `refs` is every member — what the query actually filters on.
     """
-    registry = _place_registry([c["ref"] for c in counted])
     groups: dict[tuple, list[dict]] = {}
     for entry in counted:
         name, place_id = registry.get(entry["ref"], (None, entry["ref"]))
@@ -880,11 +891,20 @@ def _options(window: _Window) -> dict[str, Any]:
             if (r or {}).get("ref")
         ]
 
+    from_counted = counted("from_places")
+    to_counted = counted("to_places")
+    # ONE registry lookup covering both dropdowns. Asked per dropdown it was two sequential jobs
+    # against the same table that could never share a cache entry, and this runs on the deadline
+    # clock of /messages -- see _place_groups for why the union is the same answer.
+    registry = _place_registry(
+        sorted({c["ref"] for c in from_counted} | {c["ref"] for c in to_counted})
+    )
+
     return {
         "operators": [v for v in (row.get("operators") or []) if v],
         "lines": [v for v in (row.get("lines") or []) if v],
-        "from_places": _place_groups(counted("from_places")),
-        "to_places": _place_groups(counted("to_places")),
+        "from_places": _place_groups(from_counted, registry),
+        "to_places": _place_groups(to_counted, registry),
     }
 
 
@@ -917,6 +937,64 @@ def _checked_places(
     return (
         _place_refs(opts["from_places"], from_place, "from_place"),
         _place_refs(opts["to_places"], to_place, "to_place"),
+    )
+
+
+def _base_query_params(
+    window: _Window,
+    operator: str | None,
+    line: str | None,
+    from_refs: list[str],
+    to_refs: list[str],
+) -> list:
+    """The opening parameters every decision-log query here takes, built once.
+
+    ``/messages``, ``/decisions`` and ``/summary`` all narrow the same POPULATION the same way — the
+    window, then the four filters that say which cycles, which trains and whose registered journeys —
+    and each used to spell the seven parameters out again. Three verbatim copies of one list is three
+    chances for them to drift, and a drift here does not fail: the queries name their parameters, so
+    an omission surfaces as a query that quietly ignores a filter the caller set.
+
+    Returns a fresh list each call, so a caller can append its own parameters to it without reaching
+    into a shared one.
+    """
+    from google.cloud import bigquery
+
+    return [
+        bigquery.ScalarQueryParameter("day", "DATE", window.day),
+        bigquery.ScalarQueryParameter("from_ts", "TIMESTAMP", window.from_ts),
+        bigquery.ScalarQueryParameter("to_ts", "TIMESTAMP", window.to_ts),
+        bigquery.ScalarQueryParameter("operator", "STRING", operator),
+        bigquery.ScalarQueryParameter("line", "STRING", line),
+        bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
+        bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
+    ]
+
+
+def _list_cache_key(
+    prefix: str,
+    window: _Window,
+    operator: str | None,
+    line: str | None,
+    from_place: str | None,
+    to_place: str | None,
+    verdict: str | None,
+    alerted_only: bool,
+    resolved_only: bool,
+    sx_only: bool,
+    limit: int,
+) -> tuple:
+    """The cache key for the two row-listing endpoints, which differ only in the leading prefix.
+
+    Every query parameter is in it — the day, BOTH quantized times, and every filter. The key is a
+    positional tuple, so a parameter added to the query and forgotten here fails silently: for two
+    minutes, whichever request landed first decides what both callers see, and on ``/messages`` that
+    would also decide which subjects get wordings. Built in one place so there is one such tuple to
+    keep in step with the parameter list above rather than two.
+    """
+    return (
+        prefix, *window.cache_key, operator, line, from_place, to_place,
+        verdict, alerted_only, resolved_only, sx_only, limit,
     )
 
 
@@ -1217,38 +1295,44 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
     return wording
 
 
-def _message_rows(window: _Window, **filters: Any) -> list[dict]:
+def _message_rows(
+    window: _Window,
+    *,
+    operator: str | None,
+    line: str | None,
+    from_place: str | None,
+    to_place: str | None,
+    verdict: str | None,
+    alerted_only: bool,
+    resolved_only: bool,
+    sx_only: bool,
+    limit: int,
+) -> list[dict]:
     """The replay inputs for the window, behind the same cache and allow-list as /decisions.
 
     Blocking: BigQuery, and the allow-list lookup that may itself be a query. Called on the pool, so
     the event loop never waits on a socket.
+
+    The filters are spelled out as keyword-only parameters rather than taken as ``**filters`` and
+    read back by string key, so this signature is the same declaration ``decisions()`` already
+    carries. A misspelled or forgotten name is then a ``TypeError`` at the call — which is where the
+    only caller is — instead of a ``KeyError`` raised on a worker thread partway through, after the
+    allow-list lookup has already run and with nothing left to answer the request but a 500.
     """
     from google.cloud import bigquery
 
-    from_refs, to_refs = _checked_places(
-        window, filters["line"], filters["from_place"], filters["to_place"]
-    )
-    params = [
-        bigquery.ScalarQueryParameter("day", "DATE", window.day),
-        bigquery.ScalarQueryParameter("from_ts", "TIMESTAMP", window.from_ts),
-        bigquery.ScalarQueryParameter("to_ts", "TIMESTAMP", window.to_ts),
-        bigquery.ScalarQueryParameter("operator", "STRING", filters["operator"]),
-        bigquery.ScalarQueryParameter("line", "STRING", filters["line"]),
-        bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
-        bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
-        bigquery.ScalarQueryParameter("verdict", "STRING", filters["verdict"]),
-        bigquery.ScalarQueryParameter("alerted_only", "BOOL", filters["alerted_only"]),
-        bigquery.ScalarQueryParameter("resolved_only", "BOOL", filters["resolved_only"]),
-        bigquery.ScalarQueryParameter("sx_only", "BOOL", filters["sx_only"]),
-        bigquery.ScalarQueryParameter("limit", "INT64", filters["limit"]),
+    from_refs, to_refs = _checked_places(window, line, from_place, to_place)
+    params = _base_query_params(window, operator, line, from_refs, to_refs) + [
+        bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
+        bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
+        bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
+        bigquery.ScalarQueryParameter("sx_only", "BOOL", sx_only),
+        bigquery.ScalarQueryParameter("limit", "INT64", limit),
     ]
-    # Same key shape as /decisions', with its own prefix. Positional, so a parameter added above and
-    # forgotten here fails silently -- for two minutes, whichever request landed first decides what
-    # both callers see, and here that would also decide which subjects get wordings.
-    key = (
-        "messages", *window.cache_key, filters["operator"], filters["line"],
-        filters["from_place"], filters["to_place"], filters["verdict"],
-        filters["alerted_only"], filters["resolved_only"], filters["sx_only"], filters["limit"],
+    # Same key shape as /decisions', with its own prefix; see _list_cache_key for what rides on it.
+    key = _list_cache_key(
+        "messages", window, operator, line, from_place, to_place,
+        verdict, alerted_only, resolved_only, sx_only, limit,
     )
     return [dict(r) for r in _query(_MESSAGES_QUERY, params, key)]
 
@@ -1464,25 +1548,17 @@ def decisions(
         raise HTTPException(
             status_code=400, detail=f"verdict must be one of {', '.join(historikk._VERDICTS)}."
         )
-    params = [
-        bigquery.ScalarQueryParameter("day", "DATE", window.day),
-        bigquery.ScalarQueryParameter("from_ts", "TIMESTAMP", window.from_ts),
-        bigquery.ScalarQueryParameter("to_ts", "TIMESTAMP", window.to_ts),
-        bigquery.ScalarQueryParameter("operator", "STRING", operator),
-        bigquery.ScalarQueryParameter("line", "STRING", line),
-        bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
-        bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
+    params = _base_query_params(window, operator, line, from_refs, to_refs) + [
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
         bigquery.ScalarQueryParameter("sx_only", "BOOL", sx_only),
         bigquery.ScalarQueryParameter("limit", "INT64", limit),
     ]
-    # Every query parameter is in the key -- the day, BOTH quantized times, and every filter. The key
-    # is a positional tuple, so a parameter added to the list above and forgotten here fails
-    # silently: for two minutes, whichever request landed first decides what both callers see.
-    key = (
-        "decisions", *window.cache_key, operator, line, from_place, to_place,
+    # Every query parameter is in the key -- the day, BOTH quantized times, and every filter; see
+    # _list_cache_key for why it is positional and what a forgotten parameter costs.
+    key = _list_cache_key(
+        "decisions", window, operator, line, from_place, to_place,
         verdict, alerted_only, resolved_only, sx_only, limit,
     )
     rows = _query(_DECISIONS_QUERY, params, key)
@@ -1530,20 +1606,12 @@ def summary(
     them shows. `verdict`, `alerted_only`, `resolved_only` and `sx_only` narrow by OUTCOME instead
     and are deliberately not accepted here at all: filtering to hits would make precision read 100 %.
     """
-    from google.cloud import bigquery
-
     window = _resolve_window(day, from_time, to_time)
     operator = _checked_operator(operator)
     from_refs, to_refs = _checked_places(window, line, from_place, to_place)
-    params = [
-        bigquery.ScalarQueryParameter("day", "DATE", window.day),
-        bigquery.ScalarQueryParameter("from_ts", "TIMESTAMP", window.from_ts),
-        bigquery.ScalarQueryParameter("to_ts", "TIMESTAMP", window.to_ts),
-        bigquery.ScalarQueryParameter("operator", "STRING", operator),
-        bigquery.ScalarQueryParameter("line", "STRING", line),
-        bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
-        bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
-    ]
+    # Only the population filters, so no extras on top of the shared block -- and for the same reason
+    # the key carries only those: /summary deliberately accepts none of the outcome filters.
+    params = _base_query_params(window, operator, line, from_refs, to_refs)
     rows = _query(
         _SUMMARY_QUERY,
         params,
