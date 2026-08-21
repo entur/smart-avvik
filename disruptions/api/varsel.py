@@ -151,6 +151,15 @@ _MAX_LLM_CALLS_PER_CYCLE = 8
 # twice will very likely keep failing for this exact payload — and retrying costs a slot from the
 # per-cycle cap without being able to change what any user already saw.
 _MAX_MESSAGE_ATTEMPTS = 3
+# Written messages per JOURNEY per cycle. The cycle cap above bounds the poller thread; this one
+# stops a single journey spending all of it. A journey routinely has more disrupted trains than
+# either budget can cover -- measured on dev over 4 099 journey-cycles: p50 3 alert-worthy trains,
+# p90 12, max 22 -- but the trains that matter are the ones about to be PUSHED, and those are few
+# (p90 1, max 18; 88 % of cycles push nothing). Sized like _MAX_ALTERNATIVE_LOOKUPS and for the same
+# reason: three covers the overwhelming majority (39 of 489 pushing cycles push more than three) at
+# a bounded worst case. Trains past it take the deterministic wording and are recorded
+# `not_selected`, so what the cap costs stays countable rather than being inferred from a log line.
+_MAX_MESSAGES_PER_JOURNEY = 3
 # Wall-clock ceiling for the whole message-writing pass. The call cap alone does not bound time:
 # one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
 # worst case. Journeys past the budget take the deterministic wording and are re-tried next tick.
@@ -710,7 +719,7 @@ def journey_key(journey: dict) -> str:
     """A canonical key for a journey *definition* — what makes two registrations the same trip.
 
     Two devices that register the same from→to, weekdays and time window get one /impact call and
-    one written message between them, and therefore identical text. Deliberately excludes
+    one written message PER DISRUPTED TRAIN between them, and therefore identical text. Deliberately excludes
     ``device_id`` and ``journey_id``: those identify a *registration*, and keying the shared work on
     them is what would duplicate it. (Delivery dedup still keys on ``journey_id`` — see
     :func:`check_and_notify`.)
@@ -1061,6 +1070,36 @@ def _train_key(alert: Alert) -> tuple | None:
     return None
 
 
+def _pending_pushes(jids, alerts: list[Alert]) -> list[Alert]:
+    """The alert-worthy trains a push is still coming for, worst-first.
+
+    This is what the writing budget is spent on.
+
+    One entry per TRAIN (`one_alert_per_train`, the same collapse loop 2 delivers through), so the
+    keys these are written under are exactly the keys the delivery loop reads back.
+
+    "Still coming" is per REGISTRATION, because `_notified` is: two devices on one trip are notified
+    separately, so a train the first device already heard about is still pending for the second
+    and its wording can still change what somebody sees. A journey definition nobody is registered
+    on any more yields nothing, which is correct — there is no push to write for.
+
+    Deliberately approximate in one direction only. It does not check that each registration
+    still has a live subscription (loop 2 does, and drops the device if the endpoint is gone), so
+    a journey whose device has vanished can still attract a write. That over-writes at worst; the
+    alternative — reading device state here — would let a stale subscription silently withhold
+    the wording from a push that does go out, and a missing wording is the failure this whole
+    path exists to prevent.
+    """
+    with _state_lock:
+        notified = set(_notified)
+    return [
+        alert
+        for alert in one_alert_per_train(alerts)
+        if alert.alertworthy
+        and any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
+    ]
+
+
 def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
     """Collapse alerts about the SAME departure to the most severe one, order preserved.
 
@@ -1079,7 +1118,10 @@ def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
     situation suppressed on the card is still a decision that was made about it.
 
     The survivor is the most severe by :func:`_alert_rank`, which is also the order `match_journey`
-    returns, so the alert that survives is the one loop 1 wrote the message for and cached under.
+    returns. Loop 1 writes its wordings for the output of this same collapse
+    (:func:`_pending_pushes`), so the alert that survives here is the one a message was written for
+    and cached under — for every train, not just the journey's worst, which is what it was until
+    2026-08-21.
     """
     winner_at: dict[tuple, int] = {}
     out: list[Alert] = []
@@ -1736,8 +1778,13 @@ def _record_decisions(
                     meta = dict(_message_meta.get(message_key) or {})
                 # No meta means the writer was never reached for this alert, and why is knowable
                 # from the state that decided it: below the threshold, push (and with it the writer)
-                # switched off, no backend available to ask — or alert-worthy but not the worst
-                # situation for this journey, which is the one the message is written about.
+                # switched off, no backend available to ask — or alert-worthy but not among the
+                # trains this journey wrote for this cycle (`not_selected`). Since 2026-08-21 that
+                # last value is much narrower: a second situation about a train another situation
+                # already covers (`one_alert_per_train` collapsed it), a train with no push pending
+                # that was not the journey's worst, or one past `_MAX_MESSAGES_PER_JOURNEY`. It used
+                # to mean "not the single worst situation on this journey" and so covered most of
+                # the alert-worthy log -- 29 501 of dev's 33 900 alert-worthy rows over 14 days.
                 status = meta.get("status")
                 if status is None:
                     if not alert.alertworthy:
@@ -1924,14 +1971,16 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     Two loops, and the split between them is load-bearing:
 
     1. **Compute, keyed by journey definition.** Journeys are grouped by :func:`journey_key`, so two
-       devices registered on the same trip drive one ``/impact`` call and one written message
-       between them — and therefore receive identical text.
+       devices registered on the same trip drive one ``/impact`` call and one written message per
+       disrupted train between them — and therefore receive identical text.
     2. **Deliver, keyed by registration.** ``_notified`` stays keyed on ``journey_id`` so each
        device is notified once per situation. Collapsing dedup onto the journey key would mean the
        first device notified silently suppresses the push for everyone else on the same trip.
 
-    Written messages are capped per cycle (:data:`_MAX_LLM_CALLS_PER_CYCLE`); journeys beyond the cap
-    get the deterministic wording this tick rather than delaying the poller thread.
+    Written messages are one per TRAIN a push is still coming for, since that is the grain loop 2
+    delivers at (:func:`_pending_pushes`), bounded by :data:`_MAX_MESSAGES_PER_JOURNEY` and by
+    :data:`_MAX_LLM_CALLS_PER_CYCLE` for the cycle. Trains beyond either cap get the deterministic
+    wording this tick rather than delaying the poller thread.
 
     **Scoring and recording run even when push is disabled**; only delivery is gated. The decision
     log's guarantee is "every decision, not every push", and an early return here quietly broke it:
@@ -1966,10 +2015,17 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             _message_meta.pop(key, None)
         changed = bool(stale)
 
-    # ---- Loop 1: one impact call and one written message per distinct journey definition --------
+    # ---- Loop 1: one impact call per journey definition, one written message per train ---------
     by_journey_key: dict[str, dict] = {}
+    # Every registration behind each journey definition. `_notified` is keyed per journey_id
+    # (loop 2 notifies each device once), so asking "is a push still coming for this train?" --
+    # which is what decides where the writing budget goes -- needs the ids, not just the
+    # definition they collapse to.
+    jids_by_key: dict[str, list[str]] = {}
     for _jid, journey in journeys:
-        by_journey_key.setdefault(journey_key(journey), journey)
+        _key = journey_key(journey)
+        by_journey_key.setdefault(_key, journey)
+        jids_by_key.setdefault(_key, []).append(_jid)
 
     alerts_by_key: dict[str, list[Alert]] = {}
     # What every message about this cycle's decisions is written from, one per journey definition x
@@ -1978,6 +2034,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # the cycle: unlike `_messages` it describes this tick's numbers and must not outlive them.
     message_inputs: dict[tuple[str, str, str], dict | None] = {}
     llm_calls = 0
+    budget_logged = False
     # Wall-clock budget, not just a call count. _MAX_LLM_CALLS_PER_CYCLE caps journeys, but one
     # "call" can be two backend attempts (a refusal or an unparseable reply falls through to the
     # other backend), so 8 journeys x 2 x _TIMEOUT_S is ~128 s rather than the 64 s the count
@@ -2027,79 +2084,116 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 exc_info=True,
                 extra={"fields": {"event": "varsel_reconcile_error"}},
             )
-        worst = next((a for a in alerts if a.alertworthy), None)
-        if worst is None or not push_on:
+        if not push_on:
             # No message writing without push: the text exists to be delivered, and the decision is
             # recorded with the deterministic wording either way.
             continue
-        message_key = _message_key(key, worst)
-        with _state_lock:
-            # Read RAW, deliberately not through `_deliverable_message`: this asks whether a wording
-            # was already WRITTEN for this situation, which is a generation-side question. Gating it
-            # on delivery would make the writer re-run every cycle wherever delivery is off (prd
-            # today) — burning the cycle budget re-writing text that is already cached.
-            already_written = message_key in _messages
-            attempts = _message_attempts.get(message_key, 0)
-        # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A `None`
-        # from `_write_message` costs an attempt (see the bottom of this loop), but several of its
-        # paths never call a backend at all — this one, where no backend can be asked. So three
-        # cycles with generation off used to exhaust a situation permanently: when the 30-minute
-        # `llm_message._LATCH_TTL` expired and a backend came back, the situation was already at
-        # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h life.
-        # That thins exactly the written-but-withheld population prd's rollout is judged on.
-        if not _generation_enabled():
-            _remember_message_meta(message_key, status="llm_disabled")
-            continue
-        if already_written:
-            # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row carries
-            # text written against an earlier cycle's payload, not the one recorded beside it.
-            _remember_message_meta(message_key, status="ok_cached")
-            continue
-        if attempts >= _MAX_MESSAGE_ATTEMPTS:
-            # Without this the retry never stops. A write that fails for a payload-dependent reason
-            # (a refusal, an over-long reply, an unparseable one) fails again on every 60 s tick for
-            # the situation's whole life -- ~720 Vertex calls that can change nothing, because the
-            # push already went out with the deterministic wording, each one burning a slot from
-            # _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have succeeded now cannot use.
-            _remember_message_meta(message_key, status="attempts_exhausted")
-            continue
-        # Reserve the worst case rather than merely checking the clock, so the budget is a ceiling on
-        # when the pass ENDS and not on when its last call starts (see _WORST_CASE_CALL_S).
-        if llm_calls >= _MAX_LLM_CALLS_PER_CYCLE or monotonic() + _WORST_CASE_CALL_S >= llm_deadline:
-            logger.info(
-                "Written-message budget spent this cycle (%d calls / %.0fs); %s gets the "
-                "deterministic wording",
-                llm_calls,
-                _MAX_LLM_SECONDS_PER_CYCLE,
-                key,
-                extra={"fields": {"event": "llm_message", "result": "capped"}},
-            )
-            _remember_message_meta(message_key, status="capped")
-            continue
-        llm_calls += 1
-        # _write_message catches Exception itself, so this is belt and braces for a future edit that
-        # lets one escape. It records an attempt rather than `continue`-ing past the counter, so a
-        # raiser is subject to the same give-up rule as a None. Delivery is unaffected either way:
-        # loop 2 pushes independently and falls back to the deterministic wording.
-        try:
-            message = _write_message(
-                worst, journey_key=key, message_input=message_inputs.get(message_key)
-            )
-        except Exception:
-            logger.warning(
-                "Written-message step raised for %s; using the deterministic wording",
-                key,
-                exc_info=True,
-                extra={"fields": {"event": "llm_message", "result": "error"}},
-            )
-            message = None
-            _remember_message_meta(message_key, status="error")
-        with _state_lock:
-            if message:
-                _messages[message_key] = message
-                _message_attempts.pop(message_key, None)
-            else:
-                _message_attempts[message_key] = attempts + 1
+        # ONE WORDING PER TRAIN THIS CYCLE WILL PUSH ABOUT, not one per journey (2026-08-21).
+        #
+        # Loop 2 delivers per train -- `one_alert_per_train`, the same collapse applied here --
+        # while this loop wrote for `next(a for a in alerts if a.alertworthy)` alone. So a journey
+        # with several disrupted departures pushed the model's prose for its worst train and the
+        # template for every other one, recorded as `message_status = 'not_selected'`: 604 of dev's
+        # 844 pushes over 14 days, 83 % of everything that reached a lock screen.
+        #
+        # `_pending_pushes` and not simply "every alert-worthy train", which the measurement says
+        # would be the expensive way to fix the cheap half of the problem. Per journey-cycle on dev:
+        # alert-worthy trains run p50 3 / p90 12 / max 22, while PUSHES run p90 1 / max 18 and 3 610
+        # of 4 099 cycles push nothing at all -- the trains are alert-worthy again every tick, but
+        # `_notified` means each one reaches a phone once. Writing for all of them would spend a
+        # bounded budget re-wording trains nobody will be told about again, and starve the one train
+        # that is about to be.
+        #
+        # The fallback keeps today's behaviour where it was right: with no push pending, the worst
+        # train is still written for, because the in-app journey card reads these same wordings
+        # through `_deliverable_message` and would otherwise decay to the template as soon as
+        # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
+        pending = _pending_pushes(jids_by_key.get(key, ()), alerts)
+        subjects = (pending or [a for a in one_alert_per_train(alerts) if a.alertworthy][:1])[
+            :_MAX_MESSAGES_PER_JOURNEY
+        ]
+        for subject in subjects:
+            message_key = _message_key(key, subject)
+            with _state_lock:
+                # Read RAW, deliberately not through `_deliverable_message`: this asks whether a
+                # wording was already WRITTEN for this situation, which is a generation-side
+                # question. Gating it on delivery would make the writer re-run every cycle wherever
+                # delivery is off (prd today) — burning the cycle budget re-writing text that is
+                # already cached.
+                already_written = message_key in _messages
+                attempts = _message_attempts.get(message_key, 0)
+            # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A
+            # `None` from `_write_message` costs an attempt (see the bottom of this loop), but
+            # several of its paths never call a backend at all — this one, where no backend can be
+            # asked. So three cycles with generation off used to exhaust a situation permanently:
+            # when the 30-minute `llm_message._LATCH_TTL` expired and a backend came back, the
+            # situation was already at `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer
+            # again for its whole 12 h life. That thins exactly the written-but-withheld population
+            # prd's rollout is judged on.
+            if not _generation_enabled():
+                _remember_message_meta(message_key, status="llm_disabled")
+                continue
+            if already_written:
+                # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row
+                # carries text written against an earlier cycle's payload, not the one recorded
+                # beside it.
+                _remember_message_meta(message_key, status="ok_cached")
+                continue
+            if attempts >= _MAX_MESSAGE_ATTEMPTS:
+                # Without this the retry never stops. A write that fails for a payload-dependent
+                # reason (a refusal, an over-long reply, an unparseable one) fails again on every 60
+                # s tick for the situation's whole life -- ~720 Vertex calls that can change
+                # nothing, because the push already went out with the deterministic wording, each
+                # one burning a slot from _MAX_LLM_CALLS_PER_CYCLE that a journey which WOULD have
+                # succeeded now cannot use.
+                _remember_message_meta(message_key, status="attempts_exhausted")
+                continue
+            # Reserve the worst case rather than merely checking the clock, so the budget is a
+            # ceiling on when the pass ENDS and not on when its last call starts (see
+            # _WORST_CASE_CALL_S).
+            spent = llm_calls >= _MAX_LLM_CALLS_PER_CYCLE
+            if spent or monotonic() + _WORST_CASE_CALL_S >= llm_deadline:
+                # Logged ONCE per cycle, not once per subject: the budget binds for every remaining
+                # train of every remaining journey, and this used to be at most one line per
+                # journey. Which subjects it cost is recorded durably anyway -- each gets `capped`
+                # below, on its own decision row, which is where the question is actually answered.
+                if not budget_logged:
+                    budget_logged = True
+                    logger.info(
+                        "Written-message budget spent this cycle (%d calls / %.0fs); the remaining "
+                        "trains take the deterministic wording, from %s onwards",
+                        llm_calls,
+                        _MAX_LLM_SECONDS_PER_CYCLE,
+                        key,
+                        extra={"fields": {"event": "llm_message", "result": "capped"}},
+                    )
+                _remember_message_meta(message_key, status="capped")
+                continue
+            llm_calls += 1
+            # _write_message catches Exception itself, so this is belt and braces for a future edit
+            # that lets one escape. It records an attempt rather than `continue`-ing past the
+            # counter, so a raiser is subject to the same give-up rule as a None. Delivery is
+            # unaffected either way: loop 2 pushes independently and falls back to the deterministic
+            # wording.
+            try:
+                message = _write_message(
+                    subject, journey_key=key, message_input=message_inputs.get(message_key)
+                )
+            except Exception:
+                logger.warning(
+                    "Written-message step raised for %s; using the deterministic wording",
+                    key,
+                    exc_info=True,
+                    extra={"fields": {"event": "llm_message", "result": "error"}},
+                )
+                message = None
+                _remember_message_meta(message_key, status="error")
+            with _state_lock:
+                if message:
+                    _messages[message_key] = message
+                    _message_attempts.pop(message_key, None)
+                else:
+                    _message_attempts[message_key] = attempts + 1
 
     # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
     # Collect first, then fan out. One broad situation produces one send per registration in a single
