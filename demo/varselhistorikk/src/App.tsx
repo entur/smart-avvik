@@ -4,9 +4,9 @@ import { Loader } from '@entur/loader';
 import { Heading1, Paragraph } from '@entur/typography';
 import DecisionCard from './components/DecisionCard';
 import SummaryStrip from './components/SummaryStrip';
-import { fetchConfig, fetchDecisions, fetchSummary } from './api';
-import type { Decision, Filters, Summary, Verdict } from './api';
-import { VERDICT_LABEL, isoDaysAgo } from './format';
+import { fetchConfig, fetchDecisions, fetchFilterOptions, fetchSummary } from './api';
+import type { Decision, FilterOptions, Filters, Summary, Verdict } from './api';
+import { VERDICT_LABEL, isoDaysAgo, lineCode } from './format';
 
 /** What the "Utfall" dropdown can be set to: no filter, or one of the four verdicts. It maps
  *  one-to-one onto the API's `verdict`, which is exactly the four values the log records.
@@ -26,6 +26,17 @@ const UTFALL_OPTIONS: Array<{ value: UtfallFilter; label: string }> = [
   })),
 ];
 
+/** The vocabulary the dropdowns start with: nothing, until /historikk-api/filters answers. Held as
+ *  a value rather than `null` so every consumer below can read `.lines` without a guard. */
+const NO_OPTIONS: FilterOptions = {
+  from_date: '',
+  to_date: '',
+  operators: [],
+  lines: [],
+  from_places: [],
+  to_places: [],
+};
+
 const WINDOW_OPTIONS = [
   { days: 7, label: '7 dager' },
   { days: 14, label: '14 dager' },
@@ -42,10 +53,16 @@ export default function App() {
   const [alertedOnly, setAlertedOnly] = useState(false);
   const [sxOnly, setSxOnly] = useState(false);
   const [operator, setOperator] = useState('');
+  // The three data-driven dropdowns. Their values are REFS — a full line ref, an NSR StopPlace ref —
+  // because that is what the decision log stores and what the API filters on; the readable name is
+  // only ever the label. So an unnamed stop still filters correctly, it just shows as its ref.
+  const [line, setLine] = useState('');
+  const [fromPlace, setFromPlace] = useState('');
+  const [toPlace, setToPlace] = useState('');
 
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
-  const [operators, setOperators] = useState<string[]>([]);
+  const [options, setOptions] = useState<FilterOptions>(NO_OPTIONS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [environment, setEnvironment] = useState<string | null>(null);
@@ -73,12 +90,21 @@ export default function App() {
     // results for a filter the user already moved off. On this page that is not just untidy — a
     // stale list beside a fresh summary makes the two disagree about the same window.
     let cancelled = false;
+    // Set when a stale selection is being cleared below: the state change re-runs this effect
+    // immediately, so the spinner must stay up rather than blink off between the two passes.
+    let rerunPending = false;
+    // Not named `window`: shadowing the DOM global inside an effect is a trap waiting for the first
+    // line of code here that needs the real one.
+    const dateWindow = { fromDate: isoDaysAgo(days) };
     // Two independent API flags now that "med fasit" is its own checkbox: `resolved_only` is the
     // judged population, `verdict` is one slice within it. Sending both is not redundant — it is
     // simply a verdict filter, which the API already narrows to judged rows anyway.
     const filters: Filters = {
-      fromDate: isoDaysAgo(days),
+      ...dateWindow,
       operator: operator || undefined,
+      line: line || undefined,
+      fromPlace: fromPlace || undefined,
+      toPlace: toPlace || undefined,
       verdict: utfall || undefined,
       alertedOnly,
       resolvedOnly,
@@ -88,18 +114,36 @@ export default function App() {
     setError(null);
     void (async () => {
       try {
+        // The dropdown vocabulary FIRST, and awaited rather than raced with the data. It is also the
+        // API's allow-list: a value it does not know is a 400, not an empty page, so narrowing the
+        // window off a selected line (or place) has to clear that selection before anything asks for
+        // rows with it. Fetched in parallel, the 400 would arrive first and flash an error box on a
+        // filter change the user never made a mistake with. Server-side it is one cached query per
+        // window shared by every filter combination, so the extra hop is a warm 200 in practice.
+        const opts = await fetchFilterOptions(dateWindow);
+        if (cancelled) return;
+        setOptions(opts);
+
+        // Reconcile, then bail: clearing a selection re-enters this effect with it gone.
+        const gone = [
+          [operator, opts.operators.includes(operator), setOperator],
+          [line, opts.lines.includes(line), setLine],
+          [fromPlace, opts.from_places.some((pl) => pl.ref === fromPlace), setFromPlace],
+          [toPlace, opts.to_places.some((pl) => pl.ref === toPlace), setToPlace],
+        ] as const;
+        const stale = gone.filter(([value, present]) => value && !present);
+        if (stale.length) {
+          rerunPending = true;
+          stale.forEach(([, , clear]) => clear(''));
+          return;
+        }
+
         // The summary describes the window as a whole and the list is filtered, so they are fetched
         // independently — a verdict filter must not be able to make precision read 100 %.
         const [d, s] = await Promise.all([fetchDecisions(filters), fetchSummary(filters)]);
         if (cancelled) return;
         setDecisions(d.decisions);
         setSummary(s);
-        // Only an unfiltered-by-operator load sees the whole population. Deriving the dropdown from
-        // the currently shown rows would let it shrink to just the selected operator, stranding the
-        // user with no way back.
-        if (!operator) {
-          setOperators([...new Set(d.decisions.map((x) => x.operator).filter(Boolean))] as string[]);
-        }
       } catch (e) {
         if (!cancelled) {
           setError(e instanceof Error ? e.message : String(e));
@@ -110,13 +154,13 @@ export default function App() {
           setSummary(null);
         }
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled && !rerunPending) setLoading(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [days, operator, utfall, resolvedOnly, alertedOnly, sxOnly]);
+  }, [days, operator, line, fromPlace, toPlace, utfall, resolvedOnly, alertedOnly, sxOnly]);
 
   return (
     <main className="vh-page">
@@ -160,11 +204,16 @@ export default function App() {
           </select>
         </label>
 
+        {/* The four data-driven dropdowns. Every one of them is populated from
+            /historikk-api/filters over the whole window — never from the decisions on screen, which
+            are capped at 200 and ordered by departure, so a line that only ran early in the window
+            would drop out of its own filter and a selection would shrink the list it came from to
+            just itself. "Alle" is always first, and always reachable. */}
         <label className="vh-select">
           <span>Operatør</span>
           <select value={operator} onChange={(e) => setOperator(e.target.value)}>
             <option value="">Alle</option>
-            {operators.map((o) => (
+            {options.operators.map((o) => (
               <option key={o} value={o}>
                 {o}
               </option>
@@ -172,9 +221,53 @@ export default function App() {
           </select>
         </label>
 
-        {/* Stacked, and in this order: each one narrows a different axis — is there an answer
-            yet, did we speak, was there a message to speak from — and side by side they read as
-            alternatives to each other rather than as three switches that compose. */}
+        {/* Value is the full ref, label the short code — the same reduction the cards use, so the
+            dropdown and the pill on a row name a line alike. Two codespaces can share a short code,
+            which is why the ref and not the label is what travels to the API. */}
+        <label className="vh-select">
+          <span>Linje</span>
+          <select value={line} onChange={(e) => setLine(e.target.value)}>
+            <option value="">Alle</option>
+            {options.lines.map((l) => (
+              <option key={l} value={l}>
+                {lineCode(l)}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* Fra/Til are the REGISTERED journey's endpoints, not the situation's geography: they
+            narrow to the decisions taken on journeys somebody registered between those two places.
+            The value is the NSR ref, so a stop the server could not name still filters correctly —
+            it just shows as its ref. */}
+        <label className="vh-select vh-select--wide">
+          <span>Fra</span>
+          <select value={fromPlace} onChange={(e) => setFromPlace(e.target.value)}>
+            <option value="">Alle</option>
+            {options.from_places.map((pl) => (
+              <option key={pl.ref} value={pl.ref}>
+                {pl.name ?? pl.ref}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="vh-select vh-select--wide">
+          <span>Til</span>
+          <select value={toPlace} onChange={(e) => setToPlace(e.target.value)}>
+            <option value="">Alle</option>
+            {options.to_places.map((pl) => (
+              <option key={pl.ref} value={pl.ref}>
+                {pl.name ?? pl.ref}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* In this order, because each one narrows a different axis: is there an answer yet, did
+            we speak, was there a message to speak from. They sit side by side on a line of their
+            own — see `.vh-checks`, which is what keeps them off the end of the dropdown row, where
+            a row of them would read as three more alternatives to pick between. */}
         <div className="vh-checks" role="group" aria-label="Avgrensninger">
           {/* Every decision the nightly job has an answer for, dropping the ones still waiting and
               the ones whose train was never found. Wider than picking a verdict, which narrows

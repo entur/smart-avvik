@@ -966,7 +966,10 @@ async def lifespan(app: FastAPI):
     # failure path is internal (logged, never raised), so a BigQuery problem cannot block startup.
     decisions.configure(bq_client=bq_client)
     decisions.ensure_table()
-    historikk.configure(bq_client=bq_client)
+    # stop_name_provider is the same cache /varsel-api/stops and llm_message read, here so the
+    # /historikk filter dropdowns can offer stop NAMES rather than bare NSR refs. Read lazily
+    # through the callable, so wiring it before the first refresh_varsel_stops() below is fine.
+    historikk.configure(bq_client=bq_client, stop_name_provider=_varsel_stops)
     varsel.load_state()
     try:
         refresh_varsel_stops()
