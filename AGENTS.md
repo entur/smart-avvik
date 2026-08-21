@@ -21,8 +21,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
 path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
-node stage builds the `/demo`, `/varsel` and `/historikk` front-ends (from
-`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk`, which is why the context is the
+node stage builds the `/demo`, `/varsel`, `/historikk` and `/tilbakeblikk` front-ends (from
+`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk` + `demo/tilbakeblikk`, which is
+why the context is the
 repo root, not `disruptions/api`), and its python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
 
 ```sh
@@ -36,7 +37,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
   app's `npm ci && npm run build`, and Vite writes into
-  `disruptions/api/{demo,varsel,historikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
+  `disruptions/api/{demo,varsel,historikk,tilbakeblikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
   its marimo snapshots run BigQuery under a developer's ADC, so they can't be built in the
   image/CI — they are rendered offline by `disruptions/api/export_eval.sh` and **committed** under
   `disruptions/api/eval_static/`, shipped as-is. Refresh them by running that script, then commit

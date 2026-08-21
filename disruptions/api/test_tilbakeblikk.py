@@ -23,6 +23,7 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
      --with google-cloud-storage --with pywebpush python test_tilbakeblikk.py   (or under pytest)
 """
 
+import asyncio
 import inspect
 import json
 import logging
@@ -30,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time as _time
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
@@ -459,6 +461,55 @@ def test_a_reversed_or_empty_time_range_is_rejected_without_a_query():
         assert bad.status_code == 400, (from_time, to_time)
         assert "to_time" in bad.json()["detail"]
         assert fake.calls == [], "a rejected time range must not reach BigQuery"
+
+
+def test_a_bare_midnight_to_time_is_rejected_rather_than_silently_empty():
+    """The bounds check must run on the RESOLVED minutes, not the raw times.
+
+    The raw comparison can only fire when both times were supplied, so `to_time=00:00` with
+    `from_time` omitted walked past it: the default start is minute 0 and midnight ceils to minute 0,
+    giving the half-open [0, 0) the docstring promises is impossible — a 200 with a permanently empty
+    window, on the one endpoint whose whole job is to describe a window. The shipped page never sends
+    it (api.ts omits `to_time` when it equals midnight), but the API is public and documented.
+
+    The `count == 0` assertion is the one that would have caught this: a request that reaches
+    BigQuery and comes back empty is indistinguishable, from the client's side, from a quiet day.
+    """
+    for params in (
+        {"to_time": "00:00"},                      # the hole: only `to_time`, at midnight
+        {"to_time": "00:00:00"},                   # ...with explicit seconds, as FastAPI parses it
+        {"from_time": "00:00", "to_time": "00:00"},  # the pair the raw check already refused
+    ):
+        _reset([_row()])
+        bad = client.get(
+            "/tilbakeblikk-api/decisions",
+            params={"day": PAST_DAY.isoformat(), **params},
+        )
+        assert bad.status_code == 400, (params, bad.status_code, bad.json())
+        assert "to_time" in bad.json()["detail"]
+        assert fake.calls == [], "a rejected time range must not reach BigQuery"
+
+
+def test_a_valid_range_still_survives_the_resolved_bounds_check():
+    """The guard moved after quantization, so pin that it did not start refusing valid ranges.
+
+    Quantization preserves order for anything already valid — `from < to` implies
+    `floor(from) < ceil(to)` — and the sub-step range is the case that proves it: 14:00 to 14:01
+    is empty before rounding and a full quarter-hour after it, which is exactly the asymmetry
+    `_ceil_to_step` exists to create.
+
+    Reaching BigQuery is the assertion, not the rendered times: a range ending at the FOLLOWING
+    midnight serves `to_time` as "00:00", so ordering the two strings would fail on the widest
+    legitimate window there is.
+    """
+    for from_time, to_time in (("14:00", "14:01"), ("00:00", "23:59"), ("14:00", "14:15")):
+        _reset([_row()])
+        ok = client.get(
+            "/tilbakeblikk-api/decisions",
+            params={"day": PAST_DAY.isoformat(), "from_time": from_time, "to_time": to_time},
+        )
+        assert ok.status_code == 200, (from_time, to_time, ok.json())
+        assert fake.calls, f"{from_time}-{to_time} was refused; it is a valid range"
 
 
 def test_a_future_day_and_a_day_beyond_the_lookback_are_rejected_without_a_query():
@@ -1286,6 +1337,75 @@ def test_the_message_model_refuses_a_redacted_column():
             pass
 
 
+def test_a_replay_is_refused_when_no_slot_is_free_and_spends_nothing():
+    """Admission control, and the thing it protects is not this page's latency.
+
+    `messages` is `async def` precisely so it does NOT hold an anyio worker slot — that escape is
+    what stops one replay starving traveller-facing registration. But the anyio pool is the only
+    other thing bounding concurrency in this process, so stepping outside it means nothing counts
+    these requests at all: N concurrent callers would mean N thread pools, N BigQuery jobs and 4N
+    threads on a pod with one replica and a memory limit.
+
+    The refusal must come BEFORE the pool and the query are allocated, which is what the
+    `fake.calls` assertion pins — a 503 that has already spent a BigQuery job protects nothing.
+    """
+    _reset([_row()])
+    real = tilbakeblikk._replay_slots
+    tilbakeblikk._replay_slots = asyncio.Semaphore(0)   # both slots taken
+    try:
+        # Bounded, because the failure mode of deleting the pre-check is a BLOCK, not a wrong answer:
+        # `async with` on an exhausted semaphore waits forever, so an unbounded call here would hang
+        # CI instead of failing it, and a suite that hangs is one nobody can bisect.
+        #
+        # A raw DAEMON thread, not a ThreadPoolExecutor, and the reason is the whole point of this
+        # guard. Pool threads are non-daemon and `concurrent.futures` joins them from an atexit
+        # hook, so a permanently blocked call keeps the interpreter alive after the assertion has
+        # already failed -- the timeout fires, the failure is reported, and the process still never
+        # exits. Only a daemon thread lets this test fail and the suite finish.
+        box: dict = {}
+        worker = threading.Thread(
+            target=lambda: box.update(r=client.get("/tilbakeblikk-api/messages")),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), (
+            "the request blocked instead of refusing: with no slot free the route must return 503 "
+            "immediately, not queue behind a deadline the caller cannot see"
+        )
+        r = box["r"]
+        assert r.status_code == 503, r.text
+        assert fake.calls == [], "a refused replay reached BigQuery before being refused"
+    finally:
+        tilbakeblikk._replay_slots = real
+
+
+def test_the_replay_slot_is_released_so_requests_do_not_leak_capacity():
+    """A gate that never gives the slot back is an outage on the third page load.
+
+    Asserted over three sequential requests rather than two: with `_MAX_CONCURRENT_REPLAYS` = 2, a
+    release bug that leaked one slot per request still lets the second through, and would pass a
+    two-request version of this test while failing in production on the very next call.
+    """
+    for i in range(3):
+        _reset([_row()])
+        r = client.get("/tilbakeblikk-api/messages")
+        assert r.status_code == 200, f"request {i + 1} was refused: {r.text}"
+    assert not tilbakeblikk._replay_slots.locked(), "slots were not returned"
+
+
+def test_the_concurrency_ceiling_matches_the_per_minute_budget_it_is_derived_from():
+    """Two, because `_MAX_CALLS_PER_MIN` is exactly two requests' worth of `_MAX_CALLS_PER_REQUEST`.
+
+    A third concurrent caller was going to be answered `rate_limited` for every subject anyway, so
+    refusing it outright is the same answer sooner. If either budget moves, this ceiling has to be
+    re-derived rather than left where it happens to sit — that is what this pins.
+    """
+    assert tilbakeblikk._MAX_CONCURRENT_REPLAYS == (
+        tilbakeblikk._MAX_CALLS_PER_MIN // tilbakeblikk._MAX_CALLS_PER_REQUEST
+    )
+
+
 def test_messages_takes_the_same_allow_list_as_decisions():
     """It never accepts a caller-supplied row key: what may be regenerated is decided by this
     module's own query over a vocabulary /filters published. An arbitrary string would otherwise mint
@@ -1298,6 +1418,70 @@ def test_messages_takes_the_same_allow_list_as_decisions():
     bad = client.get("/tilbakeblikk-api/messages", params={"operator": "NOT-AN-OPERATOR"})
     assert bad.status_code == 400
     assert fake.calls == [], "a rejected filter must not reach BigQuery"
+
+
+def test_the_wording_cache_expires_a_failure_far_sooner_than_an_answer():
+    """The differential TTL is a real mechanism, not a comment.
+
+    A transient Vertex error caches for 60 s and an answer for 30 min, and the asymmetry is the whole
+    point: without it a blip pins a red badge on a card for half an hour after Vertex has recovered,
+    on the one page whose job is to show what today's prompt produces. Nothing exercised it before —
+    `monotonic` was never faked anywhere in this suite, so `_cached_wording`'s expiry branch and
+    `_remember_wording`'s stale sweep both ran only on the real clock, where neither TTL can elapse.
+
+    Both directions are asserted. Only checking that the error expires would pass on code that
+    expired everything at 60 s, which would spend a Vertex call per card per minute for a page the
+    budget expects to serve from cache.
+    """
+    _reset()
+    clock = [1000.0]
+    real = tilbakeblikk.monotonic
+    tilbakeblikk.monotonic = lambda: clock[0]
+    try:
+        ok = tilbakeblikk._Wording("prose", "template", "ok", None, "claude", "m")
+        err = tilbakeblikk._Wording(None, "template", "error", None, None, None)
+        tilbakeblikk._remember_wording(("ok",), ok)
+        tilbakeblikk._remember_wording(("err",), err)
+        assert tilbakeblikk._cached_wording(("ok",)) == ok
+        assert tilbakeblikk._cached_wording(("err",)) == err
+
+        # Past the failure's life, well inside the answer's.
+        clock[0] += tilbakeblikk._WORDING_ERROR_TTL_S + 1
+        assert tilbakeblikk._cached_wording(("err",)) is None, "a failed draw outlived its short TTL"
+        assert tilbakeblikk._cached_wording(("ok",)) == ok, "an answer expired on the failure's TTL"
+
+        # ...and past the answer's.
+        clock[0] += tilbakeblikk._WORDING_TTL_S
+        assert tilbakeblikk._cached_wording(("ok",)) is None, "an answer never expired"
+    finally:
+        tilbakeblikk.monotonic = real
+
+
+def test_a_refused_payload_keeps_the_full_wording_ttl():
+    """`rejected` and `ungrounded` are payload-determined, so they keep the long life.
+
+    The same stored `message_input` under the same PROMPT_VERSION will be refused again — re-asking
+    spends a Vertex call to learn nothing. Only `error` says merely that the backend was unreachable
+    a moment ago. This is the same cut `varsel` makes with `_message_attempts` vs `_message_errors`,
+    expressed here as a TTL rather than a counter, and it is why the two lifetimes must not be
+    unified on the grounds that both are failures.
+    """
+    _reset()
+    clock = [1000.0]
+    real = tilbakeblikk.monotonic
+    tilbakeblikk.monotonic = lambda: clock[0]
+    try:
+        for status in ("rejected", "ungrounded"):
+            w = tilbakeblikk._Wording(None, "template", status, "the refused text", "claude", "m")
+            tilbakeblikk._remember_wording((status,), w)
+        clock[0] += tilbakeblikk._WORDING_ERROR_TTL_S + 1
+        for status in ("rejected", "ungrounded"):
+            assert tilbakeblikk._cached_wording((status,)) is not None, (
+                f"{status} expired on the transient TTL; it is determined by the input, not the "
+                "backend's mood, so re-asking spends a call to learn nothing"
+            )
+    finally:
+        tilbakeblikk.monotonic = real
 
 
 def test_the_wording_cache_is_bounded():

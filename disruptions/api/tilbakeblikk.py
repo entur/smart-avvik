@@ -168,9 +168,24 @@ _CALLS_PER_SUBJECT = 2
 #    than the worst, because an unserved Claude 404s in well under a second.
 _REQUEST_DEADLINE_S = 30.0
 _WORST_CASE_CALL_S = 16.0
-# Pool width. `varsel._PUSH_WORKERS` is the shape, not the number — it is 8; 4 leaves room beside the
-# poller. At this width the per-request cap costs three rounds, about 7 s typically.
+# Pool width. `varsel`'s pools are the shape, not the number — they run 16/16/32
+# (`_MATCH_WORKERS`/`_LLM_WORKERS`/`_PUSH_WORKERS`) on the poller thread, on a cadence nobody can
+# trigger; this one is reachable from a public unauthenticated endpoint, so it is deliberately the
+# narrowest of them. At this width the per-request cap costs three rounds, about 7 s typically.
 _REPLAY_WORKERS = 4
+# ...and the ceiling on how many of those pools can exist at once. `_REPLAY_WORKERS` bounds ONE
+# request; without this, N concurrent requests mean N pools, N BigQuery jobs and 4N threads, because
+# `messages` is `async def` and therefore deliberately outside the anyio worker pool that is the only
+# other thing bounding concurrency in this process. That escape is the point of the `async` — it
+# stops one replay holding a slot traveller-facing registration needs — but it also means nothing
+# else counts these requests, so the bound has to be stated here.
+#
+# Two, because the module's own arithmetic already implies it: `_MAX_CALLS_PER_MIN` (24) is exactly
+# two requests' worth of `_MAX_CALLS_PER_REQUEST` (12), so a third concurrent caller was going to be
+# answered `rate_limited` for every subject anyway. Refusing it outright is the same answer, sooner
+# and cheaper — and a 503 is honest, where queueing would hold a connection open behind a 30 s
+# deadline it cannot see.
+_MAX_CONCURRENT_REPLAYS = 2
 
 # 4. The wording cache, separate from the BigQuery response cache above and keyed differently: the
 #    subject key INCLUDING the replayed decided_at, plus llm_message.PROMPT_VERSION. Both halves are
@@ -734,6 +749,15 @@ def _resolve_window(
     rejected too, not only inverted ones: after quantization an equal pair is an empty range exactly
     when it lands on a step boundary and a non-empty one otherwise, and a rule whose behaviour
     depends on where the clock hands happen to be is worse than a refusal.
+
+    That refusal is checked on the RESOLVED minutes, not on the raw times, and the difference is a
+    real hole rather than a tidier spelling. The raw comparison can only fire when both times were
+    supplied, so an explicit ``to_time=00:00`` with ``from_time`` omitted walked straight past it:
+    the default start is minute 0 and midnight ceils to minute 0, giving the half-open ``[0, 0)``
+    that this docstring promises is impossible — a 200 with a permanently empty window, on the one
+    endpoint whose whole job is to describe a window. Quantization preserves order for every range
+    that was already valid (``from < to`` implies ``floor(from) < ceil(to)``), so moving the check
+    after it refuses exactly the ranges the raw form meant to refuse, plus the one it could not see.
     """
     today = datetime.now(_OSLO).date()
     day = day or today
@@ -744,11 +768,11 @@ def _resolve_window(
             status_code=400,
             detail=f"day is too far back; keep it within {historikk._MAX_WINDOW_DAYS} days.",
         )
-    if from_time is not None and to_time is not None and to_time <= from_time:
-        raise HTTPException(status_code=400, detail="to_time must be later than from_time.")
-
     from_minutes = _floor_to_step(from_time) if from_time is not None else 0
     to_minutes = _ceil_to_step(to_time) if to_time is not None else _MINUTES_PER_DAY
+    if to_minutes <= from_minutes:
+        raise HTTPException(status_code=400, detail="to_time must be later than from_time.")
+
     return _Window(
         day=day,
         from_minutes=from_minutes,
@@ -1055,6 +1079,12 @@ class _Wording(NamedTuple):
 
 _replay_state_lock = threading.Lock()
 _replay_state: Any | None = None
+
+# Admission control for /messages -- see _MAX_CONCURRENT_REPLAYS. Module-level rather than
+# per-request for the obvious reason (a per-request semaphore bounds nothing) and safe to build at
+# import on 3.10+, where a Semaphore binds to the running loop on first use rather than at
+# construction. This process runs one loop.
+_replay_slots = asyncio.Semaphore(_MAX_CONCURRENT_REPLAYS)
 
 
 def _replay_latch() -> Any:
@@ -1736,6 +1766,42 @@ async def messages(
             status_code=400, detail=f"verdict must be one of {', '.join(historikk._VERDICTS)}."
         )
 
+    # Admission control BEFORE anything is allocated -- see `_MAX_CONCURRENT_REPLAYS`. Checking
+    # `locked()` first is what makes the refusal immediate rather than a queue: the semaphore alone
+    # would make a third caller WAIT behind a 30 s deadline it cannot see, on a public
+    # unauthenticated endpoint. The check and the acquire are not one atomic step, so a rare third
+    # request can still slip in and wait briefly; the semaphore is what keeps the real ceiling, and
+    # the check is what keeps the common answer honest.
+    if _replay_slots.locked():
+        raise HTTPException(
+            status_code=503,
+            detail="Too many replays running; try again shortly.",
+        )
+    async with _replay_slots:
+        return await _messages(
+            window, operator, line, from_place, to_place, verdict,
+            alerted_only, resolved_only, sx_only, limit, deadline,
+        )
+
+
+async def _messages(
+    window: _Window,
+    operator: str | None,
+    line: str | None,
+    from_place: str | None,
+    to_place: str | None,
+    verdict: str | None,
+    alerted_only: bool,
+    resolved_only: bool,
+    sx_only: bool,
+    limit: int,
+    deadline: float,
+) -> MessagesResponse:
+    """The body of :func:`messages`, run while holding a replay slot.
+
+    Split out only so the slot is released by one `async with` around the whole of it, rather than
+    by a `try/finally` wrapped around a long body where a later edit could return past the release.
+    """
     loop = asyncio.get_running_loop()
     # One pool per request, the shape `varsel.check_and_notify`'s delivery loop uses. Per request
     # rather than module-wide so its threads cannot outlive the work: this pod runs for weeks.
