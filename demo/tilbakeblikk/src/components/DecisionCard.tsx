@@ -169,6 +169,64 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
   );
 }
 
+/** The card's second timestamp: when a message could have gone out, or — failing that — when we
+ *  last looked and stayed quiet.
+ *
+ *  Three cases, and the difference between the first two is the whole reason this is not one line.
+ *  `would_send_at` is only the FIRST opportunity when `first_in_window` says so; otherwise the
+ *  subject was already alerting before the window opened and the timestamp is merely the earliest
+ *  cycle the selected window happens to contain. Labelled apart rather than both called «Varsel»:
+ *  narrowing the picker would otherwise silently move the claimed send time later, and the reader
+ *  would have no way to see it happen. */
+function DepartureWhen({ decision }: { decision: Decision }) {
+  if (decision.would_send_at) {
+    if (decision.first_in_window) {
+      return (
+        <span
+          className="tb-when"
+          title={withLooks(
+            'Første varselverdige syklus for dette toget — tidspunktet meldingen under ' +
+              'kunne vært sendt på. Ingenting ble sendt herfra.',
+            decision,
+          )}
+        >
+          Varsel {fmtWhen(decision.would_send_at, decision.call_date)}
+        </span>
+      );
+    }
+    /* The subject was already alerting before the window opened, so this is the earliest
+       cycle the WINDOW contains and not the first opportunity. Labelled apart rather than
+       called "Varsel": narrowing the picker would otherwise silently move the claimed
+       send time later, and the reader would have no way to see it happen. */
+    return (
+      <span
+        className="tb-when"
+        title={withLooks(
+          'Toget varslet allerede før vinduet åpnet, så dette er den tidligste syklusen ' +
+            'inne i vinduet — ikke den første muligheten. Snevrer du vinduet inn, flytter ' +
+            'tidspunktet seg.',
+          decision,
+        )}
+      >
+        Tidligste i vinduet {fmtWhen(decision.would_send_at, decision.call_date)}
+        <WindowScope />
+      </span>
+    );
+  }
+  if (decision.last_decided_at) {
+    /* Nothing in the window was replayable — a decision we stayed quiet on has no
+       alert-worthy cycle at all. The last look is the one that stood: the closest we came
+       to the departure and still said nothing, which is the fact a miss turns on. */
+    return (
+      <span className="tb-when" title={fmtLooks(decision)}>
+        Sist vurdert {fmtWhen(decision.last_decided_at, decision.call_date)}
+        <WindowScope />
+      </span>
+    );
+  }
+  return null;
+}
+
 /** One replayed decision.
  *
  *  `message` is three-valued on purpose: `undefined` while /messages has not answered (or could not
@@ -198,45 +256,7 @@ export default function DecisionCard({
           <span className="tb-mode">{decision.mode ?? 'Tog'}</span>
           <span className="tb-line">{lineCode(decision.line)}</span>
           <span className="tb-departure">{fmtDeparture(decision)}</span>
-          {decision.would_send_at ? (
-            decision.first_in_window ? (
-              <span
-                className="tb-when"
-                title={withLooks(
-                  'Første varselverdige syklus for dette toget — tidspunktet meldingen under ' +
-                    'kunne vært sendt på. Ingenting ble sendt herfra.',
-                  decision,
-                )}
-              >
-                Varsel {fmtWhen(decision.would_send_at, decision.call_date)}
-              </span>
-            ) : (
-              /* The subject was already alerting before the window opened, so this is the earliest
-                 cycle the WINDOW contains and not the first opportunity. Labelled apart rather than
-                 called "Varsel": narrowing the picker would otherwise silently move the claimed
-                 send time later, and the reader would have no way to see it happen. */
-              <span
-                className="tb-when"
-                title={withLooks(
-                  'Toget varslet allerede før vinduet åpnet, så dette er den tidligste syklusen ' +
-                    'inne i vinduet — ikke den første muligheten. Snevrer du vinduet inn, flytter ' +
-                    'tidspunktet seg.',
-                  decision,
-                )}
-              >
-                Tidligste i vinduet {fmtWhen(decision.would_send_at, decision.call_date)}
-                <WindowScope />
-              </span>
-            )
-          ) : decision.last_decided_at ? (
-            /* Nothing in the window was replayable — a decision we stayed quiet on has no
-               alert-worthy cycle at all. The last look is the one that stood: the closest we came
-               to the departure and still said nothing, which is the fact a miss turns on. */
-            <span className="tb-when" title={fmtLooks(decision)}>
-              Sist vurdert {fmtWhen(decision.last_decided_at, decision.call_date)}
-              <WindowScope />
-            </span>
-          ) : null}
+          <DepartureWhen decision={decision} />
         </div>
         <div className="tb-card-badges">
           {/* Which side of the split this row is on. Without it the segmented rates at the top
