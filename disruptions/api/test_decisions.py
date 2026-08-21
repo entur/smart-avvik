@@ -590,6 +590,51 @@ def test_no_column_description_exceeds_bigquerys_1024_char_cap():
     assert not over, f"descriptions over BigQuery's 1024-char cap: {over}"
 
 
+def _decision_groups_view() -> str:
+    """The varsel_decision_groups view body, comments stripped.
+
+    It is the last statement above the best-effort marker (test_the_ddl_splits_structure_from_
+    descriptions pins that the marker really partitions the file), so slicing to the end of the
+    structural half is enough. Comments go because this view argues its case at length and every
+    phrase the assertions below look for appears in the prose too.
+    """
+    sql = decisions._STRUCTURE_SQL
+    start = sql.index("CREATE OR REPLACE VIEW `disruptions.varsel_decision_groups`")
+    return "\n".join(
+        ln for ln in sql[start:].splitlines() if not ln.strip().startswith("--")
+    )
+
+
+def test_the_quoted_wording_is_the_one_that_was_pushed():
+    """/historikk quotes `message` as what the traveller was sent, so the view must pick the row
+    that pushed it -- not merely the most recent row that had text.
+
+    A text check, because nothing in this repo executes SQL. The two diverge constantly: a wording
+    lives in varsel._messages only while its situation stays above the alert gate, so
+    _reconcile_caches forgets it the tick the subject eases off and every later cycle records the
+    template again. Measured on dev 2026-08-21, on 1 790 alerted subjects: 52 cards quoted the
+    template under "Skrevet av modellen" though the push carried the model's prose, 85 quoted the
+    reverse, and 603 more quoted the right KIND of wording from the wrong cycle -- different
+    percentages, a different replacement train. 41 % of the page was text nobody received.
+    """
+    view = _decision_groups_view()
+    aggs = re.findall(r"ARRAY_AGG\((.*?)\)\s*\[SAFE_OFFSET\(0\)\]", view, re.DOTALL)
+    wording = [a for a in aggs if "message" in a]
+    assert len(wording) == 2, (
+        f"expected a pushed-row aggregate and a fallback, found {len(wording)}"
+    )
+    assert sum("pushed" in a for a in wording) == 1, (
+        "neither half selects on `pushed`: the view is back to quoting the last wording produced"
+    )
+    # One aggregate per half carrying BOTH columns. Two separate aggregates "picking the same row"
+    # is a promise the ORDER BY cannot keep, and the way it breaks is a card showing one cycle's
+    # text under another cycle's attribution -- half of the defect this fixes, reintroduced.
+    for agg in wording:
+        assert "STRUCT(" in agg and "message_source" in agg, (
+            "message and message_source must be chosen as one struct, not aggregated separately"
+        )
+
+
 def test_a_failed_description_refresh_does_not_stop_the_log():
     """The 2026-08-07 outage, pinned.
 

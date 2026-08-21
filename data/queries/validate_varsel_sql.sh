@@ -26,14 +26,24 @@ fail=0
 
 # The two /historikk queries are parameterised; the values are irrelevant to a dry run, only the
 # types are, but they have to be supplied or the query will not parse.
+#
+# Keep these in step with the parameter lists in disruptions/api/historikk.py. A parameter the file
+# uses and this list omits is not a soft warning -- bq refuses to parse the query at all
+# ("Query parameter 'line' not found"), so the check reports FAILED and the file goes UNVALIDATED
+# until somebody notices. That is how the /historikk filter parameters added on 2026-08-21 left
+# both of these files unchecked; found on 2026-08-21 while validating the view change beside them.
 DECISION_PARAMS=(
   --parameter=from_date:DATE:2026-07-01 --parameter=to_date:DATE:2026-07-31
   --parameter=operator:STRING:VYG --parameter=verdict:STRING:hit
-  --parameter=alerted_only:BOOL:false --parameter=limit:INT64:200
+  --parameter=line:STRING:R11
+  '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
+  --parameter=alerted_only:BOOL:false --parameter=resolved_only:BOOL:false
+  --parameter=sx_only:BOOL:false --parameter=limit:INT64:200
 )
 SUMMARY_PARAMS=(
   --parameter=from_date:DATE:2026-07-01 --parameter=to_date:DATE:2026-07-31
-  --parameter=operator:STRING:VYG
+  --parameter=operator:STRING:VYG --parameter=line:STRING:R11
+  '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
 )
 
 check() {
@@ -106,5 +116,13 @@ check_each_statement "create_varsel_decisions.sql" "$API/create_varsel_decisions
 check "label_varsel_decisions.sql"  "$ROOT/queries/label_varsel_decisions.sql"
 check "historikk_decisions.sql"     "$API/historikk_decisions.sql" "${DECISION_PARAMS[@]}"
 check "historikk_summary.sql"       "$API/historikk_summary.sql"   "${SUMMARY_PARAMS[@]}"
+# The filter vocabulary and its stop-place names: both feed /historikk-api and neither was checked
+# here until 2026-08-21. historikk_filters.sql is also the API's allow-list, so a fault in it 400s
+# every filtered request rather than merely emptying a dropdown.
+check "historikk_filters.sql"       "$API/historikk_filters.sql" \
+  --parameter=from_date:DATE:2026-07-01 --parameter=to_date:DATE:2026-07-31 \
+  --parameter=limit:INT64:200
+check "historikk_stop_places.sql"   "$API/historikk_stop_places.sql" \
+  --parameter='refs:ARRAY<STRING>:["NSR:StopPlace:337"]'
 
 exit "$fail"

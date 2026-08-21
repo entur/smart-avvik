@@ -1125,6 +1125,22 @@ SNAPSHOT_MIXED = {
 }
 
 
+# TWO disrupted departures on one registered journey, each with its own SX message: the shape
+# `one_alert_per_train` keeps as two cards and loop 2 delivers as two pushes. Both clear the rail
+# gate, and t3 is deliberately the MILDER of the two so a test can tell "the writer served the worst
+# train" apart from "the writer served the train that was about to be pushed".
+SNAPSHOT_TWO_DISRUPTED = {
+    "S1": SNAPSHOT["S1"],
+    "S3": [
+        FakeCall("t3", "A", 1, DEP + timedelta(minutes=20), situation_number="S3",
+                 line="VYG:Line:R11", summary="Solnedgang i sporvekselen", p_cancel=0.40,
+                 p_impact_dep=0.75),
+        FakeCall("t3", "B", 5, None, situation_number="S3", line="VYG:Line:R11",
+                 summary="Solnedgang i sporvekselen", aimed_arr=DEP + timedelta(minutes=60)),
+    ],
+}
+
+
 # The 2026-08-05 report: two SX messages about ONE departure. Same journey (t1), same boarding call,
 # scored independently under each situation -- which is exactly why the two readings differ (0.90 vs
 # 0.87) and why the card showed "91 %" and "87 %" for one train, one box apart.
@@ -1178,6 +1194,75 @@ def test_two_notices_about_one_train_are_one_push(monkeypatch):
     varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
 
     assert len(sent) == 1
+
+
+def test_every_train_a_cycle_pushes_about_gets_its_own_wording(monkeypatch):
+    """One wording per TRAIN, because that is what loop 2 delivers (2026-08-21).
+
+    The writing pass used to serve `next(a for a in alerts if a.alertworthy)` -- one train per
+    journey -- while delivery pushes per train. So a second disrupted departure went to the lock
+    screen with the template while the first carried the model's prose: 604 of dev's 844 pushes over
+    14 days, 83 % of everything travellers actually received, filed under
+    `message_status = 'not_selected'`.
+    """
+    _reset_state()
+    _use_snapshot(SNAPSHOT_TWO_DISRUPTED)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+
+    def fake_write(alert, *, journey_key, message_input):
+        return f"Skrevet om {alert.situation_number}."
+
+    monkeypatch.setattr(varsel, "_write_message", fake_write)
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT_TWO_DISRUPTED)
+
+    assert len(sent) == 2, "two disrupted trains is two pushes"
+    # The point of the fix: BOTH bodies are written prose. Before it the milder train's push carried
+    # the deterministic wording, which names the train and quotes the numbers but is not this text.
+    assert sorted(p["body"] for p in sent) == ["Skrevet om S1.", "Skrevet om S3."]
+
+
+def test_the_writing_budget_follows_the_push_not_the_severity(monkeypatch):
+    """Spend it where it can still change what somebody sees.
+
+    Alert-worthy trains are re-scored every tick and run p50 3 / p90 12 per journey-cycle on dev,
+    but `_notified` means each reaches a phone once, so PUSHES run p90 1 and 88 % of cycles push
+    none at all. Writing for every alert-worthy train would therefore spend a bounded budget
+    re-wording trains nobody will be told about again -- and starve the one that is about to be.
+    """
+    _reset_state()
+    written = []
+
+    def fake_write(alert, *, journey_key, message_input):
+        written.append(alert.situation_number)
+        return f"Skrevet om {alert.situation_number}."
+
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", fake_write)
+    _register(DEVICE)
+
+    # Cycle 1 knows only about the worst train, and notifies the device about it.
+    _use_snapshot(SNAPSHOT)
+    varsel.check_and_notify(SNAPSHOT)
+    assert written == ["S1"]
+
+    # Forget the cached wording, exactly as _reconcile_caches does when a subject eases off below
+    # the gate. Without this the assertion below would hold for the wrong reason -- S1 would be
+    # skipped as `ok_cached` whether or not the selection had improved.
+    with varsel._state_lock:
+        varsel._messages.clear()
+    written.clear()
+
+    # Cycle 2 adds a MILDER second train. S1 is more severe and would win any severity-ordered
+    # pick, but the device has already been notified about it: no push is coming, and its wording
+    # can no longer reach anybody. S3's can.
+    _use_snapshot(SNAPSHOT_TWO_DISRUPTED)
+    varsel.check_and_notify(SNAPSHOT_TWO_DISRUPTED)
+
+    assert written == ["S3"], (
+        "the budget went to the most severe train rather than the one about to be pushed"
+    )
 
 
 def test_the_suppressed_notice_is_still_recorded(monkeypatch):
