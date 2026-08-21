@@ -231,27 +231,6 @@ button.primary:disabled {
 
 /* ---- results ---- */
 
-.stats {
-  display: flex;
-  gap: 20px;
-  flex-wrap: wrap;
-  font-size: 14px;
-  color: var(--text-soft);
-  margin-bottom: 16px;
-}
-
-.stat-good {
-  color: var(--good);
-}
-
-.stat-bad {
-  color: var(--bad);
-}
-
-.stat-warn {
-  color: var(--warn);
-}
-
 .error {
   background: var(--bad-soft);
   color: var(--bad);
@@ -555,9 +534,235 @@ button.primary:disabled {
   color: var(--text-faint);
 }
 
+/* ---- "Slik ville varslene truffet" (HitSummary.tsx) ----
+   The search's verdicts added up, above the cards they are drawn from. Sits on the page's surface
+   colour rather than a tinted panel: it is the first thing a partner reads, and a coloured box
+   around a precision figure reads as a claim being sold rather than a measurement. */
+
+.hs-summary {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 22px;
+  margin-bottom: 20px;
+}
+
+.hs-head {
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.hs-sub,
+.hs-empty {
+  margin: 6px 0 0;
+  font-size: 14px;
+  color: var(--text-soft);
+  max-width: 78ch;
+}
+
+.hs-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 13rem));
+  justify-content: start;
+  gap: 18px 32px;
+  margin: 18px 0 14px;
+}
+
+.hs-tile-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+.hs-tile-value {
+  font-size: 30px;
+  font-weight: 650;
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.hs-tile-hint,
+.hs-note {
+  margin: 2px 0 0;
+  font-size: 13px;
+  color: var(--text-faint);
+}
+
+.hs-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* The chips take the SAME fills as the verdict dots on the cards below (.verdict-*): solid for
+   the two outcomes that decide the figures, soft for the quieter pair. A partner scanning from the
+   headline down to a card should not have to re-learn the colours. Each chip also names its
+   verdict in words — the fill is a second cue, never the only one. */
+.hs-count {
+  font-size: 13px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--bg);
+  color: var(--text-soft);
+}
+
+.hs-count--hit {
+  background: var(--good);
+  color: #fff;
+}
+
+.hs-count--false {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.hs-count--miss {
+  background: var(--bad);
+  color: #fff;
+}
+
+.hs-count--ok {
+  background: var(--good-soft);
+  color: var(--good);
+}
+
+.hs-count--muted {
+  background: var(--bg);
+  color: var(--text-faint);
+}
+
+.hs-note {
+  max-width: 78ch;
+}
+
+/* The per-ask-time split. Visually subordinate to the tiles on purpose: it explains the headline
+   rather than competing with it. */
+
+.hs-split {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+/* `list-style: none` plus the WebKit pseudo-element between them remove the browser's own marker on
+   every engine that ships one, so the caret below is the only one on the row. */
+.hs-split-summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  list-style: none;
+  padding: 2px 0;
+}
+
+.hs-split-summary::-webkit-details-marker {
+  display: none;
+}
+
+.hs-split-summary::before {
+  content: '\25B8';
+  display: inline-block;
+  color: var(--text-faint);
+  transition: transform 120ms ease;
+}
+
+.hs-split[open] > .hs-split-summary::before {
+  transform: rotate(90deg);
+}
+
+.hs-split[open] > .hs-split-summary {
+  margin-bottom: 6px;
+}
+
+.hs-split-head {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.hs-split-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.hs-split-label {
+  font-weight: 600;
+  font-size: 14px;
+}
+
+.hs-split-help {
+  font-size: 13px;
+  color: var(--text-soft);
+  max-width: 44ch;
+}
+
+/* `margin-left: auto` holds the trio against the right edge once the row wraps, which at this
+   page's width it always does. A fixed basis rather than a min-width is what keeps the three rows'
+   columns lined up with each other — sized off the longest hint they carry. */
+.hs-split-figures {
+  display: flex;
+  gap: 16px;
+  margin-left: auto;
+}
+
+.hs-split-figure {
+  flex: 0 0 7.5rem;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.hs-split-figure-label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+.hs-split-value {
+  font-size: 19px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.hs-split-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.hs-caveat {
+  margin: 14px 0 0;
+  font-size: 13px;
+  color: var(--text-soft);
+  border-left: 3px solid var(--border);
+  padding-left: 12px;
+  max-width: 78ch;
+}
+
 /* ---- responsive ---- */
 
 @media (max-width: 760px) {
+  /* The figures stop hugging the right edge: at this width the label above them has already
+     wrapped to its own line, and holding them right leaves the row reading as two columns that no
+     longer line up with anything. */
+  .hs-split-figures {
+    margin-left: 0;
+    flex-wrap: wrap;
+  }
+
+  .hs-split-figure {
+    flex: 1 0 6.5rem;
+    text-align: left;
+  }
+
   .sides {
     grid-template-columns: 1fr;
   }

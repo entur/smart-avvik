@@ -10,6 +10,13 @@ ferdigplukket eksempelscenario), og siden viser alle matchende reiser med
 - en ✓/✕-indikator for om varselsbeslutningen (terskel 0,65 på
   P(innstilt eller ≥ 10 min forsinket)) traff.
 
+Øverst i resultatlisten oppsummerer **«Slik ville varslene truffet»**
+(`src/HitSummary.tsx`) hele søket: presisjon og dekning målt på siste prediksjon før
+avgang, med en utslåbar oppdeling per spørretidspunkt. Motstykket til «Slik har varslene
+truffet» på `/historikk`, men i konjunktiv — ingen av disse varslene ble sendt, terskelen
+er spilt av på nytt over holdoutet. Alt telles **per avgang på påstigningsstoppet**, som
+er beslutningen et varsel faktisk er; ankomstsiden på kortene inngår ikke.
+
 Avgang vises til venstre, ankomst til høyre. Bevisst nøytral formgivning — demoen vises
 for partnere med egne designspråk.
 
