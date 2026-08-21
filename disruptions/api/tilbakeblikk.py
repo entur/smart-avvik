@@ -80,9 +80,11 @@ logger = logging.getLogger(__name__)
 _DECISIONS_QUERY = (Path(__file__).parent / "tilbakeblikk_decisions.sql").read_text()
 _SUMMARY_QUERY = (Path(__file__).parent / "tilbakeblikk_summary.sql").read_text()
 _FILTERS_QUERY = (Path(__file__).parent / "tilbakeblikk_filters.sql").read_text()
-# Read but not routed here: /tilbakeblikk-api/messages is a later unit. It is loaded at import for
-# the same reason as the other three -- a missing .sql becomes an import error that stops the whole
-# app at startup rather than a 500 on the first page load.
+# The query behind /tilbakeblikk-api/messages, and the only one of the four that names
+# `message_input`. Its rows are read server-side and never projected: what leaves the process is the
+# wording generated FROM the input. Loaded at import for the same reason as the other three -- a
+# missing .sql becomes an import error that stops the whole app at startup rather than a 500 on the
+# first page load.
 _MESSAGES_QUERY = (Path(__file__).parent / "tilbakeblikk_messages.sql").read_text()
 # /historikk's file, deliberately SHARED rather than cloned: it takes only @refs, has no window of
 # its own, and fails open to bare refs. Two copies would be two things to keep in step for no gain.
