@@ -181,11 +181,40 @@ _MAX_JOURNEYS = 20000
 # raising it is close to zero in aggregate: demand is bursty, not sustained (prd wants ~50 writes a
 # DAY), so this only ever binds on the handful of cycles it exists for.
 _MAX_LLM_CALLS_PER_CYCLE = 64
-# Give-up point for writing one journey × situation's message. Failures are payload-dependent as
-# often as they are transient (a refusal, an over-long or unparseable reply), so a write that failed
-# twice will very likely keep failing for this exact payload — and retrying costs a slot from the
-# per-cycle cap without being able to change what any user already saw.
+# Give-up point for writing one journey × situation's message when the failure is PAYLOAD-dependent
+# — the model was asked and what came back was unusable for this exact input (a refusal, an
+# over-long or unparseable reply, an invented figure). Such a write will very likely keep failing
+# for this payload, and retrying costs a slot from the per-cycle cap without being able to change
+# what any user already saw.
+#
+# This counter used to be charged for EVERY `None`, which is the defect fixed on 2026-08-22. Several
+# of `_write_message`'s paths return `None` without asking a backend at all, and a transient backend
+# failure says nothing whatsoever about the payload — so three bad minutes retired a subject's
+# wording for its whole 12 h life. Measured in prd over the 14 days to 2026-08-21: of the subjects
+# that ever reached `attempts_exhausted`, the statuses that preceded it were **290 `error` and zero
+# `rejected` or `ungrounded`** — the budget was being spent, in prd, exclusively on the one class of
+# failure it was never meant to bound. See :data:`_MAX_TRANSIENT_ATTEMPTS`.
 _MAX_MESSAGE_ATTEMPTS = 3
+# ...and the separate, larger give-up point for TRANSIENT failures: the backend was reached and did
+# not answer (a timeout, a 429, a 5xx). A bound is still needed -- each one costs a real call and a
+# slot from `_MAX_LLM_CALLS_PER_CYCLE`, and a subject that fails every cycle for 12 h would spend
+# ~240 of them -- but it must be far looser than the payload one, because a retry here genuinely
+# works: of prd's 270 subjects that hit at least one `error` in those 14 days, **149 (55 %) went on
+# to succeed**, while 99 were retired at three. Those 99 are wordings that a retry would have
+# produced and the cap threw away.
+#
+# 12, sized above the worst run actually observed (p50 2 errors per subject, max 9) so that every
+# case measured would now get through, while still bounding the pathological one. It is a ceiling on
+# waste, not a target -- unlike the payload counter, reaching it says the environment is unwell, and
+# `transient_exhausted` on the decision row is what makes that visible instead of blaming the model.
+_MAX_TRANSIENT_ATTEMPTS = 12
+# What a failed write says about the PAYLOAD versus about the environment. The three-way split is
+# the whole fix: a status naming neither is one where no backend was asked at all (`disabled`,
+# `unavailable`, an input that could not be built), which costs nothing and teaches nothing, so it
+# must charge neither counter -- that is the path that produced prd's 753 `llm_disabled` rows beside
+# 693 `attempts_exhausted` across the same 11 subjects on 2026-08-07.
+_PAYLOAD_FAILURES = frozenset({"rejected", "ungrounded"})
+_TRANSIENT_FAILURES = frozenset({"error"})
 # Written messages per JOURNEY per cycle. The cycle cap above bounds the poller thread; this one
 # stops a single journey spending all of it. A journey routinely has more disrupted trains than
 # either budget can cover -- measured on dev over 4 099 journey-cycles: p50 3 alert-worthy trains,
@@ -663,9 +692,15 @@ _messages: dict[tuple[str, str, str], str] = {}
 # A 12 h-long situation would otherwise keep advising an escape route chosen against numbers from
 # hours ago -- including one the selection rule has since decided against.
 _alternatives: dict[tuple[str, str, str], AlternativeJourney] = {}
-# Same key, same lifecycle: how many times writing this message has failed, so a payload the LLM
-# cannot handle is not retried on every tick for the situation's whole life.
+# Same key, same lifecycle: how many times writing this message has failed FOR REASONS TO DO WITH
+# THE PAYLOAD, so an input the LLM cannot handle is not retried on every tick for the situation's
+# whole life. See :data:`_MAX_MESSAGE_ATTEMPTS`.
 _message_attempts: dict[tuple[str, str, str], int] = {}
+# Same key, same lifecycle: how many times the backend was reached and failed TRANSIENTLY. Counted
+# apart from `_message_attempts` because the two answer different questions -- "is this payload
+# hopeless?" and "is Vertex having a bad morning?" -- and one counter answering both meant a bad
+# morning permanently retired a perfectly writable payload. See :data:`_MAX_TRANSIENT_ATTEMPTS`.
+_message_errors: dict[tuple[str, str, str], int] = {}
 # Same key, same lifecycle: how this journey x situation's message came about —
 # {"status": ..., "provider": ..., "model": ...}. Written here rather than derived at record time
 # because only this loop can tell a per-cycle cap from an exhausted retry from a model that refused,
@@ -1549,7 +1584,13 @@ def _remember_message_meta(
             meta["model"] = model
 
 
-def _write_message(alert: Alert, *, journey_key: str, message_input: dict | None) -> str | None:
+def _write_message(
+    alert: Alert,
+    *,
+    journey_key: str,
+    message_input: dict | None,
+    outcome: dict[str, Any] | None = None,
+) -> str | None:
     """The LLM-written body for this journey × situation, or None to use the template wording.
 
     Takes the message input this cycle already built rather than building its own, so what the model
@@ -1571,17 +1612,40 @@ def _write_message(alert: Alert, *, journey_key: str, message_input: dict | None
     is the point: prd runs with delivery off, and the recorded pair is the only way its own pushes
     can be compared against what the model would have said. The per-cycle budgets in
     :func:`check_and_notify` bound what that costs; nothing here widened them.
+
+    `outcome`, when passed, is filled with ``{"status": ...}``: **why** this returned what it did,
+    which the returned text alone cannot say — every failure mode here produces the same `None`.
+    The caller needs it to decide which retry budget the failure should be charged to, and charging
+    the wrong one is not a cosmetic mistake: it retires a writable payload for the situation's whole
+    life (see :data:`_MAX_MESSAGE_ATTEMPTS`).
+
+    An out-parameter rather than a richer return type, for exactly the reason
+    `alternatives.fetch_candidates` gives for the same choice: this function is stubbed wholesale in
+    25 places across the suites, and an unstubbed or legacy caller must keep the plain `str | None`
+    contract. A stub that returns a string is unaffected; a stub that returns `None` leaves the
+    status unset, which the caller reads as "no backend was asked" and charges to nothing — the
+    conservative direction, since the alternative would be to retire subjects on a test double's
+    behalf.
     """
+    def note(status: str) -> None:
+        if outcome is not None:
+            outcome["status"] = status
+
     if message_input is None:
+        # No backend was asked and none could be: there is nothing to prompt with. Charging a retry
+        # budget for this would count the absence of an input as evidence about the model.
+        note("no_input")
         return None  # _message_input already logged why
     try:
         import llm_message
 
         if not llm_message.generation_enabled():
+            note("disabled")
             return None
         result = llm_message.write_message_detailed(
             message_input, journey_key=journey_key, situation_number=alert.situation_number
         )
+        note(result.status)
         _remember_message_meta(
             _message_key(journey_key, alert),
             status=result.status,
@@ -1595,6 +1659,11 @@ def _write_message(alert: Alert, *, journey_key: str, message_input: dict | None
             exc_info=True,
             extra={"fields": {"event": "llm_message", "result": "error"}},
         )
+        # Charged as transient, not payload. `llm_message.write_message_detailed` never raises, so
+        # reaching here means the import failed, the environment is broken, or a future edit let
+        # something escape — none of which is evidence that THIS input is unwritable, and all of
+        # which a later cycle may find fixed.
+        note("error")
         return None
 
 
@@ -1955,9 +2024,11 @@ def _forget_message(message_key: tuple[str, str, str]) -> None:
     so a message dropped without its meta files the next cycle's deterministic row as ``ok_cached`` —
     a row claiming to carry text that no longer exists.
 
-    The failure count is deliberately NOT cleared: it bounds retries for a payload the writer cannot
-    handle, and restarting that budget every time an alternative moved would re-open the ~720
-    calls-per-situation hole :data:`_MAX_MESSAGE_ATTEMPTS` was added to close.
+    NEITHER failure count is cleared, deliberately — not `_message_attempts` and not
+    `_message_errors`. They bound retries for a payload the writer cannot handle and for a backend
+    that will not answer, and restarting either budget every time an alternative moved would re-open
+    the ~720 calls-per-situation hole :data:`_MAX_MESSAGE_ATTEMPTS` was added to close. Only a
+    SUCCESSFUL write clears them, which is the one event that is actual evidence about either.
     """
     with _state_lock:
         _messages.pop(message_key, None)
@@ -2118,6 +2189,8 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             _alternatives.pop(key, None)
         for key in [k for k in _message_attempts if k[1] not in live]:
             _message_attempts.pop(key, None)
+        for key in [k for k in _message_errors if k[1] not in live]:
+            _message_errors.pop(key, None)
         for key in [k for k in _message_meta if k[1] not in live]:
             _message_meta.pop(key, None)
         changed = bool(stale)
@@ -2196,7 +2269,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # of it blocks on anything. The split is behaviour-preserving -- `_reconcile_caches` for one
     # journey never reads another journey's alerts, and `_pending_pushes` reads `_notified`, which
     # only loop 2 writes.
-    write_queue: list[tuple[str, Alert, tuple[str, str, str], int]] = []
+    write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int]] = []
     for key, alerts in matched:
         journey = by_journey_key[key]
         alerts_by_key[key] = alerts
@@ -2262,6 +2335,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 # already cached.
                 already_written = message_key in _messages
                 attempts = _message_attempts.get(message_key, 0)
+                errors = _message_errors.get(message_key, 0)
             # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A
             # `None` from `_write_message` costs an attempt (see pass 1c), but several of its paths
             # never call a backend at all — this one, where no backend can be asked. So three cycles
@@ -2288,7 +2362,15 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 # succeeded now cannot use.
                 _remember_message_meta(message_key, status="attempts_exhausted")
                 continue
-            write_queue.append((key, subject, message_key, attempts))
+            if errors >= _MAX_TRANSIENT_ATTEMPTS:
+                # The same stop, on the other budget and with a different meaning: the backend has
+                # been unreachable for this subject a dozen times running. Recorded under its own
+                # status so the two never have to be told apart by guesswork -- `attempts_exhausted`
+                # is a verdict on the payload, `transient_exhausted` is a verdict on the morning,
+                # and a rate computed across both measures neither.
+                _remember_message_meta(message_key, status="transient_exhausted")
+                continue
+            write_queue.append((key, subject, message_key, attempts, errors))
 
     # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
     # until the budget could actually bind across journeys there was nothing to order. The queue
@@ -2316,8 +2398,8 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # `_MAX_LLM_CALLS_PER_CYCLE` of them run per cycle; sequentially that is the difference between
     # a budget of 8 (~18 s, all of the ceiling) and one of 64 (~140 s, absurd). Across
     # `_LLM_WORKERS` it is ~9 s.
-    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int]) -> None:
-        key, subject, message_key, attempts = item
+    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int, int]) -> None:
+        key, subject, message_key, attempts, errors = item
         # Claimed here rather than filtered above, so the ceiling is spent on calls that actually
         # START. A pre-filter would hand the budget to the first N in the queue whether or not the
         # clock still allowed them.
@@ -2325,12 +2407,16 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             _remember_message_meta(message_key, status="capped")
             return
         # _write_message catches Exception itself, so this is belt and braces for a future edit
-        # that lets one escape. It records an attempt rather than returning past the counter, so a
-        # raiser is subject to the same give-up rule as a None. Delivery is unaffected either way:
+        # that lets one escape. It charges a retry budget rather than returning past the counters, so
+        # a raiser is subject to the same give-up rule as a None. Delivery is unaffected either way:
         # loop 2 pushes independently and falls back to the deterministic wording.
+        outcome: dict[str, Any] = {}
         try:
             message = _write_message(
-                subject, journey_key=key, message_input=message_inputs.get(message_key)
+                subject,
+                journey_key=key,
+                message_input=message_inputs.get(message_key),
+                outcome=outcome,
             )
         except Exception:
             logger.warning(
@@ -2340,13 +2426,33 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 extra={"fields": {"event": "llm_message", "result": "error"}},
             )
             message = None
+            outcome["status"] = "error"
             _remember_message_meta(message_key, status="error")
+        # WHICH BUDGET A FAILURE IS CHARGED TO -- the 2026-08-22 fix. Every `None` used to charge
+        # `_message_attempts`, so three bad minutes at Vertex retired a subject's wording for the
+        # situation's whole 12 h life. In prd that was not a corner case: of the subjects that ever
+        # reached `attempts_exhausted` in the 14 days to 2026-08-21, the statuses preceding it were
+        # 290 `error` and ZERO `rejected`/`ungrounded`, while 55 % of all subjects that hit an error
+        # went on to succeed on a later cycle. The counter was, in practice, doing the exact opposite
+        # of its job.
+        #
+        # Three outcomes, three treatments, and the third is the one worth naming: a status in
+        # NEITHER set means no backend was asked (`disabled`, `unavailable`, no input, or a stub in
+        # a test). Nothing was spent and nothing was learned, so it charges nothing -- and it must
+        # not fall through to a default, which is how this was wrong before.
+        status = outcome.get("status")
         with _state_lock:
             if message:
                 _messages[message_key] = message
+                # Both budgets, because a success says the payload is writable AND the backend is
+                # reachable. Leaving the error count standing would let a subject that recovers
+                # still be retired by errors it has demonstrably outlived.
                 _message_attempts.pop(message_key, None)
-            else:
+                _message_errors.pop(message_key, None)
+            elif status in _PAYLOAD_FAILURES:
                 _message_attempts[message_key] = attempts + 1
+            elif status in _TRANSIENT_FAILURES:
+                _message_errors[message_key] = errors + 1
 
     if write_queue:
         with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, len(write_queue))) as pool:
