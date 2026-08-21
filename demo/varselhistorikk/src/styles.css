@@ -86,34 +86,48 @@ body {
   color: inherit;
 }
 
-/* The three narrowings, stacked. A column rather than a row because they COMPOSE -- side by side,
-   at the end of a line of dropdowns, they read as three alternatives to pick between. */
+/* Fra/Til carry stop NAMES, which run long ("Nyvoll ferjekai", "Sandvika stasjon") and would
+   otherwise stretch their control to the widest entry in the list and push the checkbox column off
+   the row. Capped rather than truncated to a fixed width: a short list of short names still gets a
+   compact control, and the native select truncates the overflow itself. */
+.vh-select--wide select {
+  max-width: 12rem;
+}
+
+/* The three narrowings, in a row on a LINE OF THEIR OWN -- `flex-basis: 100%` in the wrapping
+   parent, so they never share a line with the dropdowns whatever the viewport is.
+
+   They were a column until 2026-08-21, and the reason was sound at the time: side by side at the
+   END OF A LINE OF DROPDOWNS they read as three more alternatives to pick between, rather than as
+   three switches that compose. The filter row has five dropdowns now, so the group wrapped below
+   them regardless -- and on its own line a row reads as what it is. The `flex-basis` is what keeps
+   that true rather than leaving it to how wide the window happens to be: at a width where the
+   checks fitted beside the selects again, the old misreading would come straight back. */
 .vh-checks {
+  flex-basis: 100%;
   display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 1.5rem;
   font-size: 0.875rem;
 }
 
-/* Two of the three controls on this row carry no caption, and a caption is what decides how far
-   down its block a control box sits: centring the BLOCKS therefore leaves the uncaptioned ones
-   riding ~10 px above the selects. These get an empty caption line of their own, from the same
-   font-size and line-height a real one would use -- so it tracks the type rather than a magic
-   number -- and every control box lands on one midline. */
-.vh-window,
-.vh-checks {
-  --vh-phantom-caption: '\00a0';
-}
-
+/* The window buttons carry no caption, and a caption is what decides how far down its block a
+   control box sits: centring the BLOCKS therefore leaves an uncaptioned one riding ~10 px above the
+   selects. This gives it an empty caption line of its own, from the same font-size and line-height a
+   real one would use -- so it tracks the type rather than a magic number -- and every control box on
+   that line lands on one midline. `.vh-checks` needed the same treatment while it sat on that line;
+   now that it has its own, a phantom caption would only be a blank first flex item to the left of
+   the first checkbox. */
 .vh-window {
+  --vh-phantom-caption: '\00a0';
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
   font-size: 0.875rem;
 }
 
-.vh-window::before,
-.vh-checks::before {
+.vh-window::before {
   content: var(--vh-phantom-caption);
 }
 

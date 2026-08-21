@@ -22,6 +22,15 @@
 -- which is precisely what llm_message.key_digest and VARSEL_LLM_LOG_PROMPTS=false already keep out
 -- of the logs. The page identifies a decision by its train, not by whose trip it was.
 --
+-- That is now a narrower claim than it was, and the narrowing was deliberate (2026-08-21): from_stop
+-- and to_stop became FILTERABLE, so the pair can be chosen and the matching departures read off, and
+-- historikk_filters.sql publishes the vocabulary of registered endpoints to populate the dropdowns
+-- with. What survives is the per-row redaction below -- no card names a journey, and a full listing
+-- still does not pair an origin with a destination -- but "the public page cannot reconstruct a
+-- commute" no longer holds on its own. Journey_digest remains absent from both surfaces. If this
+-- page ever wants stronger ground than that, the fix is access control on /historikk, not a smaller
+-- SELECT list.
+--
 -- Cost: the outcomes side prunes on its call_date partition. The groups side does NOT:
 -- varsel_decisions is partitioned on DATE(decided_at) and the view aggregates before any filter
 -- can reach it, so `call_date BETWEEN` is a post-aggregation filter over a full scan. Acceptable
@@ -48,6 +57,14 @@ FROM `disruptions.varsel_decision_outcomes` AS o
 WHERE o.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR o.operator = @operator)
   AND (@verdict  IS NULL OR o.verdict  = @verdict)
+  AND (@line     IS NULL OR o.line     = @line)
+  -- The traveller's own registered endpoints. Filtered on, never selected: the dropdowns need the
+  -- vocabulary (historikk_filters.sql), the cards do not need the value, and keeping it out of the
+  -- projection is what keeps the Decision model's extra="forbid" a working guard rather than a
+  -- comment. NULL from_stop/to_stop rows are dropped by an active filter, which is right -- a
+  -- decision that records no origin cannot be claimed to have started anywhere in particular.
+  AND (@from_place IS NULL OR o.from_stop = @from_place)
+  AND (@to_place   IS NULL OR o.to_stop   = @to_place)
   AND (NOT @alerted_only OR o.ever_alerted)
   -- "With ground truth" is the OUTCOME being known, which is what outcome_state calls 'avklart' --
   -- deliberately not `verdict IS NOT NULL`. The two differ by one row shape: an outcome that
@@ -84,6 +101,10 @@ SELECT
 FROM `disruptions.varsel_decision_groups` AS g
 WHERE g.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR g.operator = @operator)
+  AND (@line     IS NULL OR g.line     = @line)
+  -- Same three as the labelled side; see the note there for why they are filtered but not selected.
+  AND (@from_place IS NULL OR g.from_stop = @from_place)
+  AND (@to_place   IS NULL OR g.to_stop   = @to_place)
   -- Unlabelled rows carry no verdict, so a verdict filter must exclude them all rather than
   -- silently returning them as if they matched.
   AND @verdict IS NULL

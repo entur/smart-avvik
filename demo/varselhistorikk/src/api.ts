@@ -110,6 +110,32 @@ export interface Summary {
   n_unsegmented: number;
 }
 
+/** One entry in the "Fra"/"Til" dropdowns. The ref is the filter value — it is what the decision
+ *  log stores — and the name is only for display, so an unresolvable ref still filters correctly. */
+export interface PlaceOption {
+  ref: string;
+  /** Null when no stop list has loaded server-side, or the ref is not in it. Show the ref then. */
+  name: string | null;
+}
+
+/** What the dropdowns can be set to, over the current window.
+ *
+ *  Its own endpoint, not derived from the decisions on screen: that list is capped at 200 and
+ *  ordered by departure, so options taken from it would omit anything that only ran early in the
+ *  window — and would shrink to the current selection once a filter was applied. It is also the
+ *  server's allow-list, which is why a stale selection must be cleared rather than sent: an
+ *  unknown value is a 400, not an empty result. */
+export interface FilterOptions {
+  from_date: string;
+  to_date: string;
+  operators: string[];
+  /** Full line refs ("VYG:Line:R11"), not the short code the cards show — two codespaces can share
+   *  a short code, and the ref is what the filter compares against. Render with lineCode(). */
+  lines: string[];
+  from_places: PlaceOption[];
+  to_places: PlaceOption[];
+}
+
 /** Which deployment answered. Its own endpoint because it must survive a decision log that cannot
  *  be read — see the config route in disruptions/api/historikk.py. */
 export interface Config {
@@ -121,6 +147,13 @@ export interface Filters {
   fromDate?: string;
   toDate?: string;
   operator?: string;
+  /** Full line ref, e.g. "VYG:Line:R11". */
+  line?: string;
+  /** StopPlace ref the registration boards at. Values come from fetchFilterOptions — sending one
+   *  the server does not know is a 400, so a selection is cleared when the window moves off it. */
+  fromPlace?: string;
+  /** StopPlace ref the registration alights at. */
+  toPlace?: string;
   verdict?: Verdict;
   alertedOnly?: boolean;
   /** Only decisions whose outcome is known — 'avklart', i.e. everything except 'venter' and
@@ -148,6 +181,9 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.fromDate) params.set('from_date', filters.fromDate);
   if (filters.toDate) params.set('to_date', filters.toDate);
   if (filters.operator) params.set('operator', filters.operator);
+  if (filters.line) params.set('line', filters.line);
+  if (filters.fromPlace) params.set('from_place', filters.fromPlace);
+  if (filters.toPlace) params.set('to_place', filters.toPlace);
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
   if (filters.resolvedOnly) params.set('resolved_only', 'true');
@@ -164,8 +200,18 @@ export function fetchDecisions(filters: Filters): Promise<DecisionsResponse> {
 }
 
 export function fetchSummary(filters: Filters): Promise<Summary> {
-  // The summary describes the whole window, so the verdict/alerted/resolved filters — which narrow
-  // the list — deliberately do not apply to it. Filtering to hits would make precision read 100 %.
-  const { fromDate, toDate, operator } = filters;
-  return get(`/historikk-api/summary?${query({ fromDate, toDate, operator })}`);
+  // Only the filters that narrow the POPULATION reach the summary — which trains, on whose
+  // registered journeys — so its rates describe the same slice the list beside it shows. The
+  // verdict/alerted/resolved ones narrow by OUTCOME and deliberately do not: filtering to hits
+  // would make precision read 100 %. The API refuses them here for the same reason.
+  const { fromDate, toDate, operator, line, fromPlace, toPlace } = filters;
+  return get(`/historikk-api/summary?${query({ fromDate, toDate, operator, line, fromPlace, toPlace })}`);
+}
+
+/** The dropdown vocabulary for a window. Takes only the window: options narrowed by the current
+ *  selection would shrink to it, leaving no way back to the rest of the window. */
+export function fetchFilterOptions(
+  dateWindow: Pick<Filters, 'fromDate' | 'toDate'>,
+): Promise<FilterOptions> {
+  return get(`/historikk-api/filters?${query(dateWindow)}`);
 }

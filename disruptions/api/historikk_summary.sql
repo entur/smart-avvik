@@ -47,6 +47,13 @@
 -- "Inserted row has wrong column count; Has 35, expected 36"). The synthetic ids are the same
 -- `KIX:` scheme the ET relay established, one namespace per provenance.
 --
+-- WHICH FILTERS REACH THIS FILE, and why it is not all of them. operator, line, from_place and
+-- to_place narrow the POPULATION -- which trains, on whose registered journeys -- so the rates here
+-- are computed over exactly the decisions the list beside them is showing, and both answer the same
+-- question about the same slice. verdict, alerted_only and resolved_only do NOT reach it, because
+-- they narrow by OUTCOME: filtering to hits would make precision read 100 %. The distinction is the
+-- whole reason api.ts hands /summary a different subset of the filter object than /decisions.
+--
 -- Resolution order matters where they overlap: `relayed` wins. A no-SX call can be declared
 -- cancelled by ET between the cycle that scored it and the cycle the verdict judges, at which point
 -- what the traveller got WAS a relayed fact, whatever produced the first row about that train.
@@ -69,6 +76,9 @@ WITH labelled AS (
   FROM `disruptions.varsel_decision_outcomes`
   WHERE call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR operator = @operator)
+    AND (@line     IS NULL OR line     = @line)
+    AND (@from_place IS NULL OR from_stop = @from_place)
+    AND (@to_place   IS NULL OR to_stop   = @to_place)
 ),
 -- Unlabelled groups, split by whether a verdict is still possible. A decision with no journey key
 -- can never be joined to a realized call -- the labelling job skips it permanently -- so it is
@@ -80,6 +90,9 @@ unlabelled AS (
   FROM `disruptions.varsel_decision_groups` AS g
   WHERE g.call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR g.operator = @operator)
+    AND (@line     IS NULL OR g.line     = @line)
+    AND (@from_place IS NULL OR g.from_stop = @from_place)
+    AND (@to_place   IS NULL OR g.to_stop   = @to_place)
     AND NOT EXISTS (
       SELECT 1
       FROM `disruptions.varsel_decision_outcomes` AS o
@@ -124,6 +137,9 @@ hits_per_train AS (
   FROM `disruptions.varsel_decision_outcomes`
   WHERE call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR operator = @operator)
+    AND (@line     IS NULL OR line     = @line)
+    AND (@from_place IS NULL OR from_stop = @from_place)
+    AND (@to_place   IS NULL OR to_stop   = @to_place)
     AND verdict = 'hit'
   GROUP BY
     -- varsel.one_alert_per_train's key, in its own order of preference: the boarding call, then
