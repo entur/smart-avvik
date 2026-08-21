@@ -20,10 +20,24 @@ up, so a narrowed range never drops a minute the caller asked for, and the whole
 00:00 to the FOLLOWING midnight — 23:59:59.999999 is not on a 15-minute grid, and quantizing it down
 would silently drop the last quarter-hour of every default request.
 
-**This module is U1 of the plan and serves four routes only** — ``config``, ``filters``,
-``decisions`` and ``summary``. The regeneration path (``/messages``) is a separate unit; the query
-that feeds it (``tilbakeblikk_messages.sql``) is created here because that is the file that carries
-the privacy boundary, and because :func:`configure` is where its client comes from.
+**Five routes.** ``config``, ``filters``, ``decisions`` and ``summary`` are BigQuery only; ``messages``
+is the one that calls Vertex AI. They are separate endpoints deliberately: a Vertex outage empties
+the wordings and leaves every card, filter and statistic on the page intact, where one endpoint would
+503 the whole thing. The two lists are aligned POSITION BY POSITION — nothing served identifies a
+decision uniquely, since the real grain includes the redacted ``journey_digest`` — which is why
+``tilbakeblikk_messages.sql`` repeats ``tilbakeblikk_decisions.sql``'s WHERE and ORDER BY verbatim.
+
+**``/messages`` regenerates; it never renders what was stored.** It reads back the ``message_input``
+document recorded on the chosen cycle, hands it to today's prompt, and returns the result beside the
+deterministic wording built from the same document. It asks :func:`llm_message.generation_enabled`
+and never ``delivery_enabled`` — whether a *traveller* is sent model prose is a different question,
+settled per deployment, and consulting it here would blank this page in prd, which is the one
+deployment that generates without delivering. Bounded four ways (see the constants): a per-request
+cap in backend CALLS, a per-minute budget tallied against replay's own allowance, a wall-clock
+deadline that reserves the worst case rather than measuring elapsed time, and a cache keyed on the
+replayed row plus the prompt version. It runs against its OWN backend latch
+(:func:`llm_message.new_replay_state`), so a replay burst that drives both backends into a
+configuration error cannot strip model wordings from real pushes for the next half hour.
 
 Privacy is inherited verbatim from /historikk (KTD10) and extended by one column. No decision row
 carries ``journey_digest``, ``from_stop``, ``to_stop`` — or ``message_input``, which embeds all three
@@ -42,15 +56,21 @@ other.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta
+from functools import partial
 from pathlib import Path
 from time import monotonic
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 import historikk
+import llm_message
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -101,13 +121,112 @@ _MAX_LIMIT = historikk._MAX_LIMIT
 # Revisit the number when the decision log approaches it — at that point it becomes both.
 _MAX_BYTES_BILLED = 2 * 1024**3
 
+# ---- The replay bounds -------------------------------------------------------------------------
+# Four of them, every one a number rather than an adjective, because /messages is the only path in
+# this process that makes a blocking network call to Vertex AI from a public unauthenticated
+# request. What is actually being bounded is not page responsiveness: it is the per-project Vertex
+# quota the POLLER shares. A replay burst that eats it makes a real push wording 429, and a 429 is a
+# *transient* failure — `write_message_detailed` returns status="error" immediately without trying
+# the other backend — so a traveller silently receives the template and nothing on that side says so.
+#
+# 1. Per request, counted in BACKEND CALLS rather than in subjects: under VARSEL_LLM_PROVIDER=auto
+#    one subject can spend two, because an empty or ungrounded reply continues to the next backend —
+#    and a prompt edit that trips the grounding check trips it for every subject at once, which is
+#    exactly the situation somebody uses this page in.
+_MAX_CALLS_PER_REQUEST = 12
+# 2. Per minute, across requests: one full request's worth inside the wall-clock deadline below, so
+#    it binds on a second concurrent request rather than never.
+_MAX_CALLS_PER_MIN = 24
+_RATE_WINDOW_S = 60.0
+
+# How many backend calls one subject is charged for. CONSERVATIVE, and the choice is forced:
+# `write_message_detailed` reports which backend answered but not how many it tried, so the count has
+# to be decided before the call rather than read off the result. Two alternatives were rejected.
+# Inferring it from `result.provider` fails on exactly the paths where more than one backend ran —
+# `rejected` and `ungrounded` return provider=None. Wrapping `llm_message._BACKENDS` to count for
+# real would install a counting proxy on a module global the POLLER calls through, which would both
+# count its calls and be visible to it; the isolation this surface is built around (a private latch,
+# a private client cache) exists precisely to avoid reaching into shared state like that.
+#
+# So the reservation is the `auto` worst case and is never refunded. The cost is one-sided on
+# purpose: a happy-path request (Claude answers first) generates 6 subjects rather than 12, which
+# costs a page refresh — successive requests fill the rest, since the cache is consulted before the
+# budget. An under-count would let one request spend 24 Vertex calls against a stated ceiling of 12,
+# which costs a traveller their push wording. A deployment pinned to one backend simply under-spends.
+_CALLS_PER_SUBJECT = 2
+
+# 3. The wall clock, RESERVED rather than measured. `monotonic() + _WORST_CASE_CALL_S >= deadline`
+#    stops a new call being started; checking elapsed time instead would bound when the last call
+#    *starts*, not when the pass ends. The check runs inside the worker as its task starts, never at
+#    submit time — submitted all at once, every task queues before the deadline is consulted and the
+#    bound guarantees nothing.
+#
+#    16 s is the reachable worst case for one subject, by one path only: a first backend that returns
+#    an empty or ungrounded reply near `llm_message._TIMEOUT_S` (8 s) and continues, then a second
+#    that times out. A timeout on its own does NOT reach the second backend — the generic
+#    `except Exception` returns status="error" straight away — and prd is the *cheapest* path rather
+#    than the worst, because an unserved Claude 404s in well under a second.
+_REQUEST_DEADLINE_S = 30.0
+_WORST_CASE_CALL_S = 16.0
+# Pool width. `varsel._PUSH_WORKERS` is the shape, not the number — it is 8; 4 leaves room beside the
+# poller. At this width the per-request cap costs three rounds, about 7 s typically.
+_REPLAY_WORKERS = 4
+
+# 4. The wording cache, separate from the BigQuery response cache above and keyed differently: the
+#    subject key INCLUDING the replayed decided_at, plus llm_message.PROMPT_VERSION. Both halves are
+#    load-bearing. The prompt version is what makes a prompt edit invalidate the page rather than
+#    show yesterday's answer under today's brief; the replayed timestamp is what makes narrowing the
+#    window — which picks a different cycle — correctly miss rather than serve the wider window's
+#    wording under a different time.
+#
+# 2 000 entries, each one wording of at most 300 characters plus its metadata, because memory is the
+# binding constraint on this pod (1228 Mi in dev, forceReplicas 1, and uvicorn binds only after
+# lifespan's eager BigQuery loads, so an OOMKill is zero capacity for a whole cold start).
+_WORDING_MAX_ENTRIES = 2000
+_WORDING_TTL_S = 1800.0
+# A failure that nothing about the input caused is cached far more briefly than an answer: a
+# transient Vertex error must not stick a red badge on a card for half an hour after Vertex
+# recovers. Cached at all, and not simply left uncached, because during an outage every refresh
+# would otherwise re-spend the whole budget on the same first subjects and never reach the rest.
+_WORDING_ERROR_TTL_S = 60.0
+_wording_lock = threading.Lock()
+_wordings: dict[tuple, tuple[float, _Wording]] = {}
+
+# The per-minute tally, keyed BY CALLER in the shape of `alternatives._fetch_calls`. Replay spends
+# only its own key, so its ceiling is its own number. Be honest about what this does here: the poller
+# does not call this module at all, so its slot stays empty by construction — the keying is what
+# makes that a structural property rather than a fact somebody has to keep true, and what stops a
+# later caller from silently drawing replay's allowance down. The coupling it defends against is one
+# layer out, at Vertex, where the two really do share a quota.
+_REPLAY_PATH = "replay"
+_POLLER_PATH = "poller"
+_budget_lock = threading.Lock()
+_replay_calls: dict[str, list[float]] = {_REPLAY_PATH: [], _POLLER_PATH: []}
+
 _bq_client: Any | None = None
+# varsel._deterministic_body, injected. See :func:`configure`.
+_deterministic_writer: Callable[[dict], str] | None = None
+_warned_no_writer = False
 
 
-def configure(*, bq_client: Any) -> None:
-    """Wire in the BigQuery client. Called once from main.lifespan."""
-    global _bq_client
+def configure(
+    *, bq_client: Any, deterministic_writer: Callable[[dict], str] | None = None
+) -> None:
+    """Wire in the BigQuery client and the template writer. Called once from main.lifespan.
+
+    ``deterministic_writer`` is ``varsel._deterministic_body`` — a pure function of the stored
+    ``message_input`` — passed in the way :mod:`historikk`, :mod:`impact` and :mod:`reisevalg` all
+    take their dependencies. Importing :mod:`varsel` directly would pull a 147 KB module carrying the
+    poller's mutable state onto a public request path for the sake of one pure function.
+
+    Optional and fail-soft: without it every card simply has no template arm to compare the
+    regenerated wording against, which is a poorer page rather than a broken one. It is the arm, not
+    the answer.
+    """
+    global _bq_client, _deterministic_writer
     _bq_client = bq_client
+    if deterministic_writer is not None:
+        _deterministic_writer = deterministic_writer
 
 
 class Decision(BaseModel):
@@ -264,6 +383,82 @@ class DecisionsResponse(WindowFields):
 
     count: int = Field(description="Number of decisions returned.")
     decisions: list[Decision] = Field(description="Matching decisions, newest departure first.")
+
+
+class ReplayedMessage(BaseModel):
+    """What today's prompt writes for one replayed decision — and why, when it wrote nothing.
+
+    Aligned POSITION BY POSITION with :class:`DecisionsResponse`'s list: the same window, the same
+    filters, the same ORDER BY and the same LIMIT, resolved by a query that repeats the other's
+    predicate verbatim. The four identifying fields below are echoed so a client can *assert* that
+    alignment rather than assume it; they are all fields ``/decisions`` already serves.
+
+    PRIVACY: the stored ``message_input`` — origin, destination and departure time in one blob — is
+    read server-side and never leaves the process. What leaves is the wording generated FROM it.
+    ``extra="forbid"`` for the same reason as :class:`Decision`: it makes a future field addition
+    fail here rather than quietly widen what an unauthenticated public host serves.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    situation_number: str | None = Field(description="SIRI-SX situationNumber, for alignment.")
+    line: str | None = Field(description="Line ref of the matched train, for alignment.")
+    mode: str | None = Field(description="Vehicle noun: 'Tog' or 'Buss'.")
+    departure_time: datetime | None = Field(description="Aimed departure (UTC), for alignment.")
+    would_send_at: datetime | None = Field(
+        description="decided_at of the replayed cycle (UTC) — when this wording could have been "
+        "sent. Null when nothing in the window was replayable.",
+    )
+
+    status: str = Field(
+        description="Why this entry has the content it has. 'ok' — the model answered. 'no_input' — "
+        "no alert-worthy cycle in the window recorded a writer's input, so there is nothing to "
+        "replay (R7): not 'no message', not an error, and no generation was attempted. "
+        "'unreadable_input' — a recorded input that would not parse. 'disabled' — no backend could "
+        "be ASKED (VARSEL_LLM_PROVIDER=off, no project, or every backend latched off); it never "
+        "means 'this deployment sends the template'. 'unavailable' / 'error' / 'rejected' / "
+        "'ungrounded' come straight off llm_message.MessageResult. 'capped', 'rate_limited' and "
+        "'deadline' are this request's own bounds — the subject was not attempted, and a later "
+        "request will pick it up, because the cache is consulted before the budget.",
+    )
+    message: str | None = Field(
+        description="What today's prompt wrote, or null on every status but 'ok'.",
+    )
+    deterministic_message: str | None = Field(
+        description="The template wording built from the SAME stored input — the comparison arm, "
+        "which is the point of the page. Present whenever an input was replayable, including when "
+        "generation was bounded out, and independent of whether this deployment delivers model "
+        "prose to travellers.",
+    )
+    discarded: str | None = Field(
+        description="The reply that was thrown away on 'ungrounded' and 'rejected' — a model did "
+        "answer and the answer was refused. Those two are exactly what a prompt edit produces, so a "
+        "status badge with no text would hide the thing being iterated on. Never delivered, never "
+        "stored on a decision row.",
+    )
+    provider: str | None = Field(description="'claude' or 'gemini' — which backend answered.")
+    model: str | None = Field(description="The model id behind that backend.")
+
+    prompt_version: str | None = Field(
+        description="SHA-256[:8] of the prompt in force when the ORIGINAL wording was written; null "
+        "when nothing was replayable.",
+    )
+    current_prompt_version: str = Field(
+        description="SHA-256[:8] of the prompt that wrote `message`. Differs from prompt_version "
+        "exactly when the row predates the current brief. It does NOT separate a prompt change from "
+        "sampling variance: each wording is a single draw from a non-deterministic decoder (R9).",
+    )
+
+
+class MessagesResponse(WindowFields):
+    """Regenerated wordings for the same subjects, in the same order, as ``/decisions``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    count: int = Field(description="Number of subjects returned; matches /decisions' count.")
+    messages: list[ReplayedMessage] = Field(
+        description="One entry per subject, positionally aligned with /decisions' list.",
+    )
 
 
 class ConfigResponse(BaseModel):
@@ -762,6 +957,382 @@ def _query(sql: str, params: list, cache_key: tuple):
     return rows
 
 
+# ---- Replay ------------------------------------------------------------------------------------
+class _Wording(NamedTuple):
+    """One replayed wording and its provenance — what the cache holds and the response renders.
+
+    Deliberately NOT a :class:`ReplayedMessage`: the identifying half of that model comes from the
+    row and is the same whatever the wording turned out to be, so caching it would mean caching a
+    copy of the subject beside every wording, and a cache entry that could disagree with the row it
+    was keyed on.
+    """
+
+    message: str | None
+    deterministic: str | None
+    status: str
+    discarded: str | None
+    provider: str | None
+    model: str | None
+
+
+_replay_state_lock = threading.Lock()
+_replay_state: Any | None = None
+
+
+def _replay_latch() -> Any:
+    """This surface's own backend latch, built on first use and kept for the process.
+
+    Its own, and that is the whole of R15: `llm_message`'s module-global holder is what
+    `varsel.check_and_notify` writes push wordings against, and a replay burst that drives both
+    backends into a configuration error would otherwise strip model wordings from every real push for
+    the next `_LATCH_TTL` — silently, with nothing on the traveller-facing side reporting it. The
+    holder is seeded ONE-WAY from the global at construction, so replay does not re-pay for a 404 the
+    poller has already discovered, and a failure discovered here never travels back.
+
+    Built lazily rather than at import so the seeding reads the latch as it is when the page is first
+    used, not as it was before the app finished starting.
+    """
+    global _replay_state
+    with _replay_state_lock:
+        if _replay_state is None:
+            _replay_state = llm_message.new_replay_state()
+        return _replay_state
+
+
+def _wording_key(row: dict) -> tuple:
+    """What identifies a wording: the subject, the cycle replayed, and the prompt that wrote it.
+
+    The subject key is the decision log's own grain and includes `journey_digest` — which is exactly
+    why this key never leaves the process. `would_send_at` is in it because narrowing the window
+    picks a *different* cycle, and serving the wider window's wording under the narrower one's time
+    is the mismatch the 2026-08-21 fix removed from /historikk one layer down.
+    """
+    return (
+        row.get("journey_digest"),
+        row.get("operator"),
+        row.get("jkey"),
+        row.get("call_date"),
+        row.get("stop_order"),
+        row.get("situation_number"),
+        row.get("would_send_at"),
+        llm_message.PROMPT_VERSION,
+    )
+
+
+def _cached_wording(key: tuple) -> _Wording | None:
+    """A previously generated wording for this exact row and prompt, if it has not expired."""
+    now = monotonic()
+    with _wording_lock:
+        hit = _wordings.get(key)
+        if hit is None:
+            return None
+        if now >= hit[0]:
+            _wordings.pop(key, None)
+            return None
+        return hit[1]
+
+
+def _remember_wording(key: tuple, wording: _Wording) -> None:
+    """Store a wording, with a short life for a failure and a long one for an answer.
+
+    Expiry-then-cap eviction, the shape :func:`_query` uses: without it the dict only ever grows, and
+    this pod does not restart.
+    """
+    ttl = _WORDING_TTL_S if wording.status in ("ok", "rejected", "ungrounded") else _WORDING_ERROR_TTL_S
+    now = monotonic()
+    with _wording_lock:
+        for stale in [k for k, (expires, _) in _wordings.items() if now >= expires]:
+            _wordings.pop(stale, None)
+        if len(_wordings) >= _WORDING_MAX_ENTRIES:
+            for oldest in sorted(_wordings, key=lambda k: _wordings[k][0])[: _WORDING_MAX_ENTRIES // 5]:
+                _wordings.pop(oldest, None)
+        _wordings[key] = (now + ttl, wording)
+
+
+class _Budget:
+    """One request's share of the two call ceilings, and the log-once flags that go with them.
+
+    Both are claimed in the same operation and neither is decremented when the other refuses, so a
+    request that runs out of per-minute allowance does not also burn its per-request cap — it would
+    otherwise report `capped` for subjects a later request could have answered immediately.
+    """
+
+    def __init__(self, path: str = _REPLAY_PATH) -> None:
+        self.path = path
+        self.remaining = _MAX_CALLS_PER_REQUEST
+        self.lock = threading.Lock()
+        self.logged_cap = False
+        self.logged_rate = False
+
+    def reserve(self, cost: int, now: float) -> str | None:
+        """Claim `cost` backend calls from both ceilings, or name the one that refused.
+
+        Returns None when the call may proceed, else the status to report for this subject. Takes
+        this request's lock and then the module's; nothing takes them in the other order.
+        """
+        with self.lock:
+            if self.remaining < cost:
+                if not self.logged_cap:
+                    self.logged_cap = True
+                    logger.info(
+                        "Replay hit its per-request cap of %d backend calls; the remaining "
+                        "subjects are reported as capped and a later request will fill them",
+                        _MAX_CALLS_PER_REQUEST,
+                        extra={"fields": {"event": "tilbakeblikk_bounded", "reason": "capped"}},
+                    )
+                return "capped"
+            with _budget_lock:
+                calls = _replay_calls.setdefault(self.path, [])
+                calls[:] = [t for t in calls if now - t < _RATE_WINDOW_S]
+                if len(calls) + cost > _MAX_CALLS_PER_MIN:
+                    if not self.logged_rate:
+                        self.logged_rate = True
+                        logger.warning(
+                            "Replay rate-limited on the %s path (%d calls/min); regenerating "
+                            "nothing further this minute",
+                            self.path,
+                            _MAX_CALLS_PER_MIN,
+                            extra={
+                                "fields": {
+                                    "event": "tilbakeblikk_bounded",
+                                    "reason": "rate_limited",
+                                    "path": self.path,
+                                }
+                            },
+                        )
+                    return "rate_limited"
+                calls.extend([now] * cost)
+            self.remaining -= cost
+            return None
+
+
+def _deterministic(payload: dict) -> str | None:
+    """The template wording for this stored input, or None when it could not be produced.
+
+    Fail-soft in both directions. An uninjected writer says so once and costs the comparison arm, not
+    the page; an exception from the writer costs one card's arm. Neither is worth a 500 on a surface
+    whose job is to show what the model wrote.
+    """
+    global _warned_no_writer
+    writer = _deterministic_writer
+    if writer is None:
+        if not _warned_no_writer:
+            _warned_no_writer = True
+            logger.warning(
+                "No deterministic writer was injected; /tilbakeblikk-api/messages will show the "
+                "regenerated wording without its template arm",
+            )
+        return None
+    try:
+        return writer(payload)
+    except Exception:
+        logger.warning("Could not build the template wording for a replayed input", exc_info=True)
+        return None
+
+
+def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool) -> _Wording:
+    """Regenerate one subject's wording, or say why it was not regenerated. Runs on the pool.
+
+    The order of the guards is the contract. A subject with no stored input is R7's state and never
+    reaches the budget; a deployment that cannot ask a backend reports `disabled` rather than a
+    bound it never hit; the deadline is consulted before the reservation, so a request that is out
+    of time does not also spend the allowance a later one would use.
+    """
+    raw = row.get("message_input")
+    if raw is None:
+        # R7. No alert-worthy cycle in the window recorded a writer's input, so there is nothing to
+        # replay. Its own state, never an empty wording, never an attempt, never a charge.
+        return _Wording(None, None, "no_input", None, None, None)
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "A recorded message_input would not parse; reporting it rather than failing the page",
+            extra={"fields": {"event": "tilbakeblikk_bounded", "reason": "unreadable_input"}},
+        )
+        return _Wording(None, None, "unreadable_input", None, None, None)
+
+    # Built for every replayable subject, including the ones that are about to be bounded out: it is
+    # the arm the regenerated wording is read against, it costs no network, and a card that showed a
+    # bound with no text at all would be strictly less useful than one that showed the template.
+    deterministic = _deterministic(payload)
+    if not generating:
+        return _Wording(None, deterministic, "disabled", None, None, None)
+
+    now = monotonic()
+    if now + _WORST_CASE_CALL_S >= deadline:
+        return _Wording(None, deterministic, "deadline", None, None, None)
+    refusal = budget.reserve(_CALLS_PER_SUBJECT, now)
+    if refusal is not None:
+        return _Wording(None, deterministic, refusal, None, None, None)
+
+    result = llm_message.write_message_detailed(
+        payload,
+        # Deliberately EMPTY rather than the row's journey_digest. `write_message_detailed` puts
+        # `key_digest(journey_key)` on its log record, and the digest is already that function's
+        # output — passing it would hash an already-hashed value and mint a second identifier that
+        # looks joinable with the live event="llm_message" trail and is not. The unhashed digest goes
+        # on this module's own record below instead, which is what keeps a replay record joinable
+        # with the decision row and with the live trail.
+        journey_key="",
+        situation_number=row.get("situation_number") or "",
+        # Its own latch (R15) and its own client cache; `replay=True` marks the audit record and
+        # suppresses the prompt/reply DEBUG record, which dev has switched on and which would
+        # otherwise publish a traveller's origin, destination and departure time at page-load volume.
+        state=_replay_latch(),
+        replay=True,
+    )
+    wording = _Wording(
+        message=result.text,
+        deterministic=deterministic,
+        status=result.status,
+        discarded=result.discarded,
+        provider=result.provider,
+        model=result.model,
+    )
+    _remember_wording(_wording_key(row), wording)
+    # The join key, unhashed, on this surface's own event. Not event="llm_message": that record
+    # already exists for this call, carries the provider and the `replay` marker, and is what
+    # operators' existing queries count — emitting a second one under the same name would double
+    # every such count. This one adds what that record cannot carry.
+    logger.info(
+        "Replayed %s under prompt %s: %s",
+        row.get("situation_number"),
+        llm_message.PROMPT_VERSION,
+        result.status,
+        extra={
+            "fields": {
+                "event": "tilbakeblikk_replay",
+                "replay": True,
+                "journey_digest": row.get("journey_digest"),
+                "situation_number": row.get("situation_number"),
+                "result": result.status,
+                "provider": result.provider,
+                "model": result.model,
+                "prompt_version": llm_message.PROMPT_VERSION,
+                "row_prompt_version": row.get("prompt_version"),
+            }
+        },
+    )
+    return wording
+
+
+def _message_rows(window: _Window, **filters: Any) -> list[dict]:
+    """The replay inputs for the window, behind the same cache and allow-list as /decisions.
+
+    Blocking: BigQuery, and the allow-list lookup that may itself be a query. Called on the pool, so
+    the event loop never waits on a socket.
+    """
+    from google.cloud import bigquery
+
+    from_refs, to_refs = _checked_places(
+        window, filters["line"], filters["from_place"], filters["to_place"]
+    )
+    params = [
+        bigquery.ScalarQueryParameter("day", "DATE", window.day),
+        bigquery.ScalarQueryParameter("from_ts", "TIMESTAMP", window.from_ts),
+        bigquery.ScalarQueryParameter("to_ts", "TIMESTAMP", window.to_ts),
+        bigquery.ScalarQueryParameter("operator", "STRING", filters["operator"]),
+        bigquery.ScalarQueryParameter("line", "STRING", filters["line"]),
+        bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
+        bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
+        bigquery.ScalarQueryParameter("verdict", "STRING", filters["verdict"]),
+        bigquery.ScalarQueryParameter("alerted_only", "BOOL", filters["alerted_only"]),
+        bigquery.ScalarQueryParameter("resolved_only", "BOOL", filters["resolved_only"]),
+        bigquery.ScalarQueryParameter("sx_only", "BOOL", filters["sx_only"]),
+        bigquery.ScalarQueryParameter("limit", "INT64", filters["limit"]),
+    ]
+    # Same key shape as /decisions', with its own prefix. Positional, so a parameter added above and
+    # forgotten here fails silently -- for two minutes, whichever request landed first decides what
+    # both callers see, and here that would also decide which subjects get wordings.
+    key = (
+        "messages", *window.cache_key, filters["operator"], filters["line"],
+        filters["from_place"], filters["to_place"], filters["verdict"],
+        filters["alerted_only"], filters["resolved_only"], filters["sx_only"], filters["limit"],
+    )
+    return [dict(r) for r in _query(_MESSAGES_QUERY, params, key)]
+
+
+def _replayed_message(row: dict, wording: _Wording) -> ReplayedMessage:
+    """One response entry: the row's identity, and what came of replaying it.
+
+    Note what is NOT copied across from the row — `journey_digest`, and the `message_input` the
+    wording was built from. The model is `extra="forbid"`, so adding either here fails loudly.
+    """
+    return ReplayedMessage(
+        situation_number=row.get("situation_number"),
+        line=row.get("line"),
+        mode=row.get("mode"),
+        departure_time=row.get("departure_time"),
+        would_send_at=row.get("would_send_at"),
+        status=wording.status,
+        message=wording.message,
+        deterministic_message=wording.deterministic,
+        discarded=wording.discarded,
+        provider=wording.provider,
+        model=wording.model,
+        prompt_version=row.get("prompt_version"),
+        current_prompt_version=llm_message.PROMPT_VERSION,
+    )
+
+
+async def _replay(
+    rows: list[dict],
+    pool: ThreadPoolExecutor,
+    loop: asyncio.AbstractEventLoop,
+    deadline: float,
+) -> list[ReplayedMessage]:
+    """Walk the WHOLE subject list, serving cached wordings free and spending the budget on misses.
+
+    The order is what makes a day's worth of subjects reachable at all. Were the budget spent per
+    subject rather than per cache miss, every request would re-serve the same first twelve forever
+    and nothing further down the list could ever be seen; consulting the cache first means successive
+    requests fill the page progressively. (Whether an explicit offset is worth adding on top is Q3 in
+    the plan, deferred.)
+
+    `generation_enabled` is asked ONCE per request rather than per subject, and asked of this
+    surface's own latch. Asked per subject it would flip mid-pass — a configuration error latches a
+    backend off — and half the page would read `disabled` while the other half read `error` for the
+    same cause.
+    """
+    generating = llm_message.generation_enabled(_replay_latch())
+    budget = _Budget()
+    out: list[_Wording | None] = [None] * len(rows)
+    pending: list[int] = []
+    for i, row in enumerate(rows):
+        if row.get("message_input") is None:
+            out[i] = _Wording(None, None, "no_input", None, None, None)
+            continue
+        hit = _cached_wording(_wording_key(row))
+        if hit is not None:
+            out[i] = hit
+            continue
+        pending.append(i)
+
+    if pending:
+        futures = [
+            loop.run_in_executor(
+                pool,
+                partial(
+                    _replay_one,
+                    rows[i],
+                    budget=budget,
+                    deadline=deadline,
+                    generating=generating,
+                ),
+            )
+            for i in pending
+        ]
+        for i, wording in zip(pending, await asyncio.gather(*futures), strict=True):
+            out[i] = wording
+
+    return [
+        _replayed_message(row, wording)
+        for row, wording in zip(rows, out, strict=True)
+        if wording is not None
+    ]
+
+
 router = APIRouter(prefix="/tilbakeblikk-api", tags=["tilbakeblikk"])
 
 
@@ -1015,3 +1586,109 @@ def summary(
         no_sx=segment("no_sx"),
         n_unsegmented=row.get("n_unsegmented") or 0,
     )
+
+
+@router.get(
+    "/messages",
+    summary="What today's prompt would write for the decisions taken in a window",
+    response_description="One regenerated wording per subject, aligned with /decisions' list.",
+)
+async def messages(
+    day: date | None = Query(default=None, description="Oslo day of the decisions (default: today)."),
+    from_time: time | None = Query(
+        default=None, description="Start of the range, Europe/Oslo (default 00:00; rounded down)."
+    ),
+    to_time: time | None = Query(
+        default=None,
+        description="End of the range, Europe/Oslo, EXCLUSIVE (default the following midnight; "
+        "rounded up).",
+    ),
+    operator: str | None = Query(default=None, description="Filter to one codespace, e.g. 'VYG'."),
+    line: str | None = Query(
+        default=None, description="Filter to one line REF, from /tilbakeblikk-api/filters."
+    ),
+    from_place: str | None = Query(
+        default=None, description="Filter to registrations boarding at this StopPlace ref."
+    ),
+    to_place: str | None = Query(
+        default=None, description="Filter to registrations alighting at this StopPlace ref."
+    ),
+    verdict: str | None = Query(
+        default=None,
+        description="Filter to 'hit', 'false_alarm', 'miss' or 'correct_reject'.",
+    ),
+    alerted_only: bool = Query(
+        default=False, description="Only decisions that crossed the threshold INSIDE the window."
+    ),
+    resolved_only: bool = Query(
+        default=False, description="Only decisions whose realized outcome is known."
+    ),
+    sx_only: bool = Query(
+        default=False,
+        description="Only decisions about a call an operator published a SIRI-SX message for.",
+    ),
+    limit: int = Query(
+        default=200,
+        ge=1,
+        le=_MAX_LIMIT,
+        description="Maximum subjects to return. Pass the SAME value as to /decisions: the two "
+        "lists are aligned by position, and a different limit truncates one of them.",
+    ),
+) -> MessagesResponse:
+    """Replay each subject's stored writer input through today's prompt.
+
+    Takes the same window and the same allow-listed filters as ``/decisions`` and NEVER a
+    caller-supplied row key: what may be regenerated is decided by a query this module wrote, over a
+    vocabulary ``/filters`` published, so a caller cannot name an arbitrary decision — nor mint an
+    unbounded number of cache entries and Vertex calls out of arbitrary strings.
+
+    Asks :func:`llm_message.generation_enabled` and never ``delivery_enabled`` or
+    ``varsel._deliverable_message``. The two switches are not interchangeable: generation says
+    whether a wording can be WRITTEN, delivery only what a traveller RECEIVES. prd runs generation on
+    and delivery off — precisely the combination that makes its real journeys comparable — so a page
+    that consulted the delivery gate would be blank exactly where the data is worth looking at.
+
+    **Declared ``async def``, which is not a style choice.** Every other route in this process is a
+    plain ``def`` and is therefore served on the shared anyio worker threadpool — ``/impact``, the
+    ``/varsel-api`` device and journey writes, the ``/historikk`` routes. A handler that can hold one
+    of those slots for its full 30 s deadline would starve traveller-facing registration from a
+    public unauthenticated endpoint, and with no ingress cutoff nothing reclaims the slot. Declared
+    ``async``, this coroutine only awaits: both the BigQuery read and the generation fan-out run on
+    this request's own pool.
+
+    Always 200 (or the same 400s and 503s ``/decisions`` raises). A bound that binds, a backend that
+    fails and a subject with nothing to replay are all reported per entry, because a page that lost
+    every card to one subject's problem would be useless for the one thing it exists to do.
+    """
+    deadline = monotonic() + _REQUEST_DEADLINE_S
+    window = _resolve_window(day, from_time, to_time)
+    operator = _checked_operator(operator)
+    if verdict is not None and verdict not in historikk._VERDICTS:
+        raise HTTPException(
+            status_code=400, detail=f"verdict must be one of {', '.join(historikk._VERDICTS)}."
+        )
+
+    loop = asyncio.get_running_loop()
+    # One pool per request, the shape `varsel.check_and_notify`'s delivery loop uses. Per request
+    # rather than module-wide so its threads cannot outlive the work: this pod runs for weeks.
+    with ThreadPoolExecutor(
+        max_workers=_REPLAY_WORKERS, thread_name_prefix="tilbakeblikk-replay"
+    ) as pool:
+        rows = await loop.run_in_executor(
+            pool,
+            partial(
+                _message_rows,
+                window,
+                operator=operator,
+                line=line,
+                from_place=from_place,
+                to_place=to_place,
+                verdict=verdict,
+                alerted_only=alerted_only,
+                resolved_only=resolved_only,
+                sx_only=sx_only,
+                limit=limit,
+            ),
+        )
+        replayed = await _replay(rows, pool, loop, deadline)
+    return MessagesResponse(**window.fields(), count=len(replayed), messages=replayed)

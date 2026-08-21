@@ -24,8 +24,11 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
 """
 
 import inspect
+import json
+import logging
 import os
 import re
+import time as _time
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -36,6 +39,7 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import llm_message
 import tilbakeblikk
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -87,11 +91,59 @@ def _row(**overrides) -> dict:
     return base
 
 
+STORED_INPUT = {
+    "linje": "R11",
+    "reise": {"fra": "Oslo S", "til": "Drammen", "avgang": "06:15"},
+    "innstilt": True,
+    "situasjoner": [{"sammendrag": "Signalfeil ved Asker"}],
+}
+# Serialized by llm_message's OWN serializer, which is what makes the round-trip check meaningful:
+# `message_input_json(json.loads(s)) == s` is the property that lets a replayed prompt be the
+# recorded prompt rather than something that merely resembles it.
+INPUT_JSON = llm_message.message_input_json(STORED_INPUT)
+
+
+def _message_row(**overrides) -> dict:
+    """A replay row as tilbakeblikk_messages.sql returns it — subject key, input, cycle.
+
+    Carries `journey_digest` and `message_input`, which is exactly why nothing built from it may
+    reach the response: this is the server-side half of the privacy boundary.
+    """
+    base = {
+        "journey_digest": "abc123def456",
+        "operator": "VYG",
+        "jkey": "VYG:DatedServiceJourney:1",
+        "call_date": date(2026, 7, 30),
+        "stop_order": 3,
+        "situation_number": "S1",
+        "line": "VYG:Line:R11",
+        "mode": "Tog",
+        "departure_time": DEP,
+        "message_input": INPUT_JSON,
+        "would_send_at": DEP - timedelta(minutes=48),
+        "prompt_version": "a1b2c3d4",
+    }
+    base.update(overrides)
+    return base
+
+
+def _subjects(n: int) -> list[dict]:
+    """`n` distinct subjects, each with its own input, so a captured prompt names which one it was."""
+    return [
+        _message_row(
+            situation_number=f"S{i}",
+            message_input=llm_message.message_input_json({**STORED_INPUT, "sak": f"S{i}"}),
+        )
+        for i in range(n)
+    ]
+
+
 class _FakeBQ:
     """Records what it was asked — SQL, parameters and job config — and replays canned rows."""
 
     def __init__(self):
         self.rows: list[dict] = []
+        self.message_rows: list[dict] = []
         self.filter_rows: list[dict] = []
         self.registry_rows: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
@@ -122,6 +174,8 @@ class _FakeBQ:
             rows = self.filter_rows
         elif sql == tilbakeblikk._STOP_PLACES_QUERY:
             rows = self.registry_rows
+        elif sql == tilbakeblikk._MESSAGES_QUERY:
+            rows = self.message_rows
         else:
             rows = self.rows
 
@@ -133,7 +187,24 @@ class _FakeBQ:
 
 
 fake = _FakeBQ()
-tilbakeblikk.configure(bq_client=fake)
+
+# Every payload the template writer was handed, so a check can assert the two arms were built from
+# ONE input rather than two that happen to agree.
+deterministic_inputs: list[dict] = []
+
+
+def _fake_deterministic(payload: dict) -> str:
+    """Stands in for varsel._deterministic_body — a pure function of the stored input, injected.
+
+    A stub rather than the real function on purpose: importing varsel here would pull the poller's
+    module (and its mutable state) into a suite about a read path, which is the same reason the
+    module takes it by injection in the first place.
+    """
+    deterministic_inputs.append(payload)
+    return f"Mal for {payload['linje']}: avviket kan påvirke reisen din."
+
+
+tilbakeblikk.configure(bq_client=fake, deterministic_writer=_fake_deterministic)
 
 app = FastAPI()
 app.include_router(tilbakeblikk.router)
@@ -157,8 +228,9 @@ def _place(ref, name, place_id=None) -> dict:
     return {"id": ref, "name": name, "place_id": place_id or ref}
 
 
-def _reset(rows=None, error=None, filter_rows=None, registry=None):
+def _reset(rows=None, error=None, filter_rows=None, registry=None, message_rows=None):
     fake.rows = list(rows or [])
+    fake.message_rows = list(message_rows or [])
     fake.filter_rows = [_filter_row()] if filter_rows is None else list(filter_rows)
     fake.registry_rows = list(
         registry
@@ -170,10 +242,78 @@ def _reset(rows=None, error=None, filter_rows=None, registry=None):
     fake.error = error
     fake.error_on = None
     tilbakeblikk._cache.clear()  # the TTL cache would otherwise serve a previous test's rows
+    # The replay state, all four pieces of it. Leaving any one behind makes a later check pass for
+    # the wrong reason: a warm wording cache hides a missing backend call, a spent per-minute tally
+    # makes a budget check "bind" before it should, and a latched replay holder reports `disabled`
+    # where a test expects an answer.
+    tilbakeblikk._wordings.clear()
+    for spent in tilbakeblikk._replay_calls.values():
+        spent.clear()
+    tilbakeblikk._replay_state = None
+    tilbakeblikk._warned_no_writer = False
+    deterministic_inputs.clear()
+    # llm_message's own globals: this suite must never depend on the ambient environment of whoever
+    # runs it (VARSEL_LLM_PROVIDER, GOOGLE_CLOUD_PROJECT), and the module-global latch is what the
+    # isolation checks assert has NOT moved.
+    llm_message._PROVIDER = "auto"
+    llm_message._PROJECT = "ent-kixavvik-test"
+    llm_message._ENABLED = True
+    llm_message._STATE = llm_message._LatchState()
 
 
 def _decision_calls():
     return [c for c in fake.calls if c[0] == tilbakeblikk._DECISIONS_QUERY]
+
+
+def _never_called(body):
+    """A backend that must not be reached. The default stub for the second backend.
+
+    An unstubbed backend in this suite is a real Vertex client construction and a real network call,
+    and it fails OPEN — `write_message_detailed` swallows it into `status="error"` — so the
+    assertion under it would still pass while the test quietly talked to Google.
+    """
+    raise AssertionError("this backend must not be called")
+
+
+@contextmanager
+def _backends(claude, gemini=_never_called):
+    """Swap both LLM backends for the body, restoring the real ones afterwards.
+
+    Both, always: stubbing only the first leaves the fallback path pointed at the real Vertex client
+    (see `_never_called`), and the fallback path is exactly what several checks below exercise.
+    """
+    original = dict(llm_message._BACKENDS)
+    llm_message._BACKENDS.update(claude=claude, gemini=gemini)
+    try:
+        yield
+    finally:
+        llm_message._BACKENDS.update(original)
+
+
+@contextmanager
+def _captured(level=logging.INFO):
+    """Collect this module's log records for the body."""
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    module_logger = logging.getLogger("tilbakeblikk")
+    sink = _Sink(level)
+    module_logger.addHandler(sink)
+    before = module_logger.level
+    module_logger.setLevel(level)
+    try:
+        yield records
+    finally:
+        module_logger.removeHandler(sink)
+        module_logger.setLevel(before)
+
+
+def _reason(records, reason):
+    """The bounded-out log records naming `reason`."""
+    return [r for r in records if getattr(r, "fields", {}).get("reason") == reason]
 
 
 def _oslo_midnight(day: date) -> datetime:
@@ -735,6 +875,439 @@ def test_config_survives_an_unreadable_decision_log():
 
     with _deployed_as("ent-kixavvik-prd"):
         assert client.get("/tilbakeblikk-api/config").json()["environment"] is None
+
+
+# --------------------------------------------------------------------------------------------
+# /messages — the bounded replay service
+#
+# Every backend here is a stub (see `_backends` and `_never_called`): an unstubbed one would build a
+# real Vertex client and fail OPEN into status="error", so the assertion under it would still pass
+# while the suite quietly talked to Google.
+# --------------------------------------------------------------------------------------------
+
+OK_REPLY = '{"melding": "Toget er innstilt. Ta neste avgang."}'
+# A figure that is not in the payload. `_is_grounded` rejects it, `write_message_detailed` continues
+# to the next backend, and the subject therefore costs TWO calls — which is the whole reason the
+# per-request cap counts calls rather than subjects.
+UNGROUNDED_REPLY = '{"melding": "Toget er 42 minutter forsinket."}'
+
+
+def _messages(**params):
+    """GET /tilbakeblikk-api/messages, returning the parsed body and asserting it answered."""
+    r = client.get("/tilbakeblikk-api/messages", params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def _statuses(body):
+    return [m["status"] for m in body["messages"]]
+
+
+def test_a_stored_input_reaches_the_backend_verbatim():
+    """The prompt the model replays under must be the prompt the decision was written under, or the
+    page is comparing two things at once. That holds because `message_input` was serialized by
+    llm_message's own serializer and is handed back through it: json.loads then dumps is a round
+    trip, byte for byte, not an approximation of one."""
+    _reset(message_rows=[_message_row()])
+    seen = []
+    with _backends(lambda body: seen.append(body) or OK_REPLY):
+        body = _messages()
+    assert seen == [INPUT_JSON], "the stored JSON must reach the backend unchanged"
+    entry = body["messages"][0]
+    assert entry["status"] == "ok"
+    assert entry["message"] == "Toget er innstilt. Ta neste avgang."
+    assert entry["provider"] == "claude"
+    assert entry["current_prompt_version"] == llm_message.PROMPT_VERSION
+    assert entry["prompt_version"] == "a1b2c3d4", "the row's own prompt version, for R9's marker"
+    # Same blast-radius cap as every other query on this surface -- it is a public endpoint sharing
+    # its project quota with the poller.
+    assert all(jc.maximum_bytes_billed == tilbakeblikk._MAX_BYTES_BILLED for jc in fake.job_configs)
+
+
+def test_a_repeated_request_is_served_from_the_wording_cache():
+    """A page refresh must not re-spend the Vertex budget on wordings it already has — that is what
+    leaves the budget free to reach subjects further down the list."""
+    _reset(message_rows=[_message_row()])
+    calls = []
+    with _backends(lambda body: calls.append(body) or OK_REPLY):
+        first = _messages()
+        second = _messages()
+    assert len(calls) == 1, "the second request must be served from the wording cache"
+    assert first["messages"][0]["message"] == second["messages"][0]["message"]
+
+
+def test_a_new_prompt_version_invalidates_the_cached_wording():
+    """The prompt version is IN the cache key, which is what makes this page answer the question it
+    exists for: after a prompt edit the cards must show what the NEW brief writes, not yesterday's
+    answer under today's version number."""
+    _reset(message_rows=[_message_row()])
+    calls = []
+    with _backends(lambda body: calls.append(body) or OK_REPLY):
+        _messages()
+        assert len(calls) == 1
+        before = llm_message.PROMPT_VERSION
+        llm_message.PROMPT_VERSION = "0000feed"
+        try:
+            body = _messages()
+        finally:
+            llm_message.PROMPT_VERSION = before
+    assert len(calls) == 2, "a changed prompt version must miss the cache"
+    assert body["messages"][0]["current_prompt_version"] == "0000feed"
+
+
+def test_a_narrower_window_picks_a_different_cycle_and_misses_the_cache():
+    """The replayed `decided_at` is in the key too. Narrowing the window selects a different cycle,
+    whose input and figures differ — serving the wider window's wording under the narrower one's
+    time is the mismatch the 2026-08-21 fix removed from /historikk one layer down."""
+    _reset(message_rows=[_message_row()])
+    calls = []
+    with _backends(lambda body: calls.append(body) or OK_REPLY):
+        _messages(day=PAST_DAY.isoformat())
+        fake.message_rows = [_message_row(would_send_at=DEP - timedelta(minutes=20))]
+        tilbakeblikk._cache.clear()  # so the narrower window really re-reads
+        _messages(day=PAST_DAY.isoformat(), from_time="06:00", to_time="07:00")
+    assert len(calls) == 2, "a different replayed cycle is a different wording"
+
+
+def test_the_per_request_cap_counts_backend_calls_not_subjects():
+    """Under `auto` one subject can cost two calls: an ungrounded reply continues to the next
+    backend, and a prompt edit that trips the grounding check trips it for EVERY subject at once —
+    which is exactly the situation somebody has this page open in. A cap counted in subjects would
+    then let one request spend twice its stated ceiling of Vertex calls, and the resource that
+    ceiling protects is the quota the poller's push wordings share."""
+    _reset(message_rows=_subjects(12))
+    calls = []
+    with _backends(
+        lambda body: calls.append(body) or UNGROUNDED_REPLY,
+        gemini=lambda body: calls.append(body) or "",
+    ):
+        body = _messages()
+    cap = tilbakeblikk._MAX_CALLS_PER_REQUEST
+    assert len(calls) == cap, f"the cap is {cap} CALLS; {len(calls)} were made"
+    statuses = _statuses(body)
+    assert statuses.count("ungrounded") == cap // tilbakeblikk._CALLS_PER_SUBJECT == 6
+    assert statuses.count("ungrounded") < 12, "fewer subjects than the cap: each cost two calls"
+    assert statuses.count("capped") == 6, "the rest are reported, not silently absent"
+
+
+def test_the_next_request_generates_the_next_subjects_and_serves_the_rest_free():
+    """Successive requests fill the page progressively. The cache is consulted BEFORE the budget, so
+    a wording already held costs nothing and the budget lands on a subject that has none — without
+    that order the first twelve would be re-served forever and a day's worth of subjects would be
+    unreachable.
+
+    The property asserted is disjointness and coverage, not exact positions: with a four-wide pool
+    the winners are the first six subjects the pool REACHES, which is the first six give or take a
+    position. What must hold — and what the cache-before-budget order is for — is that the second
+    request spends its budget on the six it does not already hold, and on nothing else.
+    """
+    _reset(message_rows=_subjects(12))
+    seen = []
+
+    def claude(body):
+        seen.append(json.loads(body)["sak"])
+        return OK_REPLY
+
+    with _backends(claude):
+        first = _messages()
+        second = _messages()
+    assert len(seen) == 12 and len(set(seen)) == 12, (
+        "each subject generated exactly once across the two requests: none re-served, none skipped"
+    )
+    assert not set(seen[:6]) & set(seen[6:]), "the second request must generate the OTHER six"
+    assert _statuses(first).count("ok") == 6 and _statuses(first).count("capped") == 6
+    assert _statuses(second) == ["ok"] * 12, "the first six now come free from the cache"
+
+
+def test_the_per_minute_budget_binds_across_requests_and_is_logged_once():
+    """One request's cap does not bound a caller who refreshes; the per-minute budget does. It is
+    sized at one full request's worth inside the wall-clock deadline, so it binds on a second
+    concurrent reader rather than never."""
+    _reset(message_rows=_subjects(18))
+    calls = []
+    with _backends(lambda body: calls.append(body) or OK_REPLY):
+        _messages()
+        _messages()
+        with _captured(logging.WARNING) as records:
+            third = _messages()
+    assert _statuses(third).count("rate_limited") == 6, "the subjects it could not reach say so"
+    assert _statuses(third).count("ok") == 12, "the twelve it already holds are served free"
+    assert len(calls) == 12, "the third request must spend no backend call at all"
+    spent = tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH]
+    assert len(spent) == tilbakeblikk._MAX_CALLS_PER_MIN == 24
+    assert len(_reason(records, "rate_limited")) == 1, "logged once per request, not once per subject"
+
+
+def test_the_budget_is_tallied_against_replays_own_allowance_not_the_pollers():
+    """The tally is keyed by caller, in the shape of `alternatives._fetch_calls`. Replay draws on its
+    own number, so it can neither starve another caller's share nor be starved by one.
+
+    Be clear about what this buys here: the poller does not call this module, so its slot stays empty
+    by construction. The keying is what makes that structural rather than a fact somebody has to keep
+    true — and the coupling it defends against is one layer out, at Vertex, where the two really do
+    share a quota."""
+    _reset(message_rows=_subjects(2))
+    now = _time.monotonic()
+    tilbakeblikk._replay_calls[tilbakeblikk._POLLER_PATH][:] = [now] * 1000
+    calls = []
+    with _backends(lambda body: calls.append(body) or OK_REPLY):
+        body = _messages()
+    assert _statuses(body) == ["ok", "ok"], "another caller's spend must not bind replay"
+    assert len(calls) == 2
+    assert tilbakeblikk._replay_calls[tilbakeblikk._POLLER_PATH] == [now] * 1000, (
+        "replay must never draw down another caller's allowance"
+    )
+
+
+def test_generation_disabled_reports_disabled_and_calls_nothing():
+    """`disabled` means no backend could be ASKED — VARSEL_LLM_PROVIDER=off, no project, or every
+    backend latched off. It has never meant "this deployment sends the template"."""
+    _reset(message_rows=_subjects(3))
+    llm_message._PROVIDER = "off"
+    with _backends(_never_called, gemini=_never_called):
+        body = _messages()
+    assert _statuses(body) == ["disabled"] * 3
+    assert [m["message"] for m in body["messages"]] == [None] * 3
+    # The template arm is still built: it needs no backend, and a card showing a bound with no text
+    # at all would be strictly less useful than one showing the wording that would have been sent.
+    assert all(m["deterministic_message"] for m in body["messages"])
+
+
+def test_the_delivery_gate_is_never_consulted():
+    """The assertion that separates this surface from varsel, and the reason prd is worth pointing it
+    at. prd runs generation ON and delivery OFF — it writes the model's wording and sends the
+    template — so a page that asked `delivery_enabled()` would be blank in exactly the deployment
+    whose journeys are real."""
+    _reset(message_rows=[_message_row()])
+    llm_message._ENABLED = False  # travellers get the template; this page must not care
+    with _backends(lambda body: OK_REPLY):
+        body = _messages()
+    assert body["messages"][0]["message"] == "Toget er innstilt. Ta neste avgang."
+    assert llm_message.delivery_enabled() is False, "the gate really was off"
+
+    # And structurally, so the behaviour above cannot start passing for the wrong reason: neither
+    # gate name is *referenced* anywhere in the module. Parsed rather than grepped, because both
+    # names appear in its prose — explaining why they are not consulted is half the docstring.
+    import ast
+
+    tree = ast.parse(Path(tilbakeblikk.__file__).read_text())
+    referenced = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    referenced |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    assert "delivery_enabled" not in referenced
+    assert "_deliverable_message" not in referenced
+    assert "generation_enabled" in referenced, "the gate it DOES ask must still be asked"
+
+
+def test_a_subject_with_no_stored_input_is_its_own_state_and_costs_nothing():
+    """R7. No alert-worthy cycle in the window recorded a writer's input, so there is nothing to
+    replay. Not "no message", not an error, and — the part that matters for the page filling up — not
+    charged against the cap, since no call was made for it."""
+    _reset(message_rows=[_message_row(situation_number="S0", message_input=None), _message_row()])
+    calls = []
+    with _backends(lambda body: calls.append(body) or OK_REPLY):
+        body = _messages()
+    first, second = body["messages"]
+    assert first["status"] == "no_input"
+    assert first["message"] is None and first["deterministic_message"] is None
+    assert second["status"] == "ok"
+    assert len(calls) == 1, "the empty subject must not have been sent to a backend"
+    # Not merely "no call was made" — no budget was CHARGED either. A subject charged for a call it
+    # never made would eat the allowance of subjects further down the list, and on a window where
+    # most subjects never crossed the alert gate that is most of the page.
+    assert len(tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH]) == (
+        tilbakeblikk._CALLS_PER_SUBJECT
+    ), "exactly one subject's worth of budget was spent"
+
+
+def test_a_configuration_error_latches_only_the_replay_holder():
+    """R15, and the failure it prevents is silent on the traveller-facing side. A replay burst that
+    drives both backends into a configuration error would, on a shared latch, make
+    `varsel.check_and_notify` fall back to the template for every real push for the next 30 minutes,
+    and spend a message attempt per subject on each None."""
+    _reset(message_rows=_subjects(2))
+
+    def dead(body):
+        raise llm_message._ConfigurationError("404 publisher model not found")
+
+    with _backends(dead, gemini=dead):
+        body = _messages()
+    assert set(_statuses(body)) == {"unavailable"}
+    assert set(tilbakeblikk._replay_state.latched_off) == {"claude", "gemini"}
+    assert llm_message._STATE.latched_off == {}, "the live push path's latch must be untouched"
+    assert llm_message.generation_enabled() is True, "the poller can still write a wording"
+
+
+def test_a_transient_backend_failure_is_reported_per_subject():
+    """One subject's Vertex problem must cost one card, never the page. A transient failure is also
+    the one that does NOT try the other backend — `write_message_detailed` returns immediately — so
+    it is a single call, and the subjects after it still get theirs."""
+    _reset(message_rows=_subjects(3))
+
+    def flaky(body):
+        if json.loads(body)["sak"] == "S1":
+            raise RuntimeError("deadline exceeded")
+        return OK_REPLY
+
+    with _backends(flaky):
+        body = _messages()
+    assert _statuses(body) == ["ok", "error", "ok"]
+    assert body["messages"][1]["message"] is None
+    assert body["messages"][1]["deterministic_message"], "the template arm survives the failure"
+
+
+def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time():
+    """A bound that checked elapsed time would bound when the last call STARTS, not when the pass
+    ends: a call started one millisecond inside the deadline can still run for the full worst case.
+    Reserving it is what makes the 30 s a promise. And the check has to run inside the worker as its
+    task starts — submitted all at once, every task queues before the deadline is consulted and the
+    bound guarantees nothing at all.
+
+    Nothing downstream cuts a hang off: the chart sets no ingress timeout. So the contract is 200
+    with what was answered, never a hang and never a 5xx."""
+    _reset(message_rows=_subjects(8))
+    deadline_s, worst_case = tilbakeblikk._REQUEST_DEADLINE_S, tilbakeblikk._WORST_CASE_CALL_S
+    tilbakeblikk._REQUEST_DEADLINE_S = 0.6
+    tilbakeblikk._WORST_CASE_CALL_S = 0.4
+    calls = []
+
+    def slow(body):
+        calls.append(body)
+        _time.sleep(0.3)
+        return OK_REPLY
+
+    try:
+        with _backends(slow):
+            r = client.get("/tilbakeblikk-api/messages")
+    finally:
+        tilbakeblikk._REQUEST_DEADLINE_S = deadline_s
+        tilbakeblikk._WORST_CASE_CALL_S = worst_case
+
+    assert r.status_code == 200, "a bounded pass answers; it never 5xxs and never hangs"
+    statuses = _statuses(r.json())
+    assert len(calls) == tilbakeblikk._REPLAY_WORKERS, (
+        "only the first round of workers may start; the next round must find the deadline reserved"
+    )
+    assert statuses.count("ok") == len(calls)
+    assert statuses.count("deadline") == 8 - len(calls)
+    assert "capped" not in statuses, "the deadline bound here, not the per-request cap"
+
+
+def test_the_route_is_a_coroutine_so_it_cannot_hold_an_anyio_worker_slot():
+    """Every other route in this process is a plain `def` and is served on the shared anyio worker
+    threadpool — /impact, the /varsel-api device and journey writes, the /historikk routes. A
+    handler that can hold one of those slots for its full 30 s deadline would starve
+    traveller-facing registration from a public unauthenticated endpoint, and with no ingress
+    timeout nothing reclaims the slot. Declared `async`, this one only awaits: both the BigQuery read
+    and the generation fan-out run on the request's own pool."""
+    assert inspect.iscoroutinefunction(tilbakeblikk.messages)
+    assert not inspect.iscoroutinefunction(tilbakeblikk.decisions), (
+        "the comparison the check is about: /decisions IS on the shared pool"
+    )
+
+
+def test_the_two_arms_are_built_from_one_input():
+    """The page compares two writers on the same facts. Two rebuilds of "the same" input would make
+    it compare the rebuilds as well, which is the defect the 2026-08-05 message_input change removed
+    from the decision log one layer down."""
+    _reset(message_rows=[_message_row()])
+    with _backends(lambda body: OK_REPLY):
+        body = _messages()
+    entry = body["messages"][0]
+    assert deterministic_inputs == [json.loads(INPUT_JSON)], (
+        "the template writer must be handed the SAME parsed document the prompt was built from"
+    )
+    assert entry["deterministic_message"] == "Mal for R11: avviket kan påvirke reisen din."
+    assert entry["message"] != entry["deterministic_message"], "two arms, not one"
+
+
+def test_an_uninjected_template_writer_costs_the_arm_not_the_page():
+    """Fail-soft, because the template is the comparison arm and not the answer."""
+    _reset(message_rows=[_message_row()])
+    tilbakeblikk._deterministic_writer = None
+    try:
+        with _backends(lambda body: OK_REPLY):
+            body = _messages()
+    finally:
+        tilbakeblikk._deterministic_writer = _fake_deterministic
+    entry = body["messages"][0]
+    assert entry["status"] == "ok" and entry["message"]
+    assert entry["deterministic_message"] is None
+
+
+def test_an_ungrounded_reply_returns_what_the_model_actually_wrote():
+    """`ungrounded` and `rejected` are the two statuses a prompt edit most plausibly produces, and
+    this page exists to iterate on the prompt. A status badge with no text would hide precisely the
+    thing being worked on. It is never delivered and never stored on a decision row — the guards that
+    refused it have not moved."""
+    _reset(message_rows=[_message_row()])
+    with _backends(lambda body: UNGROUNDED_REPLY, gemini=lambda body: ""):
+        body = _messages()
+    entry = body["messages"][0]
+    assert entry["status"] == "ungrounded"
+    assert entry["message"] is None, "a wording quoting a figure nobody measured is not served"
+    assert "42" in entry["discarded"], "but a developer must be able to read what it wrote"
+
+
+def test_the_messages_response_carries_no_input_and_no_journey_identifier():
+    """KTD10, inherited verbatim and extended by one column. The row this entry is built from carries
+    `journey_digest` and `message_input`; neither may cross the boundary. What leaves the process is
+    the wording generated FROM the input, never the input.
+
+    The whole key set is asserted, so a future field addition fails here rather than shipping."""
+    _reset(message_rows=[_message_row()])
+    with _backends(lambda body: OK_REPLY):
+        body = _messages()
+    entry = body["messages"][0]
+    assert not {"journey_digest", "message_input", "from_stop", "to_stop", "jkey"} & set(entry)
+    assert set(entry) == {
+        "situation_number", "line", "mode", "departure_time", "would_send_at",
+        "status", "message", "deterministic_message", "discarded", "provider", "model",
+        "prompt_version", "current_prompt_version",
+    }
+
+
+def test_the_message_model_refuses_a_redacted_column():
+    """Second line of defence, the same one /decisions has: `extra="forbid"` makes a future field
+    fail loudly here instead of quietly widening what an unauthenticated public host serves."""
+    ok = {
+        "situation_number": "S1", "line": "VYG:Line:R11", "mode": "Tog", "departure_time": DEP,
+        "would_send_at": DEP, "status": "ok", "message": "x", "deterministic_message": "y",
+        "discarded": None, "provider": "claude", "model": "gemini-3.7-flash",
+        "prompt_version": "a1b2c3d4", "current_prompt_version": "b2c3d4e5",
+    }
+    tilbakeblikk.ReplayedMessage(**ok)  # the shape itself must be valid
+    for redacted in ("journey_digest", "message_input", "from_stop", "to_stop"):
+        try:
+            tilbakeblikk.ReplayedMessage(**ok, **{redacted: "x"})
+            raise AssertionError(f"ReplayedMessage must reject {redacted}")
+        except ValidationError:
+            pass
+
+
+def test_messages_takes_the_same_allow_list_as_decisions():
+    """It never accepts a caller-supplied row key: what may be regenerated is decided by this
+    module's own query over a vocabulary /filters published. An arbitrary string would otherwise mint
+    one cache entry, one BigQuery query and a fan of Vertex calls apiece, on a public endpoint."""
+    accepted = set(inspect.signature(tilbakeblikk.messages).parameters)
+    assert accepted == set(inspect.signature(tilbakeblikk.decisions).parameters), (
+        "the two lists are aligned by position, so they must be narrowed identically"
+    )
+    _reset(message_rows=[_message_row()])
+    bad = client.get("/tilbakeblikk-api/messages", params={"operator": "NOT-AN-OPERATOR"})
+    assert bad.status_code == 400
+    assert fake.calls == [], "a rejected filter must not reach BigQuery"
+
+
+def test_the_wording_cache_is_bounded():
+    """2 000 entries, each a wording of at most 300 characters plus its metadata. Memory is the
+    binding constraint on this pod — no CPU limit, but always a memory one (1228 Mi in dev),
+    forceReplicas 1, and uvicorn binds only after lifespan's eager BigQuery loads, so an OOMKill is
+    zero capacity for a whole cold start."""
+    _reset()
+    wording = tilbakeblikk._Wording("x", "y", "ok", None, "claude", "m")
+    for i in range(tilbakeblikk._WORDING_MAX_ENTRIES + 100):
+        tilbakeblikk._remember_wording((i,), wording)
+    assert len(tilbakeblikk._wordings) <= tilbakeblikk._WORDING_MAX_ENTRIES
 
 
 # --------------------------------------------------------------------------------------------
