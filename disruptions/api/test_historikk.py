@@ -11,6 +11,7 @@ Run: uv run --with fastapi --with httpx --with pydantic python test_historikk.py
 """
 
 import os
+import re
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 
@@ -70,6 +71,7 @@ class _FakeBQ:
 
     def __init__(self):
         self.rows: list[dict] = []
+        self.filter_rows: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.error: Exception | None = None
 
@@ -78,7 +80,11 @@ class _FakeBQ:
         self.calls.append((sql, params))
         if self.error is not None:
             raise self.error
-        rows = self.rows
+        # /filters reads a different table shape (four arrays, one row) off the same client, and it
+        # is now on the VALIDATION path of /decisions and /summary too — so the fake has to answer
+        # per query, not per call, or a filtered request would be handed decision rows as its
+        # allow-list and reject everything.
+        rows = self.filter_rows if sql == historikk._FILTERS_QUERY else self.rows
 
         class _Job:
             def result(self):
@@ -88,17 +94,42 @@ class _FakeBQ:
 
 
 fake = _FakeBQ()
-historikk.configure(bq_client=fake)
+# The stop list main injects from refresh_varsel_stops' cache, so the from/to dropdowns can show
+# names. Read through a callable, exactly as in main — tests rebind the list, not the provider.
+stops: list[dict] = []
+historikk.configure(bq_client=fake, stop_name_provider=lambda: stops)
 
 app = FastAPI()
 app.include_router(historikk.router)
 client = TestClient(app)
 
 
-def _reset(rows=None, error=None):
+# The vocabulary /historikk-api/filters returns, matching the line and places _row() describes.
+# One row of four arrays, which is what historikk_filters.sql produces.
+def _filter_row(**overrides) -> dict:
+    base = {
+        "operators": ["VYG"],
+        "lines": ["VYG:Line:R11"],
+        "from_places": ["NSR:StopPlace:337"],
+        "to_places": ["NSR:StopPlace:548"],
+    }
+    base.update(overrides)
+    return base
+
+
+def _reset(rows=None, error=None, filter_rows=None, stop_list=None):
     fake.rows = list(rows or [])
+    fake.filter_rows = [_filter_row()] if filter_rows is None else list(filter_rows)
     fake.calls.clear()
     fake.error = error
+    stops[:] = list(
+        stop_list
+        if stop_list is not None
+        else [
+            {"stop_place": "NSR:StopPlace:337", "stop_name": "Oslo S"},
+            {"stop_place": "NSR:StopPlace:548", "stop_name": "Asker"},
+        ]
+    )
     historikk._cache.clear()  # the TTL cache would otherwise serve a previous test's rows
 
 
@@ -528,6 +559,166 @@ def test_different_filters_do_not_share_a_cache_entry():
     client.get("/historikk-api/decisions", params={"operator": "VYG"})
     client.get("/historikk-api/decisions", params={"operator": "RUT"})
     assert len(fake.calls) == 2
+
+
+def test_filters_lists_the_windows_vocabulary_with_readable_names():
+    """The dropdowns' contents, and the reason they are their own endpoint.
+
+    /decisions is capped and ordered by departure, so options derived from it would omit anything
+    that only ran early in the window — and, once a filter were applied, would shrink to the
+    selection. The refs are the values; the names are display only.
+    """
+    _reset([_row()])
+    r = client.get("/historikk-api/filters")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["operators"] == ["VYG"]
+    assert body["lines"] == ["VYG:Line:R11"]
+    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": "Oslo S"}]
+    assert body["to_places"] == [{"ref": "NSR:StopPlace:548", "name": "Asker"}]
+
+
+def test_place_options_fall_back_to_the_ref_when_the_registry_cannot_name_it():
+    """Not a rare path: every process serves it until the first refresh_varsel_stops lands, and a
+    dropdown that fails to render is strictly worse than one showing NSR refs. The ref is the
+    filter value either way, so an unnamed stop still filters correctly."""
+    _reset([_row()], stop_list=[])
+    body = client.get("/historikk-api/filters").json()
+    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": None}]
+
+
+def test_place_options_are_sorted_by_the_name_the_reader_sees():
+    """The SQL sorts by ref, which puts NSR:StopPlace:337 next to :338 and their names nowhere near
+    each other. The endpoint re-sorts on the label — and puts the refs it could not name last,
+    rather than interleaving them where their own text happens to fall."""
+    _reset(
+        [_row()],
+        filter_rows=[
+            _filter_row(from_places=["NSR:StopPlace:1", "NSR:StopPlace:2", "NSR:StopPlace:3"])
+        ],
+        stop_list=[
+            {"stop_place": "NSR:StopPlace:1", "stop_name": "Ås"},
+            {"stop_place": "NSR:StopPlace:2", "stop_name": "Asker"},
+        ],
+    )
+    body = client.get("/historikk-api/filters").json()
+    assert [pl["name"] for pl in body["from_places"]] == ["Asker", "Ås", None]
+    assert body["from_places"][-1]["ref"] == "NSR:StopPlace:3"
+
+
+def test_a_stop_name_provider_hiccup_leaves_the_filters_usable():
+    """Fails open to refs. The provider is main's in-process cache; a raise there must not take the
+    page's dropdowns down with it."""
+
+    def _boom() -> list[dict]:
+        raise RuntimeError("stop cache exploded")
+
+    _reset([_row()])
+    historikk._stop_name_provider = _boom
+    try:
+        body = client.get("/historikk-api/filters").json()
+    finally:
+        historikk._stop_name_provider = lambda: stops
+    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": None}]
+
+
+def test_line_and_place_filters_reach_the_query():
+    _reset([_row()])
+    r = client.get(
+        "/historikk-api/decisions",
+        params={
+            "line": "VYG:Line:R11",
+            "from_place": "NSR:StopPlace:337",
+            "to_place": "NSR:StopPlace:548",
+        },
+    )
+    assert r.status_code == 200, r.text
+    # The first call is the allow-list lookup; the decisions query is the one that carries them.
+    _, params = next(c for c in fake.calls if c[0] == historikk._DECISIONS_QUERY)
+    assert params["line"] == "VYG:Line:R11"
+    assert params["from_place"] == "NSR:StopPlace:337"
+    assert params["to_place"] == "NSR:StopPlace:548"
+
+
+def test_the_population_filters_also_narrow_the_summary():
+    """operator/line/from_place/to_place narrow WHICH decisions, so the rates have to describe the
+    same slice the list beside them shows. verdict/alerted_only/resolved_only narrow by OUTCOME and
+    deliberately never reach /summary — filtering to hits would make precision read 100 %."""
+    _reset([{"n_hit": 1, "n_false_alarm": 0, "n_miss": 0, "n_correct_reject": 0}])
+    r = client.get("/historikk-api/summary", params={"line": "VYG:Line:R11"})
+    assert r.status_code == 200, r.text
+    _, params = next(c for c in fake.calls if c[0] == historikk._SUMMARY_QUERY)
+    assert params["line"] == "VYG:Line:R11"
+    assert params["from_place"] is None
+    assert "verdict" not in params
+
+
+def test_a_value_no_decision_in_the_window_carries_is_rejected():
+    """The data-driven filters are checked against /filters' own answer, the same reason
+    _checked_operator checks the codespace: the value lands in the response-cache key on a public
+    endpoint, so arbitrary strings would mint one cache entry and one BigQuery query apiece.
+
+    A 400 rather than an empty list, because "this line is not in the window" and "it is, and your
+    other filters excluded everything" are different answers — the page reconciles its selections
+    against /filters when the window moves rather than sending one it knows is gone.
+    """
+    _reset([_row()])
+    bad = client.get("/historikk-api/decisions", params={"line": "VYG:Line:R99"})
+    assert bad.status_code == 400
+    assert "Unknown line" in bad.json()["detail"]
+
+    _reset([_row()])
+    bad = client.get("/historikk-api/decisions", params={"from_place": "NSR:StopPlace:999"})
+    assert bad.status_code == 400
+    assert "Unknown from_place" in bad.json()["detail"]
+
+
+def test_an_unfiltered_request_spends_no_query_on_the_allow_list():
+    """The default load is the common one, and it needs no vocabulary to validate. Checking it
+    unconditionally would double every page load's BigQuery cost for nothing."""
+    _reset([_row()])
+    client.get("/historikk-api/decisions")
+    assert [c[0] for c in fake.calls] == [historikk._DECISIONS_QUERY]
+
+
+def test_place_filters_do_not_share_a_cache_entry():
+    """Same trap the sx_only and resolved_only checks guard: the cache key is a positional tuple, so
+    a parameter added to the params list and forgotten in the key silently serves one caller's
+    narrower answer to another for two minutes."""
+    _reset([_row(), _row(situation_number="S2")], filter_rows=[
+        _filter_row(from_places=["NSR:StopPlace:337", "NSR:StopPlace:548"])
+    ])
+    client.get("/historikk-api/decisions", params={"from_place": "NSR:StopPlace:337"})
+    client.get("/historikk-api/decisions", params={"from_place": "NSR:StopPlace:548"})
+    client.get("/historikk-api/decisions", params={"to_place": "NSR:StopPlace:548"})
+    decision_calls = [c for c in fake.calls if c[0] == historikk._DECISIONS_QUERY]
+    assert len(decision_calls) == 3
+    # ... and the allow-list itself is keyed on the window alone, so all three shared one lookup.
+    assert len([c for c in fake.calls if c[0] == historikk._FILTERS_QUERY]) == 1
+
+
+def test_the_journey_endpoints_are_filterable_but_still_not_served_per_decision():
+    """The 2026-08-21 reversal, and its remaining limit — asserted so a later change has to face it.
+
+    from_place/to_place became FILTERS and /filters publishes the vocabulary, so the pair can be
+    chosen and the matching departures read off. What did NOT change is the per-row redaction: no
+    decision carries from_stop, to_stop or journey_digest, so a card still names a train rather than
+    a trip, and a listing does not pair an origin with a destination.
+    """
+    _reset([_row()])
+    d = client.get(
+        "/historikk-api/decisions", params={"from_place": "NSR:StopPlace:337"}
+    ).json()["decisions"][0]
+    assert not {"journey_digest", "from_stop", "to_stop"} & set(d)
+    # The filter is a predicate, never a projection. Checked on the SELECT lists of both UNION arms
+    # with the comments stripped -- the file discusses these columns at length, which is the point.
+    body = "\n".join(
+        ln for ln in historikk._DECISIONS_QUERY.splitlines() if not ln.strip().startswith("--")
+    )
+    projections = re.findall(r"\bSELECT\b(.*?)\bFROM\b", body, re.DOTALL)
+    assert projections, "could not find a SELECT list to check"
+    for projection in projections:
+        assert "from_stop" not in projection and "to_stop" not in projection
 
 
 def _run():

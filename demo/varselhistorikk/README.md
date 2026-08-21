@@ -34,6 +34,33 @@ Personvern: radene er nøklet på reise*definisjonen* (en digest) pluss et enhet
 `device_id`, ingen `journey_id`, og verken tidsvindu eller ukedagsmønster lagres. Loggen er en
 oversikt over hva vi sa om et tog, ikke over hvor noen pendler.
 
+## Filtrene
+
+Fem nedtrekk, alle med «Alle» som standard: **Utfall**, **Operatør**, **Linje**, **Fra** og **Til**.
+De fire siste fylles fra `GET /historikk-api/filters` over hele tidsvinduet — aldri fra kortene på
+skjermen, som er kappet på 200 og sortert på avgang: en linje som bare kjørte tidlig i vinduet ville
+da falle ut av sitt eget filter, og et valgt filter ville krympe lista det kom fra til seg selv.
+
+Verdiene er *refs* (`VYG:Line:R11`, `NSR:StopPlace:337`) — det er dem loggen lagrer og API-et
+sammenligner mot. Navnene er bare etiketter, slått opp i den samme stoppestedslista som
+`/varsel-api/stops`; et stopp uten navn vises som sin egen ref og filtrerer like fullt.
+
+`/filters` er også API-ets tillatelsesliste: en verdi som ikke finnes i vinduet gir 400, ikke tom
+liste. Derfor rydder siden i valgene sine hver gang vinduet endres — velger du en linje i 30-dagers­
+vinduet og går ned til 7 dager, nullstilles valget i stedet for at du får en feilmelding.
+
+**Fra/Til er reisens egne endepunkter**, ikke avvikets geografi: de avgrenser til avgjørelser tatt
+om reiser noen har registrert mellom de to stedene. Det er en bevisst innsnevring av personvern­
+løftet over (2026-08-21): paret kan velges og avgangene leses av. Det som *ikke* er endret, er at
+ingen enkeltrad bærer `from_stop`/`to_stop`/`journey_digest` — et kort navngir fortsatt et tog, ikke
+en reise. Vil vi ha sterkere garanti enn det, er svaret tilgangsstyring på `/historikk`, ikke en
+kortere SELECT.
+
+Utfall/«bare med fasit»/«bare der vi varslet» avgrenser derimot på *resultat* og treffer med vilje
+bare lista, aldri `/summary`: filtrerer man til treff, blir presisjonen 100 %. De fire første
+avgrenser hvilke *avgjørelser* som er med, og treffer derfor begge — tallene beskriver samme utvalg
+som kortene under dem.
+
 ## Kjøre lokalt
 
 ```sh
