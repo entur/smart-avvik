@@ -72,19 +72,37 @@ class _FakeBQ:
     def __init__(self):
         self.rows: list[dict] = []
         self.filter_rows: list[dict] = []
+        self.registry_rows: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.error: Exception | None = None
+        # Fail ONE query while the others answer normally — how a dependency in another project
+        # (the stop registry) actually goes away.
+        self.error_on: str | None = None
 
     def query(self, sql, job_config=None):
-        params = {p.name: p.value for p in (job_config.query_parameters if job_config else [])}
+        # ArrayQueryParameter carries `.values`, ScalarQueryParameter `.value` -- the place filters
+        # are arrays now, and reading only `.value` made every query raise AttributeError inside the
+        # fake, which surfaced as unrelated tests failing on missing response keys.
+        params = {
+            p.name: list(p.values) if hasattr(p, "values") else p.value
+            for p in (job_config.query_parameters if job_config else [])
+        }
         self.calls.append((sql, params))
         if self.error is not None:
             raise self.error
-        # /filters reads a different table shape (four arrays, one row) off the same client, and it
-        # is now on the VALIDATION path of /decisions and /summary too — so the fake has to answer
-        # per query, not per call, or a filtered request would be handed decision rows as its
-        # allow-list and reject everything.
-        rows = self.filter_rows if sql == historikk._FILTERS_QUERY else self.rows
+        if self.error_on is not None and sql == self.error_on:
+            raise RuntimeError("403 Access Denied: national_stop_registry")
+        # Three distinct shapes come off the same client now: decision rows, the /filters vocabulary
+        # (four arrays, one row) and the NSR registry lookup behind the from/to grouping. The fake
+        # answers per QUERY rather than per call — /filters and the registry both sit on the
+        # VALIDATION path of /decisions and /summary, so a fake that replayed one list would hand a
+        # filtered request decision rows as its allow-list and reject everything.
+        if sql == historikk._FILTERS_QUERY:
+            rows = self.filter_rows
+        elif sql == historikk._STOP_PLACES_QUERY:
+            rows = self.registry_rows
+        else:
+            rows = self.rows
 
         class _Job:
             def result(self):
@@ -94,10 +112,7 @@ class _FakeBQ:
 
 
 fake = _FakeBQ()
-# The stop list main injects from refresh_varsel_stops' cache, so the from/to dropdowns can show
-# names. Read through a callable, exactly as in main — tests rebind the list, not the provider.
-stops: list[dict] = []
-historikk.configure(bq_client=fake, stop_name_provider=lambda: stops)
+historikk.configure(bq_client=fake)
 
 app = FastAPI()
 app.include_router(historikk.router)
@@ -105,31 +120,35 @@ client = TestClient(app)
 
 
 # The vocabulary /historikk-api/filters returns, matching the line and places _row() describes.
-# One row of four arrays, which is what historikk_filters.sql produces.
+# One row of four arrays; the two place arrays carry a per-ref decision count, which is what decides
+# a merged place's primary ref.
 def _filter_row(**overrides) -> dict:
     base = {
         "operators": ["VYG"],
         "lines": ["VYG:Line:R11"],
-        "from_places": ["NSR:StopPlace:337"],
-        "to_places": ["NSR:StopPlace:548"],
+        "from_places": [{"ref": "NSR:StopPlace:337", "n": 5}],
+        "to_places": [{"ref": "NSR:StopPlace:548", "n": 5}],
     }
     base.update(overrides)
     return base
 
 
-def _reset(rows=None, error=None, filter_rows=None, stop_list=None):
+# One National Stop Register row: the name, and the parent place that says which refs are co-located.
+def _place(ref, name, place_id=None) -> dict:
+    return {"id": ref, "name": name, "place_id": place_id or ref}
+
+
+def _reset(rows=None, error=None, filter_rows=None, registry=None):
     fake.rows = list(rows or [])
     fake.filter_rows = [_filter_row()] if filter_rows is None else list(filter_rows)
+    fake.registry_rows = list(
+        registry
+        if registry is not None
+        else [_place("NSR:StopPlace:337", "Oslo S"), _place("NSR:StopPlace:548", "Asker stasjon")]
+    )
     fake.calls.clear()
     fake.error = error
-    stops[:] = list(
-        stop_list
-        if stop_list is not None
-        else [
-            {"stop_place": "NSR:StopPlace:337", "stop_name": "Oslo S"},
-            {"stop_place": "NSR:StopPlace:548", "stop_name": "Asker"},
-        ]
-    )
+    fake.error_on = None
     historikk._cache.clear()  # the TTL cache would otherwise serve a previous test's rows
 
 
@@ -574,17 +593,18 @@ def test_filters_lists_the_windows_vocabulary_with_readable_names():
     body = r.json()
     assert body["operators"] == ["VYG"]
     assert body["lines"] == ["VYG:Line:R11"]
-    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": "Oslo S"}]
-    assert body["to_places"] == [{"ref": "NSR:StopPlace:548", "name": "Asker"}]
+    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": "Oslo S", "n_refs": 1}]
+    assert body["to_places"] == [
+        {"ref": "NSR:StopPlace:548", "name": "Asker stasjon", "n_refs": 1}
+    ]
 
 
 def test_place_options_fall_back_to_the_ref_when_the_registry_cannot_name_it():
-    """Not a rare path: every process serves it until the first refresh_varsel_stops lands, and a
-    dropdown that fails to render is strictly worse than one showing NSR refs. The ref is the
-    filter value either way, so an unnamed stop still filters correctly."""
-    _reset([_row()], stop_list=[])
+    """A dropdown showing NSR refs is strictly better than one that fails to render, and the ref is
+    the filter value either way, so an unnamed stop still filters correctly."""
+    _reset([_row()], registry=[])
     body = client.get("/historikk-api/filters").json()
-    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": None}]
+    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": None, "n_refs": 1}]
 
 
 def test_place_options_are_sorted_by_the_name_the_reader_sees():
@@ -594,32 +614,112 @@ def test_place_options_are_sorted_by_the_name_the_reader_sees():
     _reset(
         [_row()],
         filter_rows=[
-            _filter_row(from_places=["NSR:StopPlace:1", "NSR:StopPlace:2", "NSR:StopPlace:3"])
+            _filter_row(from_places=[{"ref": f"NSR:StopPlace:{i}", "n": 1} for i in (1, 2, 3)])
         ],
-        stop_list=[
-            {"stop_place": "NSR:StopPlace:1", "stop_name": "Ås"},
-            {"stop_place": "NSR:StopPlace:2", "stop_name": "Asker"},
-        ],
+        registry=[_place("NSR:StopPlace:1", "Ås"), _place("NSR:StopPlace:2", "Asker")],
     )
     body = client.get("/historikk-api/filters").json()
     assert [pl["name"] for pl in body["from_places"]] == ["Asker", "Ås", None]
     assert body["from_places"][-1]["ref"] == "NSR:StopPlace:3"
 
 
-def test_a_stop_name_provider_hiccup_leaves_the_filters_usable():
-    """Fails open to refs. The provider is main's in-process cache; a raise there must not take the
-    page's dropdowns down with it."""
-
-    def _boom() -> list[dict]:
-        raise RuntimeError("stop cache exploded")
-
+def test_an_unreadable_stop_registry_leaves_the_filters_usable():
+    """The registry lives in another project behind an allAuthenticatedUsers grant, so it is the one
+    dependency here that can go away on its own. It must cost names and grouping, never the page:
+    the refs are still the filter values and still work."""
     _reset([_row()])
-    historikk._stop_name_provider = _boom
+    fake.error_on = historikk._STOP_PLACES_QUERY
     try:
-        body = client.get("/historikk-api/filters").json()
+        r = client.get("/historikk-api/filters")
     finally:
-        historikk._stop_name_provider = lambda: stops
-    assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": None}]
+        fake.error_on = None
+    assert r.status_code == 200, r.text
+    assert r.json()["from_places"] == [{"ref": "NSR:StopPlace:337", "name": None, "n_refs": 1}]
+
+
+def test_co_located_refs_are_one_row_and_filtering_matches_every_one_of_them():
+    """The bug this page shipped with, and the reason it was worse than a missing label.
+
+    A station's rail and bus sides are separate NSR refs under one parent, and a registration lands
+    on whichever one it was made against. Measured on dev 2026-08-21, Asker stasjon was BOTH
+    NSR:StopPlace:418 (rail, 659 decisions) and NSR:StopPlace:3247 (bus, 183) -- offered as two rows,
+    one of them a bare ref because main's picker cache had collapsed the other away. Naming it alone
+    would have produced two identical "Asker stasjon" rows, which is the 2026-08-03 picker bug; so
+    they merge, AND the merged row must filter on both refs, or the row would answer for 183 of the
+    station's 842 decisions and silently drop the rest.
+    """
+    _reset(
+        [_row()],
+        filter_rows=[
+            _filter_row(
+                from_places=[
+                    {"ref": "NSR:StopPlace:418", "n": 659},
+                    {"ref": "NSR:StopPlace:3247", "n": 183},
+                ]
+            )
+        ],
+        registry=[
+            _place("NSR:StopPlace:418", "Asker stasjon", "NSR:StopPlace:59616"),
+            _place("NSR:StopPlace:3247", "Asker stasjon", "NSR:StopPlace:59616"),
+        ],
+    )
+    body = client.get("/historikk-api/filters").json()
+    assert body["from_places"] == [
+        {"ref": "NSR:StopPlace:418", "name": "Asker stasjon", "n_refs": 2}
+    ], "one row per physical place, nominating the busiest ref"
+
+    client.get("/historikk-api/decisions", params={"from_place": "NSR:StopPlace:418"})
+    _, params = next(c for c in fake.calls if c[0] == historikk._DECISIONS_QUERY)
+    assert params["from_place_refs"] == ["NSR:StopPlace:3247", "NSR:StopPlace:418"], (
+        "the merged row must match BOTH sides of the station, not just the one it is named after"
+    )
+
+
+def test_one_parent_place_can_hold_two_different_stops():
+    """Grouping needs the NAME as well as the parent. Oslo S and Jernbanetorget share a parent and
+    are not the same place; merging them would let a filter for one answer with the other."""
+    _reset(
+        [_row()],
+        filter_rows=[
+            _filter_row(
+                from_places=[
+                    {"ref": "NSR:StopPlace:337", "n": 9},
+                    {"ref": "NSR:StopPlace:58366", "n": 4},
+                ]
+            )
+        ],
+        registry=[
+            _place("NSR:StopPlace:337", "Oslo S", "NSR:StopPlace:59872"),
+            _place("NSR:StopPlace:58366", "Jernbanetorget", "NSR:StopPlace:59872"),
+        ],
+    )
+    body = client.get("/historikk-api/filters").json()
+    assert [(pl["name"], pl["n_refs"]) for pl in body["from_places"]] == [
+        ("Jernbanetorget", 1),
+        ("Oslo S", 1),
+    ]
+
+
+def test_unnamed_refs_are_never_merged_into_a_named_neighbour():
+    """An unnamed ref cannot be told from its neighbour on screen, so folding it into one would hide
+    a ref behind a row nobody can read -- and would quietly widen what that row filters on."""
+    _reset(
+        [_row()],
+        filter_rows=[
+            _filter_row(
+                from_places=[
+                    {"ref": "NSR:StopPlace:418", "n": 9},
+                    {"ref": "NSR:StopPlace:3247", "n": 4},
+                ]
+            )
+        ],
+        registry=[_place("NSR:StopPlace:418", "Asker stasjon", "NSR:StopPlace:59616")],
+    )
+    body = client.get("/historikk-api/filters").json()
+    assert [(pl["ref"], pl["name"], pl["n_refs"]) for pl in body["from_places"]] == [
+        ("NSR:StopPlace:418", "Asker stasjon", 1),
+        ("NSR:StopPlace:3247", None, 1),
+    ]
 
 
 def test_line_and_place_filters_reach_the_query():
@@ -636,8 +736,10 @@ def test_line_and_place_filters_reach_the_query():
     # The first call is the allow-list lookup; the decisions query is the one that carries them.
     _, params = next(c for c in fake.calls if c[0] == historikk._DECISIONS_QUERY)
     assert params["line"] == "VYG:Line:R11"
-    assert params["from_place"] == "NSR:StopPlace:337"
-    assert params["to_place"] == "NSR:StopPlace:548"
+    # Arrays, not scalars: a chosen place is every ref standing for it. Singletons here because
+    # neither of these stops is co-located with another in the fixture.
+    assert params["from_place_refs"] == ["NSR:StopPlace:337"]
+    assert params["to_place_refs"] == ["NSR:StopPlace:548"]
 
 
 def test_the_population_filters_also_narrow_the_summary():
@@ -649,7 +751,9 @@ def test_the_population_filters_also_narrow_the_summary():
     assert r.status_code == 200, r.text
     _, params = next(c for c in fake.calls if c[0] == historikk._SUMMARY_QUERY)
     assert params["line"] == "VYG:Line:R11"
-    assert params["from_place"] is None
+    # Empty array, never NULL: BigQuery has no NULL array parameter, so emptiness is how the SQL
+    # spells "no filter" -- and a NULL here would make the predicate match nothing at all.
+    assert params["from_place_refs"] == []
     assert "verdict" not in params
 
 
@@ -686,11 +790,18 @@ def test_place_filters_do_not_share_a_cache_entry():
     a parameter added to the params list and forgotten in the key silently serves one caller's
     narrower answer to another for two minutes."""
     _reset([_row(), _row(situation_number="S2")], filter_rows=[
-        _filter_row(from_places=["NSR:StopPlace:337", "NSR:StopPlace:548"])
+        _filter_row(
+            from_places=[
+                {"ref": "NSR:StopPlace:337", "n": 9},
+                {"ref": "NSR:StopPlace:548", "n": 4},
+            ]
+        )
     ])
     client.get("/historikk-api/decisions", params={"from_place": "NSR:StopPlace:337"})
     client.get("/historikk-api/decisions", params={"from_place": "NSR:StopPlace:548"})
     client.get("/historikk-api/decisions", params={"to_place": "NSR:StopPlace:548"})
+    # Distinct places in the default registry fixture, so these really are three different filters
+    # and not one merged row asked for twice.
     decision_calls = [c for c in fake.calls if c[0] == historikk._DECISIONS_QUERY]
     assert len(decision_calls) == 3
     # ... and the allow-list itself is keyed on the window alone, so all three shared one lookup.
@@ -719,6 +830,23 @@ def test_the_journey_endpoints_are_filterable_but_still_not_served_per_decision(
     assert projections, "could not find a SELECT list to check"
     for projection in projections:
         assert "from_stop" not in projection and "to_stop" not in projection
+
+
+def test_the_no_filter_array_test_is_null_safe():
+    """A text check, because nothing in this repo executes SQL -- and this defect is invisible
+    without executing it.
+
+    An EMPTY array parameter from the Python client serializes as {'arrayValues': []}, and BigQuery
+    evaluates ARRAY_LENGTH of that as NULL, not 0. So `ARRAY_LENGTH(@refs) = 0` -- the obvious way to
+    spell "no filter" -- is NULL on every unfiltered request, the ANDed predicate drops every row,
+    and the whole page reads zero decisions. It shipped that way for one commit on 2026-08-21. A dry
+    run validates it and `bq --parameter=refs:ARRAY<STRING>:[]` returns 0, because the CLI encodes an
+    empty array differently from the client library, so neither of the cheap checks catches it.
+    """
+    for name, sql in (("decisions", historikk._DECISIONS_QUERY), ("summary", historikk._SUMMARY_QUERY)):
+        bare = re.findall(r"\(ARRAY_LENGTH\(@\w+\)\s*= 0 OR", sql)
+        assert not bare, f"{name}: {len(bare)} null-unsafe emptiness test(s); use IFNULL(..., 0)"
+        assert "IFNULL(ARRAY_LENGTH(" in sql, f"{name}: no array emptiness test found at all"
 
 
 def _run():

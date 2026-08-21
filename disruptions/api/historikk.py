@@ -24,8 +24,12 @@ the change concedes is that a from/to pair can be chosen and the matching depart
 :class:`FilterOptions` and the header of ``historikk_decisions.sql``; stronger ground than that
 means access control on ``/historikk``, not a smaller SELECT list.
 
-Reads only. No import of main (the package rule): main injects the BigQuery client and the stop-name
-lookup via :func:`configure`, the same pattern reisevalg/varsel/llm_message/decisions already use.
+Reads only. No import of main (the package rule): main injects the BigQuery client via
+:func:`configure`, the same pattern reisevalg/varsel/llm_message/decisions already use. The stop
+names and the place grouping behind the filters come from the National Stop Register directly
+(:func:`_place_registry`), NOT from main's picker cache — that cache holds only today's timetable and
+deliberately drops co-located refs, which is exactly how a station's rail side ended up offered as a
+bare ref beside its own name.
 """
 
 from __future__ import annotations
@@ -33,7 +37,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -47,6 +50,7 @@ logger = logging.getLogger(__name__)
 _DECISIONS_QUERY = (Path(__file__).parent / "historikk_decisions.sql").read_text()
 _SUMMARY_QUERY = (Path(__file__).parent / "historikk_summary.sql").read_text()
 _FILTERS_QUERY = (Path(__file__).parent / "historikk_filters.sql").read_text()
+_STOP_PLACES_QUERY = (Path(__file__).parent / "historikk_stop_places.sql").read_text()
 
 # The tables behind this only change once a poller cycle (decisions) and once a night (outcomes),
 # so a short cache keeps a page refresh from costing a BigQuery query. Same shape as main's
@@ -74,17 +78,12 @@ _OPERATORS = frozenset(
 )
 
 _bq_client: Any | None = None
-# The canonical stop list behind /varsel-api/stops (main.refresh_varsel_stops' cache), used to give
-# the from/to dropdowns readable names. Optional on purpose: a ref that cannot be resolved is shown
-# as itself, which is also what a fresh process serves before the first stops refresh lands.
-_stop_name_provider: Callable[[], list[dict]] | None = None
 
 
-def configure(*, bq_client: Any, stop_name_provider: Callable[[], list[dict]] | None = None) -> None:
-    """Wire in the BigQuery client and (optionally) the stop-name lookup. Called from main.lifespan."""
-    global _bq_client, _stop_name_provider
+def configure(*, bq_client: Any) -> None:
+    """Wire in the BigQuery client. Called once from main.lifespan."""
+    global _bq_client
     _bq_client = bq_client
-    _stop_name_provider = stop_name_provider
 
 
 class Decision(BaseModel):
@@ -177,12 +176,27 @@ class ConfigResponse(BaseModel):
 
 
 class PlaceOption(BaseModel):
-    """One entry in the from/to dropdowns: the stored ref, plus what to call it on screen."""
+    """One entry in the from/to dropdowns: one physical PLACE, not one stop ref.
 
-    ref: str = Field(description="NSR StopPlace ref, as the decision log stores it. The filter value.")
+    A station's rail and bus sides are separate NSR refs sharing a `parentRef`, and a registration
+    lands on whichever one it was made against — so the two are offered as a single row here, the way
+    `/varsel-api/stops` already offers them to the picker. `ref` is the row's identity and `n_refs`
+    says how many refs it stands for; the server expands it back to all of them when filtering, which
+    is the part that keeps the merge from hiding half the place's decisions behind the row.
+    """
+
+    ref: str = Field(
+        description="The value to send back as from_place/to_place. The busiest of the refs this "
+        "place covers, so it is one the decision log really carries — never a synthetic id.",
+    )
     name: str | None = Field(
-        description="Registry name for that ref, or null when it cannot be resolved — no stop list "
-        "has loaded yet, or the ref is not in it. Clients fall back to showing the ref.",
+        description="National Stop Register name, or null when the registry could not be read or "
+        "does not hold the ref. Clients fall back to showing the ref.",
+    )
+    n_refs: int = Field(
+        default=1,
+        description="How many stop refs this one row stands for. Above 1 means co-located refs "
+        "were merged (a station's rail and bus sides); filtering by it matches all of them.",
     )
 
 
@@ -372,28 +386,76 @@ def _checked_choice(value: str | None, field: str, allowed: list[str]) -> str | 
     return value
 
 
-def _stop_names() -> dict[str, str]:
-    """StopPlace ref -> registry name, from the same list that backs the ``/varsel-api/stops`` picker.
+def _place_registry(refs: list[str]) -> dict[str, tuple[str | None, str]]:
+    """StopPlace ref -> (name, place_id), read from the National Stop Register.
 
-    Fails open to an empty mapping: an unresolved ref is displayed as itself, which is strictly
-    better than a dropdown that fails to render. That is not a rare path — every process serves it
-    until the first ``refresh_varsel_stops`` lands.
+    Read from the registry rather than from main's picker cache, which is what this did first and
+    which failed twice over: that cache holds only stops in TODAY's timetable, and it collapses
+    co-located refs and drops the absorbed one entirely — so Asker stasjon's rail side came back
+    nameless because its bus side had won the collapse. The registry names every ref that has ever
+    existed and is the thing that knows the two are one place.
+
+    Fails open to an empty mapping: no registry means no names and no grouping, which is the filters
+    exactly as they behaved before this existed rather than a page that will not load.
     """
-    if _stop_name_provider is None:
+    if not refs:
         return {}
+    from google.cloud import bigquery
+
+    params = [bigquery.ArrayQueryParameter("refs", "STRING", sorted(refs))]
     try:
-        return {
-            row["stop_place"]: row["stop_name"]
-            for row in _stop_name_provider() or ()
-            if row.get("stop_place") and isinstance(row.get("stop_name"), str) and row["stop_name"].strip()
-        }
-    except Exception:  # a provider hiccup must never take the filters down with it
-        logger.warning("Stop-name lookup failed; filter options will show refs", exc_info=True)
+        rows = _query(_STOP_PLACES_QUERY, params, ("stop_places", tuple(sorted(refs))))
+    except HTTPException:
+        logger.warning("Stop registry unreadable; filter options will show bare refs", exc_info=True)
         return {}
+    out: dict[str, tuple[str | None, str]] = {}
+    for r in rows:
+        row = dict(r)
+        name = row.get("name")
+        name = name.strip() if isinstance(name, str) and name.strip() else None
+        out[row["id"]] = (name, row.get("place_id") or row["id"])
+    return out
 
 
-def _options(start: date, end: date) -> dict[str, list[str]]:
-    """The distinct filter values in the window, as four lists of strings.
+def _place_groups(counted: list[dict]) -> list[dict]:
+    """Collapse `[{ref, n}]` into one entry per physical place, busiest ref first within each.
+
+    The grouping rule is main.refresh_varsel_stops', deliberately copied rather than approximated:
+    same NSR parent place AND the same name means one physical stop registered more than once, while
+    a parent alone does not (one parent legitimately holds Oslo S and Jernbanetorget, which are not
+    the same place and must not answer for each other). An **unnamed** ref is never merged either —
+    its name cannot be shown to tell it from its neighbour, so folding it in would hide a ref behind
+    a row nobody can read.
+
+    Returns dicts of {ref, name, refs}: `ref` is the busiest member (ties on the ref itself, so the
+    nomination cannot flip between refreshes and invalidate the page's selection under it), and
+    `refs` is every member — what the query actually filters on.
+    """
+    registry = _place_registry([c["ref"] for c in counted])
+    groups: dict[tuple, list[dict]] = {}
+    for entry in counted:
+        name, place_id = registry.get(entry["ref"], (None, entry["ref"]))
+        key = (place_id, name.casefold()) if name else (entry["ref"], "")
+        groups.setdefault(key, []).append({**entry, "name": name})
+
+    out = []
+    for members in groups.values():
+        members.sort(key=lambda m: (-m["n"], m["ref"]))
+        primary = members[0]
+        out.append(
+            {
+                "ref": primary["ref"],
+                # From the primary, so the label and the value describe the same stop. Members can
+                # only differ in case here -- the grouping key is the casefolded name.
+                "name": primary["name"],
+                "refs": sorted(m["ref"] for m in members),
+            }
+        )
+    return out
+
+
+def _options(start: date, end: date) -> dict[str, Any]:
+    """The filter vocabulary for the window: two lists of strings and two lists of place groups.
 
     Keyed on the window alone, so every filter combination on the page shares one cache entry and
     one BigQuery query — which is what makes it affordable to run this on the validation path of
@@ -407,22 +469,52 @@ def _options(start: date, end: date) -> dict[str, list[str]]:
     ]
     rows = _query(_FILTERS_QUERY, params, ("filters", start, end))
     row = dict(rows[0]) if rows else {}
+
+    def counted(field: str) -> list[dict]:
+        return [
+            {"ref": r["ref"], "n": r.get("n") or 0}
+            for r in (row.get(field) or [])
+            if (r or {}).get("ref")
+        ]
+
     return {
-        field: [v for v in (row.get(field) or []) if v]
-        for field in ("operators", "lines", "from_places", "to_places")
+        "operators": [v for v in (row.get("operators") or []) if v],
+        "lines": [v for v in (row.get("lines") or []) if v],
+        "from_places": _place_groups(counted("from_places")),
+        "to_places": _place_groups(counted("to_places")),
     }
+
+
+def _place_refs(groups: list[dict], value: str | None, field: str) -> list[str]:
+    """Expand a chosen place into EVERY ref standing for it; `[]` when nothing is chosen.
+
+    The expansion is the whole point of grouping, not a detail of it. The dropdown offers one row
+    per physical place and nominates one of its refs as the value; filtering on that ref alone would
+    return only the registrations made against that side of the station and silently drop the rest —
+    659 of Asker stasjon's 842 decisions, measured on dev 2026-08-21. Empty list means no filter,
+    since BigQuery has no NULL array parameter.
+    """
+    if value is None:
+        return []
+    for group in groups:
+        if group["ref"] == value:
+            return group["refs"]
+    raise HTTPException(status_code=400, detail=f"Unknown {field}: not present in this window.")
 
 
 def _checked_places(
     start: date, end: date, line: str | None, from_place: str | None, to_place: str | None
-) -> None:
-    """Validate the three data-driven filters, spending a query only when one is actually set."""
+) -> tuple[list[str], list[str]]:
+    """Validate the three data-driven filters and expand the places, spending a query only when one
+    of them is actually set. Returns the two ref arrays the queries take."""
     if line is None and from_place is None and to_place is None:
-        return
+        return [], []
     opts = _options(start, end)
     _checked_choice(line, "line", opts["lines"])
-    _checked_choice(from_place, "from_place", opts["from_places"])
-    _checked_choice(to_place, "to_place", opts["to_places"])
+    return (
+        _place_refs(opts["from_places"], from_place, "from_place"),
+        _place_refs(opts["to_places"], to_place, "to_place"),
+    )
 
 
 def _window(from_date: date | None, to_date: date | None) -> tuple[date, date]:
@@ -508,16 +600,18 @@ def filters(
     """
     start, end = _window(from_date, to_date)
     opts = _options(start, end)
-    names = _stop_names()
-    def places(refs: list[str]) -> list[PlaceOption]:
+
+    def places(groups: list[dict]) -> list[PlaceOption]:
         # Sorted by what the reader sees. The SQL sorts by ref, which puts "NSR:StopPlace:337" next
         # to "NSR:StopPlace:338" and their names nowhere near each other.
         #
         # Unnamed refs go LAST rather than under their own text: sorting the two kinds together
         # interleaves them ("Lillestrøm", NSR:StopPlace:3247, ..., "Oslo S"), which reads as a list
         # that lost its ordering. Behind the named ones they read as what they are — the tail the
-        # registry could not place.
-        options = [PlaceOption(ref=ref, name=names.get(ref)) for ref in refs]
+        # registry could not place. With the registry readable this tail is normally empty.
+        options = [
+            PlaceOption(ref=g["ref"], name=g["name"], n_refs=len(g["refs"])) for g in groups
+        ]
         return sorted(options, key=lambda o: (o.name is None, (o.name or o.ref).casefold()))
 
     return FilterOptions(
@@ -586,7 +680,7 @@ def decisions(
 
     start, end = _window(from_date, to_date)
     operator = _checked_operator(operator)
-    _checked_places(start, end, line, from_place, to_place)
+    from_refs, to_refs = _checked_places(start, end, line, from_place, to_place)
     if verdict is not None and verdict not in _VERDICTS:
         raise HTTPException(
             status_code=400, detail=f"verdict must be one of {', '.join(_VERDICTS)}."
@@ -596,8 +690,8 @@ def decisions(
         bigquery.ScalarQueryParameter("to_date", "DATE", end),
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
         bigquery.ScalarQueryParameter("line", "STRING", line),
-        bigquery.ScalarQueryParameter("from_place", "STRING", from_place),
-        bigquery.ScalarQueryParameter("to_place", "STRING", to_place),
+        bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
+        bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
@@ -649,14 +743,14 @@ def summary(
 
     start, end = _window(from_date, to_date)
     operator = _checked_operator(operator)
-    _checked_places(start, end, line, from_place, to_place)
+    from_refs, to_refs = _checked_places(start, end, line, from_place, to_place)
     params = [
         bigquery.ScalarQueryParameter("from_date", "DATE", start),
         bigquery.ScalarQueryParameter("to_date", "DATE", end),
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
         bigquery.ScalarQueryParameter("line", "STRING", line),
-        bigquery.ScalarQueryParameter("from_place", "STRING", from_place),
-        bigquery.ScalarQueryParameter("to_place", "STRING", to_place),
+        bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
+        bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
     ]
     rows = _query(
         _SUMMARY_QUERY, params, ("summary", start, end, operator, line, from_place, to_place)
