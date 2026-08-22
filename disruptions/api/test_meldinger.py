@@ -1,4 +1,4 @@
-"""Checks for /tilbakeblikk-api — a window of past alert decisions, replayed through today's prompt.
+"""Checks for /meldinger-api — a window of past alert decisions, replayed through today's prompt.
 
 Hermetic, exactly like test_historikk.py: BigQuery is replaced with a fake that records the SQL, the
 parameters and the job config it was handed and replays canned rows, so nothing here touches
@@ -19,7 +19,7 @@ rather than loud:
   and the single-aggregate replay pick.
 
 Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigquery \
-     --with google-cloud-storage --with pywebpush python test_tilbakeblikk.py   (or under pytest)
+     --with google-cloud-storage --with pywebpush python test_meldinger.py   (or under pytest)
 """
 
 import asyncio
@@ -43,7 +43,7 @@ from google.cloud import bigquery as _bq
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
 import llm_message
-import tilbakeblikk
+import meldinger
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -56,7 +56,7 @@ PAST_DAY = datetime.now(OSLO).date() - timedelta(days=3)
 
 
 def _row(**overrides) -> dict:
-    """A decision row as tilbakeblikk_decisions.sql returns it; override per test."""
+    """A decision row as meldinger_decisions.sql returns it; override per test."""
     base = {
         "situation_number": "S1",
         "summary": "Signalfeil ved Asker",
@@ -110,7 +110,7 @@ INPUT_JSON = llm_message.message_input_json(STORED_INPUT)
 
 
 def _message_row(**overrides) -> dict:
-    """A replay row as tilbakeblikk_messages.sql returns it — subject key, input, cycle.
+    """A replay row as meldinger_messages.sql returns it — subject key, input, cycle.
 
     Carries `journey_digest` and `message_input`, which is exactly why nothing built from it may
     reach the response: this is the server-side half of the privacy boundary.
@@ -176,11 +176,11 @@ class _FakeBQ:
         # answers per QUERY rather than per call — /filters and the registry both sit on the
         # VALIDATION path of /decisions and /summary, so a fake that replayed one list would hand a
         # filtered request decision rows as its allow-list and reject everything.
-        if sql == tilbakeblikk._FILTERS_QUERY:
+        if sql == meldinger._FILTERS_QUERY:
             rows = self.filter_rows
-        elif sql == tilbakeblikk._STOP_PLACES_QUERY:
+        elif sql == meldinger._STOP_PLACES_QUERY:
             rows = self.registry_rows
-        elif sql == tilbakeblikk._MESSAGES_QUERY:
+        elif sql == meldinger._MESSAGES_QUERY:
             rows = self.message_rows
         else:
             rows = self.rows
@@ -210,15 +210,15 @@ def _fake_deterministic(payload: dict) -> str:
     return f"Mal for {payload['linje']}: avviket kan påvirke reisen din."
 
 
-tilbakeblikk.configure(bq_client=fake, deterministic_writer=_fake_deterministic)
+meldinger.configure(bq_client=fake, deterministic_writer=_fake_deterministic)
 
 app = FastAPI()
-app.include_router(tilbakeblikk.router)
+app.include_router(meldinger.router)
 client = TestClient(app)
 
 
 def _filter_row(**overrides) -> dict:
-    """The vocabulary /tilbakeblikk-api/filters returns, matching the line and places _row() names."""
+    """The vocabulary /meldinger-api/filters returns, matching the line and places _row() names."""
     base = {
         "operators": ["VYG"],
         "lines": ["VYG:Line:R11"],
@@ -247,18 +247,18 @@ def _reset(rows=None, error=None, filter_rows=None, registry=None, message_rows=
     fake.job_configs.clear()
     fake.error = error
     fake.error_on = None
-    tilbakeblikk._cache.clear()  # the TTL cache would otherwise serve a previous test's rows
+    meldinger._cache.clear()  # the TTL cache would otherwise serve a previous test's rows
     # The replay state, all four pieces of it. Leaving any one behind makes a later check pass for
     # the wrong reason: a warm wording cache hides a missing backend call, a spent replay tally
     # makes a budget check "bind" before it should, and a latched replay holder reports `disabled`
     # where a test expects an answer.
-    tilbakeblikk._wordings.clear()
-    tilbakeblikk._wording_inflight.clear()
-    for spent in tilbakeblikk._replay_calls.values():
+    meldinger._wordings.clear()
+    meldinger._wording_inflight.clear()
+    for spent in meldinger._replay_calls.values():
         spent.hour.clear()
         spent.day.clear()
-    tilbakeblikk._replay_state = None
-    tilbakeblikk._warned_no_writer = False
+    meldinger._replay_state = None
+    meldinger._warned_no_writer = False
     deterministic_inputs.clear()
     # llm_message's own globals: this suite must never depend on the ambient environment of whoever
     # runs it (VARSEL_LLM_PROVIDER, GOOGLE_CLOUD_PROJECT), and the module-global latch is what the
@@ -270,7 +270,7 @@ def _reset(rows=None, error=None, filter_rows=None, registry=None, message_rows=
 
 
 def _decision_calls():
-    return [c for c in fake.calls if c[0] == tilbakeblikk._DECISIONS_QUERY]
+    return [c for c in fake.calls if c[0] == meldinger._DECISIONS_QUERY]
 
 
 def _never_called(body):
@@ -307,7 +307,7 @@ def _captured(level=logging.INFO):
         def emit(self, record):
             records.append(record)
 
-    module_logger = logging.getLogger("tilbakeblikk")
+    module_logger = logging.getLogger("meldinger")
     sink = _Sink(level)
     module_logger.addHandler(sink)
     before = module_logger.level
@@ -345,7 +345,7 @@ def _clock_at(instant: datetime):
     The module touches only `datetime.now` and `datetime.combine`, and its annotations were resolved
     at import, so a shim exposing those two is enough.
     """
-    real = tilbakeblikk.datetime
+    real = meldinger.datetime
 
     class _Clock:
         @staticmethod
@@ -354,11 +354,11 @@ def _clock_at(instant: datetime):
 
         combine = staticmethod(real.combine)
 
-    tilbakeblikk.datetime = _Clock
+    meldinger.datetime = _Clock
     try:
         yield
     finally:
-        tilbakeblikk.datetime = real
+        meldinger.datetime = real
 
 
 def test_the_day_defaults_to_the_oslo_calendar_day_not_the_utc_one():
@@ -368,7 +368,7 @@ def test_the_day_defaults_to_the_oslo_calendar_day_not_the_utc_one():
     evening, which is when a disruption surface is most likely to be open."""
     _reset([_row()])
     with _clock_at(datetime(2026, 8, 20, 22, 30, tzinfo=UTC)):
-        body = client.get("/tilbakeblikk-api/decisions").json()
+        body = client.get("/meldinger-api/decisions").json()
     assert body["day"] == "2026-08-21", "the default day must be the Oslo calendar day"
     # ...and the window it resolves to is that Oslo day, not a UTC one: 22:00 UTC to 22:00 UTC.
     _, params = _decision_calls()[0]
@@ -380,7 +380,7 @@ def test_the_day_defaults_to_today_in_oslo():
     """The ordinary path, against the ambient clock — the frozen-clock check above is what actually
     discriminates the timezone."""
     _reset([_row()])
-    body = client.get("/tilbakeblikk-api/decisions").json()
+    body = client.get("/meldinger-api/decisions").json()
     assert body["day"] == datetime.now(OSLO).date().isoformat()
 
 
@@ -393,7 +393,7 @@ def test_the_time_range_defaults_to_the_whole_day_as_a_half_open_range():
     default request, which is the busiest part of an evening window.
     """
     _reset([_row()])
-    body = client.get("/tilbakeblikk-api/decisions").json()
+    body = client.get("/meldinger-api/decisions").json()
     today = datetime.now(OSLO).date()
     assert body["from_time"] == "00:00:00"
     # 00:00 as an END means the following midnight; it cannot mean anything else, since a literal
@@ -413,7 +413,7 @@ def test_from_time_rounds_down_and_to_time_rounds_up():
     14:00-14:30, not 14:15-14:15."""
     _reset([_row()])
     client.get(
-        "/tilbakeblikk-api/decisions",
+        "/meldinger-api/decisions",
         params={"day": PAST_DAY.isoformat(), "from_time": "14:07", "to_time": "14:22"},
     )
     _, params = _decision_calls()[0]
@@ -425,7 +425,7 @@ def test_from_time_rounds_down_and_to_time_rounds_up():
     # boundaries.
     _reset([_row()])
     client.get(
-        "/tilbakeblikk-api/decisions",
+        "/meldinger-api/decisions",
         params={"day": PAST_DAY.isoformat(), "from_time": "14:00", "to_time": "15:00"},
     )
     _, params = _decision_calls()[0]
@@ -442,11 +442,11 @@ def test_two_times_in_one_step_share_a_cache_entry_and_a_query():
     _reset([_row()])
     for minute in ("14:01", "14:07", "14:14:59"):
         client.get(
-            "/tilbakeblikk-api/decisions",
+            "/meldinger-api/decisions",
             params={"day": PAST_DAY.isoformat(), "from_time": minute, "to_time": "15:00"},
         )
     assert len(_decision_calls()) == 1, "three times inside one 15-minute step must share one query"
-    assert len(tilbakeblikk._cache) == 2  # decision list + shared stop-name lookup
+    assert len(meldinger._cache) == 2  # decision list + shared stop-name lookup
 
 
 def test_a_reversed_or_empty_time_range_is_rejected_without_a_query():
@@ -459,7 +459,7 @@ def test_a_reversed_or_empty_time_range_is_rejected_without_a_query():
     for from_time, to_time in (("14:00", "13:00"), ("14:00", "14:00")):
         _reset([_row()])
         bad = client.get(
-            "/tilbakeblikk-api/decisions",
+            "/meldinger-api/decisions",
             params={"day": PAST_DAY.isoformat(), "from_time": from_time, "to_time": to_time},
         )
         assert bad.status_code == 400, (from_time, to_time)
@@ -486,7 +486,7 @@ def test_a_bare_midnight_to_time_is_rejected_rather_than_silently_empty():
     ):
         _reset([_row()])
         bad = client.get(
-            "/tilbakeblikk-api/decisions",
+            "/meldinger-api/decisions",
             params={"day": PAST_DAY.isoformat(), **params},
         )
         assert bad.status_code == 400, (params, bad.status_code, bad.json())
@@ -509,7 +509,7 @@ def test_a_valid_range_still_survives_the_resolved_bounds_check():
     for from_time, to_time in (("14:00", "14:01"), ("00:00", "23:59"), ("14:00", "14:15")):
         _reset([_row()])
         ok = client.get(
-            "/tilbakeblikk-api/decisions",
+            "/meldinger-api/decisions",
             params={"day": PAST_DAY.isoformat(), "from_time": from_time, "to_time": to_time},
         )
         assert ok.status_code == 200, (from_time, to_time, ok.json())
@@ -526,13 +526,13 @@ def test_tomorrow_is_allowed_because_the_axis_is_departure_and_not_decision():
     """
     tomorrow = datetime.now(OSLO).date() + timedelta(days=1)
     _reset([_row()])
-    ok = client.get("/tilbakeblikk-api/decisions", params={"day": tomorrow.isoformat()})
+    ok = client.get("/meldinger-api/decisions", params={"day": tomorrow.isoformat()})
     assert ok.status_code == 200, ok.text
     assert fake.calls, "tomorrow must reach BigQuery, not be refused"
 
     _reset([_row()])
     day_after = datetime.now(OSLO).date() + timedelta(days=2)
-    bad = client.get("/tilbakeblikk-api/decisions", params={"day": day_after.isoformat()})
+    bad = client.get("/meldinger-api/decisions", params={"day": day_after.isoformat()})
     assert bad.status_code == 400
     assert "future" in bad.json()["detail"]
     assert fake.calls == []
@@ -545,7 +545,7 @@ def test_a_day_beyond_the_lookback_is_rejected_without_a_query():
 
     _reset([_row()])
     ancient = datetime.now(OSLO).date() - timedelta(days=historikk._MAX_WINDOW_DAYS + 1)
-    bad = client.get("/tilbakeblikk-api/decisions", params={"day": ancient.isoformat()})
+    bad = client.get("/meldinger-api/decisions", params={"day": ancient.isoformat()})
     assert bad.status_code == 400
     assert "too far back" in bad.json()["detail"]
     assert fake.calls == []
@@ -557,7 +557,7 @@ def test_the_window_is_echoed_in_full_on_every_data_response():
     irregular days, and would get the exclusive end wrong."""
     _reset([_row()])
     body = client.get(
-        "/tilbakeblikk-api/decisions",
+        "/meldinger-api/decisions",
         params={"day": PAST_DAY.isoformat(), "from_time": "06:00", "to_time": "09:00"},
     ).json()
     assert body["day"] == PAST_DAY.isoformat()
@@ -594,15 +594,15 @@ def test_every_parameter_makes_its_own_cache_entry():
     _reset([_row()])
     for extra in variants:
         client.get(
-            "/tilbakeblikk-api/decisions", params={"day": PAST_DAY.isoformat(), **extra}
+            "/meldinger-api/decisions", params={"day": PAST_DAY.isoformat(), **extra}
         )
     assert len(_decision_calls()) == len(variants)
 
 
 def test_identical_requests_are_served_from_cache():
     _reset([_row()])
-    client.get("/tilbakeblikk-api/decisions")
-    client.get("/tilbakeblikk-api/decisions")
+    client.get("/meldinger-api/decisions")
+    client.get("/meldinger-api/decisions")
     assert len(_decision_calls()) == 1, "the second identical request should be served from cache"
 
 
@@ -611,10 +611,10 @@ def test_cache_is_bounded():
     restarts, and its memory limit is the binding constraint — an OOMKill is zero capacity for the
     length of a cold start, because uvicorn binds only after lifespan's eager BigQuery loads."""
     _reset([_row()])
-    for i in range(tilbakeblikk._CACHE_MAX_ENTRIES + 50):
+    for i in range(meldinger._CACHE_MAX_ENTRIES + 50):
         day = datetime.now(OSLO).date() - timedelta(days=i % 90)
-        client.get("/tilbakeblikk-api/decisions", params={"day": day.isoformat()})
-    assert len(tilbakeblikk._cache) <= tilbakeblikk._CACHE_MAX_ENTRIES
+        client.get("/meldinger-api/decisions", params={"day": day.isoformat()})
+    assert len(meldinger._cache) <= meldinger._CACHE_MAX_ENTRIES
 
 
 # --------------------------------------------------------------------------------------------
@@ -627,7 +627,7 @@ def test_unknown_operator_is_rejected_without_a_query():
     and `operator` is part of the cache key, so an arbitrary string would buy one cached query per
     distinct value."""
     _reset([_row()])
-    bad = client.get("/tilbakeblikk-api/decisions", params={"operator": "NOT-AN-OPERATOR"})
+    bad = client.get("/meldinger-api/decisions", params={"operator": "NOT-AN-OPERATOR"})
     assert bad.status_code == 400
     assert "operator must be one of" in bad.json()["detail"]
     assert fake.calls == [], "a rejected operator must not reach BigQuery"
@@ -643,7 +643,7 @@ def test_a_value_no_decision_in_the_window_carries_is_rejected():
         ({"to_place": "NSR:StopPlace:999"}, "Unknown to_place"),
     ):
         _reset([_row()])
-        bad = client.get("/tilbakeblikk-api/decisions", params=param)
+        bad = client.get("/meldinger-api/decisions", params=param)
         assert bad.status_code == 400, param
         assert expected in bad.json()["detail"]
         assert _decision_calls() == [], "a rejected filter must not reach the decisions query"
@@ -651,9 +651,9 @@ def test_a_value_no_decision_in_the_window_carries_is_rejected():
 
 def test_verdict_filter_is_validated():
     _reset([_row()])
-    assert client.get("/tilbakeblikk-api/decisions", params={"verdict": "hit"}).status_code == 200
+    assert client.get("/meldinger-api/decisions", params={"verdict": "hit"}).status_code == 200
     _reset([_row()])
-    bad = client.get("/tilbakeblikk-api/decisions", params={"verdict": "definitely-not"})
+    bad = client.get("/meldinger-api/decisions", params={"verdict": "definitely-not"})
     assert bad.status_code == 400
     assert "verdict must be one of" in bad.json()["detail"]
     assert fake.calls == []
@@ -663,10 +663,10 @@ def test_an_unfiltered_request_skips_the_allow_list_but_resolves_route_names():
     """The default load is the common one and needs no vocabulary to validate. Checking it
     unconditionally would double every page load's BigQuery cost for nothing."""
     _reset([_row()])
-    client.get("/tilbakeblikk-api/decisions")
+    client.get("/meldinger-api/decisions")
     assert [c[0] for c in fake.calls] == [
-        tilbakeblikk._DECISIONS_QUERY,
-        tilbakeblikk._STOP_PLACES_QUERY,
+        meldinger._DECISIONS_QUERY,
+        meldinger._STOP_PLACES_QUERY,
     ]
 
 
@@ -679,10 +679,10 @@ def test_the_allow_list_itself_is_keyed_on_the_window_alone():
             {"ref": "NSR:StopPlace:548", "n": 4},
         ])
     ])
-    client.get("/tilbakeblikk-api/decisions", params={"from_place": "NSR:StopPlace:337"})
-    client.get("/tilbakeblikk-api/decisions", params={"from_place": "NSR:StopPlace:548"})
+    client.get("/meldinger-api/decisions", params={"from_place": "NSR:StopPlace:337"})
+    client.get("/meldinger-api/decisions", params={"from_place": "NSR:StopPlace:548"})
     assert len(_decision_calls()) == 2
-    assert len([c for c in fake.calls if c[0] == tilbakeblikk._FILTERS_QUERY]) == 1
+    assert len([c for c in fake.calls if c[0] == meldinger._FILTERS_QUERY]) == 1
 
 
 def test_a_chosen_place_expands_to_every_ref_standing_for_it():
@@ -701,12 +701,12 @@ def test_a_chosen_place_expands_to_every_ref_standing_for_it():
             _place("NSR:StopPlace:3247", "Asker stasjon", "NSR:StopPlace:59616"),
         ],
     )
-    body = client.get("/tilbakeblikk-api/filters").json()
+    body = client.get("/meldinger-api/filters").json()
     assert body["from_places"] == [
         {"ref": "NSR:StopPlace:418", "name": "Asker stasjon", "n_refs": 2}
     ], "one row per physical place, nominating the busiest ref"
 
-    client.get("/tilbakeblikk-api/decisions", params={"from_place": "NSR:StopPlace:418"})
+    client.get("/meldinger-api/decisions", params={"from_place": "NSR:StopPlace:418"})
     _, params = _decision_calls()[0]
     assert params["from_place_refs"] == ["NSR:StopPlace:3247", "NSR:StopPlace:418"]
 
@@ -714,7 +714,7 @@ def test_a_chosen_place_expands_to_every_ref_standing_for_it():
 def test_filters_lists_the_windows_vocabulary_and_echoes_the_window():
     _reset([_row()])
     r = client.get(
-        "/tilbakeblikk-api/filters",
+        "/meldinger-api/filters",
         params={"day": PAST_DAY.isoformat(), "from_time": "06:07", "to_time": "09:02"},
     )
     assert r.status_code == 200, r.text
@@ -731,9 +731,9 @@ def test_an_unreadable_stop_registry_leaves_the_filters_usable():
     """The registry lives in another project behind an allAuthenticatedUsers grant, so it is the one
     dependency here that can go away on its own. It must cost names and grouping, never the page."""
     _reset([_row()])
-    fake.error_on = tilbakeblikk._STOP_PLACES_QUERY
+    fake.error_on = meldinger._STOP_PLACES_QUERY
     try:
-        r = client.get("/tilbakeblikk-api/filters")
+        r = client.get("/meldinger-api/filters")
     finally:
         fake.error_on = None
     assert r.status_code == 200, r.text
@@ -745,7 +745,7 @@ def test_limit_above_the_cap_is_fastapis_422_not_this_modules_400():
     was malformed against the schema, 400 means it was well-formed and named something that does not
     exist in this window."""
     _reset([_row()])
-    assert client.get("/tilbakeblikk-api/decisions", params={"limit": 10_000}).status_code == 422
+    assert client.get("/meldinger-api/decisions", params={"limit": 10_000}).status_code == 422
 
 
 # --------------------------------------------------------------------------------------------
@@ -761,14 +761,14 @@ def test_summary_refuses_the_outcome_filters_and_accepts_the_population_ones():
     Asserted on the route signature as well as on the query parameters — an accepted-but-ignored
     parameter reads as "it did something" from the caller's side.
     """
-    accepted = set(inspect.signature(tilbakeblikk.summary).parameters)
+    accepted = set(inspect.signature(meldinger.summary).parameters)
     assert not {"verdict", "alerted_only", "resolved_only", "sx_only"} & accepted
     assert {"day", "from_time", "to_time", "operator", "line", "from_place", "to_place"} <= accepted
 
     _reset([{"n_hit": 1}])
-    r = client.get("/tilbakeblikk-api/summary", params={"line": "VYG:Line:R11"})
+    r = client.get("/meldinger-api/summary", params={"line": "VYG:Line:R11"})
     assert r.status_code == 200, r.text
-    _, params = next(c for c in fake.calls if c[0] == tilbakeblikk._SUMMARY_QUERY)
+    _, params = next(c for c in fake.calls if c[0] == meldinger._SUMMARY_QUERY)
     assert params["line"] == "VYG:Line:R11"
     assert "verdict" not in params and "alerted_only" not in params
     # Empty array, never NULL: BigQuery has no NULL array parameter, so emptiness is how the SQL
@@ -786,7 +786,7 @@ def test_summary_reports_the_labelled_split_alongside_the_rates():
         "n_hit": 3, "n_false_alarm": 0, "n_miss": 0, "n_correct_reject": 0,
         "n_unknown": 1, "n_pending": 408, "precision": 1.0,
     }])
-    s = client.get("/tilbakeblikk-api/summary").json()
+    s = client.get("/meldinger-api/summary").json()
     assert s["n_subjects"] == 412
     assert s["n_labelled"] == 3
     assert s["n_labelled"] + s["n_unknown"] + s["n_pending"] == s["n_subjects"]
@@ -804,7 +804,7 @@ def test_summary_splits_provenance_and_keeps_unsegmented_its_own_bucket():
         "n_hit_no_sx": 0, "precision_no_sx": None,
         "n_unsegmented": 7,
     }])
-    s = client.get("/tilbakeblikk-api/summary").json()
+    s = client.get("/meldinger-api/summary").json()
     assert s["predicted"]["precision"] < s["precision"] < s["relayed"]["precision"]
     assert s["predicted"]["n_hit"] + s["relayed"]["n_hit"] == s["n_hit"]
     # None, not 0.0: a rate over no decisions is unknown, and 0 % would read as "we got them wrong".
@@ -818,7 +818,7 @@ def test_summary_splits_provenance_and_keeps_unsegmented_its_own_bucket():
 def test_summary_survives_an_empty_window():
     """A window with no decisions in it is zeroes, not a 500."""
     _reset([])
-    s = client.get("/tilbakeblikk-api/summary").json()
+    s = client.get("/meldinger-api/summary").json()
     assert s["n_subjects"] == 0 and s["n_labelled"] == 0
     assert s["precision"] is None and s["recall"] is None
     assert s["predicted"]["n_hit"] == 0 and s["predicted"]["precision"] is None
@@ -831,7 +831,7 @@ def test_summary_survives_an_empty_window():
 
 def test_decisions_returns_rows_with_the_replay_fields():
     _reset([_row()])
-    r = client.get("/tilbakeblikk-api/decisions")
+    r = client.get("/meldinger-api/decisions")
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["count"] == 1
@@ -850,7 +850,7 @@ def test_a_subject_with_no_replayable_cycle_is_its_own_state():
         would_send_at=None, prompt_version=None, send_state="under_terskel",
         ever_alerted=False, pushed_any=False,
     )])
-    d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
+    d = client.get("/meldinger-api/decisions").json()["decisions"][0]
     assert d["would_send_at"] is None
     assert d["prompt_version"] is None
     assert d["send_state"] == "under_terskel"
@@ -866,7 +866,7 @@ def test_an_alert_worthy_subject_collapsed_into_a_sibling_says_so():
         would_send_at=None, prompt_version=None, send_state="samlet",
         ever_alerted=True, pushed_any=False, other_pushed_on_train=1,
     )])
-    d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
+    d = client.get("/meldinger-api/decisions").json()["decisions"][0]
     assert d["send_state"] == "samlet"
     assert d["pushed_any"] is False
     assert d["other_pushed_on_train"] == 1
@@ -881,7 +881,7 @@ def test_response_carries_route_names_but_no_internal_identifiers_or_writer_inpu
     possibly different cycle would reintroduce exactly the mismatch the 2026-08-21 fix removed.
     """
     _reset([_row()])
-    d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
+    d = client.get("/meldinger-api/decisions").json()["decisions"][0]
     assert d["from_name"] == "Oslo S"
     assert d["to_name"] == "Asker stasjon"
     assert not {"journey_digest", "from_stop", "to_stop", "stop_place", "message_input"} & set(d)
@@ -901,8 +901,8 @@ def test_response_carries_route_names_but_no_internal_identifiers_or_writer_inpu
 
 def test_route_names_fall_back_to_refs_when_the_stop_registry_is_unavailable():
     _reset([_row()])
-    fake.error_on = tilbakeblikk._STOP_PLACES_QUERY
-    d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
+    fake.error_on = meldinger._STOP_PLACES_QUERY
+    d = client.get("/meldinger-api/decisions").json()["decisions"][0]
     assert d["from_name"] == "NSR:StopPlace:337"
     assert d["to_name"] == "NSR:StopPlace:548"
 
@@ -918,7 +918,7 @@ def test_the_decision_model_refuses_a_redacted_column():
     public_row.pop("to_stop")
     for redacted in ("journey_digest", "from_stop", "to_stop", "message_input"):
         try:
-            tilbakeblikk.Decision(**public_row, **{redacted: "x"})
+            meldinger.Decision(**public_row, **{redacted: "x"})
             raise AssertionError(f"Decision must reject {redacted} — extra='forbid' is the guard")
         except ValidationError:
             pass
@@ -930,10 +930,10 @@ def test_the_job_config_caps_what_one_request_can_bill():
     the backstop: it bounds the blast radius of a query that starts reading something big, on a
     public unauthenticated endpoint that shares its project quota with the poller."""
     _reset([_row()])
-    client.get("/tilbakeblikk-api/decisions")
+    client.get("/meldinger-api/decisions")
     assert fake.job_configs, "no query was made"
     for job_config in fake.job_configs:
-        assert job_config.maximum_bytes_billed == tilbakeblikk._MAX_BYTES_BILLED
+        assert job_config.maximum_bytes_billed == meldinger._MAX_BYTES_BILLED
 
 
 # --------------------------------------------------------------------------------------------
@@ -943,7 +943,7 @@ def test_the_job_config_caps_what_one_request_can_bill():
 
 def test_missing_tables_report_unavailable_not_a_traceback():
     _reset([], error=RuntimeError("404 Not found: Table disruptions.varsel_decisions"))
-    r = client.get("/tilbakeblikk-api/decisions")
+    r = client.get("/meldinger-api/decisions")
     assert r.status_code == 503
     assert "decision log" in r.json()["detail"].lower()
 
@@ -972,15 +972,15 @@ def test_config_survives_an_unreadable_decision_log():
     which environment you are on is what tells a broken deployment from a fresh one."""
     _reset([], error=RuntimeError("404 Not found: Table disruptions.varsel_decisions"))
     with _deployed_as("ent-kixavvik-dev"):
-        assert client.get("/tilbakeblikk-api/summary").status_code == 503
+        assert client.get("/meldinger-api/summary").status_code == 503
         queries_so_far = len(fake.calls)
-        r = client.get("/tilbakeblikk-api/config")
+        r = client.get("/meldinger-api/config")
     assert r.status_code == 200
     assert r.json()["environment"] == "dev"
     assert len(fake.calls) == queries_so_far, "/config must not query BigQuery"
 
     with _deployed_as("ent-kixavvik-prd"):
-        assert client.get("/tilbakeblikk-api/config").json()["environment"] is None
+        assert client.get("/meldinger-api/config").json()["environment"] is None
 
 
 # --------------------------------------------------------------------------------------------
@@ -999,8 +999,8 @@ UNGROUNDED_REPLY = '{"melding": "Toget er 42 minutter forsinket."}'
 
 
 def _messages(**params):
-    """GET /tilbakeblikk-api/messages, returning the parsed body and asserting it answered."""
-    r = client.get("/tilbakeblikk-api/messages", params=params)
+    """GET /meldinger-api/messages, returning the parsed body and asserting it answered."""
+    r = client.get("/meldinger-api/messages", params=params)
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -1027,7 +1027,7 @@ def test_a_stored_input_reaches_the_backend_verbatim():
     assert entry["prompt_version"] == "a1b2c3d4", "the row's own prompt version, for R9's marker"
     # Same blast-radius cap as every other query on this surface -- it is a public endpoint sharing
     # its project quota with the poller.
-    assert all(jc.maximum_bytes_billed == tilbakeblikk._MAX_BYTES_BILLED for jc in fake.job_configs)
+    assert all(jc.maximum_bytes_billed == meldinger._MAX_BYTES_BILLED for jc in fake.job_configs)
 
 
 def test_a_repeated_request_is_served_from_the_wording_cache():
@@ -1070,7 +1070,7 @@ def test_a_narrower_window_picks_a_different_cycle_and_misses_the_cache():
     with _backends(lambda body: calls.append(body) or OK_REPLY):
         _messages(day=PAST_DAY.isoformat())
         fake.message_rows = [_message_row(would_send_at=DEP - timedelta(minutes=20))]
-        tilbakeblikk._cache.clear()  # so the narrower window really re-reads
+        meldinger._cache.clear()  # so the narrower window really re-reads
         _messages(day=PAST_DAY.isoformat(), from_time="06:00", to_time="07:00")
     assert len(calls) == 2, "a different replayed cycle is a different wording"
 
@@ -1086,8 +1086,8 @@ def test_one_request_can_generate_every_subject_the_endpoint_may_return():
         gemini=lambda body: calls.append(body) or OK_REPLY,
     ):
         body = _messages()
-    assert tilbakeblikk._CALLS_PER_ATTEMPT == 1
-    assert tilbakeblikk._MAX_CALLS_PER_REQUEST >= tilbakeblikk._MAX_LIMIT
+    assert meldinger._CALLS_PER_ATTEMPT == 1
+    assert meldinger._MAX_CALLS_PER_REQUEST >= meldinger._MAX_LIMIT
     assert len(calls) == 12, "Gemini is called exactly once for each subject"
     assert _statuses(body) == ["ok"] * 12
 
@@ -1126,9 +1126,9 @@ def test_concurrent_cold_requests_share_one_generated_wording():
 
     def replay():
         results.append(
-            tilbakeblikk._replay_one_cached(
+            meldinger._replay_one_cached(
                 _message_row(),
-                budget=tilbakeblikk._Budget(),
+                budget=meldinger._Budget(),
                 deadline=_time.monotonic() + 30,
                 generating=True,
             )
@@ -1151,32 +1151,32 @@ def test_concurrent_cold_requests_share_one_generated_wording():
 def test_the_hourly_budget_allows_1000_calls_then_binds_across_requests():
     _reset()
     now = _time.monotonic()
-    assert tilbakeblikk._Budget().reserve(1000, now) is None
+    assert meldinger._Budget().reserve(1000, now) is None
     with _captured(logging.WARNING) as records:
-        assert tilbakeblikk._Budget().reserve(1, now) == "rate_limited"
-    assert tilbakeblikk._MAX_CALLS_PER_HOUR == 1000
+        assert meldinger._Budget().reserve(1, now) == "rate_limited"
+    assert meldinger._MAX_CALLS_PER_HOUR == 1000
     assert len(_reason(records, "rate_limited")) == 1
 
 
 def test_the_daily_budget_allows_5000_calls_then_binds_across_requests():
     _reset()
     now = _time.monotonic()
-    spent = tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH]
+    spent = meldinger._replay_calls[meldinger._REPLAY_PATH]
     spent.day.extend([now - 2 * 60 * 60] * 4999)
-    assert tilbakeblikk._Budget().reserve(1, now) is None
-    assert tilbakeblikk._Budget().reserve(1, now) == "rate_limited"
-    assert tilbakeblikk._MAX_CALLS_PER_DAY == 5000
+    assert meldinger._Budget().reserve(1, now) is None
+    assert meldinger._Budget().reserve(1, now) == "rate_limited"
+    assert meldinger._MAX_CALLS_PER_DAY == 5000
 
 
 def test_rolling_budgets_release_calls_at_each_window_boundary():
     _reset()
     now = _time.monotonic()
-    spent = tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH]
+    spent = meldinger._replay_calls[meldinger._REPLAY_PATH]
     spent.hour.extend([now] * 1000)
     spent.day.extend([now - 2 * 60 * 60] * 4999)
-    assert tilbakeblikk._Budget().reserve(1, now) == "rate_limited"
-    assert tilbakeblikk._Budget().reserve(1, now + tilbakeblikk._HOUR_WINDOW_S) is None
-    assert tilbakeblikk._Budget().reserve(1, now + tilbakeblikk._DAY_WINDOW_S) is None
+    assert meldinger._Budget().reserve(1, now) == "rate_limited"
+    assert meldinger._Budget().reserve(1, now + meldinger._HOUR_WINDOW_S) is None
+    assert meldinger._Budget().reserve(1, now + meldinger._DAY_WINDOW_S) is None
 
 
 def test_every_helm_environment_and_the_base_pin_gemini():
@@ -1196,7 +1196,7 @@ def test_the_budget_is_tallied_against_replays_own_allowance_not_the_pollers():
     share a quota."""
     _reset(message_rows=_subjects(2))
     now = _time.monotonic()
-    poller = tilbakeblikk._replay_calls[tilbakeblikk._POLLER_PATH]
+    poller = meldinger._replay_calls[meldinger._POLLER_PATH]
     poller.hour.extend([now] * 1000)
     poller.day.extend([now] * 1000)
     calls = []
@@ -1240,7 +1240,7 @@ def test_the_delivery_gate_is_never_consulted():
     # names appear in its prose — explaining why they are not consulted is half the docstring.
     import ast
 
-    tree = ast.parse(Path(tilbakeblikk.__file__).read_text())
+    tree = ast.parse(Path(meldinger.__file__).read_text())
     referenced = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
     referenced |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     assert "delivery_enabled" not in referenced
@@ -1264,8 +1264,8 @@ def test_a_subject_with_no_stored_input_is_its_own_state_and_costs_nothing():
     # Not merely "no call was made" — no budget was CHARGED either. A subject charged for a call it
     # never made would eat the allowance of subjects further down the list, and on a window where
     # most subjects never crossed the alert gate that is most of the page.
-    assert len(tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH].hour) == (
-        tilbakeblikk._CALLS_PER_ATTEMPT
+    assert len(meldinger._replay_calls[meldinger._REPLAY_PATH].hour) == (
+        meldinger._CALLS_PER_ATTEMPT
     ), "exactly one subject's worth of budget was spent"
 
 
@@ -1282,7 +1282,7 @@ def test_a_configuration_error_latches_only_the_replay_holder():
     with _backends(dead, gemini=dead):
         body = _messages()
     assert set(_statuses(body)) == {"unavailable"}
-    assert set(tilbakeblikk._replay_state.latched_off) == {"claude", "gemini"}
+    assert set(meldinger._replay_state.latched_off) == {"claude", "gemini"}
     assert llm_message._STATE.latched_off == {}, "the live push path's latch must be untouched"
     assert llm_message.generation_enabled() is True, "the poller can still write a wording"
 
@@ -1303,7 +1303,7 @@ def test_a_transient_backend_failure_is_retried_once_per_subject():
         body = _messages()
     assert _statuses(body) == ["ok", "ok", "ok"]
     assert calls.count("S1") == 2, "the transient failure should get exactly one retry"
-    assert len(tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH].hour) == len(calls), (
+    assert len(meldinger._replay_calls[meldinger._REPLAY_PATH].hour) == len(calls), (
         "the retry must spend the same hourly allowance as every other backend call"
     )
 
@@ -1320,7 +1320,7 @@ def test_a_persistent_backend_failure_stops_after_one_retry():
     with _backends(unavailable):
         body = _messages()
     assert _statuses(body) == ["error"]
-    assert len(calls) == tilbakeblikk._MAX_BACKEND_ATTEMPTS == 2
+    assert len(calls) == meldinger._MAX_BACKEND_ATTEMPTS == 2
 
 
 def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time():
@@ -1332,11 +1332,11 @@ def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time
 
     Nothing downstream cuts a hang off: the chart sets no ingress timeout. So the contract is 200
     with what was answered, never a hang and never a 5xx."""
-    assert tilbakeblikk._WORST_CASE_CALL_S == llm_message._TIMEOUT_S
+    assert meldinger._WORST_CASE_CALL_S == llm_message._TIMEOUT_S
     _reset(message_rows=_subjects(8))
-    deadline_s, worst_case = tilbakeblikk._REQUEST_DEADLINE_S, tilbakeblikk._WORST_CASE_CALL_S
-    tilbakeblikk._REQUEST_DEADLINE_S = 0.6
-    tilbakeblikk._WORST_CASE_CALL_S = 0.4
+    deadline_s, worst_case = meldinger._REQUEST_DEADLINE_S, meldinger._WORST_CASE_CALL_S
+    meldinger._REQUEST_DEADLINE_S = 0.6
+    meldinger._WORST_CASE_CALL_S = 0.4
     calls = []
 
     def slow(body):
@@ -1346,14 +1346,14 @@ def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time
 
     try:
         with _backends(slow):
-            r = client.get("/tilbakeblikk-api/messages")
+            r = client.get("/meldinger-api/messages")
     finally:
-        tilbakeblikk._REQUEST_DEADLINE_S = deadline_s
-        tilbakeblikk._WORST_CASE_CALL_S = worst_case
+        meldinger._REQUEST_DEADLINE_S = deadline_s
+        meldinger._WORST_CASE_CALL_S = worst_case
 
     assert r.status_code == 200, "a bounded pass answers; it never 5xxs and never hangs"
     statuses = _statuses(r.json())
-    assert len(calls) == tilbakeblikk._REPLAY_WORKERS, (
+    assert len(calls) == meldinger._REPLAY_WORKERS, (
         "only the first round of workers may start; the next round must find the deadline reserved"
     )
     assert statuses.count("ok") == len(calls)
@@ -1368,8 +1368,8 @@ def test_the_route_is_a_coroutine_so_it_cannot_hold_an_anyio_worker_slot():
     traveller-facing registration from a public unauthenticated endpoint, and with no ingress
     timeout nothing reclaims the slot. Declared `async`, this one only awaits: both the BigQuery read
     and the generation fan-out run on the request's own pool."""
-    assert inspect.iscoroutinefunction(tilbakeblikk.messages)
-    assert not inspect.iscoroutinefunction(tilbakeblikk.decisions), (
+    assert inspect.iscoroutinefunction(meldinger.messages)
+    assert not inspect.iscoroutinefunction(meldinger.decisions), (
         "the comparison the check is about: /decisions IS on the shared pool"
     )
 
@@ -1392,12 +1392,12 @@ def test_the_two_arms_are_built_from_one_input():
 def test_an_uninjected_template_writer_costs_the_arm_not_the_page():
     """Fail-soft, because the template is the comparison arm and not the answer."""
     _reset(message_rows=[_message_row()])
-    tilbakeblikk._deterministic_writer = None
+    meldinger._deterministic_writer = None
     try:
         with _backends(lambda body: OK_REPLY):
             body = _messages()
     finally:
-        tilbakeblikk._deterministic_writer = _fake_deterministic
+        meldinger._deterministic_writer = _fake_deterministic
     entry = body["messages"][0]
     assert entry["status"] == "ok" and entry["message"]
     assert entry["deterministic_message"] is None
@@ -1444,10 +1444,10 @@ def test_the_message_model_refuses_a_redacted_column():
         "discarded": None, "provider": "claude", "model": "gemini-3.7-flash",
         "prompt_version": "a1b2c3d4", "current_prompt_version": "b2c3d4e5",
     }
-    tilbakeblikk.ReplayedMessage(**ok)  # the shape itself must be valid
+    meldinger.ReplayedMessage(**ok)  # the shape itself must be valid
     for redacted in ("journey_digest", "message_input", "from_stop", "to_stop"):
         try:
-            tilbakeblikk.ReplayedMessage(**ok, **{redacted: "x"})
+            meldinger.ReplayedMessage(**ok, **{redacted: "x"})
             raise AssertionError(f"ReplayedMessage must reject {redacted}")
         except ValidationError:
             pass
@@ -1466,8 +1466,8 @@ def test_a_replay_is_refused_when_no_slot_is_free_and_spends_nothing():
     `fake.calls` assertion pins — a 503 that has already spent a BigQuery job protects nothing.
     """
     _reset([_row()])
-    real = tilbakeblikk._replay_slots
-    tilbakeblikk._replay_slots = asyncio.Semaphore(0)   # both slots taken
+    real = meldinger._replay_slots
+    meldinger._replay_slots = asyncio.Semaphore(0)   # both slots taken
     try:
         # Bounded, because the failure mode of deleting the pre-check is a BLOCK, not a wrong answer:
         # `async with` on an exhausted semaphore waits forever, so an unbounded call here would hang
@@ -1480,7 +1480,7 @@ def test_a_replay_is_refused_when_no_slot_is_free_and_spends_nothing():
         # exits. Only a daemon thread lets this test fail and the suite finish.
         box: dict = {}
         worker = threading.Thread(
-            target=lambda: box.update(r=client.get("/tilbakeblikk-api/messages")),
+            target=lambda: box.update(r=client.get("/meldinger-api/messages")),
             daemon=True,
         )
         worker.start()
@@ -1493,7 +1493,7 @@ def test_a_replay_is_refused_when_no_slot_is_free_and_spends_nothing():
         assert r.status_code == 503, r.text
         assert fake.calls == [], "a refused replay reached BigQuery before being refused"
     finally:
-        tilbakeblikk._replay_slots = real
+        meldinger._replay_slots = real
 
 
 def test_the_replay_slot_is_released_so_requests_do_not_leak_capacity():
@@ -1505,26 +1505,26 @@ def test_the_replay_slot_is_released_so_requests_do_not_leak_capacity():
     """
     for i in range(3):
         _reset([_row()])
-        r = client.get("/tilbakeblikk-api/messages")
+        r = client.get("/meldinger-api/messages")
         assert r.status_code == 200, f"request {i + 1} was refused: {r.text}"
-    assert not tilbakeblikk._replay_slots.locked(), "slots were not returned"
+    assert not meldinger._replay_slots.locked(), "slots were not returned"
 
 
 def test_the_concurrency_ceiling_remains_small_despite_the_larger_spend_budget():
     """A higher spend ceiling must not create unbounded pools, BigQuery jobs, or request threads."""
-    assert tilbakeblikk._MAX_CONCURRENT_REPLAYS == 2
+    assert meldinger._MAX_CONCURRENT_REPLAYS == 2
 
 
 def test_messages_takes_the_same_allow_list_as_decisions():
     """It never accepts a caller-supplied row key: what may be regenerated is decided by this
     module's own query over a vocabulary /filters published. An arbitrary string would otherwise mint
     one cache entry, one BigQuery query and a fan of Vertex calls apiece, on a public endpoint."""
-    accepted = set(inspect.signature(tilbakeblikk.messages).parameters)
-    assert accepted == set(inspect.signature(tilbakeblikk.decisions).parameters), (
+    accepted = set(inspect.signature(meldinger.messages).parameters)
+    assert accepted == set(inspect.signature(meldinger.decisions).parameters), (
         "the two lists are aligned by position, so they must be narrowed identically"
     )
     _reset(message_rows=[_message_row()])
-    bad = client.get("/tilbakeblikk-api/messages", params={"operator": "NOT-AN-OPERATOR"})
+    bad = client.get("/meldinger-api/messages", params={"operator": "NOT-AN-OPERATOR"})
     assert bad.status_code == 400
     assert fake.calls == [], "a rejected filter must not reach BigQuery"
 
@@ -1534,25 +1534,25 @@ def test_the_wording_cache_expires_failures_but_keeps_answers_until_restart():
     for this process and remain cached until eviction or restart."""
     _reset()
     clock = [1000.0]
-    real = tilbakeblikk.monotonic
-    tilbakeblikk.monotonic = lambda: clock[0]
+    real = meldinger.monotonic
+    meldinger.monotonic = lambda: clock[0]
     try:
-        ok = tilbakeblikk._Wording("prose", "template", "ok", None, "claude", "m")
-        err = tilbakeblikk._Wording(None, "template", "error", None, None, None)
-        tilbakeblikk._remember_wording(("ok",), ok)
-        tilbakeblikk._remember_wording(("err",), err)
-        assert tilbakeblikk._cached_wording(("ok",)) == ok
-        assert tilbakeblikk._cached_wording(("err",)) == err
+        ok = meldinger._Wording("prose", "template", "ok", None, "claude", "m")
+        err = meldinger._Wording(None, "template", "error", None, None, None)
+        meldinger._remember_wording(("ok",), ok)
+        meldinger._remember_wording(("err",), err)
+        assert meldinger._cached_wording(("ok",)) == ok
+        assert meldinger._cached_wording(("err",)) == err
 
         # Past the failure's life.
-        clock[0] += tilbakeblikk._WORDING_ERROR_TTL_S + 1
-        assert tilbakeblikk._cached_wording(("err",)) is None, "a failed draw outlived its short TTL"
-        assert tilbakeblikk._cached_wording(("ok",)) == ok, "an answer expired on the failure's TTL"
+        clock[0] += meldinger._WORDING_ERROR_TTL_S + 1
+        assert meldinger._cached_wording(("err",)) is None, "a failed draw outlived its short TTL"
+        assert meldinger._cached_wording(("ok",)) == ok, "an answer expired on the failure's TTL"
 
         clock[0] += 365 * 24 * 60 * 60
-        assert tilbakeblikk._cached_wording(("ok",)) == ok, "an answer expired before restart"
+        assert meldinger._cached_wording(("ok",)) == ok, "an answer expired before restart"
     finally:
-        tilbakeblikk.monotonic = real
+        meldinger.monotonic = real
 
 
 def test_a_refused_payload_is_cached_until_restart():
@@ -1566,30 +1566,30 @@ def test_a_refused_payload_is_cached_until_restart():
     """
     _reset()
     clock = [1000.0]
-    real = tilbakeblikk.monotonic
-    tilbakeblikk.monotonic = lambda: clock[0]
+    real = meldinger.monotonic
+    meldinger.monotonic = lambda: clock[0]
     try:
         for status in ("rejected", "ungrounded"):
-            w = tilbakeblikk._Wording(None, "template", status, "the refused text", "claude", "m")
-            tilbakeblikk._remember_wording((status,), w)
-        clock[0] += tilbakeblikk._WORDING_ERROR_TTL_S + 1
+            w = meldinger._Wording(None, "template", status, "the refused text", "claude", "m")
+            meldinger._remember_wording((status,), w)
+        clock[0] += meldinger._WORDING_ERROR_TTL_S + 1
         for status in ("rejected", "ungrounded"):
-            assert tilbakeblikk._cached_wording((status,)) is not None, (
+            assert meldinger._cached_wording((status,)) is not None, (
                 f"{status} expired on the transient TTL; it is determined by the input, not the "
                 "backend's mood, so re-asking spends a call to learn nothing"
             )
     finally:
-        tilbakeblikk.monotonic = real
+        meldinger.monotonic = real
 
 
 def test_a_token_truncated_reply_expires_on_the_transient_cache_ttl():
     """A fresh draw can fit even when the previous draw exhausted its output-token budget."""
     _reset()
     clock = [1000.0]
-    real = tilbakeblikk.monotonic
-    tilbakeblikk.monotonic = lambda: clock[0]
+    real = meldinger.monotonic
+    meldinger.monotonic = lambda: clock[0]
     try:
-        wording = tilbakeblikk._Wording(
+        wording = meldinger._Wording(
             message=None,
             deterministic="template",
             status="truncated",
@@ -1597,11 +1597,11 @@ def test_a_token_truncated_reply_expires_on_the_transient_cache_ttl():
             provider="gemini",
             model="gemini-3.7-flash",
         )
-        tilbakeblikk._remember_wording(("truncated",), wording)
-        clock[0] += tilbakeblikk._WORDING_ERROR_TTL_S + 1
-        assert tilbakeblikk._cached_wording(("truncated",)) is None
+        meldinger._remember_wording(("truncated",), wording)
+        clock[0] += meldinger._WORDING_ERROR_TTL_S + 1
+        assert meldinger._cached_wording(("truncated",)) is None
     finally:
-        tilbakeblikk.monotonic = real
+        meldinger.monotonic = real
 
 
 def test_the_wording_cache_is_bounded():
@@ -1610,10 +1610,10 @@ def test_the_wording_cache_is_bounded():
     forceReplicas 1, and uvicorn binds only after lifespan's eager BigQuery loads, so an OOMKill is
     zero capacity for a whole cold start."""
     _reset()
-    wording = tilbakeblikk._Wording("x", "y", "ok", None, "claude", "m")
-    for i in range(tilbakeblikk._WORDING_MAX_ENTRIES + 100):
-        tilbakeblikk._remember_wording((i,), wording)
-    assert len(tilbakeblikk._wordings) <= tilbakeblikk._WORDING_MAX_ENTRIES
+    wording = meldinger._Wording("x", "y", "ok", None, "claude", "m")
+    for i in range(meldinger._WORDING_MAX_ENTRIES + 100):
+        meldinger._remember_wording((i,), wording)
+    assert len(meldinger._wordings) <= meldinger._WORDING_MAX_ENTRIES
 
 
 # --------------------------------------------------------------------------------------------
@@ -1625,10 +1625,10 @@ def test_the_wording_cache_is_bounded():
 # --------------------------------------------------------------------------------------------
 
 _QUERIES = {
-    "decisions": tilbakeblikk._DECISIONS_QUERY,
-    "summary": tilbakeblikk._SUMMARY_QUERY,
-    "filters": tilbakeblikk._FILTERS_QUERY,
-    "messages": tilbakeblikk._MESSAGES_QUERY,
+    "decisions": meldinger._DECISIONS_QUERY,
+    "summary": meldinger._SUMMARY_QUERY,
+    "filters": meldinger._FILTERS_QUERY,
+    "messages": meldinger._MESSAGES_QUERY,
 }
 # The three that feed the public card model and its rates. `messages` is server-side only.
 _CARD_FACING = ("decisions", "summary", "filters")
@@ -1850,7 +1850,7 @@ def test_the_new_query_files_are_registered_in_the_validator():
     """
     script = (Path(__file__).parents[2] / "data/queries/validate_varsel_sql.sh").read_text()
     for name, sql in _QUERIES.items():
-        filename = f"tilbakeblikk_{name}.sql"
+        filename = f"meldinger_{name}.sql"
         assert filename in script, f"{filename} is not dry-run by validate_varsel_sql.sh"
         for param in sorted(set(re.findall(r"@(\w+)", _uncommented(sql)))):
             assert f"parameter={param}:" in script or f"parameter={param}<" in script, (
@@ -1859,12 +1859,16 @@ def test_the_new_query_files_are_registered_in_the_validator():
             )
 
 
-# --- The TILBAKEBLIKK_ENABLED gate (KTD9, R17) ------------------------------------------------
+# --- That the surface is served at all --------------------------------------------------------
 #
-# main.py reads the variable and builds `app` at IMPORT, so the gate cannot be exercised by
-# assigning to main._TILBAKEBLIKK_ENABLED — that would test the assignment, not the resolution.
-# Each case therefore imports main in a FRESH interpreter with the environment it is about, the
-# pattern test_llm_message.py uses for the same reason (`_ENABLED`, the Vertex locations).
+# main.py registers the router and builds `app` at IMPORT, so this cannot be exercised by poking at
+# the module afterwards — that would test the poke, not the registration. The check therefore
+# imports main in a FRESH interpreter, the pattern test_llm_message.py uses for the same reason.
+#
+# /meldinger was gated on a TILBAKEBLIKK_ENABLED environment variable until the surface was
+# renamed from /tilbakeblikk; the gate is gone and both halves are unconditional. What is worth
+# pinning is that BOTH halves are there, since half a surface is worse than none: the page would
+# load and every request behind it would 404.
 
 _API_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1872,13 +1876,13 @@ _API_DIR = os.path.dirname(os.path.abspath(__file__))
 #
 # The API half is probed by ASKING for the endpoint rather than by reading app.routes: this FastAPI
 # version keeps an included router as one opaque `_IncludedRouter` entry whose `path` is None, so a
-# scan of app.routes finds no /tilbakeblikk-api route even when the router is registered — it would
-# have "passed" identically with the gate removed. /config needs neither BigQuery nor the lifespan,
-# which is what makes 404-vs-200 a clean read on registration alone.
+# scan of app.routes finds no /meldinger-api route even when the router is registered — it would
+# have "passed" identically with the router removed. /config needs neither BigQuery nor the
+# lifespan, which is what makes 404-vs-200 a clean read on registration alone.
 #
 # The mount half stays structural, because the question there is not "does something answer" but
 # which class answers: a plain StaticFiles would put index.html back under heuristic caching.
-_GATE_PROBE = """
+_SERVED_PROBE = """
 import json
 
 from google.cloud import bigquery
@@ -1898,8 +1902,7 @@ mounts = {
 }
 client = TestClient(main.app)
 print(json.dumps({
-    "resolved": main._TILBAKEBLIKK_ENABLED,
-    "config_status": client.get("/tilbakeblikk-api/config").status_code,
+    "config_status": client.get("/meldinger-api/config").status_code,
     "historikk_config_status": client.get("/historikk-api/config").status_code,
     "mounts": mounts,
 }))
@@ -1907,15 +1910,15 @@ print(json.dumps({
 
 
 @contextmanager
-def _tilbakeblikk_static_present():
-    """Make sure tilbakeblikk_static/ exists for the duration of one check.
+def _meldinger_static_present():
+    """Make sure meldinger_static/ exists for the duration of one check.
 
     The mount is guarded on the directory existing, and that directory is generated at image-build
-    time — absent in a fresh checkout and in CI. Without this the "flag on -> mounted" assertion
-    would pass by not running, on exactly the machine where nobody would look. Created only when
-    missing and removed only when created, so a real local build is never touched.
+    time — absent in a fresh checkout and in CI. Without this the "mounted" assertion would pass by
+    not running, on exactly the machine where nobody would look. Created only when missing and
+    removed only when created, so a real local build is never touched.
     """
-    path = Path(_API_DIR) / "tilbakeblikk_static"
+    path = Path(_API_DIR) / "meldinger_static"
     created = not path.exists()
     if created:
         path.mkdir()
@@ -1926,14 +1929,12 @@ def _tilbakeblikk_static_present():
             path.rmdir()
 
 
-def _gate(value: str | None) -> dict:
-    """Resolve the gate in a child interpreter; `None` means the variable is unset."""
-    env = {k: v for k, v in os.environ.items() if k != "TILBAKEBLIKK_ENABLED"}
+def _probe() -> dict:
+    """Import main in a child interpreter and report what it registered."""
+    env = dict(os.environ)
     env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
-    if value is not None:
-        env["TILBAKEBLIKK_ENABLED"] = value
     result = subprocess.run(
-        [sys.executable, "-c", _GATE_PROBE],
+        [sys.executable, "-c", _SERVED_PROBE],
         cwd=_API_DIR,
         env=env,
         capture_output=True,
@@ -1944,66 +1945,23 @@ def _gate(value: str | None) -> dict:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-def test_the_surface_is_withheld_when_the_flag_is_off():
-    """Both halves go together: no /tilbakeblikk-api routes and no /tilbakeblikk mount.
+def test_both_halves_of_the_surface_are_served():
+    """The router and the mount, together, and the mount as the caching subclass.
 
-    Gating only one of them would be worse than gating neither — the page would load and every
-    request behind it would 404, which reads as a broken deployment rather than as a switch.
+    test_static_cache.py already asserts the subclass for every mount that exists, but it is vacuous
+    where the generated directories are absent — so this pins /meldinger's own mount with the
+    directory guaranteed to be there.
 
     /historikk-api is asserted present in the same run as a control: it proves the probe sees the
-    routers at all, so "no tilbakeblikk routes" means withheld and not "import failed quietly".
+    routers at all, so a failure here means withheld and not "import failed quietly".
     """
-    with _tilbakeblikk_static_present():
-        state = _gate("false")
-    assert state["resolved"] is False
-    assert state["config_status"] == 404, "/tilbakeblikk-api/config answered although the flag is off"
-    assert "/tilbakeblikk" not in state["mounts"]
+    with _meldinger_static_present():
+        state = _probe()
     assert state["historikk_config_status"] == 200, "the probe did not see the other routers either"
-
-
-def test_the_surface_is_served_when_the_flag_is_on():
-    """The other direction, and the mount must be the caching subclass.
-
-    test_static_cache.py already asserts that for every mount that exists, but it is vacuous where
-    the generated directories are absent — so this pins /tilbakeblikk's own mount with the
-    directory guaranteed to be there.
-    """
-    with _tilbakeblikk_static_present():
-        state = _gate("true")
-    assert state["resolved"] is True
-    assert state["config_status"] == 200, "/tilbakeblikk-api/config is not registered"
-    assert "/tilbakeblikk" in state["mounts"], "the UI is not mounted although the flag is on"
-    type_name, is_versioned = state["mounts"]["/tilbakeblikk"]
-    assert is_versioned, f"/tilbakeblikk is mounted with {type_name}, not _VersionedStaticFiles"
-
-
-def test_an_unset_or_misspelled_flag_fails_closed():
-    """The direction that matters, asserted rather than assumed (KTD9).
-
-    This surface regenerates model prose that names both ends of a traveller's trip, and every
-    environment inherits `trafficType: public` from the chart — so a value nobody recognises must
-    WITHHOLD the page, never publish it. The parsing is llm_message._TRUTHY verbatim, which is why
-    "off", "no" and a typo all land on the same answer as unset.
-    """
-    for value in (None, "", "ture", "yes please", "off", "no", "0", "enabled", " "):
-        with _tilbakeblikk_static_present():
-            state = _gate(value)
-        assert state["resolved"] is False, f"{value!r} turned the surface ON"
-        assert state["config_status"] == 404, f"{value!r} registered the router"
-        assert "/tilbakeblikk" not in state["mounts"], f"{value!r} registered the mount"
-
-
-def test_the_flag_accepts_exactly_the_four_values_llm_message_does():
-    """One parsing rule, reused rather than re-spelled.
-
-    Two switches that both mean "on" but disagree about what counts as on is the kind of drift
-    nobody notices until a deploy sets one of them to "yes" and gets two different answers.
-    """
-    assert llm_message._TRUTHY == ("true", "1", "yes", "on")
-    for value in ("true", "TRUE", " On ", "1", "yes"):
-        with _tilbakeblikk_static_present():
-            state = _gate(value)
-        assert state["resolved"] is True, f"{value!r} did not turn the surface on"
+    assert state["config_status"] == 200, "/meldinger-api/config is not registered"
+    assert "/meldinger" in state["mounts"], "the UI is not mounted"
+    type_name, is_versioned = state["mounts"]["/meldinger"]
+    assert is_versioned, f"/meldinger is mounted with {type_name}, not _VersionedStaticFiles"
 
 
 def _run():
@@ -2013,7 +1971,7 @@ def _run():
     for name, fn in tests:
         fn()
         print(f"  ok  {name}")
-    print(f"\n{len(tests)} tilbakeblikk checks passed.")
+    print(f"\n{len(tests)} meldinger checks passed.")
 
 
 if __name__ == "__main__":

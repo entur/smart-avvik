@@ -125,7 +125,7 @@ check "historikk_filters.sql"       "$API/historikk_filters.sql" \
 check "historikk_stop_places.sql"   "$API/historikk_stop_places.sql" \
   --parameter='refs:ARRAY<STRING>:["NSR:StopPlace:337"]'
 
-# /tilbakeblikk's four, on the DEPARTURE-TIME axis since 2026-08-22: a day (which bounds the DERIVED
+# /meldinger's four, on the DEPARTURE-TIME axis since 2026-08-22: a day (which bounds the DERIVED
 # DATE(decided_at) partition scan and the call_date bound on the outcomes side) plus the two absolute
 # instants the API resolves the Oslo day and the quantized times into -- those two now compare
 # against `departure_time`, not `decided_at`, so @day and @from_ts/@to_ts are predicates on two
@@ -133,7 +133,7 @@ check "historikk_stop_places.sql"   "$API/historikk_stop_places.sql" \
 #
 # The same "keep these in step" warning applies, and harder: these files carry THIRTEEN parameters
 # against /historikk's eleven, and one omitted here makes bq refuse to parse the query at all, so the
-# check reports FAILED and the file goes UNVALIDATED. test_tilbakeblikk.py greps this script for
+# check reports FAILED and the file goes UNVALIDATED. test_meldinger.py greps this script for
 # every @param each file uses, which is the cheap half of the guard; the dry run below is the half
 # that actually type-checks them.
 #
@@ -144,13 +144,13 @@ check "historikk_stop_places.sql"   "$API/historikk_stop_places.sql" \
 # the DATE(decided_at) bound as well as the call_date one: it is no longer the window predicate but
 # a derived cover for it, so narrowing it drops cycles out of the per-subject aggregates rather than
 # merely mislabelling a flag. Cost is not a correctness check.
-TILBAKEBLIKK_PARAMS=(
+MELDINGER_PARAMS=(
   --parameter=day:DATE:2026-07-15
   --parameter=from_ts:TIMESTAMP:'2026-07-15 06:00:00'
   --parameter=to_ts:TIMESTAMP:'2026-07-15 09:00:00'
 )
-TILBAKEBLIKK_DECISION_PARAMS=(
-  "${TILBAKEBLIKK_PARAMS[@]}"
+MELDINGER_DECISION_PARAMS=(
+  "${MELDINGER_PARAMS[@]}"
   --parameter=operator:STRING:VYG --parameter=verdict:STRING:hit
   --parameter=line:STRING:R11
   '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
@@ -158,21 +158,21 @@ TILBAKEBLIKK_DECISION_PARAMS=(
   --parameter=resolved_only:BOOL:false
   --parameter=sx_only:BOOL:false --parameter=limit:INT64:200
 )
-check "tilbakeblikk_decisions.sql"  "$API/tilbakeblikk_decisions.sql" \
-  "${TILBAKEBLIKK_DECISION_PARAMS[@]}"
+check "meldinger_decisions.sql"     "$API/meldinger_decisions.sql" \
+  "${MELDINGER_DECISION_PARAMS[@]}"
 # Byte-identical filters, ordering and limit to the file above -- that is what aligns the two
 # responses position by position -- so it takes the same parameter list.
-check "tilbakeblikk_messages.sql"   "$API/tilbakeblikk_messages.sql" \
-  "${TILBAKEBLIKK_DECISION_PARAMS[@]}"
+check "meldinger_messages.sql"      "$API/meldinger_messages.sql" \
+  "${MELDINGER_DECISION_PARAMS[@]}"
 # Population filters only: verdict/alerted_only/pushed_only/resolved_only/sx_only narrow by OUTCOME
 # or by what we chose to do, and never reach /summary -- filtering to hits would make precision read
 # 100 %, and filtering to the subjects a push went out for would do the same from the other side.
-check "tilbakeblikk_summary.sql"    "$API/tilbakeblikk_summary.sql" \
-  "${TILBAKEBLIKK_PARAMS[@]}" \
+check "meldinger_summary.sql"       "$API/meldinger_summary.sql" \
+  "${MELDINGER_PARAMS[@]}" \
   --parameter=operator:STRING:VYG --parameter=line:STRING:R11 \
   '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
 # The vocabulary AND the API's allow-list, so a fault here 400s every filtered request rather than
 # merely emptying a dropdown. Deliberately not narrowed by the other filters, hence three parameters.
-check "tilbakeblikk_filters.sql"    "$API/tilbakeblikk_filters.sql" "${TILBAKEBLIKK_PARAMS[@]}"
+check "meldinger_filters.sql"       "$API/meldinger_filters.sql" "${MELDINGER_PARAMS[@]}"
 
 exit "$fail"

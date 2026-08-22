@@ -47,7 +47,7 @@ Design notes
   payload is built from the :class:`varsel.Alert` fields, which do not carry it.
 * **The backend latch belongs to a caller, not to the module.** Which backend is pinned and which
   are latched off live in a :class:`_LatchState` holder, and the module keeps one global instance
-  that every existing caller works against. ``/tilbakeblikk`` replays stored inputs on a request
+  that every existing caller works against. ``/meldinger`` replays stored inputs on a request
   path and passes its own, because the two callers cannot be allowed to disable each other: a replay
   burst driving both backends into ``_ConfigurationError`` would otherwise strip model wordings from
   every real push for the whole ``_LATCH_TTL``, and nothing on the traveller-facing side would say
@@ -303,7 +303,7 @@ class _LatchState:
     `_MAX_LLM_CALLS_PER_CYCLE` wordings per cycle, on one thread, and a backend this project cannot
     serve is a fact about the project rather than about the caller.
 
-    ``/tilbakeblikk`` breaks that assumption. It replays stored message inputs on a public request
+    ``/meldinger`` breaks that assumption. It replays stored message inputs on a public request
     path, so a prompt edit, an unserved model id or a quota can drive both backends into
     ``_ConfigurationError`` in a burst — and while the state was shared, that burst reached
     ``varsel.check_and_notify``: ``generation_enabled()`` reads False for the whole ``_LATCH_TTL``,

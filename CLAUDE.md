@@ -21,8 +21,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
 path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
-node stage builds the `/demo`, `/varsel`, `/historikk` and `/tilbakeblikk` front-ends (from
-`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk` + `demo/tilbakeblikk`, which is
+node stage builds the `/demo`, `/varsel`, `/historikk` and `/meldinger` front-ends (from
+`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk` + `demo/meldinger`, which is
 why the context is the repo root, not `disruptions/api`), and its python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
 
 ```sh
@@ -63,7 +63,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   into it, so `dataset_id` stays a literal string.
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
   app's `npm ci && npm run build`, and Vite writes into
-  `disruptions/api/{demo,varsel,historikk,tilbakeblikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
+  `disruptions/api/{demo,varsel,historikk,meldinger}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
   its marimo snapshots run BigQuery under a developer's ADC, so they can't be built in the
   image/CI — they are rendered offline by `disruptions/api/export_eval.sh` and **committed** under
   `disruptions/api/eval_static/`, shipped as-is. Refresh them by running that script, then commit
@@ -601,12 +601,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `historikk_decisions.sql` are history rather than a live guarantee. Three things make it smaller
     than the deletion looks, and one of them is the whole load: the 2026-08-21 filter change had
     already made the pair *choosable*, so what goes is the work of narrowing rather than the
-    possibility; `/tilbakeblikk` already published exactly this, decided the same way; and **prd's
+    possibility; `/meldinger` already published exactly this, decided the same way; and **prd's
     registrations are test users rather than members of the public**, so there is no real traveller
     behind a k=1 pair. Team decision. The condition to re-check is therefore not a threshold but a
     fact — **if `/varsel` ever takes registrations from the public, this publishes real commutes** —
     and the fix then is access control on `/historikk`, not a shorter SELECT list, because the same
-    exposure sits in `/tilbakeblikk`'s generated prose, which no projection controls. What still
+    exposure sits in `/meldinger`'s generated prose, which no projection controls. What still
     holds: `journey_digest` is absent from both surfaces (it is the join key to the LLM audit log,
     and no page needs it), the raw stop **refs** never leave the process, and `Decision` is still
     `extra="forbid"` — which is what fails loudly if a SELECT re-adds the digest or a future change
@@ -677,22 +677,33 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     "written but withheld" population the prd rollout decision is judged on. prd's pairs are the
     ones that matter: real travellers, real journeys.
 
-- The **Tilbakeblikk** page at `/tilbakeblikk` (`demo/tilbakeblikk/`, React + Vite + Entur Linje) is
+- The **Meldinger** page at `/meldinger` (`demo/meldinger/`, React + Vite + Entur Linje) is
   the prompt-iteration loop: the alerts that actually went out for a window of DEPARTURES, replayed
   through **today's** prompt from the `message_input` already stored on every decision row.
   `/historikk` answers "what did we send, and was it right"; this one answers "what would we send out
-  for these departures now", and nothing is sent to anybody. Its API is `/tilbakeblikk-api`
-  (`disruptions/api/tilbakeblikk.py`) over `tilbakeblikk_{decisions,summary,filters,messages}.sql`.
+  for these departures now", and nothing is sent to anybody. Its API is `/meldinger-api`
+  (`disruptions/api/meldinger.py`) over `meldinger_{decisions,summary,filters,messages}.sql`.
   `config`, `filters`, `decisions` and `summary` are BigQuery only; `messages` is the one that calls
   Vertex — separate endpoints deliberately, so a Vertex outage empties the wordings and leaves every
   card, filter and statistic on the page intact, where one endpoint would 503 the whole thing. The
   two lists are aligned **position by position** — nothing served identifies a decision uniquely,
   since the real grain includes the redacted `journey_digest` — which is why
-  `tilbakeblikk_messages.sql` repeats the decisions query's WHERE and ORDER BY verbatim, full subject
+  `meldinger_messages.sql` repeats the decisions query's WHERE and ORDER BY verbatim, full subject
   key and all. /historikk's logic is **forked, not shared**: only `historikk_stop_places.sql` (it
   takes `@refs` and has no window of its own) and historikk's operator/verdict/lookback constants
   are, so a fix to one side must be mirrored to the other — the 2026-08-21 pushed-wording fix is
   exactly the shape of change that has to be.
+  - **It was `/tilbakeblikk` until 2026-08-23**, and the rename went all the way down: the route,
+    the API prefix, `demo/meldinger/`, `disruptions/api/meldinger*.{py,sql}`, `meldinger_static/`,
+    the Vite `MELDINGER_` env prefix and the `TILBAKEBLIKK_ENABLED` flag (deleted — see below). The
+    one thing that does not travel with a source rename is **Cloud Logging**: the structured events
+    are now `meldinger_replay`, `meldinger_replay_retry` and `meldinger_bounded`, so a saved query
+    or dashboard on the `tilbakeblikk_*` names silently returns nothing after the deploy rather
+    than erroring, and rows either side of the rename need both names to be counted together. The
+    `.tb-` CSS prefix in `demo/meldinger/src/` was deliberately left alone — it is internal, and
+    renaming 200 class names risks a silent styling break for no reader's benefit. The plan document
+    `docs/plans/2026-08-21-001-feat-tilbakeblikk-message-replay-plan.md` keeps its old name as the
+    dated record of what was decided at the time.
   - **The window is `departure_time`** (changed from `decided_at` on 2026-08-22) — one Oslo day plus
     a from/to time of day, both ends quantized to 15-minute steps as a half-open `[from, to)`. The
     unit of this page is a MESSAGE, and a message belongs to a departure. The old axis selected
@@ -779,7 +790,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     nothing on that side says so. **That shared draw grew 8x on 2026-08-21**:
     `varsel._MAX_LLM_CALLS_PER_CYCLE` went 8 -> 64 and the writing pass went 16-wide
     (`varsel._LLM_WORKERS`), so the poller can now hold 16 concurrent Vertex calls and sustain
-    ~22/min against the same project where it used to manage ~3. `/tilbakeblikk` is now enabled in
+    ~22/min against the same project where it used to manage ~3. `/meldinger` is now enabled in
     prd, so replay and poller demand can overlap at Vertex even though their in-process ledgers are
     separate. The replay ceilings below are a cost and abuse bound, not a reserved Vertex quota.
     (1) **1 000 backend CALLS per request.** Dev, tst, and prd all pin
@@ -846,15 +857,15 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     the ones that would notice a burst — and it suppresses the prompt/reply DEBUG record regardless
     of `VARSEL_LLM_LOG_PROMPTS`, which dev has on and which would otherwise write a traveller's
     origin, destination and departure time to Cloud Logging at page-load volume. A second record,
-    `event="tilbakeblikk_replay"`, carries the unhashed `journey_digest` so a replay joins both the
+    `event="meldinger_replay"`, carries the unhashed `journey_digest` so a replay joins both the
     decision row and the live trail. And the `/messages` route is **`async def`**, which is not a
     style choice: every other route in this process is a plain `def` and shares the anyio worker pool
     — `/impact`, the `/varsel-api` device and journey writes, the `/historikk` routes — so a handler
     that can hold one of those slots for its full 30 s deadline would starve traveller-facing
     registration from a public unauthenticated endpoint, with no ingress cutoff to reclaim it.
-  - **The privacy split is structural, not a test.** `tilbakeblikk_decisions.sql` carries
+  - **The privacy split is structural, not a test.** `meldinger_decisions.sql` carries
     `message_input` only as a **null test** (`message_input IS NOT NULL AS has_input`) — no CTE in it
-    holds the text — while `tilbakeblikk_messages.sql` names it and only the server ever reads those
+    holds the text — while `meldinger_messages.sql` names it and only the server ever reads those
     rows; what leaves the process is the wording generated *from* the input, never the input. A query
     that does not name a column cannot leak it however the model above it drifts, which is why the
     split is worth a duplicated query. The rest is /historikk's redaction verbatim: no decision row
@@ -864,14 +875,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     dropdown vocabulary exactly as /historikk's does — the redaction is per **row**, not per
     response, or the Fra/Til filters could not exist at all — and it is the API's allow-list, so an
     unknown value is a 400 rather than one more cache entry and one more BigQuery query.
-  - **`TILBAKEBLIKK_ENABLED` fails closed, and all three environments are now on.** One switch
-    decides both the router and the static mount (half a surface is worse than none: the page would
-    load and every request 404), parsed with `llm_message._TRUTHY` reused verbatim — only
-    `true`/`1`/`yes`/`on` turn it **on**, so a misspelling, an empty string or an unset variable
-    withholds the surface instead of publishing it. The base `values.yaml` still says `"false"` so a
-    fourth environment resolves to a defined state; dev, tst and — since **2026-08-22** — prd all set
-    `"true"`. The bundle is built into every image regardless; what varies is the env var, not the
-    artefact, so it is a build-time value and changing it needs a deploy rather than a runtime toggle.
+  - **The surface is served unconditionally, in every environment.** It was gated on a
+    `TILBAKEBLIKK_ENABLED` env var (one switch over both the router and the static mount, failing
+    closed) from the day it shipped until the **2026-08-23** rename to `/meldinger`, which removed
+    the flag: prd had been `"true"` since 2026-08-22 and dev/tst since the start, so the switch was
+    a chart value nobody varied any more. The bundle was always built into every image regardless;
+    only the variable moved, which is why removing it changed nothing that was deployed.
     **Q1 is answered, and the answer rests on one fact rather than on the measurement.** What the
     surface publishes is real: the prompt instructs the model to advise on the traveller's own route,
     so the prose routinely names **both ends of a trip**, `trafficType: public` is set once in the
@@ -885,12 +894,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     carry tens of thousands of people a day, so naming one as disrupted discloses nothing about
     anybody. **Re-run that measurement if prd ever takes registrations from the public** — at k=1 on
     two thirds of pairs it becomes a genuine disclosure, and the fix is then access control in front
-    of `/tilbakeblikk` (a chart change, since `trafficType` is set once), not a shorter SELECT list.
-    A page built on *hypothetical* journeys rather than registrations would retire the question
-    outright. Note the volume argument for prd is weaker than it looks: measured the same day, prd's
-    pushed subjects run only ~22 % above dev's over six days (408 vs 334), because a subject is
-    (journey × situation × train) and dev's few registrations sit on busy corridors. What prd
-    actually adds is **authenticity** — the written-but-withheld pairs
+    of `/meldinger` (a chart change, since `trafficType` is set once), not a shorter SELECT list, and
+    not the deleted flag either: withholding the whole surface from prd would answer the prompt
+    question on dev's thin data. A page built on *hypothetical* journeys rather than registrations
+    would retire the question outright. Note the volume argument for prd is weaker than it looks:
+    measured the same day, prd's pushed subjects run only ~22 % above dev's over six days (408 vs
+    334), because a subject is (journey × situation × train) and dev's few registrations sit on busy
+    corridors. What prd actually adds is **authenticity** — the written-but-withheld pairs
     (`message_source='deterministic' AND message_llm IS NOT NULL`) the rollout decision is judged on.
   - **The card's figures are whole-subject**, and were not before 2026-08-22. On the `decided_at`
     axis the per-cycle aggregates (`n_decisions`, `ever_alerted`, `first_alert_at`, `alert_lead_min`,
@@ -918,7 +928,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     top and not in a tooltip.
   - `data/queries/validate_varsel_sql.sh` covers all four new files (thirteen parameters each against
     /historikk's eleven — one omitted makes `bq` refuse to parse and the check reports FAILED, so the
-    file goes **unvalidated**; `test_tilbakeblikk.py` greps the script for every `@param` as the cheap
+    file goes **unvalidated**; `test_meldinger.py` greps the script for every `@param` as the cheap
     half of that guard). A clean dry run still proves neither of the two things that matter most:
     the CLI encodes an empty ARRAY parameter differently from the Python client, so the
     `IFNULL(ARRAY_LENGTH(@refs), 0) = 0` rule dry-runs identically either way, and **both** date
