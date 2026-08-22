@@ -95,14 +95,88 @@ const isNoSituation = (decision: Decision) =>
  *     (R12): quoting the pushed text beside one regenerated from a possibly different cycle is the
  *     mismatch the 2026-08-21 fix removed from /historikk, where 41 % of cards quoted text nobody
  *     received.
- *  2. The template arm sits beneath it — the same stored input, the other writer. That comparison is
- *     what makes a regenerated wording judgeable at a glance instead of merely readable.
+ *  2. A DELIVERED wording is drawn as the push it BECAME, not quoted as prose. The page's claim
+ *     is that these messages are more useful than the operator's own, and a claim about
+ *     usefulness is settled by the artefact rather than by the sentence — the reader sees what a
+ *     traveller saw. What the frame costs is a per-row assertion ("a phone showed this"), so it is
+ *     spent only where `send_state` says one did; the page-level caveat above the list carries the
+ *     other half, that the WORDS are today's prompt's rather than what went out.
  *  3. Every non-`ok` status renders as itself. A badge over an empty quote cannot be told apart from
  *     "the model wrote nothing", and two of the statuses (`ungrounded`, `rejected`) are precisely
  *     what a prompt edit produces — so those two show the discarded reply, which is the text a
  *     developer iterating on the prompt actually needs to read.
  */
-function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
+/** Did a push actually go out for this subject?
+ *
+ *  `sendt_uten_input` counts: a push went out, and the cycle simply stored no writing input — the
+ *  delivery is no less real for it. The three silent states are not interchangeable but they agree
+ *  on the only thing the notification frame asserts, so they share the unframed rendering;
+ *  SendStateBadge is what tells them apart in words. */
+const isDelivered = (decision: Decision) =>
+  decision.send_state === 'sendt' || decision.send_state === 'sendt_uten_input';
+
+/** Whether this card draws the wording as the push it became.
+ *
+ *  Read in two places — here, to choose the framing, and by the header, to decide whether it still
+ *  has to carry the route. Shared rather than restated because the two must not drift: if they
+ *  disagree the route is either printed twice on one card or missing from it entirely, and both
+ *  failures look like a rendering bug rather than a predicate that moved. */
+function showsNotification(decision: Decision, message?: ReplayedMessage | null): boolean {
+  if (!message || message.status !== 'ok' || !message.message) return false;
+  return isDelivered(decision);
+}
+
+function ReplayedWording({
+  decision,
+  message,
+}: {
+  decision: Decision;
+  message: ReplayedMessage;
+}) {
+  if (!isDelivered(decision)) {
+    // Same text, no frame. A notification drawn for a subject nothing was delivered for is a
+    // falsehood about THIS row, and the caveat above the list cannot repair it: that one qualifies
+    // the wording's provenance, never the delivery.
+    return <p className="tb-wording">{message.message}</p>;
+  }
+
+  return (
+    <div className="tb-notif-field">
+      <div className="tb-notif">
+        <div className="tb-notif-head">
+          {/* aria-hidden because a screen reader would otherwise announce the Entur mark as the
+              Norwegian article "en". The app name beside it carries the same identity in words. */}
+          <span className="tb-notif-mark" aria-hidden="true">
+            EN
+          </span>
+          <span className="tb-notif-app">Avviksvarsel</span>
+        </div>
+        {/* The push's real title is the journey (varsel._notification_payload), which is why it
+            repeats the route already in the card header: the header names the card's subject, this
+            names what the phone showed. No timestamp here — the header's «Varsel kl.» is the one
+            fact about when, and a second clock inside the drawing would invite the reading that
+            the text is as old as the delivery. */}
+        <p className="tb-notif-title">
+          {decision.from_name} → {decision.to_name}
+        </p>
+        {/* pre-line, exactly as on /historikk and for the same reason: the wording is written as
+            several lines (summary, the train's own news, then the alternative — see
+            varsel._deterministic_body's "\n".join), and without it the browser collapses the
+            newlines to spaces and the parts run together into one sentence that reads as
+            nonsense. */}
+        <p className="tb-notif-body">{message.message}</p>
+      </div>
+    </div>
+  );
+}
+
+function ReplayBlock({
+  decision,
+  message,
+}: {
+  decision: Decision;
+  message: ReplayedMessage | null;
+}) {
   if (message === null) {
     // Alignment failed: /messages came back, but this card's subject matched no entry at its own
     // position and more than one (or none) by content. See alignMessages — the redacted
@@ -121,14 +195,7 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
   return (
     <div className="tb-replay">
       {message.status === 'ok' && message.message ? (
-        <blockquote className="tb-message">
-          {/* pre-line, exactly as on /historikk and for the same reason: the wording is written as
-              several lines (summary, the train's own news, then the alternative — see
-              varsel._deterministic_body's "\n".join), and without it the browser collapses the
-              newlines to spaces and the parts run together into one sentence that reads as
-              nonsense. */}
-          <span className="tb-message-text">{message.message}</span>
-        </blockquote>
+        <ReplayedWording decision={decision} message={message} />
       ) : (
         <div className="tb-status">
           <span
@@ -221,12 +288,24 @@ export default function DecisionCard({
             where a timetable puts it — because that is the one an unlabelled timestamp gets read
             as. The second time names itself: it is when the message actually went out. The wording
             below it is regenerated rather than quoted, which the replay block says in its own
-            words — the timestamp is a fact about the push, the text is not. */}
+            words — the timestamp is a fact about the push, the text is not.
+
+            The route is the one element that comes and goes, and it is a DEDUPLICATION rather than
+            a demotion: a drawn push is titled with the journey, because that is what
+            varsel._notification_payload really sends, so on those cards the header would print it a
+            second line above its own copy. Where no push is drawn — the ~83 % of rows that never
+            cleared the threshold, a subject whose wording was bounded out of this request, one
+            collapsed into a sibling's push — the header keeps it, because nothing else on the card
+            would say where the train is going. */}
         <div className="tb-train">
           <span className="tb-mode">{decision.mode ?? 'Tog'}</span>
           <span className="tb-line">{lineCode(decision.line)}</span>
           <span className="tb-departure">{fmtDeparture(decision)}</span>
-          <span className="tb-route">{decision.from_name} → {decision.to_name}</span>
+          {showsNotification(decision, message) ? null : (
+            <span className="tb-route">
+              {decision.from_name} → {decision.to_name}
+            </span>
+          )}
           <DepartureWhen decision={decision} />
         </div>
         <div className="tb-card-badges">
@@ -260,14 +339,19 @@ export default function DecisionCard({
           left out entirely rather than filled with the placeholder the SQL writes. Suppressed here
           rather than blanked in the query: `varsel_decisions` is a record and keeps what it
           recorded, including the longer placeholder that rows written before 2026-08-20 carry. */}
-      {decision.summary && !noSituation ? (
+      {(decision.summary || decision.description) && !noSituation ? (
         <Paragraph className="tb-situation">
-          <span className="tb-dot" aria-hidden="true" />
-          {decision.summary}
+          <span className="tb-situation-label">SIRI-SX</span>
+          {/* Joined inline rather than stacked: on this card the two fields are one quotation, and
+              the arm is reference material — a two-line block gives it the shape of a message,
+              which is the shape the wording below it is meant to own. */}
+          <span className="tb-situation-text">
+            {[decision.summary, decision.description].filter(Boolean).join(' — ')}
+          </span>
         </Paragraph>
       ) : null}
 
-      {message !== undefined ? <ReplayBlock message={message} /> : null}
+      {message !== undefined ? <ReplayBlock decision={decision} message={message} /> : null}
 
       <dl className="tb-facts">
         <div>
