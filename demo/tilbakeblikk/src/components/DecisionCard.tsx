@@ -327,7 +327,7 @@ export default function DecisionCard({
               className="tb-tag"
               title="Avgangen var allerede meldt innstilt i sanntidsdata (SIRI-ET) da vi bestemte oss. Sannsynlighetene er 1,0 per definisjon — vi videreformidlet et faktum."
             >
-              Alt meldt i ET
+              Allerede meldt i SIRI-ET
             </span>
           ) : null}
           <SendStateBadge decision={decision} />
