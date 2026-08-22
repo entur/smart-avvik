@@ -36,24 +36,6 @@ body {
   max-width: 46rem;
 }
 
-.tb-nowrap {
-  white-space: nowrap;
-}
-
-/* The sampling-variance caveat. A box rather than a paragraph, and above the fold rather than in a
-   tooltip: a reader who reloads and gets identical text concludes the decoder is deterministic, and
-   nothing else on the page contradicts them. Left border and a tint so it reads as a standing
-   condition on everything below, not as one more sentence of intro. */
-.tb-note {
-  max-width: 46rem;
-  margin: 0.75rem 0 0;
-  padding: 0.6rem 0.9rem;
-  font-size: 0.875rem;
-  background: #fff;
-  border-left: 3px solid #e8a33d;
-  border-radius: 0.25rem;
-}
-
 /* ---- filters ---------------------------------------------------------------------------- */
 /* Centred, not bottom-aligned: the checkbox column is taller than anything else on this row, so
    sitting everything on a shared bottom edge left it towering over the selects with its head in
@@ -81,12 +63,6 @@ body {
   flex-wrap: wrap;
   align-items: center;
   gap: 0.5rem 1rem;
-}
-
-.tb-window-hint {
-  font-size: 0.8125rem;
-  color: var(--basecolors-text-subdued, #6b6b6b);
-  max-width: 30rem;
 }
 
 .tb-select {
@@ -140,32 +116,6 @@ body {
   border-radius: 0.5rem;
   padding: 1.25rem;
   margin-bottom: 1.5rem;
-}
-
-/* The labelled/unlabelled split, above the rates it qualifies. Neutral when most of the window is
-   labelled; tinted amber when it is not, which on the default window (today) is always — the point
-   being that a precision over 3 of 412 rows should not look like a precision over 400. */
-.tb-coverage {
-  margin: 1rem 0;
-  padding: 0.75rem 1rem;
-  border-radius: 0.25rem;
-  background: var(--basecolors-frame-subdued, #ededed);
-  border-left: 4px solid var(--basecolors-stroke-subdued, #c5c5c5);
-}
-
-.tb-coverage.is-thin {
-  background: #fff6e6;
-  border-left-color: #e8a33d;
-}
-
-.tb-coverage-head {
-  font-size: 1.05rem;
-  font-weight: 650;
-}
-
-.tb-coverage-help {
-  margin: 0.25rem 0 0;
-  max-width: 46rem;
 }
 
 .tb-tiles {
@@ -517,25 +467,11 @@ body {
   font-style: italic;
 }
 
-/* The template arm. Recessed relative to the regenerated text above it — same input, other writer,
-   and the comparison is the point — so it is outlined rather than filled and does not read as a
-   second thing that was said. */
-.tb-message--template {
-  background: transparent;
-  border: 1px dashed var(--basecolors-stroke-subduedalt, #c5c5c5);
-}
-
-/* Load-bearing, on BOTH arms and on the discarded reply. The wordings are newline-joined
+/* Load-bearing on the generated wording and discarded reply. The wordings are newline-joined
    (varsel._deterministic_body's "\n".join), and without pre-line the browser collapses the newlines
    to spaces and the parts run together into one sentence that reads as nonsense. */
 .tb-message-text {
   white-space: pre-line;
-}
-
-.tb-message-source {
-  margin: 0.35rem 0 0;
-  font-style: normal;
-  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
 /* Every non-ok status. Rendered as a state with its own text rather than a badge over an empty
@@ -592,15 +528,6 @@ body {
   letter-spacing: 0.04em;
   font-size: 0.7rem;
   color: var(--basecolors-text-subdued, #6b6b6b);
-}
-
-/* The row was decided under a different prompt than the one that just answered. A note, not a
-   warning: it does not separate a prompt change from sampling variance, and the tooltip says so. */
-.tb-prompt-diff {
-  margin: 0;
-  color: var(--basecolors-text-subdued, #6b6b6b);
-  font-variant-numeric: tabular-nums;
-  cursor: help;
 }
 
 .tb-facts {

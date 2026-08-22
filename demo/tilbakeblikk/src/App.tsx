@@ -26,7 +26,6 @@ import {
   isBounded,
   lineCode,
   osloDaysAgo,
-  osloToday,
   osloTomorrow,
   timeInputValue,
 } from './format';
@@ -77,19 +76,18 @@ const TIME_STEP_S = 900;
 export default function App() {
   // The window: one Oslo day, and a from/to time of day. MIDNIGHT at either end means the default —
   // the start of the day, and "the rest of the day" — and travels to the API as an omitted
-  // parameter, because an <input type="time"> cannot express "the FOLLOWING midnight" and the API
-  // rejects a literal 00:00 end. See MIDNIGHT in api.ts.
-  const [day, setDay] = useState(osloToday());
+  // parameter. The end-time input displays that sentinel as 23:59, because the API rejects a
+  // literal 00:00 end. See MIDNIGHT in api.ts.
+  const [day, setDay] = useState(osloDaysAgo(1));
   const [fromTime, setFromTime] = useState(MIDNIGHT);
   const [toTime, setToTime] = useState(MIDNIGHT);
 
   const [utfall, setUtfall] = useState<UtfallFilter>('');
-  // All three narrowings default OFF: the page opens on every decision it has, including the ones
-  // still waiting for a verdict and the ones we stayed quiet on. Each of them is a population, and
-  // a page that hides one by default measures something narrower than it says it does.
+  // Open on decisions where a traveller was actually notified. The replayed wording is not the
+  // wording they received, but this is the most useful population for reviewing today's prompt.
   const [resolvedOnly, setResolvedOnly] = useState(false);
   const [alertedOnly, setAlertedOnly] = useState(false);
-  const [pushedOnly, setPushedOnly] = useState(false);
+  const [pushedOnly, setPushedOnly] = useState(true);
   const [sxOnly, setSxOnly] = useState(false);
   const [operator, setOperator] = useState('');
   // The three data-driven dropdowns. Their values are REFS — a full line ref, an NSR StopPlace ref —
@@ -218,7 +216,8 @@ export default function App() {
         // effect only when the server actually moved a boundary, and it converges: a quantized time
         // quantizes to itself.
         setFromTime(timeInputValue(d.from_time));
-        setToTime(timeInputValue(d.to_time));
+        const resolvedToTime = timeInputValue(d.to_time);
+        setToTime(resolvedToTime);
       } catch (e) {
         if (!cancelled) {
           setError(e instanceof Error ? e.message : String(e));
@@ -282,21 +281,7 @@ export default function App() {
           Hva ville vi sendt ut for disse avgangene — skrevet av dagens prompt? Velg en dag og et
           klokkeslettintervall for <strong>avgangstid</strong>, så henter siden varslene som faktisk
           gikk ut for togene som kjørte da, og kjører det lagrede skrivegrunnlaget gjennom prompten
-          som gjelder nå. Ingenting sendes til noen; kortene viser samme avgjørelser og samme fasit
-          som <span className="tb-nowrap">/historikk</span>, men med en formulering som er skrevet på
-          nytt.
-        </Paragraph>
-        {/* R9, on the page and not in a tooltip. Without it, a reader who reloads and sees the same
-            text concludes the output is deterministic — it is not; it is cached. And two rows that
-            word themselves differently look like evidence about the prompt when they may be nothing
-            but the decoder. */}
-        <Paragraph className="tb-note">
-          <strong>Én formulering er ett enkelt trekk.</strong> Hver tekst under er skrevet én gang av
-          en ikke-deterministisk dekoder og hurtiglagret per rad og prompt-versjon. Laster du siden
-          på nytt og får samme tekst, er det hurtigbufferen — ikke et bevis på at modellen er
-          forutsigbar. En forskjell mellom to kort, eller mellom to prompt-versjoner, kan like gjerne
-          være tilfeldig variasjon som en effekt av prompten. Siden skiller ikke de to, og bør ikke
-          leses som om den gjorde det.
+          som gjelder nå.
         </Paragraph>
       </header>
 
@@ -311,15 +296,13 @@ export default function App() {
         <div className="tb-window">
           <label className="tb-select">
             <span>Avgangsdag</span>
-            {/* Falling back to today when the field is cleared rather than allowing an empty value:
-                an omitted `day` means today to the API, and a blank box above today's data is a
-                control that misreports itself. */}
+            {/* Keep the default day visible when the native field is cleared. */}
             <input
               type="date"
               value={day}
               min={osloDaysAgo(MAX_WINDOW_DAYS)}
               max={osloTomorrow()}
-              onChange={(e) => setDay(e.target.value || osloToday())}
+              onChange={(e) => setDay(e.target.value || osloDaysAgo(1))}
             />
           </label>
           <label className="tb-select">
@@ -336,16 +319,10 @@ export default function App() {
             <input
               type="time"
               step={TIME_STEP_S}
-              value={toTime}
-              onChange={(e) => setToTime(e.target.value || MIDNIGHT)}
+              value={toTime === MIDNIGHT ? '23:59' : toTime}
+              onChange={(e) => setToTime(e.target.value === '23:59' ? MIDNIGHT : e.target.value)}
             />
           </label>
-          <span className="tb-window-hint">
-            Vinduet gjelder <strong>når toget skulle gå</strong>, ikke når vi vurderte det.
-            Intervallet er halvåpent, og <strong>00:00 i «Til kl.» betyr resten av døgnet</strong>.
-            I morgen er tillatt: sent på kvelden finnes det allerede avgjørelser om nattens og
-            morgendagens første avganger.
-          </span>
         </div>
 
         <label className="tb-select">
@@ -438,7 +415,7 @@ export default function App() {
 
           <label
             className="tb-check"
-            title="Bare avgjørelser som krysset operatørens terskel. Skjuler dem vi valgte å tie om — som er de eneste sporene en bom etterlater seg, og som aldri har en formulering å spille av. Merk at å krysse terskelen ikke er det samme som at noen ble varslet: bruk «Bare sendte varsler» for det."
+            title="Bare avgjørelser som krysset operatørens terskel. Skjuler dem vi valgte å tie om — som er de eneste sporene en bom etterlater seg, og som aldri har en formulering å spille av. Merk at å krysse terskelen ikke er det samme som at noen ble varslet: bruk «Bare der vi varslet» for det."
           >
             <input
               type="checkbox"
@@ -457,7 +434,7 @@ export default function App() {
               checked={pushedOnly}
               onChange={(e) => setPushedOnly(e.target.checked)}
             />
-            <span>Bare sendte varsler</span>
+            <span>Bare der vi varslet</span>
           </label>
 
           <label
