@@ -116,6 +116,8 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
     );
   }
 
+  if (message.status === 'no_input') return null;
+
   return (
     <div className="tb-replay">
       {message.status === 'ok' && message.message ? (
