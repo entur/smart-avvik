@@ -320,17 +320,21 @@ def test_unknown_operator_is_rejected():
 
 
 def test_response_carries_no_traveller_journey_identifiers():
-    """The public response describes a train, never whose trip it was.
+    """The response names a ROUTE (2026-08-22) but still never the journey's own identifiers.
 
-    from_stop/to_stop/journey_digest next to departure_time and n_devices would publish
-    "somebody commutes A->B at 07:15" -- exactly what llm_message.key_digest keeps out of the logs.
+    from_name/to_name are served deliberately -- see the PRIVACY note atop historikk_decisions.sql
+    and the fact it rests on, that prd's registrations are test users. What must not follow them out
+    is journey_digest, the join key to the LLM audit log, or the raw stop refs: those reach the
+    process and are popped in _with_place_names, so a ref appearing here means the pop was lost.
     This asserts the whole key set, so a future field addition fails here rather than shipping.
     """
     _reset([_row()])
     d = client.get("/historikk-api/decisions").json()["decisions"][0]
     assert not {"journey_digest", "from_stop", "to_stop", "stop_place"} & set(d)
+    assert {"from_name", "to_name"} <= set(d)
     assert set(d) == {
-        "situation_number", "summary", "description", "operator", "line", "mode", "call_date",
+        "situation_number", "summary", "description", "operator", "line", "mode",
+        "from_name", "to_name", "call_date",
         "departure_time", "n_decisions", "first_decided_at", "last_decided_at",
         "ever_alerted", "first_alert_at", "alert_lead_min",
         "max_impact_probability", "final_impact_probability", "final_cancel_probability",
@@ -808,28 +812,46 @@ def test_place_filters_do_not_share_a_cache_entry():
     assert len([c for c in fake.calls if c[0] == historikk._FILTERS_QUERY]) == 1
 
 
-def test_the_journey_endpoints_are_filterable_but_still_not_served_per_decision():
-    """The 2026-08-21 reversal, and its remaining limit — asserted so a later change has to face it.
+def test_the_refs_are_selected_but_only_resolved_names_are_served():
+    """The 2026-08-22 reversal, and the line that survived it.
 
-    from_place/to_place became FILTERS and /filters publishes the vocabulary, so the pair can be
-    chosen and the matching departures read off. What did NOT change is the per-row redaction: no
-    decision carries from_stop, to_stop or journey_digest, so a card still names a train rather than
-    a trip, and a listing does not pair an origin with a destination.
+    The per-row redaction of the traveller's endpoints is gone: a card names the route. The refs
+    themselves are not what leaves the process — the SQL selects them (both UNION arms, or the two
+    sides disagree about a column and the UNION stops compiling), and _with_place_names pops them
+    and puts NSR names in their place.
+
+    Pinned because the failure is silent in the direction that matters: forget the pop and
+    extra="forbid" raises, but resolve names WITHOUT selecting the refs and every card quietly reads
+    "Ukjent → Ukjent", which looks like a registry outage rather than a missing column.
     """
     _reset([_row()])
     d = client.get(
         "/historikk-api/decisions", params={"from_place": "NSR:StopPlace:337"}
     ).json()["decisions"][0]
     assert not {"journey_digest", "from_stop", "to_stop"} & set(d)
-    # The filter is a predicate, never a projection. Checked on the SELECT lists of both UNION arms
-    # with the comments stripped -- the file discusses these columns at length, which is the point.
+    assert d["from_name"] and d["to_name"]
+
+    # Both UNION arms must project them. Comments stripped -- the file discusses these columns at
+    # length, which is the point.
     body = "\n".join(
         ln for ln in historikk._DECISIONS_QUERY.splitlines() if not ln.strip().startswith("--")
     )
-    projections = re.findall(r"\bSELECT\b(.*?)\bFROM\b", body, re.DOTALL)
-    assert projections, "could not find a SELECT list to check"
+    # Only the two top-level arms, identified by the column that is unique to them: the file also
+    # holds a `NOT EXISTS (SELECT 1 ...)`, whose projection is a literal and has no columns at all.
+    projections = [
+        p
+        for p in re.findall(r"\bSELECT\b(.*?)\bFROM\b", body, re.DOTALL)
+        if "situation_number" in p
+    ]
+    assert len(projections) == 2, f"expected both UNION arms, found {len(projections)}"
     for projection in projections:
-        assert "from_stop" not in projection and "to_stop" not in projection
+        assert "from_stop" in projection and "to_stop" in projection
+
+    # journey_digest is the one that is never PROJECTED. It is still used, and has to be: the
+    # anti-join between the two arms matches on it. Using a redacted column as a predicate is not
+    # publishing it, which is the same distinction historikk_decisions.sql draws about the refs.
+    for projection in projections:
+        assert "journey_digest" not in projection
 
 
 def test_the_no_filter_array_test_is_null_safe():

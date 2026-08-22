@@ -386,6 +386,13 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* The registered journey's endpoints, on the cards where no drawn push already names them.
+   Matches /tilbakeblikk's .tb-route — the two card layouts are forked, not shared. */
+.vh-route {
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
 /* The second time is context, not identity — when the alert went, or when we last looked and said
    nothing. Italic and subdued so it cannot compete with the departure beside it now that the two
    share a line; the label inside it is plain text and carries the distinction. */
@@ -441,35 +448,127 @@ body {
   font-weight: 600;
 }
 
+/* The operator's own words, as REFERENCE. This page's question is what WE sent, so this arm is a
+   margin note: one line, subdued, italic — italic because it genuinely is a quotation of someone
+   else, which is the distinction the old layout had backwards (it set the operator upright and our
+   own wording in the italic reserved for quotations).
+
+   The amber dot that used to lead this line is gone with it. It was the card's only accent and it
+   marked the arm that matters least. Mirrors /tilbakeblikk's .tb-situation exactly — the two card
+   layouts are forked, not shared, so this is one of the changes that has to be made twice. */
 .vh-situation {
-  margin: 0.2rem 0;
-  font-size: 0.9rem;
+  display: flex;
+  gap: 0.625rem;
+  align-items: baseline;
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
-.vh-dot {
-  display: inline-block;
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 50%;
-  background: #e8a33d;
-  margin-right: 0.4rem;
+.vh-situation-label {
+  flex: none;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
 }
 
-.vh-message {
-  margin: 0.75rem 0;
-  padding: 0.65rem 0.9rem;
-  background: var(--basecolors-frame-tint, #f5f5f5);
-  border-radius: 0.25rem;
+.vh-situation-text {
   font-style: italic;
+  text-wrap: pretty;
 }
 
-.vh-message-text {
+.vh-wording-block {
+  margin: 0.625rem 0 0;
+}
+
+/* A tinted field, so the notification reads as sitting ON a screen rather than floating. The colour
+   is load-bearing rather than decorative: `frame-subdued` is the only surface here distinct from
+   BOTH the white card and the page behind it, and the notification's own white face is invisible
+   without it. The wording used to sit on `frame-tint` — which is exactly what `body` is painted
+   with, so the one element carrying this page's whole point was drawn in the page's own background,
+   the standard grammar for something recessed and secondary. */
+.vh-notif-field {
+  background: var(--basecolors-frame-subdued, #ededed);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+}
+
+/* Kept to a phone's width rather than stretched to the card. A notification that spans 55rem is not
+   the artefact being shown — the line length is part of what the reader is judging. */
+.vh-notif {
+  max-width: 27rem;
+  padding: 0.75rem 0.875rem;
+  background: #fff;
+  border-radius: 0.875rem;
+  box-shadow:
+    0 1px 2px rgba(24, 28, 86, 0.1),
+    0 6px 16px rgba(24, 28, 86, 0.1);
+}
+
+.vh-notif-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4375rem;
+  margin-bottom: 0.4375rem;
+}
+
+.vh-notif-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.0625rem;
+  height: 1.0625rem;
+  border-radius: 0.25rem;
+  background: var(--colors-brand-blue, #181c56);
+  color: #fff;
+  font-size: 0.5rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.vh-notif-app {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.vh-notif-title {
+  margin: 0 0 0.1875rem;
+  font-size: 0.9375rem;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+/* pre-line on both arms: the wording is newline-joined (varsel._deterministic_body's "\n".join),
+   and without it the browser collapses the newlines to spaces and the parts run together into one
+   sentence that reads as nonsense. */
+.vh-notif-body,
+.vh-wording {
+  margin: 0;
+  line-height: 1.4;
   white-space: pre-line;
+  text-wrap: pretty;
 }
 
+.vh-notif-body {
+  font-size: 0.90625rem;
+}
+
+/* Written but never delivered: the same wording, unframed. The frame is a claim that a phone showed
+   this, and for a wording that reached nobody it did not. */
+.vh-wording {
+  font-size: 0.9375rem;
+  line-height: 1.45;
+}
+
+/* Below the field, never inside it: who wrote the wording and how many devices got it are facts
+   about the record, and a phone showed neither. */
 .vh-message-source {
-  margin: 0.35rem 0 0;
-  font-style: normal;
+  margin: 0.4rem 0 0;
   color: var(--basecolors-text-subdued, #6b6b6b);
 }
 

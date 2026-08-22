@@ -7,9 +7,10 @@ export type OutcomeState = 'avklart' | 'venter' | 'ukjent';
 
 export type Verdict = 'hit' | 'false_alarm' | 'miss' | 'correct_reject';
 
-/** One alert decision. Describes a *train*, not a traveller: the journey definition behind it
- *  (digest, from_stop, to_stop) is deliberately not served, because this API is public and
- *  unauthenticated — see the Decision model in disruptions/api/historikk.py. */
+/** One alert decision: the train, and since 2026-08-22 the endpoints of the journey it was watched
+ *  for. `journey_digest` and the raw stop refs are still not served — the API resolves the refs to
+ *  NSR names and pops them — but the route itself now is. See the Decision model and the PRIVACY
+ *  note atop historikk_decisions.sql for what that rests on. */
 export interface Decision {
   situation_number: string | null;
   summary: string | null;
@@ -17,6 +18,10 @@ export interface Decision {
   operator: string | null;
   line: string | null;
   mode: string | null;
+  /** Registered journey origin, resolved to an NSR name (falls back to the bare ref). */
+  from_name: string;
+  /** Registered journey destination, same resolution. */
+  to_name: string;
   call_date: string | null;
   departure_time: string | null;
 
