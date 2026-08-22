@@ -657,10 +657,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     ones that matter: real travellers, real journeys.
 
 - The **Tilbakeblikk** page at `/tilbakeblikk` (`demo/tilbakeblikk/`, React + Vite + Entur Linje) is
-  the prompt-iteration loop: a window of past alert decisions replayed through **today's** prompt,
-  written from the `message_input` already stored on every decision row. `/historikk` answers "what
-  did we send, and was it right"; this one answers "what would today's prompt say about the same
-  disruptions", and nothing is sent to anybody. Its API is `/tilbakeblikk-api`
+  the prompt-iteration loop: the alerts that actually went out for a window of DEPARTURES, replayed
+  through **today's** prompt from the `message_input` already stored on every decision row.
+  `/historikk` answers "what did we send, and was it right"; this one answers "what would we send out
+  for these departures now", and nothing is sent to anybody. Its API is `/tilbakeblikk-api`
   (`disruptions/api/tilbakeblikk.py`) over `tilbakeblikk_{decisions,summary,filters,messages}.sql`.
   `config`, `filters`, `decisions` and `summary` are BigQuery only; `messages` is the one that calls
   Vertex — separate endpoints deliberately, so a Vertex outage empties the wordings and leaves every
@@ -672,34 +672,74 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   takes `@refs` and has no window of its own) and historikk's operator/verdict/lookback constants
   are, so a fix to one side must be mirrored to the other — the 2026-08-21 pushed-wording fix is
   exactly the shape of change that has to be.
-  - **The window is `decided_at`, not `call_date`** — one Oslo day plus a from/to time of day, both
-    ends quantized to 15-minute steps as a half-open `[from, to)`. Two reasons, and the second is
-    free. It is the axis a replay needs (a stretch of real cycles whose recorded inputs can be
-    re-run), and it is the **partition key** of `varsel_decisions`, so these are the first queries in
-    this stack that prune their main input: measured 2026-08-21, `tilbakeblikk_filters.sql` dry-runs
-    at **0 bytes** where `historikk_filters.sql` reports **21 MB**. The pruning predicate spans
-    `@day - 1 day` to `@day + 1 day` because the partition column is a UTC date while the window is
-    an Oslo one, with the exact `@from_ts <= decided_at < @to_ts` applied on top. Quantizing is not
-    cosmetic: every parameter lands in the response-cache key on a public unauthenticated endpoint,
-    and two free-form second-resolution times are on the order of a billion keys a day, each one a
-    cache entry and a BigQuery query of its own. `from`
-    rounds down and `to` rounds up so a narrowed range never drops a minute the caller asked for, and
-    the whole-day default runs 00:00 to the **following** midnight — 23:59:59.999999 is not on the
-    grid and quantizing it down would silently drop the last quarter-hour of every default request.
-    A future day, a day past `historikk._MAX_WINDOW_DAYS`, and a `to_time` at or before `from_time`
-    are all 400s rather than empty pages, for the same key-space reason.
-  - **The outcomes join is bounded separately, on `call_date`**, because that table is partitioned on
-    it and a `decided_at` predicate prunes nothing there — without the explicit bound this read would
-    be strictly *more* expensive than /historikk's while the query overall claimed to be cheaper. The
-    width is **measured, not reasoned to**: `MAX(ABS(DATE_DIFF(call_date, DATE(decided_at,
-    'Europe/Oslo'), DAY)))` over dev's last seven days on 2026-08-21 gives **max = 1, p99.9 = 1 over
-    59 694 rows**, no NULL `call_date`, which agrees with the ~12 h scoring horizon. **Re-measure
-    before widening that horizon.** A too-narrow bound drops outcome rows *silently* — the subjects
-    simply read as unresolved, a state the page renders perfectly happily — and the byte counts
-    `validate_varsel_sql.sh` prints would report that loss as a **cheaper** query, i.e. as success.
-    Cost is not a correctness check here. The bound also lives inside the `ON` and never the `WHERE`:
-    in the `WHERE` it turns the LEFT JOIN into an inner one and drops every unlabelled subject, which
-    on a same-day window is nearly all of them.
+  - **The window is `departure_time`** (changed from `decided_at` on 2026-08-22) — one Oslo day plus
+    a from/to time of day, both ends quantized to 15-minute steps as a half-open `[from, to)`. The
+    unit of this page is a MESSAGE, and a message belongs to a departure. The old axis selected
+    *cycles*, which could not answer "what would we have sent for this departure" — a departure has
+    one send moment, while a cycle window has to pick one by a rule the reader cannot see — and it
+    cost a whole class of caveats: a subject's cycles straddled the window, so every per-cycle figure
+    was window-scoped and `first_in_window` existed to stop "Varsel kl." claiming a first opportunity
+    that was merely the earliest cycle the reader selected. On this axis a subject is **wholly in or
+    wholly out**, so every figure is whole-subject and means what /historikk's means; `first_in_window`
+    and the `vindu` badges are gone. **Tomorrow is a legal day** and was not before: the poller scores
+    ~12 h forward, so at 23:00 there are real decisions about a 00:30 departure tomorrow. Quantizing
+    is not cosmetic: every parameter lands in the response-cache key on a public unauthenticated
+    endpoint, and two free-form second-resolution times are on the order of a billion keys a day,
+    each one a cache entry and a BigQuery query of its own. `from` rounds down and `to` rounds up so
+    a narrowed range never drops a minute the caller asked for, and the whole-day default runs 00:00
+    to the **following** midnight — 23:59:59.999999 is not on the grid and quantizing it down would
+    silently drop the last quarter-hour of every default request. A day more than one ahead, a day
+    past `historikk._MAX_WINDOW_DAYS`, and a `to_time` at or before `from_time` are all 400s rather
+    than empty pages, for the same key-space reason. What the change gives up is real: only a
+    `decided_at` window reconstructs "what the app was saying at 07:15" as one coherent snapshot, and
+    only it let a reader sweep lead time by moving the window.
+  - **Both date bounds are now DERIVED, and both fail silently and cheaply.** `varsel_decisions` is
+    `PARTITION BY DATE(decided_at)`, which the window predicate no longer touches — so the pruning
+    predicate is a derived cover (`@day ± 1 day`) for "every cycle that could have decided about a
+    departure in the window". **The trap got sharper, not softer**: under the old axis a too-narrow
+    span only mislabelled `first_in_window`, and now it drops cycles out of the aggregates —
+    `n_decisions` undercounts, `first_alert_at` moves later, and a push whose cycle fell outside
+    reads as "never sent". Measured in dev 2026-08-22 over 117 448 rows (14 days):
+    `DATE(departure Oslo) − DATE(decided)` is **0 or 1**, lead runs **−54 min to 710 min**, and
+    `departure_time` is never NULL. Two things there are worth keeping, because the obvious version
+    of each is wrong. A decision is **not** always before its departure — `catchable_after=now` drops
+    a train that can no longer be *caught*, which a delayed train still can be — and that negative
+    tail is the only thing that could ever put a cycle on `@day + 1`; at −54 min it cannot, so the
+    `@day + 1` reach is margin against a looser cut or a lead past about −70 min, not decoration.
+    And 710 min is the ~12 h horizon, which is what bounds `@day − 1`: **re-measure before widening
+    it**, because at 24 h the bound stops covering the span. The outcomes join stays bounded
+    separately on `call_date`, because that table is partitioned on it and a `departure_time`
+    predicate prunes nothing there; it stays `± 1 day` even though the same measurement found
+    `call_date = DATE(departure_time, 'Europe/Oslo')` for **all** 117 448 rows — fourteen days of
+    dev, whose registrations number about three, is thin evidence for a claim about after-midnight
+    operating days across every operator, so tighten it only against a prd measurement. Both failures
+    are invisible — the subjects simply read as unresolved or under-counted, states the page renders
+    perfectly happily — and the byte counts `validate_varsel_sql.sh` prints would report the loss as
+    a **cheaper** query, i.e. as success. **Cost is not a correctness check here.** The outcomes bound
+    also lives inside the `ON` and never the `WHERE`: in the `WHERE` it turns the LEFT JOIN into an
+    inner one and drops every unlabelled subject, which on a same-day window is nearly all of them.
+  - **The replayed cycle is the one a push actually went out on, looked up and never re-derived.**
+    `pushed` is written by `varsel._record_decisions` *after* delivery, so it already carries all four
+    delivery filters: the operator threshold, the not-yet-departed cut (`catchable_after=now`),
+    `one_alert_per_train`'s collapse of several SX messages about one departure, and the `_notified`
+    dedup keyed on `(journey_id, situation_number)` and persisted in the GCS state blob. A
+    re-derivation would be strictly worse — it cannot see `_notified` across cycles and redeploys,
+    cannot see a `gone` subscription that pushed a cycle later, and cannot see which situation won a
+    collapse in a cycle it is not simulating — so it would produce a plausible send time that is not
+    the send time. It is the **first** such cycle, because `_notified` makes the first delivery the
+    only one for that situation's life. Picking `alertworthy` instead, which this did until
+    2026-08-22, names a cycle no message went out on: most alert-worthy cycles are repeats
+    `_notified` suppressed, and a collapse loser is alert-worthy for its whole life while reaching
+    nobody. `send_state` on each card names which of six states a subject is in — `sendt`,
+    `sendt_uten_input`, `under_terskel`, `samlet` (a sibling situation about the same train pushed
+    instead), `push_av` (no VAPID keypair in this deployment) and `ikke_sendt` — and
+    `other_pushed_on_train` is what distinguishes the middle two. That column also makes the page a
+    **detector for the open `_notified` gap**: the dedup key is per situation while the collapse is
+    per cycle, so a winner that flips between cycles pushes twice for one train, which shows up as
+    two `sendt` subjects on one train. `pushed_only` is the filter for "what a traveller actually
+    received"; it is strictly narrower than `alerted_only`, and both exist so the difference is
+    visible. Note the log's grain is the journey **definition**, so one card stands for `n_devices`
+    real pushes rather than one.
   - **Generation is the gate, delivery is not.** `/messages` asks `llm_message.generation_enabled()`
     and never `delivery_enabled()` or `varsel._deliverable_message` — the two switches are not
     interchangeable (generation says whether a wording can be *written*, delivery only what a
@@ -766,9 +806,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     nothing -- while `error` says only that the backend was unreachable a minute ago. Do not unify
     the two lifetimes on the grounds that both are failures. Both halves of the key are
     load-bearing: the prompt version is what makes an edit invalidate the page rather than show
-    yesterday's answer under today's brief, and the replayed timestamp is what makes *narrowing the
-    window* — which picks a different cycle — correctly miss instead of serving the wider window's
-    wording under a different time. The cache is consulted **before** the budget, which is what makes
+    yesterday's answer under today's brief, and the replayed timestamp is what keeps an entry tied to
+    the cycle it was written from. On the `decided_at` axis it did more than that — narrowing the
+    window picked a *different* cycle for the same subject, and the timestamp is what made that
+    correctly miss. On the departure axis narrowing only removes subjects, so the timestamp is now
+    belt-and-braces rather than the thing preventing a wrong hit; keep it, since `pushed` can name a
+    second cycle when the `_notified` winner flips. The cache is consulted **before** the budget, which is what makes
     a whole day reachable: spent per subject rather than per miss, every request would re-serve the
     same first twelve forever and nothing further down the list could ever be seen.
     A bound that binds is reported per entry and the request still returns 200 — `capped`,
@@ -831,18 +874,18 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     ~3** — so a surface off in prd answers the prompt question on thin data. dev and tst being on is
     a deliberate acceptance on the team's own registrations under the same Q1, not a sign the question
     was answered. Turning prd on is a one-value change plus a dispatch-only deploy.
-  - **Two honesty constraints the card carries**, both easy to get backwards. `first_in_window` says
-    whether the replayed cycle is the subject's **first alerting opportunity anywhere** or merely the
-    earliest one this window happens to contain — computed from `MIN(IF(alertworthy, decided_at))`
-    over the whole ±1-day span the query already scans, which costs no extra partition — because
-    without it, narrowing the time picker would silently move a card's claimed send time later. And
-    the per-cycle aggregates (`n_decisions`, `ever_alerted`, `first_alert_at`, `alert_lead_min`, the
-    four `final_*`, `max_impact_probability`, `pushed_any`) are **window-scoped** while the verdict
-    comes whole from the nightly job, so `ever_alerted: false` beside `verdict: 'hit'` is correct
-    rather than a bug — it alerted outside the window the reader chose. The field descriptions say
-    WINDOW-SCOPED and the UI labels them; `alert_lead_min` is recomputed from the window's first
-    alert rather than copied from the outcomes row, so it and `first_alert_at` cannot disagree about
-    which cycle they mean. `/summary`'s `median_lead_min_on_hits` goes the other way — whole-subject,
+  - **The card's figures are whole-subject**, and were not before 2026-08-22. On the `decided_at`
+    axis the per-cycle aggregates (`n_decisions`, `ever_alerted`, `first_alert_at`, `alert_lead_min`,
+    the four `final_*`, `max_impact_probability`, `pushed_any`) described the window's *slice* of a
+    subject while the verdict came whole from the nightly job, so `ever_alerted: false` beside
+    `verdict: 'hit'` was correct rather than a bug — it alerted outside the window the reader chose.
+    That needed a `WINDOW-SCOPED` note on every field description and a `vindu` badge on every
+    figure, plus `first_in_window` to stop "Varsel kl." claiming a first opportunity the window
+    could not support. The departure axis puts a subject wholly in or wholly out, so all of it is
+    gone and `alert_lead_min` now agrees with the nightly job's by construction rather than by a
+    recomputation kept from disagreeing with it. It is still computed here rather than copied, so an
+    unlabelled subject — nearly all of a same-day window — also gets a lead time.
+    `/summary`'s `median_lead_min_on_hits` was always whole-subject,
     from the nightly job — which is what keeps it comparable with /historikk's.
   - **What a replay measures, and what it does not.** It measures a **prompt** change, not a
     `build_message_input` change: the stored document was built by the builder of that day and is
@@ -855,13 +898,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     versions, is confounded with sampling variance, and reloading and seeing the same text is the
     cache rather than evidence that the model is predictable. The page says both, in prose at the
     top and not in a tooltip.
-  - `data/queries/validate_varsel_sql.sh` covers all four new files (twelve parameters each against
+  - `data/queries/validate_varsel_sql.sh` covers all four new files (thirteen parameters each against
     /historikk's eleven — one omitted makes `bq` refuse to parse and the check reports FAILED, so the
     file goes **unvalidated**; `test_tilbakeblikk.py` greps the script for every `@param` as the cheap
     half of that guard). A clean dry run still proves neither of the two things that matter most:
     the CLI encodes an empty ARRAY parameter differently from the Python client, so the
-    `IFNULL(ARRAY_LENGTH(@refs), 0) = 0` rule dry-runs identically either way, and the `call_date`
-    bound above fails silently and *cheaply*.
+    `IFNULL(ARRAY_LENGTH(@refs), 0) = 0` rule dry-runs identically either way, and **both** date
+    bounds above fail silently and *cheaply* — the derived `DATE(decided_at)` cover as well as the
+    `call_date` one.
   - **A same-day window is almost entirely `venter`**, because verdicts arrive from the 04:00 UTC
     labelling job the following night and /historikk avoids this by defaulting to 14 days on
     `call_date` — which this page cannot do, since its question is about a stretch of a specific day.
