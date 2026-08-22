@@ -20,9 +20,8 @@ export type SendState =
   | 'push_av'
   | 'ikke_sendt';
 
-/** One alert decision replayed. Describes a *train*, not a traveller: the journey definition behind
- *  it (digest, from_stop, to_stop) and the writer's input (message_input, which embeds all three in
- *  one blob) are deliberately not served — this API is public and unauthenticated.
+/** One alert decision replayed. The registered endpoints are served as display names for the card
+ *  heading; their internal refs, the journey digest, and message_input remain server-only.
  *
  *  /historikk's Decision field for field, with three differences:
  *
@@ -44,6 +43,8 @@ export interface Decision {
   operator: string | null;
   line: string | null;
   mode: string | null;
+  from_name: string;
+  to_name: string;
   call_date: string | null;
   departure_time: string | null;
 

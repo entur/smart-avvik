@@ -60,12 +60,10 @@ cache keyed on the replayed row plus the prompt version. It runs against its OWN
 (:func:`llm_message.new_replay_state`), so a replay burst that drives both backends into a
 configuration error cannot strip model wordings from real pushes for the next half hour.
 
-Privacy is inherited verbatim from /historikk (KTD10) and extended by one column. No decision row
-carries ``journey_digest``, ``from_stop``, ``to_stop`` — or ``message_input``, which embeds all three
-of origin, destination and departure time in one blob. :class:`Decision` is ``extra="forbid"``, so a
-future SELECT that re-adds a redacted column fails loudly here rather than quietly publishing it.
-``/filters`` publishes place refs as the dropdown vocabulary exactly as /historikk's does; the
-redaction is per row, not per response, or the Fra/Til filters could not exist at all.
+Decision rows name the registered origin and destination. The query projects their refs only long
+enough for the server to resolve National Stop Register names; the public model still forbids the
+refs, ``journey_digest`` and ``message_input``. The last embeds origin, destination and departure
+time in one blob and remains server-only.
 
 Reads only. No import of main (the package rule): main injects the BigQuery client via
 :func:`configure`. It DOES import :mod:`historikk`, for the constants the two surfaces must not let
@@ -283,10 +281,8 @@ class Decision(BaseModel):
     The departure axis puts a subject wholly in or wholly out, so these now describe the whole
     subject and mean what /historikk's mean.
 
-    Describes a *train*, not a traveller. The journey definition behind the decision
-    (``journey_digest``, ``from_stop``, ``to_stop``) and the writer's input (``message_input``) are
-    all absent: this endpoint is served unauthenticated on a public host, and those next to
-    ``departure_time`` and ``n_devices`` would publish "somebody commutes A->B at 07:15".
+    The card names the registered route, while its internal stop refs, ``journey_digest`` and the
+    writer's input (``message_input``) remain absent from the public response.
     ``extra="forbid"`` is the guard that keeps that true — the SQL and this model must agree column
     for column, so a future SELECT that re-adds one fails loudly here.
     """
@@ -299,6 +295,12 @@ class Decision(BaseModel):
     operator: str | None = Field(description="Ref codespace: VYG, GOA, RUT, ...")
     line: str | None = Field(description="Line ref of the matched train.")
     mode: str | None = Field(description="Vehicle noun: 'Tog' or 'Buss'.")
+    from_name: str = Field(
+        description="Registered journey origin, resolved to an NSR name when possible."
+    )
+    to_name: str = Field(
+        description="Registered journey destination, resolved to an NSR name when possible."
+    )
     call_date: date | None = Field(description="Operating day of the boarding call (Europe/Oslo).")
     departure_time: datetime | None = Field(
         description="Aimed departure from the boarding stop (UTC).",
@@ -1726,10 +1728,27 @@ def decisions(
         verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
     rows = _query(_DECISIONS_QUERY, params, key)
+    raw_rows = [dict(r) for r in rows]
+    refs = sorted(
+        {
+            row[field]
+            for row in raw_rows
+            for field in ("from_stop", "to_stop")
+            if row.get(field)
+        }
+    )
+    registry = _place_registry(refs)
+    decisions_out = []
+    for row in raw_rows:
+        from_ref = row.pop("from_stop", None)
+        to_ref = row.pop("to_stop", None)
+        row["from_name"] = registry.get(from_ref, (None, from_ref))[0] or from_ref or "Ukjent"
+        row["to_name"] = registry.get(to_ref, (None, to_ref))[0] or to_ref or "Ukjent"
+        decisions_out.append(Decision(**row))
     return DecisionsResponse(
         **window.fields(),
         count=len(rows),
-        decisions=[Decision(**dict(r)) for r in rows],
+        decisions=decisions_out,
     )
 
 
