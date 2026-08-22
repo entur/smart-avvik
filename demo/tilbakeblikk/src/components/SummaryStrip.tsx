@@ -16,9 +16,9 @@ function Tile({ label, value, hint }: { label: string; value: string; hint?: str
  *
  *  This is the one thing this strip says that /historikk's does not, and it is here because of the
  *  window axis. /historikk windows on `call_date` and defaults to fourteen days, so most of what it
- *  shows has been labelled; this page windows on `decided_at` and defaults to TODAY, and verdicts
- *  arrive from the 04:00 UTC job the following night. On the default view the rates below are
- *  therefore computed over a handful of rows out of hundreds.
+ *  shows has been labelled; this page windows on `departure_time` and defaults to TODAY, and
+ *  verdicts arrive from the 04:00 UTC job the following night. On the default view the rates below
+ *  are therefore computed over a handful of rows out of hundreds.
  *
  *  Counts, never a share: «3 av 412» and «0,7 %» are the same fact and land completely differently —
  *  the first makes a reader stop reading the rates, which is the point. The share is in the tile
@@ -182,9 +182,9 @@ function SegmentSplit({ summary }: { summary: Summary }) {
         «Dekning» måles blant avganger som faktisk ble flagget av en SX-melding, på reiser noen har
         registrert. Et avvik som aldri ble meldt, ser vi ikke — så dette er ikke dekning over alle
         avvik. «Ukjent» betyr at vi ikke fant igjen avgangen i sanntidsdata; den telles bevisst ikke
-        som «riktig stille». «Varslingstid» telles per avgang, ikke per melding, og er hentet for
-        hele avgjørelsens levetid — i motsetning til varslingstiden på kortene, som bare gjelder
-        vinduet. Alle de samlede tallene blander tre ulike populasjoner og flytter seg med
+        som «riktig stille». «Varslingstid» telles per avgang, ikke per melding, og er
+        hentet for hele avgjørelsens levetid — som varslingstiden på kortene nå også er. Alle de
+        samlede tallene blander tre ulike populasjoner og flytter seg med
         blandingsforholdet mellom dem. Les dem sammen med oppdelingen over — og med hvor mange av
         avgjørelsene som i det hele tatt har fasit.
       </Paragraph>

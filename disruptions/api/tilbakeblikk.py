@@ -6,11 +6,25 @@ every decision row and re-runs the current prompt over it. Same filters, same st
 different window axis, and a wording that is generated rather than quoted.
 
 **The window axis is the whole difference.** /historikk windows on ``call_date`` — the operating day
-of the train. This page windows on ``decided_at`` — when the decision was taken — as a single day
-plus a from/to time of day, all Europe/Oslo. That is what a prompt-iteration loop needs: a stretch
-of real cycles whose recorded inputs can be replayed. It is also, incidentally, the first query in
-this stack that prunes its main input, because ``varsel_decisions`` is ``PARTITION BY
-DATE(decided_at)``.
+of the train. This page windows on ``departure_time`` — the aimed departure of the boarding call —
+as a single day plus a from/to time of day, all Europe/Oslo. The unit of this page is a MESSAGE, and
+a message belongs to a departure: "what would we have sent out for the trains leaving between 07:00
+and 09:00, worded by today's prompt".
+
+It windowed on ``decided_at`` until 2026-08-22, which selected CYCLES instead. That axis could not
+answer the question — a departure has one send moment, while a cycle window has to pick one by a
+rule the reader cannot see — and it cost a whole class of caveats: a subject's cycles straddled the
+window, so every per-cycle figure was window-scoped and ``first_in_window`` had to exist to stop
+"Varsel kl." claiming a first opportunity that was merely the earliest cycle the reader selected.
+On this axis a subject is wholly in or wholly out, so every figure is whole-subject and means what
+/historikk's means. What was given up is real and is written into the SQL header: only a
+``decided_at`` window reconstructs "what the app was saying at 07:15" as one coherent snapshot, and
+only it let the reader sweep lead time by moving the window.
+
+The consequence for cost is that ``varsel_decisions`` is ``PARTITION BY DATE(decided_at)``, which
+the window predicate no longer touches — so the pruning bound is now DERIVED (every cycle that could
+have decided about a departure in the window) and a too-narrow one drops cycles from the aggregates
+silently, while reporting the loss as a cheaper query. See ``tilbakeblikk_decisions.sql``.
 
 **Both times are quantized to 15-minute steps and the range is half-open ``[from, to)``.** That is
 not cosmetic: the endpoint is public and unauthenticated and every parameter lands in the response
@@ -29,7 +43,14 @@ decision uniquely, since the real grain includes the redacted ``journey_digest``
 
 **``/messages`` regenerates; it never renders what was stored.** It reads back the ``message_input``
 document recorded on the chosen cycle, hands it to today's prompt, and returns the result beside the
-deterministic wording built from the same document. It asks :func:`llm_message.generation_enabled`
+deterministic wording built from the same document. The chosen cycle is the one a push ACTUALLY went
+out on (``pushed``), which ``_record_decisions`` writes after delivery — so it already carries
+varsel's four delivery filters (the operator threshold, the not-yet-departed cut,
+``one_alert_per_train``'s collapse, and the ``_notified`` dedup keyed on journey_id and situation).
+It is looked up rather than re-derived because a re-derivation cannot see ``_notified`` (which
+persists across cycles and redeploys), cannot see a subscription that was ``gone`` so the push
+landed a cycle later, and cannot see which situation won a collapse in a cycle it is not
+simulating. It asks :func:`llm_message.generation_enabled`
 and never ``delivery_enabled`` — whether a *traveller* is sent model prose is a different question,
 settled per deployment, and consulting it here would blank this page in prd, which is the one
 deployment that generates without delivering. Bounded four ways (see the constants): a per-request
@@ -251,19 +272,21 @@ class Decision(BaseModel):
 
     /historikk's :class:`~historikk.Decision` field for field, with three differences.
 
-    **Added**: ``would_send_at``, ``first_in_window`` and ``prompt_version`` — the replayed cycle,
-    whether it was the subject's first opportunity, and which prompt wrote the row's own wording.
+    **Added**: ``would_send_at``, ``send_state``, ``other_pushed_on_train`` and ``prompt_version`` —
+    the replayed cycle, whether a message went out for this subject at all and why not when it did
+    not, whether a sibling situation about the same train pushed, and which prompt wrote the row's
+    own wording.
 
     **Removed**: ``message`` and ``message_source``. The stored wording is deliberately not on this
     card (R12). Showing the pushed text beside one regenerated from a possibly different cycle would
     reintroduce exactly the mismatch the 2026-08-21 fix removed from /historikk, where 41 % of cards
     quoted text nobody received.
 
-    **Re-scoped**: the per-cycle aggregates below are computed over the cycles INSIDE the window,
-    while the verdict comes whole from the nightly labelling job. A subject can therefore legitimately
-    read ``ever_alerted: false`` beside ``verdict: 'hit'`` — it alerted outside the window the reader
-    chose. Each such field says so; the page labels them rather than letting them read as
-    /historikk's.
+    **Whole-subject since 2026-08-22.** On the old ``decided_at`` axis the per-cycle aggregates below
+    were computed over the window's slice of a subject and every one of them carried a WINDOW-SCOPED
+    caveat, which is how ``ever_alerted: false`` could sit beside ``verdict: 'hit'`` and be correct.
+    The departure axis puts a subject wholly in or wholly out, so these now describe the whole
+    subject and mean what /historikk's mean.
 
     Describes a *train*, not a traveller. The journey definition behind the decision
     (``journey_digest``, ``from_stop``, ``to_stop``) and the writer's input (``message_input``) are
@@ -287,43 +310,40 @@ class Decision(BaseModel):
     )
 
     n_decisions: int | None = Field(
-        description="WINDOW-SCOPED: refresh cycles that scored this train INSIDE the selected "
-        "window, not over its whole life.",
+        description="Refresh cycles that scored this train, over its whole life.",
     )
     first_decided_at: datetime | None = Field(
-        description="WINDOW-SCOPED: first time it was scored inside the window (UTC).",
+        description="First time it was scored (UTC).",
     )
     last_decided_at: datetime | None = Field(
-        description="WINDOW-SCOPED: last time it was scored inside the window (UTC).",
+        description="Last time it was scored (UTC).",
     )
     ever_alerted: bool | None = Field(
-        description="WINDOW-SCOPED: whether any cycle INSIDE the window crossed the alert "
-        "threshold. False beside a 'hit' verdict is not a contradiction — it means the alerting "
-        "happened outside the window.",
+        description="Whether any cycle crossed the alert threshold. Crossing it is not the same as "
+        "a traveller being told: see pushed_any and send_state, which are narrower.",
     )
     first_alert_at: datetime | None = Field(
-        description="WINDOW-SCOPED: when we first crossed the threshold inside the window (UTC); "
-        "null if we never did there.",
+        description="When we first crossed the threshold (UTC); null if we never did.",
     )
     alert_lead_min: int | None = Field(
-        description="WINDOW-SCOPED: departure minus first_alert_at, in minutes. Computed from the "
-        "window's first alert rather than copied from the nightly job's whole-subject figure, so it "
-        "and first_alert_at beside it describe the same cycle.",
+        description="Departure minus first_alert_at, in minutes. Agrees with the nightly job's "
+        "figure by construction now that both describe the whole subject, but still computed here "
+        "so an unlabelled subject — nearly all of a same-day window — also gets a lead time.",
     )
     max_impact_probability: float | None = Field(
-        description="WINDOW-SCOPED: highest alerting score reached inside the window.",
+        description="Highest alerting score reached.",
     )
     final_impact_probability: float | None = Field(
-        description="WINDOW-SCOPED: score at the last cycle inside the window.",
+        description="Score at the last cycle.",
     )
     final_cancel_probability: float | None = Field(
-        description="WINDOW-SCOPED: cancellation probability at that cycle.",
+        description="Cancellation probability at that cycle.",
     )
     final_delay_p50_min: int | None = Field(
-        description="WINDOW-SCOPED: median predicted departure delay (min) at that cycle.",
+        description="Median predicted departure delay (min) at that cycle.",
     )
     final_delay_p90_min: int | None = Field(
-        description="WINDOW-SCOPED: bad-case predicted departure delay (min) at that cycle.",
+        description="Bad-case predicted departure delay (min) at that cycle.",
     )
     alert_threshold: float | None = Field(description="The operator's threshold applied here.")
     et_cancelled: bool | None = Field(
@@ -333,23 +353,34 @@ class Decision(BaseModel):
         "segment /summary counted this decision in. Null for decisions taken before 2026-08-05.",
     )
     pushed_any: bool | None = Field(
-        description="WINDOW-SCOPED: whether a Web Push was actually delivered from a cycle inside "
-        "the window.",
+        description="Whether a Web Push was actually delivered for this subject. This is the "
+        "recorded output of varsel's four delivery filters, not a re-derivation of them.",
     )
-    n_devices: int | None = Field(description="How many registrations shared this journey.")
+    n_devices: int | None = Field(
+        description="How many registrations shared this journey definition. The dedup key is per "
+        "journey_id, so this card stands for that many real pushes, not one.",
+    )
+    other_pushed_on_train: int | None = Field(
+        description="How many OTHER situations about this same registration and train delivered a "
+        "push. Non-zero beside pushed_any=false is one_alert_per_train's collapse: the traveller "
+        "was told, under another situation number. Non-zero beside pushed_any=true is the open "
+        "_notified gap — the dedup key is per situation while the collapse is per cycle, so a "
+        "winner that flips between cycles pushes twice for one train.",
+    )
 
     would_send_at: datetime | None = Field(
-        description="When the replayed message could have been sent (UTC): the decided_at of the "
-        "FIRST alert-worthy cycle inside the window that recorded a writer's input. Nothing was "
-        "sent on this page, so this is the honest reading of 'Varsel kl.' — read it with "
-        "first_in_window. Null means no cycle in the window was replayable at all, which is its own "
-        "state and never 'no message'.",
+        description="When the message went out (UTC): the decided_at of the FIRST cycle that "
+        "actually delivered a push AND recorded a writer's input. First, because _notified makes "
+        "the first delivery the only one for that situation's life. Null means there is nothing to "
+        "replay, and send_state says which of the several reasons applies.",
     )
-    first_in_window: bool = Field(
-        description="Whether would_send_at is the subject's FIRST alert-worthy cycle anywhere, not "
-        "merely the earliest one this window happens to contain. False means the train was already "
-        "alerting before the window opened — narrowing the picker would otherwise silently move the "
-        "claimed send time later — or that nothing was replayable.",
+    send_state: str | None = Field(
+        description="Why this subject does or does not carry a message. 'sendt' — a push went out "
+        "and its cycle is replayable. 'sendt_uten_input' — delivered, but that cycle recorded no "
+        "message_input, so there is nothing to hand the prompt. 'under_terskel' — never crossed the "
+        "operator's threshold. 'samlet' — alert-worthy but another situation about the same train "
+        "pushed instead (one_alert_per_train). 'push_av' — this deployment has no VAPID keypair and "
+        "pushes nothing. 'ikke_sendt' — alert-worthy, and nothing was delivered for this train.",
     )
     prompt_version: str | None = Field(
         description="SHA-256[:8] of the system prompt in force when the replayed cycle was written. "
@@ -385,7 +416,7 @@ class WindowFields(BaseModel):
     anything else: a literal 00:00 end would have to be at or before the start, which is rejected.
     """
 
-    day: date = Field(description="The Europe/Oslo calendar day the decisions were taken on.")
+    day: date = Field(description="The Europe/Oslo calendar day the trains depart on.")
     from_time: time = Field(description="Quantized start of the range, Europe/Oslo (inclusive).")
     to_time: time = Field(
         description="Quantized end of the range, Europe/Oslo (EXCLUSIVE). 00:00 means the "
@@ -396,7 +427,7 @@ class WindowFields(BaseModel):
 
 
 class DecisionsResponse(WindowFields):
-    """Decisions taken inside the window, newest departure first."""
+    """Decisions about the departures inside the window, earliest departure first."""
 
     count: int = Field(description="Number of decisions returned.")
     decisions: list[Decision] = Field(description="Matching decisions, newest departure first.")
@@ -565,7 +596,7 @@ class Segment(BaseModel):
         default=None,
         description="Median minutes between the first alert and the AIMED departure, over this "
         "segment's hit TRAINS — not its hit rows. Comes whole from the nightly job, like the "
-        "verdict, so it is the subject's real first alert and NOT the window-scoped lead the cards "
+        "verdict, so it is the subject's real first alert — which the cards' lead now also is, "
         "show; that is what keeps it comparable with /historikk's. Null when the segment has no "
         "hits.",
     )
@@ -630,7 +661,7 @@ class Summary(WindowFields):
     )
     median_lead_min_on_hits: int | None = Field(
         description="Median minutes of warning on the TRAINS we got right. Whole-subject, from the "
-        "nightly job — not the window-scoped alert_lead_min the cards carry.",
+        "nightly job. Since 2026-08-22 the cards' alert_lead_min agrees with it by construction.",
     )
     n_hit_with_30min_notice: int = Field(
         description="Trains alerted 30+ min before departure. Per train, like the median beside "
@@ -741,9 +772,12 @@ def _resolve_window(
     the response-cache key on a public unauthenticated endpoint, where an unbounded key space is an
     unbounded number of cache entries and BigQuery queries.
 
-    * The day defaults to today in Europe/Oslo. A future day is rejected (there are no decisions
-      there, so it can only be key-space) and so is one further back than
-      ``historikk._MAX_WINDOW_DAYS`` — the same lookback /historikk bounds its window by.
+    * The day defaults to today in Europe/Oslo, and may reach ONE DAY AHEAD. That is a consequence
+      of the departure axis and not a loosening: the poller scores about 12 h forward, so at 23:00
+      there are already real decisions about a 00:30 departure tomorrow, and rejecting tomorrow
+      would hide them. Two days ahead cannot hold a decision, so it can only be key-space and is
+      refused, as is a day further back than ``historikk._MAX_WINDOW_DAYS`` — the same lookback
+      /historikk bounds its window by.
     * The times default to the whole day, 00:00 to the FOLLOWING midnight, and are quantized to
       15-minute steps: from down, to up, range half-open.
 
@@ -763,8 +797,10 @@ def _resolve_window(
     """
     today = datetime.now(_OSLO).date()
     day = day or today
-    if day > today:
-        raise HTTPException(status_code=400, detail="day must not be in the future.")
+    if day > today + timedelta(days=1):
+        raise HTTPException(
+            status_code=400, detail="day must not be more than one day in the future."
+        )
     if (today - day).days > historikk._MAX_WINDOW_DAYS:
         raise HTTPException(
             status_code=400,
@@ -1017,6 +1053,7 @@ def _list_cache_key(
     to_place: str | None,
     verdict: str | None,
     alerted_only: bool,
+    pushed_only: bool,
     resolved_only: bool,
     sx_only: bool,
     limit: int,
@@ -1031,7 +1068,7 @@ def _list_cache_key(
     """
     return (
         prefix, *window.cache_key, operator, line, from_place, to_place,
-        verdict, alerted_only, resolved_only, sx_only, limit,
+        verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
 
 
@@ -1347,6 +1384,7 @@ def _message_rows(
     to_place: str | None,
     verdict: str | None,
     alerted_only: bool,
+    pushed_only: bool,
     resolved_only: bool,
     sx_only: bool,
     limit: int,
@@ -1368,6 +1406,7 @@ def _message_rows(
     params = _base_query_params(window, operator, line, from_refs, to_refs) + [
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
+        bigquery.ScalarQueryParameter("pushed_only", "BOOL", pushed_only),
         bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
         bigquery.ScalarQueryParameter("sx_only", "BOOL", sx_only),
         bigquery.ScalarQueryParameter("limit", "INT64", limit),
@@ -1375,7 +1414,7 @@ def _message_rows(
     # Same key shape as /decisions', with its own prefix; see _list_cache_key for what rides on it.
     key = _list_cache_key(
         "messages", window, operator, line, from_place, to_place,
-        verdict, alerted_only, resolved_only, sx_only, limit,
+        verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
     return [dict(r) for r in _query(_MESSAGES_QUERY, params, key)]
 
@@ -1477,10 +1516,12 @@ def config() -> ConfigResponse:
 @router.get(
     "/filters",
     summary="The values the page's dropdowns can be set to",
-    response_description="Operators, lines and registered places decided on inside the window.",
+    response_description="Operators, lines and registered places departing inside the window.",
 )
 def filters(
-    day: date | None = Query(default=None, description="Oslo day of the decisions (default: today)."),
+    day: date | None = Query(
+        default=None, description="Oslo day of the DEPARTURES (default: today; tomorrow allowed)."
+    ),
     from_time: time | None = Query(
         default=None,
         description="Start of the time range, Europe/Oslo (default: 00:00). Rounded DOWN to a "
@@ -1492,7 +1533,7 @@ def filters(
         "midnight). Rounded UP to a 15-minute step.",
     ),
 ) -> FilterOptions:
-    """Every operator, line, boarding place and alighting place decided on inside the window.
+    """Every operator, line, boarding place and alighting place departing inside the window.
 
     Scoped to the same window as the data, not to the whole log, so the dropdowns offer exactly what
     the page can show. The consequence is that a selection can go stale when the window narrows —
@@ -1527,10 +1568,12 @@ def filters(
 @router.get(
     "/decisions",
     summary="Alert decisions taken in a day-and-time window, with their realized outcome",
-    response_description="Decisions decided inside the window, newest departure first.",
+    response_description="Decisions about departures inside the window, earliest first.",
 )
 def decisions(
-    day: date | None = Query(default=None, description="Oslo day of the decisions (default: today)."),
+    day: date | None = Query(
+        default=None, description="Oslo day of the DEPARTURES (default: today; tomorrow allowed)."
+    ),
     from_time: time | None = Query(
         default=None, description="Start of the range, Europe/Oslo (default 00:00; rounded down)."
     ),
@@ -1560,8 +1603,15 @@ def decisions(
     ),
     alerted_only: bool = Query(
         default=False,
-        description="Only decisions that crossed the threshold INSIDE the window. Leave off to see "
-        "the decisions we did NOT alert on — the ones a miss is made of.",
+        description="Only decisions that crossed the operator's threshold. Leave off to see the "
+        "decisions we did NOT alert on — the ones a miss is made of.",
+    ),
+    pushed_only: bool = Query(
+        default=False,
+        description="Only decisions a traveller was actually PUSHED about — strictly narrower than "
+        "alerted_only, because an alert-worthy subject can still reach nobody: another situation "
+        "about the same train won one_alert_per_train's collapse, or _notified had already "
+        "delivered for that situation on an earlier cycle.",
     ),
     resolved_only: bool = Query(
         default=False,
@@ -1574,13 +1624,18 @@ def decisions(
     ),
     limit: int = Query(default=200, ge=1, le=_MAX_LIMIT, description="Maximum rows to return."),
 ) -> DecisionsResponse:
-    """Every alert decision taken inside the window, whether or not it produced a push.
+    """Every alert decision about a departure inside the window, whether or not it produced a push.
 
     Non-alerting decisions are included by default on purpose: they are the only evidence a miss
-    leaves behind, and a log filtered to what we did send can only ever measure precision. On this
-    page they matter for a second reason — a sub-threshold cycle records a ``message_input`` too, but
-    it is never the replayed one, so a subject that never crossed the gate inside the window has no
-    replayable cycle at all.
+    leaves behind, and a log filtered to what we did send can only ever measure precision. Pass
+    ``pushed_only`` for the narrower list — the messages a traveller actually received — and note it
+    is narrower than ``alerted_only`` rather than the same cut spelled differently: an alert-worthy
+    subject reaches nobody when another situation about its train wins ``one_alert_per_train``'s
+    collapse, or when ``_notified`` already delivered for that situation on an earlier cycle.
+
+    On this page the sub-threshold rows matter for a second reason — such a cycle records a
+    ``message_input`` too, but it is never the replayed one, so a subject that never crossed the
+    gate has no replayable cycle at all. ``send_state`` names which of those states each card is in.
     """
     from google.cloud import bigquery
 
@@ -1594,6 +1649,7 @@ def decisions(
     params = _base_query_params(window, operator, line, from_refs, to_refs) + [
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
+        bigquery.ScalarQueryParameter("pushed_only", "BOOL", pushed_only),
         bigquery.ScalarQueryParameter("resolved_only", "BOOL", resolved_only),
         bigquery.ScalarQueryParameter("sx_only", "BOOL", sx_only),
         bigquery.ScalarQueryParameter("limit", "INT64", limit),
@@ -1602,7 +1658,7 @@ def decisions(
     # _list_cache_key for why it is positional and what a forgotten parameter costs.
     key = _list_cache_key(
         "decisions", window, operator, line, from_place, to_place,
-        verdict, alerted_only, resolved_only, sx_only, limit,
+        verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
     rows = _query(_DECISIONS_QUERY, params, key)
     return DecisionsResponse(
@@ -1614,11 +1670,13 @@ def decisions(
 
 @router.get(
     "/summary",
-    summary="Alerting performance over the decisions taken in a window",
+    summary="Alerting performance over the departures in a window",
     response_description="Verdict counts, precision/recall, and how much of the window is resolved.",
 )
 def summary(
-    day: date | None = Query(default=None, description="Oslo day of the decisions (default: today)."),
+    day: date | None = Query(
+        default=None, description="Oslo day of the DEPARTURES (default: today; tomorrow allowed)."
+    ),
     from_time: time | None = Query(
         default=None, description="Start of the range, Europe/Oslo (default 00:00; rounded down)."
     ),
@@ -1701,11 +1759,13 @@ def summary(
 
 @router.get(
     "/messages",
-    summary="What today's prompt would write for the decisions taken in a window",
+    summary="What we would have sent out for the departures in a window",
     response_description="One regenerated wording per subject, aligned with /decisions' list.",
 )
 async def messages(
-    day: date | None = Query(default=None, description="Oslo day of the decisions (default: today)."),
+    day: date | None = Query(
+        default=None, description="Oslo day of the DEPARTURES (default: today; tomorrow allowed)."
+    ),
     from_time: time | None = Query(
         default=None, description="Start of the range, Europe/Oslo (default 00:00; rounded down)."
     ),
@@ -1729,7 +1789,10 @@ async def messages(
         description="Filter to 'hit', 'false_alarm', 'miss' or 'correct_reject'.",
     ),
     alerted_only: bool = Query(
-        default=False, description="Only decisions that crossed the threshold INSIDE the window."
+        default=False, description="Only decisions that crossed the operator's threshold."
+    ),
+    pushed_only: bool = Query(
+        default=False, description="Only decisions a traveller was actually PUSHED about."
     ),
     resolved_only: bool = Query(
         default=False, description="Only decisions whose realized outcome is known."
@@ -1793,7 +1856,7 @@ async def messages(
     async with _replay_slots:
         return await _messages(
             window, operator, line, from_place, to_place, verdict,
-            alerted_only, resolved_only, sx_only, limit, deadline,
+            alerted_only, pushed_only, resolved_only, sx_only, limit, deadline,
         )
 
 
@@ -1805,6 +1868,7 @@ async def _messages(
     to_place: str | None,
     verdict: str | None,
     alerted_only: bool,
+    pushed_only: bool,
     resolved_only: bool,
     sx_only: bool,
     limit: int,
@@ -1832,6 +1896,7 @@ async def _messages(
                 to_place=to_place,
                 verdict=verdict,
                 alerted_only=alerted_only,
+                pushed_only=pushed_only,
                 resolved_only=resolved_only,
                 sx_only=sx_only,
                 limit=limit,

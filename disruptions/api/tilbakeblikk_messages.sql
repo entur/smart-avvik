@@ -21,17 +21,18 @@
 -- are still joined because @verdict and @resolved_only narrow the subject list, and a list narrowed
 -- differently from /decisions' would be the misalignment above.
 --
--- See tilbakeblikk_decisions.sql's header for the pruning argument, the measured +/-1 day outcomes
--- bound (dev 2026-08-21: max |call_date - Oslo(decided_at)| = 1 over 59 694 rows), and why the
--- emptiness test is IFNULL(ARRAY_LENGTH(...), 0) = 0 and never the bare form.
+-- See tilbakeblikk_decisions.sql's header for the axis argument (why DEPARTURE time and not
+-- `decided_at`), why the DERIVED DATE(decided_at) pruning bound is load-bearing for the aggregates
+-- rather than cosmetic, why the outcomes bound stays +/-1 day on `call_date`, and why the emptiness
+-- test is IFNULL(ARRAY_LENGTH(...), 0) = 0 and never the bare form.
 WITH scanned AS (
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
     line, mode, departure_time,
-    decided_at, alertworthy, message_input, prompt_version,
-    decided_at >= @from_ts AND decided_at < @to_ts AS in_window
+    decided_at, alertworthy, pushed, message_input, prompt_version
   FROM `disruptions.varsel_decisions`
   WHERE DATE(decided_at) BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
+    AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
@@ -44,23 +45,26 @@ subjects AS (
     ANY_VALUE(line)     AS line,
     ANY_VALUE(mode)     AS mode,
     MAX(departure_time) AS departure_time,
-    LOGICAL_OR(in_window AND alertworthy) AS ever_alerted,
-    -- The SAME pick as tilbakeblikk_decisions.sql, with the input carried alongside: the first
-    -- alert-worthy cycle in the window that recorded one. ONE aggregate, so `message_input`,
-    -- `would_send_at` and `prompt_version` cannot come from three different cycles -- the wording
-    -- would then be written from one cycle's numbers and stated under another cycle's time.
+    LOGICAL_OR(alertworthy)             AS ever_alerted,
+    COALESCE(LOGICAL_OR(pushed), FALSE) AS pushed_any,
+    -- The SAME pick as tilbakeblikk_decisions.sql, with the input carried alongside: the FIRST cycle
+    -- that actually delivered a push and recorded an input. `pushed` is the recorded output of
+    -- varsel's four delivery filters, written after delivery -- see that file for why it is looked
+    -- up rather than re-derived. ONE aggregate, so `message_input`, `would_send_at` and
+    -- `prompt_version` cannot come from three different cycles -- the wording would then be written
+    -- from one cycle's numbers and stated under another cycle's time.
     --
-    -- NULL here is the state R7 names: no alert-worthy cycle in the window recorded an input, so
-    -- there is nothing to replay. The caller reports that distinctly and spends no generation budget
-    -- on it -- it is not "no message", and it is not an error.
-    ARRAY_AGG(IF(in_window AND alertworthy AND message_input IS NOT NULL, STRUCT(
+    -- NULL here is the state R7 names: no delivered cycle recorded an input, so there is nothing to
+    -- replay. The caller reports that distinctly and spends no generation budget on it -- it is not
+    -- "no message", and it is not an error. On this axis it covers the `sendt_uten_input` card as
+    -- well as every card never sent at all; /decisions' `send_state` is what separates them.
+    ARRAY_AGG(IF(pushed AND message_input IS NOT NULL, STRUCT(
                 message_input  AS message_input,
                 decided_at     AS would_send_at,
                 prompt_version AS prompt_version), NULL)
               IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)] AS replay
   FROM scanned
   GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
-  HAVING COUNTIF(in_window) > 0
 )
 SELECT
   -- The subject key. Not a public projection: the caller matches these against /decisions' rows by
@@ -83,7 +87,8 @@ LEFT JOIN `disruptions.varsel_decision_outcomes` AS o
   AND o.situation_number = s.situation_number
 WHERE (@verdict IS NULL OR o.verdict = @verdict)
   AND (NOT @alerted_only OR s.ever_alerted)
+  AND (NOT @pushed_only  OR s.pushed_any)
   AND (NOT @resolved_only OR o.actual_trouble IS NOT NULL)
-ORDER BY s.departure_time DESC,
+ORDER BY s.departure_time ASC,
          s.situation_number, s.operator, s.jkey, s.call_date, s.stop_order, s.journey_digest
 LIMIT @limit

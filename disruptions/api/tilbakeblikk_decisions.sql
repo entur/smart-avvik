@@ -1,77 +1,133 @@
--- /tilbakeblikk-api/decisions: the alert decisions taken inside one day-and-time window.
+-- /tilbakeblikk-api/decisions: the alert decisions covering one day-and-time window of DEPARTURES.
 --
--- A near-clone of historikk_decisions.sql on a DIFFERENT WINDOW AXIS, and the axis is the whole
--- point. /historikk windows on `call_date` -- the operating day of the train -- and answers "what
--- did we decide about the trains that ran that day". /tilbakeblikk windows on `decided_at` -- when
--- the decision was taken -- and answers "what were we saying between 07:00 and 09:00 this morning".
--- The second question is what a prompt-iteration surface needs: a stretch of real cycles whose
--- recorded inputs can be replayed through today's prompt.
+-- A near-clone of historikk_decisions.sql on a THIRD window axis, and the axis is the whole point.
+-- /historikk windows on `call_date` -- the operating day of the train -- and answers "what did we
+-- decide about the trains that ran that day". /tilbakeblikk windows on `departure_time` -- the
+-- aimed departure of the boarding call -- and answers "what would we have sent out for the trains
+-- leaving between 07:00 and 09:00, worded by today's prompt".
 --
--- THE FORK IS DELIBERATE AND HAS A COST. /historikk is not modified (the plan's scope boundary), so
--- this file, tilbakeblikk_summary.sql, tilbakeblikk_filters.sql and tilbakeblikk_messages.sql are a
--- second copy of that logic on a second axis: a fix to one side must be mirrored to the other. The
--- 2026-08-21 pushed-wording fix is exactly the shape of change that has to be. Only
--- historikk_stop_places.sql is genuinely shared, because it takes only @refs and has no window.
+-- WHY NOT `decided_at`, which this file used until 2026-08-22. That axis selects CYCLES, and the
+-- page's unit is a MESSAGE. Two consequences made it the wrong axis:
+--
+--   * A subject's cycles straddle the window. Selecting 07:00-09:00 of decision time catches the
+--     second-through-Nth cycle about a train first decided at 06:40, so every per-cycle figure had
+--     to be computed over the window's slice of the subject and labelled WINDOW-SCOPED on the card,
+--     and `first_in_window` had to exist to stop "Varsel kl." claiming a first opportunity that was
+--     merely the earliest cycle the reader happened to select. On the departure axis a subject is
+--     wholly in or wholly out, so all of that is gone: every figure below is whole-subject and
+--     agrees with the nightly job's by construction rather than by a recomputation that had to be
+--     kept from disagreeing with it.
+--   * It cannot answer "what would we have sent for THIS departure", which is the question. A
+--     departure has one send moment; a cycle window has to pick one, and the pick was a rule the
+--     reader could not see.
+--
+-- WHAT THE OLD AXIS COULD DO AND THIS ONE CANNOT, stated because it is a real loss: only a
+-- `decided_at` window reconstructs "what the app was saying at 07:15" as one coherent snapshot, and
+-- only it let the reader sweep LEAD TIME by moving the window (the same train's 2-hour-lead cycle
+-- and its 13-minute-lead cycle carry very different inputs and produce very different wordings).
+-- Here the replayed cycle is always the send moment, which is what the page now claims to show.
+--
+-- THE FORK FROM /historikk IS DELIBERATE AND HAS A COST. /historikk is not modified (the plan's
+-- scope boundary), so this file, tilbakeblikk_summary.sql, tilbakeblikk_filters.sql and
+-- tilbakeblikk_messages.sql are a second copy of that logic on a second axis: a fix to one side must
+-- be mirrored to the other. The 2026-08-21 pushed-wording fix is exactly the shape of change that
+-- has to be. Only historikk_stop_places.sql is genuinely shared, because it takes only @refs and
+-- has no window of its own.
 --
 -- WHY THIS READS `varsel_decisions` AND NOT `varsel_decision_groups` (KTD4): the view carries
--- neither `message_input` nor any `decided_at` bound, and it aggregates before a filter can reach
--- it. Reading the table directly is the only way to get the replay input, and it is also the reason
--- the pruning below is available at all.
+-- neither `message_input` nor any date bound, and it aggregates before a filter can reach it.
+-- Reading the table directly is the only way to get the replay input, and it is also the reason the
+-- pruning below is available at all.
 --
--- COST: `varsel_decisions` is PARTITION BY DATE(decided_at), so this is the first query in the
--- stack that actually prunes its main input. The partition column is a UTC date while the window is
--- an Oslo day, so the pruning predicate spans @day-1 to @day+1 and the exact window predicate
--- (@from_ts <= decided_at < @to_ts, both resolved from the Oslo day and the quantized times in
--- tilbakeblikk._resolve_window) is applied on top. Three partitions instead of one whole table.
+-- COST, AND A TRAP THAT GOT SHARPER RATHER THAN SOFTER. `varsel_decisions` is
+-- PARTITION BY DATE(decided_at), which the window predicate no longer touches -- so the pruning
+-- predicate is now a DERIVED bound: every cycle that decided about a departure inside the window.
 --
--- THE OUTCOMES SIDE IS BOUNDED TOO, and it has to be bounded SEPARATELY: that table is
--- PARTITION BY call_date, which a `decided_at` predicate does not prune, so without an explicit
--- `call_date BETWEEN` this read would be strictly MORE expensive than /historikk's -- which does
--- prune it -- while the query overall claims to be cheaper.
+-- Under the old axis a too-narrow span only mislabelled `first_in_window`. Now it DROPS CYCLES FROM
+-- THE AGGREGATES -- `n_decisions` undercounts, `first_alert_at` moves later, `alert_lead_min`
+-- shrinks, and a push whose cycle fell outside the span reads as "never sent". Every one of those
+-- is silent, and the byte counts validate_varsel_sql.sh prints would report the loss as a CHEAPER
+-- query, i.e. as success. Cost is not a correctness check here.
 --
--- The width is MEASURED, not reasoned to. Run in dev on 2026-08-21:
+-- MEASURED in dev on 2026-08-22 over the last 14 days, 117 448 rows:
 --
---   SELECT MAX(ABS(DATE_DIFF(call_date, DATE(decided_at, 'Europe/Oslo'), DAY)))
+--   SELECT MIN(DATE_DIFF(DATE(departure_time,'Europe/Oslo'), DATE(decided_at), DAY)),   -- 0
+--          MAX(DATE_DIFF(DATE(departure_time,'Europe/Oslo'), DATE(decided_at), DAY)),   -- 1
+--          MIN(TIMESTAMP_DIFF(departure_time, decided_at, MINUTE)),                     -- -54
+--          MAX(TIMESTAMP_DIFF(departure_time, decided_at, MINUTE)),                     -- 710
+--          COUNTIF(departure_time IS NULL)                                              -- 0
 --   FROM `disruptions.varsel_decisions`
---   WHERE DATE(decided_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+--   WHERE DATE(decided_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
 --
--- -> max_days = 1 over 59 694 rows, p99.9 = 1, and no NULL call_date. So the bound is +/-1 day.
--- That agrees with the structure: a situation is scored over a ~12 h forward window, so the furthest
--- a call can sit from the Oslo day it was decided on is the following day. RE-MEASURE before
--- widening the scoring horizon -- a too-narrow bound drops outcome rows SILENTLY (the subjects just
--- read as unresolved, which is a state the page renders perfectly happily), and the byte counts
--- validate_varsel_sql.sh prints would report that loss as a CHEAPER query, i.e. as success. Cost is
--- not a correctness check here.
+-- So DATE(decided_at) lands on @day or @day-1, and the bound below covers both. Two things in that
+-- reading are worth stating because the obvious version of each is wrong.
+--
+-- A decision is NOT always before its departure: the worst observed lead is MINUS 54 minutes. The
+-- matcher's catchable_after=now cut drops a train that can no longer be CAUGHT, which is not the
+-- same as one whose aimed departure has passed -- a delayed train is still catchable. That negative
+-- tail is the only thing that could ever put a cycle on @day+1 (a late-evening Oslo departure
+-- decided after UTC midnight), and at -54 min it cannot: a departure inside @day is at most 22:00
+-- UTC on @day, so even the worst tail stays on @day. The @day+1 reach below is therefore MARGIN, and
+-- margin against a specific future -- a looser departed-train cut, or a lead past about -70 minutes
+-- -- rather than decoration. It costs nothing: three partitions either way.
+--
+-- The 710-minute maximum is the ~12 h scoring horizon, and it is what bounds @day-1. RE-MEASURE
+-- before widening that horizon: at 24 h the bound below stops covering the span.
+--
+-- THE OUTCOMES SIDE IS BOUNDED SEPARATELY, on `call_date`, because that table is
+-- PARTITION BY call_date and a `departure_time` predicate prunes nothing there. Measured on the
+-- same rows, `call_date = DATE(departure_time,'Europe/Oslo')` held for ALL 117 448 of them -- zero
+-- operating-day drift, so the exact `= @day` would have been correct on this data:
+--
+--   SELECT COUNTIF(call_date != DATE(departure_time,'Europe/Oslo'))                     -- 0
+--
+-- It stays +/-1 day anyway. Fourteen days of dev, whose registrations number about three, is thin
+-- evidence for a claim about after-midnight operating days across every operator, and the failure
+-- mode is the silent one above: a dropped verdict just reads as an unresolved subject, which the
+-- page renders perfectly happily. Tighten it only against a measurement from prd.
+--
+-- The bound also lives inside the ON and never the WHERE: in the WHERE it turns the LEFT JOIN into
+-- an inner one and drops every unlabelled subject, which on a same-day window is nearly all of them.
+--
+-- A ROW WITH NO `departure_time` CANNOT BE PLACED ON THIS AXIS and therefore drops out entirely.
+-- That is the honest handling -- it has no departure to window on -- and it is a population change
+-- against the old axis, where such a subject appeared with a NULL lead time and sorted last. The
+-- measurement above says the population is currently empty (0 NULL departure_time in 14 days), so
+-- this is a contract note rather than an observed loss.
 --
 -- PRIVACY (KTD10, inherited verbatim from /historikk): the traveller-identifying triple
 -- (journey_digest, from_stop, to_stop) is never projected. journey_digest and the two stop refs are
--- used as JOIN and ORDER BY and WHERE terms only. `message_input` is the fourth redaction and the
--- one specific to this surface: it embeds origin, destination and departure time in one blob.
---
--- Note what that means for the one reference to `message_input` below. It appears in a PREDICATE,
--- never in a projection, and it must: the replay cycle this file names in `would_send_at` has to be
--- the same cycle tilbakeblikk_messages.sql fetches the input for, or the card would state a send
--- time for a wording the page cannot produce. The redaction that matters is the projection, and
--- test_tilbakeblikk.py asserts exactly that -- SELECT lists of this file and the summary carry no
--- message_input, from_stop or to_stop, while the messages file does carry the input.
+-- used as JOIN and PARTITION BY and WHERE and ORDER BY terms only. `message_input` is the fourth
+-- redaction and the one specific to this surface: it embeds origin, destination and departure time
+-- in one blob. It appears below in a PREDICATE only, never in a projection, and it must: the replay
+-- cycle this file names in `would_send_at` has to be the same cycle tilbakeblikk_messages.sql
+-- fetches the input for, or the card would state a send time for a wording the page cannot produce.
+-- test_tilbakeblikk.py asserts exactly that -- the SELECT lists of this file and the summary carry
+-- no message_input, from_stop or to_stop, while the messages file does carry the input.
 WITH scanned AS (
-  -- Every decision cycle in the +/-1 day span, flagged for whether it is inside the requested
-  -- window. One scan serves both: the window-scoped card figures come from the flagged rows, and
-  -- `first_in_window` needs the span-wide view of the same subject (see below).
+  -- Every cycle of every subject whose DEPARTURE falls inside the window. No in/out flag: the axis
+  -- is a property of the subject, so a subject is wholly in or wholly out and each of its cycles
+  -- comes with it.
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
     summary, description, line, mode, stop_place, departure_time,
     decided_at, alertworthy, et_cancelled, impact_probability, cancel_probability,
     delay_p50_min, delay_p90_min, alert_threshold, pushed, n_devices, prompt_version,
+    -- Why no push went out is a question this page will provoke on every silent card, and this is
+    -- the only column that separates "this deployment does not push at all" from "we chose not to".
+    message_status = 'push_disabled' AS push_off,
     -- Predicate only; see the header note. TRUE when this cycle recorded an input that can be
     -- replayed through today's prompt.
-    message_input IS NOT NULL AS has_input,
-    -- Half-open [from, to). The endpoint quantizes both ends to 15-minute steps -- from down, to up
-    -- -- so a narrowed range never drops a minute the caller asked for, and the whole-day default is
-    -- midnight to the FOLLOWING midnight rather than 23:59:59.999999, which is not on the grid.
-    decided_at >= @from_ts AND decided_at < @to_ts AS in_window
+    message_input IS NOT NULL AS has_input
   FROM `disruptions.varsel_decisions`
+  -- The DERIVED partition bound. See the header: this is no longer the window predicate, and a
+  -- too-narrow one now drops cycles from the aggregates rather than mislabelling one flag.
   WHERE DATE(decided_at) BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
+    -- The window itself. Half-open [from, to). The endpoint quantizes both ends to 15-minute steps
+    -- -- from down, to up -- so a narrowed range never drops a minute the caller asked for, and the
+    -- whole-day default is midnight to the FOLLOWING midnight rather than 23:59:59.999999, which is
+    -- not on the grid. A NULL departure_time fails this and drops out, as the header says.
+    AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
     -- The traveller's own registered endpoints: filtered on, never selected. An ARRAY of EVERY ref
@@ -95,6 +151,12 @@ WITH scanned AS (
 -- groups at and the nightly labelling job writes a verdict for. Keeping it means the cards and the
 -- rates stay comparable with /historikk's; a per-cycle grain would multiply the cards roughly
 -- tenfold and describe a different population from the one /summary reports on.
+--
+-- Note what the grain means for "one push per registration". `_notified` is keyed per journey_id,
+-- so two devices watching the same trip are two pushes -- but the log is keyed on the journey
+-- DEFINITION (journey_digest) with a device count beside it, deliberately, so that it cannot
+-- identify a traveller. One row here is therefore one wording delivered to `n_devices` devices, and
+-- the page says so rather than implying a single recipient.
 subjects AS (
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
@@ -108,91 +170,113 @@ subjects AS (
     -- position by position. ANY_VALUE is free to pick differently in two queries over the same rows.
     MAX(departure_time)    AS departure_time,
 
-    -- ---- WINDOW-SCOPED per-cycle figures --------------------------------------------------------
-    -- Everything below is computed over the cycles INSIDE the window, while the verdict further
-    -- down comes whole from the nightly job. That is deliberate (KTD5) and it is visible on the
-    -- page: a subject can legitimately read ever_alerted = FALSE beside verdict = 'hit', because it
-    -- alerted outside the window the reader chose. The API's field descriptions say so, and the UI
-    -- labels these figures as window-scoped rather than letting them read as /historikk's.
-    COUNTIF(in_window)                              AS n_decisions,
-    MIN(IF(in_window, decided_at, NULL))            AS first_decided_at,
-    MAX(IF(in_window, decided_at, NULL))            AS last_decided_at,
-    LOGICAL_OR(in_window AND alertworthy)           AS ever_alerted,
-    MIN(IF(in_window AND alertworthy, decided_at, NULL)) AS first_alert_at,
-    MAX(IF(in_window, impact_probability, NULL))    AS max_impact_probability,
-    ANY_VALUE(IF(in_window, alert_threshold, NULL)) AS alert_threshold,
-    LOGICAL_OR(in_window AND pushed)                AS pushed_any,
-    MAX(IF(in_window, n_devices, NULL))             AS n_devices,
+    -- ---- per-cycle figures, now WHOLE-SUBJECT ---------------------------------------------------
+    -- Under the old axis every one of these was computed over the window's slice of the subject and
+    -- carried a WINDOW-SCOPED caveat on the card, which is how `ever_alerted = FALSE` could sit
+    -- beside `verdict = 'hit'` and be correct. On this axis the subject is wholly in the window, so
+    -- these describe the whole subject and mean the same thing as /historikk's.
+    COUNT(*)                                AS n_decisions,
+    MIN(decided_at)                         AS first_decided_at,
+    MAX(decided_at)                         AS last_decided_at,
+    LOGICAL_OR(alertworthy)                 AS ever_alerted,
+    MIN(IF(alertworthy, decided_at, NULL))  AS first_alert_at,
+    MAX(impact_probability)                 AS max_impact_probability,
+    ANY_VALUE(alert_threshold)              AS alert_threshold,
+    MAX(n_devices)                          AS n_devices,
+    -- `pushed` is written as a real bool on every row (decisions.py builds it with bool()), so this
+    -- is never NULL in practice; COALESCE anyway, because the states below branch on it and a NULL
+    -- would fall to the ELSE and report a delivered push as "never sent".
+    COALESCE(LOGICAL_OR(pushed), FALSE)     AS pushed_any,
+    COALESCE(LOGICAL_OR(push_off), FALSE)   AS push_off,
     -- The four "final" figures in ONE aggregate, not four. Two aggregates "picking the same row" is
     -- a promise ORDER BY cannot keep, and its failure mode here would be a card mixing one cycle's
     -- probability with another cycle's delay. (varsel_decision_groups still spells these as four
     -- separate ARRAY_AGGs; that is the older form, and the `delivered` aggregate beside them is the
-    -- one this copies.) The STRUCT is NULL for an out-of-window row and IGNORE NULLS drops it, so
-    -- this is "the last IN-WINDOW cycle" -- including when that cycle's own figures are NULL.
-    ARRAY_AGG(IF(in_window, STRUCT(
+    -- one this copies.) No IGNORE NULLS: the STRUCT itself is never NULL, so this is the last
+    -- cycle's figures including when that cycle's own figures are NULL, which is the intent.
+    ARRAY_AGG(STRUCT(
                 impact_probability AS final_impact_probability,
                 cancel_probability AS final_cancel_probability,
                 delay_p50_min      AS final_delay_p50_min,
-                delay_p90_min      AS final_delay_p90_min), NULL)
-              IGNORE NULLS ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS final,
+                delay_p90_min      AS final_delay_p90_min)
+              ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS final,
     -- Was this a relayed fact or a prediction, as at the point a verdict would judge? Same rule as
     -- varsel_decision_groups: the first ALERTING cycle where we alerted, any cycle where we did not.
     -- Emphatically not a plain LOGICAL_OR, which would be backwards -- a cancellation is routinely
     -- declared AFTER we alerted, since alerting before ET publishes is the whole point of the app.
     -- Used only as the fallback below, for a subject the nightly job has not labelled yet.
     COALESCE(
-      ARRAY_AGG(IF(in_window AND alertworthy, et_cancelled, NULL)
+      ARRAY_AGG(IF(alertworthy, et_cancelled, NULL)
                 IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)],
-      LOGICAL_OR(IF(in_window, et_cancelled, NULL))
-    ) AS et_cancelled_window,
+      LOGICAL_OR(et_cancelled)
+    ) AS et_cancelled_derived,
 
-    -- ---- THE REPLAY PICK (KTD5) -----------------------------------------------------------------
-    -- The FIRST alert-worthy cycle in the window that recorded an input: the moment a message could
-    -- first have gone out, which is what "Varsel kl. HH:MM" means on a surface where nothing was
-    -- sent. Not the LAST cycle -- the 2026-08-21 fix measured those as a different row for 41 % of
-    -- /historikk's alerted subjects.
+    -- ---- THE REPLAY PICK: the cycle a push actually went out on ---------------------------------
+    -- `pushed` is the RECORDED OUTPUT of varsel's four delivery filters -- alertworthy against the
+    -- operator's threshold, the train not yet departed, one_alert_per_train's collapse of several SX
+    -- messages about one departure, and the `_notified` dedup keyed on (journey_id, situation) --
+    -- written by _record_decisions AFTER delivery, so it reflects what reached a device rather than
+    -- what was queued.
     --
-    -- ONE aggregate carrying its fields together, for the same reason as `final` above and the
-    -- `delivered` aggregate in create_varsel_decisions.sql: `would_send_at` and `prompt_version`
-    -- describe one cycle, and the messages file resolves `message_input` from the same expression.
-    -- Split into two aggregates they could name two different cycles, and the symptom would be a
-    -- card quoting one cycle's wording under another cycle's time -- exactly the defect the view was
-    -- fixed for.
+    -- So this is looked up, never re-derived, and that is not a shortcut: a re-derivation cannot see
+    -- `_notified` (which persists across cycles and across redeploys in the GCS state blob), cannot
+    -- see whether a subscription was `gone` and the push landed a cycle later, and cannot see which
+    -- situation won the collapse in a cycle it is not simulating. It would produce a plausible send
+    -- time that is not the send time.
     --
-    -- The `has_input` guard is what makes this "the first replayable cycle" rather than "the first
-    -- alert-worthy cycle, possibly with nothing to replay": a subject none of whose alerting cycles
-    -- recorded an input has NO replayable cycle at all, which the API reports as its own state (R7)
-    -- instead of as "no message". message_input is NULL on rows written before 2026-08-05 and on
-    -- rows where the builder failed; both are that same third bucket, and neither is a default.
-    ARRAY_AGG(IF(in_window AND alertworthy AND has_input, STRUCT(
+    -- FIRST, not last: `_notified` makes the first delivery the only one for that situation's life,
+    -- so later alerting cycles record pushed = FALSE and the in-app card, not a second push, is what
+    -- reflects a worsening. This is the same aggregate shape as `delivered` in
+    -- create_varsel_decisions.sql, which /historikk's card was fixed to use on 2026-08-21.
+    --
+    -- ONE aggregate carrying its fields together, for the same reason as `final` above:
+    -- `would_send_at` and `prompt_version` describe one cycle, and the messages file resolves
+    -- `message_input` from the same expression. Split into two aggregates they could name two
+    -- different cycles, and the symptom would be a card quoting one cycle's wording under another
+    -- cycle's time -- exactly the defect the view was fixed for.
+    --
+    -- The `has_input` guard makes this "the pushed cycle we can replay". A push whose cycle recorded
+    -- no input has nothing to hand today's prompt; that is its own state below, not "no message".
+    ARRAY_AGG(IF(pushed AND has_input, STRUCT(
                 decided_at     AS would_send_at,
                 prompt_version AS prompt_version), NULL)
-              IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)] AS replay,
-
-    -- The subject's earliest alert-worthy cycle over the WHOLE SPAN, not just the window. This is
-    -- what keeps "Varsel kl." from claiming a first opportunity the window cannot support: for a
-    -- subject that was already alerting before the window opened, the pick above is merely the
-    -- earliest cycle the window happens to contain, and narrowing the picker would silently move the
-    -- claimed send time LATER. It costs no extra partition -- the span is already scanned.
-    --
-    -- What bounds the claim: the span reaches back at least 24 h before the window opens, against a
-    -- scoring horizon of ~12 h, so a subject's cycles cannot begin before it in practice. If the
-    -- horizon ever grows past a day, this comparison starts reading TRUE where it should read FALSE.
-    MIN(IF(alertworthy, decided_at, NULL)) AS span_first_alert_at
+              IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)] AS replay
   FROM scanned
   GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
-  -- A subject is on the page because it was DECIDED in the window. The span-wide rows above exist
-  -- only to qualify that; they never put a subject on the page by themselves.
-  HAVING COUNTIF(in_window) > 0
+),
+-- One derived fact that needs the sibling subjects: did any OTHER situation about this same
+-- registration-and-train deliver a push? It answers the question a silent card provokes -- an
+-- alert-worthy subject that never pushed is usually one_alert_per_train's collapse loser, and
+-- saying so is the difference between "we stayed quiet about this train" and "we told them, under
+-- another situation number".
+--
+-- It also makes the page a detector for the open `_notified` gap: the dedup key is per SITUATION
+-- while the collapse is per cycle, so if the winning situation for a train flips between cycles the
+-- new winner's key is not in `_notified` and a SECOND push goes out for the same train. That shows
+-- up here as two subjects on one train both reading `sendt`.
+--
+-- Partitioned on the registration too, not just the train: the collapse and the dedup are both
+-- per-registration, so another traveller's push must not explain away this one's silence. A NULL
+-- jkey identifies no train at all and would group every unkeyed subject of a digest together, so it
+-- is forced to zero rather than allowed to claim a sibling it cannot have.
+subjects_marked AS (
+  SELECT
+    *,
+    IF(jkey IS NULL, 0,
+       COUNTIF(pushed_any) OVER (
+         PARTITION BY journey_digest, operator, jkey, call_date, stop_order
+       ) - IF(pushed_any, 1, 0)) AS other_pushed_on_train
+  FROM subjects
 )
 SELECT
   s.situation_number, s.summary, s.description,
   s.operator, s.line, s.mode, s.call_date, s.departure_time,
   s.n_decisions, s.first_decided_at, s.last_decided_at,
   s.ever_alerted, s.first_alert_at,
-  -- Computed from the WINDOW's first alert, deliberately not copied from o.alert_lead_min. The
-  -- outcomes column describes the subject's whole life, so serving it beside a window-scoped
-  -- first_alert_at would put two figures on one card that disagree about which cycle they mean.
+  -- Now agrees with the nightly job's alert_lead_min by construction rather than by a recomputation
+  -- kept from disagreeing with it: both describe the subject's whole life. Still computed here
+  -- rather than copied from o.alert_lead_min, so an unlabelled subject -- nearly all of them on a
+  -- same-day window -- still gets a lead time.
   TIMESTAMP_DIFF(s.departure_time, s.first_alert_at, MINUTE) AS alert_lead_min,
   s.max_impact_probability,
   s.final.final_impact_probability,
@@ -200,28 +284,37 @@ SELECT
   s.final.final_delay_p50_min,
   s.final.final_delay_p90_min,
   s.alert_threshold,
-  -- Provenance, from the nightly job where it has run and from the window otherwise -- the same two
-  -- arms /historikk serves it from, in one expression because this query is a join rather than a
+  -- Provenance, from the nightly job where it has run and from the decisions otherwise -- the same
+  -- two arms /historikk serves it from, in one expression because this query is a join rather than a
   -- UNION. Taking it from the outcomes row where one exists is what keeps a card's tag agreeing with
   -- the segment /summary counted it in; that file reads the same column.
-  COALESCE(o.et_cancelled, s.et_cancelled_window) AS et_cancelled,
-  s.pushed_any, s.n_devices,
+  COALESCE(o.et_cancelled, s.et_cancelled_derived) AS et_cancelled,
+  s.pushed_any, s.n_devices, s.other_pushed_on_train,
 
   -- ---- the replay, projected -------------------------------------------------------------------
   s.replay.would_send_at,
-  -- TRUE only when the replayed cycle IS the subject's first alert-worthy cycle anywhere in the
-  -- span. FALSE covers two unlike-looking cases that the UI labels differently from a first
-  -- opportunity: the subject was already alerting before the window opened, and the subject had no
-  -- replayable cycle at all. COALESCE so this is a BOOL and never NULL -- the API types it strictly.
-  --
-  -- Note the comparison is against the earliest alert-worthy cycle FULL STOP, not the earliest one
-  -- that recorded an input. A subject whose very first alerting cycle wrote no input therefore reads
-  -- FALSE, which is the conservative direction: it declines to claim a first opportunity.
-  COALESCE(s.replay.would_send_at = s.span_first_alert_at, FALSE) AS first_in_window,
   -- The prompt in force when the ROW was written, against llm_message.PROMPT_VERSION today. The page
   -- marks the difference; it does not claim to separate a prompt change from sampling variance,
   -- since each wording is a single draw from a non-deterministic decoder.
   s.replay.prompt_version,
+  -- Why this subject does or does not have a message, in one field the card renders directly.
+  -- Ordered most-specific-first, and the order carries meaning: a sub-threshold subject is reported
+  -- as such even on a train where another situation pushed, because never reaching the gate is the
+  -- reason it was silent and the sibling push is incidental to it.
+  CASE
+    WHEN s.pushed_any AND s.replay.would_send_at IS NOT NULL THEN 'sendt'
+    -- Delivered, but that cycle recorded no message_input -- so there is nothing to hand today's
+    -- prompt. Rows written before 2026-08-05 have no input at all, and a builder failure leaves the
+    -- same gap; both are this state rather than "no message was sent".
+    WHEN s.pushed_any                                        THEN 'sendt_uten_input'
+    WHEN NOT s.ever_alerted                                  THEN 'under_terskel'
+    WHEN s.other_pushed_on_train > 0                         THEN 'samlet'
+    -- The deployment does not push at all (no VAPID keypair): every subject would otherwise read as
+    -- a deliberate silence, and the page would look like an alerting failure rather than a
+    -- configuration.
+    WHEN s.push_off                                          THEN 'push_av'
+    ELSE 'ikke_sendt'
+  END AS send_state,
 
   o.actual_cancelled, o.actual_dep_delay_min, o.actual_trouble, o.verdict,
   -- Three reasons a verdict can be missing, which the UI must not conflate. An unresolved row is
@@ -241,11 +334,12 @@ SELECT
     WHEN s.call_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY) THEN 'venter'
     ELSE 'ukjent'
   END AS outcome_state
-FROM subjects AS s
+FROM subjects_marked AS s
 LEFT JOIN `disruptions.varsel_decision_outcomes` AS o
   -- The partition bound FIRST, and inside the ON rather than in the WHERE: in the WHERE it would
   -- turn this into an inner join and drop every unlabelled subject -- which on a same-day window is
-  -- nearly all of them. See the header for how the +/-1 day was measured.
+  -- nearly all of them. See the header for why it stays +/-1 day rather than the exact `= @day` the
+  -- departure axis appears to allow.
   ON  o.call_date BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
   -- The subject key, plain equality. A NULL jkey therefore never matches, which is correct: the
   -- labelling job excludes those decisions entirely, and the CASE above reports them as 'ukjent'.
@@ -261,6 +355,10 @@ LEFT JOIN `disruptions.varsel_decision_outcomes` AS o
 -- so the equality is never TRUE for it.
 WHERE (@verdict IS NULL OR o.verdict = @verdict)
   AND (NOT @alerted_only OR s.ever_alerted)
+  -- "Only the ones a traveller was actually told about" -- a strictly narrower cut than
+  -- @alerted_only, and the difference is the point: an alert-worthy subject that never pushed is a
+  -- collapse loser or a repeat cycle, and it reached nobody.
+  AND (NOT @pushed_only  OR s.pushed_any)
   -- "With ground truth" is the OUTCOME being known, deliberately not `verdict IS NOT NULL`: an
   -- outcome that resolved while ever_alerted was NULL is judged by nobody yet plainly has a realized
   -- call behind it, and filtering on the verdict would leave those reachable from no filter setting.
@@ -271,6 +369,9 @@ WHERE (@verdict IS NULL OR o.verdict = @verdict)
 -- redacted). departure_time alone leaves ties -- two registrations on the same train and the same
 -- situation differ only in journey_digest -- so the whole subject key breaks them. Ordering by a
 -- redacted column is not projecting it.
-ORDER BY s.departure_time DESC,
+--
+-- ASCENDING since 2026-08-22, where the decided_at axis sorted DESC: the window now selects a
+-- stretch of departures, and a reader walking 07:00 to 09:00 wants the 07:03 first.
+ORDER BY s.departure_time ASC,
          s.situation_number, s.operator, s.jkey, s.call_date, s.stop_order, s.journey_digest
 LIMIT @limit

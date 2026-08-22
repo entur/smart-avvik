@@ -83,7 +83,8 @@ def _row(**overrides) -> dict:
         "pushed_any": True,
         "n_devices": 2,
         "would_send_at": DEP - timedelta(minutes=48),
-        "first_in_window": True,
+        "send_state": "sendt",
+        "other_pushed_on_train": 0,
         "prompt_version": "a1b2c3d4",
         "actual_cancelled": True,
         "actual_dep_delay_min": None,
@@ -512,18 +513,32 @@ def test_a_valid_range_still_survives_the_resolved_bounds_check():
         assert fake.calls, f"{from_time}-{to_time} was refused; it is a valid range"
 
 
-def test_a_future_day_and_a_day_beyond_the_lookback_are_rejected_without_a_query():
-    """Both bounds exist for the same reason as the quantization: the day is in the cache key, so an
-    unbounded range of days is an unbounded number of cache entries on a public endpoint. A future
-    day has no decisions in it at all, so it can only ever be key-space."""
-    import historikk
+def test_tomorrow_is_allowed_because_the_axis_is_departure_and_not_decision():
+    """A consequence of the departure axis, not a loosening of the bound.
 
+    The poller scores about 12 h forward, so at 23:00 there are already real decisions about a 00:30
+    departure tomorrow. On the old `decided_at` axis those cycles sat on today and tomorrow was
+    genuinely empty; on this one they belong to tomorrow's window, and refusing it would hide them.
+    Two days ahead still cannot hold a decision, so it stays key-space and stays refused.
+    """
     tomorrow = datetime.now(OSLO).date() + timedelta(days=1)
     _reset([_row()])
-    bad = client.get("/tilbakeblikk-api/decisions", params={"day": tomorrow.isoformat()})
+    ok = client.get("/tilbakeblikk-api/decisions", params={"day": tomorrow.isoformat()})
+    assert ok.status_code == 200, ok.text
+    assert fake.calls, "tomorrow must reach BigQuery, not be refused"
+
+    _reset([_row()])
+    day_after = datetime.now(OSLO).date() + timedelta(days=2)
+    bad = client.get("/tilbakeblikk-api/decisions", params={"day": day_after.isoformat()})
     assert bad.status_code == 400
     assert "future" in bad.json()["detail"]
     assert fake.calls == []
+
+
+def test_a_day_beyond_the_lookback_is_rejected_without_a_query():
+    """The day is in the cache key, so an unbounded range of days is an unbounded number of cache
+    entries and BigQuery queries on a public unauthenticated endpoint."""
+    import historikk
 
     _reset([_row()])
     ancient = datetime.now(OSLO).date() - timedelta(days=historikk._MAX_WINDOW_DAYS + 1)
@@ -817,19 +832,38 @@ def test_decisions_returns_rows_with_the_replay_fields():
     d = body["decisions"][0]
     assert d["verdict"] == "hit"
     assert d["would_send_at"] is not None
-    assert d["first_in_window"] is True
+    assert d["send_state"] == "sendt"
     assert d["prompt_version"] == "a1b2c3d4"
 
 
 def test_a_subject_with_no_replayable_cycle_is_its_own_state():
-    """R7. No alert-worthy cycle inside the window recorded a writer's input, so there is nothing to
-    replay — which is NOT "no message" and not an error. The row still appears, with the three replay
-    fields empty and first_in_window false."""
-    _reset([_row(would_send_at=None, prompt_version=None, first_in_window=False)])
+    """R7. No delivered cycle recorded a writer's input, so there is nothing to replay — which is NOT
+    "no message" and not an error. The row still appears, with the replay fields empty and
+    `send_state` naming which of the several reasons applies."""
+    _reset([_row(
+        would_send_at=None, prompt_version=None, send_state="under_terskel",
+        ever_alerted=False, pushed_any=False,
+    )])
     d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
     assert d["would_send_at"] is None
     assert d["prompt_version"] is None
-    assert d["first_in_window"] is False
+    assert d["send_state"] == "under_terskel"
+
+
+def test_an_alert_worthy_subject_collapsed_into_a_sibling_says_so():
+    """`send_state` is what separates "we stayed quiet about this train" from "we told them, under
+    another situation number". The second is one_alert_per_train's collapse loser, and it is the
+    common case: operators publish several SX messages about one disruption, and only the most
+    severe survives into `_notified`. A card that reported both as "ikke sendt" would read as an
+    alerting failure where the traveller was in fact notified."""
+    _reset([_row(
+        would_send_at=None, prompt_version=None, send_state="samlet",
+        ever_alerted=True, pushed_any=False, other_pushed_on_train=1,
+    )])
+    d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
+    assert d["send_state"] == "samlet"
+    assert d["pushed_any"] is False
+    assert d["other_pushed_on_train"] == 1
 
 
 def test_response_carries_no_traveller_journey_identifiers_and_no_writer_input():
@@ -854,7 +888,8 @@ def test_response_carries_no_traveller_journey_identifiers_and_no_writer_input()
         "ever_alerted", "first_alert_at", "alert_lead_min",
         "max_impact_probability", "final_impact_probability", "final_cancel_probability",
         "final_delay_p50_min", "final_delay_p90_min", "alert_threshold", "et_cancelled",
-        "pushed_any", "n_devices", "would_send_at", "first_in_window", "prompt_version",
+        "pushed_any", "n_devices", "other_pushed_on_train", "would_send_at", "send_state",
+        "prompt_version",
         "actual_cancelled", "actual_dep_delay_min", "actual_trouble", "verdict", "outcome_state",
     }
 
@@ -1550,13 +1585,74 @@ def test_the_no_filter_array_test_is_null_safe():
 
 
 def test_every_query_prunes_the_decision_log_on_its_partition_column():
-    """`varsel_decisions` is PARTITION BY DATE(decided_at), and the exact window predicate is a
-    TIMESTAMP range, which does not reliably prune on its own. The explicit DATE() bound is what
-    turns a whole-table scan into three partitions — the one cost claim this whole surface rests on,
-    and one no test can otherwise check."""
+    """`varsel_decisions` is PARTITION BY DATE(decided_at), which the window predicate no longer
+    touches at all since the axis moved to `departure_time`. The DATE() bound is therefore a DERIVED
+    cover for the window — every cycle that could have decided about a departure inside it — and it
+    is load-bearing twice over: it is the one cost claim this surface rests on, and narrowing it
+    drops cycles out of the per-subject aggregates rather than merely mislabelling a flag.
+
+    Both failures are silent, and the byte counts validate_varsel_sql.sh prints would report the
+    second as a CHEAPER query. Nothing here executes SQL, so this text check is the only guard.
+    """
     for name, sql in _QUERIES.items():
         body = _uncommented(sql)
         assert "DATE(decided_at) BETWEEN" in body, f"{name}: no partition bound on decided_at"
+
+
+def test_every_query_windows_on_departure_time_and_not_on_decided_at():
+    """The axis is the page's whole claim: it answers "what would we have sent out for the trains
+    leaving between 07:00 and 09:00". A file left windowing on `decided_at` would select a different
+    population from the three beside it — and nothing on the page would look inconsistent, which is
+    what makes it worth a test. /filters and /summary are the dangerous two: they feed the dropdown
+    vocabulary and the rates, so a divergence there mislabels the cards rather than emptying them.
+    """
+    for name, sql in _QUERIES.items():
+        body = _uncommented(sql)
+        assert "departure_time >= @from_ts" in body, f"{name}: window is not on departure_time"
+        assert "departure_time <" in body, f"{name}: window has no exclusive upper bound"
+        assert "decided_at >= @from_ts" not in body, f"{name}: still windows on decided_at"
+
+
+def test_the_replayed_cycle_is_the_one_a_push_went_out_on():
+    """`pushed` is the RECORDED OUTPUT of varsel's four delivery filters — the operator threshold,
+    the not-yet-departed cut, one_alert_per_train's collapse, and the `_notified` dedup keyed on
+    (journey_id, situation) — written by `_record_decisions` after delivery.
+
+    Picking `alertworthy` instead, which this did until 2026-08-22, names a cycle no message went out
+    on: most alert-worthy cycles are repeats that `_notified` suppressed, and a collapse loser is
+    alert-worthy on every cycle of its life while reaching nobody at all. The card would then state a
+    send time for a push that never happened.
+
+    It must also be the FIRST such cycle, because `_notified` makes the first delivery the only one
+    for that situation's life — a later one is the in-app card being refreshed, not a second push.
+    """
+    for name in ("decisions", "messages"):
+        body = _uncommented(_QUERIES[name])
+        picks = [seg for seg in body.split("ARRAY_AGG(")[1:] if "would_send_at" in seg]
+        assert len(picks) == 1, f"{name}: expected exactly one replay pick, found {len(picks)}"
+        pick = picks[0]
+        assert "pushed AND" in pick, f"{name}: the replay pick is not gated on `pushed`"
+        assert "ORDER BY decided_at LIMIT 1" in pick, f"{name}: replay pick is not the FIRST cycle"
+        assert "DESC" not in pick.split("LIMIT 1")[0], f"{name}: replay pick takes the LAST cycle"
+
+
+def test_pushed_only_is_narrower_than_alerted_only_in_both_row_queries():
+    """Two filters that look like one. An alert-worthy subject reaches nobody when another situation
+    about its train wins one_alert_per_train's collapse, or when `_notified` already delivered for
+    that situation on an earlier cycle — so `pushed_only` is a strict subset, and the two must both
+    exist for the difference to be visible at all.
+
+    Both row queries need it, and identically: they are aligned position by position, so a filter
+    applied to one list and not the other attaches one train's wording to another train's card.
+    """
+    for name in ("decisions", "messages"):
+        # Whitespace-collapsed: these two predicates are column-aligned in the files for
+        # readability, and a reformat must not fail a test about which filters exist.
+        body = re.sub(r"\s+", " ", _uncommented(_QUERIES[name]))
+        assert "@pushed_only OR s.pushed_any" in body, f"{name}: no pushed_only filter"
+        assert "@alerted_only OR s.ever_alerted" in body, f"{name}: lost the alerted_only filter"
+    # ...and never on /summary, where narrowing to what we sent would make precision read 100 %.
+    assert "@pushed_only" not in _uncommented(_QUERIES["summary"])
 
 
 def test_the_outcomes_join_carries_its_own_partition_bound():
@@ -1564,10 +1660,12 @@ def test_the_outcomes_join_carries_its_own_partition_bound():
     prune — so without this the outcomes read would be strictly more expensive than /historikk's,
     which does prune it, while the query overall claims to be cheaper.
 
-    The width is measured, not reasoned to: dev 2026-08-21, MAX |call_date - Oslo(decided_at)| = 1
-    day over 59 694 rows. Too narrow a bound drops outcome rows SILENTLY — the subjects just read as
-    unresolved — and the byte counts validate_varsel_sql.sh prints would report that loss as a
-    cheaper query, i.e. as success.
+    It stays +/-1 day rather than the exact `= @day` that the departure axis appears to allow, and
+    the reason is `call_date` being the OPERATING day: an after-midnight service belongs to the
+    previous timetable day, so the exact form would drop those subjects' verdicts. Too narrow a
+    bound drops outcome rows SILENTLY — the subjects just read as unresolved, which the page renders
+    perfectly happily — and the byte counts validate_varsel_sql.sh prints would report that loss as
+    a cheaper query, i.e. as success. RE-MEASURE before widening the scoring horizon.
     """
     for name in ("decisions", "summary", "messages"):
         body = _uncommented(_QUERIES[name])

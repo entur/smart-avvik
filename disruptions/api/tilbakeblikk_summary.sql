@@ -1,16 +1,17 @@
--- /tilbakeblikk-api/summary: how the alerting performed over the decisions taken in one window.
+-- /tilbakeblikk-api/summary: how the alerting performed over the departures in one window.
 --
 -- The same figures, the same arithmetic and the same provenance split as historikk_summary.sql,
--- over a population selected on `decided_at` instead of `call_date`. Read that file's header for the
--- meaning of precision, recall and lead; only what differs is written out here.
+-- over a population selected on `departure_time` instead of `call_date`. Read that file's header
+-- for the meaning of precision, recall and lead; only what differs is written out here.
 --
 -- WHAT DIFFERS, AND WHY IT MATTERS ON THIS PAGE MORE THAN ON /historikk:
 --
--- 1. THE POPULATION IS "SUBJECTS DECIDED IN THE WINDOW", resolved from `varsel_decisions` itself and
---    then LEFT JOINed to the verdicts, rather than read off `varsel_decision_outcomes`. A subject
---    enters because a cycle scored it between @from_ts and @to_ts. That is the same population the
---    card list beside these rates shows, which is the only property that makes the two readable
---    together.
+-- 1. THE POPULATION IS "SUBJECTS DEPARTING IN THE WINDOW", resolved from `varsel_decisions` itself
+--    and then LEFT JOINed to the verdicts, rather than read off `varsel_decision_outcomes`. A
+--    subject enters because its boarding call is aimed to depart between @from_ts and @to_ts. That
+--    is the same population the card list beside these rates shows, which is the only property that
+--    makes the two readable together. A row with no `departure_time` cannot be placed on this axis
+--    and drops out of both, exactly as it does there.
 --
 -- 2. A SAME-DAY WINDOW IS ALMOST ENTIRELY UNLABELLED. Verdicts arrive from the 04:00 UTC labelling
 --    job the following night, so on this page's default view precision, recall and lead are computed
@@ -19,17 +20,19 @@
 --    showing confident-looking rates over a handful of rows. `n_subjects` and `n_labelled` are here
 --    for exactly that: they are the denominator the page has to state, not diagnostics.
 --
--- 3. THE VERDICT-DERIVED FIGURES COME WHOLE, THE PER-CYCLE ONES DO NOT. Everything below is either a
---    verdict from the nightly job (whole-subject, exactly as on /historikk) or a count of subjects.
---    None of the window-scoped per-cycle figures the cards carry appears here, so this file has no
---    mixed grain -- but the cards do, and the API says so in their field descriptions.
+-- 3. EVERY FIGURE HERE IS WHOLE-SUBJECT, AND SINCE 2026-08-22 SO ARE THE CARDS'. On the old
+--    `decided_at` axis a subject's cycles straddled the window, so the cards carried window-scoped
+--    per-cycle figures beside these whole-subject rates and the API had to say so in every field
+--    description. The departure axis puts a subject wholly in or wholly out, so the two grains
+--    collapsed into one and that caveat is gone from both sides.
 --
 -- WHICH FILTERS REACH THIS FILE, and why not all of them. The day, the time range, operator, line,
 -- from_place and to_place narrow the POPULATION -- which cycles, which trains, on whose registered
 -- journeys -- so these rates describe exactly the slice the list beside them is showing. verdict,
--- alerted_only and resolved_only do NOT reach it, because they narrow by OUTCOME: filtering to hits
--- would make precision read 100 %. sx_only is not accepted either, for the same reason /historikk
--- does not accept it here.
+-- alerted_only, pushed_only and resolved_only do NOT reach it, because they narrow by OUTCOME or by
+-- what we chose to do: filtering to hits would make precision read 100 %, and filtering to the
+-- subjects a push went out for would do the same to it from the other side. sx_only is not accepted
+-- either, for the same reason /historikk does not accept it here.
 --
 -- Provenance resolution order matters where the buckets overlap, and it is the same order as
 -- /historikk's: NULL first (its own bucket), then `relayed`, then `no_sx`, else `predicted`. A no-SX
@@ -44,10 +47,13 @@
 WITH scanned AS (
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
-    line, stop_place, departure_time,
-    decided_at >= @from_ts AND decided_at < @to_ts AS in_window
+    line, stop_place, departure_time
   FROM `disruptions.varsel_decisions`
+  -- The DERIVED partition bound, then the window itself. See tilbakeblikk_decisions.sql's header:
+  -- the pruning predicate is no longer the window predicate, and a too-narrow one drops cycles
+  -- silently while reporting the loss as a cheaper query.
   WHERE DATE(decided_at) BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
+    AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
@@ -60,8 +66,9 @@ subjects AS (
     ANY_VALUE(stop_place) AS stop_place,
     MAX(departure_time)   AS departure_time
   FROM scanned
+  -- No HAVING: on this axis every scanned row is already inside the window, because the window is a
+  -- property of the subject rather than of the cycle.
   GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
-  HAVING COUNTIF(in_window) > 0
 ),
 -- The window's subjects, each carrying whatever the nightly job has resolved about it. A LEFT JOIN
 -- rather than /historikk's UNION of two sources: there the two sides are two tables holding
