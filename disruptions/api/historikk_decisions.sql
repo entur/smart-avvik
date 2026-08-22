@@ -15,21 +15,26 @@
 --               (label_varsel_decisions.sql). Counting either as a correct rejection is exactly the
 --               inflation this column exists to prevent.
 --
--- PRIVACY: this endpoint is served unauthenticated on a public host, so the traveller-identifying
--- triple (journey_digest, from_stop, to_stop) is deliberately NOT selected here. Those columns stay
--- in the access-controlled tables, where the decision log needs them to join and dedupe. Published
--- together with departure_time and n_devices they would say "somebody commutes A->B at 07:15",
--- which is precisely what llm_message.key_digest and VARSEL_LLM_LOG_PROMPTS=false already keep out
--- of the logs. The page identifies a decision by its train, not by whose trip it was.
+-- PRIVACY: this endpoint is served unauthenticated on a public host, and the per-row redaction of
+-- the traveller's endpoints is GONE as of 2026-08-22 -- from_stop and to_stop are selected here and
+-- the API resolves them to NSR names, so a card now says "Oslo S -> Lillestrom stasjon" beside
+-- departure_time and n_devices. That is the "somebody commutes A->B at 07:15" this file spent two
+-- paragraphs refusing to publish, so read those paragraphs as history, not as a live guarantee.
 --
--- That is now a narrower claim than it was, and the narrowing was deliberate (2026-08-21): from_stop
--- and to_stop became FILTERABLE, so the pair can be chosen and the matching departures read off, and
--- historikk_filters.sql publishes the vocabulary of registered endpoints to populate the dropdowns
--- with. What survives is the per-row redaction below -- no card names a journey, and a full listing
--- still does not pair an origin with a destination -- but "the public page cannot reconstruct a
--- commute" no longer holds on its own. Journey_digest remains absent from both surfaces. If this
--- page ever wants stronger ground than that, the fix is access control on /historikk, not a smaller
--- SELECT list.
+-- Three things make it a smaller step than the deletion looks. The 2026-08-21 filter change already
+-- made the pair CHOOSABLE -- historikk_filters.sql publishes the vocabulary of registered endpoints
+-- and the matching departures could be read off a narrowed page -- so what goes now is the work of
+-- narrowing, not the possibility. /tilbakeblikk already publishes exactly this, decided the same
+-- way and for the same reason (its own header carries the k-anonymity measurement: 21 of 31 prd
+-- pairs isolate a single registered journey). And prd's registrations are TEST USERS rather than
+-- members of the public -- there is no real traveller behind a k=1 pair -- which is the whole of
+-- what makes this acceptable. Team decision, 2026-08-22.
+--
+-- So the condition to re-check is not a threshold but a fact: IF /varsel EVER TAKES REGISTRATIONS
+-- FROM THE PUBLIC, this projection publishes real commutes and must be reconsidered. The fix then
+-- is access control on /historikk, not a smaller SELECT list -- the exposure would also be in
+-- /tilbakeblikk's generated prose, which no projection controls. journey_digest stays absent from
+-- both surfaces regardless: it is the join key to the LLM audit log, and no page needs it.
 --
 -- Cost: the outcomes side prunes on its call_date partition. The groups side does NOT:
 -- varsel_decisions is partitioned on DATE(decided_at) and the view aggregates before any filter
@@ -38,7 +43,7 @@
 -- cached. If it grows, give the view a decided_at bound rather than widening this comment.
 SELECT
   o.situation_number, o.summary, o.description,
-  o.operator, o.line, o.mode, o.call_date, o.departure_time,
+  o.operator, o.line, o.mode, o.from_stop, o.to_stop, o.call_date, o.departure_time,
   o.n_decisions, o.first_decided_at, o.last_decided_at,
   o.ever_alerted, o.first_alert_at, o.alert_lead_min,
   o.max_impact_probability, o.final_impact_probability, o.final_cancel_probability,
@@ -58,11 +63,11 @@ WHERE o.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR o.operator = @operator)
   AND (@verdict  IS NULL OR o.verdict  = @verdict)
   AND (@line     IS NULL OR o.line     = @line)
-  -- The traveller's own registered endpoints. Filtered on, never selected: the dropdowns need the
-  -- vocabulary (historikk_filters.sql), the cards do not need the value, and keeping it out of the
-  -- projection is what keeps the Decision model's extra="forbid" a working guard rather than a
-  -- comment. NULL from_stop/to_stop rows are dropped by an active filter, which is right -- a
-  -- decision that records no origin cannot be claimed to have started anywhere in particular.
+  -- The traveller's own registered endpoints. Both filtered on AND selected since 2026-08-22 (see
+  -- the PRIVACY note at the top); the refs go no further than this process, which pops them and
+  -- serves resolved NSR names in their place, so extra="forbid" still guards the ref itself.
+  -- NULL from_stop/to_stop rows are dropped by an active filter, which is right -- a decision that
+  -- records no origin cannot be claimed to have started anywhere in particular.
   --
   -- An ARRAY of EVERY ref standing for the chosen place, not the one the dropdown nominated, and
   -- the difference is not cosmetic. A station's rail and bus sides are separate NSR refs and each
@@ -101,7 +106,7 @@ UNION ALL
 
 SELECT
   g.situation_number, g.summary, g.description,
-  g.operator, g.line, g.mode, g.call_date, g.departure_time,
+  g.operator, g.line, g.mode, g.from_stop, g.to_stop, g.call_date, g.departure_time,
   g.n_decisions, g.first_decided_at, g.last_decided_at,
   g.ever_alerted, g.first_alert_at,
   TIMESTAMP_DIFF(g.departure_time, g.first_alert_at, MINUTE) AS alert_lead_min,

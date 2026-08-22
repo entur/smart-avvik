@@ -89,16 +89,21 @@ def configure(*, bq_client: Any) -> None:
 class Decision(BaseModel):
     """One alert decision: what we concluded, what we said, and what actually happened.
 
-    Describes a *train*, not a traveller. The journey definition behind the decision
-    (`journey_digest`, `from_stop`, `to_stop`) is deliberately absent: this endpoint is served
-    unauthenticated on a public host, and those three next to `departure_time` and `n_devices`
-    would publish "somebody commutes A->B at 07:15" — the very thing `llm_message.key_digest` and
-    `VARSEL_LLM_LOG_PROMPTS=false` keep out of the access-controlled logs. They stay in
-    `disruptions.varsel_decisions`, which is not public.
+    Describes a train AND, since 2026-08-22, the endpoints of the journey it was watched for:
+    `from_name` / `to_name` are served, so a card names a route beside `departure_time` and
+    `n_devices`. That is the "somebody commutes A->B at 07:15" this model used to refuse — see the
+    PRIVACY note atop `historikk_decisions.sql` for the reasoning and, more importantly, for the
+    fact it rests on: prd's registrations are test users rather than members of the public. Team
+    decision. `/tilbakeblikk` already published the same thing on the same grounds, and this brings
+    the two surfaces back into step rather than opening a new one.
 
-    `extra="forbid"` is the guard that keeps that true: the SQL and this model must agree column for
-    column, so a future SELECT that re-adds a redacted column fails loudly here instead of silently
-    publishing it.
+    What is still absent is `journey_digest` — the join key to the LLM audit log, which no page
+    needs — and the raw stop REFS. The refs reach this process and are popped in
+    :func:`_with_place_names`; only resolved NSR names leave it, exactly as `/tilbakeblikk` does it.
+
+    `extra="forbid"` is the guard that keeps the remaining line where it is: the SQL and this model
+    must agree column for column, so a SELECT that re-adds `journey_digest` — or that forgets to pop
+    the refs — fails loudly here instead of silently publishing it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -109,6 +114,12 @@ class Decision(BaseModel):
     operator: str | None = Field(description="Ref codespace: VYG, GOA, RUT, ...")
     line: str | None = Field(description="Line ref of the matched train.")
     mode: str | None = Field(description="Vehicle noun: 'Tog' or 'Buss'.")
+    from_name: str = Field(
+        description="Registered journey origin, resolved to an NSR name when possible."
+    )
+    to_name: str = Field(
+        description="Registered journey destination, resolved to an NSR name when possible."
+    )
     call_date: date | None = Field(description="Operating day of the boarding call (Europe/Oslo).")
     departure_time: datetime | None = Field(description="Aimed departure from the boarding stop (UTC).")
 
@@ -485,6 +496,30 @@ def _options(start: date, end: date) -> dict[str, Any]:
     }
 
 
+def _with_place_names(rows: list) -> list[Decision]:
+    """Swap each row's stop REFS for resolved NSR names, then build the models.
+
+    The refs are what the log records and what the filters match on, but they are not what leaves
+    this process: they are popped here and replaced, so `Decision` never carries one and
+    `extra="forbid"` keeps it that way. A ref that the registry cannot place falls back to the ref
+    itself and then to "Ukjent" — a card reading `NSR:StopPlace:418` is ugly but true, while a blank
+    one would read as a journey with no origin. One registry read covers the whole page; it fails
+    open to an empty mapping, which degrades every card to its bare refs rather than 500ing a
+    listing over a cosmetic lookup.
+    """
+    raw = [dict(r) for r in rows]
+    refs = {ref for row in raw for ref in (row.get("from_stop"), row.get("to_stop")) if ref}
+    registry = _place_registry(sorted(refs)) if refs else {}
+    out = []
+    for row in raw:
+        from_ref = row.pop("from_stop", None)
+        to_ref = row.pop("to_stop", None)
+        row["from_name"] = registry.get(from_ref, (None, from_ref))[0] or from_ref or "Ukjent"
+        row["to_name"] = registry.get(to_ref, (None, to_ref))[0] or to_ref or "Ukjent"
+        out.append(Decision(**row))
+    return out
+
+
 def _place_refs(groups: list[dict], value: str | None, field: str) -> list[str]:
     """Expand a chosen place into EVERY ref standing for it; `[]` when nothing is chosen.
 
@@ -707,7 +742,7 @@ def decisions(
         from_date=start,
         to_date=end,
         count=len(rows),
-        decisions=[Decision(**dict(r)) for r in rows],
+        decisions=_with_place_names(rows),
     )
 
 
