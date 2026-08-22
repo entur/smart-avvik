@@ -1,5 +1,9 @@
-/* Tilbakeblikk — an internal prompt-iteration surface, so it leans on Linje tokens rather than the
+/* Meldinger — an internal prompt-iteration surface, so it leans on Linje tokens rather than the
    brand-neutral styling /demo uses. Layout only; colours come from @entur/tokens.
+
+   The `tb-` class prefix is from the page's old name (/tilbakeblikk, renamed 2026-08-23). Left as
+   it is on purpose: it is internal to this app, and renaming ~200 class names across the markup
+   and this sheet risks a silent styling break that nothing here would catch.
 
    COLOURS COME FROM --basecolors-*, NOT --colors-greys-*. The legacy grey scale is a LIGHTNESS
    ramp — grey10 is #2a2a2a (near-black) and grey90 is #f8f8f8 — the opposite direction from the

@@ -1,13 +1,13 @@
--- /tilbakeblikk-api/messages: the replay INPUTS for the same subjects, server-side only.
+-- /meldinger-api/messages: the replay INPUTS for the same subjects, server-side only.
 --
--- The split from tilbakeblikk_decisions.sql is a PRIVACY BOUNDARY, not a convenience (KTD10). That
+-- The split from meldinger_decisions.sql is a PRIVACY BOUNDARY, not a convenience (KTD10). That
 -- file feeds the public card model, so it must never be able to project `message_input`: the stored
 -- input carries the traveller's origin, destination and departure time together -- the quasi-
 -- identifying trio /historikk-api redacts -- and a query that does not NAME a column cannot leak it,
 -- however the model above it drifts. This file names it, and only the server ever reads the rows:
 -- what leaves the process is the wording generated FROM the input, never the input.
 --
--- KEEP THIS FILE AND tilbakeblikk_decisions.sql IN STEP. The `scanned` CTE, the `subjects` grain,
+-- KEEP THIS FILE AND meldinger_decisions.sql IN STEP. The `scanned` CTE, the `subjects` grain,
 -- the replay pick, the outcomes join, the WHERE and the ORDER BY/LIMIT below are the same logic,
 -- deliberately duplicated rather than shared, because sharing would mean one query that projects the
 -- input. The two responses are aligned POSITION BY POSITION by the caller -- the page keys its list
@@ -21,7 +21,7 @@
 -- are still joined because @verdict and @resolved_only narrow the subject list, and a list narrowed
 -- differently from /decisions' would be the misalignment above.
 --
--- See tilbakeblikk_decisions.sql's header for the axis argument (why DEPARTURE time and not
+-- See meldinger_decisions.sql's header for the axis argument (why DEPARTURE time and not
 -- `decided_at`), why the DERIVED DATE(decided_at) pruning bound is load-bearing for the aggregates
 -- rather than cosmetic, why the outcomes bound stays +/-1 day on `call_date`, and why the emptiness
 -- test is IFNULL(ARRAY_LENGTH(...), 0) = 0 and never the bare form.
@@ -47,7 +47,7 @@ subjects AS (
     MAX(departure_time) AS departure_time,
     LOGICAL_OR(alertworthy)             AS ever_alerted,
     COALESCE(LOGICAL_OR(pushed), FALSE) AS pushed_any,
-    -- The SAME pick as tilbakeblikk_decisions.sql, with the input carried alongside: the FIRST cycle
+    -- The SAME pick as meldinger_decisions.sql, with the input carried alongside: the FIRST cycle
     -- that actually delivered a push and recorded an input. `pushed` is the recorded output of
     -- varsel's four delivery filters, written after delivery -- see that file for why it is looked
     -- up rather than re-derived. ONE aggregate, so `message_input`, `would_send_at` and

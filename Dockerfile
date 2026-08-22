@@ -1,21 +1,17 @@
 # Image for the /disruptions API plus its front-ends (/demo, /varsel, /historikk,
-# /tilbakeblikk).
+# /meldinger).
 #
 # Build context is the REPO ROOT (not disruptions/api) because the front-end
 # sources live in demo/reisedemo, demo/avviksvarsel, demo/varselhistorikk and
-# demo/tilbakeblikk, outside the API dir. The CI build
+# demo/meldinger, outside the API dir. The CI build
 # (.github/workflows/ci.yml) builds this file from the root.
 #
 # Why multi-stage: those UIs are Vite bundles generated from source — the
 # generated demo_static/, varsel_static/, historikk_static/ and
-# tilbakeblikk_static/ are gitignored, so they are NOT in the checkout and must
+# meldinger_static/ are gitignored, so they are NOT in the checkout and must
 # be built here. (The /eval snapshots are different: they run BigQuery under a
 # developer's ADC, so they are rendered offline and committed under
 # disruptions/api/eval_static/ — see export_eval.sh.)
-#
-# Note the /tilbakeblikk bundle is built into every image regardless of
-# environment: whether the surface is SERVED is decided at runtime by
-# TILBAKEBLIKK_ENABLED (see main.py), not by what the image contains.
 #
 # Runtime base is distroless (Entur Golden Path for Python; see entur/ai
 # guides/reference/docker.md). It ships only glibc + the CPython 3.13 runtime —
@@ -30,7 +26,7 @@
 FROM node:24-slim AS frontends
 
 # Each app's vite.config.ts writes its bundle to ../../disruptions/api/<x>_static,
-# i.e. /build/disruptions/api/{demo,varsel,historikk,tilbakeblikk}_static from the app dirs below.
+# i.e. /build/disruptions/api/{demo,varsel,historikk,meldinger}_static from the app dirs below.
 # Create that parent up front so Vite's emptyOutDir always has somewhere to write.
 RUN mkdir -p /build/disruptions/api
 
@@ -54,10 +50,10 @@ RUN npm ci --no-fund --no-audit
 COPY demo/varselhistorikk/ ./
 RUN npm run build
 
-WORKDIR /build/demo/tilbakeblikk
-COPY demo/tilbakeblikk/package.json demo/tilbakeblikk/package-lock.json ./
+WORKDIR /build/demo/meldinger
+COPY demo/meldinger/package.json demo/meldinger/package-lock.json ./
 RUN npm ci --no-fund --no-audit
-COPY demo/tilbakeblikk/ ./
+COPY demo/meldinger/ ./
 RUN npm run build
 
 # ---- Stage 2: install the Python deps into a venv -------------------------
@@ -95,17 +91,17 @@ WORKDIR /app
 COPY --from=pybuild /opt/venv /opt/venv
 
 # App code + *.sql + the committed eval_static/ snapshots. demo_static/,
-# varsel_static/, historikk_static/ and tilbakeblikk_static/ are gitignored (and
+# varsel_static/, historikk_static/ and meldinger_static/ are gitignored (and
 # .dockerignore'd), so they are absent here.
 COPY disruptions/api/ .
 
-# The freshly built /demo, /varsel, /historikk and /tilbakeblikk bundles from
+# The freshly built /demo, /varsel, /historikk and /meldinger bundles from
 # stage 1. Copied last so they always win over any stale locally-built copy that
 # slipped into the context.
 COPY --from=frontends /build/disruptions/api/demo_static ./demo_static
 COPY --from=frontends /build/disruptions/api/varsel_static ./varsel_static
 COPY --from=frontends /build/disruptions/api/historikk_static ./historikk_static
-COPY --from=frontends /build/disruptions/api/tilbakeblikk_static ./tilbakeblikk_static
+COPY --from=frontends /build/disruptions/api/meldinger_static ./meldinger_static
 
 # The Helm chart routes traffic to 8080. Single worker on purpose: the app keeps
 # an in-process cache and one background poller thread, so multiple workers would

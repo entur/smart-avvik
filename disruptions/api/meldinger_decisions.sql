@@ -1,8 +1,8 @@
--- /tilbakeblikk-api/decisions: the alert decisions covering one day-and-time window of DEPARTURES.
+-- /meldinger-api/decisions: the alert decisions covering one day-and-time window of DEPARTURES.
 --
 -- A near-clone of historikk_decisions.sql on a THIRD window axis, and the axis is the whole point.
 -- /historikk windows on `call_date` -- the operating day of the train -- and answers "what did we
--- decide about the trains that ran that day". /tilbakeblikk windows on `departure_time` -- the
+-- decide about the trains that ran that day". /meldinger windows on `departure_time` -- the
 -- aimed departure of the boarding call -- and answers "what would we have sent out for the trains
 -- leaving between 07:00 and 09:00, worded by today's prompt".
 --
@@ -28,8 +28,8 @@
 -- Here the replayed cycle is always the send moment, which is what the page now claims to show.
 --
 -- THE FORK FROM /historikk IS DELIBERATE AND HAS A COST. /historikk is not modified (the plan's
--- scope boundary), so this file, tilbakeblikk_summary.sql, tilbakeblikk_filters.sql and
--- tilbakeblikk_messages.sql are a second copy of that logic on a second axis: a fix to one side must
+-- scope boundary), so this file, meldinger_summary.sql, meldinger_filters.sql and
+-- meldinger_messages.sql are a second copy of that logic on a second axis: a fix to one side must
 -- be mirrored to the other. The 2026-08-21 pushed-wording fix is exactly the shape of change that
 -- has to be. Only historikk_stop_places.sql is genuinely shared, because it takes only @refs and
 -- has no window of its own.
@@ -100,9 +100,9 @@
 -- response validation. `message_input` is the remaining surface-specific redaction: it embeds
 -- origin, destination and departure time
 -- in one blob. It appears below in a PREDICATE only, never in a projection, and it must: the replay
--- cycle this file names in `would_send_at` has to be the same cycle tilbakeblikk_messages.sql
+-- cycle this file names in `would_send_at` has to be the same cycle meldinger_messages.sql
 -- fetches the input for, or the card would state a send time for a wording the page cannot produce.
--- test_tilbakeblikk.py asserts exactly that -- the SELECT lists of this file and the summary carry
+-- test_meldinger.py asserts exactly that -- the SELECT lists of this file and the summary carry
 -- no message_input, from_stop or to_stop, while the messages file does carry the input.
 WITH scanned AS (
   -- Every cycle of every subject whose DEPARTURE falls inside the window. No in/out flag: the axis
@@ -168,7 +168,7 @@ subjects AS (
     ANY_VALUE(from_stop)   AS from_stop,
     ANY_VALUE(to_stop)     AS to_stop,
     -- MAX rather than ANY_VALUE, and only here: this column decides the ORDER BY, and
-    -- tilbakeblikk_messages.sql has to resolve the SAME ordered list so the two responses align
+    -- meldinger_messages.sql has to resolve the SAME ordered list so the two responses align
     -- position by position. ANY_VALUE is free to pick differently in two queries over the same rows.
     MAX(departure_time)    AS departure_time,
 
@@ -365,7 +365,7 @@ WHERE (@verdict IS NULL OR o.verdict = @verdict)
   -- outcome that resolved while ever_alerted was NULL is judged by nobody yet plainly has a realized
   -- call behind it, and filtering on the verdict would leave those reachable from no filter setting.
   AND (NOT @resolved_only OR o.actual_trouble IS NOT NULL)
--- Fully deterministic, and it has to be: tilbakeblikk_messages.sql repeats this ORDER BY verbatim so
+-- Fully deterministic, and it has to be: meldinger_messages.sql repeats this ORDER BY verbatim so
 -- the two responses line up position by position, and the page keys its list on position because
 -- nothing served identifies a decision uniquely (the real grain includes journey_digest, which is
 -- redacted). departure_time alone leaves ties -- two registrations on the same train and the same

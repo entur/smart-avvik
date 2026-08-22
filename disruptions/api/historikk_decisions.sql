@@ -24,7 +24,7 @@
 -- Three things make it a smaller step than the deletion looks. The 2026-08-21 filter change already
 -- made the pair CHOOSABLE -- historikk_filters.sql publishes the vocabulary of registered endpoints
 -- and the matching departures could be read off a narrowed page -- so what goes now is the work of
--- narrowing, not the possibility. /tilbakeblikk already publishes exactly this, decided the same
+-- narrowing, not the possibility. /meldinger already publishes exactly this, decided the same
 -- way and for the same reason (its own header carries the k-anonymity measurement: 21 of 31 prd
 -- pairs isolate a single registered journey). And prd's registrations are TEST USERS rather than
 -- members of the public -- there is no real traveller behind a k=1 pair -- which is the whole of
@@ -33,7 +33,7 @@
 -- So the condition to re-check is not a threshold but a fact: IF /varsel EVER TAKES REGISTRATIONS
 -- FROM THE PUBLIC, this projection publishes real commutes and must be reconsidered. The fix then
 -- is access control on /historikk, not a smaller SELECT list -- the exposure would also be in
--- /tilbakeblikk's generated prose, which no projection controls. journey_digest stays absent from
+-- /meldinger's generated prose, which no projection controls. journey_digest stays absent from
 -- both surfaces regardless: it is the join key to the LLM audit log, and no page needs it.
 --
 -- Cost: the outcomes side prunes on its call_date partition. The groups side does NOT:
