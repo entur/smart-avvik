@@ -135,9 +135,11 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
           >
             {REPLAY_STATUS_LABEL[message.status]}
           </span>
-          <SubParagraph className="tb-status-help">
-            {REPLAY_STATUS_HELP[message.status]}
-          </SubParagraph>
+          {REPLAY_STATUS_HELP[message.status] ? (
+            <SubParagraph className="tb-status-help">
+              {REPLAY_STATUS_HELP[message.status]}
+            </SubParagraph>
+          ) : null}
           {/* The reply the model actually wrote, on the two statuses where one exists and was
               thrown away. Marked as discarded rather than quoted like a message: it was never
               delivered and never stored on a decision row. */}
