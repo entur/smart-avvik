@@ -116,9 +116,6 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
     );
   }
 
-  const stalePrompt =
-    message.prompt_version !== null && message.prompt_version !== message.current_prompt_version;
-
   return (
     <div className="tb-replay">
       {message.status === 'ok' && message.message ? (
@@ -127,12 +124,8 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
               several lines (summary, the train's own news, then the alternative — see
               varsel._deterministic_body's "\n".join), and without it the browser collapses the
               newlines to spaces and the parts run together into one sentence that reads as
-              nonsense. It applies to BOTH arms below — the template is joined the same way. */}
+              nonsense. */}
           <span className="tb-message-text">{message.message}</span>
-          <SubParagraph className="tb-message-source">
-            Skrevet nå av {message.provider ?? 'modellen'}
-            {message.model ? ` · ${message.model}` : ''}
-          </SubParagraph>
         </blockquote>
       ) : (
         <div className="tb-status">
@@ -157,30 +150,6 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
         </div>
       )}
 
-      {/* The other writer, on the same input. Present whenever an input was replayable — including
-          when generation was bounded out, where it is the only text on the card. */}
-      {message.deterministic_message ? (
-        <blockquote className="tb-message tb-message--template">
-          <span className="tb-message-text">{message.deterministic_message}</span>
-          <SubParagraph className="tb-message-source">
-            Standardformulering · samme grunnlag, andre skribent
-          </SubParagraph>
-        </blockquote>
-      ) : null}
-
-      {stalePrompt ? (
-        <SubParagraph
-          className="tb-prompt-diff"
-          title={
-            'Den opprinnelige teksten ble skrevet under en annen systemprompt enn den som svarte ' +
-            'nå. Forskjellen over kan skyldes promptendringen — men også bare tilfeldig variasjon: ' +
-            'hver formulering er ett enkelt trekk fra en ikke-deterministisk dekoder, og siden ' +
-            'skiller ikke de to.'
-          }
-        >
-          Annen prompt-versjon da: {message.prompt_version} → nå: {message.current_prompt_version}
-        </SubParagraph>
-      ) : null}
     </div>
   );
 }
