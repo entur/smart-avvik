@@ -939,10 +939,12 @@ def test_a_transient_failure_does_not_spend_the_payload_retry_budget(monkeypatch
         _reset_state()
         calls = []
 
-        def transient(*a, outcome=None, **k):
-            calls.append(1)
+        def transient(
+            *a, outcome=None, _calls=calls, _failure_status=failure_status, **k
+        ):
+            _calls.append(1)
             if outcome is not None:
-                outcome["status"] = failure_status
+                outcome["status"] = _failure_status
 
         monkeypatch.setattr(varsel, "_write_message", transient)
         _register(DEVICE)
