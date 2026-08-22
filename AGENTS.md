@@ -200,13 +200,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     traveller pushes for the whole 30 min TTL — silently, on the side nobody watches.
   - **The privacy split is structural.** `tilbakeblikk_decisions.sql` carries `message_input` only as
     a null test — no CTE in it holds the text — while `tilbakeblikk_messages.sql` holds it and only
-    the server reads it, so the redaction is a property of the query rather than of a test. Rows
-    still carry no `journey_digest`/`from_stop`/`to_stop` and the models are `extra="forbid"`;
-    `/filters` publishes place refs as vocabulary as /historikk's does — the redaction is per **row**,
-    not per response, or the Fra/Til filters could not exist.
+    the server reads it. Decision rows project `from_stop`/`to_stop` only for server-side NSR name
+    resolution; the public model returns `from_name`/`to_name` and still forbids the raw refs,
+    `journey_digest`, and `message_input` with `extra="forbid"`.
   - **`TILBAKEBLIKK_ENABLED` fails closed, and prd is off** (dev/tst `"true"`, prd `"false"`; only
     `true`/`1`/`yes`/`on` turn it on — `llm_message._TRUTHY`, reused). **Q1, open**: the prose names
-    both ends of a trip and `trafficType: public` is inherited by every environment, so whether it
+    both ends of a trip, and since 2026-08-22 each card headline names them too. `trafficType:
+    public` is inherited by every environment, so whether this route-level data
     may be published — and whether the surface needs access control first — is unanswered. It costs
     real value: prd holds the journeys that matter (36 registered against dev's ~3), so a surface off
     in prd answers the prompt question on thin data. Resolving it means access control in front of
