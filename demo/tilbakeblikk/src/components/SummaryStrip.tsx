@@ -12,38 +12,6 @@ function Tile({ label, value, hint }: { label: string; value: string; hint?: str
   );
 }
 
-/** How much of the window has a verdict at all — first, and in COUNTS.
- *
- *  This is the one thing this strip says that /historikk's does not, and it is here because of the
- *  window axis. /historikk windows on `call_date` and defaults to fourteen days, so most of what it
- *  shows has been labelled; this page windows on `departure_time` and defaults to TODAY, and
- *  verdicts arrive from the 04:00 UTC job the following night. On the default view the rates below
- *  are therefore computed over a handful of rows out of hundreds.
- *
- *  Counts, never a share: «3 av 412» and «0,7 %» are the same fact and land completely differently —
- *  the first makes a reader stop reading the rates, which is the point. The share is in the tile
- *  below for anyone who wants it.
- *
- *  It tints amber below half, rather than only when nothing is labelled: a rate over a fifth of the
- *  window is exactly the case that looks trustworthy and is not. */
-function Coverage({ summary }: { summary: Summary }) {
-  const { n_subjects: subjects, n_labelled: labelled } = summary;
-  const thin = subjects > 0 && labelled / subjects < 0.5;
-  return (
-    <div className={`tb-coverage ${thin ? 'is-thin' : ''}`}>
-      <div className="tb-coverage-head">
-        {labelled} av {subjects} avgjørelser har fasit
-      </div>
-      <SubParagraph className="tb-coverage-help">
-        Tallene under er regnet over de {labelled}, ikke over vinduet. Fasit settes av nattjobben kl.
-        04:00 UTC dagen etter, så et vindu fra i dag er nesten helt uavklart: {summary.n_pending}{' '}
-        venter på fasit og {summary.n_unknown} ble aldri funnet igjen i sanntidsdata. Formuleringene
-        på kortene under er uavhengige av dette — de kan spilles av med én gang.
-      </SubParagraph>
-    </div>
-  );
-}
-
 /** One side of the split, with its counts beside each figure.
  *
  *  All three, not just precision: they answer different questions and routinely move in opposite
@@ -197,10 +165,6 @@ export default function SummaryStrip({ summary }: { summary: Summary }) {
   return (
     <section className="tb-summary">
       <Heading3>Slik har varslene truffet i vinduet</Heading3>
-
-      {/* First, and above the rates it qualifies. A reader who meets «93 %» before they meet «3 av
-          412» has already formed the impression the counts exist to prevent. */}
-      <Coverage summary={summary} />
 
       <div className="tb-tiles">
         <Tile

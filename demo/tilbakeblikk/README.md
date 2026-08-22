@@ -12,8 +12,7 @@ gjennom systemprompten som gjelder i dag.
 
 Det er sløyfa en promptendring mangler ellers. Uten den er alternativene enten å vente på at ekte
 reisende blir varslet under den nye prompten — som tar dager og bare gir de radene trafikken tilfeldig
-byr på — eller å teste på oppdiktede eksempler, som ikke ligner. Her er inndataene ekte, og
-sammenligningsgrunnlaget står ved siden av: standardformuleringen, bygget av samme grunnlag.
+byr på — eller å teste på oppdiktede eksempler, som ikke ligner. Her er inndataene ekte.
 
 **Ingenting sendes.** Siden spør `llm_message.generation_enabled()` og aldri `delivery_enabled()`.
 De to bryterne er ikke det samme: den første sier om en tekst kan *skrives*, den andre bare om en
@@ -28,19 +27,18 @@ pluss et klokkeslettintervall — alt i Europe/Oslo.
 
 Tre ting følger av det, og de er alle synlige i grensesnittet:
 
-1. **Begge klokkeslettfeltene har `step={900}`.** Serveren kvantiserer begge ender til 15 minutter
+1. **Begge klokkeslettfeltene bruker native tidskontroller med `step={900}`.** Serveren kvantiserer
+   begge ender
    (fra rundes ned, til rundes opp), fordi hver parameter havner i svar-hurtigbufferens nøkkel på et
    åpent, uautentisert endepunkt: to fritt valgte sekundoppløste klokkeslett er i størrelsesorden en
    milliard nøkler per døgn, hver av dem en hurtigbufferrad og en BigQuery-spørring. En kontroll som
    lar deg velge minutter serveren i stillhet flytter på, lyver om seg selv. Siden skriver dessuten
    det *oppløste* vinduet tilbake i feltene, i tilfelle noen skriver inn 14:07 for hånd.
-2. **`00:00` i «Til kl.» betyr resten av døgnet.** Intervallet er halvåpent, og et `<input
-   type="time">` kan ikke uttrykke «neste midnatt». API-et leser en utelatt `to_time` som nettopp
-   det, og avviser en bokstavelig 00:00-slutt — så siden sender midnatt som *ingen* parameter. Det er
-   utvetydig begge veier, og det er derfor API-et også ekkoer `to_time: "00:00:00"` tilbake.
-3. **Nesten ingenting har fasit.** Fasit settes av nattjobben kl. 04:00 UTC dagen etter, så et vindu
-   fra i dag er nesten helt `venter`. Derfor står forholdet **først** i statistikkfeltet, og i
-   antall: «3 av 412» stopper en leser, «0,7 %» gjør det ikke.
+2. **`23:59` i «Til kl.» betyr resten av døgnet.** API-et leser en utelatt `to_time` som neste
+   midnatt og avviser en bokstavelig 00:00-slutt. Siden viser derfor den interne 00:00-sentinelen som
+   23:59 og sender den som *ingen* parameter.
+3. **Standardvinduet er gårsdagen.** Da har nattjobben rukket å sette fasit for langt flere rader enn
+   i et vindu fra i dag. Lista åpner dessuten med «Bare der vi varslet» valgt.
 
 ## Kortene
 
@@ -51,11 +49,6 @@ fire forskjeller som alle er verdt å kunne:
 ikke av dette API-et. Å vise den *sendte* teksten ved siden av en som er regenerert fra en kanskje
 annen syklus, ville gjeninnført akkurat den forvekslingen rettelsen 2026-08-21 fjernet fra
 `/historikk`, der 41 % av kortene siterte tekst ingen hadde mottatt.
-
-**Standardformuleringen står under.** Samme grunnlag, annen skribent. Det er det som gjør en
-regenerert tekst mulig å bedømme på et blikk i stedet for bare mulig å lese. Begge har
-`white-space: pre-line` — tekstene er satt sammen av flere linjer, og uten den klapper nettleseren
-dem sammen til én setning som ikke gir mening.
 
 **Hver status har sin egen synlige tilstand.** Ti av dem, og ingen av dem betyr «modellen skrev
 ingenting»: `no_input` (ingen varselverdig syklus i vinduet lagret et grunnlag), `unreadable_input`,
@@ -71,19 +64,11 @@ siden av kommer helt og holdent fra nattjobben. Et kort kan derfor med rette si 
 «traff» samtidig — varselet gikk før vinduet åpnet. De vindusavgrensede feltene er merket med
 `vindu`, med forklaringen på hover.
 
-## Én formulering er ett enkelt trekk
-
-Dette står også på selve siden, og må stå der. Hver tekst er skrevet **én gang** av en
-ikke-deterministisk dekoder og hurtiglagret per rad og prompt-versjon. Laster du siden på nytt og får
-samme tekst, er det hurtigbufferen — ikke et bevis på at modellen er forutsigbar. Og en forskjell
-mellom to kort, eller mellom to prompt-versjoner, kan like gjerne være tilfeldig variasjon som en
-effekt av prompten. Siden markerer rader som ble skrevet under en annen prompt-versjon, men den
-later ikke som om den kan skille de to tingene.
-
 ## Filtrene
 
-Fem nedtrekk (**Utfall**, **Operatør**, **Linje**, **Fra**, **Til**) og tre avkryssinger (**Bare med
-fasit**, **Bare der vi varslet**, **Bare med SIRI-SX-melding**), alle som på `/historikk`.
+Fem nedtrekk (**Utfall**, **Operatør**, **Linje**, **Fra**, **Til**) og fire avkryssinger (**Bare med
+fasit**, **Bare over terskel**, **Bare der vi varslet**, **Bare med SIRI-SX-melding**). «Bare der vi
+varslet» er valgt som standard.
 
 `/tilbakeblikk-api/filters` er også API-ets **tillatelsesliste**: en verdi det ikke kjenner gir 400,
 ikke tom liste. Derfor henter siden alltid nedtrekksverdiene *først*, rydder bort et valg det nye
