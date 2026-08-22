@@ -252,10 +252,7 @@ export const REPLAY_STATUS_LABEL: Record<ReplayStatus, string> = {
  *  reload, to look at a deploy switch — or that there is nothing to wait for at all. */
 export const REPLAY_STATUS_HELP: Record<ReplayStatus, string> = {
   ok: 'Modellen svarte, og teksten under er svaret.',
-  no_input:
-    'Ingen syklus som faktisk sendte et varsel lagret et skrivegrunnlag, så det finnes ingenting å ' +
-    'spille av. Det betyr ikke «ingen melding»: en syklus under terskelen lagrer også et grunnlag, ' +
-    'men den er aldri den som spilles av. Merkelappen på kortet sier hvilken av grunnene som gjelder.',
+  no_input: '',
   unreadable_input:
     'Det lagrede skrivegrunnlaget lot seg ikke tolke. Raden er tatt vare på som den ble skrevet, ' +
     'men den kan ikke spilles av.',
