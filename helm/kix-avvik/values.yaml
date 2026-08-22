@@ -37,5 +37,6 @@ common:
       # environment says otherwise: main.py fails closed on its own, and this base value states
       # the same answer where an operator looks, so a fourth environment added later resolves to a
       # defined state rather than to whatever the code happened to default to. Each env file below
-      # sets it explicitly; the reasoning for prd's "false" lives there.
+      # sets it explicitly and all three are now "true"; the reasoning — including what prd accepts
+      # by publishing regenerated prose on an unauthenticated host — lives in the prd file.
       TILBAKEBLIKK_ENABLED: "false"

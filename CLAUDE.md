@@ -858,22 +858,34 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     dropdown vocabulary exactly as /historikk's does — the redaction is per **row**, not per
     response, or the Fra/Til filters could not exist at all — and it is the API's allow-list, so an
     unknown value is a 400 rather than one more cache entry and one more BigQuery query.
-  - **`TILBAKEBLIKK_ENABLED` fails closed, and prd is off.** One switch decides both the router and
-    the static mount (half a surface is worse than none: the page would load and every request 404),
-    parsed with `llm_message._TRUTHY` reused verbatim — only `true`/`1`/`yes`/`on` turn it **on**, so
-    a misspelling, an empty string or an unset variable withholds the surface instead of publishing
-    it. dev and tst set `"true"`, prd sets `"false"`. The bundle is built into every image regardless;
-    what varies is the env var, not the artefact. **Q1 is the open question**: the prompt instructs
-    the model to advise on the traveller's own route, so the prose routinely names **both ends of a
-    trip**, and `trafficType: public` is set once in the chart and inherited by every environment —
-    so publishing it beside `departure_time` and `n_devices` is the exact inference the per-row
-    redaction exists to prevent. prd's public `/historikk` shows only template wordings today
-    precisely because prd does not deliver the model's. What resolves it: **access control in front
-    of `/tilbakeblikk`, or a decision that the regenerated text may be published as it stands.** Know
-    the cost of leaving it off: prd holds the journeys that matter — **36 registered against dev's
-    ~3** — so a surface off in prd answers the prompt question on thin data. dev and tst being on is
-    a deliberate acceptance on the team's own registrations under the same Q1, not a sign the question
-    was answered. Turning prd on is a one-value change plus a dispatch-only deploy.
+  - **`TILBAKEBLIKK_ENABLED` fails closed, and all three environments are now on.** One switch
+    decides both the router and the static mount (half a surface is worse than none: the page would
+    load and every request 404), parsed with `llm_message._TRUTHY` reused verbatim — only
+    `true`/`1`/`yes`/`on` turn it **on**, so a misspelling, an empty string or an unset variable
+    withholds the surface instead of publishing it. The base `values.yaml` still says `"false"` so a
+    fourth environment resolves to a defined state; dev, tst and — since **2026-08-22** — prd all set
+    `"true"`. The bundle is built into every image regardless; what varies is the env var, not the
+    artefact, so it is a build-time value and changing it needs a deploy rather than a runtime toggle.
+    **Q1 is answered, and the answer rests on one fact rather than on the measurement.** What the
+    surface publishes is real: the prompt instructs the model to advise on the traveller's own route,
+    so the prose routinely names **both ends of a trip**, `trafficType: public` is set once in the
+    chart and inherited by every environment, and measured on 2026-08-22 over 14 days of prd
+    decisions there are **49 journey definitions across 31 from/to pairs, 21 of which (68 %) isolate
+    exactly one journey** — best k anywhere is 5. So a Fra/Til selection in the page's own dropdowns
+    identifies a single registered journey two times out of three, and no column-level redaction can
+    close that, because the exposure is in the **generated sentence** and not in a column. It is
+    accepted because **prd's registrations are test users, not members of the public** (team
+    decision, 2026-08-22): there is no real traveller behind a k=1 pair, and the corridors themselves
+    carry tens of thousands of people a day, so naming one as disrupted discloses nothing about
+    anybody. **Re-run that measurement if prd ever takes registrations from the public** — at k=1 on
+    two thirds of pairs it becomes a genuine disclosure, and the fix is then access control in front
+    of `/tilbakeblikk` (a chart change, since `trafficType` is set once), not a shorter SELECT list.
+    A page built on *hypothetical* journeys rather than registrations would retire the question
+    outright. Note the volume argument for prd is weaker than it looks: measured the same day, prd's
+    pushed subjects run only ~22 % above dev's over six days (408 vs 334), because a subject is
+    (journey × situation × train) and dev's few registrations sit on busy corridors. What prd
+    actually adds is **authenticity** — the written-but-withheld pairs
+    (`message_source='deterministic' AND message_llm IS NOT NULL`) the rollout decision is judged on.
   - **The card's figures are whole-subject**, and were not before 2026-08-22. On the `decided_at`
     axis the per-cycle aggregates (`n_decisions`, `ever_alerted`, `first_alert_at`, `alert_lead_min`,
     the four `final_*`, `max_impact_probability`, `pushed_any`) described the window's *slice* of a
