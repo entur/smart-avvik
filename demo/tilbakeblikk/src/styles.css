@@ -283,6 +283,14 @@ body {
   padding-left: 0.75rem;
 }
 
+/* The one caveat that leads a LIST rather than closing a block. Everywhere else a .tb-caveat is the
+   last thing in its section and its own bottom edge is the gap; here the cards start immediately
+   below, at the 0.75rem the list already sets between them — so without this the notice reads as
+   the first card's own preamble instead of the page's. */
+.tb-caveat--above-list {
+  margin-bottom: 1rem;
+}
+
 /* ---- decision cards --------------------------------------------------------------------- */
 .tb-list {
   display: flex;
@@ -435,28 +443,43 @@ body {
   cursor: help;
 }
 
+/* The operator's own words, as REFERENCE. The page's question is what we would send, so this arm
+   is a margin note: one line, subdued, italic — italic because it genuinely is a quotation of
+   someone else, which is the distinction the old layout had backwards (it set the operator upright
+   and our own wording in the italic reserved for quotations).
+
+   The amber dot that used to lead this line is gone with it. It was the card's only accent and it
+   marked the arm that matters least; a second dot on the wording arm, added to balance it, left
+   both arms with identical grammar and so accented neither. */
 .tb-situation {
-  margin: 0.2rem 0;
-  font-size: 0.9rem;
+  display: flex;
+  gap: 0.625rem;
+  align-items: baseline;
+  margin: 0.75rem 0 0;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
-.tb-dot {
-  display: inline-block;
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 50%;
-  background: #e8a33d;
-  margin-right: 0.4rem;
+.tb-situation-label {
+  flex: none;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+.tb-situation-text {
+  font-style: italic;
+  text-wrap: pretty;
 }
 
 /* ---- the replayed wording ---------------------------------------------------------------- */
 /* The two arms and, when there is one, the status. Boxed together so it is visible that the
    template beneath is about the same input as the text above it, and not a second message. */
 .tb-replay {
-  margin: 0.75rem 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
+  margin: 0.625rem 0 0;
 }
 
 .tb-replay-note {
@@ -464,15 +487,86 @@ body {
   color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
-.tb-message {
-  margin: 0;
-  padding: 0.65rem 0.9rem;
-  background: var(--basecolors-frame-tint, #f5f5f5);
-  border-radius: 0.25rem;
-  font-style: italic;
+/* A tinted field, so the notification reads as sitting ON a screen rather than floating. The
+   colour is load-bearing rather than decorative: `frame-subdued` is the only surface here distinct
+   from BOTH the white card and the page behind it, and the notification's own white face is
+   invisible without it. The wording used to sit on `frame-tint` — which is exactly what `body` is
+   painted with, so the one element meant to carry the page's whole point was drawn in the page's
+   own background, the standard grammar for something recessed and secondary. */
+.tb-notif-field {
+  background: var(--basecolors-frame-subdued, #ededed);
+  border-radius: 0.75rem;
+  padding: 0.75rem;
 }
 
-/* Load-bearing on the generated wording and discarded reply. The wordings are newline-joined
+/* Kept to a phone's width rather than stretched to the card. A notification that spans 55rem is
+   not the artefact being shown — the line length is part of what the reader is judging. */
+.tb-notif {
+  max-width: 27rem;
+  padding: 0.75rem 0.875rem;
+  background: #fff;
+  border-radius: 0.875rem;
+  box-shadow:
+    0 1px 2px rgba(24, 28, 86, 0.1),
+    0 6px 16px rgba(24, 28, 86, 0.1);
+}
+
+.tb-notif-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4375rem;
+  margin-bottom: 0.4375rem;
+}
+
+.tb-notif-mark {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.0625rem;
+  height: 1.0625rem;
+  border-radius: 0.25rem;
+  background: var(--colors-brand-blue, #181c56);
+  color: #fff;
+  font-size: 0.5rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.tb-notif-app {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.tb-notif-title {
+  margin: 0 0 0.1875rem;
+  font-size: 0.9375rem;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.tb-notif-body,
+.tb-wording {
+  margin: 0;
+  line-height: 1.4;
+  white-space: pre-line;
+  text-wrap: pretty;
+}
+
+.tb-notif-body {
+  font-size: 0.90625rem;
+}
+
+/* A subject nothing was delivered for: the same wording, unframed. The frame is a claim that a
+   phone showed this, and for `samlet`, `ikke_sendt` and `push_av` it did not. */
+.tb-wording {
+  font-size: 0.9375rem;
+  line-height: 1.45;
+}
+
+/* Load-bearing on the discarded reply, its only remaining user — the delivered wording carries
+   pre-line on .tb-notif-body / .tb-wording instead. The wordings are newline-joined
    (varsel._deterministic_body's "\n".join), and without pre-line the browser collapses the newlines
    to spaces and the parts run together into one sentence that reads as nonsense. */
 .tb-message-text {
