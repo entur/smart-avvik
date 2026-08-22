@@ -77,15 +77,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` — the push text is written by an LLM on Vertex AI
     (`disruptions/api/llm_message.py`) from the enriched `/impact` payload. No API keys: both
     backends use the runtime SA's ADC (`roles/aiplatform.user`, already granted for `AI.CLASSIFY`).
-    `VARSEL_LLM_PROVIDER=auto` tries **Claude Sonnet 5** and latches to **Gemini** for the process
-    lifetime if the project cannot serve Anthropic publisher models — those need Vertex **Model
-    Garden enablement on top of the IAM role**, so check `jsonPayload.provider` on
-    `event="llm_message"` rather than assuming which one answered. Every failure path (unset,
+    Every Helm environment pins `VARSEL_LLM_PROVIDER=gemini`; `auto` remains a code capability but
+    is not deployed. Check `jsonPayload.provider` on `event="llm_message"` when diagnosing calls.
+    Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
     wording, so a push is never lost to an LLM problem.
     **Writing a wording and sending it are two switches** (2026-08-07): `VARSEL_LLM_PROVIDER=off`
     stops a model being *asked*; `VARSEL_LLM_ENABLED=false` still asks and records the answer but
-    *sends* the deterministic wording. prd runs them apart — `auto` with `ENABLED=false` — so it
+    *sends* the deterministic wording. prd runs them apart — `gemini` with `ENABLED=false` — so it
     writes a `message_llm` on every alert-worthy decision and delivers the template. Know what that
     sends: the traveller's origin, destination and departure time, which is not what the
     `AI.CLASSIFY` IAM precedent covers. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
@@ -184,20 +183,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     loss as a cheaper query. Cost is not a correctness check.
   - **Generation is the gate, delivery is not.** It asks `llm_message.generation_enabled()` and never
     `delivery_enabled()` or `varsel._deliverable_message`. prd already generates
-    (`VARSEL_LLM_PROVIDER=auto`), so no environment change was needed — and a page that consulted the
+    (`VARSEL_LLM_PROVIDER=gemini`), so a page that consulted the
     delivery gate would be blank in prd for a reason having nothing to do with the feature.
-  - **Four bounds on regeneration**, all protecting the Vertex quota the *poller* shares: 12 backend
-    CALLS per request (calls, not subjects — under `auto` one subject can spend two, and the
-    reservation is a conservative 2/subject), 24 calls per trailing minute tallied **by caller** the
-    way `alternatives._fetch_calls` splits its budget, a 30 s deadline that **reserves** the worst
-    case (16 s) inside each worker rather than measuring elapsed time, and a wording cache keyed on
-    subject + replayed cycle + `PROMPT_VERSION` (a failure cached 60 s, but `rejected`/`ungrounded`
-    the full 30 min — the payload-vs-transient cut `varsel._message_attempts`/`_message_errors`
-    makes, as a TTL). The route is `async def` because `/impact` and the `/varsel-api` writes are
-    sync `def` and share the anyio worker pool. **The poller's share of that quota grew 8x on
-    2026-08-21** (`_MAX_LLM_CALLS_PER_CYCLE` 8 -> 64, 16-wide) and these four did not: they still
-    hold only because `TILBAKEBLIKK_ENABLED` is `"false"` in prd, the one deployment that reaches
-    for 64. Enabling it there makes the two budgets add, and is where these get re-derived.
+  - **Four bounds on regeneration**: 1 000 backend CALLS per request and trailing hour, 5 000 per
+    trailing day, a 30 s deadline that reserves the 8 s single-provider worst case inside each worker, and a cache
+    keyed on subject + replayed cycle + `PROMPT_VERSION`. Replay has its own hourly/daily ledger;
+    all environments pin Gemini, so one subject reserves one call. Cached hits spend no allowance.
+    Successful, `rejected`, and `ungrounded` results remain in memory
+    until eviction (10 000 entries) or process restart, while transient failures expire after 60 s.
+    The route stays `async def` and admits only two concurrent replay requests, independently of the
+    larger spend allowance, so it cannot create unbounded pools beside `/impact` and `/varsel-api`.
   - **The latch is isolated.** `llm_message`'s `_active`/`_active_at`/`_latched_off` and their lock
     now live in a `_LatchState` holder; the module keeps one global instance (every existing caller
     unchanged) and replay takes its own via `new_replay_state()`, seeded one-way. Without it a replay
