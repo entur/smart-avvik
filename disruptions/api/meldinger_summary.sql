@@ -1,4 +1,4 @@
--- /tilbakeblikk-api/summary: how the alerting performed over the departures in one window.
+-- /meldinger-api/summary: how the alerting performed over the departures in one window.
 --
 -- The same figures, the same arithmetic and the same provenance split as historikk_summary.sql,
 -- over a population selected on `departure_time` instead of `call_date`. Read that file's header
@@ -42,14 +42,14 @@
 -- column to varsel_decision_outcomes breaks the registered varsel-label-daily scheduled query until
 -- it is re-registered in both projects.
 --
--- See tilbakeblikk_decisions.sql for the pruning argument, the measured +/-1 day outcomes bound and
+-- See meldinger_decisions.sql for the pruning argument, the measured +/-1 day outcomes bound and
 -- the IFNULL(ARRAY_LENGTH(...)) rule.
 WITH scanned AS (
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
     line, stop_place, departure_time
   FROM `disruptions.varsel_decisions`
-  -- The DERIVED partition bound, then the window itself. See tilbakeblikk_decisions.sql's header:
+  -- The DERIVED partition bound, then the window itself. See meldinger_decisions.sql's header:
   -- the pruning predicate is no longer the window predicate, and a too-narrow one drops cycles
   -- silently while reporting the loss as a cheaper query.
   WHERE DATE(decided_at) BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
@@ -104,7 +104,7 @@ labelled AS (
       WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
       ELSE 'predicted'
     END AS provenance,
-    -- Same split as tilbakeblikk_decisions.sql's outcome_state: an unresolved row inside the
+    -- Same split as meldinger_decisions.sql's outcome_state: an unresolved row inside the
     -- labelling job's 10-day retry window is still waiting, not permanently unknown. Keeping the two
     -- in step matters -- the page shows this count next to the per-row state.
     actual_trouble IS NULL

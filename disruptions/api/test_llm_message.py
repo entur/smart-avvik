@@ -1011,7 +1011,7 @@ def test_the_prompt_version_tracks_the_prompt_text():
 def test_a_replay_latch_does_not_reach_the_live_push_path():
     """The failure this whole holder split exists to prevent, and it is silent where it lands.
 
-    ``/tilbakeblikk`` replays stored inputs on a request path, so a prompt edit, a model id nobody
+    ``/meldinger`` replays stored inputs on a request path, so a prompt edit, a model id nobody
     can serve, or a quota can drive both backends into ``_ConfigurationError`` in a burst. While the
     latch was four module globals that burst reached ``check_and_notify``: ``generation_enabled()``
     goes False for the whole ``_LATCH_TTL``, every real push falls back to the template wording, and

@@ -1,6 +1,6 @@
-# Tilbakeblikk
+# Meldinger
 
-Intern side på `/tilbakeblikk`: hva ville **dagens prompt** skrevet om avvikene vi allerede har
+Intern side på `/meldinger`: hva ville **dagens prompt** skrevet om avvikene vi allerede har
 vurdert?
 
 ## Hvorfor den finnes
@@ -70,7 +70,7 @@ Fem nedtrekk (**Utfall**, **Operatør**, **Linje**, **Fra**, **Til**) og fire av
 fasit**, **Bare over terskel**, **Bare der vi varslet**, **Bare med SIRI-SX-melding**). «Bare der vi
 varslet» er valgt som standard.
 
-`/tilbakeblikk-api/filters` er også API-ets **tillatelsesliste**: en verdi det ikke kjenner gir 400,
+`/meldinger-api/filters` er også API-ets **tillatelsesliste**: en verdi det ikke kjenner gir 400,
 ikke tom liste. Derfor henter siden alltid nedtrekksverdiene *først*, rydder bort et valg det nye
 vinduet ikke inneholder, og først da spør om rader — ellers ville et vindusbytte blinket en feilmelding
 brukeren aldri har forårsaket.
@@ -111,13 +111,13 @@ uv run uvicorn main:app --reload --port 8000
 
 # Denne appen
 npm install
-npm run dev        # Vite proxier /tilbakeblikk-api til localhost:8000
+npm run dev        # Vite proxier /meldinger-api til localhost:8000
 ```
 
 ## Bygge
 
 ```sh
-./build.sh         # -> disruptions/api/tilbakeblikk_static/ (gitignorert)
+./build.sh         # -> disruptions/api/meldinger_static/ (gitignorert)
 ```
 
 I CI bygges den av node-steget i `Dockerfile` i repo-roten. `npm run build` kjører `tsc -b`, så en
@@ -129,5 +129,5 @@ frontend-testkjører i dette repoet. Typene er porten.
 React + Vite + TypeScript, som de tre andre appene. Bruker Entur Linje (`@entur/*`), i motsetning
 til `demo/reisedemo` som med vilje er merkevare-nøytral: denne siden er for oss, ikke for partnere.
 
-`src/api.ts` speiler Pydantic-modellene i `disruptions/api/tilbakeblikk.py` for hånd. Det finnes
+`src/api.ts` speiler Pydantic-modellene i `disruptions/api/meldinger.py` for hånd. Det finnes
 ingen kodegenerering, så de to kan gli fra hverandre — hold dem i takt.

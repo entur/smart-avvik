@@ -21,8 +21,8 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
 path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
-node stage builds the `/demo`, `/varsel`, `/historikk` and `/tilbakeblikk` front-ends (from
-`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk` + `demo/tilbakeblikk`, which is
+node stage builds the `/demo`, `/varsel`, `/historikk` and `/meldinger` front-ends (from
+`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk` + `demo/meldinger`, which is
 why the context is the
 repo root, not `disruptions/api`), and its python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
 
@@ -37,7 +37,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
   app's `npm ci && npm run build`, and Vite writes into
-  `disruptions/api/{demo,varsel,historikk,tilbakeblikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
+  `disruptions/api/{demo,varsel,historikk,meldinger}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
   its marimo snapshots run BigQuery under a developer's ADC, so they can't be built in the
   image/CI — they are rendered offline by `disruptions/api/export_eval.sh` and **committed** under
   `disruptions/api/eval_static/`, shipped as-is. Refresh them by running that script, then commit
@@ -165,14 +165,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     (`message_source='deterministic'` beside a non-null `message_llm`) — the population prd's
     rollout decision is judged on.
 
-- The **Tilbakeblikk** page at `/tilbakeblikk` (`demo/tilbakeblikk/`, React + Vite + Entur Linje)
+- The **Meldinger** page at `/meldinger` (`demo/meldinger/`, React + Vite + Entur Linje)
   replays a window of past alert decisions through **today's** prompt, from the `message_input`
   already stored on every decision row. `/historikk` answers "what did we send"; this answers "what
-  would today's prompt say", and nothing is sent to anybody. API `/tilbakeblikk-api`
-  (`disruptions/api/tilbakeblikk.py`) over `tilbakeblikk_{decisions,summary,filters,messages}.sql`;
+  would today's prompt say", and nothing is sent to anybody. API `/meldinger-api`
+  (`disruptions/api/meldinger.py`) over `meldinger_{decisions,summary,filters,messages}.sql`;
   `messages` is the only route that calls Vertex, kept separate so a Vertex outage empties the
   wordings and leaves every card and statistic intact. Its two lists align **by position**, which is
   why the messages query repeats the decisions query's WHERE and ORDER BY verbatim.
+  - **It was `/tilbakeblikk` until 2026-08-23.** The rename covers route, API prefix, module and
+    SQL filenames, the static dir and the Vite env prefix. What does not travel with it is **Cloud
+    Logging**: the events are now `meldinger_replay`, `meldinger_replay_retry` and
+    `meldinger_bounded`, so an old saved query returns nothing rather than erroring. The `.tb-` CSS
+    prefix and the dated plan document keep their old names on purpose.
   - **The window is `decided_at`, not `call_date`** — one Oslo day plus a from/to time of day,
     quantized to 15-minute half-open steps (unbounded times would mint one cache entry and one query
     apiece on a public endpoint). It is also the partition key of `varsel_decisions`, so these prune
@@ -198,19 +203,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     unchanged) and replay takes its own via `new_replay_state()`, seeded one-way. Without it a replay
     burst that drove both backends into a configuration error would strip model wordings from real
     traveller pushes for the whole 30 min TTL — silently, on the side nobody watches.
-  - **The privacy split is structural.** `tilbakeblikk_decisions.sql` carries `message_input` only as
-    a null test — no CTE in it holds the text — while `tilbakeblikk_messages.sql` holds it and only
+  - **The privacy split is structural.** `meldinger_decisions.sql` carries `message_input` only as
+    a null test — no CTE in it holds the text — while `meldinger_messages.sql` holds it and only
     the server reads it. Decision rows project `from_stop`/`to_stop` only for server-side NSR name
     resolution; the public model returns `from_name`/`to_name` and still forbids the raw refs,
     `journey_digest`, and `message_input` with `extra="forbid"`.
-  - **`TILBAKEBLIKK_ENABLED` fails closed, and prd is off** (dev/tst `"true"`, prd `"false"`; only
-    `true`/`1`/`yes`/`on` turn it on — `llm_message._TRUTHY`, reused). **Q1, open**: the prose names
-    both ends of a trip, and since 2026-08-22 each card headline names them too. `trafficType:
-    public` is inherited by every environment, so whether this route-level data
-    may be published — and whether the surface needs access control first — is unanswered. It costs
-    real value: prd holds the journeys that matter (36 registered against dev's ~3), so a surface off
-    in prd answers the prompt question on thin data. Resolving it means access control in front of
-    `/tilbakeblikk`, or a decision that the regenerated text may be published as it stands.
+  - **The surface is served unconditionally, in every environment.** A `TILBAKEBLIKK_ENABLED`
+    env var gated it (router and static mount together) until the **2026-08-23** rename to
+    `/meldinger` removed the flag; by then all three environments set it `"true"`, so it was a chart
+    value nobody varied. **Q1 is answered, and on one fact rather than on the measurement**: the
+    prose names both ends of a trip, each card headline names them too, and `trafficType: public` is
+    inherited by every environment — measured 2026-08-22 over 14 days of prd, 21 of 31 from/to pairs
+    (68 %) isolate exactly one journey definition. Accepted because prd's registrations are **test
+    users, not members of the public** (team decision, 2026-08-22). Re-run that measurement if prd
+    ever takes real registrations; the fix is then access control in front of `/meldinger`, not a
+    shorter SELECT list — the exposure is in the generated sentence, not in a column.
   - Two card constraints: `first_in_window` says whether the replayed cycle is the subject's first
     alerting opportunity or merely the earliest one this window contains (narrowing the picker moves
     it), and the per-cycle aggregates are window-scoped while the verdict comes whole from the

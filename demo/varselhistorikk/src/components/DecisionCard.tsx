@@ -150,7 +150,7 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
           is otherwise gone the moment the process restarts.
 
           Drawn as the notification it WAS, which is a stronger claim here than the same drawing
-          makes on /tilbakeblikk and a true one: that page replays a wording through today's prompt
+          makes on /meldinger and a true one: that page replays a wording through today's prompt
           and has to caveat that nobody received it, while this column is the text that went out —
           the 2026-08-21 view fix exists precisely to keep it the PUSHED row rather than the last
           one produced. So no caveat, and none is wanted: a notice saying "this may not be what was
@@ -186,7 +186,7 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
             </div>
           ) : (
             // Written, never delivered. The frame is a claim that a phone showed this, so a wording
-            // that reached nobody does not get one — the same rule /tilbakeblikk applies to its
+            // that reached nobody does not get one — the same rule /meldinger applies to its
             // undelivered states, and the line below says so in words as it always did.
             <p className="vh-wording">{decision.message}</p>
           )}

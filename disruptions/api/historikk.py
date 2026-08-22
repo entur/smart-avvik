@@ -94,12 +94,12 @@ class Decision(BaseModel):
     `n_devices`. That is the "somebody commutes A->B at 07:15" this model used to refuse — see the
     PRIVACY note atop `historikk_decisions.sql` for the reasoning and, more importantly, for the
     fact it rests on: prd's registrations are test users rather than members of the public. Team
-    decision. `/tilbakeblikk` already published the same thing on the same grounds, and this brings
+    decision. `/meldinger` already published the same thing on the same grounds, and this brings
     the two surfaces back into step rather than opening a new one.
 
     What is still absent is `journey_digest` — the join key to the LLM audit log, which no page
     needs — and the raw stop REFS. The refs reach this process and are popped in
-    :func:`_with_place_names`; only resolved NSR names leave it, exactly as `/tilbakeblikk` does it.
+    :func:`_with_place_names`; only resolved NSR names leave it, exactly as `/meldinger` does it.
 
     `extra="forbid"` is the guard that keeps the remaining line where it is: the SQL and this model
     must agree column for column, so a SELECT that re-adds `journey_digest` — or that forgets to pop
