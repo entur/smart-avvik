@@ -1,0 +1,627 @@
+/* Tilbakeblikk — an internal prompt-iteration surface, so it leans on Linje tokens rather than the
+   brand-neutral styling /demo uses. Layout only; colours come from @entur/tokens.
+
+   COLOURS COME FROM --basecolors-*, NOT --colors-greys-*. The legacy grey scale is a LIGHTNESS
+   ramp — grey10 is #2a2a2a (near-black) and grey90 is #f8f8f8 — the opposite direction from the
+   Tailwind-style convention it looks like. /historikk's stylesheet was written against the guess,
+   so every `var(--colors-greys-grey10, #ededed)` resolved to near-black and every
+   `var(--colors-greys-grey60, #6b6b6b)` to #d1d3d3: muted chips rendered charcoal, and the hint
+   text under every figure sat at roughly 1.4:1 against white. The fallbacks beside them said what
+   was meant, and not one of them was ever used, because the token does exist — it just means
+   something else.
+
+   The replacements are role-named for that reason: `stroke-subdued` cannot be inverted by guessing
+   which end of a scale is dark. They are also the only ones that are theme-aware — the legacy greys
+   are defined once in :root with no [data-color-mode='dark'] variant, so the indirection bought
+   nothing at all. Fallbacks are kept, and each one is that site's ORIGINAL intent, so a broken token
+   chain degrades to the page as designed rather than back to this bug. */
+
+body {
+  margin: 0;
+  background: var(--basecolors-frame-tint, #f5f5f5);
+  color: var(--colors-brand-blue, #181c56);
+}
+
+.tb-page {
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+.tb-header {
+  margin-bottom: 1.5rem;
+}
+
+.tb-intro {
+  max-width: 46rem;
+}
+
+.tb-nowrap {
+  white-space: nowrap;
+}
+
+/* The sampling-variance caveat. A box rather than a paragraph, and above the fold rather than in a
+   tooltip: a reader who reloads and gets identical text concludes the decoder is deterministic, and
+   nothing else on the page contradicts them. Left border and a tint so it reads as a standing
+   condition on everything below, not as one more sentence of intro. */
+.tb-note {
+  max-width: 46rem;
+  margin: 0.75rem 0 0;
+  padding: 0.6rem 0.9rem;
+  font-size: 0.875rem;
+  background: #fff;
+  border-left: 3px solid #e8a33d;
+  border-radius: 0.25rem;
+}
+
+/* ---- filters ---------------------------------------------------------------------------- */
+/* Centred, not bottom-aligned: the checkbox column is taller than anything else on this row, so
+   sitting everything on a shared bottom edge left it towering over the selects with its head in
+   the whitespace above them. On a common midline the controls read as one row. */
+.tb-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+/* The window control on a LINE OF ITS OWN — `flex-basis: 100%`, the same device `.tb-checks` uses,
+   so it never shares a line with the dropdowns whatever the viewport is. It is a different KIND of
+   control from the five selects beside it (it decides which decisions exist at all, not which of
+   them to show), and the hint under it needs a full line anyway.
+
+   No phantom caption here, unlike /historikk's `.vh-window::before`: that hack existed because a
+   button group carries no caption and a caption is what decides how far down its block a control
+   sits, so an uncaptioned box rode ~10 px above the captioned selects. All three inputs here are
+   captioned, so they land on the selects' midline on their own. */
+.tb-window {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.tb-window-hint {
+  font-size: 0.8125rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  max-width: 30rem;
+}
+
+.tb-select {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.tb-select select,
+.tb-select input {
+  font: inherit;
+  padding: 0.45rem 0.5rem;
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+  border-radius: 0.25rem;
+  background: #fff;
+  color: inherit;
+}
+
+/* Fra/Til carry stop NAMES, which run long ("Nyvoll ferjekai", "Sandvika stasjon") and would
+   otherwise stretch their control to the widest entry in the list and push the checkbox column off
+   the row. Capped rather than truncated to a fixed width: a short list of short names still gets a
+   compact control, and the native select truncates the overflow itself. */
+.tb-select--wide select {
+  max-width: 12rem;
+}
+
+/* The three narrowings, in a row on a line of their own. `flex-basis: 100%` is what keeps that true
+   rather than leaving it to how wide the window happens to be: at a width where the checks fitted
+   beside the selects again, they would read as three more alternatives to pick between rather than
+   as three switches that compose. */
+.tb-checks {
+  flex-basis: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 1.5rem;
+  font-size: 0.875rem;
+}
+
+.tb-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.875rem;
+}
+
+/* ---- summary ---------------------------------------------------------------------------- */
+.tb-summary {
+  background: #fff;
+  border-radius: 0.5rem;
+  padding: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+/* The labelled/unlabelled split, above the rates it qualifies. Neutral when most of the window is
+   labelled; tinted amber when it is not, which on the default window (today) is always — the point
+   being that a precision over 3 of 412 rows should not look like a precision over 400. */
+.tb-coverage {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border-radius: 0.25rem;
+  background: var(--basecolors-frame-subdued, #ededed);
+  border-left: 4px solid var(--basecolors-stroke-subdued, #c5c5c5);
+}
+
+.tb-coverage.is-thin {
+  background: #fff6e6;
+  border-left-color: #e8a33d;
+}
+
+.tb-coverage-head {
+  font-size: 1.05rem;
+  font-weight: 650;
+}
+
+.tb-coverage-help {
+  margin: 0.25rem 0 0;
+  max-width: 46rem;
+}
+
+.tb-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.tb-tile-label {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+}
+
+.tb-tile-value {
+  font-size: 1.9rem;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.tb-tile-hint {
+  margin: 0.15rem 0 0;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.tb-verdict-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.tb-count {
+  font-size: 0.8rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 1rem;
+  background: var(--basecolors-frame-subdued, #ededed);
+}
+
+.tb-count--success { background: #c9f0d2; }
+.tb-count--warning { background: #ffe9c2; }
+.tb-count--negative { background: #ffd4d4; }
+.tb-count--neutral { background: #e3e6f5; }
+/* No colour override: the four chips above carry their meaning in the fill and inherit the
+   page's text colour, and subdued-on-subdued lands at 4.0:1 — under AA for 0.8rem text. */
+.tb-count--muted { background: var(--basecolors-frame-subdued, #ededed); }
+
+/* The split under the blended precision. Visually subordinate to the tiles on purpose: it explains
+   the headline figure rather than competing with it. */
+.tb-split {
+  margin-top: 1.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--basecolors-frame-subdued, #ededed);
+}
+
+/* The disclosure row. `list-style: none` + the WebKit pseudo-element between them remove the
+   browser's own marker on every engine that ships one, so the caret below is the only one. */
+.tb-split-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+  list-style: none;
+  padding: 0.15rem 0;
+}
+
+.tb-split-summary::-webkit-details-marker {
+  display: none;
+}
+
+.tb-split-summary::before {
+  content: '▸';
+  display: inline-block;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  transition: transform 120ms ease;
+}
+
+.tb-split[open] > .tb-split-summary::before {
+  transform: rotate(90deg);
+}
+
+/* The heading keeps its own margins at zero — the space below the row belongs to the row, and only
+   when there is something under it. */
+.tb-split-head {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.tb-split[open] > .tb-split-summary {
+  margin-bottom: 0.5rem;
+}
+
+.tb-split-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--basecolors-frame-tint, #f5f5f5);
+}
+
+.tb-split-label {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.tb-split-help {
+  margin: 0.1rem 0 0;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  max-width: 34rem;
+}
+
+/* Three figures per segment, side by side. They are labelled because bare numbers next to each
+   other are ambiguous — and reading the coverage figure as a precision is exactly the misreading
+   this whole section exists to stop.
+
+   `margin-left: auto` keeps the trio against the right edge once the row wraps, which at the
+   page's content width it always does: the help text alone is 34rem. A fixed basis rather than a
+   min-width is what makes the segments' columns line up with each other — sized off the longest
+   hint the figures carry ("445 av 445 varsler"). */
+.tb-split-figures {
+  display: flex;
+  gap: 1rem;
+  margin-left: auto;
+}
+
+.tb-split-figure {
+  flex: 0 0 8rem;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.tb-split-figure-label {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.tb-split-value {
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.tb-split-hint,
+.tb-split-note {
+  margin: 0.1rem 0 0;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.tb-split-note {
+  margin-top: 0.5rem;
+}
+
+.tb-caveat {
+  margin: 1rem 0 0;
+  font-size: 0.8125rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  border-left: 3px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+  padding-left: 0.75rem;
+}
+
+/* ---- decision cards --------------------------------------------------------------------- */
+.tb-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+/* Rows that belong to the filter the user just moved off. Faded rather than hidden, so the page
+   keeps its height while the new window loads. */
+.tb-list.is-stale {
+  opacity: 0.45;
+  transition: opacity 0.15s ease-in;
+}
+
+/* How far the wording pass got. Subdued and on its own line above the list: it is about the budget,
+   not about any one card, and it must not read as an error. */
+.tb-replay-status {
+  font-size: 0.8125rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  margin: 0 0 0.5rem;
+  min-height: 1.2em;
+}
+
+/* `stroke-subdued`, a step stronger than the hairlines elsewhere, because this 4px edge is the only
+   thing distinguishing a decision we merely recorded from one we acted on. At the hairline weight it
+   disappears against the card, and "we stayed quiet" then looks like a rendering gap rather than a
+   state. */
+.tb-card {
+  background: #fff;
+  border-radius: 0.5rem;
+  padding: 1rem 1.25rem;
+  border-left: 4px solid var(--basecolors-stroke-subdued, #c5c5c5);
+}
+
+/* A decision we acted on reads differently from one we merely recorded. */
+.tb-card--alerted {
+  border-left-color: var(--colors-brand-blue, #181c56);
+}
+
+.tb-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+/* Mode, line pill, departure and the replayed cycle's time on one line. Aligned on the BASELINE,
+   not centred: the pill is the tallest item here, and centring against it lifts the two times off
+   the line the mode word sits on. Wraps rather than shrinks on a narrow screen — a time read as the
+   wrong one is worse than a taller card. */
+.tb-train {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0 0.55rem;
+}
+
+.tb-mode {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+/* The line as a pill, the shape /demo uses — translated to Linje tokens rather than copied, since
+   this page takes its colours from @entur/tokens. Brand blue is what `body` already sets the text
+   to, so the pill is that colour inverted, exactly as /demo inverts its own --text. */
+.tb-line {
+  font-size: 0.8125rem;
+  font-weight: 700;
+  background: var(--colors-brand-blue, #181c56);
+  color: #fff;
+  border-radius: 0.375rem;
+  padding: 0.1rem 0.45rem;
+}
+
+/* The departure is the train's identity, so it is the one thing in the header set solid. Tabular
+   figures keep the colon in the same place down a list of cards. */
+.tb-departure {
+  font-size: 0.9375rem;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The second time is context, not identity — when the replayed wording could have gone out, or when
+   we last looked and said nothing. Italic and subdued so it cannot compete with the departure
+   beside it now that the two share a line; the label inside it carries the distinction, and on this
+   page the distinction is load-bearing ("Varsel" vs "Tidligste i vinduet"). */
+.tb-when {
+  font-size: 0.875rem;
+  font-style: italic;
+  font-weight: 400;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.tb-when[title] { cursor: help; }
+
+.tb-card-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+/* Not a verdict — a note about what kind of decision this was. Outlined rather than filled so it
+   cannot be mistaken for the outcome chip beside it. */
+.tb-tag {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+  border-radius: 1rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* The send state, which is the one tag that is a FACT about the row rather than a note about how to
+   read it: did a message actually reach a phone. Given weight accordingly — a tinted border and
+   darker text — but still outlined, because the filled chip beside it is the verdict and the two
+   answer different questions ("did we tell them" vs "were we right"). Both states are marked, not
+   just the silent one: a page whose whole claim is "this is what we would send" has to let a reader
+   see at a glance which cards stand for a message that went out. */
+.tb-tag--sent {
+  border-color: #7fba8e;
+  color: #1c6b32;
+}
+
+.tb-tag--quiet {
+  border-style: dashed;
+}
+
+.tb-badge {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.2rem 0.6rem;
+  border-radius: 1rem;
+  white-space: nowrap;
+}
+
+.tb-badge--success { background: #c9f0d2; }
+.tb-badge--warning { background: #ffe9c2; }
+.tb-badge--negative { background: #ffd4d4; }
+.tb-badge--neutral { background: #e3e6f5; }
+.tb-badge--muted {
+  background: var(--basecolors-frame-subdued, #ededed);
+  cursor: help;
+}
+
+.tb-situation {
+  margin: 0.2rem 0;
+  font-size: 0.9rem;
+}
+
+.tb-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: #e8a33d;
+  margin-right: 0.4rem;
+}
+
+/* ---- the replayed wording ---------------------------------------------------------------- */
+/* The two arms and, when there is one, the status. Boxed together so it is visible that the
+   template beneath is about the same input as the text above it, and not a second message. */
+.tb-replay {
+  margin: 0.75rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.tb-replay-note {
+  margin: 0;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.tb-message {
+  margin: 0;
+  padding: 0.65rem 0.9rem;
+  background: var(--basecolors-frame-tint, #f5f5f5);
+  border-radius: 0.25rem;
+  font-style: italic;
+}
+
+/* The template arm. Recessed relative to the regenerated text above it — same input, other writer,
+   and the comparison is the point — so it is outlined rather than filled and does not read as a
+   second thing that was said. */
+.tb-message--template {
+  background: transparent;
+  border: 1px dashed var(--basecolors-stroke-subduedalt, #c5c5c5);
+}
+
+/* Load-bearing, on BOTH arms and on the discarded reply. The wordings are newline-joined
+   (varsel._deterministic_body's "\n".join), and without pre-line the browser collapses the newlines
+   to spaces and the parts run together into one sentence that reads as nonsense. */
+.tb-message-text {
+  white-space: pre-line;
+}
+
+.tb-message-source {
+  margin: 0.35rem 0 0;
+  font-style: normal;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+/* Every non-ok status. Rendered as a state with its own text rather than a badge over an empty
+   quote: a bound that bound, a backend that could not be asked and a reply that was refused are
+   three different facts, and only one of them is worth waiting on. */
+.tb-status {
+  padding: 0.5rem 0.9rem;
+  background: var(--basecolors-frame-subdued, #ededed);
+  border-radius: 0.25rem;
+}
+
+.tb-status-badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.15rem 0.5rem;
+  border-radius: 1rem;
+  background: #fff;
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+  cursor: help;
+  white-space: nowrap;
+}
+
+/* The two statuses where a model DID answer and the answer was thrown away — amber, because unlike
+   the bounds they are about the prompt and not about this request's budget. They are what a prompt
+   edit most plausibly produces, so they should catch the eye down a list. */
+.tb-status-badge--ungrounded,
+.tb-status-badge--rejected {
+  background: #ffe9c2;
+  border-color: #e8a33d;
+}
+
+.tb-status-help {
+  margin: 0.3rem 0 0;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+/* The reply that was refused. Quoted, because it is the text a developer iterating on the prompt
+   needs to read — but struck through the label rather than the body: the words matter, the claim
+   that they were sent does not exist. */
+.tb-discarded {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.75rem;
+  background: #fff;
+  border-left: 3px solid #e8a33d;
+  border-radius: 0.25rem;
+  font-style: italic;
+}
+
+.tb-discarded-label {
+  margin: 0 0 0.2rem;
+  font-style: normal;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.7rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+/* The row was decided under a different prompt than the one that just answered. A note, not a
+   warning: it does not separate a prompt change from sampling variance, and the tooltip says so. */
+.tb-prompt-diff {
+  margin: 0;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
+}
+
+.tb-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 0.75rem 0 0;
+}
+
+.tb-facts dt {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.tb-facts dd {
+  margin: 0.1rem 0 0;
+  font-size: 0.9rem;
+}
+
+.tb-loading {
+  padding: 2rem 0;
+}
