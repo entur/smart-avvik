@@ -262,7 +262,9 @@ export const REPLAY_STATUS_HELP: Record<ReplayStatus, string> = {
     'backender er låst av. Det betyr ikke at dette miljøet sender standardformuleringen til ' +
     'reisende: det er en annen bryter (VARSEL_LLM_ENABLED), og denne siden spør aldri om den.',
   unavailable: 'Ingen av backendene kunne forsøkes for denne raden.',
-  error: 'Forbigående feil mot backend. Last siden på nytt — feil hurtiglagres bare kort.',
+  error:
+    'Forbigående feil mot backend etter ett automatisk nytt forsøk. Last siden på nytt — feil ' +
+    'hurtiglagres bare kort.',
   truncated:
     'Modellen brukte opp svarrammen før teksten var ferdig. Last siden på nytt — avkortede svar ' +
     'hurtiglagres bare kort og blir forsøkt på nytt.',
