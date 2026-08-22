@@ -280,10 +280,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` — the push text is written by an LLM on Vertex AI
     (`disruptions/api/llm_message.py`) from the enriched `/impact` payload. No API keys: both
     backends use the runtime SA's ADC (`roles/aiplatform.user`, already granted for `AI.CLASSIFY`).
-    `VARSEL_LLM_PROVIDER=auto` tries **Claude Sonnet 5** and latches to **Gemini** for the process
-    lifetime if the project cannot serve Anthropic publisher models — those need Vertex **Model
-    Garden enablement on top of the IAM role**, so check `jsonPayload.provider` on
-    `event="llm_message"` rather than assuming which one answered. Every failure path (unset,
+    Every Helm environment pins `VARSEL_LLM_PROVIDER=gemini`; `auto` remains supported by the code
+    but is not deployed. Check `jsonPayload.provider` on `event="llm_message"` when diagnosing calls.
+    Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
     wording, so a push is never lost to an LLM problem.
     **Writing a wording and sending it are two switches** (2026-08-07): `VARSEL_LLM_PROVIDER=off`
@@ -295,11 +294,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     not carry. `_messages` has two other readers (`check_and_notify`'s cache probe,
     `_record_decisions`' fill of `message_llm`) that stay ungated on purpose: the log records what
     was *written*, whether or not it was sent. **prd runs the two switches apart**:
-    `VARSEL_LLM_PROVIDER=auto` (it writes a wording for every alert-worthy decision) with
+    `VARSEL_LLM_PROVIDER=gemini` (it writes a wording for every alert-worthy decision) with
     `VARSEL_LLM_ENABLED=false` (travellers still get the template). That is the combination the
     split exists for — it is what makes prd's real journeys comparable at all. Know what it sends:
-    the prompt carries the traveller's origin, destination and departure time to a `global`,
-    non-region-bound endpoint, which is *not* what the `AI.CLASSIFY` precedent covers
+    the prompt carries the traveller's origin, destination and departure time to Gemini's EU
+    multi-region endpoint, which is *not* what the `AI.CLASSIFY` precedent covers
     (operator-authored SX text); decided with that in view on 2026-08-07, and
     `VARSEL_LLM_PROVIDER=off` stops the egress if that changes. Enabling delivery in prd is a
     separate one-value deploy. Prompts and replies are logged under
@@ -651,7 +650,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `bq cp -f` overwrites. **Both environments record pairs, and they differ in what was sent.**
     dev has both switches on, so its rows carry a written wording, a template wording, and the
     written one delivered (`message_source='llm'`). prd generates but does not deliver
-    (`VARSEL_LLM_PROVIDER=auto`, `VARSEL_LLM_ENABLED=false`), so its rows carry both wordings with
+    (`VARSEL_LLM_PROVIDER=gemini`, `VARSEL_LLM_ENABLED=false`), so its rows carry both wordings with
     the template delivered — `message_source='deterministic' AND message_llm IS NOT NULL`, the
     "written but withheld" population the prd rollout decision is judged on. prd's pairs are the
     ones that matter: real travellers, real journeys.
@@ -744,8 +743,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     and never `delivery_enabled()` or `varsel._deliverable_message` — the two switches are not
     interchangeable (generation says whether a wording can be *written*, delivery only what a
     *traveller* receives), and prd is exactly the deployment that generates without delivering
-    (`VARSEL_LLM_PROVIDER=auto`, `VARSEL_LLM_ENABLED=false`). No environment change was needed to
-    ship this, and a surface that consulted the delivery gate would be **blank in prd for a reason
+    (`VARSEL_LLM_PROVIDER=gemini`, `VARSEL_LLM_ENABLED=false`). A surface that consulted the delivery
+    gate would be **blank in prd for a reason
     having nothing to do with the feature** — blank precisely where the data is worth looking at.
     `test_the_delivery_gate_is_never_consulted` pins it. `generation_enabled` is asked **once per
     request**, not per subject: asked per subject it would flip mid-pass when a configuration error
@@ -755,53 +754,39 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     not page responsiveness — it is the per-project Vertex quota the **poller** shares: a replay
     burst that eats it makes a real push wording 429, and a 429 is a *transient* failure that returns
     `status="error"` without trying the other backend, so a traveller silently gets the template and
-    nothing on that side says so. **That shared draw grew 8x on 2026-08-21 and this page did not**:
+    nothing on that side says so. **That shared draw grew 8x on 2026-08-21**:
     `varsel._MAX_LLM_CALLS_PER_CYCLE` went 8 -> 64 and the writing pass went 16-wide
     (`varsel._LLM_WORKERS`), so the poller can now hold 16 concurrent Vertex calls and sustain
-    ~22/min against the same project where it used to manage ~3. The four numbers below are
-    unchanged, and the reason they still hold is worth stating rather than assuming: the two never
-    run hot in the same pod today, because `TILBAKEBLIKK_ENABLED` is `"false"` in prd and prd is the
-    only deployment whose registrations make the poller reach for 64 (dev has ~3 journeys, tst
-    none). **Answering Q1 and enabling it in prd makes the two budgets add** -- 24/min here on top of
-    the poller's ~22/min, bursting 4 beside its 16 -- so the enabling change is where these four get
-    re-derived, not where they get carried over.
-    (1) **12 backend CALLS per request** — calls, not subjects, because under `auto` one subject can
-    spend two: an empty or ungrounded reply `continue`s to the next backend, and a prompt edit that
-    trips the grounding check or the 300-character cap trips it for every subject at once, which is
-    exactly the situation somebody uses this page in. The per-subject reservation
-    (`_CALLS_PER_SUBJECT = 2`) is **conservative and never refunded**, and the choice is forced:
-    `write_message_detailed` reports which backend answered but not how many it tried, and the two
-    ways to find out are both wrong (`result.provider` is `None` on exactly the `rejected` and
-    `ungrounded` paths where more than one ran; a counting proxy would have to be installed on a
-    module global the poller calls through). So a happy-path request generates 6 subjects rather than
-    12, which costs a page refresh, where an under-count would spend 24 Vertex calls against a stated
-    ceiling of 12 and cost a traveller their push wording.
-    (2) **24 calls per trailing minute**, one full request's worth inside the deadline so it binds on
-    a second concurrent request rather than never, tallied **by caller** in the shape of
+    ~22/min against the same project where it used to manage ~3. `/tilbakeblikk` is now enabled in
+    prd, so replay and poller demand can overlap at Vertex even though their in-process ledgers are
+    separate. The replay ceilings below are a cost and abuse bound, not a reserved Vertex quota.
+    (1) **1 000 backend CALLS per request.** Dev, tst, and prd all pin
+    `VARSEL_LLM_PROVIDER=gemini`, so a subject can make at most one backend call and
+    `_CALLS_PER_SUBJECT = 1`. The endpoint returns at most 200 subjects, so a full page fits in one
+    request without consuming half the quota on a fallback that deployments never use.
+    (2) **1 000 calls per trailing hour and 5 000 per trailing day**, tallied **by caller** in the shape of
     `alternatives._fetch_calls`' `{_REQUEST_PATH, _POLLER_PATH}` keying. Be honest about what that
     does here: the poller does not call this module at all, so its slot is empty by construction —
     the keying is what makes that structural rather than a fact somebody has to keep true, and what
     stops a later caller silently drawing replay's allowance down. The coupling it defends against is
     one layer out, at Vertex.
     (3) **A 30 s wall-clock deadline that RESERVES the worst case** rather than measuring elapsed
-    time: `monotonic() + 16 s >= deadline` stops a new call being started, the shape
+    time: `monotonic() + 8 s >= deadline` stops a new call being started, the shape
     `varsel._WORST_CASE_CALL_S` uses. Checking elapsed time would bound when the last call *starts*,
     not when the pass ends, and
     the check must run **inside the worker as its task starts**, never at submit time, or every task
-    queues before the deadline is consulted and the bound guarantees nothing. 16 s is reachable by
-    one path only — a first backend returning an empty or ungrounded reply near `_TIMEOUT_S` (8 s)
-    and continuing, then a second that times out; a timeout on its own does *not* reach the second
-    backend, and prd is the *cheapest* path rather than the worst, because an unserved Claude 404s in
-    well under a second. Pool width 4 -- the shape `varsel`'s three pools use, and deliberately the
+    queues before the deadline is consulted and the bound guarantees nothing. Every environment
+    pins one provider, so the reachable worst case is Gemini's `_TIMEOUT_S` (8 s). Pool width 4 --
+    the shape `varsel`'s three pools use, and deliberately the
     narrowest of them (`_MATCH_WORKERS`/`_LLM_WORKERS` 16 each, `_PUSH_WORKERS` 32), because those run
     on the poller thread on a cadence nobody triggers while this one is reachable from a public
     unauthenticated endpoint -- so the cap costs three rounds, ~7 s typically.
     (4) **A wording cache keyed on subject + replayed `decided_at` + `llm_message.PROMPT_VERSION`**,
-    2 000 entries, 30 min, and only 60 s for a failure so a transient Vertex error does not stick a
-    red badge on a card for half an hour after Vertex recovers. Which failures get which is the same
+    10 000 entries, process-lifetime for stable results, and only 60 s for a transient failure so a
+    red badge does not stick after Vertex recovers. Which failures get which is the same
     cut `varsel` makes with `_message_attempts` vs `_message_errors` (2026-08-22), arrived at
-    independently and expressed here as a TTL rather than a counter: `rejected` and `ungrounded` keep
-    the **full** 30 min because they are payload-determined -- the same stored `message_input` under
+    independently and expressed here as a cache lifetime rather than a counter: `rejected` and
+    `ungrounded` remain until eviction or restart because they are payload-determined -- the same stored `message_input` under
     the same `PROMPT_VERSION` will be refused again, and re-asking spends a Vertex call to learn
     nothing -- while `error` says only that the backend was unreachable a minute ago. Do not unify
     the two lifetimes on the grounds that both are failures. Both halves of the key are
@@ -812,8 +797,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     correctly miss. On the departure axis narrowing only removes subjects, so the timestamp is now
     belt-and-braces rather than the thing preventing a wrong hit; keep it, since `pushed` can name a
     second cycle when the `_notified` winner flips. The cache is consulted **before** the budget, which is what makes
-    a whole day reachable: spent per subject rather than per miss, every request would re-serve the
-    same first twelve forever and nothing further down the list could ever be seen.
+    repeated browsing cheap: a cache hit consumes no replay allowance and does not call Vertex.
     A bound that binds is reported per entry and the request still returns 200 — `capped`,
     `rate_limited` and `deadline` beside `no_input`, `unreadable_input`, `disabled` and the statuses
     off `MessageResult` — and `ungrounded`/`rejected` carry the **discarded reply**, since those two
