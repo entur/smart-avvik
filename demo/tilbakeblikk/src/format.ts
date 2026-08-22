@@ -241,6 +241,7 @@ export const REPLAY_STATUS_LABEL: Record<ReplayStatus, string> = {
   disabled: 'Ingen modell kunne spørres',
   unavailable: 'Ingen backend svarte',
   error: 'Feil mot backend',
+  truncated: 'Modellsvaret ble avkortet',
   rejected: 'Svaret ble forkastet',
   ungrounded: 'Svaret var ikke forankret',
   capped: 'Utenfor rammen i denne runden',
@@ -265,6 +266,9 @@ export const REPLAY_STATUS_HELP: Record<ReplayStatus, string> = {
     'reisende: det er en annen bryter (VARSEL_LLM_ENABLED), og denne siden spør aldri om den.',
   unavailable: 'Ingen av backendene kunne forsøkes for denne raden.',
   error: 'Forbigående feil mot backend. Last siden på nytt — feil hurtiglagres bare kort.',
+  truncated:
+    'Modellen brukte opp svarrammen før teksten var ferdig. Last siden på nytt — avkortede svar ' +
+    'hurtiglagres bare kort og blir forsøkt på nytt.',
   rejected:
     'Modellen svarte, men svaret var tomt, et avslag, eller for langt for et varsel (300 tegn). ' +
     'Teksten under er det som ble kastet. Den er aldri sendt til noen.',

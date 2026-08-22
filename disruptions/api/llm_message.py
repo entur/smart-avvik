@@ -132,8 +132,11 @@ _GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.7-flash")
 # Web Push bodies are truncated by the platform and read on a lock screen. Anything longer than this
 # is a sign the model ignored the brief, so it is rejected rather than silently cut.
 _MAX_CHARS = 300
-# Room for adaptive thinking plus one or two Norwegian sentences.
-_MAX_TOKENS = 600
+# Gemini 3.7 Flash's low thinking level still occasionally consumed the old 600-token ceiling before
+# it completed the tiny JSON answer (observed as FinishReason.MAX_TOKENS in replay on 2026-08-22).
+# The answer itself is capped separately at 300 characters below, so this extra room is for thinking,
+# not a longer notification.
+_MAX_TOKENS = 1200
 # Hard per-call wall clock. This runs on the poller thread that also rebuilds every BigQuery cache,
 # so an unbounded call stalls ingestion for /disruptions, /journey, /demo and /reisevalg too. The
 # Anthropic SDK defaults to 600 s with two retries; google-genai is likewise unbounded. At
@@ -257,10 +260,10 @@ class MessageResult:
     """What the writer produced, and which backend produced it.
 
     `status` is the one thing the stored message cannot be reverse-engineered from: 'ok', 'disabled',
-    'unavailable' (no backend could be tried), 'error' (transient failure), 'rejected' (a reply that
-    was empty, a refusal, or over-length) or 'ungrounded' (a reply quoting figures absent from the
-    payload). The deterministic wording is used for every one of these, and until they were recorded
-    they were indistinguishable in the log.
+    'unavailable' (no backend could be tried), 'error' (transient failure), 'truncated' (the backend
+    exhausted its output budget), 'rejected' (a reply that was empty, a refusal, or over-length) or
+    'ungrounded' (a reply quoting figures absent from the payload). The deterministic wording is used
+    for every one of these, and until they were recorded they were indistinguishable in the log.
 
     `discarded` is the reply that was thrown away on the 'rejected' and 'ungrounded' paths, where a
     model did answer and the answer was refused. It used to survive only in a log warning, which is
@@ -280,6 +283,10 @@ class MessageResult:
 # ---- Backends --------------------------------------------------------------------------------
 class _ConfigurationError(Exception):
     """The backend cannot serve this model in this project — latch away from it, do not retry."""
+
+
+class _TruncatedReply(Exception):
+    """The backend answered but exhausted its output budget before completing the response."""
 
 
 # How long a backend stays pinned (after a success) or latched off (after a configuration
@@ -517,7 +524,7 @@ def _claude_write(input_json: str) -> str:
                 )
             },
         )
-        return ""
+        raise _TruncatedReply(str(response.stop_reason))
     return "".join(block.text for block in response.content if block.type == "text")
 
 
@@ -581,7 +588,7 @@ def _gemini_write(input_json: str) -> str:
                 )
             },
         )
-        return ""
+        raise _TruncatedReply(str(finish))
     return response.text or ""
 
 
@@ -1071,6 +1078,7 @@ def write_message_detailed(
     status = "unavailable"
     # The reply that was thrown away, carried out beside the status it explains -- see MessageResult.
     discarded: str | None = None
+    failed_provider: str | None = None
 
     for name in _candidates(state=state):
         try:
@@ -1087,6 +1095,12 @@ def write_message_detailed(
             )
             state.latch_off(name, datetime.now(UTC))
             continue
+        except _TruncatedReply:
+            # Capacity/timing, not a payload verdict. In `auto` mode another backend may still finish;
+            # if none does, preserve the provider so the replay UI can explain what actually happened.
+            status = "truncated"
+            failed_provider = name
+            continue
         except Exception:
             logger.warning(
                 "LLM backend %s failed transiently; falling back to the deterministic wording",
@@ -1100,6 +1114,9 @@ def write_message_detailed(
             )
             return MessageResult(None, provider=name, model=_model_of(name), status="error")
 
+        # Preserve the backend even when its reply fails a content guard below. Previously a final
+        # rejection returned provider=None, hiding which model produced the unusable response.
+        failed_provider = name
         message = _extract_message(raw)
         if message and not _is_grounded(message, prompt):
             logger.warning(
@@ -1185,4 +1202,10 @@ def write_message_detailed(
                 },
             )
         return MessageResult(message, provider=name, model=_model_of(name), status="ok")
-    return MessageResult(None, status=status, discarded=discarded)
+    return MessageResult(
+        None,
+        provider=failed_provider,
+        model=_model_of(failed_provider) if failed_provider is not None else None,
+        status=status,
+        discarded=discarded,
+    )
