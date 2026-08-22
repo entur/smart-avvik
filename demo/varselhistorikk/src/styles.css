@@ -387,7 +387,7 @@ body {
 }
 
 /* The registered journey's endpoints, on the cards where no drawn push already names them.
-   Matches /tilbakeblikk's .tb-route — the two card layouts are forked, not shared. */
+   Matches /meldinger's .tb-route — the two card layouts are forked, not shared. */
 .vh-route {
   font-size: 0.9375rem;
   font-weight: 600;
@@ -454,7 +454,7 @@ body {
    own wording in the italic reserved for quotations).
 
    The amber dot that used to lead this line is gone with it. It was the card's only accent and it
-   marked the arm that matters least. Mirrors /tilbakeblikk's .tb-situation exactly — the two card
+   marked the arm that matters least. Mirrors /meldinger's .tb-situation exactly — the two card
    layouts are forked, not shared, so this is one of the changes that has to be made twice. */
 .vh-situation {
   display: flex;

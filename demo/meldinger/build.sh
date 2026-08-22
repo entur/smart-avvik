@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build the Tilbakeblikk UI into disruptions/api/tilbakeblikk_static/ (gitignored — the image
+# Build the Meldinger UI into disruptions/api/meldinger_static/ (gitignored — the image
 # builds it in the Dockerfile's node stage; this is for local dev).
 set -euo pipefail
 cd "$(dirname "$0")"

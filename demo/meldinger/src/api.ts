@@ -1,5 +1,5 @@
-// Typed client for /tilbakeblikk-api. Hand-mirrored from the Pydantic models in
-// disruptions/api/tilbakeblikk.py — there is no codegen, so the two can drift; keep them in step.
+// Typed client for /meldinger-api. Hand-mirrored from the Pydantic models in
+// disruptions/api/meldinger.py — there is no codegen, so the two can drift; keep them in step.
 
 /** Why a decision has no verdict. The two are different facts and must not be merged:
  *  'venter' resolves itself overnight, 'ukjent' never will. On this page's default window — today,
@@ -282,7 +282,7 @@ export interface FilterOptions extends WindowFields {
 }
 
 /** Which deployment answered. Its own endpoint because it must survive a decision log that cannot
- *  be read — see the config route in disruptions/api/tilbakeblikk.py. */
+ *  be read — see the config route in disruptions/api/meldinger.py. */
 export interface Config {
   /** 'dev' | 'tst' on non-prod, null in prd. */
   environment: string | null;
@@ -364,11 +364,11 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
 }
 
 export function fetchConfig(): Promise<Config> {
-  return get('/tilbakeblikk-api/config');
+  return get('/meldinger-api/config');
 }
 
 export function fetchDecisions(filters: Filters): Promise<DecisionsResponse> {
-  return get(`/tilbakeblikk-api/decisions?${query(filters, { limit: String(LIST_LIMIT) })}`);
+  return get(`/meldinger-api/decisions?${query(filters, { limit: String(LIST_LIMIT) })}`);
 }
 
 /** The regenerated wordings for the same subjects, in the same order.
@@ -377,7 +377,7 @@ export function fetchDecisions(filters: Filters): Promise<DecisionsResponse> {
  *  wordings and leaves every card, filter and statistic on the page intact, where one endpoint would
  *  503 the whole thing. Takes the SAME filters and the SAME limit — the alignment depends on it. */
 export function fetchMessages(filters: Filters): Promise<MessagesResponse> {
-  return get(`/tilbakeblikk-api/messages?${query(filters, { limit: String(LIST_LIMIT) })}`);
+  return get(`/meldinger-api/messages?${query(filters, { limit: String(LIST_LIMIT) })}`);
 }
 
 export function fetchSummary(filters: Filters): Promise<Summary> {
@@ -387,12 +387,12 @@ export function fetchSummary(filters: Filters): Promise<Summary> {
   // would make precision read 100 %. The API refuses them here for the same reason.
   const { day, fromTime, toTime, operator, line, fromPlace, toPlace } = filters;
   return get(
-    `/tilbakeblikk-api/summary?${query({ day, fromTime, toTime, operator, line, fromPlace, toPlace })}`,
+    `/meldinger-api/summary?${query({ day, fromTime, toTime, operator, line, fromPlace, toPlace })}`,
   );
 }
 
 /** The dropdown vocabulary for a window. Takes only the window: options narrowed by the current
  *  selection would shrink to it, leaving no way back to the rest of the window. */
 export function fetchFilterOptions(dateWindow: DateWindow): Promise<FilterOptions> {
-  return get(`/tilbakeblikk-api/filters?${query(dateWindow)}`);
+  return get(`/meldinger-api/filters?${query(dateWindow)}`);
 }

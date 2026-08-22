@@ -47,7 +47,7 @@ const UTFALL_OPTIONS: Array<{ value: UtfallFilter; label: string }> = [
   })),
 ];
 
-/** The vocabulary the dropdowns start with: nothing, until /tilbakeblikk-api/filters answers. Held
+/** The vocabulary the dropdowns start with: nothing, until /meldinger-api/filters answers. Held
  *  as a value rather than `null` so every consumer below can read `.lines` without a guard. */
 const NO_OPTIONS: FilterOptions = {
   day: '',
@@ -123,7 +123,7 @@ export default function App() {
   const envSuffix = environment ? ` (${environment})` : '';
 
   useEffect(() => {
-    document.title = `Tilbakeblikk${envSuffix}`;
+    document.title = `Meldinger${envSuffix}`;
   }, [envSuffix]);
 
   // A range the API would refuse (400), caught here so the refusal reads as a hint next to the
@@ -276,7 +276,7 @@ export default function App() {
   return (
     <main className="tb-page">
       <header className="tb-header">
-        <Heading1>Tilbakeblikk{envSuffix}</Heading1>
+        <Heading1>Meldinger{envSuffix}</Heading1>
         <Paragraph className="tb-intro">
           Hva ville vi sendt ut for disse avgangene — skrevet av dagens prompt? Velg en dag og et
           klokkeslettintervall for <strong>avgangstid</strong>, så henter siden varslene som faktisk
@@ -337,7 +337,7 @@ export default function App() {
         </label>
 
         {/* The four data-driven dropdowns. Every one of them is populated from
-            /tilbakeblikk-api/filters over the whole window — never from the decisions on screen,
+            /meldinger-api/filters over the whole window — never from the decisions on screen,
             which are capped and ordered by departure, so a line that only ran early in the window
             would drop out of its own filter and a selection would shrink the list it came from to
             just itself. "Alle" is always first, and always reachable. */}

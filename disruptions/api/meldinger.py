@@ -1,4 +1,4 @@
-"""/tilbakeblikk-api — replay a window of past alert decisions through today's prompt.
+"""/meldinger-api — replay a window of past alert decisions through today's prompt.
 
 /historikk answers "what did we send, and was it right". This surface answers "what would today's
 prompt say about the same disruptions": it reads the ``message_input`` document already stored on
@@ -24,7 +24,7 @@ only it let the reader sweep lead time by moving the window.
 The consequence for cost is that ``varsel_decisions`` is ``PARTITION BY DATE(decided_at)``, which
 the window predicate no longer touches — so the pruning bound is now DERIVED (every cycle that could
 have decided about a departure in the window) and a too-narrow one drops cycles from the aggregates
-silently, while reporting the loss as a cheaper query. See ``tilbakeblikk_decisions.sql``.
+silently, while reporting the loss as a cheaper query. See ``meldinger_decisions.sql``.
 
 **Both times are quantized to 15-minute steps and the range is half-open ``[from, to)``.** That is
 not cosmetic: the endpoint is public and unauthenticated and every parameter lands in the response
@@ -39,7 +39,7 @@ is the one that calls Vertex AI. They are separate endpoints deliberately: a Ver
 the wordings and leaves every card, filter and statistic on the page intact, where one endpoint would
 503 the whole thing. The two lists are aligned POSITION BY POSITION — nothing served identifies a
 decision uniquely, since the real grain includes the redacted ``journey_digest`` — which is why
-``tilbakeblikk_messages.sql`` repeats ``tilbakeblikk_decisions.sql``'s WHERE and ORDER BY verbatim.
+``meldinger_messages.sql`` repeats ``meldinger_decisions.sql``'s WHERE and ORDER BY verbatim.
 
 **``/messages`` regenerates; it never renders what was stored.** It reads back the ``message_input``
 document recorded on the chosen cycle, hands it to today's prompt, and returns the result beside the
@@ -97,15 +97,15 @@ from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
-_DECISIONS_QUERY = (Path(__file__).parent / "tilbakeblikk_decisions.sql").read_text()
-_SUMMARY_QUERY = (Path(__file__).parent / "tilbakeblikk_summary.sql").read_text()
-_FILTERS_QUERY = (Path(__file__).parent / "tilbakeblikk_filters.sql").read_text()
-# The query behind /tilbakeblikk-api/messages, and the only one of the four that names
+_DECISIONS_QUERY = (Path(__file__).parent / "meldinger_decisions.sql").read_text()
+_SUMMARY_QUERY = (Path(__file__).parent / "meldinger_summary.sql").read_text()
+_FILTERS_QUERY = (Path(__file__).parent / "meldinger_filters.sql").read_text()
+# The query behind /meldinger-api/messages, and the only one of the four that names
 # `message_input`. Its rows are read server-side and never projected: what leaves the process is the
 # wording generated FROM the input. Loaded at import for the same reason as the other three -- a
 # missing .sql becomes an import error that stops the whole app at startup rather than a 500 on the
 # first page load.
-_MESSAGES_QUERY = (Path(__file__).parent / "tilbakeblikk_messages.sql").read_text()
+_MESSAGES_QUERY = (Path(__file__).parent / "meldinger_messages.sql").read_text()
 # /historikk's file, deliberately SHARED rather than cloned: it takes only @refs, has no window of
 # its own, and fails open to bare refs. Two copies would be two things to keep in step for no gain.
 _STOP_PLACES_QUERY = (Path(__file__).parent / "historikk_stop_places.sql").read_text()
@@ -1232,7 +1232,7 @@ class _Budget:
                         "Replay hit its per-request cap of %d backend calls; the remaining "
                         "subjects are reported as capped and a later request will fill them",
                         _MAX_CALLS_PER_REQUEST,
-                        extra={"fields": {"event": "tilbakeblikk_bounded", "reason": "capped"}},
+                        extra={"fields": {"event": "meldinger_bounded", "reason": "capped"}},
                     )
                 return "capped"
             with _budget_lock:
@@ -1260,7 +1260,7 @@ class _Budget:
                             _MAX_CALLS_PER_DAY,
                             extra={
                                 "fields": {
-                                    "event": "tilbakeblikk_bounded",
+                                    "event": "meldinger_bounded",
                                     "reason": "rate_limited",
                                     "path": self.path,
                                     "window": refused_window,
@@ -1287,7 +1287,7 @@ def _deterministic(payload: dict) -> str | None:
         if not _warned_no_writer:
             _warned_no_writer = True
             logger.warning(
-                "No deterministic writer was injected; /tilbakeblikk-api/messages will show the "
+                "No deterministic writer was injected; /meldinger-api/messages will show the "
                 "regenerated wording without its template arm",
             )
         return None
@@ -1316,7 +1316,7 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
     except (TypeError, ValueError):
         logger.warning(
             "A recorded message_input would not parse; reporting it rather than failing the page",
-            extra={"fields": {"event": "tilbakeblikk_bounded", "reason": "unreadable_input"}},
+            extra={"fields": {"event": "meldinger_bounded", "reason": "unreadable_input"}},
         )
         return _Wording(None, None, "unreadable_input", None, None, None)
 
@@ -1364,7 +1364,7 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
                 "Retrying a transient replay backend failure",
                 extra={
                     "fields": {
-                        "event": "tilbakeblikk_replay_retry",
+                        "event": "meldinger_replay_retry",
                         "replay": True,
                         "journey_digest": row.get("journey_digest"),
                         "situation_number": row.get("situation_number"),
@@ -1395,7 +1395,7 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
         result.status,
         extra={
             "fields": {
-                "event": "tilbakeblikk_replay",
+                "event": "meldinger_replay",
                 "replay": True,
                 "journey_digest": row.get("journey_digest"),
                 "situation_number": row.get("situation_number"),
@@ -1566,7 +1566,7 @@ async def _replay(
     ]
 
 
-router = APIRouter(prefix="/tilbakeblikk-api", tags=["tilbakeblikk"])
+router = APIRouter(prefix="/meldinger-api", tags=["meldinger"])
 
 
 @router.get("/config", summary="Which deployment is serving this page")
@@ -1653,12 +1653,12 @@ def decisions(
     line: str | None = Query(
         default=None,
         description="Filter to one line REF, e.g. 'VYG:Line:R11' — not the short code the page "
-        "shows, since two codespaces can share one. Values come from /tilbakeblikk-api/filters.",
+        "shows, since two codespaces can share one. Values come from /meldinger-api/filters.",
     ),
     from_place: str | None = Query(
         default=None,
         description="Filter to registrations boarding at this StopPlace ref. Values come from "
-        "/tilbakeblikk-api/filters, which is also the allow-list this is checked against.",
+        "/meldinger-api/filters, which is also the allow-list this is checked against.",
     ),
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
@@ -1860,7 +1860,7 @@ async def messages(
     ),
     operator: str | None = Query(default=None, description="Filter to one codespace, e.g. 'VYG'."),
     line: str | None = Query(
-        default=None, description="Filter to one line REF, from /tilbakeblikk-api/filters."
+        default=None, description="Filter to one line REF, from /meldinger-api/filters."
     ),
     from_place: str | None = Query(
         default=None, description="Filter to registrations boarding at this StopPlace ref."
@@ -1967,7 +1967,7 @@ async def _messages(
     # One pool per request, the shape `varsel.check_and_notify`'s delivery loop uses. Per request
     # rather than module-wide so its threads cannot outlive the work: this pod runs for weeks.
     with ThreadPoolExecutor(
-        max_workers=_REPLAY_WORKERS, thread_name_prefix="tilbakeblikk-replay"
+        max_workers=_REPLAY_WORKERS, thread_name_prefix="meldinger-replay"
     ) as pool:
         rows = await loop.run_in_executor(
             pool,

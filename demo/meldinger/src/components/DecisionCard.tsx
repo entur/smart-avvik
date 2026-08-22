@@ -81,7 +81,7 @@ function withLooks(text: string, decision: Decision): string {
 
 /** Decisions about a train NO SX message named carry a synthetic situation number (predict_calls.sql
  *  writes `KIX:NoSituation:<jkey>`), and their `summary` is a placeholder this codebase wrote about
- *  itself rather than anything an operator published. The same prefix is what tilbakeblikk_summary
+ *  itself rather than anything an operator published. The same prefix is what meldinger_summary
  *  segments the third row of rates on, so the card and the strip agree by construction. */
 const isNoSituation = (decision: Decision) =>
   decision.situation_number?.startsWith('KIX:NoSituation:') ?? false;
