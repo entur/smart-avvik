@@ -2,7 +2,14 @@
 // page that is not merely a convention: the window itself is an Oslo day and an Oslo time of day,
 // so a helper that quietly worked in UTC would put the picker and the data a couple of hours apart.
 
-import type { Decision, OutcomeState, ReplayStatus, ReplayedMessage, Verdict } from './api';
+import type {
+  Decision,
+  OutcomeState,
+  ReplayStatus,
+  ReplayedMessage,
+  SendState,
+  Verdict,
+} from './api';
 
 const timeFmt = new Intl.DateTimeFormat('nb-NO', {
   timeZone: 'Europe/Oslo',
@@ -50,8 +57,22 @@ export function osloToday(): string {
  *  API's own lookback bound (historikk._MAX_WINDOW_DAYS): a day further back is a 400, and a picker
  *  that offers it is a picker that misreports what the surface can answer. */
 export function osloDaysAgo(days: number): string {
+  return osloShift(-days);
+}
+
+/** Tomorrow in Europe/Oslo — the date input's `max`, and the API's own upper bound.
+ *
+ *  A consequence of windowing on DEPARTURE time rather than decision time, not a loosening. The
+ *  poller scores about 12 h forward, so late in the evening there are already real decisions about
+ *  tomorrow's earliest departures; a picker capped at today would hide them, and the API would
+ *  accept a day the picker refuses to offer. */
+export function osloTomorrow(): string {
+  return osloShift(1);
+}
+
+function osloShift(days: number): string {
   const d = new Date(`${osloToday()}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() - days);
+  d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
 }
 
@@ -122,20 +143,46 @@ export const OUTCOME_STATE_HELP: Record<OutcomeState, string> = {
     'som «riktig stille» — da ville manglende data sett ut som en riktig avgjørelse.',
 };
 
-/** What every window-scoped figure on a card means, in one sentence the card can hang on a marker.
+/** Why a card is silent, in labels a reader can act on.
  *
- *  It is the page's most likely misreading: the per-syklus figures are counted over the cycles
- *  INSIDE the chosen window, while the verdict badge beside them comes whole from the nightly job.
- *  «Varslet ikke» next to «Traff» is therefore not a contradiction — it means the alerting happened
- *  before the window opened. */
-export const WINDOW_SCOPE_HELP =
-  'Regnet bare over syklusene inne i det valgte vinduet. Utfallet ved siden av er derimot hentet ' +
-  'for hele avgjørelsens levetid fra nattjobben, så «varslet ikke» sammen med «traff» betyr at ' +
-  'varselet gikk før vinduet åpnet — ikke at noe er galt.';
+ *  The four silent states are deliberately not one «ikke sendt». `samlet` is the common one and the
+ *  one most easily misread: operators publish several SX messages about one disruption,
+ *  `one_alert_per_train` keeps the most severe, and the losers stay alert-worthy for their whole
+ *  life while reaching nobody. Reported as a failure they would look like an alerting bug on a
+ *  train the traveller was in fact told about. */
+export const SEND_STATE_LABEL: Record<SendState, string> = {
+  sendt: 'Sendt',
+  sendt_uten_input: 'Sendt — uten grunnlag',
+  under_terskel: 'Under terskel',
+  samlet: 'Samlet med et annet varsel',
+  push_av: 'Push er av her',
+  ikke_sendt: 'Ikke sendt',
+};
 
-/** The tooltip behind the header's second time: how many cycles scored this train inside the
- *  window, and when the first and last of them did. Undefined for a single look, where the time on
- *  the card is the whole story.
+export const SEND_STATE_HELP: Record<SendState, string> = {
+  sendt:
+    'Et varsel gikk faktisk ut på dette tidspunktet. Teksten under er den samme situasjonen ' +
+    'skrevet på nytt av dagens prompt — ikke det som ble sendt.',
+  sendt_uten_input:
+    'Varselet gikk ut, men syklusen lagret ikke noe skrivegrunnlag, så det finnes ingenting å gi ' +
+    'dagens prompt. Rader skrevet før 5. august 2026 har aldri et grunnlag.',
+  under_terskel:
+    'Vi kom aldri over operatørens terskel, så ingen ble varslet. Disse radene er de eneste ' +
+    'sporene en bom etterlater seg, og de har aldri en formulering å spille av.',
+  samlet:
+    'Varselverdig, men en annen SX-melding om det SAMME toget vant sammenslåingen og ble sendt i ' +
+    'stedet. Den reisende ble altså varslet — under et annet situasjonsnummer.',
+  push_av:
+    'Denne installasjonen har ingen VAPID-nøkler og sender ingenting. Det er en innstilling, ikke ' +
+    'en svikt i varslingen.',
+  ikke_sendt:
+    'Varselverdig, men ingenting ble levert for dette toget. Enten rakk avgangen å gå, eller så ' +
+    'var det ingen abonnent igjen å sende til.',
+};
+
+/** The tooltip behind the header's second time: how many cycles scored this train, and when the
+ *  first and last of them did. Undefined for a single look, where the time on the card is the whole
+ *  story.
  *
  *  It repeats the last look on purpose. A `title` on a non-interactive element becomes that
  *  element's accessible NAME rather than its description, so anything the tooltip leaves out is not
@@ -144,7 +191,7 @@ export function fmtLooks(d: Decision): string | undefined {
   if (!d.n_decisions || d.n_decisions < 2 || !d.first_decided_at) return undefined;
   const first = fmtWhen(d.first_decided_at, d.call_date);
   const last = fmtWhen(d.last_decided_at, d.call_date);
-  return `Vurdert ${d.n_decisions} ganger i vinduet — første gang ${first}, sist ${last}.`;
+  return `Vurdert ${d.n_decisions} ganger — første gang ${first}, sist ${last}.`;
 }
 
 /** Realized outcome as a short phrase. Never claims "gikk fint" when the outcome is unknown. */
@@ -206,9 +253,9 @@ export const REPLAY_STATUS_LABEL: Record<ReplayStatus, string> = {
 export const REPLAY_STATUS_HELP: Record<ReplayStatus, string> = {
   ok: 'Modellen svarte, og teksten under er svaret.',
   no_input:
-    'Ingen varselverdig syklus inne i vinduet lagret et skrivegrunnlag, så det finnes ingenting å ' +
+    'Ingen syklus som faktisk sendte et varsel lagret et skrivegrunnlag, så det finnes ingenting å ' +
     'spille av. Det betyr ikke «ingen melding»: en syklus under terskelen lagrer også et grunnlag, ' +
-    'men den er aldri den som spilles av.',
+    'men den er aldri den som spilles av. Merkelappen på kortet sier hvilken av grunnene som gjelder.',
   unreadable_input:
     'Det lagrede skrivegrunnlaget lot seg ikke tolke. Raden er tatt vare på som den ble skrevet, ' +
     'men den kan ikke spilles av.',

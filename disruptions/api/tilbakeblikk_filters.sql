@@ -1,11 +1,11 @@
 -- /tilbakeblikk-api/filters: the values the page's dropdowns can actually be set to.
 --
 -- One row, four arrays: the operators, lines, boarding places and alighting places that occur on at
--- least one decision taken INSIDE the window. historikk_filters.sql on the `decided_at` axis; see
--- its header for why the page needs this as its own query rather than deriving the options from the
--- decisions it renders (that list is capped and ordered by departure, so a line that only ran early
--- in the window would silently drop out of its own filter, and once a filter were applied the
--- options would shrink to the selection with no way back).
+-- least one decision about a departure INSIDE the window. historikk_filters.sql on the
+-- `departure_time` axis; see its header for why the page needs this as its own query rather than
+-- deriving the options from the decisions it renders (that list is capped and ordered by departure,
+-- so a line that only ran early in the window would silently drop out of its own filter, and once a
+-- filter were applied the options would shrink to the selection with no way back).
 --
 -- ALL FOUR tilbakeblikk_*.sql files move to this axis together. A filters or summary query left on
 -- `call_date` would offer a vocabulary, and rates, for a different population than the cards beside
@@ -27,20 +27,23 @@
 --
 -- Reads `varsel_decisions` directly and does NOT touch the outcomes table at all, unlike
 -- historikk_filters.sql, which has to UNION the two because its population is defined by the
--- operating day. Here the population is "decided in the window", which lives in one table -- so this
--- is a single pruned three-partition scan.
+-- operating day. Here the population is "departing in the window", which lives in one table -- so
+-- this is a single three-partition scan.
 --
 -- Deliberately NOT narrowed by the other filters: options derived from the current selection shrink
 -- to it, and there is then no way back to the rest of the window.
 WITH universe AS (
   SELECT operator, line, from_stop, to_stop
   FROM `disruptions.varsel_decisions`
-  -- The pruning bound and the exact window predicate, exactly as in the other three files: the
-  -- partition column is a UTC date while the window is an Oslo day and time range, resolved to two
-  -- absolute timestamps by tilbakeblikk._resolve_window. Half-open [from, to).
+  -- The DERIVED pruning bound and then the exact window predicate, exactly as in the other three
+  -- files. These are now two DIFFERENT columns: the partition column is a UTC `decided_at` date,
+  -- while the window is an Oslo day and time range on `departure_time`, resolved to two absolute
+  -- timestamps by tilbakeblikk._resolve_window. Half-open [from, to). See
+  -- tilbakeblikk_decisions.sql's header for why the pruning bound reaches a day either side and why
+  -- a too-narrow one fails silently and cheaply.
   WHERE DATE(decided_at) BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
-    AND decided_at >= @from_ts
-    AND decided_at <  @to_ts
+    AND departure_time >= @from_ts
+    AND departure_time <  @to_ts
 )
 SELECT
   ARRAY(SELECT DISTINCT operator FROM universe WHERE operator IS NOT NULL ORDER BY operator)

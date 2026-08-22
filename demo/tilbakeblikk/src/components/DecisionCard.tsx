@@ -5,9 +5,10 @@ import {
   OUTCOME_STATE_LABEL,
   REPLAY_STATUS_HELP,
   REPLAY_STATUS_LABEL,
+  SEND_STATE_HELP,
+  SEND_STATE_LABEL,
   VERDICT_LABEL,
   VERDICT_VARIANT,
-  WINDOW_SCOPE_HELP,
   fmtDeparture,
   fmtLooks,
   fmtMin,
@@ -39,16 +40,31 @@ function VerdictBadge({ decision }: { decision: Decision }) {
   );
 }
 
-/** Marks a figure computed over the cycles INSIDE the selected window.
+/** Why this card is silent, or that it is not.
  *
- *  Not decoration. /historikk's card figures describe a decision's whole life; these describe the
- *  slice of it the picker above selected, and the verdict badge one line up still describes the
- *  whole. Unmarked they read as /historikk's, and «Varslet ikke» beside «Traff» then reads as a
- *  bug in the labelling job rather than as the window doing its job. */
-function WindowScope() {
+ *  Rendered even for `sendt`, and that is the point rather than clutter: the page's whole claim is
+ *  "this is what we would send", so a reader must be able to tell at a glance which cards stand for
+ *  a message that reached a phone and which stand for one that never did. The four silent states
+ *  are labelled apart because they are not interchangeable — `samlet` means the traveller WAS
+ *  notified, under another situation number. */
+function SendStateBadge({ decision }: { decision: Decision }) {
+  const state = decision.send_state;
+  if (!state) return null;
+  const sent = state === 'sendt' || state === 'sendt_uten_input';
+  let help = SEND_STATE_HELP[state];
+  // The count only ever qualifies the two states it can explain, and it says different things on
+  // each: beside a collapse it names how many siblings won, and beside a delivered push it is the
+  // open `_notified` gap — the dedup key is per situation while the collapse is per cycle, so a
+  // winner that flips between cycles pushes twice for one train.
+  if (decision.other_pushed_on_train) {
+    help +=
+      state === 'samlet'
+        ? ` Andre varsler om samme tog: ${decision.other_pushed_on_train}.`
+        : ` Merk: ${decision.other_pushed_on_train} annet varsel gikk også ut om dette toget.`;
+  }
   return (
-    <span className="tb-scope" title={WINDOW_SCOPE_HELP}>
-      vindu
+    <span className={`tb-tag ${sent ? 'tb-tag--sent' : 'tb-tag--quiet'}`} title={help}>
+      {SEND_STATE_LABEL[state]}
     </span>
   );
 }
@@ -169,58 +185,39 @@ function ReplayBlock({ message }: { message: ReplayedMessage | null }) {
   );
 }
 
-/** The card's second timestamp: when a message could have gone out, or — failing that — when we
- *  last looked and stayed quiet.
+/** The card's second timestamp: when the message went out, or — failing that — when we last looked
+ *  and stayed quiet.
  *
- *  Three cases, and the difference between the first two is the whole reason this is not one line.
- *  `would_send_at` is only the FIRST opportunity when `first_in_window` says so; otherwise the
- *  subject was already alerting before the window opened and the timestamp is merely the earliest
- *  cycle the selected window happens to contain. Labelled apart rather than both called «Varsel»:
- *  narrowing the picker would otherwise silently move the claimed send time later, and the reader
- *  would have no way to see it happen. */
+ *  Two cases now, where the `decided_at` axis needed three. There, `would_send_at` was the first
+ *  alert-worthy cycle the WINDOW contained, which was not necessarily the subject's first
+ *  opportunity, so the card had to label those apart or narrowing the picker would silently move
+ *  the claimed send time later. Here it is the cycle a push actually went out on — a fact about the
+ *  subject, not about the reader's selection — so «Varsel kl.» can simply be true. */
 function DepartureWhen({ decision }: { decision: Decision }) {
   if (decision.would_send_at) {
-    if (decision.first_in_window) {
-      return (
-        <span
-          className="tb-when"
-          title={withLooks(
-            'Første varselverdige syklus for dette toget — tidspunktet meldingen under ' +
-              'kunne vært sendt på. Ingenting ble sendt herfra.',
-            decision,
-          )}
-        >
-          Varsel {fmtWhen(decision.would_send_at, decision.call_date)}
-        </span>
-      );
-    }
-    /* The subject was already alerting before the window opened, so this is the earliest
-       cycle the WINDOW contains and not the first opportunity. Labelled apart rather than
-       called "Varsel": narrowing the picker would otherwise silently move the claimed
-       send time later, and the reader would have no way to see it happen. */
+    const devices = decision.n_devices ?? 0;
     return (
       <span
         className="tb-when"
         title={withLooks(
-          'Toget varslet allerede før vinduet åpnet, så dette er den tidligste syklusen ' +
-            'inne i vinduet — ikke den første muligheten. Snevrer du vinduet inn, flytter ' +
-            'tidspunktet seg.',
+          'Varselet gikk ut på dette tidspunktet' +
+            (devices > 1 ? ` — til ${devices} mottakere` : '') +
+            '. Teksten under er den samme situasjonen skrevet på nytt av dagens prompt, ' +
+            'ikke det som faktisk ble sendt.',
           decision,
         )}
       >
-        Tidligste i vinduet {fmtWhen(decision.would_send_at, decision.call_date)}
-        <WindowScope />
+        Varsel {fmtWhen(decision.would_send_at, decision.call_date)}
       </span>
     );
   }
   if (decision.last_decided_at) {
-    /* Nothing in the window was replayable — a decision we stayed quiet on has no
-       alert-worthy cycle at all. The last look is the one that stood: the closest we came
-       to the departure and still said nothing, which is the fact a miss turns on. */
+    /* Nothing was delivered for this subject, so there is no send time to state. The last look is
+       the one that stood: the closest we came to the departure and still said nothing, which is the
+       fact a miss turns on. The badge beside it says WHICH kind of silence this was. */
     return (
       <span className="tb-when" title={fmtLooks(decision)}>
         Sist vurdert {fmtWhen(decision.last_decided_at, decision.call_date)}
-        <WindowScope />
       </span>
     );
   }
@@ -249,9 +246,9 @@ export default function DecisionCard({
 
             Only the departure is unlabelled — leftmost, heaviest, against the line pill exactly
             where a timetable puts it — because that is the one an unlabelled timestamp gets read
-            as. The second time names itself, and on this page it has to name itself carefully: it
-            is when a message COULD have been sent, from a cycle inside the chosen window. Nothing
-            was sent from here. */}
+            as. The second time names itself: it is when the message actually went out. The wording
+            below it is regenerated rather than quoted, which the replay block says in its own
+            words — the timestamp is a fact about the push, the text is not. */}
         <div className="tb-train">
           <span className="tb-mode">{decision.mode ?? 'Tog'}</span>
           <span className="tb-line">{lineCode(decision.line)}</span>
@@ -280,6 +277,7 @@ export default function DecisionCard({
               Alt meldt i ET
             </span>
           ) : null}
+          <SendStateBadge decision={decision} />
           <VerdictBadge decision={decision} />
         </div>
       </header>
@@ -299,9 +297,7 @@ export default function DecisionCard({
 
       <dl className="tb-facts">
         <div>
-          <dt>
-            Vurdering <WindowScope />
-          </dt>
+          <dt>Vurdering</dt>
           <dd>
             {alerted ? 'Varslet' : 'Varslet ikke'}
             {' · '}
@@ -310,9 +306,7 @@ export default function DecisionCard({
           </dd>
         </div>
         <div>
-          <dt>
-            Varslingstid <WindowScope />
-          </dt>
+          <dt>Varslingstid</dt>
           <dd>{alerted ? fmtMin(decision.alert_lead_min) : '–'}</dd>
         </div>
         <div>

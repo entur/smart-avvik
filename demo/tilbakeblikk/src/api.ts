@@ -8,21 +8,35 @@ export type OutcomeState = 'avklart' | 'venter' | 'ukjent';
 
 export type Verdict = 'hit' | 'false_alarm' | 'miss' | 'correct_reject';
 
+/** Why a decision does or does not carry a message. Not a boolean, because the four silent states
+ *  are not interchangeable to a reader: 'samlet' means the traveller WAS notified under another
+ *  situation number, 'push_av' is a deployment without a VAPID keypair, and only 'ikke_sendt' means
+ *  we were alert-worthy and nobody heard about this train. */
+export type SendState =
+  | 'sendt'
+  | 'sendt_uten_input'
+  | 'under_terskel'
+  | 'samlet'
+  | 'push_av'
+  | 'ikke_sendt';
+
 /** One alert decision replayed. Describes a *train*, not a traveller: the journey definition behind
  *  it (digest, from_stop, to_stop) and the writer's input (message_input, which embeds all three in
  *  one blob) are deliberately not served — this API is public and unauthenticated.
  *
  *  /historikk's Decision field for field, with three differences:
  *
- *  - ADDED `would_send_at`, `first_in_window`, `prompt_version` — the replayed cycle, whether it was
- *    the subject's first opportunity anywhere, and which prompt wrote the row's own wording.
+ *  - ADDED `would_send_at`, `send_state`, `other_pushed_on_train`, `prompt_version` — the replayed
+ *    cycle, whether a message went out at all and why not when it did not, whether a sibling
+ *    situation about the same train pushed, and which prompt wrote the row's own wording.
  *  - REMOVED `message` and `message_source`. The stored wording is not on this card: showing the
  *    pushed text beside one regenerated from a possibly different cycle would reintroduce exactly
  *    the mismatch the 2026-08-21 fix removed from /historikk, where 41 % of cards quoted text
  *    nobody received.
- *  - RE-SCOPED: every field marked WINDOW-SCOPED below is computed over the cycles inside the
- *    selected window, while `verdict` comes whole from the nightly job. `ever_alerted: false` beside
- *    a `hit` is therefore not a contradiction — it means the alerting happened outside the window. */
+ *  - WHOLE-SUBJECT since 2026-08-22. On the old `decided_at` axis a subject's cycles straddled the
+ *    window, so every per-cycle figure was window-scoped and had to be marked as such on the card.
+ *    The departure axis puts a subject wholly in or wholly out, so these now mean what
+ *    /historikk's mean and `ever_alerted: false` beside a `hit` is simply impossible. */
 export interface Decision {
   situation_number: string | null;
   summary: string | null;
@@ -57,19 +71,28 @@ export interface Decision {
   /** ET had already declared the boarding call cancelled when we decided — the probabilities are
    *  1.0 by construction. Null for decisions taken before the flag existed. */
   et_cancelled: boolean | null;
-  /** WINDOW-SCOPED: whether a push was delivered from a cycle inside the window. */
+  /** Whether a push was actually delivered. This is the recorded output of varsel's four delivery
+   *  filters (threshold, not-yet-departed, one_alert_per_train, the `_notified` dedup), not a
+   *  re-derivation — so it is strictly narrower than `ever_alerted`. */
   pushed_any: boolean | null;
+  /** How many registrations shared this journey DEFINITION. The dedup key is per journey_id, so
+   *  one card stands for this many real pushes rather than one. */
   n_devices: number | null;
+  /** How many OTHER situations about this same registration and train delivered a push. Non-zero
+   *  beside `pushed_any: false` is one_alert_per_train's collapse — the traveller was told, under
+   *  another situation number. Non-zero beside `pushed_any: true` is the open `_notified` gap. */
+  other_pushed_on_train: number | null;
 
-  /** When the replayed message COULD have been sent: the decided_at of the first alert-worthy cycle
-   *  inside the window that recorded a writer's input. Nothing was sent from this page, which is why
-   *  it is `would_`. Null means no cycle in the window was replayable at all — its own state, never
-   *  "no message". */
+  /** When the message WENT OUT: the decided_at of the first cycle that actually delivered a push
+   *  and recorded a writer's input. First, because `_notified` makes the first delivery the only one
+   *  for that situation's life. Null means there is nothing to replay, and `send_state` says which
+   *  of the several reasons applies. */
   would_send_at: string | null;
-  /** Whether would_send_at is the subject's first alert-worthy cycle ANYWHERE, not merely the
-   *  earliest one this window happens to contain. False means the train was already alerting before
-   *  the window opened, so the card must not claim a first opportunity the window cannot support. */
-  first_in_window: boolean;
+  /** Why this subject does or does not carry a message. Rendered directly on the card, because a
+   *  silent card provokes exactly this question and the reasons are not interchangeable: 'samlet'
+   *  means the traveller WAS told under another situation number, while 'ikke_sendt' means nobody
+   *  was told about this train at all. */
+  send_state: SendState | null;
   /** SHA-256[:8] of the system prompt in force when the replayed cycle's own wording was written. */
   prompt_version: string | null;
 
@@ -292,6 +315,10 @@ export interface Filters {
   toPlace?: string;
   verdict?: Verdict;
   alertedOnly?: boolean;
+  /** Only decisions a traveller was actually PUSHED about. Strictly narrower than `alertedOnly`:
+   *  an alert-worthy subject reaches nobody when another situation about its train wins
+   *  one_alert_per_train's collapse, or when `_notified` already delivered for that situation. */
+  pushedOnly?: boolean;
   /** Only decisions whose outcome is known — 'avklart', i.e. everything except 'venter' and
    *  'ukjent'. Wider than picking a single verdict, which narrows within this same population. */
   resolvedOnly?: boolean;
@@ -327,6 +354,7 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.toPlace) params.set('to_place', filters.toPlace);
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
+  if (filters.pushedOnly) params.set('pushed_only', 'true');
   if (filters.resolvedOnly) params.set('resolved_only', 'true');
   if (filters.sxOnly) params.set('sx_only', 'true');
   return params.toString();

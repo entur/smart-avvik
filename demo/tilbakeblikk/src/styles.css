@@ -429,27 +429,6 @@ body {
 
 .tb-when[title] { cursor: help; }
 
-/* The window-scope marker. Small, outlined and hoverable — the same affordance as .tb-tag, because
-   it is the same kind of thing: a note about what a figure MEANS rather than a value. It exists
-   because these figures are /historikk's fields re-scoped to the picker above, and unmarked they
-   read as /historikk's — at which point "Varslet ikke" beside "Traff" looks like a broken labelling
-   job instead of a window that opened after the alert went. */
-.tb-scope {
-  font-size: 0.625rem;
-  font-style: normal;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 0.05rem 0.3rem;
-  margin-left: 0.3rem;
-  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
-  border-radius: 0.75rem;
-  color: var(--basecolors-text-subdued, #6b6b6b);
-  white-space: nowrap;
-  cursor: help;
-  vertical-align: middle;
-}
-
 .tb-card-badges {
   display: inline-flex;
   align-items: center;
@@ -467,6 +446,21 @@ body {
   color: var(--basecolors-text-subdued, #6b6b6b);
   white-space: nowrap;
   cursor: help;
+}
+
+/* The send state, which is the one tag that is a FACT about the row rather than a note about how to
+   read it: did a message actually reach a phone. Given weight accordingly — a tinted border and
+   darker text — but still outlined, because the filled chip beside it is the verdict and the two
+   answer different questions ("did we tell them" vs "were we right"). Both states are marked, not
+   just the silent one: a page whose whole claim is "this is what we would send" has to let a reader
+   see at a glance which cards stand for a message that went out. */
+.tb-tag--sent {
+  border-color: #7fba8e;
+  color: #1c6b32;
+}
+
+.tb-tag--quiet {
+  border-style: dashed;
 }
 
 .tb-badge {

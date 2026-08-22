@@ -125,21 +125,25 @@ check "historikk_filters.sql"       "$API/historikk_filters.sql" \
 check "historikk_stop_places.sql"   "$API/historikk_stop_places.sql" \
   --parameter='refs:ARRAY<STRING>:["NSR:StopPlace:337"]'
 
-# /tilbakeblikk's four. Same shape as /historikk's above, on the decided_at axis: a day (which bounds
-# the DATE(decided_at) partition scan and the derived call_date bound on the outcomes side) plus the
-# two absolute instants the API resolves the Oslo day and the quantized times into.
+# /tilbakeblikk's four, on the DEPARTURE-TIME axis since 2026-08-22: a day (which bounds the DERIVED
+# DATE(decided_at) partition scan and the call_date bound on the outcomes side) plus the two absolute
+# instants the API resolves the Oslo day and the quantized times into -- those two now compare
+# against `departure_time`, not `decided_at`, so @day and @from_ts/@to_ts are predicates on two
+# DIFFERENT columns and neither can be derived from the other.
 #
-# The same "keep these in step" warning applies, and harder: these files carry TWELVE parameters
+# The same "keep these in step" warning applies, and harder: these files carry THIRTEEN parameters
 # against /historikk's eleven, and one omitted here makes bq refuse to parse the query at all, so the
 # check reports FAILED and the file goes UNVALIDATED. test_tilbakeblikk.py greps this script for
 # every @param each file uses, which is the cheap half of the guard; the dry run below is the half
 # that actually type-checks them.
 #
-# WHAT A CLEAN DRY RUN HERE DOES NOT PROVE. Two of these files' most important properties are
-# invisible to it: an empty ARRAY parameter from the CLI is encoded differently from the Python
-# client (so the IFNULL(ARRAY_LENGTH(..)) rule dry-runs identically either way), and a too-narrow
-# call_date bound on the outcomes join drops rows SILENTLY -- which would show up here as a SMALLER
-# byte count, i.e. as success. Cost is not a correctness check.
+# WHAT A CLEAN DRY RUN HERE DOES NOT PROVE, and the second item got WORSE on this axis. An empty
+# ARRAY parameter from the CLI is encoded differently from the Python client (so the
+# IFNULL(ARRAY_LENGTH(..)) rule dry-runs identically either way). And a too-narrow date bound drops
+# rows SILENTLY -- which shows up here as a SMALLER byte count, i.e. as success. That now applies to
+# the DATE(decided_at) bound as well as the call_date one: it is no longer the window predicate but
+# a derived cover for it, so narrowing it drops cycles out of the per-subject aggregates rather than
+# merely mislabelling a flag. Cost is not a correctness check.
 TILBAKEBLIKK_PARAMS=(
   --parameter=day:DATE:2026-07-15
   --parameter=from_ts:TIMESTAMP:'2026-07-15 06:00:00'
@@ -150,7 +154,8 @@ TILBAKEBLIKK_DECISION_PARAMS=(
   --parameter=operator:STRING:VYG --parameter=verdict:STRING:hit
   --parameter=line:STRING:R11
   '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
-  --parameter=alerted_only:BOOL:false --parameter=resolved_only:BOOL:false
+  --parameter=alerted_only:BOOL:false --parameter=pushed_only:BOOL:false
+  --parameter=resolved_only:BOOL:false
   --parameter=sx_only:BOOL:false --parameter=limit:INT64:200
 )
 check "tilbakeblikk_decisions.sql"  "$API/tilbakeblikk_decisions.sql" \
@@ -159,8 +164,9 @@ check "tilbakeblikk_decisions.sql"  "$API/tilbakeblikk_decisions.sql" \
 # responses position by position -- so it takes the same parameter list.
 check "tilbakeblikk_messages.sql"   "$API/tilbakeblikk_messages.sql" \
   "${TILBAKEBLIKK_DECISION_PARAMS[@]}"
-# Population filters only: verdict/alerted_only/resolved_only/sx_only narrow by OUTCOME and never
-# reach /summary, because filtering to hits would make precision read 100 %.
+# Population filters only: verdict/alerted_only/pushed_only/resolved_only/sx_only narrow by OUTCOME
+# or by what we chose to do, and never reach /summary -- filtering to hits would make precision read
+# 100 %, and filtering to the subjects a push went out for would do the same from the other side.
 check "tilbakeblikk_summary.sql"    "$API/tilbakeblikk_summary.sql" \
   "${TILBAKEBLIKK_PARAMS[@]}" \
   --parameter=operator:STRING:VYG --parameter=line:STRING:R11 \
