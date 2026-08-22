@@ -492,6 +492,23 @@ export default function App() {
         </div>
       ) : null}
 
+      {/* The drawing convention, stated ONCE. Every delivered wording below is drawn as the push it
+          became, and a picture of a notification asserts "a phone showed this text" — true of the
+          delivery and false of the words, which today's prompt wrote from the stored input rather
+          than quoting what went out. Per card it would be the same sentence 200 times, which is
+          how a caveat stops being read; here it qualifies the convention, where it belongs.
+
+          Gated on `messages` as well as `decisions`: with the wording pass empty — a Vertex outage,
+          which /messages is a separate endpoint precisely to survive — nothing on the page is drawn
+          as a notification, and a caveat about a convention no row uses is just noise. */}
+      {!loading && !error && decisions.length > 0 && messages.length > 0 ? (
+        <p className="tb-caveat tb-caveat--above-list">
+          Varslene under er tegnet slik de ser ut på telefonen. Ordlyden er{' '}
+          <strong>skrevet på nytt av dagens prompt</strong> fra det lagrede skrivegrunnlaget — det
+          er ikke teksten som faktisk gikk ut.
+        </p>
+      ) : null}
+
       {/* Dimmed while a fetch is in flight: the list is deliberately left up rather than blanked
           (a filter change should not make the page jump), but a cold query runs ~2 s and the rows
           still standing are the OLD filter's. Without the cue, ticking a filter looks like it did
