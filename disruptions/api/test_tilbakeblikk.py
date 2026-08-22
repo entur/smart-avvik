@@ -11,9 +11,8 @@ rather than loud:
   every parameter lands in the response-cache key on a public unauthenticated endpoint. Two
   free-form second-resolution times are on the order of a billion keys per day, each one a cache
   entry and a BigQuery query. The checks assert the bound rather than assuming it.
-* **The redaction.** No decision row may carry `journey_digest`, `from_stop`, `to_stop` or
-  `message_input`, and the last of those is specific to this surface — it embeds all three of
-  origin, destination and departure time in one blob.
+* **The redaction.** Decision rows carry display names for the registered endpoints, but never
+  `journey_digest`, raw `from_stop`/`to_stop` refs, or `message_input`.
 * **The SQL text.** Nothing in this repo executes SQL and CI has no GCP credentials, so a defect in
   a .sql file ships green. The grep-level checks at the bottom pin the properties whose failure mode
   is a silently wrong answer rather than an error: the null-unsafe array test, the partition bounds,
@@ -65,6 +64,8 @@ def _row(**overrides) -> dict:
         "operator": "VYG",
         "line": "VYG:Line:R11",
         "mode": "Tog",
+        "from_stop": "NSR:StopPlace:337",
+        "to_stop": "NSR:StopPlace:548",
         "call_date": date(2026, 7, 30),
         "departure_time": DEP,
         "n_decisions": 4,
@@ -445,7 +446,7 @@ def test_two_times_in_one_step_share_a_cache_entry_and_a_query():
             params={"day": PAST_DAY.isoformat(), "from_time": minute, "to_time": "15:00"},
         )
     assert len(_decision_calls()) == 1, "three times inside one 15-minute step must share one query"
-    assert len(tilbakeblikk._cache) == 1
+    assert len(tilbakeblikk._cache) == 2  # decision list + shared stop-name lookup
 
 
 def test_a_reversed_or_empty_time_range_is_rejected_without_a_query():
@@ -658,12 +659,15 @@ def test_verdict_filter_is_validated():
     assert fake.calls == []
 
 
-def test_an_unfiltered_request_spends_no_query_on_the_allow_list():
+def test_an_unfiltered_request_skips_the_allow_list_but_resolves_route_names():
     """The default load is the common one and needs no vocabulary to validate. Checking it
     unconditionally would double every page load's BigQuery cost for nothing."""
     _reset([_row()])
     client.get("/tilbakeblikk-api/decisions")
-    assert [c[0] for c in fake.calls] == [tilbakeblikk._DECISIONS_QUERY]
+    assert [c[0] for c in fake.calls] == [
+        tilbakeblikk._DECISIONS_QUERY,
+        tilbakeblikk._STOP_PLACES_QUERY,
+    ]
 
 
 def test_the_allow_list_itself_is_keyed_on_the_window_alone():
@@ -868,12 +872,8 @@ def test_an_alert_worthy_subject_collapsed_into_a_sibling_says_so():
     assert d["other_pushed_on_train"] == 1
 
 
-def test_response_carries_no_traveller_journey_identifiers_and_no_writer_input():
-    """The public response describes a train, never whose trip it was.
-
-    from_stop/to_stop/journey_digest next to departure_time and n_devices would publish "somebody
-    commutes A->B at 07:15". message_input is the fourth and is specific to this surface: it embeds
-    all three of origin, destination and departure time in one blob.
+def test_response_carries_route_names_but_no_internal_identifiers_or_writer_input():
+    """The public response names the route while keeping its internal keys and prompt input private.
 
     This asserts the WHOLE key set, so a future field addition fails here rather than shipping.
     Note what is absent besides the redacted four: `message` and `message_source`. The stored wording
@@ -882,10 +882,13 @@ def test_response_carries_no_traveller_journey_identifiers_and_no_writer_input()
     """
     _reset([_row()])
     d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
+    assert d["from_name"] == "Oslo S"
+    assert d["to_name"] == "Asker stasjon"
     assert not {"journey_digest", "from_stop", "to_stop", "stop_place", "message_input"} & set(d)
     assert not {"message", "message_source"} & set(d)
     assert set(d) == {
-        "situation_number", "summary", "description", "operator", "line", "mode", "call_date",
+        "situation_number", "summary", "description", "operator", "line", "mode", "from_name",
+        "to_name", "call_date",
         "departure_time", "n_decisions", "first_decided_at", "last_decided_at",
         "ever_alerted", "first_alert_at", "alert_lead_min",
         "max_impact_probability", "final_impact_probability", "final_cancel_probability",
@@ -896,13 +899,26 @@ def test_response_carries_no_traveller_journey_identifiers_and_no_writer_input()
     }
 
 
+def test_route_names_fall_back_to_refs_when_the_stop_registry_is_unavailable():
+    _reset([_row()])
+    fake.error_on = tilbakeblikk._STOP_PLACES_QUERY
+    d = client.get("/tilbakeblikk-api/decisions").json()["decisions"][0]
+    assert d["from_name"] == "NSR:StopPlace:337"
+    assert d["to_name"] == "NSR:StopPlace:548"
+
+
 def test_the_decision_model_refuses_a_redacted_column():
     """`extra="forbid"` is what keeps the SELECT honest: it makes the SQL and this model agree column
     for column, so a future query that picks up a redacted one fails loudly here instead of quietly
     widening what an unauthenticated public host serves."""
+    public_row = _row()
+    public_row["from_name"] = "Oslo S"
+    public_row["to_name"] = "Asker stasjon"
+    public_row.pop("from_stop")
+    public_row.pop("to_stop")
     for redacted in ("journey_digest", "from_stop", "to_stop", "message_input"):
         try:
-            tilbakeblikk.Decision(**_row(), **{redacted: "x"})
+            tilbakeblikk.Decision(**public_row, **{redacted: "x"})
             raise AssertionError(f"Decision must reject {redacted} — extra='forbid' is the guard")
         except ValidationError:
             pass
@@ -1797,19 +1813,11 @@ def test_the_writers_input_is_named_by_the_messages_query_alone():
             assert not leaks, f"{name}: message_input reached a SELECT list as a value"
 
 
-def test_the_registered_endpoints_are_filterable_but_never_projected():
-    """The 2026-08-21 reversal on /historikk, inherited here with its remaining limit intact.
-
-    from_place/to_place are FILTERS and /filters publishes the vocabulary, so a pair can be chosen
-    and the matching departures read off. What did NOT change is the per-row redaction: no decision
-    carries from_stop or to_stop, so a card still names a train rather than a trip. The filters query
-    is the deliberate exemption — it must project both as the dropdown vocabulary (R13).
-    """
-    for name in ("decisions", "summary"):
-        for projection in _projections(_QUERIES[name]):
-            assert "from_stop" not in projection and "to_stop" not in projection, (
-                f"{name}: a registered endpoint reached a SELECT list"
-            )
+def test_the_registered_endpoints_are_projected_only_for_server_side_name_resolution():
+    """Decisions may carry refs internally so the API can resolve card labels; summary may not."""
+    assert any("from_stop" in p and "to_stop" in p for p in _projections(_QUERIES["decisions"]))
+    for projection in _projections(_QUERIES["summary"]):
+        assert "from_stop" not in projection and "to_stop" not in projection
     assert any("from_stop" in p for p in _projections(_QUERIES["filters"])), (
         "the filters query must project from_stop; it is the dropdown vocabulary"
     )

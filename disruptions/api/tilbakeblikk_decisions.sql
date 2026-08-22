@@ -95,10 +95,10 @@
 -- measurement above says the population is currently empty (0 NULL departure_time in 14 days), so
 -- this is a contract note rather than an observed loss.
 --
--- PRIVACY (KTD10, inherited verbatim from /historikk): the traveller-identifying triple
--- (journey_digest, from_stop, to_stop) is never projected. journey_digest and the two stop refs are
--- used as JOIN and PARTITION BY and WHERE and ORDER BY terms only. `message_input` is the fourth
--- redaction and the one specific to this surface: it embeds origin, destination and departure time
+-- PRIVACY: journey_digest and `message_input` never leave this query. The endpoint does project the
+-- two stop refs so the server can resolve human-readable route names, then removes the refs before
+-- response validation. `message_input` is the remaining surface-specific redaction: it embeds
+-- origin, destination and departure time
 -- in one blob. It appears below in a PREDICATE only, never in a projection, and it must: the replay
 -- cycle this file names in `would_send_at` has to be the same cycle tilbakeblikk_messages.sql
 -- fetches the input for, or the card would state a send time for a wording the page cannot produce.
@@ -110,7 +110,7 @@ WITH scanned AS (
   -- comes with it.
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
-    summary, description, line, mode, stop_place, departure_time,
+    summary, description, line, mode, stop_place, from_stop, to_stop, departure_time,
     decided_at, alertworthy, et_cancelled, impact_probability, cancel_probability,
     delay_p50_min, delay_p90_min, alert_threshold, pushed, n_devices, prompt_version,
     -- Why no push went out is a question this page will provoke on every silent card, and this is
@@ -165,6 +165,8 @@ subjects AS (
     ANY_VALUE(line)        AS line,
     ANY_VALUE(mode)        AS mode,
     ANY_VALUE(stop_place)  AS stop_place,
+    ANY_VALUE(from_stop)   AS from_stop,
+    ANY_VALUE(to_stop)     AS to_stop,
     -- MAX rather than ANY_VALUE, and only here: this column decides the ORDER BY, and
     -- tilbakeblikk_messages.sql has to resolve the SAME ordered list so the two responses align
     -- position by position. ANY_VALUE is free to pick differently in two queries over the same rows.
@@ -270,7 +272,7 @@ subjects_marked AS (
 )
 SELECT
   s.situation_number, s.summary, s.description,
-  s.operator, s.line, s.mode, s.call_date, s.departure_time,
+  s.operator, s.line, s.mode, s.from_stop, s.to_stop, s.call_date, s.departure_time,
   s.n_decisions, s.first_decided_at, s.last_decided_at,
   s.ever_alerted, s.first_alert_at,
   -- Now agrees with the nightly job's alert_lead_min by construction rather than by a recomputation
