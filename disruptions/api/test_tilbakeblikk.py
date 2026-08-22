@@ -1070,7 +1070,7 @@ def test_one_request_can_generate_every_subject_the_endpoint_may_return():
         gemini=lambda body: calls.append(body) or OK_REPLY,
     ):
         body = _messages()
-    assert tilbakeblikk._CALLS_PER_SUBJECT == 1
+    assert tilbakeblikk._CALLS_PER_ATTEMPT == 1
     assert tilbakeblikk._MAX_CALLS_PER_REQUEST >= tilbakeblikk._MAX_LIMIT
     assert len(calls) == 12, "Gemini is called exactly once for each subject"
     assert _statuses(body) == ["ok"] * 12
@@ -1249,7 +1249,7 @@ def test_a_subject_with_no_stored_input_is_its_own_state_and_costs_nothing():
     # never made would eat the allowance of subjects further down the list, and on a window where
     # most subjects never crossed the alert gate that is most of the page.
     assert len(tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH].hour) == (
-        tilbakeblikk._CALLS_PER_SUBJECT
+        tilbakeblikk._CALLS_PER_ATTEMPT
     ), "exactly one subject's worth of budget was spent"
 
 
@@ -1271,22 +1271,40 @@ def test_a_configuration_error_latches_only_the_replay_holder():
     assert llm_message.generation_enabled() is True, "the poller can still write a wording"
 
 
-def test_a_transient_backend_failure_is_reported_per_subject():
-    """One subject's Vertex problem must cost one card, never the page. A transient failure is also
-    the one that does NOT try the other backend — `write_message_detailed` returns immediately — so
-    it is a single call, and the subjects after it still get theirs."""
+def test_a_transient_backend_failure_is_retried_once_per_subject():
+    """A momentary Vertex failure should recover inside the request without hiding other rows."""
     _reset(message_rows=_subjects(3))
+    calls = []
 
     def flaky(body):
-        if json.loads(body)["sak"] == "S1":
+        subject = json.loads(body)["sak"]
+        calls.append(subject)
+        if subject == "S1" and calls.count(subject) == 1:
             raise RuntimeError("deadline exceeded")
         return OK_REPLY
 
     with _backends(flaky):
         body = _messages()
-    assert _statuses(body) == ["ok", "error", "ok"]
-    assert body["messages"][1]["message"] is None
-    assert body["messages"][1]["deterministic_message"], "the template arm survives the failure"
+    assert _statuses(body) == ["ok", "ok", "ok"]
+    assert calls.count("S1") == 2, "the transient failure should get exactly one retry"
+    assert len(tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH].hour) == len(calls), (
+        "the retry must spend the same hourly allowance as every other backend call"
+    )
+
+
+def test_a_persistent_backend_failure_stops_after_one_retry():
+    """Automatic recovery must not turn an unavailable backend into an unbounded call loop."""
+    _reset(message_rows=_subjects(1))
+    calls = []
+
+    def unavailable(body):
+        calls.append(body)
+        raise RuntimeError("service unavailable")
+
+    with _backends(unavailable):
+        body = _messages()
+    assert _statuses(body) == ["error"]
+    assert len(calls) == tilbakeblikk._MAX_BACKEND_ATTEMPTS == 2
 
 
 def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time():
