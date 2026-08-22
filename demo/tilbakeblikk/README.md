@@ -112,11 +112,11 @@ felles endepunkt ville gitt 503 på hele siden. Listene er stilt opp **posisjon 
 vindu, samme filtre, samme `ORDER BY`, samme `limit`), og siden *kontrollerer* det mot de fire
 identifiserende feltene `/messages` ekkoer, i stedet for å stole blindt på rekkefølgen.
 
-Avspilling er dessuten rammet inn: et tak på modellkall per forespørsel, en egen minuttkvote som
-aldri kan spise av den varsel-løypa bruker til ekte push, en tidsfrist, og en hurtigbuffer. Rammene
-sjekkes *etter* hurtigbufferen, så en ny lasting av siden fyller lenger ned i lista i stedet for å
-skrive de samme tolv radene om igjen. Står det at N kort venter på en senere runde, er det derfor
-svaret er «last på nytt».
+Avspilling er dessuten rammet inn: opptil 1 000 modellkall per forespørsel og time, 5 000 per døgn,
+en tidsfrist og en egen hurtigbuffer. En vellykket eller innholdsbestemt formulering ligger i minnet
+til neste utrulling (eller til den av kapasitetsgrunner skyves ut); forbigående feil prøves igjen
+etter 60 sekunder. Hurtigbufferen sjekkes før kvotene, så en ny lasting bruker ingen modellkall for
+kort denne prosessen allerede har skrevet.
 
 ## Kjøre lokalt
 
