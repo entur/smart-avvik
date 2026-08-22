@@ -366,6 +366,11 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.tb-route {
+  font-size: 0.9375rem;
+  font-weight: 600;
+}
+
 /* The second time is context, not identity — when the replayed wording could have gone out, or when
    we last looked and said nothing. Italic and subdued so it cannot compete with the departure
    beside it now that the two share a line; the label inside it carries the distinction, and on this

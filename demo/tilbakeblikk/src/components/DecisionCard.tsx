@@ -226,6 +226,7 @@ export default function DecisionCard({
           <span className="tb-mode">{decision.mode ?? 'Tog'}</span>
           <span className="tb-line">{lineCode(decision.line)}</span>
           <span className="tb-departure">{fmtDeparture(decision)}</span>
+          <span className="tb-route">{decision.from_name} → {decision.to_name}</span>
           <DepartureWhen decision={decision} />
         </div>
         <div className="tb-card-badges">
