@@ -934,24 +934,25 @@ def test_a_transient_failure_does_not_spend_the_payload_retry_budget(monkeypatch
     `ungrounded`**. The budget meant for hopeless payloads was, in practice, spent entirely on
     transient failures — while 55 % of subjects that hit an error went on to succeed later.
     """
-    _reset_state()
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
-    calls = []
+    for failure_status in ("error", "truncated"):
+        _reset_state()
+        calls = []
 
-    def transient(*a, outcome=None, **k):
-        calls.append(1)
-        if outcome is not None:
-            outcome["status"] = "error"
+        def transient(*a, outcome=None, **k):
+            calls.append(1)
+            if outcome is not None:
+                outcome["status"] = failure_status
 
-    monkeypatch.setattr(varsel, "_write_message", transient)
-    _register(DEVICE)
+        monkeypatch.setattr(varsel, "_write_message", transient)
+        _register(DEVICE)
 
-    for _ in range(6):
-        varsel.check_and_notify(SNAPSHOT)
+        for _ in range(6):
+            varsel.check_and_notify(SNAPSHOT)
 
-    assert len(calls) == 6, (
-        f"a transient failure spent the payload budget and stopped the retries after {len(calls)}"
-    )
+        assert len(calls) == 6, (
+            f"{failure_status} spent the payload budget and stopped after {len(calls)} retries"
+        )
 
 
 def test_a_transient_failure_is_still_bounded_by_its_own_budget(monkeypatch):

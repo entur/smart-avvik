@@ -214,7 +214,7 @@ _MAX_TRANSIENT_ATTEMPTS = 12
 # must charge neither counter -- that is the path that produced prd's 753 `llm_disabled` rows beside
 # 693 `attempts_exhausted` across the same 11 subjects on 2026-08-07.
 _PAYLOAD_FAILURES = frozenset({"rejected", "ungrounded"})
-_TRANSIENT_FAILURES = frozenset({"error"})
+_TRANSIENT_FAILURES = frozenset({"error", "truncated"})
 # Written messages per JOURNEY per cycle. The cycle cap above bounds the poller thread; this one
 # stops a single journey spending all of it. A journey routinely has more disrupted trains than
 # either budget can cover -- measured on dev over 4 099 journey-cycles: p50 3 alert-worthy trains,

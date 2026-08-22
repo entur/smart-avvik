@@ -139,7 +139,8 @@ export interface DecisionsResponse extends WindowFields {
  *    not an error, not "no message", and no generation was attempted.
  *  - `unreadable_input` — a recorded input that would not parse.
  *  - `disabled` — no backend could be ASKED. Never means "this deployment sends the template".
- *  - `unavailable` / `error` / `rejected` / `ungrounded` — straight off llm_message.MessageResult.
+ *  - `unavailable` / `error` / `truncated` / `rejected` / `ungrounded` — straight off
+ *    llm_message.MessageResult.
  *  - `capped` / `rate_limited` / `deadline` — this request's own bounds. The subject was not
  *    attempted, and a later request picks it up, because the cache is consulted before the budget. */
 export type ReplayStatus =
@@ -149,6 +150,7 @@ export type ReplayStatus =
   | 'disabled'
   | 'unavailable'
   | 'error'
+  | 'truncated'
   | 'rejected'
   | 'ungrounded'
   | 'capped'

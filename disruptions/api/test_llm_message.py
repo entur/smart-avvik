@@ -937,6 +937,30 @@ def test_each_failure_mode_is_named_rather_than_collapsed_to_none():
     assert result.text is None
 
 
+def test_a_token_truncated_reply_is_not_reported_as_payload_rejection():
+    """MAX_TOKENS is backend capacity, not a verdict on the prompt or its payload.
+
+    The replay cache keeps payload rejections until restart.  Flattening truncation into
+    ``rejected`` therefore makes one unlucky Gemini draw permanent and tells the UI that the answer
+    itself was refused, while the actual answer was never completed.
+    """
+    _reset(provider="gemini")
+
+    def truncated(body):
+        raise llm_message._TruncatedReply("MAX_TOKENS")
+
+    previous = llm_message._BACKENDS["gemini"]
+    llm_message._BACKENDS["gemini"] = truncated
+    try:
+        result = llm_message.write_message_detailed({"a": 1})
+    finally:
+        llm_message._BACKENDS["gemini"] = previous
+    assert result.status == "truncated"
+    assert result.text is None
+    assert result.provider == "gemini"
+    assert result.model == llm_message._GEMINI_MODEL
+
+
 def test_an_ungrounded_reply_is_not_recorded_as_a_plain_rejection():
     """A model quoting a figure that is not in the payload is a grounding failure, not an empty
     reply. Flattening the two would hide the only failure mode that reaches a lock screen if the
@@ -1236,6 +1260,8 @@ def test_a_discarded_reply_is_returned_beside_the_status_that_rejected_it():
     assert result.status == "rejected"
     assert result.text is None
     assert result.discarded == too_long
+    assert result.provider == "claude"
+    assert result.model == llm_message._CLAUDE_MODEL
 
 
 def test_a_successful_call_discards_nothing():

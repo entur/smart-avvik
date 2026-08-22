@@ -1548,6 +1548,28 @@ def test_a_refused_payload_is_cached_until_restart():
         tilbakeblikk.monotonic = real
 
 
+def test_a_token_truncated_reply_expires_on_the_transient_cache_ttl():
+    """A fresh draw can fit even when the previous draw exhausted its output-token budget."""
+    _reset()
+    clock = [1000.0]
+    real = tilbakeblikk.monotonic
+    tilbakeblikk.monotonic = lambda: clock[0]
+    try:
+        wording = tilbakeblikk._Wording(
+            message=None,
+            deterministic="template",
+            status="truncated",
+            discarded=None,
+            provider="gemini",
+            model="gemini-3.7-flash",
+        )
+        tilbakeblikk._remember_wording(("truncated",), wording)
+        clock[0] += tilbakeblikk._WORDING_ERROR_TTL_S + 1
+        assert tilbakeblikk._cached_wording(("truncated",)) is None
+    finally:
+        tilbakeblikk.monotonic = real
+
+
 def test_the_wording_cache_is_bounded():
     """10 000 entries, each a wording of at most 300 characters plus its metadata. Memory is the
     binding constraint on this pod — no CPU limit, but always a memory one (1228 Mi in dev),
