@@ -244,7 +244,7 @@ export const REPLAY_STATUS_LABEL: Record<ReplayStatus, string> = {
   rejected: 'Svaret ble forkastet',
   ungrounded: 'Svaret var ikke forankret',
   capped: 'Utenfor rammen i denne runden',
-  rate_limited: 'Minuttkvoten er brukt opp',
+  rate_limited: 'Avspillingskvoten er brukt opp',
   deadline: 'Tiden løp ut',
 };
 
@@ -275,8 +275,8 @@ export const REPLAY_STATUS_HELP: Record<ReplayStatus, string> = {
     'Forespørselen brukte opp rammen sin på modellkall. Last siden på nytt: allerede skrevne ' +
     'tekster kommer fra hurtigbufferen, så neste runde bruker rammen lenger ned i lista.',
   rate_limited:
-    'Avspilling har sin egen kvote per minutt, slik at den aldri kan spise av kvoten varsel-løypa ' +
-    'bruker til ekte push. Vent et minutt og last på nytt.',
+    'Avspilling har en egen kvote på 1 000 modellkall per time og 5 000 per døgn. Allerede skrevne ' +
+    'tekster ligger i hurtigbufferen til neste utrulling. Prøv igjen senere.',
   deadline:
     'Forespørselen har en tidsfrist, og det var ikke rom for et kall til innenfor den. Last på ' +
     'nytt for å fylle flere.',

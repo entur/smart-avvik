@@ -248,12 +248,14 @@ def _reset(rows=None, error=None, filter_rows=None, registry=None, message_rows=
     fake.error_on = None
     tilbakeblikk._cache.clear()  # the TTL cache would otherwise serve a previous test's rows
     # The replay state, all four pieces of it. Leaving any one behind makes a later check pass for
-    # the wrong reason: a warm wording cache hides a missing backend call, a spent per-minute tally
+    # the wrong reason: a warm wording cache hides a missing backend call, a spent replay tally
     # makes a budget check "bind" before it should, and a latched replay holder reports `disabled`
     # where a test expects an answer.
     tilbakeblikk._wordings.clear()
+    tilbakeblikk._wording_inflight.clear()
     for spent in tilbakeblikk._replay_calls.values():
-        spent.clear()
+        spent.hour.clear()
+        spent.day.clear()
     tilbakeblikk._replay_state = None
     tilbakeblikk._warned_no_writer = False
     deterministic_inputs.clear()
@@ -1057,38 +1059,25 @@ def test_a_narrower_window_picks_a_different_cycle_and_misses_the_cache():
     assert len(calls) == 2, "a different replayed cycle is a different wording"
 
 
-def test_the_per_request_cap_counts_backend_calls_not_subjects():
-    """Under `auto` one subject can cost two calls: an ungrounded reply continues to the next
-    backend, and a prompt edit that trips the grounding check trips it for EVERY subject at once —
-    which is exactly the situation somebody has this page open in. A cap counted in subjects would
-    then let one request spend twice its stated ceiling of Vertex calls, and the resource that
-    ceiling protects is the quota the poller's push wordings share."""
+def test_one_request_can_generate_every_subject_the_endpoint_may_return():
+    """The hourly and daily ceilings own spend now. The request cap must not make a normal page
+    require repeated reloads: the deployed Gemini-only provider makes one call per subject."""
     _reset(message_rows=_subjects(12))
+    llm_message._PROVIDER = "gemini"
     calls = []
     with _backends(
-        lambda body: calls.append(body) or UNGROUNDED_REPLY,
-        gemini=lambda body: calls.append(body) or "",
+        _never_called,
+        gemini=lambda body: calls.append(body) or OK_REPLY,
     ):
         body = _messages()
-    cap = tilbakeblikk._MAX_CALLS_PER_REQUEST
-    assert len(calls) == cap, f"the cap is {cap} CALLS; {len(calls)} were made"
-    statuses = _statuses(body)
-    assert statuses.count("ungrounded") == cap // tilbakeblikk._CALLS_PER_SUBJECT == 6
-    assert statuses.count("ungrounded") < 12, "fewer subjects than the cap: each cost two calls"
-    assert statuses.count("capped") == 6, "the rest are reported, not silently absent"
+    assert tilbakeblikk._CALLS_PER_SUBJECT == 1
+    assert tilbakeblikk._MAX_CALLS_PER_REQUEST >= tilbakeblikk._MAX_LIMIT
+    assert len(calls) == 12, "Gemini is called exactly once for each subject"
+    assert _statuses(body) == ["ok"] * 12
 
 
-def test_the_next_request_generates_the_next_subjects_and_serves_the_rest_free():
-    """Successive requests fill the page progressively. The cache is consulted BEFORE the budget, so
-    a wording already held costs nothing and the budget lands on a subject that has none — without
-    that order the first twelve would be re-served forever and a day's worth of subjects would be
-    unreachable.
-
-    The property asserted is disjointness and coverage, not exact positions: with a four-wide pool
-    the winners are the first six subjects the pool REACHES, which is the first six give or take a
-    position. What must hold — and what the cache-before-budget order is for — is that the second
-    request spends its budget on the six it does not already hold, and on nothing else.
-    """
+def test_a_second_request_serves_every_subject_from_cache():
+    """Once a deployment has generated a subject, page reloads spend no further backend calls."""
     _reset(message_rows=_subjects(12))
     seen = []
 
@@ -1099,31 +1088,86 @@ def test_the_next_request_generates_the_next_subjects_and_serves_the_rest_free()
     with _backends(claude):
         first = _messages()
         second = _messages()
-    assert len(seen) == 12 and len(set(seen)) == 12, (
-        "each subject generated exactly once across the two requests: none re-served, none skipped"
-    )
-    assert not set(seen[:6]) & set(seen[6:]), "the second request must generate the OTHER six"
-    assert _statuses(first).count("ok") == 6 and _statuses(first).count("capped") == 6
-    assert _statuses(second) == ["ok"] * 12, "the first six now come free from the cache"
+    assert len(seen) == 12 and len(set(seen)) == 12
+    assert _statuses(first) == ["ok"] * 12
+    assert _statuses(second) == ["ok"] * 12
 
 
-def test_the_per_minute_budget_binds_across_requests_and_is_logged_once():
-    """One request's cap does not bound a caller who refreshes; the per-minute budget does. It is
-    sized at one full request's worth inside the wall-clock deadline, so it binds on a second
-    concurrent reader rather than never."""
-    _reset(message_rows=_subjects(18))
+def test_concurrent_cold_requests_share_one_generated_wording():
+    """The two admitted requests must not spend twice or disagree on a stochastic first draw."""
+    _reset()
+    llm_message._PROVIDER = "gemini"
+    entered = threading.Event()
+    release = threading.Event()
     calls = []
-    with _backends(lambda body: calls.append(body) or OK_REPLY):
-        _messages()
-        _messages()
-        with _captured(logging.WARNING) as records:
-            third = _messages()
-    assert _statuses(third).count("rate_limited") == 6, "the subjects it could not reach say so"
-    assert _statuses(third).count("ok") == 12, "the twelve it already holds are served free"
-    assert len(calls) == 12, "the third request must spend no backend call at all"
+    results = []
+
+    def gemini(body):
+        calls.append(body)
+        entered.set()
+        assert release.wait(2)
+        return OK_REPLY
+
+    def replay():
+        results.append(
+            tilbakeblikk._replay_one_cached(
+                _message_row(),
+                budget=tilbakeblikk._Budget(),
+                deadline=_time.monotonic() + 30,
+                generating=True,
+            )
+        )
+
+    with _backends(_never_called, gemini=gemini):
+        first = threading.Thread(target=replay)
+        second = threading.Thread(target=replay)
+        first.start()
+        assert entered.wait(2)
+        second.start()
+        _time.sleep(0.05)
+        release.set()
+        first.join(2)
+        second.join(2)
+    assert len(calls) == 1
+    assert results == [results[0], results[0]]
+
+
+def test_the_hourly_budget_allows_1000_calls_then_binds_across_requests():
+    _reset()
+    now = _time.monotonic()
+    assert tilbakeblikk._Budget().reserve(1000, now) is None
+    with _captured(logging.WARNING) as records:
+        assert tilbakeblikk._Budget().reserve(1, now) == "rate_limited"
+    assert tilbakeblikk._MAX_CALLS_PER_HOUR == 1000
+    assert len(_reason(records, "rate_limited")) == 1
+
+
+def test_the_daily_budget_allows_5000_calls_then_binds_across_requests():
+    _reset()
+    now = _time.monotonic()
     spent = tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH]
-    assert len(spent) == tilbakeblikk._MAX_CALLS_PER_MIN == 24
-    assert len(_reason(records, "rate_limited")) == 1, "logged once per request, not once per subject"
+    spent.day.extend([now - 2 * 60 * 60] * 4999)
+    assert tilbakeblikk._Budget().reserve(1, now) is None
+    assert tilbakeblikk._Budget().reserve(1, now) == "rate_limited"
+    assert tilbakeblikk._MAX_CALLS_PER_DAY == 5000
+
+
+def test_rolling_budgets_release_calls_at_each_window_boundary():
+    _reset()
+    now = _time.monotonic()
+    spent = tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH]
+    spent.hour.extend([now] * 1000)
+    spent.day.extend([now - 2 * 60 * 60] * 4999)
+    assert tilbakeblikk._Budget().reserve(1, now) == "rate_limited"
+    assert tilbakeblikk._Budget().reserve(1, now + tilbakeblikk._HOUR_WINDOW_S) is None
+    assert tilbakeblikk._Budget().reserve(1, now + tilbakeblikk._DAY_WINDOW_S) is None
+
+
+def test_every_helm_environment_and_the_base_pin_gemini():
+    root = Path(__file__).parents[2] / "helm/kix-avvik"
+    values = [root / "values.yaml", *sorted((root / "env").glob("*.yaml"))]
+    for path in values:
+        assert "VARSEL_LLM_PROVIDER: gemini" in path.read_text(), path
 
 
 def test_the_budget_is_tallied_against_replays_own_allowance_not_the_pollers():
@@ -1136,13 +1180,15 @@ def test_the_budget_is_tallied_against_replays_own_allowance_not_the_pollers():
     share a quota."""
     _reset(message_rows=_subjects(2))
     now = _time.monotonic()
-    tilbakeblikk._replay_calls[tilbakeblikk._POLLER_PATH][:] = [now] * 1000
+    poller = tilbakeblikk._replay_calls[tilbakeblikk._POLLER_PATH]
+    poller.hour.extend([now] * 1000)
+    poller.day.extend([now] * 1000)
     calls = []
     with _backends(lambda body: calls.append(body) or OK_REPLY):
         body = _messages()
     assert _statuses(body) == ["ok", "ok"], "another caller's spend must not bind replay"
     assert len(calls) == 2
-    assert tilbakeblikk._replay_calls[tilbakeblikk._POLLER_PATH] == [now] * 1000, (
+    assert list(poller.hour) == [now] * 1000 and list(poller.day) == [now] * 1000, (
         "replay must never draw down another caller's allowance"
     )
 
@@ -1202,7 +1248,7 @@ def test_a_subject_with_no_stored_input_is_its_own_state_and_costs_nothing():
     # Not merely "no call was made" — no budget was CHARGED either. A subject charged for a call it
     # never made would eat the allowance of subjects further down the list, and on a window where
     # most subjects never crossed the alert gate that is most of the page.
-    assert len(tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH]) == (
+    assert len(tilbakeblikk._replay_calls[tilbakeblikk._REPLAY_PATH].hour) == (
         tilbakeblikk._CALLS_PER_SUBJECT
     ), "exactly one subject's worth of budget was spent"
 
@@ -1252,6 +1298,7 @@ def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time
 
     Nothing downstream cuts a hang off: the chart sets no ingress timeout. So the contract is 200
     with what was answered, never a hang and never a 5xx."""
+    assert tilbakeblikk._WORST_CASE_CALL_S == llm_message._TIMEOUT_S
     _reset(message_rows=_subjects(8))
     deadline_s, worst_case = tilbakeblikk._REQUEST_DEADLINE_S, tilbakeblikk._WORST_CASE_CALL_S
     tilbakeblikk._REQUEST_DEADLINE_S = 0.6
@@ -1429,16 +1476,9 @@ def test_the_replay_slot_is_released_so_requests_do_not_leak_capacity():
     assert not tilbakeblikk._replay_slots.locked(), "slots were not returned"
 
 
-def test_the_concurrency_ceiling_matches_the_per_minute_budget_it_is_derived_from():
-    """Two, because `_MAX_CALLS_PER_MIN` is exactly two requests' worth of `_MAX_CALLS_PER_REQUEST`.
-
-    A third concurrent caller was going to be answered `rate_limited` for every subject anyway, so
-    refusing it outright is the same answer sooner. If either budget moves, this ceiling has to be
-    re-derived rather than left where it happens to sit — that is what this pins.
-    """
-    assert tilbakeblikk._MAX_CONCURRENT_REPLAYS == (
-        tilbakeblikk._MAX_CALLS_PER_MIN // tilbakeblikk._MAX_CALLS_PER_REQUEST
-    )
+def test_the_concurrency_ceiling_remains_small_despite_the_larger_spend_budget():
+    """A higher spend ceiling must not create unbounded pools, BigQuery jobs, or request threads."""
+    assert tilbakeblikk._MAX_CONCURRENT_REPLAYS == 2
 
 
 def test_messages_takes_the_same_allow_list_as_decisions():
@@ -1455,19 +1495,9 @@ def test_messages_takes_the_same_allow_list_as_decisions():
     assert fake.calls == [], "a rejected filter must not reach BigQuery"
 
 
-def test_the_wording_cache_expires_a_failure_far_sooner_than_an_answer():
-    """The differential TTL is a real mechanism, not a comment.
-
-    A transient Vertex error caches for 60 s and an answer for 30 min, and the asymmetry is the whole
-    point: without it a blip pins a red badge on a card for half an hour after Vertex has recovered,
-    on the one page whose job is to show what today's prompt produces. Nothing exercised it before —
-    `monotonic` was never faked anywhere in this suite, so `_cached_wording`'s expiry branch and
-    `_remember_wording`'s stale sweep both ran only on the real clock, where neither TTL can elapse.
-
-    Both directions are asserted. Only checking that the error expires would pass on code that
-    expired everything at 60 s, which would spend a Vertex call per card per minute for a page the
-    budget expects to serve from cache.
-    """
+def test_the_wording_cache_expires_failures_but_keeps_answers_until_restart():
+    """Transient failures recover quickly; successful and payload-determined results are canonical
+    for this process and remain cached until eviction or restart."""
     _reset()
     clock = [1000.0]
     real = tilbakeblikk.monotonic
@@ -1480,25 +1510,24 @@ def test_the_wording_cache_expires_a_failure_far_sooner_than_an_answer():
         assert tilbakeblikk._cached_wording(("ok",)) == ok
         assert tilbakeblikk._cached_wording(("err",)) == err
 
-        # Past the failure's life, well inside the answer's.
+        # Past the failure's life.
         clock[0] += tilbakeblikk._WORDING_ERROR_TTL_S + 1
         assert tilbakeblikk._cached_wording(("err",)) is None, "a failed draw outlived its short TTL"
         assert tilbakeblikk._cached_wording(("ok",)) == ok, "an answer expired on the failure's TTL"
 
-        # ...and past the answer's.
-        clock[0] += tilbakeblikk._WORDING_TTL_S
-        assert tilbakeblikk._cached_wording(("ok",)) is None, "an answer never expired"
+        clock[0] += 365 * 24 * 60 * 60
+        assert tilbakeblikk._cached_wording(("ok",)) == ok, "an answer expired before restart"
     finally:
         tilbakeblikk.monotonic = real
 
 
-def test_a_refused_payload_keeps_the_full_wording_ttl():
-    """`rejected` and `ungrounded` are payload-determined, so they keep the long life.
+def test_a_refused_payload_is_cached_until_restart():
+    """`rejected` and `ungrounded` are payload-determined, so they share the stable-result lifetime.
 
     The same stored `message_input` under the same PROMPT_VERSION will be refused again — re-asking
     spends a Vertex call to learn nothing. Only `error` says merely that the backend was unreachable
     a moment ago. This is the same cut `varsel` makes with `_message_attempts` vs `_message_errors`,
-    expressed here as a TTL rather than a counter, and it is why the two lifetimes must not be
+    expressed here as a cache lifetime rather than a counter, and it is why the two lifetimes must not be
     unified on the grounds that both are failures.
     """
     _reset()
@@ -1520,7 +1549,7 @@ def test_a_refused_payload_keeps_the_full_wording_ttl():
 
 
 def test_the_wording_cache_is_bounded():
-    """2 000 entries, each a wording of at most 300 characters plus its metadata. Memory is the
+    """10 000 entries, each a wording of at most 300 characters plus its metadata. Memory is the
     binding constraint on this pod — no CPU limit, but always a memory one (1228 Mi in dev),
     forceReplicas 1, and uvicorn binds only after lifespan's eager BigQuery loads, so an OOMKill is
     zero capacity for a whole cold start."""

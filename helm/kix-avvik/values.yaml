@@ -33,6 +33,9 @@ common:
     enabled: true
     data:
       PYTHONUNBUFFERED: "1"
+      # All deployments use one named backend. Environment files repeat this explicitly, while the
+      # base keeps future/local releases aligned with /tilbakeblikk's one-call quota accounting.
+      VARSEL_LLM_PROVIDER: gemini
       # /tilbakeblikk (past alert decisions replayed through today's prompt). Off unless an
       # environment says otherwise: main.py fails closed on its own, and this base value states
       # the same answer where an operator looks, so a fourth environment added later resolves to a

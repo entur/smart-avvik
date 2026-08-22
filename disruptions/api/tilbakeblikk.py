@@ -54,9 +54,9 @@ simulating. It asks :func:`llm_message.generation_enabled`
 and never ``delivery_enabled`` — whether a *traveller* is sent model prose is a different question,
 settled per deployment, and consulting it here would blank this page in prd, which is the one
 deployment that generates without delivering. Bounded four ways (see the constants): a per-request
-cap in backend CALLS, a per-minute budget tallied against replay's own allowance, a wall-clock
-deadline that reserves the worst case rather than measuring elapsed time, and a cache keyed on the
-replayed row plus the prompt version. It runs against its OWN backend latch
+cap in backend CALLS, hourly and daily budgets tallied against replay's own allowance, a wall-clock
+deadline that reserves the worst case rather than measuring elapsed time, and a process-lifetime
+cache keyed on the replayed row plus the prompt version. It runs against its OWN backend latch
 (:func:`llm_message.new_replay_state`), so a replay burst that drives both backends into a
 configuration error cannot strip model wordings from real pushes for the next half hour.
 
@@ -81,6 +81,7 @@ import asyncio
 import json
 import logging
 import threading
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, time, timedelta
@@ -152,31 +153,20 @@ _MAX_BYTES_BILLED = 2 * 1024**3
 # *transient* failure — `write_message_detailed` returns status="error" immediately without trying
 # the other backend — so a traveller silently receives the template and nothing on that side says so.
 #
-# 1. Per request, counted in BACKEND CALLS rather than in subjects: under VARSEL_LLM_PROVIDER=auto
-#    one subject can spend two, because an empty or ungrounded reply continues to the next backend —
-#    and a prompt edit that trips the grounding check trips it for every subject at once, which is
-#    exactly the situation somebody uses this page in.
-_MAX_CALLS_PER_REQUEST = 12
-# 2. Per minute, across requests: one full request's worth inside the wall-clock deadline below, so
-#    it binds on a second concurrent request rather than never.
-_MAX_CALLS_PER_MIN = 24
-_RATE_WINDOW_S = 60.0
+# 1. Per request, counted in backend calls. Every deployed environment pins Gemini, so one replayed
+#    subject makes at most one call. Keep this assumption aligned with the Helm environment values.
+_MAX_CALLS_PER_REQUEST = 1000
+# 2. Across requests, with enough burst allowance to regenerate a full page after a deploy and a
+#    second ceiling that bounds sustained public traffic. Cached rows cost neither allowance.
+_MAX_CALLS_PER_HOUR = 1000
+_MAX_CALLS_PER_DAY = 5000
+_HOUR_WINDOW_S = 60.0 * 60
+_DAY_WINDOW_S = 24.0 * 60 * 60
 
-# How many backend calls one subject is charged for. CONSERVATIVE, and the choice is forced:
-# `write_message_detailed` reports which backend answered but not how many it tried, so the count has
-# to be decided before the call rather than read off the result. Two alternatives were rejected.
-# Inferring it from `result.provider` fails on exactly the paths where more than one backend ran —
-# `rejected` and `ungrounded` return provider=None. Wrapping `llm_message._BACKENDS` to count for
-# real would install a counting proxy on a module global the POLLER calls through, which would both
-# count its calls and be visible to it; the isolation this surface is built around (a private latch,
-# a private client cache) exists precisely to avoid reaching into shared state like that.
-#
-# So the reservation is the `auto` worst case and is never refunded. The cost is one-sided on
-# purpose: a happy-path request (Claude answers first) generates 6 subjects rather than 12, which
-# costs a page refresh — successive requests fill the rest, since the cache is consulted before the
-# budget. An under-count would let one request spend 24 Vertex calls against a stated ceiling of 12,
-# which costs a traveller their push wording. A deployment pinned to one backend simply under-spends.
-_CALLS_PER_SUBJECT = 2
+# How many backend calls one subject is charged for. Helm pins VARSEL_LLM_PROVIDER=gemini in dev,
+# tst, and prd, and a named provider never falls through to another backend. At the endpoint's
+# 200-row limit, one page therefore reserves at most 200 calls.
+_CALLS_PER_SUBJECT = 1
 
 # 3. The wall clock, RESERVED rather than measured. `monotonic() + _WORST_CASE_CALL_S >= deadline`
 #    stops a new call being started; checking elapsed time instead would bound when the last call
@@ -184,17 +174,13 @@ _CALLS_PER_SUBJECT = 2
 #    submit time — submitted all at once, every task queues before the deadline is consulted and the
 #    bound guarantees nothing.
 #
-#    16 s is the reachable worst case for one subject, by one path only: a first backend that returns
-#    an empty or ungrounded reply near `llm_message._TIMEOUT_S` (8 s) and continues, then a second
-#    that times out. A timeout on its own does NOT reach the second backend — the generic
-#    `except Exception` returns status="error" straight away — and prd is the *cheapest* path rather
-#    than the worst, because an unserved Claude 404s in well under a second.
+#    Every environment pins one provider, so one subject can consume only the backend's 8 s timeout.
 _REQUEST_DEADLINE_S = 30.0
-_WORST_CASE_CALL_S = 16.0
+_WORST_CASE_CALL_S = 8.0
 # Pool width. `varsel`'s pools are the shape, not the number — they run 16/16/32
 # (`_MATCH_WORKERS`/`_LLM_WORKERS`/`_PUSH_WORKERS`) on the poller thread, on a cadence nobody can
 # trigger; this one is reachable from a public unauthenticated endpoint, so it is deliberately the
-# narrowest of them. At this width the per-request cap costs three rounds, about 7 s typically.
+# narrowest of them. The deadline, not the spend ceiling, limits how much work one pool can finish.
 _REPLAY_WORKERS = 4
 # ...and the ceiling on how many of those pools can exist at once. `_REPLAY_WORKERS` bounds ONE
 # request; without this, N concurrent requests mean N pools, N BigQuery jobs and 4N threads, because
@@ -203,11 +189,8 @@ _REPLAY_WORKERS = 4
 # stops one replay holding a slot traveller-facing registration needs — but it also means nothing
 # else counts these requests, so the bound has to be stated here.
 #
-# Two, because the module's own arithmetic already implies it: `_MAX_CALLS_PER_MIN` (24) is exactly
-# two requests' worth of `_MAX_CALLS_PER_REQUEST` (12), so a third concurrent caller was going to be
-# answered `rate_limited` for every subject anyway. Refusing it outright is the same answer, sooner
-# and cheaper — and a 503 is honest, where queueing would hold a connection open behind a 30 s
-# deadline it cannot see.
+# This remains deliberately independent of the spend ceilings. Raising the hourly allowance must
+# not turn a public endpoint into an unbounded number of pools, BigQuery jobs, or request threads.
 _MAX_CONCURRENT_REPLAYS = 2
 
 # 4. The wording cache, separate from the BigQuery response cache above and keyed differently: the
@@ -217,20 +200,20 @@ _MAX_CONCURRENT_REPLAYS = 2
 #    window — which picks a different cycle — correctly miss rather than serve the wider window's
 #    wording under a different time.
 #
-# 2 000 entries, each one wording of at most 300 characters plus its metadata, because memory is the
-# binding constraint on this pod (1228 Mi in dev, forceReplicas 1, and uvicorn binds only after
-# lifespan's eager BigQuery loads, so an OOMKill is zero capacity for a whole cold start).
-_WORDING_MAX_ENTRIES = 2000
-_WORDING_TTL_S = 1800.0
+# Successful and payload-determined results live until eviction or restart. A deployment restarts
+# the single pod, while `PROMPT_VERSION` explicitly invalidates prompt edits as well. 10 000 entries
+# makes repeated exploration cheap while retaining a hard memory bound.
+_WORDING_MAX_ENTRIES = 10_000
 # A failure that nothing about the input caused is cached far more briefly than an answer: a
 # transient Vertex error must not stick a red badge on a card for half an hour after Vertex
 # recovers. Cached at all, and not simply left uncached, because during an outage every refresh
 # would otherwise re-spend the whole budget on the same first subjects and never reach the rest.
 _WORDING_ERROR_TTL_S = 60.0
 _wording_lock = threading.Lock()
-_wordings: dict[tuple, tuple[float, _Wording]] = {}
+_wordings: OrderedDict[tuple, tuple[float, _Wording]] = OrderedDict()
+_wording_inflight: dict[tuple, threading.Event] = {}
 
-# The per-minute tally, keyed BY CALLER in the shape of `alternatives._fetch_calls`. Replay spends
+# The hourly/daily tally, keyed BY CALLER in the shape of `alternatives._fetch_calls`. Replay spends
 # only its own key, so its ceiling is its own number. Be honest about what this does here: the poller
 # does not call this module at all, so its slot stays empty by construction — the keying is what
 # makes that a structural property rather than a fact somebody has to keep true, and what stops a
@@ -239,7 +222,17 @@ _wordings: dict[tuple, tuple[float, _Wording]] = {}
 _REPLAY_PATH = "replay"
 _POLLER_PATH = "poller"
 _budget_lock = threading.Lock()
-_replay_calls: dict[str, list[float]] = {_REPLAY_PATH: [], _POLLER_PATH: []}
+
+
+class _CallLedger(NamedTuple):
+    hour: deque[float]
+    day: deque[float]
+
+
+_replay_calls: dict[str, _CallLedger] = {
+    _REPLAY_PATH: _CallLedger(deque(), deque()),
+    _POLLER_PATH: _CallLedger(deque(), deque()),
+}
 
 _bq_client: Any | None = None
 # varsel._deterministic_body, injected. See :func:`configure`.
@@ -1178,7 +1171,7 @@ def _wording_key(row: dict) -> tuple:
 
 
 def _cached_wording(key: tuple) -> _Wording | None:
-    """A previously generated wording for this exact row and prompt, if it has not expired."""
+    """A wording for this exact row and prompt, retained until restart unless transient."""
     now = monotonic()
     with _wording_lock:
         hit = _wordings.get(key)
@@ -1187,31 +1180,30 @@ def _cached_wording(key: tuple) -> _Wording | None:
         if now >= hit[0]:
             _wordings.pop(key, None)
             return None
+        _wordings.move_to_end(key)
         return hit[1]
 
 
 def _remember_wording(key: tuple, wording: _Wording) -> None:
-    """Store a wording, with a short life for a failure and a long one for an answer.
+    """Store stable results until restart and transient failures briefly.
 
-    Expiry-then-cap eviction, the shape :func:`_query` uses: without it the dict only ever grows, and
-    this pod does not restart.
+    The ordered mapping provides O(1) LRU eviction. Transient entries expire lazily on lookup or are
+    evicted with the least-recently-used stable entries when the hard capacity is reached.
     """
-    ttl = _WORDING_TTL_S if wording.status in ("ok", "rejected", "ungrounded") else _WORDING_ERROR_TTL_S
+    stable = wording.status in ("ok", "rejected", "ungrounded")
     now = monotonic()
     with _wording_lock:
-        for stale in [k for k, (expires, _) in _wordings.items() if now >= expires]:
-            _wordings.pop(stale, None)
-        if len(_wordings) >= _WORDING_MAX_ENTRIES:
-            for oldest in sorted(_wordings, key=lambda k: _wordings[k][0])[: _WORDING_MAX_ENTRIES // 5]:
-                _wordings.pop(oldest, None)
-        _wordings[key] = (now + ttl, wording)
+        _wordings.pop(key, None)
+        while len(_wordings) >= _WORDING_MAX_ENTRIES:
+            _wordings.popitem(last=False)
+        _wordings[key] = (float("inf") if stable else now + _WORDING_ERROR_TTL_S, wording)
 
 
 class _Budget:
-    """One request's share of the two call ceilings, and the log-once flags that go with them.
+    """One request's share of the request, hourly, and daily call ceilings.
 
     Both are claimed in the same operation and neither is decremented when the other refuses, so a
-    request that runs out of per-minute allowance does not also burn its per-request cap — it would
+    request that runs out of shared allowance does not also burn its per-request cap — it would
     otherwise report `capped` for subjects a later request could have answered immediately.
     """
 
@@ -1222,7 +1214,7 @@ class _Budget:
         self.logged_cap = False
         self.logged_rate = False
 
-    def reserve(self, cost: int, now: float) -> str | None:
+    def reserve(self, cost: int, now: float | None = None) -> str | None:
         """Claim `cost` backend calls from both ceilings, or name the one that refused.
 
         Returns None when the call may proceed, else the status to report for this subject. Takes
@@ -1240,26 +1232,40 @@ class _Budget:
                     )
                 return "capped"
             with _budget_lock:
-                calls = _replay_calls.setdefault(self.path, [])
-                calls[:] = [t for t in calls if now - t < _RATE_WINDOW_S]
-                if len(calls) + cost > _MAX_CALLS_PER_MIN:
+                # Sample production timestamps while holding the ledger lock so concurrent workers
+                # cannot append them out of order. Tests may inject an explicit monotonic value.
+                now = monotonic() if now is None else now
+                ledger = _replay_calls.setdefault(self.path, _CallLedger(deque(), deque()))
+                while ledger.hour and now - ledger.hour[0] >= _HOUR_WINDOW_S:
+                    ledger.hour.popleft()
+                while ledger.day and now - ledger.day[0] >= _DAY_WINDOW_S:
+                    ledger.day.popleft()
+                refused_window = None
+                if len(ledger.hour) + cost > _MAX_CALLS_PER_HOUR:
+                    refused_window = "hour"
+                elif len(ledger.day) + cost > _MAX_CALLS_PER_DAY:
+                    refused_window = "day"
+                if refused_window is not None:
                     if not self.logged_rate:
                         self.logged_rate = True
                         logger.warning(
-                            "Replay rate-limited on the %s path (%d calls/min); regenerating "
-                            "nothing further this minute",
+                            "Replay rate-limited on the %s path (%d calls/hour, %d calls/day); "
+                            "regenerating nothing further in this request",
                             self.path,
-                            _MAX_CALLS_PER_MIN,
+                            _MAX_CALLS_PER_HOUR,
+                            _MAX_CALLS_PER_DAY,
                             extra={
                                 "fields": {
                                     "event": "tilbakeblikk_bounded",
                                     "reason": "rate_limited",
                                     "path": self.path,
+                                    "window": refused_window,
                                 }
                             },
                         )
                     return "rate_limited"
-                calls.extend([now] * cost)
+                ledger.hour.extend([now] * cost)
+                ledger.day.extend([now] * cost)
             self.remaining -= cost
             return None
 
@@ -1320,7 +1326,7 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
     now = monotonic()
     if now + _WORST_CASE_CALL_S >= deadline:
         return _Wording(None, deterministic, "deadline", None, None, None)
-    refusal = budget.reserve(_CALLS_PER_SUBJECT, now)
+    refusal = budget.reserve(_CALLS_PER_SUBJECT)
     if refusal is not None:
         return _Wording(None, deterministic, refusal, None, None, None)
 
@@ -1373,6 +1379,41 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
         },
     )
     return wording
+
+
+def _replay_one_cached(row: dict, *, budget: _Budget, deadline: float, generating: bool) -> _Wording:
+    """Generate one cache key once, even when both admitted requests miss concurrently."""
+    key = _wording_key(row)
+    hit = _cached_wording(key)
+    if hit is not None:
+        return hit
+    with _wording_lock:
+        # Close the gap between the optimistic lookup and claiming ownership: another request may
+        # have completed and removed its flight while this worker was waiting for the lock.
+        cached = _wordings.get(key)
+        if cached is not None and monotonic() < cached[0]:
+            _wordings.move_to_end(key)
+            return cached[1]
+        if cached is not None:
+            _wordings.pop(key, None)
+        event = _wording_inflight.get(key)
+        owner = event is None
+        if owner:
+            event = threading.Event()
+            _wording_inflight[key] = event
+    assert event is not None
+    if not owner:
+        event.wait(max(0.0, deadline - monotonic()))
+        hit = _cached_wording(key)
+        if hit is not None:
+            return hit
+        return _replay_one(row, budget=budget, deadline=deadline, generating=generating)
+    try:
+        return _replay_one(row, budget=budget, deadline=deadline, generating=generating)
+    finally:
+        with _wording_lock:
+            _wording_inflight.pop(key, None)
+            event.set()
 
 
 def _message_rows(
@@ -1450,11 +1491,8 @@ async def _replay(
 ) -> list[ReplayedMessage]:
     """Walk the WHOLE subject list, serving cached wordings free and spending the budget on misses.
 
-    The order is what makes a day's worth of subjects reachable at all. Were the budget spent per
-    subject rather than per cache miss, every request would re-serve the same first twelve forever
-    and nothing further down the list could ever be seen; consulting the cache first means successive
-    requests fill the page progressively. (Whether an explicit offset is worth adding on top is Q3 in
-    the plan, deferred.)
+    The cache is consulted before the budget, so page reloads spend no allowance on wordings this
+    process has already generated.
 
     `generation_enabled` is asked ONCE per request rather than per subject, and asked of this
     surface's own latch. Asked per subject it would flip mid-pass — a configuration error latches a
@@ -1480,7 +1518,7 @@ async def _replay(
             loop.run_in_executor(
                 pool,
                 partial(
-                    _replay_one,
+                    _replay_one_cached,
                     rows[i],
                     budget=budget,
                     deadline=deadline,
