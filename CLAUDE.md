@@ -592,18 +592,40 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `resolved_only` narrow by *outcome* and still must not, since filtering to hits makes precision
     read 100 %. What the change concedes is real and is written into the file headers rather than
     left implicit: `from_stop`/`to_stop` were withheld entirely before this, and a from/to pair can
-    now be chosen and the matching departures read off. What survives is the **per-row** redaction —
-    no decision carries `from_stop`, `to_stop` or `journey_digest`, `Decision` is still
-    `extra="forbid"`, and a listing still does not pair an origin with a destination. Stronger
-    ground than that means access control on `/historikk`, not a shorter SELECT list.
+    now be chosen and the matching departures read off.
+  - **The per-row redaction of the route is GONE (2026-08-22), and that was the last of it.** The
+    cards name a journey: `historikk_decisions.sql` selects `from_stop`/`to_stop`, `historikk.
+    _with_place_names` pops them and serves resolved NSR `from_name`/`to_name`, and the card prints
+    the pair — in the header, or as the drawn push's title where one is drawn. So "a listing does
+    not pair an origin with a destination" no longer holds, and the two paragraphs above it in
+    `historikk_decisions.sql` are history rather than a live guarantee. Three things make it smaller
+    than the deletion looks, and one of them is the whole load: the 2026-08-21 filter change had
+    already made the pair *choosable*, so what goes is the work of narrowing rather than the
+    possibility; `/tilbakeblikk` already published exactly this, decided the same way; and **prd's
+    registrations are test users rather than members of the public**, so there is no real traveller
+    behind a k=1 pair. Team decision. The condition to re-check is therefore not a threshold but a
+    fact — **if `/varsel` ever takes registrations from the public, this publishes real commutes** —
+    and the fix then is access control on `/historikk`, not a shorter SELECT list, because the same
+    exposure sits in `/tilbakeblikk`'s generated prose, which no projection controls. What still
+    holds: `journey_digest` is absent from both surfaces (it is the join key to the LLM audit log,
+    and no page needs it), the raw stop **refs** never leave the process, and `Decision` is still
+    `extra="forbid"` — which is what fails loudly if a SELECT re-adds the digest or a future change
+    forgets the pop. `test_historikk.test_the_refs_are_selected_but_only_resolved_names_are_served`
+    pins both halves, and pins the *selection* too: resolve names without selecting the refs and
+    every card quietly reads "Ukjent → Ukjent", which looks like a registry outage rather than a
+    missing column.
   - Privacy, in two layers. The *table* is keyed on the journey **definition**
     (`journey_digest`, the same `llm_message.key_digest` used in the LLM audit log, so the two
     join) plus a device count — no `device_id`, no `journey_id`, no time window or weekday pattern.
-    The *API* redacts further: `journey_digest`, `from_stop` and `to_stop` are **not** served,
-    because `/historikk-api` is unauthenticated on a public host and those three next to
-    `departure_time` and `n_devices` would publish "somebody commutes A→B at 07:15". `Decision` is
-    `extra="forbid"` so a future SELECT that re-adds a redacted column fails loudly instead of
-    quietly publishing it. The page identifies a decision by its **train**, not by whose trip it was.
+    The *API* redacts further — though much less than it did, see the 2026-08-22 note above.
+    `journey_digest` and the raw `from_stop`/`to_stop` refs are **not** served; the route itself is,
+    by resolved NSR name. Until 2026-08-22 the route was withheld too, on the grounds that
+    `/historikk-api` is unauthenticated on a public host and origin plus destination next to
+    `departure_time` and `n_devices` publishes "somebody commutes A→B at 07:15" — which it does, and
+    which is now accepted because the registrations behind it are test users. `Decision` is
+    `extra="forbid"` so a SELECT that re-adds the digest, or a change that forgets to pop the refs,
+    fails loudly instead of quietly publishing it. The page identifies a decision by its **train**
+    and by the **journey it was watched for** — no longer by the train alone.
   - **The card quotes the wording that was PUSHED, not the last one produced** (2026-08-21).
     `varsel_decision_groups` took `ARRAY_AGG(message ORDER BY decided_at DESC LIMIT 1)`, and that is
     a different row: a wording lives in `varsel._messages` only while its situation stays above the
