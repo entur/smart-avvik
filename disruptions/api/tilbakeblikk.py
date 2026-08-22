@@ -163,10 +163,12 @@ _MAX_CALLS_PER_DAY = 5000
 _HOUR_WINDOW_S = 60.0 * 60
 _DAY_WINDOW_S = 24.0 * 60 * 60
 
-# How many backend calls one subject is charged for. Helm pins VARSEL_LLM_PROVIDER=gemini in dev,
-# tst, and prd, and a named provider never falls through to another backend. At the endpoint's
-# 200-row limit, one page therefore reserves at most 200 calls.
-_CALLS_PER_SUBJECT = 1
+# How many backend calls one attempt is charged for. Helm pins VARSEL_LLM_PROVIDER=gemini in dev,
+# tst, and prd, and a named provider never falls through to another backend.
+_CALLS_PER_ATTEMPT = 1
+# A replay can recover from one momentary transport/service failure inside the same request. Every
+# attempt rechecks both the deadline and the spend ledger, so retrying cannot bypass any replay bound.
+_MAX_BACKEND_ATTEMPTS = 2
 
 # 3. The wall clock, RESERVED rather than measured. `monotonic() + _WORST_CASE_CALL_S >= deadline`
 #    stops a new call being started; checking elapsed time instead would bound when the last call
@@ -1323,29 +1325,54 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
     if not generating:
         return _Wording(None, deterministic, "disabled", None, None, None)
 
-    now = monotonic()
-    if now + _WORST_CASE_CALL_S >= deadline:
-        return _Wording(None, deterministic, "deadline", None, None, None)
-    refusal = budget.reserve(_CALLS_PER_SUBJECT)
-    if refusal is not None:
-        return _Wording(None, deterministic, refusal, None, None, None)
+    result = None
+    for attempt in range(_MAX_BACKEND_ATTEMPTS):
+        now = monotonic()
+        if now + _WORST_CASE_CALL_S >= deadline:
+            if result is None:
+                return _Wording(None, deterministic, "deadline", None, None, None)
+            break
+        refusal = budget.reserve(_CALLS_PER_ATTEMPT)
+        if refusal is not None:
+            if result is None:
+                return _Wording(None, deterministic, refusal, None, None, None)
+            break
 
-    result = llm_message.write_message_detailed(
-        payload,
-        # Deliberately EMPTY rather than the row's journey_digest. `write_message_detailed` puts
-        # `key_digest(journey_key)` on its log record, and the digest is already that function's
-        # output — passing it would hash an already-hashed value and mint a second identifier that
-        # looks joinable with the live event="llm_message" trail and is not. The unhashed digest goes
-        # on this module's own record below instead, which is what keeps a replay record joinable
-        # with the decision row and with the live trail.
-        journey_key="",
-        situation_number=row.get("situation_number") or "",
-        # Its own latch (R15) and its own client cache; `replay=True` marks the audit record and
-        # suppresses the prompt/reply DEBUG record, which dev has switched on and which would
-        # otherwise publish a traveller's origin, destination and departure time at page-load volume.
-        state=_replay_latch(),
-        replay=True,
-    )
+        result = llm_message.write_message_detailed(
+            payload,
+            # Deliberately EMPTY rather than the row's journey_digest. `write_message_detailed` puts
+            # `key_digest(journey_key)` on its log record, and the digest is already that function's
+            # output — passing it would hash an already-hashed value and mint a second identifier that
+            # looks joinable with the live event="llm_message" trail and is not. The unhashed digest
+            # goes on this module's own record below instead, which is what keeps a replay record
+            # joinable with the decision row and with the live trail.
+            journey_key="",
+            situation_number=row.get("situation_number") or "",
+            # Its own latch (R15) and its own client cache; `replay=True` marks the audit record and
+            # suppresses the prompt/reply DEBUG record, which dev has switched on and which would
+            # otherwise publish a traveller's origin, destination and departure time at page-load
+            # volume.
+            state=_replay_latch(),
+            replay=True,
+        )
+        if result.status != "error":
+            break
+        if attempt + 1 < _MAX_BACKEND_ATTEMPTS:
+            logger.info(
+                "Retrying a transient replay backend failure",
+                extra={
+                    "fields": {
+                        "event": "tilbakeblikk_replay_retry",
+                        "replay": True,
+                        "journey_digest": row.get("journey_digest"),
+                        "situation_number": row.get("situation_number"),
+                        "provider": result.provider,
+                        "attempt": attempt + 1,
+                    }
+                },
+            )
+
+    assert result is not None
     wording = _Wording(
         message=result.text,
         deterministic=deterministic,
