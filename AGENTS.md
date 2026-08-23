@@ -191,9 +191,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     (`VARSEL_LLM_PROVIDER=gemini`), so a page that consulted the
     delivery gate would be blank in prd for a reason having nothing to do with the feature.
   - **Four bounds on regeneration**: 1 000 backend CALLS per request and trailing hour, 5 000 per
-    trailing day, a 30 s deadline that reserves the 8 s single-provider worst case inside each worker, and a cache
+    trailing day, a configurable request deadline that reserves the 8 s single-provider worst case inside each worker, and a cache
     keyed on subject + replayed cycle + `PROMPT_VERSION`. Replay has its own hourly/daily ledger;
     all environments pin Gemini, so one subject reserves one call. Cached hits spend no allowance.
+    The code default remains 30 s, while every Helm environment sets
+    `MELDINGER_REQUEST_DEADLINE_S=60` so a cold-cache page can fill more rows per request.
     Successful, `rejected`, and `ungrounded` results remain in memory
     until eviction (10 000 entries) or process restart, while transient failures expire after 60 s.
     The route stays `async def` and admits only two concurrent replay requests, independently of the
