@@ -293,15 +293,25 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     read through; the card is the one that would otherwise silently start showing prose the push did
     not carry. `_messages` has two other readers (`check_and_notify`'s cache probe,
     `_record_decisions`' fill of `message_llm`) that stay ungated on purpose: the log records what
-    was *written*, whether or not it was sent. **prd runs the two switches apart**:
-    `VARSEL_LLM_PROVIDER=gemini` (it writes a wording for every alert-worthy decision) with
-    `VARSEL_LLM_ENABLED=false` (travellers still get the template). That is the combination the
-    split exists for — it is what makes prd's real journeys comparable at all. Know what it sends:
-    the prompt carries the traveller's origin, destination and departure time to Gemini's EU
-    multi-region endpoint, which is *not* what the `AI.CLASSIFY` precedent covers
-    (operator-authored SX text); decided with that in view on 2026-08-07, and
-    `VARSEL_LLM_PROVIDER=off` stops the egress if that changes. Enabling delivery in prd is a
-    separate one-value deploy. Prompts and replies are logged under
+    was *written*, whether or not it was sent. **prd ran the two switches apart from 2026-08-07 to
+    2026-08-23, and now runs both on** — `VARSEL_LLM_PROVIDER=gemini` with
+    `VARSEL_LLM_ENABLED=true`, so a real traveller's push carries the model's prose. The apart
+    period is what the decision rests on: it is the only way prd's real journeys were ever
+    comparable, and it produced the "written but withheld" pairs
+    (`message_source='deterministic' AND message_llm IS NOT NULL`) the rollout was judged on —
+    measured 2026-08-23 over the trailing 30 days in prd, 590 same-input pairs (234 `predicted`,
+    338 `relayed`, 18 `no_sx`), none delivered. **That population now stops growing in prd**: from
+    this deploy its rows carry `message_source='llm'`, so the side-by-side
+    (`data/queries/message_wording_comparison.sql`) is a historic window there plus whatever dev
+    keeps writing, and what replaces it is `/historikk`'s verdicts over wordings travellers actually
+    received. Reverting is one value, and *which* value depends on what is wrong: bad **text** →
+    `VARSEL_LLM_ENABLED=false`, which returns travellers to the template while the model keeps
+    writing and recording, so the next attempt has evidence; **egress** must stop →
+    `VARSEL_LLM_PROVIDER=off`, which is the kill switch and the other one is not. Know what it
+    sends — and note delivery does not change that: the prompt carries the traveller's origin,
+    destination and departure time to Gemini's EU multi-region endpoint, which is *not* what the
+    `AI.CLASSIFY` precedent covers (operator-authored SX text); decided with that in view on
+    2026-08-07, when *generation* was enabled. Prompts and replies are logged under
     `jsonPayload.event="llm_message"`.
     **There are three location shapes, not two** (2026-08-07): `global`, a single region, and the
     **EU multi-region** endpoint (`aiplatform.eu.rep.googleapis.com`, `location="eu"`) — and only the
@@ -483,8 +493,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     one of them exists. The sent wording is chosen on `delivery_enabled()`, never on "an LLM wording
     exists": `written or deterministic` would file a template push as `llm` on the `/historikk` card
     *and* permanently in `varsel_decision_outcomes`, and would leave "written but withheld"
-    (`message_source='deterministic' AND message_llm IS NOT NULL`) matching no row at all — the one
-    population prd's rollout is judged on. `message_deterministic` is written on **every** decision,
+    (`message_source='deterministic' AND message_llm IS NOT NULL`) matching no row at all — the
+    population prd's rollout was judged on, and which prd stopped adding to on 2026-08-23 when
+    delivery was turned on. `message_deterministic` is written on **every** decision,
     so its presence is what dates a row as post-change; `message_llm` cannot, since NULL there also
     means the column did not exist yet (the `n_unsegmented` third-bucket rule, one column over). The
     side-by-side is `data/queries/message_wording_comparison.sql`; filter `message_status = 'ok'` for
@@ -669,13 +680,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     given up (`ukjent`). Keep `historikk_decisions.sql` and `historikk_summary.sql` in step — the
     page shows the per-row state next to the count.
   - Neither table is in `copy_runtime_to_prd.sh`: each environment records its own decisions and
-    `bq cp -f` overwrites. **Both environments record pairs, and they differ in what was sent.**
-    dev has both switches on, so its rows carry a written wording, a template wording, and the
-    written one delivered (`message_source='llm'`). prd generates but does not deliver
-    (`VARSEL_LLM_PROVIDER=gemini`, `VARSEL_LLM_ENABLED=false`), so its rows carry both wordings with
-    the template delivered — `message_source='deterministic' AND message_llm IS NOT NULL`, the
-    "written but withheld" population the prd rollout decision is judged on. prd's pairs are the
-    ones that matter: real travellers, real journeys.
+    `bq cp -f` overwrites. **Both environments record both wordings, and since 2026-08-23 both
+    deliver the model's.** Every row carries a written wording and a template wording; which one
+    reached the phone is `message_source`, and it is `llm` in dev and — from that date — in prd too.
+    The distinction to keep is now a *date*, not an environment: prd rows before 2026-08-23 are the
+    "written but withheld" population (`message_source='deterministic' AND message_llm IS NOT
+    NULL`) the rollout was judged on, and a rate computed across that boundary is measuring two
+    different deployments. prd's rows still matter most for the same reason they did: real
+    travellers, real journeys.
 
 - The **Meldinger** page at `/meldinger` (`demo/meldinger/`, React + Vite + Entur Linje) is
   the prompt-iteration loop: the alerts that actually went out for a window of DEPARTURES, replayed
@@ -775,10 +787,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - **Generation is the gate, delivery is not.** `/messages` asks `llm_message.generation_enabled()`
     and never `delivery_enabled()` or `varsel._deliverable_message` — the two switches are not
     interchangeable (generation says whether a wording can be *written*, delivery only what a
-    *traveller* receives), and prd is exactly the deployment that generates without delivering
-    (`VARSEL_LLM_PROVIDER=gemini`, `VARSEL_LLM_ENABLED=false`). A surface that consulted the delivery
-    gate would be **blank in prd for a reason
-    having nothing to do with the feature** — blank precisely where the data is worth looking at.
+    *traveller* receives), and prd was exactly the deployment that generated without delivering
+    (`VARSEL_LLM_PROVIDER=gemini`, `VARSEL_LLM_ENABLED=false`) until 2026-08-23. Delivery is on there
+    now, which does **not** retire the rule: `VARSEL_LLM_ENABLED=false` is the documented revert for
+    bad text, so the generate-without-deliver state is one deploy away at any time, and a surface
+    that consulted the delivery gate would go **blank for a reason having nothing to do with the
+    feature** — blank precisely where the data is worth looking at, and precisely when a prompt is
+    being fixed.
     `test_the_delivery_gate_is_never_consulted` pins it. `generation_enabled` is asked **once per
     request**, not per subject: asked per subject it would flip mid-pass when a configuration error
     latched a backend off, and half the page would read `disabled` while the other half read `error`
@@ -908,8 +923,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     would retire the question outright. Note the volume argument for prd is weaker than it looks:
     measured the same day, prd's pushed subjects run only ~22 % above dev's over six days (408 vs
     334), because a subject is (journey × situation × train) and dev's few registrations sit on busy
-    corridors. What prd actually adds is **authenticity** — the written-but-withheld pairs
-    (`message_source='deterministic' AND message_llm IS NOT NULL`) the rollout decision is judged on.
+    corridors. What prd actually adds is **authenticity** — real registrations and, since
+    2026-08-23, wordings a traveller actually received; before that date its rows are the
+    written-but-withheld pairs (`message_source='deterministic' AND message_llm IS NOT NULL`) the
+    rollout decision was judged on.
   - **The card's figures are whole-subject**, and were not before 2026-08-22. On the `decided_at`
     axis the per-cycle aggregates (`n_decisions`, `ever_alerted`, `first_alert_at`, `alert_lead_min`,
     the four `final_*`, `max_impact_probability`, `pushed_any`) described the window's *slice* of a

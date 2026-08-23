@@ -84,10 +84,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     wording, so a push is never lost to an LLM problem.
     **Writing a wording and sending it are two switches** (2026-08-07): `VARSEL_LLM_PROVIDER=off`
     stops a model being *asked*; `VARSEL_LLM_ENABLED=false` still asks and records the answer but
-    *sends* the deterministic wording. prd runs them apart — `gemini` with `ENABLED=false` — so it
-    writes a `message_llm` on every alert-worthy decision and delivers the template. Know what that
-    sends: the traveller's origin, destination and departure time, which is not what the
-    `AI.CLASSIFY` IAM precedent covers. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
+    *sends* the deterministic wording. prd ran them apart — `gemini` with `ENABLED=false` — from
+    2026-08-07 to **2026-08-23**, writing a `message_llm` on every alert-worthy decision while
+    delivering the template; that period produced the "written but withheld" pairs the rollout was
+    judged on (590 same-input pairs over the trailing 30 days, measured 2026-08-23) and prd now runs
+    `ENABLED=true`, so a real traveller's push carries the model's prose. Reverting is one value and
+    which one depends on the fault: bad **text** → `VARSEL_LLM_ENABLED=false` (travellers get the
+    template, the model keeps writing and recording); **egress** must stop →
+    `VARSEL_LLM_PROVIDER=off`. Delivery never changed what Vertex receives — generation did, on
+    2026-08-07. Know what that sends: the traveller's origin, destination and departure time, which
+    is not what the `AI.CLASSIFY` IAM precedent covers. Prompts and replies are logged under `jsonPayload.event="llm_message"`.
     **There are three location shapes, not two** (2026-08-07): `global`, a single region, and the
     **EU multi-region** endpoint (`aiplatform.eu.rep.googleapis.com`, `location="eu"`) — and only the
     third both serves the model and confines processing, which is why `VERTEX_GEMINI_LOCATION` is
@@ -187,9 +193,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     because a too-narrow bound drops outcome rows *silently* and the byte counts would report the
     loss as a cheaper query. Cost is not a correctness check.
   - **Generation is the gate, delivery is not.** It asks `llm_message.generation_enabled()` and never
-    `delivery_enabled()` or `varsel._deliverable_message`. prd already generates
-    (`VARSEL_LLM_PROVIDER=gemini`), so a page that consulted the
-    delivery gate would be blank in prd for a reason having nothing to do with the feature.
+    `delivery_enabled()` or `varsel._deliverable_message`. prd generates *and*, since 2026-08-23,
+    delivers — but `VARSEL_LLM_ENABLED=false` is the documented revert for bad text, so the
+    generate-without-deliver state is one deploy away at any time and a page that consulted the
+    delivery gate would go blank for a reason having nothing to do with the feature, precisely while
+    a prompt is being fixed.
   - **Four bounds on regeneration**: 1 000 backend CALLS per request and trailing hour, 5 000 per
     trailing day, a configurable request deadline that reserves the 8 s single-provider worst case inside each worker, and a cache
     keyed on subject + replayed cycle + `PROMPT_VERSION`. Replay has its own hourly/daily ledger;
