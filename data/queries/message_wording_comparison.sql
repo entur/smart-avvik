@@ -130,8 +130,10 @@ SELECT
   COUNTIF(has_same_input_pair)        AS comparable_pairs,
   COUNTIF(instrumented AND NOT has_any_llm_wording) AS instrumented_no_llm_wording,
   COUNTIF(ever_delivered_llm)         AS delivered_llm,
-  -- Withheld by policy: a wording exists and the template went out instead. This is prd today, and
-  -- it is the population the rollout decision is judged on.
+  -- Withheld by policy: a wording exists and the template went out instead. This WAS prd, and it is
+  -- the population the rollout decision was judged on -- 590 pairs over the 30 days to 2026-08-23,
+  -- when delivery was turned on there (VARSEL_LLM_ENABLED=true). It stops growing in prd from that
+  -- date, so a window spanning it mixes two deployments; dev has delivered since the split.
   COUNTIF(has_any_llm_wording AND NOT ever_delivered_llm) AS written_but_withheld,
   ROUND(AVG(n_cycles), 1)             AS avg_cycles_per_subject
 FROM subjects AS s
