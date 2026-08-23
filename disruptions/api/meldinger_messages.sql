@@ -35,6 +35,7 @@ WITH scanned AS (
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    AND (IFNULL(ARRAY_LENGTH(@sx_summaries), 0) = 0 OR summary IN UNNEST(@sx_summaries))
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
     AND (IFNULL(ARRAY_LENGTH(@to_place_refs),   0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
     AND (NOT @sx_only OR NOT STARTS_WITH(situation_number, 'KIX:'))

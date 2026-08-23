@@ -130,6 +130,22 @@ WITH scanned AS (
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- ONE chosen SIRI-SX option, expanded to EVERY stored summary it stands for -- the same shape as
+    -- the place refs below, and for the same reason: an option can cover more than one stored value.
+    -- Today that is the no-SX placeholders, whose wording changed on 2026-08-20 while the older rows
+    -- kept the old text; matching only the value the dropdown nominated would return one of the two
+    -- populations and silently hide the other, which is `varsel.place_refs`' lesson verbatim.
+    --
+    -- The values are allow-listed against meldinger_filters.sql's top-30 array before they ever
+    -- reach here -- free-form prose from a public endpoint is otherwise one more response-cache
+    -- entry and one more BigQuery query per distinct string. Exact equality per member, never a
+    -- LIKE: the dropdown offers values that exist, so a prefix match would only add ways to select a
+    -- population the reader cannot see the boundary of.
+    --
+    -- IFNULL for the same reason as the place refs: an EMPTY array parameter from the Python client
+    -- makes ARRAY_LENGTH evaluate to NULL, not 0, so the bare form would drop every row on every
+    -- unfiltered request.
+    AND (IFNULL(ARRAY_LENGTH(@sx_summaries), 0) = 0 OR summary IN UNNEST(@sx_summaries))
     -- The traveller's own registered endpoints: filtered on, never selected. An ARRAY of EVERY ref
     -- standing for the chosen place, not the one the dropdown nominated -- a station's rail and bus
     -- sides are separate NSR refs and each feed records its calls on its own, so matching a single

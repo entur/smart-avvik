@@ -94,6 +94,7 @@ body {
   max-width: 12rem;
 }
 
+
 /* The three narrowings, in a row on a line of their own. `flex-basis: 100%` is what keeps that true
    rather than leaving it to how wide the window happens to be: at a width where the checks fitted
    beside the selects again, they would read as three more alternatives to pick between rather than
