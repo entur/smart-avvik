@@ -110,7 +110,7 @@ WITH scanned AS (
   -- comes with it.
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
-    summary, description, line, mode, stop_place, from_stop, to_stop, departure_time,
+    summary AS cycle_summary, description, line, mode, stop_place, from_stop, to_stop, departure_time,
     decided_at, alertworthy, et_cancelled, impact_probability, cancel_probability,
     delay_p50_min, delay_p90_min, alert_threshold, pushed, n_devices, prompt_version,
     -- Why no push went out is a question this page will provoke on every silent card, and this is
@@ -130,6 +130,21 @@ WITH scanned AS (
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- ONE chosen SIRI-SX option is applied after subject aggregation below. It is expanded to EVERY
+    -- stored summary it stands for -- the same shape as the place refs below, and for the same
+    -- reason: an option can cover more than one stored value.
+    -- Today that is the no-SX placeholders, whose wording changed on 2026-08-20 while the older rows
+    -- kept the old text; matching only the value the dropdown nominated would return one of the two
+    -- populations and silently hide the other, which is `varsel.place_refs`' lesson verbatim.
+    --
+    -- The values are allow-listed against meldinger_filters.sql's top-30 array before they ever
+    -- reach here -- free-form prose from a public endpoint is otherwise one more response-cache
+    -- entry and one more BigQuery query per distinct string. Exact equality per member, never a
+    -- LIKE: the dropdown offers values that exist, so a prefix match would only add ways to select a
+    -- population the reader cannot see the boundary of.
+    --
+    -- Applying this predicate here would discard the other cycles of a matching subject when its
+    -- summary changed. That would corrupt whole-subject metrics and could discard the pushed cycle.
     -- The traveller's own registered endpoints: filtered on, never selected. An ARRAY of EVERY ref
     -- standing for the chosen place, not the one the dropdown nominated -- a station's rail and bus
     -- sides are separate NSR refs and each feed records its calls on its own, so matching a single
@@ -160,7 +175,7 @@ WITH scanned AS (
 subjects AS (
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
-    ANY_VALUE(summary)     AS summary,
+    ANY_VALUE(cycle_summary) AS summary,
     ANY_VALUE(description) AS description,
     ANY_VALUE(line)        AS line,
     ANY_VALUE(mode)        AS mode,
@@ -245,6 +260,10 @@ subjects AS (
               IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)] AS replay
   FROM scanned
   GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
+  -- Eligibility is subject-scoped, while every matching subject keeps all of its cycles above.
+  -- IFNULL is required because an empty array from the Python client has NULL ARRAY_LENGTH.
+  HAVING IFNULL(ARRAY_LENGTH(@sx_summaries), 0) = 0
+      OR COUNTIF(cycle_summary IN UNNEST(@sx_summaries)) > 0
 ),
 -- One derived fact that needs the sibling subjects: did any OTHER situation about this same
 -- registration-and-train deliver a push? It answers the question a silent card provokes -- an

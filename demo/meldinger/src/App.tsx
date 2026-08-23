@@ -27,6 +27,7 @@ import {
   lineCode,
   osloDaysAgo,
   osloTomorrow,
+  sxSummaryLabel,
   timeInputValue,
 } from './format';
 
@@ -59,6 +60,7 @@ const NO_OPTIONS: FilterOptions = {
   lines: [],
   from_places: [],
   to_places: [],
+  sx_summaries: [],
 };
 
 /** How far back the day picker will go — the API's own lookback bound (historikk._MAX_WINDOW_DAYS).
@@ -96,6 +98,10 @@ export default function App() {
   const [line, setLine] = useState('');
   const [fromPlace, setFromPlace] = useState('');
   const [toPlace, setToPlace] = useState('');
+  // The SIRI-SX summary, matched exactly. The value IS the text — unlike the three above it there is
+  // no ref behind it, which is why the server allow-lists it against a capped vocabulary rather than
+  // accepting whatever arrives.
+  const [sxSummary, setSxSummary] = useState('');
 
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -168,6 +174,7 @@ export default function App() {
       line: line || undefined,
       fromPlace: fromPlace || undefined,
       toPlace: toPlace || undefined,
+      sxSummary: sxSummary || undefined,
       verdict: utfall || undefined,
       alertedOnly,
       pushedOnly,
@@ -194,6 +201,11 @@ export default function App() {
           [line, opts.lines.includes(line), setLine],
           [fromPlace, opts.from_places.some((pl) => pl.ref === fromPlace), setFromPlace],
           [toPlace, opts.to_places.some((pl) => pl.ref === toPlace), setToPlace],
+          // Reconciled like the rest, and it needs it MORE than the rest: this vocabulary is capped
+          // at 30, so a selection can fall out of it without the window losing the decisions that
+          // carry it — a narrowing that merely reshuffles which summaries are the most common is
+          // enough. Left standing it would be a 400 rather than a filter that quietly did nothing.
+          [sxSummary, opts.sx_summaries.some((o) => o.value === sxSummary), setSxSummary],
         ] as const;
         const stale = gone.filter(([value, present]) => value && !present);
         if (stale.length) {
@@ -256,6 +268,7 @@ export default function App() {
     line,
     fromPlace,
     toPlace,
+    sxSummary,
     utfall,
     resolvedOnly,
     alertedOnly,
@@ -272,6 +285,19 @@ export default function App() {
   // (reload — the cache is consulted before the budget, so the next round starts further down) is
   // not something a reader would guess.
   const boundedOut = messages.filter((m) => isBounded(m.status)).length;
+  // The hover text for the SIRI-SX control: the LABEL of the selected option, not the raw stored
+  // value, so it reads as the row that was picked. Undefined when nothing is selected, so React
+  // omits the attribute and the label's own explanatory tooltip shows through instead of being
+  // suppressed by an empty one.
+  const selectedSxLabel = sxSummary
+    ? sxSummaryLabel(
+        options.sx_summaries.find((o) => o.value === sxSummary) ?? {
+          value: sxSummary,
+          n_values: 1,
+          no_sx: false,
+        },
+      )
+    : undefined;
 
   return (
     <main className="tb-page">
@@ -336,7 +362,7 @@ export default function App() {
           </select>
         </label>
 
-        {/* The four data-driven dropdowns. Every one of them is populated from
+        {/* The five data-driven dropdowns. Every one of them is populated from
             /meldinger-api/filters over the whole window — never from the decisions on screen,
             which are capped and ordered by departure, so a line that only ran early in the window
             would drop out of its own filter and a selection would shrink the list it came from to
@@ -391,6 +417,44 @@ export default function App() {
             {options.to_places.map((pl) => (
               <option key={pl.ref} value={pl.ref}>
                 {pl.name ?? pl.ref}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* The operator's own SIRI-SX summary, matched exactly. Ordered MOST COMMON FIRST by the
+            server and rendered in that order: the reading worth having is "which disruption texts
+            dominated this window", and alphabetical free-form prose answers nothing. Capped at 30
+            server-side — the vocabulary is also the allow-list, and an uncapped dropdown of
+            free-form text would let every distinct string mint a cache entry and a BigQuery query
+            on a public endpoint.
+
+            `title` on the label, because the control truncates: these run to a full sentence and a
+            select cannot wrap. */}
+        <label
+          className="tb-select tb-select--wide"
+          title="Filtrer på én avviksmelding fra operatøren — de 30 vanligste i vinduet, vanligst først. «Ingen» er ikke en melding: det er avgangene ingen operatør har publisert noe om, og kortene under den viser derfor ingen SIRI-SX-linje. «Bare med SIRI-SX-melding» skjuler hele den gruppa."
+        >
+          <span>SIRI-SX</span>
+          {/* `title` on the SELECT, not just the label, and only once something is chosen. At 12rem
+              the closed control truncates, and these texts collide late: "Stopper ekstra på
+              Brakerøya og Lier" against "…på Lier og Brakerøya" differ at character 19, and the two
+              "Planlegger buss for tog Oslo S–…" at 30. Hovering resolves which one is selected.
+              `undefined` rather than '' when nothing is chosen, so React omits the attribute and the
+              label's own explanatory tooltip shows through instead of being suppressed by an empty
+              one. */}
+          <select
+            value={sxSummary}
+            title={selectedSxLabel}
+            onChange={(e) => setSxSummary(e.target.value)}
+          >
+            <option value="">Alle</option>
+            {options.sx_summaries.map((o) => (
+              // Value is the option's nominated stored text; label is what a reader should see. The
+              // two differ only for the no-SX option, which stands for more than one stored text and
+              // is expanded server-side. See sxSummaryLabel.
+              <option key={o.value} value={o.value}>
+                {sxSummaryLabel(o)}
               </option>
             ))}
           </select>
