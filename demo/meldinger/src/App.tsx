@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { SmallAlertBox } from '@entur/alert';
 import { Loader } from '@entur/loader';
 import { Heading1, Paragraph } from '@entur/typography';
@@ -137,6 +137,57 @@ export default function App() {
   // whole-day default and is never inverted, whatever the start is.
   const rangeInvalid = toTime !== MIDNIGHT && toTime <= fromTime;
 
+  // Which pass over the wordings is the current one. Every pass carries the number it was started
+  // with and writes nothing once it is no longer current — see loadMessages. A plain `cancelled`
+  // flag cannot do this job any more: the effect's cleanup only knows about the effect's own
+  // fetch, and there is now a second way to start one that outlives no render at all.
+  const messagesRound = useRef(0);
+  // The filters that produced the decisions ON SCREEN, latched when they land. What the button
+  // below must ask for is that set — not whatever the controls happen to say when it is clicked —
+  // because /decisions and /messages are aligned by position, and two different filter sets are
+  // two different subject lists. A ref rather than state: nothing renders from it.
+  const activeFilters = useRef<Filters | null>(null);
+
+  /** Fetch the regenerated wordings for `filters`, and show them if `round` is still the current one.
+   *
+   *  Shared by the filter effect and by the "hent flere" button, which is why it takes its
+   *  filters as an argument instead of reading them off state: the button asks for exactly the
+   *  filters behind the cards it stands next to. A filter change while a manual round is in flight
+   *  bumps the round, and the reply is then dropped rather than landing one window's prose under
+   *  another window's cards.
+   *
+   *  The previous round's wordings are deliberately left standing while a later one runs. /messages
+   *  returns the WHOLE subject list every time and consults its wording cache before its budget, so
+   *  a later round re-serves everything already written for free and spends the allowance further
+   *  down the list — it is a superset, and blanking first would only make the page flash. */
+  const loadMessages = useCallback(async (filters: Filters, round: number) => {
+    setMessagesLoading(true);
+    setMessagesError(null);
+    try {
+      const m = await fetchMessages(filters);
+      if (messagesRound.current === round) setMessages(m.messages);
+    } catch (e) {
+      if (messagesRound.current === round) {
+        setMessagesError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (messagesRound.current === round) setMessagesLoading(false);
+    }
+  }, []);
+
+  /** Spend another request's allowance on the subjects a bound stopped last round.
+   *
+   *  Not a page reload, which is what the notice used to advise: a reload re-runs the window's
+   *  BigQuery queries and re-mounts the page to arrive at the same cards, when the only thing that
+   *  needed asking again was /messages. The wording cache is process-lifetime and consulted before
+   *  the budget, so what this actually buys is the next ~1 request's worth of Vertex calls, spent
+   *  on rows that have none yet. */
+  const loadNextRound = () => {
+    const filters = activeFilters.current;
+    if (!filters || messagesLoading) return;
+    void loadMessages(filters, ++messagesRound.current);
+  };
+
   useEffect(() => {
     // `cancelled` is the stale-response guard, the same shape avviksvarsel's VarselStatus uses.
     // Filters stay enabled while a request is in flight, so two changes in quick succession leave
@@ -151,8 +202,15 @@ export default function App() {
 
     // Wordings belong to the window and filters that produced them. Dropped before anything is
     // fetched, so a card can never carry the previous filter's prose while its own figures refresh.
+    // Bumping the round here — before any early return below, and on the same tick the list is
+    // dropped — is what abandons a manual round already in flight for the filters we just left.
+    const round = ++messagesRound.current;
+    activeFilters.current = null;
     setMessages([]);
     setMessagesError(null);
+    // Cleared here rather than left to the abandoned round's `finally`, which no longer runs: that
+    // round is no longer current, so it writes nothing at all — including "done".
+    setMessagesLoading(false);
 
     if (rangeInvalid) {
       setError('«Til kl.» må være seinere enn «Fra kl.». 00:00 i til-feltet betyr resten av døgnet.');
@@ -246,15 +304,10 @@ export default function App() {
       // Wordings second, and never in the same try: /messages is the only endpoint here that calls
       // Vertex, and it must be able to fail on its own. The cards are already on screen by now.
       if (cancelled) return;
-      setMessagesLoading(true);
-      try {
-        const m = await fetchMessages(filters);
-        if (!cancelled) setMessages(m.messages);
-      } catch (e) {
-        if (!cancelled) setMessagesError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) setMessagesLoading(false);
-      }
+      // Latched only now, beside the cards these filters produced, so the button can never ask for
+      // a set the list on screen was not built from.
+      activeFilters.current = filters;
+      await loadMessages(filters, round);
     })();
     return () => {
       cancelled = true;
@@ -281,9 +334,9 @@ export default function App() {
   // entirely rather than rendering an empty one.
   const aligned = messages.length ? alignMessages(decisions, messages) : null;
   // Subjects a bound kept us from regenerating this round. Worth counting on the page: a
-  // half-filled list otherwise reads as a broken backend rather than as a budget, and the fix
-  // (reload — the cache is consulted before the budget, so the next round starts further down) is
-  // not something a reader would guess.
+  // half-filled list otherwise reads as a broken backend rather than as a budget. It is also what
+  // the "hent flere" button is gated on — nothing is bounded, nothing to fetch — and the
+  // count is the only thing that says whether pressing it again is worth anything.
   const boundedOut = messages.filter((m) => isBounded(m.status)).length;
   // The hover text for the SIRI-SX control: the LABEL of the selected option, not the raw stored
   // value, so it reads as the row that was picked. Undefined when nothing is selected, so React
@@ -546,13 +599,31 @@ export default function App() {
 
       {!loading && !error && decisions.length > 0 ? (
         <div className="tb-replay-status">
-          {messagesLoading
-            ? 'Skriver formuleringer på nytt …'
-            : boundedOut > 0
-              ? `${boundedOut} av ${messages.length} kort venter på en senere runde — avspilling har ` +
-                'en ramme per forespørsel og per minutt. Last siden på nytt for å fylle flere; ' +
-                'tekstene som allerede er skrevet, hentes fra hurtigbufferen.'
-              : null}
+          {/* The FIRST round has nothing on screen to add to, so it gets the plain notice. A later
+              one keeps the button standing — disabled, and saying what it is doing — rather than
+              swapping it for a line of text and making the control the reader just pressed vanish
+              from under their cursor. */}
+          {messagesLoading && messages.length === 0 ? (
+            <span>Skriver formuleringer på nytt …</span>
+          ) : null}
+          {boundedOut > 0 ? (
+            <>
+              <span>
+                {boundedOut} av {messages.length} kort venter på en senere runde — avspilling har en
+                ramme per forespørsel og en kvote per time og døgn. Hver runde fyller de neste;
+                tekstene som allerede er skrevet, hentes fra hurtigbufferen og koster ingenting.
+              </span>
+              <button
+                type="button"
+                className="tb-replay-more"
+                onClick={loadNextRound}
+                disabled={messagesLoading}
+                title="Henter formuleringene på nytt. Rader som allerede har en tekst kommer fra hurtigbufferen uten et modellkall, så rammen brukes lenger ned i lista."
+              >
+                {messagesLoading ? 'Henter flere …' : 'Hent flere'}
+              </button>
+            </>
+          ) : null}
         </div>
       ) : null}
 

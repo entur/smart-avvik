@@ -283,10 +283,10 @@ export const REPLAY_STATUS_HELP: Record<ReplayStatus, string> = {
     'reisende: det er en annen bryter (VARSEL_LLM_ENABLED), og denne siden spør aldri om den.',
   unavailable: 'Ingen av backendene kunne forsøkes for denne raden.',
   error:
-    'Forbigående feil mot backend etter ett automatisk nytt forsøk. Last siden på nytt — feil ' +
-    'hurtiglagres bare kort.',
+    'Forbigående feil mot backend etter ett automatisk nytt forsøk. Hent en runde til — feil ' +
+    'hurtiglagres bare kort, så raden forsøkes på nytt.',
   truncated:
-    'Modellen brukte opp svarrammen før teksten var ferdig. Last siden på nytt — avkortede svar ' +
+    'Modellen brukte opp svarrammen før teksten var ferdig. Hent en runde til — avkortede svar ' +
     'hurtiglagres bare kort og blir forsøkt på nytt.',
   rejected:
     'Modellen svarte, men svaret var tomt, et avslag, eller for langt for et varsel (300 tegn). ' +
@@ -295,14 +295,16 @@ export const REPLAY_STATUS_HELP: Record<ReplayStatus, string> = {
     'Modellen svarte med tall som ikke finnes i grunnlaget, så svaret ble kastet framfor å sendes. ' +
     'Teksten under er det som ble kastet. Dette er statusen en promptendring oftest lager.',
   capped:
-    'Forespørselen brukte opp rammen sin på modellkall. Last siden på nytt: allerede skrevne ' +
+    'Forespørselen brukte opp rammen sin på modellkall. Trykk «Hent flere»: allerede skrevne ' +
     'tekster kommer fra hurtigbufferen, så neste runde bruker rammen lenger ned i lista.',
   rate_limited:
     'Avspilling har en egen kvote på 1 000 modellkall per time og 5 000 per døgn. Allerede skrevne ' +
-    'tekster ligger i hurtigbufferen til neste utrulling. Prøv igjen senere.',
+    'tekster ligger i hurtigbufferen til neste utrulling. Her hjelper ikke en runde til — kvoten ' +
+    'må løpe ut først.',
   deadline:
-    'Forespørselen har en tidsfrist, og det var ikke rom for et kall til innenfor den. Last på ' +
-    'nytt for å fylle flere.',
+    'Forespørselen har en tidsfrist på 30 sekunder, og det var ikke rom for et kall til innenfor ' +
+    'den. Dette er rammen som oftest binder på en full liste: trykk «Hent flere» til alle ' +
+    'kortene har en tekst.',
 };
 
 /** The statuses where a model DID answer and the answer was thrown away. Those two are exactly what
