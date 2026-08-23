@@ -926,11 +926,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     versions, is confounded with sampling variance, and reloading and seeing the same text is the
     cache rather than evidence that the model is predictable. The page says both, in prose at the
     top and not in a tooltip.
-  - `data/queries/validate_varsel_sql.sh` covers all four new files (thirteen parameters each against
-    /historikk's eleven — one omitted makes `bq` refuse to parse and the check reports FAILED, so the
-    file goes **unvalidated**; `test_meldinger.py` greps the script for every `@param` as the cheap
-    half of that guard). A clean dry run still proves neither of the two things that matter most:
-    the CLI encodes an empty ARRAY parameter differently from the Python client, so the
+  - `data/queries/validate_varsel_sql.sh` covers all four new files (the parameter sets differ per
+    query — fourteen for the two row queries against /historikk's eleven, eight for the summary,
+    three for the filters — and one omitted makes `bq` refuse to parse and the check reports FAILED,
+    so the file goes **unvalidated**; `test_meldinger.py` greps the script for every `@param` as
+    the cheap half of that guard). A clean dry run still proves neither of the two things that
+    matter most: the CLI encodes an empty ARRAY parameter differently from the Python client, so the
     `IFNULL(ARRAY_LENGTH(@refs), 0) = 0` rule dry-runs identically either way, and **both** date
     bounds above fail silently and *cheaply* — the derived `DATE(decided_at)` cover as well as the
     `call_date` one.
@@ -941,9 +942,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     states that as counts (`n_subjects`, `n_labelled`, `n_pending`, `n_unknown`) *before* the rates
     rather than showing confident-looking numbers. The blended-plus-segments rule is /historikk's
     unchanged: `predicted` / `relayed` / `no_sx` beside `n_unsegmented`. `/summary` takes the
-    **population** filters only (day, time range, operator, line, from/to place); `verdict`,
-    `alerted_only` and `resolved_only` narrow by outcome and never reach it — filtering to hits would
-    make precision read 100 % — and `sx_only` is withheld from it on the same grounds.
+    **population** filters only (day, time range, operator, line, SIRI-SX summary, from/to place);
+    `verdict`, `alerted_only` and `resolved_only` narrow by outcome and never reach it — filtering
+    to hits would make precision read 100 % — and `sx_only` is withheld from it on the same
+    grounds.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)
