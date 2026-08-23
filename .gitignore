@@ -51,3 +51,6 @@ terraform/crash.log
 .ua/intermediate/
 .ua/tmp/
 .ua/diff-overlay.json
+
+# Local linked worktrees.
+.worktrees/
