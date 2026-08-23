@@ -81,6 +81,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 from collections import OrderedDict, deque
 from collections.abc import Callable
@@ -178,7 +179,7 @@ _MAX_BACKEND_ATTEMPTS = 2
 #    bound guarantees nothing.
 #
 #    Every environment pins one provider, so one subject can consume only the backend's 8 s timeout.
-_REQUEST_DEADLINE_S = 30.0
+_REQUEST_DEADLINE_S = float(os.getenv("MELDINGER_REQUEST_DEADLINE_S", "30"))
 _WORST_CASE_CALL_S = 8.0
 # Pool width. `varsel`'s pools are the shape, not the number — they run 16/16/32
 # (`_MATCH_WORKERS`/`_LLM_WORKERS`/`_PUSH_WORKERS`) on the poller thread, on a cadence nobody can
