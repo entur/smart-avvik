@@ -2,8 +2,11 @@
 
 /historikk answers "what did we send, and was it right". This surface answers "what would today's
 prompt say about the same disruptions": it reads the ``message_input`` document already stored on
-every decision row and re-runs the current prompt over it. Same filters, same stats, same cards; a
-different window axis, and a wording that is generated rather than quoted.
+every decision row and re-runs the current prompt over it. Nearly the same filters, the same stats
+and the same cards; a different window axis, and a wording that is generated rather than quoted. The
+one filter with no /historikk twin is ``sx_summary`` -- one exact SIRI-SX summary out of the window's
+30 most common -- which belongs here because the question is what the prompt makes of a given
+disruption text.
 
 **The window axis is the whole difference.** /historikk windows on ``call_date`` — the operating day
 of the train. This page windows on ``departure_time`` — the aimed departure of the boarding call —
@@ -540,6 +543,42 @@ class PlaceOption(BaseModel):
     )
 
 
+class SxSummaryOption(BaseModel):
+    """One entry in the SIRI-SX dropdown: one thing a reader can pick, not one stored string.
+
+    :class:`PlaceOption` for summaries, and for the same reason. A station's rail and bus sides are
+    separate refs standing for one place; here, several stored summaries can stand for one ANSWER.
+    ``value`` is the option's identity and ``n_values`` says how many stored texts it covers; the
+    server expands it back to all of them when filtering, which is the part that keeps the merge from
+    hiding half the population behind the row named after it.
+
+    Only ``no_sx`` merges today. Those rows are the ones no operator published anything about, where
+    ``predict_calls.sql`` writes a placeholder summary of its own — and that placeholder's wording has
+    already changed once (2026-08-20), leaving two texts meaning one thing. They are one option.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(
+        description="What to send back as sx_summary. The busiest of the stored summaries this "
+        "option covers, ties broken on the text itself — so it is one the decision log really "
+        "carries, and it cannot flip between two refreshes of the same window and invalidate a "
+        "selection the page is holding.",
+    )
+    n_values: int = Field(
+        default=1,
+        description="How many stored summary texts this one option stands for. Above 1 means they "
+        "were merged; filtering by it matches all of them.",
+    )
+    no_sx: bool = Field(
+        default=False,
+        description="True when every row behind this option is one NO operator published a "
+        "SIRI-SX message about (situationNumber `KIX:NoSituation:`), so the summary is a "
+        "placeholder this codebase wrote rather than operator prose. The page labels such an option "
+        "'Ingen' — the wording is deliberately the client's, since this is a fact about the data.",
+    )
+
+
 class FilterOptions(WindowFields):
     """What the page's dropdowns can be set to, over one window.
 
@@ -567,6 +606,16 @@ class FilterOptions(WindowFields):
     )
     from_places: list[PlaceOption] = Field(description="Registered boarding places, by name.")
     to_places: list[PlaceOption] = Field(description="Registered alighting places, by name.")
+    # No default: the one construction site must pass it, or an empty dropdown would look exactly
+    # like a window whose decisions carry no summary at all.
+    sx_summaries: list[SxSummaryOption] = Field(
+        description="The SIRI-SX options for the window, MOST COMMON FIRST and capped at 30. Order "
+        "is the answer to 'which disruption texts dominated this window', so it is served as the "
+        "query produced it and must not be re-sorted. The cap counts OPTIONS rather than stored "
+        "texts, which is why the merge happens in SQL. The only TRUNCATED vocabulary here: a "
+        "summary outside the top 30 appears on cards the page shows and is a 400 if filtered on, "
+        "which is the price of allow-listing free-form text on a public endpoint.",
+    )
 
 
 class Segment(BaseModel):
@@ -626,9 +675,9 @@ class Summary(WindowFields):
     segments are the same window split on exactly that, and are the reason the blended figure can be
     quoted at all — on its own it moves with the MIX of the populations.
 
-    Narrowed by the POPULATION filters only (day, time range, operator, line, from_place, to_place).
-    ``verdict``, ``alerted_only`` and ``resolved_only`` narrow by OUTCOME and are deliberately not
-    accepted: filtering to hits would make precision read 100 %.
+    Narrowed by the POPULATION filters only (day, time range, operator, line, from_place, to_place,
+    sx_summary). ``verdict``, ``alerted_only`` and ``resolved_only`` narrow by OUTCOME and are
+    deliberately not accepted: filtering to hits would make precision read 100 %.
     """
 
     n_subjects: int = Field(
@@ -975,6 +1024,21 @@ def _options(window: _Window) -> dict[str, Any]:
         "lines": [v for v in (row.get("lines") or []) if v],
         "from_places": _place_groups(from_counted, registry),
         "to_places": _place_groups(to_counted, registry),
+        # Left in the order the query produced -- most common first, capped at 30. Sorting it here
+        # would throw away the only thing that makes a list of free-form operator prose readable,
+        # and would do it silently, since an alphabetical dropdown looks perfectly deliberate.
+        #
+        # Already GROUPED by the query, unlike the places above, which are grouped here: the cap has
+        # to count options rather than stored texts, and only the query can cap after grouping.
+        "sx_summaries": [
+            {
+                "value": g["value"],
+                "members": [m for m in (g.get("members") or []) if m] or [g["value"]],
+                "no_sx": bool(g.get("no_sx")),
+            }
+            for g in (dict(r) for r in (row.get("sx_summaries") or []))
+            if g.get("value")
+        ],
     }
 
 
@@ -995,18 +1059,66 @@ def _place_refs(groups: list[dict], value: str | None, field: str) -> list[str]:
     raise HTTPException(status_code=400, detail=f"Unknown {field}: not present in this window.")
 
 
-def _checked_places(
-    window: _Window, line: str | None, from_place: str | None, to_place: str | None
-) -> tuple[list[str], list[str]]:
-    """Validate the three data-driven filters and expand the places, spending a query only when one
-    of them is actually set. Returns the two ref arrays the queries take."""
-    if line is None and from_place is None and to_place is None:
-        return [], []
+class _Narrowing(NamedTuple):
+    """The three expanded array parameters the population filters resolve to.
+
+    A NamedTuple rather than a bare 3-tuple because all three are ``list[str]``: unpacked
+    positionally, swapping two of them type-checks, runs, and quietly filters on the wrong column.
+    """
+
+    from_refs: list[str]
+    to_refs: list[str]
+    sx_summaries: list[str]
+
+
+def _sx_summary_values(groups: list[dict], value: str | None) -> list[str]:
+    """Expand a chosen SIRI-SX option into EVERY stored summary it stands for; `[]` when unset.
+
+    :func:`_place_refs` for summaries, and the expansion is the whole point of grouping rather than a
+    detail of it. The dropdown offers one option per answer and nominates one of its stored texts as
+    the value; filtering on that text alone would return one slice and silently drop the rest — which
+    is exactly what matching a single stop ref did to Asker stasjon's decisions on /historikk. Today
+    the only merged option is the no-SX one, whose placeholder wording changed on 2026-08-20: filter
+    on the nominated text alone and every row written before that afternoon disappears.
+
+    Empty list means no filter, since BigQuery has no NULL array parameter.
+    """
+    if value is None:
+        return []
+    for group in groups:
+        if group["value"] == value:
+            return group["members"]
+    raise HTTPException(status_code=400, detail="Unknown sx_summary: not present in this window.")
+
+
+def _checked_data_filters(
+    window: _Window,
+    line: str | None,
+    from_place: str | None,
+    to_place: str | None,
+    sx_summary: str | None,
+) -> _Narrowing:
+    """Validate the four data-driven filters and expand them, spending a query only when one of them
+    is actually set. Returns the three arrays the queries take.
+
+    Named for the filters rather than for the return value since ``sx_summary`` joined them. All
+    four are allow-listed for the same reason — the value lands in the response-cache key on a
+    public unauthenticated endpoint — and three of them expand, because an option can stand for more
+    stored values than the one it is named after. /historikk still has this as ``_checked_places``,
+    which is the shape it kept when the fork was made.
+    """
+    if line is None and from_place is None and to_place is None and sx_summary is None:
+        return _Narrowing([], [], [])
     opts = _options(window)
     _checked_choice(line, "line", opts["lines"])
-    return (
+    return _Narrowing(
         _place_refs(opts["from_places"], from_place, "from_place"),
         _place_refs(opts["to_places"], to_place, "to_place"),
+        # Free-form operator prose, so the allow-list is doing more work here than for a line ref:
+        # an unchecked value would mint one cache entry and one BigQuery query per distinct string,
+        # and there is no shape to reject a bad one by. _sx_summary_values raises the same 400 the
+        # place expansion does when the value is not in the window's vocabulary.
+        _sx_summary_values(opts["sx_summaries"], sx_summary),
     )
 
 
@@ -1016,14 +1128,16 @@ def _base_query_params(
     line: str | None,
     from_refs: list[str],
     to_refs: list[str],
+    sx_summaries: list[str],
 ) -> list:
     """The opening parameters every decision-log query here takes, built once.
 
     ``/messages``, ``/decisions`` and ``/summary`` all narrow the same POPULATION the same way — the
-    window, then the four filters that say which cycles, which trains and whose registered journeys —
-    and each used to spell the seven parameters out again. Three verbatim copies of one list is three
-    chances for them to drift, and a drift here does not fail: the queries name their parameters, so
-    an omission surfaces as a query that quietly ignores a filter the caller set.
+    window, then the five filters that say which cycles, which trains, whose registered journeys and
+    which published disruption — and each used to spell the parameters out again. Three verbatim
+    copies of one list is three chances for them to drift, and a drift here does not fail: the
+    queries name their parameters, so an omission surfaces as a query that quietly ignores a filter
+    the caller set.
 
     Returns a fresh list each call, so a caller can append its own parameters to it without reaching
     into a shared one.
@@ -1038,6 +1152,7 @@ def _base_query_params(
         bigquery.ScalarQueryParameter("line", "STRING", line),
         bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
         bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
+        bigquery.ArrayQueryParameter("sx_summaries", "STRING", sx_summaries),
     ]
 
 
@@ -1048,6 +1163,7 @@ def _list_cache_key(
     line: str | None,
     from_place: str | None,
     to_place: str | None,
+    sx_summary: str | None,
     verdict: str | None,
     alerted_only: bool,
     pushed_only: bool,
@@ -1064,7 +1180,7 @@ def _list_cache_key(
     keep in step with the parameter list above rather than two.
     """
     return (
-        prefix, *window.cache_key, operator, line, from_place, to_place,
+        prefix, *window.cache_key, operator, line, from_place, to_place, sx_summary,
         verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
 
@@ -1452,6 +1568,7 @@ def _message_rows(
     line: str | None,
     from_place: str | None,
     to_place: str | None,
+    sx_summary: str | None,
     verdict: str | None,
     alerted_only: bool,
     pushed_only: bool,
@@ -1472,8 +1589,8 @@ def _message_rows(
     """
     from google.cloud import bigquery
 
-    from_refs, to_refs = _checked_places(window, line, from_place, to_place)
-    params = _base_query_params(window, operator, line, from_refs, to_refs) + [
+    narrowed = _checked_data_filters(window, line, from_place, to_place, sx_summary)
+    params = _base_query_params(window, operator, line, *narrowed) + [
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("pushed_only", "BOOL", pushed_only),
@@ -1483,7 +1600,7 @@ def _message_rows(
     ]
     # Same key shape as /decisions', with its own prefix; see _list_cache_key for what rides on it.
     key = _list_cache_key(
-        "messages", window, operator, line, from_place, to_place,
+        "messages", window, operator, line, from_place, to_place, sx_summary,
         verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
     return [dict(r) for r in _query(_MESSAGES_QUERY, params, key)]
@@ -1629,6 +1746,13 @@ def filters(
         lines=opts["lines"],
         from_places=places(opts["from_places"]),
         to_places=places(opts["to_places"]),
+        # Not sorted at all: the query already ordered these by how often each option occurs, which
+        # is the only ordering that makes free-form prose readable in a dropdown. `n_values` is the
+        # count of stored texts behind the option, the same thing `n_refs` is for a place.
+        sx_summaries=[
+            SxSummaryOption(value=g["value"], n_values=len(g["members"]), no_sx=g["no_sx"])
+            for g in opts["sx_summaries"]
+        ],
     )
 
 
@@ -1662,6 +1786,14 @@ def decisions(
     ),
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
+    ),
+    sx_summary: str | None = Query(
+        default=None,
+        description="Filter to decisions carrying exactly this SIRI-SX summary. Values come from "
+        "/meldinger-api/filters, which offers the window's 30 most common and is also the "
+        "allow-list this is checked against — a summary outside that cap is a 400, not an empty "
+        "page. Distinct from `sx_only`, which is about whether an operator published anything at "
+        "all rather than about which text.",
     ),
     verdict: str | None = Query(
         default=None,
@@ -1708,12 +1840,12 @@ def decisions(
 
     window = _resolve_window(day, from_time, to_time)
     operator = _checked_operator(operator)
-    from_refs, to_refs = _checked_places(window, line, from_place, to_place)
+    narrowed = _checked_data_filters(window, line, from_place, to_place, sx_summary)
     if verdict is not None and verdict not in historikk._VERDICTS:
         raise HTTPException(
             status_code=400, detail=f"verdict must be one of {', '.join(historikk._VERDICTS)}."
         )
-    params = _base_query_params(window, operator, line, from_refs, to_refs) + [
+    params = _base_query_params(window, operator, line, *narrowed) + [
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("pushed_only", "BOOL", pushed_only),
@@ -1724,7 +1856,7 @@ def decisions(
     # Every query parameter is in the key -- the day, BOTH quantized times, and every filter; see
     # _list_cache_key for why it is positional and what a forgotten parameter costs.
     key = _list_cache_key(
-        "decisions", window, operator, line, from_place, to_place,
+        "decisions", window, operator, line, from_place, to_place, sx_summary,
         verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
     rows = _query(_DECISIONS_QUERY, params, key)
@@ -1777,6 +1909,12 @@ def summary(
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
     ),
+    sx_summary: str | None = Query(
+        default=None,
+        description="Filter to decisions carrying exactly this SIRI-SX summary. Accepted here, "
+        "unlike the outcome filters, because it narrows the POPULATION: it says which decisions "
+        "exist, not which of them to show.",
+    ),
 ) -> Summary:
     """Counts and rates over the window, with the unresolved share reported alongside.
 
@@ -1787,20 +1925,21 @@ def summary(
     over almost all of them. A caller cannot tell which it has without them.
 
     The filters it accepts are exactly the ones that narrow the POPULATION — which cycles, which
-    trains, on whose registered journeys — so these rates describe the same slice the list beside
-    them shows. `verdict`, `alerted_only`, `resolved_only` and `sx_only` narrow by OUTCOME instead
-    and are deliberately not accepted here at all: filtering to hits would make precision read 100 %.
+    trains, on whose registered journeys, about which published disruption — so these rates describe
+    the same slice the list beside them shows. `verdict`, `alerted_only`, `resolved_only` and
+    `sx_only` narrow by OUTCOME instead and are deliberately not accepted here at all: filtering to
+    hits would make precision read 100 %.
     """
     window = _resolve_window(day, from_time, to_time)
     operator = _checked_operator(operator)
-    from_refs, to_refs = _checked_places(window, line, from_place, to_place)
+    narrowed = _checked_data_filters(window, line, from_place, to_place, sx_summary)
     # Only the population filters, so no extras on top of the shared block -- and for the same reason
     # the key carries only those: /summary deliberately accepts none of the outcome filters.
-    params = _base_query_params(window, operator, line, from_refs, to_refs)
+    params = _base_query_params(window, operator, line, *narrowed)
     rows = _query(
         _SUMMARY_QUERY,
         params,
-        ("summary", *window.cache_key, operator, line, from_place, to_place),
+        ("summary", *window.cache_key, operator, line, from_place, to_place, sx_summary),
     )
     row = dict(rows[0]) if rows else {}
 
@@ -1867,6 +2006,13 @@ async def messages(
     ),
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
+    ),
+    sx_summary: str | None = Query(
+        default=None,
+        description="Filter to decisions carrying exactly this SIRI-SX summary, from "
+        "/meldinger-api/filters. Pass the SAME value as to /decisions: the two lists are aligned by "
+        "position, and a filter set on one of them only would pair every card with another's "
+        "wording.",
     ),
     verdict: str | None = Query(
         default=None,
@@ -1939,7 +2085,7 @@ async def messages(
         )
     async with _replay_slots:
         return await _messages(
-            window, operator, line, from_place, to_place, verdict,
+            window, operator, line, from_place, to_place, sx_summary, verdict,
             alerted_only, pushed_only, resolved_only, sx_only, limit, deadline,
         )
 
@@ -1950,6 +2096,7 @@ async def _messages(
     line: str | None,
     from_place: str | None,
     to_place: str | None,
+    sx_summary: str | None,
     verdict: str | None,
     alerted_only: bool,
     pushed_only: bool,
@@ -1978,6 +2125,7 @@ async def _messages(
                 line=line,
                 from_place=from_place,
                 to_place=to_place,
+                sx_summary=sx_summary,
                 verdict=verdict,
                 alerted_only=alerted_only,
                 pushed_only=pushed_only,

@@ -8,6 +8,7 @@ import type {
   ReplayStatus,
   ReplayedMessage,
   SendState,
+  SxSummaryOption,
   Verdict,
 } from './api';
 
@@ -215,6 +216,25 @@ export function lineCode(line: string | null): string {
   if (!line) return '–';
   const parts = line.split(':');
   return parts[parts.length - 1];
+}
+
+/** What the SIRI-SX dropdown SHOWS for one option. The option's `value` is what gets sent — this
+ *  is a label only, and the server expands the value into every stored summary behind it.
+ *
+ *  An option flagged `no_sx` is not a SIRI-SX message at all: nobody published anything about those
+ *  departures, and the summary sitting in the log is a placeholder this codebase wrote. Under a
+ *  control labelled "SIRI-SX" that text reads as though an operator published it, so it is shown as
+ *  "Ingen" — the same absence DecisionCard already renders by leaving the SIRI-SX line off.
+ *
+ *  KEYED ON THE FLAG, never on the placeholder text. The wording changed once already (2026-08-20,
+ *  ff67e58) and `varsel_decisions` keeps what it recorded, so both texts are live in the log; the
+ *  server groups them into ONE option by situationNumber namespace, which also means a third
+ *  wording would join it for free. A hard-coded list of strings would silently start showing the
+ *  next one as operator prose.
+ *
+ *  Everything else is an operator's own words, shown exactly as written. */
+export function sxSummaryLabel(option: SxSummaryOption): string {
+  return option.no_sx ? 'Ingen' : option.value;
 }
 
 /** The scheduled departure as the header shows it: "10:16" when the train runs today, and

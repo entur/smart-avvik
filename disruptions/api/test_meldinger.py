@@ -224,6 +224,12 @@ def _filter_row(**overrides) -> dict:
         "lines": ["VYG:Line:R11"],
         "from_places": [{"ref": "NSR:StopPlace:337", "n": 5}],
         "to_places": [{"ref": "NSR:StopPlace:548", "n": 5}],
+        # Most common first, as the query produces it, and already GROUPED: one entry per thing
+        # a reader can pick, each carrying every stored text it stands for.
+        "sx_summaries": [
+            {"value": "Signalfeil ved Asker", "members": ["Signalfeil ved Asker"], "no_sx": False},
+            {"value": "Innstilt tog", "members": ["Innstilt tog"], "no_sx": False},
+        ],
     }
     base.update(overrides)
     return base
@@ -585,6 +591,7 @@ def test_every_parameter_makes_its_own_cache_entry():
         {"line": "VYG:Line:R11"},
         {"from_place": "NSR:StopPlace:337"},
         {"to_place": "NSR:StopPlace:548"},
+        {"sx_summary": "Signalfeil ved Asker"},
         {"verdict": "hit"},
         {"alerted_only": "true"},
         {"resolved_only": "true"},
@@ -641,6 +648,10 @@ def test_a_value_no_decision_in_the_window_carries_is_rejected():
         ({"line": "VYG:Line:R99"}, "Unknown line"),
         ({"from_place": "NSR:StopPlace:999"}, "Unknown from_place"),
         ({"to_place": "NSR:StopPlace:999"}, "Unknown to_place"),
+        # Free-form text, so this one carries the most weight: with no allow-list every distinct
+        # string would be one more cache entry and one more BigQuery query, and there is no shape
+        # to reject a bad value by.
+        ({"sx_summary": "Aldri publisert"}, "Unknown sx_summary"),
     ):
         _reset([_row()])
         bad = client.get("/meldinger-api/decisions", params=param)
@@ -722,9 +733,107 @@ def test_filters_lists_the_windows_vocabulary_and_echoes_the_window():
     assert body["operators"] == ["VYG"]
     assert body["lines"] == ["VYG:Line:R11"]
     assert body["from_places"] == [{"ref": "NSR:StopPlace:337", "name": "Oslo S", "n_refs": 1}]
+    assert body["sx_summaries"] == [
+        {"value": "Signalfeil ved Asker", "n_values": 1, "no_sx": False},
+        {"value": "Innstilt tog", "n_values": 1, "no_sx": False},
+    ]
     # The vocabulary is scoped to the SAME quantized window as the data, or the dropdowns would offer
     # values the list beside them cannot show.
     assert (body["from_time"], body["to_time"]) == ("06:00:00", "09:15:00")
+
+
+def test_the_sx_summaries_keep_the_querys_frequency_order():
+    """Most common first, served as the query produced it.
+
+    The one vocabulary here that is NOT alphabetical, and the difference is the whole reading: a
+    dropdown of free-form operator prose is useful because the top of it is what dominated the
+    window. Sorting it would throw that away silently — an alphabetical list of sentences looks
+    perfectly deliberate — so the order is pinned rather than assumed.
+    """
+    _reset(
+        [_row()],
+        filter_rows=[_filter_row(sx_summaries=[
+            {"value": v, "members": [v], "no_sx": False}
+            for v in ("Vanligst", "Nest vanligst", "Aldri først")
+        ])],
+    )
+    body = client.get("/meldinger-api/filters").json()
+    assert [o["value"] for o in body["sx_summaries"]] == [
+        "Vanligst", "Nest vanligst", "Aldri først"
+    ]
+
+
+def test_the_no_sx_placeholders_are_one_option_that_expands_to_every_stored_text():
+    """One row in the dropdown, both stored wordings behind it.
+
+    predict_calls.sql writes its own summary on every call NO operator published anything about, and
+    that placeholder's wording CHANGED on 2026-08-20 (ff67e58) — so the log holds two texts meaning
+    one thing (measured in dev 2026-08-23: 60 288 rows carry the current one, 5 055 the original).
+    Offered as two options they are two identical-looking rows; offered as one that filters on only
+    the nominated text, every row written before that afternoon silently disappears. That is
+    `varsel.place_refs`' lesson on a different column, and it is why the option carries `members`
+    and the predicate is `IN UNNEST`.
+
+    The label is asserted here too, because it is keyed on the FLAG rather than on the placeholder
+    strings — which is what makes a THIRD wording join the same option for free instead of appearing
+    as though an operator wrote it.
+    """
+    both = ["Mulig avvik", "Mulig avvik – ingen melding fra operatøren"]
+    _reset(
+        [_row()],
+        filter_rows=[_filter_row(sx_summaries=[
+            {"value": "Mulig avvik", "members": both, "no_sx": True},
+            {"value": "Signalfeil ved Asker", "members": ["Signalfeil ved Asker"], "no_sx": False},
+        ])],
+        message_rows=[_message_row()],
+    )
+    body = client.get("/meldinger-api/filters").json()
+    assert body["sx_summaries"] == [
+        {"value": "Mulig avvik", "n_values": 2, "no_sx": True},
+        {"value": "Signalfeil ved Asker", "n_values": 1, "no_sx": False},
+    ], "one option per answer, carrying how many stored texts it stands for"
+
+    # Choosing it must reach BOTH texts, in every query that narrows the population.
+    client.get("/meldinger-api/decisions", params={"sx_summary": "Mulig avvik"})
+    client.get("/meldinger-api/summary", params={"sx_summary": "Mulig avvik"})
+    for query in (meldinger._DECISIONS_QUERY, meldinger._SUMMARY_QUERY):
+        _, params = next(c for c in fake.calls if c[0] == query)
+        assert params["sx_summaries"] == both, "the option must expand to every text behind it"
+
+
+def test_the_label_is_never_a_value():
+    """"Ingen" is what the page renders, never what it sends.
+
+    The server publishes the stored text as the option's value and a FLAG beside it; the Norwegian
+    wording lives in format.ts with every other label. So the label must not be accepted as a filter
+    value — if it ever were, it would mean the client had started inventing values the allow-list
+    happens to know, and the next label edit would 400 the page.
+    """
+    _reset([_row()], filter_rows=[_filter_row(sx_summaries=[
+        {"value": "Mulig avvik", "members": ["Mulig avvik"], "no_sx": True},
+    ])])
+    bad = client.get("/meldinger-api/decisions", params={"sx_summary": "Ingen"})
+    assert bad.status_code == 400
+    assert "Unknown sx_summary" in bad.json()["detail"]
+    assert _decision_calls() == []
+
+
+def test_the_sx_summary_filter_reaches_every_population_query():
+    """/decisions, /messages and /summary must narrow on the same population.
+
+    The first two are aligned POSITION BY POSITION, so a filter applied to one of them only pairs
+    every card with another train's wording — silently, since both responses stay well-formed. The
+    third has to describe the slice the cards show, or the rates beside them are about a different
+    set of decisions.
+    """
+    chosen = "Signalfeil ved Asker"
+    _reset([_row()], message_rows=[_message_row()])
+    for path in ("decisions", "messages", "summary"):
+        r = client.get(f"/meldinger-api/{path}", params={"sx_summary": chosen})
+        assert r.status_code == 200, (path, r.text)
+    for query in (meldinger._DECISIONS_QUERY, meldinger._MESSAGES_QUERY, meldinger._SUMMARY_QUERY):
+        _, params = next(c for c in fake.calls if c[0] == query)
+        assert params["sx_summaries"] == [chosen]
 
 
 def test_an_unreadable_stop_registry_leaves_the_filters_usable():
@@ -763,7 +872,11 @@ def test_summary_refuses_the_outcome_filters_and_accepts_the_population_ones():
     """
     accepted = set(inspect.signature(meldinger.summary).parameters)
     assert not {"verdict", "alerted_only", "resolved_only", "sx_only"} & accepted
-    assert {"day", "from_time", "to_time", "operator", "line", "from_place", "to_place"} <= accepted
+    # sx_summary IS accepted, unlike the sx_only beside it: choosing one SIRI-SX text says which
+    # decisions exist, not which of them to show, so the rates must move with it.
+    assert {
+        "day", "from_time", "to_time", "operator", "line", "from_place", "to_place", "sx_summary",
+    } <= accepted
 
     _reset([{"n_hit": 1}])
     r = client.get("/meldinger-api/summary", params={"line": "VYG:Line:R11"})
@@ -1667,6 +1780,26 @@ def test_the_no_filter_array_test_is_null_safe():
         bare = re.findall(r"\(ARRAY_LENGTH\(@\w+\)\s*= 0 OR", sql)
         assert not bare, f"{name}: {len(bare)} null-unsafe emptiness test(s); use IFNULL(..., 0)"
         assert "IFNULL(ARRAY_LENGTH(" in sql, f"{name}: no array emptiness test found at all"
+
+
+def test_the_sx_summary_predicate_is_in_all_three_population_queries():
+    """A text check, because the failure is silent in the worst possible way.
+
+    The queries NAME their parameters, so a file that takes `@sx_summary` in its parameter list and
+    never uses it does not error — it returns the unfiltered population. On /decisions and
+    /messages, which are aligned position by position, one file left out would pair every card with
+    another train's wording; on /summary it would leave the rates describing a population the cards
+    beside them do not show. /filters is excluded because it PUBLISHES the vocabulary rather than
+    filtering on it — narrowing it by the current selection would shrink it to that selection.
+    """
+    for name in ("decisions", "messages", "summary"):
+        body = _uncommented(_QUERIES[name])
+        assert "summary IN UNNEST(@sx_summaries)" in body, (
+            f"{name}: takes @sx_summaries but does not filter on it"
+        )
+    assert "@sx_summaries" not in _uncommented(_QUERIES["filters"]), (
+        "filters publishes the vocabulary; narrowing it by the selection would shrink it to itself"
+    )
 
 
 def test_every_query_prunes_the_decision_log_on_its_partition_column():

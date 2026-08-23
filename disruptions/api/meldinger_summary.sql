@@ -27,8 +27,9 @@
 --    collapsed into one and that caveat is gone from both sides.
 --
 -- WHICH FILTERS REACH THIS FILE, and why not all of them. The day, the time range, operator, line,
--- from_place and to_place narrow the POPULATION -- which cycles, which trains, on whose registered
--- journeys -- so these rates describe exactly the slice the list beside them is showing. verdict,
+-- from_place, to_place and sx_summary narrow the POPULATION -- which cycles, which trains, on whose
+-- registered journeys, about which published disruption -- so these rates describe exactly the
+-- slice the list beside them is showing. verdict,
 -- alerted_only, pushed_only and resolved_only do NOT reach it, because they narrow by OUTCOME or by
 -- what we chose to do: filtering to hits would make precision read 100 %, and filtering to the
 -- subjects a push went out for would do the same to it from the other side. sx_only is not accepted
@@ -56,6 +57,11 @@ WITH scanned AS (
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- A POPULATION filter, which is why it reaches this file and `verdict` does not: choosing one
+    -- SIRI-SX option says which decisions exist, not which of them to show, so these rates go on
+    -- describing exactly the slice the card list beside them is rendering. An ARRAY because one
+    -- option can cover several stored summaries -- see meldinger_decisions.sql.
+    AND (IFNULL(ARRAY_LENGTH(@sx_summaries), 0) = 0 OR summary IN UNNEST(@sx_summaries))
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
     AND (IFNULL(ARRAY_LENGTH(@to_place_refs),   0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
 ),
