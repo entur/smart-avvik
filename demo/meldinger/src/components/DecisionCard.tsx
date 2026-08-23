@@ -144,11 +144,11 @@ function ReplayedWording({
     <div className="tb-notif-field">
       <div className="tb-notif">
         <div className="tb-notif-head">
-          {/* aria-hidden because a screen reader would otherwise announce the Entur mark as the
-              Norwegian article "en". The app name beside it carries the same identity in words. */}
-          <span className="tb-notif-mark" aria-hidden="true">
-            EN
-          </span>
+          {/* A blank app-icon tile, not the Entur "EN" mark it used to carry: the card is a drawing
+              of a notification, and a real wordmark makes it read as Entur shipping this rather
+              than as an experiment's output. The app name beside it is the identity, in words — so
+              the tile is decorative and aria-hidden. */}
+          <span className="tb-notif-mark" aria-hidden="true" />
           <span className="tb-notif-app">Avviksvarsel</span>
         </div>
         {/* The push's real title is the journey (varsel._notification_payload), which is why it

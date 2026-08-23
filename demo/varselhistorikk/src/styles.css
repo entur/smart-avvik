@@ -515,18 +515,15 @@ body {
   margin-bottom: 0.4375rem;
 }
 
+/* An empty tile standing in for the app icon a phone would draw. It holds no wordmark on purpose
+   — see the comment on the element — so it needs no centring or type rules, and `flex: none` is
+   what keeps a childless flex item from collapsing to nothing beside the app name. */
 .vh-notif-mark {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  flex: none;
   width: 1.0625rem;
   height: 1.0625rem;
   border-radius: 0.25rem;
   background: var(--colors-brand-blue, #181c56);
-  color: #fff;
-  font-size: 0.5rem;
-  font-weight: 700;
-  letter-spacing: 0.02em;
 }
 
 .vh-notif-app {
