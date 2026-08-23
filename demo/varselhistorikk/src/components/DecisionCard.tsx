@@ -166,12 +166,11 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
             <div className="vh-notif-field">
               <div className="vh-notif">
                 <div className="vh-notif-head">
-                  {/* aria-hidden because a screen reader would otherwise announce the Entur mark as
-                      the Norwegian article "en". The app name beside it carries the same identity
-                      in words. */}
-                  <span className="vh-notif-mark" aria-hidden="true">
-                    EN
-                  </span>
+                  {/* A blank app-icon tile, not the Entur "EN" mark it used to carry: the card is a
+                      drawing of a notification, and a real wordmark makes it read as Entur shipping
+                      this rather than as an experiment's output. The app name beside it is the
+                      identity, in words — so the tile is decorative and aria-hidden. */}
+                  <span className="vh-notif-mark" aria-hidden="true" />
                   <span className="vh-notif-app">Avviksvarsel</span>
                 </div>
                 <p className="vh-notif-title">
