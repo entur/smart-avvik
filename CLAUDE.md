@@ -831,6 +831,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     belt-and-braces rather than the thing preventing a wrong hit; keep it, since `pushed` can name a
     second cycle when the `_notified` winner flips. The cache is consulted **before** the budget, which is what makes
     repeated browsing cheap: a cache hit consumes no replay allowance and does not call Vertex.
+    That is also what makes the page's **«Hent flere»** button work (2026-08-23): a bounded
+    subject is never cached — `capped`/`deadline`/`rate_limited` return before `_remember_wording` —
+    so a second `/messages` request for the same filters re-serves every wording already written for
+    free and spends its allowance further down the list. A full 200-row page therefore fills in
+    ~3 rounds rather than in one, and the button asks for the filters that produced the cards on
+    screen, never the current control values. A page **reload** would do the same thing, which is
+    what the notice used to advise; it just re-runs the window's BigQuery queries to arrive at the
+    same cards.
     A bound that binds is reported per entry and the request still returns 200 — `capped`,
     `rate_limited` and `deadline` beside `no_input`, `unreadable_input`, `disabled` and the statuses
     off `MessageResult` — and `ungrounded`/`rejected` carry the **discarded reply**, since those two
