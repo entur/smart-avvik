@@ -72,7 +72,8 @@ export interface Alert {
   // The model-written message for this journey × situation — identical for every device on the
   // same journey, and always the same text the push carried. Null in three cases: no wording has
   // been produced yet, none could be, or this deployment writes one but delivers the deterministic
-  // wording instead (VARSEL_LLM_ENABLED=false, which is prd today). Render the fallback for null;
+  // wording instead (VARSEL_LLM_ENABLED=false — prd ran that way until 2026-08-23 and it is still
+  // the documented revert, so the state stays live). Render the fallback for null;
   // it is the ordinary state, not an error.
   message?: string | null;
 }
