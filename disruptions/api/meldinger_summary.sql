@@ -27,8 +27,9 @@
 --    collapsed into one and that caveat is gone from both sides.
 --
 -- WHICH FILTERS REACH THIS FILE, and why not all of them. The day, the time range, operator, line,
--- from_place and to_place narrow the POPULATION -- which cycles, which trains, on whose registered
--- journeys -- so these rates describe exactly the slice the list beside them is showing. verdict,
+-- from_place, to_place and sx_summary narrow the POPULATION -- which cycles, which trains, on whose
+-- registered journeys, about which published disruption -- so these rates describe exactly the
+-- slice the list beside them is showing. verdict,
 -- alerted_only, pushed_only and resolved_only do NOT reach it, because they narrow by OUTCOME or by
 -- what we chose to do: filtering to hits would make precision read 100 %, and filtering to the
 -- subjects a push went out for would do the same to it from the other side. sx_only is not accepted
@@ -47,7 +48,7 @@
 WITH scanned AS (
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
-    line, stop_place, departure_time
+    summary AS cycle_summary, line, stop_place, departure_time
   FROM `disruptions.varsel_decisions`
   -- The DERIVED partition bound, then the window itself. See meldinger_decisions.sql's header:
   -- the pruning predicate is no longer the window predicate, and a too-narrow one drops cycles
@@ -56,6 +57,8 @@ WITH scanned AS (
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- The SIRI-SX population filter is applied after aggregation below so a matching subject keeps
+    -- all cycles contributing to its whole-subject figures.
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
     AND (IFNULL(ARRAY_LENGTH(@to_place_refs),   0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
 ),
@@ -66,9 +69,9 @@ subjects AS (
     ANY_VALUE(stop_place) AS stop_place,
     MAX(departure_time)   AS departure_time
   FROM scanned
-  -- No HAVING: on this axis every scanned row is already inside the window, because the window is a
-  -- property of the subject rather than of the cycle.
   GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
+  HAVING IFNULL(ARRAY_LENGTH(@sx_summaries), 0) = 0
+      OR COUNTIF(cycle_summary IN UNNEST(@sx_summaries)) > 0
 ),
 -- The window's subjects, each carrying whatever the nightly job has resolved about it. A LEFT JOIN
 -- rather than /historikk's UNION of two sources: there the two sides are two tables holding

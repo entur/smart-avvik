@@ -48,22 +48,25 @@ export interface Decision {
   call_date: string | null;
   departure_time: string | null;
 
-  /** WINDOW-SCOPED: cycles that scored this train inside the window, not over its whole life. */
+  /** Refresh cycles that scored this train, over its whole life. */
   n_decisions: number | null;
-  /** WINDOW-SCOPED. */
+  /** First time it was scored. */
   first_decided_at: string | null;
-  /** WINDOW-SCOPED: the last time inside the window that we scored the train. */
+  /** Last time it was scored. */
   last_decided_at: string | null;
-  /** WINDOW-SCOPED: whether any cycle inside the window crossed the threshold. */
+  /** Whether any cycle crossed the alert threshold. Crossing it is not the same as a traveller
+   *  being told — see `pushed_any` and `send_state`, both of which are narrower. */
   ever_alerted: boolean | null;
-  /** WINDOW-SCOPED. */
+  /** When we first crossed the threshold; null if we never did. */
   first_alert_at: string | null;
-  /** WINDOW-SCOPED: departure minus the window's first alert, so it and first_alert_at beside it
-   *  describe the same cycle. Not the nightly job's whole-subject lead. */
+  /** Departure minus `first_alert_at`, in minutes. Agrees with the nightly job's figure by
+   *  construction now that both describe the whole subject, but still computed per row so an
+   *  unlabelled subject — nearly all of a same-day window — also gets a lead time. */
   alert_lead_min: number | null;
-  /** WINDOW-SCOPED. */
+  /** Highest alerting score reached. */
   max_impact_probability: number | null;
-  /** WINDOW-SCOPED: the figures at the last cycle inside the window. */
+  /** The figures at the last cycle. All four come from ONE aggregate server-side, so they cannot
+   *  describe different cycles. */
   final_impact_probability: number | null;
   final_cancel_probability: number | null;
   final_delay_p50_min: number | null;
@@ -265,6 +268,27 @@ export interface PlaceOption {
   n_refs: number;
 }
 
+/** One entry in the "SIRI-SX" dropdown: one thing to pick, not one stored string.
+ *
+ *  PlaceOption for summaries. Several stored summaries can mean one answer, so the option nominates
+ *  one of them as its `value` and the server expands it back to all of them when filtering — which
+ *  is why `value` is just an identity and not the whole population it selects.
+ *
+ *  `no_sx` is the only merge today: those rows are the ones no operator published anything about,
+ *  where the codebase writes its own placeholder summary — and that placeholder's wording has
+ *  already changed once, leaving two stored texts meaning one thing. The page shows such an option
+ *  as "Ingen"; the server deliberately sends the FACT and not the wording, so the Norwegian label
+ *  lives with every other label in format.ts. */
+export interface SxSummaryOption {
+  /** Send this back as `sxSummary`. The busiest stored text behind the option, stable across
+   *  refreshes so a held selection cannot be invalidated under the page. */
+  value: string;
+  /** How many stored texts this option covers; above 1 means they were merged. */
+  n_values: number;
+  /** Every row behind it is one no operator published a SIRI-SX message about. */
+  no_sx: boolean;
+}
+
 /** What the dropdowns can be set to, over the current window.
  *
  *  Its own endpoint, not derived from the decisions on screen: that list is capped at 200 and
@@ -279,6 +303,14 @@ export interface FilterOptions extends WindowFields {
   lines: string[];
   from_places: PlaceOption[];
   to_places: PlaceOption[];
+  /** The SIRI-SX options for the window, MOST COMMON FIRST and capped at 30 by the server. Render
+   *  in the given order — it is the answer to "which disruption texts dominated this window", and
+   *  sorting alphabetically would throw that away while looking deliberate.
+   *
+   *  The one TRUNCATED vocabulary here: a summary outside the top 30 sits on cards the page shows
+   *  and is a 400 if filtered on, which is what allow-listing free-form text on a public endpoint
+   *  costs. The cap counts OPTIONS, not stored texts. */
+  sx_summaries: SxSummaryOption[];
 }
 
 /** Which deployment answered. Its own endpoint because it must survive a decision log that cannot
@@ -316,6 +348,9 @@ export interface Filters {
   fromPlace?: string;
   /** StopPlace ref the registration alights at. */
   toPlace?: string;
+  /** One exact SIRI-SX summary. Values come from fetchFilterOptions, which is also the server's
+   *  allow-list — and a truncated one, so a selection is cleared when the window moves off it. */
+  sxSummary?: string;
   verdict?: Verdict;
   alertedOnly?: boolean;
   /** Only decisions a traveller was actually PUSHED about. Strictly narrower than `alertedOnly`:
@@ -355,6 +390,7 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.line) params.set('line', filters.line);
   if (filters.fromPlace) params.set('from_place', filters.fromPlace);
   if (filters.toPlace) params.set('to_place', filters.toPlace);
+  if (filters.sxSummary) params.set('sx_summary', filters.sxSummary);
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
   if (filters.pushedOnly) params.set('pushed_only', 'true');
@@ -385,9 +421,18 @@ export function fetchSummary(filters: Filters): Promise<Summary> {
   // whose registered journeys — so its rates describe the same slice the list beside it shows. The
   // verdict/alerted/resolved ones narrow by OUTCOME and deliberately do not: filtering to hits
   // would make precision read 100 %. The API refuses them here for the same reason.
-  const { day, fromTime, toTime, operator, line, fromPlace, toPlace } = filters;
+  const { day, fromTime, toTime, operator, line, fromPlace, toPlace, sxSummary } = filters;
   return get(
-    `/meldinger-api/summary?${query({ day, fromTime, toTime, operator, line, fromPlace, toPlace })}`,
+    `/meldinger-api/summary?${query({
+      day,
+      fromTime,
+      toTime,
+      operator,
+      line,
+      fromPlace,
+      toPlace,
+      sxSummary,
+    })}`,
   );
 }
 
