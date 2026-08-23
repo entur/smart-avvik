@@ -312,11 +312,45 @@ body {
 
 /* How far the wording pass got. Subdued and on its own line above the list: it is about the budget,
    not about any one card, and it must not read as an error. */
+/* A row, so the notice and the "hent flere" button share a line and the button drops below
+   only when there is no room for it. `align-items: baseline` rather than `center`: the notice runs
+   to two or three lines on a narrow viewport, and a centred button then floats in the middle of a
+   paragraph instead of sitting on its first line. */
 .tb-replay-status {
   font-size: 0.8125rem;
   color: var(--basecolors-text-subdued, #6b6b6b);
   margin: 0 0 0.5rem;
   min-height: 1.2em;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+}
+
+/* The one control on this page that spends anything: each press is another /meldinger-api/messages
+   request, and every row it has no cached wording for is a Vertex call. Hand-styled rather than
+   pulled from @entur/button, for the same reason the filters above are native `select` and
+   `checkbox` elements: one button does not earn a Linje package in this app's install. */
+.tb-replay-more {
+  font: inherit;
+  font-weight: 600;
+  padding: 0.3rem 0.75rem;
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+  border-radius: 0.25rem;
+  background: #fff;
+  color: var(--colors-brand-blue, #181c56);
+  cursor: pointer;
+}
+
+.tb-replay-more:hover:not(:disabled) {
+  border-color: var(--colors-brand-blue, #181c56);
+}
+
+/* Dimmed and inert while its own round is in flight — a second press would start a second request
+   against a surface that allows two replays at once process-wide, and the third caller gets a 503. */
+.tb-replay-more:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 /* `stroke-subdued`, a step stronger than the hairlines elsewhere, because this 4px edge is the only
