@@ -1299,6 +1299,12 @@ def test_every_helm_environment_and_the_base_pin_gemini():
         assert "VARSEL_LLM_PROVIDER: gemini" in path.read_text(), path
 
 
+def test_every_helm_environment_extends_the_replay_deadline():
+    env = Path(__file__).parents[2] / "helm/kix-avvik/env"
+    for path in sorted(env.glob("*.yaml")):
+        assert 'MELDINGER_REQUEST_DEADLINE_S: "60"' in path.read_text(), path
+
+
 def test_the_budget_is_tallied_against_replays_own_allowance_not_the_pollers():
     """The tally is keyed by caller, in the shape of `alternatives._fetch_calls`. Replay draws on its
     own number, so it can neither starve another caller's share nor be starved by one.
