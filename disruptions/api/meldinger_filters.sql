@@ -66,10 +66,10 @@ WITH universe AS (
 sx_rows AS (
   SELECT
     summary,
-    -- Is this text ONLY ever written on rows no operator published anything about? LOGICAL_OR
-    -- rather than an equality, so a text an operator also happens to publish is not quietly
-    -- reclassified as ours.
-    LOGICAL_OR(STARTS_WITH(situation_number, 'KIX:NoSituation:')) AS row_no_sx,
+    -- Is this text ONLY ever written on rows no operator published anything about? AND is
+    -- deliberately conservative: if an operator also publishes the same text, it stays a real
+    -- SIRI-SX option rather than being quietly reclassified as ours.
+    LOGICAL_AND(STARTS_WITH(situation_number, 'KIX:NoSituation:')) AS row_no_sx,
     COUNT(*) AS n
   FROM universe
   -- TRIM, so a summary of nothing but whitespace is excluded too: it would otherwise be an

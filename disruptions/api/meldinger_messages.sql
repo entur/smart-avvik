@@ -28,14 +28,13 @@
 WITH scanned AS (
   SELECT
     journey_digest, operator, jkey, call_date, stop_order, situation_number,
-    line, mode, departure_time,
+    summary AS cycle_summary, line, mode, departure_time,
     decided_at, alertworthy, pushed, message_input, prompt_version
   FROM `disruptions.varsel_decisions`
   WHERE DATE(decided_at) BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
-    AND (IFNULL(ARRAY_LENGTH(@sx_summaries), 0) = 0 OR summary IN UNNEST(@sx_summaries))
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
     AND (IFNULL(ARRAY_LENGTH(@to_place_refs),   0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
     AND (NOT @sx_only OR NOT STARTS_WITH(situation_number, 'KIX:'))
@@ -66,6 +65,10 @@ subjects AS (
               IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)] AS replay
   FROM scanned
   GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
+  -- Filter subjects without truncating their cycle history. In particular, the replay pick above
+  -- must still see a pushed cycle whose summary differs from the cycle that matched the filter.
+  HAVING IFNULL(ARRAY_LENGTH(@sx_summaries), 0) = 0
+      OR COUNTIF(cycle_summary IN UNNEST(@sx_summaries)) > 0
 )
 SELECT
   -- The subject key. Not a public projection: the caller matches these against /decisions' rows by

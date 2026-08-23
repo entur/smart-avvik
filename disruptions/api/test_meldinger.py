@@ -1794,12 +1794,26 @@ def test_the_sx_summary_predicate_is_in_all_three_population_queries():
     """
     for name in ("decisions", "messages", "summary"):
         body = _uncommented(_QUERIES[name])
-        assert "summary IN UNNEST(@sx_summaries)" in body, (
+        assert "cycle_summary IN UNNEST(@sx_summaries)" in body, (
             f"{name}: takes @sx_summaries but does not filter on it"
+        )
+        scanned, subjects = body.split("subjects AS", maxsplit=1)
+        assert "cycle_summary IN UNNEST(@sx_summaries)" not in scanned, (
+            f"{name}: filtering scanned cycles truncates matching subjects' history"
+        )
+        assert "COUNTIF(cycle_summary IN UNNEST(@sx_summaries)) > 0" in subjects, (
+            f"{name}: SIRI-SX eligibility must be applied after subject aggregation"
         )
     assert "@sx_summaries" not in _uncommented(_QUERIES["filters"]), (
         "filters publishes the vocabulary; narrowing it by the selection would shrink it to itself"
     )
+
+
+def test_a_summary_is_no_sx_only_when_every_occurrence_is_synthetic():
+    """One operator-published occurrence must keep shared text out of the generated bucket."""
+    body = _uncommented(_QUERIES["filters"])
+    assert "LOGICAL_AND(STARTS_WITH(situation_number, 'KIX:NoSituation:'))" in body
+    assert "LOGICAL_OR(STARTS_WITH(situation_number, 'KIX:NoSituation:'))" not in body
 
 
 def test_every_query_prunes_the_decision_log_on_its_partition_column():
