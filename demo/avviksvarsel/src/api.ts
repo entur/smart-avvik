@@ -3,6 +3,7 @@
 export interface Config {
   push_enabled: boolean;
   vapid_public_key: string | null;
+  feedback_enabled?: boolean;
   // Which deployment answered: 'dev' | 'tst' on non-prod, null in prd. Optional so an older API
   // (or a local stub) simply reads as production instead of breaking the app.
   environment?: string | null;
@@ -76,6 +77,34 @@ export interface Alert {
   // the documented revert, so the state stays live). Render the fallback for null;
   // it is the ordinary state, not an error.
   message?: string | null;
+  feedback_context_id?: string | null;
+  feedback_enabled?: boolean;
+}
+
+export type FeedbackRating = 'up' | 'down';
+
+export interface FeedbackSubmission {
+  context_id: string;
+  response_id: string;
+  event_id: string;
+  revision: number;
+  rating: FeedbackRating;
+  comment: string | null;
+  receipt?: string | null;
+}
+
+export type FeedbackStatus =
+  | 'saved'
+  | 'downstream'
+  | 'throttled'
+  | 'expired'
+  | 'disabled'
+  | 'invalid_receipt';
+
+export interface FeedbackResponse {
+  status: FeedbackStatus;
+  revision?: number;
+  receipt?: string;
 }
 
 export interface Journey {
@@ -220,4 +249,8 @@ export function deleteDevice(deviceId: string): Promise<void> {
 
 export function sendTestPush(deviceId: string): Promise<{ status: string }> {
   return request('/varsel-api/test', jsonPost({ device_id: deviceId }));
+}
+
+export function submitFeedback(feedback: FeedbackSubmission): Promise<FeedbackResponse> {
+  return request('/varsel-api/feedback', jsonPost(feedback));
 }
