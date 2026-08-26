@@ -11,7 +11,7 @@ import os
 import threading
 import uuid
 from collections import defaultdict, deque
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from time import monotonic
 from typing import Literal
 from urllib.request import Request as UrlRequest
@@ -32,6 +32,7 @@ _global: deque[float] = deque()
 _per_context: dict[str, deque[float]] = defaultdict(deque)
 _day = datetime.now(UTC).date()
 _daily = 0
+_inflight = threading.BoundedSemaphore(4)
 
 
 class FeedbackIn(BaseModel):
@@ -82,23 +83,32 @@ def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def _receipt(response_id: uuid.UUID, context_id: str, expires: datetime) -> str:
-    payload = f"{response_id}|{context_id}|{int(expires.timestamp())}".encode()
+def _receipt(
+    response_id: uuid.UUID, context_id: str, context_date: str, expires: datetime
+) -> str:
+    payload = f"{response_id}|{context_id}|{context_date}|{int(expires.timestamp())}".encode()
     return f"{_b64(payload)}.{_b64(hmac.new(_secret() or b'', payload, hashlib.sha256).digest())}"
 
 
-def _verify(receipt: str | None, response_id: uuid.UUID, context_id: str) -> bool:
+def _verify(receipt: str | None, response_id: uuid.UUID, context_id: str) -> str | None:
     if not receipt or "." not in receipt:
-        return False
+        return None
     try:
         left, signature = receipt.split(".", 1)
         payload = base64.urlsafe_b64decode(left + "=" * (-len(left) % 4))
         expected = hmac.new(_secret() or b"", payload, hashlib.sha256).digest()
         actual = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
-        rid, cid, expiry = payload.decode().split("|")
-        return hmac.compare_digest(expected, actual) and rid == str(response_id) and cid == context_id and int(expiry) >= int(datetime.now(UTC).timestamp())
+        rid, cid, context_date, expiry = payload.decode().split("|")
+        valid = (
+            hmac.compare_digest(expected, actual)
+            and rid == str(response_id)
+            and cid == context_id
+            and int(expiry) >= int(datetime.now(UTC).timestamp())
+        )
+        date.fromisoformat(context_date)
+        return context_date if valid else None
     except (ValueError, UnicodeError):
-        return False
+        return None
 
 
 def _claim(context_id: str) -> bool:
@@ -158,25 +168,46 @@ def _capture(body: FeedbackIn, *, environment: str, context_date: str, submitted
 def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
     if not enabled():
         return {"status": "disabled"}
-    if body.revision > 1 and not _verify(body.receipt, body.response_id, body.context_id):
+    context_date = (
+        _verify(body.receipt, body.response_id, body.context_id)
+        if body.revision > 1
+        else None
+    )
+    if body.revision > 1 and context_date is None:
         return {"status": "invalid_receipt"}
-    snapshot = feedback_contexts.resolve(body.context_id)
-    if snapshot is None:
+    if body.revision == 1 and feedback_contexts.resolve(body.context_id) is None:
         return {"status": "expired"}
     if not _claim(body.context_id):
         return {"status": "throttled"}
-    submitted = datetime.now(UTC)
-    persisted, reason = feedback_contexts.persist(
-        body.context_id, context_date=submitted.date().isoformat()
-    )
-    if not persisted:
-        return {"status": reason or "downstream"}
+    if not _inflight.acquire(blocking=False):
+        return {"status": "throttled"}
     try:
-        _capture(body, environment=environment, context_date=submitted.date().isoformat(), submitted_at=submitted.isoformat())
-    except Exception:
-        logger.warning("Feedback capture failed", extra={"fields": {"event": "varsel_feedback", "result": "downstream"}}, exc_info=True)
-        return {"status": "downstream"}
+        submitted = datetime.now(UTC)
+        if body.revision == 1:
+            context_date = submitted.date().isoformat()
+            persisted, reason = feedback_contexts.persist(
+                body.context_id, context_date=context_date
+            )
+            if not persisted:
+                return {"status": reason or "downstream"}
+        try:
+            _capture(
+                body,
+                environment=environment,
+                context_date=context_date or submitted.date().isoformat(),
+                submitted_at=submitted.isoformat(),
+            )
+        except Exception:
+            logger.warning("Feedback capture failed", extra={"fields": {"event": "varsel_feedback", "result": "downstream"}}, exc_info=True)
+            return {"status": "downstream"}
+    finally:
+        _inflight.release()
     result: dict[str, str | int] = {"status": "saved", "revision": body.revision}
     if body.revision == 1:
-        result["receipt"] = _receipt(body.response_id, body.context_id, submitted + timedelta(hours=24))
+        result["receipt"] = _receipt(
+            body.response_id,
+            body.context_id,
+            context_date or submitted.date().isoformat(),
+            submitted + timedelta(hours=24),
+        )
     return result

@@ -22,6 +22,7 @@ MAX_EVENTS = 10_000
 ENVIRONMENTS = ("dev", "tst", "prd")
 _HEX_ID = re.compile(r"^[0-9a-f]{32}$")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE)
+_PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 EVENT_COLUMNS = (
     "event_timestamp", "environment", "context_id", "context_date", "response_id",
     "revision", "event_id", "rating", "comment", "submitted_at",
@@ -99,7 +100,7 @@ def collapse_events(
                 raise ValueError("invalid revision")
             if event.get("rating") not in ("up", "down"):
                 raise ValueError("invalid rating")
-            if not start <= context_date < end:
+            if not start - timedelta(days=1) <= context_date < end:
                 raise ValueError("context date outside requested horizon")
             key = (environment, context_id, response_id)
             rank = (revision, event_id)
@@ -114,6 +115,8 @@ def collapse_events(
 def fetch_contexts(
     *, project: str, context_ids: list[str], start: date, end: date, client: Any | None = None,
 ) -> list[dict[str, Any]]:
+    if not _PROJECT_ID.fullmatch(project):
+        raise ValueError("invalid Google Cloud project ID")
     if not context_ids:
         return []
     if client is None:
@@ -140,6 +143,7 @@ def enrich(
     for row in contexts:
         grouped[str(row.get("context_id"))].append(row)
     resolved: dict[str, dict[str, Any]] = {}
+    conflicting_context_ids: set[str] = set()
     for context_id, rows in grouped.items():
         # Retry-created duplicates may legitimately differ only in their insertion timestamp.
         canonical = {
@@ -152,13 +156,14 @@ def enrich(
             if len(rows) > 1:
                 errors.append({"kind": "identical_duplicate_context", "context_id": context_id, "count": len(rows)})
         else:
+            conflicting_context_ids.add(context_id)
             errors.append({"kind": "conflicting_duplicate_context", "context_id": context_id, "count": len(rows)})
     output = []
     for event in events:
         context_id = event["context_id"]
         context = resolved.get(context_id)
         if context is None:
-            if not any(e.get("kind") == "conflicting_duplicate_context" and e.get("context_id") == context_id for e in errors):
+            if context_id not in conflicting_context_ids:
                 kind = "expired_context" if retained_since and date.fromisoformat(event["context_date"]) < retained_since else "missing_context"
                 errors.append({"kind": kind, "context_id": context_id, "response_id": event["response_id"]})
             output.append({"feedback": event, "context": None})
@@ -212,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     context_ids = sorted({event["context_id"] for event in events})
     contexts = fetch_contexts(project=args.project, context_ids=context_ids,
-                              start=args.from_date, end=args.to_date)
+                              start=args.from_date - timedelta(days=1), end=args.to_date)
     rows, errors = enrich(events, contexts, errors, retained_since=datetime.now(UTC).date() - timedelta(days=90))
     write_json(args.output, {
         "metadata": {"environment": args.environment, "from_date": args.from_date,

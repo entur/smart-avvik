@@ -62,10 +62,36 @@ def test_retry_duplicate_may_differ_only_by_persistence_timestamp():
 
 def test_malformed_and_out_of_horizon_events_are_reported():
     outside = event()
-    outside["context_date"] = "2026-08-25"
+    outside["context_date"] = "2026-08-24"
     rows, errors = export.collapse_events([outside, {"_malformed": "bad row"}], environment="dev", start=date(2026, 8, 26), end=date(2026, 8, 27))
     assert rows == []
     assert len(errors) == 2
+
+
+def test_previous_day_context_is_valid_for_revision_ingested_after_midnight():
+    previous = event(revision=2)
+    previous["context_date"] = "2026-08-25"
+    rows, errors = export.collapse_events(
+        [previous], environment="dev", start=date(2026, 8, 26), end=date(2026, 8, 27)
+    )
+    assert rows == [previous]
+    assert errors == []
+
+
+def test_bigquery_project_identifier_is_validated_before_query():
+    for project in ("bad`project", "bad project", "x;select", "UPPERCASE"):
+        try:
+            export.fetch_contexts(
+                project=project,
+                context_ids=["a" * 32],
+                start=date(2026, 8, 26),
+                end=date(2026, 8, 27),
+                client=object(),
+            )
+        except ValueError as exc:
+            assert "project ID" in str(exc)
+        else:
+            raise AssertionError("unsafe project identifier accepted")
 
 
 def test_json_output_is_owner_only_non_overwriting_and_escapes_controls(tmp_path):

@@ -2831,6 +2831,7 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
     # situation. `alerts` may be shared across several registrations of the same definition, so this
     # builds a new list and never mutates the caller's.
     alerts = one_alert_per_train(match_journey(rec) if alerts is None else alerts)
+    feedback_available = feedback.enabled()
     with _state_lock:
         now = datetime.now(UTC)
         for alert in alerts:
@@ -2852,7 +2853,7 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
             # this read used `>=` while the selection rule pools on `>`.
             if _still_catchable(alt, now):
                 alert.alternative_journey = alt
-            if feedback.enabled():
+            if feedback_available:
                 meta = dict(_message_meta.get(cache_key) or {})
                 source = "llm" if alert.message is not None else "summary"
                 originating_input = meta.get("message_input") if source == "llm" else None
@@ -2906,18 +2907,28 @@ def _feedback_detail(alert: Alert) -> str:
     """Literal detail line mirrored from the current React renderer."""
     parts: list[str] = []
     if alert.departure_time:
-        code = alert.line.rsplit(":", 1)[-1] if alert.line else None
-        hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
-        parts.append(f"{alert.mode} {code} {hhmm}" if code else f"{alert.mode} kl {hhmm}")
+        parts.append(
+            _train_label(
+                alert.mode,
+                _local_line_code(alert.line),
+                _local_hhmm(alert.departure_time) or "",
+            )
+        )
     if alert.cancelled:
         parts.append("Innstilt")
     elif alert.cancel_probability >= _CANCEL_LIKELY:
-        parts.append(f"{round(alert.cancel_probability * 100)} % sjanse for innstilling")
-    elif alert.delay_p50_min or alert.delay_p90_min:
-        if alert.delay_p50_min and alert.delay_p90_min and alert.delay_p90_min > alert.delay_p50_min:
-            parts.append(f"Typisk {alert.delay_p50_min}–{alert.delay_p90_min} min forsinket")
-        else:
-            parts.append(f"Typisk {alert.delay_p90_min or alert.delay_p50_min} min forsinket")
+        # JavaScript Math.round (used by the card) rounds non-negative .5 values upward; Python's
+        # round uses ties-to-even and would make the persisted "exact" text disagree at 50.5 %.
+        parts.append(f"{int(alert.cancel_probability * 100 + 0.5)} % sjanse for innstilling")
+    elif delay := _delay_phrase(
+        {
+            "forsinkelse_min": {
+                "typisk": alert.delay_p50_min,
+                "verstefall": alert.delay_p90_min,
+            }
+        }
+    ):
+        parts.append(delay)
     return " · ".join(parts)
 
 
