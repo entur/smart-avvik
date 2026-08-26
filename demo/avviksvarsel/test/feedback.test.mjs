@@ -62,3 +62,9 @@ test('feedback identifiers and receipts are never stored in persistent browser s
   assert.doesNotMatch(source, /localStorage|sessionStorage|document\.cookie/);
   assert.match(source, /useRef\(crypto\.randomUUID\(\)\)/);
 });
+
+test('feedback POST whitelists the strict backend contract', () => {
+  const source = readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8');
+  assert.match(source, /const \{ context_id, response_id, event_id, revision, rating, comment, receipt \}/);
+  assert.doesNotMatch(source, /jsonPost\(feedback\)/);
+});
