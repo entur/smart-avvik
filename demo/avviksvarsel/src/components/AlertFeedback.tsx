@@ -36,18 +36,22 @@ export default function AlertFeedback({ contextId }: { contextId: string }) {
   const sending = useRef(false);
   const mounted = useRef(true);
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
       mounted.current = false;
-    },
-    [],
-  );
+    };
+  }, []);
 
   async function pump(): Promise<void> {
     if (sending.current) return;
-    let next = pending.current;
+    const wanted = desired.current;
+    let next =
+      pending.current && wanted && pending.current.key === snapshotKey(wanted)
+        ? pending.current
+        : null;
+    if (pending.current && !next) pending.current = null;
     if (!next) {
-      const wanted = desired.current;
       if (!wanted) return;
       next = {
         context_id: contextId,

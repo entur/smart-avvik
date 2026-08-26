@@ -24,6 +24,7 @@ _table_ready = False
 _lock = threading.RLock()
 _by_id: OrderedDict[str, tuple[float, str, dict[str, Any]]] = OrderedDict()
 _by_fingerprint: dict[str, str] = {}
+_persisted: set[str] = set()
 
 
 def configure(*, bq_client: Any | None) -> None:
@@ -47,7 +48,8 @@ def ensure_table() -> bool:
 
 
 def enabled() -> bool:
-    return _bq_client is not None and _table_ready
+    # Table readiness is retryable in persist(); configuration availability is what controls UI.
+    return _bq_client is not None
 
 
 def _canonical(snapshot: dict[str, Any]) -> str:
@@ -55,10 +57,12 @@ def _canonical(snapshot: dict[str, Any]) -> str:
 
 
 def _prune(now: float) -> None:
-    for context_id, (expires, fingerprint, _) in list(_by_id.items()):
+    while _by_id:
+        context_id, (expires, fingerprint, _) = next(iter(_by_id.items()))
         if expires > now:
-            continue
+            break
         _by_id.pop(context_id, None)
+        _persisted.discard(context_id)
         if _by_fingerprint.get(fingerprint) == context_id:
             _by_fingerprint.pop(fingerprint, None)
 
@@ -77,6 +81,10 @@ def mint(snapshot: dict[str, Any]) -> str | None:
             _by_id.move_to_end(existing)
             return existing
         if len(_by_id) >= _MAX_CONTEXTS:
+            logger.warning(
+                "Feedback context cache is full",
+                extra={"fields": {"event": "varsel_feedback_context", "result": "full"}},
+            )
             return None  # do not evict a still-live capability
         context_id = secrets.token_hex(16)
         _by_id[context_id] = (now + _LEASE_S, fingerprint, json.loads(canonical))
@@ -97,6 +105,9 @@ def persist(context_id: str, *, context_date: str | None = None) -> tuple[bool, 
     snapshot = resolve(context_id)
     if snapshot is None:
         return False, "expired"
+    with _lock:
+        if context_id in _persisted:
+            return True, None
     if not ensure_table():
         return False, "downstream"
     now = datetime.now(UTC)
@@ -107,13 +118,15 @@ def persist(context_id: str, *, context_date: str | None = None) -> tuple[bool, 
         **snapshot,
     }
     try:
-        errors = _bq_client.insert_rows_json(TABLE, [row], row_ids=[context_id])
+        errors = _bq_client.insert_rows_json(TABLE, [row], row_ids=[context_id], timeout=5)
     except Exception:
         logger.warning("Could not persist feedback context", exc_info=True)
         return False, "downstream"
     if errors:
         logger.warning("Feedback context rejected by BigQuery")
         return False, "downstream"
+    with _lock:
+        _persisted.add(context_id)
     return True, None
 
 
@@ -122,4 +135,5 @@ def _reset_for_tests() -> None:
     with _lock:
         _by_id.clear()
         _by_fingerprint.clear()
+        _persisted.clear()
     _table_ready = False

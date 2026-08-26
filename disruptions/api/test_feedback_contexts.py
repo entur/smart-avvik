@@ -17,7 +17,8 @@ class FakeBQ:
         assert "partition_expiration_days=90" in sql
         return _Job()
 
-    def insert_rows_json(self, table, rows, row_ids=None):
+    def insert_rows_json(self, table, rows, row_ids=None, timeout=None):
+        assert timeout == 5
         self.rows.append((table, rows, row_ids))
         return []
 
@@ -43,6 +44,8 @@ def test_persist_is_self_contained_and_uses_stable_insert_id():
     assert ids == [context_id]
     assert rows[0]["displayed_text"] == "Hei"
     assert rows[0]["context_id"] == context_id
+    assert feedback_contexts.persist(context_id) == (True, None)
+    assert len(fake.rows) == 1
 
 
 def test_unknown_context_never_infers_a_row():
