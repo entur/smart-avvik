@@ -28,7 +28,7 @@ function observationText(obs: NonNullable<Alert['latest_observation']>): string 
 // score here printed two different percentages for the same train in the same alert box, one line
 // apart. `impact_probability` is still what the gate gets compared against, which is why the
 // below-threshold note below is phrased as a threshold rather than restated as a probability.
-function AlertLine({ alert }: { alert: Alert }) {
+function AlertLine({ alert, notificationTarget }: { alert: Alert; notificationTarget: boolean }) {
   const parts: string[] = [];
   if (alert.departure_time) parts.push(trainLabel(alert.mode, alert.line, alert.departure_time));
   // A departure ET has already declared cancelled is stated, never scored: "91 % sjanse for
@@ -42,7 +42,11 @@ function AlertLine({ alert }: { alert: Alert }) {
   if (driver) parts.push(driver);
   const observation = alert.latest_observation ? observationText(alert.latest_observation) : null;
   return (
-    <SmallAlertBox variant={alert.alertworthy ? 'negative' : 'warning'} width="fluid">
+    <SmallAlertBox
+      variant={alert.alertworthy ? 'negative' : 'warning'}
+      width="fluid"
+      className={notificationTarget ? 'av-alert-notification-target' : undefined}
+    >
       {alert.message ? (
         /* The wording is written as several lines (see varsel._deterministic_body's "\n".join, and
            the model is asked for the same shape), and the card quotes the text the push carries.
@@ -60,15 +64,21 @@ function AlertLine({ alert }: { alert: Alert }) {
 
 export default function JourneyCard({
   journey,
+  notificationSituation,
   onDelete,
 }: {
   journey: Journey;
+  notificationSituation: string | null;
   onDelete: () => void;
 }) {
   const fromName = journey.from_name ?? journey.from_stop;
   const toName = journey.to_name ?? journey.to_stop;
   return (
-    <li className="av-card av-journey">
+    <li
+      id={`journey-${encodeURIComponent(journey.journey_id)}`}
+      className="av-card av-journey"
+      tabIndex={-1}
+    >
       <div className="av-journey-head">
         <div className="av-route">
           <span className="av-route-stop">{fromName}</span>
@@ -116,6 +126,7 @@ export default function JourneyCard({
             <AlertLine
               key={`${a.situation_number}|${a.line}|${a.departure_time}`}
               alert={a}
+              notificationTarget={a.situation_number === notificationSituation}
             />
           ))}
         </div>
