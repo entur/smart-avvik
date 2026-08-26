@@ -105,6 +105,10 @@ from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query, Request
 from impact import AlternativeOutcome, ImpactResponse, LatestObservation, severity_key
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.concurrency import run_in_threadpool
+
+import feedback
+import feedback_contexts
 
 logger = logging.getLogger(__name__)
 
@@ -706,7 +710,7 @@ _message_errors: dict[tuple[str, str, str], int] = {}
 # {"status": ..., "provider": ..., "model": ...}. Written here rather than derived at record time
 # because only this loop can tell a per-cycle cap from an exhausted retry from a model that refused,
 # and once the deterministic wording is stored all three look identical. See decisions.build_row.
-_message_meta: dict[tuple[str, str, str], dict[str, str | None]] = {}
+_message_meta: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
@@ -963,6 +967,14 @@ class Alert(BaseModel):
         "a message may well have been written and recorded). In every one of those cases the push "
         "carries the deterministic wording, and this field says so by being null rather than by "
         "repeating it: the card shows exactly what the notification showed.",
+    )
+    feedback_context_id: str | None = Field(
+        default=None,
+        description="Opaque, short-lived handle for the exact alert rendering; null when disabled.",
+    )
+    feedback_enabled: bool = Field(
+        default=False,
+        description="Whether this server currently accepts isolated per-alert feedback.",
     )
     # Internal: the full /impact response this alert was derived from, handed to the message writer
     # so it sees the complete picture (every situation's text, every line's observation, the
@@ -1575,6 +1587,7 @@ def _remember_message_meta(
     status: str,
     provider: str | None = None,
     model: str | None = None,
+    message_input: dict | None = None,
 ) -> None:
     """Note how this journey × situation's message came about, for the decision log.
 
@@ -1588,6 +1601,16 @@ def _remember_message_meta(
             meta["provider"] = provider
         if model is not None:
             meta["model"] = model
+        if message_input is not None:
+            # Keep the originating input with a cached wording. A later poll has different numbers
+            # and must not be represented as the input that produced already-cached prose.
+            meta["message_input"] = json.loads(json.dumps(message_input, ensure_ascii=False, default=str))
+            try:
+                import llm_message
+
+                meta["prompt_version"] = llm_message.PROMPT_VERSION
+            except Exception:
+                pass
 
 
 def _write_message(
@@ -1657,6 +1680,7 @@ def _write_message(
             status=result.status,
             provider=result.provider,
             model=result.model,
+            message_input=message_input,
         )
         return result.text
     except Exception:
@@ -2582,6 +2606,9 @@ class ConfigResponse(BaseModel):
     environment: str | None = Field(
         description='Non-prod environment name ("dev", "tst") for the PWA to show in its title; null in prd.',
     )
+    feedback_enabled: bool = Field(
+        default=False, description="Whether per-alert usefulness feedback is available."
+    )
 
 
 class StopItem(BaseModel):
@@ -2725,6 +2752,7 @@ async def config() -> ConfigResponse:
         push_enabled=push_enabled(),
         vapid_public_key=_VAPID_PUBLIC_KEY if push_enabled() else None,
         environment=environment_label(),
+        feedback_enabled=feedback.enabled(),
     )
 
 
@@ -2824,6 +2852,39 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
             # this read used `>=` while the selection rule pools on `>`.
             if _still_catchable(alt, now):
                 alert.alternative_journey = alt
+            if feedback.enabled():
+                meta = dict(_message_meta.get(cache_key) or {})
+                source = "llm" if alert.message is not None else "summary"
+                originating_input = meta.get("message_input") if source == "llm" else None
+                obs = alert.latest_observation
+                snapshot = {
+                    "display_source": source,
+                    "displayed_text": alert.message if alert.message is not None else alert.summary,
+                    "detail_text": _feedback_detail(alert),
+                    "observation_text": _feedback_observation(obs),
+                    "situation_number": alert.situation_number,
+                    "operator": alert.operator,
+                    "line": alert.line,
+                    "departure_time": alert.departure_time.isoformat() if alert.departure_time else None,
+                    "journey_context": {
+                        "from_stop": rec["from_stop"], "from_name": rec.get("from_name"),
+                        "to_stop": rec["to_stop"], "to_name": rec.get("to_name"),
+                    },
+                    "message_input": originating_input,
+                    "llm_provider": meta.get("provider") if source == "llm" else None,
+                    "llm_model": meta.get("model") if source == "llm" else None,
+                    "prompt_version": meta.get("prompt_version") if source == "llm" else None,
+                    "message_status": meta.get("status"),
+                    "prediction": {
+                        "cancelled": alert.cancelled, "cancel_probability": alert.cancel_probability,
+                        "impact_probability": alert.impact_probability, "ge10_probability": alert.ge10_probability,
+                        "delay_p50_min": alert.delay_p50_min, "delay_p90_min": alert.delay_p90_min,
+                    },
+                    "policy": {"alert_threshold": alert.alert_threshold, "alertworthy": alert.alertworthy},
+                    "delivery": {"message_source": source},
+                }
+                alert.feedback_context_id = feedback_contexts.mint(snapshot)
+                alert.feedback_enabled = alert.feedback_context_id is not None
     return Journey(
         journey_id=jid,
         from_stop=rec["from_stop"],
@@ -2839,6 +2900,36 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
         # departures between these stops" directly above a disruption on one of them.
         warning=None if alerts else _service_warning(rec),
     )
+
+
+def _feedback_detail(alert: Alert) -> str:
+    """Literal detail line mirrored from the current React renderer."""
+    parts: list[str] = []
+    if alert.departure_time:
+        code = alert.line.rsplit(":", 1)[-1] if alert.line else None
+        hhmm = alert.departure_time.astimezone(_OSLO).strftime("%H:%M")
+        parts.append(f"{alert.mode} {code} {hhmm}" if code else f"{alert.mode} kl {hhmm}")
+    if alert.cancelled:
+        parts.append("Innstilt")
+    elif alert.cancel_probability >= _CANCEL_LIKELY:
+        parts.append(f"{round(alert.cancel_probability * 100)} % sjanse for innstilling")
+    elif alert.delay_p50_min or alert.delay_p90_min:
+        if alert.delay_p50_min and alert.delay_p90_min and alert.delay_p90_min > alert.delay_p50_min:
+            parts.append(f"Typisk {alert.delay_p50_min}–{alert.delay_p90_min} min forsinket")
+        else:
+            parts.append(f"Typisk {alert.delay_p90_min or alert.delay_p50_min} min forsinket")
+    return " · ".join(parts)
+
+
+def _feedback_observation(obs: LatestObservation | None) -> str | None:
+    if obs is None:
+        return None
+    stop = obs.at_stop_name or obs.at_stop
+    if not stop:
+        return None
+    state = "innstilt" if obs.cancelled else (f"{obs.delayed_min} min forsinket" if obs.delayed_min else "i rute")
+    when = f" (kl {obs.observed_at.astimezone(_OSLO):%H:%M})" if obs.observed_at else ""
+    return f"Sist observert: {stop}, {state}{when}"
 
 
 @router.get("/journeys", summary="A device's journeys with the disruptions currently hitting them")
@@ -2866,6 +2957,32 @@ def list_journeys(
         journeys.append(_journey_model(jid, rec, alerts=by_key[key]))
     journeys.sort(key=lambda j: j.created_ts)
     return JourneysResponse(journeys=journeys)
+
+
+@router.post("/feedback", summary="Record isolated usefulness feedback for one displayed alert")
+async def submit_feedback(request: Request) -> dict:
+    """Read and bound the raw body before JSON decoding; downstream I/O stays off the event loop."""
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > feedback._MAX_BODY:
+                raise HTTPException(status_code=413, detail="Payload too large")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > feedback._MAX_BODY:
+            raise HTTPException(status_code=413, detail="Payload too large")
+        chunks.append(chunk)
+    try:
+        body = feedback.parse(b"".join(chunks))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="Invalid feedback") from None
+    return await run_in_threadpool(
+        feedback.submit, body, environment=environment_label() or "prd"
+    )
 
 
 @router.post("/journeys", summary="Register a journey for alerts")
