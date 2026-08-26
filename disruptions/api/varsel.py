@@ -91,6 +91,7 @@ from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Any, Protocol
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
@@ -1453,6 +1454,7 @@ def _notification_payload(
     alert: Alert,
     message: str | None = None,
     *,
+    journey_id: str | None = None,
     message_input: dict | None = None,
     brand: str = DEFAULT_BRAND,
 ) -> dict:
@@ -1474,13 +1476,17 @@ def _notification_payload(
     from_name = journey.get("from_name") or journey["from_stop"]
     to_name = journey.get("to_name") or journey["to_stop"]
     assets = _BRAND_ASSETS[normalize_brand(brand)]
+    url = assets["url"]
+    if journey_id:
+        separator = "&" if "?" in url else "?"
+        url = f"{url}{separator}{urlencode({'journey': journey_id, 'situation': alert.situation_number})}"
     return {
         # The journey alone, no "Avvik: " prefix (2026-08-20): the app that sent it is already
         # named beside the title by the OS, the body says what the disruption is, and the two
         # words cost the stop names room on a lock screen that truncates on the right.
         "title": _tag_environment(f"{from_name} → {to_name}"),
         "body": message or _deterministic_body(message_input or _message_input_from_alert(alert)),
-        "url": assets["url"],
+        "url": url,
         "icon": assets["icon"],
         "situation_number": alert.situation_number,
     }
@@ -2525,6 +2531,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 journey,
                 alert,
                 message,
+                journey_id=jid,
                 message_input=message_inputs.get(message_key),
                 brand=brand,
             )

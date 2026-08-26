@@ -31,6 +31,9 @@ self.addEventListener('push', (event) => {
     // Same situation replaces its previous notification instead of stacking.
     tag: data.situation_number || undefined,
     data: { url: data.url || '/varsel/' },
+    // Chromium-based Android browsers render this as a button. Safari ignores unsupported
+    // notification actions, so tapping the notification itself remains the complete iPhone path.
+    actions: [{ action: 'view-journey', title: 'Se reisen' }],
   };
   event.waitUntil(self.registration.showNotification(title, options));
 });
@@ -44,7 +47,34 @@ self.addEventListener('notificationclick', (event) => {
       .then((windows) => {
         for (const client of windows) {
           if (client.url.includes('/varsel') && 'focus' in client) {
-            return client.focus();
+            // Focusing alone leaves an already-open app on whichever journey it last showed.
+            // Start focusing immediately: some browsers delay or reject navigation, and a tap
+            // must still bring the app forward. Body taps and Android's action button share this
+            // deep-link behavior.
+            const focused = Promise.resolve(client.focus()).then(
+              () => true,
+              () => false,
+            );
+            if (!('navigate' in client)) return focused;
+
+            let navigation;
+            try {
+              navigation = client.navigate(url);
+            } catch (_error) {
+              return focused.then((didFocus) =>
+                !didFocus && self.clients.openWindow ? self.clients.openWindow(url) : undefined,
+              );
+            }
+            return Promise.resolve(navigation).then(
+              (navigatedClient) =>
+                navigatedClient && 'focus' in navigatedClient
+                  ? navigatedClient.focus()
+                  : focused,
+              () =>
+                focused.then((didFocus) =>
+                  !didFocus && self.clients.openWindow ? self.clients.openWindow(url) : undefined,
+                ),
+            );
           }
         }
         return self.clients.openWindow ? self.clients.openWindow(url) : undefined;
