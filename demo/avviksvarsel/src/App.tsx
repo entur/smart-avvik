@@ -48,8 +48,12 @@ export default function App({ brand }: { brand: Brand }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const notificationParams = new URLSearchParams(location.search);
+  const notificationJourney = notificationParams.get('journey');
+  const notificationSituation = notificationParams.get('situation');
 
   const refreshFailures = useRef(0);
+  const handledNotification = useRef<string | null>(null);
 
   const refreshJourneys = useCallback(async () => {
     try {
@@ -88,6 +92,19 @@ export default function App({ brand }: { brand: Brand }) {
       }
     })();
   }, [deviceId]);
+
+  // A notification can launch a cold PWA, so the target card does not exist until the initial
+  // journey request completes. Move both viewport and keyboard focus once it has rendered.
+  useEffect(() => {
+    if (loading || !notificationJourney) return;
+    const notificationKey = `${notificationJourney}|${notificationSituation ?? ''}`;
+    if (handledNotification.current === notificationKey) return;
+    handledNotification.current = notificationKey;
+    const target = document.getElementById(`journey-${encodeURIComponent(notificationJourney)}`);
+    if (!target) return;
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    target.focus({ preventScroll: true });
+  }, [loading, journeys, notificationJourney]);
 
   // Keep the live disruptions on each journey fresh: poll, and re-fetch when the app regains focus
   // (e.g. after tapping a notification).
@@ -188,6 +205,9 @@ export default function App({ brand }: { brand: Brand }) {
                     <JourneyCard
                       key={j.journey_id}
                       journey={j}
+                      notificationSituation={
+                        j.journey_id === notificationJourney ? notificationSituation : null
+                      }
                       onDelete={() => void handleDelete(j.journey_id)}
                     />
                   ))}

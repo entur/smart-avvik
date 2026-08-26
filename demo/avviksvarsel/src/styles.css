@@ -70,6 +70,15 @@ body {
   box-shadow: var(--av-card-shadow);
 }
 
+.av-journey:focus {
+  outline: 3px solid var(--av-focus-ring, #181c56);
+  outline-offset: 3px;
+}
+
+.av-alert-notification-target {
+  box-shadow: 0 0 0 3px rgb(24 28 86 / 0.28);
+}
+
 .av-status {
   display: flex;
   flex-direction: column;

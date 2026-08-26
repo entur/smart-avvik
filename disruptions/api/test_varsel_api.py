@@ -541,7 +541,7 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
     client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
-    client.post(
+    journey_response = client.post(
         "/varsel-api/journeys",
         json={
             "device_id": DEVICE,
@@ -554,10 +554,13 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
             "days": [0, 1, 2, 3, 4, 5, 6],
         },
     )
+    journey_id = journey_response.json()["journey_id"]
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1
     assert sent[0]["title"] == "Oslo S → Lillehammer"
-    assert sent[0]["url"] == "/varsel/"
+    assert sent[0]["url"] == (
+        f"/varsel/?journey={journey_id}&situation=S1"
+    )
     assert "82 % sjanse for innstilling" in sent[0]["body"]
     assert "min forsinket" not in sent[0]["body"]
     # Second pass: already notified -> no new push.
@@ -576,8 +579,8 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
 # the Entur-styled page, which is the whole thing the variant exists to avoid.
 
 
-def _register_journey(device: str) -> None:
-    client.post(
+def _register_journey(device: str) -> str:
+    response = client.post(
         "/varsel-api/journeys",
         json={
             "device_id": device,
@@ -590,6 +593,7 @@ def _register_journey(device: str) -> None:
             "days": [0, 1, 2, 3, 4, 5, 6],
         },
     )
+    return response.json()["journey_id"]
 
 
 def test_an_unbranded_device_is_pushed_its_own_icon_and_url(monkeypatch):
@@ -600,13 +604,15 @@ def test_an_unbranded_device_is_pushed_its_own_icon_and_url(monkeypatch):
         "/varsel-api/devices",
         json={"device_id": DEVICE, "subscription": SUBSCRIPTION, "brand": "none"},
     )
-    _register_journey(DEVICE)
+    journey_id = _register_journey(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1
     assert sent[0]["icon"] == "/varsel/icons/pwa-192-none.png"
     # Tapping through has to land back on the unbranded page, or the notification is neutral and
     # the app it opens is not.
-    assert sent[0]["url"] == "/varsel/?brand=none"
+    assert sent[0]["url"] == (
+        f"/varsel/?brand=none&journey={journey_id}&situation=S1"
+    )
     # The WORDING is brand-independent on purpose: it is what /historikk records, and text that
     # varied by variant would split every wording comparison along a second axis.
     assert sent[0]["title"] == "Oslo S → Lillehammer"
@@ -624,11 +630,13 @@ def test_a_device_that_never_named_a_brand_is_entur(monkeypatch):
     # Simulate a record written before the field existed, which is what a restored blob looks like.
     with varsel._state_lock:
         varsel._devices[DEVICE].pop("brand", None)
-    _register_journey(DEVICE)
+    journey_id = _register_journey(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1
     assert sent[0]["icon"] == "/varsel/icons/pwa-192.png"
-    assert sent[0]["url"] == "/varsel/"
+    assert sent[0]["url"] == (
+        f"/varsel/?journey={journey_id}&situation=S1"
+    )
 
 
 def test_a_brand_this_server_cannot_draw_falls_back_rather_than_404ing(monkeypatch):
