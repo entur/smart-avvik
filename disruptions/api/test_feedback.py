@@ -30,6 +30,7 @@ def test_strict_validation_rejects_extra_and_oversized_comment():
 
 
 def test_capture_is_allowlisted_and_personless(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "https://eu.i.posthog.com")
     captured = {}
 
     class Response:
@@ -64,11 +65,23 @@ def test_receipt_binds_response_to_context(monkeypatch):
     assert not feedback._verify(receipt, uuid.uuid4(), body.context_id)
 
 
+def test_enabled_requires_explicit_flag_and_fixed_eu_host(monkeypatch):
+    monkeypatch.setattr(feedback, "_token", lambda: "phc_test")
+    monkeypatch.setattr(feedback, "_secret", lambda: b"s" * 32)
+    monkeypatch.setattr(feedback.feedback_contexts, "enabled", lambda: True)
+    monkeypatch.setenv("POSTHOG_HOST", "https://eu.i.posthog.com")
+    assert not feedback.enabled()
+    monkeypatch.setenv("VARSEL_FEEDBACK_ENABLED", "true")
+    assert feedback.enabled()
+    monkeypatch.setenv("POSTHOG_HOST", "https://example.invalid")
+    assert not feedback.enabled()
+
+
 def test_submit_persists_context_before_capture_and_returns_receipt(monkeypatch):
     order = []
     monkeypatch.setattr(feedback, "enabled", lambda: True)
     monkeypatch.setattr(feedback.feedback_contexts, "resolve", lambda context_id: {"displayed_text": "Hei"})
-    monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id: (order.append("bq") or True, None))
+    monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (order.append("bq") or True, None))
     monkeypatch.setattr(feedback, "_capture", lambda *args, **kwargs: order.append("posthog"))
     monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
     monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
@@ -81,7 +94,7 @@ def test_submit_persists_context_before_capture_and_returns_receipt(monkeypatch)
 def test_submit_stops_before_posthog_when_context_persistence_fails(monkeypatch):
     monkeypatch.setattr(feedback, "enabled", lambda: True)
     monkeypatch.setattr(feedback.feedback_contexts, "resolve", lambda context_id: {"displayed_text": "Hei"})
-    monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id: (False, "downstream"))
+    monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (False, "downstream"))
     monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
     monkeypatch.setattr(feedback, "_capture", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("called")))
     assert feedback.submit(_body(), environment="dev") == {"status": "downstream"}

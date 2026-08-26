@@ -36,3 +36,8 @@ common:
       # All deployments use one named backend. Environment files repeat this explicitly, while the
       # base keeps future/local releases aligned with /meldinger's one-call quota accounting.
       VARSEL_LLM_PROVIDER: gemini
+      # Per-alert feedback is a privacy-gated opt-in. This remains false unless an environment has
+      # passed the capture/read-back/deletion and access gates in data/feedback/README.md.
+      VARSEL_FEEDBACK_ENABLED: "false"
+      # Non-secret EU ingestion origin. Capture and review credentials stay separate.
+      POSTHOG_HOST: https://eu.i.posthog.com
