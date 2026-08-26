@@ -233,6 +233,53 @@ body {
   opacity: 0.8;
 }
 
+.av-feedback {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.av-feedback-question,
+.av-feedback-help {
+  margin: 0;
+}
+
+.av-feedback-question {
+  font-weight: 600;
+}
+
+.av-feedback-ratings,
+.av-feedback-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.av-feedback-ratings button[aria-pressed='true'] {
+  box-shadow: inset 0 0 0 2px currentColor;
+}
+
+.av-feedback-comment {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.av-feedback-comment > :first-child {
+  width: 100%;
+}
+
+.av-feedback-help {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
 /* ---- add-journey form ---- */
 
 .av-form {

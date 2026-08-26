@@ -4,6 +4,7 @@ import { SmallAlertBox } from '@entur/alert';
 import { Paragraph, SmallText } from '@entur/typography';
 import type { Alert, Journey } from '../api';
 import { CANCEL_LIKELY, fmtDelay, fmtPct, fmtTime, formatDays, trainLabel } from '../format';
+import AlertFeedback from './AlertFeedback';
 
 // "Sist observert: Asker, 18 min forsinket (kl 07:42)" — what has actually happened on the line, as
 // opposed to what is predicted. Shown with its time because the observation can be up to an hour
@@ -58,6 +59,9 @@ function AlertLine({ alert, notificationTarget }: { alert: Alert; notificationTa
       )}
       <span className="av-alert-detail">{parts.join(' · ')}</span>
       {observation && <span className="av-alert-observed">{observation}</span>}
+      {alert.feedback_enabled && alert.feedback_context_id && (
+        <AlertFeedback key={alert.feedback_context_id} contextId={alert.feedback_context_id} />
+      )}
     </SmallAlertBox>
   );
 }
