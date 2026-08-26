@@ -141,6 +141,21 @@ Push requires a secure context; `localhost` counts, so end-to-end push works loc
 Or build once (`npm run build`) and open `http://localhost:8000/varsel/` — the API serves the
 built app, mirroring production exactly.
 
+## Per-alert feedback (privacy gated)
+
+The thumbs up/down control sends minimal, personless feedback through `/varsel-api`; no PostHog
+browser SDK, cookies, autocapture, or replay runs in this app. Exact displayed wording and its
+prompt/model/policy context stay in BigQuery and are joined internally by an opaque, short-lived
+display-context ID. Feedback measures whether the alert was immediately useful, not whether the
+prediction later proved correct.
+
+Capture requires all of `VARSEL_FEEDBACK_ENABLED=true`, `POSTHOG_PROJECT_TOKEN`, and a secret
+`VARSEL_FEEDBACK_RECEIPT_SECRET` of at least 32 bytes. `POSTHOG_HOST` is pinned to
+`https://eu.i.posthog.com`. Missing or disabled configuration hides the control without affecting
+alerts. Do not enable it merely because the secrets exist: setup, raw-payload audit, access,
+retention, deletion/subject-rights, staged rollout, reviewer usage, and rollback are documented in
+[`data/feedback/README.md`](../../data/feedback/README.md).
+
 Regenerate the PWA icons — the Entur mark for the default brand, a white bell on petrol for
 `?brand=none` — after changing the glyph:
 

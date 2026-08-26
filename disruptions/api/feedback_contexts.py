@@ -92,7 +92,7 @@ def resolve(context_id: str) -> dict[str, Any] | None:
         return dict(entry[2]) if entry else None
 
 
-def persist(context_id: str) -> tuple[bool, str | None]:
+def persist(context_id: str, *, context_date: str | None = None) -> tuple[bool, str | None]:
     """Persist the live snapshot before PostHog capture, idempotently by context id."""
     snapshot = resolve(context_id)
     if snapshot is None:
@@ -102,7 +102,7 @@ def persist(context_id: str) -> tuple[bool, str | None]:
     now = datetime.now(UTC)
     row = {
         "context_id": context_id,
-        "context_date": now.date().isoformat(),
+        "context_date": context_date or now.date().isoformat(),
         "persisted_at": now.isoformat(),
         **snapshot,
     }

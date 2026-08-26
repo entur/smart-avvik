@@ -14,7 +14,8 @@ from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Literal
-from urllib.request import Request as UrlRequest, urlopen
+from urllib.request import Request as UrlRequest
+from urllib.request import urlopen
 
 import feedback_contexts
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -61,7 +62,11 @@ def _secret() -> bytes | None:
 
 
 def enabled() -> bool:
-    return bool(_token() and _secret() and feedback_contexts.enabled())
+    return (
+        os.environ.get("VARSEL_FEEDBACK_ENABLED", "").lower() == "true"
+        and os.environ.get("POSTHOG_HOST") == "https://eu.i.posthog.com"
+        and bool(_token() and _secret() and feedback_contexts.enabled())
+    )
 
 
 def parse(raw: bytes) -> FeedbackIn:
@@ -139,8 +144,13 @@ def _capture(body: FeedbackIn, *, environment: str, context_date: str, submitted
         "$process_person_profile": False,
     }
     payload = json.dumps({"api_key": _token(), "event": EVENT, "properties": properties}).encode()
-    request = UrlRequest("https://eu.i.posthog.com/i/v0/e/", data=payload, headers={"Content-Type": "application/json"}, method="POST")
-    with urlopen(request, timeout=3) as response:  # noqa: S310 - fixed EU ingestion origin
+    request = UrlRequest(
+        f"{os.environ['POSTHOG_HOST']}/i/v0/e/",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlopen(request, timeout=3) as response:
         if response.status >= 300:
             raise RuntimeError(f"PostHog returned {response.status}")
 
@@ -155,10 +165,12 @@ def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
         return {"status": "expired"}
     if not _claim(body.context_id):
         return {"status": "throttled"}
-    persisted, reason = feedback_contexts.persist(body.context_id)
+    submitted = datetime.now(UTC)
+    persisted, reason = feedback_contexts.persist(
+        body.context_id, context_date=submitted.date().isoformat()
+    )
     if not persisted:
         return {"status": reason or "downstream"}
-    submitted = datetime.now(UTC)
     try:
         _capture(body, environment=environment, context_date=submitted.date().isoformat(), submitted_at=submitted.isoformat())
     except Exception:
