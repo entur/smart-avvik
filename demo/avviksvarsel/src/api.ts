@@ -252,5 +252,11 @@ export function sendTestPush(deviceId: string): Promise<{ status: string }> {
 }
 
 export function submitFeedback(feedback: FeedbackSubmission): Promise<FeedbackResponse> {
-  return request('/varsel-api/feedback', jsonPost(feedback));
+  // Components may decorate a queued submission with local bookkeeping. Keep the public wire
+  // contract explicit because the backend rejects unknown fields by design.
+  const { context_id, response_id, event_id, revision, rating, comment, receipt } = feedback;
+  return request(
+    '/varsel-api/feedback',
+    jsonPost({ context_id, response_id, event_id, revision, rating, comment, receipt }),
+  );
 }
