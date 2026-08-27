@@ -94,6 +94,9 @@ from typing import Any, Protocol
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import feedback
+import feedback_contexts
+
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
 # it back from here would be a cycle — see alert_policy's docstring). Bound at module level rather
 # than reached through `alert_policy.`, so `varsel.threshold_for` / `varsel.TROUBLE_DELAY_MIN` keep
@@ -106,9 +109,6 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from impact import AlternativeOutcome, ImpactResponse, LatestObservation, severity_key
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
-
-import feedback
-import feedback_contexts
 
 logger = logging.getLogger(__name__)
 
@@ -1609,8 +1609,8 @@ def _remember_message_meta(
                 import llm_message
 
                 meta["prompt_version"] = llm_message.PROMPT_VERSION
-            except Exception:
-                pass
+            except (ImportError, AttributeError):
+                logger.debug("Prompt version unavailable for feedback context", exc_info=True)
 
 
 def _write_message(
