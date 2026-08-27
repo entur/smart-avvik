@@ -1,14 +1,14 @@
 WITH pp AS (
-  SELECT 'am_0630' m, 'A' fold, d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_am_0630_A` UNION ALL
-  SELECT 'am_0630', 'B', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_am_0630_B` UNION ALL
-  SELECT 'pm_0630', 'A', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_0630_A` UNION ALL
-  SELECT 'pm_0630', 'B', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_0630_B` UNION ALL
-  SELECT 'pm_0900', 'A', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_0900_A` UNION ALL
-  SELECT 'pm_0900', 'B', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_0900_B` UNION ALL
-  SELECT 'pm_1200', 'A', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_1200_A` UNION ALL
-  SELECT 'pm_1200', 'B', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_1200_B` UNION ALL
-  SELECT 'pm_1400', 'A', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_1400_A` UNION ALL
-  SELECT 'pm_1400', 'B', d, label, p FROM `ent-kixavvik-dev.togvarsel.pred_lr_pm_1400_B`
+  SELECT 'am_0630' m, 'A' fold, d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_am_0630_A` UNION ALL
+  SELECT 'am_0630', 'B', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_am_0630_B` UNION ALL
+  SELECT 'pm_0630', 'A', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_0630_A` UNION ALL
+  SELECT 'pm_0630', 'B', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_0630_B` UNION ALL
+  SELECT 'pm_0900', 'A', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_0900_A` UNION ALL
+  SELECT 'pm_0900', 'B', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_0900_B` UNION ALL
+  SELECT 'pm_1200', 'A', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_1200_A` UNION ALL
+  SELECT 'pm_1200', 'B', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_1200_B` UNION ALL
+  SELECT 'pm_1400', 'A', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_1400_A` UNION ALL
+  SELECT 'pm_1400', 'B', d, label, p FROM `ent-kixavvik-dev.disruptions.togvarsel_pred_lr_pm_1400_B`
 ),
 r AS (SELECT *, RANK() OVER (PARTITION BY m, fold ORDER BY p) rk FROM pp),
 a AS (

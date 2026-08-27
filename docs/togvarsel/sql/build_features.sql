@@ -1,10 +1,10 @@
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.togvarsel.features` AS
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.togvarsel_features` AS
 WITH oc AS (
   SELECT DATE(c.aimed_local) d, c.dsj, c.cancelled,
     EXTRACT(HOUR FROM c.aimed_local) + EXTRACT(MINUTE FROM c.aimed_local)/60.0 h,
     COALESCE(c.arr_delay_min, c.dep_delay_min) delay_min,
     (c.cancelled OR c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) resolved
-  FROM `ent-kixavvik-dev.togvarsel.calls` c JOIN `ent-kixavvik-dev.togvarsel.oslo_stations` USING (stop_place)
+  FROM `ent-kixavvik-dev.disruptions.togvarsel_calls` c JOIN `ent-kixavvik-dev.disruptions.togvarsel_oslo_stations` USING (stop_place)
   WHERE NOT IFNULL(c.extra_journey,FALSE)
 ),
 et AS (
@@ -50,7 +50,7 @@ SELECT dd.d, dd.dow, dd.weekday, EXTRACT(MONTH FROM dd.d) month, EXTRACT(ISOWEEK
   et.* EXCEPT(d),
   -- sx
   sx.* EXCEPT(d)
-FROM `ent-kixavvik-dev.togvarsel.days` dd
+FROM `ent-kixavvik-dev.disruptions.togvarsel_days` dd
 LEFT JOIN et ON et.d = dd.d
-LEFT JOIN `ent-kixavvik-dev.togvarsel.sx_day` sx ON sx.d = dd.d
+LEFT JOIN `ent-kixavvik-dev.disruptions.togvarsel_sx_day` sx ON sx.d = dd.d
 LEFT JOIN hol ON hol.d = dd.d

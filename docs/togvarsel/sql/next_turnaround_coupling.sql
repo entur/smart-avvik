@@ -1,13 +1,13 @@
 WITH ends AS (
   SELECT c.operating_date, c.line, c.dsj, c.stop_place, c.aimed_arr, c.actual_arr, c.arr_delay_min,
     EXTRACT(HOUR FROM c.aimed_local) h
-  FROM `ent-kixavvik-dev.togvarsel.calls` c
+  FROM `ent-kixavvik-dev.disruptions.togvarsel_calls` c
   WHERE NOT IFNULL(c.extra_journey,FALSE) AND c.actual_arr IS NOT NULL AND NOT c.cancelled
   QUALIFY ROW_NUMBER() OVER (PARTITION BY c.dsj ORDER BY c.seq DESC) = 1
 ),
 starts AS (
   SELECT c.operating_date, c.line, c.dsj, c.stop_place, c.aimed_dep, c.actual_dep, c.dep_delay_min, c.cancelled
-  FROM `ent-kixavvik-dev.togvarsel.calls` c
+  FROM `ent-kixavvik-dev.disruptions.togvarsel_calls` c
   WHERE NOT IFNULL(c.extra_journey,FALSE)
   QUALIFY ROW_NUMBER() OVER (PARTITION BY c.dsj ORDER BY c.seq ASC) = 1
 ),

@@ -5,7 +5,7 @@ hourly AS (
 ),
 wx AS (SELECT d, MIN(t) tmin, MAX(t) tmax, MAX(snow) snow, SUM(precip) precip, MAX(wind) wind, MIN(IF(h<=6, t, NULL)) tmin_night, SUM(IF(h<=6, precip, 0)) precip_night, COUNT(*) n_h FROM hourly GROUP BY d),
 f AS (
-  SELECT f.*, wx.tmin, wx.tmax, wx.snow, wx.precip, wx.tmin_night, wx.precip_night, wx.wind FROM `ent-kixavvik-dev.togvarsel.features` f JOIN wx USING (d)
+  SELECT f.*, wx.tmin, wx.tmax, wx.snow, wx.precip, wx.tmin_night, wx.precip_night, wx.wind FROM `ent-kixavvik-dev.disruptions.togvarsel_features` f JOIN wx USING (d)
   WHERE weekday AND NOT holiday AND am_n>300 AND pm_n>300 AND n_h >= 20
 )
 SELECT COUNT(*) n, ROUND(AVG(snow),1) avg_snow, ROUND(CORR(tmin, am_t5),2) r_tmin_am, ROUND(CORR(tmin, pm_t5),2) r_tmin_pm, ROUND(CORR(snow, am_t5),2) r_snow_am, ROUND(CORR(snow, pm_t5),2) r_snow_pm,

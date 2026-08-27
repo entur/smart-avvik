@@ -1,4 +1,4 @@
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.togvarsel.sx_events` AS
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.togvarsel_sx_events` AS
 WITH sx AS (
   SELECT participantRef p, situationNumber sn, SAFE.TIMESTAMP(creationTime) created_ts,
     DATETIME(SAFE.TIMESTAMP(creationTime), 'Europe/Oslo') created_local,
@@ -47,4 +47,4 @@ SELECT c.p, c.sn, c.created_ts, c.created_local, DATE(c.created_local) created_d
   j.n_cancelled, j.n_calls, j.oslo_mean_delay
 FROM cls c
 LEFT JOIN UNNEST(c.affected_journeys) j_ref
-LEFT JOIN `ent-kixavvik-dev.togvarsel.journeys` j ON j.sj = j_ref AND j.operating_date BETWEEN DATE(c.created_local) - 1 AND DATE(c.created_local) + 1
+LEFT JOIN `ent-kixavvik-dev.disruptions.togvarsel_journeys` j ON j.sj = j_ref AND j.operating_date BETWEEN DATE(c.created_local) - 1 AND DATE(c.created_local) + 1
