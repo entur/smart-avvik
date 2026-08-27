@@ -14,7 +14,7 @@ class FakeBQ:
 
     def query(self, sql):
         assert "CREATE TABLE IF NOT EXISTS" in sql
-        assert "partition_expiration_days=90" in sql
+        assert "partition_expiration_days=45" in sql
         return _Job()
 
     def insert_rows_json(self, table, rows, row_ids=None, timeout=None):

@@ -9,7 +9,9 @@ commit it, serve it from the API, paste it into tickets, or keep it longer than 
 
 Use a PostHog **personal API key with read-only Query API access**, supplied through the
 environment (never an argument). Use developer ADC for BigQuery. Both date arguments are UTC and
-`--to-date` is exclusive; windows are required and limited to 31 days.
+`--to-date` is exclusive; windows are required and limited to 31 days. PostHog keeps events for
+**30 days** (the project's data-retention setting), so run the export at least fortnightly:
+anything older is gone from PostHog, and its BigQuery context expires at 45 days.
 
 ```sh
 export POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)"
@@ -49,7 +51,8 @@ PostHog EU project:
    cadence. The receipt key rotation ends updates to already-issued receipts but does not affect
    alert delivery.
 2. Confirm `POSTHOG_HOST=https://eu.i.posthog.com`, EU project residency, IP capture disabled,
-   autocapture/session replay disabled, no person profiles, and 90-day event retention. Inspect the
+   autocapture/session replay disabled, the GeoIP transformation removed, no person profiles, and
+   30-day event retention (the project data-retention setting). Inspect the
    **raw captured event**, not only a transformed view: it may contain only the documented event
    fields, PostHog ingestion metadata, and no IP, user-agent, geo, URL, route, prompt, session, or
    browser-library properties.
@@ -60,7 +63,8 @@ PostHog EU project:
    through that approved group/process. Revoke PostHog membership, personal API keys, BigQuery IAM,
    and cached exports at offboarding.
 4. Obtain privacy-owner approval for free-text purpose/lawful basis, the “do not enter personal
-   information” notice, access list, 90-day PostHog/BigQuery retention, 30-day export cleanup, and
+   information” notice, access list, 30-day PostHog and 45-day BigQuery retention, 30-day export
+   cleanup, and
    anonymous subject-rights limitations. Record whether PostHog supports event deletion for these
    personless events; if it does not, an explicit retention-only procedure must be approved.
 5. In dev, submit a synthetic response, wait the measured consistency delay, retrieve it through
