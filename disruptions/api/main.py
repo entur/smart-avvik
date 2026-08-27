@@ -14,8 +14,8 @@ from zoneinfo import ZoneInfo
 # `impact.` would resolve to that function rather than to this module.
 import alert_policy  # sibling module: the shared alert gate (thresholds, the "trouble" bar)
 import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
-import feedback_contexts  # exact display snapshots for isolated /varsel feedback
 import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
+import feedback_contexts  # exact display snapshots for isolated /varsel feedback
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
 import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
