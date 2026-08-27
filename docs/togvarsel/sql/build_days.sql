@@ -1,4 +1,4 @@
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.togvarsel.days` AS
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.togvarsel_days` AS
 WITH p AS (
   SELECT d,
     MAX(IF(win='night',  trouble5, NULL)) night_t5,
@@ -21,7 +21,7 @@ WITH p AS (
     MAX(IF(win='early',  n_calls, NULL)) early_n,
     MAX(IF(win='am_rush',n_calls, NULL)) am_n,
     MAX(IF(win='pm_rush',n_calls, NULL)) pm_n
-  FROM `ent-kixavvik-dev.togvarsel.day_windows` WHERE corridor='all' GROUP BY d
+  FROM `ent-kixavvik-dev.disruptions.togvarsel_day_windows` WHERE corridor='all' GROUP BY d
 )
 SELECT *,
   EXTRACT(DAYOFWEEK FROM d) dow,

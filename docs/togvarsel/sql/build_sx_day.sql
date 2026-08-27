@@ -1,11 +1,11 @@
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.togvarsel.sx_day` AS
-WITH dates AS (SELECT d FROM `ent-kixavvik-dev.togvarsel.days`),
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.togvarsel_sx_day` AS
+WITH dates AS (SELECT d FROM `ent-kixavvik-dev.disruptions.togvarsel_days`),
 ev AS (
   SELECT e.*, 
     -- which forecast day does this message belong to: messages from prev day 18:00 up to the cutoff of day D
     CASE WHEN created_h >= 18 THEN DATE_ADD(created_date, INTERVAL 1 DAY) ELSE created_date END AS fday,
     CASE WHEN created_h >= 18 THEN created_h - 24 ELSE created_h END AS fh   -- hours relative to midnight of fday (negative = previous evening)
-  FROM `ent-kixavvik-dev.togvarsel.sx_events` e
+  FROM `ent-kixavvik-dev.disruptions.togvarsel_sx_events` e
 ),
 agg AS (
   SELECT fday d,

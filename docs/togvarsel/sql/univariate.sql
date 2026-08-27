@@ -1,4 +1,4 @@
-WITH f AS (SELECT * FROM `ent-kixavvik-dev.togvarsel.features` WHERE weekday AND NOT holiday AND am_n > 300 AND pm_n > 300),
+WITH f AS (SELECT * FROM `ent-kixavvik-dev.disruptions.togvarsel_features` WHERE weekday AND NOT holiday AND am_n > 300 AND pm_n > 300),
 u AS (
   SELECT name, val, am_t5, pm_t5, am_bad, pm_bad FROM f, UNNEST([
     STRUCT('et_t5_0630' AS name, et_t5_0630 AS val), ('et_t10_0630', et_t10_0630), ('et_cx_0630', et_cx_0630), ('et_cxj_0630', et_cxj_0630), ('et_md_0630', et_md_0630), ('et_max_0630', et_max_0630),

@@ -1,12 +1,12 @@
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.togvarsel.day_windows` AS
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.togvarsel_day_windows` AS
 WITH c AS (
   SELECT c.operating_date, DATE(c.aimed_local) AS local_date, c.dsj, c.line, s.corridor, s.station,
     c.cancelled,
     COALESCE(c.arr_delay_min, c.dep_delay_min) AS delay_min,
     (c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) AS has_actual,
     EXTRACT(HOUR FROM c.aimed_local) + EXTRACT(MINUTE FROM c.aimed_local)/60.0 AS h
-  FROM `ent-kixavvik-dev.togvarsel.calls` c
-  JOIN `ent-kixavvik-dev.togvarsel.oslo_stations` s USING (stop_place)
+  FROM `ent-kixavvik-dev.disruptions.togvarsel_calls` c
+  JOIN `ent-kixavvik-dev.disruptions.togvarsel_oslo_stations` s USING (stop_place)
   WHERE NOT IFNULL(c.extra_journey, FALSE)
 ),
 w AS (

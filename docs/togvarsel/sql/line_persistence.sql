@@ -1,7 +1,7 @@
 WITH lc AS (
   SELECT DATE(c.aimed_local) d, c.line, EXTRACT(HOUR FROM c.aimed_local)+EXTRACT(MINUTE FROM c.aimed_local)/60 h, c.cancelled,
     COALESCE(c.arr_delay_min,c.dep_delay_min) delay_min, (c.cancelled OR c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) resolved
-  FROM `ent-kixavvik-dev.togvarsel.calls` c JOIN `ent-kixavvik-dev.togvarsel.oslo_stations` USING (stop_place)
+  FROM `ent-kixavvik-dev.disruptions.togvarsel_calls` c JOIN `ent-kixavvik-dev.disruptions.togvarsel_oslo_stations` USING (stop_place)
   WHERE NOT IFNULL(c.extra_journey,FALSE) AND EXTRACT(DAYOFWEEK FROM DATE(c.aimed_local)) BETWEEN 2 AND 6
 ),
 ld AS (

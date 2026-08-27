@@ -1,4 +1,4 @@
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.togvarsel.calls`
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.togvarsel_calls`
 PARTITION BY operating_date
 CLUSTER BY line, stop_place AS
 SELECT

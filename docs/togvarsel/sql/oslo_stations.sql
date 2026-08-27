@@ -1,4 +1,4 @@
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.togvarsel.oslo_stations` AS
+CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.togvarsel_oslo_stations` AS
 SELECT * FROM UNNEST([
  STRUCT('NSR:StopPlace:418' AS stop_place,'Asker' AS station,'west' AS corridor, 14 AS km_from_oslo),
  ('NSR:StopPlace:319','Høn','west',13),('NSR:StopPlace:368','Vakås','west',12),('NSR:StopPlace:295','Hvalstad','west',11),
