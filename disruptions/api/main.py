@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import alert_policy  # sibling module: the shared alert gate (thresholds, the "trouble" bar)
 import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
 import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
+import feedback_contexts  # exact display snapshots for isolated /varsel feedback
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
 import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
@@ -1056,6 +1057,8 @@ async def lifespan(app: FastAPI):
     # failure path is internal (logged, never raised), so a BigQuery problem cannot block startup.
     decisions.configure(bq_client=bq_client)
     decisions.ensure_table()
+    feedback_contexts.configure(bq_client=bq_client)
+    feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
     # /meldinger reads the same decision log and replays each row's stored message_input through
     # today's prompt. The template writer is passed in rather than imported by the module —
