@@ -218,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     context_ids = sorted({event["context_id"] for event in events})
     contexts = fetch_contexts(project=args.project, context_ids=context_ids,
                               start=args.from_date - timedelta(days=1), end=args.to_date)
-    rows, errors = enrich(events, contexts, errors, retained_since=datetime.now(UTC).date() - timedelta(days=90))
+    rows, errors = enrich(events, contexts, errors, retained_since=datetime.now(UTC).date() - timedelta(days=45))
     write_json(args.output, {
         "metadata": {"environment": args.environment, "from_date": args.from_date,
                      "to_date_exclusive": args.to_date, "response_count": len(rows),

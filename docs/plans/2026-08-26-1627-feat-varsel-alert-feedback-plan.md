@@ -215,12 +215,12 @@ The context cache must treat the rendered string as part of its identity. A chan
 - The API remains a single replica with no HPA while feedback contexts and abuse ledgers are in-process. Scaling requires a shared store or a stateless signed display capability first.
 - A 500-character comment cap is sufficient for the initial qualitative review workflow.
 - A low hard daily capture budget plus bounded global and per-context limits is sufficient for the pilot. Residual distributed spam is accepted only within that budget because per-person enforcement would violate the no-correlation decision.
-- PostHog feedback and BigQuery display contexts default to 90-day retention. Local enriched exports are owner-only and removed within 30 days unless an approved analysis requires less.
+- PostHog feedback events are retained for 30 days (the project's data-retention setting, its default) and BigQuery display contexts for 45 days — the 30-day export window plus the exporter's one-day reach and slack. Local enriched exports are owner-only and removed within 30 days unless an approved analysis requires less.
 - PostHog project access, retention, deletion, and the lawful basis for free-text processing are approved before the feature is enabled in production.
 
 ### System-Wide Impact
 
-- **Data lifecycle:** A new append-only BigQuery context table contains allow-listed route-bearing wording and irreducible provenance. It is partitioned by server persistence date, clustered by context ID, retained for 90 days, environment-local, and excluded from runtime copy scripts.
+- **Data lifecycle:** A new append-only BigQuery context table contains allow-listed route-bearing wording and irreducible provenance. It is partitioned by server persistence date, clustered by context ID, retained for 45 days (PostHog's 30-day event retention plus the exporter's reach and slack), environment-local, and excluded from runtime copy scripts.
 - **Privacy:** PostHog receives comments, which can still contain personal data. All other sensitive context stays behind BigQuery access controls.
 - **Availability:** BigQuery and PostHog are optional to alert delivery. Feedback errors remain local to the feedback control.
 - **Capacity:** The public endpoint adds bounded memory state and bounded external calls to the single API replica. Cache size, request rate, parsed and pre-parse body size, daily capture budget, and network time all have fixed ceilings.
@@ -268,7 +268,7 @@ The context cache must treat the rendered string as part of its identity. A chan
   1. Extend the alert response with optional feedback capability and context ID fields.
   2. Add a bounded, lock-protected cache keyed by the exact display identity and content version. Reuse an ID only while the rendered snapshot is byte-equivalent and its 15-minute lease is live.
   3. Retain the originating message input and model metadata when an LLM message enters the message cache. Represent summary fallback as its own display source.
-  4. Add an append-only, 90-day context table created with `CREATE TABLE IF NOT EXISTS`. Partition on server persistence date, cluster by context ID, and persist with a stable insertion ID when feedback first uses the capability. Make each row self-contained with the exact rendered lines plus allow-listed prompt/model, prediction, policy, and delivery fields required by R9; do not depend on a later join to a non-unique decision row.
+  4. Add an append-only, 45-day context table created with `CREATE TABLE IF NOT EXISTS`. Partition on server persistence date, cluster by context ID, and persist with a stable insertion ID when feedback first uses the capability. Make each row self-contained with the exact rendered lines plus allow-listed prompt/model, prediction, policy, and delivery fields required by R9; do not depend on a later join to a non-unique decision row.
   5. Keep the new table out of `varsel_decision_groups`, outcome labelling, and environment-copy scripts.
 - **Execution note:** Add characterization tests for current cached-message and summary-fallback rendering before extending the cache structures.
 - **Patterns to follow:** `_message_key`, `_message_meta`, `_reconcile_caches`, `_journey_model`, and the fail-open table setup in `disruptions/api/decisions.py`.
@@ -381,7 +381,7 @@ The context cache must treat the rendered string as part of its identity. A chan
   2. Collapse complete snapshots by environment, context, response, revision, and event ID. Deduplicate context IDs before a parameterized join bounded by the server-derived context dates.
   3. Report missing, identical-duplicate, conflicting-duplicate, expired, malformed, and out-of-horizon identifiers without guessing. Write owner-only JSON only; refuse stdout, symlinks, and implicit overwrite.
   4. Configure the EU ingestion host as non-secret deployment data and the capture token through the existing ExternalSecret pattern. Keep reviewer credentials out of the workload.
-  5. Document staged enablement, privacy prerequisites, named least-privilege BigQuery and PostHog access groups/roles, credential rotation and offboarding revocation, 90-day service retention, 30-day export cleanup, tested deletion or approved retention-only limitation, local review usage, budgets, telemetry, and rollback by disabling new capture. The runtime may append contexts but must not expose a public context-read route.
+  5. Document staged enablement, privacy prerequisites, named least-privilege BigQuery and PostHog access groups/roles, credential rotation and offboarding revocation, 30-day PostHog and 45-day BigQuery service retention, 30-day export cleanup, tested deletion or approved retention-only limitation, local review usage, budgets, telemetry, and rollback by disabling new capture. The runtime may append contexts but must not expose a public context-read route.
   6. Before enabling capture, prove on the intended Entur EU project that a synthetic personless event can be captured, retrieved completely after the documented consistency delay, and removed through the named mechanism (or covered by an explicitly approved retention-only rule). Record pagination/limits, time-bound semantics, credential scopes, and project-tier constraints.
 - **Execution note:** Prove query bytes with dry runs only. Do not run a BigQuery operation estimated above the repository's $10 approval threshold.
 - **Patterns to follow:** `uv` scripts under `data/`, partition-bounded queries in the meldinger feature, and environment-specific Helm secret mappings.
