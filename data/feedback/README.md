@@ -49,7 +49,8 @@ PostHog EU project:
    referenced while absent, so the disabled-code rollout cannot break an existing deployment.
    Values never belong in git. Rotate either secret after suspected disclosure and on the platform team's normal rotation
    cadence. The receipt key rotation ends updates to already-issued receipts but does not affect
-   alert delivery.
+   alert delivery. Done for all three environments on 2026-08-28 — see the tst/prd pre-wiring
+   section below for what each one still needs.
 2. Confirm `POSTHOG_HOST=https://eu.i.posthog.com`, EU project residency, IP capture disabled,
    autocapture/session replay disabled, the GeoIP transformation removed, no person profiles, and
    30-day event retention (the project data-retention setting). Inspect the
@@ -249,6 +250,74 @@ have none, so they age out at 30 days rather than being removable: **exclude the
 when reviewing dev feedback. The BigQuery rows are deletable once the streaming buffer clears. One
 row is *not* synthetic — a submit at 16:59:27 on `Oslo S -> Sandvika`, a journey this measurement
 never registered.
+
+### Steps 1 and 3, pre-wired for tst and prd (2026-08-28)
+
+Step 1 is done for all three environments and step 3 needs nothing further, so **promotion is a flag
+plus the approval, not an infrastructure project.** What that leaves per environment:
+
+| | dev | tst | prd |
+| --- | --- | --- | --- |
+| `POSTHOG_PROJECT_TOKEN` in Secret Manager | yes | yes | **placeholder** |
+| `VARSEL_FEEDBACK_RECEIPT_SECRET` in Secret Manager | yes | yes | yes |
+| both names in Helm `secrets.varsel` | yes | yes | yes |
+| `disruptions` dataset exists (EU) | yes | yes | yes |
+| step 4 approval | dev only | **no** | **no** |
+| `VARSEL_FEEDBACK_ENABLED` | `true` | `false` | `false` |
+
+**Order, and why it is not negotiable.** Every secret was created in its project *before* its name
+was added to Helm. Each namespace's `SecretStore` reads its own `ent-kixavvik-<env>` with
+`secretVersionSelectionPolicy: LatestOrFail`, and the rendered `ExternalSecret` is all-or-nothing —
+one unresolvable name fails the whole object, and the container takes the resulting `kix-avvik-varsel`
+Secret through a single `envFrom.secretRef`. In prd that would have taken `VAPID_PRIVATE_KEY` and
+`VAPID_PUBLIC_KEY` down with it, **silently disabling push for real travellers over a feature that is
+switched off**. `roles/secretmanager.secretAccessor` was already granted project-wide to
+`application@ent-kixavvik-<env>` in all three, so no per-secret IAM was needed.
+
+**tst deliberately shares dev's PostHog project ("Kix - dev").** The token value is dev's byte for
+byte (verified by hash, never displayed). What separates the two inside that project is the
+`environment` event property — `deployment.environment_label() or "prd"`, so `"dev"`, `"tst"`, `"prd"`
+— which is also salted into the per-response `distinct_id`, so no person can span environments. So an
+export of tst is `--environment tst` with **dev's** `--posthog-project-id`, and tst's events age out
+on dev's 30-day retention clock. The exporter already takes both as arguments and its `ENVIRONMENTS`
+tuple already lists all three; nothing there needed changing.
+
+**The three receipt keys are distinct** (fresh 64-byte values, verified by hash). Sharing one would
+let a receipt minted in dev authorize a `revision > 1` update against a real traveller's response in
+prd, which is the single thing that HMAC exists to prevent.
+
+**prd's token is a labelled placeholder, not the real one.** `state=placeholder` in Secret Manager.
+Adding the real "Kix - prod" project write token is a `gcloud secrets versions add` (the exact command
+is in the flag's comment in `values-kub-ent-prd.yaml`) and is the one step that needs a human with
+PostHog access. A placeholder rather than an absent secret because of the all-or-nothing failure
+above: this way the Helm reference is safe from the moment it lands, and the missing piece is a value
+rather than a landmine. Flipping the flag before replacing it fails **loudly** — PostHog 401s,
+`submit()` returns `downstream` and logs `event=varsel_feedback result=downstream`, and the PWA shows
+the traveller an error — but not harmlessly: revision 1 persists the route-bearing context row to
+BigQuery *before* calling PostHog, so each attempt leaves a 45-day context no response will ever join
+to. The prd export also needs the "Kix - prod" numeric project id, which is likewise not recorded
+here yet.
+
+**Step 3 needs no change for tst or prd.** The app SA holds `roles/bigquery.{dataEditor,jobUser}`
+project-wide in all three, which is what lets `feedback_contexts.ensure_table()` create the table on
+first persist — it does not exist in prd or tst yet and does not need to be created by hand. Reviewer
+read access is inherited from an ancestor rather than granted on the project (no human or group has a
+project-level BigQuery binding in any of the three), and it was verified by querying prd's
+`varsel_decisions` from a laptop. `terraform/env/{tst,prd}.tfvars` therefore stay `disruptions_readers
+= []`: that list grants *other* teams, and the 2026-08-13 note there still applies unchanged.
+
+**One correction to a claim in CLAUDE.md.** Nothing in this repo creates the `disruptions` dataset —
+there is no `create_dataset` call and no `CREATE SCHEMA` statement; the startup CTASes create *tables*
+into a dataset that must already exist. tst had none, so `ensure_table()` would have failed there with
+"Dataset not found" and every submit would have returned `downstream`. `ent-kixavvik-tst:disruptions`
+was created in **EU**, matching dev and prd. It is empty and stays empty: tst has no models or runtime
+tables, so its poller produces no alerts and there is nothing there to rate. tst's wiring exists to
+make promotion a flag and to exercise the plumbing, not because tst can evaluate the feature.
+
+**What stays unverified until a flag actually moves:** egress from the tst and prd clusters to
+`eu.i.posthog.com`. It cannot be probed from outside and the image is distroless, so there is no shell
+to `kubectl exec` into. The evidence is indirect but good: every `NetworkPolicy` in both namespaces is
+`policyTypes: ["Ingress"]` only, and both deployments already reach `api.entur.io` and Vertex AI.
 
 ## Official API assumptions to verify
 
