@@ -52,8 +52,21 @@ api = [
 default-groups = ["dev", "api"]
 
 # ruff 0.16 widened its default rule set well beyond E/F (B, UP, SIM, PLR, I, C4, RUF, ...).
-# The defaults are adopted as-is; the two exemptions below are rules that misfire on a
+# The defaults are adopted as-is; the exemptions below are rules that misfire on a
 # framework/tool idiom rather than findings worth fixing.
+[tool.ruff]
+# docs/togvarsel/analysis/ holds the one-off scripts that produced a dated investigation's numbers,
+# kept as the record of how those numbers were arrived at rather than as maintained code. Linting
+# them reported 56 findings across 9 rules, every one of them a property of a throwaway script
+# (C408 dict() literals, SIM115 unclosed open(), import order) — and two that are the technique
+# working as intended: xgb_tune.py exec()s the data-loading half of sweep.py so the two share one
+# feature build, which is S102 plus an F821 for every name that arrives that way. Fixing those
+# would mean rewriting a script whose output is already committed beside it. The cost of excluding
+# rather than exempting per rule is real and worth stating: a genuine bug in a future analysis
+# script here will not be caught, so anything promoted out of this directory into code that runs
+# more than once should move out of the exclusion with it.
+extend-exclude = ["docs/togvarsel/analysis"]
+
 [tool.ruff.lint.flake8-bugbear]
 # `param: str = Query(...)` in an endpoint signature is how FastAPI declares query
 # parameters — it is not the mutable-default bug B008 looks for.

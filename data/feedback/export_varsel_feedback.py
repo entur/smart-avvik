@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 EVENT = "varsel_alert_feedback"
@@ -40,10 +41,24 @@ def _hogql(environment: str, start: date, end: date) -> str:
     """Build from parsed/allow-listed values only; no raw user string reaches HogQL."""
     start_ts = datetime.combine(start, time.min, tzinfo=UTC).isoformat()
     end_ts = datetime.combine(end, time.min, tzinfo=UTC).isoformat()
+    # Every date-ish column is projected through an explicit cast, because PostHog type-infers a
+    # property and there is no way to ask for the raw string back once it has. Measured against the
+    # real project 2026-08-28: `context_date` and `submitted_at` are both typed
+    # Nullable(DateTime64(6, 'Europe/Oslo')) — the PROJECT timezone, not the value's. So the plain
+    # `properties.context_date` returned "2026-08-27T00:00:00+02:00" for a stored "2026-08-27" and
+    # date.fromisoformat rejected it, reported as one malformed_event with every response dropped.
+    # toDate truncates in the same zone the coercion used, which recovers the stored calendar date
+    # exactly; reading the date off a UTC rendering of that instant would land a day early.
+    # submitted_at is normalized to UTC for the same reason in reverse: it is a real instant, so the
+    # zone is only a rendering, and leaving it project-relative makes an evidence document change
+    # value when somebody edits a PostHog setting — which is why PostHog's own ingestion
+    # `timestamp` is pinned to UTC here as well. HogQL exposes toInt, never ClickHouse's toInt64.
     return f"""SELECT
-timestamp, properties.environment, properties.context_id, properties.context_date,
-properties.response_id, toInt64(properties.revision), properties.event_id,
-properties.rating, properties.comment, properties.submitted_at
+toString(toTimeZone(timestamp, 'UTC')), properties.environment, properties.context_id,
+toString(toDate(properties.context_date)),
+properties.response_id, toInt(properties.revision), properties.event_id,
+properties.rating, properties.comment,
+toString(toTimeZone(properties.submitted_at, 'UTC'))
 FROM events
 WHERE event = '{EVENT}'
   AND timestamp >= toDateTime('{start_ts}')
@@ -57,15 +72,35 @@ def fetch_posthog(
     *, project_id: int, environment: str, start: date, end: date, token: str,
     opener: Callable[..., Any] = urlopen,
 ) -> list[dict[str, Any]]:
-    payload = json.dumps({"query": {"kind": "HogQLQuery", "query": _hogql(environment, start, end)}}).encode()
+    # force_blocking, because the Query API CACHES a result per query text and will happily serve an
+    # earlier answer to an identical request: measured 2026-08-28, a repeat of the same query came
+    # back is_cached=true. For a reviewer export that is a correctness bug, not a latency saving —
+    # re-running a window after more feedback arrived would return the earlier, shorter answer and
+    # read as "nothing new came in". It is also what makes the ~50 s ingestion delay a wait rather
+    # than a trap: without it one early empty read is cached and every retry repeats it, which is
+    # exactly how the delay first measured as "never" (README).
+    payload = json.dumps({
+        "query": {"kind": "HogQLQuery", "query": _hogql(environment, start, end)},
+        "refresh": "force_blocking",
+    }).encode()
     request = Request(
         f"{QUERY_HOST}/api/projects/{project_id}/query/",
         data=payload,
         method="POST",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
     )
-    with opener(request, timeout=30) as response:
-        result = json.load(response)
+    try:
+        with opener(request, timeout=30) as response:
+            result = json.load(response)
+    except HTTPError as exc:
+        # The Query API puts the reason a query was refused in the RESPONSE BODY, which urllib
+        # discards behind "HTTP Error 400: Bad Request" — the whole diagnosis in the one place a
+        # traceback does not reach. Surfacing it is what turned an opaque 400 into "Unsupported
+        # function call 'toInt64(...)'" (2026-08-28). The body can carry the submitted query, so it
+        # stays out of the exception when the caller is not entitled to it: this tool is the
+        # reviewer's own, and the query is built from allow-listed values only.
+        detail = exc.read().decode("utf-8", "replace")[:2000]
+        raise RuntimeError(f"PostHog Query API refused the query (HTTP {exc.code}): {detail}") from exc
     rows = result.get("results")
     if not isinstance(rows, list):
         raise TypeError("PostHog Query API returned no result rows")
