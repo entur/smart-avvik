@@ -54,6 +54,12 @@ def test_capture_is_allowlisted_and_personless(monkeypatch):
     assert captured["properties"]["$insert_id"] == str(body.event_id)
     forbidden = {"device_id", "journey_id", "wording", "route", "prompt", "user_agent"}
     assert forbidden.isdisjoint(captured["properties"])
+    # The $ip field must be OCCUPIED, not omitted and not null. Measured against the real project
+    # 2026-08-28: PostHog reads an absent, null or empty $ip as "not supplied" and stamps the socket
+    # address, while a valid value survives — so `del properties["$ip"]` or a None here would put the
+    # caller's real address in a store with no per-event deletion, and the project's "discard client
+    # IP data" setting did not suppress it.
+    assert captured["properties"]["$ip"] == "0.0.0.0"
 
 
 def test_receipt_binds_response_to_context(monkeypatch):
