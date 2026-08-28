@@ -76,8 +76,14 @@ PostHog EU project:
    exact context, and delete the response plus an exclusively referenced context. A shared context
    remains until no retained response refers to it. Repeat the approved procedure in tst and prd.
 6. Verify public-endpoint global/per-context rates, the 2,000/day hard capture budget, bounded logs,
-   p95 submit latency below 3 seconds, and the kill switch. Then set
-   `VARSEL_FEEDBACK_ENABLED=true` only in the environment being promoted.
+   and the kill switch — none of those four needs a deployment, and all four must pass first. Then
+   set `VARSEL_FEEDBACK_ENABLED=true` only in the environment being promoted, and measure **p95
+   submit latency below 3 seconds against that deployment**. That order is forced rather than
+   careless: `submit()` returns `{"status": "disabled"}` before it touches BigQuery or PostHog — the
+   two calls that are very nearly all of the cost — so a latency figure taken with capture off
+   measures the short-circuit and nothing else. Minting is gated the same way, so there is also no
+   real `context_id` to submit against until the flag is on. The kill switch is verified *before* the
+   enable precisely so that it is what a failed latency reading is rolled back with.
 
 Rollback is `VARSEL_FEEDBACK_ENABLED=false` followed by a deployment. It stops new capture only;
 alert display and delivery stay healthy, while existing feedback remains reviewable until expiry.
@@ -119,6 +125,34 @@ a person" rule in `CLAUDE.md`, and it is the one deviation with a cheap fix.
 all (only `projectWriters`/`projectReaders` plus that personal OWNER), the two capture secrets do not
 exist in Secret Manager, and `varsel_feedback_contexts` **has not been created** — the app creates it
 at startup, so it will appear on the first deploy after capture is configured, not before.
+
+### Step 4, approved for dev (2026-08-28)
+
+Approval covers **dev only**, and this step is per environment — tst and prd each need their own,
+because each has different subjects. The artifact is
+`docs/personvern/2026-08-28-varsel-tilbakemelding-personvernvurdering.md`: purpose and lawful basis,
+the free-text notice as it actually reads in the PWA (`Ikke skriv personopplysninger.`), the true
+access list — `roles/bigquery.admin` through the team group, not the Data Viewer/Job User this file
+claimed before the step-3 read-out — 30-day PostHog and 45-day BigQuery retention, 30-day export
+cleanup, and the subject-rights limitation.
+
+**The retention-only procedure is the part that needed approving, and it is approved.** PostHog's
+deletion path is per *person*; these events have no person, so there is nothing to delete against
+and no per-event route exists. A response therefore ages out at 30 days rather than being erasable
+on request, and its BigQuery context at 45. Evidence under the measurements below.
+
+Two things a dev approval does **not** settle, recorded so nobody reads more into it than it says:
+
+- **Punkt 9b of the assessment is still open**: whether the origin/destination/departure-time trio
+  `/varsel` already sends to Gemini is "Fortrolig" under Entur's information classification, and
+  whether KI-løypa applies to it. That is not a feedback question — the trio predates this feature
+  and reaches Vertex whether or not capture is on — which is why it does not block dev. It is
+  unanswered, not answered favourably.
+- **Dev's subjects are the team.** The approval rests on that, so it is not evidence for an
+  environment with real travellers behind it. If `/varsel` ever takes public registrations this
+  re-opens, alongside the k=1 exposure recorded for `/meldinger` in `CLAUDE.md`.
+
+Reference for the approval record (ticket, email or meeting note): _to be filled in by the owner._
 
 ### Step 6, the half that needs no deployment (2026-08-28)
 
