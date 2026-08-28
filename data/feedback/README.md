@@ -92,3 +92,20 @@ linked from the operational change record.
 
 The reviewer credential is intentionally absent from Kubernetes. Runtime capture project tokens
 are not reviewer credentials and cannot be used by this tool.
+
+### Measured against the Entur dev project (2026-08-28, project 259080)
+
+Verified by running the exporter, not by reading docs — the first two are defects this found:
+
+- **HogQL is not ClickHouse.** `toInt64(...)` is refused with a 400 and the whole query fails;
+  HogQL exposes `toInt(...)`. Nothing offline validates the dialect, so only a real run proves it.
+- **PostHog type-infers a date-ish property as `DateTime64(6, 'Europe/Oslo')`** — the *project*
+  timezone — and the raw stored string cannot be recovered. An unwrapped `properties.context_date`
+  therefore returns `2026-08-27T00:00:00+02:00` for a stored `2026-08-27`, which the exporter
+  rejected as one `malformed_event` while dropping every response. All date-ish columns are now
+  projected through explicit casts; changing one needs a real run to re-verify.
+- **The completeness guard is sound.** `SELECT number FROM numbers(N+5000) LIMIT N` returned exactly
+  10 001 rows at N=10 001 and 20 000 at N=20 000, so PostHog does not silently cap below
+  `MAX_EVENTS + 1` and the guard fires instead of truncating a busy window in silence.
+- **A refused query now carries the API's reason.** urllib hides the body behind
+  `HTTP Error 400: Bad Request`; the body is the entire diagnosis.

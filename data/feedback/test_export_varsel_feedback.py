@@ -5,6 +5,7 @@ import os
 import uuid
 from datetime import date
 from pathlib import Path
+from urllib.error import HTTPError
 
 MODULE = Path(__file__).with_name("export_varsel_feedback.py")
 spec = importlib.util.spec_from_file_location("export_varsel_feedback", MODULE)
@@ -128,6 +129,54 @@ def test_hogql_is_bounded_to_event_environment_and_dates():
     assert "properties.environment = 'prd'" in query
     assert "timestamp >=" in query and "timestamp <" in query
     assert f"LIMIT {export.MAX_EVENTS + 1}" in query
+
+
+def test_hogql_uses_hogql_functions_and_not_clickhouse_ones():
+    # Nothing offline can validate HogQL, so this pins the constructs a real query already refused
+    # rather than pretending to check the dialect. toInt64 is ClickHouse's; HogQL rejects the whole
+    # query with a 400 ("Perhaps you meant 'toInt(...)'?"), which cost a release-gate run on
+    # 2026-08-28 because the only assertions here were about bounds.
+    query = export._hogql("dev", date(2026, 8, 1), date(2026, 8, 3))
+    assert "toInt64" not in query
+    assert "toInt(properties.revision)" in query
+
+
+def test_hogql_pins_every_timestamp_to_utc_and_the_context_date_to_a_day():
+    # PostHog types a date-ish property as DateTime in the PROJECT timezone, so an unwrapped
+    # projection returns "2026-08-27T00:00:00+02:00" for a stored "2026-08-27" — which
+    # date.fromisoformat rejects, dropping every response as one malformed_event. toDate truncates
+    # in the coercion's own zone and recovers the stored day; the instants are pinned to UTC so an
+    # exported document does not change value when somebody edits a PostHog project setting.
+    query = export._hogql("dev", date(2026, 8, 1), date(2026, 8, 3))
+    assert "toString(toDate(properties.context_date))" in query
+    assert "toString(toTimeZone(timestamp, 'UTC'))" in query
+    assert "toString(toTimeZone(properties.submitted_at, 'UTC'))" in query
+    # A bare projection of either instant would reintroduce the project-timezone dependency.
+    assert "\ntimestamp," not in query
+    assert "properties.submitted_at\n" not in query
+
+
+def test_a_refused_query_carries_the_api_reason_not_just_the_status():
+    # urllib hides the body behind "HTTP Error 400: Bad Request", and the body is where PostHog puts
+    # the reason — the entire diagnosis, in the one place a traceback does not reach.
+    class Refused(HTTPError):
+        def __init__(self):
+            super().__init__("https://eu.posthog.com", 400, "Bad Request", {}, None)
+
+        def read(self):
+            return b'{"code":"hogql_query_error","detail":"Unsupported function call'
+
+    def opener(request, timeout=None):
+        raise Refused()
+
+    try:
+        export.fetch_posthog(project_id=1, environment="dev", start=date(2026, 8, 1),
+                             end=date(2026, 8, 2), token="phx_x", opener=opener)
+    except RuntimeError as exc:
+        assert "hogql_query_error" in str(exc)
+        assert "400" in str(exc)
+    else:
+        raise AssertionError("a refused query must not pass silently")
 
 
 def stat_mode(path):
