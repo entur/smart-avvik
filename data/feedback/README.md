@@ -323,15 +323,22 @@ Secret Manager refuses an empty payload (`INVALID_ARGUMENT: Secret Payload canno
 parking the prd secret as an empty string — which would also have failed closed — was not an option;
 the shape guard is what makes the descriptive placeholder safe.
 
-**Those two suites were not running in CI.** `test_feedback.py` (now 10 checks) and
-`test_feedback_contexts.py` (3) had no `if __name__ == "__main__"` runner, and CI executes each suite
-as `python <suite>.py` rather than under pytest — so both imported cleanly, collected nothing and
-exited 0. Thirteen checks covering the whole capture path, including the personless-payload and
-receipt-binding assertions the privacy gate leans on, had never once run in CI. Both now have runners
-(`test_feedback.py` also needs a `setenv`-capable `_MonkeyPatch` shim, which the `test_varsel_api.py`
-original lacked). The CI loop globs `test_*.py` deliberately so that adding a suite cannot be
-forgotten — but a glob catches the *file*, not a missing runner, so **a suite that prints no "N checks
-passed" line is a suite that did not run.**
+**Every test of this feature was unrun in CI, in two different ways.** CI executes each suite as
+`python <suite>.py` rather than under pytest, so a file with no `if __name__ == "__main__"` runner
+imports cleanly, collects nothing and exits 0.
+
+- `test_feedback.py` (now 10 checks) and `test_feedback_contexts.py` (3) had no runner. Thirteen
+  checks over the whole capture path — including the personless-payload and receipt-binding
+  assertions this gate leans on — had never once run. `test_feedback.py` also needed a
+  `setenv`-capable `_MonkeyPatch` shim, which the `test_varsel_api.py` original lacked.
+- `test_export_varsel_feedback.py` (14) was unrun **twice over**: no runner, *and* outside the CI
+  loop's `working-directory: disruptions/api`, so the glob never saw it. It guards the export of
+  travellers' free text, which is the most sensitive path in this repo. It now has a runner (with a
+  `tempfile`-backed `tmp_path` shim) and a CI step of its own.
+
+The loop globs `test_*.py` deliberately, so that adding a suite cannot be forgotten — but a glob
+catches the *file*, not a missing runner or a directory it never enters. **A suite that prints no
+"N checks passed" line is a suite that did not run**; that line is the only evidence CI produces.
 
 **Step 3 needs no change for tst or prd.** The app SA holds `roles/bigquery.{dataEditor,jobUser}`
 project-wide in all three, which is what lets `feedback_contexts.ensure_table()` create the table on
