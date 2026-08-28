@@ -54,8 +54,12 @@ PostHog EU project:
    autocapture/session replay disabled, the GeoIP transformation removed, no person profiles, and
    30-day event retention (the project data-retention setting). Inspect the
    **raw captured event**, not only a transformed view: it may contain only the documented event
-   fields, PostHog ingestion metadata, and no IP, user-agent, geo, URL, route, prompt, session, or
-   browser-library properties.
+   fields, PostHog ingestion metadata, and no user-agent, geo, URL, route, prompt, session, or
+   browser-library properties. `$ip` is the one exception and must read exactly **`0.0.0.0`** rather
+   than be absent — an absent one means the capture code lost its override and PostHog has stamped a
+   real address, which the project's own IP setting was measured not to prevent (see the IP entry
+   under the measurements below). Check `person_mode`, which reads `propertyless` when no profile
+   was created.
 3. Assign runtime write access only to the kix-avvik workload identity: BigQuery Job User plus the
    minimum dataset/table append/create permissions needed for `varsel_feedback_contexts`. There is
    no public context-read route. The owning access group is `team-ki-eksperimentering`; developers
@@ -113,6 +117,20 @@ Verified by running the exporter, not by reading docs — the first two are defe
   became readable through the Query API after 50.5 s (not visible at 48.2 s). Server-side submit
   latency was 1.07-1.29 s over three runs, against step 6's 3 s bar — a single-shot local figure,
   not a p95 through the ingress. Re-measure per environment; this is dev.
+- **PostHog stamps `$ip` from the socket, and only a valid value in the payload displaces it.**
+  Five probes: an absent, `null` or `""` `$ip` all recorded the caller's real address — null and
+  empty are read as "not supplied" — while `"0.0.0.0"` survived intact, as did an
+  `X-Forwarded-For: 0.0.0.0` header (not used: trusting PostHog's proxy handling is a weaker
+  contract than occupying the property). The project's **"discard client IP data" setting did not
+  suppress it**, which is why `feedback._capture` now sends `"$ip": "0.0.0.0"`: a privacy guarantee
+  resting on a console toggle is one click from silently ending. Note what the field would otherwise
+  hold — capture is server-side, so it is this pod's egress address, Entur infrastructure rather than
+  the traveller, whose browser never contacts PostHog. The exposure it actually closes is a
+  **developer** running the synthetic round-trip below from a laptop and writing their own
+  residential address into a store with 30-day retention and no per-event deletion. That happened
+  during this gate: the four synthetic responses of 2026-08-27/28 carry a real developer address and
+  cannot be deleted, only aged out. Run the round-trip from inside the cluster, or accept and record
+  it as was done here.
 - **Deletion is retention-only, and this is the evidence step 4 asks for.** Measured on the four
   synthetic responses: `persons` holds **0 rows** for the whole project, `person_distinct_ids` has no
   row for any of their `distinct_id`s, and every event carries
