@@ -149,10 +149,13 @@ prompt/model/policy context stay in BigQuery and are joined internally by an opa
 display-context ID. Feedback measures whether the alert was immediately useful, not whether the
 prediction later proved correct.
 
-Capture requires all of `VARSEL_FEEDBACK_ENABLED=true`, `POSTHOG_PROJECT_TOKEN`, and a secret
-`VARSEL_FEEDBACK_RECEIPT_SECRET` of at least 32 bytes. `POSTHOG_HOST` is pinned to
-`https://eu.i.posthog.com`. Missing or disabled configuration hides the control without affecting
-alerts. Do not enable it merely because the secrets exist: setup, raw-payload audit, access,
+Capture requires all of `VARSEL_FEEDBACK_ENABLED=true`, a `POSTHOG_PROJECT_TOKEN` that is a **`phc_`
+project write token** of at least 32 characters, and a secret `VARSEL_FEEDBACK_RECEIPT_SECRET` of at
+least 32 bytes. `POSTHOG_HOST` is pinned to `https://eu.i.posthog.com`. Missing or disabled
+configuration hides the control without affecting alerts. The token's shape is checked because its
+value cannot be: PostHog's capture endpoint answers HTTP 200 to any non-empty key, so a wrong one
+would otherwise discard feedback in silence (measured 2026-08-28 — see
+[`data/feedback/README.md`](../../data/feedback/README.md)). Do not enable it merely because the secrets exist: setup, raw-payload audit, access,
 retention, deletion/subject-rights, staged rollout, reviewer usage, and rollback are documented in
 [`data/feedback/README.md`](../../data/feedback/README.md).
 

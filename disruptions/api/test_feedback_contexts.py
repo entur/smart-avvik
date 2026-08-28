@@ -67,3 +67,17 @@ def test_persist_is_self_contained_and_uses_stable_insert_id():
 
 def test_unknown_context_never_infers_a_row():
     assert feedback_contexts.persist("0" * 32) == (False, "expired")
+
+
+def _run():
+    tests = sorted(
+        (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
+    )
+    for name, fn in tests:
+        fn()
+        print(f"  ok  {name}")
+    print(f"\n{len(tests)} feedback-context checks passed.")
+
+
+if __name__ == "__main__":
+    _run()

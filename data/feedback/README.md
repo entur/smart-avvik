@@ -43,13 +43,15 @@ Capture is deliberately disabled by `VARSEL_FEEDBACK_ENABLED=false`. Configure e
 separately and promote dev → tst → prd only after every item below is recorded for that exact
 PostHog EU project:
 
-1. Create `POSTHOG_PROJECT_TOKEN` and a separate 32-byte-or-longer
+1. Create `POSTHOG_PROJECT_TOKEN` — a **`phc_` project write token**, which `_token()` requires by
+   shape, for the reason in the measurement section below — and a separate 32-byte-or-longer
    `VARSEL_FEEDBACK_RECEIPT_SECRET` in Google Secret Manager, then add both names to that
    environment's Helm `secrets.varsel` mapping before enabling capture. They are deliberately not
    referenced while absent, so the disabled-code rollout cannot break an existing deployment.
    Values never belong in git. Rotate either secret after suspected disclosure and on the platform team's normal rotation
    cadence. The receipt key rotation ends updates to already-issued receipts but does not affect
-   alert delivery.
+   alert delivery. Done for all three environments on 2026-08-28 — see the tst/prd pre-wiring
+   section below for what each one still needs.
 2. Confirm `POSTHOG_HOST=https://eu.i.posthog.com`, EU project residency, IP capture disabled,
    autocapture/session replay disabled, the GeoIP transformation removed, no person profiles, and
    30-day event retention (the project data-retention setting). Inspect the
@@ -249,6 +251,115 @@ have none, so they age out at 30 days rather than being removable: **exclude the
 when reviewing dev feedback. The BigQuery rows are deletable once the streaming buffer clears. One
 row is *not* synthetic — a submit at 16:59:27 on `Oslo S -> Sandvika`, a journey this measurement
 never registered.
+
+### Steps 1 and 3, pre-wired for tst and prd (2026-08-28)
+
+Step 1 is done for all three environments and step 3 needs nothing further, so **promotion is a flag
+plus the approval, not an infrastructure project.** What that leaves per environment:
+
+| | dev | tst | prd |
+| --- | --- | --- | --- |
+| `POSTHOG_PROJECT_TOKEN` in Secret Manager | yes | yes | **placeholder** |
+| `VARSEL_FEEDBACK_RECEIPT_SECRET` in Secret Manager | yes | yes | yes |
+| both names in Helm `secrets.varsel` | yes | yes | yes |
+| `disruptions` dataset exists (EU) | yes | yes | yes |
+| step 4 approval | dev only | **no** | **no** |
+| `VARSEL_FEEDBACK_ENABLED` | `true` | `false` | `false` |
+
+**Order, and why it is not negotiable.** Every secret was created in its project *before* its name
+was added to Helm. Each namespace's `SecretStore` reads its own `ent-kixavvik-<env>` with
+`secretVersionSelectionPolicy: LatestOrFail`, and the rendered `ExternalSecret` is all-or-nothing —
+one unresolvable name fails the whole object, and the container takes the resulting `kix-avvik-varsel`
+Secret through a single `envFrom.secretRef`. In prd that would have taken `VAPID_PRIVATE_KEY` and
+`VAPID_PUBLIC_KEY` down with it, **silently disabling push for real travellers over a feature that is
+switched off**. `roles/secretmanager.secretAccessor` was already granted project-wide to
+`application@ent-kixavvik-<env>` in all three, so no per-secret IAM was needed.
+
+**tst deliberately shares dev's PostHog project ("Kix - dev").** The token value is dev's byte for
+byte (verified by hash, never displayed). What separates the two inside that project is the
+`environment` event property — `deployment.environment_label() or "prd"`, so `"dev"`, `"tst"`, `"prd"`
+— which is also salted into the per-response `distinct_id`, so no person can span environments. So an
+export of tst is `--environment tst` with **dev's** `--posthog-project-id`, and tst's events age out
+on dev's 30-day retention clock. The exporter already takes both as arguments and its `ENVIRONMENTS`
+tuple already lists all three; nothing there needed changing.
+
+**The three receipt keys are distinct** (fresh 64-byte values, verified by hash). Sharing one would
+let a receipt minted in dev authorize a `revision > 1` update against a real traveller's response in
+prd, which is the single thing that HMAC exists to prevent.
+
+**prd's token is a labelled placeholder, not the real one.** `state=placeholder` in Secret Manager.
+Adding the real "Kix - prod" project write token is a `gcloud secrets versions add` (the exact command
+is in the flag's comment in `values-kub-ent-prd.yaml`) and is the one step that needs a human with
+PostHog access. A placeholder rather than an absent secret because of the all-or-nothing failure
+above: this way the Helm reference is safe from the moment it lands, and the missing piece is a value
+rather than a landmine. Flipping the flag before replacing it is **safe and does nothing** —
+`_token()` rejects it, so `enabled()` reads False, `/varsel-api/config` reports capture off and no
+context row is written. That is only true because of the guard described next. The prd export also
+needs the "Kix - prod" numeric project id, which is likewise not recorded here yet.
+
+### A wrong PostHog token cannot be detected after the fact (measured 2026-08-28)
+
+`POST https://eu.i.posthog.com/i/v0/e/` is **fire-and-forget**. Measured with four keys: a
+`phc_`-shaped random token, a well-formed-but-wrong token, and the prd placeholder string all
+returned **HTTP 200 `{"status":"Ok"}`**; only an **empty** key returned `401 API key is not valid:
+empty`. The token is validated later, asynchronously, at ingestion. So `_capture`'s
+`response.status >= 300` check cannot distinguish a wrong token from a right one, and a bad one would
+discard every traveller's feedback **in complete silence** while `submit()` still returned `saved`,
+still issued a receipt, and still wrote the route-bearing context row to BigQuery. This is not
+hypothetical maintenance work: a rotation that pastes a personal API key (`phx_`) where the project
+token belongs would do exactly that, in dev today.
+
+Two consequences, both now in place:
+
+- **`_token()` checks the shape** — a `phc_` prefix and at least 32 characters — so a placeholder or
+  a wrong *kind* of key fails **closed** rather than silent: `enabled()` reads False, nothing is
+  captured, nothing is persisted, and `/varsel-api/config` says capture is off, which is a
+  one-request diagnosis. Do not relax this to make a demo work.
+- **A well-formed token for the wrong project is still undetectable in-band**, and the only detector
+  is on this side: an export returning **zero responses beside a growing
+  `varsel_feedback_contexts`**. Check that pairing after any token rotation, in any environment.
+
+Secret Manager refuses an empty payload (`INVALID_ARGUMENT: Secret Payload cannot be empty`), so
+parking the prd secret as an empty string — which would also have failed closed — was not an option;
+the shape guard is what makes the descriptive placeholder safe.
+
+**Every test of this feature was unrun in CI, in two different ways.** CI executes each suite as
+`python <suite>.py` rather than under pytest, so a file with no `if __name__ == "__main__"` runner
+imports cleanly, collects nothing and exits 0.
+
+- `test_feedback.py` (now 10 checks) and `test_feedback_contexts.py` (3) had no runner. Thirteen
+  checks over the whole capture path — including the personless-payload and receipt-binding
+  assertions this gate leans on — had never once run. `test_feedback.py` also needed a
+  `setenv`-capable `_MonkeyPatch` shim, which the `test_varsel_api.py` original lacked.
+- `test_export_varsel_feedback.py` (14) was unrun **twice over**: no runner, *and* outside the CI
+  loop's `working-directory: disruptions/api`, so the glob never saw it. It guards the export of
+  travellers' free text, which is the most sensitive path in this repo. It now has a runner (with a
+  `tempfile`-backed `tmp_path` shim) and a CI step of its own.
+
+The loop globs `test_*.py` deliberately, so that adding a suite cannot be forgotten — but a glob
+catches the *file*, not a missing runner or a directory it never enters. **A suite that prints no
+"N checks passed" line is a suite that did not run**; that line is the only evidence CI produces.
+
+**Step 3 needs no change for tst or prd.** The app SA holds `roles/bigquery.{dataEditor,jobUser}`
+project-wide in all three, which is what lets `feedback_contexts.ensure_table()` create the table on
+first persist — it does not exist in prd or tst yet and does not need to be created by hand. Reviewer
+read access is inherited from an ancestor rather than granted on the project (no human or group has a
+project-level BigQuery binding in any of the three), and it was verified by querying prd's
+`varsel_decisions` from a laptop. `terraform/env/{tst,prd}.tfvars` therefore stay `disruptions_readers
+= []`: that list grants *other* teams, and the 2026-08-13 note there still applies unchanged.
+
+**One correction to a claim in CLAUDE.md.** Nothing in this repo creates the `disruptions` dataset —
+there is no `create_dataset` call and no `CREATE SCHEMA` statement; the startup CTASes create *tables*
+into a dataset that must already exist. tst had none, so `ensure_table()` would have failed there with
+"Dataset not found" and every submit would have returned `downstream`. `ent-kixavvik-tst:disruptions`
+was created in **EU**, matching dev and prd. It is empty and stays empty: tst has no models or runtime
+tables, so its poller produces no alerts and there is nothing there to rate. tst's wiring exists to
+make promotion a flag and to exercise the plumbing, not because tst can evaluate the feature.
+
+**What stays unverified until a flag actually moves:** egress from the tst and prd clusters to
+`eu.i.posthog.com`. It cannot be probed from outside and the image is distroless, so there is no shell
+to `kubectl exec` into. The evidence is indirect but good: every `NetworkPolicy` in both namespaces is
+`policyTypes: ["Ingress"]` only, and both deployments already reach `api.entur.io` and Vertex AI.
 
 ## Official API assumptions to verify
 
