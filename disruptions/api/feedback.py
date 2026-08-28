@@ -152,6 +152,20 @@ def _capture(body: FeedbackIn, *, environment: str, context_date: str, submitted
         "submitted_at": submitted_at,
         "$insert_id": str(body.event_id),
         "$process_person_profile": False,
+        # PostHog stamps $ip from the socket unless the payload supplies a VALID one, so the only way
+        # to keep an address out of the store is to occupy the field. Measured against the real
+        # project 2026-08-28, five probes: absent, null and "" all recorded the caller's real
+        # address — null and empty are read as "not supplied" — while "0.0.0.0" survived intact (as
+        # did an X-Forwarded-For header, not used here: relying on PostHog's proxy trust is a weaker
+        # contract than occupying the property). The project's "discard client IP data" setting did
+        # not suppress it either, which is the other reason this belongs in code: a privacy
+        # guarantee that depends on a console toggle is one click from silently ending.
+        # Nothing here wants an IP. Capture is server-side, so the address would be this pod's
+        # egress — Entur infrastructure, not the traveller, whose browser never contacts PostHog —
+        # and a developer running data/feedback's synthetic round-trip from a laptop would otherwise
+        # write their own residential address into a store with 30-day retention and no per-event
+        # deletion path.
+        "$ip": "0.0.0.0",
     }
     payload = json.dumps({"api_key": _token(), "event": EVENT, "properties": properties}).encode()
     request = UrlRequest(
