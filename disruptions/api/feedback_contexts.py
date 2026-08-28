@@ -16,6 +16,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 TABLE = "disruptions.varsel_feedback_contexts"
+# The JSON-typed columns of TABLE. insert_rows_json streams through the legacy insertAll API, which
+# reads a native dict against a JSON column as a record and rejects the row ("This field: policy is
+# not a record") — every context write failed this way until 2026-08-27, invisibly, because the
+# failure path only logs and the traveller's rating still reaches PostHog. A None stays None: a
+# JSON column holds SQL NULL that way, while json.dumps(None) would store a JSON `null` literal
+# that `IS NOT NULL` matches and /meldinger-style "has input" tests would read as present.
+_JSON_COLUMNS = ("journey_context", "message_input", "prediction", "policy", "delivery")
 _DDL = (Path(__file__).parent / "create_varsel_feedback_contexts.sql").read_text()
 _LEASE_S = 15 * 60
 _MAX_CONTEXTS = 10_000
@@ -117,6 +124,9 @@ def persist(context_id: str, *, context_date: str | None = None) -> tuple[bool, 
         "persisted_at": now.isoformat(),
         **snapshot,
     }
+    for column in _JSON_COLUMNS:
+        if row.get(column) is not None:
+            row[column] = json.dumps(row[column], ensure_ascii=False, default=str)
     try:
         errors = _bq_client.insert_rows_json(TABLE, [row], row_ids=[context_id], timeout=5)
     except Exception:

@@ -1,5 +1,8 @@
 -- Exact traveller-visible alert snapshots used to enrich isolated PostHog feedback.
 -- Append-only and environment-local. Never add this table to runtime copy scripts.
+-- 45 days: PostHog keeps the responses that reference a context for 30 days (the project's data-retention
+-- setting), and the exporter reaches back one day before its window; a context that outlives every
+-- response is unreviewable but still holds route-bearing wording, so it should not sit for 90.
 CREATE TABLE IF NOT EXISTS `disruptions.varsel_feedback_contexts`
 (
   context_id STRING NOT NULL,
@@ -25,4 +28,4 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_feedback_contexts`
 )
 PARTITION BY context_date
 CLUSTER BY context_id
-OPTIONS(partition_expiration_days=90);
+OPTIONS(partition_expiration_days=45);
