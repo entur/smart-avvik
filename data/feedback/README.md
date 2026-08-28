@@ -83,6 +83,43 @@ Rollback is `VARSEL_FEEDBACK_ENABLED=false` followed by a deployment. It stops n
 alert display and delivery stay healthy, while existing feedback remains reviewable until expiry.
 PostHog outages or context-write failures must never be worked around by logging feedback bodies.
 
+### Step 3, verified (2026-08-28) — with three deviations from what the step claims
+
+Read out of the live IAM, not out of the plan. The **principle holds**: nothing here is granted to a
+person-shaped list, access arrives through `sg-dig-team-ki-eksperimentering@entur.no` bound at the
+`team-ki-eksperimentering` folder and inherited by both projects. But three specifics are wider than
+this file said, and a reviewer comparing the two would rightly not trust either until it is written
+down.
+
+**Runtime write access.** `application@ent-kixavvik-{dev,prd}` holds `roles/bigquery.dataEditor` +
+`roles/bigquery.jobUser` at *project* level, which reaches the dataset through its `projectWriters`
+ACL entry. That satisfies create + `insertAll` for `varsel_feedback_contexts`, and is proved in
+practice rather than on paper: the same SA already writes `varsel_decisions` through the identical
+`ensure_table` + `insert_rows_json` path. **Deviation 1: `dataEditor` is project-wide, not scoped to
+this table**, so "the minimum permissions needed" above is aspirational. Narrowing it is a separate
+piece of work — the whole app runs on that grant.
+
+**No public context-read route** — structural, not a policy. `feedback_contexts.resolve` has exactly
+one caller (`feedback.submit`, `revision == 1`) and is used as an existence test (`is None`); no
+value from it reaches a response. `mint` and `persist` only write. So there is nothing to restrict.
+
+**Reader access. Deviation 2, and the one to read twice:** this file said developers and product
+managers get "BigQuery Data Viewer/Job User". They actually hold **`roles/bigquery.admin`** (plus
+`aiplatform.admin` and `entur.devOps`) via the team group at the folder. `bigquery.admin` includes
+delete. So the real access is far wider than documented, and any statement to a privacy owner must
+use the true figure. Terraform's `disruptions_readers` is a *separate* grant and currently holds only
+`group:sg-dig-team-sd@entur.no` (Team SD) — it is not how the owning team gets in.
+
+**Deviation 3: a person holds OWNER on the dataset** in *both* environments —
+`thomas.oldervoll@entur.org`, almost certainly because BigQuery grants the creator OWNER and the app
+creates the dataset at startup under whoever ran it first. It contradicts the "grant to a group, never
+a person" rule in `CLAUDE.md`, and it is the one deviation with a cheap fix.
+
+**prd is not ready and should not be made ready yet.** The dataset ACL there carries no team group at
+all (only `projectWriters`/`projectReaders` plus that personal OWNER), the two capture secrets do not
+exist in Secret Manager, and `varsel_feedback_contexts` **has not been created** — the app creates it
+at startup, so it will appear on the first deploy after capture is configured, not before.
+
 ### Step 6, the half that needs no deployment (2026-08-28)
 
 Driven against the real modules, not asserted — `_claim`, `parse` and `enabled` were called directly
