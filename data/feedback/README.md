@@ -83,6 +83,31 @@ Rollback is `VARSEL_FEEDBACK_ENABLED=false` followed by a deployment. It stops n
 alert display and delivery stay healthy, while existing feedback remains reviewable until expiry.
 PostHog outages or context-write failures must never be worked around by logging feedback bodies.
 
+### Step 6, the half that needs no deployment (2026-08-28)
+
+Driven against the real modules, not asserted — `_claim`, `parse` and `enabled` were called directly
+and the counts read back. 15 checks, all passing:
+
+- **Rate limits bind at exactly the documented numbers**: 12 accepted per context per minute out of
+  50 offered (`_PER_CONTEXT_PER_MIN`), 60 out of 200 offered across *different* contexts
+  (`_GLOBAL_PER_MIN`) — the second is what proves the global cap is not merely the per-context one.
+- **The 2 000/day budget outranks a fresh minute**: at the cap a claim is refused even with both
+  minute windows empty, and the last slot below it is honoured.
+- **Two independent length caps**: a body over `_MAX_BODY` (2 KiB) raises `body_too_large` before any
+  parsing, and a 501-character comment is refused by the model even inside a legal body.
+- **The kill switch, and three things that also kill it**: `VARSEL_FEEDBACK_ENABLED=false`, a
+  **trailing slash** on `POSTHOG_HOST`, a non-EU host, and a receipt secret under 32 bytes. The
+  trailing slash is worth knowing — the host compare is an exact string match, so
+  `https://eu.i.posthog.com/` disables capture silently rather than working.
+- **No log line carries the traveller's free text.** Verified on the two paths that actually log,
+  because an early return proves nothing: a failed BigQuery context write (67 characters logged) and
+  a raising PostHog capture (**1 004 characters, a full `exc_info` traceback**). A canary string in
+  the comment appears in neither, nor does the `context_id`.
+
+Still needing a deployment: **p95 submit latency** against the 3 s bar. Server-side submit measured
+1.07-1.29 s over three local runs (dominated by the BigQuery context write plus the PostHog POST),
+but that is a laptop against dev, not a p95 through the ingress under concurrency.
+
 ## Official API assumptions to verify
 
 The exporter follows PostHog's official [Query API endpoint](https://posthog.com/docs/api/query)
