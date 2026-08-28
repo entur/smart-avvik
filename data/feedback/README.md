@@ -113,6 +113,16 @@ Verified by running the exporter, not by reading docs — the first two are defe
   became readable through the Query API after 50.5 s (not visible at 48.2 s). Server-side submit
   latency was 1.07-1.29 s over three runs, against step 6's 3 s bar — a single-shot local figure,
   not a p95 through the ingress. Re-measure per environment; this is dev.
+- **Deletion is retention-only, and this is the evidence step 4 asks for.** Measured on the four
+  synthetic responses: `persons` holds **0 rows** for the whole project, `person_distinct_ids` has no
+  row for any of their `distinct_id`s, and every event carries
+  `$process_person_profile: false`. Each event does show a derived `person_id`, but
+  `person.created_at` reads `1970-01-01`, i.e. a placeholder rather than a stored profile. PostHog's
+  deletion path is per **person**, so for these events there is nothing to delete against and no
+  per-event route exists. The BigQuery half works and was exercised: all five synthetic context rows
+  were deleted, the table back to 0. Note DML is refused while rows sit in the streaming buffer
+  ("would affect rows in the streaming buffer") — ~10-30 min here, documented as up to 90 — so a
+  deletion request cannot be serviced immediately after capture.
 - **The Query API caches a result per query text**, and that interacts badly with the delay above.
   A repeat of an identical query returns `is_cached: true`, so the first measurement of the delay
   read as "never readable in 300 s": the poll's own first empty answer was cached and re-served to
