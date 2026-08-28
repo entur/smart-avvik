@@ -72,7 +72,17 @@ def fetch_posthog(
     *, project_id: int, environment: str, start: date, end: date, token: str,
     opener: Callable[..., Any] = urlopen,
 ) -> list[dict[str, Any]]:
-    payload = json.dumps({"query": {"kind": "HogQLQuery", "query": _hogql(environment, start, end)}}).encode()
+    # force_blocking, because the Query API CACHES a result per query text and will happily serve an
+    # earlier answer to an identical request: measured 2026-08-28, a repeat of the same query came
+    # back is_cached=true. For a reviewer export that is a correctness bug, not a latency saving —
+    # re-running a window after more feedback arrived would return the earlier, shorter answer and
+    # read as "nothing new came in". It is also what makes the ~50 s ingestion delay a wait rather
+    # than a trap: without it one early empty read is cached and every retry repeats it, which is
+    # exactly how the delay first measured as "never" (README).
+    payload = json.dumps({
+        "query": {"kind": "HogQLQuery", "query": _hogql(environment, start, end)},
+        "refresh": "force_blocking",
+    }).encode()
     request = Request(
         f"{QUERY_HOST}/api/projects/{project_id}/query/",
         data=payload,

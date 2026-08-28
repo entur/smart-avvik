@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import uuid
 from datetime import date
@@ -154,6 +155,32 @@ def test_hogql_pins_every_timestamp_to_utc_and_the_context_date_to_a_day():
     # A bare projection of either instant would reintroduce the project-timezone dependency.
     assert "\ntimestamp," not in query
     assert "properties.submitted_at\n" not in query
+
+
+def test_the_query_is_never_served_from_the_api_cache():
+    # PostHog caches a result per query text (measured: is_cached=true on a repeat). A reviewer
+    # re-running a window after more feedback arrived would otherwise get the earlier answer and read
+    # it as "nothing new"; and during the ~50 s ingestion delay one early empty read would be cached
+    # and repeated by every retry.
+    seen = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b'{"results": []}'
+
+    def opener(request, timeout=None):
+        seen["body"] = json.loads(request.data.decode())
+        return Response()
+
+    export.fetch_posthog(project_id=1, environment="dev", start=date(2026, 8, 1),
+                         end=date(2026, 8, 2), token="phx_x", opener=opener)
+    assert seen["body"]["refresh"] == "force_blocking"
 
 
 def test_a_refused_query_carries_the_api_reason_not_just_the_status():

@@ -109,3 +109,13 @@ Verified by running the exporter, not by reading docs — the first two are defe
   `MAX_EVENTS + 1` and the guard fires instead of truncating a busy window in silence.
 - **A refused query now carries the API's reason.** urllib hides the body behind
   `HTTP Error 400: Bad Request`; the body is the entire diagnosis.
+- **Ingestion consistency delay: ~50 s.** A synthetic response submitted through `feedback.submit`
+  became readable through the Query API after 50.5 s (not visible at 48.2 s). Server-side submit
+  latency was 1.07-1.29 s over three runs, against step 6's 3 s bar — a single-shot local figure,
+  not a p95 through the ingress. Re-measure per environment; this is dev.
+- **The Query API caches a result per query text**, and that interacts badly with the delay above.
+  A repeat of an identical query returns `is_cached: true`, so the first measurement of the delay
+  read as "never readable in 300 s": the poll's own first empty answer was cached and re-served to
+  every retry. The exporter therefore sends `refresh: "force_blocking"`. Without it a reviewer who
+  re-runs a window after more feedback arrived gets the earlier, shorter answer — with no indication
+  that anything was withheld.
