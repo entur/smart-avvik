@@ -85,6 +85,20 @@ jobs:
                    --with pywebpush python "$suite"
             echo "::endgroup::"
           done
+      # Separate step, and separate from the loop above, because this suite lives outside
+      # disruptions/api -- the loop's working-directory made it invisible, and it had no
+      # `__main__` runner either, so it was unrun twice over. It guards the export of travellers'
+      # free text, which is the most sensitive path in the repo.
+      - name: Run feedback export tests
+        working-directory: data/feedback
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for suite in test_*.py; do
+            echo "::group::$suite"
+            uv run python "$suite"
+            echo "::endgroup::"
+          done
       - name: Run Avviksvarsel tests
         working-directory: demo/avviksvarsel
         run: |

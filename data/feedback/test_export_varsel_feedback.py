@@ -208,3 +208,29 @@ def test_a_refused_query_carries_the_api_reason_not_just_the_status():
 
 def stat_mode(path):
     return os.stat(path).st_mode & 0o777
+
+
+def _run():
+    # CI executes each suite as `python <suite>.py`, not under pytest, so without this the file
+    # imports cleanly, collects nothing and exits 0 -- a green tick over an unrun suite. A suite
+    # that prints no "N checks passed" line did not run.
+    import inspect
+    import tempfile
+
+    tests = sorted(
+        (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
+    )
+    for name, fn in tests:
+        if "tmp_path" in inspect.signature(fn).parameters:
+            # A fresh directory per test, as pytest's fixture gives: two of these write the same
+            # file name and assert that a second write is refused.
+            with tempfile.TemporaryDirectory() as directory:
+                fn(Path(directory))
+        else:
+            fn()
+        print(f"  ok  {name}")
+    print(f"\n{len(tests)} feedback-export checks passed.")
+
+
+if __name__ == "__main__":
+    _run()
