@@ -175,9 +175,80 @@ and the counts read back. 15 checks, all passing:
   a raising PostHog capture (**1 004 characters, a full `exc_info` traceback**). A canary string in
   the comment appears in neither, nor does the `context_id`.
 
-Still needing a deployment: **p95 submit latency** against the 3 s bar. Server-side submit measured
-1.07-1.29 s over three local runs (dominated by the BigQuery context write plus the PostHog POST),
-but that is a laptop against dev, not a p95 through the ingress under concurrency.
+The one thing left needing a deployment — p95 submit latency — is measured below.
+
+### Step 6, complete in dev (2026-08-28): p95 0.429 s against a 3 s bar
+
+Capture went live in dev at 16:53 UTC and was measured through the public ingress against a **real
+disruption** (Vy L1 Asker-Lillestrom cancelled all evening for staff shortage), not a contrived one.
+
+| population | what it exercises | n | p50 | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| **full** | ingress + BigQuery insert + PostHog POST | 55 | 0.230 s | **0.429 s** | 1.352 s |
+| repeat | ingress + PostHog POST (context already persisted) | 10 | 0.185 s | 0.398 s | 0.398 s |
+| floor | ingress + `resolve`, refused before any I/O | 40 | 0.113 s | 0.172 s | 0.203 s |
+
+**The three are separate because `persist` is idempotent, and a naive load test reports the middle
+row as the bar.** After a context's first successful write it returns early on the in-process
+`_persisted` set, so every later submit on that context skips BigQuery entirely. The `full` row is
+therefore one sample per *distinct* context — a real first tap — which is why it needed 55 distinct
+alert renderings rather than 55 requests. Confirmed in the data rather than assumed: the 55 full
+submits wrote exactly 55 rows and the 10 repeats wrote none.
+
+The `floor` row is worth keeping for the next environment. An unknown `context_id` is refused
+*before* `_claim`, so it costs no rate budget and no daily budget and can be measured freely; it
+isolates the fixed cost of the public path at ~0.11-0.20 s. A burst of 8 concurrent floor requests
+gave p95 0.176 s — no degradation — but note they return before `_inflight`, which refuses rather
+than queues at 4, so that burst does not exercise the semaphore.
+
+**Deployed is ~5x faster than the laptop figure, and the old number must not be quoted as if it
+were this one**: 1.07-1.29 s locally against a 0.230 s p50 here. BigQuery and PostHog EU are both
+far closer from inside GCP than from a developer's machine.
+
+Two honest limits. n=55 puts the p95 at the 53rd value, which is coarse — tolerable only because it
+lands 7x under the bar. And the code's own timeouts (`insert_rows_json(timeout=5)` plus
+`urlopen(timeout=3)`) *permit* a single submit above 3 s; the bar is a p95, and the observed max was
+1.352 s.
+
+**Also verified against the deployment, none of it previously exercised outside unit tests:**
+
+- **The receipt model.** `revision 1` returned a receipt, `revision 2` carrying it was accepted,
+  and both `revision 3` with a tampered signature and `revision 2` with no receipt returned
+  `invalid_receipt`. The HMAC works against the deployed secret.
+- **The JSON-column serialization fix, for the first time in a deployment.** All rows were accepted
+  and `policy` / `prediction` / `journey_context` are queryable through `JSON_VALUE`. Before that
+  fix every context write failed invisibly, and only a real write proves it.
+- **No free text reaches the logs.** A canary in the comment returned **0 hits** in `ent-kub-dev`
+  over the window, against a control query on the same resource that did return entries. The first
+  attempt searched `ent-kixavvik-dev`, which holds only BigQuery audit logs — its empty result meant
+  nothing, and a log check whose control is not run is not a check. The only warnings in the window
+  were unrelated: one transient Gemini fallback, a `google_genai` AFC notice, and the known
+  `varsel_decisions` description-refresh warning.
+
+**What was measured is not what a traveller will mostly see.** 49 of the 55 contexts carried
+`display_source='summary'` with an 11-character `displayed_text` (`Mulig avvik`) — 44 of them were
+no-SX scored alerts, and a **device-less** registration has no pending pushes, so the poller wrote a
+wording only for each journey's worst train (the documented fallback), 6 in all. A real install with
+a push subscription gets a written wording far more often. Latency is unaffected — same path, payloads
+differing by tens of bytes — but the mix must not be read as a statement about card quality.
+
+**Step 2's raw-event inspection, re-done on the real path (2026-08-28).** The gate's earlier
+inspection used events sent from a laptop; this one is a real tap on a real phone, which is the path
+that matters. Every required property holds: `$ip` reads exactly **`0.0.0.0`**, `person_mode` reads
+**`propertyless`**, `$process_person_profile` is `false`, `team_id` is the intended EU project, and
+`elements_chain` is empty. Nothing undocumented is present — no user-agent, no `$geoip_*` (so the
+GeoIP transformation really is removed, which `$ip: 0.0.0.0` alone would not have proved), no URL,
+route, session, prompt or `$lib` browser-library property. The event carried `revision: 2`, so the
+**client-side receipt round-trip works from the PWA** as well as from the synthetic test above: the
+rating was submitted first and the comment added afterwards under the receipt, writing no second
+context row. Its `context_id` is the one genuine row named below.
+
+**Residue in dev that cannot be cleaned up.** 67 synthetic PostHog events and 56 synthetic context
+rows, every one carrying a comment beginning `SYNTETISK`. PostHog deletion is per person and these
+have none, so they age out at 30 days rather than being removable: **exclude them by that prefix**
+when reviewing dev feedback. The BigQuery rows are deletable once the streaming buffer clears. One
+row is *not* synthetic — a submit at 16:59:27 on `Oslo S -> Sandvika`, a journey this measurement
+never registered.
 
 ## Official API assumptions to verify
 
