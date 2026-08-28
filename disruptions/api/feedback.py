@@ -54,7 +54,22 @@ class FeedbackIn(BaseModel):
 
 
 def _token() -> str | None:
-    return os.environ.get("POSTHOG_PROJECT_TOKEN")
+    # The shape is checked here because nothing downstream can check the VALUE. Measured against
+    # eu.i.posthog.com on 2026-08-28: /i/v0/e/ is fire-and-forget, so EVERY non-empty api_key —
+    # a placeholder, a well-formed token for someone else's project, random noise — returns
+    # HTTP 200 {"status":"Ok"} and is only validated later, asynchronously, at ingestion. Only an
+    # *empty* key 401s. So _capture's `response.status >= 300` check cannot tell a wrong token from
+    # a right one, and a bad one discards every traveller's feedback in complete silence while
+    # submit() still reports "saved" and still writes the route-bearing context row to BigQuery.
+    # A "phc_" project write token is what belongs here. Rejecting anything else catches the two
+    # mistakes that actually happen — a placeholder secret version, and a personal API key ("phx_")
+    # pasted where the project token goes — and it fails SAFE rather than silent: enabled() reads
+    # False, so no context is persisted either and /varsel-api/config reports capture off, which is
+    # a one-request diagnosis. What it cannot catch is a well-formed token for the WRONG project;
+    # the only detector for that is an export returning zero responses beside a growing
+    # varsel_feedback_contexts, which is why data/feedback/README.md names that check.
+    value = os.environ.get("POSTHOG_PROJECT_TOKEN") or ""
+    return value if value.startswith("phc_") and len(value) >= 32 else None
 
 
 def _secret() -> bytes | None:

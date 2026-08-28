@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 
 import feedback
@@ -81,6 +82,26 @@ def test_revision_requires_a_well_formed_receipt(monkeypatch):
     assert feedback.submit(body, environment="dev") == {"status": "invalid_receipt"}
 
 
+def test_a_token_that_is_not_a_project_write_key_fails_closed(monkeypatch):
+    # PostHog's capture endpoint answers 200 to any non-empty api_key (measured 2026-08-28), so a
+    # wrong token cannot be detected after the fact -- it has to keep capture from starting.
+    monkeypatch.setattr(feedback, "_secret", lambda: b"s" * 32)
+    monkeypatch.setattr(feedback.feedback_contexts, "enabled", lambda: True)
+    monkeypatch.setenv("POSTHOG_HOST", "https://eu.i.posthog.com")
+    monkeypatch.setenv("VARSEL_FEEDBACK_ENABLED", "true")
+    for rejected in (
+        "",
+        "PLACEHOLDER-replace-with-the-Kix-prod-project-write-token",  # prd's parked secret
+        "phx_" + "a" * 44,  # a personal API key pasted over the project token
+        "phc_short",
+    ):
+        monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", rejected)
+        assert feedback._token() is None, rejected
+        assert not feedback.enabled(), rejected
+    monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "phc_" + "a" * 44)
+    assert feedback.enabled()
+
+
 def test_enabled_requires_explicit_flag_and_fixed_eu_host(monkeypatch):
     monkeypatch.setattr(feedback, "_token", lambda: "phc_test")
     monkeypatch.setattr(feedback, "_secret", lambda: b"s" * 32)
@@ -149,3 +170,49 @@ def test_signed_revision_survives_display_lease_and_reuses_context_date(monkeypa
     )
     assert feedback.submit(revised, environment="dev")["status"] == "saved"
     assert captured["context_date"] == "2026-08-26"
+
+
+class _MonkeyPatch:
+    """Minimal monkeypatch shim so the tests run standalone (without pytest)."""
+
+    def __init__(self):
+        self._undo = []
+
+    def setattr(self, obj, name, value):
+        self._undo.append((setattr, obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def setenv(self, name, value):
+        self._undo.append((os.environ, name, os.environ.get(name)))
+        os.environ[name] = value
+
+    def undo(self):
+        for entry in reversed(self._undo):
+            if entry[0] is setattr:
+                _, obj, name, old = entry
+                setattr(obj, name, old)
+            else:
+                _, name, old = entry
+                if old is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = old
+
+
+if __name__ == "__main__":
+    import inspect
+
+    tests = sorted(
+        (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
+    )
+    for name, fn in tests:
+        if "monkeypatch" in inspect.signature(fn).parameters:
+            mp = _MonkeyPatch()
+            try:
+                fn(mp)
+            finally:
+                mp.undo()
+        else:
+            fn()
+        print(f"  ok  {name}")
+    print(f"\n{len(tests)} feedback checks passed.")
