@@ -1,4 +1,4 @@
-"""Checks for the togvarsel push-notification policy core and matcher (togvarsel_notify.py).
+"""Checks for the togvarsel push-notification policy core, matcher, and delivery (togvarsel_notify.py).
 
 Hermetic: every policy scenario is a plain-function call with explicit issue dicts, a marker map,
 and `now` — no Web Push, no clock patching — and BigQuery is a fake that replays canned station
@@ -8,7 +8,12 @@ baseline round PUSHED (not what was recomputed), the all-clear is the one green 
 broken round or journey must never stop the others in the same tick, and while the station set is
 unavailable nothing may be evaluated or marked — so the round still fires when the set arrives.
 
-Run: uv run python test_togvarsel_notify.py  (or under pytest)
+The composition and delivery sections wire the module to varsel's REAL delivery seams the way
+main does (KTD4: injected callables, never an import), with only `varsel._send_push` stubbed —
+so the wording, brand assets, gone-grace-drop rule and round counts are checked against the same
+machinery the SX pushes ride on.
+
+Run: uv run --with fastapi --with httpx python test_togvarsel_notify.py  (or under pytest)
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
 import togvarsel_notify
+import varsel
 
 _OSLO = ZoneInfo("Europe/Oslo")
 
@@ -519,14 +525,278 @@ def test_match_journeys_refuses_an_unknown_issue_key():
         raise AssertionError("expected ValueError for an unknown issue key")
 
 
+# ---------------------------------------------------------------------------- composition (R7, KTD6)
+
+# Reasons as togvarsel's rule engine really words them (test_togvarsel pins that vocabulary).
+_REASONS = (
+    "2 tog er innstilt før kl. 06:30",
+    "forsinkelser i morgentimene så langt",
+    "personalmangel meldt",
+)
+
+
+def _issued(key: str = "0630", level: str = "yellow", scope: str = "morgenrushet 06:30–09:00",
+            reasons=_REASONS) -> dict:
+    """An issue dict with the payload fields togvarsel's Issue model really serves: composition
+    reads `scope` and `reasons` on top of the policy core's issue+level."""
+    return {**_issue(key, level), "scope": scope, "reasons": list(reasons)}
+
+
+def test_warning_payload_is_forecast_framed_with_level_env_prefix_and_reasons():
+    """AE1 (message grain): the title says rush forecast + level (never train-alert framing), the
+    injected tagger prefixes the environment, the body is scope + leading reasons — and there is
+    no situation_number: this is not an SX situation (precedent: the /varsel-api/test push)."""
+    decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
+    payload = togvarsel_notify.build_payload(
+        decision, _issued(), "entur",
+        brand_assets=varsel._BRAND_ASSETS, tag_title=lambda t: f"[dev] {t}",
+    )
+    assert payload["title"] == "[dev] Rushvarsel: gult nivå for morgenrushet"
+    assert payload["body"] == (
+        "Prognosen for morgenrushet 06:30–09:00 er gult nivå. "
+        "2 tog er innstilt før kl. 06:30. Forsinkelser i morgentimene så langt."
+    )
+    assert "personalmangel" not in payload["body"]  # leading reasons only — a lock screen is small
+    assert payload["url"] == "/togmelding"  # R8: the entur brand lands on the forecast page
+    assert payload["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
+    assert "situation_number" not in payload
+
+
+def test_none_brand_gets_its_own_icon_and_the_unbranded_varsel_url():
+    """R8: the unbranded install has no /togmelding to land on, so it keeps its own varsel URL —
+    the body carries the essentials. The WORDING is identical across brands (varsel precedent)."""
+    decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
+    entur, none = (
+        togvarsel_notify.build_payload(
+            decision, _issued(), brand,
+            brand_assets=varsel._BRAND_ASSETS, tag_title=lambda t: t,
+        )
+        for brand in ("entur", "none")
+    )
+    assert none["url"] == varsel._BRAND_ASSETS["none"]["url"]
+    assert none["icon"] == varsel._BRAND_ASSETS["none"]["icon"]
+    assert none["icon"] != entur["icon"]
+    assert (none["title"], none["body"]) == (entur["title"], entur["body"])
+
+
+def test_afternoon_warning_names_the_afternoon_rush():
+    issue = _issued("1200", "red", scope="ettermiddagsrushet 15:00–18:00",
+                    reasons=("12 innstilte avganger så langt i dag",))
+    decision = togvarsel_notify.decide_issue(issue, {}, now=_monday(12, 1))
+    title, body = togvarsel_notify.compose_message(decision, issue)
+    assert title == "Rushvarsel: rødt nivå for ettermiddagsrushet"
+    assert body == ("Prognosen for ettermiddagsrushet 15:00–18:00 er rødt nivå. "
+                    "12 innstilte avganger så langt i dag.")
+
+
+def test_update_payload_marks_the_forecast_as_updated():
+    """AE3: a follow-up against a pushed baseline says the forecast is UPDATED, so the second
+    push in one rush reads as a revision, not a repeat."""
+    markers = {"0630": {"level": "yellow", "pushed": True}}
+    issue = _issued("0700", "red", scope="resten av morgenrushet 07:00–09:00")
+    decision = togvarsel_notify.decide_issue(issue, markers, now=_monday(7, 1))
+    assert decision.kind == "update"
+    title, body = togvarsel_notify.compose_message(decision, issue)
+    assert title == "Oppdatert rushvarsel: rødt nivå for morgenrushet"
+    assert body.startswith("Prognosen for resten av morgenrushet 07:00–09:00 er endret til rødt nivå.")
+
+
+def test_a_fresh_warning_from_a_follow_up_round_is_not_worded_as_an_update():
+    # the baseline pushed nothing, so there is no forecast to have "updated"
+    markers = {"0630": {"level": "green", "pushed": False}}
+    decision = togvarsel_notify.decide_issue(_issued("0700", "yellow"), markers, now=_monday(7, 1))
+    title, _body = togvarsel_notify.compose_message(decision, _issued("0700", "yellow"))
+    assert title == "Rushvarsel: gult nivå for morgenrushet"
+
+
+def test_all_clear_payload_is_a_friskmelding_without_warning_language():
+    """AE7: the drop back to green is framed as a friskmelding — calm, and free of every word the
+    warnings use (R7). No reasons either: green's own reasons still talk about trouble signs."""
+    markers = {"0630": {"level": "yellow", "pushed": True}}
+    issue = _issued("0700", "green", scope="resten av morgenrushet 07:00–09:00",
+                    reasons=("ingen tegn til trøbbel i morgentimene",))
+    decision = togvarsel_notify.decide_issue(issue, markers, now=_monday(7, 1))
+    assert decision.kind == "all_clear"
+    title, body = togvarsel_notify.compose_message(decision, issue)
+    assert title == "Friskmelding: grønt nivå for morgenrushet"
+    assert body == "Utsiktene for resten av morgenrushet 07:00–09:00 er tilbake på grønt nivå."
+    for word in ("rushvarsel", "avvik", "forsinkel", "innstil", "trøbbel", "advarsel"):
+        assert word not in title.lower() and word not in body.lower(), word
+
+
+def test_composition_refuses_a_non_push_decision():
+    decision = togvarsel_notify.decide_issue(_issued("0630", "green"), {}, now=_monday(6, 31))
+    assert decision.push is False
+    try:
+        togvarsel_notify.compose_message(decision, _issued("0630", "green"))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for a non-push decision")
+
+
+# ---------------------------------------------------------------------------- round delivery (R6, KTD8)
+
+def _dev(endpoint: str, brand: str | None = None, created: str | None = None) -> dict:
+    """A varsel device record: subscription + created_ts (the grace window reads it), brand opt."""
+    d = {
+        "subscription": {"endpoint": endpoint, "keys": {"p256dh": "k", "auth": "a"}},
+        "created_ts": created or datetime.now(UTC).isoformat(),
+    }
+    if brand:
+        d["brand"] = brand
+    return d
+
+
+@contextmanager
+def _push_devices(devices: dict):
+    """Swap varsel's device map for the scenario's and restore it — the delivery tests run against
+    varsel's real seams, so they must not leak state into (or from) the other suites' checks."""
+    with varsel._state_lock:
+        saved = dict(varsel._devices)
+        varsel._devices.clear()
+        varsel._devices.update(devices)
+    try:
+        yield
+    finally:
+        with varsel._state_lock:
+            varsel._devices.clear()
+            varsel._devices.update(saved)
+
+
+def _wiring() -> dict:
+    """push_round's injected seams, wired to varsel exactly as main will (KTD4, U4)."""
+    return {
+        "resolve_device": varsel.device_subscription,
+        "deliver": varsel.deliver_to_devices,
+        "handle_gone": varsel.handle_gone_device,
+        "brand_assets": varsel._BRAND_ASSETS,
+        "tag_title": lambda t: t,
+    }
+
+
+def test_push_round_pushes_once_per_device_with_each_brands_assets(monkeypatch):
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        varsel, "_send_push", lambda sub, payload: sent.append((sub["endpoint"], payload)) or "sent"
+    )
+    decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
+    devices = {
+        "dev-e": _dev("https://push.example.com/e", brand="entur"),
+        "dev-n": _dev("https://push.example.com/n", brand="none"),
+    }
+    with _push_devices(devices):
+        summary = togvarsel_notify.push_round(
+            # dev-x matched but was deleted before delivery: skipped, counted, never a crash
+            decision, _issued(), ["j1", "j2", "j3"], {"dev-e", "dev-n", "dev-x"}, **_wiring()
+        )
+    assert len(sent) == 2  # R6: one push per device per round, and only to live subscriptions
+    by_endpoint = dict(sent)
+    entur = by_endpoint["https://push.example.com/e"]
+    none = by_endpoint["https://push.example.com/n"]
+    assert entur["url"] == "/togmelding" and entur["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
+    assert none["url"] == varsel._BRAND_ASSETS["none"]["url"]
+    assert none["icon"] == varsel._BRAND_ASSETS["none"]["icon"]
+    assert "situation_number" not in entur and "situation_number" not in none
+    assert summary["sent"] == 2 and summary["error"] == 0 and summary["gone"] == 0
+    assert summary["no_subscription"] == 1 and summary["matched_devices"] == 3
+
+
+def test_a_gone_device_is_dropped_after_grace_and_the_round_completes(monkeypatch):
+    results = {
+        "https://push.example.com/old": "gone",
+        "https://push.example.com/fresh": "gone",
+        "https://push.example.com/ok": "sent",
+    }
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: results[sub["endpoint"]])
+    decision = togvarsel_notify.decide_issue(_issued("0630", "red"), {}, now=_monday(6, 31))
+    devices = {
+        "dev-old": _dev("https://push.example.com/old", created="2000-01-01T00:00:00+00:00"),
+        "dev-fresh": _dev("https://push.example.com/fresh"),  # inside the propagation grace window
+        "dev-ok": _dev("https://push.example.com/ok"),
+    }
+    with _push_devices(devices):
+        summary = togvarsel_notify.push_round(
+            decision, _issued("0630", "red"), ["j1"], set(devices), **_wiring()
+        )
+        assert "dev-old" not in varsel._devices  # past grace: the same drop rule as SX pushes
+        assert "dev-fresh" in varsel._devices  # a fresh 404/410 is transient: kept
+    assert summary["sent"] == 1 and summary["gone"] == 2
+    assert summary["dropped"] == 1  # what tells the caller device state changed and needs persisting
+
+
+def test_one_erroring_device_never_stops_the_others_and_the_round_is_logged(monkeypatch):
+    """KTD8: a transient send error is counted, never retried within the round — and the round's
+    marker stays pushed, so the round never re-fires for the error's sake."""
+    results = {
+        "https://push.example.com/a": "sent",
+        "https://push.example.com/b": "error",
+        "https://push.example.com/c": "sent",
+    }
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: results[sub["endpoint"]])
+    markers: dict = {}
+    (decision,) = togvarsel_notify.decide_rounds([_issued("0630", "red")], markers, now=_monday(6, 31))
+    devices = {
+        "dev-a": _dev("https://push.example.com/a"),
+        "dev-b": _dev("https://push.example.com/b"),
+        "dev-c": _dev("https://push.example.com/c"),
+    }
+    with _push_devices(devices), _capture_logs() as records:
+        summary = togvarsel_notify.push_round(
+            decision, _issued("0630", "red"), ["j1", "j2", "j3"], set(devices), **_wiring()
+        )
+    assert summary["sent"] == 2 and summary["error"] == 1 and summary["gone"] == 0
+    assert markers["0630"] == {"level": "red", "pushed": True}  # the marker was never unwound
+    rounds = [r for r in records if getattr(r, "fields", {}).get("event") == "togvarsel_notify_round"]
+    assert len(rounds) == 1, "exactly one structured round event (R10)"
+    f = rounds[0].fields
+    assert (f["issue"], f["level"], f["kind"]) == ("0630", "red", "warning")
+    assert (f["matched_journeys"], f["matched_devices"]) == (3, 3)
+    assert (f["sent"], f["error"], f["gone"], f["dropped"]) == (2, 1, 0, 0)
+
+
+def test_push_round_refuses_a_non_push_decision(monkeypatch):
+    monkeypatch.setattr(
+        varsel, "_send_push", lambda sub, payload: (_ for _ in ()).throw(AssertionError("no send"))
+    )
+    decision = togvarsel_notify.decide_issue(_issued("0630", "green"), {}, now=_monday(6, 31))
+    try:
+        togvarsel_notify.push_round(decision, _issued("0630", "green"), [], set(), **_wiring())
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for a non-push decision")
+
+
+class _MonkeyPatch:
+    """Minimal monkeypatch shim so the tests run standalone (without pytest)."""
+
+    def __init__(self):
+        self._undo = []
+
+    def setattr(self, obj, name, value):
+        self._undo.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def undo(self):
+        for obj, name, old in reversed(self._undo):
+            setattr(obj, name, old)
+
+
 if __name__ == "__main__":
+    import inspect
+
     failures = 0
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
+            mp = _MonkeyPatch() if "monkeypatch" in inspect.signature(fn).parameters else None
             try:
-                fn()
+                fn(mp) if mp else fn()
                 print(f"ok   {name}")
             except AssertionError as exc:
                 failures += 1
                 print(f"FAIL {name}: {exc}")
+            finally:
+                if mp:
+                    mp.undo()
     raise SystemExit(1 if failures else 0)
