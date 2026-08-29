@@ -55,6 +55,40 @@ The output is created mode `0600`. The tool refuses stdout, symlinks, missing pa
 and existing files. Delete exports within 30 days using the team's approved secure-deletion
 procedure; ordinary local filesystem deletion may not erase snapshots or backups.
 
+## Read it in a notebook
+
+`review_feedback.py` beside this file is a marimo app that runs the same export **in memory** and
+renders it: the gate's synthetic residue filtered out by default, a selectable list, and per-response
+drill-down to the exact alert — displayed wording, observation, prediction, policy, delivery and the
+`message_input` the wording was written from.
+
+```sh
+POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" \
+uv run marimo edit data/feedback/review_feedback.py
+```
+
+It calls the exporter's own `collapse_events`, `fetch_contexts` and `enrich` by loading this
+directory's script by path, rather than reimplementing them — a divergent copy would be worse than no
+notebook, since it would look like the export without being it. It skips only `write_json`, because
+that function refuses to overwrite and a notebook that wrote on every run would fail on its second;
+saving is opt-in in the last cell, through that same guarded function, and writes the **unfiltered**
+document — filtering is a reading convenience, and an evidence file that quietly omits rows is not
+evidence. Table download buttons are disabled throughout for the same reason the exporter sets
+`0600`: a widget-dropped CSV in `~/Downloads` has none of that protection.
+
+**It must never move to `eval/`.** `disruptions/api/export_eval.sh` globs `eval/*.py`, renders every
+notebook there to static HTML, and `eval_static/` is committed and served publicly at `/eval` — which
+for this page would publish travellers' free text and their routes. That is the whole reason it lives
+here, and it is recorded in `pyproject.toml` beside the B018 exemption the marimo cell idiom needs.
+
+The synthetic filter is an editable case-insensitive regex, `^\s*(syntetisk|synthetic)` by default,
+and what it removed is rendered underneath what it kept rather than hidden behind a toggle. Both
+choices are deliberate: the prefix is a **convention in free text** that the gate's submissions
+happened to follow — nothing enforces it and no column records it — so a pattern that tried to be
+forgiving about spelling would silently discard real feedback, and a filter on free text can only be
+trusted if what it dropped stays as visible as what it kept. A response with no comment at all
+(`comment: null`, an ordinary thumbs-up) is never matched by it.
+
 ## Setup and release gate
 
 Capture is deliberately disabled by `VARSEL_FEEDBACK_ENABLED=false`. Configure each environment
