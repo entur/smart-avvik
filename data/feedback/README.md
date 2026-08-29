@@ -20,10 +20,14 @@ uv run python data/feedback/export_varsel_feedback.py \
   --environment dev \
   --from-date 2026-08-25 \
   --to-date 2026-08-27 \
-  --posthog-project-id PROJECT_ID \
+  --posthog-project-id 259080 \
   --output /private/tmp/varsel-feedback-2026-08-25.json
 unset POSTHOG_PERSONAL_API_KEY
 ```
+
+`--posthog-project-id` is **259080** for `Kix - dev` — which serves the dev *and* tst environments, so
+`--environment` is what separates them — and **259077** for `Kix - prod`. `--project` is the GCP
+project holding the context table, so it always tracks `--environment`: `ent-kixavvik-{dev,tst,prd}`.
 
 The tool talks only to `https://eu.posthog.com/api/projects/{project_id}/query/`, queries the
 single `varsel_alert_feedback` event with server-built time/environment predicates, and refuses
@@ -259,7 +263,7 @@ plus the approval, not an infrastructure project.** What that leaves per environ
 
 | | dev | tst | prd |
 | --- | --- | --- | --- |
-| `POSTHOG_PROJECT_TOKEN` in Secret Manager | yes | yes | **placeholder** |
+| `POSTHOG_PROJECT_TOKEN` in Secret Manager | yes | yes | yes |
 | `VARSEL_FEEDBACK_RECEIPT_SECRET` in Secret Manager | yes | yes | yes |
 | both names in Helm `secrets.varsel` | yes | yes | yes |
 | `disruptions` dataset exists (EU) | yes | yes | yes |
@@ -287,15 +291,24 @@ tuple already lists all three; nothing there needed changing.
 let a receipt minted in dev authorize a `revision > 1` update against a real traveller's response in
 prd, which is the single thing that HMAC exists to prevent.
 
-**prd's token is a labelled placeholder, not the real one.** `state=placeholder` in Secret Manager.
-Adding the real "Kix - prod" project write token is a `gcloud secrets versions add` (the exact command
-is in the flag's comment in `values-kub-ent-prd.yaml`) and is the one step that needs a human with
-PostHog access. A placeholder rather than an absent secret because of the all-or-nothing failure
-above: this way the Helm reference is safe from the moment it lands, and the missing piece is a value
-rather than a landmine. Flipping the flag before replacing it is **safe and does nothing** —
-`_token()` rejects it, so `enabled()` reads False, `/varsel-api/config` reports capture off and no
-context row is written. That is only true because of the guard described next. The prd export also
-needs the "Kix - prod" numeric project id, which is likewise not recorded here yet.
+**prd's real token landed on 2026-08-29**, replacing the labelled placeholder the secret was parked
+with. Verified without printing the value: version 2 enabled and current, `phc_` prefix, 48
+characters, no trailing newline, and **byte-distinct from both dev's and tst's** — that last check is
+not ceremony, since dev's token is the one closest to hand and pasting it here would have routed real
+travellers' feedback into the dev project with nothing anywhere reporting an error. Version 1 is now
+`disabled` so a rollback cannot restore the placeholder, and the `state=placeholder` label is gone.
+
+The placeholder was worth its short life. A secret that is absent fails the whole `ExternalSecret`
+and takes the VAPID keys with it; a secret holding a placeholder keeps the Helm reference safe from
+the moment it lands and leaves only a value for a human to supply. It was safe to sit there because
+`_token()` rejects it — `enabled()` reads False, `/varsel-api/config` reports capture off, and no
+context row is written — which is the guard described next, and the exact placeholder string is
+pinned by `test_a_token_that_is_not_a_project_write_key_fails_closed`.
+
+**The PostHog project ids**, needed for `--posthog-project-id` on an export: **259080** for
+`Kix - dev` (which serves both the dev *and* tst environments — separate them with `--environment`)
+and **259077** for `Kix - prod`. Not secrets, and recorded here so an export does not start with a
+console visit.
 
 ### A wrong PostHog token cannot be detected after the fact (measured 2026-08-28)
 
