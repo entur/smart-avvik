@@ -336,30 +336,31 @@ cats AS (
     COUNT(DISTINCT IF(fh < 7.0 AND cat='materiell_teknisk' AND oslo AND operating_date=CURRENT_DATE('Europe/Oslo') AND amh BETWEEN 6.5 AND 9, j_ref, NULL)) catj_mat_am_0700,
     COUNT(DISTINCT IF(fh < 7.0 AND cat LIKE 'drift%' AND oslo AND operating_date=CURRENT_DATE('Europe/Oslo') AND amh BETWEEN 6.5 AND 9, j_ref, NULL)) catj_drift_am_0700
   FROM _tv_sx
+),
+cal AS (
+  -- Today's row from the shared calendar (data/queries/togvarsel/00_calendar.sql, copied to prd
+  -- by copy_runtime_to_prd.sh). Zero rows means the calendar has EXPIRED: fail loudly rather
+  -- than silently forecasting on an unmaintained holiday.
+  SELECT
+    IF(COUNT(*) = 0,
+       ERROR('disruptions.togvarsel_calendar dekker ikke dagens dato — utvid data/queries/togvarsel/00_calendar.sql og kjør copy_runtime_to_prd.sh'),
+       LOGICAL_OR(holiday)) AS holiday,
+    LOGICAL_OR(low_season) AS low_season
+  FROM `disruptions.togvarsel_calendar`
+  WHERE d = CURRENT_DATE('Europe/Oslo')
 )
 SELECT
   CURRENT_DATE('Europe/Oslo') AS d,
   CURRENT_TIMESTAMP() AS computed_at,
-  -- calendar (same hardcoded lists as data/queries/togvarsel/07_features.sql — EXTEND YEARLY)
-  CURRENT_DATE('Europe/Oslo') IN (
-    '2025-04-17', '2025-04-18', '2025-04-21', '2025-05-01', '2025-05-17', '2025-05-29', '2025-06-09',
-    '2025-12-24', '2025-12-25', '2025-12-26', '2025-12-31', '2026-01-01',
-    '2026-04-02', '2026-04-03', '2026-04-06', '2026-05-01', '2026-05-14', '2026-05-25',
-    '2026-12-24', '2026-12-25', '2026-12-26', '2026-12-31', '2027-01-01',
-    '2027-03-25', '2027-03-26', '2027-03-29', '2027-05-01', '2027-05-06', '2027-05-17') AS holiday,
-  (EXTRACT(MONTH FROM CURRENT_DATE('Europe/Oslo'))=7
-   OR CURRENT_DATE('Europe/Oslo') BETWEEN '2025-12-22' AND '2026-01-02'
-   OR CURRENT_DATE('Europe/Oslo') BETWEEN '2025-04-14' AND '2025-04-21'
-   OR CURRENT_DATE('Europe/Oslo') BETWEEN '2026-03-30' AND '2026-04-06'
-   OR CURRENT_DATE('Europe/Oslo') BETWEEN '2026-12-21' AND '2027-01-03'
-   OR CURRENT_DATE('Europe/Oslo') BETWEEN '2027-03-22' AND '2027-03-29') AS low_season,
+  cal.holiday,
+  cal.low_season,
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=2,1,0) dow_2,
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=3,1,0) dow_3,
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=4,1,0) dow_4,
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=5,1,0) dow_5,
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=6,1,0) dow_6,
   et.*, prev.*, sx.*, cats.*
-FROM et CROSS JOIN prev CROSS JOIN sx CROSS JOIN cats;
+FROM et CROSS JOIN prev CROSS JOIN sx CROSS JOIN cats CROSS JOIN cal;
 
 -- ---------------------------------------------------------------------------- today's SX list
 -- One row per situation belonging to today's forecast: the deterministic "kjente avvik" list

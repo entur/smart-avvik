@@ -16,21 +16,27 @@ avvik" list is likewise deterministic: it repeats what SIRI-SX already announces
 nothing. Reasons on each issue are rule-based sentences derived from the same feature values the
 model saw — the features are human-readable by construction, no text generation involved.
 
-How it runs: :func:`refresh` is called from the poller's rebuild cycle (isolated there like every
-other step). On each tick it computes the issues that are DUE and not yet computed today — so a
-restart at 13:00 back-fills 06:30/07:00/12:00 retroactively, which is sound because every feature
-column is defined by a fixed clock cutoff, not by "now" (recomputing later only gives the ET
-denominators more resolved calls, i.e. numbers closer to the training-time batch view). One tick
-does at most one rebuild of disruptions.togvarsel_features_today (shared by every issue computed
-that tick) plus one ML.PREDICT per issue. Weekends and the holiday list (the feature row carries
-the flag) get an honest "ingen prognose i dag" instead of a forecast trained on days like them.
+How it runs: :func:`refresh` is called on every poller tick — wall-clock-driven, because an
+issue is due at its clock cutoff whether or not new SX ingestion arrived. On each tick it
+computes the issues that are DUE and not yet computed today — so a restart at 13:00 back-fills
+06:30/07:00/12:00 retroactively, which is sound because every feature column is defined by a
+fixed clock cutoff, not by "now" (recomputing later only gives the ET denominators more resolved
+calls, i.e. numbers closer to the training-time batch view). A back-filled issue is marked
+`late`: for a window already underway it saw post-cutoff reality, so skill audits must exclude
+it. One tick does at most one rebuild of disruptions.togvarsel_features_today (shared by every
+issue computed that tick) plus one ML.PREDICT per issue; every failure backs off per issue
+(cooldown, then give up for the day) so a broken model or feed costs a bounded number of billable
+scans. Weekends and holidays (a rollover probe of disruptions.togvarsel_calendar, confirmed by
+the feature row's flag) get an honest "ingen prognose i dag" instead of a forecast trained on
+days like them.
 
-Every issued forecast is appended to disruptions.togvarsel_issued so realized skill can be
-audited later against the training chain's labels (§14k item 8: claims come with verification,
-and the first product-side claim is the forecast itself).
+Every issued forecast lands in disruptions.togvarsel_issued — MERGE, first write per (d, issue)
+wins — so realized skill can be audited later against the training chain's labels (§14k item 8:
+claims come with verification, and the first product-side claim is the forecast itself).
 
-Reads only; no import of main (the package rule): main injects the BigQuery client via
-:func:`configure`. Model names are fixed literals here — nothing user-supplied ever reaches SQL.
+No import of main (the package rule): main injects the BigQuery client via :func:`configure`.
+BigQuery writes touch only this module's own tables (the *_today pair and togvarsel_issued).
+Model names are fixed literals here — nothing user-supplied ever reaches SQL.
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -66,18 +72,39 @@ WHERE LOWER(CAST(p.label AS STRING)) = 'true'
 """
 _ISSUED_DDL = """
 CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_issued` (
-  d DATE, issue STRING, model STRING, p FLOAT64, level STRING, computed_at TIMESTAMP
+  d DATE, issue STRING, model STRING, p FLOAT64, level STRING, computed_at TIMESTAMP, late BOOL
 )
 """
-_ISSUED_INSERT = """
-INSERT INTO `disruptions.togvarsel_issued` (d, issue, model, p, level, computed_at)
-VALUES (@d, @issue, @model, @p, @level, @computed_at)
+# First write per (d, issue) wins: a restart or failure-path recompute must neither duplicate
+# nor rewrite the forecast as it was originally served.
+_ISSUED_MERGE = """
+MERGE `disruptions.togvarsel_issued` t
+USING (SELECT @d AS d, @issue AS issue) s
+ON t.d = s.d AND t.issue = s.issue
+WHEN NOT MATCHED THEN
+  INSERT (d, issue, model, p, level, computed_at, late)
+  VALUES (@d, @issue, @model, @p, @level, @computed_at, @late)
+"""
+# The rollover probe: is today a holiday? Tiny lookup, so the page can say "helligdag" from the
+# first tick of the day instead of first learning it from the 06:30 feature row.
+_CALENDAR_TODAY_SQL = """
+SELECT holiday FROM `disruptions.togvarsel_calendar` WHERE d = CURRENT_DATE('Europe/Oslo')
 """
 
 # The study's three-level bins (§14a/§14e): pooled out-of-sample, green ≈ 1–6 % bad days,
 # red ≈ 55–61 %. Fixed cuts on the calibrated probability, not quantiles.
 GREEN_MAX = 0.10
 RED_MIN = 0.30
+
+# An issue computed more than this after its due time is marked `late` (it saw post-cutoff
+# reality — restart back-fills, backoff retries), and the payload lists a due-but-missing issue
+# as overdue only past the same grace. Normal ticks land within a minute or two of the cutoff.
+_GRACE_H = 10 / 60
+# Failure backoff — the negative-caching twin of the holiday path: a failed issue is retried at
+# most every _FAIL_COOLDOWN, and abandoned for the day after _MAX_FAILS_PER_DAY, so a persistent
+# failure (a missing model in prd, a broken feed) costs a bounded number of billable scans.
+_FAIL_COOLDOWN = timedelta(minutes=15)
+_MAX_FAILS_PER_DAY = 8
 
 
 @dataclass(frozen=True)
@@ -105,6 +132,11 @@ class Issue(BaseModel):
     level: str = Field(description="green | yellow | red")
     reasons: list[str]
     computed_at: datetime
+    late: bool = Field(
+        default=False,
+        description="Computed more than 10 min after its due time (restart/backoff back-fill, "
+        "so it saw post-cutoff reality) — skill audits must exclude these",
+    )
 
 
 class KnownDeviation(BaseModel):
@@ -121,6 +153,11 @@ class Togmelding(BaseModel):
     forecast_day: bool = Field(description="False on weekends/holidays — no forecast issued")
     no_forecast_reason: str | None = None
     next_issue: str | None = Field(default=None, description="HHMM of the next issue not yet due")
+    overdue_issues: list[str] = Field(
+        default_factory=list,
+        description="HHMM of issues past due (plus a 10 min grace) but not issued — the forecast "
+        "is delayed or failed, as opposed to not yet due",
+    )
     issues: list[Issue]
     pm_outlook: str | None = None
     known_deviations: list[KnownDeviation]
@@ -144,6 +181,8 @@ def _blank_state(d: date) -> dict[str, Any]:
         "issues": {},  # key -> Issue
         "sx": [],  # list[KnownDeviation]
         "holiday": False,
+        "calendar_checked": False,  # the rollover togvarsel_calendar probe ran for this day
+        "backoff": {},  # key -> {"fails": int, "until": datetime}; see _note_failure
         "generated_at": None,
     }
 
@@ -283,15 +322,17 @@ def _rows(query: str) -> list[dict]:
 
 
 def _record_issue(d: date, issue: Issue, model: str) -> None:
-    """Append the issued forecast for later skill audits. Failure is logged, never raised —
-    the forecast the traveller sees must not depend on the bookkeeping write."""
+    """Record the issued forecast for later skill audits (first write per (d, issue) wins).
+    Failure is logged, never raised — the forecast the traveller sees must not depend on the
+    bookkeeping write. timeout=60 on both calls: this sits in front of the poller thread, the
+    same latch-guarded shape decisions.py and feedback_contexts.py bound the same way."""
     global _issued_table_ready
     try:
         # Deferred import so hermetic tests need no google libs.
         from google.cloud import bigquery
 
         if not _issued_table_ready:
-            _bq_client.query(_ISSUED_DDL).result()
+            _bq_client.query(_ISSUED_DDL).result(timeout=60)
             _issued_table_ready = True
         cfg = bigquery.QueryJobConfig(
             query_parameters=[
@@ -301,9 +342,10 @@ def _record_issue(d: date, issue: Issue, model: str) -> None:
                 bigquery.ScalarQueryParameter("p", "FLOAT64", issue.p),
                 bigquery.ScalarQueryParameter("level", "STRING", issue.level),
                 bigquery.ScalarQueryParameter("computed_at", "TIMESTAMP", issue.computed_at),
+                bigquery.ScalarQueryParameter("late", "BOOL", issue.late),
             ]
         )
-        _bq_client.query(_ISSUED_INSERT, job_config=cfg).result()
+        _bq_client.query(_ISSUED_MERGE, job_config=cfg).result(timeout=60)
     except Exception:
         logger.exception("togvarsel: recording issued forecast failed (forecast still served)")
 
@@ -312,12 +354,32 @@ def due_issues(now_h: float, computed: set[str]) -> list[_IssueSpec]:
     return [s for s in ISSUE_SPECS if s.due_h <= now_h and s.key not in computed]
 
 
-def refresh(now: datetime | None = None) -> None:
-    """Compute any due-but-missing issues. Called from the poller cycle; blocking BigQuery I/O.
+def _note_failure(key: str, now: datetime) -> None:
+    """Register a failed attempt for an issue (call with _lock held)."""
+    b = _state["backoff"].setdefault(key, {"fails": 0, "until": now})
+    b["fails"] += 1
+    if b["fails"] >= _MAX_FAILS_PER_DAY:
+        b["until"] = datetime.max.replace(tzinfo=_OSLO)  # state resets at day rollover
+        logger.error("togvarsel: issue %s failed %d times; giving up for today", key, b["fails"])
+    else:
+        b["until"] = now + _FAIL_COOLDOWN
 
-    One features rebuild per tick at most, shared by every issue computed on that tick."""
+
+def _retryable(key: str, now: datetime) -> bool:
+    """Whether the issue is out of its failure cooldown (call with _lock held)."""
+    b = _state["backoff"].get(key)
+    return b is None or now >= b["until"]
+
+
+def refresh(now: datetime | None = None) -> None:
+    """Compute any due-but-missing issues. Called on every poller tick; blocking BigQuery I/O.
+
+    One features rebuild per tick at most, shared by every issue computed on that tick. Each
+    issue fails independently and backs off independently — one broken model must neither drop
+    the issues already computed nor re-run the billable feature scan every tick."""
     now = now.astimezone(_OSLO) if now else datetime.now(_OSLO)
     today = now.date()
+    now_h = now.hour + now.minute / 60.0
 
     with _lock:
         if _state.get("date") != today:
@@ -325,18 +387,52 @@ def refresh(now: datetime | None = None) -> None:
             _state.update(_blank_state(today))
         if now.weekday() >= 5 or _state["holiday"]:
             return
-        missing = due_issues(now.hour + now.minute / 60.0, set(_state["issues"]))
+        probe_calendar = not _state["calendar_checked"]
+
+    # First weekday tick of the day: one tiny calendar lookup, so a holiday reads "helligdag"
+    # from midnight instead of from the first feature rebuild after 06:30. Best effort — the
+    # feature row's flag (same table) still gates every forecast.
+    if probe_calendar:
+        holiday = False
+        try:
+            cal_rows = _rows(_CALENDAR_TODAY_SQL)
+            if cal_rows:
+                holiday = bool(cal_rows[0]["holiday"])
+            else:
+                logger.error(
+                    "togvarsel: togvarsel_calendar has no row for %s — extend "
+                    "data/queries/togvarsel/00_calendar.sql and re-run copy_runtime_to_prd.sh",
+                    today,
+                )
+        except Exception:
+            logger.exception("togvarsel: calendar probe failed; the feature row still gates")
+        with _lock:
+            _state["calendar_checked"] = True
+            _state["holiday"] = _state["holiday"] or holiday
+        if holiday:
+            logger.info("togvarsel: %s is a holiday; no forecast issued", today)
+            return
+
+    with _lock:
+        missing = [s for s in due_issues(now_h, set(_state["issues"])) if _retryable(s.key, now)]
     if not missing:
         return
 
     # Rebuild the live feature row + today's SX list (one multi-statement job), then read both.
-    _bq_client.query(_FEATURES_TODAY_SQL).result()
-    rows = _rows(_FEATURES_ROW_SQL)
-    if not rows:
-        logger.warning("togvarsel: features_today came back empty; skipping this tick")
+    # A failure here charges every issue the rebuild was serving, capping the daily spend.
+    try:
+        _bq_client.query(_FEATURES_TODAY_SQL).result()
+        rows = _rows(_FEATURES_ROW_SQL)
+        if not rows:
+            raise RuntimeError("togvarsel_features_today came back empty")
+        row = rows[0]
+        sx = _rows(_SX_TODAY_SQL)
+    except Exception:
+        logger.exception("togvarsel: feature rebuild failed; backing off")
+        with _lock:
+            for spec in missing:
+                _note_failure(spec.key, now)
         return
-    row = rows[0]
-    sx = _rows(_SX_TODAY_SQL)
 
     if row.get("holiday"):
         with _lock:
@@ -346,13 +442,17 @@ def refresh(now: datetime | None = None) -> None:
         logger.info("togvarsel: %s is a holiday; no forecast issued", today)
         return
 
-    computed: dict[str, Issue] = {}
     for spec in missing:
-        p_rows = _rows(_PREDICT_SQL.format(model=spec.model))
-        if not p_rows:
-            logger.warning("togvarsel: ML.PREDICT for %s returned nothing", spec.model)
+        try:
+            p_rows = _rows(_PREDICT_SQL.format(model=spec.model))
+            if not p_rows:
+                raise RuntimeError(f"ML.PREDICT for {spec.model} returned no probability row")
+            p = float(p_rows[0]["p"])
+        except Exception:
+            logger.exception("togvarsel: computing issue %s failed; backing off", spec.key)
+            with _lock:
+                _note_failure(spec.key, now)
             continue
-        p = float(p_rows[0]["p"])
         issue = Issue(
             issue=spec.key,
             scope=spec.scope,
@@ -360,8 +460,13 @@ def refresh(now: datetime | None = None) -> None:
             level=level_for(p),
             reasons=reasons_for(spec, row, sx),
             computed_at=now,
+            late=now_h > spec.due_h + _GRACE_H,
         )
-        computed[spec.key] = issue
+        # The served state first, the audit write second: bookkeeping trouble must never cost
+        # the traveller a computed forecast.
+        with _lock:
+            _state["issues"][spec.key] = issue
+            _state["backoff"].pop(spec.key, None)
         _record_issue(today, issue, spec.model)
         logger.info(
             "togvarsel: issued %s p=%.3f level=%s",
@@ -371,7 +476,6 @@ def refresh(now: datetime | None = None) -> None:
         )
 
     with _lock:
-        _state["issues"].update(computed)
         _state["sx"] = known_deviations_for(sx)
         _state["generated_at"] = now
 
@@ -391,6 +495,13 @@ def build_melding(now: datetime) -> Togmelding:
     weekend = now.weekday() >= 5
     now_h = now.hour + now.minute / 60.0
     upcoming = [s for s in ISSUE_SPECS if s.due_h > now_h]
+    # Past due (plus grace) but not issued: the honest "delayed or failed" signal, distinct from
+    # "not yet due" — without it the page cannot tell a quiet 06:00 from a broken 20:00.
+    overdue = (
+        []
+        if (weekend or holiday)
+        else [s.key for s in ISSUE_SPECS if now_h > s.due_h + _GRACE_H and s.key not in issues]
+    )
     no_forecast = None
     if weekend:
         no_forecast = "Togmeldingen lages bare på hverdager."
@@ -403,6 +514,7 @@ def build_melding(now: datetime) -> Togmelding:
         forecast_day=not (weekend or holiday),
         no_forecast_reason=no_forecast,
         next_issue=upcoming[0].key if (not weekend and not holiday and upcoming) else None,
+        overdue_issues=overdue,
         issues=[issues[k] for k in sorted(issues)],
         pm_outlook=None if (weekend or holiday) else pm_outlook_for(issues),
         known_deviations=sx,

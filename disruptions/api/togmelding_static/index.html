@@ -68,17 +68,23 @@ function el(tag, cls, text) {
   return n;
 }
 
+const fmtT = k => k.slice(0, 2) + ":" + k.slice(2);
+
 function issueCard(i) {
   const card = el("section", "card issue " + i.level);
   const dot = el("div", "dot", LEVEL_LABEL[i.level] || "?");
   const body = el("div");
-  const t = i.issue.slice(0, 2) + ":" + i.issue.slice(2);
-  body.appendChild(el("h2", null, "Kl. " + t + " — " + i.scope));
+  body.appendChild(el("h2", null, "Kl. " + fmtT(i.issue) + " — " + i.scope));
   body.appendChild(el("div", "p",
     LEVEL_TEXT[i.level] + " (ca. " + Math.round(i.p * 100) + " % sjanse for mye trøbbel)"));
   const ul = el("ul", "reasons");
   for (const r of i.reasons) ul.appendChild(el("li", null, r));
   body.appendChild(ul);
+  if (i.late) {
+    body.appendChild(el("div", "note", "Beregnet i etterkant, kl. " +
+      new Date(i.computed_at).toLocaleTimeString("no-NO",
+        { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Oslo" }) + "."));
+  }
   card.appendChild(dot); card.appendChild(body);
   return card;
 }
@@ -91,15 +97,35 @@ function render(m) {
       "Sist oppdatert " + new Date(m.generated_at).toLocaleTimeString("no-NO",
         { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Oslo" }) + ".";
   }
+  const overdue = m.overdue_issues || [];
   if (!m.forecast_day) {
     const card = el("section", "card");
     card.appendChild(el("h2", null, "Ingen prognose i dag"));
     card.appendChild(el("p", "note", m.no_forecast_reason || ""));
     c.appendChild(card);
+  } else if (!m.issues.length && overdue.length) {
+    // Due but not issued: technical trouble, honestly distinct from "not yet due".
+    const card = el("section", "card");
+    if (m.next_issue) {
+      card.appendChild(el("h2", null, "Prognosen kl. " + fmtT(overdue[0]) + " er forsinket"));
+      card.appendChild(el("p", "note",
+        "Teknisk trøbbel — prognosen er ikke beregnet ennå. Neste forsøk kommer fortløpende."));
+    } else {
+      card.appendChild(el("h2", null, "Ingen prognose tilgjengelig i dag"));
+      card.appendChild(el("p", "note",
+        "Teknisk feil hindret beregningen av dagens prognoser (kl. " +
+        overdue.map(fmtT).join(", ") + ")."));
+    }
+    c.appendChild(card);
   } else if (!m.issues.length) {
     const card = el("section", "card");
-    const nxt = m.next_issue ? m.next_issue.slice(0, 2) + ":" + m.next_issue.slice(2) : null;
-    card.appendChild(el("h2", null, "Dagens første prognose kommer " + (nxt ? "kl. " + nxt : "snart")));
+    card.appendChild(el("h2", null,
+      "Dagens første prognose kommer " + (m.next_issue ? "kl. " + fmtT(m.next_issue) : "snart")));
+    c.appendChild(card);
+  } else if (overdue.length) {
+    const card = el("section", "card");
+    card.appendChild(el("p", "note", "Prognosen kl. " + overdue.map(fmtT).join(" og kl. ") +
+      " mangler (teknisk trøbbel)."));
     c.appendChild(card);
   }
   for (const i of m.issues.slice().reverse()) c.appendChild(issueCard(i));

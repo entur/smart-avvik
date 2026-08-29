@@ -96,6 +96,7 @@ TABLES=(
   nosx_platt_weights       # flattened no-SX platt coefficients; predict_calls.sql joins it directly
   demo_stops demo_highlights demo_calls demo_predictions
   togvarsel_oslo_stations   # the togmelding geography; togvarsel_features_today.sql joins it
+  togvarsel_calendar        # the togmelding holiday/low-season calendar (00_calendar.sql)
 )
 
 # Ensure the destination dataset exists (EU multi-region, same as dev, so

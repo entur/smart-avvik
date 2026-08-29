@@ -11,14 +11,15 @@ menneskelesbare featurene, og en deterministisk «kjente avvik»-liste.
 
 | del | hvor | hva |
 |---|---|---|
+| kalender | `data/queries/togvarsel/00_calendar.sql` | `disruptions.togvarsel_calendar` — helligdager + lavsesong, ETT sted; trening, servering og rollover-proben leser alle herfra |
 | treningskjede | `data/queries/togvarsel/00–09_*.sql` | batch-kildene → dag-tabellene → `disruptions.togvarsel_training` |
-| modelltrening | `data/queries/togvarsel/10_train_models.sql` | `LOGISTIC_REG` med log1p-TRANSFORM og `l2_reg`-grid på holdout; resultat i `disruptions.togvarsel_tuning`, modeller `disruptions.togvarsel_m_{am0630,am0700,pm1200,pm1400}` |
-| retrening | `data/queries/togvarsel/retrain.sh` | hele kjeden, månedlig, ≈ $1.5 / ~40 min |
+| modelltrening | `data/queries/togvarsel/10_train_models.sql` | `LOGISTIC_REG` med log1p-TRANSFORM og `l2_reg`-grid på holdout; resultat i `disruptions.togvarsel_tuning`, kandidater `togvarsel_m_cand_*` som retrain.sh promoterer til `disruptions.togvarsel_m_{am0630,am0700,pm1200,pm1400}` |
+| retrening | `data/queries/togvarsel/retrain.sh` | hele kjeden, månedlig, ≈ $1.5 / ~40 min; promoterer kandidatene først når ALT lyktes, så en feilet retrening aldri etterlater en blandet modellfamilie |
 | live features | `disruptions/api/togvarsel_features_today.sql` | serveringstvillingen: samme kolonner fra sanntids-ET/SX → `disruptions.togvarsel_features_today` + `togvarsel_sx_today` |
-| serveringsmodul | `disruptions/api/togvarsel.py` | polleren beregner forfalte prognoser (én features-rebuild + ML.PREDICT per prognose), `/togmelding-api/today` serverer fra cache |
-| side | `disruptions/api/togmelding_static/index.html` | committet enkeltside på `/togmelding`, ingen byggesteg |
-| tester | `disruptions/api/test_togvarsel.py` | hermetiske; portene (helg/helligdag/klokkeslett) og regelsetningene |
-| utstedte prognoser | `disruptions.togvarsel_issued` | append per prognose, for senere etterprøving av treffsikkerhet |
+| serveringsmodul | `disruptions/api/togvarsel.py` | hver poll-tick (veggklokke, uavhengig av SX-ingestion) beregner forfalte prognoser (én features-rebuild + ML.PREDICT per prognose, feil backer av per prognose), `/togmelding-api/today` serverer fra cache |
+| side | `disruptions/api/togmelding_static/index.html` | committet enkeltside på `/togmelding`, ingen byggesteg; skiller «kommer kl. HH:MM» fra «forsinket/utilgjengelig» |
+| tester | `disruptions/api/test_togvarsel.py` | hermetiske; portene (helg/helligdag/klokkeslett), regelsetningene, feil-/backoff-banene |
+| utstedte prognoser | `disruptions.togvarsel_issued` | én rad per (dato, prognose) — MERGE, første skriving vinner; `late` flagger etterberegnede (restart/backoff) som etterprøvingen skal utelate |
 
 ## Beslutninger som følger §14k, punkt for punkt
 
@@ -66,17 +67,26 @@ Kjente, aksepterte skjevheter (dokumentert i SQL-headeren):
 
 - **Månedlig**: kjør `data/queries/togvarsel/retrain.sh` (dev). Se på tuning-tabellen den
   printer; holdout-AUC skal ligge rundt §14a/§14e-nivåene, og en vinter-holdout leser lavere
-  (§14f). Appen plukker opp nye modeller på neste prognose — ingen redeploy.
-- **Årlig**: utvid helligdags- og lavsesonglistene BEGGE steder
-  (`data/queries/togvarsel/07_features.sql` og `disruptions/api/togvarsel_features_today.sql`) —
-  en kjent vorte (§13); listene dekker nå t.o.m. 17. mai 2027.
-- **prd**: modellene og `togvarsel_oslo_stations` må finnes i prd-prosjektet før siden gir
-  prognoser der (samme `copy_runtime_to_prd`-mønster som de andre modellene, eller kjør
-  retrain-skriptet mot prd). Til det skjer degraderer siden ærlig: prognosene mangler,
-  «kjente avvik» og resten av appen er uberørt.
+  (§14f). Treningen lander i `togvarsel_m_cand_*`; skriptet promoterer alle fire til de levende
+  navnene først når hele kjeden lyktes. Appen plukker opp nye modeller på neste prognose —
+  ingen redeploy.
+- **Årlig**: utvid `data/queries/togvarsel/00_calendar.sql` (helligdager + lavsesong, ett sted),
+  kjør filen og `copy_runtime_to_prd.sh`. Kalenderen dekker nå t.o.m. 17. mai 2027 (`horizon`);
+  serveringsspørringen ERRORer høylytt forbi horisonten i stedet for å stille behandle en
+  helligdag som hverdag, og retrain.sh nekter å kjøre med under 60 dagers margin.
+- **prd**: modellene, `togvarsel_oslo_stations` og `togvarsel_calendar` må finnes i
+  prd-prosjektet før siden gir prognoser der (`copy_runtime_to_prd.sh` kopierer alle). Til det
+  skjer degraderer siden ærlig: prognosene vises som forsinket/utilgjengelige, «kjente avvik» og
+  resten av appen er uberørt.
+- **Feil og backoff**: én modells feil dropper aldri de andre prognosene den ticken; en feilet
+  prognose prøves igjen etter 15 min og gis opp for dagen etter 8 forsøk (én tydelig loggfeil),
+  så en vedvarende feil koster et begrenset antall skanninger — ikke én per poll-tick hele dagen.
+  Prognoser beregnet > 10 min etter cutoff (restart-backfill, backoff-retry) flagges `late` i
+  både payload og `togvarsel_issued`, og skal utelates fra etterprøving av treffsikkerhet.
 - **Kostnad**: ~4 feature-rebuilds + 4 ML.PREDICT per hverdag (to ET-partisjoner + to
   SX-partisjoner per rebuild) — samme størrelsesorden som pollerens eksisterende
-  `rail_calls_today`-refresh, og bare en håndfull ganger om dagen.
+  `rail_calls_today`-refresh, og bare en håndfull ganger om dagen; backoffen holder taket
+  også når noe er brukket.
 
 ## Verifikasjon ved lansering (2026-08-29)
 
@@ -93,8 +103,12 @@ Trening på data t.o.m. 2026-08-28: 343 kvalifiserte hverdager, labels 62/71/58 
 
 Sterke straffer vant overalt, som §14j forutsa. Full grid i `disruptions.togvarsel_tuning`.
 
-Røyktest samme kveld mot fredag 2026-08-29 live: featureraden stemte med batch-kjeden
-(prev_eve_t5 0.4073 mot 0.4059), og de fire modellene ga p = 0.107 / 0.067 / 0.129 / 0.074
-(gul/grønn/gul/grønn) på en dag der torsdagskvelden var dårlig (eve_t5 0.41), morgenen holdt
-seg rolig, og realisert am_t10 ble 0.0 — riktige nivåer, koherent historie. Treningskjeden +
-treningen kostet ≈ $0.4; hele implementasjonsøkten inkludert røyktester ≈ $0.7.
+Røyktest samme kveld mot lørdag 2026-08-29 live (en ren pipelinetest — helgeporten hadde stoppet
+en ekte utstedelse): featureraden stemte med batch-kjeden (prev_eve_t5 0.4073 mot 0.4059), og de
+fire modellene ga p = 0.107 / 0.067 / 0.129 / 0.074 (gul/grønn/gul/grønn) på en dag der
+fredagskvelden var dårlig (eve_t5 0.41), morgenen holdt seg rolig, og realisert am_t10 ble 0.0 —
+riktige nivåer, koherent historie. Treningskjeden + treningen kostet ≈ $0.4; hele
+implementasjonsøkten inkludert røyktester ≈ $0.7. Etter lanseringsgjennomgangen (multi-agent
+kodegjennomgang + kryssmodell-motpart) ble kalenderjoinen, backoffen og MERGE-skrivingen
+verifisert på nytt mot dev: treningstabellen identisk (343/62/71/58), live-raden identisk
+(prev_eve_t5 0.4073), modellkopi-promoteringen testet.
