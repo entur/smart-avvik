@@ -38,10 +38,20 @@ stored-inclusive [begin, end] window overlaps — compared half-open — the LIV
 scope window, [max(scope start, evaluation time), scope end): a push about a rush window the
 traveller has already exited is noise, friskmelding included.
 
+On top of matching sits composition and delivery (R6–R8). The wording is deterministic Norwegian
+assembled from the issue's own fields — level, scope text, rule-based reasons — never an LLM
+(KTD6) and never a journey-, line- or corridor-specific claim: the model's grain is the whole
+network, and the wording keeps that honest. Each pushing round sends one push per matched device
+(R6) through varsel's own delivery machinery; a send error is counted and logged, never retried
+within the round (KTD8) — the marker is already committed, and a forecast is lower-stakes than a
+train alert.
+
 All time logic is Europe/Oslo wall-clock. No import of main, varsel, or togvarsel (the package
 rule): runtime dependencies are injected — main passes the BigQuery client via :func:`configure`
-(togvarsel's own seam), and the matcher takes varsel's `place_refs` as a plain callable; the
-policy core needs none.
+(togvarsel's own seam), the matcher takes varsel's `place_refs` as a plain callable, and
+:func:`push_round` takes varsel's delivery seams (device_subscription, deliver_to_devices,
+handle_gone_device, the brand-asset table, the environment tagger) the same way; the policy core
+needs none.
 """
 
 from __future__ import annotations
@@ -311,3 +321,160 @@ def match_journeys(
         matched.append(jid)
         devices.add(device)
     return matched, devices
+
+
+# ---- Message composition and round delivery (R6, R7, R8; KTD6, KTD8) ----------------------------
+
+# Deterministic Norwegian only (KTD6): every phrase below is assembled from the issue's own fields,
+# so a push can never say something the forecast did not see. The scope text and the reasons come
+# verbatim from togvarsel (its Issue payload), which keeps the two surfaces in one vocabulary.
+_LEVEL_ADJ = {"green": "grønt", "yellow": "gult", "red": "rødt"}
+_RUSH_NAME = {
+    "0630": "morgenrushet",
+    "0700": "morgenrushet",
+    "1200": "ettermiddagsrushet",
+    "1400": "ettermiddagsrushet",
+}
+# Leading reasons only: a notification body is read on a lock screen that truncates, and
+# togvarsel's rule engine already orders them by weight.
+_BODY_REASONS = 2
+# R8: the entur-branded install has the forecast page to land on; the unbranded one does not, so
+# it keeps its own varsel URL — the body carries the essentials, no click-through required.
+_TOGMELDING_URL = "/togmelding"
+
+
+def _sentence(text: str) -> str:
+    t = str(text).strip().rstrip(".")
+    return f"{t[:1].upper()}{t[1:]}."
+
+
+def compose_message(decision: Decision, issue: Mapping[str, Any]) -> tuple[str, str]:
+    """(title, body) for one pushing round — deterministic Norwegian, untagged (the environment
+    prefix is the payload's concern, see :func:`build_payload`).
+
+    The title identifies a rush FORECAST with its level — "Rushvarsel", never train-alert framing,
+    so a red morning that legitimately produces both an SX push and this one stays tellable apart
+    (R7). An update against a pushed baseline is marked "Oppdatert"; the all-clear is a
+    friskmelding, free of every word the warnings use — its body carries no reasons either, since
+    green's own reasons still talk about trouble signs. Raises on a non-push decision: composing
+    a message for a suppressed round is the caller's bug."""
+    if not decision.push or decision.kind not in ("warning", "update", "all_clear"):
+        raise ValueError(f"not a pushing decision: {decision}")
+    rush = _RUSH_NAME[decision.issue]
+    scope = str(issue["scope"])
+    if decision.kind == "all_clear":
+        return (
+            f"Friskmelding: grønt nivå for {rush}",
+            f"Utsiktene for {scope} er tilbake på grønt nivå.",
+        )
+    adj = _LEVEL_ADJ[decision.level]
+    reasons = [str(r) for r in (issue.get("reasons") or [])][:_BODY_REASONS]
+    if decision.kind == "update":
+        title = f"Oppdatert rushvarsel: {adj} nivå for {rush}"
+        lead = f"Prognosen for {scope} er endret til {adj} nivå."
+    else:
+        title = f"Rushvarsel: {adj} nivå for {rush}"
+        lead = f"Prognosen for {scope} er {adj} nivå."
+    return title, " ".join([lead, *(_sentence(r) for r in reasons)])
+
+
+def build_payload(
+    decision: Decision,
+    issue: Mapping[str, Any],
+    brand: str,
+    *,
+    brand_assets: Mapping[str, Mapping[str, str]],
+    tag_title: Callable[[str], str],
+) -> dict[str, Any]:
+    """The Web Push payload for one device of `brand`.
+
+    `brand_assets` (varsel's _BRAND_ASSETS) and `tag_title` (varsel's _tag_environment) are
+    injected by main (KTD4). The icon follows the brand exactly as SX pushes do; the URL follows
+    R8 — the entur brand lands on /togmelding, the unbranded install keeps its own varsel URL.
+    The wording is identical across brands (varsel precedent: only icon and URL ever move). No
+    situation_number: this is not an SX situation, and the standalone-push precedent (varsel's
+    /varsel-api/test) already omits it."""
+    title, body = compose_message(decision, issue)
+    assets = brand_assets.get(brand) or brand_assets["entur"]
+    return {
+        "title": tag_title(title),
+        "body": body,
+        "url": assets["url"] if brand == "none" else _TOGMELDING_URL,
+        "icon": assets["icon"],
+    }
+
+
+def push_round(
+    decision: Decision,
+    issue: Mapping[str, Any],
+    matched: Collection[str],
+    devices: Collection[str],
+    *,
+    resolve_device: Callable[[str], tuple[dict, str] | None],
+    deliver: Callable[
+        [Mapping[str, list[Any]], Callable[[Any], tuple[dict, dict]]],
+        list[tuple[str, Any, str, dict]],
+    ],
+    handle_gone: Callable[[str], bool],
+    brand_assets: Mapping[str, Mapping[str, str]],
+    tag_title: Callable[[str], str],
+) -> dict[str, Any]:
+    """Deliver one pushing round to its matched devices — one push per device (R6).
+
+    Every delivery seam is varsel's, injected by main (KTD4): `resolve_device`
+    (device_subscription — the deleted-while-iterating re-check under varsel's lock), `deliver`
+    (deliver_to_devices — the bounded parallel fan-out), `handle_gone` (handle_gone_device — the
+    grace-then-drop rule). A device that resolves to nothing was deleted between matching and
+    delivery, or registered without push: skipped and counted, never a crash. Send errors are NOT
+    retried within the round (KTD8) — the round marker is already committed, and a forecast is
+    lower-stakes than a train alert — so the counts are logged in ONE structured round event
+    (R10) and returned; a returned "dropped" > 0 means device state changed and the caller must
+    persist it. `matched` (the affected journey ids) rides along for that log only."""
+    if not decision.push:
+        raise ValueError(f"push_round called for a non-push decision: {decision}")
+    payload_by_brand: dict[str, dict[str, Any]] = {}
+    per_device: dict[str, list[tuple[dict, dict]]] = {}
+    no_subscription = 0
+    for device_id in sorted(devices):  # deterministic order, for the fan-out and the logs alike
+        resolved = resolve_device(device_id)
+        if resolved is None:
+            no_subscription += 1
+            continue
+        subscription, brand = resolved
+        payload = payload_by_brand.get(brand)
+        if payload is None:
+            payload = payload_by_brand[brand] = build_payload(
+                decision, issue, brand, brand_assets=brand_assets, tag_title=tag_title
+            )
+        per_device[device_id] = [(subscription, payload)]  # one item per device per round (R6)
+    counts = {"sent": 0, "error": 0, "gone": 0}
+    dropped = 0
+    for device_id, _item, result, _payload in deliver(per_device, lambda item: item):
+        counts[result] = counts.get(result, 0) + 1
+        if result == "gone" and handle_gone(device_id):
+            dropped += 1
+    summary: dict[str, Any] = {
+        "issue": decision.issue,
+        "level": decision.level,
+        "kind": decision.kind,
+        "matched_journeys": len(matched),
+        "matched_devices": len(devices),
+        "no_subscription": no_subscription,
+        "dropped": dropped,
+        **counts,
+    }
+    logger.info(
+        "togvarsel_notify: round %s %s (%s) — %d journeys on %d devices matched; "
+        "%d sent, %d error (not retried), %d gone (%d dropped)",
+        decision.issue,
+        decision.level,
+        decision.kind,
+        len(matched),
+        len(devices),
+        counts["sent"],
+        counts["error"],
+        counts["gone"],
+        dropped,
+        extra={"fields": {"event": "togvarsel_notify_round", **summary}},
+    )
+    return summary
