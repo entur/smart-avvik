@@ -73,9 +73,24 @@ extend-exclude = ["docs/togvarsel/analysis"]
 extend-immutable-calls = ["fastapi.Query"]
 
 [tool.ruff.lint.per-file-ignores]
-# marimo notebooks: a cell's trailing bare expression IS the cell's rendered output (it shows
-# up in the /eval snapshots), so B018 "useless expression" does not apply. Only the marimo
-# apps are listed — eval/tune_alert_thresholds.py is a plain script, where B018 is a real bug.
-"eval/impact_eval.py" = ["B018"]
-"eval/pooled-model-bus-eval.py" = ["B018"]
-"eval/pooled-model-train-eval.py" = ["B018"]
+# marimo notebooks: a cell's trailing bare expression IS the cell's rendered output (for the
+# eval ones, it is what shows up in the /eval snapshots), so B018 "useless expression" does not
+# apply. Only the marimo apps are listed — eval/tune_alert_thresholds.py is a plain script,
+# where B018 is a real bug. data/feedback/review_feedback.py is a marimo app that deliberately
+# does NOT live in eval/: export_eval.sh globs that directory and commits the rendered HTML,
+# which for a page showing travellers' free text would publish it.
+#
+# PLR1711 is the same kind of exemption for the same reason. Current marimo (0.23.16) closes
+# EVERY cell with a `return`, including display-only ones, and `marimo check --fix` re-adds them
+# when they are deleted — so stripping them to satisfy the linter lasts exactly until the next
+# person opens the file in the editor, and CI then fails on a file nobody meaningfully changed.
+# That is not hypothetical: it is how this entry came to exist, on a notebook that had linted
+# clean minutes earlier. All four notebooks are listed, and all four are now SAVED in that
+# format (2026-08-29) rather than only exempted from complaining about it — the three eval ones
+# were written by marimo 0.23.13, which emitted none, so an editor session on any of them would
+# otherwise have buried a real change under a 26-42 line reformat. Normalizing them changed no
+# cell's defs or refs and no /eval title, and needs no re-render: `return` is not output.
+"eval/impact_eval.py" = ["B018", "PLR1711"]
+"eval/pooled-model-bus-eval.py" = ["B018", "PLR1711"]
+"eval/pooled-model-train-eval.py" = ["B018", "PLR1711"]
+"data/feedback/review_feedback.py" = ["B018", "PLR1711"]

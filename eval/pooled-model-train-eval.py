@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.13"
+__generated_with = "0.23.16"
 app = marimo.App(width="medium")
 
 
@@ -25,6 +25,7 @@ def header(mo):
     (`pooled-model-bus-eval.py`) tester samme idé utvidet til buss — der **feiler** gaten,
     og arkitekturen ender som to familier.
     """)
+    return
 
 
 @app.cell
@@ -69,6 +70,7 @@ def build_md(mo):
       GOA-onset-tekstene (delte meldingsmaler).
     - **Totalkostnad ≈ $1,6** (trening $1,40, GOA-tabellen $0,10) og ~40 min vegg-tid.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -93,6 +95,7 @@ def families_md(mo):
     Platt-laget for den poolede familien er **ett delt fitt** på det poolede holdout-settet
     (~95 % NSB-rader) — kalibreringsavsnittet under sjekker om GOA rir den kurven akseptabelt.
     """)
+    return
 
 
 @app.cell
@@ -289,6 +292,7 @@ def headline_md(mo):
     2. **Hva vinner GOA på pooling?** Sammenlikn `GOA/pooled` mot `GOA/zeroshot` — gapet er
        verdien av å trene med GOA-radene inne.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -335,6 +339,7 @@ def gate_md(mo):
     **Gaten passerer** når NSB-differansene er støy (± noen få tusendeler); GOA-gevinsten viser
     hva selve poolingen kjøper utover ren egenskaps-overføring.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -371,6 +376,7 @@ def gate_tables(fam_metrics, mo, pd):
         mo.md("**GOA: pooling-gevinsten** (Δ = pooled − zeroshot)"),
         _sty(_goa, 0.05),
     ])
+    return
 
 
 @app.cell(hide_code=True)
@@ -389,6 +395,7 @@ def pr_fig_md(mo):
     - **Høyre (NSB):** pooled- og prod-kurvene ligger oppå hverandre — poolingen er gratis
       for NSB. Det er hele gaten.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -430,6 +437,7 @@ def pr_figure(THR, metric_slice, plt, pr_curve, scored):
                   arrowprops={"arrowstyle": "-", "color": "#9a9a92", "lw": 0.8})
     plt.tight_layout()
     _fig
+    return
 
 
 @app.cell(hide_code=True)
@@ -448,6 +456,7 @@ def calib_md(mo):
     **per-operatør-intercept i platt-laget** første ratt å vri på — det er nøyaktig det den
     all-operatør-poolede familien i neste notatbok gjør (`sigmoid(b + a·logit + w[operatør])`).
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -484,6 +493,7 @@ def calib_figure(metric_slice, np, pd, plt, scored):
                   arrowprops={"arrowstyle": "-", "color": "#9a9a92", "lw": 0.8})
     plt.tight_layout()
     _fig
+    return
 
 
 @app.cell(hide_code=True)
@@ -550,6 +560,7 @@ def findings(mo):
     `train_call_models_pooled.sql` → `create_pooled_calibration.sql` → `eval_pooled_models.sql`,
     alle i `data/queries/`.
     """)
+    return
 
 
 if __name__ == "__main__":
