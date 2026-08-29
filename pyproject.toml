@@ -80,15 +80,17 @@ extend-immutable-calls = ["fastapi.Query"]
 # does NOT live in eval/: export_eval.sh globs that directory and commits the rendered HTML,
 # which for a page showing travellers' free text would publish it.
 #
-# PLR1711 is the same kind of exemption for the same reason, and it is listed only where it has
-# to be. Current marimo (0.23.16) closes EVERY cell with a `return`, including display-only ones
-# — `marimo check --fix` re-adds all nine of this notebook's if they are deleted — so stripping
-# them to satisfy the linter lasts exactly until the next person opens the file in the editor,
-# and CI then fails on a file nobody meaningfully changed. The three eval notebooks were written
-# by an older marimo that emitted none, which is why they are not listed here; opening any of
-# them in a current editor would add them (measured: 19 in impact_eval.py) and would need this
-# same entry.
-"eval/impact_eval.py" = ["B018"]
-"eval/pooled-model-bus-eval.py" = ["B018"]
-"eval/pooled-model-train-eval.py" = ["B018"]
+# PLR1711 is the same kind of exemption for the same reason. Current marimo (0.23.16) closes
+# EVERY cell with a `return`, including display-only ones, and `marimo check --fix` re-adds them
+# when they are deleted — so stripping them to satisfy the linter lasts exactly until the next
+# person opens the file in the editor, and CI then fails on a file nobody meaningfully changed.
+# That is not hypothetical: it is how this entry came to exist, on a notebook that had linted
+# clean minutes earlier. All four notebooks are listed, and all four are now SAVED in that
+# format (2026-08-29) rather than only exempted from complaining about it — the three eval ones
+# were written by marimo 0.23.13, which emitted none, so an editor session on any of them would
+# otherwise have buried a real change under a 26-42 line reformat. Normalizing them changed no
+# cell's defs or refs and no /eval title, and needs no re-render: `return` is not output.
+"eval/impact_eval.py" = ["B018", "PLR1711"]
+"eval/pooled-model-bus-eval.py" = ["B018", "PLR1711"]
+"eval/pooled-model-train-eval.py" = ["B018", "PLR1711"]
 "data/feedback/review_feedback.py" = ["B018", "PLR1711"]
