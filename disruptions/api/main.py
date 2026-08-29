@@ -22,6 +22,7 @@ import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
+import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -1029,6 +1030,15 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             varsel.check_and_notify(_varsel_snapshot())
     except Exception:
         logger.exception("Avviksvarsel notify failed")
+    # Togmeldingen (/togmelding-api): on weekday ticks past an un-issued forecast time this
+    # rebuilds the live togvarsel feature row and scores the due models; every other tick it
+    # returns immediately. Isolated so a failure never touches the feed — the endpoint keeps
+    # serving whatever issues the day already has.
+    try:
+        with _phase("togvarsel", timings):
+            togvarsel.refresh()
+    except Exception:
+        logger.exception("Togvarsel refresh failed; /togmelding-api serves the day's existing issues")
 
 
 
@@ -1080,6 +1090,10 @@ async def lifespan(app: FastAPI):
         reisevalg.refresh_baselines()
     except Exception:
         logger.exception("Initial svv baselines load failed; will retry on ingestion poll")
+    # Togmeldingen: BigQuery only (live feature rebuild + ML.PREDICT), driven from the poller
+    # cycle. No eager load — the first tick past an issue time computes it, and a restart
+    # back-fills the day's earlier issues (the features are clock-cutoff-defined, see togvarsel.py).
+    togvarsel.configure(bq_client=bq_client)
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
@@ -1176,6 +1190,10 @@ app.include_router(historikk.router)
 # (a chart change, since trafficType is set once), not a shorter SELECT list. A page built on
 # hypothetical journeys rather than registrations would retire the question outright.
 app.include_router(meldinger.router)
+
+# Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
+# the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
+app.include_router(togvarsel.router)
 
 # --- How long a browser may keep a static file ----------------------------------------------
 #
@@ -1294,6 +1312,20 @@ else:
         "No historikk_static/ directory; /historikk not mounted "
         "(run demo/varselhistorikk/build.sh)"
     )
+
+# The Togmelding page — a single hand-written HTML file, COMMITTED (like eval_static, unlike the
+# built front-ends): no build step, no framework, it just renders /togmelding-api/today. Mounted
+# only when present, same pattern as the mounts above.
+_TOGMELDING_STATIC_DIR = Path(__file__).parent / "togmelding_static"
+if _TOGMELDING_STATIC_DIR.is_dir():
+    app.mount(
+        "/togmelding",
+        _VersionedStaticFiles(directory=_TOGMELDING_STATIC_DIR, html=True),
+        name="togmelding",
+    )
+    logger.info("Mounted togmelding page at /togmelding from %s", _TOGMELDING_STATIC_DIR)
+else:
+    logger.info("No togmelding_static/ directory; /togmelding not mounted")
 
 # The Meldinger UI (demo/meldinger) — the same decisions, replayed through today's prompt.
 # Same generated-directory pattern as the mounts above; its data comes from /meldinger-api, which
