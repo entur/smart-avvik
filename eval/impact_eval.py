@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.13"
+__generated_with = "0.23.16"
 app = marimo.App(width="medium")
 
 
@@ -25,6 +25,7 @@ def _(mo):
     **avgangssiden** = innstilt ELLER avgangsforsinkelse ≥ 10 (påstigningsstopp).
     Bare rader der siden finnes (ikke origin/terminal) og utfallet er observert, telles med.
     """)
+    return
 
 
 @app.cell
@@ -184,6 +185,7 @@ def explain_numbers(mo):
     - **AUC** — trekk ett rammet og ett urammet stopp tilfeldig; AUC er sjansen for at modellen
       ga det rammede stoppet høyest sannsynlighet. 0,5 er myntkast, 1,0 er perfekt.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -200,6 +202,7 @@ def headline(arr_eval, auc_score, dep_eval, pd):
         "n": "antall stopp", "base_rate": "andel rammet",
         "mean_pred": "snittprediksjon", "auc": "AUC",
     })
+    return
 
 
 @app.cell(hide_code=True)
@@ -219,6 +222,7 @@ def explain_threshold(mo):
     sider: for eksempel ved terskel **0,65** er ankomstvarselet riktig **91 %** av gangene og
     fanger fortsatt **59 %** av alle rammede stopp.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -255,6 +259,7 @@ def explain_charts(mo):
     ble tilpasset på den samme evalueringsperioden, så figuren ser litt bedre ut enn den ville
     gjort på helt ferske data — se forbeholdene nederst.)
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -317,6 +322,7 @@ def pr_and_reliability(
         _ax.legend(frameon=False, loc="lower left" if _ax is _ax1 else "upper left")
     plt.tight_layout()
     _fig
+    return
 
 
 @app.cell(hide_code=True)
@@ -344,6 +350,7 @@ def findings(mo):
     - Stopp uten observert utfall (ingen registrert forsinkelse, ikke innstilt) er utelatt; hvis
       manglende data korrelerer med påvirkning, er de realiserte ratene en nedre grense.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -369,6 +376,7 @@ def lead_header(mo):
     linjetilstand (ren planlegging). L = 30 reproduserer treningsforankringen eksakt (verifisert:
     0 avvik mot `training_calls`). Tabellen bygges av `data/queries/leadtime_eval.sql`.
     """)
+    return
 
 
 @app.cell
@@ -441,6 +449,7 @@ def lead_metrics_cell(auc_score, dep_eval, df_lead, pd, recall_at_precision):
         })
     lead_metrics = pd.DataFrame(_rows).round(3)
     lead_metrics
+    return
 
 
 @app.cell(hide_code=True)
@@ -496,6 +505,7 @@ def lead_figure(dep_eval, df_lead, plt, recall_at_precision):
         _ax.legend(frameon=False, loc="upper right")
     plt.tight_layout()
     _fig
+    return
 
 
 @app.cell(hide_code=True)
@@ -516,6 +526,7 @@ def lead_quality_expl(mo):
       færre enn 80 %. Det er derfor terskelen må heves (0,62 → 0,86–0,88) for å holde 90 %
       presisjon ved tidlig varsling.
     """)
+    return
 
 
 @app.cell
@@ -562,6 +573,7 @@ def lead_quality_fig(df_lead, np, pd, plt, pr_curve):
     _ax2.legend(frameon=False, loc="upper left")
     plt.tight_layout()
     _fig
+    return
 
 
 @app.cell(hide_code=True)
@@ -598,6 +610,7 @@ def lead_findings(mo):
     lavere presisjon enn 90 % per spørring. Tabellen bygges av `data/queries/leadtime_eval.sql`
     (lead 30 verifisert identisk med treningsforankringen).
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -620,6 +633,7 @@ def platt_header(mo):
     `dep_ge10_platt_lead*`, se `data/queries/create_leadtime_calibration.sql`) tilpasses på hele
     holdout-vinduet etterpå.
     """)
+    return
 
 
 @app.cell
@@ -736,6 +750,7 @@ def platt_metrics_cell(pd, platt_b, recall_at_precision):
         })
     platt_metrics = pd.DataFrame(_rows).round(3)
     platt_metrics
+    return
 
 
 @app.cell(hide_code=True)
@@ -751,6 +766,7 @@ def platt_charts_expl(mo):
       samler den seg i stedet for å jages mot 0,96. Til høyre presisjonen hvis vi låser terskelen
       til 0,65 — med eget lag holder den seg over 90 %-målet på alle spørretidspunkter.
     """)
+    return
 
 
 @app.cell(hide_code=True)
@@ -788,6 +804,7 @@ def platt_fig(np, pd, platt_b, plt):
                   arrowprops={"arrowstyle": "-", "color": "#9a9a92", "lw": 0.8})
     plt.tight_layout()
     _fig
+    return
 
 
 @app.cell(hide_code=True)
@@ -833,6 +850,7 @@ def platt_thr_fig(np, platt_b, plt, recall_at_precision):
         _ax.legend(frameon=False, loc="lower right")
     plt.tight_layout()
     _fig
+    return
 
 
 @app.cell(hide_code=True)
@@ -861,6 +879,7 @@ def platt_findings(mo):
       0,200 ved melding) treffer nå basisraten. Lagene må re-tilpasses etter hver
       hodetrening, som de eksisterende.
     """)
+    return
 
 
 if __name__ == "__main__":
