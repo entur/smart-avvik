@@ -14,7 +14,7 @@ environment (never an argument). Use developer ADC for BigQuery. Both date argum
 anything older is gone from PostHog, and its BigQuery context expires at 45 days.
 
 ```sh
-export POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)"
+POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" \
 uv run python data/feedback/export_varsel_feedback.py \
   --project ent-kixavvik-dev \
   --environment dev \
@@ -22,8 +22,22 @@ uv run python data/feedback/export_varsel_feedback.py \
   --to-date 2026-08-27 \
   --posthog-project-id 259080 \
   --output /private/tmp/varsel-feedback-2026-08-25.json
-unset POSTHOG_PERSONAL_API_KEY
 ```
+
+**The key is a one-command prefix, not an `export`, and that is the safer of the two forms** — it
+was `export` plus a trailing `unset` until 2026-08-29. A variable assignment preceding a simple
+command is placed in that command's environment and nowhere else, so the key never enters the
+interactive shell: with `export` it lives in the shell's memory, and in the environment of every
+process spawned from it, until the `unset` runs — and the `unset` is exactly what does not run when
+the export succeeds and the command then fails, is interrupted, or is simply walked away from.
+Verified 2026-08-29 that both links hold for this command specifically, since neither is pure shell
+semantics: `uv run` passes the variable through to the child Python, and the assignment survives the
+`\` continuation that follows it. What does not change is the "never an argument" rule the value
+still obeys — argv is readable by every user on the machine via `ps`, an environment is not — nor
+that shell history records the `$(...)` substitution rather than the value either way, so that half
+rests on the secret command, not on this choice. The transience is guaranteed for an **external**
+command only; `VAR=x some_shell_function` can leak the assignment into the shell, which is not this
+case but is the trap if the recipe is ever wrapped in a helper function.
 
 `--posthog-project-id` is **259080** for `Kix - dev` — which serves the dev *and* tst environments, so
 `--environment` is what separates them — and **259077** for `Kix - prod`. `--project` is the GCP
