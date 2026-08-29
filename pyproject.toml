@@ -79,7 +79,16 @@ extend-immutable-calls = ["fastapi.Query"]
 # where B018 is a real bug. data/feedback/review_feedback.py is a marimo app that deliberately
 # does NOT live in eval/: export_eval.sh globs that directory and commits the rendered HTML,
 # which for a page showing travellers' free text would publish it.
+#
+# PLR1711 is the same kind of exemption for the same reason, and it is listed only where it has
+# to be. Current marimo (0.23.16) closes EVERY cell with a `return`, including display-only ones
+# — `marimo check --fix` re-adds all nine of this notebook's if they are deleted — so stripping
+# them to satisfy the linter lasts exactly until the next person opens the file in the editor,
+# and CI then fails on a file nobody meaningfully changed. The three eval notebooks were written
+# by an older marimo that emitted none, which is why they are not listed here; opening any of
+# them in a current editor would add them (measured: 19 in impact_eval.py) and would need this
+# same entry.
 "eval/impact_eval.py" = ["B018"]
 "eval/pooled-model-bus-eval.py" = ["B018"]
 "eval/pooled-model-train-eval.py" = ["B018"]
-"data/feedback/review_feedback.py" = ["B018"]
+"data/feedback/review_feedback.py" = ["B018", "PLR1711"]

@@ -27,8 +27,7 @@ def _(mo):
     for the same reason (argv is readable by every user on the machine via `ps`):
 
     ```sh
-    POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" \
-    uv run marimo edit data/feedback/review_feedback.py
+    POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" uv run marimo edit data/feedback/review_feedback.py
     ```
 
     BigQuery uses your developer ADC. Everything you read here is subject to the same rules
@@ -414,6 +413,11 @@ def save_file(
 ):
     mo.stop(not save.value, mo.md(""))
     mo.stop(not save_path.value.strip(), mo.md("_Give it a path first._"))
+    # Both branches assign and the cell ends on a bare `_outcome`, rather than each branch
+    # ending on its own mo.md(...). marimo renders only an UNNESTED trailing expression, so the
+    # nested form silently displays nothing — you press the button and the notebook looks
+    # inert whether it wrote the file or refused to. `marimo check` catches this (branch-expression);
+    # ruff and the Python interpreter do not.
     try:
         exporter.write_json(
             Path(save_path.value.strip()),
@@ -429,9 +433,10 @@ def save_file(
                 "issues": issues,
             },
         )
-        mo.md(f"Wrote `{save_path.value.strip()}` (mode 0600).")
+        _outcome = mo.md(f"Wrote `{save_path.value.strip()}` (mode 0600).")
     except (FileExistsError, FileNotFoundError, ValueError, OSError) as _exc:
-        mo.md(f"/// attention | Not written\n`{_exc}`\n///")
+        _outcome = mo.md(f"/// attention | Not written\n`{_exc}`\n///")
+    _outcome
     return
 
 

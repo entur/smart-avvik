@@ -76,6 +76,14 @@ document — filtering is a reading convenience, and an evidence file that quiet
 evidence. Table download buttons are disabled throughout for the same reason the exporter sets
 `0600`: a widget-dropped CSV in `~/Downloads` has none of that protection.
 
+Run `uv run marimo check data/feedback/review_feedback.py` after editing it, not just `ruff`. The
+two catch different things: marimo's checker found a save cell whose `try`/`except` branches each
+ended in their own `mo.md(...)`, which renders **nothing** — marimo only displays an *unnested*
+trailing expression, so the button would have looked inert whether it wrote the file or refused to.
+Ruff and the interpreter are both happy with that code. Note also that current marimo closes every
+cell with a `return`, including display-only ones, and re-adds them on save; `pyproject.toml` exempts
+this file from `PLR1711` for that reason rather than fighting the formatter.
+
 **It must never move to `eval/`.** `disruptions/api/export_eval.sh` globs `eval/*.py`, renders every
 notebook there to static HTML, and `eval_static/` is committed and served publicly at `/eval` — which
 for this page would publish travellers' free text and their routes. That is the whole reason it lives
