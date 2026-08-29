@@ -250,6 +250,24 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   road side as UNKNOWN until a road provider is validated. Rebuild baselines/backtest with
   `data/queries/reisevalg_*.sql`; raw volume backfill via `data/svv/download_volumes.py`.
 
+- **Togmeldingen** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
+  the rush-hour forecast from `docs/togvarsel/` (§8 of the findings as revised by §14k; the
+  implementation is `docs/togvarsel/03-implementasjon.md`). Four weekday issues (06:30, 07:00 for
+  the AM rush; 12:00, 14:00 for the PM rush), each a tuned `LOGISTIC_REG` probability on the
+  product bar (cancelled OR ≥ 10 min) mapped to green/yellow/red at fixed cuts (0.10/0.30), with
+  rule-based reasons and a deterministic "kjente avvik" list. `togvarsel.refresh()` runs on
+  every poll tick (wall-clock — an issue is due at its cutoff whether or not SX moved) and
+  computes due issues (one rebuild of `togvarsel_features_today` + one `ML.PREDICT` per issue —
+  a handful of BQ jobs per weekday; failures back off per issue and give up after 8 tries/day);
+  weekends/holidays get no forecast, and issued forecasts land in `disruptions.togvarsel_issued`
+  (MERGE, first write per (d, issue) wins; `late` marks back-fills — per-environment, not copied
+  to prd). Retrain monthly with `data/queries/togvarsel/retrain.sh` (≈ $1.5; trains candidates,
+  promotes all four `togvarsel_m_*` only on full success), then `copy_runtime_to_prd.sh` copies
+  models + tables to prd. Holidays/low season live in ONE place: `disruptions.togvarsel_calendar`
+  (`data/queries/togvarsel/00_calendar.sql`) — extend yearly; serving ERRORs loudly past its
+  horizon and retrain.sh refuses under 60 days of headroom. The page itself is one committed HTML
+  file (`disruptions/api/togmelding_static/`, the eval_static pattern — no build step).
+
 ## Conventions
 
 - All SQL targets BigQuery Standard SQL; legacy SQL is not used.

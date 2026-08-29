@@ -1,0 +1,172 @@
+<!doctype html>
+<!-- Togmeldingen — a single hand-written page, COMMITTED (the eval_static pattern, not the
+     built-front-end pattern): no build step, no framework. It renders /togmelding-api/today. -->
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Togmeldingen</title>
+<style>
+  :root {
+    --green: #1a7f37; --green-bg: #e6f4ea;
+    --yellow: #9a6700; --yellow-bg: #fff8e1;
+    --red: #b42318; --red-bg: #fdecea;
+    --ink: #1c2226; --muted: #5b6770; --line: #e3e8ec; --bg: #f6f8f9;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.5 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 680px; margin: 0 auto; padding: 20px 16px 48px; }
+  h1 { font-size: 26px; margin: 8px 0 2px; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+  .card { background: #fff; border: 1px solid var(--line); border-radius: 12px;
+          padding: 16px; margin: 12px 0; }
+  .issue { display: flex; gap: 14px; align-items: flex-start; }
+  .dot { flex: none; width: 46px; height: 46px; border-radius: 50%;
+         display: flex; align-items: center; justify-content: center;
+         font-weight: 700; font-size: 13px; color: #fff; }
+  .green .dot { background: var(--green); } .yellow .dot { background: var(--yellow); }
+  .red .dot { background: var(--red); }
+  .green { background: var(--green-bg); } .yellow { background: var(--yellow-bg); }
+  .red { background: var(--red-bg); }
+  .issue h2 { font-size: 17px; margin: 2px 0 4px; }
+  .issue .p { font-weight: 600; }
+  .reasons { margin: 6px 0 0; padding-left: 18px; color: var(--ink); font-size: 14px; }
+  .tag { display: inline-block; font-size: 12px; border-radius: 6px; padding: 1px 8px;
+         background: var(--line); color: var(--muted); margin-right: 6px; }
+  .note { color: var(--muted); font-size: 13px; }
+  .kjent { font-size: 14px; padding: 8px 0; border-top: 1px solid var(--line); }
+  .kjent:first-of-type { border-top: 0; }
+  #error { color: var(--red); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Togmeldingen</h1>
+  <p class="sub">Rushtidsvarsel for lokaltogene i Oslo-området (Vy). Prognoser kl. 06:30, 07:00,
+     12:00 og 14:00 på hverdager. <span id="gen"></span></p>
+  <div id="error" hidden>Fikk ikke hentet togmeldingen. Prøv igjen om litt.</div>
+  <div id="content"></div>
+  <p class="note" id="skill"></p>
+</main>
+<script>
+const LEVEL_LABEL = { green: "GRØNN", yellow: "GUL", red: "RØD" };
+const LEVEL_TEXT = {
+  green: "liten fare for forstyrrelser",
+  yellow: "noe usikkert",
+  red: "stor fare for forstyrrelser",
+};
+const CLS_LABEL = {
+  buss_for_tog: "Buss for tog", stengt: "Stengt strekning", faerre_avganger: "Færre avganger",
+  innstilt: "Innstillinger", faerre_vogner: "Kortere tog", ny_kjoererute: "Ny kjørerute",
+};
+
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+}
+
+const fmtT = k => k.slice(0, 2) + ":" + k.slice(2);
+
+function issueCard(i) {
+  const card = el("section", "card issue " + i.level);
+  const dot = el("div", "dot", LEVEL_LABEL[i.level] || "?");
+  const body = el("div");
+  body.appendChild(el("h2", null, "Kl. " + fmtT(i.issue) + " — " + i.scope));
+  body.appendChild(el("div", "p",
+    LEVEL_TEXT[i.level] + " (ca. " + Math.round(i.p * 100) + " % sjanse for mye trøbbel)"));
+  const ul = el("ul", "reasons");
+  for (const r of i.reasons) ul.appendChild(el("li", null, r));
+  body.appendChild(ul);
+  if (i.late) {
+    body.appendChild(el("div", "note", "Beregnet i etterkant, kl. " +
+      new Date(i.computed_at).toLocaleTimeString("no-NO",
+        { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Oslo" }) + "."));
+  }
+  card.appendChild(dot); card.appendChild(body);
+  return card;
+}
+
+function render(m) {
+  const c = document.getElementById("content");
+  c.replaceChildren();
+  if (m.generated_at) {
+    document.getElementById("gen").textContent =
+      "Sist oppdatert " + new Date(m.generated_at).toLocaleTimeString("no-NO",
+        { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Oslo" }) + ".";
+  }
+  const overdue = m.overdue_issues || [];
+  if (!m.forecast_day) {
+    const card = el("section", "card");
+    card.appendChild(el("h2", null, "Ingen prognose i dag"));
+    card.appendChild(el("p", "note", m.no_forecast_reason || ""));
+    c.appendChild(card);
+  } else if (!m.issues.length && overdue.length) {
+    // Due but not issued: technical trouble, honestly distinct from "not yet due".
+    const card = el("section", "card");
+    if (m.next_issue) {
+      card.appendChild(el("h2", null, "Prognosen kl. " + fmtT(overdue[0]) + " er forsinket"));
+      card.appendChild(el("p", "note",
+        "Teknisk trøbbel — prognosen er ikke beregnet ennå. Neste forsøk kommer fortløpende."));
+    } else {
+      card.appendChild(el("h2", null, "Ingen prognose tilgjengelig i dag"));
+      card.appendChild(el("p", "note",
+        "Teknisk feil hindret beregningen av dagens prognoser (kl. " +
+        overdue.map(fmtT).join(", ") + ")."));
+    }
+    c.appendChild(card);
+  } else if (!m.issues.length) {
+    const card = el("section", "card");
+    card.appendChild(el("h2", null,
+      "Dagens første prognose kommer " + (m.next_issue ? "kl. " + fmtT(m.next_issue) : "snart")));
+    c.appendChild(card);
+  } else if (overdue.length) {
+    const card = el("section", "card");
+    card.appendChild(el("p", "note", "Prognosen kl. " + overdue.map(fmtT).join(" og kl. ") +
+      " mangler (teknisk trøbbel)."));
+    c.appendChild(card);
+  }
+  for (const i of m.issues.slice().reverse()) c.appendChild(issueCard(i));
+  if (m.forecast_day && m.pm_outlook && !m.issues.some(i => i.issue >= "1200")) {
+    const card = el("section", "card");
+    card.appendChild(el("h2", null, "Ettermiddagsrushet"));
+    card.appendChild(el("p", null, m.pm_outlook));
+    c.appendChild(card);
+  }
+  if (m.known_deviations.length) {
+    const card = el("section", "card");
+    card.appendChild(el("h2", null, "Kjente avvik i dag"));
+    for (const k of m.known_deviations) {
+      const row = el("div", "kjent");
+      row.appendChild(el("span", "tag", k.planned ? "Planlagt" : (CLS_LABEL[k.cls] || "Avvik")));
+      row.appendChild(document.createTextNode(k.summary || ""));
+      if (k.n_am_rush_journeys || k.n_pm_rush_journeys) {
+        row.appendChild(el("div", "note",
+          (k.n_am_rush_journeys ? k.n_am_rush_journeys + " avganger i morgenrushet" : "") +
+          (k.n_am_rush_journeys && k.n_pm_rush_journeys ? ", " : "") +
+          (k.n_pm_rush_journeys ? k.n_pm_rush_journeys + " i ettermiddagsrushet" : "")));
+      }
+      card.appendChild(row);
+    }
+    c.appendChild(card);
+  }
+  document.getElementById("skill").textContent = m.skill_note || "";
+}
+
+async function load() {
+  try {
+    const resp = await fetch("/togmelding-api/today", { cache: "no-store" });
+    if (!resp.ok) throw new Error(resp.status);
+    render(await resp.json());
+    document.getElementById("error").hidden = true;
+  } catch (e) {
+    document.getElementById("error").hidden = false;
+  }
+}
+load();
+setInterval(load, 5 * 60 * 1000);
+</script>
+</body>
+</html>

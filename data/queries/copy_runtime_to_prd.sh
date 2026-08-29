@@ -33,7 +33,8 @@
 # replace prd's real alerting history with dev's. The app creates the table and
 # view itself on startup (disruptions/api/create_varsel_decisions.sql), and
 # data/queries/label_varsel_decisions.sh labels each environment separately.
-# Same reasoning as svv_baselines.
+# Same reasoning as svv_baselines, and as togvarsel_issued (each environment
+# logs its own issued forecasts; togvarsel.py creates the table on first use).
 set -euo pipefail
 
 SRC_PROJECT="ent-kixavvik-dev"
@@ -43,6 +44,9 @@ DATASET="disruptions"
 MODELS=(
   # initial-duration models (predict.sql / disruptions_as_of.sql)
   dur_init_reopen impact_remaining_noet
+  # togmelding forecast models (togvarsel.py / togvarsel_features_today.sql); retrained by
+  # data/queries/togvarsel/retrain.sh in dev, promoted here
+  togvarsel_m_am0630 togvarsel_m_am0700 togvarsel_m_pm1200 togvarsel_m_pm1400
 )
 # rail family ("" suffix) + bus/pooled family (_pooled_all suffix)
 for fam in "" "_pooled_all"; do
@@ -91,6 +95,8 @@ TABLES=(
   pooled_all_platt_weights
   nosx_platt_weights       # flattened no-SX platt coefficients; predict_calls.sql joins it directly
   demo_stops demo_highlights demo_calls demo_predictions
+  togvarsel_oslo_stations   # the togmelding geography; togvarsel_features_today.sql joins it
+  togvarsel_calendar        # the togmelding holiday/low-season calendar (00_calendar.sql)
 )
 
 # Ensure the destination dataset exists (EU multi-region, same as dev, so
