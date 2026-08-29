@@ -1030,16 +1030,6 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             varsel.check_and_notify(_varsel_snapshot())
     except Exception:
         logger.exception("Avviksvarsel notify failed")
-    # Togmeldingen (/togmelding-api): on weekday ticks past an un-issued forecast time this
-    # rebuilds the live togvarsel feature row and scores the due models; every other tick it
-    # returns immediately. Isolated so a failure never touches the feed — the endpoint keeps
-    # serving whatever issues the day already has.
-    try:
-        with _phase("togvarsel", timings):
-            togvarsel.refresh()
-    except Exception:
-        logger.exception("Togvarsel refresh failed; /togmelding-api serves the day's existing issues")
-
 
 
 @asynccontextmanager
@@ -1090,9 +1080,10 @@ async def lifespan(app: FastAPI):
         reisevalg.refresh_baselines()
     except Exception:
         logger.exception("Initial svv baselines load failed; will retry on ingestion poll")
-    # Togmeldingen: BigQuery only (live feature rebuild + ML.PREDICT), driven from the poller
-    # cycle. No eager load — the first tick past an issue time computes it, and a restart
-    # back-fills the day's earlier issues (the features are clock-cutoff-defined, see togvarsel.py).
+    # Togmeldingen: BigQuery only (live feature rebuild + ML.PREDICT), driven wall-clock from
+    # every poll tick (see poll_for_changes). No eager load — the first tick past an issue time
+    # computes it, and a restart back-fills the day's earlier issues as `late` (the features are
+    # clock-cutoff-defined, see togvarsel.py).
     togvarsel.configure(bq_client=bq_client)
     stop_event = threading.Event()
     thread = threading.Thread(
@@ -1376,6 +1367,18 @@ def poll_for_changes(
                 on_change(current)
         except Exception:
             logger.exception("Ingestion poll failed; retrying on next tick")
+        # Togmeldingen (/togmelding-api) runs on EVERY tick, not just ingestion changes: an issue
+        # is due at its clock cutoff (06:30/07:00/12:00/14:00) whether or not new SX arrived, so
+        # it must not hang off the SX cadence. Cheap in-memory no-op on the vast majority of
+        # ticks; on a weekday tick past an un-issued forecast time it rebuilds the live togvarsel
+        # feature row and scores the due models. Isolated so a failure never touches the feed —
+        # the endpoint keeps serving whatever issues the day already has.
+        try:
+            togvarsel.refresh()
+        except Exception:
+            logger.exception(
+                "Togvarsel refresh failed; /togmelding-api serves the day's existing issues"
+            )
         if stop_event is not None:
             if stop_event.wait(interval):
                 return

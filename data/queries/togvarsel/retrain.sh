@@ -6,11 +6,14 @@
 #
 #   create_disruptions.sql   ../create_disruptions.sql — refresh disruptions.disruptions
 #                            (2-year SIRI-SX scan, ~$1; the SX-event source for the chain)
-#   00..09_*.sql             stations → calls → journeys → windows → days → sx → features →
-#                            training (01 scans last_recorded VYG rail, ~$0.5; the rest read
-#                            tiny tables)
-#   10_train_models.sql      l2_reg grid + final LOGISTIC_REG fits (~36 model jobs, ~25 min,
-#                            costs cents — LOGISTIC_REG, not boosted trees; see the file header)
+#   00..09_*.sql             calendar + stations → calls → journeys → windows → days → sx →
+#                            features → training (01 scans last_recorded VYG rail, ~$0.5; the
+#                            rest read tiny tables)
+#   10_train_models.sql      l2_reg grid + final LOGISTIC_REG fits into togvarsel_m_cand_*
+#                            (~36 model jobs, ~25 min, costs cents)
+#   promotion                bq cp the four candidates onto the live togvarsel_m_* names — only
+#                            reached when ALL of the above succeeded, so a failed retrain leaves
+#                            the live model family untouched instead of half-replaced
 #
 # Total ≈ $1.5 and ~40 min. The serving app picks the new models up on its next togvarsel issue
 # (ML.PREDICT names the models; no redeploy needed). After a retrain, eyeball the tuning table
@@ -31,7 +34,26 @@ run() {
 
 run "$DIR/../create_disruptions.sql"
 for f in "$DIR"/0[0-9]_*.sql; do run "$f"; done
+
+# Refuse to retrain on a calendar about to expire — extend 00_calendar.sql first (§13).
+bq query --nouse_legacy_sql --format=none --project_id="$PROJECT" '
+SELECT IF(MAX(d) < DATE_ADD(CURRENT_DATE("Europe/Oslo"), INTERVAL 60 DAY),
+          ERROR(FORMAT("togvarsel_calendar slutter %t — utvid data/queries/togvarsel/00_calendar.sql før retrening", MAX(d))),
+          TRUE)
+FROM `disruptions.togvarsel_calendar`'
+
 run "$DIR/10_train_models.sql"
+
+# All four candidates trained: promote them to the live names. Model copies are quick metadata
+# jobs, so the window where the family is mixed shrinks from ~25 min of training to seconds
+# (and a failed copy is re-runnable: just re-run this loop).
+for m in am0630 am0700 pm1200 pm1400; do
+  bq cp -f "$PROJECT:disruptions.togvarsel_m_cand_$m" "$PROJECT:disruptions.togvarsel_m_$m" >/dev/null
+  echo "== promoted togvarsel_m_$m =="
+done
+for m in am0630 am0700 pm1200 pm1400; do
+  bq rm -f -m "$PROJECT:disruptions.togvarsel_m_cand_$m"
+done
 
 bq query --nouse_legacy_sql --project_id="$PROJECT" --format=pretty '
 SELECT model_name, l2_reg, ROUND(holdout_log_loss,4) log_loss, ROUND(holdout_auc,3) auc,

@@ -4,9 +4,10 @@
 -- sees trains scheduled up to 06:20), with rates over resolved calls only, so a partially
 -- ingested morning changes the denominator, not the meaning.
 --
--- HOLIDAYS AND SEASONS ARE HARDCODED and must be extended once a year (a known wart, §13 of the
--- findings doc). The serving query (disruptions/api/togvarsel_features_today.sql) carries the
--- SAME lists — extend both together, and keep them covering at least a year past today.
+-- Holiday and low-season flags come from disruptions.togvarsel_calendar (00_calendar.sql — the
+-- single source shared with the serving query). A training day outside the calendar's maintained
+-- range ERRORs the rebuild, so a retrain can never silently treat an unmaintained holiday as an
+-- ordinary day.
 CREATE OR REPLACE TABLE `disruptions.togvarsel_features` AS
 WITH oc AS (
   SELECT DATE(c.aimed_local) d, c.dsj, c.cancelled,
@@ -44,19 +45,14 @@ et AS (
     COUNTIF(h>=4 AND h<13.83 AND cancelled) et_cx_1400
   FROM oc GROUP BY d
 ),
-hol AS (
-  -- Norwegian public holidays + the rail-quiet 24/12 and 31/12, on weekdays in the data window.
-  -- EXTEND YEARLY (together with the serving query's copy).
-  SELECT d FROM UNNEST([DATE '2025-04-17', '2025-04-18', '2025-04-21', '2025-05-01', '2025-05-17', '2025-05-29', '2025-06-09', '2025-12-24', '2025-12-25', '2025-12-26', '2025-12-31', '2026-01-01',
-    '2026-04-02', '2026-04-03', '2026-04-06', '2026-05-01', '2026-05-14', '2026-05-25',
-    '2026-12-24', '2026-12-25', '2026-12-26', '2026-12-31', '2027-01-01',
-    '2027-03-25', '2027-03-26', '2027-03-29', '2027-05-01', '2027-05-06', '2027-05-17']) d
+cal AS (
+  SELECT d, holiday, low_season FROM `disruptions.togvarsel_calendar`
 )
 SELECT dd.d, dd.dow, dd.weekday, EXTRACT(MONTH FROM dd.d) month, EXTRACT(ISOWEEK FROM dd.d) isoweek,
-  (hol.d IS NOT NULL) AS holiday,
-  -- Low season: July + Christmas + Easter weeks. EXTEND YEARLY (with the serving query's copy).
-  (EXTRACT(MONTH FROM dd.d)=7 OR dd.d BETWEEN '2025-12-22' AND '2026-01-02' OR dd.d BETWEEN '2025-04-14' AND '2025-04-21' OR dd.d BETWEEN '2026-03-30' AND '2026-04-06'
-   OR dd.d BETWEEN '2026-12-21' AND '2027-01-03' OR dd.d BETWEEN '2027-03-22' AND '2027-03-29') AS low_season,
+  IF(cal.d IS NULL,
+     ERROR(FORMAT('togvarsel_calendar mangler %t — utvid data/queries/togvarsel/00_calendar.sql', dd.d)),
+     cal.holiday) AS holiday,
+  cal.low_season,
   -- realized outcomes (label sources)
   dd.am_t5, dd.pm_t5, dd.am_t10, dd.pm_t10, dd.am_cancel, dd.pm_cancel, dd.mid_t5, dd.eve_t5, dd.am_n, dd.pm_n,
   -- previous evening
@@ -68,4 +64,4 @@ SELECT dd.d, dd.dow, dd.weekday, EXTRACT(MONTH FROM dd.d) month, EXTRACT(ISOWEEK
 FROM `disruptions.togvarsel_days` dd
 LEFT JOIN et ON et.d = dd.d
 LEFT JOIN `disruptions.togvarsel_sx_day` sx ON sx.d = dd.d
-LEFT JOIN hol ON hol.d = dd.d
+LEFT JOIN cal ON cal.d = dd.d

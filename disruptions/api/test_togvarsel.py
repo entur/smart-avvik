@@ -4,7 +4,8 @@ Hermetic: BigQuery is replaced with a fake that dispatches on the SQL it is hand
 canned rows — nothing here touches BigQuery, the models, or the network. The checks that matter
 most are the gates: a weekend or holiday must never get a forecast (the models never saw such
 days), an issue must never be computed before its clock cutoff, and a failed prediction must
-degrade to "issue missing" rather than a wrong number or a dead endpoint.
+degrade to "issue missing" — never a wrong number or a dead endpoint — then back off instead of
+re-running the billable feature scan every tick.
 
 Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigquery python test_togvarsel.py  (or under pytest)
 """
@@ -48,22 +49,31 @@ def _feature_row(**overrides) -> dict:
     return base
 
 
+class _FakeNotFound(Exception):
+    """Stands in for google.api_core.exceptions.NotFound: the real BigQuery client RAISES when a
+    model or table is missing — it never returns an empty result set for that case."""
+
+
 class _FakeJob:
     def __init__(self, rows):
         self._rows = rows
 
-    def result(self):
+    def result(self, timeout=None):
         return self._rows
 
 
 class _FakeBQ:
     """Dispatches on the SQL text: the feature-rebuild script and bookkeeping writes return no
-    rows; the three reads replay canned data. Records every query for assertions."""
+    rows; the reads replay canned data; an ML.PREDICT against a model not in `probs` raises,
+    like the real client does. Records every query for assertions."""
 
-    def __init__(self, feature_row=None, sx_rows=(), probs=None):
+    def __init__(self, feature_row=None, sx_rows=(), probs=None, calendar_holiday=False,
+                 fail_rebuild=False):
         self.feature_row = feature_row
         self.sx_rows = list(sx_rows)
-        self.probs = probs or {}  # model suffix -> p (missing -> empty result)
+        self.probs = probs or {}  # model suffix -> p (a missing model RAISES)
+        self.calendar_holiday = calendar_holiday  # None -> the calendar has no row for today
+        self.fail_rebuild = fail_rebuild
         self.queries: list[str] = []
         self.inserted: list[str] = []
 
@@ -73,17 +83,23 @@ class _FakeBQ:
             for model, p in self.probs.items():
                 if f"togvarsel_m_{model}" in sql:
                     return _FakeJob([{"p": p}])
-            return _FakeJob([])
-        if "INSERT INTO" in sql:
+            raise _FakeNotFound("model not found")
+        if "MERGE" in sql:
             self.inserted.append(sql)
             return _FakeJob([])
         if "CREATE TABLE IF NOT EXISTS" in sql:
             return _FakeJob([])
+        if sql.strip().startswith("SELECT") and "togvarsel_calendar" in sql:
+            return _FakeJob(
+                [] if self.calendar_holiday is None else [{"holiday": self.calendar_holiday}]
+            )
         if sql.strip().startswith("SELECT") and "togvarsel_features_today" in sql:
             return _FakeJob([self.feature_row] if self.feature_row else [])
         if sql.strip().startswith("SELECT") and "togvarsel_sx_today" in sql:
             return _FakeJob(list(self.sx_rows))
         # the multi-statement feature rebuild script
+        if self.fail_rebuild:
+            raise _FakeNotFound("rebuild failed")
         return _FakeJob([])
 
 
@@ -175,10 +191,16 @@ def test_refresh_computes_due_issues_and_records_them():
     assert set(issues) == {"0630", "0700"}
     assert issues["0630"].level == "green" and issues["0630"].p == 0.05
     assert issues["0700"].level == "red"
+    # 07:10 is 40 min past the 06:30 cutoff (a back-fill, hindsight risk) but only 10 min past
+    # 07:00 — within the grace, so on time
+    assert issues["0630"].late is True
+    assert issues["0700"].late is False
     # one feature rebuild (the script), then reads + predicts; the forecasts were recorded
+    # idempotently (MERGE keyed on (d, issue) — a restart's recompute can never duplicate a row)
     scripts = [q for q in fake.queries if "Live togvarsel features" in q]
     assert len(scripts) == 1
     assert len(fake.inserted) == 2
+    assert all("MERGE" in q and "WHEN NOT MATCHED" in q for q in fake.inserted)
 
 
 def test_refresh_is_idempotent_within_the_day():
@@ -196,7 +218,9 @@ def test_refresh_backfills_after_a_restart():
     _reset(fake)
     togvarsel.refresh(now=MONDAY_1430)
     with togvarsel._lock:
-        assert set(togvarsel._state["issues"]) == {"0630", "0700", "1200", "1400"}
+        issues = dict(togvarsel._state["issues"])
+    assert set(issues) == {"0630", "0700", "1200", "1400"}
+    assert all(i.late for i in issues.values())  # every one saw post-cutoff reality
 
 
 def test_weekend_runs_no_queries():
@@ -220,12 +244,69 @@ def test_holiday_row_blocks_the_forecast():
     assert len(fake.queries) == n
 
 
-def test_missing_prediction_degrades_to_missing_issue():
+def test_missing_model_degrades_to_missing_issue_and_backs_off():
+    """One model raising (prd before the model copy landed) must not drop the issues that DID
+    compute, must not duplicate their audit rows, and must not re-run the billable feature
+    rebuild every tick while it stays broken."""
     fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.05})  # am0700 model absent
     _reset(fake)
     togvarsel.refresh(now=MONDAY_0710)
     with togvarsel._lock:
         assert set(togvarsel._state["issues"]) == {"0630"}
+    assert len(fake.inserted) == 1
+    # cooldown: the very next tick runs no queries at all for the failed issue
+    n = len(fake.queries)
+    togvarsel.refresh(now=MONDAY_0710.replace(minute=11))
+    assert len(fake.queries) == n
+    # after the cooldown the issue is retried — and recovers when the model is back
+    fake.probs["am0700"] = 0.2
+    togvarsel.refresh(now=MONDAY_0710.replace(minute=40))
+    with togvarsel._lock:
+        issues = dict(togvarsel._state["issues"])
+    assert set(issues) == {"0630", "0700"}
+    assert issues["0700"].late is True  # recovered 40 min past its cutoff: hindsight-flagged
+    assert len(fake.inserted) == 2  # 0630 was NOT re-recorded
+
+
+def test_persistent_failure_gives_up_for_the_day():
+    fake = _FakeBQ(feature_row=_feature_row(), probs={})  # every model absent
+    _reset(fake)
+    t = MONDAY_0710
+    for _ in range(togvarsel._MAX_FAILS_PER_DAY):
+        togvarsel.refresh(now=t)
+        t += togvarsel._FAIL_COOLDOWN
+    scripts = [q for q in fake.queries if "Live togvarsel features" in q]
+    assert len(scripts) == togvarsel._MAX_FAILS_PER_DAY
+    togvarsel.refresh(now=t + togvarsel._FAIL_COOLDOWN)  # given up: not even a rebuild
+    assert len([q for q in fake.queries if "Live togvarsel features" in q]) == len(scripts)
+
+
+def test_feature_rebuild_failure_backs_off():
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.05}, fail_rebuild=True)
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_0710)
+    with togvarsel._lock:
+        assert togvarsel._state["issues"] == {}
+    n = len(fake.queries)
+    togvarsel.refresh(now=MONDAY_0710.replace(minute=12))  # cooldown: no immediate retry
+    assert len(fake.queries) == n
+
+
+def test_calendar_probe_flags_a_holiday_before_the_first_issue():
+    """The rollover probe reads togvarsel_calendar, so a holiday says 'helligdag' from the first
+    tick of the day — not first when the 06:30 feature rebuild happens to run."""
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.5}, calendar_holiday=True)
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_0710.replace(hour=0, minute=5))
+    with togvarsel._lock:
+        assert togvarsel._state["holiday"] is True
+    assert not any("Live togvarsel features" in q for q in fake.queries)
+    m = togvarsel.build_melding(MONDAY_0710.replace(hour=0, minute=6))
+    assert m.forecast_day is False and "Helligdag" in m.no_forecast_reason
+    # and the rest of the day stays quiet
+    n = len(fake.queries)
+    togvarsel.refresh(now=MONDAY_0710)
+    assert len(fake.queries) == n
 
 
 def test_day_rollover_resets_state():
@@ -250,8 +331,22 @@ def test_build_melding_weekday_shape():
     assert m.forecast_day is True
     assert [i.issue for i in m.issues] == ["0630", "0700"]
     assert m.next_issue == "1200"
+    assert m.overdue_issues == []
     assert m.pm_outlook is not None and "forhøyet" in m.pm_outlook  # 07:00 was red
     assert m.skill_note
+
+
+def test_build_melding_distinguishes_overdue_from_not_yet_due():
+    """#8 in the launch review: 'due but missing' must be visible in the payload, or the page
+    shows 'first forecast coming soon' at 20:00 on a broken day."""
+    _reset(_FakeBQ())  # nothing ever computed
+    early = togvarsel.build_melding(MONDAY_0710.replace(hour=6, minute=0))
+    assert early.overdue_issues == [] and early.next_issue == "0630"
+    in_grace = togvarsel.build_melding(MONDAY_0710.replace(hour=6, minute=35))
+    assert in_grace.overdue_issues == []  # 5 min past the cutoff: still just in flight
+    evening = togvarsel.build_melding(MONDAY_0710.replace(hour=20, minute=0))
+    assert evening.overdue_issues == ["0630", "0700", "1200", "1400"]
+    assert evening.next_issue is None and evening.forecast_day is True
 
 
 def test_build_melding_weekend():

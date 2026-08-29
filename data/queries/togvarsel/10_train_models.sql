@@ -9,6 +9,9 @@
 --   togvarsel_m_pm1200   P(bad PM rush 15:00–18:00)      from the 12:00 state  (no categories — §14b: PM categories fail placebo)
 --   togvarsel_m_pm1400   P(bad PM rush 15:00–18:00)      from the 14:00 state  (no categories)
 --
+-- The final fits land in togvarsel_m_cand_* (candidates); retrain.sh copies them onto the live
+-- togvarsel_m_* names only after all four trained, so the serving set is never half-replaced.
+--
 -- The log1p rule is BY PREFIX (cat_/catj_/sx_/et_cx/et_n/early_cx — the study's COUNT_PREFIX),
 -- baked into each model's TRANSFORM so ML.PREDICT takes RAW feature columns. l2_reg is chosen by
 -- holdout log-loss (smoother than AUC on ~40 days), ties broken toward the stronger penalty —
@@ -104,9 +107,11 @@ FOR m IN (SELECT mname, label, cols FROM UNNEST(specs)) DO
   UPDATE `disruptions.togvarsel_tuning` SET chosen = TRUE
   WHERE model_name = m.mname AND l2_reg = best_l2;
 
-  -- Final fit: everything eligible, tuning holdout folded back in, split disabled.
+  -- Final fit: everything eligible, tuning holdout folded back in, split disabled. Trains a
+  -- CANDIDATE; retrain.sh promotes all four to togvarsel_m_* only after this whole script has
+  -- succeeded, so a failed retrain leaves the live model family untouched (never mixed old/new).
   EXECUTE IMMEDIATE FORMAT("""
-      CREATE OR REPLACE MODEL `disruptions.togvarsel_m_%s`
+      CREATE OR REPLACE MODEL `disruptions.togvarsel_m_cand_%s`
       TRANSFORM(
         %s,
         label)
