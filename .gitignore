@@ -10,6 +10,8 @@ __marimo__/
 # run BigQuery under a developer's ADC, so they can't be built in the image or CI.
 # They are rendered offline (export_eval.sh) and committed, then shipped in the
 # image. Refresh by running disruptions/api/export_eval.sh, then commit and push.
+# disruptions/api/togmelding_static/ is likewise NOT ignored: a single hand-written
+# HTML page with no build step, committed and shipped as-is.
 
 # Built into the image by the root Dockerfile's node stage; not committed.
 disruptions/api/demo_static/
