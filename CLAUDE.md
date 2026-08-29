@@ -1029,3 +1029,5 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `varsel_decision_outcomes` breaks the registered scheduled query** until it is re-registered.
 - Consider cost before running BigQuery operations. Ask for permission before running anything more expensive than $10.
 - In docs/kix-docs, references to R1, R2 etc refers to the documents docs/kix-docs/docs/Context/r1-entur-rolle-og-mandat.md, docs/kix-docs/docs/Context/r2-entur-teknisk-deep-dive.md etc.
+- All commit messages, PRs (including titles) and code comments should be written in English. Documentation can
+  be either English or Norwegian, depending on the intended audience.
