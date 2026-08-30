@@ -999,6 +999,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   (`data/queries/togvarsel/00_calendar.sql`) — extend yearly; serving ERRORs loudly past its
   horizon and retrain.sh refuses under 60 days of headroom. The page itself is one committed HTML
   file (`disruptions/api/togmelding_static/`, the eval_static pattern — no build step).
+  **Each issue card carries the /varsel feedback widget** (2026-08-30): `togmelding_today` mints
+  one `feedback_contexts` capability per issued forecast — on the request path only, never in
+  `refresh()`/`build_melding()`, and on a COPY of the cached Issue, so `issued_today()`'s notify
+  seam stays a pure forecast — and the page posts to the shared `POST /varsel-api/feedback`, so
+  the gate (`feedback.enabled()`, dev-only today), rate limits, receipts, PostHog event and the
+  data/feedback exporter/reviewer are all varsel's, unchanged. Rows are discriminated the
+  documented way — `display_source='togvarsel'`, `situation_number = KIX:Togvarsel:<date>:<issue>`
+  — never a new column or event name (a new event would drop them out of every existing export
+  query, the meldinger-rename lesson). The snapshot quotes the page's literal rendering
+  (`togvarsel._LEVEL_TEXT` mirrors the page's `LEVEL_TEXT`, JS-round parity on the percentage) and
+  its key set is pinned against the contexts DDL in `test_togvarsel.py` — a key the table lacks
+  fails the streamed insert invisibly (the 2026-08-27 mode). Page-side, widget state lives outside
+  the DOM keyed by context_id and `load()` skips re-rendering an unchanged payload: fingerprint
+  dedup keeps the context ids — and therefore the payload — byte-stable between forecast changes,
+  which is what lets a half-typed comment survive the 5-minute poll.
 
 - **Togvarsel push rounds** (`disruptions/api/togvarsel_notify.py`, 2026-08-30) deliver
   Togmeldingen's prognoses as /varsel Web Pushes. Each of the four weekday issues is one

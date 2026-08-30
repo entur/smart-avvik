@@ -38,6 +38,22 @@
   .kjent { font-size: 14px; padding: 8px 0; border-top: 1px solid var(--line); }
   .kjent:first-of-type { border-top: 0; }
   #error { color: var(--red); }
+  .fb { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(0, 0, 0, 0.08);
+        font-size: 14px; }
+  .fb-q { margin: 0 0 6px; color: var(--muted); }
+  .fb button { font: inherit; font-size: 14px; padding: 3px 14px; border: 1px solid var(--muted);
+               border-radius: 8px; background: #fff; color: var(--ink); cursor: pointer; }
+  .fb button[aria-pressed="true"] { border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink);
+                                    font-weight: 600; }
+  .fb button:disabled { opacity: 0.5; cursor: default; }
+  .fb-actions { display: flex; gap: 8px; }
+  .fb-comment { margin-top: 8px; }
+  .fb-comment textarea { width: 100%; font: inherit; font-size: 14px; border: 1px solid var(--muted);
+                         border-radius: 8px; padding: 6px 8px; resize: vertical; background: #fff; }
+  .fb-comment button { margin-top: 4px; }
+  .fb-status { margin-top: 6px; color: var(--muted); display: flex; gap: 8px; align-items: center;
+               flex-wrap: wrap; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
@@ -70,6 +86,169 @@ function el(tag, cls, text) {
 
 const fmtT = k => k.slice(0, 2) + ":" + k.slice(2);
 
+/* --- Feedback («Var denne prognosen nyttig?») -------------------------------------------------
+   Posts to the shared /varsel-api/feedback endpoint. The server minted the context_id the card
+   carries (one per issued forecast), so a rating joins the exact rendering without any
+   identifier of the visitor; response_id is fresh per page load, exactly as in the /varsel PWA.
+   State lives OUTSIDE the DOM, keyed by context_id: render() rebuilds every card, and a rebuild
+   must restore a half-typed comment or an in-flight submission rather than reset it. The
+   submission machinery is the PWA's AlertFeedback pump, serialized per context: while a request
+   is in flight the latest desired (rating, comment) is remembered and sent when it returns. */
+const FB_MAX_COMMENT = 500;
+const FB_STATUS_TEXT = {
+  idle: "",
+  submitting: "Sender tilbakemeldingen …",
+  rated: "Takk! Vurderingen er lagret.",
+  saved: "Takk! Kommentaren er lagret.",
+  retryable: "Tilbakemeldingen ble ikke lagret. Prøv igjen.",
+  throttled: "Det er mange tilbakemeldinger akkurat nå. Vent litt og prøv igjen.",
+  expired: "Prognosen er oppdatert. Denne tilbakemeldingen ble ikke lagret.",
+  disabled: "Tilbakemeldinger er midlertidig utilgjengelige.",
+};
+const fbStates = new Map();    // context_id -> submission state (outlives re-renders)
+const fbUpdaters = new Map();  // context_id -> refresh the CURRENT widget DOM from that state
+
+function fbState(id) {
+  let st = fbStates.get(id);
+  if (!st) {
+    st = { rating: null, comment: "", phase: "idle", responseId: crypto.randomUUID(),
+           receipt: null, acceptedRevision: 0, sending: false, desired: null, pending: null };
+    fbStates.set(id, st);
+  }
+  return st;
+}
+
+const fbKey = w => w.rating + "\u0000" + w.comment;
+function fbRefresh(id) { const u = fbUpdaters.get(id); if (u) u(); }
+
+async function fbPump(id) {
+  const st = fbState(id);
+  if (st.sending) return;
+  const wanted = st.desired;
+  // Reuse a pending submission only while it still matches what the user wants — a kept event_id
+  // makes the retry idempotent server-side ($insert_id), a changed snapshot gets a fresh one.
+  let next = st.pending && wanted && st.pending.key === fbKey(wanted) ? st.pending : null;
+  if (st.pending && !next) st.pending = null;
+  if (!next) {
+    if (!wanted) return;
+    next = { context_id: id, response_id: st.responseId, event_id: crypto.randomUUID(),
+             revision: st.acceptedRevision + 1, rating: wanted.rating,
+             comment: wanted.comment || null, receipt: st.receipt, key: fbKey(wanted) };
+    st.pending = next;
+  }
+  st.sending = true;
+  st.phase = "submitting";
+  fbRefresh(id);
+  let result;
+  try {
+    const resp = await fetch("/varsel-api/feedback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ context_id: next.context_id, response_id: next.response_id,
+        event_id: next.event_id, revision: next.revision, rating: next.rating,
+        comment: next.comment, receipt: next.receipt }),
+    });
+    result = resp.ok ? await resp.json() : { status: "downstream" };
+  } catch (e) {
+    result = { status: "downstream" };
+  }
+  st.sending = false;
+  if (result.status !== "saved") {
+    st.phase = { expired: "expired", invalid_receipt: "expired", disabled: "disabled",
+                 throttled: "throttled" }[result.status] || "retryable";
+    fbRefresh(id);
+    return;
+  }
+  st.acceptedRevision = Math.max(st.acceptedRevision, result.revision || next.revision);
+  if (result.receipt) st.receipt = result.receipt;
+  st.pending = null;
+  const queued = st.desired && fbKey(st.desired) !== next.key;
+  st.phase = queued ? "submitting" : (next.comment ? "saved" : "rated");
+  fbRefresh(id);
+  if (queued) fbPump(id);
+}
+
+function fbQueue(id, wanted) {
+  fbState(id).desired = wanted;
+  fbPump(id);
+}
+
+function feedbackBlock(id) {
+  if (!crypto.randomUUID) return null;  // no UUID, no valid submission — offer nothing
+  const st = fbState(id);
+  const root = el("div", "fb");
+  root.appendChild(el("p", "fb-q", "Var denne prognosen nyttig?"));
+
+  const group = el("div", "fb-actions");
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", "Vurder denne prognosen");
+  const yes = el("button", null, "Ja");
+  const no = el("button", null, "Nei");
+  yes.type = no.type = "button";
+  yes.setAttribute("aria-label", "Ja, prognosen var nyttig");
+  no.setAttribute("aria-label", "Nei, prognosen var ikke nyttig");
+  group.appendChild(yes);
+  group.appendChild(no);
+  root.appendChild(group);
+
+  const commentWrap = el("div", "fb-comment");
+  const ta = document.createElement("textarea");
+  ta.maxLength = FB_MAX_COMMENT;
+  ta.rows = 3;
+  ta.value = st.comment;
+  ta.setAttribute("aria-label", "Kommentar (valgfritt)");
+  const help = el("div", "note");
+  const save = el("button", null, "Lagre kommentar");
+  save.type = "button";
+  commentWrap.appendChild(ta);
+  commentWrap.appendChild(help);
+  commentWrap.appendChild(save);
+  root.appendChild(commentWrap);
+
+  const statusWrap = el("div", "fb-status");
+  statusWrap.setAttribute("aria-live", "polite");
+  statusWrap.setAttribute("aria-atomic", "true");
+  const statusText = el("span");
+  const retryBtn = el("button", null, "Prøv igjen");
+  const refreshBtn = el("button", null, "Oppdater");
+  retryBtn.type = refreshBtn.type = "button";
+  statusWrap.appendChild(statusText);
+  statusWrap.appendChild(retryBtn);
+  statusWrap.appendChild(refreshBtn);
+  root.appendChild(statusWrap);
+
+  function update() {
+    const unavailable = st.phase === "expired" || st.phase === "disabled";
+    yes.disabled = no.disabled = unavailable;
+    yes.setAttribute("aria-pressed", String(st.rating === "up"));
+    no.setAttribute("aria-pressed", String(st.rating === "down"));
+    commentWrap.hidden = !st.rating;
+    ta.disabled = unavailable;
+    save.disabled = unavailable || st.sending;
+    help.textContent = "Ikke skriv personopplysninger. " +
+      st.comment.length + "/" + FB_MAX_COMMENT + " tegn.";
+    statusText.textContent = FB_STATUS_TEXT[st.phase] || "";
+    retryBtn.hidden = !(st.phase === "retryable" || st.phase === "throttled");
+    // «Oppdater» re-fetches: an expired context is re-minted server-side under a NEW id, so the
+    // changed payload re-renders the card with a live widget (a reload would too, this is gentler).
+    refreshBtn.hidden = st.phase !== "expired";
+  }
+
+  yes.addEventListener("click", () => { st.rating = "up"; fbQueue(id, { rating: "up", comment: st.comment }); });
+  no.addEventListener("click", () => { st.rating = "down"; fbQueue(id, { rating: "down", comment: st.comment }); });
+  ta.addEventListener("input", () => { st.comment = ta.value.slice(0, FB_MAX_COMMENT); update(); });
+  save.addEventListener("click", () => {
+    if (!st.rating || st.comment.length > FB_MAX_COMMENT) return;
+    fbQueue(id, { rating: st.rating, comment: st.comment });
+  });
+  retryBtn.addEventListener("click", () => fbPump(id));
+  refreshBtn.addEventListener("click", () => load());
+
+  fbUpdaters.set(id, update);
+  update();
+  return root;
+}
+
 function issueCard(i) {
   const card = el("section", "card issue " + i.level);
   const dot = el("div", "dot", LEVEL_LABEL[i.level] || "?");
@@ -84,6 +263,10 @@ function issueCard(i) {
     body.appendChild(el("div", "note", "Beregnet i etterkant, kl. " +
       new Date(i.computed_at).toLocaleTimeString("no-NO",
         { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Oslo" }) + "."));
+  }
+  if (i.feedback_enabled && i.feedback_context_id) {
+    const fb = feedbackBlock(i.feedback_context_id);
+    if (fb) body.appendChild(fb);
   }
   card.appendChild(dot); card.appendChild(body);
   return card;
@@ -155,12 +338,19 @@ function render(m) {
   document.getElementById("skill").textContent = m.skill_note || "";
 }
 
+let lastPayload = null;
 async function load() {
   try {
     const resp = await fetch("/togmelding-api/today", { cache: "no-store" });
     if (!resp.ok) throw new Error(resp.status);
-    render(await resp.json());
+    const text = await resp.text();
     document.getElementById("error").hidden = true;
+    // Unchanged payload: don't rebuild the cards under a half-typed comment. The payload is
+    // byte-stable between forecast changes because the server dedups feedback contexts by
+    // snapshot fingerprint, so the same rendering keeps the same context_id across polls.
+    if (text === lastPayload) return;
+    lastPayload = text;
+    render(JSON.parse(text));
   } catch (e) {
     document.getElementById("error").hidden = false;
   }

@@ -49,6 +49,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import feedback  # the /varsel feedback stack; gates and mints are shared, see togmelding_today
+import feedback_contexts
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
@@ -136,6 +138,16 @@ class Issue(BaseModel):
         default=False,
         description="Computed more than 10 min after its due time (restart/backoff back-fill, "
         "so it saw post-cutoff reality) — skill audits must exclude these",
+    )
+    # Set on the /togmelding-api/today response only, on a COPY (_with_feedback_context): the
+    # cached Issue is shared with issued_today()'s notify seam and stays a pure forecast.
+    feedback_context_id: str | None = Field(
+        default=None,
+        description="Opaque, short-lived handle for the exact forecast rendering; null when disabled.",
+    )
+    feedback_enabled: bool = Field(
+        default=False,
+        description="Whether this server currently accepts isolated feedback for this forecast.",
     )
 
 
@@ -535,6 +547,78 @@ def build_melding(now: datetime) -> Togmelding:
     )
 
 
+# Literal level line mirrored from the static page renderer (LEVEL_TEXT in
+# togmelding_static/index.html) — the varsel._feedback_detail convention: the persisted snapshot
+# must say what the traveller actually read, not a paraphrase of it.
+# test_feedback_snapshot_mirrors_the_static_page pins the mirror.
+_LEVEL_TEXT = {
+    "green": "liten fare for forstyrrelser",
+    "yellow": "noe usikkert",
+    "red": "stor fare for forstyrrelser",
+}
+
+
+def _feedback_snapshot(issue: Issue, d: date) -> dict[str, Any]:
+    """The exact rendering of one issued forecast, shaped for the shared feedback context table.
+
+    Same key set as varsel's per-alert snapshot — these ARE varsel_feedback_contexts' columns, and
+    persist() writes them positionlessly by name — with the forecast discriminated the documented
+    way: display_source='togvarsel' and a KIX:Togvarsel:<date>:<issue> situation number, never a
+    new column or PostHog event (a new event name would drop these rows out of the existing
+    exporter/reviewer, exactly the meldinger-rename lesson). Every value is a pure function of the
+    issued Issue, so the fingerprint is byte-stable across requests and the page's 5-minute
+    polling refreshes one lease per issue instead of minting fresh contexts.
+    """
+    return {
+        "display_source": "togvarsel",
+        # JavaScript Math.round (used by the page) rounds non-negative .5 upward; Python's round
+        # uses ties-to-even and would make the persisted "exact" text disagree at half percents.
+        "displayed_text": f"{_LEVEL_TEXT.get(issue.level, issue.level)}"
+        f" (ca. {int(issue.p * 100 + 0.5)} % sjanse for mye trøbbel)",
+        "detail_text": f"Kl. {issue.issue[:2]}:{issue.issue[2:]} — {issue.scope}",
+        "observation_text": None,
+        "situation_number": f"KIX:Togvarsel:{d.isoformat()}:{issue.issue}",
+        "operator": "VYG",  # the forecast's whole scope: Vy's Oslo locals
+        "line": None,
+        "departure_time": None,
+        "journey_context": None,
+        "message_input": None,
+        "llm_provider": None,
+        "llm_model": None,
+        "prompt_version": None,
+        "message_status": None,
+        "prediction": {
+            "issue": issue.issue,
+            "scope": issue.scope,
+            "p": issue.p,
+            "level": issue.level,
+            # The reasons are traveller-visible (the card's bullet list), so they belong in the
+            # snapshot: a "not useful" beside a wrong-sounding reason is the actionable reading.
+            "reasons": issue.reasons,
+            "computed_at": issue.computed_at.isoformat(),
+            "late": issue.late,
+        },
+        "policy": {"green_max": GREEN_MAX, "red_min": RED_MIN},
+        "delivery": {"surface": "togmelding"},
+    }
+
+
+def _with_feedback_context(issue: Issue, d: date) -> Issue:
+    """A copy of the cached Issue carrying a feedback capability for this exact rendering."""
+    context_id = feedback_contexts.mint(_feedback_snapshot(issue, d))
+    # mint() returns None when the context cache is full; the card then simply offers no widget.
+    return issue.model_copy(
+        update={"feedback_context_id": context_id, "feedback_enabled": context_id is not None}
+    )
+
+
 @router.get("/togmelding-api/today", response_model=Togmelding)
 def togmelding_today() -> Togmelding:
-    return build_melding(datetime.now(_OSLO))
+    """The page payload, each issued forecast annotated with a feedback capability when the
+    /varsel feedback stack is configured (dev today; the flag and secrets are per-environment).
+    Minting happens here on the request path — never in refresh() or build_melding(), which the
+    poller and the notify chain also feed from — and on copies, so `_state` stays clean."""
+    melding = build_melding(datetime.now(_OSLO))
+    if melding.issues and feedback.enabled():
+        melding.issues = [_with_feedback_context(i, melding.date) for i in melding.issues]
+    return melding
