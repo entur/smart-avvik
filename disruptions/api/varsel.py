@@ -369,6 +369,7 @@ class ConnectivityProvider(Protocol):
 _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 _connectivity_provider: ConnectivityProvider | None = None
+_togvarsel_notify_provider: Callable[[], bool] | None = None
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -380,16 +381,20 @@ def configure(
     impact_provider: ImpactProvider,
     stops_provider: Callable[[], list[dict]],
     connectivity_provider: ConnectivityProvider | None = None,
+    togvarsel_notify_provider: Callable[[], bool] | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
     `connectivity_provider` is optional: without it, registrations are simply not checked, which is
-    what every deploy did before the check existed.
+    what every deploy did before the check existed. `togvarsel_notify_provider` is main's
+    TOGVARSEL_NOTIFY_ENABLED read, surfaced through /config so the PWA can announce the rush
+    forecasts only where they are actually delivered; absent reads as off.
     """
-    global _impact_provider, _stops_provider, _connectivity_provider
+    global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
+    _togvarsel_notify_provider = togvarsel_notify_provider
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -2717,6 +2722,13 @@ class ConfigResponse(BaseModel):
     feedback_enabled: bool = Field(
         default=False, description="Whether per-alert usefulness feedback is available."
     )
+    togvarsel_notify: bool = Field(
+        default=False,
+        description=(
+            "Whether subscriptions here also receive Oslo rush-hour forecast pushes "
+            "(TOGVARSEL_NOTIFY_ENABLED); the PWA shows its notice only when true."
+        ),
+    )
 
 
 class StopItem(BaseModel):
@@ -2861,6 +2873,9 @@ async def config() -> ConfigResponse:
         vapid_public_key=_VAPID_PUBLIC_KEY if push_enabled() else None,
         environment=environment_label(),
         feedback_enabled=feedback.enabled(),
+        togvarsel_notify=(
+            _togvarsel_notify_provider() if _togvarsel_notify_provider is not None else False
+        ),
     )
 
 

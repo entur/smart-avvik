@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { SkipToContent } from '@entur/a11y';
 import { Contrast } from '@entur/layout';
 import { Logo } from '@entur/menu';
-import { Heading1, Heading3, LeadParagraph, Paragraph } from '@entur/typography';
+import { Heading1, Heading3, LeadParagraph, Link, Paragraph } from '@entur/typography';
 import { PrimaryButton } from '@entur/button';
 import { AddIcon } from '@entur/icons';
 import { Loader } from '@entur/loader';
@@ -175,6 +175,26 @@ export default function App({ brand }: { brand: Brand }) {
         ) : (
           <>
             {config && <VarselStatus config={config} deviceId={deviceId} brand={brand} />}
+
+            {/* Shown only where the server actually delivers rush-forecast pushes
+                (TOGVARSEL_NOTIFY_ENABLED via /config): existing subscribers opted into
+                train-specific avviksvarsel, so a new push class gets announced before it
+                arrives. The Togmeldingen link is Entur-branded and stays off the unbranded
+                variant — matching the pushes themselves, whose unbranded click-through also
+                skips /togmelding. */}
+            {config?.togvarsel_notify && (
+              <SmallAlertBox variant="information" title="Nytt: rushvarsel" width="fluid">
+                Varslene omfatter nå også togtrafikken i rushtiden: på hverdager får du beskjed
+                når prognosen for morgen- eller ettermiddagsrushet i Oslo-området er gul eller
+                rød og en av de registrerte reisene dine kan bli berørt.
+                {brand.id === 'entur' && (
+                  <>
+                    {' '}
+                    <Link href="/togmelding">Se dagens togmelding</Link>
+                  </>
+                )}
+              </SmallAlertBox>
+            )}
 
             {error && (
               <SmallAlertBox variant="negative" width="fluid">
