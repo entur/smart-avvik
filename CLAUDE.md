@@ -1010,13 +1010,15 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Norwegian from the issue's own fields (no LLM), titled `Rushvarsel`/`Oppdatert
   rushvarsel`/`Friskmelding` so a red morning's SX push and forecast push stay tellable apart;
   entur-brand pushes click through to `/togmelding`. Delivery is gated by
-  `TOGVARSEL_NOTIFY_ENABLED` (allow-list parse; **unset = off**; helm base off, dev on), and while
-  off nothing is evaluated and no state written, so an enable-restart inside a window still
-  delivers. Turning it on outside dev needs more than the flag: on prd the 39-station geography
-  `disruptions.togvarsel_oslo_stations` (fetched once per Oslo day, DEFINES matching, never
-  duplicated in Python) exists only after `copy_runtime_to_prd.sh` — and existing subscribers
-  opted into train-specific alerts, so the deferred /varsel UI notice ("your subscription now
-  includes rush forecasts") must land first. State is one primitive: round markers
+  `TOGVARSEL_NOTIFY_ENABLED` (allow-list parse; **unset = off**; helm base off, dev on since
+  launch, prd on since 2026-08-30, tst off), and while off nothing is evaluated and no state
+  written, so an enable-restart inside a window still delivers. Turning it on in an environment
+  needs more than the flag: the 39-station geography `disruptions.togvarsel_oslo_stations`
+  (fetched once per Oslo day, DEFINES matching, never duplicated in Python) exists on prd only
+  after `copy_runtime_to_prd.sh` — and existing subscribers opted into train-specific alerts, so
+  the /varsel page announces the new push class ("Nytt: rushvarsel", shown only where /config
+  reports `togvarsel_notify: true`, which follows this same flag via a provider injected in
+  `varsel.configure`). State is one primitive: round markers
   `{date: {issue: {level, pushed}}}` in the varsel state blob — dedup (a marked round never
   re-fires, suppressions included) and the follow-up baseline in one; markers commit in memory
   before fan-out and persist after, so a crash mid-round inside the timeliness window can
