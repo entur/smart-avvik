@@ -13,6 +13,7 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
 from __future__ import annotations
 
 from datetime import date, datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import togvarsel
@@ -366,6 +367,120 @@ def test_endpoint_serves():
     assert resp.status_code == 200
     body = resp.json()
     assert {"date", "forecast_day", "issues", "known_deviations", "skill_note"} <= set(body)
+
+
+def _rekey_state_to_the_real_clock() -> None:
+    """The endpoint reads datetime.now(); the fakes seed a fixed Monday. Re-keying the cached
+    day makes build_melding treat the canned issues as today's, whatever day the suite runs."""
+    with togvarsel._lock:
+        togvarsel._state["date"] = datetime.now(_OSLO).date()
+
+
+def test_endpoint_mints_one_feedback_context_per_issued_forecast():
+    """When the /varsel feedback stack is configured, each issued forecast on the payload carries
+    its own short-lived capability — and three things about the minting are load-bearing. The id
+    is STABLE across requests (feedback_contexts dedups byte-equivalent snapshots), which is what
+    lets the page skip re-renders on an unchanged payload and keeps the cache at one entry per
+    forecast instead of one per poll. The persisted snapshot says exactly what the card rendered,
+    discriminated the documented way: display_source='togvarsel' and a KIX:Togvarsel: situation
+    number, never a new column or event. And the annotation lands on a COPY — the cached Issue,
+    and therefore issued_today()'s notify seam, must stay a pure forecast."""
+    import feedback
+    import feedback_contexts
+
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.15, "am0700": 0.34})
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_0710)
+    _rekey_state_to_the_real_clock()
+    feedback_contexts._reset_for_tests()
+    original_enabled = feedback.enabled
+    feedback.enabled = lambda: True
+    try:
+        app = FastAPI()
+        app.include_router(togvarsel.router)
+        client = TestClient(app)
+        first = client.get("/togmelding-api/today").json()
+        second = client.get("/togmelding-api/today").json()
+        issues = {i["issue"]: i for i in first["issues"]}
+        assert set(issues) == {"0630", "0700"}
+        assert all(i["feedback_enabled"] and i["feedback_context_id"] for i in issues.values())
+        assert issues["0630"]["feedback_context_id"] != issues["0700"]["feedback_context_id"]
+        assert second["issues"] == first["issues"]  # stable ids -> byte-stable cards across polls
+
+        snapshot = feedback_contexts.resolve(issues["0700"]["feedback_context_id"])
+        assert snapshot["display_source"] == "togvarsel"
+        assert snapshot["situation_number"] == f"KIX:Togvarsel:{first['date']}:0700"
+        # the literal page rendering, JS-rounded (0.34 -> 34; >= RED_MIN 0.30 -> red)
+        assert snapshot["displayed_text"] == "stor fare for forstyrrelser (ca. 34 % sjanse for mye trøbbel)"
+        assert snapshot["detail_text"] == "Kl. 07:00 — resten av morgenrushet 07:00–09:00"
+        assert snapshot["operator"] == "VYG"
+        assert snapshot["journey_context"] is None and snapshot["message_input"] is None
+        assert snapshot["prediction"]["level"] == "red" and snapshot["prediction"]["reasons"]
+        assert snapshot["policy"] == {"green_max": togvarsel.GREEN_MAX, "red_min": togvarsel.RED_MIN}
+        assert snapshot["delivery"] == {"surface": "togmelding"}
+
+        for issue in togvarsel.issued_today(now=datetime.now(_OSLO)):
+            assert issue["feedback_context_id"] is None
+            assert issue["feedback_enabled"] is False
+    finally:
+        feedback.enabled = original_enabled
+        feedback_contexts._reset_for_tests()
+
+
+def test_endpoint_offers_no_feedback_when_the_stack_is_off():
+    """feedback.enabled() False — the default everywhere the flag and secrets are not provisioned
+    — means null/false fields and NOTHING minted: the page renders no widget, and the endpoint
+    spends no context-cache entry per poll on a deployment where a submission could only 'disabled'."""
+    import feedback
+    import feedback_contexts
+
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.15})
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_0710)
+    _rekey_state_to_the_real_clock()
+    feedback_contexts._reset_for_tests()
+    original_enabled = feedback.enabled
+    feedback.enabled = lambda: False
+    try:
+        app = FastAPI()
+        app.include_router(togvarsel.router)
+        (issue,) = TestClient(app).get("/togmelding-api/today").json()["issues"]
+        assert issue["feedback_context_id"] is None and issue["feedback_enabled"] is False
+        assert feedback_contexts._by_id == {}
+    finally:
+        feedback.enabled = original_enabled
+
+
+def test_feedback_snapshot_matches_the_context_table_columns():
+    """feedback_contexts.persist() writes the snapshot into varsel_feedback_contexts BY KEY; a key
+    the table does not have makes the streamed insert fail — logged and swallowed while the rating
+    still reaches PostHog, exactly the invisible 2026-08-27 failure mode that module's header
+    documents — so pin the key set against the DDL the app runs at startup."""
+    import re
+
+    import feedback_contexts
+
+    columns = set(re.findall(r"^\s{2}(\w+)\s", feedback_contexts._DDL, re.MULTILINE))
+    assert "display_source" in columns  # the parse found the column list, not noise
+    issue = togvarsel.Issue(
+        issue="0630", scope="morgenrushet 06:30–09:00", p=0.05, level="green",
+        reasons=["Ingen tegn til trøbbel."], computed_at=MONDAY_0710,
+    )
+    snapshot = togvarsel._feedback_snapshot(issue, date(2026, 8, 31))
+    assert set(snapshot) == columns - {"context_id", "context_date", "persisted_at"}
+
+
+def test_feedback_snapshot_mirrors_the_static_page():
+    """_LEVEL_TEXT and the percentage phrase are COPIES of the page's own rendering — the snapshot
+    must say what the traveller actually read, so an edit to either side must show up here (the
+    cheap grep guard; nothing executes the page's JS). Also pins the wiring the widget depends on:
+    the shared submission endpoint and the two payload fields the card gates on."""
+    page = (Path(togvarsel.__file__).parent / "togmelding_static" / "index.html").read_text()
+    for text in togvarsel._LEVEL_TEXT.values():
+        assert text in page, f"page no longer renders the level text {text!r}"
+    assert " % sjanse for mye trøbbel)" in page
+    assert "/varsel-api/feedback" in page
+    assert "feedback_context_id" in page and "feedback_enabled" in page
 
 
 def test_issued_today_snapshots_plain_dicts_for_the_notify_seam():
