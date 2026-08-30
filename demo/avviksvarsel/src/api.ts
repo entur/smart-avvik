@@ -7,6 +7,9 @@ export interface Config {
   // Which deployment answered: 'dev' | 'tst' on non-prod, null in prd. Optional so an older API
   // (or a local stub) simply reads as production instead of breaking the app.
   environment?: string | null;
+  // Whether this deployment also sends Oslo rush-hour forecast pushes (togvarsel) to subscribed
+  // devices. Optional for the same reason: an older API simply shows no notice.
+  togvarsel_notify?: boolean;
 }
 
 export interface StopItem {
