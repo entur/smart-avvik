@@ -59,7 +59,9 @@ rule): runtime dependencies are injected — main passes the BigQuery client and
 via :func:`configure` (togvarsel's own idiom), the matcher takes varsel's `place_refs` as a plain
 callable, and :func:`push_round` takes varsel's delivery seams (device_subscription,
 deliver_to_devices, handle_gone_device, the brand-asset table, the environment tagger) the same
-way; the policy core needs none.
+way; the policy core needs none. The one HTTP surface is the dev-only test trigger at the bottom
+(R11): a router main mounts, refusing everything but the dev deployment, that fires one synthetic
+round through the same composition + delivery seams without ever touching the markers.
 """
 
 from __future__ import annotations
@@ -70,6 +72,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
+
+from deployment import environment_label
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -632,3 +638,85 @@ def _evaluate(now: datetime) -> None:
         s["store_markers"](date_str, markers)
     if not pushes:
         s["store_markers"](date_str, markers)  # suppression-only pass: the markers still count
+
+
+# ---- Dev-only test trigger (R11) -----------------------------------------------------------------
+
+router = APIRouter()
+
+# The synthetic round the trigger sends: a fixed yellow warning whose reasons say TEST in plain
+# Norwegian, so a screenshot of the notification can never pass for a real forecast. Everything
+# else — wording template, environment tag, brand icon, click-through — is the REAL pipe
+# (compose_message/build_payload/push_round over the injected seams); only the round DECISION is
+# synthetic, and with it the markers, which the trigger must never read or write.
+_TEST_DECISION = Decision(
+    issue="0630", level="yellow", push=True, marker=_marker("yellow", True), kind="warning"
+)
+_TEST_ISSUE: Mapping[str, Any] = {
+    "issue": "0630",
+    "scope": "morgenrushet 06:30–09:00",
+    "reasons": (
+        "dette er et testvarsel, ikke en ekte prognose",
+        "eksempel på årsak: 2 tog er innstilt før kl. 06:30",
+    ),
+}
+# What the trigger needs wired (a subset of _EVALUATE_SEAMS): the VAPID gate and push_round's
+# delivery seams. Deliberately NOT `enabled`: the trigger exists to prove the pipe before the
+# delivery flag opens it, and `load_markers`/`store_markers` are excluded by design.
+_TRIGGER_SEAMS = ("push_ready", "resolve_device", "deliver", "handle_gone", "brand_assets", "tag_title")
+
+
+class TestNotifyIn(BaseModel):
+    """Request one synthetic togvarsel push — the mirror of varsel's TestIn, same field, same bounds."""
+
+    device_id: str = Field(min_length=8, max_length=100)
+
+
+@router.post("/togmelding-api/test-notify", summary="Send a synthetic togvarsel push (dev only)")
+def test_notify(body: TestNotifyIn) -> dict:
+    """Send one synthetic rush-forecast push to this device — proves the whole pipe (wording,
+    environment tag, brand icon, click-through) without waiting for a real round.
+
+    Served ONLY by the dev deployment, and the gate fails closed (R11): environment_label() is
+    read per call and everything that is not exactly "dev" is refused — tst ("tst"), prd and
+    unset (both None), and any unrecognized label alike — with a plain 404, before any seam is
+    touched, so the refused route is indistinguishable from an absent one. Delivery is
+    :func:`push_round` over the seams main injected, which is the same code path a real round
+    takes; the response statuses mirror /varsel-api/test (404 unknown device, 425 fresh-gone,
+    410 gone-and-dropped, 502 send error). One dev-only wrinkle, accepted: a device dropped here
+    is dropped in memory only (the trigger has no persist seam that is not the markers'), so the
+    next real round or SX push re-drops and persists it.
+
+    Plain `def`, like varsel's test_push: the send blocks for up to the push timeout against a
+    client-supplied endpoint, which on `async def` would freeze the whole event loop.
+    """
+    if environment_label() != "dev":
+        raise HTTPException(status_code=404, detail="Not Found")
+    s = _seams
+    if any(s.get(key) is None for key in _TRIGGER_SEAMS) or not s["push_ready"]():
+        raise HTTPException(status_code=503, detail="Push er ikke konfigurert på tjeneren.")
+    summary = push_round(
+        _TEST_DECISION,
+        _TEST_ISSUE,
+        [],
+        [body.device_id],
+        resolve_device=s["resolve_device"],
+        deliver=s["deliver"],
+        handle_gone=s["handle_gone"],
+        brand_assets=s["brand_assets"],
+        tag_title=s["tag_title"],
+    )
+    if summary["no_subscription"]:
+        raise HTTPException(status_code=404, detail="Enheten har ingen aktiv varsel-abonnement.")
+    if summary["gone"]:
+        if summary["dropped"]:
+            raise HTTPException(
+                status_code=410, detail="Abonnementet er utløpt; slå på varsler på nytt."
+            )
+        raise HTTPException(
+            status_code=425,
+            detail="Varselet er nettopp slått på. Vent et lite øyeblikk og prøv testvarsel igjen.",
+        )
+    if summary["error"]:
+        raise HTTPException(status_code=502, detail="Kunne ikke sende testvarsel.")
+    return {"status": "sent"}

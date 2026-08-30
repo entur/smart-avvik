@@ -1224,6 +1224,13 @@ app.include_router(meldinger.router)
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
 app.include_router(togvarsel.router)
 
+# Togvarsel-notify's dev-only test trigger (POST /togmelding-api/test-notify, R11): one synthetic
+# rush-forecast push through the same composition + delivery seams the real rounds use (injected
+# in lifespan above). The route gates itself on deployment.environment_label() == "dev" per call
+# — tst, prd and unset labels get a plain 404 — so mounting it everywhere is safe and keeps the
+# image identical across environments.
+app.include_router(togvarsel_notify.router)
+
 # --- How long a browser may keep a static file ----------------------------------------------
 #
 # Starlette's StaticFiles sends ETag and Last-Modified but no Cache-Control, and a response with
