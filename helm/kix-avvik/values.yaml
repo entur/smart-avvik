@@ -39,5 +39,10 @@ common:
       # Per-alert feedback is a privacy-gated opt-in. This remains false unless an environment has
       # passed the capture/read-back/deletion and access gates in data/feedback/README.md.
       VARSEL_FEEDBACK_ENABLED: "false"
+      # Togvarsel rush-forecast pushes to /varsel subscribers. Delivery-flag convention: only
+      # true/1/yes/on enable, and the code default for an UNSET value is also off — this value
+      # states the posture where an operator looks. Dev opts in; tst/prd stay off (prd would
+      # additionally need the runtime tables, see data/queries/copy_runtime_to_prd.sh).
+      TOGVARSEL_NOTIFY_ENABLED: "false"
       # Non-secret EU ingestion origin. Capture and review credentials stay separate.
       POSTHOG_HOST: https://eu.i.posthog.com

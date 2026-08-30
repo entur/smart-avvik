@@ -1265,6 +1265,63 @@ def test_the_two_write_limits_are_independent_after_the_fan_out():
     assert varsel._LLM_WORKERS > 1 and varsel._MATCH_WORKERS > 1
 
 
+# --- Persisted state: togvarsel round markers + unknown-key round-trip (U4) --------------------
+
+
+def test_togvarsel_rounds_and_unknown_keys_survive_a_state_round_trip():
+    """Round markers ride the persisted blob (a completed togvarsel round never re-fires across
+    restarts), and a top-level key THIS build does not know still survives serialize→apply —
+    rollback insurance, so a blob written by a future feature outlives a roll-back-and-forward."""
+    import json as _json
+
+    with varsel._state_lock:
+        saved_raw = varsel._serialize_state()
+    save_state, varsel._save_state = varsel._save_state, lambda: None
+    try:
+        blob = _json.loads(saved_raw)
+        blob["future_feature"] = {"anything": [1, 2, 3]}
+        blob["togvarsel_rounds"] = {"2026-08-31": {"0630": {"level": "yellow", "pushed": True}}}
+        varsel._apply_state(_json.dumps(blob))
+        assert varsel.togvarsel_rounds_for("2026-08-31") == {
+            "0630": {"level": "yellow", "pushed": True}
+        }
+        assert varsel.togvarsel_rounds_for("2026-08-30") == {}  # only the asked-for date
+        round_tripped = _json.loads(varsel._serialize_state())
+        assert round_tripped["future_feature"] == {"anything": [1, 2, 3]}
+        assert round_tripped["togvarsel_rounds"] == {
+            "2026-08-31": {"0630": {"level": "yellow", "pushed": True}}
+        }
+        # the known keys still round-trip beside the unknown one
+        assert set(round_tripped) >= {"devices", "journeys", "notified", "togvarsel_rounds"}
+    finally:
+        varsel._save_state = save_state
+        varsel._apply_state(saved_raw)
+
+
+def test_store_togvarsel_rounds_prunes_to_the_given_date_saves_and_copies():
+    """The store accessor keeps exactly one Oslo day (day rollover prunes yesterday's markers),
+    persists on every write, and the read accessor hands out copies — togvarsel_notify mutating
+    its working map must never reach back into varsel's state."""
+    saves = []
+    with varsel._state_lock:
+        saved_raw = varsel._serialize_state()
+    save_state, varsel._save_state = varsel._save_state, lambda: saves.append(1)
+    try:
+        varsel.store_togvarsel_rounds("2026-08-30", {"1400": {"level": "red", "pushed": True}})
+        varsel.store_togvarsel_rounds("2026-08-31", {"0630": {"level": "yellow", "pushed": True}})
+        assert varsel.togvarsel_rounds_for("2026-08-30") == {}  # yesterday pruned at rollover
+        assert varsel.togvarsel_rounds_for("2026-08-31") == {
+            "0630": {"level": "yellow", "pushed": True}
+        }
+        assert len(saves) == 2  # persisted on every store
+        got = varsel.togvarsel_rounds_for("2026-08-31")
+        got["0630"]["pushed"] = False
+        assert varsel.togvarsel_rounds_for("2026-08-31")["0630"]["pushed"] is True
+    finally:
+        varsel._save_state = save_state
+        varsel._apply_state(saved_raw)
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

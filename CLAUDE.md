@@ -1000,6 +1000,47 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   horizon and retrain.sh refuses under 60 days of headroom. The page itself is one committed HTML
   file (`disruptions/api/togmelding_static/`, the eval_static pattern — no build step).
 
+- **Togvarsel push rounds** (`disruptions/api/togvarsel_notify.py`, 2026-08-30) deliver
+  Togmeldingen's prognoses as /varsel Web Pushes. Each of the four weekday issues is one
+  notification *round*: the baselines (06:30, 12:00) push iff yellow or red; the follow-ups
+  (07:00, 14:00) push iff the level *differs* from what their baseline pushed — a level
+  transition, never a probability delta (the paired models answer different questions with
+  different calibration, so raw p is not comparable across them) — and a green follow-up after a
+  pushed warning is the one green that pushes: the friskmelding. Wording is deterministic
+  Norwegian from the issue's own fields (no LLM), titled `Rushvarsel`/`Oppdatert
+  rushvarsel`/`Friskmelding` so a red morning's SX push and forecast push stay tellable apart;
+  entur-brand pushes click through to `/togmelding`. Delivery is gated by
+  `TOGVARSEL_NOTIFY_ENABLED` (allow-list parse; **unset = off**; helm base off, dev on), and while
+  off nothing is evaluated and no state written, so an enable-restart inside a window still
+  delivers. Turning it on outside dev needs more than the flag: on prd the 39-station geography
+  `disruptions.togvarsel_oslo_stations` (fetched once per Oslo day, DEFINES matching, never
+  duplicated in Python) exists only after `copy_runtime_to_prd.sh` — and existing subscribers
+  opted into train-specific alerts, so the deferred /varsel UI notice ("your subscription now
+  includes rush forecasts") must land first. State is one primitive: round markers
+  `{date: {issue: {level, pushed}}}` in the varsel state blob — dedup (a marked round never
+  re-fires, suppressions included) and the follow-up baseline in one; markers commit in memory
+  before fan-out and persist after, so a crash mid-round inside the timeliness window can
+  duplicate that one round — accepted. Timeliness is strict Oslo wall-clock at evaluation time
+  (0630 < 07:00, 0700 < 09:00, 1200 < 14:00, 1400 < 18:00; a late back-fill is recorded as
+  suppressed and never revisited), and matching is additionally bounded by evaluation time: a
+  journey whose registered window has already passed never gets the push, friskmelding included.
+  Fatigue is the known cost: yellow-or-red fires on ≈56 % of weekday mornings (measured level
+  bins), the alert-noise shape this repo has rejected before — shipped as requested, mitigated
+  (the change gate caps a rush at two pushes, reasons ride in the body, delivery starts dev-only;
+  red-only/per-user levels are the documented follow-up). Audit is structured logs (one
+  `togvarsel_notify_round` event per round with decision and sent/error/gone counts) +
+  `disruptions.togvarsel_issued` + the persisted markers — deliberately **no `varsel_decisions`
+  rows** in v1: the decision is a deterministic function of durable inputs, and adding columns to
+  the decisions/outcomes tables is a documented trap (a new `varsel_decision_outcomes` column
+  breaks the registered scheduled query — see Conventions below); if rows come later, discriminate on
+  a `KIX:Togvarsel:<date>:<issue>` situationNumber prefix, never a new column. Dev-only test
+  trigger: `POST /togmelding-api/test-notify` with `{"device_id": ...}` (same shape as
+  `/varsel-api/test`) sends one synthetic yellow round — body marked as testvarsel — through the
+  real composition + delivery path without touching markers; it 404s wherever
+  `deployment.environment_label()` is not exactly `"dev"` (tst, prd, unset and unrecognized labels
+  all fail closed). Tests: `disruptions/api/test_togvarsel_notify.py` (hermetic; standalone and
+  under pytest).
+
 ## Conventions
 
 - All SQL targets BigQuery Standard SQL; legacy SQL is not used.
