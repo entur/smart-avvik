@@ -1797,7 +1797,7 @@ def _deliverable_message(message_key: tuple[str, str, str]) -> str | None:
     rather than a check at each call site. Since 2026-08-07 a wording is written whenever a backend
     can be tried (:func:`_write_message`), so the cache holds LLM prose in environments that have
     decided not to send it — prd, today. Two surfaces carry that text: the Web Push body
-    (`_deliver_device`) and the in-app journey card (`_journey_model`). Gating them separately is
+    (`_prepare_alert`) and the in-app journey card (`_journey_model`). Gating them separately is
     how they drift: the card is the one an implementer forgets, and the drift is silent, because a
     card quoting a wording the push beside it does not is not a crash and not a failing assertion.
     `llm_message.delivery_enabled()` therefore owns the answer, and both surfaces read it here.

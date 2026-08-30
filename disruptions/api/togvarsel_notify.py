@@ -29,30 +29,30 @@ decided, so a restart that back-fills a baseline and issues its follow-up in the
 resolves deterministically. Each round is decided in its own try/except: a failure records no
 marker (the round is retried next tick, bounded by its deadline) and never stops later rounds.
 
-Below the policy core sits the matching layer: which registrations a pushing round affects (R5)
-and which devices get the push, deduped (R6). The geography is `disruptions.togvarsel_oslo_stations`
+Below the policy core sits the matching layer: which registrations a pushing round affects
+and which devices get the push, deduped. The geography is `disruptions.togvarsel_oslo_stations`
 — fetched once per Oslo day through the injected BigQuery client and never duplicated in Python
-(KTD5; that table DEFINES "the Oslo area" for the whole togvarsel chain). A journey is affected
+(that table DEFINES "the Oslo area" for the whole togvarsel chain). A journey is affected
 iff both alias-expanded endpoints are in that set, today's Oslo weekday is in its `days`, and its
 stored-inclusive [begin, end] window overlaps — compared half-open — the LIVE part of the issue's
 scope window, [max(scope start, evaluation time), scope end): a push about a rush window the
 traveller has already exited is noise, friskmelding included.
 
-On top of matching sits composition and delivery (R6–R8). The wording is deterministic Norwegian
+On top of matching sits composition and delivery. The wording is deterministic Norwegian
 assembled from the issue's own fields — level, scope text, rule-based reasons — never an LLM
-(KTD6) and never a journey-, line- or corridor-specific claim: the model's grain is the whole
+ and never a journey-, line- or corridor-specific claim: the model's grain is the whole
 network, and the wording keeps that honest. Each pushing round sends one push per matched device
-(R6) through varsel's own delivery machinery; a send error is counted and logged, never retried
-within the round (KTD8) — the marker is already committed, and a forecast is lower-stakes than a
+ through varsel's own delivery machinery; a send error is counted and logged, never retried
+within the round — the marker is already committed, and a forecast is lower-stakes than a
 train alert.
 
 At the top sits :func:`evaluate`, the per-tick orchestration main calls right after
 togvarsel.refresh() on the wall-clock tick: gates first — while the delivery flag is off or VAPID
-is unset, NOTHING is evaluated and no markers are written (R9), so an enable-restart inside a
+is unset, NOTHING is evaluated and no markers are written, so an enable-restart inside a
 timeliness window still delivers — then the station set (unavailable → no markers), then
 decide_rounds over the injected issued-today snapshot, then match + push per pushing round, with
-the marker map persisted through the injected store accessor after each round's delivery (KTD2)
-and the whole pass wrapped so one failure never breaks the poller tick (R10).
+the marker map persisted through the injected store accessor after each round's delivery
+and the whole pass wrapped so one failure never breaks the poller tick.
 
 All time logic is Europe/Oslo wall-clock. No import of main, varsel, or togvarsel (the package
 rule): runtime dependencies are injected — main passes the BigQuery client and evaluate()'s seams
@@ -60,7 +60,7 @@ via :func:`configure` (togvarsel's own idiom), the matcher takes varsel's `place
 callable, and :func:`push_round` takes varsel's delivery seams (device_subscription,
 deliver_to_devices, handle_gone_device, the brand-asset table, the environment tagger) the same
 way; the policy core needs none. The one HTTP surface is the dev-only test trigger at the bottom
-(R11): a router main mounts, refusing everything but the dev deployment, that fires one synthetic
+: a router main mounts, refusing everything but the dev deployment, that fires one synthetic
 round through the same composition + delivery seams without ever touching the markers.
 """
 
@@ -91,7 +91,7 @@ class _NotifySpec:
     due_h: float  # Oslo fractional hour the issue becomes computable — the evaluation order
     deadline_h: float  # notify only strictly BEFORE this Oslo wall-clock hour
     baseline: str | None  # the round a follow-up is compared against; None for baselines
-    scope_start_h: float  # the rush window the forecast is ABOUT (R5) — what journeys are
+    scope_start_h: float  # the rush window the forecast is ABOUT — what journeys are
     scope_end_h: float  # matched against, distinct from due/deadline (when the push may go out)
 
 
@@ -130,7 +130,7 @@ def _marker(level: str, pushed: bool) -> dict[str, Any]:
 
 def _effective_baseline(spec: _NotifySpec, markers: Mapping[str, Any]) -> str:
     """The level the baseline round pushed, or green when it pushed nothing — what a follow-up's
-    level must differ from to count as significant change (R2)."""
+    level must differ from to count as significant change."""
     m = markers.get(spec.baseline)
     if m and m.get("pushed"):
         return str(m["level"])
@@ -164,7 +164,7 @@ def decide_issue(issue: Mapping[str, Any], markers: Mapping[str, Any], now: date
     if level == base:
         return Decision(key, level, push=False, marker=_marker(level, False), reason="no_change")
     if level == "green":
-        kind = "all_clear"  # dropped back to green after a pushed warning (KTD11)
+        kind = "all_clear"  # dropped back to green after a pushed warning
     elif base == "green":
         kind = "warning"  # the baseline pushed nothing, so there is nothing to "update"
     else:
@@ -186,10 +186,10 @@ def decide_rounds(
 
     Commits each round's marker into `markers` (in place) before the next round is decided, so a
     same-tick follow-up reads the just-decided baseline marker — the restart case that back-fills
-    0630 and issues 0700 in one tick resolves deterministically (KTD9). A round that raises is
+    0630 and issues 0700 in one tick resolves deterministically. A round that raises is
     logged with its issue context, records no marker (so the next tick retries it, bounded by the
-    timeliness deadline), and never stops the later rounds (R10). Returns the decisions made this
-    pass; already-marked rounds are skipped entirely (R4: a completed round never re-fires)."""
+    timeliness deadline), and never stops the later rounds. Returns the decisions made this
+    pass; already-marked rounds are skipped entirely (a completed round never re-fires)."""
     decisions: list[Decision] = []
     for issue in sorted(issues, key=_due_order):
         try:
@@ -208,7 +208,7 @@ def decide_rounds(
     return decisions
 
 
-# ---- Station set (KTD5) ------------------------------------------------------------------------
+# ---- Station set ------------------------------------------------------------------------
 
 _STATIONS_SQL = "SELECT stop_place FROM `disruptions.togvarsel_oslo_stations`"
 
@@ -218,7 +218,7 @@ _bq_client: Any = None
 # state), so no lock.
 _station_state: dict[str, Any] = {}
 
-# evaluate()'s injected seams (KTD4), set by configure(). All-or-nothing at evaluation time:
+# evaluate()'s injected seams, set by configure(). All-or-nothing at evaluation time:
 # until main wires the full set, evaluate() is a silent no-op — the same closed-gate posture as
 # the flag itself.
 _seams: dict[str, Any] = {}
@@ -254,7 +254,7 @@ def configure(
     load_markers: Callable[[str], Mapping[str, Any]] | None = None,
     store_markers: Callable[[str, Mapping[str, Any]], None] | None = None,
 ) -> None:
-    """Inject the module's runtime seams (KTD4): the BigQuery client for :func:`station_set`,
+    """Inject the module's runtime seams: the BigQuery client for :func:`station_set`,
     and — for :func:`evaluate` — the two gates (`enabled` reads the delivery flag, `push_ready`
     varsel's VAPID state), togvarsel's issued-today snapshot, varsel's journey snapshot,
     place-alias expander, delivery machinery, brand assets and environment tagger, and the
@@ -282,7 +282,7 @@ def configure(
 def station_set(now: datetime) -> frozenset[str] | None:
     """The Oslo local-network StopPlace refs, fetched once per Oslo day — or None while unavailable.
 
-    The table defines the product's geography (KTD5), so it is never duplicated in Python; an
+    The table defines the product's geography, so it is never duplicated in Python; an
     empty result is refused for the same reason (it would make every journey silently unaffected).
     On failure the NEXT call simply retries: no cooldown and no daily give-up — deliberately
     unlike togvarsel's _FAIL_COOLDOWN, whose 15-minute cooldown and 8-fails give-up would keep
@@ -319,11 +319,15 @@ def station_set(now: datetime) -> frozenset[str] | None:
     return refs
 
 
-# ---- Journey matching (R5, R6) -----------------------------------------------------------------
+# ---- Journey matching -----------------------------------------------------------------
 
 
 def _parse_hhmm(value: str) -> int:
-    """"HH:MM" -> minutes since midnight (varsel's window encoding), refusing nonsense."""
+    """"HH:MM" -> minutes since midnight (varsel's window encoding), refusing nonsense.
+
+    Deliberately stricter than varsel's own ``_parse_hhmm`` (which accepts "25:99" as 1599):
+    the range check is what lets one malformed legacy record be skipped and logged instead of
+    silently matching, and this module cannot import varsel to share it."""
     h, m = str(value).split(":")
     if not (0 <= int(h) <= 23 and 0 <= int(m) <= 59):
         raise ValueError(f"not a wall-clock time: {value!r}")
@@ -335,7 +339,7 @@ def _endpoint_listed(
 ) -> bool:
     """Whether any ref of `ref`'s physical place is a listed station. `expand_refs` is varsel's
     place_refs, injected: a registration made on a bus-side alias of Lysaker still counts as
-    Lysaker (accepted imprecision — registrations carry no mode, and R7's network-level wording
+    Lysaker (accepted imprecision — registrations carry no mode, and the network-level wording
     keeps the message honest)."""
     return any(r in stations for r in expand_refs(str(ref)))
 
@@ -347,7 +351,7 @@ def match_journeys(
     expand_refs: Callable[[str], Iterable[str]],
     now: datetime,
 ) -> tuple[list[str], set[str]]:
-    """The registrations an issue affects (R5) and the device set to push to, deduped (R6).
+    """The registrations an issue affects and the device set to push to, deduped.
 
     A journey is affected iff today's Oslo weekday is in its `days`, its stored-inclusive
     [begin, end] window overlaps — compared half-open — the live part of the issue's scope window
@@ -355,7 +359,7 @@ def match_journeys(
     station set. The evaluation-time bound means a journey whose window has fully passed at
     evaluation never matches — a late warning and a friskmelding are equally noise to a traveller
     who has exited the rush. One malformed record (a legacy begin/end, a broken days list) is
-    skipped and logged, never kills the round (R10) — the same per-journey guard as varsel's
+    skipped and logged, never kills the round — the same per-journey guard as varsel's
     check_and_notify loop 1. Raises only on an unknown issue key (the caller's bug, not data)."""
     spec = _SPEC_BY_KEY.get(str(issue_key))
     if spec is None:
@@ -392,9 +396,9 @@ def match_journeys(
     return matched, devices
 
 
-# ---- Message composition and round delivery (R6, R7, R8; KTD6, KTD8) ----------------------------
+# ---- Message composition and round delivery ----------------------------
 
-# Deterministic Norwegian only (KTD6): every phrase below is assembled from the issue's own fields,
+# Deterministic Norwegian only: every phrase below is assembled from the issue's own fields,
 # so a push can never say something the forecast did not see. The scope text and the reasons come
 # verbatim from togvarsel (its Issue payload), which keeps the two surfaces in one vocabulary.
 _LEVEL_ADJ = {"green": "grønt", "yellow": "gult", "red": "rødt"}
@@ -407,7 +411,7 @@ _RUSH_NAME = {
 # Leading reasons only: a notification body is read on a lock screen that truncates, and
 # togvarsel's rule engine already orders them by weight.
 _BODY_REASONS = 2
-# R8: the entur-branded install has the forecast page to land on; the unbranded one does not, so
+# The entur-branded install has the forecast page to land on; the unbranded one does not, so
 # it keeps its own varsel URL — the body carries the essentials, no click-through required.
 _TOGMELDING_URL = "/togmelding"
 
@@ -423,7 +427,7 @@ def compose_message(decision: Decision, issue: Mapping[str, Any]) -> tuple[str, 
 
     The title identifies a rush FORECAST with its level — "Rushvarsel", never train-alert framing,
     so a red morning that legitimately produces both an SX push and this one stays tellable apart
-    (R7). An update against a pushed baseline is marked "Oppdatert"; the all-clear is a
+   . An update against a pushed baseline is marked "Oppdatert"; the all-clear is a
     friskmelding, free of every word the warnings use — its body carries no reasons either, since
     green's own reasons still talk about trouble signs. Raises on a non-push decision: composing
     a message for a suppressed round is the caller's bug."""
@@ -458,8 +462,8 @@ def build_payload(
     """The Web Push payload for one device of `brand`.
 
     `brand_assets` (varsel's _BRAND_ASSETS) and `tag_title` (varsel's _tag_environment) are
-    injected by main (KTD4). The icon follows the brand exactly as SX pushes do; the URL follows
-    R8 — the entur brand lands on /togmelding, the unbranded install keeps its own varsel URL.
+    injected by main. The icon follows the brand exactly as SX pushes do; the URL follows
+    The entur brand lands on /togmelding, the unbranded install keeps its own varsel URL.
     The wording is identical across brands (varsel precedent: only icon and URL ever move). No
     situation_number: this is not an SX situation, and the standalone-push precedent (varsel's
     /varsel-api/test) already omits it."""
@@ -488,16 +492,16 @@ def push_round(
     brand_assets: Mapping[str, Mapping[str, str]],
     tag_title: Callable[[str], str],
 ) -> dict[str, Any]:
-    """Deliver one pushing round to its matched devices — one push per device (R6).
+    """Deliver one pushing round to its matched devices — one push per device.
 
-    Every delivery seam is varsel's, injected by main (KTD4): `resolve_device`
+    Every delivery seam is varsel's, injected by main: `resolve_device`
     (device_subscription — the deleted-while-iterating re-check under varsel's lock), `deliver`
     (deliver_to_devices — the bounded parallel fan-out), `handle_gone` (handle_gone_device — the
     grace-then-drop rule). A device that resolves to nothing was deleted between matching and
     delivery, or registered without push: skipped and counted, never a crash. Send errors are NOT
-    retried within the round (KTD8) — the round marker is already committed, and a forecast is
+    retried within the round — the round marker is already committed, and a forecast is
     lower-stakes than a train alert — so the counts are logged in ONE structured round event
-    (R10) and returned; a returned "dropped" > 0 means device state changed and the caller must
+    and returned; a returned "dropped" > 0 means device state changed and the caller must
     persist it. `matched` (the affected journey ids) rides along for that log only."""
     if not decision.push:
         raise ValueError(f"push_round called for a non-push decision: {decision}")
@@ -515,7 +519,7 @@ def push_round(
             payload = payload_by_brand[brand] = build_payload(
                 decision, issue, brand, brand_assets=brand_assets, tag_title=tag_title
             )
-        per_device[device_id] = [(subscription, payload)]  # one item per device per round (R6)
+        per_device[device_id] = [(subscription, payload)]  # one item per device per round
     counts = {"sent": 0, "error": 0, "gone": 0}
     dropped = 0
     for device_id, _item, result, _payload in deliver(per_device, lambda item: item):
@@ -549,23 +553,23 @@ def push_round(
     return summary
 
 
-# ---- Per-tick orchestration (R9, R10; KTD2, KTD9) ------------------------------------------------
+# ---- Per-tick orchestration ------------------------------------------------
 
 
 def evaluate(now: datetime | None = None) -> None:
     """One tick's togvarsel notification pass — main calls this right after togvarsel.refresh()
     on the every-tick wall-clock path (never from the SX-ingestion rebuild).
 
-    Gate order is the safety story (R9): while the flag is off or VAPID is unset this returns
+    Gate order is the safety story: while the flag is off or VAPID is unset this returns
     before ANY evaluation, writing no markers — which is exactly what lets an enable-restart
     inside a timeliness window still deliver that round. While the station set is unavailable,
-    the same: nothing evaluated, nothing marked (KTD5). Marker ordering per KTD2/KTD9:
+    the same: nothing evaluated, nothing marked. Marker ordering:
     decide_rounds commits every round's marker in memory before any fan-out, and the injected
     store accessor persists after each pushing round's delivery — plus once at the end of a
     suppression-only pass. The store's persistence is best-effort (varsel's _save_state never
     raises), so a lost write costs at most the accepted crash-window duplicate on the next
     restart, never the in-process dedup. Wrapped whole: a failure here is logged and the tick
-    goes on (main wraps its call too, R10)."""
+    goes on (main wraps its call too)."""
     try:
         _evaluate(now if now is not None else datetime.now(_OSLO))
     except Exception:
@@ -577,13 +581,13 @@ def _evaluate(now: datetime) -> None:
     if any(s.get(key) is None for key in _EVALUATE_SEAMS):
         return  # not wired for delivery (e.g. a station-set-only configuration): nothing to do
     if not s["enabled"]():
-        return  # R9: no evaluation and NO markers, so an enable-restart still delivers
+        return  # no evaluation and NO markers, so an enable-restart still delivers
     if not s["push_ready"]():
         return  # no VAPID keys: degrade to a no-op under the same no-markers contract
     now = now.astimezone(_OSLO)
     stations = station_set(now)
     if stations is None:
-        return  # KTD5: evaluate nothing while the geography is unavailable; retry next tick
+        return  # evaluate nothing while the geography is unavailable; retry next tick
     issues = s["issued_today"]()
     if not issues:
         return  # weekend/holiday, or nothing issued yet today — the natural no-op
@@ -630,17 +634,17 @@ def _evaluate(now: datetime) -> None:
         except Exception:
             logger.exception(
                 "togvarsel_notify: delivering round %s failed; its marker is already committed, "
-                "so the round is not retried (KTD8) and later rounds go on (R10)",
+                "so the round is not retried and later rounds go on",
                 decision.issue,
             )
-        # Persist AFTER the round's fan-out (KTD2): the in-memory commit above already protects
+        # Persist AFTER the round's fan-out: the in-memory commit above already protects
         # this process, and a crash inside the window costs at most one accepted duplicate.
         s["store_markers"](date_str, markers)
     if not pushes:
         s["store_markers"](date_str, markers)  # suppression-only pass: the markers still count
 
 
-# ---- Dev-only test trigger (R11) -----------------------------------------------------------------
+# ---- Dev-only test trigger -----------------------------------------------------------------
 
 router = APIRouter()
 
@@ -677,7 +681,7 @@ def test_notify(body: TestNotifyIn) -> dict:
     """Send one synthetic rush-forecast push to this device — proves the whole pipe (wording,
     environment tag, brand icon, click-through) without waiting for a real round.
 
-    Served ONLY by the dev deployment, and the gate fails closed (R11): environment_label() is
+    Served ONLY by the dev deployment, and the gate fails closed: environment_label() is
     read per call and everything that is not exactly "dev" is refused — tst ("tst"), prd and
     unset (both None), and any unrecognized label alike — with a plain 404, before any seam is
     touched, so the refused route is indistinguishable from an absent one. Delivery is
