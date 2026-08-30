@@ -768,6 +768,226 @@ def test_push_round_refuses_a_non_push_decision(monkeypatch):
         raise AssertionError("expected ValueError for a non-push decision")
 
 
+# ---------------------------------------------------------------------------- evaluate (U4: R9, R10; KTD2)
+
+MONDAY_STR = "2026-08-31"
+
+
+class _MarkerStore:
+    """A fake of varsel's marker accessor pair (togvarsel_rounds_for / store_togvarsel_rounds):
+    load returns a detached copy like the real one; store counts persists and keeps only the
+    stored date (the real one prunes to the current Oslo day)."""
+
+    def __init__(self, initial: dict | None = None):
+        self.by_date: dict = deepcopy(initial or {})
+        self.stores = 0
+
+    def load(self, date_str: str) -> dict:
+        return deepcopy(self.by_date.get(date_str, {}))
+
+    def store(self, date_str: str, markers: dict) -> None:
+        self.stores += 1
+        self.by_date = {date_str: deepcopy(dict(markers))}
+
+
+def _configure_evaluate(**overrides) -> tuple[_MarkerStore, _StationsBQ]:
+    """Wire configure() the way main does (KTD4, U4), with fakes for the gates and the marker
+    store; every delivery seam is varsel's REAL one, so evaluate() is exercised against the same
+    machinery the SX pushes ride on. Returns (marker store, stations fake) for assertions."""
+    store = overrides.pop("store", None) or _MarkerStore()
+    issues = overrides.pop("issues", [])
+    fake = overrides.pop("bq", None) or _StationsBQ(refs=sorted(STATIONS))
+    kwargs = {
+        "bq_client": fake,
+        "enabled": lambda: True,
+        "push_ready": lambda: True,
+        "issued_today": lambda: deepcopy(list(issues)),
+        "journeys": lambda: {"j1": _j()},
+        "expand_refs": _ident,
+        "resolve_device": varsel.device_subscription,
+        "deliver": varsel.deliver_to_devices,
+        "handle_gone": varsel.handle_gone_device,
+        "brand_assets": varsel._BRAND_ASSETS,
+        "tag_title": lambda t: t,
+        "load_markers": store.load,
+        "store_markers": store.store,
+    }
+    kwargs.update(overrides)
+    togvarsel_notify._station_state.clear()
+    togvarsel_notify.configure(**kwargs)
+    return store, fake
+
+
+def test_evaluate_flag_off_evaluates_nothing_and_writes_no_markers(monkeypatch):
+    """R9: while disabled the evaluator must not even LOOK — no station fetch, no markers — which
+    is exactly what lets an enable-restart inside a timeliness window still deliver (AE6)."""
+    monkeypatch.setattr(
+        varsel, "_send_push",
+        lambda sub, payload: (_ for _ in ()).throw(AssertionError("sent while disabled")),
+    )
+    store, fake = _configure_evaluate(issues=[_issued("0630", "yellow")], enabled=lambda: False)
+    togvarsel_notify.evaluate(now=_monday(6, 31))
+    assert store.stores == 0 and store.by_date == {}
+    assert fake.queries == []  # not even the station fetch ran
+
+
+def test_evaluate_without_vapid_is_a_no_op_with_no_markers(monkeypatch):
+    """R9: no VAPID keys degrades to a no-op with no markers, same contract as the flag."""
+    monkeypatch.setattr(
+        varsel, "_send_push",
+        lambda sub, payload: (_ for _ in ()).throw(AssertionError("sent without VAPID")),
+    )
+    store, fake = _configure_evaluate(issues=[_issued("0630", "red")], push_ready=lambda: False)
+    togvarsel_notify.evaluate(now=_monday(6, 31))
+    assert store.stores == 0 and fake.queries == []
+
+
+def test_evaluate_pushes_after_an_enable_restart_inside_the_window(monkeypatch):
+    """AE6: the flag was off all morning so no markers exist; the 06:50 restart with the flag on
+    evaluates 0630 fresh and delivers — and the stored marker dedups the very next tick."""
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    store, _fake = _configure_evaluate(issues=[_issued("0630", "yellow")])
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+        togvarsel_notify.evaluate(now=_monday(6, 50))
+        assert len(sent) == 1
+        assert sent[0]["title"] == "Rushvarsel: gult nivå for morgenrushet"
+        assert store.by_date[MONDAY_STR]["0630"] == {"level": "yellow", "pushed": True}
+        togvarsel_notify.evaluate(now=_monday(6, 51))
+    assert len(sent) == 1  # R4: the marker dedups; a completed round never re-fires
+
+
+def test_evaluate_after_a_late_restart_suppresses_and_never_revisits(monkeypatch):
+    """AE6's flip side: a 07:10 restart is past 0630's deadline — no push, and the suppression is
+    itself marked (and persisted) so the round is never revisited."""
+    monkeypatch.setattr(
+        varsel, "_send_push",
+        lambda sub, payload: (_ for _ in ()).throw(AssertionError("untimely push")),
+    )
+    store, _fake = _configure_evaluate(issues=[_issued("0630", "yellow")])
+    togvarsel_notify.evaluate(now=_monday(7, 10))
+    assert store.by_date[MONDAY_STR]["0630"] == {"level": "yellow", "pushed": False}
+    assert store.stores == 1  # the suppression-only tick persists once, at the end
+
+
+def test_evaluate_writes_no_markers_while_the_station_set_is_unavailable(monkeypatch):
+    """KTD5 at the evaluate grain: while the geography cannot be fetched, nothing is evaluated or
+    marked — so the round still fires, once, when the set arrives inside the window."""
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    fake = _StationsBQ(refs=sorted(STATIONS), fail=True)
+    store, _ = _configure_evaluate(issues=[_issued("0630", "red")], bq=fake)
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}), _capture_logs():
+        togvarsel_notify.evaluate(now=_monday(6, 31))
+        assert store.stores == 0 and sent == []
+        fake.fail = False
+        togvarsel_notify.evaluate(now=_monday(6, 40))
+    assert len(sent) == 1
+    assert store.by_date[MONDAY_STR]["0630"] == {"level": "red", "pushed": True}
+
+
+def test_evaluate_with_nothing_issued_is_a_natural_no_op():
+    """AE5: a weekend (or a weekday tick before 06:30) has no issued rounds — nothing is decided,
+    delivered, or marked."""
+    store, _fake = _configure_evaluate(issues=[])
+    with _capture_logs():
+        togvarsel_notify.evaluate(now=SATURDAY)
+    assert store.stores == 0
+
+
+def test_evaluate_isolates_a_failing_round_and_never_retries_it(monkeypatch):
+    """R10/KTD8 at the evaluate grain: the first round's delivery blowing up must not stop the
+    second round in the same tick — and the failed round's already-committed marker (KTD2) means
+    it is never retried."""
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    calls = {"n": 0}
+
+    def flaky_deliver(per_device, prepare):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("push service down")
+        return varsel.deliver_to_devices(per_device, prepare)
+
+    store, _fake = _configure_evaluate(
+        issues=[_issued("1200", "red", scope="ettermiddagsrushet 15:00–18:00"),
+                _issued("1400", "yellow", scope="ettermiddagsrushet 15:00–18:00")],
+        journeys=lambda: {"j1": _j(begin="15:30", end="17:00")},
+        deliver=flaky_deliver,
+    )
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}), _capture_logs() as records:
+        togvarsel_notify.evaluate(now=_monday(13, 30))
+        # 1200 red failed in delivery; 1400 yellow (an update against red) still went out
+        assert len(sent) == 1 and "gult" in sent[0]["title"]
+        day = store.by_date[MONDAY_STR]
+        assert day["1200"] == {"level": "red", "pushed": True}  # committed before fan-out (KTD2)
+        assert day["1400"] == {"level": "yellow", "pushed": True}
+        assert any(r.levelno >= logging.ERROR and "1200" in r.getMessage() for r in records)
+        togvarsel_notify.evaluate(now=_monday(13, 31))
+    assert len(sent) == 1  # KTD8: the failed round is never retried — its marker is committed
+
+
+def test_evaluate_persists_after_each_delivery_and_once_for_suppression_only_ticks(monkeypatch):
+    """KTD2 ordering: the persist rides AFTER the round's fan-out (the in-memory marker already
+    protects this process), and a tick that only recorded suppressions still persists them."""
+    order: list[str] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: order.append("send") or "sent")
+
+    class _OrderedStore(_MarkerStore):
+        def store(self, date_str, markers):
+            order.append("store")
+            super().store(date_str, markers)
+
+    _configure_evaluate(issues=[_issued("0630", "yellow")], store=_OrderedStore())
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+        togvarsel_notify.evaluate(now=_monday(6, 31))
+    assert order == ["send", "store"]
+    # suppression-only tick: a green baseline decides, nothing delivers, one persist at the end
+    order.clear()
+    store2, _fake = _configure_evaluate(issues=[_issued("0630", "green")], store=_OrderedStore())
+    togvarsel_notify.evaluate(now=_monday(6, 31))
+    assert order == ["store"]
+    assert store2.by_date[MONDAY_STR]["0630"] == {"level": "green", "pushed": False}
+
+
+def test_evaluate_survives_a_lost_persist_and_a_restart_is_bounded_by_timeliness(monkeypatch):
+    """The KTD2 crash window, end to end against varsel's REAL marker accessors: when persisting
+    the state blob fails (GCS down), the in-memory marker still dedups this process; a restart
+    that lost the marker re-evaluates — the one accepted duplicate — bounded by the deadline."""
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(varsel, "_save_state", lambda: None)  # every persist silently lost
+    with varsel._state_lock:
+        saved_rounds = deepcopy(varsel._togvarsel_rounds)
+    _configure_evaluate(
+        issues=[_issued("0630", "yellow")],
+        load_markers=varsel.togvarsel_rounds_for,
+        store_markers=varsel.store_togvarsel_rounds,
+    )
+    try:
+        with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+            togvarsel_notify.evaluate(now=_monday(6, 31))
+            assert len(sent) == 1
+            # the persist was lost, but the IN-MEMORY marker still prevents a re-push this process
+            togvarsel_notify.evaluate(now=_monday(6, 35))
+            assert len(sent) == 1
+            # "restart" before the deadline: the unpersisted marker is gone → the accepted duplicate
+            with varsel._state_lock:
+                varsel._togvarsel_rounds.clear()
+            togvarsel_notify.evaluate(now=_monday(6, 40))
+            assert len(sent) == 2
+            # "restart" past the deadline: timeliness bounds the window — suppressed, no third push
+            with varsel._state_lock:
+                varsel._togvarsel_rounds.clear()
+            togvarsel_notify.evaluate(now=_monday(7, 10))
+            assert len(sent) == 2
+            marker = varsel.togvarsel_rounds_for(MONDAY_STR)["0630"]
+            assert marker == {"level": "yellow", "pushed": False}
+    finally:
+        with varsel._state_lock:
+            varsel._togvarsel_rounds = saved_rounds
+
+
 class _MonkeyPatch:
     """Minimal monkeypatch shim so the tests run standalone (without pytest)."""
 

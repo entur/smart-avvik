@@ -46,12 +46,20 @@ network, and the wording keeps that honest. Each pushing round sends one push pe
 within the round (KTD8) — the marker is already committed, and a forecast is lower-stakes than a
 train alert.
 
+At the top sits :func:`evaluate`, the per-tick orchestration main calls right after
+togvarsel.refresh() on the wall-clock tick: gates first — while the delivery flag is off or VAPID
+is unset, NOTHING is evaluated and no markers are written (R9), so an enable-restart inside a
+timeliness window still delivers — then the station set (unavailable → no markers), then
+decide_rounds over the injected issued-today snapshot, then match + push per pushing round, with
+the marker map persisted through the injected store accessor after each round's delivery (KTD2)
+and the whole pass wrapped so one failure never breaks the poller tick (R10).
+
 All time logic is Europe/Oslo wall-clock. No import of main, varsel, or togvarsel (the package
-rule): runtime dependencies are injected — main passes the BigQuery client via :func:`configure`
-(togvarsel's own seam), the matcher takes varsel's `place_refs` as a plain callable, and
-:func:`push_round` takes varsel's delivery seams (device_subscription, deliver_to_devices,
-handle_gone_device, the brand-asset table, the environment tagger) the same way; the policy core
-needs none.
+rule): runtime dependencies are injected — main passes the BigQuery client and evaluate()'s seams
+via :func:`configure` (togvarsel's own idiom), the matcher takes varsel's `place_refs` as a plain
+callable, and :func:`push_round` takes varsel's delivery seams (device_subscription,
+deliver_to_devices, handle_gone_device, the brand-asset table, the environment tagger) the same
+way; the policy core needs none.
 """
 
 from __future__ import annotations
@@ -204,10 +212,65 @@ _bq_client: Any = None
 # state), so no lock.
 _station_state: dict[str, Any] = {}
 
+# evaluate()'s injected seams (KTD4), set by configure(). All-or-nothing at evaluation time:
+# until main wires the full set, evaluate() is a silent no-op — the same closed-gate posture as
+# the flag itself.
+_seams: dict[str, Any] = {}
+_EVALUATE_SEAMS = (
+    "enabled",
+    "push_ready",
+    "issued_today",
+    "journeys",
+    "expand_refs",
+    "resolve_device",
+    "deliver",
+    "handle_gone",
+    "brand_assets",
+    "tag_title",
+    "load_markers",
+    "store_markers",
+)
 
-def configure(*, bq_client: Any) -> None:
-    global _bq_client
+
+def configure(
+    *,
+    bq_client: Any,
+    enabled: Callable[[], bool] | None = None,
+    push_ready: Callable[[], bool] | None = None,
+    issued_today: Callable[[], list[dict[str, Any]]] | None = None,
+    journeys: Callable[[], Mapping[str, Mapping[str, Any]]] | None = None,
+    expand_refs: Callable[[str], Iterable[str]] | None = None,
+    resolve_device: Callable[[str], tuple[dict, str] | None] | None = None,
+    deliver: Callable[..., list[tuple[str, Any, str, dict]]] | None = None,
+    handle_gone: Callable[[str], bool] | None = None,
+    brand_assets: Mapping[str, Mapping[str, str]] | None = None,
+    tag_title: Callable[[str], str] | None = None,
+    load_markers: Callable[[str], Mapping[str, Any]] | None = None,
+    store_markers: Callable[[str, Mapping[str, Any]], None] | None = None,
+) -> None:
+    """Inject the module's runtime seams (KTD4): the BigQuery client for :func:`station_set`,
+    and — for :func:`evaluate` — the two gates (`enabled` reads the delivery flag, `push_ready`
+    varsel's VAPID state), togvarsel's issued-today snapshot, varsel's journey snapshot,
+    place-alias expander, delivery machinery, brand assets and environment tagger, and the
+    round-marker accessor pair (`load_markers(date) -> copy`, `store_markers(date, markers)`
+    persists and prunes to that date). Everything past `bq_client` is optional so the station-set
+    tests keep their one-argument call; a partial wiring simply leaves evaluate() a no-op."""
+    global _bq_client, _seams
     _bq_client = bq_client
+    _seams = {
+        "enabled": enabled,
+        "push_ready": push_ready,
+        "issued_today": issued_today,
+        "journeys": journeys,
+        "expand_refs": expand_refs,
+        "resolve_device": resolve_device,
+        "deliver": deliver,
+        "handle_gone": handle_gone,
+        "brand_assets": brand_assets,
+        "tag_title": tag_title,
+        "load_markers": load_markers,
+        "store_markers": store_markers,
+    }
 
 
 def station_set(now: datetime) -> frozenset[str] | None:
@@ -478,3 +541,94 @@ def push_round(
         extra={"fields": {"event": "togvarsel_notify_round", **summary}},
     )
     return summary
+
+
+# ---- Per-tick orchestration (R9, R10; KTD2, KTD9) ------------------------------------------------
+
+
+def evaluate(now: datetime | None = None) -> None:
+    """One tick's togvarsel notification pass — main calls this right after togvarsel.refresh()
+    on the every-tick wall-clock path (never from the SX-ingestion rebuild).
+
+    Gate order is the safety story (R9): while the flag is off or VAPID is unset this returns
+    before ANY evaluation, writing no markers — which is exactly what lets an enable-restart
+    inside a timeliness window still deliver that round. While the station set is unavailable,
+    the same: nothing evaluated, nothing marked (KTD5). Marker ordering per KTD2/KTD9:
+    decide_rounds commits every round's marker in memory before any fan-out, and the injected
+    store accessor persists after each pushing round's delivery — plus once at the end of a
+    suppression-only pass. The store's persistence is best-effort (varsel's _save_state never
+    raises), so a lost write costs at most the accepted crash-window duplicate on the next
+    restart, never the in-process dedup. Wrapped whole: a failure here is logged and the tick
+    goes on (main wraps its call too, R10)."""
+    try:
+        _evaluate(now if now is not None else datetime.now(_OSLO))
+    except Exception:
+        logger.exception("togvarsel_notify: evaluate failed this tick; retrying next tick")
+
+
+def _evaluate(now: datetime) -> None:
+    s = _seams
+    if any(s.get(key) is None for key in _EVALUATE_SEAMS):
+        return  # not wired for delivery (e.g. a station-set-only configuration): nothing to do
+    if not s["enabled"]():
+        return  # R9: no evaluation and NO markers, so an enable-restart still delivers
+    if not s["push_ready"]():
+        return  # no VAPID keys: degrade to a no-op under the same no-markers contract
+    now = now.astimezone(_OSLO)
+    stations = station_set(now)
+    if stations is None:
+        return  # KTD5: evaluate nothing while the geography is unavailable; retry next tick
+    issues = s["issued_today"]()
+    if not issues:
+        return  # weekend/holiday, or nothing issued yet today — the natural no-op
+    date_str = now.date().isoformat()
+    markers: dict[str, Any] = dict(s["load_markers"](date_str))
+    decisions = decide_rounds(issues, markers, now)
+    if not decisions:
+        return  # every issued round already carries a marker — nothing changed, nothing to save
+    for decision in decisions:
+        if not decision.push:
+            logger.info(
+                "togvarsel_notify: round %s %s suppressed (%s)",
+                decision.issue,
+                decision.level,
+                decision.reason,
+                extra={
+                    "fields": {
+                        "event": "togvarsel_notify_round",
+                        "issue": decision.issue,
+                        "level": decision.level,
+                        "decision": decision.reason,
+                    }
+                },
+            )
+    pushes = [d for d in decisions if d.push]
+    issue_by_key = {str(issue["issue"]): issue for issue in issues}
+    journeys = s["journeys"]() if pushes else {}
+    for decision in pushes:
+        try:
+            matched, devices = match_journeys(
+                decision.issue, journeys, stations, s["expand_refs"], now
+            )
+            push_round(
+                decision,
+                issue_by_key[decision.issue],
+                matched,
+                devices,
+                resolve_device=s["resolve_device"],
+                deliver=s["deliver"],
+                handle_gone=s["handle_gone"],
+                brand_assets=s["brand_assets"],
+                tag_title=s["tag_title"],
+            )
+        except Exception:
+            logger.exception(
+                "togvarsel_notify: delivering round %s failed; its marker is already committed, "
+                "so the round is not retried (KTD8) and later rounds go on (R10)",
+                decision.issue,
+            )
+        # Persist AFTER the round's fan-out (KTD2): the in-memory commit above already protects
+        # this process, and a crash inside the window costs at most one accepted duplicate.
+        s["store_markers"](date_str, markers)
+    if not pushes:
+        s["store_markers"](date_str, markers)  # suppression-only pass: the markers still count

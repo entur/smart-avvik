@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import threading
 import time
@@ -23,6 +24,7 @@ import logging_setup  # noqa: F401  (import side effect: golden-path JSON loggin
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
+import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -1032,6 +1034,22 @@ def _rebuild_all(timings: dict[str, int]) -> None:
         logger.exception("Avviksvarsel notify failed")
 
 
+def _togvarsel_notify_enabled() -> bool:
+    """The togvarsel push delivery gate, read per call so a check always reflects the environment.
+
+    Allow-list parse, the delivery-flag convention VARSEL_LLM_ENABLED established (llm_message.py
+    explains why the failure direction must be OFF) — but with UNSET parsing as off, deliberately
+    unlike that flag's default-"true" read: the code default matches the closed gate instead of
+    relying on helm values alone. While this is off, togvarsel_notify.evaluate() writes no
+    markers, so an enable-restart inside a timeliness window still delivers that round."""
+    return os.environ.get("TOGVARSEL_NOTIFY_ENABLED", "").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+        "on",
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Eager initial load so /alert_profile works before the first ingestion change fires
@@ -1085,6 +1103,26 @@ async def lifespan(app: FastAPI):
     # computes it, and a restart back-fills the day's earlier issues as `late` (the features are
     # clock-cutoff-defined, see togvarsel.py).
     togvarsel.configure(bq_client=bq_client)
+    # Togvarsel push rounds (togvarsel_notify): the forecast above delivered as /varsel Web
+    # Pushes. Wired the same way (the module imports neither varsel nor togvarsel, so every seam
+    # is injected): the two gates, togvarsel's issued snapshot, varsel's journey/device/delivery
+    # machinery, and the round-marker accessors in the persisted varsel state. Driven from the
+    # same wall-clock tick as togvarsel.refresh (see poll_for_changes), never the SX rebuild.
+    togvarsel_notify.configure(
+        bq_client=bq_client,
+        enabled=_togvarsel_notify_enabled,
+        push_ready=varsel.push_enabled,
+        issued_today=togvarsel.issued_today,
+        journeys=varsel.journeys_snapshot,
+        expand_refs=varsel.place_refs,
+        resolve_device=varsel.device_subscription,
+        deliver=varsel.deliver_to_devices,
+        handle_gone=varsel.handle_gone_device,
+        brand_assets=varsel._BRAND_ASSETS,
+        tag_title=varsel._tag_environment,
+        load_markers=varsel.togvarsel_rounds_for,
+        store_markers=varsel.store_togvarsel_rounds,
+    )
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
@@ -1379,6 +1417,13 @@ def poll_for_changes(
             logger.exception(
                 "Togvarsel refresh failed; /togmelding-api serves the day's existing issues"
             )
+        # Togvarsel pushes ride the same wall-clock tick, AFTER refresh so the tick that issues a
+        # round is the tick that can notify it — and never the SX-ingestion rebuild above.
+        # Isolated the same way: a notify failure costs notifications, never the feed or the tick.
+        try:
+            togvarsel_notify.evaluate()
+        except Exception:
+            logger.exception("Togvarsel notify failed this tick; retrying on next tick")
         if stop_event is not None:
             if stop_event.wait(interval):
                 return

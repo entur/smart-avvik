@@ -368,6 +368,24 @@ def test_endpoint_serves():
     assert {"date", "forecast_day", "issues", "known_deviations", "skill_note"} <= set(body)
 
 
+def test_issued_today_snapshots_plain_dicts_for_the_notify_seam():
+    """issued_today() is togvarsel_notify's injected snapshot (U4): plain dicts carrying the
+    Issue payload fields the notify chain reads, [] before the first refresh of the day, and []
+    on a stale (yesterday's) state — old issues must never leak into a new day's rounds."""
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.15})
+    _reset(fake)
+    assert togvarsel.issued_today(now=MONDAY_0710) == []  # before any refresh
+    togvarsel.refresh(now=MONDAY_0710)
+    issued = togvarsel.issued_today(now=MONDAY_0710)
+    assert [i["issue"] for i in issued] == ["0630"]  # am0700 failed -> only 0630 exists
+    (issue,) = issued
+    assert isinstance(issue, dict)
+    assert issue["level"] == "yellow" and issue["late"] is True
+    assert {"scope", "reasons", "computed_at", "p"} <= set(issue)
+    # the next day sees a stale state, not yesterday's issues
+    assert togvarsel.issued_today(now=datetime(2026, 9, 1, 7, 10, tzinfo=_OSLO)) == []
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
