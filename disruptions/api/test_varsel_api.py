@@ -177,6 +177,19 @@ def test_config_reports_push_enabled():
     assert body["vapid_public_key"] == _PUB
 
 
+def test_config_reports_togvarsel_notify_only_where_wired_on():
+    """The PWA's rush-forecast notice follows the delivery gate through /config: a deployment
+    without the provider (this suite's configure call, an older image) reads as off, so the page
+    can never announce a push class the environment's TOGVARSEL_NOTIFY_ENABLED gate withholds."""
+    assert client.get("/varsel-api/config").json()["togvarsel_notify"] is False
+    before = varsel._togvarsel_notify_provider
+    varsel._togvarsel_notify_provider = lambda: True
+    try:
+        assert client.get("/varsel-api/config").json()["togvarsel_notify"] is True
+    finally:
+        varsel._togvarsel_notify_provider = before
+
+
 @contextmanager
 def _deployed_as(project: str | None, override: str | None = None):
     """Run the body as if the app were deployed in `project` (ambient env, if any, restored after)."""

@@ -1062,6 +1062,9 @@ async def lifespan(app: FastAPI):
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
         connectivity_provider=_varsel_connectivity,
+        # /config tells the PWA whether rush-forecast pushes are delivered HERE, so the page's
+        # notice can never promise a push class this environment's gate withholds.
+        togvarsel_notify_provider=_togvarsel_notify_enabled,
     )
     llm_message.configure(stop_name_provider=_varsel_stops)
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
