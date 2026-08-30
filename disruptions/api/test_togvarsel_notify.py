@@ -19,6 +19,7 @@ Run: uv run --with fastapi --with httpx python test_togvarsel_notify.py  (or und
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -26,6 +27,8 @@ from zoneinfo import ZoneInfo
 
 import togvarsel_notify
 import varsel
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 _OSLO = ZoneInfo("Europe/Oslo")
 
@@ -986,6 +989,84 @@ def test_evaluate_survives_a_lost_persist_and_a_restart_is_bounded_by_timeliness
     finally:
         with varsel._state_lock:
             varsel._togvarsel_rounds = saved_rounds
+
+
+# ---------------------------------------------------------------------------- the dev-only test trigger (R11, U5)
+
+
+def _trigger_client() -> TestClient:
+    """The trigger's router mounted the way main mounts it (include_router), nothing else."""
+    app = FastAPI()
+    app.include_router(togvarsel_notify.router)
+    return TestClient(app)
+
+
+@contextmanager
+def _deployed_as(project: str | None, override: str | None = None):
+    """Run the body as if deployed in `project` (same shape as test_varsel_api's helper —
+    deployment.environment_label reads the environment per call, so setting it around the
+    request is enough)."""
+    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "KIX_ENVIRONMENT")}
+    for key, value in (("GOOGLE_CLOUD_PROJECT", project), ("KIX_ENVIRONMENT", override)):
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_the_test_trigger_sends_the_synthetic_round_through_the_real_pipe(monkeypatch):
+    """R11: one POST in dev delivers one synthetic push through the REAL composition + delivery
+    path — forecast-framed title with the environment prefix, brand icon and click-through, a
+    body that says it is a test — and never touches the round markers, so a morning of test
+    pushes cannot eat a real round's dedup or feed a follow-up a synthetic baseline."""
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    # tag_title is varsel's REAL tagger here: the env prefix is part of what the trigger proves.
+    store, fake = _configure_evaluate(issues=[], tag_title=varsel._tag_environment)
+    with (
+        _deployed_as("ent-kixavvik-dev"),
+        _push_devices({"dev-trig-1": _dev("https://push.example.com/t", brand="entur")}),
+    ):
+        r = _trigger_client().post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+    assert r.status_code == 200 and r.json() == {"status": "sent"}
+    (payload,) = sent
+    assert payload["title"] == "[dev] Rushvarsel: gult nivå for morgenrushet"  # real composition
+    assert "testvarsel" in payload["body"].lower()  # clearly a test, never a real forecast
+    assert payload["url"] == "/togmelding"
+    assert payload["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
+    assert "situation_number" not in payload
+    assert store.stores == 0 and store.by_date == {}  # NEVER touches round markers
+    assert fake.queries == []  # and needs no geography: the round is synthetic, not matched
+
+
+def test_the_test_trigger_is_refused_everywhere_but_dev(monkeypatch):
+    """R11 fails closed: tst, prd, unset and unrecognized labels are all refused with 404 —
+    before any delivery seam is touched, so nothing can be sent however the module is wired."""
+    monkeypatch.setattr(
+        varsel, "_send_push",
+        lambda sub, payload: (_ for _ in ()).throw(AssertionError("sent outside dev")),
+    )
+    _configure_evaluate(issues=[], tag_title=varsel._tag_environment)
+    client = _trigger_client()
+    scenarios = (
+        ("ent-kixavvik-tst", None),  # tst
+        ("ent-kixavvik-prd", None),  # prd: environment_label() is None
+        (None, None),  # unset: reads as production (unlabelled), still refused
+        ("ent-kixavvik-prd", "staging"),  # an unrecognized label is not dev either
+    )
+    with _push_devices({"dev-trig-1": _dev("https://push.example.com/t")}):
+        for project, override in scenarios:
+            with _deployed_as(project, override):
+                r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+                assert r.status_code == 404, (project, override, r.status_code)
 
 
 class _MonkeyPatch:
