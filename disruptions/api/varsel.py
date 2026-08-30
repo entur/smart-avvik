@@ -712,6 +712,19 @@ _message_errors: dict[tuple[str, str, str], int] = {}
 # and once the deterministic wording is stored all three look identical. See decisions.build_row.
 _message_meta: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+# Togvarsel push round markers, {"<YYYY-MM-DD Oslo>": {"<issue>": {"level": str, "pushed": bool}}} —
+# togvarsel_notify's single state primitive (dedup + the follow-up baseline in one). Persisted in
+# the state blob so a completed round never re-fires across restarts. Exactly one date is kept:
+# store_togvarsel_rounds prunes to the date it is given, which is how day rollover forgets
+# yesterday. Only the accessor pair below touches this — togvarsel_notify gets those injected and
+# never reads varsel globals.
+_togvarsel_rounds: dict[str, dict[str, Any]] = {}
+# Unknown top-level keys in the loaded blob, carried through apply→serialize verbatim (rollback
+# insurance): a key written by a future feature must survive THIS build rewriting the blob, so a
+# rollback-and-forward does not silently erase that feature's state.
+_state_extra: dict[str, Any] = {}
+_STATE_KEYS = frozenset({"devices", "journeys", "notified", "togvarsel_rounds"})
+
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
 _STATE_BLOB = os.environ.get("VARSEL_STATE_BLOB", "varsel_state.json")
@@ -724,17 +737,25 @@ def _now_iso() -> str:
 def _serialize_state() -> str:
     with _state_lock:
         return json.dumps(
-            {"devices": _devices, "journeys": _journeys, "notified": sorted(_notified)}
+            {
+                **_state_extra,  # unknown keys ride along verbatim (rollback insurance)
+                "devices": _devices,
+                "journeys": _journeys,
+                "notified": sorted(_notified),
+                "togvarsel_rounds": _togvarsel_rounds,
+            }
         )
 
 
 def _apply_state(raw: str) -> None:
     data = json.loads(raw)
     with _state_lock:
-        global _devices, _journeys, _notified
+        global _devices, _journeys, _notified, _togvarsel_rounds, _state_extra
         _devices = dict(data.get("devices", {}))
         _journeys = dict(data.get("journeys", {}))
         _notified = set(data.get("notified", []))
+        _togvarsel_rounds = dict(data.get("togvarsel_rounds", {}))
+        _state_extra = {k: v for k, v in data.items() if k not in _STATE_KEYS}
 
 
 _gcs_client = None
@@ -805,6 +826,40 @@ def _save_state() -> None:
             blob.upload_from_string(payload, content_type="application/json")
     except Exception:
         logger.exception("Could not upload varsel state to gs://%s/%s", _STATE_BUCKET, _STATE_BLOB)
+
+
+# ---- Togvarsel round markers + journey snapshot (injected into togvarsel_notify) --------------
+# That module imports neither varsel nor main (the package rule), so main hands it these
+# callables. Both marker accessors deal in detached copies: togvarsel_notify mutates its working
+# map freely and hands it back whole through the store — it never reaches varsel globals.
+
+
+def togvarsel_rounds_for(date_str: str) -> dict[str, Any]:
+    """A copy of the togvarsel round markers for one Oslo date ({} when none exist)."""
+    with _state_lock:
+        return {k: dict(v) for k, v in _togvarsel_rounds.get(str(date_str), {}).items()}
+
+
+def store_togvarsel_rounds(date_str: str, markers: Mapping[str, Any]) -> None:
+    """Replace the round markers for `date_str` — the current Oslo date — and persist.
+
+    Every OTHER date is pruned: markers dedup rounds and seed follow-up baselines for one day
+    only, so the first write after midnight is what forgets yesterday. Persistence is
+    :func:`_save_state`'s best-effort write-through — a failure there is logged, never raised, so
+    the in-memory markers still dedup this process and the cost of a lost write is bounded by the
+    next restart re-evaluating inside the timeliness window."""
+    with _state_lock:
+        global _togvarsel_rounds
+        _togvarsel_rounds = {str(date_str): {k: dict(v) for k, v in markers.items()}}
+        _save_state()
+
+
+def journeys_snapshot() -> dict[str, dict]:
+    """A shallow-copied snapshot of the registered journeys, for togvarsel_notify's matcher (it
+    only reads scalar fields, and one take of the lock keeps a concurrent delete from tearing a
+    record mid-iteration)."""
+    with _state_lock:
+        return {jid: dict(rec) for jid, rec in _journeys.items()}
 
 
 # ---- Matcher ---------------------------------------------------------------------------------
