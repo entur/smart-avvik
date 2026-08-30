@@ -9,7 +9,7 @@ broken round or journey must never stop the others in the same tick, and while t
 unavailable nothing may be evaluated or marked — so the round still fires when the set arrives.
 
 The composition and delivery sections wire the module to varsel's REAL delivery seams the way
-main does (KTD4: injected callables, never an import), with only `varsel._send_push` stubbed —
+main does (injected callables, never an import), with only `varsel._send_push` stubbed —
 so the wording, brand assets, gone-grace-drop rule and round counts are checked against the same
 machinery the SX pushes ride on.
 
@@ -49,7 +49,7 @@ def _issue(key: str, level: str, late: bool = False) -> dict:
 
 class _SpyMarkers(dict):
     """A marker map that records reads and writes, so the commit-before-read contract (a same-tick
-    follow-up must see the just-decided baseline marker, KTD9) is asserted, not assumed."""
+    follow-up must see the just-decided baseline marker) is asserted, not assumed."""
 
     def __init__(self, *args):
         super().__init__(*args)
@@ -80,7 +80,7 @@ def test_notify_specs_pin_deadlines_and_baseline_pairing():
 # ---------------------------------------------------------------------------- baseline rounds
 
 def test_baseline_yellow_before_the_deadline_pushes_a_warning():
-    """AE1 (round level): 0630 yellow at 06:31 with no marker pushes exactly once."""
+    """A 0630 yellow at 06:31 with no marker pushes exactly once."""
     markers = {}
     decisions = togvarsel_notify.decide_rounds(
         [_issue("0630", "yellow")], markers, now=_monday(6, 31)
@@ -101,7 +101,7 @@ def test_baseline_green_is_recorded_but_not_pushed():
 # ---------------------------------------------------------------------------- follow-up rounds
 
 def test_follow_up_at_the_same_pushed_level_is_suppressed_as_no_change():
-    """AE2: 0700 yellow after 0630 pushed yellow — no repeat of the same message."""
+    """A 0700 yellow after 0630 pushed yellow — no repeat of the same message."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
     (d,) = togvarsel_notify.decide_rounds([_issue("0700", "yellow")], markers, now=_monday(7, 1))
     assert d.push is False and d.reason == "no_change"
@@ -109,7 +109,7 @@ def test_follow_up_at_the_same_pushed_level_is_suppressed_as_no_change():
 
 
 def test_follow_up_escalation_pushes_an_update():
-    """AE3: 0700 red after 0630 pushed yellow — a level transition is the significant change."""
+    """A 0700 red after 0630 pushed yellow — a level transition is the significant change."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
     (d,) = togvarsel_notify.decide_rounds([_issue("0700", "red")], markers, now=_monday(7, 1))
     assert d.push is True and d.kind == "update"
@@ -138,7 +138,7 @@ def test_follow_up_pushes_when_the_baseline_round_never_ran():
 
 
 def test_green_follow_up_after_a_pushed_warning_is_the_all_clear():
-    """AE7: the one green that pushes — friskmelding after a pushed yellow (KTD11)."""
+    """The one green that pushes — friskmelding after a pushed yellow."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
     (d,) = togvarsel_notify.decide_rounds([_issue("0700", "green")], markers, now=_monday(7, 1))
     assert d.push is True and d.kind == "all_clear"
@@ -147,7 +147,7 @@ def test_green_follow_up_after_a_pushed_warning_is_the_all_clear():
 
 
 def test_green_follow_up_after_a_green_baseline_stays_quiet():
-    """AE7, second half: green after a green (unpushed) baseline is no change, not an all-clear."""
+    """Green after a green (unpushed) baseline is no change, not an all-clear."""
     markers = {"0630": {"level": "green", "pushed": False}}
     (d,) = togvarsel_notify.decide_rounds([_issue("0700", "green")], markers, now=_monday(7, 1))
     assert d.push is False and d.reason == "no_change"
@@ -162,8 +162,8 @@ def test_pm_all_clear_after_a_red_1200():
 # ---------------------------------------------------------------------------- timeliness
 
 def test_restart_at_0730_suppresses_the_backfill_and_pushes_the_follow_up():
-    """AE4: one tick back-fills 0630 (late, red) and issues 0700 (red). Handed over in the wrong
-    order on purpose: evaluation must follow due-time order, not input order (KTD9)."""
+    """One tick back-fills 0630 (late, red) and issues 0700 (red). Handed over in the wrong
+    order on purpose: evaluation must follow due-time order, not input order."""
     markers = _SpyMarkers()
     decisions = togvarsel_notify.decide_rounds(
         [_issue("0700", "red"), _issue("0630", "red", late=True)], markers, now=_monday(7, 30)
@@ -210,7 +210,7 @@ def test_1400_is_gated_by_what_a_1359_1200_pushed():
 
 
 def test_now_in_utc_is_read_as_oslo_wall_clock():
-    # 04:31 UTC on 2026-08-31 is 06:31 in Oslo (CEST): timely for 0630 (KTD10)
+    # 04:31 UTC on 2026-08-31 is 06:31 in Oslo (CEST): timely for 0630
     markers = {}
     (d,) = togvarsel_notify.decide_rounds(
         [_issue("0630", "yellow")], markers, now=datetime(2026, 8, 31, 4, 31, tzinfo=UTC)
@@ -230,7 +230,7 @@ def test_a_marked_round_is_never_reevaluated():
 
 
 def test_an_empty_issue_list_is_a_natural_no_op():
-    """AE5 (round level): weekends and holidays issue nothing, so there is nothing to decide."""
+    """Weekends and holidays issue nothing, so there is nothing to decide."""
     markers = {}
     assert togvarsel_notify.decide_rounds([], markers, now=SATURDAY) == []
     assert markers == {}
@@ -238,7 +238,7 @@ def test_an_empty_issue_list_is_a_natural_no_op():
 
 def test_one_broken_round_never_stops_the_rest_of_the_tick():
     # a restart at 13:30 back-fills 0630 with a malformed level alongside a fresh 1200: the broken
-    # round records no marker; the healthy one still pushes (R10)
+    # round records no marker; the healthy one still pushes
     markers = {}
     decisions = togvarsel_notify.decide_rounds(
         [_issue("0630", "purple", late=True), _issue("1200", "yellow")], markers, now=_monday(13, 30)
@@ -274,7 +274,7 @@ def test_decide_issue_is_pure_and_mutates_nothing():
     assert markers == before_markers and issue == before_issue
 
 
-# ---------------------------------------------------------------------------- station set (KTD5)
+# ---------------------------------------------------------------------------- station set
 
 # 39 refs like the real table's — the count is what the sanity log is asserted on.
 _OSLO_REFS = tuple(f"NSR:StopPlace:{n}" for n in range(1, 40))
@@ -349,7 +349,7 @@ def test_station_set_is_fetched_once_per_oslo_day_and_logs_the_count():
 
 
 def test_station_fetch_failure_is_unavailable_then_recovers_with_no_markers_meanwhile():
-    """KTD5: fetch fails at 06:30 → the caller skips evaluation entirely (no markers) and retries
+    """Fetch fails at 06:30 → the caller skips evaluation entirely (no markers) and retries
     on the very next call — no cooldown, no daily give-up — so 0630 still pushes at 06:40."""
     fake = _StationsBQ(refs=_OSLO_REFS, fail=True)
     _reset_stations(fake)
@@ -387,7 +387,7 @@ def test_an_empty_station_table_reads_as_unavailable():
         assert togvarsel_notify.station_set(now=_monday(6, 30)) is None
 
 
-# ---------------------------------------------------------------------------- matching (R5, R6)
+# ---------------------------------------------------------------------------- matching
 
 # Three of the table's 39 stations are enough for the matcher: Asker, Oslo S, Sandvika.
 STATIONS = frozenset({"NSR:StopPlace:418", "NSR:StopPlace:337", "NSR:StopPlace:610"})
@@ -480,7 +480,7 @@ def test_a_window_ending_before_the_follow_up_scope_does_not_match_it():
 
 
 def test_the_live_window_is_bounded_by_evaluation_time():
-    # R5: [max(scope start, now), scope end) — a traveller whose window has fully passed gets
+    # [max(scope start, now), scope end) — a traveller whose window has fully passed gets
     # nothing, warnings and friskmelding alike
     journeys = {"gone": _j(begin="07:00", end="07:40"), "still": _j(begin="07:00", end="08:30")}
     matched, _devices = togvarsel_notify.match_journeys(
@@ -506,7 +506,7 @@ def test_two_matching_journeys_on_one_device_yield_one_device():
         "0630", journeys, STATIONS, _ident, now=_monday(6, 31)
     )
     assert matched == ["j1", "j2"]
-    assert devices == {"dev-1"}  # R6: one push per device per round
+    assert devices == {"dev-1"}  # one push per device per round
 
 
 def test_a_malformed_record_is_skipped_and_the_healthy_ones_still_match():
@@ -528,7 +528,7 @@ def test_match_journeys_refuses_an_unknown_issue_key():
         raise AssertionError("expected ValueError for an unknown issue key")
 
 
-# ---------------------------------------------------------------------------- composition (R7, KTD6)
+# ---------------------------------------------------------------------------- composition
 
 # Reasons as togvarsel's rule engine really words them (test_togvarsel pins that vocabulary).
 _REASONS = (
@@ -546,7 +546,7 @@ def _issued(key: str = "0630", level: str = "yellow", scope: str = "morgenrushet
 
 
 def test_warning_payload_is_forecast_framed_with_level_env_prefix_and_reasons():
-    """AE1 (message grain): the title says rush forecast + level (never train-alert framing), the
+    """The title says rush forecast + level (never train-alert framing), the
     injected tagger prefixes the environment, the body is scope + leading reasons — and there is
     no situation_number: this is not an SX situation (precedent: the /varsel-api/test push)."""
     decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
@@ -560,13 +560,13 @@ def test_warning_payload_is_forecast_framed_with_level_env_prefix_and_reasons():
         "2 tog er innstilt før kl. 06:30. Forsinkelser i morgentimene så langt."
     )
     assert "personalmangel" not in payload["body"]  # leading reasons only — a lock screen is small
-    assert payload["url"] == "/togmelding"  # R8: the entur brand lands on the forecast page
+    assert payload["url"] == "/togmelding"  # the entur brand lands on the forecast page
     assert payload["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
     assert "situation_number" not in payload
 
 
 def test_none_brand_gets_its_own_icon_and_the_unbranded_varsel_url():
-    """R8: the unbranded install has no /togmelding to land on, so it keeps its own varsel URL —
+    """The unbranded install has no /togmelding to land on, so it keeps its own varsel URL —
     the body carries the essentials. The WORDING is identical across brands (varsel precedent)."""
     decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
     entur, none = (
@@ -593,7 +593,7 @@ def test_afternoon_warning_names_the_afternoon_rush():
 
 
 def test_update_payload_marks_the_forecast_as_updated():
-    """AE3: a follow-up against a pushed baseline says the forecast is UPDATED, so the second
+    """A follow-up against a pushed baseline says the forecast is UPDATED, so the second
     push in one rush reads as a revision, not a repeat."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
     issue = _issued("0700", "red", scope="resten av morgenrushet 07:00–09:00")
@@ -613,8 +613,8 @@ def test_a_fresh_warning_from_a_follow_up_round_is_not_worded_as_an_update():
 
 
 def test_all_clear_payload_is_a_friskmelding_without_warning_language():
-    """AE7: the drop back to green is framed as a friskmelding — calm, and free of every word the
-    warnings use (R7). No reasons either: green's own reasons still talk about trouble signs."""
+    """The drop back to green is framed as a friskmelding — calm, and free of every word the
+    warnings use. No reasons either: green's own reasons still talk about trouble signs."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
     issue = _issued("0700", "green", scope="resten av morgenrushet 07:00–09:00",
                     reasons=("ingen tegn til trøbbel i morgentimene",))
@@ -638,7 +638,7 @@ def test_composition_refuses_a_non_push_decision():
         raise AssertionError("expected ValueError for a non-push decision")
 
 
-# ---------------------------------------------------------------------------- round delivery (R6, KTD8)
+# ---------------------------------------------------------------------------- round delivery
 
 def _dev(endpoint: str, brand: str | None = None, created: str | None = None) -> dict:
     """A varsel device record: subscription + created_ts (the grace window reads it), brand opt."""
@@ -668,7 +668,7 @@ def _push_devices(devices: dict):
 
 
 def _wiring() -> dict:
-    """push_round's injected seams, wired to varsel exactly as main will (KTD4, U4)."""
+    """push_round's injected seams, wired to varsel exactly as main will."""
     return {
         "resolve_device": varsel.device_subscription,
         "deliver": varsel.deliver_to_devices,
@@ -693,7 +693,7 @@ def test_push_round_pushes_once_per_device_with_each_brands_assets(monkeypatch):
             # dev-x matched but was deleted before delivery: skipped, counted, never a crash
             decision, _issued(), ["j1", "j2", "j3"], {"dev-e", "dev-n", "dev-x"}, **_wiring()
         )
-    assert len(sent) == 2  # R6: one push per device per round, and only to live subscriptions
+    assert len(sent) == 2  # one push per device per round, and only to live subscriptions
     by_endpoint = dict(sent)
     entur = by_endpoint["https://push.example.com/e"]
     none = by_endpoint["https://push.example.com/n"]
@@ -729,7 +729,7 @@ def test_a_gone_device_is_dropped_after_grace_and_the_round_completes(monkeypatc
 
 
 def test_one_erroring_device_never_stops_the_others_and_the_round_is_logged(monkeypatch):
-    """KTD8: a transient send error is counted, never retried within the round — and the round's
+    """A transient send error is counted, never retried within the round — and the round's
     marker stays pushed, so the round never re-fires for the error's sake."""
     results = {
         "https://push.example.com/a": "sent",
@@ -751,7 +751,7 @@ def test_one_erroring_device_never_stops_the_others_and_the_round_is_logged(monk
     assert summary["sent"] == 2 and summary["error"] == 1 and summary["gone"] == 0
     assert markers["0630"] == {"level": "red", "pushed": True}  # the marker was never unwound
     rounds = [r for r in records if getattr(r, "fields", {}).get("event") == "togvarsel_notify_round"]
-    assert len(rounds) == 1, "exactly one structured round event (R10)"
+    assert len(rounds) == 1, "exactly one structured round event"
     f = rounds[0].fields
     assert (f["issue"], f["level"], f["kind"]) == ("0630", "red", "warning")
     assert (f["matched_journeys"], f["matched_devices"]) == (3, 3)
@@ -771,7 +771,7 @@ def test_push_round_refuses_a_non_push_decision(monkeypatch):
         raise AssertionError("expected ValueError for a non-push decision")
 
 
-# ---------------------------------------------------------------------------- evaluate (U4: R9, R10; KTD2)
+# ---------------------------------------------------------------------------- evaluate
 
 MONDAY_STR = "2026-08-31"
 
@@ -794,7 +794,7 @@ class _MarkerStore:
 
 
 def _configure_evaluate(**overrides) -> tuple[_MarkerStore, _StationsBQ]:
-    """Wire configure() the way main does (KTD4, U4), with fakes for the gates and the marker
+    """Wire configure() the way main does, with fakes for the gates and the marker
     store; every delivery seam is varsel's REAL one, so evaluate() is exercised against the same
     machinery the SX pushes ride on. Returns (marker store, stations fake) for assertions."""
     store = overrides.pop("store", None) or _MarkerStore()
@@ -822,8 +822,8 @@ def _configure_evaluate(**overrides) -> tuple[_MarkerStore, _StationsBQ]:
 
 
 def test_evaluate_flag_off_evaluates_nothing_and_writes_no_markers(monkeypatch):
-    """R9: while disabled the evaluator must not even LOOK — no station fetch, no markers — which
-    is exactly what lets an enable-restart inside a timeliness window still deliver (AE6)."""
+    """While disabled the evaluator must not even LOOK — no station fetch, no markers — which
+    is exactly what lets an enable-restart inside a timeliness window still deliver."""
     monkeypatch.setattr(
         varsel, "_send_push",
         lambda sub, payload: (_ for _ in ()).throw(AssertionError("sent while disabled")),
@@ -835,7 +835,7 @@ def test_evaluate_flag_off_evaluates_nothing_and_writes_no_markers(monkeypatch):
 
 
 def test_evaluate_without_vapid_is_a_no_op_with_no_markers(monkeypatch):
-    """R9: no VAPID keys degrades to a no-op with no markers, same contract as the flag."""
+    """No VAPID keys degrades to a no-op with no markers, same contract as the flag."""
     monkeypatch.setattr(
         varsel, "_send_push",
         lambda sub, payload: (_ for _ in ()).throw(AssertionError("sent without VAPID")),
@@ -846,7 +846,7 @@ def test_evaluate_without_vapid_is_a_no_op_with_no_markers(monkeypatch):
 
 
 def test_evaluate_pushes_after_an_enable_restart_inside_the_window(monkeypatch):
-    """AE6: the flag was off all morning so no markers exist; the 06:50 restart with the flag on
+    """The flag was off all morning so no markers exist; the 06:50 restart with the flag on
     evaluates 0630 fresh and delivers — and the stored marker dedups the very next tick."""
     sent: list[dict] = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
@@ -857,11 +857,11 @@ def test_evaluate_pushes_after_an_enable_restart_inside_the_window(monkeypatch):
         assert sent[0]["title"] == "Rushvarsel: gult nivå for morgenrushet"
         assert store.by_date[MONDAY_STR]["0630"] == {"level": "yellow", "pushed": True}
         togvarsel_notify.evaluate(now=_monday(6, 51))
-    assert len(sent) == 1  # R4: the marker dedups; a completed round never re-fires
+    assert len(sent) == 1  # the marker dedups; a completed round never re-fires
 
 
 def test_evaluate_after_a_late_restart_suppresses_and_never_revisits(monkeypatch):
-    """AE6's flip side: a 07:10 restart is past 0630's deadline — no push, and the suppression is
+    """The flip side: a 07:10 restart is past 0630's deadline — no push, and the suppression is
     itself marked (and persisted) so the round is never revisited."""
     monkeypatch.setattr(
         varsel, "_send_push",
@@ -874,7 +874,7 @@ def test_evaluate_after_a_late_restart_suppresses_and_never_revisits(monkeypatch
 
 
 def test_evaluate_writes_no_markers_while_the_station_set_is_unavailable(monkeypatch):
-    """KTD5 at the evaluate grain: while the geography cannot be fetched, nothing is evaluated or
+    """At the evaluate grain: while the geography cannot be fetched, nothing is evaluated or
     marked — so the round still fires, once, when the set arrives inside the window."""
     sent: list[dict] = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
@@ -890,7 +890,7 @@ def test_evaluate_writes_no_markers_while_the_station_set_is_unavailable(monkeyp
 
 
 def test_evaluate_with_nothing_issued_is_a_natural_no_op():
-    """AE5: a weekend (or a weekday tick before 06:30) has no issued rounds — nothing is decided,
+    """A weekend (or a weekday tick before 06:30) has no issued rounds — nothing is decided,
     delivered, or marked."""
     store, _fake = _configure_evaluate(issues=[])
     with _capture_logs():
@@ -899,8 +899,8 @@ def test_evaluate_with_nothing_issued_is_a_natural_no_op():
 
 
 def test_evaluate_isolates_a_failing_round_and_never_retries_it(monkeypatch):
-    """R10/KTD8 at the evaluate grain: the first round's delivery blowing up must not stop the
-    second round in the same tick — and the failed round's already-committed marker (KTD2) means
+    """At the evaluate grain: the first round's delivery blowing up must not stop the
+    second round in the same tick — and the failed round's already-committed marker means
     it is never retried."""
     sent: list[dict] = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
@@ -923,15 +923,15 @@ def test_evaluate_isolates_a_failing_round_and_never_retries_it(monkeypatch):
         # 1200 red failed in delivery; 1400 yellow (an update against red) still went out
         assert len(sent) == 1 and "gult" in sent[0]["title"]
         day = store.by_date[MONDAY_STR]
-        assert day["1200"] == {"level": "red", "pushed": True}  # committed before fan-out (KTD2)
+        assert day["1200"] == {"level": "red", "pushed": True}  # committed before fan-out
         assert day["1400"] == {"level": "yellow", "pushed": True}
         assert any(r.levelno >= logging.ERROR and "1200" in r.getMessage() for r in records)
         togvarsel_notify.evaluate(now=_monday(13, 31))
-    assert len(sent) == 1  # KTD8: the failed round is never retried — its marker is committed
+    assert len(sent) == 1  # the failed round is never retried — its marker is committed
 
 
 def test_evaluate_persists_after_each_delivery_and_once_for_suppression_only_ticks(monkeypatch):
-    """KTD2 ordering: the persist rides AFTER the round's fan-out (the in-memory marker already
+    """Ordering: the persist rides AFTER the round's fan-out (the in-memory marker already
     protects this process), and a tick that only recorded suppressions still persists them."""
     order: list[str] = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: order.append("send") or "sent")
@@ -954,7 +954,7 @@ def test_evaluate_persists_after_each_delivery_and_once_for_suppression_only_tic
 
 
 def test_evaluate_survives_a_lost_persist_and_a_restart_is_bounded_by_timeliness(monkeypatch):
-    """The KTD2 crash window, end to end against varsel's REAL marker accessors: when persisting
+    """The accepted crash window, end to end against varsel's REAL marker accessors: when persisting
     the state blob fails (GCS down), the in-memory marker still dedups this process; a restart
     that lost the marker re-evaluates — the one accepted duplicate — bounded by the deadline."""
     sent: list[dict] = []
@@ -991,7 +991,7 @@ def test_evaluate_survives_a_lost_persist_and_a_restart_is_bounded_by_timeliness
             varsel._togvarsel_rounds = saved_rounds
 
 
-# ---------------------------------------------------------------------------- the dev-only test trigger (R11, U5)
+# ---------------------------------------------------------------------------- the dev-only test trigger
 
 
 def _trigger_client() -> TestClient:
@@ -1023,7 +1023,7 @@ def _deployed_as(project: str | None, override: str | None = None):
 
 
 def test_the_test_trigger_sends_the_synthetic_round_through_the_real_pipe(monkeypatch):
-    """R11: one POST in dev delivers one synthetic push through the REAL composition + delivery
+    """One POST in dev delivers one synthetic push through the REAL composition + delivery
     path — forecast-framed title with the environment prefix, brand icon and click-through, a
     body that says it is a test — and never touches the round markers, so a morning of test
     pushes cannot eat a real round's dedup or feed a follow-up a synthetic baseline."""
@@ -1048,7 +1048,7 @@ def test_the_test_trigger_sends_the_synthetic_round_through_the_real_pipe(monkey
 
 
 def test_the_test_trigger_is_refused_everywhere_but_dev(monkeypatch):
-    """R11 fails closed: tst, prd, unset and unrecognized labels are all refused with 404 —
+    """The trigger fails closed: tst, prd, unset and unrecognized labels are all refused with 404 —
     before any delivery seam is touched, so nothing can be sent however the module is wired."""
     monkeypatch.setattr(
         varsel, "_send_push",
@@ -1067,6 +1067,43 @@ def test_the_test_trigger_is_refused_everywhere_but_dev(monkeypatch):
             with _deployed_as(project, override):
                 r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
                 assert r.status_code == 404, (project, override, r.status_code)
+
+
+def test_the_test_trigger_maps_delivery_outcomes_to_the_test_push_statuses(monkeypatch):
+    """The non-happy statuses mirror /varsel-api/test — 503 push-not-ready, 404 unknown device,
+    425 fresh-gone (kept for retry), 410 stale-gone (dropped), 502 send error — each read from
+    the REAL delivery outcome, and no failure branch touches the round markers."""
+    client = _trigger_client()
+    with _deployed_as("ent-kixavvik-dev"):
+        store, _ = _configure_evaluate(issues=[], push_ready=lambda: False)
+        r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+        assert r.status_code == 503  # VAPID/push not configured
+
+        store, _ = _configure_evaluate(issues=[])
+        with _push_devices({}):
+            r = client.post("/togmelding-api/test-notify", json={"device_id": "unknown-dev"})
+            assert r.status_code == 404  # no such device
+
+        monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "gone")
+        with _push_devices({"dev-trig-1": _dev("https://push.example.com/t")}):
+            r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+            assert r.status_code == 425  # fresh device saying gone is kept (grace window)
+            with varsel._state_lock:
+                assert "dev-trig-1" in varsel._devices
+
+        with _push_devices(
+            {"dev-trig-1": _dev("https://push.example.com/t", created="2020-01-01T00:00:00+00:00")}
+        ):
+            r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+            assert r.status_code == 410  # stale device saying gone is dropped
+            with varsel._state_lock:
+                assert "dev-trig-1" not in varsel._devices
+
+        monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "error")
+        with _push_devices({"dev-trig-1": _dev("https://push.example.com/t")}):
+            r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+            assert r.status_code == 502  # transient send error
+    assert store.stores == 0  # no failure branch touches the round markers
 
 
 class _MonkeyPatch:

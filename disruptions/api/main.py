@@ -1042,12 +1042,7 @@ def _togvarsel_notify_enabled() -> bool:
     unlike that flag's default-"true" read: the code default matches the closed gate instead of
     relying on helm values alone. While this is off, togvarsel_notify.evaluate() writes no
     markers, so an enable-restart inside a timeliness window still delivers that round."""
-    return os.environ.get("TOGVARSEL_NOTIFY_ENABLED", "").strip().lower() in (
-        "true",
-        "1",
-        "yes",
-        "on",
-    )
+    return os.environ.get("TOGVARSEL_NOTIFY_ENABLED", "").strip().lower() in llm_message._TRUTHY
 
 
 @asynccontextmanager
@@ -1224,7 +1219,7 @@ app.include_router(meldinger.router)
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
 app.include_router(togvarsel.router)
 
-# Togvarsel-notify's dev-only test trigger (POST /togmelding-api/test-notify, R11): one synthetic
+# Togvarsel-notify's dev-only test trigger (POST /togmelding-api/test-notify): one synthetic
 # rush-forecast push through the same composition + delivery seams the real rounds use (injected
 # in lifespan above). The route gates itself on deployment.environment_label() == "dev" per call
 # — tst, prd and unset labels get a plain 404 — so mounting it everywhere is safe and keeps the
