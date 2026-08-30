@@ -85,7 +85,7 @@ import os
 import re
 import threading
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
@@ -271,8 +271,8 @@ _WORST_CASE_CALL_S = 2 * 8.0
 # Sized against the WORST case, not the normal one, because the normal one is invisible at any
 # width: a healthy send is ~100-300 ms, so even several hundred devices finish in seconds. What this
 # number actually decides is how long a DEGRADED push service holds the ingestion thread. The pool
-# runs one task per device with pending alerts and each task's sends stay sequential (see
-# `_deliver_device` -- a "gone" result must stop that device's remaining alerts), so the ceiling is
+# runs one task per device with pending pushes and each task's sends stay sequential (see
+# `deliver_to_devices` -- a "gone" result must stop that device's remaining items), so the ceiling is
 # ceil(devices / _PUSH_WORKERS) x _PUSH_TIMEOUT_S. At 8 workers a 10x pilot whose endpoints all hang
 # costs ~9 minutes of stalled poller; at 32 it is ~2. The threads are nearly free -- every one is
 # parked in a socket read, not computing -- so this tracks the device cap rather than the machine,
@@ -712,6 +712,19 @@ _message_errors: dict[tuple[str, str, str], int] = {}
 # and once the deterministic wording is stored all three look identical. See decisions.build_row.
 _message_meta: dict[tuple[str, str, str], dict[str, Any]] = {}
 
+# Togvarsel push round markers, {"<YYYY-MM-DD Oslo>": {"<issue>": {"level": str, "pushed": bool}}} —
+# togvarsel_notify's single state primitive (dedup + the follow-up baseline in one). Persisted in
+# the state blob so a completed round never re-fires across restarts. Exactly one date is kept:
+# store_togvarsel_rounds prunes to the date it is given, which is how day rollover forgets
+# yesterday. Only the accessor pair below touches this — togvarsel_notify gets those injected and
+# never reads varsel globals.
+_togvarsel_rounds: dict[str, dict[str, Any]] = {}
+# Unknown top-level keys in the loaded blob, carried through apply→serialize verbatim (rollback
+# insurance): a key written by a future feature must survive THIS build rewriting the blob, so a
+# rollback-and-forward does not silently erase that feature's state.
+_state_extra: dict[str, Any] = {}
+_STATE_KEYS = frozenset({"devices", "journeys", "notified", "togvarsel_rounds"})
+
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
 _STATE_BLOB = os.environ.get("VARSEL_STATE_BLOB", "varsel_state.json")
@@ -724,17 +737,25 @@ def _now_iso() -> str:
 def _serialize_state() -> str:
     with _state_lock:
         return json.dumps(
-            {"devices": _devices, "journeys": _journeys, "notified": sorted(_notified)}
+            {
+                **_state_extra,  # unknown keys ride along verbatim (rollback insurance)
+                "devices": _devices,
+                "journeys": _journeys,
+                "notified": sorted(_notified),
+                "togvarsel_rounds": _togvarsel_rounds,
+            }
         )
 
 
 def _apply_state(raw: str) -> None:
     data = json.loads(raw)
     with _state_lock:
-        global _devices, _journeys, _notified
+        global _devices, _journeys, _notified, _togvarsel_rounds, _state_extra
         _devices = dict(data.get("devices", {}))
         _journeys = dict(data.get("journeys", {}))
         _notified = set(data.get("notified", []))
+        _togvarsel_rounds = dict(data.get("togvarsel_rounds", {}))
+        _state_extra = {k: v for k, v in data.items() if k not in _STATE_KEYS}
 
 
 _gcs_client = None
@@ -805,6 +826,40 @@ def _save_state() -> None:
             blob.upload_from_string(payload, content_type="application/json")
     except Exception:
         logger.exception("Could not upload varsel state to gs://%s/%s", _STATE_BUCKET, _STATE_BLOB)
+
+
+# ---- Togvarsel round markers + journey snapshot (injected into togvarsel_notify) --------------
+# That module imports neither varsel nor main (the package rule), so main hands it these
+# callables. Both marker accessors deal in detached copies: togvarsel_notify mutates its working
+# map freely and hands it back whole through the store — it never reaches varsel globals.
+
+
+def togvarsel_rounds_for(date_str: str) -> dict[str, Any]:
+    """A copy of the togvarsel round markers for one Oslo date ({} when none exist)."""
+    with _state_lock:
+        return {k: dict(v) for k, v in _togvarsel_rounds.get(str(date_str), {}).items()}
+
+
+def store_togvarsel_rounds(date_str: str, markers: Mapping[str, Any]) -> None:
+    """Replace the round markers for `date_str` — the current Oslo date — and persist.
+
+    Every OTHER date is pruned: markers dedup rounds and seed follow-up baselines for one day
+    only, so the first write after midnight is what forgets yesterday. Persistence is
+    :func:`_save_state`'s best-effort write-through — a failure there is logged, never raised, so
+    the in-memory markers still dedup this process and the cost of a lost write is bounded by the
+    next restart re-evaluating inside the timeliness window."""
+    with _state_lock:
+        global _togvarsel_rounds
+        _togvarsel_rounds = {str(date_str): {k: dict(v) for k, v in markers.items()}}
+        _save_state()
+
+
+def journeys_snapshot() -> dict[str, dict]:
+    """A shallow-copied snapshot of the registered journeys, for togvarsel_notify's matcher (it
+    only reads scalar fields, and one take of the lock keeps a concurrent delete from tearing a
+    record mid-iteration)."""
+    with _state_lock:
+        return {jid: dict(rec) for jid, rec in _journeys.items()}
 
 
 # ---- Matcher ---------------------------------------------------------------------------------
@@ -1581,6 +1636,44 @@ def _log_push(
     )
 
 
+def deliver_to_devices(
+    per_device: Mapping[str, list[Any]],
+    prepare: Callable[[Any], tuple[dict, dict]],
+) -> list[tuple[str, Any, str, dict]]:
+    """Fan one batch of pending pushes out across devices, bounded by the module's worker pool.
+
+    ``per_device`` maps device_id → that device's pending items, in send order; ``prepare`` turns
+    one item into ``(subscription, payload)`` and runs on the fan-out's worker thread. Parallel
+    ACROSS devices, sequential WITHIN one: each send can block for :data:`_PUSH_TIMEOUT_S` against
+    a client-supplied endpoint (FCM, Mozilla, Apple), so sequential delivery would stall the
+    poller for devices × 10 s in the bad case — while a "gone" result must still stop that
+    device's REMAINING items this batch, which only holds if its own sends stay ordered.
+
+    Returns ``(device_id, item, result, payload)`` flattened in ``per_device`` order; the caller
+    owns what a result means — logging, dedup bookkeeping, and the gone → grace → drop rule
+    (:func:`handle_gone_device`). Shared by check_and_notify's SX delivery loop and (injected by
+    main, so that module imports no varsel) togvarsel_notify's forecast rounds.
+    """
+
+    def _deliver_device(entry: tuple[str, list[Any]]) -> list[tuple[str, Any, str, dict]]:
+        """One device's pending items, in order, stopping at a dead subscription."""
+        device_id, items = entry
+        out = []
+        for item in items:
+            subscription, payload = prepare(item)
+            result = _send_push(subscription, payload)
+            out.append((device_id, item, result, payload))
+            if result == "gone":
+                break  # stop this device's remaining pushes this batch
+        return out
+
+    if not per_device:
+        return []
+    with ThreadPoolExecutor(max_workers=min(_PUSH_WORKERS, len(per_device))) as pool:
+        batches = list(pool.map(_deliver_device, per_device.items()))
+    return [r for batch in batches for r in batch]
+
+
 def _remember_message_meta(
     message_key: tuple[str, str, str],
     *,
@@ -1704,7 +1797,7 @@ def _deliverable_message(message_key: tuple[str, str, str]) -> str | None:
     rather than a check at each call site. Since 2026-08-07 a wording is written whenever a backend
     can be tried (:func:`_write_message`), so the cache holds LLM prose in environments that have
     decided not to send it — prd, today. Two surfaces carry that text: the Web Push body
-    (`_deliver_device`) and the in-app journey card (`_journey_model`). Gating them separately is
+    (`_prepare_alert`) and the in-app journey card (`_journey_model`). Gating them separately is
     how they drift: the card is the one an implementer forgets, and the drift is silent, because a
     card quoting a wording the push beside it does not is not a crash and not a failing assertion.
     `llm_message.delivery_enabled()` therefore owns the answer, and both surfaces read it here.
@@ -2024,6 +2117,20 @@ def _record_decisions(
         logger.warning("Could not record alert decisions this cycle", exc_info=True)
 
 
+def device_subscription(device_id: str) -> tuple[dict, str] | None:
+    """The device's push subscription and normalized brand, or None when the device is gone or
+    never subscribed. Both are read under ONE take of the state lock — devices can be deleted or
+    re-branded while a caller iterates a matched set, and a split read could describe one
+    registration's subscription with another's icon."""
+    with _state_lock:
+        dev = _devices.get(device_id)
+        subscription = dev.get("subscription") if dev else None
+        brand = normalize_brand(dev.get("brand") if dev else None)
+    if subscription is None:
+        return None
+    return subscription, brand
+
+
 def _drop_device(device_id: str) -> None:
     """Forget a device whose push subscription is gone (404/410). Journeys are kept — the client
     re-attaches its subscription (same device_id) if the user re-enables notifications."""
@@ -2045,6 +2152,23 @@ def _device_is_fresh(device_id: str) -> bool:
     except (KeyError, ValueError):
         return False
     return datetime.now(UTC) - created < _SUBSCRIPTION_GRACE
+
+
+def handle_gone_device(device_id: str) -> bool:
+    """React to a delivery's "gone" (404/410): keep the device while its subscription is inside
+    the propagation grace window (see :func:`_device_is_fresh`), drop it otherwise. Returns True
+    when the device was dropped — state changed, and the caller owns persisting it. Shared by the
+    SX delivery loop and (injected) togvarsel_notify's rounds; the /varsel-api/test endpoint keeps
+    its own gone handling because it turns the same two cases into HTTP statuses."""
+    if _device_is_fresh(device_id):
+        # Likely transient (subscription still propagating): keep it, retry next tick.
+        logger.info(
+            "Transient push failure for fresh device %s; keeping subscription",
+            device_id,
+        )
+        return False
+    _drop_device(device_id)
+    return True
 
 
 def _forget_message(message_key: tuple[str, str, str]) -> None:
@@ -2509,12 +2633,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         )
 
     # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
-    # Collect first, then fan out. One broad situation produces one send per registration in a single
-    # cycle, and each send can block for _PUSH_TIMEOUT_S against a client-supplied endpoint (FCM,
-    # Mozilla, Apple). Sequentially that is devices x 10 s of a stalled poller in the bad case --
-    # minutes during which no cache is rebuilt and nobody else is alerted.
-    # Parallel ACROSS devices, sequential WITHIN one: a "gone" result must still stop that device's
-    # remaining alerts for the tick, which only holds if its own sends stay ordered.
+    # Collect first, then fan out through deliver_to_devices -- parallel ACROSS devices, sequential
+    # WITHIN one; the worker/timeout rationale lives on that helper, which the togvarsel rounds
+    # share. One broad situation produces one send per registration in a single cycle.
     per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str]]] = {}
     for jid, journey in journeys if push_on else []:
         device = None
@@ -2543,33 +2664,27 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 (jid, device, journey, alert, key, brand)
             )
 
-    def _deliver_device(items: list[tuple[str, dict, dict, Alert, str, str]]) -> list[tuple]:
-        """One device's pending alerts, in order, stopping at a dead subscription."""
-        out = []
-        for jid, device, journey, alert, key, brand in items:
-            message_key = _message_key(key, alert)
-            # The written wording only if this deployment delivers it; otherwise None, and
-            # _notification_payload words the push from the same message input the model was shown.
-            message = _deliverable_message(message_key)
-            payload = _notification_payload(
-                journey,
-                alert,
-                message,
-                journey_id=jid,
-                message_input=message_inputs.get(message_key),
-                brand=brand,
-            )
-            result = _send_push(device, payload)
-            out.append((jid, journey, alert, result, payload))
-            if result == "gone":
-                break  # stop this device's remaining alerts this tick
-        return out
+    def _prepare_alert(item: tuple[str, dict, dict, Alert, str, str]) -> tuple[dict, dict]:
+        """One pending alert → (subscription, payload), run on the fan-out's worker thread."""
+        jid, device, journey, alert, key, brand = item
+        message_key = _message_key(key, alert)
+        # The written wording only if this deployment delivers it; otherwise None, and
+        # _notification_payload words the push from the same message input the model was shown.
+        message = _deliverable_message(message_key)
+        payload = _notification_payload(
+            journey,
+            alert,
+            message,
+            journey_id=jid,
+            message_input=message_inputs.get(message_key),
+            brand=brand,
+        )
+        return device, payload
 
     pushed_keys: set[tuple[str, str]] = set()
     if per_device:
-        with ThreadPoolExecutor(max_workers=min(_PUSH_WORKERS, len(per_device))) as pool:
-            batches = list(pool.map(_deliver_device, per_device.values()))
-        for jid, journey, alert, result, payload in [r for batch in batches for r in batch]:
+        for _device_id, item, result, payload in deliver_to_devices(per_device, _prepare_alert):
+            jid, _device, journey, alert, _key, _brand = item
             _log_push("alert", result, journey["device_id"], payload, journey_id=jid, alert=alert)
             if result == "sent":
                 with _state_lock:
@@ -2577,14 +2692,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 pushed_keys.add((journey_key(journey), alert.situation_number))
                 changed = True
             elif result == "gone":
-                if _device_is_fresh(journey["device_id"]):
-                    # Likely transient (subscription still propagating): keep it, retry next tick.
-                    logger.info(
-                        "Transient push failure for fresh device %s; keeping subscription",
-                        journey["device_id"],
-                    )
-                else:
-                    _drop_device(journey["device_id"])
+                if handle_gone_device(journey["device_id"]):
                     changed = True
 
     _record_decisions(
@@ -3138,14 +3246,12 @@ def test_push(body: TestIn) -> dict:
     """
     if not push_enabled():
         raise HTTPException(status_code=503, detail="Push er ikke konfigurert på tjeneren.")
-    with _state_lock:
-        dev = _devices.get(body.device_id)
-        subscription = dev.get("subscription") if dev else None
-        # Read the brand under the same lock as the subscription, so the test push cannot describe
-        # one registration's subscription with another's icon.
-        brand = normalize_brand(dev.get("brand") if dev else None)
-    if subscription is None:
+    # Subscription and brand under one lock take (see device_subscription), so the test push
+    # cannot describe one registration's subscription with another's icon.
+    resolved = device_subscription(body.device_id)
+    if resolved is None:
         raise HTTPException(status_code=404, detail="Enheten har ingen aktiv varsel-abonnement.")
+    subscription, brand = resolved
     assets = _BRAND_ASSETS[brand]
     payload = {
         "title": _tag_environment("Varsler er aktivert"),

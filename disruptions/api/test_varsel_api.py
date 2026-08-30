@@ -2491,6 +2491,33 @@ def test_transient_410_keeps_fresh_device(monkeypatch):
     assert DEVICE not in varsel._devices
 
 
+def test_deliver_to_devices_stops_a_device_at_gone_but_not_the_others(monkeypatch):
+    """Direct pin of the extracted fan-out seam (shared with togvarsel_notify): sends stay
+    sequential and ordered WITHIN a device, a "gone" stops that device's REMAINING items only,
+    and results come back flattened in per-device order — the contract loop 2's dedup and drop
+    bookkeeping is written against."""
+    calls = []
+
+    def _fake_send(sub, payload):
+        calls.append((sub["endpoint"], payload["n"]))
+        return "gone" if payload["n"] == "a2" else "sent"
+
+    monkeypatch.setattr(varsel, "_send_push", _fake_send)
+    per_device = {
+        "dev-a": [("a1", {"n": "a1"}), ("a2", {"n": "a2"}), ("a3", {"n": "a3"})],
+        "dev-b": [("b1", {"n": "b1"})],
+    }
+    results = varsel.deliver_to_devices(
+        per_device, lambda item: ({"endpoint": f"https://p.example/{item[0]}"}, item[1])
+    )
+    # a3 was never attempted: its device died at a2. dev-b is untouched by dev-a's fate.
+    assert [(d, i[0], r) for d, i, r, _p in results] == [
+        ("dev-a", "a1", "sent"), ("dev-a", "a2", "gone"), ("dev-b", "b1", "sent"),
+    ]
+    assert sorted(c[1] for c in calls) == ["a1", "a2", "b1"]
+    assert varsel.deliver_to_devices({}, lambda item: item) == []  # no pool spun up for nothing
+
+
 def test_test_push_fresh_410_is_425_not_dropped(monkeypatch):
     _reset_state()
     client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})

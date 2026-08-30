@@ -223,6 +223,85 @@ def test_the_cycle_summary_is_logged_even_when_the_rebuild_dies():
     assert cycle[0]["phases"] == {"reached_step": 42}
 
 
+# --- The wall-clock tick: togvarsel refresh + notify wiring (U4) --------------------------------
+#
+# togvarsel_notify.evaluate() rides the EVERY-TICK wall-clock path, after togvarsel.refresh() so
+# the tick that issues a round is the tick that can notify it -- and never the SX-ingestion
+# rebuild, whose cadence is ingestion changes, not the clock. Its failure isolation matters the
+# same way refresh's does: a notify bug must cost notifications, never the feed or the tick.
+
+
+class _Ticks:
+    """Duck-types the stop_event: poll_for_changes runs exactly `n` loop iterations."""
+
+    def __init__(self, n: int) -> None:
+        self.left = n
+
+    def wait(self, interval: float) -> bool:
+        self.left -= 1
+        return self.left <= 0
+
+
+def test_the_wall_clock_tick_runs_refresh_then_evaluate_and_isolates_evaluate():
+    calls: list[str] = []
+
+    def fake_evaluate():
+        calls.append("evaluate")
+        raise RuntimeError("notify blew up")  # must be logged, never kill the tick or the loop
+
+    before = (main.get_last_ingestion_time, main.togvarsel.refresh, main.togvarsel_notify.evaluate)
+    main.get_last_ingestion_time = lambda: datetime(2026, 8, 31, 5, 0, tzinfo=UTC)
+    main.togvarsel.refresh = lambda: calls.append("refresh")
+    main.togvarsel_notify.evaluate = fake_evaluate
+    try:
+        _fields, exc = _with_recorder(
+            lambda: main.poll_for_changes(lambda ts: calls.append("on_change"), _Ticks(2))
+        )
+    finally:
+        (
+            main.get_last_ingestion_time,
+            main.togvarsel.refresh,
+            main.togvarsel_notify.evaluate,
+        ) = before
+    assert exc is None, "an evaluate failure escaped the tick"
+    # tick 1: the first-ever ingestion value fires on_change, then refresh, then evaluate;
+    # evaluate's failure reaches neither the loop nor tick 2 (unchanged value -> no on_change).
+    assert calls == ["on_change", "refresh", "evaluate", "refresh", "evaluate"]
+
+
+def test_evaluate_never_rides_the_sx_rebuild():
+    """The notify step is wall-clock-driven only: never from the SX-ingestion rebuild, and on the
+    wall-clock tick always AFTER togvarsel.refresh() (a just-issued round is seen this tick)."""
+    import inspect
+
+    assert "togvarsel_notify" not in inspect.getsource(main._rebuild_all)
+    assert "togvarsel_notify" not in inspect.getsource(main._on_ingestion_change)
+    poll = inspect.getsource(main.poll_for_changes)
+    assert poll.index("togvarsel.refresh()") < poll.index("togvarsel_notify.evaluate()")
+
+
+def test_togvarsel_notify_flag_is_an_allow_list_with_unset_off():
+    """R9: only true/1/yes/on enable (the delivery-flag convention), and UNSET is OFF — the code
+    default matches the closed gate, deliberately unlike VARSEL_LLM_ENABLED's default-"true"."""
+    import os
+
+    before = os.environ.pop("TOGVARSEL_NOTIFY_ENABLED", None)
+    try:
+        assert main._togvarsel_notify_enabled() is False  # unset -> off, no helm value needed
+        for value, want in (
+            ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
+            (" true ", True), ("false", False), ("", False), ("off", False), ("disabled", False),
+            ("0", False),
+        ):
+            os.environ["TOGVARSEL_NOTIFY_ENABLED"] = value
+            assert main._togvarsel_notify_enabled() is want, value
+    finally:
+        if before is None:
+            os.environ.pop("TOGVARSEL_NOTIFY_ENABLED", None)
+        else:
+            os.environ["TOGVARSEL_NOTIFY_ENABLED"] = before
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -480,6 +480,19 @@ def refresh(now: datetime | None = None) -> None:
         _state["generated_at"] = now
 
 
+def issued_today(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Today's issued issues as plain dicts — togvarsel_notify's injected snapshot, so that
+    module never reads ``_state`` (main wires this in). Empty before the day's first
+    refresh, on a stale (yesterday's) state, and on weekends/holidays where no issues exist.
+    Each dict is a full Issue dump (issue, level, scope, p, reasons, computed_at, late) — the
+    notify chain's wording reads scope and reasons on top of the policy's issue+level."""
+    now = now.astimezone(_OSLO) if now else datetime.now(_OSLO)
+    with _lock:
+        if _state.get("date") != now.date():
+            return []
+        return [issue.model_dump() for issue in _state["issues"].values()]
+
+
 def build_melding(now: datetime) -> Togmelding:
     """The response payload as a pure function of (cached state, now) — recomputed per request,
     so next_issue and the weekend gate can never serve stale."""
