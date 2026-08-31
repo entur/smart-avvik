@@ -53,6 +53,48 @@ class FeedbackIn(BaseModel):
         return value
 
 
+_WHITESPACE_REPORTED: set[str] = set()
+
+
+def _env(name: str) -> str:
+    """One environment read for every value that arrives as a Secret Manager payload, whitespace
+    stripped, with the stripping reported once.
+
+    A payload written with `echo` rather than `printf '%s'`, or piped from a file, carries a
+    trailing newline, and that newline is invisible to every check anyone naturally runs:
+    `_token()`'s shape guard passes it (the prefix and the length only grow), and the hash
+    comparisons this repo prescribes were all written `| tr -d '\n' | shasum`, which deletes
+    exactly the defect being looked for. Measured in prd on 2026-08-31: the stored token was 49
+    bytes ending `0x0a` against dev's clean 48, `phc_...\n` went out as the `api_key`, PostHog EU
+    answered `200 {"status":"Ok"}` as it does for any non-empty key, and **eight submissions over
+    eight hours were dropped at ingestion** while travellers were told "saved" and their
+    route-bearing context rows were written to BigQuery. It survived three separate verifications
+    of the secret, including one on the day it was installed.
+
+    Stripping rather than rejecting, deliberately. Fail-closed is the right answer to a token that
+    is the WRONG value, which is what `_token()`'s shape check is for; whitespace is not a wrong
+    value but a transport artefact of how the payload was written, and refusing it would trade
+    silent loss for silent absence. The WARNING is what keeps the provisioning defect visible, and
+    it fires once per variable per process so a per-request read cannot flood the log. Nothing
+    else is loosened: the `phc_` prefix, the 32-byte minimum, the 32-byte receipt key and the
+    exact-match EU host all still decide on the cleaned value, so a trailing SLASH on the host
+    still disables capture exactly as before.
+    """
+    raw = os.environ.get(name) or ""
+    value = raw.strip()
+    if value != raw and name not in _WHITESPACE_REPORTED:
+        _WHITESPACE_REPORTED.add(name)
+        logger.warning(
+            "%s carried surrounding whitespace and was stripped before use; fix it at the source "
+            "(a Secret Manager payload written with `echo` rather than `printf '%%s'` is the usual "
+            "cause). A trailing newline passes every shape check and is then rejected downstream, "
+            "which reports nothing.",
+            name,
+            extra={"fields": {"event": "varsel_feedback_config", "variable": name}},
+        )
+    return value
+
+
 def _token() -> str | None:
     # The shape is checked here because nothing downstream can check the VALUE. Measured against
     # eu.i.posthog.com on 2026-08-28: /i/v0/e/ is fire-and-forget, so EVERY non-empty api_key —
@@ -68,19 +110,23 @@ def _token() -> str | None:
     # a one-request diagnosis. What it cannot catch is a well-formed token for the WRONG project;
     # the only detector for that is an export returning zero responses beside a growing
     # varsel_feedback_contexts, which is why data/feedback/README.md names that check.
-    value = os.environ.get("POSTHOG_PROJECT_TOKEN") or ""
+    value = _env("POSTHOG_PROJECT_TOKEN")
     return value if value.startswith("phc_") and len(value) >= 32 else None
 
 
 def _secret() -> bytes | None:
-    value = os.environ.get("VARSEL_FEEDBACK_RECEIPT_SECRET")
-    return value.encode() if value and len(value) >= 32 else None
+    value = _env("VARSEL_FEEDBACK_RECEIPT_SECRET")
+    return value.encode() if len(value) >= 32 else None
+
+
+def _host() -> str:
+    return _env("POSTHOG_HOST")
 
 
 def enabled() -> bool:
     return (
-        os.environ.get("VARSEL_FEEDBACK_ENABLED", "").lower() == "true"
-        and os.environ.get("POSTHOG_HOST") == "https://eu.i.posthog.com"
+        os.environ.get("VARSEL_FEEDBACK_ENABLED", "").strip().lower() == "true"
+        and _host() == "https://eu.i.posthog.com"
         and bool(_token() and _secret() and feedback_contexts.enabled())
     )
 
@@ -184,7 +230,9 @@ def _capture(body: FeedbackIn, *, environment: str, context_date: str, submitted
     }
     payload = json.dumps({"api_key": _token(), "event": EVENT, "properties": properties}).encode()
     request = UrlRequest(
-        f"{os.environ['POSTHOG_HOST']}/i/v0/e/",
+        # _host(), never a raw environ read: a newline here would build an unusable URL, and the
+        # two must agree or enabled() and the POST could disagree about the destination.
+        f"{_host()}/i/v0/e/",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",

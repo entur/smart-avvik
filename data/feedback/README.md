@@ -251,8 +251,9 @@ across 82 journeys in prd on 2026-08-30 — and the approval is for that populat
 takes registrations from the public, this re-opens together with the k=1 from/to exposure recorded
 for `/meldinger` in `CLAUDE.md`, and the fix there is access control rather than a shorter SELECT.
 
-**Three gate items are outstanding for prd and could not be done first**, because each needs capture
-on: step 5's synthetic round-trip against the prd PostHog project (submit, wait the measured
+**Three gate items were outstanding for prd and could not be done first**, because each needs
+capture on — step 2 was completed on 2026-08-31 (see the incident section below); the other two
+stand: step 5's synthetic round-trip against the prd PostHog project (submit, wait the measured
 consistency delay, retrieve through the Query API, join the exact context, delete the response and an
 exclusively referenced context), step 6's **p95 submit latency against the prd deployment** — dev's
 0.429 s is not transferable evidence, and a figure taken with the flag off measures the
@@ -396,11 +397,16 @@ let a receipt minted in dev authorize a `revision > 1` update against a real tra
 prd, which is the single thing that HMAC exists to prevent.
 
 **prd's real token landed on 2026-08-29**, replacing the labelled placeholder the secret was parked
-with. Verified without printing the value: version 2 enabled and current, `phc_` prefix, 48
-characters, no trailing newline, and **byte-distinct from both dev's and tst's** — that last check is
-not ceremony, since dev's token is the one closest to hand and pasting it here would have routed real
-travellers' feedback into the dev project with nothing anywhere reporting an error. Version 1 is now
-`disabled` so a rollback cannot restore the placeholder, and the `state=placeholder` label is gone.
+with. Verified without printing the value: version 2 enabled and current, `phc_` prefix, and
+**byte-distinct from both dev's and tst's** — that last check is not ceremony, since dev's token is
+the one closest to hand and pasting it here would have routed real travellers' feedback into the dev
+project with nothing anywhere reporting an error. Version 1 was `disabled` so a rollback could not
+restore the placeholder, and the `state=placeholder` label is gone.
+
+**That verification also claimed "48 characters, no trailing newline", and it was wrong** — the
+payload was 49 bytes ending `0x0a`, and version 2 is now disabled too. What went wrong and how to
+check it properly is the incident below; the short version is that every recipe in this file used
+`tr -d '\n'`, which deletes the byte being looked for.
 
 The placeholder was worth its short life. A secret that is absent fails the whole `ExternalSecret`
 and takes the VAPID keys with it; a secret holding a placeholder keeps the Helm reference safe from
@@ -413,6 +419,57 @@ pinned by `test_a_token_that_is_not_a_project_write_key_fails_closed`.
 `Kix - dev` (which serves both the dev *and* tst environments — separate them with `--environment`)
 and **259077** for `Kix - prod`. Not secrets, and recorded here so an export does not start with a
 console visit.
+
+### The detector fired, and it took eight hours (2026-08-31)
+
+The failure this file predicted — "an export returning **zero responses beside a growing
+`varsel_feedback_contexts`**" — happened on the day prd capture was enabled, and it is worth reading
+as a case study in why the shape guard is not enough.
+
+**What was wrong: one byte.** prd's `POSTHOG_PROJECT_TOKEN` payload was **49 bytes ending `0x0a`**
+against dev's clean 48. The token itself was correct. `phc_...\n` went out as the `api_key`, PostHog
+EU answered `200 {"status":"Ok"}` exactly as it does for any non-empty key, and every submission was
+dropped at ingestion while `submit()` returned `saved`, issued a receipt, and wrote the
+route-bearing context row to BigQuery. Eight submissions between 13:00 and 21:20 CEST were lost;
+nothing is recoverable, because PostHog never accepted them under a key it recognised.
+
+**Why three verifications missed it.** `_token()` checks a `phc_` prefix and a 32-byte minimum, and
+a trailing newline only makes both *more* true. Worse, the hash comparisons this file and the values
+comments prescribe were all written `| tr -d '\n' | shasum -a 256` — which deletes precisely the
+defect, so the stored value hashed identically to the token in PostHog's UI on 2026-08-29 and again
+on 2026-08-31. **A check that normalises the input cannot detect a defect in the input.**
+
+**The verification that works**, and the one to use after any rotation, in any environment:
+
+```sh
+gcloud secrets versions access latest --secret=POSTHOG_PROJECT_TOKEN \
+  --project=ent-kixavvik-<env> | wc -c            # 48, not 49
+gcloud secrets versions access latest --secret=POSTHOG_PROJECT_TOKEN \
+  --project=ent-kixavvik-<env> | tail -c1 | xxd -p  # not 0a
+```
+
+Write the value with `printf '%s'`, never `echo`, and never from a file. `feedback._env` now strips
+surrounding whitespace from the token, the receipt key and the host before any guard reads them, and
+logs `event="varsel_feedback_config"` once per variable when it has to — so the same provisioning
+artefact is now a startup WARNING rather than eight silent hours. Three checks in `test_feedback.py`
+pin it, including that padding cannot smuggle a short receipt key past the 32-byte minimum.
+
+**Two operational traps found in the same hour, both of which cost a round trip.** A corrected secret
+reaches the process only after *both* of these:
+
+- the **ExternalSecret re-syncs** — `refreshInterval: 1h` on `kix-avvik-varsel`, so either wait or
+  `kubectl annotate externalsecret kix-avvik-varsel force-sync=$(date +%s) --overwrite`;
+- the **pod restarts**, because the container takes the Secret through `envFrom` and reads its
+  environment once at start. A pod whose Secret was fixed underneath it keeps serving the old value
+  with nothing to show for it.
+
+And pass `--context` explicitly. Both fix commands were run against the wrong cluster (kubectl's
+active context was dev), which restarted dev, left prd untouched, and looked exactly like the fix
+having failed — prd's Secret was correct by then only because its own hourly refresh had landed.
+
+**Capture verified end to end at 21:27 CEST**, which also closed step 2 of the gate for
+`Kix - prod`: the raw event carries `$ip` exactly `0.0.0.0`, `person_mode` `propertyless`, and no
+`$geoip_*` or user-agent properties.
 
 ### A wrong PostHog token cannot be detected after the fact (measured 2026-08-28)
 

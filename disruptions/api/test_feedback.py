@@ -102,6 +102,58 @@ def test_a_token_that_is_not_a_project_write_key_fails_closed(monkeypatch):
     assert feedback.enabled()
 
 
+def test_a_trailing_newline_in_a_secret_payload_is_stripped_not_honoured(monkeypatch):
+    # The prd incident of 2026-08-31: the token was correct and 49 bytes, the 49th being 0x0a. The
+    # shape guard passed it, PostHog answered 200 to `phc_...\n` as it does to any non-empty key,
+    # and eight submissions were dropped at ingestion. The hash checks all used `tr -d '\n'`, which
+    # removes the very byte at fault -- so this asserts on the value the app SENDS, not on a
+    # cleaned copy of it.
+    feedback._WHITESPACE_REPORTED.clear()
+    monkeypatch.setattr(feedback, "_secret", lambda: b"s" * 32)
+    monkeypatch.setattr(feedback.feedback_contexts, "enabled", lambda: True)
+    monkeypatch.setenv("VARSEL_FEEDBACK_ENABLED", "true")
+    monkeypatch.setenv("POSTHOG_HOST", "https://eu.i.posthog.com\n")
+    clean = "phc_" + "a" * 44
+    for payload in (clean + "\n", clean + "\r\n", " " + clean + " "):
+        monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", payload)
+        assert feedback._token() == clean, payload
+        assert feedback.enabled(), payload
+    # The host is stripped on the same path, and a trailing SLASH must still disable capture --
+    # that check is an exact match on purpose and this change must not soften it.
+    monkeypatch.setenv("POSTHOG_HOST", "https://eu.i.posthog.com/")
+    assert not feedback.enabled()
+
+
+def test_stripping_a_secret_is_reported_once_per_variable(monkeypatch):
+    # Silent repair is how the next one hides for eight hours; a WARNING is the whole point. It
+    # fires once because enabled() is read on every alert render and every submit.
+    feedback._WHITESPACE_REPORTED.clear()
+    records = []
+    monkeypatch.setattr(feedback.logger, "warning", lambda *args, **kwargs: records.append(args))
+    monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "phc_" + "a" * 44 + "\n")
+    for _ in range(5):
+        feedback._token()
+    assert len(records) == 1, records
+    assert "POSTHOG_PROJECT_TOKEN" in records[0]
+    monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32 + "\n")
+    assert feedback._secret() == b"s" * 32
+    assert len(records) == 2, records
+    # A clean value reports nothing, in any process.
+    monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "phc_" + "b" * 44)
+    feedback._token()
+    assert len(records) == 2, records
+
+
+def test_whitespace_never_smuggles_a_value_past_a_length_check(monkeypatch):
+    # Stripping must happen BEFORE the guards, or padding would satisfy them: a 20-byte receipt key
+    # with 12 trailing spaces is 32 bytes long and worthless as an HMAC key.
+    feedback._WHITESPACE_REPORTED.clear()
+    monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 20 + " " * 12)
+    assert feedback._secret() is None
+    monkeypatch.setenv("POSTHOG_PROJECT_TOKEN", "phc_short" + " " * 40)
+    assert feedback._token() is None
+
+
 def test_enabled_requires_explicit_flag_and_fixed_eu_host(monkeypatch):
     monkeypatch.setattr(feedback, "_token", lambda: "phc_test")
     monkeypatch.setattr(feedback, "_secret", lambda: b"s" * 32)
