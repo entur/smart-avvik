@@ -22,6 +22,13 @@ import time
 from contextlib import contextmanager
 from urllib.parse import parse_qs, urlsplit
 
+# --- Stub the BigQuery client BEFORE anything imports main (it builds one at module scope, and
+# CI has no GCP credentials — test_static_cache.py's exact pattern; locally this suite only passed
+# because a developer's ADC made the real constructor succeed). ---
+from google.cloud import bigquery as _bq
+
+_bq.Client = lambda *a, **k: None  # type: ignore[assignment]
+
 import sso
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
