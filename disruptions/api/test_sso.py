@@ -77,6 +77,10 @@ def _app() -> TestClient:
     def meldinger_api() -> dict:
         return {"api": "meldinger"}
 
+    @app.get("/demo-api/config")
+    def demo_api() -> dict:
+        return {"api": "demo"}
+
     @app.get("/varsel-api/config")
     def public_api() -> dict:
         return {"public": True}
@@ -125,6 +129,30 @@ def test_browser_navigation_redirects_to_login():
         target = urlsplit(response.headers["location"])
         assert target.path == "/auth/login"
         assert parse_qs(target.query)["next"] == ["/historikk?dag=2026-08-30"]
+
+
+def test_demo_is_gated():
+    """/demo joined the gated surfaces on 2026-08-31 (partner demos are driven by an Entur
+    person's logged-in browser, so SSO does not lock the demo out of its own showings)."""
+    client = _app()
+    with _env(**_ENV_ON):
+        response = client.get("/demo", headers={"accept": "text/html"})
+        assert response.status_code == 302
+        assert response.headers["location"].startswith("/auth/login")
+        assert client.get("/demo-api/config").status_code == 401
+        response = client.get("/demo-api/config", cookies=_session_cookie())
+        assert response.status_code == 200
+
+
+def test_prefixes_are_absolute_paths():
+    """Every ASGI path starts with "/", so an unslashed prefix matches NOTHING and the surface
+    silently stays public while looking gated — exactly how /demo first shipped ("demo",
+    "demo-api"). Also pins the per-segment rule: /demo must not claim /demolition."""
+    assert all(prefix.startswith("/") for prefix in sso.PROTECTED_PREFIXES)
+    assert sso._is_protected("/demo")
+    assert sso._is_protected("/demo/index.html")
+    assert not sso._is_protected("/demolition")
+    assert not sso._is_protected("demo")
 
 
 def test_api_fetch_gets_401():
@@ -335,9 +363,16 @@ def test_main_wires_the_gate():
         assert response.headers["location"].startswith("/auth/login")
         response = client.get("/meldinger-api/messages", headers={"accept": "application/json"})
         assert response.status_code == 401
-    # The four surfaces, exactly: a fifth internal surface must be added here deliberately, and
-    # removing one un-gates it.
-    assert sso.PROTECTED_PREFIXES == ("/historikk", "/historikk-api", "/meldinger", "/meldinger-api")
+    # The six surfaces, exactly: a seventh must be added here deliberately, and removing one
+    # un-gates it.
+    assert sso.PROTECTED_PREFIXES == (
+        "/historikk",
+        "/historikk-api",
+        "/meldinger",
+        "/meldinger-api",
+        "/demo",
+        "/demo-api",
+    )
 
 
 def _run():
