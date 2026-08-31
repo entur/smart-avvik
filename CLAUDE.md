@@ -1003,7 +1003,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   one `feedback_contexts` capability per issued forecast — on the request path only, never in
   `refresh()`/`build_melding()`, and on a COPY of the cached Issue, so `issued_today()`'s notify
   seam stays a pure forecast — and the page posts to the shared `POST /varsel-api/feedback`, so
-  the gate (`feedback.enabled()`, dev-only today), rate limits, receipts, PostHog event and the
+  the gate (`feedback.enabled()` — dev since 2026-08-28 and prd since 2026-08-31, tst off; the
+  approval behind it is per environment because the subjects are, and prd's also classified the
+  origin/destination/departure-time trio as «Intern», which closed punkt 9b for the Gemini prompt
+  too), rate limits, receipts, PostHog event and the
   data/feedback exporter/reviewer are all varsel's, unchanged. Rows are discriminated the
   documented way — `display_source='togvarsel'`, `situation_number = KIX:Togvarsel:<date>:<issue>`
   — never a new column or event name (a new event would drop them out of every existing export
