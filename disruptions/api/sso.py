@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 # The gated surfaces. Matching is per path segment (see _is_protected), and /auth/* is public by
 # construction — it is how a session comes to exist.
-PROTECTED_PREFIXES = ("/historikk", "/historikk-api", "/meldinger", "/meldinger-api")
+PROTECTED_PREFIXES = ("/historikk", "/historikk-api", "/meldinger", "/meldinger-api", "demo", "demo-api")
 
 _COOKIE_NAME = "kix_sso"
 _SESSION_TTL_S = 12 * 3600  # a working day; renewal is a silent bounce while the Google session lives
