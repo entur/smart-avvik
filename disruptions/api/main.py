@@ -23,6 +23,7 @@ import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
+import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
@@ -1184,6 +1185,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Entur-SSO gate (sso.py): Google OIDC against the entur.org Workspace, in front of the two
+# internal surfaces — /historikk and /meldinger, pages and APIs both (sso.PROTECTED_PREFIXES is
+# the source of truth). Everything else stays public. Off unless SSO_REQUIRED is set; when
+# required but unconfigured the gated paths fail CLOSED (503), never open. Added after
+# CORSMiddleware, so it runs OUTSIDE it; it exempts OPTIONS itself so a preflight still gets its
+# CORS answer.
+app.add_middleware(sso.RequireSSO)
+
 # Avviksvarsel API (registered-journey push alerts). Registered before the /varsel static mount
 # so /varsel-api/* resolves to these routes.
 app.include_router(varsel.router)
@@ -1228,6 +1237,9 @@ app.include_router(togvarsel.router)
 # — tst, prd and unset labels get a plain 404 — so mounting it everywhere is safe and keeps the
 # image identical across environments.
 app.include_router(togvarsel_notify.router)
+
+# The SSO login/callback/logout routes (public by construction — they are how a session is made).
+app.include_router(sso.router)
 
 # --- How long a browser may keep a static file ----------------------------------------------
 #
