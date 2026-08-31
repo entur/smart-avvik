@@ -99,9 +99,10 @@ trusted if what it dropped stays as visible as what it kept. A response with no 
 
 ## Setup and release gate
 
-Capture is deliberately disabled by `VARSEL_FEEDBACK_ENABLED=false`. Configure each environment
-separately and promote dev → tst → prd only after every item below is recorded for that exact
-PostHog EU project:
+Capture is off until `VARSEL_FEEDBACK_ENABLED=true`, and the gate below is **per environment**:
+dev since 2026-08-28, prd since 2026-08-31, tst still off. Configure each environment separately and
+promote only after every item below is recorded for that exact PostHog EU project — an approval for
+one environment is not evidence for another, because the subjects differ:
 
 1. Create `POSTHOG_PROJECT_TOKEN` — a **`phc_` project write token**, which `_token()` requires by
    shape, for the reason in the measurement section below — and a separate 32-byte-or-longer
@@ -183,10 +184,13 @@ use the true figure. Terraform's `disruptions_readers` is a *separate* grant and
 creates the dataset at startup under whoever ran it first. It contradicts the "grant to a group, never
 a person" rule in `CLAUDE.md`, and it is the one deviation with a cheap fix.
 
-**prd is not ready and should not be made ready yet.** The dataset ACL there carries no team group at
-all (only `projectWriters`/`projectReaders` plus that personal OWNER), the two capture secrets do not
-exist in Secret Manager, and `varsel_feedback_contexts` **has not been created** — the app creates it
-at startup, so it will appear on the first deploy after capture is configured, not before.
+**prd, as read on 2026-08-28 — since overtaken, except for one line.** The two capture secrets did
+not exist in Secret Manager then; they landed on 2026-08-28/29 and capture is on there since
+2026-08-31 (see the prd approval below). `varsel_feedback_contexts` still **has not been created** at
+the time of writing — the app creates it on first persist, so it appears after the enabling deploy,
+not before, which is also why nothing had to be created by hand. What is unchanged and still worth
+fixing: the prd dataset ACL carries no team group at all, only `projectWriters`/`projectReaders`
+plus that personal OWNER.
 
 ### Step 4, approved for dev (2026-08-28)
 
@@ -205,14 +209,57 @@ on request, and its BigQuery context at 45. Evidence under the measurements belo
 
 Two things a dev approval does **not** settle, recorded so nobody reads more into it than it says:
 
-- **Punkt 9b of the assessment is still open**: whether the origin/destination/departure-time trio
-  `/varsel` already sends to Gemini is "Fortrolig" under Entur's information classification, and
-  whether KI-løypa applies to it. That is not a feedback question — the trio predates this feature
-  and reaches Vertex whether or not capture is on — which is why it does not block dev. It is
-  unanswered, not answered favourably.
+- **Punkt 9b of the assessment was still open on that date**: whether the origin/destination/
+  departure-time trio `/varsel` already sends to Gemini is "Fortrolig" under Entur's information
+  classification, and whether KI-løypa applies to it. That is not a feedback question — the trio
+  predates this feature and reaches Vertex whether or not capture is on — which is why it did not
+  block dev. It was **answered with the prd approval on 2026-08-31**; see that section below.
 - **Dev's subjects are the team.** The approval rests on that, so it is not evidence for an
   environment with real travellers behind it. If `/varsel` ever takes public registrations this
   re-opens, alongside the k=1 exposure recorded for `/meldinger` in `CLAUDE.md`.
+
+Reference for the approval record (ticket, email or meeting note): _to be filled in by the owner._
+
+### Step 4, approved for prd (2026-08-31) — and it closed punkt 9b too
+
+prd's approval is its own, as this step requires, and it rests on what the dev one could not speak
+for: the subjects here are real travellers rather than the team. It covers the same artifact,
+`docs/personvern/2026-08-28-varsel-tilbakemelding-personvernvurdering.md` — purpose and lawful basis
+for the free text, the notice as it reads in the PWA (`Ikke skriv personopplysninger.`), the access
+list, 30-day PostHog and 45-day BigQuery retention, 30-day export cleanup, the **expiry-only**
+deletion procedure and the subject-rights limitation that follows from it.
+
+**Punkt 9b was answered, which is the part worth reading twice.** The assessment attached it
+deliberately, on the grounds that approving the feedback feature while the larger intrusion on the
+same surface stayed open would approve the smaller of two. So it is not a footnote that this approval
+settled it:
+
+- The origin/destination/departure-time trio is classified **«Intern», not «Fortrolig»**. That is one
+  answer for the whole of `/varsel`, as the assessment asked for — it covers both the context row
+  this feature writes and the Gemini prompt that has carried the same trio since 2026-08-07. The
+  Gemini generation running in prd therefore stands unchanged, and no re-assessment is triggered by
+  classification.
+- **KI-løypa does not apply** to an in-house service that calls an already-approved platform; the
+  løype covers procurement of AI tooling, so no KI-vurderingsskjema is owed for `/varsel`.
+
+Neither answer changes any code, and neither retires a kill switch: `VARSEL_LLM_PROVIDER=off` still
+stops the Vertex egress and `VARSEL_FEEDBACK_ENABLED=false` still stops capture, each one value and
+one deployment.
+
+**What this approval still does not settle.** `/varsel`'s registrations are internal — 22 devices
+across 82 journeys in prd on 2026-08-30 — and the approval is for that population. If `/varsel` ever
+takes registrations from the public, this re-opens together with the k=1 from/to exposure recorded
+for `/meldinger` in `CLAUDE.md`, and the fix there is access control rather than a shorter SELECT.
+
+**Three gate items are outstanding for prd and could not be done first**, because each needs capture
+on: step 5's synthetic round-trip against the prd PostHog project (submit, wait the measured
+consistency delay, retrieve through the Query API, join the exact context, delete the response and an
+exclusively referenced context), step 6's **p95 submit latency against the prd deployment** — dev's
+0.429 s is not transferable evidence, and a figure taken with the flag off measures the
+`{"status": "disabled"}` short-circuit — and step 2's raw-event inspection for `Kix - prod` itself
+(`$ip` exactly `0.0.0.0`, `person_mode` `propertyless`, no `$geoip_*`, no user-agent, no URL), which
+needs one real event in that project. Rollback is the flag, as always, and it is what a failure of
+any of the three is corrected with.
 
 Reference for the approval record (ticket, email or meeting note): _to be filled in by the owner._
 
@@ -315,7 +362,8 @@ never registered.
 ### Steps 1 and 3, pre-wired for tst and prd (2026-08-28)
 
 Step 1 is done for all three environments and step 3 needs nothing further, so **promotion is a flag
-plus the approval, not an infrastructure project.** What that leaves per environment:
+plus the approval, not an infrastructure project.** That is how prd was promoted on 2026-08-31 —
+one value, once the approval existed. What that leaves per environment:
 
 | | dev | tst | prd |
 | --- | --- | --- | --- |
@@ -323,8 +371,8 @@ plus the approval, not an infrastructure project.** What that leaves per environ
 | `VARSEL_FEEDBACK_RECEIPT_SECRET` in Secret Manager | yes | yes | yes |
 | both names in Helm `secrets.varsel` | yes | yes | yes |
 | `disruptions` dataset exists (EU) | yes | yes | yes |
-| step 4 approval | dev only | **no** | **no** |
-| `VARSEL_FEEDBACK_ENABLED` | `true` | `false` | `false` |
+| step 4 approval | yes (2026-08-28) | **no** | yes (2026-08-31) |
+| `VARSEL_FEEDBACK_ENABLED` | `true` | `false` | `true` |
 
 **Order, and why it is not negotiable.** Every secret was created in its project *before* its name
 was added to Helm. Each namespace's `SecretStore` reads its own `ent-kixavvik-<env>` with
