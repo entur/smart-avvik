@@ -9,9 +9,12 @@ to the entur.org organisation), while an Entra app registration is a request to 
 flow and this module are issuer-agnostic enough that swapping later is a config-plus-verifier
 change, not a redesign.
 
-What is gated is exactly :data:`PROTECTED_PREFIXES`. Everything else — /varsel, /demo,
-/togmelding, the read-only APIs — is deliberately untouched: those are the public surfaces, and
-this gate exists so the internal ones can stop being public without moving anybody's URL.
+What is gated is exactly :data:`PROTECTED_PREFIXES` — entries are absolute path prefixes, so a
+new one MUST start with "/" (every ASGI path does; an unslashed entry matches nothing and the
+surface silently stays public — shipped once, 2026-08-31, pinned by the test suite since).
+Everything else — /varsel, /togmelding, the read-only APIs — is deliberately untouched: those are
+the traveller-facing surfaces, and this gate exists so the internal ones (and the partner demo)
+can stop being public without moving anybody's URL.
 
 **Failure posture: closed.** ``SSO_REQUIRED=true`` with a missing client id/secret serves the
 protected paths as 503, never as public — a deployment that loses an env var must not quietly
@@ -62,7 +65,14 @@ logger = logging.getLogger(__name__)
 
 # The gated surfaces. Matching is per path segment (see _is_protected), and /auth/* is public by
 # construction — it is how a session comes to exist.
-PROTECTED_PREFIXES = ("/historikk", "/historikk-api", "/meldinger", "/meldinger-api", "demo", "demo-api")
+PROTECTED_PREFIXES = (
+    "/historikk",
+    "/historikk-api",
+    "/meldinger",
+    "/meldinger-api",
+    "/demo",
+    "/demo-api",
+)
 
 _COOKIE_NAME = "kix_sso"
 _SESSION_TTL_S = 12 * 3600  # a working day; renewal is a silent bounce while the Google session lives
