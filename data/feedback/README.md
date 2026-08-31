@@ -252,8 +252,8 @@ takes registrations from the public, this re-opens together with the k=1 from/to
 for `/meldinger` in `CLAUDE.md`, and the fix there is access control rather than a shorter SELECT.
 
 **Three gate items were outstanding for prd and could not be done first**, because each needs
-capture on — step 2 was completed on 2026-08-31 (see the incident section below); the other two
-stand: step 5's synthetic round-trip against the prd PostHog project (submit, wait the measured
+capture on. **All three were completed on 2026-08-31** — step 2 once a real event finally reached
+`Kix - prod` (see the incident section below), steps 5 and 6 in the section after it. They were: step 5's synthetic round-trip against the prd PostHog project (submit, wait the measured
 consistency delay, retrieve through the Query API, join the exact context, delete the response and an
 exclusively referenced context), step 6's **p95 submit latency against the prd deployment** — dev's
 0.429 s is not transferable evidence, and a figure taken with the flag off measures the
@@ -419,6 +419,62 @@ pinned by `test_a_token_that_is_not_a_project_write_key_fails_closed`.
 `Kix - dev` (which serves both the dev *and* tst environments — separate them with `--environment`)
 and **259077** for `Kix - prod`. Not secrets, and recorded here so an export does not start with a
 console visit.
+
+### Steps 5 and 6, complete in prd (2026-08-31)
+
+Both were run against the deployment through the public ingress, the same way dev's were, and only
+after the token defect above was fixed — a latency figure taken while every capture was being
+dropped would have measured a POST that did no useful work.
+
+**Step 6: p95 0.403 s against a 3 s bar.**
+
+| population | what it exercises | n | p50 | p95 | max |
+| --- | --- | --- | --- | --- | --- |
+| **full** | ingress + BigQuery insert + PostHog POST | 4 | 0.391 s | **0.403 s** | 0.403 s |
+| repeat | ingress + PostHog POST (context already persisted) | 8 | 0.162 s | 0.167 s | 0.167 s |
+| floor | ingress + `resolve`, refused before any I/O | 40 | 0.098 s | 0.111 s | 0.114 s |
+| floor, 8 concurrent | the same, issued at once | 8 | 0.107 s | 0.111 s | 0.111 s |
+
+prd is marginally faster than dev on every population, which is what a shared platform predicts;
+the three are kept separate for dev's reason, that `persist` is idempotent and a naive load test
+reports the `repeat` row as the bar.
+
+**`full` is n=4, and that is a real limit rather than an impatience.** A first tap needs a *distinct*
+context, one context is one rendering, and `mint`'s fingerprint dedup deliberately returns the same
+id for an unchanged rendering — so prd offered exactly four that day, the Togmeldingen issue cards.
+Dev's 55 came from a live disruption across registered journeys. At n=4 the p95 is arithmetically the
+maximum, so read the row as "four first taps, 0.225-0.403 s", not as a distribution. It clears the
+bar by 7.4x, which is why this was not worth manufacturing more traffic in prd for: every extra
+sample is an unremovable synthetic response in a store that holds real travellers' feedback.
+
+**Step 5, clause by clause.** Four synthetic responses submitted, all `saved`. The export returned
+**14 responses with `issue_count: 0`** — every response resolved its exact context, none missing,
+malformed, out-of-horizon, duplicated or conflicting. The count reconciles and is worth stating,
+because it is the collapse working: **15 submissions produced 14 responses**, the fifteenth being a
+`revision 2` carrying its receipt, which updates its response rather than adding one. The receipt
+model was exercised against prd's own key in all three directions — `revision 2` with the receipt
+accepted, a tampered signature and a missing receipt both `invalid_receipt`. Those two negatives cost
+nothing: they are refused before `_claim`, so they consume no rate budget and write no event.
+
+**Deletion, and the half of it that does not exist.** One exclusively referenced synthetic context
+was deleted (1 row affected, 10 -> 9); the context carrying nine responses was left in place and
+verified still present, which is the shared-context rule; the two contexts behind genuine responses
+were verified untouched, having been identified first — context ids are fingerprint-stable, so a
+synthetic submission on the same rendering as a real one would share its context, and deleting it
+would have orphaned somebody's real feedback. **The response itself cannot be deleted**: it is
+personless, PostHog's deletion path is per person, and the retention-only procedure approved in step
+4 is what covers it. Note the consequence, which is by design rather than a fault: the next export
+reports `issue_count: 1`, `kind: "missing_context"`, for the response whose context is gone — an
+orphan surfaces as a listed issue instead of silently.
+
+**One sub-item is carried from dev, not re-proven here.** "The bounded query returns all rows at its
+limit" cannot be exercised against ~15 events with a 10 000-event cap. It is a property of the
+exporter, covered by `test_export_varsel_feedback.py` and demonstrated in dev; claiming it as
+re-verified in prd would be a fiction.
+
+**Residue in prd**: 13 synthetic responses, every comment prefixed `SYNTETISK`, unremovable for the
+same reason as dev's and ageing out at 30 days. Exclude them by that prefix when reviewing prd
+feedback — the reviewer notebook's default filter already does.
 
 ### The detector fired, and it took eight hours (2026-08-31)
 
