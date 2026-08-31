@@ -46,3 +46,11 @@ common:
       TOGVARSEL_NOTIFY_ENABLED: "false"
       # Non-secret EU ingestion origin. Capture and review credentials stay separate.
       POSTHOG_HOST: https://eu.i.posthog.com
+      # Entur-SSO gate (sso.py) for the internal surfaces /historikk and /meldinger, pages and
+      # APIs both. Same flag convention as the two above: only true/1/yes/on enables, unset is
+      # also off, and this line states the posture where an operator looks. Flipping an
+      # environment on additionally needs SSO_GOOGLE_CLIENT_ID (configmap) plus
+      # SSO_GOOGLE_CLIENT_SECRET and SSO_SESSION_SECRET (Secret Manager, wired like the VAPID
+      # keys) — the OAuth client recipe is in sso.py's docstring. "true" WITHOUT those serves the
+      # two surfaces as 503 (fail closed), never publicly; rollback is this flag back to "false".
+      SSO_REQUIRED: "false"
