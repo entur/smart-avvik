@@ -457,7 +457,7 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
         assert snapshot["situation_number"] == f"KIX:Togvarsel:{first['date']}:0700"
         # the literal page rendering, JS-rounded (0.34 -> 34; >= RED_MIN 0.30 -> red)
         assert snapshot["displayed_text"] == "stor fare for forstyrrelser (ca. 34 % sjanse for mye trøbbel)"
-        assert snapshot["detail_text"] == "Kl. 07:00 — resten av morgenrushet 07:00–09:00"
+        assert snapshot["detail_text"] == "Kl. 07:00 — morgenrushet 07:00–09:00"
         assert snapshot["operator"] == "VYG"
         assert snapshot["journey_context"] is None and snapshot["message_input"] is None
         assert snapshot["prediction"]["level"] == "red" and snapshot["prediction"]["reasons"]
