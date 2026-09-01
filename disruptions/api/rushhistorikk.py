@@ -334,6 +334,40 @@ def _issue_from_row(row: Any, today: date) -> verdicts.Issue:
     )
 
 
+def _issue_row(row: Any, issue: verdicts.Issue) -> IssueRow:
+    """One served issue: the row's own facts plus the three things the classifier derives.
+
+    `scope` is resolved once, the way `_issue_from_row` does it — inline this was three separate
+    dict lookups inside a comprehension inside a loop.
+
+    Note what `provisional` CANNOT be: it is not `issue.outcome != OUTCOME_SETTLED`. The settled
+    MERGE can write `settled = TRUE` and `unresolvable = TRUE` on the same row (the "no resolved
+    call in this window" case), and `resolve_outcome_state` checks unresolvable FIRST — so the two
+    diverge exactly there, and deriving this from the outcome would mark a settled-but-unresolvable
+    day as still provisional.
+    """
+    scope = verdicts.SCOPE_BY_SLOT[issue.issue]
+    return IssueRow(
+        issue=issue.issue,
+        rush=verdicts.RUSH_BY_SLOT[issue.issue],
+        forecast_level=row["forecast_level"],
+        p=row["p"],
+        late=issue.late,
+        recorded=issue.recorded,
+        sent=issue.sent,
+        kind=issue.kind,
+        reason=issue.reason,
+        baseline_level=issue.baseline_level,
+        decided_at=issue.decided_at,
+        actual_level=issue.actual,
+        actual_trouble10=row[f"{scope}_trouble10"],
+        provisional=not bool(row[f"{scope}_settled"]) and row[f"{scope}_level"] is not None,
+        verdict=verdicts.classify(issue),
+        lead_min=verdicts.lead_minutes(issue.issue, issue.decided_at) if issue.sent else None,
+        scored=verdicts.population(issue) == verdicts.BUCKET_SCORED,
+    )
+
+
 def _matrix_rows(matrix: dict[str, dict[str, int]]) -> list[MatrixRow]:
     return [
         MatrixRow(
@@ -423,32 +457,7 @@ def days(
             DayRow(
                 d=d,
                 issues=[
-                    IssueRow(
-                        issue=issue.issue,
-                        rush=verdicts.RUSH_BY_SLOT[issue.issue],
-                        forecast_level=row["forecast_level"],
-                        p=row["p"],
-                        late=issue.late,
-                        recorded=issue.recorded,
-                        sent=issue.sent,
-                        kind=issue.kind,
-                        reason=issue.reason,
-                        baseline_level=issue.baseline_level,
-                        decided_at=issue.decided_at,
-                        actual_level=issue.actual,
-                        actual_trouble10=row[
-                            f"{verdicts.SCOPE_BY_SLOT[issue.issue]}_trouble10"
-                        ],
-                        provisional=not bool(
-                            row[f"{verdicts.SCOPE_BY_SLOT[issue.issue]}_settled"]
-                        )
-                        and row[f"{verdicts.SCOPE_BY_SLOT[issue.issue]}_level"] is not None,
-                        verdict=verdicts.classify(issue),
-                        lead_min=verdicts.lead_minutes(issue.issue, issue.decided_at)
-                        if issue.sent
-                        else None,
-                        scored=verdicts.population(issue) == verdicts.BUCKET_SCORED,
-                    )
+                    _issue_row(row, issue)
                     for row, issue in sorted(by_day[d], key=lambda pair: pair[1].issue)
                 ],
                 am_level=facts["am_level"],
