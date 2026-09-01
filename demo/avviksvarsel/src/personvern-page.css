@@ -1,0 +1,73 @@
+/* Layout for the privacy page entry (src/personvern-page.tsx), and only for it.
+
+   This entry deliberately does NOT import src/styles.css: that file is the app shell's layout —
+   journey cards, the status card, the stop picker — none of which exists here, and pulling it in
+   would ship the whole app's CSS on a page of text. The cost is that the handful of shell rules
+   the page does need (the body reset, the 640px column, the Contrast band) are restated below
+   rather than shared. They are restated with the SAME token names, so the two agree by
+   construction and a token change reaches both.
+
+   Token-driven throughout, no literal colours. A hardcoded hex survives the ?brand=none reskin —
+   the brand sheet redefines Linje's tokens, so anything written as a literal here would come
+   through the reskin unchanged and leave one Entur-coloured detail on the page whose whole point
+   is being honest about who is behind the service. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--lavender-10);
+  color: var(--colors-blues-blueMain, var(--lavender-90));
+  min-height: 100vh;
+}
+
+/* ---- header (Contrast band) ----
+   Same measurements as the app masthead, so navigating from /varsel/ to this page does not move
+   the band. `env(safe-area-inset-top)` is what keeps the band clear of the notch when an installed
+   PWA opens the page full-screen — which is the common way it is read. */
+
+.pv-header {
+  padding: env(safe-area-inset-top) 0 0;
+}
+
+.pv-header-inner {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.pv-header-title {
+  margin: 0;
+}
+
+/* ---- page body ---- */
+
+.pv-main {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem calc(3rem + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.pv-back {
+  margin: 0;
+}
+
+.pv-intro {
+  margin: 0;
+}
+
+/* A title and its paragraph are one unit: the gap inside a section is smaller than the gap between
+   sections, which is what makes nine headings scan as nine topics rather than eighteen blocks. */
+.pv-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
