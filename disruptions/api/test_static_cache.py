@@ -39,6 +39,12 @@ _root = Path(_tmp.name)
 (_root / "assets" / "Entur-Nationale-Regular-BpXINGXk.woff").write_bytes(b"font")
 (_root / "manifest.webmanifest").write_text("{}")
 (_root / "sw.js").write_text("// service worker")
+# A second Vite entry, as /varsel's privacy page ships (demo/avviksvarsel/personvern/index.html):
+# its own directory with its own unhashed index.html, sharing the one assets/ directory.
+(_root / "personvern").mkdir()
+(_root / "personvern" / "index.html").write_text(
+    '<script src="/x/assets/index-B8Bt7o5h.js"></script>'
+)
 
 _app = FastAPI()
 _app.mount("/x", main._VersionedStaticFiles(directory=_root, html=True), name="x")
@@ -72,6 +78,38 @@ def test_the_directory_url_is_the_same_file_and_gets_the_same_rule():
     """
     r = client.get("/x/")
     assert r.status_code == 200
+    assert r.headers["cache-control"] == REVALIDATE
+
+
+def test_the_privacy_page_is_reachable_without_its_trailing_slash():
+    """/varsel/personvern is a second Vite entry, not a route — Starlette does the rest.
+
+    The page ships as personvern/index.html inside the varsel bundle, so nothing in main.py knows
+    it exists: html=True answers the slash-less URL with a 307 to the directory form. That is what
+    makes the URL people will type, link and paste into a phone work, so it is worth pinning where
+    a future mount change would break it silently.
+
+    follow_redirects=False is load-bearing: TestClient follows redirects by default, which would
+    turn this into an assertion about the 200 at the other end and let the redirect itself rot.
+    """
+    r = client.get("/x/personvern", follow_redirects=False)
+    assert r.status_code == 307, r.status_code
+    assert r.headers["location"].endswith("/x/personvern/"), r.headers["location"]
+
+    followed = client.get("/x/personvern", follow_redirects=True)
+    assert followed.status_code == 200, followed.status_code
+
+
+def test_the_privacy_page_must_be_revalidated():
+    """index.html's rule, one directory down.
+
+    personvern/index.html sits outside assets/ and keeps its name across every deploy, so it needs
+    the same no-cache treatment as the root entry point — a privacy text a browser is allowed to
+    keep is the one file where serving last month's copy is a legal problem rather than a cosmetic
+    one.
+    """
+    r = client.get("/x/personvern/")
+    assert r.status_code == 200, r.status_code
     assert r.headers["cache-control"] == REVALIDATE
 
 

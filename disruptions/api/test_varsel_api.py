@@ -52,6 +52,7 @@ os.environ.update(
 )
 
 import json
+import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -2621,6 +2622,342 @@ def test_state_persisted_to_file():
     with open(_STATE_PATH) as fh:
         data = json.load(fh)
     assert DEVICE in data["devices"]
+
+
+# ---- delete-all («Slett alt») + consent version -------------------------------------------------
+# The privacy plan's two backend halves (docs/plans/2026-08-31-001): a one-request deletion of
+# everything keyed to a device (GDPR art. 17), and a provable record of which consent text a
+# registration was shown (art. 7). The delete-all endpoint is deliberately NOT delete_device:
+# that one is «Skru av» (forget the push subscription, keep the journeys) and gets its own pin
+# below so the two contracts cannot quietly merge.
+
+_PAYLOAD = {
+    "device_id": DEVICE,
+    "from_stop": "A",
+    "from_name": "Oslo S",
+    "to_stop": "B",
+    "to_name": "Lillehammer",
+    "begin": "00:00",
+    "end": "23:59",
+    "days": [0, 1, 2, 3, 4, 5, 6],
+}
+
+
+@contextmanager
+def _capture_varsel_logs():
+    """Collect varsel's log records so a test can assert on the structured `fields` payloads."""
+    records: list[logging.LogRecord] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collector()
+    before_level = varsel.logger.level
+    varsel.logger.addHandler(handler)
+    varsel.logger.setLevel(logging.INFO)
+    try:
+        yield records
+    finally:
+        varsel.logger.removeHandler(handler)
+        varsel.logger.setLevel(before_level)
+
+
+def _events(records, name: str) -> list[dict]:
+    return [f for f in (getattr(r, "fields", {}) for r in records) if f.get("event") == name]
+
+
+def test_delete_all_removes_device_journeys_and_notified_state():
+    """The server half of «Slett alt»: one request removes the device record, every journey the
+    device registered, and the journeys' _notified dedup keys — from module state AND from the
+    persisted state file, which is what a redeploy would restore (R9)."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid1 = _register_journey(DEVICE)
+    jid2 = _register_journey(DEVICE)
+    with varsel._state_lock:
+        varsel._notified.add(f"{jid1}|S1")
+        varsel._notified.add(f"{jid2}|S1")
+        varsel._save_state()  # the dedup keys must demonstrably reach the state file first
+    with _capture_varsel_logs() as records:
+        r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"status": "ok", "journeys_deleted": 2}
+    assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
+    assert DEVICE not in varsel._devices
+    assert not any(k.split("|", 1)[0] in {jid1, jid2} for k in varsel._notified)
+    with open(_STATE_PATH) as fh:
+        data = json.load(fh)
+    assert DEVICE not in data["devices"]
+    assert jid1 not in data["journeys"] and jid2 not in data["journeys"]
+    assert not any(k.split("|", 1)[0] in {jid1, jid2} for k in data["notified"])
+    # The art. 17 execution record: exactly one structured line, with the count.
+    events = _events(records, "varsel_delete_all")
+    assert len(events) == 1
+    assert events[0]["device_id"] == DEVICE and events[0]["journeys_deleted"] == 2
+
+
+def test_delete_all_leaves_other_devices_untouched():
+    _reset_state()
+    other = "dev-other-98765"
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    client.post("/varsel-api/devices", json={"device_id": other, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    other_jid = _register_journey(other)
+    with varsel._state_lock:
+        varsel._notified.add(f"{other_jid}|S1")
+    r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 200 and r.json()["journeys_deleted"] == 1
+    assert other in varsel._devices
+    listing = client.get(f"/varsel-api/journeys?device_id={other}").json()["journeys"]
+    assert [j["journey_id"] for j in listing] == [other_jid]
+    assert f"{other_jid}|S1" in varsel._notified
+
+
+def test_delete_all_unknown_id_is_idempotent_and_does_zero_io(monkeypatch):
+    """An unknown device_id answers 200 with zero deletions, twice — and the no-op path must do
+    ZERO I/O: every mutation holds _state_lock across a blocking GCS upload, so an unauthenticated
+    endpoint that saved state on every random UUID would be free write amplification. No log
+    either — nothing happened."""
+    _reset_state()
+    saves = []
+    monkeypatch.setattr(varsel, "_save_state", lambda: saves.append(1))
+    with _capture_varsel_logs() as records:
+        for _ in range(2):
+            r = client.delete("/varsel-api/devices/dev-nobody-1234/data")
+            assert r.status_code == 200
+            assert r.json() == {"status": "ok", "journeys_deleted": 0}
+    assert saves == []
+    assert _events(records, "varsel_delete_all") == []
+
+
+def test_delete_all_rejects_out_of_bounds_device_ids():
+    """The path param mirrors the body models' device_id bounds (8..100). No charset pattern:
+    the legacy fallback shape dev-<ts>-<rand> must stay legal."""
+    _reset_state()
+    assert client.delete(f"/varsel-api/devices/{'x' * 101}/data").status_code == 422
+    assert client.delete("/varsel-api/devices/short/data").status_code == 422
+
+
+def test_delete_all_without_a_device_record_still_deletes_journeys():
+    """Push never enabled → no device record, but the journeys are still the user's data."""
+    _reset_state()
+    _register_journey(DEVICE)
+    r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 200 and r.json()["journeys_deleted"] == 1
+    assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
+
+
+def test_delete_device_keeps_journeys():
+    """«Skru av» vs «Slett alt»: the existing DELETE /devices/{id} forgets only the push
+    subscription — the registered journeys survive it. First-ever pin of that contract, added
+    beside delete-all so the two endpoints' semantics cannot quietly merge."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    assert client.delete(f"/varsel-api/devices/{DEVICE}").status_code == 200
+    assert DEVICE not in varsel._devices
+    listing = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert [j["journey_id"] for j in listing] == [jid]
+
+
+def test_consent_text_version_is_stored_echoed_and_survives_a_reload():
+    _reset_state()
+    r = client.post(
+        "/varsel-api/journeys", json={**_PAYLOAD, "consent_text_version": "2026-08-31.1"}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["consent_text_version"] == "2026-08-31.1"
+    jid = r.json()["journey_id"]
+    listing = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert listing[0]["consent_text_version"] == "2026-08-31.1"
+    # The journey record rides the state blob wholesale, so the version must round-trip it: what a
+    # redeploy restores is what proves which text this registration was shown.
+    blob = varsel._serialize_state()
+    with varsel._state_lock:
+        varsel._journeys.clear()
+    varsel._apply_state(blob)
+    assert varsel._journeys[jid]["consent_text_version"] == "2026-08-31.1"
+
+
+def test_consent_text_version_is_optional_for_old_clients():
+    _reset_state()
+    r = client.post("/varsel-api/journeys", json=_PAYLOAD)
+    assert r.status_code == 200, r.text
+    assert r.json()["consent_text_version"] is None
+
+
+def test_consent_text_version_is_constrained():
+    """Every sibling string field on JourneyIn carries bounds; an unbounded client-controlled
+    string would ride the state blob on every save and land in a structured log field."""
+    _reset_state()
+    overlong = "2026-08-31." + "9" * 35  # matches the pattern, blows max_length=40
+    r = client.post("/varsel-api/journeys", json={**_PAYLOAD, "consent_text_version": overlong})
+    assert r.status_code == 422
+    r = client.post(
+        "/varsel-api/journeys", json={**_PAYLOAD, "consent_text_version": "not-a-version"}
+    )
+    assert r.status_code == 422
+
+
+def test_unknown_extra_fields_on_post_are_still_ignored():
+    """Pydantic's default extra='ignore' is what makes the consent rollout safe in both
+    directions (old API ignores the field; new API accepts old clients) — pin that no
+    model_config tightened it."""
+    _reset_state()
+    r = client.post("/varsel-api/journeys", json={**_PAYLOAD, "favourite_colour": "red"})
+    assert r.status_code == 200, r.text
+
+
+def test_registration_logs_the_consent_version_but_never_the_route_or_the_digest():
+    """The journey_registered event carries consent_text_version and journey_id — never
+    from_stop/to_stop or the stop names, and never the journey DIGEST.
+
+    The digest is the point of this test. event="push" already carries device_id + journey_id and
+    event="llm_message" carries the digest alone; a record pairing device_id WITH the digest would
+    be the first join between the two, and it would make every varsel_decisions row (keyed on that
+    same digest) device-linkable through Cloud Logging — while the privacy page this work publishes
+    states the decision log «identifiserer ikke enheten din». journey_id identifies the
+    registration for consent provenance without minting the cross-log join."""
+    _reset_state()
+    with _capture_varsel_logs() as records:
+        r = client.post(
+            "/varsel-api/journeys", json={**_PAYLOAD, "consent_text_version": "2026-08-31.1"}
+        )
+    assert r.status_code == 200, r.text
+    registered = [
+        record for record in records
+        if getattr(record, "fields", {}).get("event") == "journey_registered"
+    ]
+    assert len(registered) == 1
+    fields = registered[0].fields
+    assert fields["consent_text_version"] == "2026-08-31.1"
+    assert fields["journey_id"] == r.json()["journey_id"]
+    assert fields["device_id"] == DEVICE
+    assert "journey_digest" not in fields
+    assert "from_stop" not in fields and "to_stop" not in fields
+    assert "from_name" not in fields and "to_name" not in fields
+    assert all(
+        name not in record.getMessage()
+        for record in registered
+        for name in ("Oslo S", "Lillehammer", '"A"', '"B"')
+    )
+
+
+def test_save_state_reports_the_durable_copy_up_to_date_without_a_bucket():
+    """No VARSEL_STATE_BUCKET means there is no durable copy to be stale — the documented
+    local-only dev mode — so _save_state reports success. delete_device_data reads this return
+    value, and a False here would 503 every erasure in dev and in this suite."""
+    _reset_state()
+    assert not varsel._STATE_BUCKET, "the suite runs bucket-less; this test is about that mode"
+    assert varsel._save_state() is True
+
+
+def test_save_state_reports_failure_when_a_configured_upload_fails(monkeypatch):
+    """The GCS branch keeps its swallow-and-log, but it now SIGNALS. Before this the only trace of
+    a failed durable write was a log line nobody reads on the request path, so «Slett alt» could
+    answer 200 over a blob that still held everything."""
+    _reset_state()
+
+    class _FailingBlob:
+        def upload_from_string(self, *a, **k):
+            raise RuntimeError("503 backend error")
+
+    monkeypatch.setattr(varsel, "_gcs_blob", lambda: _FailingBlob())
+    assert varsel._save_state() is False
+    # The local file is still written — that half stays best-effort and is unaffected.
+    with open(_STATE_PATH) as fh:
+        json.load(fh)
+
+
+def test_delete_all_rolls_back_and_503s_when_the_durable_write_fails(monkeypatch):
+    """A GDPR art. 17 erasure must not report success over a durable blob that still holds the
+    data: load_state would resurrect it on the next restart, and by then the client has cleared its
+    device id, so the resurrected rows are unreachable by the person they belong to.
+
+    The ROLLBACK is what makes the retry correct. Without it the second attempt finds nothing in
+    memory, takes the zero-I/O unknown-id path, and answers 200 while the blob is still full."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid1 = _register_journey(DEVICE)
+    jid2 = _register_journey(DEVICE)
+    with varsel._state_lock:
+        varsel._notified.add(f"{jid1}|S1")
+        varsel._notified.add(f"{jid2}|S1")
+
+    real_save = varsel._save_state
+    durable = {"ok": False}
+    monkeypatch.setattr(varsel, "_save_state", lambda: real_save() and durable["ok"])
+
+    with _capture_varsel_logs() as records:
+        r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 503, r.text
+    assert "Prøv igjen" in r.json()["detail"]
+    # Distinct, alertable event — a silently-failed erasure has to be findable in the logs.
+    failures = _events(records, "varsel_delete_all_persist_failed")
+    assert len(failures) == 1 and failures[0]["device_id"] == DEVICE
+    assert _events(records, "varsel_delete_all") == []
+    # Everything is still there: memory and the blob agree, which is what lets the retry work.
+    assert DEVICE in varsel._devices
+    listing = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert {j["journey_id"] for j in listing} == {jid1, jid2}
+    assert {f"{jid1}|S1", f"{jid2}|S1"} <= varsel._notified
+
+    # The retry, with the durable write healthy again, deletes everything.
+    durable["ok"] = True
+    r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"status": "ok", "journeys_deleted": 2}
+    assert DEVICE not in varsel._devices
+    assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
+    assert not any(k.split("|", 1)[0] in {jid1, jid2} for k in varsel._notified)
+
+
+def test_a_journey_deleted_mid_cycle_is_not_pushed_to(monkeypatch):
+    """«Slett alt» landing inside the notification fan-out. Loop 2 captures its work items —
+    subscription included — before the pool starts, so without a last look just before the send a
+    push still reaches the phone after the UI said everything was deleted, and the "sent" result
+    writes a _notified key for a journey that no longer exists."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+
+    real_deliver = varsel.deliver_to_devices
+
+    def _delete_all_then_deliver(per_device, prepare):
+        # The window: the items are collected, the erasure lands, the sends have not gone out.
+        assert per_device, "the fan-out must have had something queued for this to be a test"
+        assert client.delete(f"/varsel-api/devices/{DEVICE}/data").status_code == 200
+        return real_deliver(per_device, prepare)
+
+    monkeypatch.setattr(varsel, "deliver_to_devices", _delete_all_then_deliver)
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent == []
+    assert not any(k.split("|", 1)[0] == jid for k in varsel._notified)
+
+
+def test_a_single_journey_deleted_mid_cycle_is_not_pushed_to(monkeypatch):
+    """The other half of the same window: the device survives («Skru av» was not pressed) but the
+    one journey is gone, so the re-check has to look at _journeys and not only at _devices."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+
+    real_deliver = varsel.deliver_to_devices
+
+    def _delete_journey_then_deliver(per_device, prepare):
+        assert client.delete(f"/varsel-api/journeys/{jid}?device_id={DEVICE}").status_code == 200
+        return real_deliver(per_device, prepare)
+
+    monkeypatch.setattr(varsel, "deliver_to_devices", _delete_journey_then_deliver)
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent == []
+    assert DEVICE in varsel._devices
+    assert not any(k.split("|", 1)[0] == jid for k in varsel._notified)
 
 
 class _MonkeyPatch:
