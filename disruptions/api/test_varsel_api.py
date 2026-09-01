@@ -2809,12 +2809,16 @@ def test_unknown_extra_fields_on_post_are_still_ignored():
     assert r.status_code == 200, r.text
 
 
-def test_registration_logs_the_consent_version_but_never_the_route():
-    """The journey_registered event carries consent_text_version and the journey DIGEST — never
-    from_stop/to_stop or the stop names: keeping the commute pattern out of Cloud Logging is the
-    digest's documented purpose (llm_message.key_digest)."""
-    import llm_message
+def test_registration_logs_the_consent_version_but_never_the_route_or_the_digest():
+    """The journey_registered event carries consent_text_version and journey_id — never
+    from_stop/to_stop or the stop names, and never the journey DIGEST.
 
+    The digest is the point of this test. event="push" already carries device_id + journey_id and
+    event="llm_message" carries the digest alone; a record pairing device_id WITH the digest would
+    be the first join between the two, and it would make every varsel_decisions row (keyed on that
+    same digest) device-linkable through Cloud Logging — while the privacy page this work publishes
+    states the decision log «identifiserer ikke enheten din». journey_id identifies the
+    registration for consent provenance without minting the cross-log join."""
     _reset_state()
     with _capture_varsel_logs() as records:
         r = client.post(
@@ -2828,8 +2832,9 @@ def test_registration_logs_the_consent_version_but_never_the_route():
     assert len(registered) == 1
     fields = registered[0].fields
     assert fields["consent_text_version"] == "2026-08-31.1"
-    rec = varsel._journeys[r.json()["journey_id"]]
-    assert fields["journey_digest"] == llm_message.key_digest(varsel.journey_key(rec))
+    assert fields["journey_id"] == r.json()["journey_id"]
+    assert fields["device_id"] == DEVICE
+    assert "journey_digest" not in fields
     assert "from_stop" not in fields and "to_stop" not in fields
     assert "from_name" not in fields and "to_name" not in fields
     assert all(
@@ -2837,6 +2842,122 @@ def test_registration_logs_the_consent_version_but_never_the_route():
         for record in registered
         for name in ("Oslo S", "Lillehammer", '"A"', '"B"')
     )
+
+
+def test_save_state_reports_the_durable_copy_up_to_date_without_a_bucket():
+    """No VARSEL_STATE_BUCKET means there is no durable copy to be stale — the documented
+    local-only dev mode — so _save_state reports success. delete_device_data reads this return
+    value, and a False here would 503 every erasure in dev and in this suite."""
+    _reset_state()
+    assert not varsel._STATE_BUCKET, "the suite runs bucket-less; this test is about that mode"
+    assert varsel._save_state() is True
+
+
+def test_save_state_reports_failure_when_a_configured_upload_fails(monkeypatch):
+    """The GCS branch keeps its swallow-and-log, but it now SIGNALS. Before this the only trace of
+    a failed durable write was a log line nobody reads on the request path, so «Slett alt» could
+    answer 200 over a blob that still held everything."""
+    _reset_state()
+
+    class _FailingBlob:
+        def upload_from_string(self, *a, **k):
+            raise RuntimeError("503 backend error")
+
+    monkeypatch.setattr(varsel, "_gcs_blob", lambda: _FailingBlob())
+    assert varsel._save_state() is False
+    # The local file is still written — that half stays best-effort and is unaffected.
+    with open(_STATE_PATH) as fh:
+        json.load(fh)
+
+
+def test_delete_all_rolls_back_and_503s_when_the_durable_write_fails(monkeypatch):
+    """A GDPR art. 17 erasure must not report success over a durable blob that still holds the
+    data: load_state would resurrect it on the next restart, and by then the client has cleared its
+    device id, so the resurrected rows are unreachable by the person they belong to.
+
+    The ROLLBACK is what makes the retry correct. Without it the second attempt finds nothing in
+    memory, takes the zero-I/O unknown-id path, and answers 200 while the blob is still full."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid1 = _register_journey(DEVICE)
+    jid2 = _register_journey(DEVICE)
+    with varsel._state_lock:
+        varsel._notified.add(f"{jid1}|S1")
+        varsel._notified.add(f"{jid2}|S1")
+
+    real_save = varsel._save_state
+    durable = {"ok": False}
+    monkeypatch.setattr(varsel, "_save_state", lambda: real_save() and durable["ok"])
+
+    with _capture_varsel_logs() as records:
+        r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 503, r.text
+    assert "Prøv igjen" in r.json()["detail"]
+    # Distinct, alertable event — a silently-failed erasure has to be findable in the logs.
+    failures = _events(records, "varsel_delete_all_persist_failed")
+    assert len(failures) == 1 and failures[0]["device_id"] == DEVICE
+    assert _events(records, "varsel_delete_all") == []
+    # Everything is still there: memory and the blob agree, which is what lets the retry work.
+    assert DEVICE in varsel._devices
+    listing = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert {j["journey_id"] for j in listing} == {jid1, jid2}
+    assert {f"{jid1}|S1", f"{jid2}|S1"} <= varsel._notified
+
+    # The retry, with the durable write healthy again, deletes everything.
+    durable["ok"] = True
+    r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"status": "ok", "journeys_deleted": 2}
+    assert DEVICE not in varsel._devices
+    assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
+    assert not any(k.split("|", 1)[0] in {jid1, jid2} for k in varsel._notified)
+
+
+def test_a_journey_deleted_mid_cycle_is_not_pushed_to(monkeypatch):
+    """«Slett alt» landing inside the notification fan-out. Loop 2 captures its work items —
+    subscription included — before the pool starts, so without a last look just before the send a
+    push still reaches the phone after the UI said everything was deleted, and the "sent" result
+    writes a _notified key for a journey that no longer exists."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+
+    real_deliver = varsel.deliver_to_devices
+
+    def _delete_all_then_deliver(per_device, prepare):
+        # The window: the items are collected, the erasure lands, the sends have not gone out.
+        assert per_device, "the fan-out must have had something queued for this to be a test"
+        assert client.delete(f"/varsel-api/devices/{DEVICE}/data").status_code == 200
+        return real_deliver(per_device, prepare)
+
+    monkeypatch.setattr(varsel, "deliver_to_devices", _delete_all_then_deliver)
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent == []
+    assert not any(k.split("|", 1)[0] == jid for k in varsel._notified)
+
+
+def test_a_single_journey_deleted_mid_cycle_is_not_pushed_to(monkeypatch):
+    """The other half of the same window: the device survives («Skru av» was not pressed) but the
+    one journey is gone, so the re-check has to look at _journeys and not only at _devices."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+
+    real_deliver = varsel.deliver_to_devices
+
+    def _delete_journey_then_deliver(per_device, prepare):
+        assert client.delete(f"/varsel-api/journeys/{jid}?device_id={DEVICE}").status_code == 200
+        return real_deliver(per_device, prepare)
+
+    monkeypatch.setattr(varsel, "deliver_to_devices", _delete_journey_then_deliver)
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent == []
+    assert DEVICE in varsel._devices
+    assert not any(k.split("|", 1)[0] == jid for k in varsel._notified)
 
 
 class _MonkeyPatch:
