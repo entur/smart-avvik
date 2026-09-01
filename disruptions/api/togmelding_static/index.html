@@ -38,6 +38,9 @@
   .kjent { font-size: 14px; padding: 8px 0; border-top: 1px solid var(--line); }
   .kjent:first-of-type { border-top: 0; }
   #error { color: var(--red); }
+  footer { max-width: 680px; margin: 0 auto; padding: 16px 16px 40px; font-size: 13px;
+           color: var(--muted); border-top: 1px solid var(--line); }
+  footer a { color: inherit; }
   .fb { margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(0, 0, 0, 0.08);
         font-size: 14px; }
   .fb-q { margin: 0 0 6px; color: var(--muted); }
@@ -62,10 +65,27 @@
   <p class="sub">Rushtidsvarsel for lokaltogene i Oslo-området (Vy). Prognoser kl. 06:30, 07:00,
      12:00 og 14:00 på hverdager; kl. 07:00 og 14:00 erstatter de to tidligere.
      <span id="gen"></span></p>
+  <!-- Published privacy texts (plan 2026-08-31-001, U8). STATIC MARKUP, deliberately: every
+       dynamic string on this page goes through el()/textContent, and there is not one innerHTML
+       sink here — routing a fixed sentence through a JS-filled id would create the page's first
+       interpolation for no benefit. The wording is a duplicate of TOGMELDING_DISCLAIMER and
+       TOGMELDING_SENDER_LINE in demo/avviksvarsel/src/personvern.ts; this page has no build step
+       and cannot import that module, so disruptions/api/test_personvern_texts.py is what keeps
+       the two copies identical (KTD8). Edit both, or the suite fails. -->
+  <section class="card">
+    <h2>Dette er et eksperiment</h2>
+    <p class="note">Togmeldingen er et eksperiment fra Enturs KI-lab. Prognosene er anslag som
+       ikke alltid treffer — ikke planlegg reisen din på dem alene. Tjenesten kan endres eller
+       avsluttes på kort varsel.</p>
+  </section>
   <div id="error" hidden>Fikk ikke hentet togmeldingen. Prøv igjen om litt.</div>
   <div id="content"></div>
   <p class="note" id="skill"></p>
 </main>
+<footer>
+  Tjenesten leveres av Entur AS.
+  <a href="/varsel/personvern/">Slik behandler vi opplysningene</a>
+</footer>
 <script>
 const LEVEL_LABEL = { green: "GRØNN", yellow: "GUL", red: "RØD" };
 const LEVEL_TEXT = {
