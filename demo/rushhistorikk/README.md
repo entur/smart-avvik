@@ -64,7 +64,7 @@ nivået som vurderes. Uten den regelen ville 07:00 og 14:00 lest `bom` hver enes
 | Riktig stille | ingenting meldt, ingenting påkrevd |
 | Venter / Ukjent / Ikke vurdert | de tre måtene å ikke vite (se over) |
 
-Logikken ligger i `disruptions/api/rushvarsel_verdicts.py` — rene funksjoner, uten I/O, med 38
+Logikken ligger i `disruptions/api/rushhistorikk_verdicts.py` — rene funksjoner, uten I/O, med 38
 sjekker og en enumerasjon over alle nåbare kombinasjoner. Den finnes bare ett sted nettopp fordi
 tabellen har fjorten grener; skrevet en gang til i SQL blir det to definisjoner av «traff».
 

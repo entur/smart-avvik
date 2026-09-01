@@ -269,6 +269,60 @@ def test_the_wall_clock_tick_runs_refresh_then_evaluate_and_isolates_evaluate():
     assert calls == ["on_change", "refresh", "evaluate", "refresh", "evaluate"]
 
 
+def test_the_outcome_pass_runs_last_and_is_isolated_like_the_two_before_it():
+    """The third wall-clock step, and it must fail exactly as harmlessly as the other two.
+
+    Order matters in one direction only: it runs AFTER notify because it reads what the rounds
+    wrote, and it must never run before `togvarsel.refresh()` either. Isolation is what actually
+    bites — this pass makes blocking BigQuery calls (a ~32.5 MB SELECT plus three MERGEs per day of
+    the backlog) on the SOLE poller thread, so a BigQuery outage inside it would otherwise take the
+    disruption feed and every push down with /rushhistorikk's verdicts.
+    """
+    calls: list[str] = []
+    before = (
+        main.get_last_ingestion_time,
+        main.togvarsel.refresh,
+        main.togvarsel_notify.evaluate,
+        main.togvarsel_outcomes.refresh,
+    )
+    main.get_last_ingestion_time = lambda: datetime(2026, 8, 31, 5, 0, tzinfo=UTC)
+    main.togvarsel.refresh = lambda: calls.append("refresh")
+    main.togvarsel_notify.evaluate = lambda: calls.append("evaluate")
+
+    def fake_outcomes():
+        calls.append("outcomes")
+        raise RuntimeError("BigQuery is having a day")
+
+    main.togvarsel_outcomes.refresh = fake_outcomes
+    try:
+        _fields, exc = _with_recorder(
+            lambda: main.poll_for_changes(lambda ts: calls.append("on_change"), _Ticks(2))
+        )
+    finally:
+        (
+            main.get_last_ingestion_time,
+            main.togvarsel.refresh,
+            main.togvarsel_notify.evaluate,
+            main.togvarsel_outcomes.refresh,
+        ) = before
+    assert exc is None, "an outcome-pass failure escaped the tick"
+    assert calls == [
+        "on_change", "refresh", "evaluate", "outcomes",
+        "refresh", "evaluate", "outcomes",
+    ]
+
+
+def test_the_outcome_pass_never_rides_the_sx_rebuild():
+    """Wall-clock only, and last of the three. `_run_settled`'s own docstring describes where it
+    sits relative to the other two, so this is also what keeps that comment honest."""
+    import inspect
+
+    assert "togvarsel_outcomes" not in inspect.getsource(main._rebuild_all)
+    assert "togvarsel_outcomes" not in inspect.getsource(main._on_ingestion_change)
+    poll = inspect.getsource(main.poll_for_changes)
+    assert poll.index("togvarsel_notify.evaluate()") < poll.index("togvarsel_outcomes.refresh()")
+
+
 def test_evaluate_never_rides_the_sx_rebuild():
     """The notify step is wall-clock-driven only: never from the SX-ingestion rebuild, and on the
     wall-clock tick always AFTER togvarsel.refresh() (a just-issued round is seen this tick)."""

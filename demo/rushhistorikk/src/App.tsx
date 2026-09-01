@@ -104,13 +104,15 @@ export default function App() {
             etterfylles. Det er forventet, ikke en ødelagt kobling.
           </li>
           <li>
-            Varslingstid måles fra rushets egen start (06:30 for morgenrushet, 15:00 for
+            Varslingstid måles fra hver utstedelses egen start (06:30 og 07:00 for morgenrushet, 15:00 for
             ettermiddagsrushet), så morgentallene ligger rundt null eller er negative av ren
             konstruksjon.
           </li>
           <li>
-            «Ikke vurdert» betyr at ingen varselrunde ble vurdert — varslingen var slått av, eller
-            dagen er eldre enn loggen over varselrunder. Det betyr <em>ikke</em> at et varsel var unødvendig.
+            «Ikke vurdert» betyr at ingen varselrunde ble vurdert: dagen er eldre enn loggen over
+            varselrunder, varslingen var slått av i dette miljøet, eller skrivingen av runden
+            feilet. De to siste telles for seg som «mangler runde», siden en tapt skriving ellers
+            er umulig å skille fra etterslepet. Det betyr <em>ikke</em> at et varsel var unødvendig.
           </li>
           <li>
             Et foreløpig utfall («foreløpig») er dagens egen lesning og kan endre seg over natten.

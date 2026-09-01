@@ -120,9 +120,14 @@ export interface StatsRow {
   /** traff + traff nesten over the scored issues where a warning was in force. All-clear pushes
    *  are excluded: a friskmelding is not a warning. */
   presisjon_varslet: number | null;
+  /** Issues behind that rate — its own population, so the figure is never readable without it. */
+  presisjon_varslet_den: number;
   /** Share of yellow-or-red rushes we had a warning in force for. Counted per RUSH on the total
    *  row, because a confirming follow-up is covered only via its baseline. */
   dekning: number | null;
+  /** Bad rushes behind that rate (bad issues on a slot row) — the one most likely to be a
+   *  handful. */
+  dekning_den: number;
   /** Median minutes from the push to the rush's start. The last push per rush on the total row. */
   varslingstid_min: number | null;
   varslingstid_n: number;
@@ -132,6 +137,9 @@ export interface StatsRow {
   /** Outcome unestablishable, or the day was ineligible. */
   n_ukjent: number;
   n_ikke_vurdert: number;
+  /** Of those, the ones on a day the round log already covered: a LOST best-effort write rather
+   *  than the pre-launch backlog. */
+  n_ikke_vurdert_etter_start: number;
   n_late: number;
   n_untimely: number;
   /** Forecast level (rows) against realized level (columns), over this row's scored issues. */

@@ -86,13 +86,32 @@ function Count({ label, n, title }: { label: string; n: number; title: string })
  *  Segmented rather than blended because the baselines push on LEVEL and the follow-ups on level
  *  CHANGE — two different decisions with two different calibrations — so a single headline moves
  *  with the mix of the two rather than with the product. */
-/** One rate cell. The three Presisjon/Dekning cells differ only in their value and their tooltip;
- *  Varslingstid and Avgjørelser deliberately stay inline — one carries an extra child, the other no
+/** One rate cell: the percentage over the count it is computed from.
+ *
+ *  The denominator is not decoration. Each of these three figures is over a DIFFERENT population,
+ *  and on a page whose first weeks are almost entirely «ikke vurdert» a bare percentage invites the
+ *  one reading that is wrong — 100 % over two bad rushes and 100 % over two hundred are the same
+ *  glyph. Varslingstid already showed its own; these did not.
+ *
+ *  Varslingstid and Avgjørelser stay inline — one carries a differently-worded child, the other no
  *  tooltip, so folding them in would take a flag per difference. */
-function RateCell({ value, title }: { value: number | null; title: string }) {
+function RateCell({
+  value,
+  den,
+  unit,
+  title,
+}: {
+  value: number | null;
+  den: number;
+  unit: string;
+  title: string;
+}) {
   return (
     <td className="rh-num" title={title}>
       {fmtPct(value)}
+      <span className="rh-population">
+        ({den} {unit})
+      </span>
     </td>
   );
 }
@@ -139,14 +158,20 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
                 </th>
                 <RateCell
                   value={row.presisjon_samlet}
+                  den={row.n_scored}
+                  unit="vurdert"
                   title="Andel av de vurderte utstedelsene med utfallet «Traff»."
                 />
                 <RateCell
                   value={row.presisjon_varslet}
+                  den={row.presisjon_varslet_den}
+                  unit="varslet"
                   title="«Traff» + «Traff nesten» blant de vurderte utstedelsene der et varsel sto i kraft. Friskmeldinger er holdt utenfor — en friskmelding er ikke et varsel."
                 />
                 <RateCell
                   value={row.dekning}
+                  den={row.dekning_den}
+                  unit={row.slot === "total" ? "rush" : "utstedelser"}
                   title="Andel av de gule og røde rushene vi hadde et varsel i kraft for. Videre grunnlag enn Presisjon: sene utstedelser og runder utenfor frist er med."
                 />
                 <td
@@ -198,8 +223,15 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
           />
           <Count
             label="Ikke vurdert"
-            n={total.n_ikke_vurdert}
-            title="Ingen varselrunde ble vurdert — varslingen var slått av, eller dagen er eldre enn runde-loggen."
+            n={total.n_ikke_vurdert - total.n_ikke_vurdert_etter_start}
+            title="Ingen varselrunde ble vurdert, og dagen er eldre enn runde-loggen: den forventede etterslepet fra før siden fantes."
+          />
+          {/* Its own chip, because the two causes are not the same news. Inside the backlog count
+              a lost write is invisible during exactly the weeks the backlog is large. */}
+          <Count
+            label="Mangler runde"
+            n={total.n_ikke_vurdert_etter_start}
+            title="Ingen varselrunde ble vurdert selv om runde-loggen dekket dagen: varslingen var slått av i dette miljøet, eller skrivingen av runden feilet."
           />
           <Count
             label="Sen utstedelse"

@@ -24,7 +24,7 @@
 -- test_rushhistorikk pins it by grepping this text.
 --
 -- No partition-pruning predicate to get right: all three tables are tiny (four issue rows per
--- weekday, three outcome rows per day), so a 365-day window is kilobytes. Measured 22 kB by dry run
+-- weekday, three outcome rows per day), so a 365-day window is bytes, not kilobytes. Measured 305 bytes by dry run
 -- against ent-kixavvik-dev on 2026-09-01. The response is cached anyway, on a four-value window
 -- allow-list, so the reachable key space is four.
 WITH outcomes AS (
@@ -46,12 +46,22 @@ WITH outcomes AS (
     MAX(IF(scope = 'pm', provisional_level, NULL)) AS pm_provisional_level,
     -- Eligibility is a property of the DAY (09_training.sql thresholds am_n and pm_n), so
     -- LOGICAL_AND over the scopes that carry it, and NULL while only provisional rows exist.
-    LOGICAL_AND(IFNULL(eligible, TRUE)) AS eligible,
+    -- NULL when no scope has answered yet, rather than the TRUE that IFNULL alone would produce:
+    -- the provisional pass writes eligible = NULL on purpose (its call counts are not the training
+    -- chain's COUNT(*)), and a reader -- including api.ts's `eligible: boolean | null` -- tests for
+    -- that NULL.
+    IF(COUNTIF(eligible IS NOT NULL) = 0, NULL, LOGICAL_AND(IFNULL(eligible, TRUE))) AS eligible,
     -- The whole day is settled only when every scope is. A half-settled day is still `venter` for
     -- the issues whose own scope has not landed, which is why the per-scope flags travel too.
-    LOGICAL_AND(IF(scope = 'am', IFNULL(settled, FALSE), TRUE)) AS am_settled,
-    LOGICAL_AND(IF(scope = 'amrest', IFNULL(settled, FALSE), TRUE)) AS amrest_settled,
-    LOGICAL_AND(IF(scope = 'pm', IFNULL(settled, FALSE), TRUE)) AS pm_settled,
+    -- LOGICAL_OR over "is this THE scope, and is it settled", never LOGICAL_AND over an IF whose
+    -- else-branch is TRUE. That form reports a scope as SETTLED when the day has no row for it at
+    -- all -- the else-branch answers TRUE for every other scope's row and the AND passes -- so
+    -- today's 12:00/14:00 issues read `ukjent` instead of `venter` every weekday between 12:00 and
+    -- 18:20, which is exactly the window a reader looks at. Verified against BigQuery: the old form
+    -- returns true and this one false for a day carrying only am + amrest rows.
+    LOGICAL_OR(scope = 'am' AND IFNULL(settled, FALSE)) AS am_settled,
+    LOGICAL_OR(scope = 'amrest' AND IFNULL(settled, FALSE)) AS amrest_settled,
+    LOGICAL_OR(scope = 'pm' AND IFNULL(settled, FALSE)) AS pm_settled,
     LOGICAL_OR(IFNULL(unresolvable, FALSE)) AS any_unresolvable,
     MAX(IF(scope = 'am', IFNULL(unresolvable, FALSE), FALSE)) AS am_unresolvable,
     MAX(IF(scope = 'amrest', IFNULL(unresolvable, FALSE), FALSE)) AS amrest_unresolvable,

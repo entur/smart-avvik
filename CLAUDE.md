@@ -1192,6 +1192,30 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     from every rate, and why `provisional_trouble10`/`_level`/`_at` are **never overwritten** by the
     settled pass: the overnight disagreement rate is the measurement that decides whether the pass
     earns its keep, and destroying it would repeat the marker store's own defect.
+  - **The authoritative pass's latch is keyed on the UTC DATE, and mixing the two calendars once
+    cost the whole page.** Its gate is a UTC hour (04:00) because the batch it waits for rewrites at
+    a UTC hour, while everything else in `togvarsel_outcomes` is scoped to the **Oslo** day because a
+    rush is an Oslo-clock thing. Held as a boolean inside the Oslo-day state those two shared one
+    dict, and the failure was not a near miss: at Oslo midnight — 22:00 UTC in CEST, 23:00 in CET —
+    the Oslo rollover cleared the flag while `hour >= 4` was trivially true, so the pass ran about
+    five hours **before** the batch it depends on, found nothing, and settled every day as
+    `unresolvable` — permanently, and with nothing logged as an error. Two calendars now live in two
+    variables: `_settled_last_utc` sits outside `_state`, which is also why it needs resetting in the
+    suite's own `_reset` (a leaked latch makes half the suite pass by accident). Both offsets are
+    pinned, because a fix that handled only the summer one would look right for half the year.
+  - **A day NO scope resolved for is left for the retry window; a day missing ONE scope settles.**
+    That pair is the discriminator between the two causes of an empty read, and only one is final.
+    With a sibling scope resolved the batch has demonstrably landed, so "no resolved call in this
+    window" is an answer about the data and `unresolvable` is right — `last_recorded` is immutable,
+    and retrying for ten days re-runs one query to reach the same NULL. With nothing at all the
+    likeliest cause is that the batch has not landed for that day yet, and because
+    `resolve_outcome_state` reads `unresolvable` **before** the window, three rows written there
+    burn the day for good on the strength of one early read. Left alone the day stays in the work
+    set, reads `venter`, is retried daily, and turns `ukjent` at day 11 by itself. Same shape one
+    layer up: a provisional scope the query answered nothing for stays **due**, or one empty read
+    retires it for the rest of the Oslo day and the page waits for the overnight pass with nothing
+    retrying. And the two provisional windows hold **separate** give-up budgets, or a morning
+    outage silently forfeits an afternoon check on a day that was healthy by 18:20.
   - **ROUNDING IS PER SCOPE, and getting it uniform breaks the identity the page rests on.**
     `03_day_windows.sql` emits `ROUND(SAFE_DIVIDE(...), 4)`, which `04_days.sql` carries into
     `am_t10`/`pm_t10`; `08_features_cat.sql` emits a **raw** `SAFE_DIVIDE` for `am_t10_rest0700` —
@@ -1218,7 +1242,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `amrest`, `pm`), the verdict picks the issue's own, and the row shows `amrest` beside `am` so the
     two morning figures cannot silently disagree.
   - **The verdict grades what was COMMUNICATED, not what the issue forecast** — a fourteen-branch
-    table in `rushvarsel_verdicts.py`, pure functions, no I/O. A follow-up that confirms its baseline
+    table in `rushhistorikk_verdicts.py`, pure functions, no I/O. A follow-up that confirms its baseline
     sends nothing, yet the traveller holds a warning at the BASELINE's level, and that is what gets
     graded: 12:00 pushes yellow, the 14:00 round is suppressed `untimely` with a red forecast, the
     rush is yellow, and grading the red would give `traff nesten` where the yellow the traveller
@@ -1239,14 +1263,27 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     numerator too — a friskmelding is not a warning, and counting a correct one as a correct warning
     lets 20 right friskmeldinger plus 20 wrong red warnings read 50 %. Dekning's total row counts
     **rushes, not issues**, because a confirming follow-up is covered only via its baseline.
+  - **The outcomes pivot is `LOGICAL_OR(scope = 'x' AND settled)`, never `LOGICAL_AND` over an `IF`
+    whose else-branch is TRUE.** That second form reports a scope as settled when the day has no row
+    for it at all — the else-branch answers TRUE for every *other* scope's row and the AND passes —
+    so both afternoon issues read `ukjent`, a settled verdict, instead of `venter` every weekday
+    between 12:00 and 18:20, which is exactly the window a reader looks at. Verified against
+    BigQuery. `eligible` is the deliberate opposite: bare `LOGICAL_AND(eligible)`, because BigQuery
+    skips NULLs and returns NULL when every input is NULL, which is the "no scope has answered yet"
+    state `api.ts` tests for. Nothing in this repo executes SQL and the vacuous form dry-runs clean,
+    so what guards it is a **grep** of the uncommented text.
   - **Three kinds of "we do not know", kept apart:** `venter` (still being retried), `ukjent` (can no
     longer be established, or the day failed the training chain's day-level eligibility test —
     `am_n > 300 AND pm_n > 300`, which has no `amrest` term, so eligibility is a property of the DAY)
     and `ikke vurdert` (no round was ever recorded — the gate was closed, or the day predates the
     log). Folding any two together manufactures skill out of missing data. `ikke vurdert` is split on
-    the earliest `decided_at` in `togvarsel_rounds`: before it is the expected backlog, at or after
-    it can only mean a lost best-effort write, and without the split a write regression is
-    indistinguishable from the backlog during exactly the weeks the backlog is large.
+    the earliest day a round was ever recorded (`first_recorded_day`) and served as its own count,
+    `n_ikke_vurdert_etter_start`, with its own chip: before that day is the expected backlog, after
+    it means the gate was closed or a best-effort write was lost, and without the split a write
+    regression is indistinguishable from the backlog during exactly the weeks the backlog is large.
+    **Strictly after**, because that value is a DAY — on the deploy day itself the issues that fired
+    before the restart legitimately have no round, and reading those as lost writes would put one
+    false positive per environment permanently on the page.
   - **Varslingstid is measured from each issue's own `NOTIFY_SPECS.scope_start_h`** — 6.5 / 7.0 /
     15.0 / 15.0, identical to each model's label window, so there is no second source to choose
     between. Positive means the push preceded the rush, so 1200 leads by ~180 min and 1400 by ~60
@@ -1274,7 +1311,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     integers would mint one cache entry and one BigQuery query apiece. Four values, four reachable
     keys.
   - Both new SQL files plus `rushhistorikk_days.sql` are registered in
-    `data/queries/validate_varsel_sql.sh` — the first togvarsel SQL that script covers; the eleven
+    `data/queries/validate_varsel_sql.sh` — the first togvarsel SQL that script covers; the twelve
     files under `data/queries/togvarsel/` and `togvarsel_features_today.sql` are still unvalidated.
     **The prerequisite is not optional:** both new tables must EXIST in the project, because a dry
     run resolves table references and both are created from Python at startup, so a validation run

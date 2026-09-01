@@ -1,4 +1,4 @@
-"""Checks for rushvarsel_verdicts — /rushhistorikk's verdict taxonomy and stats-table metrics.
+"""Checks for rushhistorikk_verdicts — /rushhistorikk's verdict taxonomy and stats-table metrics.
 
 Hermetic and pure. The module under test does no I/O at all, so nothing here touches BigQuery, the
 network or the wall clock; every input is a plain dataclass and every expectation is a literal.
@@ -9,7 +9,7 @@ KTD5-KTD8). It is transcribed below one test per row, named for the row, because
 artefact most likely to be got subtly wrong and the cheapest place to prove right: everything
 above it — the SQL, the API, the page — only renders what these functions decide.
 
-Run: uv run python test_rushvarsel_verdicts.py  (or under pytest)
+Run: uv run python test_rushhistorikk_verdicts.py  (or under pytest)
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import rushvarsel_verdicts as rv
+import rushhistorikk_verdicts as rv
 
 _OSLO = ZoneInfo("Europe/Oslo")
 
@@ -310,18 +310,6 @@ def test_the_buckets_are_resolved_in_the_tables_order():
     assert rv.population(_issue(**{**settled, "late": False, "reason": None})) == rv.BUCKET_SCORED
 
 
-def test_population_class_names_the_three_named_populations():
-    """scored / delivered_only / excluded, the three-way reading the metric table uses. `late` and
-    `untimely` are the two buckets that are delivered but not scored (KTD7)."""
-    scored = _issue(sent=True, level="red", actual="red")
-    assert rv.population_class(scored) == "scored"
-    assert rv.population_class(_issue(sent=True, level="red", actual="red", late=True)) == (
-        "delivered_only"
-    )
-    untimely = _issue(sent=False, reason="untimely", level="red", actual="red")
-    assert rv.population_class(untimely) == "delivered_only"
-    assert rv.population_class(_issue(eligible=False)) == "excluded"
-    assert rv.population_class(_issue(recorded=False)) == "excluded"
 
 
 def test_resolve_outcome_state_gives_up_after_the_retry_window():

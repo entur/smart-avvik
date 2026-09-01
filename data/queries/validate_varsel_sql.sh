@@ -182,7 +182,7 @@ check "meldinger_filters.sql"       "$API/meldinger_filters.sql" "${MELDINGER_PA
 
 # ---- /rushhistorikk: the Rushvarsel feedback loop -------------------------------------------
 #
-# The first togvarsel SQL this script covers. The eleven files under data/queries/togvarsel/ and
+# The first togvarsel SQL this script covers. The twelve files under data/queries/togvarsel/ and
 # disruptions/api/togvarsel_features_today.sql are still unvalidated -- a separate, overdue pass.
 #
 # PREREQUISITE, and it is not optional: disruptions.togvarsel_rounds and
@@ -193,7 +193,7 @@ check "meldinger_filters.sql"       "$API/meldinger_filters.sql" "${MELDINGER_PA
 # to prevent.
 #
 # Measured 2026-09-01 against ent-kixavvik-dev: settled 32.5 MB for one day, provisional 3.4 MB,
-# the day query 22 kB. The usual caveat applies harder than the byte counts suggest -- a too-narrow
+# the day query 305 bytes. The usual caveat applies harder than the byte counts suggest -- a too-narrow
 # date bound drops rows SILENTLY and shows up here as a CHEAPER query, i.e. as success.
 check "togvarsel_outcomes_settled.sql" "$API/togvarsel_outcomes_settled.sql" \
   --parameter=from_date:DATE:2026-08-28 --parameter=to_date:DATE:2026-08-28
