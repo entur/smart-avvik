@@ -230,6 +230,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   KeyError on the poller thread and take the whole cycle's alerting with it. Push **wording** is
   deliberately brand-independent: it is what `/historikk` records, and text that varied by variant
   would split every wording comparison along a second axis.
+  **Unbranded is now about the four brand carriers, NOT about never saying "Entur"** (2026-08-31).
+  The privacy texts made the old invariant false and it had to give: GDPR art. 13(1)(a) obliges the
+  page to name its **controller**, so the unbranded variant states «Entur AS» in the privacy line
+  under the intro (T2), in the sender footer (T7) and throughout `/varsel/personvern/`, where the
+  whole point of the page is saying who holds the data. Naming a company in body copy is not
+  branding it: what still holds unchanged is every one of the four carriers — colour, typeface,
+  the `<Logo/>`, and the PWA/notification identity — so `?brand=none` still does not look, read or
+  install as an Entur product, which is what the variant was for. There is no way to have both:
+  an unattributed privacy notice is not a lesser brand, it is an unlawful one. The privacy page
+  itself renders unbranded via a **second Vite entry**, and two duplications keep it that way (Vite
+  shares nothing between entries) — `personvern/index.html`'s inline brand script and
+  `personvern-page.tsx`'s `@entur/*` import block, both byte-for-byte parity-guarded in
+  `disruptions/api/test_personvern_texts.py`. The import block is the one that bites: diverge it
+  and Rollup moves a Linje sheet after `brands/none.css`, un-reskinning **the whole app**, with
+  nothing red anywhere.
   **The colour sheet is generated, and has to be** (`demo/avviksvarsel/scripts/make_brand_css.py`
   → the committed `src/brands/none.generated.css`): Linje's components do **not** read the design
   tokens at runtime — each package's `dist/styles.css` defines its own `--components-<pkg>-*` with
