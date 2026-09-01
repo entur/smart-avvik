@@ -330,11 +330,54 @@ def test_build_melding_weekday_shape():
     togvarsel.refresh(now=MONDAY_0710)
     m = togvarsel.build_melding(MONDAY_0710)
     assert m.forecast_day is True
-    assert [i.issue for i in m.issues] == ["0630", "0700"]
+    # 07:00 REPLACES 06:30 -- one card per rush, the newest of the pair. See SUPERSEDED_BY.
+    assert [i.issue for i in m.issues] == ["0700"]
     assert m.next_issue == "1200"
     assert m.overdue_issues == []
     assert m.pm_outlook is not None and "forhøyet" in m.pm_outlook  # 07:00 was red
     assert m.skill_note
+
+
+def test_a_follow_up_replaces_its_baseline_on_the_page():
+    """07:00 replaces 06:30 and 14:00 replaces 12:00 -- one card per rush, the newest. Two cards
+    for one rush are one forecast beside its stale predecessor, and a reader with a train to
+    catch has to work out which of the two numbers still applies.
+
+    The narrowing is display-only, which is the half that is easy to lose: the notify chain's
+    change gate compares the follow-up's level against exactly the baseline it pushed, so a
+    baseline dropped from `_state` (rather than from the payload) would silence every
+    friskmelding.
+    """
+    fake = _FakeBQ(feature_row=_feature_row(),
+                   probs={"am0630": 0.05, "am0700": 0.42, "pm1200": 0.2, "pm1400": 0.05})
+    _reset(fake)
+
+    # A baseline with no follow-up yet is still the current forecast for its rush.
+    togvarsel.refresh(now=MONDAY_0710.replace(hour=6, minute=40))
+    assert [i.issue for i in togvarsel.build_melding(MONDAY_0710).issues] == ["0630"]
+
+    togvarsel.refresh(now=MONDAY_1430)
+    m = togvarsel.build_melding(MONDAY_1430)
+    assert [i.issue for i in m.issues] == ["0700", "1400"]
+    # ... while every issue is still computed, cached and handed to the notify seam.
+    assert {i["issue"] for i in togvarsel.issued_today(now=MONDAY_1430)} == {
+        "0630", "0700", "1200", "1400"
+    }
+
+
+def test_a_superseded_baseline_is_not_reported_overdue():
+    """A missing 06:30 whose 07:00 did arrive is not a hole the reader can act on. Reported, the
+    page prints "Prognosen kl. 06:30 er forsinket" directly above the card that replaced it."""
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0700": 0.2})
+    _reset(fake)
+    with togvarsel._lock:  # 06:30 failed; only 07:00 got issued
+        togvarsel._state.update(togvarsel._blank_state(MONDAY_0710.date()))
+        togvarsel._state["issues"]["0700"] = togvarsel.Issue(
+            issue="0700", scope="x", p=0.2, level="yellow", reasons=[], computed_at=MONDAY_0710
+        )
+    m = togvarsel.build_melding(MONDAY_0710.replace(hour=11, minute=0))
+    assert [i.issue for i in m.issues] == ["0700"]
+    assert m.overdue_issues == []
 
 
 def test_build_melding_distinguishes_overdue_from_not_yet_due():
@@ -388,9 +431,10 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
     import feedback
     import feedback_contexts
 
-    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.15, "am0700": 0.34})
+    fake = _FakeBQ(feature_row=_feature_row(),
+                   probs={"am0630": 0.15, "am0700": 0.34, "pm1200": 0.2, "pm1400": 0.05})
     _reset(fake)
-    togvarsel.refresh(now=MONDAY_0710)
+    togvarsel.refresh(now=MONDAY_1430)
     _rekey_state_to_the_real_clock()
     feedback_contexts._reset_for_tests()
     original_enabled = feedback.enabled
@@ -402,9 +446,10 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
         first = client.get("/togmelding-api/today").json()
         second = client.get("/togmelding-api/today").json()
         issues = {i["issue"]: i for i in first["issues"]}
-        assert set(issues) == {"0630", "0700"}
+        # 06:30 and 12:00 were issued too; the page carries only what superseded them.
+        assert set(issues) == {"0700", "1400"}
         assert all(i["feedback_enabled"] and i["feedback_context_id"] for i in issues.values())
-        assert issues["0630"]["feedback_context_id"] != issues["0700"]["feedback_context_id"]
+        assert issues["1400"]["feedback_context_id"] != issues["0700"]["feedback_context_id"]
         assert second["issues"] == first["issues"]  # stable ids -> byte-stable cards across polls
 
         snapshot = feedback_contexts.resolve(issues["0700"]["feedback_context_id"])
