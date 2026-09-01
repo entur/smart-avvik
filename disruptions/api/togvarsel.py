@@ -126,7 +126,7 @@ class _IssueSpec:
 
 ISSUE_SPECS: tuple[_IssueSpec, ...] = (
     _IssueSpec("0630", 6.5, "am0630", "morgenrushet 06:30–09:00", "am", "0630"),
-    _IssueSpec("0700", 7.0, "am0700", "resten av morgenrushet 07:00–09:00", "am", "0700"),
+    _IssueSpec("0700", 7.0, "am0700", "morgenrushet 07:00–09:00", "am", "0700"),
     _IssueSpec("1200", 12.0, "pm1200", "ettermiddagsrushet 15:00–18:00", "pm", "1200"),
     _IssueSpec("1400", 14.0, "pm1400", "ettermiddagsrushet 15:00–18:00", "pm", "1400"),
 )

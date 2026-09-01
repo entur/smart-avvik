@@ -596,12 +596,12 @@ def test_update_payload_marks_the_forecast_as_updated():
     """A follow-up against a pushed baseline says the forecast is UPDATED, so the second
     push in one rush reads as a revision, not a repeat."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
-    issue = _issued("0700", "red", scope="resten av morgenrushet 07:00–09:00")
+    issue = _issued("0700", "red", scope="morgenrushet 07:00–09:00")
     decision = togvarsel_notify.decide_issue(issue, markers, now=_monday(7, 1))
     assert decision.kind == "update"
     title, body = togvarsel_notify.compose_message(decision, issue)
     assert title == "Oppdatert rushvarsel: rødt nivå for morgenrushet"
-    assert body.startswith("Prognosen for resten av morgenrushet 07:00–09:00 er endret til rødt nivå.")
+    assert body.startswith("Prognosen for morgenrushet 07:00–09:00 er endret til rødt nivå.")
 
 
 def test_a_fresh_warning_from_a_follow_up_round_is_not_worded_as_an_update():
@@ -616,13 +616,13 @@ def test_all_clear_payload_is_a_friskmelding_without_warning_language():
     """The drop back to green is framed as a friskmelding — calm, and free of every word the
     warnings use. No reasons either: green's own reasons still talk about trouble signs."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
-    issue = _issued("0700", "green", scope="resten av morgenrushet 07:00–09:00",
+    issue = _issued("0700", "green", scope="morgenrushet 07:00–09:00",
                     reasons=("ingen tegn til trøbbel i morgentimene",))
     decision = togvarsel_notify.decide_issue(issue, markers, now=_monday(7, 1))
     assert decision.kind == "all_clear"
     title, body = togvarsel_notify.compose_message(decision, issue)
     assert title == "Friskmelding: grønt nivå for morgenrushet"
-    assert body == "Utsiktene for resten av morgenrushet 07:00–09:00 er tilbake på grønt nivå."
+    assert body == "Utsiktene for morgenrushet 07:00–09:00 er tilbake på grønt nivå."
     for word in ("rushvarsel", "avvik", "forsinkel", "innstil", "trøbbel", "advarsel"):
         assert word not in title.lower() and word not in body.lower(), word
 
