@@ -10,8 +10,6 @@ __marimo__/
 # run BigQuery under a developer's ADC, so they can't be built in the image or CI.
 # They are rendered offline (export_eval.sh) and committed, then shipped in the
 # image. Refresh by running disruptions/api/export_eval.sh, then commit and push.
-# disruptions/api/togmelding_static/ is likewise NOT ignored: a single hand-written
-# HTML page with no build step, committed and shipped as-is.
 
 # Built into the image by the root Dockerfile's node stage; not committed.
 disruptions/api/demo_static/
@@ -32,6 +30,13 @@ demo/varselhistorikk/tsconfig.tsbuildinfo
 disruptions/api/meldinger_static/
 demo/meldinger/node_modules/
 demo/meldinger/tsconfig.tsbuildinfo
+
+# Built into the image by the root Dockerfile's node stage; not committed. Was a single
+# committed HTML page until 2026-09-01, when /togmelding moved onto Entur Linje — which
+# needs the npm packages, and therefore a build step.
+disruptions/api/togmelding_static/
+demo/togmelding/node_modules/
+demo/togmelding/tsconfig.tsbuildinfo
 
 # Local avviksvarsel state file (durable state lives in the GCS bucket in prod).
 disruptions/api/varsel_state.json

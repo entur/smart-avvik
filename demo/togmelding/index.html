@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="nb">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="robots" content="noindex" />
+    <title>Rushvarsel</title>
+    <meta
+      name="description"
+      content="Prognose for lokaltogene i Oslo-området i rushtiden: grønt, gult eller rødt nivå."
+    />
+
+    <!-- Entur-branded, like /varsel and unlike /demo: the rush-forecast pushes that carry a
+         traveller here are the Entur-branded ones (the unbranded install's click-through
+         deliberately stays inside /varsel — see togvarsel_notify.build_payload). -->
+    <link rel="icon" href="/varsel/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/varsel/favicon-32.png" sizes="32x32" type="image/png" />
+    <link rel="icon" href="/varsel/favicon-16.png" sizes="16x16" type="image/png" />
+    <meta name="theme-color" content="#181c56" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

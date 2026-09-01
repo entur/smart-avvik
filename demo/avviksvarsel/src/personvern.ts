@@ -205,16 +205,19 @@ export const T7_AVSENDER: LinkedText = {
   linkText: PERSONVERN_LINK_TEXT,
 };
 
-// Strings shared with the committed /togmelding page
-// (disruptions/api/togmelding_static/index.html). That page has no build step,
-// so it carries duplicated copies; a Python parity test (plan U8) reads both
-// files and asserts they match.
+// Strings shared with /togmelding (demo/togmelding/src/personvern.ts). That is
+// its own npm app, and the image's node stage copies only its own directory, so
+// it cannot import this module and carries duplicated copies instead; a Python
+// parity test (plan U8) resolves both modules and asserts they match. The same
+// arrangement held when that page was committed vanilla HTML with no build step
+// at all, which is what it was until 2026-09-01.
 export const TOGMELDING_SENDER_LINE = T7_AVSENDER.prose;
+export const TOGMELDING_PERSONVERN_LINK_TEXT = T7_AVSENDER.linkText;
 export const TOGMELDING_PERSONVERN_HREF = PERSONVERN_PATH;
 export const TOGMELDING_DISCLAIMER = {
   title: 'Dette er et eksperiment',
   body:
-    'Togmeldingen er et eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid ' +
+    'Rushvarsel er et eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid ' +
     'treffer — ikke planlegg reisen din på dem alene. Tjenesten kan endres eller avsluttes på ' +
     'kort varsel.',
 };

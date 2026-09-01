@@ -54,14 +54,22 @@ decide_rounds over the injected issued-today snapshot, then match + push per pus
 the marker map persisted through the injected store accessor after each round's delivery
 and the whole pass wrapped so one failure never breaks the poller tick.
 
+Beside all of that sits one read-only surface, :func:`rush_outlook`: the same matching and the
+same supersession, asked per device and answered without sending anything, so /varsel can show the
+levels a traveller is being notified about at the top of its page. It reuses the poller's station
+cache rather than fetching (:func:`cached_station_set`) and never queries BigQuery, and it differs
+from the push policy in exactly one deliberate way — the window is the whole rush rather than the
+part still ahead of now (see :func:`affected_rushes`).
+
 All time logic is Europe/Oslo wall-clock. No import of main, varsel, or togvarsel (the package
 rule): runtime dependencies are injected — main passes the BigQuery client and evaluate()'s seams
 via :func:`configure` (togvarsel's own idiom), the matcher takes varsel's `place_refs` as a plain
 callable, and :func:`push_round` takes varsel's delivery seams (device_subscription,
 deliver_to_devices, handle_gone_device, the brand-asset table, the environment tagger) the same
-way; the policy core needs none. The one HTTP surface is the dev-only test trigger at the bottom
-: a router main mounts, refusing everything but the dev deployment, that fires one synthetic
-round through the same composition + delivery seams without ever touching the markers.
+way; the policy core needs none. Two HTTP surfaces, both on a router main mounts:
+GET /togmelding-api/outlook (the panel above) and the dev-only test trigger at the bottom, which
+refuses everything but the dev deployment and fires one synthetic round through the same
+composition + delivery seams without ever touching the markers.
 """
 
 from __future__ import annotations
@@ -74,7 +82,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from deployment import environment_label
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -309,14 +317,38 @@ def station_set(now: datetime) -> frozenset[str] | None:
                 "skipped (no markers) until it succeeds — on prd, has copy_runtime_to_prd.sh run?"
             )
         return None
-    _station_state["date"] = today
+    # `refs` BEFORE `date`: the request path reads this cache without a lock (see
+    # :func:`cached_station_set`), and publishing the date first would let a reader see today's
+    # date and then miss the refs it is supposed to imply.
     _station_state["refs"] = refs
+    _station_state["date"] = today
     logger.info(
         "togvarsel_notify: fetched %d Oslo stations (expect 39)",
         len(refs),
         extra={"fields": {"event": "togvarsel_notify_stations", "count": len(refs)}},
     )
     return refs
+
+
+def cached_station_set(now: datetime) -> frozenset[str] | None:
+    """Today's station set if the poller has already fetched it — and NEVER a query.
+
+    The read-only twin of :func:`station_set`, for the request path (:func:`rush_outlook`).
+    /togmelding-api is public and unauthenticated, and station_set deliberately has no failure
+    cooldown — sound on a poller tick, one billable scan per page view during an outage here. No
+    lock: the fetch publishes `refs` before `date`, so a reader that sees today's date has already
+    seen its refs.
+
+    A warm cache also means more than "the table was readable". :func:`_evaluate` reaches
+    station_set only past the delivery flag and the VAPID gate, so a warm cache is evidence that
+    rounds are actually being evaluated today — which is what makes it the right gate for a panel
+    whose whole claim is "you are being notified about this".
+    """
+    return (
+        _station_state["refs"]
+        if _station_state.get("date") == now.astimezone(_OSLO).date()
+        else None
+    )
 
 
 # ---- Journey matching -----------------------------------------------------------------
@@ -342,6 +374,32 @@ def _endpoint_listed(
     Lysaker (accepted imprecision — registrations carry no mode, and the network-level wording
     keeps the message honest)."""
     return any(r in stations for r in expand_refs(str(ref)))
+
+
+def _affects(
+    journey: Mapping[str, Any],
+    weekday: int,
+    window_start: float,
+    window_end: float,
+    stations: Collection[str],
+    expand_refs: Callable[[str], Iterable[str]],
+) -> bool:
+    """Whether one registration is inside `[window_start, window_end)` minutes and the geography.
+
+    The three tests both callers share — today's weekday is in `days`, the stored-inclusive
+    [begin, end] window overlaps (compared half-open), both endpoints' alias-expanded ref sets
+    intersect the station set. What differs is the window they pass: :func:`match_journeys` uses
+    the part of the rush still ahead of evaluation time, :func:`affected_rushes` the whole rush.
+    Raises on a malformed record; both callers turn that into "skip this journey and log it"."""
+    if weekday not in journey["days"]:
+        return False
+    begin_min = _parse_hhmm(journey["begin"])
+    end_min = _parse_hhmm(journey["end"])
+    if not (window_start < window_end and begin_min < window_end and window_start < end_min):
+        return False
+    return _endpoint_listed(journey["from_stop"], stations, expand_refs) and _endpoint_listed(
+        journey["to_stop"], stations, expand_refs
+    )
 
 
 def match_journeys(
@@ -374,16 +432,7 @@ def match_journeys(
     devices: set[str] = set()
     for jid, journey in journeys.items():
         try:
-            if weekday not in journey["days"]:
-                continue
-            begin_min = _parse_hhmm(journey["begin"])
-            end_min = _parse_hhmm(journey["end"])
-            if not (live_start < live_end and begin_min < live_end and live_start < end_min):
-                continue
-            if not (
-                _endpoint_listed(journey["from_stop"], stations, expand_refs)
-                and _endpoint_listed(journey["to_stop"], stations, expand_refs)
-            ):
+            if not _affects(journey, weekday, live_start, live_end, stations, expand_refs):
                 continue
             device = str(journey["device_id"])
         except Exception:
@@ -394,6 +443,145 @@ def match_journeys(
         matched.append(jid)
         devices.add(device)
     return matched, devices
+
+
+# ---- Rush outlook (the status panel /varsel shows at the top) -----------------------------
+
+# The two rushes, derived from NOTIFY_SPECS rather than restated, so a scope change moves the
+# panel with the pushes: which rush an issue belongs to, and each rush's whole window (the union
+# of its two issues' scopes — am 06:30–09:00, pm 15:00–18:00).
+RUSH_OF_ISSUE: dict[str, str] = {
+    spec.key: ("am" if spec.scope_start_h < 12 else "pm") for spec in NOTIFY_SPECS
+}
+
+
+def _rush_windows() -> dict[str, tuple[float, float]]:
+    windows: dict[str, tuple[float, float]] = {}
+    for spec in NOTIFY_SPECS:
+        rush = RUSH_OF_ISSUE[spec.key]
+        start, end = windows.get(rush, (spec.scope_start_h, spec.scope_end_h))
+        windows[rush] = (min(start, spec.scope_start_h), max(end, spec.scope_end_h))
+    return windows
+
+
+RUSH_WINDOWS: dict[str, tuple[float, float]] = _rush_windows()
+
+
+class RushForecast(BaseModel):
+    """One rush's current level, for a device that is notified about it."""
+
+    rush: str = Field(description='"am" (morgenrushet) or "pm" (ettermiddagsrushet)')
+    issue: str = Field(
+        description="HHMM of the forecast shown — the NEWEST issued for this rush, so a follow-up "
+        "replaces its baseline exactly as it does on /togmelding"
+    )
+    scope: str = Field(description="The window the probability is about, verbatim from togvarsel")
+    level: str = Field(description="green | yellow | red")
+    p: float = Field(description="Calibrated probability of a bad window (the trouble10 bar)")
+
+
+class RushOutlook(BaseModel):
+    rushes: list[RushForecast] = Field(
+        description="Rushes not yet over that this device would be notified about; [] whenever "
+        "there is nothing to show — off deployment, weekend/holiday, nothing issued yet, no "
+        "registration in the Oslo geography, or every rush already past."
+    )
+
+
+def affected_rushes(
+    device_id: str,
+    journeys: Mapping[str, Mapping[str, Any]],
+    stations: Collection[str],
+    expand_refs: Callable[[str], Iterable[str]],
+    now: datetime,
+) -> set[str]:
+    """Which rushes this device would be notified about today — "am", "pm", both or neither.
+
+    :func:`_affects`' three tests, over this device's registrations only, with ONE deliberate
+    difference from :func:`match_journeys`: the window is the rush's WHOLE span, not the part
+    still ahead of `now`. match_journeys clamps to evaluation time because a push about a window
+    the traveller has already left is noise. A status panel is the opposite — a 07:00–08:00
+    registration should keep reading the morning's level until the morning rush itself is over at
+    09:00, rather than going blank at 08:00 with the trains still late. What bounds the panel is
+    therefore the rush's end (:func:`rush_outlook`), never the registration's.
+
+    One malformed record is skipped and logged, exactly as in match_journeys' loop.
+    """
+    weekday = now.astimezone(_OSLO).weekday()
+    affected: set[str] = set()
+    for jid, journey in journeys.items():
+        if str(journey.get("device_id")) != device_id:
+            continue
+        for rush, (start_h, end_h) in RUSH_WINDOWS.items():
+            if rush in affected:
+                continue
+            try:
+                if _affects(journey, weekday, start_h * 60, end_h * 60, stations, expand_refs):
+                    affected.add(rush)
+            except Exception:
+                logger.exception(
+                    "togvarsel_notify: journey %s is malformed; skipped for the %s outlook",
+                    jid,
+                    rush,
+                )
+                break  # a record that cannot be parsed cannot match the other rush either
+    return affected
+
+
+def rush_outlook(device_id: str, now: datetime | None = None) -> list[RushForecast]:
+    """Today's rush forecasts this device is notified about, for the rushes not yet over.
+
+    Same policy as the pushes, read-only: the level shown is the newest issued forecast for the
+    rush (a follow-up supersedes its baseline, as on /togmelding), the device must have a
+    registration the round would have matched, and a rush whose window has ended is dropped —
+    a level nobody can still act on is noise on a page about catching trains.
+
+    Two gates, both closed by default. `enabled()` is the delivery flag, so the panel appears only
+    where these pushes are actually sent — the same read /varsel-api/config already surfaces as
+    `togvarsel_notify`. And :func:`cached_station_set` must be warm, which additionally implies
+    the poller got past the VAPID gate and is evaluating rounds today; a cold cache yields [], and
+    never a BigQuery query on this request path. The VAPID gate is not consulted directly: a
+    device with no push subscription still gets an honest forecast, and the page already says
+    push is unavailable.
+    """
+    seams = _seams
+    if any(
+        seams.get(key) is None for key in ("enabled", "issued_today", "journeys", "expand_refs")
+    ):
+        return []
+    if not seams["enabled"]():
+        return []
+    now = (now if now is not None else datetime.now(_OSLO)).astimezone(_OSLO)
+    stations = cached_station_set(now)
+    if stations is None:
+        return []
+    issued = {str(issue["issue"]): issue for issue in seams["issued_today"]()}
+    if not issued:
+        return []  # weekend, holiday, or nothing issued yet today
+    now_h = now.hour + now.minute / 60 + now.second / 3600
+    affected = affected_rushes(device_id, seams["journeys"](), stations, seams["expand_refs"], now)
+    if not affected:
+        return []
+    out: list[RushForecast] = []
+    for rush, (_start_h, end_h) in sorted(RUSH_WINDOWS.items(), key=lambda item: item[1]):
+        if rush not in affected or now_h >= end_h:
+            continue
+        candidates = [
+            spec for spec in NOTIFY_SPECS if RUSH_OF_ISSUE[spec.key] == rush and spec.key in issued
+        ]
+        if not candidates:
+            continue  # this rush has no forecast yet (the other one may well have)
+        issue = issued[max(candidates, key=lambda spec: spec.due_h).key]
+        out.append(
+            RushForecast(
+                rush=rush,
+                issue=str(issue["issue"]),
+                scope=str(issue["scope"]),
+                level=str(issue["level"]),
+                p=float(issue["p"]),
+            )
+        )
+    return out
 
 
 # ---- Message composition and round delivery ----------------------------
@@ -644,9 +832,34 @@ def _evaluate(now: datetime) -> None:
         s["store_markers"](date_str, markers)  # suppression-only pass: the markers still count
 
 
-# ---- Dev-only test trigger -----------------------------------------------------------------
+# ---- HTTP surfaces --------------------------------------------------------------------------
 
 router = APIRouter()
+
+
+@router.get(
+    "/togmelding-api/outlook",
+    response_model=RushOutlook,
+    summary="Today's rush forecasts a device is notified about",
+)
+async def outlook(
+    device_id: str = Query(description="Client-generated device UUID, as /varsel-api uses."),
+) -> RushOutlook:
+    """The status panel /varsel renders at the top of the page, with its link to /togmelding.
+
+    Device-scoped because the panel's claim is "you are being notified about this": a rush level is
+    network-wide, but whether it reaches this traveller depends on their registrations. Nothing
+    device-identifying is returned — see :func:`rush_outlook` for the policy and the two gates.
+
+    `async def`, unlike :func:`test_notify` below: every input is already in this process (the
+    poller's station cache, togvarsel's issued snapshot, varsel's journey snapshot), so there is no
+    blocking call to keep off the event loop, and no reason to spend an anyio worker on a page that
+    every /varsel poll asks.
+    """
+    return RushOutlook(rushes=rush_outlook(device_id))
+
+
+# ---- Dev-only test trigger -----------------------------------------------------------------
 
 # The synthetic round the trigger sends: a fixed yellow warning whose reasons say TEST in plain
 # Norwegian, so a screenshot of the notification can never pass for a real forecast. Everything

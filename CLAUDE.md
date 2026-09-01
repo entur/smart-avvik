@@ -997,7 +997,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   road side as UNKNOWN until a road provider is validated. Rebuild baselines/backtest with
   `data/queries/reisevalg_*.sql`; raw volume backfill via `data/svv/download_volumes.py`.
 
-- **Togmeldingen** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
+- **Rushvarsel** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
   the rush-hour forecast from `docs/togvarsel/` (§8 of the findings as revised by §14k; the
   implementation is `docs/togvarsel/03-implementasjon.md`). Four weekday issues (06:30, 07:00 for
   the AM rush; 12:00, 14:00 for the PM rush), each a tuned `LOGISTIC_REG` probability on the
@@ -1012,8 +1012,55 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   promotes all four `togvarsel_m_*` only on full success), then `copy_runtime_to_prd.sh` copies
   models + tables to prd. Holidays/low season live in ONE place: `disruptions.togvarsel_calendar`
   (`data/queries/togvarsel/00_calendar.sql`) — extend yearly; serving ERRORs loudly past its
-  horizon and retrain.sh refuses under 60 days of headroom. The page itself is one committed HTML
-  file (`disruptions/api/togmelding_static/`, the eval_static pattern — no build step).
+  horizon and retrain.sh refuses under 60 days of headroom.
+  **The page is a Vite bundle on Entur Linje** (`demo/togmelding/`, React + Vite + Linje), built
+  into the image by the root Dockerfile's node stage like the other four front-ends, with
+  `disruptions/api/togmelding_static/` now GENERATED and gitignored. It was one committed
+  hand-written HTML file (the `eval_static` pattern, no build step) until 2026-09-01, when it moved
+  onto Linje to match `/varsel` — a traveller usually arrives here by tapping a rush-forecast push
+  from that PWA, and two surfaces of one product should not look like two products. So the header
+  band, the card language and the feedback widget are `/varsel`'s, `src/styles.css` is a near-copy
+  of `demo/avviksvarsel/src/styles.css`, and `GET /togmelding-api/config` labels non-prod in the
+  heading and tab title exactly as `/historikk` and `/meldinger` do (its own endpoint, not a field
+  on `/today`, because `/today` is legitimately empty on a weekend or a failed rebuild and that is
+  when "dev or prd?" matters most). Three things the move has to keep right. The level colours are
+  Linje **validation tokens** (`--stroke-success` / `--fill-success-muted` and the warning/negative
+  pair), never literal hex, and the badge keeps DARK ink on a LIGHT tint at all three levels —
+  Linje's canary is too light for white text and too light to darken without leaving the palette,
+  so a filled swatch cannot be done consistently. The level accent is an **inset box-shadow**, not
+  a thick `border-left`, which against the card's radius leaves a mitred wedge at both corners.
+  And the widget's half-typed comment survives the 5-minute poll because the component is **keyed
+  on `feedback_context_id`** — the vanilla page kept that state outside the DOM by hand; React's
+  key does the same job only as long as the server keeps the id byte-stable, which its fingerprint
+  dedup does. There is deliberately no `?brand=none` variant, unlike `/varsel`: the unbranded
+  install's pushes never link here.
+  **The product is called «Rushvarsel» and the code is called togvarsel/togmelding** (renamed
+  from «Togmeldingen» on 2026-09-01). The rename is deliberately DISPLAY-ONLY: the page heading,
+  `<title>`, meta description, the two no-forecast sentences, the published disclaimer and the two
+  link texts on /varsel. Nothing identifying moved — not the `/togmelding` route (already baked into push
+  payloads sitting on lock screens, where a moved path is a dead tap), not `/togmelding-api`, the
+  modules, `demo/togmelding/`, the `disruptions.togvarsel_*` tables and models,
+  `TOGVARSEL_NOTIFY_ENABLED`, the `togvarsel_*` log events, or the two data discriminators
+  (`display_source='togvarsel'`, `KIX:Togvarsel:<date>:<issue>`) — that last pair for the
+  meldinger-rename reason: a new name drops the rows out of every export query that already
+  exists. The page intro no longer opens with «Rushtidsvarsel for lokaltogene …» — the phrase the
+  name was drawn from, so keeping it would have the intro restate the heading. One thing the name
+  buys for free: the push titles already said «Rushvarsel»/«Oppdatert rushvarsel»
+  (`togvarsel_notify.compose_message`), so the notifications and the product now carry the same
+  word instead of two — and the /varsel notice announcing the push class reads «Nytt: Rushvarsel»,
+  capitalised, because that string went from a common noun to a proper name.
+  **The published privacy texts stay DUPLICATED, and the reason changed while the arrangement did
+  not** (2026-09-01, plan 2026-08-31-001 KTD8): the experiment disclaimer and the T7 sender footer
+  live in `demo/togmelding/src/personvern.ts`, a copy of `demo/avviksvarsel/src/personvern.ts`.
+  Before the move the page could not import that module because it had no build step; now it cannot
+  because the image's node stage copies **only `demo/togmelding/`**, so a relative import into
+  `../avviksvarsel/src/` resolves on a laptop and fails in CI — the worst shape of breakage.
+  `disruptions/api/test_personvern_texts.py` now resolves the constants out of BOTH modules and
+  compares them, which is tighter than the old markup search (a text present but never rendered
+  used to pass) — so it also asserts each constant is actually **referenced** by the app, and the
+  bracket guard moved from a slice of markup, which JSX has no equivalent of, onto the resolved
+  strings. `TOGMELDING_PERSONVERN_LINK_TEXT` was added to the shared vocabulary in the same pass:
+  the vanilla footer shipped that string un-guarded.
   **Each issue card carries the /varsel feedback widget** (2026-08-30): `togmelding_today` mints
   one `feedback_contexts` capability per issued forecast — on the request path only, never in
   `refresh()`/`build_melding()`, and on a COPY of the cached Issue, so `issued_today()`'s notify
@@ -1034,7 +1081,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   which is what lets a half-typed comment survive the 5-minute poll.
 
 - **Togvarsel push rounds** (`disruptions/api/togvarsel_notify.py`, 2026-08-30) deliver
-  Togmeldingen's prognoses as /varsel Web Pushes. Each of the four weekday issues is one
+  Rushvarsel's prognoses as /varsel Web Pushes. Each of the four weekday issues is one
   notification *round*: the baselines (06:30, 12:00) push iff yellow or red; the follow-ups
   (07:00, 14:00) push iff the level *differs* from what their baseline pushed — a level
   transition, never a probability delta (the paired models answer different questions with
@@ -1068,7 +1115,26 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   rows** in v1: the decision is a deterministic function of durable inputs, and adding columns to
   the decisions/outcomes tables is a documented trap (a new `varsel_decision_outcomes` column
   breaks the registered scheduled query — see Conventions below); if rows come later, discriminate on
-  a `KIX:Togvarsel:<date>:<issue>` situationNumber prefix, never a new column. Dev-only test
+  a `KIX:Togvarsel:<date>:<issue>` situationNumber prefix, never a new column.
+  **The levels also sit at the top of `/varsel`** (2026-09-01):
+  `GET /togmelding-api/outlook?device_id=…` (`togvarsel_notify.rush_outlook`) answers with the
+  rushes THIS device is notified about that are not yet over, and `demo/avviksvarsel`'s
+  `RushOutlook` card renders them with a link to `/togmelding` — nothing at all when the list is
+  empty, which is the ordinary state. It is the push policy read-only, in the same module, so
+  there is one definition of "a relevant journey": the same three matching tests, the same
+  supersession (the newest issued forecast per rush, so the two surfaces cannot quote different
+  numbers for one rush), gated on the delivery flag. Two things are deliberately different from a
+  round. The window is the **whole rush**, not the part still ahead of `now` — `match_journeys`
+  clamps to evaluation time because a push about a window the traveller has left is noise, while a
+  status panel going blank at 08:00 with the trains still late is the opposite of useful — so what
+  bounds the panel is the rush's end (09:00 / 18:00), never the registration's. And the request
+  path reads the poller's station cache through `cached_station_set` and **never queries**:
+  `station_set` deliberately has no failure cooldown, which is right on a poller tick and one
+  billable scan per page view on a public unauthenticated endpoint. A cold cache therefore yields
+  no panel — and that doubles as the VAPID gate, since `_evaluate` reaches the fetch only past
+  both gates. The route is `async def` (every input is already in-process) where `test-notify` is
+  a plain `def`, and the two writes in `station_set` publish `refs` before `date` so the lock-free
+  read cannot see a date whose refs have not landed. Dev-only test
   trigger: `POST /togmelding-api/test-notify` with `{"device_id": ...}` (same shape as
   `/varsel-api/test`) sends one synthetic yellow round — body marked as testvarsel — through the
   real composition + delivery path without touching markers; it 404s wherever

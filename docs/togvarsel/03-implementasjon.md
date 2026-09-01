@@ -1,4 +1,8 @@
-# Togmeldingen — implementasjon (2026-08-29)
+# Rushvarsel — implementasjon (2026-08-29)
+
+> Produktnavnet ble endret fra «Togmeldingen» til «Rushvarsel» 2026-09-01. Endringen er
+> bare visuell: rute, API-prefiks, moduler, `disruptions.togvarsel_*`-tabeller, miljøvariabel,
+> logghendelser og de to datadiskriminatorene heter fortsatt togvarsel/togmelding.
 
 Dette dokumentet beskriver produktimplementasjonen av anbefalingen i
 [02-findings-2026-08-27.md](02-findings-2026-08-27.md) §8, slik §14k reviderte den. Kort:
@@ -17,7 +21,9 @@ menneskelesbare featurene, og en deterministisk «kjente avvik»-liste.
 | retrening | `data/queries/togvarsel/retrain.sh` | hele kjeden, månedlig, ≈ $1.5 / ~40 min; promoterer kandidatene først når ALT lyktes, så en feilet retrening aldri etterlater en blandet modellfamilie |
 | live features | `disruptions/api/togvarsel_features_today.sql` | serveringstvillingen: samme kolonner fra sanntids-ET/SX → `disruptions.togvarsel_features_today` + `togvarsel_sx_today` |
 | serveringsmodul | `disruptions/api/togvarsel.py` | hver poll-tick (veggklokke, uavhengig av SX-ingestion) beregner forfalte prognoser (én features-rebuild + ML.PREDICT per prognose, feil backer av per prognose), `/togmelding-api/today` serverer fra cache |
-| side | `disruptions/api/togmelding_static/index.html` | committet enkeltside på `/togmelding`, ingen byggesteg; skiller «kommer kl. HH:MM» fra «forsinket/utilgjengelig» |
+| side | `demo/togmelding/` (React + Vite + Entur Linje) | `/togmelding`, bygget inn i imaget som de andre frontendene (`disruptions/api/togmelding_static/` er generert og gitignorert fra 2026-09-01, da siden gikk fra én committet HTML-fil til Linje for å matche `/varsel`); skiller «kommer kl. HH:MM» fra «forsinket/utilgjengelig» |
+| statuspanel i /varsel | `disruptions/api/togvarsel_notify.py` (`GET /togmelding-api/outlook`) | samme prognose smalnet til én enhet: rushene den faktisk varsles om og som ikke er over ennå, med lenke til `/togmelding`. Push-policyen lest-bare — samme match-tester og samme supersession — men avgrenset av rushets slutt (09:00 / 18:00), ikke av reisevinduet, og leser pollerens stasjonscache uten å spørre BigQuery |
+| personverntekster | `demo/togmelding/src/personvern.ts` | duplikat av `demo/avviksvarsel/src/personvern.ts` (appen kan ikke importere den: Docker-steget kopierer bare sin egen katalog), sikret av `disruptions/api/test_personvern_texts.py` — som sammenligner begge modulenes oppløste konstanter og krever at appen faktisk rendrer dem |
 | tester | `disruptions/api/test_togvarsel.py` | hermetiske; portene (helg/helligdag/klokkeslett), regelsetningene, feil-/backoff-banene |
 | utstedte prognoser | `disruptions.togvarsel_issued` | én rad per (dato, prognose) — MERGE, første skriving vinner; `late` flagger etterberegnede (restart/backoff) som etterprøvingen skal utelate |
 
