@@ -24,28 +24,15 @@ import VarselStatus from './components/VarselStatus';
 import JourneyCard from './components/JourneyCard';
 import AddJourneyModal from './components/AddJourneyModal';
 import { AvsenderFooter, EksperimentNotis, PersonvernLinje } from './components/PersonvernNotis';
-
-// Stable per-device id, kept in localStorage. Journeys and push subscriptions are keyed to it.
-//
-// Reading and minting are deliberately two functions, and only a REGISTRATION action may mint —
-// adding a journey, or turning push on. «Slett alt» deletes the id while the 60 s poll and the
-// focus/visibilitychange listeners keep running, so a single getter that minted for every caller
-// would put a fresh id back in localStorage seconds after the deletion (the focus listener fires
-// the moment the user returns to the tab) and quietly recreate the identity the user just erased.
-const DEVICE_ID_KEY = 'avviksvarsel.device_id';
-
-function readDeviceId(): string | null {
-  return localStorage.getItem(DEVICE_ID_KEY);
-}
-
-function mintDeviceId(): string {
-  const id =
-    typeof crypto !== 'undefined' && 'randomUUID' in crypto
-      ? crypto.randomUUID()
-      : `dev-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  localStorage.setItem(DEVICE_ID_KEY, id);
-  return id;
-}
+// Stable per-device id, kept in localStorage. Journeys and push subscriptions are keyed to it, and
+// only a REGISTRATION action may mint one — see components/deviceIdentity.ts, which owns that rule
+// so test/deviceIdentity.test.mjs can hold it.
+import {
+  forgetDeviceId,
+  isStoredDeviceId,
+  mintDeviceId,
+  readDeviceId,
+} from './components/deviceIdentity';
 
 const REFRESH_MS = 60_000;
 
@@ -54,7 +41,7 @@ export default function App({ brand }: { brand: Brand }) {
   // poll and the VarselStatus flows, and the next registration mints a new one and resumes
   // everything on it. Frozen at mount, the "register a new journey" the done-notice invites would
   // write under the DELETED key and orphan the journey on the next reload.
-  const [deviceId, setDeviceId] = useState<string | null>(() => readDeviceId());
+  const [deviceId, setDeviceId] = useState<string | null>(() => readDeviceId(localStorage));
   const [config, setConfig] = useState<Config | null>(null);
   const [stops, setStops] = useState<StopItem[]>([]);
   const [journeys, setJourneys] = useState<Journey[]>([]);
@@ -71,19 +58,32 @@ export default function App({ brand }: { brand: Brand }) {
   // Mint on demand, from a registration action only. Reads localStorage rather than state, so a
   // second tab's id is adopted instead of a competing one being created.
   const ensureDeviceId = useCallback((): string => {
-    const id = readDeviceId() ?? mintDeviceId();
+    const id = readDeviceId(localStorage) ?? mintDeviceId(localStorage);
     setDeviceId(id);
     return id;
   }, []);
 
   const refreshJourneys = useCallback(async () => {
-    if (!deviceId) return; // deleted, or never registered — nothing to poll for, and nothing to mint
+    // The id this response will be judged against. The 60 s interval and the focus/
+    // visibilitychange listeners keep firing straight through «Slett alt», and the list endpoint
+    // snapshots under a lock but scores each journey outside it, so it is routinely slower than
+    // the single-pop DELETE: a GET dispatched just before the deletion can land after it and
+    // repaint the deleted journeys directly under the «Alt er slettet» notice. It would not heal
+    // either — once the id is null the rebound closure short-circuits, so no later poll clears it.
+    const issuedFor = deviceId;
+    if (!issuedFor) return; // deleted, or never registered — nothing to poll for, and nothing to mint
     try {
-      const res = await fetchJourneys(deviceId);
+      const res = await fetchJourneys(issuedFor);
+      // Storage, not state: «Slett alt» removes the id synchronously, so this is already false in
+      // the sliver between the deletion and the re-render — and it covers a second tab's delete.
+      if (!isStoredDeviceId(issuedFor, localStorage)) return;
       setJourneys(res.journeys);
       refreshFailures.current = 0;
       setError(null); // a recovered poll must clear an earlier error, or it sticks forever
     } catch (e) {
+      // Same guard on the failure path: a poll for an id that no longer exists must not raise a
+      // banner over a deletion that worked.
+      if (!isStoredDeviceId(issuedFor, localStorage)) return;
       // A single failed background poll (phone briefly offline, server redeploying) isn't worth
       // a red banner over data that is at most a minute stale — surface it only when it persists.
       refreshFailures.current += 1;
@@ -101,7 +101,7 @@ export default function App({ brand }: { brand: Brand }) {
   // loading state. The id-dependent half is the journey poll above.
   useEffect(() => {
     if (isPushSupported()) void registerServiceWorker().catch(() => undefined);
-    const id = readDeviceId();
+    const id = readDeviceId(localStorage);
     (async () => {
       try {
         const [cfg, stopList, journeyRes] = await Promise.all([
@@ -179,11 +179,20 @@ export default function App({ brand }: { brand: Brand }) {
 
   // Last step of «Slett alt», reached only after the server confirmed. The only place the stored
   // id is removed — never on the failure path, where it is exactly what a retry needs.
+  //
+  // Storage first, and that ordering is load-bearing: `isStoredDeviceId` is the staleness oracle
+  // for every background response, and it only starts refusing once the key is gone. React state
+  // follows unconditionally, so a storage that refuses `removeItem` still leaves the page showing
+  // an empty list rather than journeys the server no longer has — the throw then propagates to
+  // VarselStatus, which reports it in the card.
   const handleDeletedAll = useCallback(() => {
-    localStorage.removeItem(DEVICE_ID_KEY);
-    setDeviceId(null);
-    setJourneys([]);
-    setError(null);
+    try {
+      forgetDeviceId(localStorage);
+    } finally {
+      setDeviceId(null);
+      setJourneys([]);
+      setError(null);
+    }
   }, []);
 
   return (
