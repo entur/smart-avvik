@@ -26,6 +26,7 @@ import reisevalg  # sibling module: car vs train corridor recommendation (/reise
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
+import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -1127,6 +1128,11 @@ async def lifespan(app: FastAPI):
     # tst — so a lazily created table would never exist there and /rushhistorikk-api would 503 the
     # whole page in the one environment that never notifies. Same reasoning as decisions.py above.
     togvarsel_notify.ensure_table()
+    # The realized rush outcome /rushhistorikk scores against. Created at startup for the same
+    # reason as the round log: the page LEFT JOINs it on every request, so a missing table 503s the
+    # whole surface until the first rush resolves — which is every environment on the day it ships.
+    togvarsel_outcomes.configure(bq_client=bq_client)
+    togvarsel_outcomes.ensure_table()
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
@@ -1453,6 +1459,15 @@ def poll_for_changes(
             togvarsel_notify.evaluate()
         except Exception:
             logger.exception("Togvarsel notify failed this tick; retrying on next tick")
+        # The rush outcome resolves on the same wall-clock tick, and for the same reason: a rush
+        # ends at its hour whether or not SX moved. Both of its passes are due-gated internally
+        # (provisional 09:20/18:20 Oslo, authoritative after 04:00 UTC), so this is a cheap no-op on
+        # all but a few ticks a day. Isolated like the two above: a fasit failure costs
+        # /rushhistorikk a day of verdicts, never the feed, the forecast or the notifications.
+        try:
+            togvarsel_outcomes.refresh()
+        except Exception:
+            logger.exception("Togvarsel outcome refresh failed this tick; retrying on next tick")
         if stop_event is not None:
             if stop_event.wait(interval):
                 return
