@@ -4,10 +4,22 @@
 // component carries its own copy of a published wording.
 //
 // IMPORTANT — versioned consent: a registering user consents to the texts in
-// REGISTRATION_TEXTS (bottom of this file). Changing ANY of them requires
-// bumping CONSENT_TEXT_VERSION *and* updating the pinned sha256[:8] hash in
-// test/personvern.test.mjs — the suite fails until both move, so nobody has
-// to remember (the PROMPT_VERSION reasoning from disruptions/api/llm_message.py).
+// REGISTRATION_TEXTS (bottom of this file), under the version stamped on their
+// journey record. Changing ANY of those texts requires bumping
+// CONSENT_TEXT_VERSION *and* updating the pin in test/personvern.test.mjs.
+//
+// What the guard actually enforces, stated exactly, because it used to promise
+// more than it kept: the pinned sha256[:8] covers CONSENT_TEXT_VERSION AND the
+// texts together, and the version literal is asserted beside it in the same
+// PINNED_CONSENT block. So a text edit breaks the digest, a version bump breaks
+// the digest, and neither can move alone — but the guard cannot tell a bump
+// from a re-pin. It puts the decision in front of whoever edits, in one block,
+// with the reason attached; it does not make it for them. (Same derived-version
+// reasoning as disruptions/api/llm_message.py's PROMPT_VERSION.)
+//
+// Texts OUTSIDE REGISTRATION_TEXTS — the privacy page T5, the T4 card, T6, T7 —
+// are not consented to at registration and are deliberately not versioned. They
+// have their own guards further down the suite.
 //
 // This module is imported directly by `node --test` via type-stripping (the
 // alertFeedbackState.ts pattern): keep it free of runtime imports and of
@@ -199,8 +211,9 @@ export const TOGMELDING_DISCLAIMER = {
 
 /** The texts a registering user sees and consents to: the on-page notices T1
  * and T2 plus the registration text T3 in «Legg til reise». The test suite pins
- * sha256(join('\n'))[:8] of this array — changing any entry requires bumping
- * CONSENT_TEXT_VERSION above and the pinned hash in test/personvern.test.mjs. */
+ * sha256[:8] of CONSENT_TEXT_VERSION followed by this array, joined with '\n' —
+ * so changing any entry breaks the digest, and the pin block that has to be
+ * touched to green it again is the one holding the version literal. */
 export const REGISTRATION_TEXTS: readonly string[] = [
   T1_EKSPERIMENT.title,
   T1_EKSPERIMENT.body,
