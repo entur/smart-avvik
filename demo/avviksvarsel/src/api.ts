@@ -120,6 +120,11 @@ export interface Journey {
   end: string;
   days: number[];
   created_ts: string;
+  // Which version of the registration-visible privacy texts was recorded when this journey was
+  // registered (NewJourney.consent_text_version). The server returns it on every GET and POST.
+  // Optional and nullable for the two ways it can be absent: a journey registered by a client
+  // that sends none, or one registered before the field existed.
+  consent_text_version?: string | null;
   alerts: Alert[];
   // Something about the registration itself, not about today's traffic: currently only "no planned
   // trip connects these stops today", which means this journey cannot produce an alert.
@@ -134,6 +139,11 @@ export interface NewJourney {
   begin: string;
   end: string;
   days: number[];
+  // Version of the registration-visible privacy texts the user saw (personvern.ts
+  // CONSENT_TEXT_VERSION), persisted on the journey record so which wording was consented to is
+  // provable. Optional on the wire in both directions: an older API ignores it, and a cached
+  // bundle that predates it registers without one, which reads as «pre-versioning».
+  consent_text_version?: string;
 }
 
 // ---- Client -> server error reporting ---------------------------------------------------------
@@ -248,6 +258,16 @@ export function registerDevice(
 
 export function deleteDevice(deviceId: string): Promise<void> {
   return request(`/varsel-api/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
+}
+
+// «Slett alt»: one atomic server-side deletion of everything keyed to this device — the device
+// record, every journey registered from it, and the notification-dedup entries belonging to those
+// journeys. Distinct from deleteDevice, which is «Skru av» and deliberately keeps the journeys.
+// Idempotent: an id the server does not know still answers 200, with journeys_deleted: 0.
+export function deleteAllData(
+  deviceId: string,
+): Promise<{ status: string; journeys_deleted: number }> {
+  return request(`/varsel-api/devices/${encodeURIComponent(deviceId)}/data`, { method: 'DELETE' });
 }
 
 export function sendTestPush(deviceId: string): Promise<{ status: string }> {

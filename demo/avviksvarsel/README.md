@@ -53,9 +53,32 @@ A brand is four things, and leaving any one of them out still reads as Entur:
 | favicon / home screen | Entur "EN" mark | bell on petrol |
 | manifest | `manifest.webmanifest` | `manifest-none.webmanifest`, `start_url=/varsel/?brand=none` |
 | push notification | Entur icon, opens `/varsel/` | neutral icon, opens `/varsel/?brand=none` |
+| sender line | "Tjenesten leveres av Entur AS." | **the same line** — see below |
 
 The wording of a push is deliberately **identical** across brands: it is what `/historikk` records,
 and text that varied by variant would split every wording comparison along a second axis.
+
+### The unbranded variant names the sender, by design
+
+`?brand=none` used to mean the word «Entur» appeared nowhere on the rendered page
+(`/entur/i.test(document.body.innerText) === false`). **That is no longer true, and reinstating it
+would be a defect.** GDPR art. 13(1)(a) requires the controller's identity wherever personal data
+is collected, and `?brand=none` keeps registration fully operational — so the footer renders the
+T7 sender line and a privacy link in *every* variant (plan
+`docs/plans/2026-08-31-001-feat-varsel-personvern-tekster-plan.md`, KTD1; the alternative was
+disabling registration under `?brand=none`, which would have cost the demo).
+
+The invariant now is narrower and still worth checking:
+
+- The **page text** names Entur AS as the sender, in both variants, and links to
+  `/varsel/personvern/` (the link keeps `?brand=none`, so the privacy page comes back unbranded).
+- Everything else stays unbranded: **notifications** (icon, click-through URL), the **manifest**
+  and installed app name, the **icons**, the **tab title**, the **logo**, the **palette** and the
+  **typeface**. A phone that installed the unbranded variant shows nothing of Entur on the home
+  screen or in the notification tray.
+
+So the check is no longer "does the word appear" but "does it appear anywhere *other than* the
+sender line and the privacy texts".
 
 ### How the colour override works, and why it is generated
 

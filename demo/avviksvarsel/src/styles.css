@@ -96,6 +96,41 @@ body {
   color: var(--basecolors-text-subdued, var(--grey-70));
 }
 
+/* ---- privacy notices (T1-T4) ---- */
+
+/* Subdued, like .av-status-note: the privacy texts are standing information rather than something
+   demanding action, and must stay legible without competing with the alerts around them. Colour
+   comes from the same tokens, so ?brand=none recolours these for free. */
+.av-personvern-linje,
+.av-personvern-notis {
+  margin: 0;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* The intro's own gap already separates T2 from the lead paragraph; pull it up so the line reads
+   as a footnote to that sentence rather than as the next block down. */
+.av-personvern-linje {
+  margin-top: -0.75rem;
+}
+
+/* «Slett alt» is the last thing in the card and reads as a separate act from the push controls
+   above it — a rule rather than a colour, so the brand sheet recolours it with everything else. */
+.av-status-danger {
+  border-top: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  padding-top: 0.75rem;
+}
+
+/* ---- sender footer (T7) ---- */
+
+/* Same column as .av-main. Sits below the main padding rather than inside it, so the sender line
+   reads as the page's colophon and not as one more block of content. */
+.av-footer {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 0 1.25rem calc(2rem + env(safe-area-inset-bottom));
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
 /* ---- iOS "add to Home Screen" instructions ---- */
 
 .av-ios-steps {

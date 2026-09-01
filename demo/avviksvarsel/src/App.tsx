@@ -23,25 +23,25 @@ import type { Brand } from './brand';
 import VarselStatus from './components/VarselStatus';
 import JourneyCard from './components/JourneyCard';
 import AddJourneyModal from './components/AddJourneyModal';
-
-// Stable per-device id, kept in localStorage. Journeys and push subscriptions are keyed to it.
-function getDeviceId(): string {
-  const key = 'avviksvarsel.device_id';
-  let id = localStorage.getItem(key);
-  if (!id) {
-    id =
-      typeof crypto !== 'undefined' && 'randomUUID' in crypto
-        ? crypto.randomUUID()
-        : `dev-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    localStorage.setItem(key, id);
-  }
-  return id;
-}
+import { AvsenderFooter, EksperimentNotis, PersonvernLinje } from './components/PersonvernNotis';
+// Stable per-device id, kept in localStorage. Journeys and push subscriptions are keyed to it, and
+// only a REGISTRATION action may mint one — see components/deviceIdentity.ts, which owns that rule
+// so test/deviceIdentity.test.mjs can hold it.
+import {
+  forgetDeviceId,
+  isStoredDeviceId,
+  mintDeviceId,
+  readDeviceId,
+} from './components/deviceIdentity';
 
 const REFRESH_MS = 60_000;
 
 export default function App({ brand }: { brand: Brand }) {
-  const deviceId = useRef(getDeviceId()).current;
+  // Nullable app state, not a mount-frozen ref: «Slett alt» sets it to null, which suspends the
+  // poll and the VarselStatus flows, and the next registration mints a new one and resumes
+  // everything on it. Frozen at mount, the "register a new journey" the done-notice invites would
+  // write under the DELETED key and orphan the journey on the next reload.
+  const [deviceId, setDeviceId] = useState<string | null>(() => readDeviceId(localStorage));
   const [config, setConfig] = useState<Config | null>(null);
   const [stops, setStops] = useState<StopItem[]>([]);
   const [journeys, setJourneys] = useState<Journey[]>([]);
@@ -55,13 +55,35 @@ export default function App({ brand }: { brand: Brand }) {
   const refreshFailures = useRef(0);
   const handledNotification = useRef<string | null>(null);
 
+  // Mint on demand, from a registration action only. Reads localStorage rather than state, so a
+  // second tab's id is adopted instead of a competing one being created.
+  const ensureDeviceId = useCallback((): string => {
+    const id = readDeviceId(localStorage) ?? mintDeviceId(localStorage);
+    setDeviceId(id);
+    return id;
+  }, []);
+
   const refreshJourneys = useCallback(async () => {
+    // The id this response will be judged against. The 60 s interval and the focus/
+    // visibilitychange listeners keep firing straight through «Slett alt», and the list endpoint
+    // snapshots under a lock but scores each journey outside it, so it is routinely slower than
+    // the single-pop DELETE: a GET dispatched just before the deletion can land after it and
+    // repaint the deleted journeys directly under the «Alt er slettet» notice. It would not heal
+    // either — once the id is null the rebound closure short-circuits, so no later poll clears it.
+    const issuedFor = deviceId;
+    if (!issuedFor) return; // deleted, or never registered — nothing to poll for, and nothing to mint
     try {
-      const res = await fetchJourneys(deviceId);
+      const res = await fetchJourneys(issuedFor);
+      // Storage, not state: «Slett alt» removes the id synchronously, so this is already false in
+      // the sliver between the deletion and the re-render — and it covers a second tab's delete.
+      if (!isStoredDeviceId(issuedFor, localStorage)) return;
       setJourneys(res.journeys);
       refreshFailures.current = 0;
       setError(null); // a recovered poll must clear an earlier error, or it sticks forever
     } catch (e) {
+      // Same guard on the failure path: a poll for an id that no longer exists must not raise a
+      // banner over a deletion that worked.
+      if (!isStoredDeviceId(issuedFor, localStorage)) return;
       // A single failed background poll (phone briefly offline, server redeploying) isn't worth
       // a red banner over data that is at most a minute stale — surface it only when it persists.
       refreshFailures.current += 1;
@@ -73,14 +95,19 @@ export default function App({ brand }: { brand: Brand }) {
 
   // Initial load: config, stops, journeys. Register the service worker up front so enabling
   // push later is a single tap.
+  //
+  // Runs once, not per device id: config and stops do not depend on it, and re-running when
+  // «Slett alt» or a fresh registration moves the id would throw the whole page back into its
+  // loading state. The id-dependent half is the journey poll above.
   useEffect(() => {
     if (isPushSupported()) void registerServiceWorker().catch(() => undefined);
+    const id = readDeviceId(localStorage);
     (async () => {
       try {
         const [cfg, stopList, journeyRes] = await Promise.all([
           fetchConfig(),
           fetchStops(),
-          fetchJourneys(deviceId),
+          id ? fetchJourneys(id) : Promise.resolve({ journeys: [] as Journey[] }),
         ]);
         setConfig(cfg);
         setStops(stopList);
@@ -91,7 +118,7 @@ export default function App({ brand }: { brand: Brand }) {
         setLoading(false);
       }
     })();
-  }, [deviceId]);
+  }, []);
 
   // A notification can launch a cold PWA, so the target card does not exist until the initial
   // journey request completes. Move both viewport and keyboard focus once it has rendered.
@@ -133,19 +160,40 @@ export default function App({ brand }: { brand: Brand }) {
 
   const handleCreate = useCallback(
     async (journey: NewJourney) => {
-      const created = await createJourney(deviceId, journey);
+      // One of the two actions allowed to mint an id — this is the path that brings the app back
+      // to life after «Slett alt», in the same session and with no reload.
+      const created = await createJourney(ensureDeviceId(), journey);
       setJourneys((prev) => [...prev, created]);
     },
-    [deviceId],
+    [ensureDeviceId],
   );
 
   const handleDelete = useCallback(
     async (journeyId: string) => {
+      if (!deviceId) return; // no id, no journeys — the list this button sits in is empty
       await deleteJourney(journeyId, deviceId);
       setJourneys((prev) => prev.filter((j) => j.journey_id !== journeyId));
     },
     [deviceId],
   );
+
+  // Last step of «Slett alt», reached only after the server confirmed. The only place the stored
+  // id is removed — never on the failure path, where it is exactly what a retry needs.
+  //
+  // Storage first, and that ordering is load-bearing: `isStoredDeviceId` is the staleness oracle
+  // for every background response, and it only starts refusing once the key is gone. React state
+  // follows unconditionally, so a storage that refuses `removeItem` still leaves the page showing
+  // an empty list rather than journeys the server no longer has — the throw then propagates to
+  // VarselStatus, which reports it in the card.
+  const handleDeletedAll = useCallback(() => {
+    try {
+      forgetDeviceId(localStorage);
+    } finally {
+      setDeviceId(null);
+      setJourneys([]);
+      setError(null);
+    }
+  }, []);
 
   return (
     <>
@@ -164,9 +212,16 @@ export default function App({ brand }: { brand: Brand }) {
       </Contrast>
 
       <main id="main-content" className="av-main">
+        {/* T1 and T2 sit above and below the intro, before the loading branch, so the experiment
+            caveat and the privacy line are on screen without scrolling or a single tap — which is
+            the acceptance criterion, and the point of giving art. 13 information at collection. */}
+        <EksperimentNotis />
+
         <LeadParagraph className="av-intro">
           Registrer kollektivreisene dine, så varsler vi deg når et avvik kan ramme en av dem.
         </LeadParagraph>
+
+        <PersonvernLinje brandId={brand.id} />
 
         {loading ? (
           <div className="av-loading">
@@ -174,7 +229,15 @@ export default function App({ brand }: { brand: Brand }) {
           </div>
         ) : (
           <>
-            {config && <VarselStatus config={config} deviceId={deviceId} brand={brand} />}
+            {config && (
+              <VarselStatus
+                config={config}
+                deviceId={deviceId}
+                ensureDeviceId={ensureDeviceId}
+                onDeletedAll={handleDeletedAll}
+                brand={brand}
+              />
+            )}
 
             {/* Shown only where the server actually delivers rush-forecast pushes
                 (TOGVARSEL_NOTIFY_ENABLED via /config): existing subscribers opted into
@@ -238,11 +301,17 @@ export default function App({ brand }: { brand: Brand }) {
         )}
       </main>
 
+      {/* Unconditional on brand. `?brand=none` strips the logo, the palette and the typeface, but
+          art. 13(1)(a) requires the controller's identity, so this one line names Entur in every
+          variant — the one place the unbranded page says the word. */}
+      <AvsenderFooter brandId={brand.id} />
+
       <AddJourneyModal
         open={modalOpen}
         onClose={() => setModalOpen(false)}
         stops={stops}
         onCreate={handleCreate}
+        brandId={brand.id}
       />
     </>
   );
