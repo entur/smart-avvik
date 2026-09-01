@@ -54,7 +54,9 @@ Design notes
   probability and nothing else — no cancellation-probability fallback (measured 2026-07-27: in
   ``call_predictions_{,bus_}today`` ``p_impact_dep`` is NULL only where ``aimed_dep`` is NULL,
   i.e. at terminals the matcher already skips, so the old fallback could never fire on a boarding).
-  The in-app list shows *all* current matches regardless, flagged with ``alertworthy``.
+  The in-app list shows every match an operator PUBLISHED regardless, flagged with
+  ``alertworthy``; a match no SX message named is shown only once it crosses that gate
+  (:func:`_card_alerts`), since a sub-threshold one carries no operator text to read.
 * **What the push says** — which train (``_train_label``: "Tog L1 09:24", the line included
   because a journey matches several of them and a time alone does not say which), then the
   *alerting* quantity in ``/demo``'s wording: P(innstilling eller ≥ 10 min forsinkelse), then
@@ -2829,7 +2831,11 @@ class Journey(BaseModel):
     end: str
     days: list[int] = Field(description="0=Monday … 6=Sunday.")
     created_ts: str
-    alerts: list[Alert] = Field(description="Situations currently affecting this journey, worst first.")
+    alerts: list[Alert] = Field(
+        description="Situations currently affecting this journey, worst first — one per "
+        "train. Published (SX) matches appear whether or not they cross the push threshold; "
+        "a match no SX message named appears only if it does. See `_card_alerts`.",
+    )
     warning: str | None = Field(
         default=None,
         description=(
@@ -2936,6 +2942,31 @@ def delete_device(device_id: str) -> dict:
     return {"status": "ok"}
 
 
+def _card_alerts(alerts: list[Alert]) -> list[Alert]:
+    """The matches a journey card should show: everything an operator published, plus the no-SX
+    predictions that cleared their own push threshold.
+
+    A call NO SX message named is scored anyway (predict_calls.sql's `nosx` branch, 3/4 of the
+    timetable) and every such match used to reach the card, headlined "Mulig avvik" and gated only
+    by whether a situation touched the journey at all -- which for a no-SX row is every departure
+    on it. So a quiet morning filled the page with a card per train quoting a few minutes of
+    typical delay, and the disruption worth reading sat somewhere in the list. There is nothing to
+    read on a sub-threshold one either: with no operator text behind it, the card is the model's
+    own numbers and nothing else.
+
+    Applied BEFORE `one_alert_per_train`, which is not interchangeable with after. The collapse
+    keeps the most severe alert per train, and the two populations are cut at different bars
+    (`alert_policy.threshold_for`, 0.85 vs 0.65) -- so a no-SX alert can outrank an alert-worthy
+    published one about the same train, win the collapse, and then be dropped here, taking a card
+    the traveller should have seen with it.
+
+    Display only. `match_journey` still returns every match, so the decision log keeps its row
+    (those rows are the lead-time series, and a match that stayed under the gate is exactly what a
+    `miss` is made of) and the push gate is unchanged -- a sub-threshold alert was never pushed.
+    """
+    return [alert for alert in alerts if alert.has_situation or alert.alertworthy]
+
+
 def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) -> Journey:
     """A journey plus its live alerts, each annotated with the message that was pushed for it.
 
@@ -2949,11 +2980,12 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
     of the same journey definition runs the matcher once rather than once per registration.
     """
     key = journey_key(rec)
+    matched = match_journey(rec) if alerts is None else alerts
     # One card per train, not per SX message -- see one_alert_per_train. Collapsed here rather than
     # in match_journey because the matcher also feeds the decision log, which must keep every
     # situation. `alerts` may be shared across several registrations of the same definition, so this
     # builds a new list and never mutates the caller's.
-    alerts = one_alert_per_train(match_journey(rec) if alerts is None else alerts)
+    alerts = one_alert_per_train(_card_alerts(matched))
     feedback_available = feedback.enabled()
     with _state_lock:
         now = datetime.now(UTC)
@@ -3022,7 +3054,11 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
         alerts=alerts,
         # Suppressed while something is actually matching: a card cannot credibly say "we found no
         # departures between these stops" directly above a disruption on one of them.
-        warning=None if alerts else _service_warning(rec),
+        # Judged on the MATCHES, not on the filtered card list: a no-SX alert that was dropped
+        # for being sub-threshold is still a train running between these two stops, and "vi fant
+        # ingen avganger mellom disse stoppene" is a claim about the timetable rather than about
+        # today's disruptions.
+        warning=None if matched else _service_warning(rec),
     )
 
 

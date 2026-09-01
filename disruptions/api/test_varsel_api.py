@@ -1299,6 +1299,71 @@ def test_two_notices_about_one_train_are_one_card():
     assert alerts[0]["impact_probability"] == 0.9
 
 
+# The two populations on one journey. `n1`/`n2` are calls NO SX message named (predict_calls.sql's
+# `nosx` branch, 3/4 of the timetable), scored by the models alone and cut at 0.85; `S2` is an
+# operator-published one that scores well under the rail gate of 0.65. Only the no-SX pair is
+# gated on the card -- and only the sub-threshold half of it.
+SNAPSHOT_NO_SX = {
+    "S1": SNAPSHOT["S1"],
+    "S2": SNAPSHOT_MIXED["S2"],
+    "KIX:NoSituation:n1": [
+        FakeCall("n1", "A", 1, DEP + timedelta(minutes=5), situation_number="KIX:NoSituation:n1",
+                 line="VYG:Line:R12", summary="Mulig avvik", has_situation=False,
+                 p_cancel=0.03, p_impact_dep=0.40),
+        FakeCall("n1", "B", 5, None, situation_number="KIX:NoSituation:n1", line="VYG:Line:R12",
+                 summary="Mulig avvik", has_situation=False,
+                 aimed_arr=DEP + timedelta(minutes=45)),
+    ],
+    "KIX:NoSituation:n2": [
+        FakeCall("n2", "A", 1, DEP + timedelta(minutes=15), situation_number="KIX:NoSituation:n2",
+                 line="VYG:Line:R13", summary="Mulig avvik", has_situation=False,
+                 p_cancel=0.55, p_impact_dep=0.92),
+        FakeCall("n2", "B", 5, None, situation_number="KIX:NoSituation:n2", line="VYG:Line:R13",
+                 summary="Mulig avvik", has_situation=False,
+                 aimed_arr=DEP + timedelta(minutes=55)),
+    ],
+}
+
+
+def test_a_mulig_avvik_card_needs_the_push_threshold_a_published_one_does_not():
+    """A no-SX match reaches the card only once it would have been pushed.
+
+    Every call a situation named produces a card whether or not it crosses the gate, because there
+    is an operator message on it to read. A call NO situation named produces one only if it clears
+    its own (higher) bar: with nothing published behind it the card is the model's numbers and
+    nothing else, and every departure on the journey qualifies as a match -- so a quiet morning
+    filled the page with "Mulig avvik" cards quoting a few minutes of typical delay and buried the
+    disruption worth reading.
+    """
+    _reset_state()
+    _use_snapshot(SNAPSHOT_NO_SX)
+    _register(DEVICE)
+
+    alerts = client.get(
+        "/varsel-api/journeys", params={"device_id": DEVICE}
+    ).json()["journeys"][0]["alerts"]
+    shown = {a["situation_number"] for a in alerts}
+    assert "KIX:NoSituation:n2" in shown, "0.92 clears the no-SX cut of 0.85"
+    assert "KIX:NoSituation:n1" not in shown, "0.40 does not, and has no message to read"
+    # Unchanged for anything an operator published: S2 is under the 0.65 rail gate and still shows.
+    assert {"S1", "S2"} <= shown
+    assert not next(a for a in alerts if a["situation_number"] == "S2")["alertworthy"]
+
+
+def test_the_card_filter_never_reaches_the_decision_log_or_the_matcher():
+    """Display only. `match_journey` still returns the sub-threshold no-SX match, because those
+    rows are the lead-time series /historikk measures recall on -- a match that stayed under the
+    gate is exactly what a `miss` is made of."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT_NO_SX)
+    _register(DEVICE)
+
+    with varsel._state_lock:
+        rec = next(iter(varsel._journeys.values()))
+    matched = {a.situation_number for a in varsel.match_journey(rec)}
+    assert "KIX:NoSituation:n1" in matched
+
+
 def test_two_notices_about_two_different_trains_stay_two_cards():
     """The collapse is per departure, not per journey: two trains is still two things to know."""
     _reset_state()
