@@ -102,6 +102,12 @@ base AS (
     -- `latest_observation`; the propagation features already read the same two columns.
     r.dep_delay_min AS et_dep_delay_min,
     r.call_source,
+    -- Whether a passenger may board / alight HERE (rail_calls_planned_today.sql owns the reading).
+    -- Carried, like every serving-only column here, into the ML.PREDICT input: a model ignores an
+    -- input column it does not know, and only the reverse -- a contract naming a column the input
+    -- lacks -- fails the scoring job. `impact._trip_cells` is the reader: without these two, a
+    -- long-distance train whose local calls are boarding-only was offered as somebody's trip.
+    r.boarding_allowed, r.alighting_allowed,
     COALESCE(r.aimed_dep, r.aimed_arr) AS call_ts,
     IFNULL(a.status, 'other') AS status,
     IFNULL(a.planned, FALSE)  AS planned,
@@ -152,6 +158,7 @@ nosx_base AS (
     r.call_cancelled AS et_declared_cancelled,
     r.dep_delay_min AS et_dep_delay_min,
     r.call_source,
+    r.boarding_allowed, r.alighting_allowed,
     COALESCE(r.aimed_dep, r.aimed_arr) AS call_ts,
     'none' AS status,
     FALSE  AS planned,
@@ -716,6 +723,7 @@ et_cancelled AS (
   SELECT
     r.jkey, r.lineRef, r.stop_place, r.stop_name, r.stop_order,
     r.aimed_dep, r.aimed_arr, r.dep_delay_min, r.call_source,
+    r.boarding_allowed, r.alighting_allowed,
     -- The cancelled stretch, for the summary. Computed over EVERY cancelled call of the journey
     -- rather than over what the anti-join below happens to leave, so the headline describes the
     -- disruption and not the leftovers. IGNORE NULLS because stop_name arrives through a LEFT JOIN
@@ -758,6 +766,7 @@ SELECT
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
   s.et_declared_cancelled, s.et_dep_delay_min, s.call_source,
+  s.boarding_allowed, s.alighting_allowed,
   ROUND(1/(1+EXP(-(wch.b + wch.a *
     LN(GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)/(1-GREATEST(LEAST(s.p_cancel_raw,1-1e-6),1e-6)))))), 4) AS p_cancel,
   IF(s.is_terminal, NULL, GREATEST(CAST(ROUND(EXP(s.dep_plog)-1) AS INT64), 0)) AS dep_delay_typ_min,
@@ -876,6 +885,7 @@ SELECT
   TRUE                  AS et_declared_cancelled,
   e.dep_delay_min       AS et_dep_delay_min,
   e.call_source,
+  e.boarding_allowed, e.alighting_allowed,
   1.0                   AS p_cancel,
   CAST(NULL AS INT64)   AS dep_delay_typ_min,
   CAST(NULL AS INT64)   AS dep_delay_p90_min,

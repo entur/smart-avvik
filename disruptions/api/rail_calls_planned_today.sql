@@ -13,6 +13,24 @@
 -- source at this table instead of rail_calls. call_cancelled here is what ET ALREADY declares
 -- (not the model's prediction); call_source distinguishes recorded vs estimated stops.
 --
+-- WHETHER A PASSENGER MAY USE A CALL is a property of the call, not of the stop, and it is the one
+-- thing a stop list cannot say (2026-09-01). SIRI's two boarding activities carry it, and Vy uses
+-- them to close the local stretch of a long-distance run: the 16:23 Oslo S - Bergen calls Sandvika,
+-- Asker, Drammen and Hokksund with arrivalBoardingActivity = NO_ALIGHTING -- board for Bergen, but
+-- nobody gets off before Hønefoss. Without these two columns the matcher happily offered that train
+-- to an Oslo - Drammen registration: one cancellation reached five registered journeys and eight
+-- devices, none of whom could have been on that train. Measured on VYG the same day: 56 mid-journey NO_ALIGHTING calls on F4
+-- (24 of its 28 journeys) and 417 mid-journey NO_BOARDING calls across F4, R31 and RE30.
+--
+-- The reading is fail-open and the rule lives HERE, in one place per source table, so nothing
+-- downstream has to remember the vocabulary: only an explicit prohibition prohibits. Most operators
+-- leave both fields NULL on most calls (RUT, KOL, TRO, SKY, OST: the large majority), and a NULL
+-- means "not stated", never "not allowed" -- reading it as a prohibition would silently stop
+-- alerting for whole operators. PASS_THRU is a call the vehicle does not serve at all, so it bars
+-- both sides. An origin has no arrival and a terminal no departure, and the feed marks them
+-- NO_ALIGHTING / NO_BOARDING accordingly; that costs nothing, since the matcher already requires an
+-- aimed time on the side it is using.
+--
 -- HORIZON: ET only carries journeys it currently knows (active + near-future within the operating
 -- day), so the forward horizon is bounded by how far ahead ET emits -- not a full multi-day plan.
 -- A NeTEx planned-timetable feed would extend it; ET is the pragmatic source already wired here.
@@ -49,6 +67,8 @@ calls AS (
   SELECT
     s.jkey, s.lineRef, rc.stopPointRef AS quay, rc.order AS stop_order, 'recorded' AS call_source,
     (rc.cancellation OR s.journey_cancelled) AS call_cancelled,
+    (IFNULL(rc.departureBoardingActivity, 'BOARDING')  NOT IN ('NO_BOARDING',  'PASS_THRU')) AS boarding_allowed,
+    (IFNULL(rc.arrivalBoardingActivity,   'ALIGHTING') NOT IN ('NO_ALIGHTING', 'PASS_THRU')) AS alighting_allowed,
     SAFE.TIMESTAMP(rc.aimedDepartureTime) AS aimed_dep,
     SAFE.TIMESTAMP(rc.aimedArrivalTime)   AS aimed_arr,
     TIMESTAMP_DIFF(SAFE.TIMESTAMP(rc.actualDepartureTime),
@@ -59,6 +79,8 @@ calls AS (
   SELECT
     s.jkey, s.lineRef, ec.stopPointRef, ec.order, 'estimated',
     (ec.cancellation OR s.journey_cancelled),
+    (IFNULL(ec.departureBoardingActivity, 'BOARDING')  NOT IN ('NO_BOARDING',  'PASS_THRU')),
+    (IFNULL(ec.arrivalBoardingActivity,   'ALIGHTING') NOT IN ('NO_ALIGHTING', 'PASS_THRU')),
     SAFE.TIMESTAMP(ec.aimedDepartureTime),
     SAFE.TIMESTAMP(ec.aimedArrivalTime),
     CAST(NULL AS INT64)
@@ -89,7 +111,7 @@ SELECT
   COALESCE(n.stop_name, q.name) AS stop_name,
   d.stop_order, d.aimed_dep, d.aimed_arr, d.dep_delay_min,
   DATE(COALESCE(d.aimed_dep, d.aimed_arr), 'Europe/Oslo') AS call_date,
-  d.call_cancelled, d.call_source
+  d.call_cancelled, d.call_source, d.boarding_allowed, d.alighting_allowed
 FROM dedup AS d
 LEFT JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` AS q
   ON d.quay = q.id

@@ -116,6 +116,15 @@ class CallPred:
     # is why the alert gate takes it (`alert_policy.threshold_for`) rather than assuming one scale.
     # Defaults TRUE: the bus family has no such column, and every row it produces is SX-derived.
     has_situation: bool = True
+    # Whether a passenger may actually USE this call (SIRI's two boarding activities, read in the
+    # planned-call source). A stop on the route is not the same as a stop you can get on or off at:
+    # Vy sells the local stretch of a long-distance run as boarding-only, so the 16:23 Oslo S -
+    # Bergen calls Drammen with alighting closed. Both default TRUE, which is also what a NULL in
+    # the feed means and what a serving table built before 2026-09-01 supplies -- an absent
+    # restriction must never read as a restriction, or a feed that stops stating them stops every
+    # alert. `_trip_cells` is the only reader; see its eligibility block.
+    boarding_allowed: bool = True
+    alighting_allowed: bool = True
 
 
 class StopPrediction(BaseModel):
@@ -529,8 +538,9 @@ def _trip_cells(
     """Build one (situation × line) cell per line with a departure from `from_stop` in the window.
 
     A boarding call qualifies when its aimed departure falls inside the inclusive
-    ``[window_start, window_end]`` window and the same train later calls at `to_stop` (a higher
-    stop_order — the travel direction). Situations with no qualifying departure are skipped.
+    ``[window_start, window_end]`` window, a passenger may board it, and the same train later calls
+    at `to_stop` (a higher stop_order — the travel direction) at a call they may alight from.
+    Situations with no qualifying departure are skipped.
 
     The window is the primitive because the two callers ask different questions of the same data:
     ``/impact`` asks about one intended departure (window = ``at`` ± :data:`_IMPACT_AT_TOLERANCE`),
@@ -579,12 +589,23 @@ def _trip_cells(
         # Eligibility BEFORE per-line selection. Selecting first and checking the destination after
         # would drop a whole line whenever its most severe train happens not to serve `to_stop`,
         # silently losing an alert for a less severe train on that line that does.
+        #
+        # **CALLING AT A STOP IS NOT THE SAME AS BEING USABLE FROM IT** (2026-09-01). An operator
+        # can serve a stop with boarding or alighting closed, and Vy does exactly that for the local
+        # stretch of every long-distance run: the 16:23 Oslo S - Bergen calls Sandvika, Asker,
+        # Drammen and Hokksund, and none of them lets a passenger off. Until this check, an
+        # Oslo S -> Drammen registration matched that train on stop_order alone, and one cancellation
+        # went to five registered journeys / eight devices — not one of whom could have been aboard,
+        # and one of whom wrote in to say so. The two flags come off the planned-call source, which owns the
+        # fail-open reading (an unstated activity is permission, never prohibition).
         eligible: list[tuple[CallPred, CallPred | None]] = []
         for group in by_journey.values():
             bcall = None
             for c in group:
                 if c.stop_place != from_stop or c.aimed_dep is None:
                     continue
+                if not c.boarding_allowed:
+                    continue  # boarding closed here (see the note above the loop)
                 if not (window_start <= c.aimed_dep <= window_end):
                     continue
                 if catchable_after is not None:
@@ -603,12 +624,15 @@ def _trip_cells(
                         for c in group
                         if c.stop_place == to_stop
                         and c.aimed_arr is not None
+                        and c.alighting_allowed
                         and c.stop_order > bcall.stop_order
                     ),
                     None,
                 )
                 if acall is None:
-                    continue  # this train does not reach to_stop in the travel direction
+                    # No usable alighting call: either the train never reaches `to_stop` in the
+                    # travel direction, or it does but nobody may get off there.
+                    continue
             eligible.append((bcall, acall))
 
         # Per line, keep one eligible train per the selection strategy.
