@@ -120,6 +120,17 @@ body {
   padding-top: 0.75rem;
 }
 
+/* ---- sender footer (T7) ---- */
+
+/* Same column as .av-main. Sits below the main padding rather than inside it, so the sender line
+   reads as the page's colophon and not as one more block of content. */
+.av-footer {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 0 1.25rem calc(2rem + env(safe-area-inset-bottom));
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
 /* ---- iOS "add to Home Screen" instructions ---- */
 
 .av-ios-steps {
