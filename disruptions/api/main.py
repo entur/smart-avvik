@@ -1122,6 +1122,11 @@ async def lifespan(app: FastAPI):
         load_markers=varsel.togvarsel_rounds_for,
         store_markers=varsel.store_togvarsel_rounds,
     )
+    # The round log /rushhistorikk scores, created here rather than on first write: evaluate()
+    # returns before deciding anything while TOGVARSEL_NOTIFY_ENABLED is off — permanently true in
+    # tst — so a lazily created table would never exist there and /rushhistorikk-api would 503 the
+    # whole page in the one environment that never notifies. Same reasoning as decisions.py above.
+    togvarsel_notify.ensure_table()
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
