@@ -26,6 +26,7 @@ Run the checks: ``uv run --with google-cloud-bigquery python test_togvarsel_outc
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -273,6 +274,21 @@ def _scalar(name: str, type_: str, value: Any) -> Any:
     return bigquery.ScalarQueryParameter(name, type_, value)
 
 
+def _outcome_scalars(row_d, scope, trouble10, n_resolved, n_unresolved, n_calls, now) -> list:
+    """The eight parameters both MERGEs share. BigQuery binds @name by name, not by position, so a
+    shared builder plus per-pass extras is exactly equivalent to spelling both lists out."""
+    return [
+        _scalar("d", "DATE", row_d),
+        _scalar("scope", "STRING", scope),
+        _scalar("trouble10", "FLOAT64", trouble10),
+        _scalar("level", "STRING", level_for(scope, trouble10)),
+        _scalar("n_resolved", "INT64", n_resolved),
+        _scalar("n_unresolved", "INT64", n_unresolved),
+        _scalar("n_calls", "INT64", n_calls),
+        _scalar("now", "TIMESTAMP", now),
+    ]
+
+
 def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
     """One same-day pass over `scopes`, writing the provisional trio and the served value."""
     from google.cloud import bigquery
@@ -290,16 +306,10 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
         _bq_client.query(
             _PROVISIONAL_MERGE,
             job_config=_job_config(
-                [
-                    _scalar("d", "DATE", row["d"]),
-                    _scalar("scope", "STRING", scope),
-                    _scalar("trouble10", "FLOAT64", trouble10),
-                    _scalar("level", "STRING", level_for(scope, trouble10)),
-                    _scalar("n_resolved", "INT64", row["n_resolved"]),
-                    _scalar("n_unresolved", "INT64", row["n_unresolved"]),
-                    _scalar("n_calls", "INT64", row["n_calls"]),
-                    _scalar("now", "TIMESTAMP", now),
-                ]
+                _outcome_scalars(
+                    row["d"], scope, trouble10,
+                    row["n_resolved"], row["n_unresolved"], row["n_calls"], now,
+                )
             ),
         ).result(timeout=60)
     logger.info(
@@ -319,21 +329,42 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
     )
 
 
-def _run_settled(day: date, now: datetime) -> None:
-    """One authoritative pass over a past day: all three scopes, settling every row.
+def _run_settled(days: Sequence[date], now: datetime) -> None:
+    """The authoritative pass over every day in the work set: all three scopes, settling each row.
+
+    ONE SELECT for the whole span, not one per day. The query takes a real range (BETWEEN, GROUP BY
+    d, scope) and this is the caller that needs it: the work set is normally a single day, but it is
+    a backlog exactly once per environment — `togvarsel_issued` already holds forecasts issued
+    before this feature existed — and again after any poller outage longer than a day. At one SELECT
+    plus three MERGEs per day that was up to ~28 sequential BigQuery jobs in a single tick, and this
+    runs on the SOLE poller thread, ahead of the SX rebuild and the notify pass, so the cost is not
+    /rushhistorikk's latency but a poller tick that goes quiet for tens of seconds.
+
+    The MERGE loop stays per (day, scope) and iterates the WORK SET, never the scanned span: a day
+    inside min..max that already settled, or a weekend with no issued forecast, must not get a row.
+    Re-reading an already-settled day is harmless anyway — the MERGE guard is
+    `WHEN MATCHED AND NOT settled` — but the loop is what keeps "a day with no issued forecast is
+    never resolved" true.
 
     A scope the query returns no row for is still settled, as `unresolvable`: last_recorded is an
     immutable daily batch, so once it has landed, "no resolved call in this window" is a final
     answer. Retrying it for ten days would re-run the same query to reach the same NULL while the
     page said `venter`.
     """
+    if not days:
+        return
     cfg = _job_config(
-        [_scalar("from_date", "DATE", day), _scalar("to_date", "DATE", day)]
+        [_scalar("from_date", "DATE", min(days)), _scalar("to_date", "DATE", max(days))]
     )
-    rows = {
-        row["scope"]: row
-        for row in _bq_client.query(_SETTLED_QUERY, job_config=cfg).result(timeout=180)
-    }
+    by_day: dict[date, dict[str, Any]] = {}
+    for row in _bq_client.query(_SETTLED_QUERY, job_config=cfg).result(timeout=180):
+        by_day.setdefault(row["d"], {})[row["scope"]] = row
+    for day in days:
+        _settle_day(day, by_day.get(day, {}), now)
+
+
+def _settle_day(day: date, rows: dict[str, Any], now: datetime) -> None:
+    """Write one day's three scopes from the rows the range SELECT returned for it."""
     eligible = eligible_for({scope: (rows[scope]["n_calls"] or 0) for scope in rows})
     for scope in SCOPES:
         row = rows.get(scope)
@@ -341,17 +372,16 @@ def _run_settled(day: date, now: datetime) -> None:
         _bq_client.query(
             _SETTLED_MERGE,
             job_config=_job_config(
-                [
-                    _scalar("d", "DATE", day),
-                    _scalar("scope", "STRING", scope),
-                    _scalar("trouble10", "FLOAT64", trouble10),
-                    _scalar("level", "STRING", level_for(scope, trouble10)),
-                    _scalar("n_resolved", "INT64", row["n_resolved"] if row else 0),
-                    _scalar("n_unresolved", "INT64", row["n_unresolved"] if row else 0),
-                    _scalar("n_calls", "INT64", row["n_calls"] if row else 0),
+                _outcome_scalars(
+                    day, scope, trouble10,
+                    row["n_resolved"] if row else 0,
+                    row["n_unresolved"] if row else 0,
+                    row["n_calls"] if row else 0,
+                    now,
+                )
+                + [
                     _scalar("eligible", "BOOL", eligible),
                     _scalar("unresolvable", "BOOL", trouble10 is None),
-                    _scalar("now", "TIMESTAMP", now),
                 ]
             ),
         ).result(timeout=60)
@@ -415,8 +445,7 @@ def refresh(now: datetime | None = None) -> None:
 
     if settled_due(now, _state["settled_done"]) and _retryable("settled", now):
         try:
-            for day in _work_set(today):
-                _run_settled(day, now)
+            _run_settled(_work_set(today), now)
             _state["settled_done"] = True
             _state["backoff"].pop("settled", None)
         except Exception:

@@ -8,7 +8,8 @@ Run: uv run --with google-cloud-bigquery python test_togvarsel_outcomes.py   (or
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # --- Stub the BigQuery client BEFORE importing the module (main builds one at module scope). ---
@@ -46,6 +47,9 @@ class _FakeBQ:
         self.ddl = 0
         self.merges: list[dict] = []
         self.queries: list[str] = []
+        # (sql, params) for every query. self.queries carries the text only, which cannot answer
+        # "what range did the settled SELECT actually ask for?".
+        self.sent: list[tuple[str, dict]] = []
 
     def query(self, sql, job_config=None):
         self.queries.append(sql)
@@ -55,6 +59,7 @@ class _FakeBQ:
         if job_config is not None:
             for p in job_config.query_parameters:
                 params[p.name] = list(p.values) if hasattr(p, "values") else p.value
+        self.sent.append((sql, params))
         if sql.lstrip().startswith("CREATE TABLE"):
             self.ddl += 1
             return _FakeJob([])
@@ -359,6 +364,83 @@ def test_every_query_is_bounded_by_maximum_bytes_billed():
     configs = [c for c in captured if c is not None]
     assert configs, "no parameterised query ran"
     assert all(c.maximum_bytes_billed == togvarsel_outcomes._MAX_BYTES_BILLED for c in configs)
+
+
+def test_a_multi_day_backlog_is_one_select_and_only_the_work_set_is_written():
+    """The catch-up path, which had no test at all — and it fires for real ONCE PER ENVIRONMENT,
+    because togvarsel_issued already holds forecasts issued before this feature existed.
+
+    One SELECT for the whole span, not one per day: at one SELECT plus three MERGEs per day a
+    seven-weekday backlog was ~28 sequential BigQuery jobs in a single tick, on the sole poller
+    thread, ahead of the SX rebuild and the notify pass.
+
+    And only the WORK SET is written. The span min..max necessarily covers days that are not in it —
+    a weekend, or a day that already settled — and writing those would resolve a day we never
+    issued a forecast for."""
+    monday, tuesday, thursday = date(2026, 8, 24), date(2026, 8, 25), date(2026, 8, 27)
+    rows = []
+    for d in (monday, tuesday, date(2026, 8, 26), thursday):
+        rows += [_row("am", 0.12, 1500, 1490, d=d), _row("amrest", 0.11, 900, 890, d=d),
+                 _row("pm", 0.05, 1400, 1390, d=d)]
+    # Wednesday the 26th is deliberately absent from the work set though it lies inside the span.
+    fake = _FakeBQ(settled=rows, work_set=[monday, tuesday, thursday])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=datetime(2026, 9, 1, 6, 5, tzinfo=_OSLO))
+
+    selects = [q for q in fake.queries if "last_recorded" in q]
+    assert len(selects) == 1, f"expected ONE range SELECT for the whole span, got {len(selects)}"
+    settled = [m for m in fake.merges if m["kind"] == "settled"]
+    assert {m["d"] for m in settled} == {monday, tuesday, thursday}, "only the work set is written"
+    assert len(settled) == 3 * len(togvarsel_outcomes.SCOPES)
+
+
+def test_the_range_select_is_bounded_by_the_work_sets_own_min_and_max():
+    monday, thursday = date(2026, 8, 24), date(2026, 8, 27)
+    fake = _FakeBQ(settled=[_row("am", 0.12, d=monday)], work_set=[monday, thursday])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=datetime(2026, 9, 1, 6, 5, tzinfo=_OSLO))
+    # the parameters the module actually sent, not the ones we hoped it would
+    sent = [q for q in fake.sent if "last_recorded" in q[0]]
+    assert sent, "no settled SELECT ran"
+    params = sent[0][1]
+    assert params["from_date"] == monday and params["to_date"] == thursday
+
+
+def test_a_day_the_range_returned_nothing_for_still_settles_every_scope():
+    """A day inside the work set with no rows at all — a full feed outage — settles as
+    unresolvable rather than staying `venter` for ten days against an immutable batch."""
+    monday, thursday = date(2026, 8, 24), date(2026, 8, 27)
+    fake = _FakeBQ(settled=[_row("am", 0.12, d=monday), _row("amrest", 0.11, d=monday),
+                            _row("pm", 0.05, d=monday)],
+                   work_set=[monday, thursday])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=datetime(2026, 9, 1, 6, 5, tzinfo=_OSLO))
+    thu = [m for m in fake.merges if m["kind"] == "settled" and m["d"] == thursday]
+    assert len(thu) == len(togvarsel_outcomes.SCOPES)
+    assert all(m["unresolvable"] is True and m["trouble10"] is None for m in thu)
+
+
+def test_the_backoff_constants_stay_in_step_with_togvarsels():
+    """A source-text parity check, not an import.
+
+    This module's backoff is a deliberate copy of togvarsel's (same cooldown, same give-up count,
+    same datetime.max sentinel), and it has to be a copy: those functions close over
+    togvarsel._state["backoff"], so calling them from here would file this module's pass names into
+    togvarsel's per-issue failure state and cross-contaminate two domains the poller's per-step
+    isolation exists to keep apart. Sharing them properly means parameterising togvarsel's pair on
+    the backoff dict, which is a change to a module this feature does not otherwise touch.
+
+    So: pin the values instead, the way SCOPE_START_H is pinned against NOTIFY_SPECS. Grepped
+    rather than imported to keep this suite hermetic."""
+    source = (Path(__file__).parent / "togvarsel.py").read_text()
+    assert "_FAIL_COOLDOWN = timedelta(minutes=15)" in source, (
+        "togvarsel's cooldown moved; togvarsel_outcomes._FAIL_COOLDOWN must move with it"
+    )
+    assert "_MAX_FAILS_PER_DAY = 8" in source, (
+        "togvarsel's give-up count moved; togvarsel_outcomes._MAX_FAILS_PER_DAY must move with it"
+    )
+    assert togvarsel_outcomes._FAIL_COOLDOWN == timedelta(minutes=15)
+    assert togvarsel_outcomes._MAX_FAILS_PER_DAY == 8
 
 
 def _run():

@@ -86,6 +86,17 @@ function Count({ label, n, title }: { label: string; n: number; title: string })
  *  Segmented rather than blended because the baselines push on LEVEL and the follow-ups on level
  *  CHANGE — two different decisions with two different calibrations — so a single headline moves
  *  with the mix of the two rather than with the product. */
+/** One rate cell. The three Presisjon/Dekning cells differ only in their value and their tooltip;
+ *  Varslingstid and Avgjørelser deliberately stay inline — one carries an extra child, the other no
+ *  tooltip, so folding them in would take a flag per difference. */
+function RateCell({ value, title }: { value: number | null; title: string }) {
+  return (
+    <td className="rh-num" title={title}>
+      {fmtPct(value)}
+    </td>
+  );
+}
+
 export default function HitTable({ stats }: { stats: StatsRow[] }) {
   const total = stats.find((r) => r.slot === 'total');
   return (
@@ -126,21 +137,18 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
                     {row.n_scored} avklarte, kvalifiserte utstedelser
                   </span>
                 </th>
-                <td className="rh-num" title="Andel av de vurderte utstedelsene med utfallet «Traff».">
-                  {fmtPct(row.presisjon_samlet)}
-                </td>
-                <td
-                  className="rh-num"
+                <RateCell
+                  value={row.presisjon_samlet}
+                  title="Andel av de vurderte utstedelsene med utfallet «Traff»."
+                />
+                <RateCell
+                  value={row.presisjon_varslet}
                   title="«Traff» + «Traff nesten» blant de vurderte utstedelsene der et varsel sto i kraft. Friskmeldinger er holdt utenfor — en friskmelding er ikke et varsel."
-                >
-                  {fmtPct(row.presisjon_varslet)}
-                </td>
-                <td
-                  className="rh-num"
+                />
+                <RateCell
+                  value={row.dekning}
                   title="Andel av de gule og røde rushene vi hadde et varsel i kraft for. Videre grunnlag enn Presisjon: sene utstedelser og runder utenfor frist er med."
-                >
-                  {fmtPct(row.dekning)}
-                </td>
+                />
                 <td
                   className="rh-num"
                   title="Median tid fra pushen til rushet startet. Målt fra rushets egen start, så morgentallene ligger rundt null."

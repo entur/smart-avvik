@@ -342,6 +342,16 @@ def population_class(issue: Issue) -> str:
     return "excluded"
 
 
+def _aware_utc(value: datetime) -> datetime:
+    """A naive timestamp read as UTC, an aware one untouched.
+
+    BigQuery hands back aware UTC, so a naive value here is a test fixture or a stray — and reading
+    it as UTC rather than as local time keeps the figure from shifting by whatever offset the
+    machine happens to be on. Shared by lead_minutes and _decided, which had this written out twice.
+    """
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+
+
 def lead_minutes(issue_key: str, decided_at: datetime | None) -> float | None:
     """Varslingstid for one round: signed minutes of WARNING TIME, positive when the push preceded
     the rush window it is about (KTD8).
@@ -358,11 +368,7 @@ def lead_minutes(issue_key: str, decided_at: datetime | None) -> float | None:
     _check_slot(issue_key)
     if decided_at is None:
         return None
-    if decided_at.tzinfo is None:
-        # BigQuery hands back aware UTC; a naive value is read as UTC rather than as local time, so
-        # a stray naive timestamp cannot shift the figure by the developer's own offset.
-        decided_at = decided_at.replace(tzinfo=UTC)
-    pushed = decided_at.astimezone(_OSLO)
+    pushed = _aware_utc(decided_at).astimezone(_OSLO)
     return (_scope_start(issue_key, pushed.date()) - pushed).total_seconds() / 60
 
 
@@ -509,7 +515,7 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
         slot=name,
         presisjon_samlet=_rate(samlet_num, len(scored)),
         presisjon_samlet_num=samlet_num,
-        presisjon_samlet_den=len(scored),
+        presisjon_samlet_den=counts.n_scored,
         presisjon_varslet=_rate(varslet_num, len(varslet)),
         presisjon_varslet_num=varslet_num,
         presisjon_varslet_den=len(varslet),
@@ -518,7 +524,7 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
         dekning_den=dekning_den,
         varslingstid_min=float(median(leads)) if leads else None,
         varslingstid_n=len(leads),
-        avgjorelser=len(issues),
+        avgjorelser=counts.n,
         matrix=matrix,
         counts=counts,
     )
@@ -578,6 +584,4 @@ def _decided(issue: Issue) -> datetime:
     `lead_minutes`, so a mixed list cannot raise mid-comparison."""
     decided_at = issue.decided_at
     assert decided_at is not None  # callers filter on it
-    if decided_at.tzinfo is None:
-        return decided_at.replace(tzinfo=UTC)
-    return decided_at
+    return _aware_utc(decided_at)
