@@ -822,9 +822,22 @@ def load_state() -> None:
         logger.exception("Could not load varsel state; starting empty")
 
 
-def _save_state() -> None:
+def _save_state() -> bool:
     """Write state through to the local file and (when configured) the GCS blob. Best-effort:
-    a persistence failure is logged, not raised — the in-memory state is still authoritative."""
+    a persistence failure is logged, not raised — the in-memory state is still authoritative.
+
+    Returns whether the DURABLE copy is up to date: True when the GCS upload succeeded, and True
+    when no bucket is configured — there is then no durable copy to be stale, which is the
+    documented local-only dev mode (`VARSEL_STATE_BUCKET` unset). False only when a *configured*
+    upload actually failed, `_gcs_blob` itself blowing up on ADC included.
+
+    The return value is backward compatible: nothing raises, the local-file write keeps its own
+    swallow-and-log, and every caller but :func:`delete_device_data` ignores it. That one is the
+    single place where "logged, not raised" is wrong — a GDPR art. 17 erasure that answers 200
+    while the blob still holds the data has it resurrected by the next restart's `load_state`, and
+    by then the client has cleared its device id, so the resurrected rows are unreachable by the
+    person they belong to.
+    """
     payload = _serialize_state()
     try:
         _STATE_PATH.write_text(payload)
@@ -832,10 +845,13 @@ def _save_state() -> None:
         logger.exception("Could not write varsel state to %s", _STATE_PATH)
     try:
         blob = _gcs_blob()
-        if blob is not None:
-            blob.upload_from_string(payload, content_type="application/json")
+        if blob is None:
+            return True
+        blob.upload_from_string(payload, content_type="application/json")
     except Exception:
         logger.exception("Could not upload varsel state to gs://%s/%s", _STATE_BUCKET, _STATE_BLOB)
+        return False
+    return True
 
 
 # ---- Togvarsel round markers + journey snapshot (injected into togvarsel_notify) --------------
@@ -1648,12 +1664,17 @@ def _log_push(
 
 def deliver_to_devices(
     per_device: Mapping[str, list[Any]],
-    prepare: Callable[[Any], tuple[dict, dict]],
+    prepare: Callable[[Any], tuple[dict, dict] | None],
 ) -> list[tuple[str, Any, str, dict]]:
     """Fan one batch of pending pushes out across devices, bounded by the module's worker pool.
 
     ``per_device`` maps device_id → that device's pending items, in send order; ``prepare`` turns
-    one item into ``(subscription, payload)`` and runs on the fan-out's worker thread. Parallel
+    one item into ``(subscription, payload)`` and runs on the fan-out's worker thread. It may
+    return ``None`` to withdraw an item it has decided must no longer be sent — the batch is
+    collected before the pool starts, so ``prepare`` is the last look a caller gets before the
+    network call (:func:`check_and_notify`'s ``_prepare_alert`` uses it for a registration deleted
+    inside that window). A withdrawn item yields no result tuple at all, so the caller's own
+    bookkeeping never sees it. Parallel
     ACROSS devices, sequential WITHIN one: each send can block for :data:`_PUSH_TIMEOUT_S` against
     a client-supplied endpoint (FCM, Mozilla, Apple), so sequential delivery would stall the
     poller for devices × 10 s in the bad case — while a "gone" result must still stop that
@@ -1670,7 +1691,10 @@ def deliver_to_devices(
         device_id, items = entry
         out = []
         for item in items:
-            subscription, payload = prepare(item)
+            prepared = prepare(item)
+            if prepared is None:
+                continue  # withdrawn between collection and dispatch; not a delivery attempt
+            subscription, payload = prepared
             result = _send_push(subscription, payload)
             out.append((device_id, item, result, payload))
             if result == "gone":
@@ -2674,9 +2698,22 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 (jid, device, journey, alert, key, brand)
             )
 
-    def _prepare_alert(item: tuple[str, dict, dict, Alert, str, str]) -> tuple[dict, dict]:
-        """One pending alert → (subscription, payload), run on the fan-out's worker thread."""
+    def _prepare_alert(item: tuple[str, dict, dict, Alert, str, str]) -> tuple[dict, dict] | None:
+        """One pending alert → (subscription, payload), run on the fan-out's worker thread.
+
+        ``None`` means "the registration went away; skip the send". The collection loop above
+        already re-checks `_journeys` (a delete landing while it iterates), but everything it
+        collects -- the device's SUBSCRIPTION included -- is captured before the pool starts, so a
+        «Slett alt» arriving inside the fan-out window would otherwise still put a push on the
+        phone after the UI said everything was deleted, and the "sent" result below would write a
+        `_notified` key for a journey that no longer exists. This is the same re-check, moved to
+        the latest point that still precedes the network call. It takes `_state_lock` for two dict
+        lookups and never across `_send_push`.
+        """
         jid, device, journey, alert, key, brand = item
+        with _state_lock:
+            if jid not in _journeys or journey["device_id"] not in _devices:
+                return None
         message_key = _message_key(key, alert)
         # The written wording only if this deployment delivers it; otherwise None, and
         # _notification_payload words the push from the same message input the model was shown.
@@ -2698,9 +2735,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             _log_push("alert", result, journey["device_id"], payload, journey_id=jid, alert=alert)
             if result == "sent":
                 with _state_lock:
-                    _notified.add(f"{jid}|{alert.situation_number}")
+                    # Same liveness rule as `_prepare_alert`, re-asked because the delete can also
+                    # land during the send itself: a dedup key for a journey that no longer exists
+                    # would be persisted by the save below and reloaded on the next restart.
+                    if jid in _journeys:
+                        _notified.add(f"{jid}|{alert.situation_number}")
+                        changed = True
                 pushed_keys.add((journey_key(journey), alert.situation_number))
-                changed = True
             elif result == "gone":
                 if handle_gone_device(journey["device_id"]):
                     changed = True
@@ -3002,12 +3043,17 @@ def delete_device_data(
     persisted blob, so a redeploy would restore dedup keys pointing at journeys that no longer
     exist.
 
-    Idempotent, following `delete_device` (`pop` with a default, always 200) and deliberately NOT
-    `delete_journey`, which 404s on a miss: a client retrying after a dropped response must not see
-    a spurious failure. The unknown-id path does **zero** I/O — no save, no log. Every mutation
+    Idempotent, following `delete_device` (`pop` with a default, 200 on a miss) and deliberately
+    NOT `delete_journey`, which 404s: a client retrying after a dropped response must not see a
+    spurious failure. The unknown-id path does **zero** I/O — no save, no log. Every mutation
     here holds `_state_lock` across a blocking GCS upload, so an unauthenticated endpoint that
     uploaded on each random UUID would be free write amplification, and the lock it holds while
     doing so is the one the poller and every registration need.
+
+    The one non-200 is a **failed durable write**, which rolls back and 503s — see below. This is
+    the only caller that reads `_save_state`'s return value: everywhere else the in-memory state
+    is authoritative and a lost write costs one restart's worth of freshness, whereas here it
+    costs the erasure itself.
 
     The path param carries the same bounds every body model puts on `device_id` (FastAPI validates
     a path param only where constraints are declared). No charset pattern: the legacy fallback id
@@ -3025,15 +3071,42 @@ def delete_device_data(
         deleted = [jid for jid, rec in _journeys.items() if rec["device_id"] == device_id]
         if device is None and not deleted:
             return {"status": "ok", "journeys_deleted": 0}
-        for jid in deleted:
-            del _journeys[jid]
-        if deleted:
-            gone = set(deleted)
-            # Dedup keys are "journey_id|situationNumber" — see check_and_notify.
-            _notified.difference_update(
-                {key for key in _notified if key.split("|", 1)[0] in gone}
+        removed_journeys = {jid: _journeys.pop(jid) for jid in deleted}
+        gone = set(deleted)
+        # Dedup keys are "journey_id|situationNumber" — see check_and_notify.
+        removed_notified = {key for key in _notified if key.split("|", 1)[0] in gone}
+        _notified.difference_update(removed_notified)
+        if not _save_state():
+            # The durable blob still holds everything, so the erasure did NOT happen. Reporting
+            # success here is how an art. 17 request gets quietly undone: `load_state` reads the
+            # blob on the next restart and brings the device, its journeys and their dedup keys
+            # back — by which time the client has cleared its device id, so what came back is
+            # unreachable by the person it belongs to.
+            #
+            # Restoring is what makes the retry correct, not tidiness: without it the second
+            # attempt finds nothing in memory, takes the zero-I/O unknown-id path above, and
+            # answers 200 over a blob that is still full. Done under the SAME lock acquisition, so
+            # memory and the blob cannot be observed disagreeing. Restored journeys land at the
+            # end of the dict rather than in their old positions; nothing reads that order (the
+            # write queue sorts by departure), and this is a failure path.
+            if device is not None:
+                _devices[device_id] = device
+            _journeys.update(removed_journeys)
+            _notified.update(removed_notified)
+            logger.error(
+                "Could not persist the data deletion for device %s; rolled it back",
+                device_id,
+                extra={
+                    "fields": {
+                        "event": "varsel_delete_all_persist_failed",
+                        "device_id": device_id,
+                        "journeys": len(deleted),
+                    }
+                },
             )
-        _save_state()
+            raise HTTPException(
+                status_code=503, detail="Kunne ikke slette dataene akkurat nå. Prøv igjen."
+            )
     logger.info(
         "Deleted all data for device %s (%d journeys)",
         device_id,
@@ -3317,12 +3390,19 @@ def create_journey(body: JourneyIn) -> Journey:
         ) from None
     # Logged only once the registration STANDS -- the rollback above un-registers it, and an audit
     # record of a registration that does not exist is worse than none. The journey is identified by
-    # its DIGEST and never by from_stop/to_stop or their names: keeping the commute pattern out of
-    # Cloud Logging is what key_digest exists for, and this record sits beside device_id-bearing
-    # ones (event="push", event="client_error"). Same digest as decisions.record's, so a
-    # registration and its later decisions join.
-    from llm_message import key_digest
-
+    # its `journey_id` and never by from_stop/to_stop or their names: keeping the commute pattern
+    # out of Cloud Logging is the whole point, and this record sits beside device_id-bearing ones
+    # (event="push", event="client_error").
+    #
+    # And deliberately NOT by `journey_digest`, which this record carried when it was first
+    # written. The digest is `llm_message.key_digest` -- the key `varsel_decisions` and
+    # event="llm_message" are both written under -- while nothing else in Cloud Logging pairs it
+    # with a device: event="push" carries device_id + journey_id, event="llm_message" carries the
+    # digest alone. Logging the two together here would be the join that makes every decision row
+    # device-linkable through the logs, and the privacy page states the decision log
+    # «identifiserer ikke enheten din» -- with THIS record's own justification resting on the same
+    # property. `journey_id` gives consent provenance everything it needs (which registration was
+    # made under which text) without minting that join.
     logger.info(
         "Journey registered (consent text %s)",
         body.consent_text_version or "unversioned",
@@ -3331,7 +3411,6 @@ def create_journey(body: JourneyIn) -> Journey:
                 "event": "journey_registered",
                 "journey_id": jid,
                 "device_id": body.device_id,
-                "journey_digest": key_digest(journey_key(rec)),
                 "consent_text_version": body.consent_text_version,
             }
         },
