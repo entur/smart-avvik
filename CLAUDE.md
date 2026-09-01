@@ -142,6 +142,30 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   also suppresses it. `None` from the provider means "could not establish" — an outage, a timeout, the
   30/min rate limit that exists because the endpoint is unauthenticated — and never becomes a
   warning. Answers are cached 10 min.
+  **Calling at a stop is not the same as being usable from it** (2026-09-01): a traveller wrote in
+  after an Oslo S → Drammen registration was pushed «Tog F4 16:23 er innstilt» — the 16:23 is the
+  Bergen train, which calls Drammen with **alighting closed**. Vy sells the local stretch of every
+  long-distance run as boarding-only (`arrivalBoardingActivity = NO_ALIGHTING` at Sandvika, Asker,
+  Drammen and Hokksund; alighting opens at Hønefoss), and the matcher knew only stop_order, so it
+  offered that train to five registered journeys (Oslo S → Drammen ×3, → Asker, → Sandvika) and
+  pushed the one cancellation to all eight of their devices — not one of whom could have been
+  aboard. The two SIRI activities now ride from the planned sources
+  (`boarding_allowed` / `alighting_allowed` in `{rail,bus}_calls_planned_today.sql`) through
+  `predict_calls*.sql` onto `impact.CallPred`, and `impact._trip_cells` requires both: board at
+  `from_stop`, alight at `to_stop`. Not fjerntog-only — measured the same day on Vy alone, 56
+  mid-journey NO_ALIGHTING calls (F4, RX11) and 417 mid-journey NO_BOARDING ones (F4, R31, RE30),
+  and on the served bus operators 0–6.3 % of mid-journey calls carry one. **The reading is fail-open
+  and lives in ONE place per source table**: most operators leave both fields NULL on most calls
+  (RUT, KOL, TRO, SKY, OST), so "not stated" must mean permission — read as prohibition it would
+  silently retire whole operators — and `PASS_THRU` bars both sides. Every default is
+  permissive for the same reason, including `CallPred`'s and `_call_pred_from_row`'s `getattr`, which
+  is what carries the app through the cycle after a deploy where the serving table predates the
+  columns. `main._VARSEL_CONNECTIVITY_QUERY` asks in the same shape — **four CTEs, not two**, because
+  the reverse direction boards at the *to*-place and alights at the *from*-place — so the caveat above
+  and the alerting cannot disagree; measured against dev's timetable it drops the Oslo S → Drammen
+  trip set from 173 journeys to 161, all twelve of them F4. Cost: ~0.68 GB more per planned rebuild
+  on each side (+3.5 %). Nothing in `alternatives.py` needed the rule — the Journey Planner plans real
+  trips and never offers a leg nobody may board.
   **What ET already knows is a fact, not a forecast** (2026-08-05): when a call carries
   `et_declared_cancelled`, `impact._cancelled_prediction` serves `cancel_probability` /
   `impact_probability` of **1.0**, `cancelled=True` and **null delay figures** (every one of them
