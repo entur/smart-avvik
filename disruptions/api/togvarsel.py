@@ -9,10 +9,11 @@ OR ≥10 min late), mapped to green/yellow/red at the study's fixed bins:
     12:00  PM rush 15–18               model disruptions.togvarsel_m_pm1200
     14:00  PM rush 15–18               model disruptions.togvarsel_m_pm1400
 
-The follow-up of each pair REPLACES its baseline on the page once issued (``SUPERSEDED_BY``): the
-page shows at most one card per rush, the newest. Only the display is narrowed — every issue is
-still computed, recorded and handed to the notify chain, which needs the baseline to decide
-whether the follow-up changed level.
+The follow-up of each pair REPLACES its baseline on the page once issued (``SUPERSEDED_BY``), and
+a card is retired outright once its rush has ended (``RUSH_END_H``): the page shows at most one
+card per rush, the newest, and none at all for a rush that is over. Only the display is narrowed
+— every issue is still computed, recorded and handed to the notify chain, which needs the
+baseline to decide whether the follow-up changed level.
 
 Between the morning issues and 12:00 the PM outlook is DETERMINISTIC two-state prose (§8 part 3:
 "normale utsikter" vs "noe forhøyet risiko" after a red morning) — the study found no real PM
@@ -121,7 +122,7 @@ class _IssueSpec:
     due_h: float  # Oslo fractional hour the issue becomes computable
     model: str  # suffix of disruptions.togvarsel_m_*
     scope: str  # what window the probability is about, for display
-    kind: str  # "am" | "pm" — which reason rules apply
+    kind: str  # "am" | "pm" — which reason rules apply, and which rush it expires with
     suffix: str  # feature-column suffix for the reason rules
 
 
@@ -131,6 +132,18 @@ ISSUE_SPECS: tuple[_IssueSpec, ...] = (
     _IssueSpec("1200", 12.0, "pm1200", "ettermiddagsrushet 15:00–18:00", "pm", "1200"),
     _IssueSpec("1400", 14.0, "pm1400", "ettermiddagsrushet 15:00–18:00", "pm", "1400"),
 )
+_SPEC_BY_KEY = {s.key: s for s in ISSUE_SPECS}
+
+# When each rush ends, in Oslo fractional hours — the moment its forecast stops being a forecast.
+# A card is about a window, so once the window has passed it is a record of the past dressed as
+# advice, and the reader has to work out for themselves that "morgenrushet 07:00–09:00" no longer
+# concerns them. The same cut bounds /varsel's rush panel (togvarsel_notify.RUSH_WINDOWS, pinned
+# by test_the_rush_windows_agree_with_the_notify_chain), because the two surfaces must not
+# disagree about whether a rush is still a live topic. It is the rush's END and not the issue's
+# due time: a status that goes blank at 08:00 with the trains still late is the opposite of
+# useful. Keyed by _IssueSpec.kind.
+RUSH_END_H: dict[str, float] = {"am": 9.0, "pm": 18.0}
+_LAST_RUSH_END_H = max(RUSH_END_H.values())
 
 # Each rush has a baseline issue and a follow-up that REPLACES it on the page. The follow-up
 # answers the same question over what is left of the same window from a sharper model (§14e), so
@@ -181,6 +194,12 @@ class Togmelding(BaseModel):
     forecast_day: bool = Field(description="False on weekends/holidays — no forecast issued")
     no_forecast_reason: str | None = None
     next_issue: str | None = Field(default=None, description="HHMM of the next issue not yet due")
+    rushes_over: bool = Field(
+        default=False,
+        description="Both of today's rush windows have ended, so every forecast issued today has "
+        "expired — a forecast day with nothing left to say, as opposed to one whose first issue "
+        "is still to come",
+    )
     overdue_issues: list[str] = Field(
         default_factory=list,
         description="HHMM of issues past due (plus a 10 min grace) but not issued — the forecast "
@@ -530,11 +549,21 @@ def issued_today(now: datetime | None = None) -> list[dict[str, Any]]:
         return [issue.model_dump() for issue in _state["issues"].values()]
 
 
-def visible_issues(issues: dict[str, Issue]) -> list[Issue]:
-    """Today's issues in issue order, with each superseded baseline dropped once its follow-up
-    has been issued. A baseline whose follow-up has NOT arrived (not yet due, failed, backing
-    off) is still the current forecast for its rush and stays."""
-    return [issues[k] for k in sorted(issues) if SUPERSEDED_BY.get(k) not in issues]
+def visible_issues(issues: dict[str, Issue], now_h: float) -> list[Issue]:
+    """Today's issues in issue order, narrowed twice — display only, so `_state` keeps them all.
+
+    A superseded baseline is dropped once its follow-up has been issued; one whose follow-up has
+    NOT arrived (not yet due, failed, backing off) is still the current forecast for its rush and
+    stays. And an issue whose rush has ENDED is dropped outright (RUSH_END_H): it is no longer a
+    forecast, and the page has no other way to retire it — a restart at 15:38 back-fills the
+    morning's issues as `late`, which is how prd came to be offering "Kl. 07:00 — morgenrushet
+    07:00–09:00" at 16:17 on 2026-09-01.
+    """
+    return [
+        issues[k]
+        for k in sorted(issues)
+        if SUPERSEDED_BY.get(k) not in issues and now_h < RUSH_END_H[_SPEC_BY_KEY[k].kind]
+    ]
 
 
 def build_melding(now: datetime) -> Togmelding:
@@ -581,8 +610,14 @@ def build_melding(now: datetime) -> Togmelding:
         no_forecast_reason=no_forecast,
         next_issue=upcoming[0].key if (not weekend and not holiday and upcoming) else None,
         overdue_issues=overdue,
-        issues=visible_issues(issues),
-        pm_outlook=None if (weekend or holiday) else pm_outlook_for(issues),
+        rushes_over=not (weekend or holiday) and now_h >= _LAST_RUSH_END_H,
+        issues=visible_issues(issues, now_h),
+        # Both states this can be in are about a rush that has not happened yet — the morning's
+        # read-across before 12:00, a pointer to the PM card after it — so it goes with the rush
+        # it is about. Left standing it would point at a card visible_issues has just retired.
+        pm_outlook=(
+            None if (weekend or holiday or now_h >= RUSH_END_H["pm"]) else pm_outlook_for(issues)
+        ),
         known_deviations=sx,
         skill_note=skill_note_for(today),
     )
@@ -665,13 +700,21 @@ def togmelding_config() -> ConfigResponse:
     return ConfigResponse(environment=environment_label())
 
 
+def _now() -> datetime:
+    """The request clock, in one place. Every other entry point here takes `now` explicitly, and
+    the endpoint checks need the same handle: what the payload contains is a function of the hour
+    (RUSH_END_H retires a card), so a suite that read the real clock would pass or fail by the
+    time of day it happened to run."""
+    return datetime.now(_OSLO)
+
+
 @router.get("/togmelding-api/today", response_model=Togmelding)
 def togmelding_today() -> Togmelding:
     """The page payload, each issued forecast annotated with a feedback capability when the
     /varsel feedback stack is configured (dev today; the flag and secrets are per-environment).
     Minting happens here on the request path — never in refresh() or build_melding(), which the
     poller and the notify chain also feed from — and on copies, so `_state` stays clean."""
-    melding = build_melding(datetime.now(_OSLO))
+    melding = build_melding(_now())
     if melding.issues and feedback.enabled():
         melding.issues = [_with_feedback_context(i, melding.date) for i in melding.issues]
     return melding

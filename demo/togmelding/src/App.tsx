@@ -170,14 +170,27 @@ export default function App() {
                   )}
                 </section>
               ) : (
-                issues.length === 0 && (
+                issues.length === 0 &&
+                // Nothing to show, for one of two opposite reasons the reader must be able to
+                // tell apart: the day's forecasts are all behind us (their rush has ended and
+                // visible_issues retired them), or the next one is still to come.
+                (melding.rushes_over ? (
                   <section className="tm-card">
                     <Heading3 as="h2" margin="none">
-                      Dagens første prognose kommer{' '}
+                      Dagens rush er over
+                    </Heading3>
+                    <Paragraph margin="none" className="tm-muted">
+                      Nytt varsel til morgenrushet neste hverdag, kl. 06:30.
+                    </Paragraph>
+                  </section>
+                ) : (
+                  <section className="tm-card">
+                    <Heading3 as="h2" margin="none">
+                      Neste prognose kommer{' '}
                       {melding.next_issue ? `kl. ${issueTime(melding.next_issue)}` : 'snart'}
                     </Heading3>
                   </section>
-                )
+                ))
               )}
 
               {issues.length > 0 && overdue.length > 0 && (
