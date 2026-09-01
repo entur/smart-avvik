@@ -120,6 +120,11 @@ export interface Journey {
   end: string;
   days: number[];
   created_ts: string;
+  // Which version of the registration-visible privacy texts was recorded when this journey was
+  // registered (NewJourney.consent_text_version). The server returns it on every GET and POST.
+  // Optional and nullable for the two ways it can be absent: a journey registered by a client
+  // that sends none, or one registered before the field existed.
+  consent_text_version?: string | null;
   alerts: Alert[];
   // Something about the registration itself, not about today's traffic: currently only "no planned
   // trip connects these stops today", which means this journey cannot produce an alert.
