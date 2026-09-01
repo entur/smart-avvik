@@ -9,6 +9,11 @@ OR ≥10 min late), mapped to green/yellow/red at the study's fixed bins:
     12:00  PM rush 15–18               model disruptions.togvarsel_m_pm1200
     14:00  PM rush 15–18               model disruptions.togvarsel_m_pm1400
 
+The follow-up of each pair REPLACES its baseline on the page once issued (``SUPERSEDED_BY``): the
+page shows at most one card per rush, the newest. Only the display is narrowed — every issue is
+still computed, recorded and handed to the notify chain, which needs the baseline to decide
+whether the follow-up changed level.
+
 Between the morning issues and 12:00 the PM outlook is DETERMINISTIC two-state prose (§8 part 3:
 "normale utsikter" vs "noe forhøyet risiko" after a red morning) — the study found no real PM
 skill before ~12:00, and pretending otherwise with a probability would be theatre. The "kjente
@@ -125,6 +130,16 @@ ISSUE_SPECS: tuple[_IssueSpec, ...] = (
     _IssueSpec("1200", 12.0, "pm1200", "ettermiddagsrushet 15:00–18:00", "pm", "1200"),
     _IssueSpec("1400", 14.0, "pm1400", "ettermiddagsrushet 15:00–18:00", "pm", "1400"),
 )
+
+# Each rush has a baseline issue and a follow-up that REPLACES it on the page. The follow-up
+# answers the same question over what is left of the same window from a sharper model (§14e), so
+# two cards for one rush are not two forecasts — they are one forecast and its stale predecessor,
+# and a reader with a train to catch has to work out which number still applies. Display only.
+# The superseded issue is still computed, still recorded in togvarsel_issued and still handed to
+# `issued_today()`, because the notify chain's change gate compares the follow-up's level against
+# exactly the baseline it pushed (togvarsel_notify) — dropping it from `_state` would silence
+# every friskmelding.
+SUPERSEDED_BY: dict[str, str] = {"0630": "0700", "1200": "1400"}
 
 
 class Issue(BaseModel):
@@ -505,6 +520,13 @@ def issued_today(now: datetime | None = None) -> list[dict[str, Any]]:
         return [issue.model_dump() for issue in _state["issues"].values()]
 
 
+def visible_issues(issues: dict[str, Issue]) -> list[Issue]:
+    """Today's issues in issue order, with each superseded baseline dropped once its follow-up
+    has been issued. A baseline whose follow-up has NOT arrived (not yet due, failed, backing
+    off) is still the current forecast for its rush and stays."""
+    return [issues[k] for k in sorted(issues) if SUPERSEDED_BY.get(k) not in issues]
+
+
 def build_melding(now: datetime) -> Togmelding:
     """The response payload as a pure function of (cached state, now) — recomputed per request,
     so next_issue and the weekend gate can never serve stale."""
@@ -525,7 +547,16 @@ def build_melding(now: datetime) -> Togmelding:
     overdue = (
         []
         if (weekend or holiday)
-        else [s.key for s in ISSUE_SPECS if now_h > s.due_h + _GRACE_H and s.key not in issues]
+        else [
+            s.key
+            for s in ISSUE_SPECS
+            if now_h > s.due_h + _GRACE_H
+            and s.key not in issues
+            # A missing baseline whose follow-up did arrive is not a hole the reader can act on:
+            # the follow-up replaced it. Reported, the page would print "Prognosen kl. 06:30 er
+            # forsinket" directly above the 07:00 card that superseded it.
+            and SUPERSEDED_BY.get(s.key) not in issues
+        ]
     )
     no_forecast = None
     if weekend:
@@ -540,7 +571,7 @@ def build_melding(now: datetime) -> Togmelding:
         no_forecast_reason=no_forecast,
         next_issue=upcoming[0].key if (not weekend and not holiday and upcoming) else None,
         overdue_issues=overdue,
-        issues=[issues[k] for k in sorted(issues)],
+        issues=visible_issues(issues),
         pm_outlook=None if (weekend or holiday) else pm_outlook_for(issues),
         known_deviations=sx,
         skill_note=skill_note_for(today),
