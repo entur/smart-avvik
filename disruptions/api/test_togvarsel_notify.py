@@ -293,22 +293,44 @@ class _StationsBQ:
     refs; `fail=True` raises like the real client on a missing table (prd before
     copy_runtime_to_prd.sh has landed — a real launch state, not an edge case)."""
 
-    def __init__(self, refs=(), fail=False):
+    def __init__(self, refs=(), fail=False, rounds_fail=False):
         self.refs = list(refs)
         self.fail = fail
+        self.rounds_fail = rounds_fail
         self.queries: list[str] = []
+        # Every togvarsel_rounds MERGE, as {param: value}. Recording is best-effort in the module,
+        # so without capturing it here a broken write is INVISIBLE: the except swallows it (an
+        # assert in this fake included) and every other check still passes.
+        self.rounds: list[dict] = []
+        self.rounds_ddl = 0
 
     def query(self, sql, job_config=None):
         self.queries.append(sql)
+        if "togvarsel_rounds" in sql:
+            if self.rounds_fail:
+                raise RuntimeError("table disruptions.togvarsel_rounds is not there")
+            if sql.lstrip().startswith("CREATE"):
+                self.rounds_ddl += 1
+            else:
+                self.rounds.append(
+                    {p.name: p.value for p in (job_config.query_parameters if job_config else [])}
+                )
+            return _FakeJob([])
         if self.fail:
             raise RuntimeError("table disruptions.togvarsel_oslo_stations is not there")
         assert "togvarsel_oslo_stations" in sql
         return _FakeJob([{"stop_place": r} for r in self.refs])
 
+    def round_for(self, issue: str) -> dict:
+        rows = [r for r in self.rounds if r["issue"] == issue]
+        assert len(rows) == 1, f"expected exactly one round row for {issue}, got {len(rows)}"
+        return rows[0]
+
 
 def _reset_stations(fake) -> None:
     togvarsel_notify.configure(bq_client=fake)
     togvarsel_notify._station_state.clear()
+    togvarsel_notify._rounds_table_ready = False
 
 
 @contextmanager
@@ -818,6 +840,9 @@ def _configure_evaluate(**overrides) -> tuple[_MarkerStore, _StationsBQ]:
     }
     kwargs.update(overrides)
     togvarsel_notify._station_state.clear()
+    # The DDL latch is module state: a leaked True makes the next test's "was the table created?"
+    # assertion pass by accident, which is the shape of the _reset_state trap.
+    togvarsel_notify._rounds_table_ready = False
     togvarsel_notify.configure(**kwargs)
     return store, fake
 
@@ -1300,6 +1325,140 @@ def test_the_outlook_endpoint_serves_the_panel(monkeypatch):
     assert asked == ["dev-1"]
     assert body == {"rushes": [{"rush": "am", "issue": "0700",
                                 "scope": "morgenrushet 07:00–09:00", "level": "red", "p": 0.44}]}
+
+
+# ---- The round record /rushhistorikk scores ------------------------------------------------
+
+
+def _sent_ok(monkeypatch) -> list:
+    """Stub delivery to succeed. Every test below that has a matching device needs this: without
+    it varsel._send_push reaches the real pywebpush against push.example.com."""
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    return sent
+
+
+def test_a_pushing_round_is_recorded_with_its_kind_and_device_counts(monkeypatch):
+    """The row carries the policy decision AND the fan-out counts. `sent` means a push was
+    ISSUED — the counts are what say whether it reached anybody."""
+    sent = _sent_ok(monkeypatch)
+    _store, fake = _configure_evaluate(issues=[_issued("0630", "yellow")])
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+        togvarsel_notify.evaluate(now=_monday(6, 31))
+    assert len(sent) == 1
+    row = fake.round_for("0630")
+    assert row["level"] == "yellow" and row["sent"] is True
+    assert row["kind"] == "warning" and row["reason"] is None
+    assert row["baseline_level"] is None, "a baseline round has no baseline"
+    assert row["matched_devices"] == 1 and row["n_sent"] == 1
+    assert row["d"] == _monday(6, 31).date()
+
+
+def test_a_suppressed_round_is_recorded_with_its_reason():
+    """Suppressions are the rows a page needs most: on /historikk the sub-threshold decisions are
+    83 % of the log and the only thing that makes a miss visible. A green baseline pushes nothing
+    and must still leave a trace."""
+    _store, fake = _configure_evaluate(issues=[_issued("0630", "green")])
+    togvarsel_notify.evaluate(now=_monday(6, 31))
+    row = fake.round_for("0630")
+    assert row["sent"] is False and row["reason"] == "green_baseline"
+    assert row["kind"] is None and row["n_sent"] is None
+
+
+def test_a_confirming_follow_up_records_the_level_left_in_force(monkeypatch):
+    """0700 confirms a pushed yellow: it sends nothing, yet the traveller holds a yellow warning.
+    baseline_level is what /rushhistorikk grades that round on, and it is recorded rather than read
+    off the 0630 row — one swallowed write there would otherwise invert the verdict."""
+    _sent_ok(monkeypatch)
+    issues = [_issued("0630", "yellow")]
+    _store, fake = _configure_evaluate(issues=issues)
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+        togvarsel_notify.evaluate(now=_monday(6, 31))
+        issues.append(_issued("0700", "yellow"))  # issued_today only grows as issues compute
+        togvarsel_notify.evaluate(now=_monday(7, 1))
+    row = fake.round_for("0700")
+    assert row["sent"] is False and row["reason"] == "no_change"
+    assert row["baseline_level"] == "yellow"
+
+
+def test_an_untimely_follow_up_still_records_the_standing_level():
+    """The 12:00 yellow / 14:00 red case. The 14:00 round is past its deadline so nothing is sent,
+    and the level in force is still the yellow the traveller received — recorded here so the page
+    grades that yellow rather than crediting a red nobody saw. This is why _effective_baseline is
+    resolved BEFORE the deadline check."""
+    issues = [_issued("1200", "yellow")]
+    _store, fake = _configure_evaluate(issues=issues)
+    togvarsel_notify.evaluate(now=_monday(12, 1))
+    issues.append(_issued("1400", "red"))  # the 14:00 forecast does not exist at 12:01
+    togvarsel_notify.evaluate(now=_monday(18, 0))
+    row = fake.round_for("1400")
+    assert row["sent"] is False and row["reason"] == "untimely"
+    assert row["level"] == "red" and row["baseline_level"] == "yellow"
+
+
+def test_a_mixed_pass_records_both_the_suppression_and_the_push(monkeypatch):
+    """THE regression the recording placement exists for. One tick back-fills 0630 (untimely) and
+    pushes 0700. The two sites that persist markers are inside the pushes loop and in the
+    not-pushes branch, and neither iterates the suppressed decisions — so a hook on either would
+    drop 0630 silently, and the page would read it as "never evaluated" rather than as the outcome
+    it was."""
+    _sent_ok(monkeypatch)
+    _store, fake = _configure_evaluate(issues=[_issued("0700", "red"), _issued("0630", "red")])
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+        togvarsel_notify.evaluate(now=_monday(7, 30))
+    assert sorted(r["issue"] for r in fake.rounds) == ["0630", "0700"]
+    assert fake.round_for("0630")["reason"] == "untimely"
+    assert fake.round_for("0700")["sent"] is True
+
+
+def test_a_round_matching_zero_devices_is_still_recorded_as_sent():
+    """`sent` is the policy decision, not delivery. Nobody is registered, so the push reaches no
+    one — and the row says so through the counts rather than by pretending nothing was issued."""
+    _store, fake = _configure_evaluate(issues=[_issued("0630", "red")], journeys=dict)
+    togvarsel_notify.evaluate(now=_monday(6, 31))
+    row = fake.round_for("0630")
+    assert row["sent"] is True and row["matched_devices"] == 0 and row["n_sent"] == 0
+
+
+def test_recording_failure_costs_neither_the_push_nor_the_markers(monkeypatch):
+    """Best-effort, and the ordering proves it: the write is attempted after the markers persist,
+    so a dead table cannot cost a traveller a notification."""
+    sent = _sent_ok(monkeypatch)
+    store, fake = _configure_evaluate(
+        issues=[_issued("0630", "red")],
+        bq=_StationsBQ(refs=sorted(STATIONS), rounds_fail=True),
+    )
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+        togvarsel_notify.evaluate(now=_monday(6, 31))
+    assert len(sent) == 1, "the push must survive a failed round write"
+    assert store.by_date and store.stores >= 1, "markers must survive it too"
+    assert fake.rounds == []
+
+
+def test_the_test_trigger_records_no_round(monkeypatch):
+    """POST /togmelding-api/test-notify reaches push_round directly on the public dev host with a
+    caller-supplied device_id and a synthetic 0630 decision. On a first-write-wins MERGE that write
+    would take the day's row and the real 06:30 round would be lost for good — so the recording
+    hook lives in _evaluate and nowhere else."""
+    _sent_ok(monkeypatch)
+    _store, fake = _configure_evaluate(issues=[])
+    decision = togvarsel_notify.decide_issue(_issued("0630", "yellow"), {}, now=_monday(6, 31))
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+        togvarsel_notify.push_round(
+            decision, _issued("0630", "yellow"), ["j1"], ["dev-1"], **_wiring()
+        )
+    assert fake.rounds == [], "push_round must never record a round"
+
+
+def test_the_round_table_is_created_once_and_survives_a_closed_gate():
+    """ensure_table runs at startup, not on first write: evaluate() returns before deciding
+    anything while the flag is off — permanently true in tst — so a lazily created table would
+    never exist in the one environment that never notifies, and the page would 503 there."""
+    fake = _StationsBQ(refs=sorted(STATIONS))
+    _reset_stations(fake)
+    togvarsel_notify.ensure_table()
+    togvarsel_notify.ensure_table()
+    assert fake.rounds_ddl == 1, "the readiness latch must not re-issue the DDL"
 
 
 class _MonkeyPatch:
