@@ -1,0 +1,471 @@
+"""/rushhistorikk-api — did the rush forecasts land, and did we tell anybody?
+
+The feedback loop for Rushvarsel, and /historikk's sibling: that page scores what Avviksvarsel
+decided about a registered journey, this one scores what the rush-hour forecast said about a day.
+Three records join to answer it — :mod:`togvarsel` for what we forecast, :mod:`togvarsel_notify`'s
+round log for what we communicated, and :mod:`togvarsel_outcomes` for what the rush actually did.
+
+Two things this module is deliberate about:
+
+* **The verdict is not computed here.** It is a fourteen-branch table over three named populations,
+  and it lives in :mod:`rushvarsel_verdicts` as pure functions. The SQL returns facts, Python
+  classifies and aggregates. That is one definition of "traff", unit-testable without BigQuery.
+* **Silence has three different meanings and the page keeps them apart.** ``venter`` is an outcome
+  still being retried, ``ukjent`` one that can no longer be established (or a day whose call volume
+  disqualifies it), and ``ikke vurdert`` an issue for which no notification round was ever recorded
+  — the gate was closed, or the day predates the round log. Folding any of them into a verdict
+  would manufacture skill out of missing data, in one direction or the other.
+
+**Nothing here is redacted, and that is a claim about the FORECAST fields only.** This page carries
+no traveller data: a rush forecast is one product-wide prognosis over a fixed 39-station geography,
+with no journey, route, device or departure behind it — the one way this surface is simpler than its
+two siblings. But ``togvarsel_rounds`` also holds five subscriber-derived counts
+(``matched_journeys``, ``matched_devices``, ``n_sent``, ``n_error``, ``n_gone``), which are
+day-grained readings of a subscriber population currently numbering a handful. Those are recorded
+for audit and **never served**: ``rushhistorikk_days.sql`` does not name them, which is
+``meldinger_decisions.sql``'s rule that a query which cannot name a column cannot leak it however
+the model above it drifts. ``test_rushhistorikk`` pins both halves.
+
+Note what gates this page, because the answer is "nothing, today": ``sso.PROTECTED_PREFIXES``
+carries both of its prefixes, but ``SSO_REQUIRED`` is ``"false"`` in every environment and no
+environment wires the OAuth client, so ``sso.required()`` returns False and the middleware
+short-circuits. With ``trafficType: public`` set once in the chart and inherited, the page and this
+API are readable by anyone on all three hosts. Same posture as /historikk and /meldinger; the
+registration is what makes turning the gate on a one-value change rather than a code change.
+
+Reads only. No import of main (the package rule): main injects the BigQuery client via
+:func:`configure`.
+"""
+
+from __future__ import annotations
+
+import logging
+import threading
+import time
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+import rushvarsel_verdicts as verdicts
+from deployment import environment_label
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger(__name__)
+
+# The page counts in Oslo days, because a rush is an Oslo-clock thing. rushvarsel_verdicts is
+# deliberately timezone-agnostic — it takes dates and a `today` — so the zone lives here.
+_OSLO = ZoneInfo("Europe/Oslo")
+
+# Read at import, not per request: a missing .sql becomes an import error that stops the app at
+# startup rather than a 500 on the first page load.
+_DAYS_QUERY = (Path(__file__).parent / "rushhistorikk_days.sql").read_text()
+
+# The three tables behind this change a few times a weekday (four issue rows, four round rows, three
+# outcome rows), so a short cache keeps a page refresh from costing a BigQuery query. Bounded
+# because the endpoint is public and unauthenticated — though far more tightly than /historikk's,
+# since the key space here is the four-value window allow-list rather than caller-chosen dates.
+_CACHE_TTL_S = 120
+_CACHE_MAX_ENTRIES = 16
+_cache_lock = threading.Lock()
+_cache: dict[tuple, tuple[float, Any]] = {}
+
+# The picker's four values, and the API's allow-list. An allow-list rather than a range check for
+# the reason `historikk._checked_operator` gives: the value lands in the response-cache key on a
+# public endpoint, so accepting arbitrary integers lets a caller mint one cache entry and one
+# BigQuery query per distinct value. Four values means four reachable keys.
+#
+# "All time" is a bounded 365 days. The tables are kilobytes, so the span costs nothing; the label
+# outlives its meaning once the product has more than a year of weekdays.
+WINDOW_DAYS: tuple[int, ...] = (7, 14, 30, 365)
+_DEFAULT_DAYS = 14
+
+# A blast-radius bound, not a pruning check — a too-narrow date bound reads as a CHEAPER query, so
+# cost can never detect it. The day query measured 305 bytes; this is orders of magnitude above any
+# reachable read and exists to catch a mistyped join, as meldinger's does.
+_MAX_BYTES_BILLED = 2 * 1024**3
+
+
+def _tznow() -> datetime:
+    """Now, in the Oslo day the page counts in. Wrapped so tests can pin it."""
+    return datetime.now(UTC)
+
+
+_bq_client: Any | None = None
+
+
+def configure(*, bq_client: Any) -> None:
+    """Wire in the BigQuery client. Called once from main.lifespan."""
+    global _bq_client
+    _bq_client = bq_client
+
+
+class ConfigResponse(BaseModel):
+    """What the page needs to describe itself, independent of the data."""
+
+    environment: str | None = Field(
+        description='Non-prod environment name ("dev", "tst") for the page to show in its title; '
+        "null in prd.",
+    )
+
+
+class IssueRow(BaseModel):
+    """One forecast issue: what it said, what we communicated, and how it turned out."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    issue: str = Field(description="Issue time, HHMM: 0630 | 0700 | 1200 | 1400.")
+    rush: str = Field(description="Which rush this issue is about: am | pm.")
+    forecast_level: str | None = Field(description="green | yellow | red, as forecast.")
+    p: float | None = Field(description="The calibrated probability behind that level.")
+    late: bool = Field(
+        description="Forecast computed more than 10 min after its cutoff, so it saw post-cutoff "
+        "reality. Excluded from Presisjon, kept in Dekning."
+    )
+    recorded: bool = Field(
+        description="A notification round was recorded for this issue. False means 'ikke vurdert': "
+        "the notify gate was closed, or the day predates the round log."
+    )
+    sent: bool = Field(
+        description="A push was ISSUED — the policy decision, not delivery. A round can match zero "
+        "devices and still be what the traveller would have received."
+    )
+    kind: str | None = Field(description="warning | update | all_clear when sent.")
+    reason: str | None = Field(
+        description="untimely | no_change | green_baseline when the round decided not to push."
+    )
+    baseline_level: str | None = Field(
+        description="For a follow-up, the level its baseline left in force — the level a confirming "
+        "follow-up is graded on, since that is what the traveller holds."
+    )
+    decided_at: datetime | None = Field(description="When the round was evaluated.")
+    actual_level: str | None = Field(
+        description="The realized level over THIS issue's own trained window (0630 -> 06:30-09:00, "
+        "0700 -> 07:00-09:00, 1200/1400 -> 15:00-18:00)."
+    )
+    actual_trouble10: float | None = Field(
+        description="The realized share behind that level: calls cancelled OR >= 10 min late, over "
+        "resolved calls."
+    )
+    provisional: bool = Field(
+        description="The realized value is the same-day reading and can still change overnight. "
+        "Excluded from the stats table."
+    )
+    verdict: str = Field(
+        description="traff | traff_nesten | falsk_alarm | bom | riktig_stille | venter | ukjent | "
+        "ikke_vurdert."
+    )
+    lead_min: float | None = Field(
+        description="Minutes from the push to the start of the rush it is about — positive when the "
+        "push preceded it. Near zero or negative for the morning issues by construction."
+    )
+    scored: bool = Field(
+        description="Whether this issue is in the population Presisjon and the confusion matrix are "
+        "computed over."
+    )
+
+
+class DayRow(BaseModel):
+    """One weekday: its four issues, and what the two rushes actually did."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    d: date = Field(description="The Oslo date.")
+    issues: list[IssueRow] = Field(description="The day's issues, 0630 first. Usually four.")
+    am_level: str | None = Field(description="Realized morning level over 06:30-09:00.")
+    am_trouble10: float | None = Field(description="The share behind it.")
+    amrest_level: str | None = Field(
+        description="Realized level over 07:00-09:00 — the 0700 issue's own window, shown so the "
+        "two morning figures cannot silently disagree."
+    )
+    pm_level: str | None = Field(description="Realized afternoon level over 15:00-18:00.")
+    pm_trouble10: float | None = Field(description="The share behind it.")
+    am_provisional_level: str | None = Field(description="What the page showed at 09:20, if it differs.")
+    pm_provisional_level: str | None = Field(description="What the page showed at 18:20, if it differs.")
+    eligible: bool | None = Field(
+        description="The training chain's day-level test (am and pm both above 300 calls). False "
+        "means the realized share means nothing and the day is not scored."
+    )
+
+
+class MatrixRow(BaseModel):
+    """One row of the 3x3: a forecast level against the three realized levels."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    forecast: str = Field(description="green | yellow | red, as forecast.")
+    green: int = Field(description="Count where the rush was green.")
+    yellow: int = Field(description="Count where the rush was yellow.")
+    red: int = Field(description="Count where the rush was red.")
+
+
+class StatsRow(BaseModel):
+    """One row of «Slik har varslene truffet»: the total, or one issue slot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    slot: str = Field(description='"total", or an issue time: 0630 | 0700 | 1200 | 1400.')
+    presisjon_samlet: float | None = Field(
+        description="traff over every scored verdict. Null on an empty denominator, never 0."
+    )
+    presisjon_varslet: float | None = Field(
+        description="traff + traff nesten over the scored issues where a warning was in force. "
+        "All-clear pushes are excluded: a friskmelding is not a warning."
+    )
+    dekning: float | None = Field(
+        description="Share of yellow-or-red rushes we had a warning in force for. Counted per RUSH "
+        "on the total row, because a confirming follow-up is covered only via its baseline."
+    )
+    varslingstid_min: float | None = Field(
+        description="Median minutes from the push to the rush's start. The last push per rush on "
+        "the total row."
+    )
+    varslingstid_n: int = Field(description="Pushes behind that median.")
+    avgjorelser: int = Field(description="Issues recorded in this row's window.")
+    n_scored: int = Field(description="Issues in the Presisjon population.")
+    n_venter: int = Field(description="Outcome not settled yet.")
+    n_ukjent: int = Field(description="Outcome unestablishable, or the day was ineligible.")
+    n_ikke_vurdert: int = Field(description="No notification round recorded.")
+    n_late: int = Field(description="Forecast issued after its own cutoff.")
+    n_untimely: int = Field(description="Round evaluated past its delivery deadline.")
+    matrix: list[MatrixRow] = Field(
+        description="Forecast level (rows) against realized level (columns), over scored issues."
+    )
+
+
+class DaysResponse(BaseModel):
+    """The page: one row per day, plus the stats table over the same population."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    days_window: int = Field(description="The window the caller asked for, in days.")
+    from_date: date = Field(description="First Oslo date included.")
+    days: list[DayRow] = Field(description="Newest first.")
+    stats: list[StatsRow] = Field(description="The total row first, then one per issue slot.")
+    recording_started: date | None = Field(
+        description="The earliest day a notification round was ever recorded. An 'ikke vurdert' "
+        "issue BEFORE this is the expected pre-launch backlog; one at or after it can only mean a "
+        "lost write or a closed gate."
+    )
+
+
+def _checked_days(days: int) -> int:
+    """Reject a window outside the picker's four values.
+
+    Not cosmetic validation: the value becomes part of the response-cache key, so accepting
+    arbitrary integers on a public endpoint lets a caller mint one cache entry and one BigQuery
+    query apiece. Same reasoning as historikk._checked_operator.
+    """
+    if days not in WINDOW_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"days must be one of {', '.join(str(d) for d in WINDOW_DAYS)}.",
+        )
+    return days
+
+
+def _query(sql: str, params: list, cache_key: tuple):
+    """Run a parameterised query behind the TTL cache. Rows are returned as a list."""
+    if _bq_client is None:
+        raise HTTPException(status_code=503, detail="Rush forecast log unavailable.")
+    now = time.monotonic()
+    with _cache_lock:
+        hit = _cache.get(cache_key)
+        if hit is not None and now - hit[0] < _CACHE_TTL_S:
+            return hit[1]
+    from google.cloud import bigquery
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=params, maximum_bytes_billed=_MAX_BYTES_BILLED
+    )
+    try:
+        rows = list(_bq_client.query(sql, job_config=job_config).result())
+    except Exception as exc:
+        # Most likely cause on a fresh environment: no rush has resolved yet, or the app has not
+        # started here since the tables were introduced. Say so rather than surfacing a traceback.
+        logger.warning("Rush forecast query failed", exc_info=True)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not read the rush forecast log; it may not have been written to yet.",
+        ) from exc
+    with _cache_lock:
+        for key in [k for k, (ts, _) in _cache.items() if now - ts >= _CACHE_TTL_S]:
+            _cache.pop(key, None)
+        if len(_cache) >= _CACHE_MAX_ENTRIES:
+            for key in sorted(_cache, key=lambda k: _cache[k][0])[: _CACHE_MAX_ENTRIES // 5]:
+                _cache.pop(key, None)
+        _cache[cache_key] = (now, rows)
+    return rows
+
+
+def _issue_from_row(row: Any, today: date) -> verdicts.Issue:
+    """One SQL row as the classifier's input.
+
+    The scope triple is picked per issue, not per rush: 0630 is scored against am (06:30-09:00) and
+    0700 against amrest (07:00-09:00), because that is the window each one's model was trained on.
+    Giving 0700 the whole morning would hand it thirty minutes that had already happened when it was
+    issued, and inflate its skill.
+    """
+    slot = str(row["issue"])
+    scope = verdicts.SCOPE_BY_SLOT[slot]
+    settled = bool(row[f"{scope}_settled"])
+    return verdicts.Issue(
+        d=row["d"],
+        issue=slot,
+        # The round's own level where there is one, the forecast otherwise: they agree by
+        # construction, but only the round record exists for an issue we evaluated.
+        level=row["round_level"] or row["forecast_level"],
+        late=bool(row["late"]),
+        recorded=bool(row["has_round"]),
+        sent=bool(row["sent"]),
+        kind=row["kind"],
+        reason=row["reason"],
+        baseline_level=row["baseline_level"],
+        decided_at=row["decided_at"],
+        eligible=row["eligible"],
+        outcome=verdicts.resolve_outcome_state(
+            settled=settled,
+            unresolvable=bool(row[f"{scope}_unresolvable"]),
+            d=row["d"],
+            today=today,
+        ),
+        actual=row[f"{scope}_level"] if settled else None,
+    )
+
+
+def _matrix_rows(matrix: dict[str, dict[str, int]]) -> list[MatrixRow]:
+    return [
+        MatrixRow(
+            forecast=level,
+            green=matrix[level]["green"],
+            yellow=matrix[level]["yellow"],
+            red=matrix[level]["red"],
+        )
+        for level in verdicts.LEVELS
+    ]
+
+
+def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
+    return [
+        StatsRow(
+            slot=row.slot,
+            presisjon_samlet=row.presisjon_samlet,
+            presisjon_varslet=row.presisjon_varslet,
+            dekning=row.dekning,
+            varslingstid_min=row.varslingstid_min,
+            varslingstid_n=row.varslingstid_n,
+            avgjorelser=row.avgjorelser,
+            n_scored=row.counts.n_scored,
+            n_venter=row.counts.n_venter,
+            n_ukjent=row.counts.n_ukjent + row.counts.n_ineligible,
+            n_ikke_vurdert=row.counts.n_ikke_vurdert,
+            n_late=row.counts.n_late,
+            n_untimely=row.counts.n_untimely,
+            matrix=_matrix_rows(row.matrix),
+        )
+        for row in stats.rows
+    ]
+
+
+router = APIRouter(prefix="/rushhistorikk-api", tags=["rushhistorikk"])
+
+
+@router.get("/config", summary="Which deployment is serving this page")
+def config() -> ConfigResponse:
+    """The environment name the page appends to its title, or null in prd.
+
+    Its own endpoint rather than a field on ``/days`` deliberately: that endpoint 503s when the log
+    cannot be read (no client, tables not written to yet), which is exactly when knowing whether you
+    are looking at dev or prd matters most. This one touches no BigQuery.
+    """
+    return ConfigResponse(environment=environment_label())
+
+
+@router.get("/days", summary="Rush forecasts by day, with the stats table over the same window")
+def days(
+    days: int = Query(
+        default=_DEFAULT_DAYS,
+        description="Window in days. One of 7, 14, 30 or 365 (365 is the page's 'all time').",
+    ),
+) -> DaysResponse:
+    """One row per day plus «Slik har varslene truffet», from one query.
+
+    Both come from the same rows on purpose: the population the rates describe is exactly the list
+    beside them, so the two cannot drift. /historikk splits its decisions and summary because its
+    decision log is large and its list is capped; neither holds here — four issue rows per weekday
+    means a year is about a thousand rows.
+    """
+    from google.cloud import bigquery
+
+    window = _checked_days(days)
+    today = _tznow().astimezone(_OSLO).date()
+    from_date = today - timedelta(days=window - 1)
+    rows = _query(
+        _DAYS_QUERY,
+        [bigquery.ScalarQueryParameter("from_date", "DATE", from_date)],
+        ("days", window, today),
+    )
+
+    issues = [_issue_from_row(row, today) for row in rows]
+    stats = verdicts.summarize(issues)
+
+    by_day: dict[date, list[tuple[Any, verdicts.Issue]]] = {}
+    day_facts: dict[date, Any] = {}
+    for row, issue in zip(rows, issues, strict=True):
+        by_day.setdefault(row["d"], []).append((row, issue))
+        day_facts[row["d"]] = row
+
+    day_rows: list[DayRow] = []
+    for d in sorted(by_day, reverse=True):
+        facts = day_facts[d]
+        day_rows.append(
+            DayRow(
+                d=d,
+                issues=[
+                    IssueRow(
+                        issue=issue.issue,
+                        rush=verdicts.RUSH_BY_SLOT[issue.issue],
+                        forecast_level=row["forecast_level"],
+                        p=row["p"],
+                        late=issue.late,
+                        recorded=issue.recorded,
+                        sent=issue.sent,
+                        kind=issue.kind,
+                        reason=issue.reason,
+                        baseline_level=issue.baseline_level,
+                        decided_at=issue.decided_at,
+                        actual_level=issue.actual,
+                        actual_trouble10=row[
+                            f"{verdicts.SCOPE_BY_SLOT[issue.issue]}_trouble10"
+                        ],
+                        provisional=not bool(
+                            row[f"{verdicts.SCOPE_BY_SLOT[issue.issue]}_settled"]
+                        )
+                        and row[f"{verdicts.SCOPE_BY_SLOT[issue.issue]}_level"] is not None,
+                        verdict=verdicts.classify(issue),
+                        lead_min=verdicts.lead_minutes(issue.issue, issue.decided_at)
+                        if issue.sent
+                        else None,
+                        scored=verdicts.population(issue) == verdicts.BUCKET_SCORED,
+                    )
+                    for row, issue in sorted(by_day[d], key=lambda pair: pair[1].issue)
+                ],
+                am_level=facts["am_level"],
+                am_trouble10=facts["am_trouble10"],
+                amrest_level=facts["amrest_level"],
+                pm_level=facts["pm_level"],
+                pm_trouble10=facts["pm_trouble10"],
+                am_provisional_level=facts["am_provisional_level"],
+                pm_provisional_level=facts["pm_provisional_level"],
+                eligible=facts["eligible"],
+            )
+        )
+
+    return DaysResponse(
+        days_window=window,
+        from_date=from_date,
+        days=day_rows,
+        stats=_stats_rows(stats),
+        recording_started=rows[0]["first_recorded_day"] if rows else None,
+    )
