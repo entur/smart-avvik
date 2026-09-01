@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useState } from 'react';
-import { PrimaryButton, SecondaryButton, TertiaryButton } from '@entur/button';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { NegativeButton, PrimaryButton, SecondaryButton, TertiaryButton } from '@entur/button';
 import { SmallAlertBox } from '@entur/alert';
+import { Modal } from '@entur/modal';
 import { Paragraph, SubParagraph } from '@entur/typography';
 import type { Brand } from '../brand';
 import type { Config } from '../api';
-import { deleteDevice, registerDevice, sendTestPush } from '../api';
+import { deleteAllData, deleteDevice, registerDevice, sendTestPush } from '../api';
 import { disablePush, enablePush, getExistingSubscription, isIOS, isPushSupported, isStandalone } from '../push';
+import { T6_SLETT_ALT } from '../personvern';
+import { runDeleteAll } from './deleteAllFlow';
 import { VarselkortNotis } from './PersonvernNotis';
 
 type State =
@@ -48,10 +51,18 @@ function ShareGlyph() {
 export default function VarselStatus({
   config,
   deviceId,
+  ensureDeviceId,
+  onDeletedAll,
   brand,
 }: {
   config: Config;
-  deviceId: string;
+  /** Null right after «Slett alt», and for a visitor who has never registered anything. */
+  deviceId: string | null;
+  /** Returns the stored device id, minting and persisting one if there is none. Turning push on
+   *  is a registration action, so it may mint; no background path may. */
+  ensureDeviceId: () => string;
+  /** Last step of «Slett alt»: App forgets the id and everything keyed to it. */
+  onDeletedAll: () => void;
   brand: Brand;
 }) {
   const [state, setState] = useState<State>(() => computeState(config));
@@ -59,6 +70,11 @@ export default function VarselStatus({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  // `loading` on an Entur button shows a spinner but does not disable it, so a double tap would
+  // otherwise start two teardowns racing each other. A ref, not the busy state: state updates are
+  // batched, and two taps in one tick would both read the stale value.
+  const deleting = useRef(false);
 
   // Reconcile the button state with the actual subscription (e.g. after reload, or if the user
   // granted permission earlier). Re-registering the device is cheap and keeps the server's copy
@@ -70,8 +86,10 @@ export default function VarselStatus({
       if (cancelled) return;
       setSubscribed(Boolean(sub));
       // Re-registering also refreshes the stored brand, so opening the app under a different
-      // ?brand= moves this device's notifications with it rather than stranding them.
-      if (sub) void registerDevice(deviceId, sub.toJSON(), brand.id).catch(() => undefined);
+      // ?brand= moves this device's notifications with it rather than stranding them. With no
+      // device id there is nothing to refresh — and minting one on this background path would
+      // recreate the record «Slett alt» just deleted.
+      if (sub && deviceId) void registerDevice(deviceId, sub.toJSON(), brand.id).catch(() => undefined);
     });
     return () => {
       cancelled = true;
@@ -84,7 +102,7 @@ export default function VarselStatus({
     setNotice(null);
     try {
       const subscription = await enablePush(config.vapid_public_key!);
-      await registerDevice(deviceId, subscription, brand.id);
+      await registerDevice(ensureDeviceId(), subscription, brand.id);
       setSubscribed(true);
       setState('granted');
       setNotice('Varsler er slått på.');
@@ -94,9 +112,10 @@ export default function VarselStatus({
     } finally {
       setBusy(false);
     }
-  }, [config, deviceId, brand]);
+  }, [config, ensureDeviceId, brand]);
 
   const test = useCallback(async () => {
+    if (!deviceId) return; // only reachable while subscribed, which implies an id
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -111,6 +130,7 @@ export default function VarselStatus({
   }, [deviceId]);
 
   const disable = useCallback(async () => {
+    if (!deviceId) return; // only reachable while subscribed, which implies an id
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -125,6 +145,33 @@ export default function VarselStatus({
       setBusy(false);
     }
   }, [deviceId]);
+
+  // Server first: see deleteAllFlow.ts. On failure nothing client-side has moved, so the stored
+  // id — the only handle on the data still held server-side — is intact for a retry.
+  const deleteEverything = useCallback(async () => {
+    if (!deviceId || deleting.current) return;
+    deleting.current = true;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    const outcome = await runDeleteAll({
+      deleteServerData: () => deleteAllData(deviceId),
+      hasPushSubscription: async () => Boolean(await getExistingSubscription()),
+      unsubscribePush: disablePush,
+      forgetDevice: () => {
+        setSubscribed(false);
+        setState('default');
+        onDeletedAll();
+      },
+    });
+    // Closed either way: an error belongs in the card, where it is readable and where tapping
+    // «Slett alt» again is the retry.
+    setConfirmDelete(false);
+    if (outcome.status === 'deleted') setNotice(T6_SLETT_ALT.doneNotice);
+    else setError(outcome.message);
+    setBusy(false);
+    deleting.current = false;
+  }, [deviceId, onDeletedAll]);
 
   return (
     <div className="av-card av-status">
@@ -224,6 +271,41 @@ export default function VarselStatus({
           {error}
         </SmallAlertBox>
       )}
+
+      {/* Withdrawal has to be as easy as consent, so this sits outside every `state === …` branch
+          — nested in the subscribed one it would be hidden from exactly the user who registered
+          journeys and never turned push on. It is gated only on there being an id: without one
+          nothing is stored, because a journey cannot exist without the id it is keyed to. */}
+      {deviceId && (
+        <div className="av-status-actions av-status-danger">
+          <TertiaryButton onClick={() => setConfirmDelete(true)} disabled={busy}>
+            {T6_SLETT_ALT.buttonText}
+          </TertiaryButton>
+        </div>
+      )}
+
+      {/* Renders through a portal (Linje's Modal wraps @reach/dialog), so sitting inside the card
+          costs it nothing in layout and keeps it next to the button that opens it. */}
+      <Modal
+        open={confirmDelete}
+        onDismiss={() => {
+          if (!busy) setConfirmDelete(false);
+        }}
+        size="medium"
+        title={T6_SLETT_ALT.dialogTitle}
+      >
+        <div className="av-form">
+          <Paragraph margin="none">{T6_SLETT_ALT.dialogBody}</Paragraph>
+          <div className="av-form-actions">
+            <SecondaryButton onClick={() => setConfirmDelete(false)} disabled={busy}>
+              {T6_SLETT_ALT.cancelText}
+            </SecondaryButton>
+            <NegativeButton onClick={deleteEverything} loading={busy} disabled={busy}>
+              {T6_SLETT_ALT.confirmText}
+            </NegativeButton>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

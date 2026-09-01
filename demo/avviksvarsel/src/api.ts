@@ -255,6 +255,16 @@ export function deleteDevice(deviceId: string): Promise<void> {
   return request(`/varsel-api/devices/${encodeURIComponent(deviceId)}`, { method: 'DELETE' });
 }
 
+// «Slett alt»: one atomic server-side deletion of everything keyed to this device — the device
+// record, every journey registered from it, and the notification-dedup entries belonging to those
+// journeys. Distinct from deleteDevice, which is «Skru av» and deliberately keeps the journeys.
+// Idempotent: an id the server does not know still answers 200, with journeys_deleted: 0.
+export function deleteAllData(
+  deviceId: string,
+): Promise<{ status: string; journeys_deleted: number }> {
+  return request(`/varsel-api/devices/${encodeURIComponent(deviceId)}/data`, { method: 'DELETE' });
+}
+
 export function sendTestPush(deviceId: string): Promise<{ status: string }> {
   return request('/varsel-api/test', jsonPost({ device_id: deviceId }));
 }

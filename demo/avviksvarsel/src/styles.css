@@ -113,6 +113,13 @@ body {
   margin-top: -0.75rem;
 }
 
+/* «Slett alt» is the last thing in the card and reads as a separate act from the push controls
+   above it — a rule rather than a colour, so the brand sheet recolours it with everything else. */
+.av-status-danger {
+  border-top: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  padding-top: 0.75rem;
+}
+
 /* ---- iOS "add to Home Screen" instructions ---- */
 
 .av-ios-steps {
