@@ -4,6 +4,13 @@
 export const WEEKDAY_SHORT = ['Man', 'Tir', 'Ons', 'Tor', 'Fre', 'Lør', 'Søn'];
 export const WEEKDAYS = [0, 1, 2, 3, 4, 5, 6];
 
+/** The two rush windows togvarsel forecasts, as the push bodies name them
+ *  (togvarsel_notify._RUSH_NAME) — capitalised here because the card starts a line with it. */
+export const RUSH_NAME: Record<string, string> = {
+  am: 'Morgenrushet',
+  pm: 'Ettermiddagsrushet',
+};
+
 const timeFmt = new Intl.DateTimeFormat('nb-NO', {
   timeZone: 'Europe/Oslo',
   hour: '2-digit',

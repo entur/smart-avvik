@@ -20,9 +20,12 @@ utenfor kodebasen.
 | A7 — avmerkevaret variant | T7 avsenderlinje, synlig i alle merkevarevarianter | `App.tsx` (bunntekst), og på `/togmelding` |
 
 Alle publiserte tekster har **én kilde**: `demo/avviksvarsel/src/personvern.ts`. Komponentene
-importerer derfra; ingen norsk streng er hardkodet i en komponent. `/togmelding` er ren, committet
-HTML uten byggesteg og kan ikke importere modulen — derfor er tekstene duplisert der og sikret med
-en paritetstest (`disruptions/api/test_personvern_texts.py`).
+importerer derfra; ingen norsk streng er hardkodet i en komponent. `/togmelding` kan ikke importere
+modulen — derfor er tekstene duplisert der (`demo/togmelding/src/personvern.ts`) og sikret med en
+paritetstest (`disruptions/api/test_personvern_texts.py`). *Grunnen* endret seg 2026-09-01, ikke
+ordningen: siden var ren, committet HTML uten byggesteg fram til da, og er nå en egen npm-app hvis
+Docker-steg bare kopierer sin egen katalog — så et relativt import inn i `../avviksvarsel/src/`
+ville løst seg lokalt og feilet i CI.
 
 **Samtykkeversjon ved lansering:** `2026-08-31.1`.
 

@@ -1,0 +1,250 @@
+/* App-level layout for Togmeldingen. Brand colours come from Entur Linje tokens (imported in
+   main.tsx); this file only adds phone-first layout and the three level accents, and it is
+   deliberately a near-copy of demo/avviksvarsel/src/styles.css so the two surfaces read as one
+   product. No hardcoded hex: the level colours are Linje's own validation tokens, which is what
+   keeps them in step with the SmallAlertBox variants used elsewhere on the page. */
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  /* Not a Linje token (the PWA carries the same one). Entur navy at low alpha. */
+  --tm-card-shadow: 0 1px 3px rgb(24 28 86 / 0.06);
+}
+
+body {
+  margin: 0;
+  background: var(--lavender-10);
+  color: var(--basecolors-text-accent, var(--lavender-90));
+  min-height: 100vh;
+}
+
+/* ---- header (Contrast band) ---- */
+
+.tm-header {
+  padding: env(safe-area-inset-top) 0 0;
+}
+
+.tm-header-inner {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.tm-header-title {
+  margin: 0;
+}
+
+/* ---- main ---- */
+
+.tm-main {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1.25rem 1.25rem calc(3rem + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.tm-intro {
+  margin: 0;
+}
+
+.tm-loading {
+  display: flex;
+  justify-content: center;
+  padding: 3rem 0;
+}
+
+.tm-muted {
+  margin: 0;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+.tm-skill {
+  margin: 0;
+}
+
+/* ---- cards ---- */
+
+.tm-card {
+  background: var(--basecolors-frame-default);
+  border: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  border-radius: var(--border-radiuses-large, 0.5rem);
+  padding: 1rem 1.125rem;
+  box-shadow: var(--tm-card-shadow);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* ---- one issued forecast ---- */
+
+/* The level rides on an accent bar plus a badge, both driven by --tm-level-*. The card body stays
+   white like every other card, because a tinted card behind a tinted badge reads as mud — and the
+   badge keeps DARK ink on a LIGHT tint at all three levels, which a filled swatch cannot: Linje's
+   canary (--shape-warning) is too light for white text and too light to darken without leaving
+   the palette. */
+/* An INSET shadow rather than a 6px border-left: a thick border against the card's 0.5rem
+   radius leaves a mitred wedge at both left corners, where an inset shadow follows the radius. */
+.tm-issue {
+  padding-left: 1.5rem;
+  box-shadow:
+    inset 6px 0 0 var(--tm-level-accent, var(--basecolors-stroke-subdued)),
+    var(--tm-card-shadow);
+}
+
+.tm-level-green {
+  --tm-level-accent: var(--stroke-success);
+  --tm-level-tint: var(--fill-success-muted);
+}
+
+.tm-level-yellow {
+  --tm-level-accent: var(--stroke-warning);
+  --tm-level-tint: var(--fill-warning-muted);
+}
+
+.tm-level-red {
+  --tm-level-accent: var(--stroke-negative);
+  --tm-level-tint: var(--fill-negative-muted);
+}
+
+/* No flex-wrap: the verdict wraps BESIDE the badge rather than dropping below it, so a long
+   level sentence ("stor fare for forstyrrelser (ca. 44 % …)") lines up with a short one. */
+.tm-issue-level {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.625rem;
+}
+
+.tm-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--font-sizes-small, 0.75rem);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--basecolors-text-accent, var(--lavender-90));
+  background: var(--tm-level-tint, var(--lavender-20));
+  border: 2px solid var(--tm-level-accent, var(--basecolors-stroke-subdued));
+  border-radius: 999px;
+  padding: 0.15rem 0.7rem;
+  white-space: nowrap;
+}
+
+.tm-issue-verdict {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.tm-reasons {
+  margin: 0;
+  padding-left: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+/* ---- known deviations ---- */
+
+.tm-kjente {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.tm-kjent {
+  padding: 0.625rem 0;
+  border-top: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.4rem;
+}
+
+.tm-kjent:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.tm-kjent-count {
+  flex-basis: 100%;
+}
+
+.tm-tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--font-sizes-small, 0.75rem);
+  font-weight: 600;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+  background: var(--basecolors-frame-subdued, var(--lavender-10));
+  border-radius: var(--border-radiuses-small, 0.25rem);
+  padding: 0.1rem 0.5rem;
+  white-space: nowrap;
+}
+
+/* ---- sender footer (T7) ---- */
+/* Outside .tm-main, so it keeps its own width and its own bottom safe-area padding — the same
+   shape as .av-footer in the PWA. */
+
+.tm-footer {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 0 1.25rem calc(2rem + env(safe-area-inset-bottom));
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* ---- feedback («Var denne prognosen nyttig?») ---- */
+
+.tm-feedback {
+  margin-top: 0.25rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.tm-feedback-question,
+.tm-feedback-help {
+  margin: 0;
+}
+
+.tm-feedback-question {
+  font-weight: 600;
+}
+
+.tm-feedback-ratings,
+.tm-feedback-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.tm-feedback-ratings button[aria-pressed='true'] {
+  box-shadow: inset 0 0 0 2px currentColor;
+}
+
+.tm-feedback-comment {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.tm-feedback-comment > :first-child {
+  width: 100%;
+}
+
+.tm-feedback-help {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}

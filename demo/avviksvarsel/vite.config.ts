@@ -28,6 +28,10 @@ export default defineConfig({
     proxy: {
       // Local dev: `uvicorn main:app` in disruptions/api serves the data + push endpoints.
       '/varsel-api': 'http://localhost:8000',
+      // The rush-outlook panel is served by the Togmelding API, not this app's own (the policy
+      // lives with the pushes it describes) — so dev needs the second prefix too, or the panel
+      // 404s locally and looks like a server that has nothing to say.
+      '/togmelding-api': 'http://localhost:8000',
     },
   },
 });

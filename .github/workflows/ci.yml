@@ -113,10 +113,11 @@ jobs:
     uses: entur/gha-docker/.github/workflows/build.yml@v1
     with:
       # Context is the repo root: the multi-stage Dockerfile builds the /demo,
-      # /varsel, /historikk and /meldinger front-ends from demo/reisedemo +
-      # demo/avviksvarsel + demo/varselhistorikk + demo/meldinger (outside the API
-      # dir), then assembles the API image from disruptions/api. All paths are
-      # relative to the repository root.
+      # /varsel, /historikk, /meldinger and /togmelding front-ends from
+      # demo/reisedemo + demo/avviksvarsel + demo/varselhistorikk +
+      # demo/meldinger + demo/togmelding (outside the API dir), then assembles the
+      # API image from disruptions/api. All paths are relative to the repository
+      # root.
       # Those builds run `tsc -b`, so a TypeScript error fails the image build —
       # there is no separate front-end job.
       context: .
