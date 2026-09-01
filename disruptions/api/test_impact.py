@@ -139,6 +139,88 @@ def test_to_stop_not_served_yields_no_cell():
     assert _cells(scope, to_stop=B) == []
 
 
+def test_a_call_the_traveller_may_not_alight_from_is_not_a_destination():
+    """The 2026-09-01 bug report: Vy's 16:23 Oslo S - Bergen CALLS Drammen, with alighting closed
+    for the whole local stretch. Matching on stop_order alone made it somebody's Oslo->Drammen train
+    and pushed its cancellation to five registered journeys who could never have been aboard."""
+    scope = _scope(S1=_train("f4", 16, 23, line="VYG:Line:F4", alighting_allowed=False))
+    assert _cells(scope, to_stop=B) == []
+
+
+def test_a_call_the_traveller_may_not_board_is_not_a_departure():
+    """The mirror restriction, which is just as real: R31/RE30 close boarding on part of their run
+    (417 mid-journey NO_BOARDING calls across three Vy lines on the day this was written)."""
+    board = FakeCall(jkey="j1", stop_place=A, stop_order=1, aimed_dep=_at(8), boarding_allowed=False)
+    alight = FakeCall(
+        jkey="j1", stop_place=B, stop_order=5, aimed_dep=None, aimed_arr=_at(8, 40)
+    )
+    assert _cells(_scope(S1=[board, alight])) == []
+    # ...and without a to_stop either: "can I get on here" does not depend on where I am going.
+    assert _cells(_scope(S1=[board, alight]), to_stop=None) == []
+
+
+def test_a_boarding_only_train_does_not_hide_a_usable_one_on_the_same_line():
+    """The eligibility-before-selection invariant again, now for the usability filter. The severe
+    train is boarding-only at the destination; the survivor must be the one the traveller can use,
+    not an empty line."""
+    scope = _scope(
+        S1=_train("closed", 8, 10, p_impact_dep=0.99, alighting_allowed=False)
+        + _train("usable", 8, 30, p_impact_dep=0.70)
+    )
+    cells = _cells(scope, to_stop=B, select="worst", at=None, start=_at(7), end=_at(9))
+    assert len(cells) == 1
+    assert cells[0].jkey == "usable"
+
+
+def test_an_unstated_boarding_activity_permits():
+    """Most operators leave both SIRI activities NULL on most calls, and the planned-call source
+    reads a NULL as permission. CallPred's defaults have to agree, or a feed that says nothing
+    silently stops every alert for that operator."""
+    call = impact.CallPred(
+        situation_number="S1", summary=None, description=None, jkey="j1", operator="VYG",
+        line="VYG:Line:R10", stop_place=A, stop_name=None, stop_order=1,
+        aimed_dep=_at(8), aimed_arr=None, et_declared_cancelled=False, et_dep_delay_min=None,
+        call_source="estimated", p_cancel=0.1, dep_delay_typ_min=None, dep_delay_p90_min=None,
+        arr_delay_typ_min=None, arr_delay_p90_min=None, p_arr_ge10=None, p_arr_ge20=None,
+        arr_delay_p50_stack_min=None, arr_delay_p90_stack_min=None, p_impact=None,
+        p_dep_ge10=None, p_dep_ge20=None, dep_delay_p50_stack_min=None,
+        dep_delay_p90_stack_min=None, p_impact_dep=0.9,
+    )
+    assert call.boarding_allowed and call.alighting_allowed
+
+
+def test_a_prediction_row_without_the_columns_still_permits():
+    """A serving table built before 2026-09-01 has neither column, and the app can outrun the
+    poller by a cycle. `_call_pred_from_row` must read that absence as permission -- reading it as
+    a restriction would take out all alerting for as long as the old table stood."""
+
+    class Row:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    # Every remaining column the mapper reads, all of them nullable and none of them the point here.
+    numbers = dict.fromkeys(
+        [
+            "summary", "description", "stop_name", "aimed_arr", "et_dep_delay_min",
+            "dep_delay_typ_min", "dep_delay_p90_min", "arr_delay_typ_min", "arr_delay_p90_min",
+            "p_arr_ge10", "p_arr_ge20", "arr_delay_p50_stack_min", "arr_delay_p90_stack_min",
+            "p_impact", "p_dep_ge10", "p_dep_ge20", "dep_delay_p50_stack_min",
+            "dep_delay_p90_stack_min",
+        ]
+    )
+    fields = {
+        "situationNumber": "S1", "jkey": "j1", "lineRef": "VYG:Line:R10", "stop_place": A,
+        "stop_order": 1, "aimed_dep": _at(8), "et_declared_cancelled": False,
+        "call_source": "estimated", "p_cancel": 0.1, "p_impact_dep": 0.9, **numbers,
+    }
+    before = main._call_pred_from_row(Row(**fields), "VYG")
+    assert before.boarding_allowed and before.alighting_allowed
+    after = main._call_pred_from_row(
+        Row(**fields, boarding_allowed=True, alighting_allowed=False), "VYG"
+    )
+    assert after.boarding_allowed and not after.alighting_allowed
+
+
 def test_a_severe_train_that_skips_to_stop_does_not_hide_a_less_severe_one_that_serves_it():
     """The eligibility-before-selection invariant, which _trip_cells says was got wrong twice.
 

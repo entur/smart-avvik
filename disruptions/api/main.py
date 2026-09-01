@@ -497,6 +497,11 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
         # the poller by one cycle. Both cases mean "an SX message named this call", which is what
         # the default says.
         has_situation=getattr(r, "has_situation", True),
+        # Same getattr rule, same rollout window: a prediction table built before 2026-09-01 has
+        # neither column, and "not stated" is permission. The matcher reads these to keep a
+        # boarding-only long-distance call from being offered as somebody's trip.
+        boarding_allowed=getattr(r, "boarding_allowed", None) is not False,
+        alighting_allowed=getattr(r, "alighting_allowed", None) is not False,
     )
 
 
@@ -667,26 +672,51 @@ def _varsel_stops() -> list[dict]:
 # MIN and MAX per side rather than a plain join on stop_order: a circular route calls at the same
 # stop twice, and "is there a boarding call before an alighting call" is then a question about the
 # earliest boarding and the latest alighting — with the mirror image for the other direction.
+#
+# A missing `boarding_allowed` column (a planned table the poller has not rebuilt since 2026-09-01)
+# makes this query error, which `_varsel_connectivity` already turns into "could not establish" —
+# no warning, registration proceeds. That is the right failure and it self-heals on the next
+# rebuild; the alternative, guessing the column away, would be a silent wrong answer.
 _VARSEL_CONNECTIVITY_QUERY = """
     WITH calls AS (
-        SELECT jkey, stop_place, stop_order FROM `disruptions.rail_calls_planned_today`
+        SELECT jkey, stop_place, stop_order, boarding_allowed, alighting_allowed
+        FROM `disruptions.rail_calls_planned_today`
         WHERE stop_place IN UNNEST(@from_refs) OR stop_place IN UNNEST(@to_refs)
         UNION ALL
-        SELECT jkey, stop_place, stop_order FROM `disruptions.bus_calls_planned_today`
+        SELECT jkey, stop_place, stop_order, boarding_allowed, alighting_allowed
+        FROM `disruptions.bus_calls_planned_today`
         WHERE stop_place IN UNNEST(@from_refs) OR stop_place IN UNNEST(@to_refs)
     ),
-    board AS (
-        SELECT jkey, MIN(stop_order) AS first_ord, MAX(stop_order) AS last_ord
-        FROM calls WHERE stop_place IN UNNEST(@from_refs) GROUP BY jkey
+    -- Boarding and alighting, not merely "calls here": a trip nobody may get on or off is not
+    -- service, and the question has to be asked in exactly the shape `impact._trip_cells` matches
+    -- in — otherwise the caveat and the alerting disagree, and a pair served only by boarding-only
+    -- long-distance trains is told service exists and then never hears about one of them.
+    --
+    -- FOUR CTEs, NOT TWO, because the two directions need opposite ends of the same restriction:
+    -- travelling to->from, the traveller BOARDS at the to-place and ALIGHTS at the from-place. One
+    -- pair of "calls at from" / "calls at to" sets filtered by one activity each would answer the
+    -- reverse direction with the forward direction's permissions.
+    board_from AS (
+        SELECT jkey, MIN(stop_order) AS ord
+        FROM calls WHERE stop_place IN UNNEST(@from_refs) AND boarding_allowed GROUP BY jkey
     ),
-    alight AS (
-        SELECT jkey, MIN(stop_order) AS first_ord, MAX(stop_order) AS last_ord
-        FROM calls WHERE stop_place IN UNNEST(@to_refs) GROUP BY jkey
+    alight_to AS (
+        SELECT jkey, MAX(stop_order) AS ord
+        FROM calls WHERE stop_place IN UNNEST(@to_refs) AND alighting_allowed GROUP BY jkey
+    ),
+    board_to AS (
+        SELECT jkey, MIN(stop_order) AS ord
+        FROM calls WHERE stop_place IN UNNEST(@to_refs) AND boarding_allowed GROUP BY jkey
+    ),
+    alight_from AS (
+        SELECT jkey, MAX(stop_order) AS ord
+        FROM calls WHERE stop_place IN UNNEST(@from_refs) AND alighting_allowed GROUP BY jkey
     )
     SELECT
-        COUNTIF(b.first_ord < a.last_ord) > 0 AS forward,
-        COUNTIF(a.first_ord < b.last_ord) > 0 AS reverse
-    FROM board AS b JOIN alight AS a USING (jkey)
+        (SELECT COUNT(*) FROM board_from AS b JOIN alight_to   AS a USING (jkey)
+          WHERE b.ord < a.ord) > 0 AS forward,
+        (SELECT COUNT(*) FROM board_to   AS b JOIN alight_from AS a USING (jkey)
+          WHERE b.ord < a.ord) > 0 AS reverse
 """
 # Answers are cached: the planned tables are rebuilt on their own TTL, so re-asking about the same
 # pair within a few minutes cannot change the verdict, and a client retrying a rejected registration
