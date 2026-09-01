@@ -2,11 +2,18 @@
 
 Four things nothing else in this repo detects, all of them silent failures:
 
-1. **Text parity.** `/togmelding` is a committed, self-contained vanilla-HTML page with no build
-   step, so it cannot import `demo/avviksvarsel/src/personvern.ts` — the single source of every
-   published privacy text. It therefore carries DUPLICATED copies of the sender line, the privacy
-   href and the experiment disclaimer, and the duplication is guarded rather than shared (KTD8).
-   The extraction below asserts every expected constant was actually found *before* it compares
+1. **Text parity.** `/togmelding` cannot import `demo/avviksvarsel/src/personvern.ts` — the single
+   source of every published privacy text. It therefore carries DUPLICATED copies of the sender
+   line, its link text, the privacy href and the experiment disclaimer, and the duplication is
+   guarded rather than shared (KTD8). The REASON changed on 2026-09-01 and the arrangement did not:
+   the page used to be a committed vanilla-HTML file with no build step, and is now its own npm app
+   (`demo/togmelding/`) whose Docker stage copies only its own directory — so a relative import
+   into `../avviksvarsel/src/` would resolve on a laptop and fail the image build, which is worse
+   than a duplicate. Both copies are now TypeScript modules, so this compares RESOLVED CONSTANTS
+   rather than searching markup for a substring: strictly tighter, since a text present but never
+   rendered no longer passes. What the markup search did carry is kept as its own check — that the
+   app actually renders each constant (see below).
+   The extraction asserts every expected constant was actually found *before* it compares
    anything: a regex over a TypeScript export breaks the day somebody reformats the file or moves
    to a template literal, and a guard that then iterates zero extracted strings passes vacuously.
    This repo has already paid for a suite that silently never ran.
@@ -29,7 +36,11 @@ Four things nothing else in this repo detects, all of them silent failures:
    here — and pinned EXPLICITLY, because "eu wherever set" would stay green while a deleted Gemini
    pin quietly moved processing to `global`.
 
-4. **Bracket guard.** No bracketed placeholder text (`[…]`) may reach the static page.
+4. **Bracket guard.** No bracketed placeholder text (`[…]`) may reach a published string. Applied
+   to the resolved constants rather than to a slice of markup — the old page's JS was full of
+   legitimate brackets, so the guard read the hand-written region between `<body>` and the first
+   `<script>`; in a JSX app there is no such region, and the constants are where a placeholder
+   from the plan's appendix would actually survive.
 
 Reads files only: no FastAPI, no BigQuery, no network, no new dependencies.
 
@@ -42,16 +53,24 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[2]
 
 PERSONVERN_TS = _REPO / "demo" / "avviksvarsel" / "src" / "personvern.ts"
-TOGMELDING_HTML = _REPO / "disruptions" / "api" / "togmelding_static" / "index.html"
+# /togmelding's own copy, and the app sources that have to render it. togmelding_static/ is a build
+# output now (gitignored, minified, absent in a fresh checkout), so nothing here may read it.
+TOGMELDING_TS = _REPO / "demo" / "togmelding" / "src" / "personvern.ts"
+TOGMELDING_SRC = _REPO / "demo" / "togmelding" / "src"
 VARSEL_INDEX_HTML = _REPO / "demo" / "avviksvarsel" / "index.html"
 PERSONVERN_INDEX_HTML = _REPO / "demo" / "avviksvarsel" / "personvern" / "index.html"
 MAIN_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "main.tsx"
 PERSONVERN_PAGE_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "personvern-page.tsx"
 HELM_ENV_DIR = _REPO / "helm" / "kix-avvik" / "env"
 
-# The constants /togmelding duplicates. Named here so a rename in personvern.ts fails loudly
+# The constants /togmelding duplicates. Named here so a rename on either side fails loudly
 # instead of dropping a text out of the guard.
-_SHARED_CONSTANTS = ("TOGMELDING_SENDER_LINE", "TOGMELDING_PERSONVERN_HREF", "TOGMELDING_DISCLAIMER")
+_SHARED_CONSTANTS = (
+    "TOGMELDING_SENDER_LINE",
+    "TOGMELDING_PERSONVERN_LINK_TEXT",
+    "TOGMELDING_PERSONVERN_HREF",
+    "TOGMELDING_DISCLAIMER",
+)
 
 
 class ExtractionError(AssertionError):
@@ -184,22 +203,30 @@ def _resolve(expr: str, source: str, depth: int = 0) -> str:
     return _resolve(value, source, depth + 1)
 
 
-def _shared_texts() -> dict[str, str]:
+def _shared_texts(path: Path = PERSONVERN_TS) -> dict[str, str]:
     """Every published string /togmelding duplicates, keyed by a label used in failure messages.
+
+    Takes the module path so ONE extractor reads both copies — the /varsel source of truth and
+    /togmelding's duplicate. A second, differently-written reader would be a third place for the
+    vocabulary to drift.
 
     Fails loudly if ANY expected constant is missing or unparseable — the whole point: a guard
     that iterates an empty dict is a guard that has been switched off without anybody noticing.
     """
-    source = PERSONVERN_TS.read_text(encoding="utf-8")
+    source = path.read_text(encoding="utf-8")
     missing = [name for name in _SHARED_CONSTANTS if f"const {name}" not in source]
     if missing:
         raise ExtractionError(
-            f"{PERSONVERN_TS.name} no longer declares {', '.join(missing)}. These are the strings "
-            "the committed /togmelding page duplicates (it has no build step and cannot import "
-            "the module), so losing them silently unguards the duplication."
+            f"{path.relative_to(_REPO)} no longer declares {', '.join(missing)}. These are the "
+            "strings /togmelding duplicates (its own npm app, whose Docker stage copies only its "
+            "own directory, so it cannot import the /varsel module), so losing them silently "
+            "unguards the duplication."
         )
     texts = {
         "TOGMELDING_SENDER_LINE": _resolve(_declaration(source, "TOGMELDING_SENDER_LINE"), source),
+        "TOGMELDING_PERSONVERN_LINK_TEXT": _resolve(
+            _declaration(source, "TOGMELDING_PERSONVERN_LINK_TEXT"), source
+        ),
         "TOGMELDING_PERSONVERN_HREF": _resolve(
             _declaration(source, "TOGMELDING_PERSONVERN_HREF"), source
         ),
@@ -219,19 +246,24 @@ def _shared_texts() -> dict[str, str]:
     return texts
 
 
-def _normalized(html: str) -> str:
-    """Collapse whitespace runs so markup may wrap freely without defeating a `contains` check."""
-    return re.sub(r"\s+", " ", html)
+def _togmelding_sources() -> str:
+    """Every TypeScript source of the /togmelding app, concatenated.
 
-
-def _static_markup(html: str) -> str:
-    """The hand-written markup between `<body>` and the page's inline script.
-
-    The page's JS is full of legitimate `[`/`]` (array literals, indexing); the published texts
-    live in this region, and the bracket guard applies to them.
+    Used to assert the app RENDERS what its text module declares. Reads the sources and never
+    `togmelding_static/`: that is a Vite output now — gitignored, minified, and absent in a fresh
+    checkout, so a guard pointed at it would pass vacuously on any machine that has not built the
+    app. Refuses an empty read for the usual reason.
     """
-    body = html.index("<body>")
-    return html[body : html.index("<script>", body)]
+    sources = sorted(
+        path for path in TOGMELDING_SRC.rglob("*") if path.suffix in (".ts", ".tsx")
+    )
+    if len(sources) < 4:
+        raise ExtractionError(
+            f"found only {len(sources)} TypeScript sources under "
+            f"{TOGMELDING_SRC.relative_to(_REPO)} — the app has more than that, so this is a bad "
+            "path or a moved app, not a real list."
+        )
+    return "\n".join(path.read_text(encoding="utf-8") for path in sources)
 
 
 def _entur_style_imports(path: Path) -> list[str]:
@@ -269,54 +301,90 @@ def _brand_script(path: Path) -> str:
 
 
 def test_the_shared_text_extraction_finds_every_expected_constant():
-    """The guard on the guard: extraction failure must be an error, never a vacuous pass."""
-    texts = _shared_texts()
-    assert set(texts) == {
-        "TOGMELDING_SENDER_LINE",
-        "TOGMELDING_PERSONVERN_HREF",
-        "TOGMELDING_DISCLAIMER.title",
-        "TOGMELDING_DISCLAIMER.body",
-    }
-    assert texts["TOGMELDING_PERSONVERN_HREF"].startswith("/"), (
-        "TOGMELDING_PERSONVERN_HREF must resolve to a path; got "
-        f"{texts['TOGMELDING_PERSONVERN_HREF']!r}"
-    )
+    """The guard on the guard: extraction failure must be an error, never a vacuous pass.
 
-
-def test_the_togmelding_page_carries_the_shared_privacy_texts_verbatim():
-    """KTD8: /togmelding duplicates these strings because it cannot import the module."""
-    texts = _shared_texts()
-    page = _normalized(TOGMELDING_HTML.read_text(encoding="utf-8"))
-    for label, value in texts.items():
-        if label == "TOGMELDING_PERSONVERN_HREF":
-            continue
-        assert _normalized(value) in page, (
-            f"{TOGMELDING_HTML.name} does not contain {label} from {PERSONVERN_TS.name}:\n"
-            f"  {value!r}\n"
-            "The two copies must match verbatim — /togmelding has no build step and cannot import "
-            "the text module, so this test is the only thing keeping them in step (KTD8)."
+    Run over BOTH modules, because either one going unparseable unguards the duplication.
+    """
+    for path in (PERSONVERN_TS, TOGMELDING_TS):
+        texts = _shared_texts(path)
+        assert set(texts) == {
+            "TOGMELDING_SENDER_LINE",
+            "TOGMELDING_PERSONVERN_LINK_TEXT",
+            "TOGMELDING_PERSONVERN_HREF",
+            "TOGMELDING_DISCLAIMER.title",
+            "TOGMELDING_DISCLAIMER.body",
+        }, path
+        assert texts["TOGMELDING_PERSONVERN_HREF"].startswith("/"), (
+            f"TOGMELDING_PERSONVERN_HREF in {path.relative_to(_REPO)} must resolve to a path; got "
+            f"{texts['TOGMELDING_PERSONVERN_HREF']!r}"
         )
 
 
-def test_the_togmelding_page_links_to_the_privacy_page():
+def test_the_togmelding_app_duplicates_the_shared_privacy_texts_verbatim():
+    """KTD8: /togmelding duplicates these strings because it cannot import the module.
+
+    Its own npm app since 2026-09-01, and the image's node stage copies only `demo/togmelding/`
+    into the build — so a relative import into `../avviksvarsel/src/` would resolve on a laptop and
+    fail in CI. Same duplication as when the page was vanilla HTML, and this is still the only
+    thing keeping the two copies in step.
+    """
+    source = _shared_texts(PERSONVERN_TS)
+    copy = _shared_texts(TOGMELDING_TS)
+    for label, value in source.items():
+        assert copy[label] == value, (
+            f"{TOGMELDING_TS.relative_to(_REPO)} disagrees with {PERSONVERN_TS.relative_to(_REPO)} "
+            f"on {label}:\n"
+            f"  /varsel:     {value!r}\n"
+            f"  /togmelding: {copy[label]!r}\n"
+            "Edit both, or neither (KTD8)."
+        )
+
+
+def test_the_togmelding_app_renders_every_text_it_declares():
+    """A declared-but-unrendered text would pass the parity check above and ship nothing.
+
+    That risk is new: the old guard searched the page's markup, so presence in the file WAS
+    presence on the page. Two TypeScript modules can agree perfectly while the app renders
+    neither, so the constants are checked for actually being referenced.
+    """
+    rendered = _togmelding_sources()
+    for name in _SHARED_CONSTANTS:
+        uses = rendered.count(name)
+        assert uses >= 2, (
+            f"{name} is declared in {TOGMELDING_TS.relative_to(_REPO)} but referenced "
+            f"{uses - 1} time(s) elsewhere in {TOGMELDING_SRC.relative_to(_REPO)} — a published "
+            "privacy text that nothing renders is the failure this guard exists for."
+        )
+
+
+def test_the_togmelding_app_links_to_the_privacy_page():
     """R11: the same sender/privacy footer as /varsel, pointing at the canonical path."""
-    href = _shared_texts()["TOGMELDING_PERSONVERN_HREF"]
-    page = _normalized(TOGMELDING_HTML.read_text(encoding="utf-8"))
-    assert f'href="{href}"' in page, (
-        f"{TOGMELDING_HTML.name} has no link to {href} (TOGMELDING_PERSONVERN_HREF in "
-        f"{PERSONVERN_TS.name}). The footer's «Slik behandler vi opplysningene» link is how a "
-        "/togmelding visitor reaches the privacy page at all."
+    href = _shared_texts(TOGMELDING_TS)["TOGMELDING_PERSONVERN_HREF"]
+    assert href == _shared_texts(PERSONVERN_TS)["TOGMELDING_PERSONVERN_HREF"]
+    rendered = _togmelding_sources()
+    assert "href={TOGMELDING_PERSONVERN_HREF}" in rendered, (
+        f"nothing in {TOGMELDING_SRC.relative_to(_REPO)} links to {href} via "
+        "TOGMELDING_PERSONVERN_HREF. The footer's «Slik behandler vi opplysningene» link is how a "
+        "/togmelding visitor reaches the privacy page at all — and a literal path written out "
+        "instead of the constant would drift out from under the parity guard above."
     )
 
 
 def test_the_togmelding_privacy_texts_carry_no_placeholder_brackets():
-    """Acceptance criterion: no bracketed placeholder text reaches production."""
-    markup = _static_markup(TOGMELDING_HTML.read_text(encoding="utf-8"))
-    for bracket in "[]":
-        assert bracket not in markup, (
-            f"{TOGMELDING_HTML.name}'s static markup contains {bracket!r} — an unresolved "
-            "placeholder from the plan's appendix must never ship."
-        )
+    """Acceptance criterion: no bracketed placeholder text reaches production.
+
+    Applied to the resolved constants, not to a slice of markup: the vanilla page's JS was full of
+    legitimate brackets, so the old guard read only the hand-written region before the first
+    `<script>`. A JSX app has no such region — and the constants are where an unresolved appendix
+    placeholder would actually survive, on both sides of the duplication.
+    """
+    for path in (PERSONVERN_TS, TOGMELDING_TS):
+        for label, value in _shared_texts(path).items():
+            for bracket in "[]":
+                assert bracket not in value, (
+                    f"{label} in {path.relative_to(_REPO)} contains {bracket!r} — an unresolved "
+                    "placeholder from the plan's appendix must never ship."
+                )
 
 
 def test_the_privacy_page_repeats_the_brand_script_byte_for_byte():

@@ -1359,9 +1359,10 @@ else:
         "(run demo/varselhistorikk/build.sh)"
     )
 
-# The Togmelding page — a single hand-written HTML file, COMMITTED (like eval_static, unlike the
-# built front-ends): no build step, no framework, it just renders /togmelding-api/today. Mounted
-# only when present, same pattern as the mounts above.
+# The Togmelding page (demo/togmelding) — the rush-hour forecast, rendered from
+# /togmelding-api/today. Same generated-directory pattern as the mounts above: it was a single
+# COMMITTED hand-written HTML file until 2026-09-01, when it moved onto Entur Linje to match
+# /varsel — which means npm packages, and therefore a Vite bundle built in the image.
 _TOGMELDING_STATIC_DIR = Path(__file__).parent / "togmelding_static"
 if _TOGMELDING_STATIC_DIR.is_dir():
     app.mount(
@@ -1371,7 +1372,10 @@ if _TOGMELDING_STATIC_DIR.is_dir():
     )
     logger.info("Mounted togmelding page at /togmelding from %s", _TOGMELDING_STATIC_DIR)
 else:
-    logger.info("No togmelding_static/ directory; /togmelding not mounted")
+    logger.info(
+        "No togmelding_static/ directory; /togmelding not mounted "
+        "(run demo/togmelding/build.sh)"
+    )
 
 # The Meldinger UI (demo/meldinger) — the same decisions, replayed through today's prompt.
 # Same generated-directory pattern as the mounts above; its data comes from /meldinger-api, which
