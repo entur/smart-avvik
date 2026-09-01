@@ -19,7 +19,6 @@ function recorder(overrides = {}) {
     deleteServerData: async () => {
       calls.push('server');
     },
-    hasPushSubscription: async () => true,
     unsubscribePush: async () => {
       calls.push('unsubscribe');
     },
@@ -60,28 +59,20 @@ test('a non-Error rejection still yields a showable message', async () => {
   assert.deepEqual(await runDeleteAll(steps), { status: 'failed', message: 'boom' });
 });
 
-test('with no subscription the teardown skips unsubscribe and still forgets the device', async () => {
-  // The push-disabled deployment, and the user who never turned notifications on: both must be
-  // able to delete their journeys.
-  const { calls, steps } = recorder({ hasPushSubscription: async () => false });
+test('an unsubscribe with nothing to unsubscribe still forgets the device', async () => {
+  // The push-disabled deployment, and the user who never turned notifications on: `disablePush`
+  // looks for a subscription, finds none and returns quietly. Both must still delete.
+  const { calls, steps } = recorder({ unsubscribePush: async () => {} });
   assert.deepEqual(await runDeleteAll(steps), { status: 'deleted' });
   assert.deepEqual(calls, ['server', 'forget']);
 });
 
 test('a failing unsubscribe is tolerated — the data is already gone server-side', async () => {
+  // Covers a failing subscription lookup too: `disablePush` does that lookup itself, so both
+  // surface here as a rejected unsubscribe.
   const { calls, steps } = recorder({
     unsubscribePush: async () => {
       throw new Error('unsubscribe failed');
-    },
-  });
-  assert.deepEqual(await runDeleteAll(steps), { status: 'deleted' });
-  assert.deepEqual(calls, ['server', 'forget']);
-});
-
-test('a failing subscription probe does not strand the deletion either', async () => {
-  const { calls, steps } = recorder({
-    hasPushSubscription: async () => {
-      throw new Error('no service worker');
     },
   });
   assert.deepEqual(await runDeleteAll(steps), { status: 'deleted' });
