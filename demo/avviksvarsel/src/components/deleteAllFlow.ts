@@ -25,7 +25,43 @@ export interface DeleteAllSteps {
 
 export type DeleteAllOutcome = { status: 'deleted' } | { status: 'failed'; message: string };
 
-export async function runDeleteAll(steps: DeleteAllSteps): Promise<DeleteAllOutcome> {
+/**
+ * The window during which no background path may write to the server.
+ *
+ * VarselStatus's subscription-reconciliation effect is a plain `useEffect`, not one of the
+ * busy-gated button handlers, so nothing in «Slett alt» would otherwise suspend it: its
+ * `getExistingSubscription()` promise can already be in flight when the user confirms, and when it
+ * resolves it calls `registerDevice`. The server's upsert has no tombstone, so that recreates the
+ * device record — with a live push subscription — seconds after the dialog said «Alt er slettet»,
+ * and invisibly: the call's rejection is swallowed, and the DELETE it undid genuinely succeeded.
+ *
+ * The flow owns the window rather than the component so that "closed before the first await, and
+ * reopened only once every step has settled" is a tested property (test/deleteAllFlow.test.mjs)
+ * instead of a hand-maintained pair of assignments. Shaped `{ current }` so the component passes
+ * the `useRef(false)` it already keeps for its double-submit guard straight in — one flag, so the
+ * two can never disagree about whether a teardown is running.
+ */
+export interface DeleteAllGate {
+  current: boolean;
+}
+
+export async function runDeleteAll(
+  steps: DeleteAllSteps,
+  gate?: DeleteAllGate,
+): Promise<DeleteAllOutcome> {
+  // Synchronously, before the first await: the reconciliation effect's `.then` callback is a
+  // microtask, so a gate closed one tick later is a gate that was open when it mattered.
+  if (gate) gate.current = true;
+  try {
+    return await teardown(steps);
+  } finally {
+    // `finally`, so a throwing `forgetDevice` (localStorage.removeItem, which a locked-down
+    // profile can refuse) cannot leave reconciliation suspended for the rest of the session.
+    if (gate) gate.current = false;
+  }
+}
+
+async function teardown(steps: DeleteAllSteps): Promise<DeleteAllOutcome> {
   try {
     await steps.deleteServerData();
   } catch (e) {

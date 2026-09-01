@@ -9,6 +9,7 @@ import { deleteAllData, deleteDevice, registerDevice, sendTestPush } from '../ap
 import { disablePush, enablePush, getExistingSubscription, isIOS, isPushSupported, isStandalone } from '../push';
 import { T6_SLETT_ALT } from '../personvern';
 import { runDeleteAll } from './deleteAllFlow';
+import { isStoredDeviceId } from './deviceIdentity';
 import { VarselkortNotis } from './PersonvernNotis';
 
 type State =
@@ -74,6 +75,10 @@ export default function VarselStatus({
   // `loading` on an Entur button shows a spinner but does not disable it, so a double tap would
   // otherwise start two teardowns racing each other. A ref, not the busy state: state updates are
   // batched, and two taps in one tick would both read the stale value.
+  //
+  // It doubles as `runDeleteAll`'s suspension gate (`DeleteAllGate` is `{ current: boolean }` for
+  // exactly this): the flow closes it synchronously and reopens it in a `finally`, so "a teardown
+  // is running" is one flag rather than two that can disagree.
   const deleting = useRef(false);
 
   // Reconcile the button state with the actual subscription (e.g. after reload, or if the user
@@ -84,12 +89,24 @@ export default function VarselStatus({
     let cancelled = false;
     getExistingSubscription().then((sub) => {
       if (cancelled) return;
+      // This is a background effect, not one of the busy-gated handlers, so «Slett alt» has to
+      // suspend it explicitly: the lookup above can already be in flight when the user confirms,
+      // and the server's device upsert has no tombstone — a write landing here would recreate the
+      // record, with a live push subscription, seconds after the dialog said «Alt er slettet».
+      if (deleting.current) return;
       setSubscribed(Boolean(sub));
       // Re-registering also refreshes the stored brand, so opening the app under a different
       // ?brand= moves this device's notifications with it rather than stranding them. With no
       // device id there is nothing to refresh — and minting one on this background path would
       // recreate the record «Slett alt» just deleted.
-      if (sub && deviceId) void registerDevice(deviceId, sub.toJSON(), brand.id).catch(() => undefined);
+      //
+      // The second guard closes the sliver the first cannot: the lookup can also resolve just
+      // *after* the teardown settles, while this closure still holds the deleted id and React has
+      // not yet re-rendered with the null one. `isStoredDeviceId` reads storage, which «Slett
+      // alt» clears synchronously, so it is already false there.
+      if (sub && isStoredDeviceId(deviceId, localStorage)) {
+        void registerDevice(deviceId, sub.toJSON(), brand.id).catch(() => undefined);
+      }
     });
     return () => {
       cancelled = true;
@@ -148,28 +165,45 @@ export default function VarselStatus({
 
   // Server first: see deleteAllFlow.ts. On failure nothing client-side has moved, so the stored
   // id — the only handle on the data still held server-side — is intact for a retry.
+  //
+  // The same try/catch/finally shape as `enable`/`test`/`disable`, and for a sharper reason than
+  // symmetry: the last step reaches `localStorage.removeItem`, which a locked-down profile can
+  // refuse. Without the `finally`, that throw skipped `setBusy(false)` and left the confirm modal
+  // open, undismissable (its dismiss is gated on not-busy) and unretryable for the session — after
+  // the server-side deletion had already succeeded. `deleting.current` is released by
+  // `runDeleteAll`'s own `finally`, so it survives the same throw.
   const deleteEverything = useCallback(async () => {
     if (!deviceId || deleting.current) return;
-    deleting.current = true;
     setBusy(true);
     setError(null);
     setNotice(null);
-    const outcome = await runDeleteAll({
-      deleteServerData: () => deleteAllData(deviceId),
-      unsubscribePush: disablePush,
-      forgetDevice: () => {
-        setSubscribed(false);
-        setState('default');
-        onDeletedAll();
-      },
-    });
-    // Closed either way: an error belongs in the card, where it is readable and where tapping
-    // «Slett alt» again is the retry.
-    setConfirmDelete(false);
-    if (outcome.status === 'deleted') setNotice(T6_SLETT_ALT.doneNotice);
-    else setError(outcome.message);
-    setBusy(false);
-    deleting.current = false;
+    try {
+      const outcome = await runDeleteAll(
+        {
+          deleteServerData: () => deleteAllData(deviceId),
+          unsubscribePush: disablePush,
+          forgetDevice: () => {
+            setSubscribed(false);
+            setState('default');
+            onDeletedAll();
+          },
+        },
+        // Closes the window in which the subscription-reconciliation effect could re-register
+        // this device. Set synchronously inside the call, before the first await.
+        deleting,
+      );
+      if (outcome.status === 'deleted') setNotice(T6_SLETT_ALT.doneNotice);
+      else setError(outcome.message);
+    } catch (e) {
+      // Only reachable from `forgetDevice`: everything before it is handled inside the flow. The
+      // server data is gone at this point, so this reports rather than offers a retry.
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      // Closed either way: an error belongs in the card, where it is readable and where tapping
+      // «Slett alt» again is the retry.
+      setConfirmDelete(false);
+      setBusy(false);
+    }
   }, [deviceId, onDeletedAll]);
 
   return (
