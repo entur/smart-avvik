@@ -15,11 +15,28 @@ import {
   personvernUrl,
 } from '../src/personvern.ts';
 
-// Registration-visible texts are hash-pinned (sha256 hex of REGISTRATION_TEXTS
-// joined with '\n', first 8 chars). Editing any of those texts must update BOTH
-// this pin AND CONSENT_TEXT_VERSION in src/personvern.ts — the same derived-version
-// reasoning as disruptions/api/llm_message.py's PROMPT_VERSION.
-const PINNED_REGISTRATION_TEXTS_HASH = 'b3186ab7';
+// THE CONSENT PIN. One block, two values, and they are deliberately not
+// independent: the digest is sha256[:8] over CONSENT_TEXT_VERSION *followed by*
+// every entry of REGISTRATION_TEXTS, joined with '\n'. So editing a
+// registration-visible text breaks the digest, and bumping the version breaks
+// it too — neither can move on its own, and the only place that compiles again
+// is right here, where the version literal sits next to the hash.
+//
+// What it cannot do is prove the editor bumped rather than merely re-pinned;
+// nothing local can. What it does is put that choice in front of them, in one
+// block, with the reason attached — the same derived-version reasoning as
+// disruptions/api/llm_message.py's PROMPT_VERSION.
+const PINNED_CONSENT = {
+  version: '2026-08-31.1',
+  hash: '0d049fa7',
+};
+
+/** sha256[:8] of the exact corpus a registering user consents to, version included. */
+const consentDigest = () =>
+  createHash('sha256')
+    .update([CONSENT_TEXT_VERSION, ...REGISTRATION_TEXTS].join('\n'), 'utf8')
+    .digest('hex')
+    .slice(0, 8);
 
 const collectStrings = (value, out = []) => {
   if (typeof value === 'string') {
@@ -97,6 +114,26 @@ test('T6 dialog stays enumerative: it names the three things «Slett alt» delet
       `the T6 dialog body must name '${named}' — the enumeration is what keeps «Alt er slettet» true`,
     );
   }
+  // Inclusion alone is only half the guard (T4 above already pairs the two). An enumeration is
+  // kept honest at BOTH ends: «Slett alt» reaches the journeys, the varselabonnement and the
+  // technical key, and nothing else. The operational logs, the BigQuery decision log and any
+  // feedback already sent all SURVIVE it — see the survival table in
+  // docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md §3 — so a dialog
+  // that grew a reassuring extra noun would promise an erasure the endpoint does not perform.
+  const survives = {
+    logg: 'the operational logs (push sends, the deletion receipt) and the BigQuery decision log',
+    tilbakemelding: 'feedback already sent (PostHog, and the BigQuery contexts)',
+    beslutning: 'the BigQuery decision log, which is keyed on the journey definition',
+  };
+  const body = T6_SLETT_ALT.dialogBody.toLowerCase();
+  for (const [word, what] of Object.entries(survives)) {
+    assert.ok(
+      !body.includes(word),
+      `the T6 dialog body mentions '${word}', but «Slett alt» does not erase ${what}. ` +
+        'The dialog may only claim what the endpoint actually deletes — journeys, the ' +
+        'varselabonnement, the technical key — or «Alt er slettet» becomes a false promise.',
+    );
+  }
 });
 
 test('personvernUrl preserves the brand across navigation', () => {
@@ -106,15 +143,24 @@ test('personvernUrl preserves the brand across navigation', () => {
 
 test('editing a registration-visible text requires bumping CONSENT_TEXT_VERSION and this pin', () => {
   assert.ok(Array.isArray(REGISTRATION_TEXTS) && REGISTRATION_TEXTS.length > 0);
-  const digest = createHash('sha256')
-    .update(REGISTRATION_TEXTS.join('\n'), 'utf8')
-    .digest('hex')
-    .slice(0, 8);
+  // Both halves are asserted. Pinning only the digest let a text edit go green on a re-pinned
+  // hash alone, leaving two materially different wordings stamped with one version — exactly
+  // what the version exists to prevent.
+  assert.equal(
+    CONSENT_TEXT_VERSION,
+    PINNED_CONSENT.version,
+    `CONSENT_TEXT_VERSION is '${CONSENT_TEXT_VERSION}', pinned '${PINNED_CONSENT.version}'. ` +
+      'A version bump is intended whenever a registration-visible text changes: update ' +
+      'PINNED_CONSENT.version and PINNED_CONSENT.hash together.',
+  );
+  const digest = consentDigest();
   assert.equal(
     digest,
-    PINNED_REGISTRATION_TEXTS_HASH,
-    `The registration-visible texts changed (sha256[:8] is now '${digest}', pinned '${PINNED_REGISTRATION_TEXTS_HASH}'). ` +
-      'If the change is intended, update BOTH this pinned hash in test/personvern.test.mjs ' +
-      'AND bump CONSENT_TEXT_VERSION in src/personvern.ts — a registering user consents to these exact texts.',
+    PINNED_CONSENT.hash,
+    `The consent corpus changed (sha256[:8] of CONSENT_TEXT_VERSION + REGISTRATION_TEXTS is now ` +
+      `'${digest}', pinned '${PINNED_CONSENT.hash}'). A registering user consents to these exact ` +
+      'texts under that exact version, so: if a TEXT changed, bump CONSENT_TEXT_VERSION in ' +
+      'src/personvern.ts and update BOTH values in PINNED_CONSENT. If only the version moved, ' +
+      'update PINNED_CONSENT.version and this hash. Never re-pin the hash alone.',
   );
 });
