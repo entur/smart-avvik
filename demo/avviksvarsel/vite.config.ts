@@ -11,6 +11,18 @@ export default defineConfig({
   build: {
     outDir: '../../disruptions/api/varsel_static',
     emptyOutDir: true,
+    // Two entry documents, i.e. a Vite MPA. The privacy page is a SECOND HTML ENTRY rather than a
+    // client route because the app has no router and the API's static mount has no SPA fallback —
+    // a client route would 404 server-side on a direct hit, which is exactly how a privacy page is
+    // reached (a link in a push, a pasted URL). Emitting personvern/index.html instead lets
+    // Starlette's html=True serve it at /varsel/personvern/ with no backend change at all; the
+    // Dockerfile copies varsel_static/ wholesale, so nothing else has to know it exists.
+    rollupOptions: {
+      input: {
+        main: 'index.html',
+        personvern: 'personvern/index.html',
+      },
+    },
   },
   server: {
     proxy: {
