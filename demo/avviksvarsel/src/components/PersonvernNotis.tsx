@@ -1,4 +1,4 @@
-// The four on-page privacy notices T1-T4 of plan 2026-08-31-001.
+// The four on-page privacy notices T1-T4 of plan 2026-08-31-001, plus the sender footer T7.
 //
 // Purely presentational: every word comes from src/personvern.ts, which is the single source for
 // published privacy texts and the only place a wording may be edited (a registration-visible text
@@ -18,6 +18,7 @@ import {
   T2_PERSONVERNLINJE,
   T3_REGISTRERING,
   T4_VARSELKORT,
+  T7_AVSENDER,
   type LinkedText,
 } from '../personvern';
 
@@ -69,5 +70,19 @@ export function VarselkortNotis() {
     <SubParagraph className="av-personvern-notis" margin="none">
       {T4_VARSELKORT}
     </SubParagraph>
+  );
+}
+
+/** T7 — the sender line, at the bottom of the page. Rendered in EVERY brand variant, `?brand=none`
+ *  included: art. 13(1)(a) makes the controller's identity non-optional, which is why the
+ *  unbranded variant no longer keeps the word «Entur» off the page. Only the page text names the
+ *  sender — notifications, the manifest and the icons stay unbranded (see README, «Brands»). */
+export function AvsenderFooter({ brandId }: { brandId: BrandId }) {
+  return (
+    <footer className="av-footer">
+      <SubParagraph margin="none">
+        <LinkedProse text={T7_AVSENDER} brandId={brandId} />
+      </SubParagraph>
+    </footer>
   );
 }

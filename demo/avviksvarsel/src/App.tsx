@@ -23,7 +23,7 @@ import type { Brand } from './brand';
 import VarselStatus from './components/VarselStatus';
 import JourneyCard from './components/JourneyCard';
 import AddJourneyModal from './components/AddJourneyModal';
-import { EksperimentNotis, PersonvernLinje } from './components/PersonvernNotis';
+import { AvsenderFooter, EksperimentNotis, PersonvernLinje } from './components/PersonvernNotis';
 
 // Stable per-device id, kept in localStorage. Journeys and push subscriptions are keyed to it.
 //
@@ -291,6 +291,11 @@ export default function App({ brand }: { brand: Brand }) {
           </>
         )}
       </main>
+
+      {/* Unconditional on brand. `?brand=none` strips the logo, the palette and the typeface, but
+          art. 13(1)(a) requires the controller's identity, so this one line names Entur in every
+          variant — the one place the unbranded page says the word. */}
+      <AvsenderFooter brandId={brand.id} />
 
       <AddJourneyModal
         open={modalOpen}
