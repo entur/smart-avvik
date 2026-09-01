@@ -96,6 +96,23 @@ body {
   color: var(--basecolors-text-subdued, var(--grey-70));
 }
 
+/* ---- privacy notices (T1-T4) ---- */
+
+/* Subdued, like .av-status-note: the privacy texts are standing information rather than something
+   demanding action, and must stay legible without competing with the alerts around them. Colour
+   comes from the same tokens, so ?brand=none recolours these for free. */
+.av-personvern-linje,
+.av-personvern-notis {
+  margin: 0;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* The intro's own gap already separates T2 from the lead paragraph; pull it up so the line reads
+   as a footnote to that sentence rather than as the next block down. */
+.av-personvern-linje {
+  margin-top: -0.75rem;
+}
+
 /* ---- iOS "add to Home Screen" instructions ---- */
 
 .av-ios-steps {

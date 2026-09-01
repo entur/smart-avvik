@@ -23,6 +23,7 @@ import type { Brand } from './brand';
 import VarselStatus from './components/VarselStatus';
 import JourneyCard from './components/JourneyCard';
 import AddJourneyModal from './components/AddJourneyModal';
+import { EksperimentNotis, PersonvernLinje } from './components/PersonvernNotis';
 
 // Stable per-device id, kept in localStorage. Journeys and push subscriptions are keyed to it.
 function getDeviceId(): string {
@@ -164,9 +165,16 @@ export default function App({ brand }: { brand: Brand }) {
       </Contrast>
 
       <main id="main-content" className="av-main">
+        {/* T1 and T2 sit above and below the intro, before the loading branch, so the experiment
+            caveat and the privacy line are on screen without scrolling or a single tap — which is
+            the acceptance criterion, and the point of giving art. 13 information at collection. */}
+        <EksperimentNotis />
+
         <LeadParagraph className="av-intro">
           Registrer kollektivreisene dine, så varsler vi deg når et avvik kan ramme en av dem.
         </LeadParagraph>
+
+        <PersonvernLinje brandId={brand.id} />
 
         {loading ? (
           <div className="av-loading">
@@ -243,6 +251,7 @@ export default function App({ brand }: { brand: Brand }) {
         onClose={() => setModalOpen(false)}
         stops={stops}
         onCreate={handleCreate}
+        brandId={brand.id}
       />
     </>
   );

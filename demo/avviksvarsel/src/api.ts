@@ -134,6 +134,11 @@ export interface NewJourney {
   begin: string;
   end: string;
   days: number[];
+  // Version of the registration-visible privacy texts the user saw (personvern.ts
+  // CONSENT_TEXT_VERSION), persisted on the journey record so which wording was consented to is
+  // provable. Optional on the wire in both directions: an older API ignores it, and a cached
+  // bundle that predates it registers without one, which reads as «pre-versioning».
+  consent_text_version?: string;
 }
 
 // ---- Client -> server error reporting ---------------------------------------------------------

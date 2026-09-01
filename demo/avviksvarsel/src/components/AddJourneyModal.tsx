@@ -8,6 +8,9 @@ import { PrimaryButton, SecondaryButton } from '@entur/button';
 import { SmallAlertBox } from '@entur/alert';
 import { Label } from '@entur/typography';
 import type { NewJourney, StopItem } from '../api';
+import type { BrandId } from '../brand';
+import { CONSENT_TEXT_VERSION } from '../personvern';
+import { RegistreringsNotis } from './PersonvernNotis';
 import { WEEKDAYS, WEEKDAY_SHORT } from '../format';
 
 type Item = NormalizedDropdownItemType<string>;
@@ -91,11 +94,14 @@ export default function AddJourneyModal({
   onClose,
   stops,
   onCreate,
+  brandId,
 }: {
   open: boolean;
   onClose: () => void;
   stops: StopItem[];
   onCreate: (journey: NewJourney) => Promise<void>;
+  /** Only so the privacy link keeps `?brand=none` across the navigation. */
+  brandId: BrandId;
 }) {
   const [mode, setMode] = useState('alle');
   const pool = useMemo(
@@ -169,6 +175,9 @@ export default function AddJourneyModal({
         begin,
         end,
         days,
+        // Which version of the registration-visible texts this user actually saw. Stored on the
+        // journey record so the consent is provable after the wording changes.
+        consent_text_version: CONSENT_TEXT_VERSION,
       });
       onClose();
     } catch (e) {
@@ -248,6 +257,11 @@ export default function AddJourneyModal({
             {error}
           </SmallAlertBox>
         )}
+
+        {/* T3, directly above the buttons: what this form collects, why, and how to undo it.
+            Registration stays confirmation-style — this is the information that makes tapping
+            «Lagre reise» informed, not a consent checkbox. */}
+        <RegistreringsNotis brandId={brandId} />
 
         <div className="av-form-actions">
           <SecondaryButton onClick={onClose} disabled={saving}>
