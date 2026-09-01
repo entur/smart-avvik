@@ -83,6 +83,10 @@ base AS (
     -- OBSERVED state, not predicted -- see the same two columns in predict_calls.sql.
     r.dep_delay_min AS et_dep_delay_min,
     r.call_source,
+    -- Whether a passenger may board / alight HERE -- see predict_calls.sql for why these ride
+    -- into the ML.PREDICT input rather than being joined back, and bus_calls_planned_today.sql
+    -- for the reading itself.
+    r.boarding_allowed, r.alighting_allowed,
     COALESCE(r.aimed_dep, r.aimed_arr) AS call_ts,
     IFNULL(a.status, 'other') AS status,
     IFNULL(a.planned, FALSE)  AS planned,
@@ -328,6 +332,7 @@ et_cancelled AS (
   SELECT
     r.operator, r.jkey, r.lineRef, r.stop_place, r.stop_name, r.stop_order,
     r.aimed_dep, r.aimed_arr, r.dep_delay_min, r.call_source, r.call_date,
+    r.boarding_allowed, r.alighting_allowed,
     COALESCE(r.aimed_dep, r.aimed_arr) AS call_ts,
     -- The cancelled stretch, for the summary -- over EVERY cancelled call of the journey, not what
     -- the anti-join leaves. IGNORE NULLS: stop_name arrives through a LEFT JOIN in the planned
@@ -366,6 +371,7 @@ SELECT
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
   s.et_declared_cancelled, s.et_dep_delay_min, s.call_source,
+  s.boarding_allowed, s.alighting_allowed,
   ROUND(s.pc_cal, 4) AS p_cancel,
   IF(s.is_terminal, NULL, GREATEST(CAST(ROUND(EXP(s.dep_plog)-1) AS INT64), 0)) AS dep_delay_typ_min,
   IF(s.is_terminal, NULL, COALESCE(dpq_dep.p90_min, dpg_dep.p90_min))            AS dep_delay_p90_min,
@@ -459,6 +465,7 @@ SELECT
   TRUE                  AS et_declared_cancelled,
   e.dep_delay_min       AS et_dep_delay_min,
   e.call_source,
+  e.boarding_allowed, e.alighting_allowed,
   1.0                   AS p_cancel,
   CAST(NULL AS INT64)   AS dep_delay_typ_min,
   CAST(NULL AS INT64)   AS dep_delay_p90_min,

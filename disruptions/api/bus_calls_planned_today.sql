@@ -17,6 +17,13 @@
 --      scored by a head that never saw them. SOF/GCO are kept in the list but do not appear as live
 --      ET journey-ref codespaces today (GCO fans across KOL/SOF/NOR/SKY on the SX side).
 --
+-- BOARDING / ALIGHTING: same two columns and the same fail-open reading as the rail source (see
+-- its header for the F4 case that motivated them and for why a NULL must mean "not stated"). The
+-- rule is duplicated rather than shared because these two files already duplicate everything else
+-- about a call; keep them identical. Measured on 2026-09-01, the served bus operators mark between
+-- 0.0 % and 6.3 % of their mid-journey calls with a prohibition -- MOR highest, most of them 0 --
+-- so nothing here is a mass exclusion.
+--
 -- STOP NAMES: NSR quays give stopPlaceRef but a NULL name; GTFS gtfs_last_recorded_ent_v1 supplies
 -- the StopPlace name (by parent_station) for ALL agencies here (no VYG filter), COALESCE'd with the
 -- quay name. CURRENT_DATE() partition prune keeps the ET scan small; re-run on a TTL from main.py.
@@ -47,6 +54,8 @@ calls AS (
     s.operator, s.jkey, s.lineRef, rc.stopPointRef AS quay, rc.order AS stop_order,
     'recorded' AS call_source,
     (rc.cancellation OR s.journey_cancelled) AS call_cancelled,
+    (IFNULL(rc.departureBoardingActivity, 'BOARDING')  NOT IN ('NO_BOARDING',  'PASS_THRU')) AS boarding_allowed,
+    (IFNULL(rc.arrivalBoardingActivity,   'ALIGHTING') NOT IN ('NO_ALIGHTING', 'PASS_THRU')) AS alighting_allowed,
     SAFE.TIMESTAMP(rc.aimedDepartureTime) AS aimed_dep,
     SAFE.TIMESTAMP(rc.aimedArrivalTime)   AS aimed_arr,
     TIMESTAMP_DIFF(SAFE.TIMESTAMP(rc.actualDepartureTime),
@@ -57,6 +66,8 @@ calls AS (
   SELECT
     s.operator, s.jkey, s.lineRef, ec.stopPointRef, ec.order, 'estimated',
     (ec.cancellation OR s.journey_cancelled),
+    (IFNULL(ec.departureBoardingActivity, 'BOARDING')  NOT IN ('NO_BOARDING',  'PASS_THRU')),
+    (IFNULL(ec.arrivalBoardingActivity,   'ALIGHTING') NOT IN ('NO_ALIGHTING', 'PASS_THRU')),
     SAFE.TIMESTAMP(ec.aimedDepartureTime),
     SAFE.TIMESTAMP(ec.aimedArrivalTime),
     CAST(NULL AS INT64)
@@ -84,7 +95,7 @@ SELECT
   COALESCE(n.stop_name, q.name) AS stop_name,
   d.stop_order, d.aimed_dep, d.aimed_arr, d.dep_delay_min,
   DATE(COALESCE(d.aimed_dep, d.aimed_arr), 'Europe/Oslo') AS call_date,
-  d.call_cancelled, d.call_source
+  d.call_cancelled, d.call_source, d.boarding_allowed, d.alighting_allowed
 FROM dedup AS d
 LEFT JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` AS q
   ON d.quay = q.id

@@ -71,6 +71,10 @@ class FakeCall:
     # Whether an SX message named this call. Defaults True, matching CallPred: every case written
     # before the no-SX population existed is about a train a situation pointed at.
     has_situation: bool = True
+    # Whether a passenger may board / alight at this call. Default True, matching CallPred: every
+    # case written before the F4 boarding-only bug is about a call anyone may use.
+    boarding_allowed: bool = True
+    alighting_allowed: bool = True
 
 
 def _journey(begin="07:00", end="09:00", days=(0, 1, 2, 3, 4)):
@@ -477,6 +481,34 @@ def test_direction_reverse_no_match():
 def test_missing_destination_no_match():
     # Boarding in window but the train never calls at B.
     calls = [FakeCall("t1", "A", 1, MON_0800)]
+    assert match(_journey(), {"S1": calls}) == []
+
+
+def test_a_train_the_traveller_may_not_alight_from_does_not_match():
+    """The 2026-09-01 bug report, end to end through the matcher a push is built from.
+
+    Vy's 16:23 Oslo S - Bergen calls Drammen, Asker and Sandvika with alighting closed: board it for
+    Bergen, but nobody gets off before Hønefoss. It was cancelled, and five registered journeys —
+    Oslo S to Drammen (three of them), Asker and Sandvika — were pushed "Tog F4 16:23 er innstilt"
+    across eight devices. None of them could have been on it, and one of them wrote in.
+    """
+    calls = [
+        FakeCall("f4", "A", 1, MON_0800, line="VYG:Line:F4", p_cancel=1.0, p_impact_dep=1.0),
+        FakeCall("f4", "B", 5, None, aimed_arr=MON_0800 + timedelta(minutes=40),
+                 line="VYG:Line:F4", alighting_allowed=False),
+    ]
+    assert match(_journey(), {"S1": calls}) == []
+    # The same train with alighting open is exactly the alert we still want.
+    calls[1].alighting_allowed = True
+    assert len(match(_journey(), {"S1": calls})) == 1
+
+
+def test_a_train_the_traveller_may_not_board_does_not_match():
+    """The mirror restriction, on the boarding stop."""
+    calls = [
+        FakeCall("t1", "A", 1, MON_0800, p_impact_dep=0.9, boarding_allowed=False),
+        FakeCall("t1", "B", 5, None, aimed_arr=MON_0800 + timedelta(minutes=40)),
+    ]
     assert match(_journey(), {"S1": calls}) == []
 
 
