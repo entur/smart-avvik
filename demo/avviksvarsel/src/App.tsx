@@ -12,15 +12,18 @@ import {
   deleteJourney,
   fetchConfig,
   fetchJourneys,
+  fetchRushOutlook,
   fetchStops,
   type Config,
   type Journey,
   type NewJourney,
+  type RushForecast,
   type StopItem,
 } from './api';
 import { isPushSupported, registerServiceWorker } from './push';
 import type { Brand } from './brand';
 import VarselStatus from './components/VarselStatus';
+import RushOutlook from './components/RushOutlook';
 import JourneyCard from './components/JourneyCard';
 import AddJourneyModal from './components/AddJourneyModal';
 import { AvsenderFooter, EksperimentNotis, PersonvernLinje } from './components/PersonvernNotis';
@@ -45,6 +48,7 @@ export default function App({ brand }: { brand: Brand }) {
   const [config, setConfig] = useState<Config | null>(null);
   const [stops, setStops] = useState<StopItem[]>([]);
   const [journeys, setJourneys] = useState<Journey[]>([]);
+  const [rushes, setRushes] = useState<RushForecast[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
@@ -93,6 +97,31 @@ export default function App({ brand }: { brand: Brand }) {
     }
   }, [deviceId]);
 
+  // Today's rush levels, for the panel at the top. Deliberately its own request and its own
+  // silent failure: the server returns [] for every ordinary "nothing to show" reason, so an
+  // outage here should leave the previous panel standing rather than raise a banner over a page
+  // whose actual job — the registered journeys — is unaffected.
+  //
+  // Reads the id and never mints one (deviceIdentity.ts's rule: only a registration may), and with
+  // no id there is nothing to ask about — the panel is a claim about THIS device's registrations,
+  // so emptying it here is what clears it after «Slett alt». The post-await staleness guard is
+  // refreshJourneys' verbatim: a response dispatched before the deletion must not repaint a panel
+  // about registrations the server no longer has.
+  const refreshRushes = useCallback(async () => {
+    const issuedFor = deviceId;
+    if (!issuedFor) {
+      setRushes([]);
+      return;
+    }
+    try {
+      const res = await fetchRushOutlook(issuedFor);
+      if (!isStoredDeviceId(issuedFor, localStorage)) return;
+      setRushes(res.rushes);
+    } catch {
+      // keep whatever was last shown
+    }
+  }, [deviceId]);
+
   // Initial load: config, stops, journeys. Register the service worker up front so enabling
   // push later is a single tap.
   //
@@ -120,6 +149,14 @@ export default function App({ brand }: { brand: Brand }) {
     })();
   }, []);
 
+  // The rush panel's own first fetch, deliberately NOT folded into the load above: that effect
+  // runs once by design (see its note), while this one must re-run when the device id moves — a
+  // fresh registration brings the panel to life, «Slett alt» empties it — and it must never be
+  // able to fail the page load or hold up the loading state.
+  useEffect(() => {
+    void refreshRushes();
+  }, [refreshRushes]);
+
   // A notification can launch a cold PWA, so the target card does not exist until the initial
   // journey request completes. Move both viewport and keyboard focus once it has rendered.
   useEffect(() => {
@@ -136,9 +173,14 @@ export default function App({ brand }: { brand: Brand }) {
   // Keep the live disruptions on each journey fresh: poll, and re-fetch when the app regains focus
   // (e.g. after tapping a notification).
   useEffect(() => {
-    const timer = window.setInterval(() => void refreshJourneys(), REFRESH_MS);
+    const timer = window.setInterval(() => {
+      void refreshJourneys();
+      void refreshRushes();
+    }, REFRESH_MS);
     const onVisible = () => {
-      if (document.visibilityState === 'visible') void refreshJourneys();
+      if (document.visibilityState !== 'visible') return;
+      void refreshJourneys();
+      void refreshRushes();
     };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', onVisible);
@@ -147,7 +189,7 @@ export default function App({ brand }: { brand: Brand }) {
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onVisible);
     };
-  }, [refreshJourneys]);
+  }, [refreshJourneys, refreshRushes]);
 
   // Which deployment this is, e.g. " (dev)" — empty in prd. The installed app's home-screen name and
   // icon come from the manifest, which is baked into the one image every environment shares, so the
@@ -229,6 +271,12 @@ export default function App({ brand }: { brand: Brand }) {
           </div>
         ) : (
           <>
+            {/* Above the push controls, and below T1/T2 — which must stay on screen without
+                scrolling. On a red morning this is what the traveller opened the app to find out.
+                Renders nothing at all unless the server says this device is notified about a rush
+                that is still ahead. */}
+            <RushOutlook rushes={rushes} brand={brand} />
+
             {config && (
               <VarselStatus
                 config={config}

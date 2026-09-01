@@ -265,8 +265,18 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   promotes all four `togvarsel_m_*` only on full success), then `copy_runtime_to_prd.sh` copies
   models + tables to prd. Holidays/low season live in ONE place: `disruptions.togvarsel_calendar`
   (`data/queries/togvarsel/00_calendar.sql`) — extend yearly; serving ERRORs loudly past its
-  horizon and retrain.sh refuses under 60 days of headroom. The page itself is one committed HTML
-  file (`disruptions/api/togmelding_static/`, the eval_static pattern — no build step).
+  horizon and retrain.sh refuses under 60 days of headroom. The page is a React + Vite + Entur
+  Linje bundle (`demo/togmelding/`, built into the image like the other four front-ends;
+  `disruptions/api/togmelding_static/` is generated and gitignored since 2026-09-01, when the page
+  moved off one committed HTML file to match `/varsel`). Level colours are Linje validation
+  tokens, never hex; `GET /togmelding-api/config` labels non-prod in the heading and title. The
+  published privacy texts stay duplicated in `demo/togmelding/src/personvern.ts` (the app cannot
+  import /varsel's module: its Docker stage copies only its own directory), guarded by
+  `disruptions/api/test_personvern_texts.py`, which compares both modules' resolved constants.
+  `GET /togmelding-api/outlook?device_id=…` (`togvarsel_notify.rush_outlook`) is the same forecast
+  narrowed to a device, for the status panel at the top of `/varsel` — the push policy read-only,
+  bounded by the rush's end rather than the registration's, and reading the poller's station cache
+  without ever querying.
 
 ## Conventions
 

@@ -1231,11 +1231,14 @@ app.include_router(meldinger.router)
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
 app.include_router(togvarsel.router)
 
-# Togvarsel-notify's dev-only test trigger (POST /togmelding-api/test-notify): one synthetic
-# rush-forecast push through the same composition + delivery seams the real rounds use (injected
-# in lifespan above). The route gates itself on deployment.environment_label() == "dev" per call
-# — tst, prd and unset labels get a plain 404 — so mounting it everywhere is safe and keeps the
-# image identical across environments.
+# Togvarsel-notify's two routes, both over the seams injected in lifespan above.
+# GET /togmelding-api/outlook is the status panel /varsel shows at the top of its page: today's
+# rush levels for a device, gated on the delivery flag and on the poller's station cache, so it
+# only ever claims "you are being notified about this" where that is true.
+# POST /togmelding-api/test-notify is the dev-only test trigger: one synthetic rush-forecast push
+# through the same composition + delivery seams the real rounds use. It gates itself on
+# deployment.environment_label() == "dev" per call — tst, prd and unset labels get a plain 404 —
+# so mounting it everywhere is safe and keeps the image identical across environments.
 app.include_router(togvarsel_notify.router)
 
 # The SSO login/callback/logout routes (public by construction — they are how a session is made).

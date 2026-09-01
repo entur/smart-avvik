@@ -35,6 +35,16 @@ Served by the disruptions API at **`/varsel`**; data + push endpoints are **`/va
   > 90 %, which made real alerts look trivial (fixed 2026-07-27).
 - Subscriptions + journeys are keyed by a client-generated `device_id` (no login — prototype).
   State persists to a GCS blob so it survives redeploys.
+- **Rush-hour outlook at the top of the page** (`components/RushOutlook.tsx`): today's Oslo
+  green/yellow/red levels from `GET /togmelding-api/outlook`, with a link to `/togmelding`. The
+  server narrows the list to the rushes this device is actually notified about and that are not
+  yet over, so an empty list is the ordinary state and the card then renders **nothing at all** —
+  no heading, no empty state, no explanation of a feature this traveller does not have. It has its
+  own request and its own silent failure: the page's real job is the registered journeys, and an
+  outage in the forecast must not raise a banner over them. See `togvarsel_notify.rush_outlook`
+  for the policy — notably that a rush is dropped when the *rush* ends (09:00 / 18:00), not when
+  the traveller's own window does, so a 07:00–08:00 registration still reads the morning level at
+  08:15 with the trains still late.
 
 ## Brands
 
