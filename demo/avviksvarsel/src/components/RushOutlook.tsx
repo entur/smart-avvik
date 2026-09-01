@@ -67,7 +67,7 @@ export default function RushOutlook({
           deliberately never leaves /varsel, so it gets the levels without the link. */}
       {brand.id === 'entur' && (
         <SmallText>
-          <Link href="/togmelding">Se hele togmeldingen</Link>
+          <Link href="/togmelding">Se hele rushvarselet</Link>
         </SmallText>
       )}
     </section>

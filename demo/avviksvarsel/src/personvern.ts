@@ -217,7 +217,7 @@ export const TOGMELDING_PERSONVERN_HREF = PERSONVERN_PATH;
 export const TOGMELDING_DISCLAIMER = {
   title: 'Dette er et eksperiment',
   body:
-    'Togmeldingen er et eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid ' +
+    'Rushvarsel er et eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid ' +
     'treffer — ikke planlegg reisen din på dem alene. Tjenesten kan endres eller avsluttes på ' +
     'kort varsel.',
 };

@@ -23,7 +23,7 @@ import {
 } from './personvern';
 import IssueCard from './components/IssueCard';
 
-// Togmeldingen: the rush-hour forecast for the Oslo local network, rendered from
+// Rushvarsel: the rush-hour forecast for the Oslo local network, rendered from
 // /togmelding-api/today. Entur-branded and laid out like the Avviksvarsel PWA (/varsel) on
 // purpose — a traveller arrives here by tapping a rush-forecast push from that app, and two
 // surfaces of one product should not look like two products.
@@ -80,7 +80,7 @@ export default function App() {
   const envSuffix = environment ? ` (${environment})` : '';
 
   useEffect(() => {
-    document.title = `Togmeldingen${envSuffix}`;
+    document.title = `Rushvarsel${envSuffix}`;
   }, [envSuffix]);
 
   const overdue = melding?.overdue_issues ?? [];
@@ -97,15 +97,20 @@ export default function App() {
         <div className="tm-header-inner">
           <Logo />
           <Heading1 as="h1" margin="none" className="tm-header-title">
-            Togmeldingen{envSuffix}
+            Rushvarsel{envSuffix}
           </Heading1>
         </div>
       </Contrast>
 
       <main id="main-content" className="tm-main">
+        {/* Deliberately does not open with the page's own name. It used to read «Rushtidsvarsel
+            for lokaltogene …» — the phrase the product name was then drawn from, so keeping it
+            would have the intro restate the heading instead of adding to it. It says what the
+            forecast covers instead. */}
         <LeadParagraph className="tm-intro">
-          Rushtidsvarsel for lokaltogene i Oslo-området (Vy). Prognoser kl. 06:30, 07:00, 12:00 og
-          14:00 på hverdager; kl. 07:00 og 14:00 erstatter de to tidligere.
+          Hvordan lokaltogene i Oslo-området (Vy) ligger an i morgen- og ettermiddagsrushet. Nye
+          prognoser kl. 06:30, 07:00, 12:00 og 14:00 på hverdager; kl. 07:00 og 14:00 erstatter de
+          to tidligere.
           {melding?.generated_at && ` Sist oppdatert ${osloTime(melding.generated_at)}.`}
         </LeadParagraph>
 

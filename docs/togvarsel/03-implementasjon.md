@@ -1,4 +1,8 @@
-# Togmeldingen — implementasjon (2026-08-29)
+# Rushvarsel — implementasjon (2026-08-29)
+
+> Produktnavnet ble endret fra «Togmeldingen» til «Rushvarsel» 2026-09-01. Endringen er
+> bare visuell: rute, API-prefiks, moduler, `disruptions.togvarsel_*`-tabeller, miljøvariabel,
+> logghendelser og de to datadiskriminatorene heter fortsatt togvarsel/togmelding.
 
 Dette dokumentet beskriver produktimplementasjonen av anbefalingen i
 [02-findings-2026-08-27.md](02-findings-2026-08-27.md) §8, slik §14k reviderte den. Kort:

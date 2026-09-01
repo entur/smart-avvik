@@ -1,4 +1,9 @@
-# Togmeldingen (`/togmelding`)
+# Rushvarsel (`/togmelding`)
+
+> The product is **Rushvarsel**; the code is `togvarsel` / `togmelding`. The 2026-09-01 rename
+> (from «Togmeldingen») was display-only — the route, the API prefix, this directory, the `disruptions.togvarsel_*`
+> tables, `TOGVARSEL_NOTIFY_ENABLED`, the log events and the two data discriminators all kept their
+> names. Renaming the route would strand every push already sitting on a lock screen.
 
 The rush-hour forecast for the Oslo local network, rendered from `GET /togmelding-api/today`
 (`disruptions/api/togvarsel.py`). React + Vite + [Entur Linje]; served by the disruptions API at

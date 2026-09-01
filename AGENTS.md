@@ -250,7 +250,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   road side as UNKNOWN until a road provider is validated. Rebuild baselines/backtest with
   `data/queries/reisevalg_*.sql`; raw volume backfill via `data/svv/download_volumes.py`.
 
-- **Togmeldingen** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
+- **Rushvarsel** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
   the rush-hour forecast from `docs/togvarsel/` (§8 of the findings as revised by §14k; the
   implementation is `docs/togvarsel/03-implementasjon.md`). Four weekday issues (06:30, 07:00 for
   the AM rush; 12:00, 14:00 for the PM rush), each a tuned `LOGISTIC_REG` probability on the
@@ -269,7 +269,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Linje bundle (`demo/togmelding/`, built into the image like the other four front-ends;
   `disruptions/api/togmelding_static/` is generated and gitignored since 2026-09-01, when the page
   moved off one committed HTML file to match `/varsel`). Level colours are Linje validation
-  tokens, never hex; `GET /togmelding-api/config` labels non-prod in the heading and title. The
+  tokens, never hex; `GET /togmelding-api/config` labels non-prod in the heading and title.
+  The product was renamed from «Togmeldingen» to «Rushvarsel» on 2026-09-01, DISPLAY-ONLY: the
+  route, `/togmelding-api`, the modules, `demo/togmelding/`, the `disruptions.togvarsel_*` tables,
+  `TOGVARSEL_NOTIFY_ENABLED`, the `togvarsel_*` log events and the two data discriminators
+  (`display_source='togvarsel'`, `KIX:Togvarsel:<date>:<issue>`) all keep their names — the route
+  because it is already in pushes on lock screens, the discriminators because a new name drops the
+  rows out of every existing export query. The
   published privacy texts stay duplicated in `demo/togmelding/src/personvern.ts` (the app cannot
   import /varsel's module: its Docker stage copies only its own directory), guarded by
   `disruptions/api/test_personvern_texts.py`, which compares both modules' resolved constants.
