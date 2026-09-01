@@ -1,6 +1,6 @@
 """Guards on the published privacy texts (plan 2026-08-31-001, U8 — R11, R12, KTD2, KTD8).
 
-Three things nothing else in this repo detects, all of them silent failures:
+Four things nothing else in this repo detects, all of them silent failures:
 
 1. **Text parity.** `/togmelding` is a committed, self-contained vanilla-HTML page with no build
    step, so it cannot import `demo/avviksvarsel/src/personvern.ts` — the single source of every
@@ -11,11 +11,14 @@ Three things nothing else in this repo detects, all of them silent failures:
    to a template literal, and a guard that then iterates zero extracted strings passes vacuously.
    This repo has already paid for a suite that silently never ran.
 
-2. **Brand-script parity.** `demo/avviksvarsel/personvern/index.html` is a second Vite entry and
-   repeats index.html's inline brand-detection script verbatim (Vite has no HTML include). That
-   copy is the only thing that keeps `?brand=none` correct on the privacy page — on the one page
-   whose job is telling an unbranded visitor who the controller is — and nothing else notices when
-   the two drift.
+2. **Second-entry parity, in both places it was duplicated.** The privacy page is a second Vite
+   entry, and Vite shares nothing between entries — so it repeats index.html's inline
+   brand-detection script verbatim (`personvern/index.html`) AND main.tsx's `@entur/*` stylesheet
+   import block verbatim (`personvern-page.tsx`). Both copies exist only to keep `?brand=none`
+   correct on the one page whose job is telling an unbranded visitor who the controller is; both
+   drift invisibly. The import block is the nastier of the two, because divergence does not just
+   fail to reskin the privacy page — it moves a Linje sheet after `brands/none.css` in the shared
+   chunk and un-reskins the whole app, with nothing red anywhere.
 
 3. **The EU/Google claims.** The published page states that Google Cloud operates the service in
    the EU, that the alert text is written by a language model at Google in the EU, and that
@@ -42,6 +45,8 @@ PERSONVERN_TS = _REPO / "demo" / "avviksvarsel" / "src" / "personvern.ts"
 TOGMELDING_HTML = _REPO / "disruptions" / "api" / "togmelding_static" / "index.html"
 VARSEL_INDEX_HTML = _REPO / "demo" / "avviksvarsel" / "index.html"
 PERSONVERN_INDEX_HTML = _REPO / "demo" / "avviksvarsel" / "personvern" / "index.html"
+MAIN_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "main.tsx"
+PERSONVERN_PAGE_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "personvern-page.tsx"
 HELM_ENV_DIR = _REPO / "helm" / "kix-avvik" / "env"
 
 # The constants /togmelding duplicates. Named here so a rename in personvern.ts fails loudly
@@ -229,6 +234,25 @@ def _static_markup(html: str) -> str:
     return html[body : html.index("<script>", body)]
 
 
+def _entur_style_imports(path: Path) -> list[str]:
+    """The `@entur/*` stylesheet specifiers a Vite entry imports, in source order.
+
+    Order is the whole point (see the test below), so this returns a list and never a set.
+    Refuses to return a short list: an extraction that quietly finds nothing would turn the
+    parity assertion into `[] == []`, which is the vacuous pass this module exists to avoid.
+    """
+    source = path.read_text(encoding="utf-8")
+    specifiers = re.findall(r"^import\s+['\"](@entur/[^'\"]+\.css)['\"];", source, re.MULTILINE)
+    if len(specifiers) < 5:
+        raise ExtractionError(
+            f"found only {len(specifiers)} `@entur/*` stylesheet imports in "
+            f"{path.relative_to(_REPO)}: {specifiers}. Both Vite entries import the whole Linje "
+            "sheet set, so this is an extraction failure (a reformat, a different import form), "
+            "not a real list — treat it as an unguarded duplication rather than a passing check."
+        )
+    return specifiers
+
+
 def _brand_script(path: Path) -> str:
     html = path.read_text(encoding="utf-8")
     blocks = [
@@ -312,6 +336,34 @@ def test_the_privacy_page_repeats_the_brand_script_byte_for_byte():
     )
 
 
+def test_the_privacy_page_repeats_the_linje_stylesheet_imports_in_the_same_order():
+    """`?brand=none` also depends on this second duplication — the Linje import block.
+
+    `personvern-page.tsx` renders four Linje components and imports all thirteen sheets anyway,
+    deliberately: a second entry makes the build an MPA, and Rollup hoists what the two entries
+    SHARE into a common chunk linked BEFORE each entry's own. Diverge the lists and the split
+    falls at the divergence — the sheets only `main.tsx` imports land in main's chunk, i.e. AFTER
+    `brands/none.css`. About 80 generated brand rules are `:where()`-scoped, so they tie exactly
+    with Linje's own selectors and win on source order alone; reverse the order and the tie flips.
+
+    Nothing errors, no other test fails, and `/varsel` quietly goes back to Entur navy on the
+    unbranded variant. `personvern-page.tsx` documents all of that and then guards it with a
+    comment — the same "keep this in step" the inline brand script had before it got the parity
+    test above. This is that test for the other half.
+    """
+    root = _entur_style_imports(MAIN_TSX)
+    copy = _entur_style_imports(PERSONVERN_PAGE_TSX)
+    assert root == copy, (
+        f"The `@entur/*` stylesheet import block in {PERSONVERN_PAGE_TSX.relative_to(_REPO)} has "
+        f"drifted from {MAIN_TSX.relative_to(_REPO)}. Both entries must import the same sheets in "
+        "the same order: any divergence moves a Linje sheet out of the shared chunk and after "
+        "brands/none.css, which silently un-reskins `?brand=none` (the :where()-scoped brand rules "
+        "win on source order alone). Nothing will fail at build time and no page will error.\n"
+        f"--- main.tsx ---\n{chr(10).join(root)}\n"
+        f"--- personvern-page.tsx ---\n{chr(10).join(copy)}"
+    )
+
+
 # --- Claim guards on the Helm values (KTD2, R12) -------------------------------------------------
 
 
@@ -335,18 +387,39 @@ def _pinned(path: Path, key: str) -> str | None:
     return values[0] if values else None
 
 
+# The only two values that keep «Varselteksten skrives av en språkmodell hos Google i EU» honest.
+#
+# `gemini` makes it true. `off` is admitted because it can only ever make the sentence
+# OVER-disclose: no backend is asked at all (`llm_message.generation_enabled()` is False, every
+# push carries the deterministic template), so the published claim describes egress that is not
+# happening — a reader is told more than occurs, never less. And `off` is the documented egress
+# kill switch (CLAUDE.md: "«egress» must stop → VARSEL_LLM_PROVIDER=off"). A guard that turned red
+# the moment somebody pulled it would be exactly backwards: it would make the incident response
+# fail CI, which is when nobody has attention to spare for arguing with a test.
+#
+# `auto` and `claude` stay out. Both can reach Anthropic — served through Vertex at
+# `VERTEX_LOCATION`, which dev and prd set to `global` — so either makes the sentence name the
+# wrong company AND the wrong jurisdiction, in the under-disclosing direction.
+_HONEST_LLM_PROVIDERS = ("gemini", "off")
+
+
 def test_every_environment_pins_gemini_as_the_llm_provider():
     """Protects: «Varselteksten skrives av en språkmodell hos Google i EU» (T5).
 
     The code default is `provider="auto"`, which would try Claude first. The published sentence
-    names Google, so every environment must name Gemini.
+    names Google, so every environment must name Gemini — or `off`, which asks nobody. See
+    `_HONEST_LLM_PROVIDERS`.
     """
     for path in _env_files():
-        assert _pinned(path, "VARSEL_LLM_PROVIDER") == "gemini", (
-            f"{path.name} does not pin VARSEL_LLM_PROVIDER: gemini. The published privacy page at "
+        assert _pinned(path, "VARSEL_LLM_PROVIDER") in _HONEST_LLM_PROVIDERS, (
+            f"{path.name} pins VARSEL_LLM_PROVIDER: {_pinned(path, 'VARSEL_LLM_PROVIDER')!r}, "
+            f"expected one of {_HONEST_LLM_PROVIDERS}. The published privacy page at "
             "/varsel/personvern/ states «Varselteksten skrives av en språkmodell hos Google i EU»; "
             "the code default is `auto`, so that sentence is true only while this value is pinned. "
-            "Change the published text before changing this value."
+            "`off` is allowed — it asks no model, so the sentence over-discloses rather than "
+            "becoming false, and it is the documented egress kill switch. Anything else "
+            "(`auto`, `claude`) can reach Anthropic at VERTEX_LOCATION, which dev and prd set to "
+            "`global`: change the published text before changing this value."
         )
 
 
