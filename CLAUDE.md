@@ -997,7 +997,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   road side as UNKNOWN until a road provider is validated. Rebuild baselines/backtest with
   `data/queries/reisevalg_*.sql`; raw volume backfill via `data/svv/download_volumes.py`.
 
-- **Togmeldingen** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
+- **Rushvarsel** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
   the rush-hour forecast from `docs/togvarsel/` (§8 of the findings as revised by §14k; the
   implementation is `docs/togvarsel/03-implementasjon.md`). Four weekday issues (06:30, 07:00 for
   the AM rush; 12:00, 14:00 for the PM rush), each a tuned `LOGISTIC_REG` probability on the
@@ -1034,6 +1034,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   key does the same job only as long as the server keeps the id byte-stable, which its fingerprint
   dedup does. There is deliberately no `?brand=none` variant, unlike `/varsel`: the unbranded
   install's pushes never link here.
+  **The product is called «Rushvarsel» and the code is called togvarsel/togmelding** (renamed
+  from «Togmeldingen» on 2026-09-01). The rename is deliberately DISPLAY-ONLY: the page heading,
+  `<title>`, meta description, the two no-forecast sentences, the published disclaimer and the two
+  link texts on /varsel. Nothing identifying moved — not the `/togmelding` route (already baked into push
+  payloads sitting on lock screens, where a moved path is a dead tap), not `/togmelding-api`, the
+  modules, `demo/togmelding/`, the `disruptions.togvarsel_*` tables and models,
+  `TOGVARSEL_NOTIFY_ENABLED`, the `togvarsel_*` log events, or the two data discriminators
+  (`display_source='togvarsel'`, `KIX:Togvarsel:<date>:<issue>`) — that last pair for the
+  meldinger-rename reason: a new name drops the rows out of every export query that already
+  exists. The page intro no longer opens with «Rushtidsvarsel for lokaltogene …» — the phrase the
+  name was drawn from, so keeping it would have the intro restate the heading. One thing the name
+  buys for free: the push titles already said «Rushvarsel»/«Oppdatert rushvarsel»
+  (`togvarsel_notify.compose_message`), so the notifications and the product now carry the same
+  word instead of two — and the /varsel notice announcing the push class reads «Nytt: Rushvarsel»,
+  capitalised, because that string went from a common noun to a proper name.
   **The published privacy texts stay DUPLICATED, and the reason changed while the arrangement did
   not** (2026-09-01, plan 2026-08-31-001 KTD8): the experiment disclaimer and the T7 sender footer
   live in `demo/togmelding/src/personvern.ts`, a copy of `demo/avviksvarsel/src/personvern.ts`.
@@ -1066,7 +1081,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   which is what lets a half-typed comment survive the 5-minute poll.
 
 - **Togvarsel push rounds** (`disruptions/api/togvarsel_notify.py`, 2026-08-30) deliver
-  Togmeldingen's prognoses as /varsel Web Pushes. Each of the four weekday issues is one
+  Rushvarsel's prognoses as /varsel Web Pushes. Each of the four weekday issues is one
   notification *round*: the baselines (06:30, 12:00) push iff yellow or red; the follow-ups
   (07:00, 14:00) push iff the level *differs* from what their baseline pushed — a level
   transition, never a probability delta (the paired models answer different questions with

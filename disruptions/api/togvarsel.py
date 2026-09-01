@@ -570,9 +570,9 @@ def build_melding(now: datetime) -> Togmelding:
     )
     no_forecast = None
     if weekend:
-        no_forecast = "Togmeldingen lages bare på hverdager."
+        no_forecast = "Rushvarselet lages bare på hverdager."
     elif holiday:
-        no_forecast = "Helligdag — togmeldingen lages bare på vanlige hverdager."
+        no_forecast = "Helligdag — rushvarselet lages bare på vanlige hverdager."
 
     return Togmelding(
         date=today,
