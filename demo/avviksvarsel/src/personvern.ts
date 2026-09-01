@@ -35,12 +35,13 @@ export function personvernUrl(brandId: PersonvernBrandId): string {
 
 /** A text that renders with a trailing Link component. The plan appendix's
  * [text](url) notation denotes this structure — never literal markdown, which
- * is why no exported string may contain '[' or ']'. `href` is the default
- * (Entur) URL; brand-aware components pass `personvernUrl(brand.id)` instead. */
+ * is why no exported string may contain '[' or ']'. It carries no href on
+ * purpose: the target depends on the brand the caller is rendering, so every
+ * consumer builds it with `personvernUrl(brand.id)`. A stored default would be
+ * a field nothing reads, and editing it would silently change nothing. */
 export interface LinkedText {
   prose: string;
   linkText: string;
-  href: string;
 }
 
 const PERSONVERN_LINK_TEXT = 'Slik behandler vi opplysningene';
@@ -58,7 +59,6 @@ export const T1_EKSPERIMENT = {
 export const T2_PERSONVERNLINJE: LinkedText = {
   prose: 'Entur AS lagrer reisene du registrerer, slik at vi kan varsle deg.',
   linkText: PERSONVERN_LINK_TEXT,
-  href: personvernUrl('entur'),
 };
 
 /** T3 — registration text in «Legg til reise», above the buttons. */
@@ -67,7 +67,6 @@ export const T3_REGISTRERING: LinkedText = {
     'Vi lagrer holdeplassene, ukedagene og tidsrommet du velger her. Vi trenger dem for å vite ' +
     'hvilke avvik som gjelder deg. Du kan slette reisen når som helst.',
   linkText: PERSONVERN_LINK_TEXT,
-  href: personvernUrl('entur'),
 };
 
 /** T4 — notification card. Deliberately claims only that «Skru av» deletes the
@@ -182,7 +181,6 @@ export const T6_SLETT_ALT = {
 export const T7_AVSENDER: LinkedText = {
   prose: 'Tjenesten leveres av Entur AS.',
   linkText: PERSONVERN_LINK_TEXT,
-  href: personvernUrl('entur'),
 };
 
 // Strings shared with the committed /togmelding page

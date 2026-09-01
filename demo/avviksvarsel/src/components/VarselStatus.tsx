@@ -156,7 +156,6 @@ export default function VarselStatus({
     setNotice(null);
     const outcome = await runDeleteAll({
       deleteServerData: () => deleteAllData(deviceId),
-      hasPushSubscription: async () => Boolean(await getExistingSubscription()),
       unsubscribePush: disablePush,
       forgetDevice: () => {
         setSubscribed(false);

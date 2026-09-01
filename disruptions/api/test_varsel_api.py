@@ -2821,18 +2821,17 @@ def test_registration_logs_the_consent_version_but_never_the_route():
             "/varsel-api/journeys", json={**_PAYLOAD, "consent_text_version": "2026-08-31.1"}
         )
     assert r.status_code == 200, r.text
-    events = _events(records, "journey_registered")
-    assert len(events) == 1
-    fields = events[0]
+    registered = [
+        record for record in records
+        if getattr(record, "fields", {}).get("event") == "journey_registered"
+    ]
+    assert len(registered) == 1
+    fields = registered[0].fields
     assert fields["consent_text_version"] == "2026-08-31.1"
     rec = varsel._journeys[r.json()["journey_id"]]
     assert fields["journey_digest"] == llm_message.key_digest(varsel.journey_key(rec))
     assert "from_stop" not in fields and "to_stop" not in fields
     assert "from_name" not in fields and "to_name" not in fields
-    registered = [
-        record for record in records
-        if getattr(record, "fields", {}).get("event") == "journey_registered"
-    ]
     assert all(
         name not in record.getMessage()
         for record in registered

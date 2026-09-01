@@ -13,9 +13,11 @@
 export interface DeleteAllSteps {
   /** DELETE /varsel-api/devices/{id}/data — journeys, device record and dedup entries in one go. */
   deleteServerData: () => Promise<unknown>;
-  /** Whether this browser currently holds a push subscription. */
-  hasPushSubscription: () => Promise<boolean>;
-  /** Unsubscribe this browser. Best-effort — see below. */
+  /**
+   * Unsubscribe this browser. Best-effort — see below. Must be safe to call when there is no
+   * subscription at all (`push.disablePush` looks one up and returns quietly when there is none),
+   * so this flow does not look it up a second time itself.
+   */
   unsubscribePush: () => Promise<void>;
   /** Last step: remove the stored device id and reset app state. Never runs on the failure path. */
   forgetDevice: () => void;
@@ -35,7 +37,7 @@ export async function runDeleteAll(steps: DeleteAllSteps): Promise<DeleteAllOutc
   // subscription the server has no record of receives nothing. A push-disabled deployment (no
   // VAPID keys, so no subscription was ever made) takes the same path and must still delete.
   try {
-    if (await steps.hasPushSubscription()) await steps.unsubscribePush();
+    await steps.unsubscribePush();
   } catch {
     // ignored on purpose — see above
   }
