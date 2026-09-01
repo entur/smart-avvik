@@ -1,0 +1,424 @@
+"""What the rush actually did — the fasit /rushhistorikk scores Rushvarsel's forecasts against.
+
+Two passes, because no single source serves both same-day timeliness and training-identical
+semantics:
+
+* **Provisional**, due 09:20 and 18:20 Oslo, from ``rail_calls_planned_today`` +
+  ``rail_calls_today`` — tables the poller already builds. Four known skews against the label
+  (see ``togvarsel_outcomes_provisional.sql``), so the value is marked and never enters a rate.
+* **Authoritative**, due after 04:00 UTC, from ``realtime_siri_et_last_recorded``, reproducing each
+  scope's own label expression. This is the value that agrees with the models, and it settles the
+  row.
+
+Why not a BigQuery scheduled query, which is how ``varsel-label-daily`` does the equivalent job for
+/varsel: two schedules times two environments is four transfer configs, each holding its own COPY of
+the SQL — the documented drift trap — pinned to a fixed UTC time that slides an hour against Oslo
+twice a year, and unable to self-heal a run it missed. ``togvarsel.refresh()`` already establishes
+the wall-clock-on-the-poller-tick pattern next door, and this pass re-derives its own work set every
+tick, so a missed run costs nothing.
+
+Reads only ``disruptions.*`` and the upstream ET/NSR tables. No import of ``main`` (the package
+rule): main injects the BigQuery client via :func:`configure`.
+
+Run the checks: ``uv run --with google-cloud-bigquery python test_togvarsel_outcomes.py``
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+
+_OSLO = ZoneInfo("Europe/Oslo")
+
+_PROVISIONAL_QUERY = (Path(__file__).parent / "togvarsel_outcomes_provisional.sql").read_text()
+_SETTLED_QUERY = (Path(__file__).parent / "togvarsel_outcomes_settled.sql").read_text()
+
+# The three scopes, and the bar each one's model was trained against
+# (data/queries/togvarsel/09_training.sql lines 5-7). ONE dict, so the level mapping below and any
+# future reader cannot spell the bar differently:
+#   am      06:30-09:00  y_am10      am_t10 >= 0.10
+#   amrest  07:00-09:00  y_amrest10  am_t10_rest0700 >= 0.10
+#   pm      15:00-18:00  y_pm10      pm_t10 >= 0.15
+BARS: dict[str, float] = {"am": 0.10, "amrest": 0.10, "pm": 0.15}
+SCOPES: tuple[str, ...] = ("am", "amrest", "pm")
+
+# Which scopes each rush owns, and when a provisional check for it is due (Oslo hours).
+#
+# :20 and not :05, deliberately. Both provisional sources are TTL-gated off the SX-ingestion
+# rebuild rather than rebuilt every tick (main._RAIL_CALLS_TTL 15 min, main._PLANNED_TTL 60 min), so
+# an earlier check routinely reads a table that stops before the end of the window it is measuring.
+# The rush itself ends at 09:00 / 18:00 (togvarsel.RUSH_END_H).
+_PROVISIONAL_DUE: tuple[tuple[float, tuple[str, ...]], ...] = (
+    (9.0 + 20 / 60, ("am", "amrest")),
+    (18.0 + 20 / 60, ("pm",)),
+)
+
+# The authoritative pass reads last_recorded, whose one daily rewrite landed at ~03:04 UTC when it
+# was measured (2026-09-01). 04:00 UTC is varsel-label-daily's own slot, chosen the same way: far
+# enough after the batch to be complete, early enough that a morning verdict is there by the time
+# anybody looks.
+_SETTLED_DUE_UTC_HOUR = 4
+
+# Matching label_varsel_decisions.sql: an outcome still inside this window is being retried, past it
+# the attempts have given up and /rushhistorikk reports `ukjent`.
+_RETRY_DAYS = 10
+
+# The training chain's own eligibility test (09_training.sql): `am_n > 300 AND pm_n > 300`, which
+# drops strike days and data gaps. A day below it has a realized share that means nothing.
+#
+# DAY-LEVEL, not per scope, and that distinction is load-bearing. 09_training.sql has no `amrest`
+# term at all, and `amrest`'s window is a strict subset of `am`'s — so a per-scope test would mark
+# the 0700 issue `ukjent` on days the chain scored happily.
+_MIN_CALLS = 300
+
+# A blast-radius bound on an unattended query against an upstream ET table, the reason
+# meldinger._MAX_BYTES_BILLED exists. NOT a pruning check: a too-narrow date bound reads as a
+# CHEAPER query, so cost can never detect it. Measured 32.5 MB for one settled day and 3.4 MB for a
+# provisional run, so 2 GiB is ~60x the widest expected read.
+_MAX_BYTES_BILLED = 2 * 1024**3
+
+_FAIL_COOLDOWN = timedelta(minutes=15)
+_MAX_FAILS_PER_DAY = 8
+
+_DDL = """
+CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_outcomes` (
+  d DATE OPTIONS(description="Oslo date of the rush."),
+  scope STRING OPTIONS(description="am (06:30-09:00) | amrest (07:00-09:00) | pm (15:00-18:00) — the window the issue's own model was trained on."),
+  trouble10 FLOAT64 OPTIONS(description="Share of calls cancelled OR >= 10 min late, over resolved calls. The product bar."),
+  level STRING OPTIONS(description="green below the scope's bar, yellow to twice the bar, red at or above. Non-green coincides exactly with the training label being true."),
+  n_resolved INT64 OPTIONS(description="Calls with a known outcome — trouble10's denominator."),
+  n_unresolved INT64 OPTIONS(description="Calls neither cancelled nor with an actual time."),
+  n_calls INT64 OPTIONS(description="All calls in the window. Eligibility reads this."),
+  eligible BOOL OPTIONS(description="The training chain's day-level test (am and pm both > 300 calls). NULL on a provisional row, whose counts are not the same quantity."),
+  settled BOOL OPTIONS(description="TRUE once confirmed against last_recorded. The stats table reads settled rows only."),
+  unresolvable BOOL OPTIONS(description="last_recorded had no resolved call for the window, so no retry can help — reported as ukjent immediately."),
+  provisional_trouble10 FLOAT64 OPTIONS(description="What the same-day pass measured. Never overwritten by the settled pass: the overnight disagreement rate is the measurement that decides whether that pass earns its keep."),
+  provisional_level STRING OPTIONS(description="The level the page showed at 09:20 / 18:20."),
+  provisional_at TIMESTAMP OPTIONS(description="When the provisional pass ran."),
+  resolved_at TIMESTAMP OPTIONS(description="When the authoritative pass settled the row.")
+)
+PARTITION BY d
+OPTIONS(description="Realized rush outcome per (Oslo day, scope) for /rushhistorikk. Never CREATE OR REPLACE, and never copied dev->prd: each environment resolves the forecasts it issued itself.")
+"""
+
+# Provisional: fills the provisional_* trio AND the served value, so the page has something to show
+# after the rush. eligible stays NULL — see _MIN_CALLS. Never touches a settled row.
+_PROVISIONAL_MERGE = """
+MERGE `disruptions.togvarsel_outcomes` t
+USING (SELECT @d AS d, @scope AS scope) s
+ON t.d = s.d AND t.scope = s.scope
+WHEN MATCHED AND NOT IFNULL(t.settled, FALSE) THEN UPDATE SET
+  trouble10 = @trouble10, level = @level,
+  n_resolved = @n_resolved, n_unresolved = @n_unresolved, n_calls = @n_calls,
+  provisional_trouble10 = @trouble10, provisional_level = @level, provisional_at = @now
+WHEN NOT MATCHED THEN
+  INSERT (d, scope, trouble10, level, n_resolved, n_unresolved, n_calls, eligible, settled,
+          unresolvable, provisional_trouble10, provisional_level, provisional_at, resolved_at)
+  VALUES (@d, @scope, @trouble10, @level, @n_resolved, @n_unresolved, @n_calls, NULL, FALSE,
+          FALSE, @trouble10, @level, @now, NULL)
+"""
+
+# Authoritative: overwrites the served value and settles the row, LEAVING provisional_* alone.
+_SETTLED_MERGE = """
+MERGE `disruptions.togvarsel_outcomes` t
+USING (SELECT @d AS d, @scope AS scope) s
+ON t.d = s.d AND t.scope = s.scope
+WHEN MATCHED AND NOT IFNULL(t.settled, FALSE) THEN UPDATE SET
+  trouble10 = @trouble10, level = @level,
+  n_resolved = @n_resolved, n_unresolved = @n_unresolved, n_calls = @n_calls,
+  eligible = @eligible, settled = TRUE, unresolvable = @unresolvable, resolved_at = @now
+WHEN NOT MATCHED THEN
+  INSERT (d, scope, trouble10, level, n_resolved, n_unresolved, n_calls, eligible, settled,
+          unresolvable, provisional_trouble10, provisional_level, provisional_at, resolved_at)
+  VALUES (@d, @scope, @trouble10, @level, @n_resolved, @n_unresolved, @n_calls, @eligible, TRUE,
+          @unresolvable, NULL, NULL, NULL, @now)
+"""
+
+# The work set: days we issued a forecast for that are not fully settled yet. Derived every tick
+# rather than tracked, which is what makes a missed run self-heal. Bounded to days strictly before
+# today, because last_recorded carries no complete day for today.
+_WORK_SET_SQL = """
+WITH issued AS (
+  SELECT DISTINCT d FROM `disruptions.togvarsel_issued`
+  WHERE d BETWEEN DATE_SUB(@today, INTERVAL @retry_days DAY) AND DATE_SUB(@today, INTERVAL 1 DAY)
+),
+resolved AS (
+  SELECT d, COUNTIF(IFNULL(settled, FALSE)) AS n_settled
+  FROM `disruptions.togvarsel_outcomes`
+  WHERE d BETWEEN DATE_SUB(@today, INTERVAL @retry_days DAY) AND DATE_SUB(@today, INTERVAL 1 DAY)
+  GROUP BY d
+)
+SELECT i.d
+FROM issued AS i
+LEFT JOIN resolved AS r USING (d)
+WHERE IFNULL(r.n_settled, 0) < @n_scopes
+ORDER BY i.d
+"""
+
+_bq_client: Any = None
+_table_ready = False
+# Per-Oslo-day state: which passes have run, and the failure backoff. Poller-thread only, same
+# discipline as togvarsel's _state, so no lock.
+_state: dict[str, Any] = {}
+
+
+def configure(*, bq_client: Any) -> None:
+    """Wire in the BigQuery client. Called once from main.lifespan."""
+    global _bq_client
+    _bq_client = bq_client
+
+
+def level_for(scope: str, trouble10: float | None) -> str | None:
+    """green below the scope's bar, yellow to twice the bar, red at or above. None for None.
+
+    Only the GREEN boundary follows from the models: the bar IS the training label's threshold, so a
+    non-green level coincides exactly with the label being true and the page splits "bad" into two
+    severities rather than inventing a second definition of it. Twice-the-bar is a display
+    convention chosen for class balance — measured over 345 non-holiday weekdays it gives
+    82.0/11.6/6.4 % for the morning and 82.9/12.8/4.3 % for the afternoon.
+
+    NULL is outside this mapping's domain, not a fourth level: trouble10 is NULL exactly when no
+    call in the window resolved, and a day with no evidence is `ukjent`, never green.
+    """
+    if trouble10 is None:
+        return None
+    bar = BARS[scope]
+    if trouble10 < bar:
+        return "green"
+    if trouble10 < 2 * bar:
+        return "yellow"
+    return "red"
+
+
+def eligible_for(counts: dict[str, int]) -> bool:
+    """The training chain's day-level test, given {scope: n_calls} for one day.
+
+    `amrest` inherits the day's verdict rather than being tested on its own window: 09_training.sql
+    thresholds `am_n` and `pm_n` only, and `amrest`'s window is a strict subset of `am`'s.
+    """
+    return counts.get("am", 0) > _MIN_CALLS and counts.get("pm", 0) > _MIN_CALLS
+
+
+def provisional_due(now_h: float, done: set[str]) -> tuple[str, ...]:
+    """Scopes whose provisional check is due at `now_h` Oslo and has not run today."""
+    due: list[str] = []
+    for at_h, scopes in _PROVISIONAL_DUE:
+        if now_h >= at_h:
+            due.extend(s for s in scopes if s not in done)
+    return tuple(due)
+
+
+def settled_due(now: datetime, done: bool) -> bool:
+    """Whether the authoritative pass is due: past 04:00 UTC today and not yet run."""
+    return not done and now.astimezone(UTC).hour >= _SETTLED_DUE_UTC_HOUR
+
+
+def _blank_state(d: date) -> dict[str, Any]:
+    return {"date": d, "provisional_done": set(), "settled_done": False, "backoff": {}}
+
+
+def _retryable(key: str, now: datetime) -> bool:
+    b = _state["backoff"].get(key)
+    return b is None or now >= b["until"]
+
+
+def _note_failure(key: str, now: datetime) -> None:
+    """Back off a failing pass, and give up for the day at _MAX_FAILS_PER_DAY.
+
+    Same shape as togvarsel._note_failure: the state resets at the Oslo day rollover, so
+    `datetime.max` means "not again today" rather than "never".
+    """
+    b = _state["backoff"].setdefault(key, {"fails": 0, "until": now})
+    b["fails"] += 1
+    if b["fails"] >= _MAX_FAILS_PER_DAY:
+        b["until"] = datetime.max.replace(tzinfo=_OSLO)
+        logger.error("togvarsel_outcomes: %s failed %d times; giving up for today", key, b["fails"])
+    else:
+        b["until"] = now + _FAIL_COOLDOWN
+
+
+def ensure_table() -> None:
+    """Create disruptions.togvarsel_outcomes if absent. Called once from main.lifespan.
+
+    Not left to the first write: /rushhistorikk LEFT JOINs this table on every request, and a
+    missing table is a BigQuery error, so the page would 503 in any environment where no rush has
+    resolved yet — every environment, on the day this ships. Failure is logged, never raised.
+    """
+    global _table_ready
+    if _bq_client is None or _table_ready:
+        return
+    try:
+        _bq_client.query(_DDL).result(timeout=60)
+        _table_ready = True
+    except Exception:
+        logger.exception("togvarsel_outcomes: creating the table failed; retrying on write")
+
+
+def _job_config(params: list) -> Any:
+    from google.cloud import bigquery
+
+    return bigquery.QueryJobConfig(
+        query_parameters=params, maximum_bytes_billed=_MAX_BYTES_BILLED
+    )
+
+
+def _scalar(name: str, type_: str, value: Any) -> Any:
+    from google.cloud import bigquery
+
+    return bigquery.ScalarQueryParameter(name, type_, value)
+
+
+def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
+    """One same-day pass over `scopes`, writing the provisional trio and the served value."""
+    from google.cloud import bigquery
+
+    cfg = _job_config(
+        [
+            _scalar("day", "DATE", day),
+            bigquery.ArrayQueryParameter("scopes", "STRING", list(scopes)),
+        ]
+    )
+    rows = list(_bq_client.query(_PROVISIONAL_QUERY, job_config=cfg).result(timeout=120))
+    for row in rows:
+        scope = row["scope"]
+        trouble10 = row["trouble10"]
+        _bq_client.query(
+            _PROVISIONAL_MERGE,
+            job_config=_job_config(
+                [
+                    _scalar("d", "DATE", row["d"]),
+                    _scalar("scope", "STRING", scope),
+                    _scalar("trouble10", "FLOAT64", trouble10),
+                    _scalar("level", "STRING", level_for(scope, trouble10)),
+                    _scalar("n_resolved", "INT64", row["n_resolved"]),
+                    _scalar("n_unresolved", "INT64", row["n_unresolved"]),
+                    _scalar("n_calls", "INT64", row["n_calls"]),
+                    _scalar("now", "TIMESTAMP", now),
+                ]
+            ),
+        ).result(timeout=60)
+    logger.info(
+        "togvarsel_outcomes: provisional %s for %s — %d rows",
+        ",".join(scopes),
+        day,
+        len(rows),
+        extra={
+            "fields": {
+                "event": "togvarsel_outcomes_pass",
+                "pass": "provisional",
+                "day": str(day),
+                "scopes": list(scopes),
+                "rows": len(rows),
+            }
+        },
+    )
+
+
+def _run_settled(day: date, now: datetime) -> None:
+    """One authoritative pass over a past day: all three scopes, settling every row.
+
+    A scope the query returns no row for is still settled, as `unresolvable`: last_recorded is an
+    immutable daily batch, so once it has landed, "no resolved call in this window" is a final
+    answer. Retrying it for ten days would re-run the same query to reach the same NULL while the
+    page said `venter`.
+    """
+    cfg = _job_config(
+        [_scalar("from_date", "DATE", day), _scalar("to_date", "DATE", day)]
+    )
+    rows = {
+        row["scope"]: row
+        for row in _bq_client.query(_SETTLED_QUERY, job_config=cfg).result(timeout=180)
+    }
+    eligible = eligible_for({scope: (rows[scope]["n_calls"] or 0) for scope in rows})
+    for scope in SCOPES:
+        row = rows.get(scope)
+        trouble10 = row["trouble10"] if row is not None else None
+        _bq_client.query(
+            _SETTLED_MERGE,
+            job_config=_job_config(
+                [
+                    _scalar("d", "DATE", day),
+                    _scalar("scope", "STRING", scope),
+                    _scalar("trouble10", "FLOAT64", trouble10),
+                    _scalar("level", "STRING", level_for(scope, trouble10)),
+                    _scalar("n_resolved", "INT64", row["n_resolved"] if row else 0),
+                    _scalar("n_unresolved", "INT64", row["n_unresolved"] if row else 0),
+                    _scalar("n_calls", "INT64", row["n_calls"] if row else 0),
+                    _scalar("eligible", "BOOL", eligible),
+                    _scalar("unresolvable", "BOOL", trouble10 is None),
+                    _scalar("now", "TIMESTAMP", now),
+                ]
+            ),
+        ).result(timeout=60)
+    logger.info(
+        "togvarsel_outcomes: settled %s — %d of %d scopes resolved, eligible=%s",
+        day,
+        len(rows),
+        len(SCOPES),
+        eligible,
+        extra={
+            "fields": {
+                "event": "togvarsel_outcomes_pass",
+                "pass": "settled",
+                "day": str(day),
+                "rows": len(rows),
+                "eligible": eligible,
+            }
+        },
+    )
+
+
+def _work_set(today: date) -> list[date]:
+    """Past days we issued a forecast for whose outcome is not fully settled."""
+    from google.cloud import bigquery
+
+    cfg = _job_config(
+        [
+            _scalar("today", "DATE", today),
+            bigquery.ScalarQueryParameter("retry_days", "INT64", _RETRY_DAYS),
+            bigquery.ScalarQueryParameter("n_scopes", "INT64", len(SCOPES)),
+        ]
+    )
+    rows = _bq_client.query(_WORK_SET_SQL, job_config=cfg).result(timeout=60)
+    return [row["d"] for row in rows]
+
+
+def refresh(now: datetime | None = None) -> None:
+    """One tick of both passes. Called from the poller's wall-clock path, beside togvarsel.refresh.
+
+    Wall-clock, not ingestion-driven: a rush ends at its hour whether or not SX moved. Every failure
+    is contained per pass, so a dead provisional query cannot stop the authoritative one.
+    """
+    if _bq_client is None:
+        return
+    now = (now or datetime.now(UTC)).astimezone(_OSLO)
+    today = now.date()
+    if _state.get("date") != today:
+        _state.clear()
+        _state.update(_blank_state(today))
+    now_h = now.hour + now.minute / 60 + now.second / 3600
+
+    due = provisional_due(now_h, _state["provisional_done"])
+    if due and _retryable("provisional", now):
+        try:
+            _run_provisional(today, due, now)
+            _state["provisional_done"].update(due)
+            _state["backoff"].pop("provisional", None)
+        except Exception:
+            logger.exception("togvarsel_outcomes: provisional pass failed; retrying after backoff")
+            _note_failure("provisional", now)
+
+    if settled_due(now, _state["settled_done"]) and _retryable("settled", now):
+        try:
+            for day in _work_set(today):
+                _run_settled(day, now)
+            _state["settled_done"] = True
+            _state["backoff"].pop("settled", None)
+        except Exception:
+            logger.exception("togvarsel_outcomes: settled pass failed; retrying after backoff")
+            _note_failure("settled", now)
