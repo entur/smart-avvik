@@ -39,6 +39,7 @@ export interface Togmelding {
   no_forecast_reason?: string | null;
   next_issue?: string | null; // HHMM of the next issue not yet due
   overdue_issues: string[]; // past due but not issued: delayed or failed, not "not yet due"
+  rushes_over: boolean; // both rush windows are behind us — today's forecasts have all expired
   issues: Issue[];
   pm_outlook?: string | null;
   known_deviations: KnownDeviation[];
