@@ -167,9 +167,19 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
       'Mener du at vi behandler opplysningene dine i strid med regelverket, kan du klage til ' +
       'Datatilsynet.',
   },
+  // The unqualified «Behandlingen skjer i EU/EØS» was false, and contradicted the
+  // sentence two sections up: a Web Push is POSTed to an endpoint the browser vendor
+  // supplies (Google, Mozilla, Apple), routinely outside the EØS. The original
+  // assessment weighed Google Cloud, Vertex and PostHog only — everything Entur picks —
+  // and missed the one processor the *browser* picks. See
+  // docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md.
   {
     title: 'Overføring ut av EØS',
-    body: 'Behandlingen skjer i EU/EØS.',
+    body:
+      'Behandlingen vi selv styrer skjer i EU/EØS. Men for å få varselet fram til telefonen din ' +
+      'må vi sende det via varslingstjenesten til nettleseren du bruker — Google, Mozilla eller ' +
+      'Apple — og den kan ligge utenfor EØS. Den får bare den krypterte meldingen og adressen ' +
+      'den skal leveres til, og kan ikke lese innholdet.',
   },
 ];
 

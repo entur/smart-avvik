@@ -71,8 +71,8 @@ To påstander i T5 ble bekreftet av produkteier og står i teksten:
 
 - varselteksten skrives av en språkmodell hos Google i EU, som får vite hvilken strekning og
   avgang varselet gjelder;
-- Google Cloud drifter tjenesten på Enturs vegne, i EU. «Overføring ut av EØS» er dermed
-  «Behandlingen skjer i EU/EØS».
+- Google Cloud drifter tjenesten på Enturs vegne, i EU. «Overføring ut av EØS» ble dermed satt til
+  «Behandlingen skjer i EU/EØS» — **rettet 1. september 2026**, se neste avsnitt.
 
 Begge hviler på **Helm-verdier, ikke kodestandarder**: kodens standard er `provider="auto"`, som
 ville forsøkt Claude på `global` først. `disruptions/api/test_personvern_texts.py` pinner derfor at
@@ -81,6 +81,32 @@ Eksplisitt er poenget: effektiv lokasjon er `VERTEX_GEMINI_LOCATION or VERTEX_LO
 dev og prd setter allerede `VERTEX_LOCATION: global` — å fjerne Gemini-pinnen ville flyttet
 behandlingen ut av EU uten at noe ble rødt. Samme test pinner `POSTHOG_HOST` i prd, som
 PostHog-i-EU-setningen hviler på.
+
+### Rettelse 1. september 2026 — Web Push-transporten manglet i EØS-vurderingen
+
+«Overføring ut av EØS» sto opprinnelig som den ene setningen **«Behandlingen skjer i EU/EØS»**. Den
+var usann, og motsa dessuten sin egen nabo to seksjoner opp — der teksten allerede sa at «tjenesten
+som leverer varselet til telefonen din ser ikke innholdet — det er kryptert». En tjeneste som ikke
+kan lese innholdet er nettopp en tjeneste som *får* noe.
+
+Årsaken er en systematisk skjevhet i vurderingen, ikke en glipp i ordlyden: vi veide de
+databehandlerne **Entur velger** — Google Cloud, Vertex, PostHog — og alle tre ligger i EU. Web
+Push har én til, og den velges av **nettleseren**: hvert varsel POSTes til et endepunkt
+abonnementet oppgir, driftet av nettleserleverandøren (FCM for Chrome/Android, Mozilla for Firefox,
+Apple for Safari/iOS). De endepunktene ligger rutinemessig utenfor EØS, og vi kan verken velge dem
+bort eller pålegge dem lokasjon — de følger av brukerens nettleservalg.
+
+Teksten sier nå at behandlingen *vi selv styrer* skjer i EU/EØS, at varselet må via nettleserens
+varslingstjeneste for å nå fram, at den kan ligge utenfor EØS, og hva den faktisk får: den
+krypterte meldingen og leveringsadressen. Overføringen er reell, men innholdet er kryptert
+ende-til-ende av Web Push-protokollen (RFC 8291), så det som krysser grensen er et chiffertekst-
+blob pluss abonnementsadressen — ikke strekningen, avgangstiden eller varselteksten.
+
+To ting dette **ikke** avgjør, og som hører hjemme i personvernvurderingen: hvilket
+overføringsgrunnlag som gjelder for abonnementsadressen (den er en identifikator for nettleseren,
+og den krysser grensen i klartekst), og om Entur regner nettleserleverandøren som databehandler
+eller som ren transportør. Formuleringen er valgt så den er sann uansett hvilket av de to svarene
+som lander.
 
 ### Sletting — ett endepunkt, ikke en klientløkke
 
@@ -124,7 +150,7 @@ ikke på personen), men bør stå i personvernvurderingen.
 
 ---
 
-## 4. Tre ting som må bekreftes utenfor kodebasen
+## 4. Fire ting som må bekreftes utenfor kodebasen
 
 Disse lot seg ikke avgjøre fra repoet. Teksten er formulert så den er sann uansett svar, men
 svarene bør inn i personvernvurderingen — og to av dem kan kreve en tekstjustering.
@@ -138,6 +164,11 @@ svarene bør inn i personvernvurderingen — og to av dem kan kreve en tekstjust
    med det verifiserte tallet når det er kjent.
 3. **PostHogs konfigurerte lagringstid** i EU-instansen. «Inntil 45 dager» er verifisert for
    BigQuery-kontekstene; bekreft at PostHog ligger på eller under samme grense.
+4. **Overføringsgrunnlaget for Web Push-endepunktet** (nytt 1. september 2026, se rettelsen i
+   avsnitt 2). Avklar om nettleserleverandørens varslingstjeneste regnes som databehandler eller
+   som transportør, og hvilket grunnlag som dekker abonnementsadressen — det eneste som krysser
+   grensen i klartekst. Teksten er formulert så den er sann uansett svar, men svaret hører hjemme i
+   vurderingen.
 
 ---
 
