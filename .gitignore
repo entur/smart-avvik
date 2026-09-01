@@ -38,6 +38,11 @@ disruptions/api/togmelding_static/
 demo/togmelding/node_modules/
 demo/togmelding/tsconfig.tsbuildinfo
 
+# Built into the image by the root Dockerfile's node stage; not committed.
+disruptions/api/rushhistorikk_static/
+demo/rushhistorikk/node_modules/
+demo/rushhistorikk/tsconfig.tsbuildinfo
+
 # Local avviksvarsel state file (durable state lives in the GCS bucket in prod).
 disruptions/api/varsel_state.json
 
