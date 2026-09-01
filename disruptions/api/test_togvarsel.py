@@ -356,13 +356,71 @@ def test_a_follow_up_replaces_its_baseline_on_the_page():
     togvarsel.refresh(now=MONDAY_0710.replace(hour=6, minute=40))
     assert [i.issue for i in togvarsel.build_melding(MONDAY_0710).issues] == ["0630"]
 
+    # The follow-up replaces it. And since a card is retired when its rush ends
+    # (test_a_forecast_is_retired_when_its_rush_ends), at most one card is ever on the page:
+    # the morning pair collapses to 07:00 while the morning lasts ...
+    togvarsel.refresh(now=MONDAY_0710)
+    assert [i.issue for i in togvarsel.build_melding(MONDAY_0710).issues] == ["0700"]
+
+    # ... and the afternoon pair to 14:00, by which time the morning is long gone.
     togvarsel.refresh(now=MONDAY_1430)
     m = togvarsel.build_melding(MONDAY_1430)
-    assert [i.issue for i in m.issues] == ["0700", "1400"]
+    assert [i.issue for i in m.issues] == ["1400"]
     # ... while every issue is still computed, cached and handed to the notify seam.
     assert {i["issue"] for i in togvarsel.issued_today(now=MONDAY_1430)} == {
         "0630", "0700", "1200", "1400"
     }
+
+
+def test_a_forecast_is_retired_when_its_rush_ends():
+    """A card is about a window. Past that window it is a record of the past dressed as advice,
+    and the reader has to work out for themselves that it no longer concerns them.
+
+    prd, 2026-09-01 16:17: "Kl. 07:00 — morgenrushet 07:00–09:00 (Beregnet i etterkant, kl.
+    15:38)". An afternoon restart clears `_state`, so the poller back-fills every due issue at
+    once and marks it `late` — nothing was stale, the page simply had no rule for expiry.
+    """
+    fake = _FakeBQ(feature_row=_feature_row(),
+                   probs={"am0630": 0.05, "am0700": 0.42, "pm1200": 0.2, "pm1400": 0.05})
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_1430)  # the whole day computed at once, as a restart does
+
+    # A card is retired when its own rush ENDS -- never when another one starts, so the
+    # afternoon's forecast is on the page from the moment it is issued.
+    at_0859 = MONDAY_0710.replace(hour=8, minute=59)
+    assert [i.issue for i in togvarsel.build_melding(at_0859).issues] == ["0700", "1400"]
+    # 09:00 sharp: the morning is over and its card goes; the afternoon's stays until 18:00.
+    for hour in (9, 12, 17):
+        assert [
+            i.issue for i in togvarsel.build_melding(at_0859.replace(hour=hour, minute=0)).issues
+        ] == ["1400"], hour
+
+    # ... and every one of them is still cached, recorded and handed to the notify seam, whose
+    # change gate compares a follow-up against exactly the baseline it pushed.
+    evening = togvarsel.build_melding(MONDAY_1430.replace(hour=18, minute=1))
+    assert evening.issues == []
+    assert {i["issue"] for i in togvarsel.issued_today(now=MONDAY_1430.replace(hour=18, minute=1))} \
+        == {"0630", "0700", "1200", "1400"}
+    # An empty page for two opposite reasons: the day is done, not "the first one is coming".
+    assert evening.rushes_over is True and evening.next_issue is None
+    assert togvarsel.build_melding(MONDAY_0710.replace(hour=6)).rushes_over is False
+    # The PM read-across goes with the rush it is about, or it points at a retired card.
+    assert evening.pm_outlook is None
+    assert togvarsel.build_melding(MONDAY_1430.replace(hour=17)).pm_outlook is not None
+
+
+def test_the_rush_windows_agree_with_the_notify_chain():
+    """/togmelding retires a card at RUSH_END_H; /varsel's panel drops the same rush at
+    togvarsel_notify.RUSH_WINDOWS' end. Two surfaces of one product disagreeing about whether a
+    rush is still a live topic is the failure — one showing the morning at 09:30 while the other
+    has moved on. Pinned here rather than in test_togvarsel_notify, which stays hermetic."""
+    import togvarsel_notify
+
+    assert togvarsel.RUSH_END_H == {
+        rush: end for rush, (_start, end) in togvarsel_notify.RUSH_WINDOWS.items()
+    }
+    # ... and every issue belongs to a rush both modules place the same way.
+    assert {s.key: s.kind for s in togvarsel.ISSUE_SPECS} == togvarsel_notify.RUSH_OF_ISSUE
 
 
 def test_a_superseded_baseline_is_not_reported_overdue():
@@ -375,7 +433,8 @@ def test_a_superseded_baseline_is_not_reported_overdue():
         togvarsel._state["issues"]["0700"] = togvarsel.Issue(
             issue="0700", scope="x", p=0.2, level="yellow", reasons=[], computed_at=MONDAY_0710
         )
-    m = togvarsel.build_melding(MONDAY_0710.replace(hour=11, minute=0))
+    # Inside the morning rush: past 06:30 + grace, before the 09:00 that retires the card.
+    m = togvarsel.build_melding(MONDAY_0710.replace(hour=8, minute=0))
     assert [i.issue for i in m.issues] == ["0700"]
     assert m.overdue_issues == []
 
@@ -412,11 +471,20 @@ def test_endpoint_serves():
     assert {"date", "forecast_day", "issues", "known_deviations", "skill_note"} <= set(body)
 
 
-def _rekey_state_to_the_real_clock() -> None:
-    """The endpoint reads datetime.now(); the fakes seed a fixed Monday. Re-keying the cached
-    day makes build_melding treat the canned issues as today's, whatever day the suite runs."""
-    with togvarsel._lock:
-        togvarsel._state["date"] = datetime.now(_OSLO).date()
+class _pinned_clock:
+    """Pin the endpoint's clock to the fakes' fixed Monday. What /today serves is a function of
+    the hour — a card is retired once its rush ends — so reading the real clock would make these
+    checks pass or fail by the time of day the suite happens to run."""
+
+    def __init__(self, now: datetime) -> None:
+        self._now = now
+
+    def __enter__(self) -> None:
+        self._original = togvarsel._now
+        togvarsel._now = lambda: self._now
+
+    def __exit__(self, *exc: object) -> None:
+        togvarsel._now = self._original
 
 
 def test_endpoint_mints_one_feedback_context_per_issued_forecast():
@@ -434,8 +502,7 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
     fake = _FakeBQ(feature_row=_feature_row(),
                    probs={"am0630": 0.15, "am0700": 0.34, "pm1200": 0.2, "pm1400": 0.05})
     _reset(fake)
-    togvarsel.refresh(now=MONDAY_1430)
-    _rekey_state_to_the_real_clock()
+    togvarsel.refresh(now=MONDAY_1430)  # the whole day computed at once, as a restart does
     feedback_contexts._reset_for_tests()
     original_enabled = feedback.enabled
     feedback.enabled = lambda: True
@@ -443,8 +510,12 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
         app = FastAPI()
         app.include_router(togvarsel.router)
         client = TestClient(app)
-        first = client.get("/togmelding-api/today").json()
-        second = client.get("/togmelding-api/today").json()
+        # 07:10: a card is retired when its rush ENDS, never before the rush starts, so the
+        # back-filled afternoon forecast rides along beside the live morning one — which is what
+        # puts two forecasts on one payload to compare ids across.
+        with _pinned_clock(MONDAY_0710):
+            first = client.get("/togmelding-api/today").json()
+            second = client.get("/togmelding-api/today").json()
         issues = {i["issue"]: i for i in first["issues"]}
         # 06:30 and 12:00 were issued too; the page carries only what superseded them.
         assert set(issues) == {"0700", "1400"}
@@ -464,7 +535,7 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
         assert snapshot["policy"] == {"green_max": togvarsel.GREEN_MAX, "red_min": togvarsel.RED_MIN}
         assert snapshot["delivery"] == {"surface": "togmelding"}
 
-        for issue in togvarsel.issued_today(now=datetime.now(_OSLO)):
+        for issue in togvarsel.issued_today(now=MONDAY_1430):
             assert issue["feedback_context_id"] is None
             assert issue["feedback_enabled"] is False
     finally:
@@ -482,14 +553,14 @@ def test_endpoint_offers_no_feedback_when_the_stack_is_off():
     fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.15})
     _reset(fake)
     togvarsel.refresh(now=MONDAY_0710)
-    _rekey_state_to_the_real_clock()
     feedback_contexts._reset_for_tests()
     original_enabled = feedback.enabled
     feedback.enabled = lambda: False
     try:
         app = FastAPI()
         app.include_router(togvarsel.router)
-        (issue,) = TestClient(app).get("/togmelding-api/today").json()["issues"]
+        with _pinned_clock(MONDAY_0710):
+            (issue,) = TestClient(app).get("/togmelding-api/today").json()["issues"]
         assert issue["feedback_context_id"] is None and issue["feedback_enabled"] is False
         assert feedback_contexts._by_id == {}
     finally:
