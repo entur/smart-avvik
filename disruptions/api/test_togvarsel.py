@@ -515,12 +515,20 @@ def test_feedback_snapshot_matches_the_context_table_columns():
     assert set(snapshot) == columns - {"context_id", "context_date", "persisted_at"}
 
 
-def test_feedback_snapshot_mirrors_the_static_page():
+def test_feedback_snapshot_mirrors_the_page():
     """_LEVEL_TEXT and the percentage phrase are COPIES of the page's own rendering — the snapshot
     must say what the traveller actually read, so an edit to either side must show up here (the
     cheap grep guard; nothing executes the page's JS). Also pins the wiring the widget depends on:
-    the shared submission endpoint and the two payload fields the card gates on."""
-    page = (Path(togvarsel.__file__).parent / "togmelding_static" / "index.html").read_text()
+    the shared submission endpoint and the two payload fields the card gates on.
+
+    Reads the page's SOURCES (demo/togmelding/src), not its build output: since 2026-09-01 the
+    page is a Vite bundle on Entur Linje rather than one committed HTML file, so togmelding_static/
+    is generated — absent in a fresh checkout, and minified when present."""
+    src = Path(togvarsel.__file__).parents[2] / "demo" / "togmelding" / "src"
+    page = "\n".join(
+        path.read_text() for path in sorted(src.rglob("*")) if path.suffix in (".ts", ".tsx")
+    )
+    assert page, f"no page sources found under {src}"
     for text in togvarsel._LEVEL_TEXT.values():
         assert text in page, f"page no longer renders the level text {text!r}"
     assert " % sjanse for mye trøbbel)" in page

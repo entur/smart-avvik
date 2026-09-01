@@ -56,6 +56,7 @@ from zoneinfo import ZoneInfo
 
 import feedback  # the /varsel feedback stack; gates and mints are shared, see togmelding_today
 import feedback_contexts
+from deployment import environment_label
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
@@ -189,6 +190,15 @@ class Togmelding(BaseModel):
     pm_outlook: str | None = None
     known_deviations: list[KnownDeviation]
     skill_note: str
+
+
+class ConfigResponse(BaseModel):
+    """What the page needs to describe itself, independent of the forecast."""
+
+    environment: str | None = Field(
+        description='Non-prod environment name ("dev", "tst") for the page to show in its title; '
+        "null in prd.",
+    )
 
 
 _bq_client: Any = None
@@ -578,10 +588,10 @@ def build_melding(now: datetime) -> Togmelding:
     )
 
 
-# Literal level line mirrored from the static page renderer (LEVEL_TEXT in
-# togmelding_static/index.html) — the varsel._feedback_detail convention: the persisted snapshot
+# Literal level line mirrored from the page's renderer (LEVEL_TEXT in
+# demo/togmelding/src/format.ts) — the varsel._feedback_detail convention: the persisted snapshot
 # must say what the traveller actually read, not a paraphrase of it.
-# test_feedback_snapshot_mirrors_the_static_page pins the mirror.
+# test_feedback_snapshot_mirrors_the_page pins the mirror.
 _LEVEL_TEXT = {
     "green": "liten fare for forstyrrelser",
     "yellow": "noe usikkert",
@@ -641,6 +651,18 @@ def _with_feedback_context(issue: Issue, d: date) -> Issue:
     return issue.model_copy(
         update={"feedback_context_id": context_id, "feedback_enabled": context_id is not None}
     )
+
+
+@router.get("/togmelding-api/config", response_model=ConfigResponse)
+def togmelding_config() -> ConfigResponse:
+    """Which deployment is serving the page, for the "(dev)" it appends to its heading and title.
+
+    Its own endpoint rather than a field on ``/today``, the way /historikk and /meldinger already
+    do it: /today can be empty or stale for perfectly ordinary reasons (a weekend, a failed
+    feature rebuild, a holiday), and "am I looking at dev or prd?" matters most exactly then.
+    This one reads GOOGLE_CLOUD_PROJECT and touches nothing else.
+    """
+    return ConfigResponse(environment=environment_label())
 
 
 @router.get("/togmelding-api/today", response_model=Togmelding)
