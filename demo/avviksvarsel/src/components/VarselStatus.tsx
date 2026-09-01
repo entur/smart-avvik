@@ -132,7 +132,7 @@ export default function VarselStatus({
   }, [config, ensureDeviceId, brand]);
 
   const test = useCallback(async () => {
-    if (!deviceId) return; // only reachable while subscribed, which implies an id
+    if (!deviceId) return; // unreachable: the button renders only when `deliverable`, i.e. with an id
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -147,7 +147,7 @@ export default function VarselStatus({
   }, [deviceId]);
 
   const disable = useCallback(async () => {
-    if (!deviceId) return; // only reachable while subscribed, which implies an id
+    if (!deviceId) return; // unreachable: the button renders only when `deliverable`, i.e. with an id
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -206,6 +206,16 @@ export default function VarselStatus({
     }
   }, [deviceId, onDeletedAll]);
 
+  // `subscribed` tracks the BROWSER's push subscription; this tracks whether that subscription is
+  // one the server can actually deliver to, which additionally needs a device id. The two come
+  // apart after a «Slett alt» whose unsubscribe step failed (it is best-effort by design — see
+  // deleteAllFlow.ts): on the next load the id is gone but the subscription is not, so the card
+  // would announce «Varsler er på for denne enheten» over a «Send testvarsel» and a «Skru av»
+  // that both early-return on the null id and do nothing at all. Falling back to the unfinished-
+  // setup branch is honest and actionable: «Slå på varsler» mints an id and re-registers the
+  // subscription that is already there.
+  const deliverable = subscribed && deviceId !== null;
+
   return (
     <div className="av-card av-status">
       {state === 'server-off' && (
@@ -254,7 +264,7 @@ export default function VarselStatus({
 
       {state === 'granted' && (
         <>
-          {subscribed ? (
+          {deliverable ? (
             <SmallAlertBox variant="success" width="fluid">
               Varsler er på for denne enheten.
             </SmallAlertBox>
@@ -262,7 +272,7 @@ export default function VarselStatus({
             <Paragraph margin="none">Fullfør oppsettet for å få varsler på denne enheten.</Paragraph>
           )}
           <div className="av-status-actions">
-            {subscribed ? (
+            {deliverable ? (
               <>
                 <SecondaryButton onClick={test} loading={busy}>
                   Send testvarsel
