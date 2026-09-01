@@ -23,6 +23,7 @@ import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
+import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
@@ -1078,6 +1079,7 @@ async def lifespan(app: FastAPI):
     feedback_contexts.configure(bq_client=bq_client)
     feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
+    rushhistorikk.configure(bq_client=bq_client)
     # /meldinger reads the same decision log and replays each row's stored message_input through
     # today's prompt. The template writer is passed in rather than imported by the module —
     # varsel.py is 147 KB of poller state, and _deterministic_body is a pure function of the
@@ -1238,6 +1240,17 @@ app.include_router(historikk.router)
 # hypothetical journeys rather than registrations would retire the question outright.
 app.include_router(meldinger.router)
 
+# Rushhistorikk API (did the rush forecasts land, and did we tell anybody?). Registered before
+# the /rushhistorikk static mount, like the routers above.
+#
+# What this publishes, since the SSO prefixes it registers gate nothing today (SSO_REQUIRED is
+# "false" in every environment and no environment wires the OAuth client): a rush forecast is one
+# product-wide prognosis over a fixed 39-station geography, so there is no journey, route, device or
+# departure behind any row — the one way this surface is simpler than /historikk and /meldinger. The
+# five subscriber-derived counts on togvarsel_rounds are the exception, and rushhistorikk_days.sql
+# never names them.
+app.include_router(rushhistorikk.router)
+
 # Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
 app.include_router(togvarsel.router)
@@ -1394,6 +1407,24 @@ else:
 # The Meldinger UI (demo/meldinger) — the same decisions, replayed through today's prompt.
 # Same generated-directory pattern as the mounts above; its data comes from /meldinger-api, which
 # is registered unconditionally beside it (see the router above for what the surface publishes).
+# The Rushhistorikk UI (demo/rushhistorikk) — did the rush forecasts land, and did we tell
+# anybody? Same generated-directory pattern as the mounts above; its data comes from
+# /rushhistorikk-api, registered unconditionally beside it.
+_RUSHHISTORIKK_STATIC_DIR = Path(__file__).parent / "rushhistorikk_static"
+if _RUSHHISTORIKK_STATIC_DIR.is_dir():
+    app.mount(
+        "/rushhistorikk",
+        _VersionedStaticFiles(directory=_RUSHHISTORIKK_STATIC_DIR, html=True),
+        name="rushhistorikk",
+    )
+    logger.info("Mounted rushhistorikk UI at /rushhistorikk from %s", _RUSHHISTORIKK_STATIC_DIR)
+else:
+    logger.info(
+        "No rushhistorikk_static/ directory; /rushhistorikk not mounted "
+        "(run demo/rushhistorikk/build.sh)"
+    )
+
+
 _MELDINGER_STATIC_DIR = Path(__file__).parent / "meldinger_static"
 if _MELDINGER_STATIC_DIR.is_dir():
     app.mount(
