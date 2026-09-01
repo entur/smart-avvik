@@ -92,7 +92,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
-from typing import Any, Protocol
+from typing import Annotated, Any, Protocol
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -108,6 +108,9 @@ from alert_policy import TROUBLE_DELAY_MIN, min_threshold, threshold_for  # noqa
 from alternatives import AlternativeJourney
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import (
+    Path as PathParam,  # aliased: `Path` here is pathlib's (see _STATE_PATH)
+)
 from impact import AlternativeOutcome, ImpactResponse, LatestObservation, severity_key
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
@@ -2794,6 +2797,18 @@ class JourneyIn(BaseModel):
     begin: str = Field(description='Window start "HH:MM" (Europe/Oslo).')
     end: str = Field(description='Window end "HH:MM" (Europe/Oslo); must be after begin.')
     days: list[int] = Field(description="Weekdays to watch: 0=Monday … 6=Sunday.")
+    consent_text_version: str | None = Field(
+        default=None,
+        max_length=40,
+        pattern=r"^\d{4}-\d{2}-\d{2}\.\d+$",
+        description=(
+            "Which version of the privacy/consent text the traveller was shown when registering "
+            "(the PWA's CONSENT_TEXT_VERSION, e.g. '2026-08-31.1'), so which text was live at a "
+            "given time is provable afterwards. Optional: an older PWA build sends nothing. "
+            "Constrained like every sibling string here — the value rides the state blob on every "
+            "save and lands in a structured log field, so an unbounded client string is not free."
+        ),
+    )
 
     @field_validator("begin", "end")
     @classmethod
@@ -2831,6 +2846,13 @@ class Journey(BaseModel):
     end: str
     days: list[int] = Field(description="0=Monday … 6=Sunday.")
     created_ts: str
+    consent_text_version: str | None = Field(
+        default=None,
+        description=(
+            "The privacy/consent text version recorded at registration. NULL for a journey "
+            "registered by a client that sends none, or before the field existed."
+        ),
+    )
     alerts: list[Alert] = Field(
         description="Situations currently affecting this journey, worst first — one per "
         "train. Published (SX) matches appear whether or not they cross the push threshold; "
@@ -2967,6 +2989,66 @@ def _card_alerts(alerts: list[Alert]) -> list[Alert]:
     return [alert for alert in alerts if alert.has_situation or alert.alertworthy]
 
 
+@router.delete("/devices/{device_id}/data", summary="Delete everything stored about a device")
+def delete_device_data(
+    device_id: Annotated[str, PathParam(min_length=8, max_length=100)],
+) -> dict:
+    """«Slett alt»: the device record, every journey it registered, and those journeys' dedup
+    entries — one lock acquisition, one save (the GDPR art. 17 request, served in one call).
+
+    Distinct from :func:`delete_device`, which is «Skru av»: that one forgets the push subscription
+    and deliberately KEEPS the journeys. A client-side loop over the two per-item deletes would be
+    non-atomic, N round trips, and would strand the `_notified` entries — which live in the
+    persisted blob, so a redeploy would restore dedup keys pointing at journeys that no longer
+    exist.
+
+    Idempotent, following `delete_device` (`pop` with a default, always 200) and deliberately NOT
+    `delete_journey`, which 404s on a miss: a client retrying after a dropped response must not see
+    a spurious failure. The unknown-id path does **zero** I/O — no save, no log. Every mutation
+    here holds `_state_lock` across a blocking GCS upload, so an unauthenticated endpoint that
+    uploaded on each random UUID would be free write amplification, and the lock it holds while
+    doing so is the one the poller and every registration need.
+
+    The path param carries the same bounds every body model puts on `device_id` (FastAPI validates
+    a path param only where constraints are declared). No charset pattern: the legacy fallback id
+    shape `dev-<ts>-<rand>` must stay legal.
+
+    Plain `def`, not `async def`: `_save_state` blocks on GCS. See `upsert_device`.
+
+    Note what is deliberately left alone: the caches keyed on the journey *definition*
+    (`_messages`, `_message_attempts`) carry no device identifier and are shared by every
+    registration of that definition, so clearing them here would discard another device's wording.
+    They expire with their situation.
+    """
+    with _state_lock:
+        device = _devices.pop(device_id, None)
+        deleted = [jid for jid, rec in _journeys.items() if rec["device_id"] == device_id]
+        if device is None and not deleted:
+            return {"status": "ok", "journeys_deleted": 0}
+        for jid in deleted:
+            del _journeys[jid]
+        if deleted:
+            gone = set(deleted)
+            # Dedup keys are "journey_id|situationNumber" — see check_and_notify.
+            _notified.difference_update(
+                {key for key in _notified if key.split("|", 1)[0] in gone}
+            )
+        _save_state()
+    logger.info(
+        "Deleted all data for device %s (%d journeys)",
+        device_id,
+        len(deleted),
+        extra={
+            "fields": {
+                "event": "varsel_delete_all",
+                "device_id": device_id,
+                "journeys_deleted": len(deleted),
+            }
+        },
+    )
+    return {"status": "ok", "journeys_deleted": len(deleted)}
+
+
 def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) -> Journey:
     """A journey plus its live alerts, each annotated with the message that was pushed for it.
 
@@ -3051,6 +3133,8 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
         end=rec["end"],
         days=rec["days"],
         created_ts=rec["created_ts"],
+        # `.get`, not `[…]`: every record persisted before the field existed lacks the key.
+        consent_text_version=rec.get("consent_text_version"),
         alerts=alerts,
         # Suppressed while something is actually matching: a card cannot credibly say "we found no
         # departures between these stops" directly above a disruption on one of them.
@@ -3206,6 +3290,10 @@ def create_journey(body: JourneyIn) -> Journey:
             "end": body.end,
             "days": body.days,
             "created_ts": _now_iso(),
+            # Which privacy text this traveller was shown. Stored on the RECORD (the state blob
+            # carries it verbatim, so it needs no migration) and never on a varsel_decisions
+            # column: adding one there breaks the registered scheduled query.
+            "consent_text_version": body.consent_text_version,
         }
         if verdict is not None:
             rec["service_checked_ts"] = _now_iso()
@@ -3215,7 +3303,7 @@ def create_journey(body: JourneyIn) -> Journey:
         _journeys[jid] = rec
         _save_state()
     try:
-        return _journey_model(jid, rec)
+        model = _journey_model(jid, rec)
     except Exception:
         # The registration is already committed, so a failure rendering the response would otherwise
         # burn one of the 20 per-device slots on every retry while the UI shows nothing (review
@@ -3227,6 +3315,28 @@ def create_journey(body: JourneyIn) -> Journey:
         raise HTTPException(
             status_code=503, detail="Kunne ikke opprette reisen akkurat nå. Prøv igjen."
         ) from None
+    # Logged only once the registration STANDS -- the rollback above un-registers it, and an audit
+    # record of a registration that does not exist is worse than none. The journey is identified by
+    # its DIGEST and never by from_stop/to_stop or their names: keeping the commute pattern out of
+    # Cloud Logging is what key_digest exists for, and this record sits beside device_id-bearing
+    # ones (event="push", event="client_error"). Same digest as decisions.record's, so a
+    # registration and its later decisions join.
+    from llm_message import key_digest
+
+    logger.info(
+        "Journey registered (consent text %s)",
+        body.consent_text_version or "unversioned",
+        extra={
+            "fields": {
+                "event": "journey_registered",
+                "journey_id": jid,
+                "device_id": body.device_id,
+                "journey_digest": key_digest(journey_key(rec)),
+                "consent_text_version": body.consent_text_version,
+            }
+        },
+    )
+    return model
 
 
 @router.delete("/journeys/{journey_id}", summary="Delete a registered journey")
