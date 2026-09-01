@@ -192,6 +192,14 @@ class Issue:
     eligible: bool | None = None  # the training chain's DAY-level test; None = not established yet
     outcome: str = OUTCOME_PENDING  # one of OUTCOME_STATES
     actual: str | None = None  # A: the realized level for THIS issue's own window (SCOPE_BY_SLOT)
+    # Whether the round log demonstrably already covered this whole day: `d` is strictly after the
+    # earliest day any round was recorded on. Only meaningful when `recorded` is false, where it
+    # separates a LOST best-effort write from the pre-launch backlog. Strictly after, not at or
+    # after: the earliest recorded day is a DAY, and on the deploy day itself the issues that fired
+    # before the restart legitimately have no round — reading those as lost writes would put one
+    # false positive per environment permanently on the page. The cost is that a write lost on that
+    # first day reads as backlog, which is the safe direction.
+    after_recording_started: bool = False
 
 
 def _check_slot(slot: str) -> str:
@@ -331,16 +339,6 @@ def population(issue: Issue) -> str:
     return BUCKET_SCORED
 
 
-def population_class(issue: Issue) -> str:
-    """The three named populations as one word: "scored", "delivered_only" or "excluded". The
-    bucket is the finer answer; this is the reading the metric table's Population column uses."""
-    bucket = population(issue)
-    if bucket == BUCKET_SCORED:
-        return "scored"
-    if bucket in DELIVERED_ONLY:
-        return "delivered_only"
-    return "excluded"
-
 
 def _aware_utc(value: datetime) -> datetime:
     """A naive timestamp read as UTC, an aware one untouched.
@@ -398,6 +396,10 @@ class Counts:
     n_late: int = 0
     n_untimely: int = 0
     n_scored: int = 0
+    # A SUBSET of n_ikke_vurdert, not an eighth bucket — the seven above still sum to n. Counts the
+    # ones the round log should have covered, so a lost best-effort write is visible during exactly
+    # the weeks the pre-launch backlog is large enough to hide it.
+    n_ikke_vurdert_etter_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -487,6 +489,11 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
         n_late=buckets.count(BUCKET_LATE),
         n_untimely=buckets.count(BUCKET_UNTIMELY),
         n_scored=buckets.count(BUCKET_SCORED),
+        n_ikke_vurdert_etter_start=sum(
+            1
+            for issue, bucket in zip(issues, buckets, strict=True)
+            if bucket == BUCKET_IKKE_VURDERT and issue.after_recording_started
+        ),
     )
     scored = [i for i, b in zip(issues, buckets, strict=True) if b == BUCKET_SCORED]
     delivered = [i for i, b in zip(issues, buckets, strict=True) if b in DELIVERED_BUCKETS]

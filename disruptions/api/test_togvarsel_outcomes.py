@@ -96,6 +96,9 @@ def _reset(fake) -> None:
     togvarsel_outcomes.configure(bq_client=fake)
     togvarsel_outcomes._state.clear()
     togvarsel_outcomes._table_ready = False
+    # Module state outside `_state` has to be reset here too, or a leaked latch makes half the suite
+    # pass by accident — the shape varsel's own `_reset_state` lesson warns about.
+    togvarsel_outcomes._settled_last_utc = None
 
 
 # ---- The level mapping: the bars, the boundaries, and the identity it rests on ----------------
@@ -181,9 +184,35 @@ def test_a_scope_already_checked_today_is_not_due_again():
 def test_the_authoritative_pass_is_due_after_0400_utc():
     """last_recorded's one daily rewrite landed at ~03:04 UTC when it was measured; 04:00 is
     varsel-label-daily's own slot, chosen the same way."""
-    assert togvarsel_outcomes.settled_due(datetime(2026, 8, 31, 3, 30, tzinfo=UTC), False) is False
-    assert togvarsel_outcomes.settled_due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), False) is True
-    assert togvarsel_outcomes.settled_due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), True) is False
+    due = togvarsel_outcomes.settled_due
+    assert due(datetime(2026, 8, 31, 3, 30, tzinfo=UTC), None) is False
+    assert due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), None) is True
+    assert due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), date(2026, 8, 31)) is False
+    # A run recorded YESTERDAY does not satisfy today.
+    assert due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), date(2026, 8, 30)) is True
+
+
+def test_the_authoritative_pass_does_not_fire_at_oslo_midnight():
+    """The gate is a UTC hour and the latch must be keyed on the UTC date, or the pass runs five
+    hours BEFORE the batch it waits for.
+
+    Oslo midnight is 22:00 UTC of the previous UTC day in CEST (23:00 in CET). While the latch was
+    a boolean inside the module's Oslo-day state, the Oslo rollover cleared it at exactly the moment
+    `hour >= 4` was trivially true, so the pass ran against a last_recorded whose newest rewrite
+    predated both of that day's rushes, found nothing, and settled every scope as `unresolvable` —
+    irreversibly, and with nothing logged as an error. Both offsets are pinned because the summer
+    one is 22:00 and the winter one 23:00, and a fix that handled only one would look correct for
+    half the year.
+    """
+    due = togvarsel_outcomes.settled_due
+    for oslo_midnight, ran_on in (
+        (datetime(2026, 9, 2, 0, 5, tzinfo=_OSLO), date(2026, 9, 1)),  # CEST: 22:05 UTC on the 1st
+        (datetime(2026, 12, 2, 0, 5, tzinfo=_OSLO), date(2026, 12, 1)),  # CET: 23:05 UTC on the 1st
+    ):
+        assert oslo_midnight.astimezone(UTC).hour >= togvarsel_outcomes._SETTLED_DUE_UTC_HOUR
+        assert due(oslo_midnight, ran_on) is False, oslo_midnight
+        # ... and it does become due once the UTC day turns and 04:00 UTC passes.
+        assert due(oslo_midnight.astimezone(UTC).replace(hour=4) + timedelta(days=1), ran_on) is True
 
 
 # ---- The provisional pass --------------------------------------------------------------------
@@ -387,7 +416,9 @@ def test_a_multi_day_backlog_is_one_select_and_only_the_work_set_is_written():
     _reset(fake)
     togvarsel_outcomes.refresh(now=datetime(2026, 9, 1, 6, 5, tzinfo=_OSLO))
 
-    selects = [q for q in fake.queries if "last_recorded" in q]
+    # Identity, not a substring: `last_recorded` also appears in the DDL's column descriptions, so
+    # a substring filter counts the table-creation job as a range SELECT.
+    selects = [q for q in fake.queries if q == togvarsel_outcomes._SETTLED_QUERY]
     assert len(selects) == 1, f"expected ONE range SELECT for the whole span, got {len(selects)}"
     settled = [m for m in fake.merges if m["kind"] == "settled"]
     assert {m["d"] for m in settled} == {monday, tuesday, thursday}, "only the work set is written"
@@ -400,24 +431,78 @@ def test_the_range_select_is_bounded_by_the_work_sets_own_min_and_max():
     _reset(fake)
     togvarsel_outcomes.refresh(now=datetime(2026, 9, 1, 6, 5, tzinfo=_OSLO))
     # the parameters the module actually sent, not the ones we hoped it would
-    sent = [q for q in fake.sent if "last_recorded" in q[0]]
+    # Identity, not a substring: `last_recorded` also appears in the DDL's column descriptions.
+    sent = [q for q in fake.sent if q[0] == togvarsel_outcomes._SETTLED_QUERY]
     assert sent, "no settled SELECT ran"
     params = sent[0][1]
     assert params["from_date"] == monday and params["to_date"] == thursday
 
 
-def test_a_day_the_range_returned_nothing_for_still_settles_every_scope():
-    """A day inside the work set with no rows at all — a full feed outage — settles as
-    unresolvable rather than staying `venter` for ten days against an immutable batch."""
+def test_a_day_the_range_returned_nothing_for_at_all_is_left_for_the_retry_window():
+    """A day NO scope resolved for writes nothing, where a day missing ONE scope settles it.
+
+    That pair is the discriminator between the two causes of an empty read, and only one of them is
+    final. With a sibling scope resolved the batch has demonstrably landed and "no resolved call in
+    this window" is an answer about the data. With nothing at all, the likeliest cause is that the
+    batch has not landed for that day yet — and because `resolve_outcome_state` reads
+    `unresolvable` BEFORE the retry window, three rows written here would burn the day permanently
+    on one early read. Left alone it stays in the work set, reads `venter`, is retried daily, and
+    turns `ukjent` at day 11 by itself.
+    """
     monday, thursday = date(2026, 8, 24), date(2026, 8, 27)
     fake = _FakeBQ(settled=[_row("am", 0.12, d=monday), _row("amrest", 0.11, d=monday),
                             _row("pm", 0.05, d=monday)],
                    work_set=[monday, thursday])
     _reset(fake)
     togvarsel_outcomes.refresh(now=datetime(2026, 9, 1, 6, 5, tzinfo=_OSLO))
-    thu = [m for m in fake.merges if m["kind"] == "settled" and m["d"] == thursday]
-    assert len(thu) == len(togvarsel_outcomes.SCOPES)
-    assert all(m["unresolvable"] is True and m["trouble10"] is None for m in thu)
+    assert [m for m in fake.merges if m["d"] == thursday] == []
+    # Monday, which did resolve, is written in full — the skip is per day, not a blanket bail-out.
+    assert len([m for m in fake.merges if m["kind"] == "settled" and m["d"] == monday]) == len(
+        togvarsel_outcomes.SCOPES
+    )
+
+
+def test_the_two_provisional_windows_have_separate_give_up_budgets():
+    """A morning outage must not forfeit the afternoon check.
+
+    One shared "provisional" backoff key meant eight failed morning attempts retired the pass for
+    the whole Oslo day, so an environment that was healthy by 18:20 still recorded nothing for the
+    afternoon rush — and the page reads that as `venter`, then `ukjent`, with no error anywhere.
+    """
+    fake = _FakeBQ(fail_on="rail_calls_planned_today")
+    _reset(fake)
+    for minute in range(0, 8 * 20, 20):  # burn the morning budget past _MAX_FAILS_PER_DAY
+        togvarsel_outcomes.refresh(now=_oslo(9, 25) + timedelta(minutes=minute))
+    morning_attempts = len(fake.queries)
+    assert morning_attempts >= togvarsel_outcomes._MAX_FAILS_PER_DAY
+    togvarsel_outcomes.refresh(now=_oslo(18, 25))  # the afternoon window, same day
+    assert len(fake.queries) > morning_attempts, "the afternoon window inherited the morning's budget"
+
+
+def test_a_startup_ddl_failure_is_retried_on_the_next_write():
+    """ensure_table's own log promises "retrying on write", and until it did that was untrue: one
+    BigQuery blip at startup left the table absent until somebody redeployed. Its sibling
+    togvarsel_notify._record_round has always carried this latch."""
+    fake = _FakeBQ(provisional=[_row("am", 0.12)], fail_on="CREATE TABLE")
+    _reset(fake)
+    togvarsel_outcomes.ensure_table()  # swallowed
+    assert togvarsel_outcomes._table_ready is False
+    fake.fail_on = None
+    togvarsel_outcomes.refresh(now=_oslo(9, 25))
+    assert togvarsel_outcomes._table_ready is True
+    assert fake.merges, "the pass ran but wrote nothing"
+
+
+def test_an_unanswered_provisional_scope_stays_due():
+    """Marking a scope done on an empty read retires it for the rest of the Oslo day, and the page
+    then shows `venter` until the overnight pass with nothing retrying."""
+    fake = _FakeBQ(provisional=[])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=_oslo(9, 25))
+    assert togvarsel_outcomes._state["provisional_done"] == set()
+    fake.provisional = [_row("am", 0.12), _row("amrest", 0.11)]
+    togvarsel_outcomes.refresh(now=_oslo(9, 45))
+    assert {m["scope"] for m in fake.merges} == {"am", "amrest"}
 
 
 def test_the_backoff_constants_stay_in_step_with_togvarsels():

@@ -72,7 +72,7 @@ export function fmtLead(v: number | null): string {
   return `${m > 0 ? '+' : ''}${m} min`;
 }
 
-/** Mirrored from rushvarsel_verdicts.VERDICT_LABEL — the canonical source. Retyping them here is
+/** Mirrored from rushhistorikk_verdicts.VERDICT_LABEL — the canonical source. Retyping them here is
  *  how a rename ships to one surface only, so any edit belongs in that module first. */
 export const VERDICT_LABEL: Record<Verdict, string> = {
   traff: 'Traff',

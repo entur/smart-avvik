@@ -1,7 +1,7 @@
 """Checks for /rushhistorikk-api — the Rushvarsel feedback loop's read side.
 
 Hermetic: the BigQuery client is a fake replaying canned rows, and the clock is pinned, so nothing
-here reads a network or a real date. The verdict logic itself is rushvarsel_verdicts' own suite;
+here reads a network or a real date. The verdict logic itself is rushhistorikk_verdicts' own suite;
 what these checks are for is the seam — that the right scope reaches the right issue, that the
 states which mean "we do not know" stay apart, and that the five subscriber-derived columns never
 leave the process.
@@ -28,6 +28,7 @@ from google.cloud import bigquery as _bq
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
 import rushhistorikk
+import rushhistorikk_verdicts as verdicts
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -55,8 +56,12 @@ class _FakeBQ:
         self.rows = list(rows)
         self.error = error
         self.calls: list[tuple[str, dict]] = []
+        # Kept apart from `calls`, which 30-odd assertions unpack as (sql, params). Without it the
+        # bytes-billed check has nothing to assert on and can only observe THAT a query ran.
+        self.configs: list = []
 
     def query(self, sql, job_config=None):
+        self.configs.append(job_config)
         params = {}
         if job_config is not None:
             for p in job_config.query_parameters:
@@ -117,6 +122,7 @@ def _reset(rows=None, error=None) -> None:
     fake.rows = list(rows if rows is not None else [_row()])
     fake.error = error
     fake.calls.clear()
+    fake.configs.clear()
     # The TTL cache would otherwise serve a previous test's rows. A new module-level cache must be
     # added here or half the suite passes by accident.
     rushhistorikk._cache.clear()
@@ -377,9 +383,10 @@ def test_the_response_carries_exactly_the_expected_keys():
         "verdict", "lead_min", "scored",
     }
     assert set(body["stats"][0]) == {
-        "slot", "presisjon_samlet", "presisjon_varslet", "dekning", "varslingstid_min",
-        "varslingstid_n", "avgjorelser", "n_scored", "n_venter", "n_ukjent", "n_ikke_vurdert",
-        "n_late", "n_untimely", "matrix",
+        "slot", "presisjon_samlet", "presisjon_varslet", "presisjon_varslet_den", "dekning",
+        "dekning_den", "varslingstid_min", "varslingstid_n", "avgjorelser", "n_scored", "n_venter",
+        "n_ukjent", "n_ikke_vurdert", "n_ikke_vurdert_etter_start", "n_late", "n_untimely",
+        "matrix",
     }
 
 
@@ -459,9 +466,93 @@ def test_the_cache_is_bounded():
 
 
 def test_every_query_is_bounded_by_maximum_bytes_billed():
+    """A blast-radius bound, not a pruning check. This test asserted only that a query RAN until
+    2026-09-01 — it carried the bound's name while checking nothing about it, which is worse than
+    having no test, because the gap reads as covered."""
     _reset()
     _days()
-    assert fake.calls, "no query ran"
+    assert fake.configs, "no query ran"
+    assert all(
+        c is not None and c.maximum_bytes_billed == rushhistorikk._MAX_BYTES_BILLED
+        for c in fake.configs
+    )
+
+
+def test_a_scope_with_no_outcome_row_reads_venter_and_never_ukjent():
+    """The pivot in rushhistorikk_days.sql must default an ABSENT scope to NOT settled.
+
+    The vacuous form -- LOGICAL_AND(IF(scope = 'pm', IFNULL(settled, FALSE), TRUE)) -- answers TRUE
+    for a day with no pm row at all, because the else-branch answers TRUE for every other scope's
+    row and the AND passes. Verified against BigQuery. That is not a corner case: between 12:00 and
+    18:20 every weekday, the afternoon has no outcome row yet, so both afternoon issues would read
+    `ukjent` -- a settled verdict -- instead of `venter`, in exactly the window a reader looks at.
+    """
+    _reset([_row(issue="1200", pm_settled=False, pm_level=None, sent=True, round_level="yellow")])
+    issue = _days().json()["days"][0]["issues"][0]
+    assert issue["verdict"] == "venter"
+    assert issue["actual_level"] is None
+
+
+def test_the_vacuous_settled_default_is_not_reintroduced():
+    """Nothing in this repo executes SQL, so the shape has to be guarded by reading the text --
+    `test_the_no_filter_array_test_is_null_safe`'s approach one file over. A dry run cannot catch it
+    either: the vacuous form is valid SQL that simply answers the wrong question."""
+    uncommented = _uncommented((Path(_API_DIR) / "rushhistorikk_days.sql").read_text())
+    for scope in ("am", "amrest", "pm"):
+        assert f"LOGICAL_OR(scope = '{scope}' AND IFNULL(settled, FALSE))" in uncommented
+        assert f"LOGICAL_AND(IF(scope = '{scope}'" not in uncommented
+
+
+def test_a_missing_round_after_the_log_started_is_counted_apart_from_the_backlog():
+    """`ikke vurdert` has two causes and only one is benign, so the SQL selects
+    `first_recorded_day` and the page splits on it. Without the split a lost best-effort write is
+    invisible during exactly the weeks the pre-launch backlog is large enough to hide it.
+
+    Strictly AFTER the earliest recorded day: that value is a DAY, so on the deploy day itself the
+    issues that fired before the restart legitimately have no round.
+    """
+    first = date(2026, 8, 24)
+    _reset([
+        # Before the log existed: the expected backlog.
+        _row(d=date(2026, 8, 20), has_round=False, sent=False, first_recorded_day=first),
+        # The deploy day itself: no round, but not evidence of a lost write.
+        _row(d=first, has_round=False, sent=False, first_recorded_day=first),
+        # After it: the log covered this day and there is still no round.
+        _row(d=date(2026, 8, 26), has_round=False, sent=False, first_recorded_day=first),
+    ])
+    total = _days().json()["stats"][0]
+    assert total["n_ikke_vurdert"] == 3
+    assert total["n_ikke_vurdert_etter_start"] == 1
+
+
+def test_every_served_rate_carries_its_own_denominator():
+    """Each of the three rates is over a DIFFERENT population, and a bare percentage on a page whose
+    first weeks are nearly all `ikke vurdert` invites the one reading that is wrong: 100 % over two
+    bad rushes and 100 % over two hundred are the same glyph."""
+    _reset()
+    for row in _days().json()["stats"]:
+        assert {"n_scored", "presisjon_varslet_den", "dekning_den"} <= set(row)
+
+
+def test_an_unknown_issue_key_is_dropped_rather_than_500ing_the_page():
+    """`verdicts.classify` is total on purpose — a state it refused to name is a state the page
+    cannot render — and indexing SCOPE_BY_SLOT in the API would undo that for the one input most
+    likely to change: a fifth entry in togvarsel.ISSUE_SPECS reaches togvarsel_issued long before
+    it reaches this page."""
+    _reset([_row(), _row(issue="1600")])
+    body = _days().json()
+    assert [i["issue"] for i in body["days"][0]["issues"]] == ["0630"]
+    assert body["stats"][0]["avgjorelser"] == 1
+
+
+def test_the_verdict_labels_are_mirrored_verbatim_in_the_front_end():
+    """VERDICT_LABEL has no Python consumer — it exists as the canonical source format.ts retypes,
+    which is the fork this repo prefers to a shared module. A fork nothing checks is just a
+    divergence waiting to happen, and the failure is a chip reading one thing on the card and
+    another in the tooltip."""
+    ts = (Path(_API_DIR).parent.parent / "demo/rushhistorikk/src/format.ts").read_text()
+    for verdict, label in verdicts.VERDICT_LABEL.items():
+        assert f"{verdict}: '{label}'" in ts, f"{verdict} drifted or is missing from format.ts"
 
 
 # ---- the surface is actually served -----------------------------------------------------------

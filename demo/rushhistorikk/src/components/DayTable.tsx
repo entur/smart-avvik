@@ -61,6 +61,20 @@ function communicated(issue: IssueRow): { text: string; title: string } | null {
         `dekket, og utfallet er vurdert mot det nivået — ikke mot denne utstedelsens eget.`,
     };
   }
+  // Its own marker, and for the same reason the one above exists: an untimely round with a
+  // standing baseline is ALSO graded against the baseline's level, so without this the cell shows
+  // a verdict derived from a level it never mentions. It is not the same news, though — nothing
+  // went out because the round was evaluated too late, and where a friskmelding was the one owed
+  // the verdict is «bom» however calm the rush turned out.
+  if (issue.baseline_level && issue.reason === 'untimely') {
+    return {
+      text: 'For sent',
+      title:
+        `Runden ble vurdert etter leveringsfristen, så ingen push kunne gå ut. Varselet på ` +
+        `${levelLabel(issue.baseline_level)} nivå fra grunnvarselet sto dermed uendret, og ` +
+        `utfallet er vurdert mot det nivået.`,
+    };
+  }
   return null;
 }
 
@@ -142,7 +156,7 @@ function RushCell({
             className="rh-tag"
             title={`Samme dag viste siden ${levelLabel(provisionalLevel)} nivå. Fasit ble satt over natten og står nå på ${levelLabel(level)}.`}
           >
-            foreløpig
+            endret
           </span>
         ) : null}
       </div>

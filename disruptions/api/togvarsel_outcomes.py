@@ -167,6 +167,13 @@ _table_ready = False
 # discipline as togvarsel's _state, so no lock.
 _state: dict[str, Any] = {}
 
+# The authoritative pass's once-per-day latch, and it lives OUT HERE on purpose: `_state` is scoped
+# to the Oslo day (a rush is an Oslo-clock thing) while this gate is a UTC hour (the batch it waits
+# for rewrites at ~03:04 UTC). Held as a boolean inside `_state`, the two calendars shared one dict
+# and the Oslo rollover re-armed the UTC gate at 22:00/23:00 UTC — five hours before the batch. Two
+# calendars, two variables.
+_settled_last_utc: date | None = None
+
 
 def configure(*, bq_client: Any) -> None:
     """Wire in the BigQuery client. Called once from main.lifespan."""
@@ -214,13 +221,26 @@ def provisional_due(now_h: float, done: set[str]) -> tuple[str, ...]:
     return tuple(due)
 
 
-def settled_due(now: datetime, done: bool) -> bool:
-    """Whether the authoritative pass is due: past 04:00 UTC today and not yet run."""
-    return not done and now.astimezone(UTC).hour >= _SETTLED_DUE_UTC_HOUR
+def settled_due(now: datetime, last_run_utc: date | None) -> bool:
+    """Whether the authoritative pass is due: at or after 04:00 UTC on a UTC day it has not run.
+
+    KEYED ON THE UTC DATE, and that is the whole point. The gate is a UTC hour because the batch it
+    waits for is (last_recorded rewrites at ~03:04 UTC), but the module's other state is scoped to
+    the OSLO day because a rush is an Oslo-clock thing. Holding "has it run?" as a boolean inside
+    the Oslo-day state put those two calendars in one dict, and the result was not a near miss:
+    at Oslo midnight — 22:00 UTC in CEST — the Oslo rollover cleared the flag while
+    `hour >= 4` was trivially true, so the pass ran about five hours BEFORE the batch it depends on
+    landed, found nothing, and settled every day as `unresolvable` — permanently, and with no error
+    anywhere. The two calendars now live in two variables instead of one.
+    """
+    now_utc = now.astimezone(UTC)
+    return now_utc.hour >= _SETTLED_DUE_UTC_HOUR and last_run_utc != now_utc.date()
 
 
 def _blank_state(d: date) -> dict[str, Any]:
-    return {"date": d, "provisional_done": set(), "settled_done": False, "backoff": {}}
+    """The Oslo-day-scoped state. Note what is NOT here: the authoritative pass's last-run date,
+    which is UTC-scoped and must survive the Oslo rollover (see settled_due)."""
+    return {"date": d, "provisional_done": set(), "backoff": {}}
 
 
 def _retryable(key: str, now: datetime) -> bool:
@@ -260,6 +280,20 @@ def ensure_table() -> None:
         logger.exception("togvarsel_outcomes: creating the table failed; retrying on write")
 
 
+def _ensure_table_ready() -> None:
+    """Create the table if the startup attempt failed. Called before each pass's first write.
+
+    ensure_table()'s own log says "retrying on write", and until this existed that was simply untrue:
+    a BigQuery blip during startup left the table absent until someone redeployed. Its sibling
+    togvarsel_notify._record_round has always carried this latch fallback; this is the same shape.
+    """
+    global _table_ready
+    if _table_ready:
+        return
+    _bq_client.query(_DDL).result(timeout=60)
+    _table_ready = True
+
+
 def _job_config(params: list) -> Any:
     from google.cloud import bigquery
 
@@ -293,6 +327,7 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
     """One same-day pass over `scopes`, writing the provisional trio and the served value."""
     from google.cloud import bigquery
 
+    _ensure_table_ready()
     cfg = _job_config(
         [
             _scalar("day", "DATE", day),
@@ -337,7 +372,7 @@ def _run_settled(days: Sequence[date], now: datetime) -> None:
     a backlog exactly once per environment — `togvarsel_issued` already holds forecasts issued
     before this feature existed — and again after any poller outage longer than a day. At one SELECT
     plus three MERGEs per day that was up to ~28 sequential BigQuery jobs in a single tick, and this
-    runs on the SOLE poller thread, ahead of the SX rebuild and the notify pass, so the cost is not
+    runs on the SOLE poller thread, after the SX rebuild and the notify pass, so the cost is not
     /rushhistorikk's latency but a poller tick that goes quiet for tens of seconds.
 
     The MERGE loop stays per (day, scope) and iterates the WORK SET, never the scanned span: a day
@@ -346,13 +381,20 @@ def _run_settled(days: Sequence[date], now: datetime) -> None:
     `WHEN MATCHED AND NOT settled` — but the loop is what keeps "a day with no issued forecast is
     never resolved" true.
 
-    A scope the query returns no row for is still settled, as `unresolvable`: last_recorded is an
-    immutable daily batch, so once it has landed, "no resolved call in this window" is a final
-    answer. Retrying it for ten days would re-run the same query to reach the same NULL while the
-    page said `venter`.
+    A scope the query returns no row for is still settled, as `unresolvable` — but ONLY when some
+    other scope did return one. That is the discriminator between the two causes of an empty read,
+    and it is the whole reason the retry window exists. With a sibling scope resolved, the batch has
+    demonstrably landed for that day and "no resolved call in this window" is final: last_recorded
+    is immutable, so retrying for ten days re-runs one query to reach the same NULL. With NO scope
+    resolved, the likeliest cause is that the batch has not landed for that day at all, and writing
+    three `unresolvable` rows would burn the day permanently on the strength of one early read —
+    `resolve_outcome_state` reads unresolvable BEFORE the window, so nothing ever revisits it. Such
+    a day is therefore skipped entirely: it stays in the work set, reads `venter`, is retried each
+    day, and turns `ukjent` at day 11 on its own.
     """
     if not days:
         return
+    _ensure_table_ready()
     cfg = _job_config(
         [_scalar("from_date", "DATE", min(days)), _scalar("to_date", "DATE", max(days))]
     )
@@ -364,7 +406,25 @@ def _run_settled(days: Sequence[date], now: datetime) -> None:
 
 
 def _settle_day(day: date, rows: dict[str, Any], now: datetime) -> None:
-    """Write one day's three scopes from the rows the range SELECT returned for it."""
+    """Write one day's three scopes from the rows the range SELECT returned for it.
+
+    A day no scope resolved for writes NOTHING — see `_run_settled` on why that is not the same
+    answer as "unresolvable".
+    """
+    if not rows:
+        logger.info(
+            "togvarsel_outcomes: %s returned no resolved calls; leaving it for the retry window",
+            day,
+            extra={
+                "fields": {
+                    "event": "togvarsel_outcomes_pass",
+                    "pass": "settled",
+                    "day": str(day),
+                    "rows": 0,
+                }
+            },
+        )
+        return
     eligible = eligible_for({scope: (rows[scope]["n_calls"] or 0) for scope in rows})
     for scope in SCOPES:
         row = rows.get(scope)
@@ -433,20 +493,28 @@ def refresh(now: datetime | None = None) -> None:
         _state.update(_blank_state(today))
     now_h = now.hour + now.minute / 60 + now.second / 3600
 
+    global _settled_last_utc
     due = provisional_due(now_h, _state["provisional_done"])
-    if due and _retryable("provisional", now):
+    # Keyed on the WINDOW, not on the pass. One "provisional" budget meant a morning outage that
+    # burned the eight-failure give-up silently forfeited the afternoon check too, on a day when
+    # nothing was wrong by 18:20.
+    due_key = f"provisional:{'+'.join(due)}"
+    if due and _retryable(due_key, now):
         try:
-            _run_provisional(today, due, now)
-            _state["provisional_done"].update(due)
-            _state["backoff"].pop("provisional", None)
+            answered = _run_provisional(today, due, now)
+            # Only a scope the query actually answered for is done. Marking an unanswered scope
+            # done would retire it for the rest of the Oslo day on the strength of one empty read —
+            # and the page would show `venter` until the overnight pass, with nothing retrying.
+            _state["provisional_done"].update(answered)
+            _state["backoff"].pop(due_key, None)
         except Exception:
             logger.exception("togvarsel_outcomes: provisional pass failed; retrying after backoff")
-            _note_failure("provisional", now)
+            _note_failure(due_key, now)
 
-    if settled_due(now, _state["settled_done"]) and _retryable("settled", now):
+    if settled_due(now, _settled_last_utc) and _retryable("settled", now):
         try:
             _run_settled(_work_set(today), now)
-            _state["settled_done"] = True
+            _settled_last_utc = now.astimezone(UTC).date()
             _state["backoff"].pop("settled", None)
         except Exception:
             logger.exception("togvarsel_outcomes: settled pass failed; retrying after backoff")

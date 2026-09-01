@@ -8,7 +8,7 @@ round log for what we communicated, and :mod:`togvarsel_outcomes` for what the r
 Two things this module is deliberate about:
 
 * **The verdict is not computed here.** It is a fourteen-branch table over three named populations,
-  and it lives in :mod:`rushvarsel_verdicts` as pure functions. The SQL returns facts, Python
+  and it lives in :mod:`rushhistorikk_verdicts` as pure functions. The SQL returns facts, Python
   classifies and aggregates. That is one definition of "traff", unit-testable without BigQuery.
 * **Silence has three different meanings and the page keeps them apart.** ``venter`` is an outcome
   still being retried, ``ukjent`` one that can no longer be established (or a day whose call volume
@@ -47,14 +47,14 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import rushvarsel_verdicts as verdicts
+import rushhistorikk_verdicts as verdicts
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
-# The page counts in Oslo days, because a rush is an Oslo-clock thing. rushvarsel_verdicts is
+# The page counts in Oslo days, because a rush is an Oslo-clock thing. rushhistorikk_verdicts is
 # deliberately timezone-agnostic — it takes dates and a `today` — so the zone lives here.
 _OSLO = ZoneInfo("Europe/Oslo")
 
@@ -213,9 +213,18 @@ class StatsRow(BaseModel):
         description="traff + traff nesten over the scored issues where a warning was in force. "
         "All-clear pushes are excluded: a friskmelding is not a warning."
     )
+    presisjon_varslet_den: int = Field(
+        description="Issues behind that rate. Served because the population differs from "
+        "n_scored — a rate on a page whose first weeks are nearly all 'ikke vurdert' must not be "
+        "readable without its denominator."
+    )
     dekning: float | None = Field(
         description="Share of yellow-or-red rushes we had a warning in force for. Counted per RUSH "
         "on the total row, because a confirming follow-up is covered only via its baseline."
+    )
+    dekning_den: int = Field(
+        description="Bad rushes behind that rate (bad issues on a slot row) — its own population "
+        "again, and the one most likely to be a handful."
     )
     varslingstid_min: float | None = Field(
         description="Median minutes from the push to the rush's start. The last push per rush on "
@@ -227,6 +236,10 @@ class StatsRow(BaseModel):
     n_venter: int = Field(description="Outcome not settled yet.")
     n_ukjent: int = Field(description="Outcome unestablishable, or the day was ineligible.")
     n_ikke_vurdert: int = Field(description="No notification round recorded.")
+    n_ikke_vurdert_etter_start: int = Field(
+        description="Of those, the ones on a day the round log already covered — so a lost "
+        "best-effort write is tellable apart from the pre-launch backlog."
+    )
     n_late: int = Field(description="Forecast issued after its own cutoff.")
     n_untimely: int = Field(description="Round evaluated past its delivery deadline.")
     matrix: list[MatrixRow] = Field(
@@ -299,6 +312,16 @@ def _query(sql: str, params: list, cache_key: tuple):
     return rows
 
 
+def _known_slot(row: Any) -> bool:
+    """Whether this row's issue key is one the taxonomy can score. See `days` for why it drops."""
+    if str(row["issue"]) in verdicts.SCOPE_BY_SLOT:
+        return True
+    logger.warning(
+        "rushhistorikk: dropping an issue key the taxonomy does not know: %r", row["issue"]
+    )
+    return False
+
+
 def _issue_from_row(row: Any, today: date) -> verdicts.Issue:
     """One SQL row as the classifier's input.
 
@@ -308,7 +331,7 @@ def _issue_from_row(row: Any, today: date) -> verdicts.Issue:
     issued, and inflate its skill.
     """
     slot = str(row["issue"])
-    scope = verdicts.SCOPE_BY_SLOT[slot]
+    scope = verdicts.SCOPE_BY_SLOT[slot]  # KeyError is caught by the caller — see _known_slot
     settled = bool(row[f"{scope}_settled"])
     return verdicts.Issue(
         d=row["d"],
@@ -331,6 +354,9 @@ def _issue_from_row(row: Any, today: date) -> verdicts.Issue:
             today=today,
         ),
         actual=row[f"{scope}_level"] if settled else None,
+        after_recording_started=(
+            row["first_recorded_day"] is not None and row["d"] > row["first_recorded_day"]
+        ),
     )
 
 
@@ -386,7 +412,9 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
             slot=row.slot,
             presisjon_samlet=row.presisjon_samlet,
             presisjon_varslet=row.presisjon_varslet,
+            presisjon_varslet_den=row.presisjon_varslet_den,
             dekning=row.dekning,
+            dekning_den=row.dekning_den,
             varslingstid_min=row.varslingstid_min,
             varslingstid_n=row.varslingstid_n,
             avgjorelser=row.avgjorelser,
@@ -394,6 +422,7 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
             n_venter=row.counts.n_venter,
             n_ukjent=row.counts.n_ukjent + row.counts.n_ineligible,
             n_ikke_vurdert=row.counts.n_ikke_vurdert,
+            n_ikke_vurdert_etter_start=row.counts.n_ikke_vurdert_etter_start,
             n_late=row.counts.n_late,
             n_untimely=row.counts.n_untimely,
             matrix=_matrix_rows(row.matrix),
@@ -441,6 +470,12 @@ def days(
         ("days", window, today),
     )
 
+    # An issue key the taxonomy does not know is DROPPED, not fatal. `verdicts.classify` is
+    # deliberately total so no state can 500 the page, and indexing SCOPE_BY_SLOT here would have
+    # undone that for the one input most likely to change: a fifth issue added to
+    # togvarsel.ISSUE_SPECS reaches togvarsel_issued long before it reaches this page. Logged
+    # rather than silent, because a dropped row is a real gap in what the page reports.
+    rows = [row for row in rows if _known_slot(row)]
     issues = [_issue_from_row(row, today) for row in rows]
     stats = verdicts.summarize(issues)
 

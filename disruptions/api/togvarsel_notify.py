@@ -3,8 +3,11 @@
 Togvarsel (togvarsel.py) issues four green/yellow/red prognoses per weekday: 0630 and 0700 for
 the morning rush, 1200 and 1400 for the afternoon. This module decides which of those rounds
 notify /varsel subscribers. The policy core below is pure functions over plain data — issue
-dicts, a marker map, an explicit Oslo-aware `now` — so every decision is reproducible from
-durable inputs (the issued level, the marker state, the clock) without rows in a decisions table.
+dicts, a marker map, an explicit Oslo-aware `now` — so a decision is a function of its inputs
+rather than of anything ambient. That is NOT the same as being reconstructible after the fact, and
+the Round Record section below is where the difference is argued: what the markers do not preserve
+is which rounds were never evaluated at all, so every round is recorded to
+`disruptions.togvarsel_outcomes`' sibling table as it is decided.
 
 The gates, in order, per round:
 
@@ -91,6 +94,9 @@ _OSLO = ZoneInfo("Europe/Oslo")
 
 # togvarsel's level vocabulary; anything else is a malformed round and is refused loudly.
 _LEVELS = ("green", "yellow", "red")
+
+# Blast-radius bound on the round-record MERGE, matching rushhistorikk._MAX_BYTES_BILLED.
+_MAX_BYTES_BILLED = 2 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -336,6 +342,10 @@ def _record_round(
             _bq_client.query(_ROUNDS_DDL).result(timeout=60)
             _rounds_table_ready = True
         cfg = bigquery.QueryJobConfig(
+            # The same blast-radius bound every other BigQuery job in this repo carries. It cannot
+            # catch a pruning regression on a MERGE this small — it is there so a mistyped table
+            # reference cannot reach a ~10 TiB ET partition from the poller thread.
+            maximum_bytes_billed=_MAX_BYTES_BILLED,
             query_parameters=[
                 bigquery.ScalarQueryParameter("d", "DATE", d),
                 bigquery.ScalarQueryParameter("issue", "STRING", decision.issue),
@@ -362,6 +372,13 @@ def _record_round(
         logger.exception(
             "togvarsel_notify: recording round %s failed (the push itself is unaffected)",
             decision.issue,
+            extra={
+                "fields": {
+                    "event": "togvarsel_notify_round_record_failed",
+                    "d": str(d),
+                    "issue": decision.issue,
+                }
+            },
         )
 
 

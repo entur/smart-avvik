@@ -291,7 +291,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   DAY: the four forecast issues (06:30, 07:00, 12:00, 14:00), what was communicated for each, and
   what the two rushes actually did. Its API is `/rushhistorikk-api`
   (`disruptions/api/rushhistorikk.py`), one query per request; the verdict is computed in Python
-  (`rushvarsel_verdicts.py`, pure functions) so there is one definition of "traff".
+  (`rushhistorikk_verdicts.py`, pure functions) so there is one definition of "traff".
+  The fasit is two passes: provisional at 09:20/18:20 Oslo (marked, excluded from every rate, never
+  overwritten) and authoritative after 04:00 **UTC**, because `last_recorded` is a once-daily batch
+  landing ~03:04 UTC. Three traps, all of which shipped once. The authoritative latch is keyed on the
+  **UTC date** — held in the Oslo-day state it re-armed at Oslo midnight (22:00/23:00 UTC) and ran
+  five hours before the batch, settling every day `unresolvable` with no error. A day **no** scope
+  resolved for is left for the retry window while a day missing **one** scope settles — only the
+  second proves the batch landed. And the outcomes pivot must be
+  `LOGICAL_OR(scope = 'x' AND settled)`: the `LOGICAL_AND(IF(..., TRUE))` form reads an absent scope
+  as settled, so the afternoon issues showed `ukjent` instead of `venter` all afternoon, every day.
   - **Two new tables, both per-environment** (not in `copy_runtime_to_prd.sh`):
     `disruptions.togvarsel_rounds` records every notification round as it was DECIDED — pushes and
     suppressions alike, plus the reason — and `disruptions.togvarsel_outcomes` records what the rush
