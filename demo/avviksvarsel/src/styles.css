@@ -79,6 +79,77 @@ body {
   box-shadow: 0 0 0 3px rgb(24 28 86 / 0.28);
 }
 
+/* ---- Oslo rush-hour outlook (the panel at the top; see components/RushOutlook.tsx) ----
+   The three level colours are Linje's validation tokens, the same ones /togmelding's level cards
+   use, so the two surfaces cannot drift into different greens. The badge keeps DARK ink on a
+   LIGHT tint at all three levels: Linje's canary is too light for white text and too light to
+   darken without leaving the palette, so a filled swatch cannot be done consistently. */
+
+.av-rush {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+
+.av-rush-head {
+  margin: 0;
+  font-weight: 600;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.av-rush-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.av-rush-row {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  border-left: 6px solid var(--av-rush-accent, var(--basecolors-stroke-subdued));
+  padding-left: 0.625rem;
+}
+
+.av-rush-green {
+  --av-rush-accent: var(--stroke-success);
+  --av-rush-tint: var(--fill-success-muted);
+}
+
+.av-rush-yellow {
+  --av-rush-accent: var(--stroke-warning);
+  --av-rush-tint: var(--fill-warning-muted);
+}
+
+.av-rush-red {
+  --av-rush-accent: var(--stroke-negative);
+  --av-rush-tint: var(--fill-negative-muted);
+}
+
+.av-rush-badge {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  font-size: var(--font-sizes-small, 0.75rem);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--basecolors-text-accent, var(--lavender-90));
+  background: var(--av-rush-tint, var(--lavender-20));
+  border: 2px solid var(--av-rush-accent, var(--basecolors-stroke-subdued));
+  border-radius: 999px;
+  padding: 0.15rem 0.7rem;
+  white-space: nowrap;
+}
+
+.av-rush-name {
+  font-weight: 600;
+}
+
 .av-status {
   display: flex;
   flex-direction: column;

@@ -1100,7 +1100,26 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   rows** in v1: the decision is a deterministic function of durable inputs, and adding columns to
   the decisions/outcomes tables is a documented trap (a new `varsel_decision_outcomes` column
   breaks the registered scheduled query — see Conventions below); if rows come later, discriminate on
-  a `KIX:Togvarsel:<date>:<issue>` situationNumber prefix, never a new column. Dev-only test
+  a `KIX:Togvarsel:<date>:<issue>` situationNumber prefix, never a new column.
+  **The levels also sit at the top of `/varsel`** (2026-09-01):
+  `GET /togmelding-api/outlook?device_id=…` (`togvarsel_notify.rush_outlook`) answers with the
+  rushes THIS device is notified about that are not yet over, and `demo/avviksvarsel`'s
+  `RushOutlook` card renders them with a link to `/togmelding` — nothing at all when the list is
+  empty, which is the ordinary state. It is the push policy read-only, in the same module, so
+  there is one definition of "a relevant journey": the same three matching tests, the same
+  supersession (the newest issued forecast per rush, so the two surfaces cannot quote different
+  numbers for one rush), gated on the delivery flag. Two things are deliberately different from a
+  round. The window is the **whole rush**, not the part still ahead of `now` — `match_journeys`
+  clamps to evaluation time because a push about a window the traveller has left is noise, while a
+  status panel going blank at 08:00 with the trains still late is the opposite of useful — so what
+  bounds the panel is the rush's end (09:00 / 18:00), never the registration's. And the request
+  path reads the poller's station cache through `cached_station_set` and **never queries**:
+  `station_set` deliberately has no failure cooldown, which is right on a poller tick and one
+  billable scan per page view on a public unauthenticated endpoint. A cold cache therefore yields
+  no panel — and that doubles as the VAPID gate, since `_evaluate` reaches the fetch only past
+  both gates. The route is `async def` (every input is already in-process) where `test-notify` is
+  a plain `def`, and the two writes in `station_set` publish `refs` before `date` so the lock-free
+  read cannot see a date whose refs have not landed. Dev-only test
   trigger: `POST /togmelding-api/test-notify` with `{"device_id": ...}` (same shape as
   `/varsel-api/test`) sends one synthetic yellow round — body marked as testvarsel — through the
   real composition + delivery path without touching markers; it 404s wherever

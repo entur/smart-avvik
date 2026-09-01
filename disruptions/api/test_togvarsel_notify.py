@@ -539,10 +539,11 @@ _REASONS = (
 
 
 def _issued(key: str = "0630", level: str = "yellow", scope: str = "morgenrushet 06:30–09:00",
-            reasons=_REASONS) -> dict:
+            reasons=_REASONS, p: float = 0.21) -> dict:
     """An issue dict with the payload fields togvarsel's Issue model really serves: composition
-    reads `scope` and `reasons` on top of the policy core's issue+level."""
-    return {**_issue(key, level), "scope": scope, "reasons": list(reasons)}
+    reads `scope` and `reasons` on top of the policy core's issue+level, and the rush outlook
+    reads `p` on top of those."""
+    return {**_issue(key, level), "scope": scope, "reasons": list(reasons), "p": p}
 
 
 def test_warning_payload_is_forecast_framed_with_level_env_prefix_and_reasons():
@@ -1104,6 +1105,201 @@ def test_the_test_trigger_maps_delivery_outcomes_to_the_test_push_statuses(monke
             r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
             assert r.status_code == 502  # transient send error
     assert store.stores == 0  # no failure branch touches the round markers
+
+
+
+# ---------------------------------------------------------------------------- the rush outlook
+
+def _configure_outlook(**overrides):
+    """The read-only subset rush_outlook needs, wired the way main does. Deliberately WITHOUT the
+    delivery seams: the panel must work off the four it names and nothing else."""
+    issues = overrides.pop("issues", [_issued("0630", "yellow")])
+    journeys = overrides.pop("journeys", {"j1": _j()})
+    fake = _StationsBQ(refs=sorted(STATIONS))
+    kwargs = {
+        "bq_client": fake,
+        "enabled": lambda: True,
+        "push_ready": lambda: True,
+        "issued_today": lambda: deepcopy(list(issues)),
+        "journeys": lambda: deepcopy(dict(journeys)),
+        "expand_refs": _ident,
+    }
+    kwargs.update(overrides)
+    togvarsel_notify._station_state.clear()
+    togvarsel_notify.configure(**kwargs)
+    return fake
+
+
+def _warm_stations(fake, now):
+    """What the poller does on its first tick of the day; the panel reads this cache and never
+    fetches, so every outlook test has to warm it explicitly."""
+    assert togvarsel_notify.station_set(now) == frozenset(STATIONS)
+    return fake
+
+
+def test_the_rushes_and_their_windows_are_derived_from_the_notify_specs():
+    """One source for "which rush" and "how long it lasts" — a scope change must move the panel
+    and the pushes together, so these are computed from NOTIFY_SPECS, never restated."""
+    assert togvarsel_notify.RUSH_OF_ISSUE == {
+        "0630": "am", "0700": "am", "1200": "pm", "1400": "pm",
+    }
+    assert togvarsel_notify.RUSH_WINDOWS == {"am": (6.5, 9.0), "pm": (15.0, 18.0)}
+
+
+def test_the_panel_reads_the_pollers_station_cache_and_never_queries():
+    """cached_station_set is read-only: /togmelding-api is public and unauthenticated, and
+    station_set has no failure cooldown, so one scan per page view during an outage is the thing
+    this prevents. A cold cache yields no panel rather than a query."""
+    fake = _configure_outlook()
+    assert togvarsel_notify.cached_station_set(_monday(6, 31)) is None
+    assert togvarsel_notify.rush_outlook("dev-1", now=_monday(6, 31)) == []
+    assert fake.queries == []  # the request path issued nothing
+
+    _warm_stations(fake, _monday(6, 31))
+    assert len(fake.queries) == 1
+    assert [f.rush for f in togvarsel_notify.rush_outlook("dev-1", now=_monday(6, 31))] == ["am"]
+    assert len(fake.queries) == 1  # still just the poller's own fetch
+    # yesterday's cache is not today's geography
+    assert togvarsel_notify.cached_station_set(datetime(2026, 9, 1, 6, 31, tzinfo=_OSLO)) is None
+
+
+# A device registered for BOTH rushes: the default _j() is a morning commute only, and relevance
+# is per rush, so a two-rush expectation needs a two-registration device (the real commuter case —
+# one journey in each direction).
+BOTH_RUSHES = {"j1": _j(begin="07:00", end="08:30"), "j2": _j(begin="16:00", end="17:00")}
+
+
+def test_the_panel_serves_the_newest_forecast_per_rush():
+    """A follow-up supersedes its baseline here exactly as it does on /togmelding — otherwise the
+    two surfaces quote different numbers for one rush, and the reader cannot tell which applies."""
+    fake = _configure_outlook(
+        issues=[
+            _issued("0630", "yellow", "morgenrushet 06:30–09:00", p=0.21),
+            _issued("0700", "red", "morgenrushet 07:00–09:00", p=0.44),
+            _issued("1200", "green", "ettermiddagsrushet 15:00–18:00", p=0.04),
+        ],
+        journeys=BOTH_RUSHES,
+    )
+    _warm_stations(fake, _monday(7, 5))
+    outlook = togvarsel_notify.rush_outlook("dev-1", now=_monday(7, 5))
+    assert [(f.rush, f.issue, f.level) for f in outlook] == [
+        ("am", "0700", "red"),
+        ("pm", "1200", "green"),
+    ]
+    # am before pm, and the payload is the issue's own text and probability
+    assert outlook[0].scope == "morgenrushet 07:00–09:00" and outlook[0].p == 0.44
+
+
+def test_a_rush_that_is_over_is_dropped_but_the_other_is_not():
+    """"if not already over" is the RUSH's end (09:00 / 18:00): a level nobody can act on is
+    noise, while the afternoon's forecast is exactly what a reader at 09:30 wants."""
+    fake = _configure_outlook(
+        issues=[_issued("0700", "red"), _issued("1400", "yellow", "ettermiddagsrushet 15:00–18:00")],
+        journeys=BOTH_RUSHES,
+    )
+    _warm_stations(fake, _monday(8, 59))
+    assert [f.rush for f in togvarsel_notify.rush_outlook("dev-1", now=_monday(8, 59))] == [
+        "am", "pm",
+    ]
+    assert [f.rush for f in togvarsel_notify.rush_outlook("dev-1", now=_monday(9, 0))] == ["pm"]
+    assert togvarsel_notify.rush_outlook("dev-1", now=_monday(18, 0)) == []
+
+
+def test_the_panel_window_is_the_whole_rush_not_the_part_still_ahead():
+    """The one deliberate difference from match_journeys. A 07:00–08:00 registration is matched
+    for the push at 07:00 and would NOT be at 08:15 (its window has passed) — but the panel must
+    still show the morning level while the morning rush is on, or it goes blank at 08:00 with the
+    trains still late."""
+    journeys = {"j1": _j(begin="07:00", end="08:00")}
+    fake = _configure_outlook(issues=[_issued("0700", "red")], journeys=journeys)
+    _warm_stations(fake, _monday(8, 15))
+    matched, _devices = togvarsel_notify.match_journeys(
+        "0700", journeys, STATIONS, _ident, now=_monday(8, 15)
+    )
+    assert matched == []  # the push would not go out any more
+    assert [f.rush for f in togvarsel_notify.rush_outlook("dev-1", now=_monday(8, 15))] == ["am"]
+
+
+def test_the_panel_is_per_rush_and_per_device():
+    """Relevance is the push's own three tests, asked per rush: a morning-only registration gets
+    the morning card and not the afternoon one, and another device's journey is not this one's."""
+    fake = _configure_outlook(
+        issues=[_issued("0700", "red"), _issued("1400", "yellow", "ettermiddagsrushet 15:00–18:00")],
+        journeys={
+            "j1": _j(begin="07:30", end="08:15", device="dev-morning"),
+            "j2": _j(begin="16:00", end="16:45", device="dev-afternoon"),
+            "j3": _j(begin="10:00", end="11:00", device="dev-midday"),
+            "j4": _j(from_stop="NSR:StopPlace:99999", begin="07:30", end="08:15",
+                     device="dev-elsewhere"),
+            "j5": _j(begin="07:30", end="08:15", days=(5, 6), device="dev-weekend"),
+        },
+    )
+    _warm_stations(fake, _monday(7, 5))
+    at = _monday(7, 5)
+    assert [f.rush for f in togvarsel_notify.rush_outlook("dev-morning", now=at)] == ["am"]
+    assert [f.rush for f in togvarsel_notify.rush_outlook("dev-afternoon", now=at)] == ["pm"]
+    assert togvarsel_notify.rush_outlook("dev-midday", now=at) == []  # between the rushes
+    assert togvarsel_notify.rush_outlook("dev-elsewhere", now=at) == []  # outside the geography
+    assert togvarsel_notify.rush_outlook("dev-weekend", now=at) == []  # not today's weekday
+    assert togvarsel_notify.rush_outlook("dev-unknown", now=at) == []  # no registrations at all
+
+
+def test_the_panel_is_gated_on_the_delivery_flag():
+    """The panel's claim is "you are being notified about this", so the delivery flag is what
+    turns it on — the same read /varsel-api/config surfaces as togvarsel_notify."""
+    fake = _configure_outlook(enabled=lambda: False)
+    _warm_stations(fake, _monday(6, 31))
+    assert togvarsel_notify.rush_outlook("dev-1", now=_monday(6, 31)) == []
+
+
+def test_the_panel_is_empty_before_the_first_forecast_and_on_a_weekend():
+    fake = _configure_outlook(issues=[])
+    _warm_stations(fake, _monday(6, 0))
+    assert togvarsel_notify.rush_outlook("dev-1", now=_monday(6, 0)) == []
+    # a weekend issues nothing, so togvarsel's snapshot is empty and so is the panel
+    fake = _configure_outlook(issues=[])
+    assert togvarsel_notify.station_set(SATURDAY) == frozenset(STATIONS)
+    assert togvarsel_notify.rush_outlook("dev-1", now=SATURDAY) == []
+
+
+def test_one_malformed_registration_never_breaks_the_panel():
+    """The per-journey guard match_journeys' loop has: a legacy begin/end must cost that one
+    record, not the whole panel."""
+    fake = _configure_outlook(
+        issues=[_issued("0700", "red")],
+        journeys={"bad": {**_j(), "begin": "kl. sju"}, "good": _j()},
+    )
+    _warm_stations(fake, _monday(7, 5))
+    with _capture_logs() as records:
+        assert [f.rush for f in togvarsel_notify.rush_outlook("dev-1", now=_monday(7, 5))] == ["am"]
+    assert any("malformed" in r.getMessage() for r in records)
+
+
+def test_the_outlook_endpoint_serves_the_panel(monkeypatch):
+    """The route's own job: pass the device id through and shape the response.
+
+    The policy is checked above as a pure function with an explicit clock; this one cannot be,
+    because the route deliberately takes no `now` — so rush_outlook is stubbed here rather than
+    pinning the suite to the wall clock."""
+    asked: list[str] = []
+
+    def _stub(device_id, now=None):
+        asked.append(device_id)
+        assert now is None  # the route must not invent a clock of its own
+        return [togvarsel_notify.RushForecast(
+            rush="am", issue="0700", scope="morgenrushet 07:00–09:00", level="red", p=0.44
+        )]
+
+    monkeypatch.setattr(togvarsel_notify, "rush_outlook", _stub)
+    app = FastAPI()
+    app.include_router(togvarsel_notify.router)
+    with TestClient(app) as client:
+        body = client.get("/togmelding-api/outlook", params={"device_id": "dev-1"}).json()
+        # no device_id at all is a 422, as everywhere else that takes one
+        assert client.get("/togmelding-api/outlook").status_code == 422
+    assert asked == ["dev-1"]
+    assert body == {"rushes": [{"rush": "am", "issue": "0700",
+                                "scope": "morgenrushet 07:00–09:00", "level": "red", "p": 0.44}]}
 
 
 class _MonkeyPatch:
