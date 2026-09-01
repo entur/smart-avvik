@@ -6,6 +6,7 @@ import type { Brand } from '../brand';
 import type { Config } from '../api';
 import { deleteDevice, registerDevice, sendTestPush } from '../api';
 import { disablePush, enablePush, getExistingSubscription, isIOS, isPushSupported, isStandalone } from '../push';
+import { VarselkortNotis } from './PersonvernNotis';
 
 type State =
   | 'server-off' // server has no VAPID keys configured
@@ -205,6 +206,13 @@ export default function VarselStatus({
           systeminnstillingene for å få avviksvarsel.
         </SmallAlertBox>
       )}
+
+      {/* T4 — what enabling notifications stores, and what «Skru av» does and does not delete.
+          Outside every `state === …` branch on purpose: this has to be readable *before* the user
+          taps «Slå på varsler», which is the moment the subscription would be collected, and it
+          stays true afterwards. Nested in the subscribed branch it would only ever appear once the
+          collection it describes had already happened. */}
+      <VarselkortNotis />
 
       {notice && (
         <SubParagraph className="av-status-note" role="status">
