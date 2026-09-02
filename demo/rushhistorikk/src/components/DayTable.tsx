@@ -88,6 +88,13 @@ function IssueCell({ issue }: { issue: IssueRow | undefined }) {
     return <td className="rh-issue rh-issue--empty">{DASH}</td>;
   }
   const told = communicated(issue);
+  // A reconstructed round's marker says what the policy WOULD have done; the sentence behind it
+  // must say so too, or «Varsel» on a day before the round log existed reads as a push that went
+  // out.
+  const toldTitle =
+    told && issue.reconstructed
+      ? `${told.title} Rekonstruert fra prognoseloggen: ingen runde ble registrert, så dette er det regelverket ville ha avgjort med varsling på og i tide – ingen push gikk faktisk ut.`
+      : told?.title;
   return (
     <td className="rh-issue">
       <div className="rh-issue-verdict">
@@ -103,7 +110,15 @@ function IssueCell({ issue }: { issue: IssueRow | undefined }) {
         <span className="rh-num" title="Modellens sannsynlighet for mye trøbbel i dette rushet.">
           {fmtPct(issue.p)}
         </span>
-        {told ? <span title={told.title}>{told.text}</span> : null}
+        {told ? <span title={toldTitle}>{told.text}</span> : null}
+        {issue.reconstructed ? (
+          <span
+            className="rh-tag"
+            title="Ingen varselrunde ble registrert for denne utstedelsen, så runden er rekonstruert: regelverket er kjørt på prognosen slik den forelå, som om varslingen var på og i tide. Vurdert som en vanlig runde – siden skal bedømme modellen – men teller ikke som et sendt varsel."
+          >
+            rekonstruert
+          </span>
+        ) : null}
         {issue.late ? (
           <span
             className="rh-tag"

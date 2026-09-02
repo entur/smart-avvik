@@ -1182,13 +1182,27 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - **Nothing about the notification was durable before.** The round markers in the `/varsel` state
     blob are the runtime primitive, but `varsel.store_togvarsel_rounds` replaces the whole map with
     a SINGLE DATE — the first write after midnight destroys yesterday's — and the
-    `togvarsel_notify_round` log event carries no Oslo date and has no BigQuery sink. So no history
-    can be backfilled: the page starts at the deploy and fills forward, which is why it reads mostly
-    `ikke vurdert` for its first weeks and says so in prose.
-  - **The round is recorded, never re-derived.** `decide_issue` is a pure function of (level, marker
-    state, clock), so reconstruction looks feasible and is not: it cannot see a round the gate closed
-    before evaluating (which writes no markers at all), cannot see the `untimely` verdict on a
-    back-filled round, and cannot see how many devices matched. Same rule as `/meldinger`'s `pushed`.
+    `togvarsel_notify_round` log event carries no Oslo date and has no BigQuery sink. So no round
+    HISTORY can be backfilled as a record. What the page does instead, since 2026-09-02, is
+    **reconstruct** the rounds nobody recorded from the forecast log — next bullet — so it fills
+    back to the first issued forecast rather than starting at the deploy.
+  - **A recorded round is never re-derived, and a round nobody recorded is reconstructed and
+    labelled** (the second half since 2026-09-02). `decide_issue` is a pure function of (level,
+    marker state, clock), so replaying it looks like a substitute for the record and is not: it
+    cannot see a round the gate closed before evaluating (which writes no markers at all), cannot
+    see the `untimely` verdict on a back-filled round, and cannot see how many devices matched. Same
+    rule as `/meldinger`'s `pushed` — so where a `togvarsel_rounds` row exists it always wins. But
+    the page exists to judge the MODEL, and for that the forecast plus the policy is the whole
+    input, so `rushhistorikk.reconstruct_rounds` replays `togvarsel_notify.decide_issue` for every
+    issue with NO row — at the forecast's own `computed_at`, baseline before follow-up, with the
+    day's recorded rounds seeding the marker state — and grades the result like a recorded round.
+    It calls the policy rather than restating it (a test greps the source for policy tokens), flags
+    every such issue (`reconstructed`), counts them beside the rates (`n_reconstructed`, and
+    `n_reconstructed_after_start` as the lost-write detector), and keeps a would-have-been push out
+    of `varsler_sendt` (it goes in `varsler_rekonstruert`), because that column says "sent". The
+    product owner asked for this on 2026-09-02 ("the main purpose of this dashboard is to judge
+    the quality of the model"), having earlier chosen to score only real rounds; without it the
+    page read `ikke vurdert` for every issue before the round log and, in tst, forever.
     Three things the write gets right: `baseline_level` rides on the `Decision` (reading it off the
     BASELINE's row would let one swallowed best-effort write invert a verdict — a 06:30 red that
     pushed and was right reads as a miss if only its own MERGE failed), so `_effective_baseline` is
@@ -1227,6 +1241,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     variables: `_settled_last_utc` sits outside `_state`, which is also why it needs resetting in the
     suite's own `_reset` (a leaked latch makes half the suite pass by accident). Both offsets are
     pinned, because a fix that handled only the summer one would look right for half the year.
+  - **The settled work set has two reaches, and the SELECT is chunked** (2026-09-02). Inside the
+    10-day retry window, any issued day not fully settled; beyond it, out to `_BACKFILL_DAYS` (60),
+    only issued days with NO outcome row at all — the pre-feature backlog each environment has
+    once, and any day a long outage skipped — because a day with rows there was settled or marked
+    unresolvable, and re-reading either re-runs an immutable query to the same answer. This is what
+    lets the page initialise from the forecast log: without it every issue older than ten days
+    read `ukjent`. The range SELECT is cut into spans of `_SETTLED_CHUNK_DAYS` (14) CALENDAR days,
+    one job each, because at the measured 32.5 MB/day the whole horizon in one job sits at
+    `_MAX_BYTES_BILLED` and the first pass in a fresh environment would fail every retry and settle
+    nothing — a failure that logs as a bytes error, not as "nothing ever settles". By calendar span
+    and not by count, since the work set holds weekdays only.
   - **A day NO scope resolved for is left for the retry window; a day missing ONE scope settles.**
     That pair is the discriminator between the two causes of an empty read, and only one is final.
     With a sibling scope resolved the batch has demonstrably landed, so "no resolved call in this
@@ -1300,12 +1325,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - **Three kinds of "we do not know", kept apart:** `venter` (still being retried), `ukjent` (can no
     longer be established, or the day failed the training chain's day-level eligibility test —
     `am_n > 300 AND pm_n > 300`, which has no `amrest` term, so eligibility is a property of the DAY)
-    and `ikke vurdert` (no round was ever recorded — the gate was closed, or the day predates the
-    log). Folding any two together manufactures skill out of missing data. `ikke vurdert` is split on
-    the earliest day a round was ever recorded (`first_recorded_day`) and served as its own count,
-    `n_ikke_vurdert_etter_start`, with its own chip: before that day is the expected backlog, after
-    it means the gate was closed or a best-effort write was lost, and without the split a write
-    regression is indistinguishable from the backlog during exactly the weeks the backlog is large.
+    and `ikke vurdert` (no round was recorded AND none could be reconstructed — the forecast row
+    has no `computed_at`, or the policy refused it; rare since 2026-09-02). Folding any two together
+    manufactures skill out of missing data. The reconstructions are split on the earliest day a
+    round was ever recorded (`first_recorded_day`) and served as `n_reconstructed_after_start`
+    beside `n_reconstructed`, with its own chip («Mangler runde»): before that day is the expected
+    backlog, after it means the gate was closed or a best-effort write was lost, and without the
+    split a write regression is indistinguishable from the backlog during exactly the weeks the
+    backlog is large.
     **Strictly after**, because that value is a DAY — on the deploy day itself the issues that fired
     before the restart legitimately have no round, and reading those as lost writes would put one
     false positive per environment permanently on the page.

@@ -223,7 +223,7 @@ def _every_reachable_issue():
     """Every combination of the columns the table reads, plus the two KTD7 exclusions and the
     fields the metrics read. Levels are drawn from the closed vocabulary only — a malformed level
     is not a reachable round, since togvarsel_notify records the level decide_issue validated."""
-    for (recorded, eligible, outcome, actual, sent, level, baseline, late, reason) in (
+    for (recorded, eligible, outcome, actual, sent, level, baseline, late, reason, recon) in (
         itertools.product(
             (True, False),
             (True, False, None),
@@ -234,12 +234,13 @@ def _every_reachable_issue():
             (None, *rv.LEVELS),
             (True, False),
             (None, "untimely", "no_change", "green_baseline"),
+            (True, False),
         )
     ):
         yield rv.Issue(
             d=DAY, issue="0700", level=level, recorded=recorded, eligible=eligible,
             outcome=outcome, actual=actual, sent=sent, baseline_level=baseline, late=late,
-            reason=reason, decided_at=_at(7, 1) if sent else None,
+            reason=reason, decided_at=_at(7, 1) if sent else None, reconstructed=recon,
         )
 
 
@@ -525,6 +526,24 @@ def test_varsler_sendt_counts_the_pushes_and_nothing_else():
     assert stats.total.varsler_sendt == 3
     assert [row.varsler_sendt for row in stats.slots] == [1, 0, 1, 1]
     assert stats.total.counts.n == 4  # the recorded population is still every issue
+
+
+def test_a_reconstructed_round_is_scored_like_a_recorded_one_and_counted_apart():
+    """The flag changes no verdict and no bucket — the page judges the model, and the policy is a
+    pure function of the forecast — but a would-have-been push is not a sent one, and the counts
+    say how much of a rate rests on replay."""
+    real = _issue(sent=True, level="yellow", actual="yellow", decided_at=_at(6, 31))
+    replayed = _issue(d=NEXT_DAY, sent=True, level="yellow", actual="yellow",
+                      decided_at=_at(6, 31, day=NEXT_DAY), reconstructed=True,
+                      after_recording_started=True)
+    assert rv.classify(replayed) == rv.classify(real) == rv.TRAFF
+    assert rv.population(replayed) == rv.population(real) == rv.BUCKET_SCORED
+    row = rv.summarize([real, replayed]).total
+    assert row.presisjon == 1.0 and row.presisjon_den == 2
+    assert row.matrix["yellow"]["yellow"] == 2
+    assert row.varslingstid_n == 2  # the replayed push time counts: it is when the forecast existed
+    assert row.varsler_sendt == 1 and row.varsler_rekonstruert == 1
+    assert row.counts.n_reconstructed == 1 and row.counts.n_reconstructed_after_start == 1
 
 
 # ---- Varslingstid -----------------------------------------------------------------------

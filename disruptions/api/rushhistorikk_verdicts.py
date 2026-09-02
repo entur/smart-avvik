@@ -22,6 +22,15 @@ until then — and with 82 % of days green that put Presisjon at 0 % on a good m
 verdict a calm month produces was not in its numerator. `bom` is unchanged: silence on a bad rush is
 still the miss the product exists to avoid.
 
+**A round nobody recorded is reconstructed upstream, and this module cannot tell** (2026-09-02) —
+by design. `rushhistorikk.reconstruct_rounds` replays togvarsel_notify.decide_issue over the
+forecast log for issues with no round row, at each forecast's own computed_at, and hands the result
+in as an ordinary recorded Issue with `reconstructed=True`. Nothing here branches on the flag: the
+page exists to judge the model, and for that the forecast plus the policy IS the input, so a
+reconstructed round is classified and bucketed exactly like one that ran. The flag is counted
+(`n_reconstructed`, and `n_reconstructed_after_start` for the lost-write detector) and it keeps a
+would-have-been push out of Varsler sendt, which says "sent" and means it.
+
 **Every recorded issue gets exactly one verdict** (R13), including the states R7-R11 do not name:
 no round record is `ikke_vurdert` (the notify gate was off, VAPID was absent, or the day predates
 the round table — defaulting those to `bom` would manufacture failures out of a deployment
@@ -185,23 +194,32 @@ class Issue:
     # so the fallback is about a missing row rather than about a disagreement.
     level: str | None = None
     late: bool = False  # togvarsel_issued.late — the forecast saw post-cutoff reality
-    recorded: bool = False  # a togvarsel_rounds row exists: the round was actually evaluated
+    recorded: bool = False  # a round exists: recorded in togvarsel_rounds, or reconstructed (below)
     sent: bool = False  # a push was ISSUED here (the policy decision, not delivery)
     kind: str | None = None  # warning | update | all_clear when sent; unmapped from the record
     reason: str | None = None  # untimely | no_change | green_baseline when suppressed; unmapped
     baseline_level: str | None = None  # B: the level a standing warning leaves in force
     decided_at: datetime | None = None  # when the round was evaluated — the push time
+    # When the forecast was computed (togvarsel_issued.computed_at). Read by the API's
+    # reconstruction only — it is the instant a round would have been evaluated at — never by the
+    # taxonomy, which grades what the round record says.
+    computed_at: datetime | None = None
     eligible: bool | None = None  # the training chain's DAY-level test; None = not established yet
     outcome: str = OUTCOME_PENDING  # one of OUTCOME_STATES
     actual: str | None = None  # A: the realized level for THIS issue's own window (SCOPE_BY_SLOT)
     # Whether the round log demonstrably already covered this whole day: `d` is strictly after the
-    # earliest day any round was recorded on. Only meaningful when `recorded` is false, where it
+    # earliest day any round was recorded on. Only meaningful for a RECONSTRUCTED round, where it
     # separates a LOST best-effort write from the pre-launch backlog. Strictly after, not at or
     # after: the earliest recorded day is a DAY, and on the deploy day itself the issues that fired
     # before the restart legitimately have no round — reading those as lost writes would put one
     # false positive per environment permanently on the page. The cost is that a write lost on that
     # first day reads as backlog, which is the safe direction.
     after_recording_started: bool = False
+    # The round is not a record: rushhistorikk.reconstruct_rounds replayed the push policy on the
+    # forecast because no togvarsel_rounds row existed. Classified and bucketed exactly like a
+    # recorded round — the page judges the model, and the policy is a pure function of the forecast
+    # — but counted apart, and never a sent push: Varsler sendt counts pushes that went out.
+    reconstructed: bool = False
 
 
 def _check_slot(slot: str) -> str:
@@ -393,10 +411,14 @@ class Counts:
     n_late: int = 0
     n_untimely: int = 0
     n_scored: int = 0
-    # A SUBSET of n_ikke_vurdert, not an eighth bucket — the seven above still sum to n. Counts the
-    # ones the round log should have covered, so a lost best-effort write is visible during exactly
-    # the weeks the pre-launch backlog is large enough to hide it.
-    n_ikke_vurdert_etter_start: int = 0
+    # Orthogonal to the seven buckets, not an eighth: a reconstructed round lands in whichever
+    # bucket its day puts it, and the seven above still sum to n. Counted so a reader can see how
+    # much of a rate rests on replayed policy rather than on rounds that ran.
+    n_reconstructed: int = 0
+    # A SUBSET of n_reconstructed: the ones on a day the round log already covered, so a lost
+    # best-effort write (or a closed gate) is visible during exactly the weeks the pre-launch
+    # backlog is large enough to hide it.
+    n_reconstructed_after_start: int = 0
 
 
 @dataclass(frozen=True)
@@ -422,8 +444,12 @@ class StatsRow:
     # Pushes issued in the window, friskmeldinger included — the notification-VOLUME figure, which
     # is what the fatigue question is about. Over the recorded population, not the scored one: a
     # push on a day that never settled still reached a phone. One per round, so it stands for
-    # however many devices matched.
+    # however many devices matched. RECORDED rounds only — see the next field.
     varsler_sendt: int
+    # Pushes a RECONSTRUCTED round would have issued. Apart from varsler_sendt because that column
+    # says "sent" and these never were; beside it so the volume the policy implies is still
+    # readable over a window the round log does not cover.
+    varsler_rekonstruert: int
     matrix: dict[str, dict[str, int]]  # matrix[forecast level][realized level] -> count, scored
     counts: Counts
 
@@ -487,10 +513,9 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
         n_late=buckets.count(BUCKET_LATE),
         n_untimely=buckets.count(BUCKET_UNTIMELY),
         n_scored=buckets.count(BUCKET_SCORED),
-        n_ikke_vurdert_etter_start=sum(
-            1
-            for issue, bucket in zip(issues, buckets, strict=True)
-            if bucket == BUCKET_IKKE_VURDERT and issue.after_recording_started
+        n_reconstructed=sum(1 for issue in issues if issue.reconstructed),
+        n_reconstructed_after_start=sum(
+            1 for issue in issues if issue.reconstructed and issue.after_recording_started
         ),
     )
     scored = [i for i, b in zip(issues, buckets, strict=True) if b == BUCKET_SCORED]
@@ -519,7 +544,8 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
         dekning_den=dekning_den,
         varslingstid_min=float(median(leads)) if leads else None,
         varslingstid_n=len(leads),
-        varsler_sendt=sum(1 for issue in issues if issue.sent),
+        varsler_sendt=sum(1 for issue in issues if issue.sent and not issue.reconstructed),
+        varsler_rekonstruert=sum(1 for issue in issues if issue.sent and issue.reconstructed),
         matrix=matrix,
         counts=counts,
     )

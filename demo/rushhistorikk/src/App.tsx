@@ -93,15 +93,17 @@ export default function App() {
           er tatt med: en runde som valgte å ikke varsle er det eneste sporet en bom etterlater seg.
         </Paragraph>
         {/* The five things a reader otherwise gets wrong, in prose rather than hidden in tooltips.
-            Each one has a failure mode behind it: the first reads as a broken join, the second as a
-            product with no warning time, the third as "we saw nothing coming", the fourth as a
-            settled figure, the fifth as rates over the whole window. */}
+            Each one has a failure mode behind it: the first reads as pushes that went out, the
+            second as a product with no warning time, the third as "we saw nothing coming", the
+            fourth as a settled figure, the fifth as rates over the whole window. */}
         <ul className="rh-caveats">
           <li>
-            Siden er stort sett «ikke vurdert» — og tabellen under tynn — de første ukene. Loggen over varselrunder
-            starter først da denne funksjonen ble tatt i bruk
-            {recordingStarted ? ` (${fmtDate(recordingStarted)})` : ''}, og historikken kan ikke
-            etterfylles. Det er forventet, ikke en ødelagt kobling.
+            Runder fra før loggen over varselrunder startet
+            {recordingStarted ? ` (${fmtDate(recordingStarted)})` : ''} er rekonstruert fra
+            prognoseloggen: det regelverket ville ha avgjort ut fra prognosen, med varsling på og i
+            tide. De er merket «rekonstruert» og teller i Presisjon, Dekning og treffmatrisen —
+            siden skal bedømme modellen — men ikke i «Varsler sendt», som bare teller push som
+            faktisk gikk ut.
           </li>
           <li>
             Varslingstid måles fra hver utstedelses egen start (06:30 og 07:00 for morgenrushet, 15:00 for
@@ -109,10 +111,10 @@ export default function App() {
             konstruksjon.
           </li>
           <li>
-            «Ikke vurdert» betyr at ingen varselrunde ble vurdert: dagen er eldre enn loggen over
-            varselrunder, varslingen var slått av i dette miljøet, eller skrivingen av runden
-            feilet. De to siste telles for seg som «mangler runde», siden en tapt skriving ellers
-            er umulig å skille fra etterslepet. Det betyr <em>ikke</em> at et varsel var unødvendig.
+            «Mangler runde» teller rekonstruksjoner på dager runde-loggen allerede dekket:
+            varslingen var slått av i dette miljøet, eller skrivingen av runden feilet. «Ikke
+            vurdert» betyr at ingen runde ble registrert og heller ikke kunne rekonstrueres. Ingen
+            av delene betyr at et varsel var unødvendig.
           </li>
           <li>
             Et foreløpig utfall («foreløpig») er dagens egen lesning og kan endre seg over natten.
