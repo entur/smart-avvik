@@ -21,10 +21,14 @@ export const TOGMELDING_PERSONVERN_LINK_TEXT = 'Slik behandler vi opplysningene'
 /** Trailing-slash form, so the server never has to answer with a redirect. */
 export const TOGMELDING_PERSONVERN_HREF = '/varsel/personvern/';
 
+// One line, since 2026-09-02: the two dropped sentences («Vi tester om …», «kan endres eller
+// avsluttes på kort varsel») live on the privacy page, and on a phone they stood between the
+// reader and the level they came for (design review 2026-09-01, findings 29-31). The comment sits
+// OUTSIDE the literal: test_personvern_texts.py's literal reader resolves the object's fields and
+// does not skip comments.
 export const TOGMELDING_DISCLAIMER = {
   title: 'Dette er et eksperiment',
   body:
-    'Rushvarsel er et eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid ' +
-    'treffer — ikke planlegg reisen din på dem alene. Tjenesten kan endres eller avsluttes på ' +
-    'kort varsel.',
+    'Eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid treffer – ikke planlegg ' +
+    'reisen din på dem alene.',
 };

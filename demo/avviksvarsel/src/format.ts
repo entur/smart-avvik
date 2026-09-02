@@ -61,13 +61,43 @@ export function lineCode(line: string | null): string | null {
   return parts[parts.length - 1] || null;
 }
 
+const osloDay = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/Oslo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+/** Is this departure on the Oslo calendar day after `now`'s? Exactly tomorrow, like varsel.py's
+ *  `_departs_tomorrow`: a push about the 07:18 routinely goes out the evening before, by design,
+ *  and without the word it reads as tonight's train (design review 2026-09-01, finding 48). */
+export function departsTomorrow(iso: string | null, now: Date = new Date()): boolean {
+  if (!iso) return false;
+  const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  return osloDay.format(new Date(iso)) === osloDay.format(tomorrow);
+}
+
 /** "Tog L1 09:24" — which train the alert is about, as a departure board names it. Word for word
  *  varsel.py's `_train_label`, "kl"-less line form and all: the card sits under the notification
- *  this text came from, so a difference between them reads as two different trains. */
+ *  this text came from, so a difference between them reads as two different trains. Gains
+ *  «i morgen» when the departure is tomorrow, exactly as the push wording does. */
 export function trainLabel(mode: string | null, line: string | null, iso: string | null): string {
   const code = lineCode(line);
-  return code ? `${mode ?? 'Tog'} ${code} ${fmtTime(iso)}` : `${mode ?? 'Tog'} kl ${fmtTime(iso)}`;
+  const label = code ? `${mode ?? 'Tog'} ${code} ${fmtTime(iso)}` : `${mode ?? 'Tog'} kl ${fmtTime(iso)}`;
+  return departsTomorrow(iso) ? `${label} i morgen` : label;
 }
+
+/** The Journey Planner's transport modes as lower-case Norwegian nouns — varsel.py's
+ *  `_LEG_MODE_NOUN`, so the card's «Ta tog RE11 07:24 i stedet» and the push's «Alternativ tog
+ *  RE11 07:24» name the vehicle alike. Unknown modes yield no noun rather than a guessed one. */
+export const LEG_MODE_NOUN: Record<string, string> = {
+  rail: 'tog',
+  bus: 'buss',
+  coach: 'buss',
+  tram: 'trikk',
+  metro: 'T-bane',
+  water: 'båt',
+};
 
 // Mirrors varsel.py's _CANCEL_LIKELY: above a 50 % cancellation probability the wording states the
 // cancellation instead of the delay interval.

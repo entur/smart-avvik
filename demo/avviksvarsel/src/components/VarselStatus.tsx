@@ -292,17 +292,16 @@ export default function VarselStatus({
 
       {state === 'denied' && (
         <SmallAlertBox variant="warning" title="Varsler er blokkert" width="fluid">
-          Du har blokkert varsler for denne siden. Skru dem på igjen i nettleser- eller
-          systeminnstillingene for å få avviksvarsel.
+          Skru dem på igjen i nettleser- eller systeminnstillingene for å få varsel.
         </SmallAlertBox>
       )}
 
       {/* T4 — what enabling notifications stores, and what «Skru av» does and does not delete.
-          Outside every `state === …` branch on purpose: this has to be readable *before* the user
-          taps «Slå på varsler», which is the moment the subscription would be collected, and it
-          stays true afterwards. Nested in the subscribed branch it would only ever appear once the
-          collection it describes had already happened. */}
-      <VarselkortNotis />
+          Shown where the actions it names exist: BEFORE the user taps «Slå på varsler» (the moment
+          the subscription would be collected) and after. In the blocked / unsupported / not-installed
+          states nothing can be collected and no «Skru av» is rendered, so the text pointed at
+          buttons that were not there (design review 2026-09-01, finding 34). */}
+      {(state === 'default' || state === 'granted') && <VarselkortNotis />}
 
       {notice && (
         <SubParagraph className="av-status-note" role="status">

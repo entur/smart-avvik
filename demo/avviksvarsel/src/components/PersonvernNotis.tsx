@@ -10,6 +10,7 @@
 // navigated to the plain path would come back Entur-branded.
 
 import { SmallAlertBox } from '@entur/alert';
+import { ExpandableText } from '@entur/expand';
 import { Link, SubParagraph } from '@entur/typography';
 import type { BrandId } from '../brand';
 import {
@@ -17,6 +18,7 @@ import {
   T1_EKSPERIMENT,
   T2_PERSONVERNLINJE,
   T3_REGISTRERING,
+  T4_TITTEL,
   T4_VARSELKORT,
   T7_AVSENDER,
   type LinkedText,
@@ -33,11 +35,12 @@ function LinkedProse({ text, brandId }: { text: LinkedText; brandId: BrandId }) 
   );
 }
 
-/** T1 — the experiment disclaimer at the top of the page. Same SmallAlertBox shape as the
- *  togvarsel notice below it, so the two read as one band of page-level information. */
+/** T1 — the experiment disclaimer at the top of the page. One line and no title (design review
+ *  2026-09-01, finding 29): the sentence is its own headline, and on a phone the first screen has
+ *  to reach «Legg til reise». Same SmallAlertBox shape as the togvarsel notice further down. */
 export function EksperimentNotis() {
   return (
-    <SmallAlertBox variant="information" title={T1_EKSPERIMENT.title} width="fluid">
+    <SmallAlertBox variant="information" width="fluid">
       {T1_EKSPERIMENT.body}
     </SmallAlertBox>
   );
@@ -63,13 +66,16 @@ export function RegistreringsNotis({ brandId }: { brandId: BrandId }) {
   );
 }
 
-/** T4 — what the notification card collects. Rendered whether or not push is on, because the
- *  point is to say what happens *before* the user turns it on. */
+/** T4 — what the notification card collects, behind an expandable heading (finding 41). Still
+ *  rendered BEFORE the user turns push on — the fold label is on screen, the text one tap away —
+ *  and still word for word the consented text; only the placement changed. */
 export function VarselkortNotis() {
   return (
-    <SubParagraph className="av-personvern-notis" margin="none">
-      {T4_VARSELKORT}
-    </SubParagraph>
+    <div className="av-personvern-notis av-personvern-fold">
+      <ExpandableText title={T4_TITTEL} titleElement="SubParagraph">
+        <SubParagraph margin="none">{T4_VARSELKORT}</SubParagraph>
+      </ExpandableText>
+    </div>
   );
 }
 

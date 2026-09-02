@@ -12,6 +12,7 @@ import '@entur/layout/dist/styles.css';
 import '@entur/button/dist/styles.css';
 import '@entur/form/dist/styles.css';
 import '@entur/alert/dist/styles.css';
+import '@entur/expand/dist/styles.css';
 import '@entur/menu/dist/styles.css';
 import '@entur/a11y/dist/styles.css';
 import '@entur/loader/dist/styles.css';

@@ -16,6 +16,7 @@
     "@entur/button": "^4.0.11",
     "@entur/chip": "^0.10.16",
     "@entur/dropdown": "^8.1.8",
+    "@entur/expand": "^3.7.12",
     "@entur/form": "^9.3.8",
     "@entur/icons": "^9.0.4",
     "@entur/layout": "^3.7.5",

@@ -14,6 +14,7 @@ import '@entur/dropdown/dist/styles.css';
 import '@entur/chip/dist/styles.css';
 import '@entur/alert/dist/styles.css';
 import '@entur/modal/dist/styles.css';
+import '@entur/expand/dist/styles.css';
 import '@entur/menu/dist/styles.css';
 import '@entur/a11y/dist/styles.css';
 import '@entur/loader/dist/styles.css';

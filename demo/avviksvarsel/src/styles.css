@@ -75,8 +75,22 @@ body {
   outline-offset: 3px;
 }
 
-.av-alert-notification-target {
-  box-shadow: 0 0 0 3px rgb(24 28 86 / 0.28);
+/* Opened from a notification about one of this card's alerts: a thin stripe in the card's own ink,
+   not the 3 px ring that used to compete with the red alert fill inside it (design review
+   2026-09-01, finding 35) — the fill is the semantic signal, the stripe only says "this one".
+   Inset, so it follows the card's radius (a border-left leaves a mitred wedge at both corners). */
+.av-journey-from-push {
+  box-shadow:
+    inset 4px 0 0 var(--colors-blues-blueMain, var(--lavender-90)),
+    var(--av-card-shadow);
+}
+
+.av-alert-eyebrow {
+  margin: 0;
+  font-weight: 600;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 /* ---- Oslo rush-hour outlook (the panel at the top; see components/RushOutlook.tsx) ----
@@ -232,11 +246,28 @@ body {
   gap: 0.875rem;
 }
 
+/* Heading over a full-width action on a phone (finding 27: a 133×32 px small button beside the
+   heading was the page's only action); side by side once there is room for both. */
 .av-section-head {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
   gap: 0.75rem;
+}
+
+.av-add-journey {
+  width: 100%;
+}
+
+@media (min-width: 640px) {
+  .av-section-head {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .av-add-journey {
+    width: auto;
+  }
 }
 
 .av-empty {
@@ -339,14 +370,55 @@ body {
   opacity: 0.8;
 }
 
+/* The alert box's icon is vertically centred by Linje for a one-line message; with several lines
+   and a box inside it that put the ✕ mid-air beside a rule (finding 36). Top-aligned it sits
+   beside the first line, where the eye expects it. */
+.av-alerts .eds-alert-box--no-title {
+  align-items: flex-start;
+}
+
+/* The escape route, as its own surface inside the alert (finding 1): a dashed frame on the card's
+   own ground, so it reads as advice attached to the alert rather than as more alert. */
+.av-alternative {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin: 0.5rem 0 0.25rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px dashed var(--basecolors-stroke-subdued, var(--blue-50));
+  border-radius: var(--border-radiuses-medium, 0.375rem);
+  background: var(--basecolors-frame-default);
+}
+
+.av-alternative-title {
+  font-weight: 600;
+}
+
+.av-alternative-line {
+  display: block;
+}
+
+/* Feedback sits below the alert box, not inside it (finding 37): lighter weight, no red. */
 .av-feedback {
-  margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+  margin-top: 0.25rem;
+  padding: 0 0.25rem;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 0.5rem;
+}
+
+.av-feedback-question {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* A journey inside its undo window: the notice and the «Angre» button on one line. */
+.av-journey-deleted {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: var(--basecolors-text-subdued, var(--grey-70));
 }
 
 .av-feedback-question,
@@ -423,4 +495,30 @@ body {
   display: flex;
   justify-content: flex-end;
   gap: 0.5rem;
+}
+
+/* The swap button between Fra and Til, centred and pulled into the gap (finding 40). */
+.av-form-swap {
+  display: flex;
+  justify-content: center;
+  margin: -0.5rem 0;
+}
+
+.av-form-hint,
+.av-field-error {
+  margin: 0;
+}
+
+.av-form-hint {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+.av-field-error {
+  color: var(--basecolors-text-negative, var(--coral-50));
+}
+
+/* The folded T4 (finding 41): its toggle reads as a footnote heading, not as a section heading. */
+.av-personvern-fold .eds-expandable-text__title,
+.av-personvern-fold .eds-sub-paragraph {
+  color: var(--basecolors-text-subdued, var(--grey-70));
 }

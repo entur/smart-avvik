@@ -44,6 +44,7 @@ import '@entur/dropdown/dist/styles.css';
 import '@entur/chip/dist/styles.css';
 import '@entur/alert/dist/styles.css';
 import '@entur/modal/dist/styles.css';
+import '@entur/expand/dist/styles.css';
 import '@entur/menu/dist/styles.css';
 import '@entur/a11y/dist/styles.css';
 import '@entur/loader/dist/styles.css';
@@ -56,9 +57,15 @@ import './brands/none.css';
 
 import { Contrast } from '@entur/layout';
 import { Logo } from '@entur/menu';
-import { Heading1, Heading2, LeadParagraph, Link, Paragraph } from '@entur/typography';
+import { Heading1, Heading2, LeadParagraph, Link, Paragraph, SubParagraph } from '@entur/typography';
 import { applyBrand, resolveBrand } from './brand';
-import { T5_INTRO, T5_PAGE_HEADING, T5_SECTIONS } from './personvern';
+import {
+  consentTextDate,
+  T5_INTRO,
+  T5_LAST_UPDATED_LABEL,
+  T5_PAGE_HEADING,
+  T5_SECTIONS,
+} from './personvern';
 import './personvern-page.css';
 
 const brand = resolveBrand();
@@ -101,15 +108,36 @@ function PersonvernPage() {
 
         <LeadParagraph className="pv-intro">{T5_INTRO}</LeadParagraph>
 
-        {/* Each section title is a real <h2>, never bold body text: this page is a list of nine
+        {/* The date every registration is stamped with (CONSENT_TEXT_VERSION), shown as the
+            page's own «Sist oppdatert» so the two cannot disagree (design review 2026-09-01,
+            finding 44). */}
+        <SubParagraph className="pv-updated" margin="none">
+          {T5_LAST_UPDATED_LABEL} {consentTextDate()}.
+        </SubParagraph>
+
+        {/* Each section title is a real <h2>, never bold body text: this page is a list of ten
             topics people arrive wanting one of, and heading navigation is how a screen-reader user
-            reaches «Rettighetene dine» without listening to «Hva vi lagrer» first. */}
+            reaches «Rettighetene dine» without listening to «Hva vi lagrer» first. The body keeps
+            its line breaks (controller and DPO are two art. 13 items on two lines), and a section's
+            links are real links: «du kan klage til Datatilsynet» without saying where was half an
+            answer (finding 43). */}
         {T5_SECTIONS.map((section) => (
           <section key={section.title} className="pv-section">
             <Heading2 as="h2" margin="none">
               {section.title}
             </Heading2>
-            <Paragraph margin="none">{section.body}</Paragraph>
+            <Paragraph margin="none" className="pv-body">
+              {section.body}
+            </Paragraph>
+            {section.links && (
+              <ul className="pv-links">
+                {section.links.map((link) => (
+                  <li key={link.href}>
+                    <Link href={link.href}>{link.text}</Link>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
         ))}
       </main>
