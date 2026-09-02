@@ -190,7 +190,7 @@ function RushCell({
         <LevelChip level={level} />
         <span
           className="rh-num"
-          title="Andel avganger som var innstilt eller mer enn 10 min forsinket, av de oppløste avgangene."
+          title="Andel avganger som var innstilt eller mer enn 10 min forsinket, av avgangene med kjent utfall."
         >
           {fmtShare(trouble10)}
         </span>
@@ -218,7 +218,7 @@ function DayCells({ day }: { day: DayRow }) {
         {day.eligible === false ? (
           <span
             className="rh-tag"
-            title="Dagen har for få oppløste avganger (treningskjedens test: over 300 i både morgen- og ettermiddagsrushet) til at andelen betyr noe. Dagen får derfor «Ukjent» og teller ikke i noen av tallene."
+            title="Dagen har for få avganger med kjent utfall (treningskjedens test: over 300 i både morgen- og ettermiddagsrushet) til at andelen betyr noe. Dagen får derfor «Ukjent» og teller ikke i noen av tallene."
           >
             ikke kvalifisert
           </span>
@@ -232,13 +232,22 @@ function DayCells({ day }: { day: DayRow }) {
         trouble10={day.am_trouble10}
         provisionalLevel={day.am_provisional_level}
       >
-        {/* The 0700 issue is scored against 07:00-09:00, not the whole morning, so both morning
-            figures are shown: one column carrying only the wider window would let the two silently
-            disagree about the same rush. */}
-        <div className="rh-issue-detail">
-          <span>07–09</span>
-          <LevelChip level={day.amrest_level} />
-        </div>
+        {/* The 0700 issue is scored against 07:00-09:00, not the whole morning, so its verdict can
+            sit beside a morning pill of another colour. The 07-09 level is shown ONLY on the rows
+            where it differs — measured over 343 eligible weekdays it differs on 19 (5.5 %), almost
+            always because the trouble was concentrated after 07:00 — so it explains the apparent
+            contradiction exactly where one exists and is clutter nowhere else (product owner,
+            2026-09-02). A second pill on every row was the original design. Same pattern as the
+            «endret» tag: only a DISAGREEMENT is news. */}
+        {day.amrest_level !== null && day.amrest_level !== day.am_level ? (
+          <div
+            className="rh-issue-detail"
+            title="Nivået for 07:00–09:00, som utstedelsen kl 07:00 vurderes mot. Vises bare når det avviker fra hele morgenrushet."
+          >
+            <span>07–09</span>
+            <LevelChip level={day.amrest_level} />
+          </div>
+        ) : null}
       </RushCell>
       <RushCell
         level={day.pm_level}

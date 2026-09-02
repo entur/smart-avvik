@@ -114,19 +114,26 @@ export interface MatrixRow {
 
 /** One row of «Slik har varslene truffet»: the total, or one issue slot.
  *
- *  The two rates are over DIFFERENT populations — Presisjon over the scored issues (`n_scored`),
- *  Dekning over a wider one that keeps the late and untimely rounds — which is why each carries its
- *  own count and the page states the population rather than leaving one denominator to be assumed. */
+ *  The two rates are precision and recall over NOTIFICATIONS, and over DIFFERENT populations —
+ *  Presisjon over the pushes on scored issues, Dekning over the situations that owed a push, late
+ *  and untimely rounds kept — which is why each carries its own count and the page states it rather
+ *  than leaving one denominator to be assumed. */
 export interface StatsRow {
   slot: StatSlot;
-  /** traff over every scored verdict — the right class communicated, silence included. Null on an
-   *  empty denominator, never 0 (R17). The denominator is `n_scored`. */
+  /** Of the pushes that went out, the share that were justified: a yellow or red push on a rush
+   *  that turned yellow or red (either level), or a friskmelding on a rush that turned green. Null
+   *  on an empty denominator, never 0 (R17) — a calm window has no pushes to rate. */
   presisjon: number | null;
-  /** Share of yellow-or-red rushes we had a warning in force for. Counted per RUSH on the total
-   *  row, because a confirming follow-up is covered only via its baseline. */
+  /** Pushes behind that rate: sent issues in the scored population, reconstructed rounds included. */
+  presisjon_den: number;
+  /** Of the situations where a push was owed, the share that got a justified one. A situation is a
+   *  rush that turned yellow or red with no warning standing, or turned green with one standing (a
+   *  friskmelding was owed); a confirming follow-up is none. Per ISSUE on a slot row, per RUSH on
+   *  the total row — a rush caught at the follow-up after a silent baseline is covered there, and
+   *  the lateness is Varslingstid's to show. */
   dekning: number | null;
-  /** Bad rushes behind that rate (bad issues on a slot row) — the one most likely to be a
-   *  handful. */
+  /** Situations behind that rate — issues on a slot row, rushes on the total row — and the count
+   *  most likely to be a handful. */
   dekning_den: number;
   /** Median minutes from the push to the rush's start. The last push per rush on the total row. */
   varslingstid_min: number | null;
