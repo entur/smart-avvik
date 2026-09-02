@@ -1,37 +1,30 @@
-import { Fragment } from 'react';
 import { Heading3, SubParagraph } from '@entur/typography';
 import type { Level, MatrixRow, StatsRow } from '../api';
 import { LEVEL_LABEL, SLOT_LABEL, fmtLead, fmtPct } from '../format';
 
-/** Level order, severity ascending — the matrix's row and column order, and what makes "adjacent"
- *  a distance of one rather than a hand-written pair list. */
+/** Level order, severity ascending — the matrix's row and column order. */
 const LEVEL_ORDER: Level[] = ['green', 'yellow', 'red'];
 
-/** Column labels for the matrix. Abbreviated because the grid pins those three columns at 2.1rem
- *  (see `.rh-matrix` in styles.css) and «grønt» does not fit; the full word rides on the title, and
- *  the ROW labels in the auto-sized first column are spelled out. */
-const LEVEL_SHORT: Record<Level, string> = { green: 'grø', yellow: 'gul', red: 'rød' };
-
-/** Which tint a cell gets. Distance in LEVEL_ORDER, not a lookup table: the diagonal is a hit, one
- *  step off (green/yellow, yellow/red) is near, and the two green/red corners are far.
- *
- *  Zero wins over all of it. An empty cell tinted "far" would draw the eye to a failure mode that
- *  never happened, which on a thin window is most of the grid. */
+/** A cell's classes carry both levels: `.rh-cell--meldt-*` sets the colour of the lower-left half
+ *  (the row, what we communicated) and `.rh-cell--ble-*` the upper-right half (the column, what the
+ *  rush became); `.rh-cell` paints the split. On the diagonal the two are one colour (`--hit`), and
+ *  a zero is faded rather than greyed (`--empty`) — see `.rh-matrix` in styles.css for why. */
 function cellClass(forecast: Level, actual: Level, count: number): string {
-  if (count === 0) return 'rh-cell rh-cell--empty';
-  const distance = Math.abs(LEVEL_ORDER.indexOf(forecast) - LEVEL_ORDER.indexOf(actual));
-  if (distance === 0) return 'rh-cell rh-cell--hit';
-  if (distance === 1) return 'rh-cell rh-cell--near';
-  return 'rh-cell rh-cell--far';
+  const classes = ['rh-cell', `rh-cell--meldt-${forecast}`, `rh-cell--ble-${actual}`];
+  if (forecast === actual) classes.push('rh-cell--hit');
+  if (count === 0) classes.push('rh-cell--empty');
+  return classes.join(' ');
 }
 
-/** Forecast level down the rows, realized level across the columns, every cell printing its count
- *  as text inside the tint.
+/** Forecast down the rows, realized level across the columns, no axis labels: the levels are
+ *  painted into the cells, and the header's «meldt ↓ / ble →» plus the legend under the table carry
+ *  the orientation.
  *
- *  The number is not redundant with the colour: the two structurally different misses — forecast
- *  red on a yellow rush, forecast yellow on a red one — sit in cells that share the `near` tint,
- *  and without the counts the grid stops distinguishing over-warning from under-warning, which is
- *  the one thing a threshold discussion needs from it. */
+ *  The number is not redundant with the colour: colour says WHICH two levels met, the count how
+ *  often — and the two structurally different misses (forecast red on a yellow rush, forecast
+ *  yellow on a red one) are the same two colours in swapped halves, so the grid keeps
+ *  distinguishing over-warning from under-warning, which is the one thing a threshold discussion
+ *  needs from it. */
 function ConfusionMatrix({ rows }: { rows: MatrixRow[] }) {
   const byForecast = new Map(rows.map((r) => [r.forecast, r]));
   return (
@@ -39,32 +32,20 @@ function ConfusionMatrix({ rows }: { rows: MatrixRow[] }) {
       className="rh-matrix"
       title="Rader: nivået vi meldte. Kolonner: nivået rushet faktisk fikk."
     >
-      {/* The corner cell disambiguates the orientation; the labels around it name the two axes. */}
-      <span className="rh-matrix-axis">meldt ↓</span>
-      {LEVEL_ORDER.map((actual) => (
-        <span key={`col-${actual}`} className="rh-matrix-axis" title={`ble ${LEVEL_LABEL[actual]}`}>
-          {LEVEL_SHORT[actual]}
-        </span>
-      ))}
       {LEVEL_ORDER.map((forecast) => {
         const row = byForecast.get(forecast);
-        return (
-          <Fragment key={forecast}>
-            <span className="rh-matrix-axis">{LEVEL_LABEL[forecast]}</span>
-            {LEVEL_ORDER.map((actual) => {
-              const count = row ? row[actual] : 0;
-              return (
-                <span
-                  key={`${forecast}-${actual}`}
-                  className={cellClass(forecast, actual, count)}
-                  title={`Meldt ${LEVEL_LABEL[forecast]}, ble ${LEVEL_LABEL[actual]}: ${count}`}
-                >
-                  {count}
-                </span>
-              );
-            })}
-          </Fragment>
-        );
+        return LEVEL_ORDER.map((actual) => {
+          const count = row ? row[actual] : 0;
+          return (
+            <span
+              key={`${forecast}-${actual}`}
+              className={cellClass(forecast, actual, count)}
+              title={`Meldt ${LEVEL_LABEL[forecast]}, ble ${LEVEL_LABEL[actual]}: ${count}`}
+            >
+              {count}
+            </span>
+          );
+        });
       })}
     </div>
   );
@@ -194,6 +175,18 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
           </tbody>
         </table>
       </div>
+
+      {/* What the split means. The swatch is the under-warning the page exists to find — meldt
+          yellow, ble red — and the sentence is the one place the encoding is spelled out, since the
+          axis labels are gone. */}
+      <p className="rh-matrix-legend">
+        <span
+          className="rh-cell rh-cell--meldt-yellow rh-cell--ble-red rh-matrix-swatch"
+          aria-hidden="true"
+        />
+        Treffmatrisen: nedre venstre halvdel er nivået vi meldte, øvre høyre nivået rushet ble. Én
+        farge betyr at de var like.
+      </p>
 
       {/* §14a's measured bad-day rate per forecast level. Without it the diagonal reads as a defect:
           it compares two differently-scaled categoricals — forecast red lands on 13 % of days,

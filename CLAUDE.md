@@ -1428,6 +1428,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     variants alike; `test_rushhistorikk` now checks the front-end's label KEYS against the module's,
     not only that each module label is present, so a chip nothing can ever show cannot linger. API
     fields: `presisjon`, `varsler_sendt`.
+  - **The Treffmatrise paints LEVELS, not verdicts** (2026-09-02). Each cell is split on the
+    diagonal — lower-left half the level we communicated (the row), upper-right half the level the
+    rush became (the column), one colour on the diagonal — with the count on top, and the text axis
+    labels are gone: the header's «meldt ↓ / ble →» and a legend line under the table carry the
+    orientation, and each half sits nearest the axis that names it. The old hit/near/far tints
+    borrowed the level hues, so a «far» miss painted red read as a red rush. The colours are Linje's
+    `--fill-*-tint` step, one step stronger than the level chips' `--fill-*-muted`, because two
+    muted fills do not separate across a diagonal at 24 px; a zero cell is faded rather than greyed
+    so the grid keeps its structure without labels. The full rationale is at `.rh-matrix` in
+    `demo/rushhistorikk/src/styles.css`.
 
 ## Conventions
 
