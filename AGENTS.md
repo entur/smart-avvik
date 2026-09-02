@@ -348,6 +348,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     follow-up sends nothing yet the traveller holds a warning at the BASELINE's level, and that is
     what gets graded — without the rule, 0700 and 1400 read `bom` on every warned day. `sent` is the
     policy decision, not delivery.
+  - **A standing warning is a yellow/red `baseline_level`, never a truthy one**: the policy records
+    `"green"` on every follow-up after an unpushed baseline, and `issue.baseline_level &&` showed
+    «Sto ved lag» on every calm weekday. The day table's `standing()` mirrors the taxonomy's, a grep
+    refuses the truthiness form, and every `untimely` round now carries «For sent».
   - **Three populations**: `scored` (Presisjon and the matrix), `delivered` (Dekning — late and
     untimely INCLUDED, because a rush nobody was warned about is a coverage miss whatever
     contaminated the forecast), `recorded` (every issue; what `Varsler sendt` counts pushes
