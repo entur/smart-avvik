@@ -1320,7 +1320,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `y_pm10` over 15:00-18:00. Giving 0700 the whole morning would hand it thirty minutes that had
     already happened when it was issued. Three realized figures are resolved per day (`am`,
     `amrest`, `pm`), the verdict picks the issue's own, and the row shows `amrest` beside `am` so the
-    two morning figures cannot silently disagree.
+    two morning figures cannot silently disagree — **only when they differ** (2026-09-02, product
+    owner: two pills on every row read as clutter). Measured over 343 eligible weekdays the 07–09
+    level differs from the whole-morning one on 19 (5.5 %): 10 green mornings with a bad 07–09, 8
+    yellow with a red 07–09, 1 the other way — so the pill appears about once a month, exactly where
+    a 07:00 verdict would otherwise contradict the visible morning level.
   - **The verdict grades what was COMMUNICATED, not what the issue forecast** — a fourteen-branch
     table in `rushhistorikk_verdicts.py`, pure functions, no I/O. A follow-up that confirms its baseline
     sends nothing, yet the traveller holds a warning at the BASELINE's level, and that is what gets
@@ -1351,10 +1355,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     from both halves of that ratio would hide exactly the misses. **`late` and `untimely` are
     independent**, and the shortcut that a late forecast never pushed is FALSE: `late` is
     `now > due + 10 min` while `untimely` is `now >= deadline`, and the gap is 30 min for 0630, 120
-    for 0700 and 1200, and 240 for 1400. An all-clear push leaves Dekning's numerator too — it
-    RETRACTS a warning rather than issuing one, so a wrong friskmelding must not read as having
-    covered a red rush. Dekning's total row counts **rushes, not issues**, because a confirming
-    follow-up is covered only via its baseline.
+    for 0700 and 1200, and 240 for 1400. (The all-clear exclusion that lived here until the second
+    2026-09-02 redefinition is gone with the warning-in-force reading; the total row still counts
+    rushes, for a different reason — see the precision-and-recall bullet below.)
   - **The outcomes pivot is `LOGICAL_OR(scope = 'x' AND settled)`, never `LOGICAL_AND` over an `IF`
     whose else-branch is TRUE.** That second form reports a scope as settled when the day has no row
     for it at all — the else-branch answers TRUE for every *other* scope's row and the AND passes —
@@ -1382,7 +1385,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     15.0 / 15.0, identical to each model's label window, so there is no second source to choose
     between. Positive means the push preceded the rush, so 1200 leads by ~180 min and 1400 by ~60
     while 0630 and 0700 land ~1 min INTO their rush. That is a product finding worth seeing rather
-    than a number to massage, and the page states the reference point beside the figure.
+    than a number to massage. **The column is no longer on the page** (2026-09-02, product owner):
+    it went together with the row's scored count («8 avklarte, kvalifiserte utstedelser») and the
+    «(N varsler / situasjoner / rush)» denominators beside the two rates, leaving Tidspunkt,
+    Presisjon, Dekning, Varsler sendt and the Treffmatrise. The API still serves `varslingstid_min`,
+    `varslingstid_n` and the per-issue `lead_min`, computed exactly as above, so the figure is one
+    front-end change away from returning. The question that preceded the drop is worth keeping:
+    the 06:30 row read **-1 min** where the reader expected ~+29, because the 06:30 forecast is
+    about 06:30–09:00 (its model's window, and the scope the card names) while the product's
+    heading says «Morgenrushet 07:00–09:00» — two defensible reference points, and the figure
+    follows the first.
   - **The five subscriber-derived columns are never served.** `togvarsel_rounds` holds
     `matched_journeys`, `matched_devices`, `n_sent`, `n_error`, `n_gone` — day-grained counts over a
     subscriber population numbering a handful — and `rushhistorikk_days.sql` does not name them,
@@ -1410,24 +1422,55 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     **The prerequisite is not optional:** both new tables must EXIST in the project, because a dry
     run resolves table references and both are created from Python at startup, so a validation run
     against an environment the app has never started in reports FAILED and the files go unvalidated.
-  - **`traff` means the right CLASS was communicated, silence included, and `Presisjon` is `traff`
-    over everything scored** (2026-09-02). A green forecast on a green rush is a hit. Until then it
-    was its own verdict, `riktig stille`, outside Presisjon's numerator — and since green is 82 % of
-    days, «Presisjon (samlet)» read 0 % on a good month by construction, the plan's first Open
-    Question. The product owner's answer folded the verdict into `traff` (table rows 11 and 13),
-    dropped «Presisjon (varslet)» and its all-clear exclusion (which retired `is_all_clear`; the
-    all-clear rule survives only in Dekning's `warned`), renamed «Presisjon (samlet)» to plain
-    «Presisjon», and replaced «Avgjørelser» — four per weekday whether or not anything was sent —
-    with **«Varsler sendt»**: pushes issued in the window, friskmeldinger included, one per round,
-    over the RECORDED population so a push on an unsettled or ineligible day still counts. That is
-    the notification-VOLUME figure the second Open Question asked for. Two things to keep straight.
-    Presisjon is **not** the matrix's diagonal over its total, though it reads like it: the matrix
-    plots the issue's own FORECAST level (R16) while `traff` is graded on what was COMMUNICATED, so
-    a confirming follow-up whose own red sits over a standing yellow is `traff` on a yellow rush and
-    lands in the red row. And `riktig_stille` is gone from `VERDICTS`, `format.ts` and the badge
-    variants alike; `test_rushhistorikk` now checks the front-end's label KEYS against the module's,
-    not only that each module label is present, so a chip nothing can ever show cannot linger. API
-    fields: `presisjon`, `varsler_sendt`.
+  - **`traff` means the right CLASS was communicated, silence included** (2026-09-02). A green
+    forecast on a green rush is a hit. Until then it was its own verdict, `riktig stille` — and since
+    green is 82 % of days, and the verdict sat outside Presisjon's numerator while its rows sat
+    inside the denominator, «Presisjon (samlet)» read 0 % on a good month by construction, the plan's
+    first Open Question. The product owner's answer folded the verdict into `traff` (table rows 11
+    and 13), dropped «Presisjon (varslet)», renamed «Presisjon (samlet)» to plain «Presisjon», and
+    replaced «Avgjørelser» — four per weekday whether or not anything was sent — with **«Varsler
+    sendt»**: pushes issued in the window, friskmeldinger included, one per round, over the RECORDED
+    population so a push on an unsettled or ineligible day still counts. That is the
+    notification-VOLUME figure the second Open Question asked for. `riktig_stille` is gone from
+    `VERDICTS`, `format.ts` and the badge variants alike; `test_rushhistorikk` checks the
+    front-end's label KEYS against the module's, not only that each module label is present, so a
+    chip nothing can ever show cannot linger.
+  - **Presisjon and Dekning are precision and recall over NOTIFICATIONS** (later on 2026-09-02, the
+    product owner's second redefinition of the day — the first made Presisjon `traff` over every
+    scored issue, silence included, which is an accuracy figure and not the question the table is
+    read for). **Presisjon**: of the pushes that went out on scored issues, the share that were
+    *justified* — a yellow or red push on a rush that turned yellow or red, whichever of the two
+    (`traff` and `traff_nesten` alike), or a friskmelding on a rush that turned green
+    (`rushhistorikk_verdicts.justified`). **Dekning**: of the *situations* where a push was owed,
+    the share that got a justified one — `due` names a situation as an issue whose rush turned
+    yellow or red with no warning standing (a warning was owed) or turned green with one standing (a
+    friskmelding was owed). Four consequences worth knowing before reading the table. **Silence
+    enters neither rate**: a green forecast on a green day is `traff` in the day table and nothing
+    here, so a calm month reads an en dash (`presisjon_den` 0), not 100 % and not 0 %. **A
+    confirming follow-up is in neither rate** — nothing sent, nothing owed. The old warning-in-force
+    reading kept a correct friskmelding out of Dekning because it retracts rather than warns; now a
+    correct friskmelding covers the friskmelding that was owed, and a wrong one on a rush that
+    stayed bad is a Presisjon failure only (no situation existed — the traveller already held the
+    right warning). **Dekning's total row counts RUSHES, its slot rows ISSUES** (product owner,
+    same day): a rush missed at 06:30 and caught at 07:00 reads 100 % on the total row — the
+    traveller was told, late, and how late is a Varslingstid question (the API's per-rush figure
+    takes the LAST push for exactly this reason; the page no longer shows the column) — while the
+    06:30 row keeps the miss and the 07:00 row the hit. So the
+    total is NOT the slot rows added up, and a rush missed at both issues is one miss there, two on
+    the slot rows. The old code also counted rushes on that row, to avoid crediting one baseline
+    push twice through its confirming follow-up; that motive is gone (the follow-up is no
+    situation), the aggregation stays for the new one. **Dekning's numerator asks for a JUSTIFIED
+    push, not any push**, for one edge: yellow standing, the follow-up escalates to red, the rush
+    turns green — a friskmelding was owed and an escalation went out. Populations are unchanged:
+    Presisjon over
+    `scored` (a late forecast's push stays out — it saw post-cutoff reality), Dekning over
+    `delivered` (a late push that reached the traveller covers, an untimely round that owed one and
+    sent nothing is a miss). The verdicts, the day table and the matrix did not move; only what the
+    two rates count did. Presisjon is therefore even less the matrix's diagonal than before: the
+    matrix is over every scored issue by FORECAST level (R16), the rate over the pushes among them.
+    API fields: `presisjon`, `presisjon_den` (new), `dekning`, `dekning_den`. The page shows the
+    two percentages alone since the same day's third request; the denominators are served, not
+    shown.
   - **The Treffmatrise paints LEVELS, not verdicts** (2026-09-02). Each cell is split on the
     diagonal — lower-left half the level we communicated (the row), upper-right half the level the
     rush became (the column), one colour on the diagonal — with the count on top, and the text axis

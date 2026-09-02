@@ -387,7 +387,8 @@ def test_the_response_carries_exactly_the_expected_keys():
         "provisional", "verdict", "lead_min", "scored",
     }
     assert set(body["stats"][0]) == {
-        "slot", "presisjon", "dekning", "dekning_den", "varslingstid_min", "varslingstid_n",
+        "slot", "presisjon", "presisjon_den", "dekning", "dekning_den", "varslingstid_min",
+        "varslingstid_n",
         "varsler_sendt", "varsler_rekonstruert", "n_scored", "n_venter", "n_ukjent",
         "n_ikke_vurdert", "n_reconstructed", "n_reconstructed_after_start", "n_late",
         "n_untimely", "matrix",
@@ -624,7 +625,14 @@ def test_a_round_nobody_recorded_is_reconstructed_from_the_forecast_log():
     assert d["lead_min"] is not None and round(d["lead_min"]) == 60
     total = body["stats"][0]
     assert total["n_reconstructed"] == 4 and total["n_ikke_vurdert"] == 0
-    assert total["n_scored"] == 4 and total["presisjon"] == 0.75
+    assert total["n_scored"] == 4
+    # Both replayed pushes said the right class. The 12:00 silence on a red rush is a missed
+    # situation on its own row, but the 14:00 caught that rush, so both rushes are covered on the
+    # total row; the confirming 07:00 is no situation at all.
+    assert total["presisjon"] == 1.0 and total["presisjon_den"] == 2
+    assert total["dekning"] == 1.0 and total["dekning_den"] == 2
+    by_slot = {row["slot"]: row for row in body["stats"]}
+    assert by_slot["1200"]["dekning"] == 0.0 and by_slot["1400"]["dekning"] == 1.0
     assert total["varsler_sendt"] == 0 and total["varsler_rekonstruert"] == 2
 
 
