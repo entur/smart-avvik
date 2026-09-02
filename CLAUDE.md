@@ -1298,6 +1298,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     actually holds was exactly right. Without the rule at all, 0700 and 1400 would read `bom` on
     every warned day. `sent` records the POLICY decision, not delivery: `push_round` can fan out to
     zero matched devices.
+  - **A standing warning is a yellow or red `baseline_level`, never a truthy one** (2026-09-02).
+    `decide_issue` records a `baseline_level` on EVERY follow-up — `"green"` when the baseline
+    pushed nothing — and the day table tested `issue.baseline_level &&`, so the ordinary calm weekday
+    showed «Sto ved lag» on both follow-up cells with a tooltip claiming a warning at green level
+    still stood. The verdict was never wrong (`rushhistorikk_verdicts.standing()` already tests
+    yellow/red); the marker was. The day table now has its own `standing()` mirroring it, a grep in
+    `test_rushhistorikk` refuses the truthiness form, and every `untimely` round now carries «For
+    sent» — a baseline round used to show nothing, leaving a cell excluded from Presisjon with no
+    hint of why. The old render stub never showed the defect because it modelled a non-pushing
+    baseline as null, unlike the code: a stub payload that does not come through the real writer
+    hides exactly the class of bug a render exists to catch.
   - **Three populations, because the figures are not over the same rows.** `scored` (record present,
     day eligible, outcome settled and resolvable, forecast not late, round not untimely) is
     Presisjon's and the matrix's; `delivered` is the same with late and untimely INCLUDED and is

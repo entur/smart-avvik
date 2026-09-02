@@ -25,13 +25,26 @@ function LevelChip({ level }: { level: Level | null }) {
   return <span className={levelClass(level)}>{levelLabel(level)}</span>;
 }
 
+/** Whether the baseline's warning is still in force at this follow-up: a yellow or red
+ *  `baseline_level`. NOT truthiness. The policy records a baseline_level on EVERY follow-up —
+ *  "green" when the baseline pushed nothing — so read as truthiness, the ordinary calm weekday
+ *  showed «Sto ved lag» on both follow-up cells, with a tooltip claiming a warning at green level
+ *  still stood. Mirrors rushhistorikk_verdicts.standing(), which the verdict itself uses. */
+function standing(issue: IssueRow): boolean {
+  return issue.baseline_level === 'yellow' || issue.baseline_level === 'red';
+}
+
 /** What the traveller was actually told at this issue, as a short marker plus the sentence behind
  *  it. Null when nothing was communicated and nothing stood — the ordinary quiet weekday, where a
  *  marker would be noise on every one of four cells.
  *
  *  «Sto ved lag» is the case that is easy to render as silence and must not be: a confirming
  *  follow-up pushes nothing precisely because the baseline's warning still holds, so the traveller
- *  was covered. That is also the level the verdict grades — the baseline's, not this issue's own. */
+ *  was covered. That is also the level the verdict grades — the baseline's, not this issue's own.
+ *
+ *  «For sent» is the other marker a suppressed round can carry, and EVERY untimely round gets it,
+ *  baseline rounds included: an untimely round is excluded from Presisjon, and a cell showing a
+ *  verdict with no hint of why nothing went out reads as a decision that was taken. */
 function communicated(issue: IssueRow): { text: string; title: string } | null {
   if (issue.sent) {
     const when = issue.decided_at ? ` kl. ${fmtTime(issue.decided_at)}` : '';
@@ -52,7 +65,7 @@ function communicated(issue: IssueRow): { text: string; title: string } | null {
     }
     return null;
   }
-  if (issue.baseline_level && issue.reason === 'no_change') {
+  if (issue.reason === 'no_change' && standing(issue)) {
     return {
       text: 'Sto ved lag',
       title:
@@ -61,18 +74,33 @@ function communicated(issue: IssueRow): { text: string; title: string } | null {
         `dekket, og utfallet er vurdert mot det nivået — ikke mot denne utstedelsens eget.`,
     };
   }
-  // Its own marker, and for the same reason the one above exists: an untimely round with a
-  // standing baseline is ALSO graded against the baseline's level, so without this the cell shows
-  // a verdict derived from a level it never mentions. It is not the same news, though — nothing
-  // went out because the round was evaluated too late, and where a friskmelding was the one owed
-  // the verdict is «bom» however calm the rush turned out.
-  if (issue.baseline_level && issue.reason === 'untimely') {
+  if (issue.reason === 'untimely') {
+    // Four consequences, and the verdict differs across them. With a warning standing and a
+    // friskmelding owed (green forecast) it is «bom» however calm the rush turned out; with a
+    // warning standing and confirmed, the cell is graded against THAT level, which it otherwise
+    // never mentions; with a warning warranted but nothing standing it is graded as silence; with a
+    // green forecast and nothing standing the lateness cost nothing at all.
+    const owedWarning = issue.forecast_level !== null && issue.forecast_level !== 'green';
+    let consequence: string;
+    if (standing(issue) && !owedWarning) {
+      consequence =
+        `Friskmeldingen som skulle gått ut, ble aldri sendt, så den reisende satt igjen med ` +
+        `varselet på ${levelLabel(issue.baseline_level)} nivå — en bom uansett hvordan rushet ble.`;
+    } else if (standing(issue)) {
+      consequence =
+        `Varselet på ${levelLabel(issue.baseline_level)} nivå fra grunnvarselet sto dermed ` +
+        `uendret, og utfallet er vurdert mot det nivået.`;
+    } else if (owedWarning) {
+      consequence =
+        'Varselet prognosen ga grunnlag for, gikk aldri ut, så utfallet er vurdert som taushet.';
+    } else {
+      consequence = 'Prognosen var grønn, så ingen push var uansett aktuell.';
+    }
     return {
       text: 'For sent',
       title:
-        `Runden ble vurdert etter leveringsfristen, så ingen push kunne gå ut. Varselet på ` +
-        `${levelLabel(issue.baseline_level)} nivå fra grunnvarselet sto dermed uendret, og ` +
-        `utfallet er vurdert mot det nivået.`,
+        `Runden ble vurdert etter leveringsfristen, så ingen push kunne gå ut. ${consequence} ` +
+        `Holdt utenfor Presisjon, men med i Dekning.`,
     };
   }
   return null;

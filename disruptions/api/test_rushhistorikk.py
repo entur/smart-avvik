@@ -663,6 +663,21 @@ def test_a_reconstruction_is_untimely_when_the_forecast_itself_came_after_the_de
     assert total["dekning"] == 0.0 and total["dekning_den"] == 1
 
 
+def test_the_day_table_reads_a_standing_warning_as_yellow_or_red_never_as_truthiness():
+    """The policy records `baseline_level` on EVERY follow-up — "green" when the baseline pushed
+    nothing — so a front-end test of `issue.baseline_level &&` marked the ordinary calm weekday
+    «Sto ved lag» on both follow-up cells, with a tooltip claiming a warning at green level still
+    stood. The day table must mirror rushhistorikk_verdicts.standing(): yellow or red, nothing else.
+    A grep, because this repo has no TypeScript test runner; the shape is the vacuous-boolean trap
+    the outcomes pivot already fell into once."""
+    tsx = (
+        Path(_API_DIR).parent.parent / "demo/rushhistorikk/src/components/DayTable.tsx"
+    ).read_text()
+    assert "issue.baseline_level &&" not in tsx, "truthiness of baseline_level is not 'standing'"
+    assert "function standing(issue: IssueRow): boolean" in tsx
+    assert "issue.baseline_level === 'yellow' || issue.baseline_level === 'red'" in tsx
+
+
 def test_the_reconstruction_replays_the_policy_and_defines_none_of_its_own():
     """One push policy. The replay must call togvarsel_notify.decide_issue rather than restate its
     rules here — a second copy is how the page and the pusher come to disagree about what would
