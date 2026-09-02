@@ -479,6 +479,12 @@ class StatsRow:
     # says "sent" and these never were; beside it so the volume the policy implies is still
     # readable over a window the round log does not cover.
     varsler_rekonstruert: int
+    # Of varsler_sendt, the pushes on days whose outcome has not settled — in the count, not yet in
+    # the matrix, which is over scored issues only. Printed beside the count because that gap is
+    # the first thing a same-day reader sees: three pushes on the 06:30 row against a matrix that
+    # sums to two, the morning's fasit still hours away. A SUBSET of varsler_sendt (recorded
+    # rounds, not reconstructed ones), so "3 (1 venter)" reads as three, of which one.
+    varsler_venter: int
     matrix: dict[str, dict[str, int]]  # matrix[forecast level][realized level] -> count, scored
     counts: Counts
 
@@ -577,6 +583,11 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
         varslingstid_n=len(leads),
         varsler_sendt=sum(1 for issue in issues if issue.sent and not issue.reconstructed),
         varsler_rekonstruert=sum(1 for issue in issues if issue.sent and issue.reconstructed),
+        varsler_venter=sum(
+            1
+            for issue, bucket in zip(issues, buckets, strict=True)
+            if issue.sent and not issue.reconstructed and bucket == BUCKET_VENTER
+        ),
         matrix=matrix,
         counts=counts,
     )

@@ -144,6 +144,9 @@ export interface StatsRow {
   /** Pushes a reconstructed round would have issued. Apart from varsler_sendt because that column
    *  says sent and these never were. */
   varsler_rekonstruert: number;
+  /** Of varsler_sendt, the pushes on days whose outcome is not settled yet — in the count, not yet
+   *  in the matrix. Printed as «N venter» beside the count. */
+  varsler_venter: number;
   n_scored: number;
   n_venter: number;
   /** Outcome unestablishable, or the day was ineligible. */
