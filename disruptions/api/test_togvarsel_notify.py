@@ -79,16 +79,31 @@ def test_notify_specs_pin_deadlines_and_baseline_pairing():
 
 # ---------------------------------------------------------------------------- baseline rounds
 
-def test_baseline_yellow_before_the_deadline_pushes_a_warning():
-    """A 0630 yellow at 06:31 with no marker pushes exactly once."""
+def test_the_push_level_is_red_only():
+    """The one line the red-only rule lives on (2026-09-02). A fourth level would be added here."""
+    assert togvarsel_notify.PUSH_LEVELS == frozenset({"red"})
+
+
+def test_baseline_red_before_the_deadline_pushes_a_warning():
+    """A 0630 red at 06:31 with no marker pushes exactly once."""
     markers = {}
     decisions = togvarsel_notify.decide_rounds(
-        [_issue("0630", "yellow")], markers, now=_monday(6, 31)
+        [_issue("0630", "red")], markers, now=_monday(6, 31)
     )
     (d,) = decisions
     assert d.push is True and d.kind == "warning"
-    assert markers == {"0630": {"level": "yellow", "pushed": True}}
+    assert markers == {"0630": {"level": "red", "pushed": True}}
     assert d.marker == markers["0630"]
+
+
+def test_baseline_yellow_is_recorded_but_not_pushed():
+    """Red-only (2026-09-02): a yellow forecast is p 0.10-0.30, calibrated at 15-23 % bad days, so
+    pushing it was a false alarm four times in five. Suppressed with its own reason so the round
+    log can tell it from a green — and marked, so a follow-up reads its baseline as green."""
+    markers = {}
+    (d,) = togvarsel_notify.decide_rounds([_issue("0630", "yellow")], markers, now=_monday(6, 31))
+    assert d.push is False and d.reason == "yellow_baseline"
+    assert markers == {"0630": {"level": "yellow", "pushed": False}}
 
 
 def test_baseline_green_is_recorded_but_not_pushed():
@@ -101,32 +116,68 @@ def test_baseline_green_is_recorded_but_not_pushed():
 # ---------------------------------------------------------------------------- follow-up rounds
 
 def test_follow_up_at_the_same_pushed_level_is_suppressed_as_no_change():
-    """A 0700 yellow after 0630 pushed yellow — no repeat of the same message."""
-    markers = {"0630": {"level": "yellow", "pushed": True}}
-    (d,) = togvarsel_notify.decide_rounds([_issue("0700", "yellow")], markers, now=_monday(7, 1))
-    assert d.push is False and d.reason == "no_change"
-    assert markers["0700"] == {"level": "yellow", "pushed": False}
-
-
-def test_follow_up_escalation_pushes_an_update():
-    """A 0700 red after 0630 pushed yellow — a level transition is the significant change."""
-    markers = {"0630": {"level": "yellow", "pushed": True}}
+    """A 0700 red after 0630 pushed red — no repeat of the same message."""
+    markers = {"0630": {"level": "red", "pushed": True}}
     (d,) = togvarsel_notify.decide_rounds([_issue("0700", "red")], markers, now=_monday(7, 1))
-    assert d.push is True and d.kind == "update"
+    assert d.push is False and d.reason == "no_change"
+    assert markers["0700"] == {"level": "red", "pushed": False}
+
+
+def test_follow_up_escalating_past_an_unpushed_yellow_baseline_is_a_fresh_warning():
+    """A 0700 red after a 0630 yellow the red-only rule held back: the effective baseline is green
+    (nothing was pushed), so this is the first warning of the morning and must not be worded as an
+    update. Under the launch rule this same transition was an "update" against a pushed yellow."""
+    markers = {"0630": {"level": "yellow", "pushed": False}}
+    (d,) = togvarsel_notify.decide_rounds([_issue("0700", "red")], markers, now=_monday(7, 1))
+    assert d.push is True and d.kind == "warning" and d.baseline_level == "green"
     assert markers["0700"] == {"level": "red", "pushed": True}
 
 
-def test_follow_up_easing_from_red_to_yellow_also_pushes_an_update():
+def test_follow_up_easing_from_red_to_yellow_stays_silent_and_the_red_stands():
+    """A push says red or says green, never yellow. So after a pushed red a yellow follow-up sends
+    nothing and records the red as standing — /rushhistorikk grades that red, and the /varsel panel
+    shows the current level meanwhile. A yellow downgrade push was left out on purpose: the page
+    grades a push on the level it says, and 21 of 23 such rushes in the rolling replay turned green,
+    so it would have read as a false alarm nine times in ten."""
     markers = {"0630": {"level": "red", "pushed": True}}
     (d,) = togvarsel_notify.decide_rounds([_issue("0700", "yellow")], markers, now=_monday(7, 1))
-    assert d.push is True and d.kind == "update"
+    assert d.push is False and d.reason == "no_change" and d.baseline_level == "red"
+    assert markers["0700"] == {"level": "yellow", "pushed": False}
 
 
 def test_follow_up_pushes_a_fresh_warning_when_the_baseline_pushed_nothing():
     markers = {"0630": {"level": "green", "pushed": False}}
-    (d,) = togvarsel_notify.decide_rounds([_issue("0700", "yellow")], markers, now=_monday(7, 1))
+    (d,) = togvarsel_notify.decide_rounds([_issue("0700", "red")], markers, now=_monday(7, 1))
     # not an "update": nothing was pushed for this rush yet, so the wording must not claim one
     assert d.push is True and d.kind == "warning"
+
+
+def test_yellow_follow_up_with_nothing_standing_is_suppressed_as_no_change():
+    """Green -> yellow with no warning out: a level a push never says, and what the traveller holds
+    is unchanged — the same branch a green after an unpushed green baseline has always taken.
+    Marked like every suppression, recording the green nothing-standing state as its baseline."""
+    for baseline in ({"level": "green", "pushed": False}, {"level": "yellow", "pushed": False}):
+        markers = {"0630": dict(baseline)}
+        (d,) = togvarsel_notify.decide_rounds([_issue("0700", "yellow")], markers, now=_monday(7, 1))
+        assert d.push is False and d.reason == "no_change" and d.baseline_level == "green"
+        assert markers["0700"] == {"level": "yellow", "pushed": False}
+
+
+def test_no_marker_the_red_only_rule_writes_can_yield_an_update():
+    """Exhaustive over the marker states decide_issue itself produces now (an unpushed green or
+    yellow, a red pushed or untimely, or no baseline at all) and every follow-up level: a push is a
+    warning or a friskmelding, never an "update" — there is no lower pushed level to escalate from
+    nor one to ease to. The kind survives only for rows the launch rule wrote, and for a pushed
+    yellow marker left over from it on the deploy day itself."""
+    baselines = [None, {"level": "green", "pushed": False}, {"level": "yellow", "pushed": False},
+                 {"level": "red", "pushed": True}, {"level": "red", "pushed": False}]
+    for baseline in baselines:
+        for level in ("green", "yellow", "red"):
+            markers = {} if baseline is None else {"0630": dict(baseline)}
+            d = togvarsel_notify.decide_issue(_issue("0700", level), markers, now=_monday(7, 1))
+            assert d.kind != "update", (baseline, level)
+            if d.push:
+                assert (d.kind, level) in (("warning", "red"), ("all_clear", "green")), (baseline, level)
 
 
 def test_follow_up_pushes_when_the_baseline_round_never_ran():
@@ -138,8 +189,8 @@ def test_follow_up_pushes_when_the_baseline_round_never_ran():
 
 
 def test_green_follow_up_after_a_pushed_warning_is_the_all_clear():
-    """The one green that pushes — friskmelding after a pushed yellow."""
-    markers = {"0630": {"level": "yellow", "pushed": True}}
+    """The one green that pushes — friskmelding after a pushed red."""
+    markers = {"0630": {"level": "red", "pushed": True}}
     (d,) = togvarsel_notify.decide_rounds([_issue("0700", "green")], markers, now=_monday(7, 1))
     assert d.push is True and d.kind == "all_clear"
     # the all-clear is marked like any push; no later round reads it, so the effect is dedup only
@@ -203,17 +254,17 @@ def test_1400_is_gated_by_what_a_1359_1200_pushed():
         [_issue("1200", "red"), _issue("1400", "red")], markers, now=_monday(14, 1)
     )
     assert d1400.issue == "1400" and d1400.push is False and d1400.reason == "no_change"
-    # with a level change instead, the 14:01 round pushes as an update
+    # with a drop to green instead, the 14:01 round pushes the friskmelding
     markers2 = {"1200": {"level": "red", "pushed": True}}
-    (chg,) = togvarsel_notify.decide_rounds([_issue("1400", "yellow")], markers2, now=_monday(14, 1))
-    assert chg.push is True and chg.kind == "update"
+    (chg,) = togvarsel_notify.decide_rounds([_issue("1400", "green")], markers2, now=_monday(14, 1))
+    assert chg.push is True and chg.kind == "all_clear"
 
 
 def test_now_in_utc_is_read_as_oslo_wall_clock():
     # 04:31 UTC on 2026-08-31 is 06:31 in Oslo (CEST): timely for 0630
     markers = {}
     (d,) = togvarsel_notify.decide_rounds(
-        [_issue("0630", "yellow")], markers, now=datetime(2026, 8, 31, 4, 31, tzinfo=UTC)
+        [_issue("0630", "red")], markers, now=datetime(2026, 8, 31, 4, 31, tzinfo=UTC)
     )
     assert d.push is True
 
@@ -221,7 +272,7 @@ def test_now_in_utc_is_read_as_oslo_wall_clock():
 # ---------------------------------------------------------------------------- idempotency + safety
 
 def test_a_marked_round_is_never_reevaluated():
-    markers = {"0630": {"level": "yellow", "pushed": True}}
+    markers = {"0630": {"level": "yellow", "pushed": False}}
     before = deepcopy(markers)
     assert togvarsel_notify.decide_rounds([_issue("0630", "yellow")], markers, now=_monday(6, 45)) == []
     # even when a recompute changed the level after the fact — the round is done for the day
@@ -241,7 +292,7 @@ def test_one_broken_round_never_stops_the_rest_of_the_tick():
     # round records no marker; the healthy one still pushes
     markers = {}
     decisions = togvarsel_notify.decide_rounds(
-        [_issue("0630", "purple", late=True), _issue("1200", "yellow")], markers, now=_monday(13, 30)
+        [_issue("0630", "purple", late=True), _issue("1200", "red")], markers, now=_monday(13, 30)
     )
     assert [d.issue for d in decisions] == ["1200"]
     assert decisions[0].push is True
@@ -249,7 +300,7 @@ def test_one_broken_round_never_stops_the_rest_of_the_tick():
     # the failed round is retried on the next tick (here it is sane again — and untimely by now,
     # so it is recorded as suppressed rather than left dangling)
     retried = togvarsel_notify.decide_rounds(
-        [_issue("0630", "red", late=True), _issue("1200", "yellow")], markers, now=_monday(13, 31)
+        [_issue("0630", "red", late=True), _issue("1200", "red")], markers, now=_monday(13, 31)
     )
     assert [d.issue for d in retried] == ["0630"]
     assert retried[0].reason == "untimely"
@@ -384,7 +435,7 @@ def test_station_fetch_failure_is_unavailable_then_recovers_with_no_markers_mean
     assert len(fake.queries) == 2  # retried immediately: no cooldown between attempts
     fake.fail = False
     assert togvarsel_notify.station_set(now=_monday(6, 40)) == frozenset(_OSLO_REFS)
-    (d,) = togvarsel_notify.decide_rounds([_issue("0630", "yellow")], markers, now=_monday(6, 40))
+    (d,) = togvarsel_notify.decide_rounds([_issue("0630", "red")], markers, now=_monday(6, 40))
     assert d.push is True  # the round was never marked while the set was unavailable
 
 
@@ -560,8 +611,8 @@ _REASONS = (
 )
 
 
-def _issued(key: str = "0630", level: str = "yellow", scope: str = "morgenrushet 06:30–09:00",
-            reasons=_REASONS, p: float = 0.21) -> dict:
+def _issued(key: str = "0630", level: str = "red", scope: str = "morgenrushet 06:30–09:00",
+            reasons=_REASONS, p: float = 0.41) -> dict:
     """An issue dict with the payload fields togvarsel's Issue model really serves: composition
     reads `scope` and `reasons` on top of the policy core's issue+level, and the rush outlook
     reads `p` on top of those."""
@@ -577,9 +628,9 @@ def test_warning_payload_is_forecast_framed_with_level_env_prefix_and_reasons():
         decision, _issued(), "entur",
         brand_assets=varsel._BRAND_ASSETS, tag_title=lambda t: f"[dev] {t}",
     )
-    assert payload["title"] == "[dev] Rushvarsel: gult nivå for morgenrushet"
+    assert payload["title"] == "[dev] Rushvarsel: rødt nivå for morgenrushet"
     assert payload["body"] == (
-        "Prognosen for morgenrushet 06:30–09:00 er gult nivå. "
+        "Prognosen for morgenrushet 06:30–09:00 er rødt nivå. "
         "2 tog er innstilt før kl. 06:30. Forsinkelser i morgentimene så langt."
     )
     assert "personalmangel" not in payload["body"]  # leading reasons only — a lock screen is small
@@ -617,7 +668,9 @@ def test_afternoon_warning_names_the_afternoon_rush():
 
 def test_update_payload_marks_the_forecast_as_updated():
     """A follow-up against a pushed baseline says the forecast is UPDATED, so the second
-    push in one rush reads as a revision, not a repeat."""
+    push in one rush reads as a revision, not a repeat. Reachable under red-only only through a
+    pushed-yellow marker the launch rule left behind (the deploy day itself); the wording stays
+    because rows and lock screens from before 2026-09-02 carry it."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
     issue = _issued("0700", "red", scope="morgenrushet 07:00–09:00")
     decision = togvarsel_notify.decide_issue(issue, markers, now=_monday(7, 1))
@@ -630,15 +683,15 @@ def test_update_payload_marks_the_forecast_as_updated():
 def test_a_fresh_warning_from_a_follow_up_round_is_not_worded_as_an_update():
     # the baseline pushed nothing, so there is no forecast to have "updated"
     markers = {"0630": {"level": "green", "pushed": False}}
-    decision = togvarsel_notify.decide_issue(_issued("0700", "yellow"), markers, now=_monday(7, 1))
-    title, _body = togvarsel_notify.compose_message(decision, _issued("0700", "yellow"))
-    assert title == "Rushvarsel: gult nivå for morgenrushet"
+    decision = togvarsel_notify.decide_issue(_issued("0700", "red"), markers, now=_monday(7, 1))
+    title, _body = togvarsel_notify.compose_message(decision, _issued("0700", "red"))
+    assert title == "Rushvarsel: rødt nivå for morgenrushet"
 
 
 def test_all_clear_payload_is_a_friskmelding_without_warning_language():
     """The drop back to green is framed as a friskmelding — calm, and free of every word the
     warnings use. No reasons either: green's own reasons still talk about trouble signs."""
-    markers = {"0630": {"level": "yellow", "pushed": True}}
+    markers = {"0630": {"level": "red", "pushed": True}}
     issue = _issued("0700", "green", scope="morgenrushet 07:00–09:00",
                     reasons=("ingen tegn til trøbbel i morgentimene",))
     decision = togvarsel_notify.decide_issue(issue, markers, now=_monday(7, 1))
@@ -854,7 +907,7 @@ def test_evaluate_flag_off_evaluates_nothing_and_writes_no_markers(monkeypatch):
         varsel, "_send_push",
         lambda sub, payload: (_ for _ in ()).throw(AssertionError("sent while disabled")),
     )
-    store, fake = _configure_evaluate(issues=[_issued("0630", "yellow")], enabled=lambda: False)
+    store, fake = _configure_evaluate(issues=[_issued("0630", "red")], enabled=lambda: False)
     togvarsel_notify.evaluate(now=_monday(6, 31))
     assert store.stores == 0 and store.by_date == {}
     assert fake.queries == []  # not even the station fetch ran
@@ -876,12 +929,12 @@ def test_evaluate_pushes_after_an_enable_restart_inside_the_window(monkeypatch):
     evaluates 0630 fresh and delivers — and the stored marker dedups the very next tick."""
     sent: list[dict] = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
-    store, _fake = _configure_evaluate(issues=[_issued("0630", "yellow")])
+    store, _fake = _configure_evaluate(issues=[_issued("0630", "red")])
     with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
         togvarsel_notify.evaluate(now=_monday(6, 50))
         assert len(sent) == 1
-        assert sent[0]["title"] == "Rushvarsel: gult nivå for morgenrushet"
-        assert store.by_date[MONDAY_STR]["0630"] == {"level": "yellow", "pushed": True}
+        assert sent[0]["title"] == "Rushvarsel: rødt nivå for morgenrushet"
+        assert store.by_date[MONDAY_STR]["0630"] == {"level": "red", "pushed": True}
         togvarsel_notify.evaluate(now=_monday(6, 51))
     assert len(sent) == 1  # the marker dedups; a completed round never re-fires
 
@@ -893,9 +946,9 @@ def test_evaluate_after_a_late_restart_suppresses_and_never_revisits(monkeypatch
         varsel, "_send_push",
         lambda sub, payload: (_ for _ in ()).throw(AssertionError("untimely push")),
     )
-    store, _fake = _configure_evaluate(issues=[_issued("0630", "yellow")])
+    store, _fake = _configure_evaluate(issues=[_issued("0630", "red")])
     togvarsel_notify.evaluate(now=_monday(7, 10))
-    assert store.by_date[MONDAY_STR]["0630"] == {"level": "yellow", "pushed": False}
+    assert store.by_date[MONDAY_STR]["0630"] == {"level": "red", "pushed": False}
     assert store.stores == 1  # the suppression-only tick persists once, at the end
 
 
@@ -940,17 +993,17 @@ def test_evaluate_isolates_a_failing_round_and_never_retries_it(monkeypatch):
 
     store, _fake = _configure_evaluate(
         issues=[_issued("1200", "red", scope="ettermiddagsrushet 15:00–18:00"),
-                _issued("1400", "yellow", scope="ettermiddagsrushet 15:00–18:00")],
+                _issued("1400", "green", scope="ettermiddagsrushet 15:00–18:00")],
         journeys=lambda: {"j1": _j(begin="15:30", end="17:00")},
         deliver=flaky_deliver,
     )
     with _push_devices({"dev-1": _dev("https://push.example.com/1")}), _capture_logs() as records:
         togvarsel_notify.evaluate(now=_monday(13, 30))
-        # 1200 red failed in delivery; 1400 yellow (an update against red) still went out
-        assert len(sent) == 1 and "gult" in sent[0]["title"]
+        # 1200 red failed in delivery; 1400 green (the friskmelding against red) still went out
+        assert len(sent) == 1 and "Friskmelding" in sent[0]["title"]
         day = store.by_date[MONDAY_STR]
         assert day["1200"] == {"level": "red", "pushed": True}  # committed before fan-out
-        assert day["1400"] == {"level": "yellow", "pushed": True}
+        assert day["1400"] == {"level": "green", "pushed": True}
         assert any(r.levelno >= logging.ERROR and "1200" in r.getMessage() for r in records)
         togvarsel_notify.evaluate(now=_monday(13, 31))
     assert len(sent) == 1  # the failed round is never retried — its marker is committed
@@ -967,7 +1020,7 @@ def test_evaluate_persists_after_each_delivery_and_once_for_suppression_only_tic
             order.append("store")
             super().store(date_str, markers)
 
-    _configure_evaluate(issues=[_issued("0630", "yellow")], store=_OrderedStore())
+    _configure_evaluate(issues=[_issued("0630", "red")], store=_OrderedStore())
     with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
         togvarsel_notify.evaluate(now=_monday(6, 31))
     assert order == ["send", "store"]
@@ -989,7 +1042,7 @@ def test_evaluate_survives_a_lost_persist_and_a_restart_is_bounded_by_timeliness
     with varsel._state_lock:
         saved_rounds = deepcopy(varsel._togvarsel_rounds)
     _configure_evaluate(
-        issues=[_issued("0630", "yellow")],
+        issues=[_issued("0630", "red")],
         load_markers=varsel.togvarsel_rounds_for,
         store_markers=varsel.store_togvarsel_rounds,
     )
@@ -1011,7 +1064,7 @@ def test_evaluate_survives_a_lost_persist_and_a_restart_is_bounded_by_timeliness
             togvarsel_notify.evaluate(now=_monday(7, 10))
             assert len(sent) == 2
             marker = varsel.togvarsel_rounds_for(MONDAY_STR)["0630"]
-            assert marker == {"level": "yellow", "pushed": False}
+            assert marker == {"level": "red", "pushed": False}
     finally:
         with varsel._state_lock:
             varsel._togvarsel_rounds = saved_rounds
@@ -1064,7 +1117,7 @@ def test_the_test_trigger_sends_the_synthetic_round_through_the_real_pipe(monkey
         r = _trigger_client().post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
     assert r.status_code == 200 and r.json() == {"status": "sent"}
     (payload,) = sent
-    assert payload["title"] == "[dev] Rushvarsel: gult nivå for morgenrushet"  # real composition
+    assert payload["title"] == "[dev] Rushvarsel: rødt nivå for morgenrushet"  # real composition
     assert "testvarsel" in payload["body"].lower()  # clearly a test, never a real forecast
     assert payload["url"] == "/togmelding"
     assert payload["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
@@ -1342,12 +1395,12 @@ def test_a_pushing_round_is_recorded_with_its_kind_and_device_counts(monkeypatch
     """The row carries the policy decision AND the fan-out counts. `sent` means a push was
     ISSUED — the counts are what say whether it reached anybody."""
     sent = _sent_ok(monkeypatch)
-    _store, fake = _configure_evaluate(issues=[_issued("0630", "yellow")])
+    _store, fake = _configure_evaluate(issues=[_issued("0630", "red")])
     with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
         togvarsel_notify.evaluate(now=_monday(6, 31))
     assert len(sent) == 1
     row = fake.round_for("0630")
-    assert row["level"] == "yellow" and row["sent"] is True
+    assert row["level"] == "red" and row["sent"] is True
     assert row["kind"] == "warning" and row["reason"] is None
     assert row["baseline_level"] is None, "a baseline round has no baseline"
     assert row["matched_devices"] == 1 and row["n_sent"] == 1
@@ -1357,43 +1410,48 @@ def test_a_pushing_round_is_recorded_with_its_kind_and_device_counts(monkeypatch
 def test_a_suppressed_round_is_recorded_with_its_reason():
     """Suppressions are the rows a page needs most: on /historikk the sub-threshold decisions are
     83 % of the log and the only thing that makes a miss visible. A green baseline pushes nothing
-    and must still leave a trace."""
-    _store, fake = _configure_evaluate(issues=[_issued("0630", "green")])
-    togvarsel_notify.evaluate(now=_monday(6, 31))
-    row = fake.round_for("0630")
-    assert row["sent"] is False and row["reason"] == "green_baseline"
-    assert row["kind"] is None and row["n_sent"] is None
+    and must still leave a trace — and so must the yellow the red-only rule holds back, under a
+    reason of its own, or the page could not tell a calm forecast from a warning we chose not to
+    send."""
+    for level in ("green", "yellow"):
+        _store, fake = _configure_evaluate(issues=[_issued("0630", level)])
+        togvarsel_notify.evaluate(now=_monday(6, 31))
+        row = fake.round_for("0630")
+        assert row["sent"] is False and row["reason"] == f"{level}_baseline"
+        assert row["level"] == level and row["kind"] is None and row["n_sent"] is None
 
 
 def test_a_confirming_follow_up_records_the_level_left_in_force(monkeypatch):
-    """0700 confirms a pushed yellow: it sends nothing, yet the traveller holds a yellow warning.
+    """0700 confirms a pushed red: it sends nothing, yet the traveller holds a red warning.
     baseline_level is what /rushhistorikk grades that round on, and it is recorded rather than read
-    off the 0630 row — one swallowed write there would otherwise invert the verdict."""
+    off the 0630 row — one swallowed write there would otherwise invert the verdict. Same for a
+    yellow 0700 after that red: nothing sent (yellow is never pushed), the red still standing."""
     _sent_ok(monkeypatch)
-    issues = [_issued("0630", "yellow")]
-    _store, fake = _configure_evaluate(issues=issues)
-    with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
-        togvarsel_notify.evaluate(now=_monday(6, 31))
-        issues.append(_issued("0700", "yellow"))  # issued_today only grows as issues compute
-        togvarsel_notify.evaluate(now=_monday(7, 1))
-    row = fake.round_for("0700")
-    assert row["sent"] is False and row["reason"] == "no_change"
-    assert row["baseline_level"] == "yellow"
+    for follow_up in ("red", "yellow"):
+        issues = [_issued("0630", "red")]
+        _store, fake = _configure_evaluate(issues=issues)
+        with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
+            togvarsel_notify.evaluate(now=_monday(6, 31))
+            issues.append(_issued("0700", follow_up))  # issued_today only grows as issues compute
+            togvarsel_notify.evaluate(now=_monday(7, 1))
+        row = fake.round_for("0700")
+        assert row["sent"] is False and row["reason"] == "no_change"
+        assert row["level"] == follow_up and row["baseline_level"] == "red"
 
 
 def test_an_untimely_follow_up_still_records_the_standing_level():
-    """The 12:00 yellow / 14:00 red case. The 14:00 round is past its deadline so nothing is sent,
-    and the level in force is still the yellow the traveller received — recorded here so the page
-    grades that yellow rather than crediting a red nobody saw. This is why _effective_baseline is
-    resolved BEFORE the deadline check."""
-    issues = [_issued("1200", "yellow")]
+    """The 12:00 red / 14:00 green case. The 14:00 round is past its deadline so nothing is sent
+    — the friskmelding it owed never goes out — and the level in force is still the red the
+    traveller received, recorded here so the page grades that red rather than crediting a green
+    nobody saw. This is why _effective_baseline is resolved BEFORE the deadline check."""
+    issues = [_issued("1200", "red")]
     _store, fake = _configure_evaluate(issues=issues)
     togvarsel_notify.evaluate(now=_monday(12, 1))
-    issues.append(_issued("1400", "red"))  # the 14:00 forecast does not exist at 12:01
+    issues.append(_issued("1400", "green"))  # the 14:00 forecast does not exist at 12:01
     togvarsel_notify.evaluate(now=_monday(18, 0))
     row = fake.round_for("1400")
     assert row["sent"] is False and row["reason"] == "untimely"
-    assert row["level"] == "red" and row["baseline_level"] == "yellow"
+    assert row["level"] == "green" and row["baseline_level"] == "red"
 
 
 def test_a_mixed_pass_records_both_the_suppression_and_the_push(monkeypatch):
@@ -1442,10 +1500,10 @@ def test_the_test_trigger_records_no_round(monkeypatch):
     hook lives in _evaluate and nowhere else."""
     _sent_ok(monkeypatch)
     _store, fake = _configure_evaluate(issues=[])
-    decision = togvarsel_notify.decide_issue(_issued("0630", "yellow"), {}, now=_monday(6, 31))
+    decision = togvarsel_notify.decide_issue(_issued("0630", "red"), {}, now=_monday(6, 31))
     with _push_devices({"dev-1": _dev("https://push.example.com/1")}):
         togvarsel_notify.push_round(
-            decision, _issued("0630", "yellow"), ["j1"], ["dev-1"], **_wiring()
+            decision, _issued("0630", "red"), ["j1"], ["dev-1"], **_wiring()
         )
     assert fake.rounds == [], "push_round must never record a round"
 

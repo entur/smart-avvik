@@ -233,7 +233,7 @@ def _every_reachable_issue():
             rv.LEVELS,
             (None, *rv.LEVELS),
             (True, False),
-            (None, "untimely", "no_change", "green_baseline"),
+            (None, "untimely", "no_change", "green_baseline", "yellow_baseline"),
             (True, False),
         )
     ):
