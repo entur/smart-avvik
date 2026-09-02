@@ -69,6 +69,21 @@ _SETTLED_DUE_UTC_HOUR = 4
 # the attempts have given up and /rushhistorikk reports `ukjent`.
 _RETRY_DAYS = 10
 
+# How far back the authoritative pass reaches for days that have NO outcome row at all — the
+# forecasts issued before this feature existed, in each environment once, and any day a long poller
+# outage skipped entirely. Wider than the retry window on purpose: the window bounds how long a day
+# whose batch never lands keeps being re-read, and a row-less day inside this horizon is re-read
+# daily until it ages out, at 32.5 MB a read. Bounded so that cannot be forever. Sized to cover the
+# forecast log's whole history when the page shipped (2026-09-02: three-plus weeks) with margin.
+_BACKFILL_DAYS = 60
+
+# The settled SELECT runs over a calendar span, and at 32.5 MB per day a 60-day backfill in one job
+# is ~2 GB — at `_MAX_BYTES_BILLED`, so the first pass in a fresh environment would fail every
+# retry and never settle anything. Spans wider than this are cut into consecutive chunks, one
+# SELECT each: 14 days plus the query's own ±1-day reach is ~16 partitions, ~520 MB, a quarter of
+# the bound.
+_SETTLED_CHUNK_DAYS = 14
+
 # The training chain's own eligibility test (09_training.sql): `am_n > 300 AND pm_n > 300`, which
 # drops strike days and data gaps. A day below it has a realized share that means nothing.
 #
@@ -143,21 +158,30 @@ WHEN NOT MATCHED THEN
 # The work set: days we issued a forecast for that are not fully settled yet. Derived every tick
 # rather than tracked, which is what makes a missed run self-heal. Bounded to days strictly before
 # today, because last_recorded carries no complete day for today.
+#
+# Two reaches, and they answer different questions. Inside the RETRY window, any day not fully
+# settled: the provisional rows live here, and a day the batch had not covered yet is re-read until
+# the window closes. Beyond it, out to the BACKFILL horizon, only days with NO outcome row at all —
+# the pre-feature backlog, or a day a long outage skipped — because a day with rows there was either
+# settled or deliberately marked unresolvable, and re-reading either re-runs an immutable query to
+# reach the same answer.
 _WORK_SET_SQL = """
 WITH issued AS (
   SELECT DISTINCT d FROM `disruptions.togvarsel_issued`
-  WHERE d BETWEEN DATE_SUB(@today, INTERVAL @retry_days DAY) AND DATE_SUB(@today, INTERVAL 1 DAY)
+  WHERE d BETWEEN DATE_SUB(@today, INTERVAL @backfill_days DAY) AND DATE_SUB(@today, INTERVAL 1 DAY)
 ),
 resolved AS (
   SELECT d, COUNTIF(IFNULL(settled, FALSE)) AS n_settled
   FROM `disruptions.togvarsel_outcomes`
-  WHERE d BETWEEN DATE_SUB(@today, INTERVAL @retry_days DAY) AND DATE_SUB(@today, INTERVAL 1 DAY)
+  WHERE d BETWEEN DATE_SUB(@today, INTERVAL @backfill_days DAY) AND DATE_SUB(@today, INTERVAL 1 DAY)
   GROUP BY d
 )
 SELECT i.d
 FROM issued AS i
 LEFT JOIN resolved AS r USING (d)
-WHERE IFNULL(r.n_settled, 0) < @n_scopes
+WHERE
+  (i.d >= DATE_SUB(@today, INTERVAL @retry_days DAY) AND IFNULL(r.n_settled, 0) < @n_scopes)
+  OR (i.d < DATE_SUB(@today, INTERVAL @retry_days DAY) AND r.d IS NULL)
 ORDER BY i.d
 """
 
@@ -367,13 +391,16 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
 def _run_settled(days: Sequence[date], now: datetime) -> None:
     """The authoritative pass over every day in the work set: all three scopes, settling each row.
 
-    ONE SELECT for the whole span, not one per day. The query takes a real range (BETWEEN, GROUP BY
-    d, scope) and this is the caller that needs it: the work set is normally a single day, but it is
-    a backlog exactly once per environment — `togvarsel_issued` already holds forecasts issued
-    before this feature existed — and again after any poller outage longer than a day. At one SELECT
-    plus three MERGEs per day that was up to ~28 sequential BigQuery jobs in a single tick, and this
-    runs on the SOLE poller thread, after the SX rebuild and the notify pass, so the cost is not
-    /rushhistorikk's latency but a poller tick that goes quiet for tens of seconds.
+    ONE SELECT per span of up to `_SETTLED_CHUNK_DAYS` calendar days, not one per day. The query
+    takes a real range (BETWEEN, GROUP BY d, scope) and this is the caller that needs it: the work
+    set is normally a single day, but it is a backlog exactly once per environment —
+    `togvarsel_issued` already holds forecasts issued before this feature existed, and the
+    `_BACKFILL_DAYS` horizon reaches them — and again after any poller outage longer than a day. At
+    one SELECT plus three MERGEs per day that was up to ~28 sequential BigQuery jobs in a single
+    tick, and this runs on the SOLE poller thread, after the SX rebuild and the notify pass, so the
+    cost is not /rushhistorikk's latency but a poller tick that goes quiet for tens of seconds — on
+    the backlog pass, a few minutes, once. The chunking is a BYTES bound, not a latency one: the
+    whole backfill horizon in one SELECT sits at `_MAX_BYTES_BILLED` and would fail every retry.
 
     The MERGE loop stays per (day, scope) and iterates the WORK SET, never the scanned span: a day
     inside min..max that already settled, or a weekend with no issued forecast, must not get a row.
@@ -395,14 +422,31 @@ def _run_settled(days: Sequence[date], now: datetime) -> None:
     if not days:
         return
     _ensure_table_ready()
-    cfg = _job_config(
-        [_scalar("from_date", "DATE", min(days)), _scalar("to_date", "DATE", max(days))]
-    )
-    by_day: dict[date, dict[str, Any]] = {}
-    for row in _bq_client.query(_SETTLED_QUERY, job_config=cfg).result(timeout=180):
-        by_day.setdefault(row["d"], {})[row["scope"]] = row
-    for day in days:
-        _settle_day(day, by_day.get(day, {}), now)
+    for chunk in _spans(days, _SETTLED_CHUNK_DAYS):
+        cfg = _job_config(
+            [_scalar("from_date", "DATE", chunk[0]), _scalar("to_date", "DATE", chunk[-1])]
+        )
+        by_day: dict[date, dict[str, Any]] = {}
+        for row in _bq_client.query(_SETTLED_QUERY, job_config=cfg).result(timeout=180):
+            by_day.setdefault(row["d"], {})[row["scope"]] = row
+        for day in chunk:
+            _settle_day(day, by_day.get(day, {}), now)
+
+
+def _spans(days: Sequence[date], max_span_days: int) -> list[list[date]]:
+    """The work set cut into consecutive runs each covering fewer than `max_span_days` calendar
+    days, sorted. By calendar span and not by count: the work set holds weekdays only, so a count
+    would let a chunk stretch over more partitions than it has days."""
+    spans: list[list[date]] = []
+    current: list[date] = []
+    for day in sorted(days):
+        if current and (day - current[0]).days >= max_span_days:
+            spans.append(current)
+            current = []
+        current.append(day)
+    if current:
+        spans.append(current)
+    return spans
 
 
 def _settle_day(day: date, rows: dict[str, Any], now: datetime) -> None:
@@ -471,6 +515,7 @@ def _work_set(today: date) -> list[date]:
         [
             _scalar("today", "DATE", today),
             bigquery.ScalarQueryParameter("retry_days", "INT64", _RETRY_DAYS),
+            bigquery.ScalarQueryParameter("backfill_days", "INT64", _BACKFILL_DAYS),
             bigquery.ScalarQueryParameter("n_scopes", "INT64", len(SCOPES)),
         ]
     )

@@ -49,9 +49,14 @@ export interface IssueRow {
   /** Forecast computed more than 10 min after its own cutoff, so it saw post-cutoff reality.
    *  Excluded from Presisjon, kept in Dekning. */
   late: boolean;
-  /** A notification round was recorded. False means «ikke vurdert»: the notify gate was closed, or
-   *  the day predates the round log — never that no warning was warranted. */
+  /** A notification round exists — recorded, or reconstructed from the forecast log (see
+   *  `reconstructed`). False means «ikke vurdert»: none recorded and none reconstructable — never
+   *  that no warning was warranted. */
   recorded: boolean;
+  /** The round is not a record: no round row existed, so the push policy was replayed on the
+   *  forecast at its own computed_at — what would have been decided with delivery on and on time.
+   *  Graded like a recorded round (the page judges the model), counted apart, never a sent push. */
+  reconstructed: boolean;
   /** A push was ISSUED — the policy decision, not delivery. A round can match zero devices and
    *  still be what the traveller would have received. */
   sent: boolean;
@@ -126,17 +131,24 @@ export interface StatsRow {
   /** Median minutes from the push to the rush's start. The last push per rush on the total row. */
   varslingstid_min: number | null;
   varslingstid_n: number;
-  /** Pushes issued in the window, friskmeldinger included — one per round that sent, over every
-   *  issue, unsettled days included. The notification-volume figure. */
+  /** Pushes issued in the window, friskmeldinger included — one per RECORDED round that sent, over
+   *  every issue, unsettled days included. The notification-volume figure. */
   varsler_sendt: number;
+  /** Pushes a reconstructed round would have issued. Apart from varsler_sendt because that column
+   *  says sent and these never were. */
+  varsler_rekonstruert: number;
   n_scored: number;
   n_venter: number;
   /** Outcome unestablishable, or the day was ineligible. */
   n_ukjent: number;
+  /** No round recorded and none reconstructable. */
   n_ikke_vurdert: number;
-  /** Of those, the ones on a day the round log already covered: a LOST best-effort write rather
-   *  than the pre-launch backlog. */
-  n_ikke_vurdert_etter_start: number;
+  /** Issues whose round was reconstructed from the forecast log. Orthogonal to the buckets: a
+   *  reconstructed round is scored like a recorded one. */
+  n_reconstructed: number;
+  /** Of those, the ones on a day the round log already covered: a LOST best-effort write or a
+   *  closed gate rather than the pre-launch backlog. */
+  n_reconstructed_after_start: number;
   n_late: number;
   n_untimely: number;
   /** Forecast level (rows) against realized level (columns), over this row's scored issues. */
@@ -150,9 +162,8 @@ export interface DaysResponse {
   days: DayRow[];
   /** The total row first, then one per issue slot. */
   stats: StatsRow[];
-  /** The earliest day a notification round was ever recorded. An «ikke vurdert» issue BEFORE this
-   *  is the expected pre-launch backlog; one at or after it can only mean a lost write or a closed
-   *  gate. */
+  /** The earliest day a notification round was ever recorded. A reconstructed round BEFORE this is
+   *  the expected pre-launch backlog; one after it can only mean a lost write or a closed gate. */
   recording_started: string | null;
 }
 

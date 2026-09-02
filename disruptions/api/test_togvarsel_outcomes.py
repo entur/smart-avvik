@@ -462,6 +462,50 @@ def test_a_day_the_range_returned_nothing_for_at_all_is_left_for_the_retry_windo
     )
 
 
+def test_the_work_set_reaches_back_for_row_less_days_and_only_those():
+    """Beyond the retry window the pass back-fills the pre-feature backlog — days with NO outcome
+    row — out to `_BACKFILL_DAYS`, and nothing else: a day with rows there was settled or marked
+    unresolvable, and re-reading either re-runs an immutable query to reach the same answer. The
+    horizon exists so /rushhistorikk can be initialised from the forecast log rather than reading
+    `ukjent` for every day older than ten days."""
+    sql = togvarsel_outcomes._WORK_SET_SQL
+    assert "INTERVAL @backfill_days DAY" in sql and "r.d IS NULL" in sql
+    assert "INTERVAL @retry_days DAY" in sql  # the inner window is still the retry window
+    assert togvarsel_outcomes._BACKFILL_DAYS > togvarsel_outcomes._RETRY_DAYS
+    fake = _FakeBQ(work_set=[])
+    _reset(fake)
+    togvarsel_outcomes._work_set(MONDAY)
+    params = next(p for sql, p in fake.sent if "togvarsel_issued" in sql)
+    assert params["backfill_days"] == togvarsel_outcomes._BACKFILL_DAYS
+    assert params["retry_days"] == togvarsel_outcomes._RETRY_DAYS
+
+
+def test_a_wide_backlog_is_read_in_bounded_spans_and_every_day_is_written():
+    """At 32.5 MB per day the whole backfill horizon in one SELECT sits at `_MAX_BYTES_BILLED`, so
+    the first pass in a fresh environment would fail every retry and settle nothing. Spans are cut
+    by CALENDAR days — the work set holds weekdays only, so a count would let a chunk stretch over
+    more partitions than it has days — each SELECT bounded by its own chunk, and the MERGE loop
+    still walks the whole work set."""
+    days = [MONDAY - timedelta(days=40), MONDAY - timedelta(days=20), MONDAY - timedelta(days=1)]
+    rows = []
+    for d in days:
+        rows += [_row("am", 0.12, d=d), _row("amrest", 0.11, d=d), _row("pm", 0.05, d=d)]
+    fake = _FakeBQ(settled=rows, work_set=days)
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=datetime(2026, 9, 1, 6, 5, tzinfo=_OSLO))
+    selects = [p for sql, p in fake.sent if sql == togvarsel_outcomes._SETTLED_QUERY]
+    assert len(selects) == 3, f"expected one SELECT per span, got {len(selects)}"
+    for p in selects:
+        assert (p["to_date"] - p["from_date"]).days < togvarsel_outcomes._SETTLED_CHUNK_DAYS
+    settled = [m for m in fake.merges if m["kind"] == "settled"]
+    assert {m["d"] for m in settled} == set(days)
+    assert len(settled) == len(days) * len(togvarsel_outcomes.SCOPES)
+    # and the bound is not fiction: a chunk plus the query's own ±1-day reach, at the measured
+    # 32.5 MB a day, stays under half the job's bytes cap
+    reach = togvarsel_outcomes._SETTLED_CHUNK_DAYS + 2
+    assert reach * 32.5e6 < togvarsel_outcomes._MAX_BYTES_BILLED / 2
+
+
 def test_the_two_provisional_windows_have_separate_give_up_budgets():
     """A morning outage must not forfeit the afternoon check.
 
