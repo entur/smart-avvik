@@ -389,7 +389,7 @@ def test_the_response_carries_exactly_the_expected_keys():
     assert set(body["stats"][0]) == {
         "slot", "presisjon", "presisjon_den", "dekning", "dekning_den", "varslingstid_min",
         "varslingstid_n",
-        "varsler_sendt", "varsler_rekonstruert", "n_scored", "n_venter", "n_ukjent",
+        "varsler_sendt", "varsler_rekonstruert", "varsler_venter", "n_scored", "n_venter", "n_ukjent",
         "n_ikke_vurdert", "n_reconstructed", "n_reconstructed_after_start", "n_late",
         "n_untimely", "matrix",
     }
@@ -544,7 +544,12 @@ def test_varsler_sendt_counts_pushes_whatever_became_of_the_day():
     """The notification-volume figure is over the RECORDED population, not the scored one: a push
     on a day that never settled, or that failed the eligibility test, still reached a phone. Two
     pushes here, one of them on an unsettled day, beside a suppressed round and an ineligible day
-    that also pushed — three sent, none of the other counts moving with it."""
+    that also pushed — three sent, none of the other counts moving with it.
+
+    `varsler_venter` is the unsettled one alone: a SUBSET of varsler_sendt, so the page can print
+    "3 (1 venter)" and reconcile the count with a matrix that holds only scored issues. The push
+    on the ineligible day is in the count and out of the matrix too, but it is `ukjent`, not
+    pending, and must not be counted as waiting."""
     _reset([
         _row(issue="0630"),
         _row(issue="0700", sent=False, reason="no_change", baseline_level="yellow", kind=None),
@@ -556,9 +561,12 @@ def test_varsler_sendt_counts_pushes_whatever_became_of_the_day():
     body = _days().json()
     total = body["stats"][0]
     assert total["varsler_sendt"] == 3
+    assert total["varsler_venter"] == 1
     assert total["n_scored"] == 2 and total["n_venter"] == 1 and total["n_ukjent"] == 1
     by_slot = {row["slot"]: row["varsler_sendt"] for row in body["stats"][1:]}
     assert by_slot == {"0630": 1, "0700": 0, "1200": 1, "1400": 1}
+    venter_by_slot = {row["slot"]: row["varsler_venter"] for row in body["stats"][1:]}
+    assert venter_by_slot == {"0630": 0, "0700": 0, "1200": 1, "1400": 0}
 
 
 def test_an_unknown_issue_key_is_dropped_rather_than_500ing_the_page():

@@ -116,7 +116,7 @@ export default function App() {
           </li>
           <li>
             Ratene i «Slik har varslene truffet» dekker bare avklarte dager. «Varsler sendt» teller
-            alle push i vinduet, uavklarte dager medregnet.
+            alle push i vinduet, uavklarte dager medregnet – de står som «N venter» ved tallet.
           </li>
         </ul>
       </header>
