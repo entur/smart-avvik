@@ -409,34 +409,69 @@ def test_an_ineligible_day_is_excluded_from_everything():
     assert row.varsler_sendt == 1  # the push still went out; the day's share is what means nothing
 
 
-def test_a_correct_all_clear_is_traff_and_a_sent_notification_but_not_coverage():
-    """A right friskmelding is the right class communicated, so it is traff and in Presisjon, and
-    it is a push, so it is in Varsler sendt — but it is not a warning, so the green rush it announced
-    is not a bad rush it covered: Dekning has nothing to count."""
+def test_a_correct_all_clear_is_a_justified_push_and_covers_the_friskmelding_that_was_owed():
+    """A yellow warning stood and the rush turned green, so a friskmelding was OWED — that is a
+    situation in Dekning's denominator — and the one that went out said the right class, so it is
+    justified in Presisjon and covers the situation. Until 2026-09-02's second redefinition an
+    all-clear was kept out of Dekning entirely, on the grounds that it retracts rather than warns;
+    counting notifications rather than warnings makes a right retraction a hit like any other."""
     all_clear = _issue(issue="0700", sent=True, kind="all_clear", level="green",
                        baseline_level="yellow", actual="green", decided_at=_at(7, 1))
     row = rv.summarize([all_clear]).total
     assert rv.classify(all_clear) == rv.TRAFF
+    assert rv.due(all_clear) and rv.justified(all_clear)
     assert row.presisjon == 1.0 and row.presisjon_den == 1
+    assert row.dekning == 1.0 and row.dekning_den == 1 and row.dekning_num == 1
     assert row.varsler_sendt == 1
+
+
+def test_a_wrong_all_clear_is_an_unjustified_push_and_no_situation_at_all():
+    """The other half. A red warning stood and the rush stayed red, so NOTHING was owed at 14:00 —
+    the traveller already held the right warning — and Dekning has no situation to count; the
+    push that retracted it is Presisjon's failure. The red rush itself is covered, or not, at the
+    12:00 issue that warned about it."""
+    all_clear = _issue(issue="1400", sent=True, kind="all_clear", level="green",
+                       baseline_level="red", actual="red", decided_at=_at(14, 1))
+    row = rv.summarize([all_clear]).total
+    assert rv.classify(all_clear) == rv.FALSK_ALARM
+    assert not rv.due(all_clear) and not rv.justified(all_clear)
+    assert row.presisjon == 0.0 and row.presisjon_den == 1
     assert row.dekning is None and row.dekning_den == 0
 
 
-def test_a_wrong_all_clear_does_not_cover_a_bad_rush():
-    """The other half. Counting a wrong friskmelding in Dekning's numerator would credit "all
-    clear" with having warned about a red rush."""
-    all_clear = _issue(issue="1400", sent=True, kind="all_clear", level="green",
-                       baseline_level="red", actual="red")
-    row = rv.summarize([all_clear]).total
-    assert rv.classify(all_clear) == rv.FALSK_ALARM
+def test_a_missed_friskmelding_is_a_miss_and_a_confirmed_warning_is_no_situation():
+    """Two silent follow-ups under a standing warning, told apart by the rush. The rush turned
+    green: a friskmelding was owed and nothing went out — one situation, uncovered. The rush
+    stayed yellow: nothing was owed, so the confirming silence is in neither rate, whatever the
+    day table grades it."""
+    owed = _issue(issue="0700", sent=False, reason="no_change", level="yellow",
+                  baseline_level="yellow", actual="green")
+    confirmed = _issue(d=NEXT_DAY, issue="0700", sent=False, reason="no_change", level="yellow",
+                       baseline_level="yellow", actual="yellow")
+    assert rv.due(owed) and not rv.due(confirmed)
+    row = rv.summarize([owed, confirmed]).total
     assert row.dekning == 0.0 and row.dekning_den == 1 and row.dekning_num == 0
-    assert row.presisjon == 0.0
+    assert row.presisjon is None and row.presisjon_den == 0  # nothing was pushed
+    assert row.counts.n_scored == 2  # both are scored, both sit in the matrix
 
 
-def test_dekning_counts_a_rush_once_on_the_total_row():
-    """The total row counts RUSHES, not issues: a confirming follow-up is notified only because
-    its baseline pushed, so per-issue counting makes the 0700 and 1400 rows restate the
-    baseline's coverage — and adding the slot rows up would double the day."""
+def test_an_escalation_where_a_friskmelding_was_owed_covers_nothing():
+    """The one edge that makes Dekning's numerator ask for a JUSTIFIED push rather than any push:
+    yellow standing, the follow-up escalates to red, the rush turns green. A friskmelding was owed
+    and an escalation went out — a push, but not the notification the situation called for."""
+    escalation = _issue(issue="0700", sent=True, kind="update", level="red",
+                        baseline_level="yellow", actual="green", decided_at=_at(7, 1))
+    row = rv.summarize([escalation]).total
+    assert rv.due(escalation) and not rv.justified(escalation)
+    assert row.dekning == 0.0 and row.dekning_den == 1
+    assert row.presisjon == 0.0 and row.presisjon_den == 1
+
+
+def test_dekning_counts_issues_on_a_slot_row_and_rushes_on_the_total_row():
+    """A baseline that warned a yellow rush is one situation covered; its confirming follow-up is
+    no situation, so the 0700 row is empty rather than restating the baseline. A second bad rush
+    on the same day, or the same rush on another day, is another situation — on the total row a
+    RUSH each, so the total is the number of rushes that owed a push, not the slot rows added up."""
     baseline = _issue(issue="0630", sent=True, level="yellow", actual="yellow",
                       decided_at=_at(6, 31))
     follow_up = _issue(issue="0700", sent=False, reason="no_change", level="yellow",
@@ -445,22 +480,84 @@ def test_dekning_counts_a_rush_once_on_the_total_row():
     assert stats.total.dekning_den == 1 and stats.total.dekning_num == 1
     assert stats.total.dekning == 1.0
     by_slot = {row.slot: row for row in stats.slots}
-    assert by_slot["0630"].dekning_den == 1 and by_slot["0700"].dekning_den == 1
+    assert by_slot["0630"].dekning_den == 1 and by_slot["0630"].dekning == 1.0
+    assert by_slot["0700"].dekning is None and by_slot["0700"].dekning_den == 0
     assert by_slot["1200"].dekning is None  # nothing in that slot at all
 
-    # Two rushes on one day are two denominators; the same rush over two days is two as well.
     pm = _issue(issue="1200", sent=False, reason="green_baseline", level="green", actual="red")
     assert rv.summarize([baseline, follow_up, pm]).total.dekning_den == 2
     tomorrow = _issue(d=NEXT_DAY, issue="0630", sent=False, reason="green_baseline",
                       level="green", actual="red")
     assert rv.summarize([baseline, follow_up, tomorrow]).total.dekning_den == 2
 
+    # Three rushes owed a push and one got it. Each has one owing issue, so the slot rows happen
+    # to add up to the same three here — see the next test for where they do not.
+    rows = rv.summarize([baseline, follow_up, pm, tomorrow])
+    assert rows.total.dekning_den == 3 and rows.total.dekning_num == 1
+    assert sum(r.dekning_den for r in rows.slots) == 3
 
-def test_a_calm_window_reads_a_full_presisjon_and_no_pushes():
-    """The reading the 2026-09-02 redefinition exists for. Four green forecasts on a green day are
-    four right calls, so Presisjon is 100 % over a denominator of four — and nothing was pushed, so
-    Varsler sendt is 0. Until then these were `riktig stille`, outside traff, and the same day read
-    0 % over the same four: a calm month scored as a total failure, by construction."""
+
+def test_a_rush_missed_at_the_baseline_and_caught_at_the_follow_up_is_covered_on_the_total_row():
+    """Both issues owed a warning — nothing stood at 06:30, and the silent baseline left nothing
+    standing at 07:00 — and the 07:00 one delivered. The total row counts the RUSH: it was warned,
+    late, so it reads 100 % there and the lateness is Varslingstid's to show (the last push per
+    rush, here the 07:00 one at about -1 min). The slot rows keep their own issue: the 06:30 row
+    holds the miss, the 07:00 row the hit. Missed at both, the rush is one miss on the total row
+    and two on the slot rows."""
+    silent = _issue(issue="0630", sent=False, reason="green_baseline", level="green", actual="red")
+    caught = _issue(issue="0700", sent=True, kind="warning", level="red", baseline_level="green",
+                    actual="red", decided_at=_at(7, 1))
+    stats = rv.summarize([silent, caught])
+    assert rv.due(silent) and rv.due(caught) and rv.justified(caught)
+    assert stats.total.dekning == 1.0 and stats.total.dekning_den == 1
+    assert round(stats.total.varslingstid_min) == -1  # told, but only as the rush began
+    by_slot = {row.slot: row for row in stats.slots}
+    assert by_slot["0630"].dekning == 0.0 and by_slot["0630"].dekning_den == 1
+    assert by_slot["0700"].dekning == 1.0 and by_slot["0700"].dekning_den == 1
+    assert stats.total.presisjon == 1.0 and stats.total.presisjon_den == 1  # the one push
+
+    also_missed = _issue(issue="0700", sent=False, reason="untimely", level="red",
+                         baseline_level="green", actual="red")
+    both = rv.summarize([silent, also_missed])
+    assert both.total.dekning == 0.0 and both.total.dekning_den == 1
+    assert sum(r.dekning_den for r in both.slots) == 2
+
+    # The afternoon pair works the same way: silent at 12:00, caught at 14:00.
+    pm_silent = _issue(issue="1200", sent=False, reason="green_baseline", level="green",
+                       actual="red")
+    pm_caught = _issue(issue="1400", sent=True, kind="warning", level="yellow",
+                       baseline_level="green", actual="red", decided_at=_at(14, 1))
+    pm = rv.summarize([pm_silent, pm_caught]).total
+    assert pm.dekning == 1.0 and pm.dekning_den == 1 and round(pm.varslingstid_min) == 59
+
+
+def test_presisjon_is_justified_pushes_over_pushes_and_a_level_swap_is_justified():
+    """Of the pushes that went out, how many said the right class. A red push on a yellow rush is
+    `traff nesten` in the day table and justified here — the traveller was warned, and which of
+    the two levels is the matrix's business. A yellow push on a green rush is not. Silence is not a
+    push and enters neither half, however the day table grades it."""
+    issues = [
+        _issue(issue="0630", sent=True, level="red", actual="yellow", decided_at=_at(6, 31)),
+        _issue(d=NEXT_DAY, issue="0630", sent=True, level="yellow", actual="red",
+               decided_at=_at(6, 31, day=NEXT_DAY)),
+        _issue(issue="1200", sent=True, level="yellow", actual="green", decided_at=_at(12, 1)),
+        _issue(issue="1400", sent=False, reason="green_baseline", level="green", actual="green"),
+        _issue(d=NEXT_DAY, issue="1200", sent=False, reason="green_baseline", level="green",
+               actual="red"),
+    ]
+    row = rv.summarize(issues).total
+    assert [rv.classify(i) for i in issues[:3]] == [rv.TRAFF_NESTEN, rv.TRAFF_NESTEN, rv.FALSK_ALARM]
+    assert row.presisjon_den == 3 and row.presisjon_num == 2
+    assert row.presisjon == 2 / 3
+    assert row.counts.n_scored == 5  # the two silent issues are scored, just not pushes
+
+
+def test_a_calm_window_has_nothing_to_rate_and_no_pushes():
+    """Four green forecasts on a green day are four right calls in the day table and NOTHING in
+    the stats table: no push went out, so Presisjon has no denominator, and none was owed, so
+    Dekning has none either. Both read an en dash. The first 2026-09-02 redefinition made them
+    100 % (traff over every scored issue) to cure a 0 % that the earlier `riktig stille` exclusion
+    produced; the second makes the rates about notifications, which a calm day has none of."""
     calm = [
         _issue(d=DAY, issue=slot, sent=False, reason="green_baseline", level="green",
                actual="green")
@@ -468,9 +565,35 @@ def test_a_calm_window_reads_a_full_presisjon_and_no_pushes():
     ]
     row = rv.summarize(calm).total
     assert all(rv.classify(i) == rv.TRAFF for i in calm)
-    assert row.presisjon == 1.0 and row.presisjon_den == 4
+    assert not any(rv.due(i) for i in calm)
+    assert row.presisjon is None and row.presisjon_den == 0
+    assert row.dekning is None and row.dekning_den == 0
     assert row.varsler_sendt == 0
-    assert row.dekning is None  # no bad rush to cover, so nothing to be covered
+    assert row.counts.n_scored == 4  # the matrix still holds them, on its green/green cell
+    assert row.matrix["green"]["green"] == 4
+
+
+def test_the_rates_reconcile_with_the_pushes_and_never_exceed_their_denominators():
+    """Over every reachable issue: Presisjon's denominator is exactly the scored pushes, so it can
+    never exceed Varsler sendt plus the reconstructed pushes; both numerators are bounded by their
+    denominators; and a Dekning hit is always a push, never a silence."""
+    issues = list(_every_reachable_issue())
+    row = rv.summarize(issues).total
+    scored_pushes = [i for i in issues if rv.population(i) == rv.BUCKET_SCORED and i.sent]
+    assert row.presisjon_den == len(scored_pushes) > 0
+    assert row.presisjon_den <= row.varsler_sendt + row.varsler_rekonstruert
+    assert 0 < row.presisjon_num <= row.presisjon_den
+    assert 0 < row.dekning_num <= row.dekning_den
+    delivered = [i for i in issues if rv.population(i) in rv.DELIVERED_BUCKETS]
+    # Every enumerated issue is the same rush (DAY, am), so the total row's Dekning is one rush,
+    # owed and covered; the 0700 slot row is the per-issue identity.
+    assert (row.dekning_den, row.dekning_num) == (1, 1)
+    slot = next(r for r in rv.summarize(issues).slots if r.slot == "0700")
+    assert slot.dekning_den == sum(1 for i in delivered if rv.due(i)) > 0
+    assert slot.dekning_num == sum(1 for i in delivered if rv.due(i) and i.sent and rv.justified(i))
+    for i in scored_pushes:
+        # For a push on a settled, eligible day the predicate and the verdict table agree.
+        assert rv.justified(i) == (rv.classify(i) in {rv.TRAFF, rv.TRAFF_NESTEN}), i
 
 
 def test_every_rate_is_none_on_an_empty_denominator():

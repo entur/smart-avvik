@@ -1,6 +1,6 @@
 import { Heading3, SubParagraph } from '@entur/typography';
 import type { Level, MatrixRow, StatsRow } from '../api';
-import { LEVEL_LABEL, SLOT_LABEL, fmtLead, fmtPct } from '../format';
+import { LEVEL_LABEL, SLOT_LABEL, fmtPct } from '../format';
 
 /** Level order, severity ascending — the matrix's row and column order. */
 const LEVEL_ORDER: Level[] = ['green', 'yellow', 'red'];
@@ -67,32 +67,13 @@ function Count({ label, n, title }: { label: string; n: number; title: string })
  *  Segmented rather than blended because the baselines push on LEVEL and the follow-ups on level
  *  CHANGE — two different decisions with two different calibrations — so a single headline moves
  *  with the mix of the two rather than with the product. */
-/** One rate cell: the percentage over the count it is computed from.
- *
- *  The denominator is not decoration. The two rates are over DIFFERENT populations, and on a page
- *  whose first weeks are almost entirely «ikke vurdert» a bare percentage invites the one reading
- *  that is wrong — 100 % over two bad rushes and 100 % over two hundred are the same glyph.
- *  Varslingstid already showed its own; these did not.
- *
- *  Varslingstid and Varsler sendt stay inline — one carries a differently-worded child, the other
- *  is a count rather than a rate, so folding them in would take a flag per difference. */
-function RateCell({
-  value,
-  den,
-  unit,
-  title,
-}: {
-  value: number | null;
-  den: number;
-  unit: string;
-  title: string;
-}) {
+/** One rate cell. Just the percentage: the denominators («12 varsler», «9 rush») were shown beside
+ *  it until 2026-09-02 and dropped at the product owner's request, along with the row's scored
+ *  count. What each rate is over is in its tooltip and in the footnote under the table. */
+function RateCell({ value, title }: { value: number | null; title: string }) {
   return (
     <td className="rh-num" title={title}>
-      {fmtPct(value)}{' '}
-      <span className="rh-population">
-        ({den} {unit})
-      </span>
+      {fmtPct(value)}
     </td>
   );
 }
@@ -110,7 +91,6 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
               <th scope="col">Tidspunkt</th>
               <th scope="col">Presisjon</th>
               <th scope="col">Dekning</th>
-              <th scope="col">Varslingstid</th>
               <th scope="col">Varsler sendt</th>
               <th scope="col">
                 Treffmatrise <span className="rh-population">meldt ↓ / ble →</span>
@@ -120,41 +100,24 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
           <tbody>
             {stats.map((row) => (
               <tr key={row.slot} className={row.slot === 'total' ? 'rh-row-total' : ''}>
-                {/* Each row states the population its Presisjon figure is over — the two rates use
-                    different denominators, and a reader who assumes one across the row reads the
-                    page wrong. */}
                 {/* A real row header, so a screen reader announces which slot each figure belongs
                     to. `.rh-row-label` undoes .rh-table th's uppercase/nowrap, which is what makes
                     a th usable here at all. */}
                 <th scope="row" className="rh-row-label">
-                  <div>{SLOT_LABEL[row.slot]}</div>
-                  {/* "utstedelser", not "dager": on a slot row the two happen to coincide (one
-                      issue per slot per day), but the total row counts four issues per day, so
-                      "dager" would overstate the window fourfold on exactly the row a reader
-                      trusts most. */}
-                  <span className="rh-population">
-                    {row.n_scored} avklarte, kvalifiserte utstedelser
-                  </span>
+                  {SLOT_LABEL[row.slot]}
                 </th>
                 <RateCell
                   value={row.presisjon}
-                  den={row.n_scored}
-                  unit="vurdert"
-                  title="Andel av de vurderte utstedelsene med utfallet «Traff»: riktig nivå meldt, eller ingenting meldt og rushet ble grønt."
+                  title="Av varslene som gikk ut: andelen som var berettiget. Et gult eller rødt varsel på et rush som ble gult eller rødt – uansett hvilket av de to – eller en friskmelding på et rush som ble grønt. Stille dager er ikke med: de er ikke varsler."
                 />
                 <RateCell
                   value={row.dekning}
-                  den={row.dekning_den}
-                  unit={row.slot === "total" ? "rush" : "utstedelser"}
-                  title="Andel av de gule og røde rushene vi hadde et varsel i kraft for. Videre grunnlag enn Presisjon: sene utstedelser og runder utenfor frist er med."
+                  title={
+                    row.slot === 'total'
+                      ? 'Av rushene der et varsel burde gått ut: andelen som fikk et riktig varsel ved minst én av sine to utstedelser. Et rush som først ble varslet kl 07:00 eller 14:00 er dekket her; tidsradene viser hvor det glapp. Videre grunnlag enn Presisjon: sene utstedelser og runder utenfor frist er med.'
+                      : 'Av situasjonene der et varsel burde gått ut ved dette tidspunktet: andelen der et riktig varsel gikk ut. En situasjon er et gult eller rødt rush uten stående varsel, eller et grønt rush med et stående varsel (friskmelding skyldig). Videre grunnlag enn Presisjon: sene utstedelser og runder utenfor frist er med.'
+                  }
                 />
-                <td
-                  className="rh-num"
-                  title="Median tid fra pushen til rushet startet. Målt fra rushets egen start, så morgentallene ligger rundt null."
-                >
-                  {fmtLead(row.varslingstid_min)}{' '}
-                  <span className="rh-population">({row.varslingstid_n} varsler)</span>
-                </td>
                 <td
                   className="rh-num"
                   title="Antall push som gikk ut i vinduet, friskmeldinger medregnet. Én per runde, uansett hvor mange enheter den nådde — og uavklarte dager er med: en push er sendt uansett hva dagen ble. Tallet i parentes er push rekonstruerte runder ville ha sendt; de gikk aldri ut."
@@ -195,13 +158,16 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
       <p className="rh-calibration">
         Kalibrering (§14a, hele måleperioden): grønt varsel ≈ 6 % dårlige dager, gult ≈ 21 %, rødt
         ≈ 55 %. Et velkalibrert rødt varsel havner derfor oftere i «traff nesten» enn i «traff» —
-        det er forventet, ikke en feil.
+        det er forventet, ikke en feil, og begge regnes som berettiget i Presisjon.
       </p>
 
       <SubParagraph className="rh-population">
-        Presisjon gjelder avklarte, kvalifiserte dager. Dekning bruker et videre grunnlag: sene
-        utstedelser og runder utenfor frist er tatt med, fordi varselet nådde den reisende likevel.
-        «Varsler sendt» teller alle push i vinduet, uavklarte dager medregnet.
+        Presisjon: av varslene som gikk ut på avklarte, kvalifiserte dager, andelen som var
+        berettiget. Dekning: av situasjonene der et varsel burde gått ut, andelen der det gjorde det
+        – per rush på totalraden, per utstedelse på de fire tidsradene, og sene utstedelser og
+        runder utenfor frist er tatt med, fordi et varsel som nådde den reisende teller likevel. En
+        stille dag inngår i ingen av dem. «Varsler sendt» teller alle push i vinduet, uavklarte
+        dager medregnet.
       </SubParagraph>
 
       {/* What the rates above leave out, from the total row. Counted rather than hidden: a rate over

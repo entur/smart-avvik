@@ -49,9 +49,9 @@ body {
   max-width: 46rem;
 }
 
-/* The four things a reader otherwise gets wrong, stated in prose rather than hidden in tooltips:
-   the page is mostly "ikke vurdert" for its first weeks, Varslingstid is measured from each rush's
-   own start, a provisional outcome can change overnight, and the table covers settled days only. */
+/* The things a reader otherwise gets wrong, stated in prose rather than hidden in tooltips: the
+   page is mostly reconstructed for its first weeks, a provisional outcome can change overnight, and
+   the table covers settled days only. */
 .rh-caveats {
   max-width: 46rem;
   margin: 0.75rem 0 1.5rem;

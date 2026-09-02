@@ -61,17 +61,6 @@ export function fmtShare(v: number | null): string {
   return v === null || v === undefined ? DASH : shareFmt.format(v);
 }
 
-/** Minutes of warning, signed: 179 -> "+179 min", -1 -> "-1 min", null -> en dash.
- *
- *  The sign is not decoration. Varslingstid is measured from each rush's own start, so the morning
- *  issues lead by about a minute either side of zero by construction — an unsigned "1 min" would
- *  read as a minute of warning where there was a minute of lateness. */
-export function fmtLead(v: number | null): string {
-  if (v === null || v === undefined) return DASH;
-  const m = Math.round(v);
-  return `${m > 0 ? '+' : ''}${m} min`;
-}
-
 /** Mirrored from rushhistorikk_verdicts.VERDICT_LABEL — the canonical source. Retyping them here is
  *  how a rename ships to one surface only, so any edit belongs in that module first. */
 export const VERDICT_LABEL: Record<Verdict, string> = {
