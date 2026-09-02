@@ -35,9 +35,11 @@ export type Verdict =
  *  so it is never coverage. */
 export type NotifyKind = 'warning' | 'update' | 'all_clear';
 
-/** Why a round decided not to push. `no_change` is the confirming follow-up: nothing was sent
- *  because the baseline's warning still stands, which is what `baseline_level` carries. */
-export type NotifyReason = 'untimely' | 'no_change' | 'green_baseline';
+/** Why a round decided not to push. `no_change` is the follow-up whose push state did not move:
+ *  a confirming follow-up (the baseline's warning still stands, which is what `baseline_level`
+ *  carries) or a yellow with nothing standing. `yellow_baseline` (since 2026-09-02, when baselines
+ *  went red-only) is a yellow baseline the rule held back — silence, graded as silence. */
+export type NotifyReason = 'untimely' | 'no_change' | 'green_baseline' | 'yellow_baseline';
 
 /** One forecast issue: what it said, what we communicated, and how the rush turned out. */
 export interface IssueRow {
