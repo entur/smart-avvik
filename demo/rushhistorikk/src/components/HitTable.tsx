@@ -16,6 +16,17 @@ function cellClass(forecast: Level, actual: Level, count: number): string {
   return classes.join(' ');
 }
 
+/** The qualifiers printed beside «Varsler sendt», in the order a reader reconciles the count with
+ *  the matrix. First the pushes on days whose outcome has not settled: in the count and not yet in
+ *  the matrix, which is why a same-day view's count exceeds its matrix — the first question the
+ *  page got asked. Then the pushes reconstructed rounds would have sent, which are in neither. */
+function sentNotes(row: Pick<StatsRow, 'varsler_venter' | 'varsler_rekonstruert'>): string[] {
+  const notes: string[] = [];
+  if (row.varsler_venter > 0) notes.push(`${row.varsler_venter} venter`);
+  if (row.varsler_rekonstruert > 0) notes.push(`+${row.varsler_rekonstruert} rekonstruert`);
+  return notes;
+}
+
 /** Forecast down the rows, realized level across the columns, no axis labels: the levels are
  *  painted into the cells, and the header's «meldt ↓ / ble →» plus the legend under the table carry
  *  the orientation.
@@ -120,13 +131,13 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
                 />
                 <td
                   className="rh-num"
-                  title="Antall push som gikk ut i vinduet, friskmeldinger medregnet. Én per runde, uansett hvor mange enheter den nådde — og uavklarte dager er med: en push er sendt uansett hva dagen ble. Tallet i parentes er push rekonstruerte runder ville ha sendt; de gikk aldri ut."
+                  title="Antall push som gikk ut i vinduet, friskmeldinger medregnet. Én per runde, uansett hvor mange enheter den nådde — og uavklarte dager er med: en push er sendt uansett hva dagen ble. «N venter» er push på dager som ennå ikke har fasit: de teller her, men står ikke i treffmatrisen før dagen er avklart. «+N rekonstruert» er push rekonstruerte runder ville ha sendt; de gikk aldri ut."
                 >
                   {row.varsler_sendt}
-                  {row.varsler_rekonstruert > 0 ? (
+                  {sentNotes(row).length > 0 ? (
                     <>
                       {' '}
-                      <span className="rh-population">(+{row.varsler_rekonstruert} rekonstruert)</span>
+                      <span className="rh-population">({sentNotes(row).join(', ')})</span>
                     </>
                   ) : null}
                 </td>
@@ -167,7 +178,8 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
         – per rush på totalraden, per utstedelse på de fire tidsradene, og sene utstedelser og
         runder utenfor frist er tatt med, fordi et varsel som nådde den reisende teller likevel. En
         stille dag inngår i ingen av dem. «Varsler sendt» teller alle push i vinduet, uavklarte
-        dager medregnet.
+        dager medregnet – de står som «N venter» ved tallet, og er grunnen til at tallet kan være
+        høyere enn summen i treffmatrisen.
       </SubParagraph>
 
       {/* What the rates above leave out, from the total row. Counted rather than hidden: a rate over

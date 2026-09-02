@@ -265,6 +265,10 @@ class StatsRow(BaseModel):
         description="Pushes a reconstructed round would have issued. Apart from varsler_sendt "
         "because that column says sent and these never were."
     )
+    varsler_venter: int = Field(
+        description="Of varsler_sendt, the pushes on days whose outcome is not settled yet: in "
+        "that count, not yet in the matrix. Why a same-day view's count exceeds its matrix."
+    )
     n_scored: int = Field(description="Issues in the Presisjon population.")
     n_venter: int = Field(description="Outcome not settled yet.")
     n_ukjent: int = Field(description="Outcome unestablishable, or the day was ineligible.")
@@ -534,6 +538,7 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
             varslingstid_n=row.varslingstid_n,
             varsler_sendt=row.varsler_sendt,
             varsler_rekonstruert=row.varsler_rekonstruert,
+            varsler_venter=row.varsler_venter,
             n_scored=row.counts.n_scored,
             n_venter=row.counts.n_venter,
             n_ukjent=row.counts.n_ukjent + row.counts.n_ineligible,
