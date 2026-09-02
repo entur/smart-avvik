@@ -229,16 +229,27 @@ class StatsRow(BaseModel):
 
     slot: str = Field(description='"total", or an issue time: 0630 | 0700 | 1200 | 1400.')
     presisjon: float | None = Field(
-        description="traff over every scored verdict — the right class communicated, silence "
-        "included. Null on an empty denominator, never 0. The denominator is n_scored."
+        description="Of the pushes that went out on scored issues, the share that were justified: "
+        "a yellow or red push on a rush that turned yellow or red (either level), or a friskmelding "
+        "on a rush that turned green. Null on an empty denominator, never 0 — a calm window has no "
+        "pushes to rate. The denominator is presisjon_den."
+    )
+    presisjon_den: int = Field(
+        description="Pushes behind that rate: sent issues in the scored population, reconstructed "
+        "rounds included."
     )
     dekning: float | None = Field(
-        description="Share of yellow-or-red rushes we had a warning in force for. Counted per RUSH "
-        "on the total row, because a confirming follow-up is covered only via its baseline."
+        description="Of the situations where a push was owed, the share that got a justified one. "
+        "A situation is an issue whose rush turned yellow or red with no warning standing (a "
+        "warning was owed) or turned green with one standing (a friskmelding was owed); a "
+        "confirming follow-up is none. Per ISSUE on a slot row and per RUSH on the total row, where "
+        "a rush caught at the follow-up after a silent baseline counts as covered — the lateness "
+        "is Varslingstid's to show."
     )
     dekning_den: int = Field(
-        description="Bad rushes behind that rate (bad issues on a slot row) — its own population "
-        "again, and the one most likely to be a handful."
+        description="Situations behind that rate — issues on a slot row, rushes on the total row, "
+        "over the delivered population with late and untimely included — and the count most "
+        "likely to be a handful."
     )
     varslingstid_min: float | None = Field(
         description="Median minutes from the push to the rush's start. The last push per rush on "
@@ -516,6 +527,7 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
         StatsRow(
             slot=row.slot,
             presisjon=row.presisjon,
+            presisjon_den=row.presisjon_den,
             dekning=row.dekning,
             dekning_den=row.dekning_den,
             varslingstid_min=row.varslingstid_min,

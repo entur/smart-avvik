@@ -18,9 +18,19 @@ scoreable both ways — `traff` when nothing was warranted and `bom` when someth
 **`traff` means the right CLASS was communicated, silence included** (2026-09-02). A green forecast
 on a green rush is a hit, exactly as a yellow warning on a yellow rush is: the traveller was told
 the right thing, and "nothing" is a thing to be told. It was a separate verdict, `riktig stille`,
-until then — and with 82 % of days green that put Presisjon at 0 % on a good month, because the one
-verdict a calm month produces was not in its numerator. `bom` is unchanged: silence on a bad rush is
-still the miss the product exists to avoid.
+until then. `bom` is unchanged: silence on a bad rush is still the miss the product exists to avoid.
+
+**The two rates are precision and recall over NOTIFICATIONS, not over issues** (later on
+2026-09-02, the product owner's second redefinition of the day). Presisjon asks "of the pushes we
+sent, how many were justified" — a yellow or red push on a rush that turned yellow or red, whichever
+of the two it was (`traff` and `traff_nesten` alike), or a friskmelding on a rush that turned green.
+Dekning asks "of the situations where a push was owed, how many got the right one" — `due` names
+those situations: a bad rush with no warning standing (a warning was owed) and a green rush with a
+warning standing (a friskmelding was owed). Silence enters neither rate: a green forecast on a green
+day is `traff` in the day table and nothing in the stats table, which is why a calm month reads an
+en dash rather than 100 % or 0 %. Before this Presisjon was `traff` over every scored issue, silence
+included — a fine accuracy figure and not the question "were the notifications justified" the
+table is read for. The verdicts themselves did not move; only what the two rates count did.
 
 **A round nobody recorded is reconstructed upstream, and this module cannot tell** (2026-09-02) —
 by design. `rushhistorikk.reconstruct_rounds` replays togvarsel_notify.decide_issue over the
@@ -47,11 +57,18 @@ partition and what Varsler sendt counts pushes across — a push is a push whate
 day. The seven exclusion buckets are resolved in the table's order so they are disjoint and sum to
 n — segment, never filter.
 
-Two things are load-bearing and stated here because they read as arbitrary otherwise. An all-clear
-push (a green friskmelding) leaves Dekning's numerator: it RETRACTS a warning, so counting a wrong
-one as coverage would credit "all clear" with having warned about a red rush. And Dekning's total
-row counts RUSHES, not issues, since a confirming follow-up is notified only because its baseline
-pushed.
+Three consequences of counting notifications are stated here because they read as arbitrary
+otherwise. A confirming follow-up — nothing sent, the baseline's warning still standing on a rush
+that stayed bad — is in NEITHER rate: no push went out, and none was owed. A wrong friskmelding on
+a rush that stayed bad is a Presisjon failure only: the situation called for no push at all (the
+traveller already held the right warning), so Dekning has no situation to count, while the push
+that retracted it is unjustified. And Dekning's total row counts RUSHES, not issues (product
+owner, 2026-09-02): a rush missed at 06:30 and caught at 07:00 reads 100 % there — the traveller
+was told, late, and how late is Varslingstid's to say (it takes the LAST push per rush on that
+row, so the catch's own lead is what the API reports; the page dropped the column the same day
+and keeps only the rates, Varsler sendt and the matrix). The slot rows still count their own issue, so the
+06:30 row keeps the miss. The total's Presisjon needs no such lifting: a push is a push whichever
+issue sent it.
 
 Nothing here reads the clock, BigQuery or the network, and nothing is imported from main, varsel,
 togvarsel or togvarsel_notify (the package rule). The one constant copied from
@@ -239,17 +256,29 @@ def standing(issue: Issue) -> bool:
     return issue.baseline_level in _WARNING_LEVELS
 
 
-def warned(issue: Issue) -> bool:
-    """Whether a warning was in force at this issue — Dekning's numerator condition.
+def due(issue: Issue) -> bool:
+    """Whether a push was OWED at this issue — Dekning's denominator condition.
 
-    A warning pushed here, or the baseline's still standing. An all-clear push RETRACTS the
-    warning, so it is never coverage: the traveller was told it was over. A green PUSH is the
-    all-clear and the only green that ever pushes, so the level is the discriminator — it agrees
-    with `kind == "all_clear"` by construction.
+    The class the traveller held going in — nothing for a baseline, the baseline's standing warning
+    for a follow-up — differs from the class the rush became: a yellow or red rush with no warning
+    standing owed a warning, a green rush with one standing owed a friskmelding. A level change
+    inside the warning class (yellow held, red rush) owes nothing here, matching `justified`: the
+    traveller was warned, and which of the two levels is the matrix's business. Reads `actual`
+    without checking it is known — callers pass settled issues only.
     """
-    if issue.sent:
-        return issue.level != "green"
-    return standing(issue)
+    return standing(issue) != (issue.actual in _WARNING_LEVELS)
+
+
+def justified(issue: Issue) -> bool:
+    """Whether a push that went out said the right CLASS — Presisjon's numerator condition, and
+    with `due` Dekning's.
+
+    A warning (yellow or red, either one) on a rush that turned yellow or red, or a friskmelding
+    (the only green that ever pushes) on a rush that turned green. Equivalent to the verdict being
+    `traff` or `traff_nesten` for a sent issue on a settled, eligible day; restated as a predicate
+    so the rates do not depend on the verdict table's row order. Meaningless for an unsent issue.
+    """
+    return (issue.level != "green") == (issue.actual in _WARNING_LEVELS)
 
 
 def grade(level: str | None, actual: str | None) -> str:
@@ -434,11 +463,11 @@ class StatsRow:
 
     slot: str  # one of SLOTS, or "total"
     presisjon: float | None
-    presisjon_num: int  # traff — the right class communicated, silence included
-    presisjon_den: int  # every verdict in the scored population
+    presisjon_num: int  # justified pushes: the right class said, over the scored population
+    presisjon_den: int  # pushes in the scored population (recorded or reconstructed)
     dekning: float | None
-    dekning_num: int  # yellow-or-red with a warning in force
-    dekning_den: int  # yellow-or-red; RUSHES on the total row, issues on a slot row
+    dekning_num: int  # situations where a push was owed and a justified one went out
+    dekning_den: int  # situations owing a push: ISSUES on a slot row, RUSHES on the total row
     varslingstid_min: float | None  # median warning time, minutes; the LAST push per rush in total
     varslingstid_n: int
     # Pushes issued in the window, friskmeldinger included — the notification-VOLUME figure, which
@@ -502,7 +531,8 @@ def summarize(issues: Iterable[Issue]) -> Stats:
 def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRow:
     """One row. `per_rush` is the total row's two aggregations: Dekning counts rushes rather than
     issues, and Varslingstid takes the last push per rush — neither is an aggregate of the slot
-    rows, which is why they are computed here rather than combined afterwards."""
+    rows, which is why they are computed here rather than combined afterwards. Presisjon adds up
+    across slots and needs no flag."""
     buckets = [population(issue) for issue in issues]
     counts = Counts(
         n=len(issues),
@@ -521,11 +551,12 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
     scored = [i for i, b in zip(issues, buckets, strict=True) if b == BUCKET_SCORED]
     delivered = [i for i, b in zip(issues, buckets, strict=True) if b in DELIVERED_BUCKETS]
 
-    # Presisjon: the right class communicated, over everything scored. NOT the matrix's diagonal
-    # over its total, though it reads like it: the matrix plots the issue's own FORECAST level (R16)
-    # while traff is graded on what was communicated — a confirming follow-up whose own red sits
-    # over a standing yellow is traff on a yellow rush and lands in the red row.
-    presisjon_num = sum(1 for issue in scored if classify(issue) == TRAFF)
+    # Presisjon: of the pushes that went out, the justified ones. Over the scored population only,
+    # and over its PUSHES — a silent issue is not a notification and enters neither half. Not the
+    # matrix's diagonal, which is over every scored issue by forecast level: a confirming follow-up
+    # sits in the matrix and in no rate.
+    pushes = [issue for issue in scored if issue.sent]
+    presisjon_num = sum(1 for issue in pushes if justified(issue))
 
     matrix = _empty_matrix()
     for issue in scored:
@@ -536,9 +567,9 @@ def _stats_row(name: str, issues: Sequence[Issue], *, per_rush: bool) -> StatsRo
 
     return StatsRow(
         slot=name,
-        presisjon=_rate(presisjon_num, len(scored)),
+        presisjon=_rate(presisjon_num, len(pushes)),
         presisjon_num=presisjon_num,
-        presisjon_den=counts.n_scored,
+        presisjon_den=len(pushes),
         dekning=_rate(dekning_num, dekning_den),
         dekning_num=dekning_num,
         dekning_den=dekning_den,
@@ -556,26 +587,29 @@ def _rush_key(issue: Issue) -> tuple[date, str]:
 
 
 def _coverage(delivered: Sequence[Issue], *, per_rush: bool) -> tuple[int, int]:
-    """Dekning's numerator and denominator over the delivered population.
+    """Dekning's numerator and denominator over the delivered population: of the situations where
+    a push was owed (`due`), those where a justified one went out.
 
-    A slot row counts ISSUES: how often that slot had a warning in force on a bad rush. The total
-    row counts RUSHES, because a confirming follow-up is notified only because its baseline pushed
-    — counting per issue there would make the 0700 and 1400 rows restate the baseline's coverage
-    and double every warned day. A rush is bad if any of its delivered issues saw a bad rush, and
-    covered if any of them had a warning in force; that "any" also keeps the figure right when one
-    of a rush's two issues is missing, and absorbs the `am`/`amrest` scope difference, which can
-    straddle the bar in either direction.
+    A slot row counts ISSUES — that slot's own opportunities to notify, so the 06:30 row keeps a
+    miss the 07:00 round later made good. The total row counts RUSHES: a rush is a situation if
+    either of its issues owed a push, and covered if either of those got a justified one, so a
+    rush missed at 06:30 and caught at 07:00 reads 100 % there and the lateness is left to
+    Varslingstid. A confirming follow-up owes nothing and is no situation on either row.
+
+    The numerator asks for a JUSTIFIED push and not merely a push, for one edge: a yellow warning
+    standing, the follow-up escalating to red, and the rush turning green — a friskmelding was
+    owed and an escalation went out, which is not the notification the situation called for.
     """
+    owed = [issue for issue in delivered if due(issue)]
     if not per_rush:
-        bad = [i for i in delivered if i.actual in _WARNING_LEVELS]
-        return sum(1 for i in bad if warned(i)), len(bad)
+        return sum(1 for issue in owed if issue.sent and justified(issue)), len(owed)
     rushes: dict[tuple[date, str], list[Issue]] = {}
-    for issue in delivered:
+    for issue in owed:
         rushes.setdefault(_rush_key(issue), []).append(issue)
-    bad_rushes = [
-        group for group in rushes.values() if any(i.actual in _WARNING_LEVELS for i in group)
-    ]
-    return sum(1 for group in bad_rushes if any(warned(i) for i in group)), len(bad_rushes)
+    covered = sum(
+        1 for group in rushes.values() if any(i.sent and justified(i) for i in group)
+    )
+    return covered, len(rushes)
 
 
 def _leads(delivered: Sequence[Issue], *, per_rush: bool) -> list[float]:

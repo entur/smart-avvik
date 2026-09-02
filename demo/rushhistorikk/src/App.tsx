@@ -106,11 +106,6 @@ export default function App() {
             faktisk gikk ut.
           </li>
           <li>
-            Varslingstid måles fra hver utstedelses egen start (06:30 og 07:00 for morgenrushet, 15:00 for
-            ettermiddagsrushet), så morgentallene ligger rundt null eller er negative av ren
-            konstruksjon.
-          </li>
-          <li>
             «Mangler runde» teller rekonstruksjoner på dager runde-loggen allerede dekket:
             varslingen var slått av i dette miljøet, eller skrivingen av runden feilet. «Ikke
             vurdert» betyr at ingen runde ble registrert og heller ikke kunne rekonstrueres. Ingen
