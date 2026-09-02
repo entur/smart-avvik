@@ -77,6 +77,14 @@ def _app() -> TestClient:
     def meldinger_api() -> dict:
         return {"api": "meldinger"}
 
+    @app.get("/rushhistorikk")
+    def rushhistorikk_page() -> dict:
+        return {"page": "rushhistorikk"}
+
+    @app.get("/rushhistorikk-api/days")
+    def rushhistorikk_api() -> dict:
+        return {"api": "rushhistorikk"}
+
     @app.get("/demo-api/config")
     def demo_api() -> dict:
         return {"api": "demo"}
@@ -363,11 +371,19 @@ def test_main_wires_the_gate():
         assert response.headers["location"].startswith("/auth/login")
         response = client.get("/meldinger-api/messages", headers={"accept": "application/json"})
         assert response.status_code == 401
-    # The six surfaces, exactly: a seventh must be added here deliberately, and removing one
+        # /rushhistorikk is its own prefix pair: matching is per path segment, so "/historikk"
+        # does not claim it and "/rushhistorikk" does not claim "/rushhistorikk-api".
+        response = client.get("/rushhistorikk", headers={"accept": "text/html"})
+        assert response.status_code == 302
+        response = client.get("/rushhistorikk-api/days", headers={"accept": "application/json"})
+        assert response.status_code == 401
+    # The eight surfaces, exactly: a ninth must be added here deliberately, and removing one
     # un-gates it.
     assert sso.PROTECTED_PREFIXES == (
         "/historikk",
         "/historikk-api",
+        "/rushhistorikk",
+        "/rushhistorikk-api",
         "/meldinger",
         "/meldinger-api",
         "/demo",

@@ -21,8 +21,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
 path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
-node stage builds the `/demo`, `/varsel`, `/historikk` and `/meldinger` front-ends (from
-`demo/reisedemo` + `demo/avviksvarsel` + `demo/varselhistorikk` + `demo/meldinger`, which is
+node stage builds the `/demo`, `/varsel`, `/historikk`, `/meldinger`, `/togmelding` and
+`/rushhistorikk` front-ends (from `demo/reisedemo` + `demo/avviksvarsel` +
+`demo/varselhistorikk` + `demo/meldinger` + `demo/togmelding` + `demo/rushhistorikk`, which is
 why the context is the repo root, not `disruptions/api`), and its python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
 
 ```sh
@@ -63,7 +64,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   into it, so `dataset_id` stays a literal string.
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
   app's `npm ci && npm run build`, and Vite writes into
-  `disruptions/api/{demo,varsel,historikk,meldinger}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
+  `disruptions/api/{demo,varsel,historikk,meldinger,togmelding,rushhistorikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
   its marimo snapshots run BigQuery under a developer's ADC, so they can't be built in the
   image/CI — they are rendered offline by `disruptions/api/export_eval.sh` and **committed** under
   `disruptions/api/eval_static/`, shipped as-is. Refresh them by running that script, then commit
@@ -1165,6 +1166,199 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `deployment.environment_label()` is not exactly `"dev"` (tst, prd, unset and unrecognized labels
   all fail closed). Tests: `disruptions/api/test_togvarsel_notify.py` (hermetic; standalone and
   under pytest).
+
+
+- The **Rushhistorikk** page at `/rushhistorikk` (`demo/rushhistorikk/`, React + Vite + Entur
+  Linje) is the feedback loop for **Rushvarsel** — what `/historikk` is to `/varsel`. One row per
+  DAY: the four forecast issues (06:30, 07:00, 12:00, 14:00), what was communicated for each, and
+  what the two rushes actually did. Its API is `/rushhistorikk-api`
+  (`disruptions/api/rushhistorikk.py`), one query (`rushhistorikk_days.sql`) per request.
+  - **Three records join to answer it, and two of them are new.** `togvarsel_issued` had no reader
+    anywhere in the repo before this; `disruptions.togvarsel_rounds` records every notification
+    round as it was DECIDED (pushes and suppressions alike, plus the reason) and
+    `disruptions.togvarsel_outcomes` records what the rush actually did. Neither is in
+    `copy_runtime_to_prd.sh`: each environment resolves the forecasts it issued itself, and
+    `bq cp -f` overwrites.
+  - **Nothing about the notification was durable before.** The round markers in the `/varsel` state
+    blob are the runtime primitive, but `varsel.store_togvarsel_rounds` replaces the whole map with
+    a SINGLE DATE — the first write after midnight destroys yesterday's — and the
+    `togvarsel_notify_round` log event carries no Oslo date and has no BigQuery sink. So no history
+    can be backfilled: the page starts at the deploy and fills forward, which is why it reads mostly
+    `ikke vurdert` for its first weeks and says so in prose.
+  - **The round is recorded, never re-derived.** `decide_issue` is a pure function of (level, marker
+    state, clock), so reconstruction looks feasible and is not: it cannot see a round the gate closed
+    before evaluating (which writes no markers at all), cannot see the `untimely` verdict on a
+    back-filled round, and cannot see how many devices matched. Same rule as `/meldinger`'s `pushed`.
+    Three things the write gets right: `baseline_level` rides on the `Decision` (reading it off the
+    BASELINE's row would let one swallowed best-effort write invert a verdict — a 06:30 red that
+    pushed and was right reads as a miss if only its own MERGE failed), so `_effective_baseline` is
+    resolved BEFORE the deadline check; the recording loop sits at the very END of `_evaluate`,
+    because the two sites that persist markers are inside the `pushes` loop and in the `not pushes`
+    branch and NEITHER reaches a suppression on a mixed pass; and it is never called from
+    `push_round`, which `POST /togmelding-api/test-notify` reaches directly on the public dev host
+    with a caller-supplied `device_id` — on a first-write-wins MERGE that write would take the day's
+    row for good.
+  - **The fasit is two passes, because no single source serves both timeliness and the models'
+    semantics.** `last_recorded` is a once-daily batch (measured 2026-09-01: every partition shares
+    one `last_modified_time` of ~03:04 UTC, and the current day's held 115 k rows against 1.81 M for
+    the previous full day), so it cannot answer for the morning rush at 09:20 — and `01_calls.sql`
+    codifies that by stopping at `CURRENT_DATE() - 1`. So: a **provisional** pass at 09:20 and 18:20
+    Oslo from `rail_calls_today` + `rail_calls_planned_today` (3.4 MB, tables the poller already
+    builds), and an **authoritative** pass after 04:00 UTC from `last_recorded` (32.5 MB/day,
+    ~$0.0002) that settles the row. Both ride the poller's wall-clock tick beside
+    `togvarsel.refresh()` rather than a transfer config — four configs each holding its own COPY of
+    the SQL, on a fixed UTC time that slides an hour against Oslo twice a year, none of which could
+    self-heal a missed run. `:20` and not `:05` because both provisional sources are TTL-gated off
+    the SX rebuild (`_RAIL_CALLS_TTL` 15 min, `_PLANNED_TTL` 60 min), so an earlier read stops
+    before the window it measures. The provisional pass's **four skews are named in its file
+    header** (departure delay where the label prefers arrival; `recordedCalls` coverage;
+    TTL staleness; extra journeys it cannot exclude) — that is why its value is marked and excluded
+    from every rate, and why `provisional_trouble10`/`_level`/`_at` are **never overwritten** by the
+    settled pass: the overnight disagreement rate is the measurement that decides whether the pass
+    earns its keep, and destroying it would repeat the marker store's own defect.
+  - **The authoritative pass's latch is keyed on the UTC DATE, and mixing the two calendars once
+    cost the whole page.** Its gate is a UTC hour (04:00) because the batch it waits for rewrites at
+    a UTC hour, while everything else in `togvarsel_outcomes` is scoped to the **Oslo** day because a
+    rush is an Oslo-clock thing. Held as a boolean inside the Oslo-day state those two shared one
+    dict, and the failure was not a near miss: at Oslo midnight — 22:00 UTC in CEST, 23:00 in CET —
+    the Oslo rollover cleared the flag while `hour >= 4` was trivially true, so the pass ran about
+    five hours **before** the batch it depends on, found nothing, and settled every day as
+    `unresolvable` — permanently, and with nothing logged as an error. Two calendars now live in two
+    variables: `_settled_last_utc` sits outside `_state`, which is also why it needs resetting in the
+    suite's own `_reset` (a leaked latch makes half the suite pass by accident). Both offsets are
+    pinned, because a fix that handled only the summer one would look right for half the year.
+  - **A day NO scope resolved for is left for the retry window; a day missing ONE scope settles.**
+    That pair is the discriminator between the two causes of an empty read, and only one is final.
+    With a sibling scope resolved the batch has demonstrably landed, so "no resolved call in this
+    window" is an answer about the data and `unresolvable` is right — `last_recorded` is immutable,
+    and retrying for ten days re-runs one query to reach the same NULL. With nothing at all the
+    likeliest cause is that the batch has not landed for that day yet, and because
+    `resolve_outcome_state` reads `unresolvable` **before** the window, three rows written there
+    burn the day for good on the strength of one early read. Left alone the day stays in the work
+    set, reads `venter`, is retried daily, and turns `ukjent` at day 11 by itself. Same shape one
+    layer up: a provisional scope the query answered nothing for stays **due**, or one empty read
+    retires it for the rest of the Oslo day and the page waits for the overnight pass with nothing
+    retrying. And the two provisional windows hold **separate** give-up budgets, or a morning
+    outage silently forfeits an afternoon check on a day that was healthy by 18:20.
+  - **ROUNDING IS PER SCOPE, and getting it uniform breaks the identity the page rests on.**
+    `03_day_windows.sql` emits `ROUND(SAFE_DIVIDE(...), 4)`, which `04_days.sql` carries into
+    `am_t10`/`pm_t10`; `08_features_cat.sql` emits a **raw** `SAFE_DIVIDE` for `am_t10_rest0700` —
+    and it is the only file that defines the 07:00-09:00 window at all, so "reproduces
+    `03_day_windows.sql`" could never have covered the 0700 issue. Worked example: 204 troubled of
+    2041 resolved is 0.0999510, which rounds to the 0.10 bar (label TRUE, level must be yellow) and
+    truncates below it (label TRUE, level would read green).
+  - **The realized level is green below the bar, yellow to twice the bar, red at or above — and only
+    the green boundary follows from the models.** Nothing in the repo defined a realized
+    green/yellow/red: the 0.10/0.30 cuts are on the PROBABILITY while the truth is the binary
+    `trouble10 >= bar`. What keeps this from minting a second definition of "a bad rush" is that a
+    non-green level coincides EXACTLY with the training label being true — the green boundary *is*
+    the bar (per-scope: 0.10 for `am`/`amrest`, 0.15 for `pm`). Twice-the-bar is a display convention
+    chosen for class balance: measured over 345 non-holiday weekdays it gives 82.0/11.6/6.4 % for the
+    morning and 82.9/12.8/4.3 % for the afternoon. Two consequences the page carries rather than
+    buries — the matrix diagonal compares two differently-scaled categoricals (forecast red on 13 %
+    of days against realized red on 6.4 %), so a well-calibrated red lands in `traff nesten` more
+    often than in `traff`, and §14a's expected bad-day rate per level (6/21/55 %) prints beside the
+    matrix as the reference.
+  - **Each issue is scored against ITS OWN trained window.** `10_train_models.sql` gives 0630 the
+    label `y_am10` over 06:30-09:00 and 0700 `y_amrest10` over 07:00-09:00; 1200 and 1400 share
+    `y_pm10` over 15:00-18:00. Giving 0700 the whole morning would hand it thirty minutes that had
+    already happened when it was issued. Three realized figures are resolved per day (`am`,
+    `amrest`, `pm`), the verdict picks the issue's own, and the row shows `amrest` beside `am` so the
+    two morning figures cannot silently disagree.
+  - **The verdict grades what was COMMUNICATED, not what the issue forecast** — a fourteen-branch
+    table in `rushhistorikk_verdicts.py`, pure functions, no I/O. A follow-up that confirms its baseline
+    sends nothing, yet the traveller holds a warning at the BASELINE's level, and that is what gets
+    graded: 12:00 pushes yellow, the 14:00 round is suppressed `untimely` with a red forecast, the
+    rush is yellow, and grading the red would give `traff nesten` where the yellow the traveller
+    actually holds was exactly right. Without the rule at all, 0700 and 1400 would read `bom` on
+    every warned day. `sent` records the POLICY decision, not delivery: `push_round` can fan out to
+    zero matched devices.
+  - **Three populations, because the figures are not over the same rows.** `scored` (record present,
+    day eligible, outcome settled and resolvable, forecast not late, round not untimely) is
+    Presisjon's and the matrix's; `delivered` is the same with late and untimely INCLUDED and is
+    Dekning's; `recorded` is every issue, and is what `Varsler sendt` counts pushes across — a push
+    on a day that never settled still reached a phone. That split is what keeps a **late**
+    forecast out of Presisjon (it saw post-cutoff reality — `03-implementasjon.md` says such
+    forecasts "skal utelates fra etterprøving av treffsikkerhet") while keeping it in Dekning, since
+    a rush nobody was warned about is a coverage miss whatever contaminated the forecast; dropping it
+    from both halves of that ratio would hide exactly the misses. **`late` and `untimely` are
+    independent**, and the shortcut that a late forecast never pushed is FALSE: `late` is
+    `now > due + 10 min` while `untimely` is `now >= deadline`, and the gap is 30 min for 0630, 120
+    for 0700 and 1200, and 240 for 1400. An all-clear push leaves Dekning's numerator too — it
+    RETRACTS a warning rather than issuing one, so a wrong friskmelding must not read as having
+    covered a red rush. Dekning's total row counts **rushes, not issues**, because a confirming
+    follow-up is covered only via its baseline.
+  - **The outcomes pivot is `LOGICAL_OR(scope = 'x' AND settled)`, never `LOGICAL_AND` over an `IF`
+    whose else-branch is TRUE.** That second form reports a scope as settled when the day has no row
+    for it at all — the else-branch answers TRUE for every *other* scope's row and the AND passes —
+    so both afternoon issues read `ukjent`, a settled verdict, instead of `venter` every weekday
+    between 12:00 and 18:20, which is exactly the window a reader looks at. Verified against
+    BigQuery. `eligible` is the deliberate opposite: bare `LOGICAL_AND(eligible)`, because BigQuery
+    skips NULLs and returns NULL when every input is NULL, which is the "no scope has answered yet"
+    state `api.ts` tests for. Nothing in this repo executes SQL and the vacuous form dry-runs clean,
+    so what guards it is a **grep** of the uncommented text.
+  - **Three kinds of "we do not know", kept apart:** `venter` (still being retried), `ukjent` (can no
+    longer be established, or the day failed the training chain's day-level eligibility test —
+    `am_n > 300 AND pm_n > 300`, which has no `amrest` term, so eligibility is a property of the DAY)
+    and `ikke vurdert` (no round was ever recorded — the gate was closed, or the day predates the
+    log). Folding any two together manufactures skill out of missing data. `ikke vurdert` is split on
+    the earliest day a round was ever recorded (`first_recorded_day`) and served as its own count,
+    `n_ikke_vurdert_etter_start`, with its own chip: before that day is the expected backlog, after
+    it means the gate was closed or a best-effort write was lost, and without the split a write
+    regression is indistinguishable from the backlog during exactly the weeks the backlog is large.
+    **Strictly after**, because that value is a DAY — on the deploy day itself the issues that fired
+    before the restart legitimately have no round, and reading those as lost writes would put one
+    false positive per environment permanently on the page.
+  - **Varslingstid is measured from each issue's own `NOTIFY_SPECS.scope_start_h`** — 6.5 / 7.0 /
+    15.0 / 15.0, identical to each model's label window, so there is no second source to choose
+    between. Positive means the push preceded the rush, so 1200 leads by ~180 min and 1400 by ~60
+    while 0630 and 0700 land ~1 min INTO their rush. That is a product finding worth seeing rather
+    than a number to massage, and the page states the reference point beside the figure.
+  - **The five subscriber-derived columns are never served.** `togvarsel_rounds` holds
+    `matched_journeys`, `matched_devices`, `n_sent`, `n_error`, `n_gone` — day-grained counts over a
+    subscriber population numbering a handful — and `rushhistorikk_days.sql` does not name them,
+    `meldinger_decisions.sql`'s rule that a query which cannot name a column cannot leak it. The
+    test greps the UNCOMMENTED SQL, because the file names all five in its header explaining why it
+    never selects them. Otherwise nothing here is redacted, and that claim is easy to over-read: a
+    rush forecast is one product-wide prognosis over a fixed 39-station geography, with no journey,
+    route, device or departure behind a row — the one way this surface is simpler than its two
+    siblings.
+  - **Its SSO prefixes gate nothing today**, like its siblings'. `sso.PROTECTED_PREFIXES` carries
+    both `/rushhistorikk` and `/rushhistorikk-api` (matching is per path segment, so one does not
+    claim the other), but `SSO_REQUIRED` is `"false"` in `helm/kix-avvik/values.yaml`, overridden in
+    no environment file, and no environment wires the OAuth client — so `sso.required()` returns
+    False and the middleware short-circuits. With `trafficType: public` set once and inherited, the
+    page ships publicly readable on all three hosts. The prefixes land in the same commit as the
+    router, so no deploy ever serves the API with no entry. `test_sso.py` pins the tuple EXACTLY
+    (eight entries now) — extend it, never weaken it to a containment check.
+  - The window is a four-value allow-list (7 / 14 / 30 / 365, "all time" being a bounded year), not
+    a range check: the value lands in the response-cache key on a public endpoint, so arbitrary
+    integers would mint one cache entry and one BigQuery query apiece. Four values, four reachable
+    keys.
+  - Both new SQL files plus `rushhistorikk_days.sql` are registered in
+    `data/queries/validate_varsel_sql.sh` — the first togvarsel SQL that script covers; the twelve
+    files under `data/queries/togvarsel/` and `togvarsel_features_today.sql` are still unvalidated.
+    **The prerequisite is not optional:** both new tables must EXIST in the project, because a dry
+    run resolves table references and both are created from Python at startup, so a validation run
+    against an environment the app has never started in reports FAILED and the files go unvalidated.
+  - **`traff` means the right CLASS was communicated, silence included, and `Presisjon` is `traff`
+    over everything scored** (2026-09-02). A green forecast on a green rush is a hit. Until then it
+    was its own verdict, `riktig stille`, outside Presisjon's numerator — and since green is 82 % of
+    days, «Presisjon (samlet)» read 0 % on a good month by construction, the plan's first Open
+    Question. The product owner's answer folded the verdict into `traff` (table rows 11 and 13),
+    dropped «Presisjon (varslet)» and its all-clear exclusion (which retired `is_all_clear`; the
+    all-clear rule survives only in Dekning's `warned`), renamed «Presisjon (samlet)» to plain
+    «Presisjon», and replaced «Avgjørelser» — four per weekday whether or not anything was sent —
+    with **«Varsler sendt»**: pushes issued in the window, friskmeldinger included, one per round,
+    over the RECORDED population so a push on an unsettled or ineligible day still counts. That is
+    the notification-VOLUME figure the second Open Question asked for. Two things to keep straight.
+    Presisjon is **not** the matrix's diagonal over its total, though it reads like it: the matrix
+    plots the issue's own FORECAST level (R16) while `traff` is graded on what was COMMUNICATED, so
+    a confirming follow-up whose own red sits over a standing yellow is `traff` on a yellow rush and
+    lands in the red row. And `riktig_stille` is gone from `VERDICTS`, `format.ts` and the badge
+    variants alike; `test_rushhistorikk` now checks the front-end's label KEYS against the module's,
+    not only that each module label is present, so a chip nothing can ever show cannot linger. API
+    fields: `presisjon`, `varsler_sendt`.
 
 ## Conventions
 
