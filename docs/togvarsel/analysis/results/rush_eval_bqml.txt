@@ -1,0 +1,57 @@
+## AUC per variant (rolling OOS, BQML)
+| variant | model | n | AUC | log-loss | ΔAUC vs baseline [95 % CI] | green n→bad | yellow n→bad | red n→bad (p̄) |
+|---|---|---|---|---|---|---|---|---|
+| baseline | am0630 | 226 | 0.765 | 0.445 |  | 97 → 7% (p̄ 0.05) | 86 → 23% (p̄ 0.17) | 43 → 42% (p̄ 0.61) |
+| l2x10 | am0630 | 226 | 0.775 | 0.428 | +0.010 [-0.019, +0.038] | 19 → 5% (p̄ 0.08) | 144 → 14% (p̄ 0.18) | 63 → 38% (p̄ 0.47) |
+| l2x30 | am0630 | 226 | 0.728 | 0.519 | -0.037 [-0.117, +0.031] | 7 → 29% (p̄ 0.08) | 77 → 6% (p̄ 0.23) | 142 → 27% (p̄ 0.45) |
+| baseline | am0700 | 226 | 0.757 | 0.465 |  | 54 → 6% (p̄ 0.07) | 120 → 19% (p̄ 0.18) | 52 → 50% (p̄ 0.56) |
+| l2x10 | am0700 | 226 | 0.788 | 0.515 | +0.031 [-0.027, +0.083] | 0 | 73 → 3% (p̄ 0.24) | 153 → 33% (p̄ 0.47) |
+| l2x30 | am0700 | 226 | 0.767 | 0.529 | +0.010 [-0.050, +0.073] | 31 → 6% (p̄ 0.07) | 86 → 14% (p̄ 0.19) | 109 → 35% (p̄ 0.60) |
+| baseline | pm1200 | 226 | 0.580 | 0.460 |  | 45 → 11% (p̄ 0.08) | 158 → 18% (p̄ 0.17) | 23 → 22% (p̄ 0.42) |
+| l2x10 | pm1200 | 226 | 0.616 | 0.466 | +0.036 [-0.026, +0.103] | 0 | 173 → 14% (p̄ 0.21) | 53 → 28% (p̄ 0.39) |
+| l2x30 | pm1200 | 226 | 0.599 | 0.557 | +0.018 [-0.049, +0.089] | 0 | 6 → 17% (p̄ 0.29) | 220 → 17% (p̄ 0.39) |
+| pmmin | pm1200 | 226 | 0.625 | 0.442 | +0.045 [-0.054, +0.137] | 2 → 0% (p̄ 0.10) | 213 → 16% (p̄ 0.16) | 11 → 45% (p̄ 0.42) |
+| baseline | pm1400 | 226 | 0.651 | 0.430 |  | 33 → 9% (p̄ 0.08) | 164 → 15% (p̄ 0.17) | 29 → 41% (p̄ 0.44) |
+| l2x10 | pm1400 | 226 | 0.682 | 0.543 | +0.031 [-0.030, +0.094] | 0 | 36 → 11% (p̄ 0.27) | 190 → 18% (p̄ 0.41) |
+| l2x30 | pm1400 | 226 | 0.671 | 0.504 | +0.021 [-0.055, +0.091] | 31 → 16% (p̄ 0.07) | 124 → 11% (p̄ 0.19) | 71 → 28% (p̄ 0.55) |
+| pmmin | pm1400 | 226 | 0.714 | 0.417 | +0.063 [-0.007, +0.133] | 10 → 10% (p̄ 0.09) | 182 → 13% (p̄ 0.16) | 34 → 44% (p̄ 0.49) |
+
+## baseline OOS AUC by half-year
+am0630 Oct25–Mar26: n=125 bad=0.24 auc=0.728
+am0630 Apr–Aug26: n=101 bad=0.15 auc=0.833
+am0700 Oct25–Mar26: n=125 bad=0.29 auc=0.721
+am0700 Apr–Aug26: n=101 bad=0.16 auc=0.835
+pm1200 Oct25–Mar26: n=125 bad=0.14 auc=0.530
+pm1200 Apr–Aug26: n=101 bad=0.22 auc=0.646
+pm1400 Oct25–Mar26: n=125 bad=0.14 auc=0.589
+pm1400 Apr–Aug26: n=101 bad=0.22 auc=0.711
+
+## page rates on the BQML baseline: OOS 2025-10-01..2026-08-28 n=226
+| policy | Presisjon (all pushes) | warnings only | Dekning | bad rushes warned | pushes/day | expected Presisjon | per slot |
+|---|---|---|---|---|---|---|---|
+| production 0.10 / 0.30 | 25% (114/455) | 22% (98/437) | 31% | 91% (83/91) | 2.01 | 28% | 0630 29% 0700 25% 1200 19% 1400 35% |
+| yellow from 0.15 | 29% (103/352) | 26% (84/328) | 38% | 77% (70/91) | 1.56 | 34% | 0630 34% 0700 26% 1200 20% 1400 42% |
+| yellow from 0.20 | 35% (87/251) | 29% (65/224) | 45% | 62% (56/91) | 1.11 | 42% | 0630 38% 0700 35% 1200 22% 1400 46% |
+| red only (p ≥ 0.30) | 47% (60/127) | 38% (39/104) | 45% | 43% (39/91) | 0.56 | 56% | 0630 42% 0700 57% 1200 22% 1400 67% |
+| red only, morning issues only | 49% (39/80) | 41% (27/66) | 34% | 30% (27/91) | 0.35 | 62% | 0630 42% 0700 57% 1200 nan% 1400 nan% |
+| push at p ≥ 0.40 | 57% (47/83) | 50% (32/64) | 42% | 35% (32/91) | 0.37 | 65% | 0630 46% 0700 66% 1200 50% 1400 78% |
+| push at p ≥ 0.50 | 60% (30/50) | 57% (24/42) | 29% | 26% (24/91) | 0.22 | 72% | 0630 52% 0700 73% 1200 67% 1400 60% |
+| AM as production, 12:00 red only, 14:00 from 0.20 | 28% (84/299) | 26% (76/291) | 37% | 69% (63/91) | 1.32 | 33% | 0630 29% 0700 25% 1200 22% 1400 32% |
+
+## windows, production policy, BQML baseline
+last  14 d: presisjon    8/23 (35%)  dekning    6/17  bad rushes warned 6/6  pushes/day 2.30  expected 36%
+last  30 d: presisjon   18/48 (38%)  dekning   13/35  bad rushes warned 13/13  pushes/day 2.18  expected 31%
+last  90 d: presisjon  39/127 (31%)  dekning   31/93  bad rushes warned 28/29  pushes/day 1.98  expected 28%
+last 180 d: presisjon  64/242 (26%)  dekning  56/169  bad rushes warned 44/47  pushes/day 1.97  expected 30%
+
+## red-only by half-year, BQML baseline
+Oct25–Mar26: n=125 presisjon 37/78 (47%) warnings-only 21/61 (34%) bad rushes warned 21/53 pushes/day 0.62
+   production: presisjon 61/262 (23%) bad rushes warned 47/53 pushes/day 2.10
+Apr–Aug26: n=101 presisjon 23/49 (47%) warnings-only 18/43 (42%) bad rushes warned 18/38 pushes/day 0.49
+   production: presisjon 53/193 (27%) bad rushes warned 36/38 pushes/day 1.91
+
+## combo l2x10 (AM) + pmmin (PM): n=226
+| policy | Presisjon (all pushes) | warnings only | Dekning | bad rushes warned | pushes/day | expected Presisjon | per slot |
+|---|---|---|---|---|---|---|---|
+| production 0.10 / 0.30 | 22% (128/583) | 21% (120/574) | 22% | 98% (89/91) | 2.58 | 27% | 0630 21% 0700 23% 1200 17% 1400 55% |
+| red only (p ≥ 0.30) | 35% (71/201) | 34% (65/194) | 53% | 71% (65/91) | 0.89 | 44% | 0630 38% 0700 31% 1200 45% 1400 43% |
