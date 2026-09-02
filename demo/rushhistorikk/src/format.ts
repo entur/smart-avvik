@@ -79,24 +79,22 @@ export const VERDICT_LABEL: Record<Verdict, string> = {
   traff_nesten: 'Traff nesten',
   falsk_alarm: 'Falsk alarm',
   bom: 'Bom',
-  riktig_stille: 'Riktig stille',
   venter: 'Venter',
   ukjent: 'Ukjent',
   ikke_vurdert: 'Ikke vurdert',
 };
 
-export type BadgeVariant = 'success' | 'near' | 'warning' | 'negative' | 'neutral' | 'muted';
+export type BadgeVariant = 'success' | 'near' | 'warning' | 'negative' | 'muted';
 
 /** Chip variant per verdict. `traff_nesten` gets its own OUTLINED variant rather than sharing
  *  `falsk_alarm`'s fill: it is a near-success and the other an outright failure, and collapsing
- *  them destroys exactly the distinction the eight-state taxonomy exists for. `bom` is negative
+ *  them destroys exactly the distinction the seven-state taxonomy exists for. `bom` is negative
  *  because a warning that never went out is the failure the traveller actually feels. */
 export const VERDICT_VARIANT: Record<Verdict, BadgeVariant> = {
   traff: 'success',
   traff_nesten: 'near',
   falsk_alarm: 'warning',
   bom: 'negative',
-  riktig_stille: 'neutral',
   venter: 'muted',
   ukjent: 'muted',
   ikke_vurdert: 'muted',
@@ -111,7 +109,7 @@ export const VERDICT_HELP: Partial<Record<Verdict, string>> = {
     'kan fortsatt bli avklart.',
   ukjent:
     'Fasit kan ikke lenger fastslås — kilden ga aldri nok avganger, eller forsøkene har gitt seg. ' +
-    'Det telles ikke som «riktig stille»: da ville manglende data sett ut som en riktig avgjørelse.',
+    'Det telles ikke som «traff»: da ville manglende data sett ut som en riktig avgjørelse.',
   ikke_vurdert:
     'Ingen varselrunde ble vurdert for denne utstedelsen — varslingen var slått av, eller dagen ' +
     'er eldre enn runde-loggen. Det betyr ikke at et varsel var unødvendig.',

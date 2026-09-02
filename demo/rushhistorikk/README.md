@@ -57,14 +57,17 @@ nivået som vurderes. Uten den regelen ville 07:00 og 14:00 lest `bom` hver enes
 
 | Verdikt | Betyr |
 |---|---|
-| Traff | det som ble meldt stemte |
+| Traff | riktig klasse ble meldt — riktig nivå varslet, eller ingenting varslet og rushet ble grønt |
 | Traff nesten | rødt varsel og gult rush, eller omvendt |
 | Falsk alarm | det som ble meldt stemte ikke |
 | Bom | et varsel som burde gått ut, gikk ikke |
-| Riktig stille | ingenting meldt, ingenting påkrevd |
 | Venter / Ukjent / Ikke vurdert | de tre måtene å ikke vite (se over) |
 
-Logikken ligger i `disruptions/api/rushhistorikk_verdicts.py` — rene funksjoner, uten I/O, med 38
+«Traff» tar med tausheten (siden 2026-09-02): grønn prognose på et grønt rush er et treff, akkurat
+som gult varsel på et gult rush. Før det var det et eget verdikt, «riktig stille», som ikke telte i
+Presisjon — og siden 82 % av dagene er grønne leste tallet 0 % en god måned, rett fra definisjonen.
+
+Logikken ligger i `disruptions/api/rushhistorikk_verdicts.py` — rene funksjoner, uten I/O, med 37
 sjekker og en enumerasjon over alle nåbare kombinasjoner. Den finnes bare ett sted nettopp fordi
 tabellen har fjorten grener; skrevet en gang til i SQL blir det to definisjoner av «traff».
 
@@ -76,21 +79,23 @@ Tre populasjoner, fordi tallene ikke er over samme rader:
   frist. Presisjon og treffmatrisen.
 - **`delivered`** — som over, men **med** sene og for-sent-vurderte. Dekning, fordi et rush ingen ble
   varslet om er et dekningstap uansett hva som forurenset prognosen.
-- **`recorded`** — alle utstedelser. Avgjørelser.
+- **`recorded`** — alle utstedelser. Det er grunnlaget eksklusjonstellingene deler opp, og det
+  «Varsler sendt» teller push over: en push er sendt uansett hva dagen ble, uavklarte dager
+  medregnet, friskmeldinger medregnet — én per runde.
 
 To fallgruver som er lette å snu: en **friskmelding** er ikke et varsel, så den holdes utenfor
-Presisjon (varslet) og utenfor telleren i Dekning — ellers leser tjue riktige friskmeldinger og tjue
-gale røde varsler som 50 %. Og **Dekning på totalraden teller rush, ikke utstedelser**, siden en
-bekreftende oppfølging bare er dekket via baselinen sin.
+telleren i Dekning — en gal friskmelding skal ikke få kreditt for å ha varslet om et rødt rush. Og
+**Dekning på totalraden teller rush, ikke utstedelser**, siden en bekreftende oppfølging bare er
+dekket via baselinen sin.
 
 `Varslingstid` måles fra hvert vindus egen start (06:30 / 07:00 / 15:00), positivt når pushen kom
 før rushet. Morgenutstedelsene lander derfor ~1 minutt *inne* i sitt eget rush. Det er et funn om
 produktet, ikke et tall som skal pyntes på.
 
-> **`Presisjon (samlet)` leser 0 % en god måned**, og det følger av definisjonen: «andel traff» over
-> alle avklarte verdikt, der et korrekt grønt rush aldri gir `traff` — og grønt er 82 % av dagene.
-> Definisjonen er beholdt som spesifisert og den degenererte lesningen er pinnet i en test; se
-> Open Questions i planen for de tre veiene ut.
+Tabellen hadde fem tall til 2026-09-02: «Presisjon (samlet)», «Presisjon (varslet)» og
+«Avgjørelser» ble til «Presisjon» (traff over alt avklart) og «Varsler sendt» (antall push). Det
+første fordi «samlet» leste 0 % en god måned, det siste fordi fire per hverdag uansett hva som ble
+sendt ikke sier noe om varselvolum — som er det tretthetsspørsmålet handler om.
 
 ## Kjøre lokalt
 

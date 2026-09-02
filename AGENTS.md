@@ -342,10 +342,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     policy decision, not delivery.
   - **Three populations**: `scored` (Presisjon and the matrix), `delivered` (Dekning — late and
     untimely INCLUDED, because a rush nobody was warned about is a coverage miss whatever
-    contaminated the forecast), `recorded` (Avgjørelser). Note `late` and `untimely` are
-    INDEPENDENT: `late` is `now > due + 10 min`, `untimely` is `now >= deadline`, and the gap runs
-    30-240 min. An all-clear push leaves Presisjon (varslet) and Dekning's numerator — a
-    friskmelding is not a warning. Dekning's total row counts rushes, not issues.
+    contaminated the forecast), `recorded` (every issue; what `Varsler sendt` counts pushes
+    across). Note `late` and `untimely` are INDEPENDENT: `late` is `now > due + 10 min`,
+    `untimely` is `now >= deadline`, and the gap runs 30-240 min. An all-clear push leaves Dekning's
+    numerator — it retracts a warning rather than issuing one. Dekning's total row counts rushes,
+    not issues.
   - **Three kinds of "we do not know", kept apart**: `venter` (still retried), `ukjent`
     (unestablishable, or the day failed the training chain's DAY-level eligibility `am_n > 300 AND
     pm_n > 300`) and `ikke vurdert` (no round recorded). `ikke vurdert` is split on the earliest
@@ -364,10 +365,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - All three new SQL files are in `validate_varsel_sql.sh` — the first togvarsel SQL it covers.
     **Prerequisite:** both tables must EXIST, since a dry run resolves table references and both are
     created from Python at startup.
-  - **`presisjon_samlet` reads 0 % on a good month, by specification**: "percentage traff" over
-    every scored verdict, and a correctly-green rush earns no `traff`. Kept as specified, pinned in
-    a test, and the first Open Question in the plan. Also open: no figure measures notification
-    VOLUME, which is what the fatigue problem is about.
+  - **`traff` is the right CLASS communicated, silence included** (2026-09-02): a green forecast on
+    a green rush is a hit. It was its own verdict, `riktig stille`, outside Presisjon's numerator,
+    which read the figure as 0 % on a good month (green is 82 % of days). Same change: «Presisjon
+    (varslet)» removed, «Presisjon (samlet)» is plain «Presisjon» (`traff` over scored, denominator
+    `n_scored`), and «Avgjørelser» is «Varsler sendt» — pushes issued, one per round, friskmeldinger
+    included, over the RECORDED population — the notification-volume figure. Presisjon is NOT the
+    matrix diagonal: the matrix plots the FORECAST level, `traff` grades what was COMMUNICATED.
 
 ## Conventions
 

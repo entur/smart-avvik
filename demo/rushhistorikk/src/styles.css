@@ -296,8 +296,8 @@ body {
 .rh-badge--success { background: #c9f0d2; }
 
 /* `traff nesten` is a NEAR-SUCCESS and `falsk alarm` is an outright failure, so they must not share
-   a chip. /historikk's own VERDICT_VARIANT gives every verdict its own variant; this page has eight
-   states against five fills, and this is the pair where collapsing them would destroy exactly the
+   a chip. /historikk's own VERDICT_VARIANT gives every verdict its own variant; this page has seven
+   states against four fills, and this is the pair where collapsing them would destroy exactly the
    distinction the taxonomy exists for — a reader scanning for bad days would read one as the other.
    Outlined against the solid warning fill: same hue, different weight, and it stays legible where
    colour alone would not (the tints land near 4:1 at this size). */
@@ -309,7 +309,6 @@ body {
 
 .rh-badge--warning { background: #ffe9c2; }
 .rh-badge--negative { background: #ffd4d4; }
-.rh-badge--neutral { background: #e3e6f5; }
 /* No colour override on the fills: they carry their meaning in the fill and inherit the page's text
    colour, and subdued-on-subdued lands at 4.0:1 — under AA for 0.75rem text. */
 .rh-badge--muted {

@@ -249,7 +249,7 @@ def test_an_issue_with_no_round_record_is_ikke_vurdert_and_in_no_denominator():
     assert issue["verdict"] == "ikke_vurdert" and issue["scored"] is False
     total = body["stats"][0]
     assert total["n_ikke_vurdert"] == 1 and total["n_scored"] == 0
-    assert total["presisjon_samlet"] is None
+    assert total["presisjon"] is None
 
 
 def test_an_unsettled_outcome_inside_the_retry_window_is_venter():
@@ -289,7 +289,7 @@ def test_a_provisional_outcome_is_marked_and_excluded_from_the_stats():
     issue = body["days"][0]["issues"][0]
     assert issue["provisional"] is True
     assert issue["verdict"] == "venter" and issue["scored"] is False
-    assert body["stats"][0]["presisjon_samlet"] is None
+    assert body["stats"][0]["presisjon"] is None
     assert body["days"][0]["am_provisional_level"] == "yellow"
 
 
@@ -319,16 +319,16 @@ def test_a_rate_over_an_empty_denominator_is_null_never_zero():
     """A rate over nothing is not 0 %, and rendering it as one reads as "we got everything wrong"."""
     _reset([_row(has_round=False, sent=False, round_level=None, kind=None, decided_at=None)])
     total = _days().json()["stats"][0]
-    for key in ("presisjon_samlet", "presisjon_varslet", "dekning", "varslingstid_min"):
+    for key in ("presisjon", "dekning", "varslingstid_min"):
         assert total[key] is None, key
-    assert total["avgjorelser"] == 1
+    assert total["n_ikke_vurdert"] == 1 and total["varsler_sendt"] == 0
 
 
 def test_the_matrix_and_the_verdict_agree_on_one_scored_day():
     _reset()
     body = _days().json()
     total = body["stats"][0]
-    assert total["n_scored"] == 1 and total["presisjon_samlet"] == 1.0
+    assert total["n_scored"] == 1 and total["presisjon"] == 1.0
     cells = {cell["forecast"]: cell for cell in total["matrix"]}
     assert cells["yellow"]["yellow"] == 1
 
@@ -383,10 +383,9 @@ def test_the_response_carries_exactly_the_expected_keys():
         "verdict", "lead_min", "scored",
     }
     assert set(body["stats"][0]) == {
-        "slot", "presisjon_samlet", "presisjon_varslet", "presisjon_varslet_den", "dekning",
-        "dekning_den", "varslingstid_min", "varslingstid_n", "avgjorelser", "n_scored", "n_venter",
-        "n_ukjent", "n_ikke_vurdert", "n_ikke_vurdert_etter_start", "n_late", "n_untimely",
-        "matrix",
+        "slot", "presisjon", "dekning", "dekning_den", "varslingstid_min", "varslingstid_n",
+        "varsler_sendt", "n_scored", "n_venter", "n_ukjent", "n_ikke_vurdert",
+        "n_ikke_vurdert_etter_start", "n_late", "n_untimely", "matrix",
     }
 
 
@@ -448,7 +447,7 @@ def test_an_empty_window_is_an_empty_page_not_an_error():
     body = _days().json()
     assert body["days"] == [] and body["recording_started"] is None
     assert [row["slot"] for row in body["stats"]] == ["total", "0630", "0700", "1200", "1400"]
-    assert body["stats"][0]["avgjorelser"] == 0
+    assert body["stats"][0]["varsler_sendt"] == 0
 
 
 def test_two_requests_inside_the_ttl_run_one_query():
@@ -526,12 +525,33 @@ def test_a_missing_round_after_the_log_started_is_counted_apart_from_the_backlog
 
 
 def test_every_served_rate_carries_its_own_denominator():
-    """Each of the three rates is over a DIFFERENT population, and a bare percentage on a page whose
-    first weeks are nearly all `ikke vurdert` invites the one reading that is wrong: 100 % over two
-    bad rushes and 100 % over two hundred are the same glyph."""
+    """The two rates are over DIFFERENT populations, and a bare percentage on a page whose first
+    weeks are nearly all `ikke vurdert` invites the one reading that is wrong: 100 % over two bad
+    rushes and 100 % over two hundred are the same glyph. Presisjon's denominator is n_scored."""
     _reset()
     for row in _days().json()["stats"]:
-        assert {"n_scored", "presisjon_varslet_den", "dekning_den"} <= set(row)
+        assert {"n_scored", "dekning_den"} <= set(row)
+
+
+def test_varsler_sendt_counts_pushes_whatever_became_of_the_day():
+    """The notification-volume figure is over the RECORDED population, not the scored one: a push
+    on a day that never settled, or that failed the eligibility test, still reached a phone. Two
+    pushes here, one of them on an unsettled day, beside a suppressed round and an ineligible day
+    that also pushed — three sent, none of the other counts moving with it."""
+    _reset([
+        _row(issue="0630"),
+        _row(issue="0700", sent=False, reason="no_change", baseline_level="yellow", kind=None),
+        _row(issue="1200", d=TODAY, round_level="red", pm_settled=False, pm_level=None,
+             eligible=None),
+        _row(d=date(2026, 8, 28), issue="1400", round_level="red", baseline_level="yellow",
+             kind="update", eligible=False),
+    ])
+    body = _days().json()
+    total = body["stats"][0]
+    assert total["varsler_sendt"] == 3
+    assert total["n_scored"] == 2 and total["n_venter"] == 1 and total["n_ukjent"] == 1
+    by_slot = {row["slot"]: row["varsler_sendt"] for row in body["stats"][1:]}
+    assert by_slot == {"0630": 1, "0700": 0, "1200": 1, "1400": 1}
 
 
 def test_an_unknown_issue_key_is_dropped_rather_than_500ing_the_page():
@@ -542,7 +562,7 @@ def test_an_unknown_issue_key_is_dropped_rather_than_500ing_the_page():
     _reset([_row(), _row(issue="1600")])
     body = _days().json()
     assert [i["issue"] for i in body["days"][0]["issues"]] == ["0630"]
-    assert body["stats"][0]["avgjorelser"] == 1
+    assert body["stats"][0]["varsler_sendt"] == 1
 
 
 def test_the_verdict_labels_are_mirrored_verbatim_in_the_front_end():
@@ -553,6 +573,10 @@ def test_the_verdict_labels_are_mirrored_verbatim_in_the_front_end():
     ts = (Path(_API_DIR).parent.parent / "demo/rushhistorikk/src/format.ts").read_text()
     for verdict, label in verdicts.VERDICT_LABEL.items():
         assert f"{verdict}: '{label}'" in ts, f"{verdict} drifted or is missing from format.ts"
+    # And the other direction: a verdict the taxonomy no longer produces must not linger page-side
+    # as a chip nothing can ever show — `riktig_stille` was folded into `traff` on 2026-09-02.
+    block = ts.split("export const VERDICT_LABEL", 1)[1].split("};", 1)[0]
+    assert set(re.findall(r"^\s*(\w+):", block, re.MULTILINE)) == set(verdicts.VERDICTS)
 
 
 # ---- the surface is actually served -----------------------------------------------------------
