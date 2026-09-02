@@ -16,14 +16,28 @@ The gates, in order, per round:
                  A restart back-fill evaluated past the deadline is recorded as suppressed and
                  never revisited. Judged at evaluation time, which subsumes togvarsel's `late`
                  flag — the policy never reads it.
-    baselines    0630 and 1200 push iff the level is yellow or red.
-    follow-ups   0700 and 1400 push iff the level differs from the EFFECTIVE baseline: the level
+    baselines    0630 and 1200 push iff the level is RED (PUSH_LEVELS). Red-only since
+                 2026-09-02: it was yellow-or-red from launch, which fired on ~56 % of weekday
+                 mornings at a measured Presisjon of 25-29 % — a yellow forecast (p 0.10-0.30) is
+                 calibrated at 15-23 % bad days, so four yellow pushes in five were false alarms
+                 by construction (docs/togvarsel/04-presisjon-2026-09-02.md). Red-only reads
+                 ~47 % justified at about a quarter of the volume, warning ~43 % of the bad
+                 rushes instead of ~90 %. A yellow baseline is recorded as suppressed
+                 (`yellow_baseline`), exactly as a green one is (`green_baseline`).
+    follow-ups   0700 and 1400 push iff the level differs from the EFFECTIVE baseline — the level
                  their baseline round pushed, or green when it pushed nothing (not issued,
-                 suppressed, or green). A significant change is a level transition, never a
-                 probability delta — the paired models answer different questions with different
-                 calibration, so raw p is not comparable across them; the level is. A green
-                 follow-up after a pushed yellow/red baseline is the one green that pushes: the
-                 all-clear ("friskmelding"), the trust-building update after a warning.
+                 suppressed, or green) — and is itself a level a push can SAY. A significant
+                 change is a level transition, never a probability delta — the paired models
+                 answer different questions with different calibration, so raw p is not
+                 comparable across them; the level is. And a push says red or says green, never
+                 yellow: with nothing standing only a red follow-up pushes (a fresh warning), and
+                 after a pushed red only a green one does — the all-clear ("friskmelding"), the
+                 trust-building retraction. A yellow follow-up is `no_change` either way: the
+                 traveller's state (a red standing, or nothing) is left as it is, and the /varsel
+                 panel shows the current level meanwhile. A yellow "downgrade" push was considered
+                 and left out: /rushhistorikk grades a push on the level it says, and in the
+                 rolling replay 21 of 23 such rushes turned green, so it would have read as a
+                 false alarm nine times in ten while adding a push on ~10 % of days.
 
 Round markers `{issue: {"level": ..., "pushed": ...}}` are the single state primitive: dedup (at
 most one evaluation per round, ever) and the follow-up baseline in one. The caller owns date
@@ -94,6 +108,12 @@ _OSLO = ZoneInfo("Europe/Oslo")
 
 # togvarsel's level vocabulary; anything else is a malformed round and is refused loudly.
 _LEVELS = ("green", "yellow", "red")
+# The levels a forecast must reach before a baseline round pushes, or a follow-up pushes a fresh
+# warning. Red only (2026-09-02; see the module docstring for the measurement behind it). A
+# set rather than a comparison so the one place that would change if a fourth level ever arrived
+# is this line — and so the reconstruction on /rushhistorikk, which replays decide_issue, moves
+# with it by construction.
+PUSH_LEVELS: frozenset[str] = frozenset({"red"})
 
 # Blast-radius bound on the round-record MERGE, matching rushhistorikk._MAX_BYTES_BILLED.
 _MAX_BYTES_BILLED = 2 * 1024**3
@@ -126,9 +146,12 @@ _SPEC_BY_KEY = {s.key: s for s in NOTIFY_SPECS}
 @dataclass(frozen=True)
 class Decision:
     """One round's outcome. `push` with kind "warning" | "update" | "all_clear", or suppression
-    with reason "untimely" | "no_change" | "green_baseline". `marker` is the entry the round
-    commits either way: {"level": ..., "pushed": ...} — its presence is what makes the round
-    never re-evaluated, so even a suppressed round records one."""
+    with reason "untimely" | "no_change" | "green_baseline" | "yellow_baseline". `marker` is the
+    entry the round commits either way: {"level": ..., "pushed": ...} — its presence is what makes
+    the round never re-evaluated, so even a suppressed round records one. Under the red-only rule
+    "update" is no longer reachable from decide_issue (a yellow is never pushed, so there is
+    neither a lower pushed level to escalate from nor one to ease to); it stays in the vocabulary
+    because rows written before 2026-09-02 carry it and compose_message still words it."""
 
     issue: str
     level: str
@@ -185,14 +208,20 @@ def decide_issue(issue: Mapping[str, Any], markers: Mapping[str, Any], now: date
         )
 
     if spec.baseline is None:
-        if level == "green":
+        if level not in PUSH_LEVELS:
+            # Below the push level: recorded, never pushed. The reason names the level so the
+            # round log can tell a green baseline from a yellow one the red-only rule held back.
             return Decision(
-                key, level, push=False, marker=_marker(level, False), reason="green_baseline"
+                key, level, push=False, marker=_marker(level, False), reason=f"{level}_baseline"
             )
         return Decision(key, level, push=True, marker=_marker(level, True), kind="warning")
 
     assert base is not None  # spec.baseline is set, so the hoisted resolution ran
-    if level == base:
+    if level == base or (level != "green" and level not in PUSH_LEVELS):
+        # Same level as the effective baseline — or a level a push never says (yellow), whether
+        # a red stands or nothing does. Either way what the traveller holds is unchanged, which is
+        # what "no_change" has always meant here (green after an unpushed green baseline took
+        # this branch before the red-only rule too).
         return Decision(
             key,
             level,
@@ -206,7 +235,7 @@ def decide_issue(issue: Mapping[str, Any], markers: Mapping[str, Any], now: date
     elif base == "green":
         kind = "warning"  # the baseline pushed nothing, so there is nothing to "update"
     else:
-        kind = "update"  # yellow <-> red transition against a pushed baseline
+        kind = "update"  # only via a pushed-yellow marker the launch rule left (see Decision)
     return Decision(
         key, level, push=True, marker=_marker(level, True), kind=kind, baseline_level=base
     )
@@ -280,7 +309,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_rounds` (
   baseline_level STRING OPTIONS(description="For a follow-up, the level its baseline left in force (_effective_baseline); NULL for a baseline round."),
   sent BOOL OPTIONS(description="A push was ISSUED here. The policy decision, not delivery: a round can match zero devices."),
   kind STRING OPTIONS(description="warning | update | all_clear when sent; NULL when suppressed."),
-  reason STRING OPTIONS(description="untimely | no_change | green_baseline when suppressed; NULL when sent."),
+  reason STRING OPTIONS(description="untimely | no_change | green_baseline | yellow_baseline when suppressed; NULL when sent. yellow_baseline since 2026-09-02, when baselines went red-only."),
   decided_at TIMESTAMP OPTIONS(description="When the round was evaluated — the push time Varslingstid measures from."),
   matched_journeys INT64 OPTIONS(description="Registered journeys matched. Never served by /rushhistorikk-api."),
   matched_devices INT64 OPTIONS(description="Devices matched. Never served by /rushhistorikk-api."),
@@ -701,10 +730,12 @@ def affected_rushes(
 def rush_outlook(device_id: str, now: datetime | None = None) -> list[RushForecast]:
     """Today's rush forecasts this device is notified about, for the rushes not yet over.
 
-    Same policy as the pushes, read-only: the level shown is the newest issued forecast for the
+    Same matching as the pushes, read-only: the level shown is the newest issued forecast for the
     rush (a follow-up supersedes its baseline, as on /togmelding), the device must have a
     registration the round would have matched, and a rush whose window has ended is dropped —
-    a level nobody can still act on is noise on a page about catching trains.
+    a level nobody can still act on is noise on a page about catching trains. The push level is
+    deliberately NOT applied here: a panel showing green and yellow is information the traveller
+    asked for by opening the page, where a push at those levels is noise they did not.
 
     Two gates, both closed by default. `enabled()` is the delivery flag, so the panel appears only
     where these pushes are actually sent — the same read /varsel-api/config already surfaces as
@@ -1046,20 +1077,21 @@ async def outlook(
 
 # ---- Dev-only test trigger -----------------------------------------------------------------
 
-# The synthetic round the trigger sends: a fixed yellow warning whose reasons say TEST in plain
-# Norwegian, so a screenshot of the notification can never pass for a real forecast. Everything
-# else — wording template, environment tag, brand icon, click-through — is the REAL pipe
-# (compose_message/build_payload/push_round over the injected seams); only the round DECISION is
-# synthetic, and with it the markers, which the trigger must never read or write.
+# The synthetic round the trigger sends: a fixed RED warning — the only level a baseline pushes
+# at — whose reasons say TEST in plain Norwegian, so a screenshot of the notification can never
+# pass for a real forecast. Everything else — wording template, environment tag, brand icon,
+# click-through — is the REAL pipe (compose_message/build_payload/push_round over the injected
+# seams); only the round DECISION is synthetic, and with it the markers, which the trigger must
+# never read or write.
 _TEST_DECISION = Decision(
-    issue="0630", level="yellow", push=True, marker=_marker("yellow", True), kind="warning"
+    issue="0630", level="red", push=True, marker=_marker("red", True), kind="warning"
 )
 _TEST_ISSUE: Mapping[str, Any] = {
     "issue": "0630",
     "scope": "morgenrushet 06:30–09:00",
     "reasons": (
         "dette er et testvarsel, ikke en ekte prognose",
-        "eksempel på årsak: 2 tog er innstilt før kl. 06:30",
+        "eksempel på årsak: 6 tog er innstilt før kl. 06:30",
     ),
 }
 # What the trigger needs wired (a subset of _EVALUATE_SEAMS): the VAPID gate and push_round's

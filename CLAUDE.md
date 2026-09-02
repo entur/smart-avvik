@@ -1138,11 +1138,32 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
 
 - **Togvarsel push rounds** (`disruptions/api/togvarsel_notify.py`, 2026-08-30) deliver
   Rushvarsel's prognoses as /varsel Web Pushes. Each of the four weekday issues is one
-  notification *round*: the baselines (06:30, 12:00) push iff yellow or red; the follow-ups
-  (07:00, 14:00) push iff the level *differs* from what their baseline pushed — a level
-  transition, never a probability delta (the paired models answer different questions with
-  different calibration, so raw p is not comparable across them) — and a green follow-up after a
-  pushed warning is the one green that pushes: the friskmelding. Wording is deterministic
+  notification *round*: the baselines (06:30, 12:00) push iff **red** (`PUSH_LEVELS`; a yellow
+  baseline is recorded as suppressed with reason `yellow_baseline`, exactly as a green one is
+  `green_baseline`); the follow-ups (07:00, 14:00) push iff the level *differs* from what their
+  baseline pushed — a level transition, never a probability delta (the paired models answer
+  different questions with different calibration, so raw p is not comparable across them) — and
+  is a level a push can SAY: **a push says red or says green, never yellow.** With nothing
+  standing only a red follow-up pushes (a fresh warning); after a pushed red only a green one does
+  (the friskmelding); a yellow follow-up is `no_change` either way and the red, if any, stands —
+  the /varsel panel shows the current level meanwhile. A yellow downgrade push was considered
+  and left out: the page grades a push on the level it says, and 21 of 23 such rushes in the
+  rolling replay turned green, so it would read as a false alarm nine times in ten. `kind =
+  update` is therefore unreachable from `decide_issue` now; rows before the date carry it.
+  **Red-only since 2026-09-02** (product owner: notifications perceived as noisy). It was
+  yellow-or-red from launch, and `docs/togvarsel/04-presisjon-2026-09-02.md` is the measurement
+  behind the change: a yellow forecast (p 0.10–0.30) is calibrated at 15–23 % bad days and was
+  ~70 % of all pushes, so /rushhistorikk's Presisjon read 25–29 % on every window, in-sample and
+  rolling out-of-sample, by construction. Red-only as implemented, replayed on the same 226 OOS
+  days with the BigQuery ML re-fit of the production recipe: Presisjon ~38 % (39/104 pushes),
+  0.46 pushes a day instead of 2.0, 43 % of bad rushes warned instead of 91 % — the trade the
+  owner accepted. (The note's 47 % counted every drop below p 0.30 as a friskmelding; the
+  implemented rule retracts only at green, which the replay never reached, so 38 % is the figure
+  to expect on the page.) Two things follow. `/rushhistorikk`'s Dekning falls with it (a bad
+  rush under a yellow forecast is now a `bom`, the silence we chose), so a rate spanning the date
+  measures two policies; and `rushhistorikk.reconstruct_rounds` replays the LIVE policy, so an
+  issue with no round row before the date reconstructs red-only while recorded rounds keep what
+  they did. The /varsel «Nytt: Rushvarsel» notice says «rød», not «gul eller rød». Wording is deterministic
   Norwegian from the issue's own fields (no LLM), titled `Rushvarsel`/`Oppdatert
   rushvarsel`/`Friskmelding` so a red morning's SX push and forecast push stay tellable apart;
   entur-brand pushes click through to `/togmelding`. Delivery is gated by
@@ -1162,10 +1183,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   (0630 < 07:00, 0700 < 09:00, 1200 < 14:00, 1400 < 18:00; a late back-fill is recorded as
   suppressed and never revisited), and matching is additionally bounded by evaluation time: a
   journey whose registered window has already passed never gets the push, friskmelding included.
-  Fatigue is the known cost: yellow-or-red fires on ≈56 % of weekday mornings (measured level
-  bins), the alert-noise shape this repo has rejected before — shipped as requested, mitigated
-  (the change gate caps a rush at two pushes, reasons ride in the body, delivery starts dev-only;
-  red-only/per-user levels are the documented follow-up). Audit is structured logs (one
+  Fatigue was the known cost of the launch rule — yellow-or-red fired on ≈56 % of weekday
+  mornings (measured level bins), the alert-noise shape this repo has rejected before — shipped
+  as requested and mitigated (the change gate caps a rush at two pushes, reasons ride in the
+  body, delivery started dev-only); red-only was the documented follow-up and landed 2026-09-02
+  (above). Per-user levels remain the next lever if red still reads as noise. Audit is structured logs (one
   `togvarsel_notify_round` event per round with decision and sent/error/gone counts) +
   `disruptions.togvarsel_issued` + the persisted markers — deliberately **no `varsel_decisions`
   rows** in v1: the decision is a deterministic function of durable inputs, and adding columns to
