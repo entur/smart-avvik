@@ -153,8 +153,9 @@ class IssueRow(BaseModel):
         "Excluded from the stats table."
     )
     verdict: str = Field(
-        description="traff | traff_nesten | falsk_alarm | bom | riktig_stille | venter | ukjent | "
-        "ikke_vurdert."
+        description="traff | traff_nesten | falsk_alarm | bom | venter | ukjent | ikke_vurdert. "
+        "traff is the right class communicated, silence included: a green forecast on a green "
+        "rush is a hit."
     )
     lead_min: float | None = Field(
         description="Minutes from the push to the start of the rush it is about — positive when the "
@@ -206,17 +207,9 @@ class StatsRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     slot: str = Field(description='"total", or an issue time: 0630 | 0700 | 1200 | 1400.')
-    presisjon_samlet: float | None = Field(
-        description="traff over every scored verdict. Null on an empty denominator, never 0."
-    )
-    presisjon_varslet: float | None = Field(
-        description="traff + traff nesten over the scored issues where a warning was in force. "
-        "All-clear pushes are excluded: a friskmelding is not a warning."
-    )
-    presisjon_varslet_den: int = Field(
-        description="Issues behind that rate. Served because the population differs from "
-        "n_scored — a rate on a page whose first weeks are nearly all 'ikke vurdert' must not be "
-        "readable without its denominator."
+    presisjon: float | None = Field(
+        description="traff over every scored verdict — the right class communicated, silence "
+        "included. Null on an empty denominator, never 0. The denominator is n_scored."
     )
     dekning: float | None = Field(
         description="Share of yellow-or-red rushes we had a warning in force for. Counted per RUSH "
@@ -231,7 +224,10 @@ class StatsRow(BaseModel):
         "the total row."
     )
     varslingstid_n: int = Field(description="Pushes behind that median.")
-    avgjorelser: int = Field(description="Issues recorded in this row's window.")
+    varsler_sendt: int = Field(
+        description="Pushes issued in this row's window, friskmeldinger included: one per round that "
+        "sent, over every issue whatever became of its day. The notification-volume figure."
+    )
     n_scored: int = Field(description="Issues in the Presisjon population.")
     n_venter: int = Field(description="Outcome not settled yet.")
     n_ukjent: int = Field(description="Outcome unestablishable, or the day was ineligible.")
@@ -410,14 +406,12 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
     return [
         StatsRow(
             slot=row.slot,
-            presisjon_samlet=row.presisjon_samlet,
-            presisjon_varslet=row.presisjon_varslet,
-            presisjon_varslet_den=row.presisjon_varslet_den,
+            presisjon=row.presisjon,
             dekning=row.dekning,
             dekning_den=row.dekning_den,
             varslingstid_min=row.varslingstid_min,
             varslingstid_n=row.varslingstid_n,
-            avgjorelser=row.avgjorelser,
+            varsler_sendt=row.varsler_sendt,
             n_scored=row.counts.n_scored,
             n_venter=row.counts.n_venter,
             n_ukjent=row.counts.n_ukjent + row.counts.n_ineligible,

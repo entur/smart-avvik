@@ -581,6 +581,8 @@ Three things a clean dry run does not prove, all of which fail silently and *che
 
 ## Open Questions
 
+> **The first two were resolved on 2026-09-02, after the page shipped**, by the product owner: `traff` now means the right class was communicated, silence included — table rows 11 and 13 return `traff`, and `riktig stille` no longer exists; «Presisjon (varslet)» is removed and «Presisjon (samlet)» is plain «Presisjon» (`traff` over the scored population); and «Avgjørelser» is replaced by «Varsler sendt», the count of pushes issued — the volume figure the second question asked for. R7, R11, R15 and the tables above are kept unchanged as the dated record of what was specified; the code, `demo/rushhistorikk/README.md` and CLAUDE.md carry the current definitions.
+
 The first is the one worth a decision before U3; the rest are deferred with stated defaults.
 
 - **Presisjon (samlet) reads 0 % on a good month, and that follows from the specified definition.** "Percentage traff" with every verdict in the denominator gives 0/80 on a calm month, because `traff` requires a notification and a green rush correctly gets none — and KTD3's measurement says green is 82 % of days. It is also insensitive to the change the page exists to inform: a red-only gate converts `falsk alarm` into `riktig stille` and leaves the figure untouched. Three ways out: put `riktig stille` in the numerator and rename to «Andel riktige (samlet)»; restrict the denominator to issues where something was communicated; or keep it and label it. **Default if unanswered: keep the specified definition, pin the degenerate reading in a test (U3), and label the denominator on the page.**

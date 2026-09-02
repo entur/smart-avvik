@@ -88,13 +88,13 @@ function Count({ label, n, title }: { label: string; n: number; title: string })
  *  with the mix of the two rather than with the product. */
 /** One rate cell: the percentage over the count it is computed from.
  *
- *  The denominator is not decoration. Each of these three figures is over a DIFFERENT population,
- *  and on a page whose first weeks are almost entirely «ikke vurdert» a bare percentage invites the
- *  one reading that is wrong — 100 % over two bad rushes and 100 % over two hundred are the same
- *  glyph. Varslingstid already showed its own; these did not.
+ *  The denominator is not decoration. The two rates are over DIFFERENT populations, and on a page
+ *  whose first weeks are almost entirely «ikke vurdert» a bare percentage invites the one reading
+ *  that is wrong — 100 % over two bad rushes and 100 % over two hundred are the same glyph.
+ *  Varslingstid already showed its own; these did not.
  *
- *  Varslingstid and Avgjørelser stay inline — one carries a differently-worded child, the other no
- *  tooltip, so folding them in would take a flag per difference. */
+ *  Varslingstid and Varsler sendt stay inline — one carries a differently-worded child, the other
+ *  is a count rather than a rate, so folding them in would take a flag per difference. */
 function RateCell({
   value,
   den,
@@ -127,11 +127,10 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
           <thead>
             <tr>
               <th scope="col">Tidspunkt</th>
-              <th scope="col">Presisjon (samlet)</th>
-              <th scope="col">Presisjon (varslet)</th>
+              <th scope="col">Presisjon</th>
               <th scope="col">Dekning</th>
               <th scope="col">Varslingstid</th>
-              <th scope="col">Avgjørelser</th>
+              <th scope="col">Varsler sendt</th>
               <th scope="col">
                 Treffmatrise <span className="rh-population">meldt ↓ / ble →</span>
               </th>
@@ -140,9 +139,9 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
           <tbody>
             {stats.map((row) => (
               <tr key={row.slot} className={row.slot === 'total' ? 'rh-row-total' : ''}>
-                {/* Each row states the population its Presisjon figures are over — three of the
-                    five figures use different denominators, and a reader who assumes one across
-                    the row reads the page wrong. */}
+                {/* Each row states the population its Presisjon figure is over — the two rates use
+                    different denominators, and a reader who assumes one across the row reads the
+                    page wrong. */}
                 {/* A real row header, so a screen reader announces which slot each figure belongs
                     to. `.rh-row-label` undoes .rh-table th's uppercase/nowrap, which is what makes
                     a th usable here at all. */}
@@ -157,16 +156,10 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
                   </span>
                 </th>
                 <RateCell
-                  value={row.presisjon_samlet}
+                  value={row.presisjon}
                   den={row.n_scored}
                   unit="vurdert"
-                  title="Andel av de vurderte utstedelsene med utfallet «Traff»."
-                />
-                <RateCell
-                  value={row.presisjon_varslet}
-                  den={row.presisjon_varslet_den}
-                  unit="varslet"
-                  title="«Traff» + «Traff nesten» blant de vurderte utstedelsene der et varsel sto i kraft. Friskmeldinger er holdt utenfor — en friskmelding er ikke et varsel."
+                  title="Andel av de vurderte utstedelsene med utfallet «Traff»: riktig nivå meldt, eller ingenting meldt og rushet ble grønt."
                 />
                 <RateCell
                   value={row.dekning}
@@ -181,7 +174,12 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
                   {fmtLead(row.varslingstid_min)}{' '}
                   <span className="rh-population">({row.varslingstid_n} varsler)</span>
                 </td>
-                <td className="rh-num">{row.avgjorelser}</td>
+                <td
+                  className="rh-num"
+                  title="Antall push som gikk ut i vinduet, friskmeldinger medregnet. Én per runde, uansett hvor mange enheter den nådde — og uavklarte dager er med: en push er sendt uansett hva dagen ble."
+                >
+                  {row.varsler_sendt}
+                </td>
                 <td>
                   <ConfusionMatrix rows={row.matrix} />
                 </td>
@@ -202,9 +200,9 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
       </p>
 
       <SubParagraph className="rh-population">
-        Presisjon-tallene gjelder avklarte, kvalifiserte dager. Dekning bruker et videre grunnlag:
-        sene utstedelser og runder utenfor frist er tatt med, fordi varselet nådde den reisende
-        likevel.
+        Presisjon gjelder avklarte, kvalifiserte dager. Dekning bruker et videre grunnlag: sene
+        utstedelser og runder utenfor frist er tatt med, fordi varselet nådde den reisende likevel.
+        «Varsler sendt» teller alle push i vinduet, uavklarte dager medregnet.
       </SubParagraph>
 
       {/* What the rates above leave out, from the total row. Counted rather than hidden: a rate over
@@ -219,7 +217,7 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
           <Count
             label="Ukjent"
             n={total.n_ukjent}
-            title="Fasit kan ikke lenger fastslås, eller dagen er ikke kvalifisert. Ikke regnet som «riktig stille»."
+            title="Fasit kan ikke lenger fastslås, eller dagen er ikke kvalifisert. Ikke regnet som «traff»."
           />
           <Count
             label="Ikke vurdert"

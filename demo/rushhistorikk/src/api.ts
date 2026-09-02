@@ -19,14 +19,14 @@ export type StatSlot = 'total' | IssueSlot;
 /** Which rush an issue is about. Two issues per rush. */
 export type Rush = 'am' | 'pm';
 
-/** The verdict taxonomy, mirrored from rushvarsel_verdicts.VERDICTS. The last three are not
- *  outcomes at all — they say why there is none — and must never render as one. */
+/** The verdict taxonomy, mirrored from rushhistorikk_verdicts.VERDICTS. `traff` is the right class
+ *  communicated, silence included — a green forecast on a green rush is a hit. The last three are
+ *  not outcomes at all — they say why there is none — and must never render as one. */
 export type Verdict =
   | 'traff'
   | 'traff_nesten'
   | 'falsk_alarm'
   | 'bom'
-  | 'riktig_stille'
   | 'venter'
   | 'ukjent'
   | 'ikke_vurdert';
@@ -109,19 +109,14 @@ export interface MatrixRow {
 
 /** One row of «Slik har varslene truffet»: the total, or one issue slot.
  *
- *  The three rates are over three DIFFERENT populations — Presisjon over the scored issues,
- *  Presisjon (varslet) over the scored issues where a warning was in force, Dekning over a wider
- *  one that keeps the late and untimely rounds — which is why each figure carries its own count
- *  and the page states the population rather than leaving one denominator to be assumed. */
+ *  The two rates are over DIFFERENT populations — Presisjon over the scored issues (`n_scored`),
+ *  Dekning over a wider one that keeps the late and untimely rounds — which is why each carries its
+ *  own count and the page states the population rather than leaving one denominator to be assumed. */
 export interface StatsRow {
   slot: StatSlot;
-  /** traff over every scored verdict. Null on an empty denominator, never 0 (R17). */
-  presisjon_samlet: number | null;
-  /** traff + traff nesten over the scored issues where a warning was in force. All-clear pushes
-   *  are excluded: a friskmelding is not a warning. */
-  presisjon_varslet: number | null;
-  /** Issues behind that rate — its own population, so the figure is never readable without it. */
-  presisjon_varslet_den: number;
+  /** traff over every scored verdict — the right class communicated, silence included. Null on an
+   *  empty denominator, never 0 (R17). The denominator is `n_scored`. */
+  presisjon: number | null;
   /** Share of yellow-or-red rushes we had a warning in force for. Counted per RUSH on the total
    *  row, because a confirming follow-up is covered only via its baseline. */
   dekning: number | null;
@@ -131,7 +126,9 @@ export interface StatsRow {
   /** Median minutes from the push to the rush's start. The last push per rush on the total row. */
   varslingstid_min: number | null;
   varslingstid_n: number;
-  avgjorelser: number;
+  /** Pushes issued in the window, friskmeldinger included — one per round that sent, over every
+   *  issue, unsettled days included. The notification-volume figure. */
+  varsler_sendt: number;
   n_scored: number;
   n_venter: number;
   /** Outcome unestablishable, or the day was ineligible. */

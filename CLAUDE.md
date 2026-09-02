@@ -1252,17 +1252,18 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - **Three populations, because the figures are not over the same rows.** `scored` (record present,
     day eligible, outcome settled and resolvable, forecast not late, round not untimely) is
     Presisjon's and the matrix's; `delivered` is the same with late and untimely INCLUDED and is
-    Dekning's; `recorded` is every issue and is Avgjørelser's. That split is what keeps a **late**
+    Dekning's; `recorded` is every issue, and is what `Varsler sendt` counts pushes across — a push
+    on a day that never settled still reached a phone. That split is what keeps a **late**
     forecast out of Presisjon (it saw post-cutoff reality — `03-implementasjon.md` says such
     forecasts "skal utelates fra etterprøving av treffsikkerhet") while keeping it in Dekning, since
     a rush nobody was warned about is a coverage miss whatever contaminated the forecast; dropping it
     from both halves of that ratio would hide exactly the misses. **`late` and `untimely` are
     independent**, and the shortcut that a late forecast never pushed is FALSE: `late` is
     `now > due + 10 min` while `untimely` is `now >= deadline`, and the gap is 30 min for 0630, 120
-    for 0700 and 1200, and 240 for 1400. An all-clear push leaves Presisjon (varslet) and Dekning's
-    numerator too — a friskmelding is not a warning, and counting a correct one as a correct warning
-    lets 20 right friskmeldinger plus 20 wrong red warnings read 50 %. Dekning's total row counts
-    **rushes, not issues**, because a confirming follow-up is covered only via its baseline.
+    for 0700 and 1200, and 240 for 1400. An all-clear push leaves Dekning's numerator too — it
+    RETRACTS a warning rather than issuing one, so a wrong friskmelding must not read as having
+    covered a red rush. Dekning's total row counts **rushes, not issues**, because a confirming
+    follow-up is covered only via its baseline.
   - **The outcomes pivot is `LOGICAL_OR(scope = 'x' AND settled)`, never `LOGICAL_AND` over an `IF`
     whose else-branch is TRUE.** That second form reports a scope as settled when the day has no row
     for it at all — the else-branch answers TRUE for every *other* scope's row and the AND passes —
@@ -1316,17 +1317,24 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     **The prerequisite is not optional:** both new tables must EXIST in the project, because a dry
     run resolves table references and both are created from Python at startup, so a validation run
     against an environment the app has never started in reports FAILED and the files go unvalidated.
-  - **`presisjon_samlet` reads 0 % on a good month, by construction and by specification.**
-    "Percentage traff" over every scored verdict gives 0/80 on a calm month, because `traff`
-    requires a notification and a correctly-green rush gets none — and green is 82 % of days. It is
-    also insensitive to the change the page exists to inform: a red-only gate converts `falsk alarm`
-    into `riktig stille` and leaves the figure untouched. The specified definition is kept and the
-    degenerate reading is pinned in a test; the three ways out (add `riktig stille` to the numerator
-    and rename to «Andel riktige»; restrict the denominator to issues where something was
-    communicated; or keep and label it) are the plan's first Open Question. Also open: no figure
-    measures notification VOLUME, which is what the fatigue problem is actually about — `Avgjørelser`
-    is four per weekday whether or not anything was sent, and `togvarsel_rounds.sent` is one column
-    away from a «Varslingsrate».
+  - **`traff` means the right CLASS was communicated, silence included, and `Presisjon` is `traff`
+    over everything scored** (2026-09-02). A green forecast on a green rush is a hit. Until then it
+    was its own verdict, `riktig stille`, outside Presisjon's numerator — and since green is 82 % of
+    days, «Presisjon (samlet)» read 0 % on a good month by construction, the plan's first Open
+    Question. The product owner's answer folded the verdict into `traff` (table rows 11 and 13),
+    dropped «Presisjon (varslet)» and its all-clear exclusion (which retired `is_all_clear`; the
+    all-clear rule survives only in Dekning's `warned`), renamed «Presisjon (samlet)» to plain
+    «Presisjon», and replaced «Avgjørelser» — four per weekday whether or not anything was sent —
+    with **«Varsler sendt»**: pushes issued in the window, friskmeldinger included, one per round,
+    over the RECORDED population so a push on an unsettled or ineligible day still counts. That is
+    the notification-VOLUME figure the second Open Question asked for. Two things to keep straight.
+    Presisjon is **not** the matrix's diagonal over its total, though it reads like it: the matrix
+    plots the issue's own FORECAST level (R16) while `traff` is graded on what was COMMUNICATED, so
+    a confirming follow-up whose own red sits over a standing yellow is `traff` on a yellow rush and
+    lands in the red row. And `riktig_stille` is gone from `VERDICTS`, `format.ts` and the badge
+    variants alike; `test_rushhistorikk` now checks the front-end's label KEYS against the module's,
+    not only that each module label is present, so a chip nothing can ever show cannot linger. API
+    fields: `presisjon`, `varsler_sendt`.
 
 ## Conventions
 

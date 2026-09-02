@@ -65,9 +65,9 @@ def _issue(**overrides) -> rv.Issue:
 # |  8 | present | yes      | known        | no   | yellow or red | yes      | grade B vs A   |
 # |  9 | present | yes      | green        | no   | green         | yes      | bom            |
 # | 10 | present | yes      | yel. or red  | no   | green         | yes      | bom            |
-# | 11 | present | yes      | green        | no   | green         | no       | riktig stille  |
+# | 11 | present | yes      | green        | no   | green         | no       | traff          |
 # | 12 | present | yes      | yel. or red  | no   | green         | no       | bom            |
-# | 13 | present | yes      | green        | no   | yellow or red | no       | riktig stille  |
+# | 13 | present | yes      | green        | no   | yellow or red | no       | traff          |
 # | 14 | present | yes      | yel. or red  | no   | yellow or red | no       | bom            |
 
 
@@ -126,7 +126,7 @@ def test_row_6_an_all_clear_on_a_green_rush_is_traff():
 
 def test_row_7_an_all_clear_on_a_rush_that_was_not_green_is_falsk_alarm():
     """Row 7. We told the traveller it was over and it was not. The wrong direction of error, and
-    the reason an all-clear is kept out of Presisjon (varslet) rather than counted as a warning."""
+    the reason an all-clear is never coverage: it retracts a warning rather than issuing one."""
     for actual in ("yellow", "red"):
         issue = _issue(issue="1400", sent=True, kind="all_clear", level="green",
                        baseline_level="red", actual=actual)
@@ -166,11 +166,13 @@ def test_row_10_an_owed_friskmelding_that_never_went_out_is_bom_on_a_bad_rush():
         assert rv.classify(issue) == rv.BOM, actual
 
 
-def test_row_11_green_forecast_green_rush_and_nothing_standing_is_riktig_stille():
+def test_row_11_green_forecast_green_rush_and_nothing_standing_is_traff():
     """Row 11. Nothing was communicated and nothing was warranted — the ordinary calm weekday, and
-    82 % of days by KTD3's measurement."""
+    82 % of days by KTD3's measurement. `traff`: the right class, silence included. It was its own
+    verdict, `riktig stille`, until 2026-09-02, which kept the one verdict a calm month produces out
+    of Presisjon's numerator and read the figure as 0 % on a good month."""
     issue = _issue(sent=False, reason="green_baseline", level="green", actual="green")
-    assert rv.classify(issue) == rv.RIKTIG_STILLE
+    assert rv.classify(issue) == rv.TRAFF
 
 
 def test_row_12_green_forecast_on_a_bad_rush_is_bom():
@@ -181,13 +183,14 @@ def test_row_12_green_forecast_on_a_bad_rush_is_bom():
         assert rv.classify(issue) == rv.BOM, actual
 
 
-def test_row_13_a_suppressed_warning_on_a_green_rush_is_riktig_stille():
+def test_row_13_a_suppressed_warning_on_a_green_rush_is_traff():
     """Row 13. The forecast said yellow or red, nothing reached the traveller and nothing needed
     to. Graded on what was communicated (nothing) rather than on the forecast — silence was right,
-    whatever suppressed it."""
+    whatever suppressed it — so the same `traff` as row 11, never a `falsk alarm` on a warning
+    nobody received."""
     for level in ("yellow", "red"):
         issue = _issue(issue="1400", sent=False, reason="untimely", level=level, actual="green")
-        assert rv.classify(issue) == rv.RIKTIG_STILLE, level
+        assert rv.classify(issue) == rv.TRAFF, level
 
 
 def test_row_14_a_suppressed_warning_on_a_bad_rush_is_bom():
@@ -342,24 +345,26 @@ def test_the_labels_cover_every_verdict():
     assert rv.VERDICT_LABEL[rv.TRAFF_NESTEN] == "Traff nesten"
     assert rv.VERDICT_LABEL[rv.FALSK_ALARM] == "Falsk alarm"
     assert rv.VERDICT_LABEL[rv.BOM] == "Bom"
-    assert rv.VERDICT_LABEL[rv.RIKTIG_STILLE] == "Riktig stille"
     assert rv.VERDICT_LABEL[rv.VENTER] == "Venter"
     assert rv.VERDICT_LABEL[rv.UKJENT] == "Ukjent"
     assert rv.VERDICT_LABEL[rv.IKKE_VURDERT] == "Ikke vurdert"
+    # Folded into traff on 2026-09-02. Reintroducing it takes Presisjon back to 0 % on a calm month,
+    # so it has to be deliberate rather than a leftover that crept back.
+    assert "riktig_stille" not in rv.VERDICTS and not hasattr(rv, "RIKTIG_STILLE")
 
 
 # ---- The metrics ------------------------------------------------------------------------
 
 
 def test_no_round_record_enters_no_denominator():
-    """Row 1 is in Avgjørelser and in nothing else: defaulting those to bom would manufacture
-    failures out of a deployment setting, and counting them anywhere else would too."""
-    stats = rv.summarize([_issue(recorded=False, level="red", actual="red", sent=True)])
+    """Row 1 is counted and enters nothing else: defaulting those to bom would manufacture failures
+    out of a deployment setting, and counting them in any rate would too. Nothing is sent without a
+    round, so Varsler sendt is zero here by construction rather than by a rule."""
+    stats = rv.summarize([_issue(recorded=False, level="red", actual="red")])
     row = stats.total
-    assert row.avgjorelser == 1
-    assert row.counts.n_ikke_vurdert == 1
-    assert row.presisjon_samlet is None and row.presisjon_samlet_den == 0
-    assert row.presisjon_varslet is None and row.presisjon_varslet_den == 0
+    assert row.counts.n == 1 and row.counts.n_ikke_vurdert == 1
+    assert row.varsler_sendt == 0
+    assert row.presisjon is None and row.presisjon_den == 0
     assert row.dekning is None and row.dekning_den == 0
     assert row.varslingstid_min is None and row.varslingstid_n == 0
 
@@ -373,9 +378,10 @@ def test_a_late_forecast_leaves_presisjon_and_stays_in_dekning():
     row = rv.summarize([issue]).total
     assert rv.classify(issue) == rv.TRAFF  # it still carries a verdict, and the page shows it
     assert row.counts.n_late == 1 and row.counts.n_scored == 0
-    assert row.presisjon_samlet is None and row.presisjon_varslet is None
+    assert row.presisjon is None
     assert row.dekning == 1.0 and row.dekning_den == 1 and row.dekning_num == 1
     assert row.matrix["yellow"]["yellow"] == 0  # the matrix is the scored population
+    assert row.varsler_sendt == 1  # the push went out, late or not
 
 
 def test_an_untimely_round_leaves_presisjon_and_stays_in_dekning():
@@ -385,8 +391,9 @@ def test_an_untimely_round_leaves_presisjon_and_stays_in_dekning():
     row = rv.summarize([issue]).total
     assert rv.classify(issue) == rv.BOM
     assert row.counts.n_untimely == 1 and row.counts.n_scored == 0
-    assert row.presisjon_samlet is None and row.presisjon_varslet is None
+    assert row.presisjon is None
     assert row.dekning == 0.0 and row.dekning_den == 1 and row.dekning_num == 0
+    assert row.varsler_sendt == 0  # an untimely round never pushes
 
 
 def test_an_ineligible_day_is_excluded_from_everything():
@@ -395,22 +402,23 @@ def test_an_ineligible_day_is_excluded_from_everything():
     issue = _issue(eligible=False, sent=True, level="red", actual="red", decided_at=_at(6, 31))
     row = rv.summarize([issue]).total
     assert row.counts.n_ineligible == 1
-    assert row.presisjon_samlet is None and row.presisjon_varslet is None
+    assert row.presisjon is None
     assert row.dekning is None and row.dekning_den == 0
     assert row.varslingstid_min is None and row.varslingstid_n == 0
-    assert row.avgjorelser == 1  # still a decision that was taken
+    assert row.varsler_sendt == 1  # the push still went out; the day's share is what means nothing
 
 
-def test_a_correct_all_clear_is_not_a_correct_warning():
-    """The exclusion that is easiest to get backwards. A right friskmelding is traff and belongs
-    in Presisjon (samlet), but it is not a warning — counting it as one would let a month of 20
-    right friskmeldinger and 20 wrong red warnings read 50 %."""
+def test_a_correct_all_clear_is_traff_and_a_sent_notification_but_not_coverage():
+    """A right friskmelding is the right class communicated, so it is traff and in Presisjon, and
+    it is a push, so it is in Varsler sendt — but it is not a warning, so the green rush it announced
+    is not a bad rush it covered: Dekning has nothing to count."""
     all_clear = _issue(issue="0700", sent=True, kind="all_clear", level="green",
-                       baseline_level="yellow", actual="green")
+                       baseline_level="yellow", actual="green", decided_at=_at(7, 1))
     row = rv.summarize([all_clear]).total
     assert rv.classify(all_clear) == rv.TRAFF
-    assert row.presisjon_samlet == 1.0 and row.presisjon_samlet_den == 1
-    assert row.presisjon_varslet is None and row.presisjon_varslet_den == 0
+    assert row.presisjon == 1.0 and row.presisjon_den == 1
+    assert row.varsler_sendt == 1
+    assert row.dekning is None and row.dekning_den == 0
 
 
 def test_a_wrong_all_clear_does_not_cover_a_bad_rush():
@@ -421,8 +429,7 @@ def test_a_wrong_all_clear_does_not_cover_a_bad_rush():
     row = rv.summarize([all_clear]).total
     assert rv.classify(all_clear) == rv.FALSK_ALARM
     assert row.dekning == 0.0 and row.dekning_den == 1 and row.dekning_num == 0
-    assert row.presisjon_varslet is None  # and it is not a warning here either
-    assert row.presisjon_samlet == 0.0
+    assert row.presisjon == 0.0
 
 
 def test_dekning_counts_a_rush_once_on_the_total_row():
@@ -448,31 +455,30 @@ def test_dekning_counts_a_rush_once_on_the_total_row():
     assert rv.summarize([baseline, follow_up, tomorrow]).total.dekning_den == 2
 
 
-def test_presisjon_samlet_reads_zero_on_a_window_of_only_riktig_stille():
-    """The degenerate reading the plan's Open Questions flags, pinned so it cannot change
-    silently. traff requires a NOTIFICATION, and a green rush correctly gets none — so a calm
-    month reads 0 % over a non-empty denominator. The default is to keep the specified definition
-    and label the denominator on the page; if that is ever revisited, this test is the record of
-    what the figure used to mean."""
+def test_a_calm_window_reads_a_full_presisjon_and_no_pushes():
+    """The reading the 2026-09-02 redefinition exists for. Four green forecasts on a green day are
+    four right calls, so Presisjon is 100 % over a denominator of four — and nothing was pushed, so
+    Varsler sendt is 0. Until then these were `riktig stille`, outside traff, and the same day read
+    0 % over the same four: a calm month scored as a total failure, by construction."""
     calm = [
         _issue(d=DAY, issue=slot, sent=False, reason="green_baseline", level="green",
                actual="green")
         for slot in rv.SLOTS
     ]
     row = rv.summarize(calm).total
-    assert all(rv.classify(i) == rv.RIKTIG_STILLE for i in calm)
-    assert row.presisjon_samlet == 0.0
-    assert row.presisjon_samlet_den == 4  # non-empty: 0 %, not "no data"
-    assert row.presisjon_varslet is None  # nothing was communicated, so nothing to be right about
+    assert all(rv.classify(i) == rv.TRAFF for i in calm)
+    assert row.presisjon == 1.0 and row.presisjon_den == 4
+    assert row.varsler_sendt == 0
+    assert row.dekning is None  # no bad rush to cover, so nothing to be covered
 
 
 def test_every_rate_is_none_on_an_empty_denominator():
     """R17. A rate whose denominator is empty is null and renders as an en dash, never 0 % —
     counts default to 0 and the nine matrix cells exist and are zero."""
     for row in rv.summarize([]).rows:
-        assert row.presisjon_samlet is None and row.presisjon_varslet is None
+        assert row.presisjon is None
         assert row.dekning is None and row.varslingstid_min is None
-        assert row.avgjorelser == 0 and row.counts.n == 0
+        assert row.varsler_sendt == 0 and row.counts.n == 0
         assert set(row.matrix) == set(rv.LEVELS)
         assert all(set(cells) == set(rv.LEVELS) for cells in row.matrix.values())
         assert sum(sum(cells.values()) for cells in row.matrix.values()) == 0
@@ -498,18 +504,27 @@ def test_the_confusion_matrix_is_forecast_against_realized_over_scored_issues():
     assert per_slot["0630"].matrix["red"]["yellow"] == 1
 
 
-def test_avgjorelser_counts_every_issue_in_the_window():
-    """The recorded population: every issue, whatever became of it. Four per weekday whether or
-    not anything was sent, which is exactly why it is not a notification-volume figure."""
+def test_varsler_sendt_counts_the_pushes_and_nothing_else():
+    """The notification-volume figure: one per round that pushed, friskmeldinger included, over
+    every issue in the window — a push on a day that never settled still reached a phone. Not four
+    per weekday, which is what `Avgjørelser` was until 2026-09-02, and what made it useless for the
+    fatigue question the page exists to inform."""
     issues = [
-        _issue(issue="0630", recorded=False),
-        _issue(issue="0700", eligible=False),
-        _issue(issue="1200", outcome=rv.OUTCOME_PENDING),
-        _issue(issue="1400", sent=True, level="red", actual="red", decided_at=_at(14, 5)),
+        _issue(issue="0630", sent=True, level="yellow", actual="yellow", decided_at=_at(6, 31)),
+        # the confirming follow-up: warned, but nothing was sent
+        _issue(issue="0700", sent=False, reason="no_change", level="yellow",
+               baseline_level="yellow", actual="yellow"),
+        # pushed, and the day has not settled: still a push
+        _issue(issue="1200", sent=True, level="red", actual=None, outcome=rv.OUTCOME_PENDING,
+               decided_at=_at(12, 1)),
+        # a friskmelding is a notification too
+        _issue(issue="1400", sent=True, kind="all_clear", level="green", baseline_level="red",
+               actual="green", decided_at=_at(14, 1)),
     ]
     stats = rv.summarize(issues)
-    assert stats.total.avgjorelser == 4
-    assert [row.avgjorelser for row in stats.slots] == [1, 1, 1, 1]
+    assert stats.total.varsler_sendt == 3
+    assert [row.varsler_sendt for row in stats.slots] == [1, 0, 1, 1]
+    assert stats.total.counts.n == 4  # the recorded population is still every issue
 
 
 # ---- Varslingstid -----------------------------------------------------------------------

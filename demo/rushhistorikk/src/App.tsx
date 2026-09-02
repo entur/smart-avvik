@@ -117,7 +117,10 @@ export default function App() {
           <li>
             Et foreløpig utfall («foreløpig») er dagens egen lesning og kan endre seg over natten.
           </li>
-          <li>Tabellen «Slik har varslene truffet» dekker bare avklarte dager.</li>
+          <li>
+            Ratene i «Slik har varslene truffet» dekker bare avklarte dager. «Varsler sendt» teller
+            alle push i vinduet, uavklarte dager medregnet.
+          </li>
         </ul>
       </header>
 
