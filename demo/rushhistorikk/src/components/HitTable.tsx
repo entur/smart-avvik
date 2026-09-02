@@ -108,7 +108,7 @@ function RateCell({
 }) {
   return (
     <td className="rh-num" title={title}>
-      {fmtPct(value)}
+      {fmtPct(value)}{' '}
       <span className="rh-population">
         ({den} {unit})
       </span>
@@ -176,9 +176,15 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
                 </td>
                 <td
                   className="rh-num"
-                  title="Antall push som gikk ut i vinduet, friskmeldinger medregnet. Én per runde, uansett hvor mange enheter den nådde — og uavklarte dager er med: en push er sendt uansett hva dagen ble."
+                  title="Antall push som gikk ut i vinduet, friskmeldinger medregnet. Én per runde, uansett hvor mange enheter den nådde — og uavklarte dager er med: en push er sendt uansett hva dagen ble. Tallet i parentes er push rekonstruerte runder ville ha sendt; de gikk aldri ut."
                 >
                   {row.varsler_sendt}
+                  {row.varsler_rekonstruert > 0 ? (
+                    <>
+                      {' '}
+                      <span className="rh-population">(+{row.varsler_rekonstruert} rekonstruert)</span>
+                    </>
+                  ) : null}
                 </td>
                 <td>
                   <ConfusionMatrix rows={row.matrix} />
@@ -220,16 +226,22 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
             title="Fasit kan ikke lenger fastslås, eller dagen er ikke kvalifisert. Ikke regnet som «traff»."
           />
           <Count
-            label="Ikke vurdert"
-            n={total.n_ikke_vurdert - total.n_ikke_vurdert_etter_start}
-            title="Ingen varselrunde ble vurdert, og dagen er eldre enn runde-loggen: den forventede etterslepet fra før siden fantes."
+            label="Rekonstruert"
+            n={total.n_reconstructed}
+            title="Runder uten registrering, rekonstruert fra prognoseloggen: det regelverket ville ha avgjort med varsling på og i tide. De teller i ratene over – siden skal bedømme modellen – men ikke i «Varsler sendt»."
           />
-          {/* Its own chip, because the two causes are not the same news. Inside the backlog count
-              a lost write is invisible during exactly the weeks the backlog is large. */}
+          {/* Its own chip, because the two causes of a reconstruction are not the same news. Inside
+              the backlog count a lost write is invisible during exactly the weeks the backlog is
+              large. */}
           <Count
             label="Mangler runde"
-            n={total.n_ikke_vurdert_etter_start}
-            title="Ingen varselrunde ble vurdert selv om runde-loggen dekket dagen: varslingen var slått av i dette miljøet, eller skrivingen av runden feilet."
+            n={total.n_reconstructed_after_start}
+            title="Rekonstruert selv om runde-loggen dekket dagen: varslingen var slått av i dette miljøet, eller skrivingen av runden feilet."
+          />
+          <Count
+            label="Ikke vurdert"
+            n={total.n_ikke_vurdert}
+            title="Ingen varselrunde ble registrert, og den kunne heller ikke rekonstrueres (prognosen mangler tidsstempel, eller regelverket avviste raden)."
           />
           <Count
             label="Sen utstedelse"
