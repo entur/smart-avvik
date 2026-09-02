@@ -606,9 +606,9 @@ def test_a_round_nobody_recorded_is_reconstructed_from_the_forecast_log():
     forecast's own computed_at, baseline before follow-up, so the 0700 reads the 0630's marker.
     Every such issue is flagged, counted, and never a sent push."""
     _reset([
-        _row(issue="0630", forecast_level="yellow", am_level="yellow",
+        _row(issue="0630", forecast_level="red", am_level="red", am_trouble10=0.22,
              computed_at=datetime(2026, 8, 31, 4, 30, tzinfo=UTC), **_UNRECORDED),
-        _row(issue="0700", forecast_level="yellow", amrest_level="yellow",
+        _row(issue="0700", forecast_level="red", amrest_level="red", amrest_trouble10=0.21,
              computed_at=datetime(2026, 8, 31, 5, 0, tzinfo=UTC), **_UNRECORDED),
         _row(issue="1200", forecast_level="green", pm_level="red", pm_trouble10=0.4,
              computed_at=datetime(2026, 8, 31, 10, 0, tzinfo=UTC), **_UNRECORDED),
@@ -622,7 +622,7 @@ def test_a_round_nobody_recorded_is_reconstructed_from_the_forecast_log():
     assert (a["sent"], a["kind"], a["verdict"]) == (True, "warning", "traff")
     # the follow-up confirms a reconstructed baseline it never saw recorded
     assert (b["sent"], b["reason"], b["baseline_level"], b["verdict"]) == (
-        False, "no_change", "yellow", "traff"
+        False, "no_change", "red", "traff"
     )
     assert (c["sent"], c["reason"], c["verdict"]) == (False, "green_baseline", "bom")
     assert (d["sent"], d["kind"], d["baseline_level"], d["verdict"]) == (
@@ -644,15 +644,38 @@ def test_a_round_nobody_recorded_is_reconstructed_from_the_forecast_log():
     assert total["varsler_sendt"] == 0 and total["varsler_rekonstruert"] == 2
 
 
+def test_a_reconstructed_yellow_baseline_is_held_back_and_graded_as_silence():
+    """The replay follows the LIVE policy, red-only included: a yellow 0630 with no round row
+    reconstructs as the suppression it would have been, so a bad morning under it is a `bom` and a
+    calm one a `traff` — never a push, and never in Presisjon. Rows before 2026-09-02 that a
+    yellow-or-red round DID push keep their record; only the unrecorded ones replay this way."""
+    _reset([
+        _row(issue="0630", forecast_level="yellow", am_level="yellow",
+             computed_at=datetime(2026, 8, 31, 4, 30, tzinfo=UTC), **_UNRECORDED),
+        _row(issue="0700", forecast_level="yellow", amrest_level="yellow",
+             computed_at=datetime(2026, 8, 31, 5, 0, tzinfo=UTC), **_UNRECORDED),
+    ])
+    body = _days().json()
+    issues = {i["issue"]: i for i in body["days"][0]["issues"]}
+    a, b = issues["0630"], issues["0700"]
+    assert (a["sent"], a["reason"], a["verdict"]) == (False, "yellow_baseline", "bom")
+    assert (b["sent"], b["reason"], b["baseline_level"], b["verdict"]) == (
+        False, "no_change", "green", "bom"
+    )
+    total = body["stats"][0]
+    assert total["presisjon_den"] == 0 and total["varsler_rekonstruert"] == 0
+    assert total["dekning"] == 0.0 and total["dekning_den"] == 1  # one rush, owed, never warned
+
+
 def test_a_recorded_round_is_never_overridden_by_the_reconstruction():
     """The real record wins wherever it exists; the replay fills gaps only. The recorded 0630 here
     was suppressed `untimely` — a fact about the poller's clock the replay cannot know, since the
     forecast itself was on time — and the missing 0700 is reconstructed against ITS marker: an
-    unpushed baseline, so the yellow follow-up is a fresh warning rather than a confirmation."""
+    unpushed baseline, so the red follow-up is a fresh warning rather than a confirmation."""
     _reset([
-        _row(issue="0630", sent=False, kind=None, reason="untimely", round_level="yellow",
+        _row(issue="0630", sent=False, kind=None, reason="untimely", round_level="red",
              decided_at=datetime(2026, 8, 31, 5, 2, tzinfo=UTC)),
-        _row(issue="0700", forecast_level="yellow", amrest_level="yellow",
+        _row(issue="0700", forecast_level="red", amrest_level="red", amrest_trouble10=0.21,
              computed_at=datetime(2026, 8, 31, 5, 0, tzinfo=UTC), **_UNRECORDED),
     ])
     issues = {i["issue"]: i for i in _days().json()["days"][0]["issues"]}

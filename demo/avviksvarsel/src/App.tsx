@@ -412,8 +412,8 @@ export default function App({ brand }: { brand: Brand }) {
             {config?.togvarsel_notify && (
               <SmallAlertBox variant="information" title="Nytt: Rushvarsel" width="fluid">
                 Varslene omfatter nå også togtrafikken i rushtiden: på hverdager får du beskjed
-                når prognosen for morgen- eller ettermiddagsrushet i Oslo-området er gul eller
-                rød og en av de registrerte reisene dine kan bli berørt.
+                når prognosen for morgen- eller ettermiddagsrushet i Oslo-området er rød og en av
+                de registrerte reisene dine kan bli berørt.
                 {brand.id === 'entur' && (
                   <>
                     {' '}
