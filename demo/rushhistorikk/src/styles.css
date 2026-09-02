@@ -171,38 +171,81 @@ body {
 
 /* ---- the 3x3 confusion matrix ------------------------------------------------------------- */
 
-/* Forecast down, realized across, both axes labelled: a matrix whose orientation is implicit gets
-   read backwards. Each cell prints its COUNT as text inside the tint — colour marks the direction
-   of the miss, the number carries the magnitude, and without it the two structurally different
-   misses (forecast red / realized yellow vs forecast yellow / realized red) render identically and
-   the matrix stops being a confusion matrix at all. */
+/* Forecast down, realized across, and the LEVELS painted into the cells: a hit cell is one colour,
+   a miss is split along the diagonal — lower-left half the level we communicated («meldt», the
+   row), upper-right half the level the rush became («ble», the column). This replaced text axis
+   labels and hit/near/far verdict tints on 2026-09-02: the verdict tints borrowed the level hues,
+   so a «far» miss tinted red read as "a red rush", and the axis text («grø / gul / rød») cost more
+   width than the cells it labelled. Now the colour IS the level, and each half sits nearest the
+   axis the header names (meldt ↓ down the left, ble → across the top), which is what makes the
+   orientation learnable without labels. The count stays: colour says WHICH two levels met, the
+   number how often — and the two structurally different misses (meldt red / ble yellow against
+   meldt yellow / ble red) are the same two colours in swapped halves, which only the seam
+   direction tells apart.
+
+   The two colours ride on custom properties set by `.rh-cell--meldt-*` / `.rh-cell--ble-*`, so the
+   painting is defined once. They are Linje's `--fill-*-tint` step, one step STRONGER than the
+   `--fill-*-muted` the level chips use: on a 24 px cell two muted fills (mint-20 beside canary-20)
+   do not separate across a diagonal, while the -30 tints do and still take the page's dark ink at
+   7:1 or better. Same hue family as the chips, so the two surfaces still agree about what red looks
+   like. A 1 px white seam — the card is white — keeps the halves apart where two pale tints meet.
+
+   A zero cell is FADED, not greyed: with no axis labels the faint colours are what still say which
+   row and column an empty cell belongs to, while the low opacity keeps the eye off a failure mode
+   that never happened — on a thin window, most of the grid. */
 .rh-matrix {
   display: grid;
-  grid-template-columns: auto repeat(3, 2.1rem);
+  grid-template-columns: repeat(3, 1.5rem);
   gap: 2px;
   font-size: 0.7rem;
+  line-height: 1;
 }
 
-.rh-matrix-axis {
-  color: var(--basecolors-text-subdued, #6b6b6b);
-  padding: 0 0.25rem;
-  align-self: center;
-  white-space: nowrap;
+.rh-cell,
+.rh-matrix-swatch {
+  background: linear-gradient(
+    to top right,
+    var(--rh-meldt) 0 calc(50% - 0.5px),
+    #fff calc(50% - 0.5px) calc(50% + 0.5px),
+    var(--rh-ble) calc(50% + 0.5px) 100%
+  );
 }
 
 .rh-cell {
-  text-align: center;
-  padding: 0.25rem 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.5rem;
   border-radius: 0.15rem;
   font-variant-numeric: tabular-nums;
 }
 
-/* Diagonal, adjacent, far — the same three-step reading as the verdict chips, so the matrix and the
-   badges beside it cannot suggest different things about one day. */
-.rh-cell--hit { background: #c9f0d2; }
-.rh-cell--near { background: #ffe9c2; }
-.rh-cell--far { background: #ffd4d4; }
-.rh-cell--empty { background: var(--basecolors-frame-subdued, #ededed); }
+.rh-cell--hit { background: var(--rh-meldt); }
+.rh-cell--empty { opacity: 0.3; }
+
+.rh-cell--meldt-green { --rh-meldt: var(--fill-success-tint); }
+.rh-cell--meldt-yellow { --rh-meldt: var(--fill-warning-tint); }
+.rh-cell--meldt-red { --rh-meldt: var(--fill-negative-tint); }
+.rh-cell--ble-green { --rh-ble: var(--fill-success-tint); }
+.rh-cell--ble-yellow { --rh-ble: var(--fill-warning-tint); }
+.rh-cell--ble-red { --rh-ble: var(--fill-negative-tint); }
+
+/* The legend under the table, in the calibration note's register: one split swatch beside one
+   sentence. `.rh-matrix-swatch` only resizes a cell; it comes after `.rh-cell` so its box wins. */
+.rh-matrix-legend {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0.5rem 0 0;
+  font-size: 0.7rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.rh-matrix-swatch {
+  flex: none;
+  width: 0.875rem;
+  height: 0.875rem;
+}
 
 /* The calibration reference beside the matrix: §14a's measured bad-day rate per forecast level
    (6 / 21 / 55 %). The diagonal compares two differently-scaled categoricals — forecast red lands
