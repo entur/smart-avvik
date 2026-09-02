@@ -1611,5 +1611,21 @@ def _run():
     print(f"\n{len(tests)} alternative checks passed.")
 
 
+def test_a_late_replacement_carries_how_late_against_the_plan():
+    """`minutes_after_original` is the figure behind `arrives_before_original = False`, so a wording
+    can say «10 min senere enn planlagt» instead of leaving the reader to subtract two clock times
+    (design review 2026-09-01, finding 16). Same anchor as the flag — the PLANNED arrival — and
+    absent whenever the flag is True, so the two can never disagree."""
+    late = _best(
+        [_cand(5, 80, ordinal=0), _cand(20, 70, ordinal=1)],
+        _original(predicted_min=100),
+    )
+    assert late is not None and late.arrives_before_original is False
+    assert late.minutes_after_original == 10  # lands at +70 against a +60 deadline
+    in_time = _best([_cand(5, 40)], _original(predicted_min=90))
+    assert in_time is not None and in_time.arrives_before_original is True
+    assert in_time.minutes_after_original is None
+
+
 if __name__ == "__main__":
     _run()

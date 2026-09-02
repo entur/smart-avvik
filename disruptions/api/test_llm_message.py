@@ -1303,5 +1303,43 @@ def _run():
     print(f"\n{len(tests)} llm message checks passed.")
 
 
+# ---- design review 2026-09-01: «i morgen» and «N min senere» ------------------------------------
+def test_a_departure_tomorrow_is_flagged_and_the_prompt_knows_the_key():
+    """Finding 48: the poller scores ~12 h ahead, so a wording about the 07:18 is routinely written
+    the evening before -- by design -- and without the word it reads as tonight's train. Present only
+    when TRUE, and only for EXACTLY the next Oslo calendar day: a `false` is a key the model can
+    quote, and «i morgen» for a train two days out would be a false statement."""
+    _reset()
+    tomorrow = build_message_input(JOURNEY, FakeImpact(), FakeAlert(), now=DEP - timedelta(days=1))
+    assert tomorrow["i_morgen"] is True
+    today = build_message_input(JOURNEY, FakeImpact(), FakeAlert(), now=DEP - timedelta(hours=2))
+    assert "i_morgen" not in today
+    later = build_message_input(JOURNEY, FakeImpact(), FakeAlert(), now=DEP - timedelta(days=2))
+    assert "i_morgen" not in later
+    assert "i_morgen" in llm_message._SYSTEM_PROMPT
+
+
+def test_a_late_alternative_carries_the_minutes_after_the_plan():
+    """Finding 16: «ankomst 18:54, som er senere enn planlagt» left the reader subtracting clock
+    times. The figure rides beside `ankommer_i_tide: false` and never beside `true` -- the same
+    presence-only discipline as `minutter_spart` -- and the prompt is told to quote it."""
+    _reset()
+    late = FakeAlternative(minutes_saved=-18, arrives_before_original=False)
+    late.minutes_after_original = 34
+    alert = FakeAlert()
+    alert.alternative_journey = late
+    payload = build_message_input(JOURNEY, FakeImpact(), alert)
+    assert payload["alternativ_reise"]["minutter_senere"] == 34
+    assert payload["alternativ_reise"]["ankommer_i_tide"] is False
+    in_time = FakeAlternative()
+    in_time.minutes_after_original = None
+    alert.alternative_journey = in_time
+    assert "minutter_senere" not in build_message_input(JOURNEY, FakeImpact(), alert)["alternativ_reise"]
+    # a selector older than the field: nothing to quote, nothing invented
+    alert.alternative_journey = FakeAlternative(minutes_saved=-18, arrives_before_original=False)
+    assert "minutter_senere" not in build_message_input(JOURNEY, FakeImpact(), alert)["alternativ_reise"]
+    assert "minutter_senere" in llm_message._SYSTEM_PROMPT
+
+
 if __name__ == "__main__":
     _run()

@@ -38,6 +38,10 @@ import {
 } from './components/deviceIdentity';
 
 const REFRESH_MS = 60_000;
+// How long a deleted journey can be brought back before the DELETE is actually sent (design
+// review 2026-09-01, finding 7). Long enough to read the notice and reach the button, short enough
+// that the registration — and the consent it rests on — is gone before anyone forgets they removed it.
+const UNDO_MS = 8_000;
 
 export default function App({ brand }: { brand: Brand }) {
   // Nullable app state, not a mount-frozen ref: «Slett alt» sets it to null, which suspends the
@@ -52,6 +56,10 @@ export default function App({ brand }: { brand: Brand }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  // Journeys the user has deleted whose DELETE has not been sent yet — rendered as an undo notice
+  // in place of the card. The timers live in a ref: they must survive re-renders and be cancellable.
+  const [pendingDeletes, setPendingDeletes] = useState<ReadonlySet<string>>(() => new Set());
+  const deleteTimers = useRef(new Map<string, number>());
   const notificationParams = new URLSearchParams(location.search);
   const notificationJourney = notificationParams.get('journey');
   const notificationSituation = notificationParams.get('situation');
@@ -210,14 +218,68 @@ export default function App({ brand }: { brand: Brand }) {
     [ensureDeviceId],
   );
 
-  const handleDelete = useCallback(
-    async (journeyId: string) => {
-      if (!deviceId) return; // no id, no journeys — the list this button sits in is empty
-      await deleteJourney(journeyId, deviceId);
+  // The deletion itself, after the undo window. The 60 s poll keeps repainting the list from the
+  // server meanwhile, which is fine: the card stays rendered as its undo notice for as long as the
+  // id is in `pendingDeletes`, and leaves both the list and that set here.
+  const commitDelete = useCallback(async (journeyId: string, forDevice: string) => {
+    deleteTimers.current.delete(journeyId);
+    try {
+      await deleteJourney(journeyId, forDevice);
       setJourneys((prev) => prev.filter((j) => j.journey_id !== journeyId));
+    } catch (e) {
+      // The card comes back with the error over it — the registration still exists server-side.
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPendingDeletes((prev) => {
+        const next = new Set(prev);
+        next.delete(journeyId);
+        return next;
+      });
+    }
+  }, []);
+
+  // Delete with an undo window (design review 2026-09-01, finding 7): three identical bins sit
+  // close together on a phone, and a delete also withdraws the consent the registration rests on.
+  // Nothing reaches the server until the window has passed; «Angre» cancels the timer.
+  const handleDelete = useCallback(
+    (journeyId: string) => {
+      if (!deviceId) return; // no id, no journeys — the list this button sits in is empty
+      if (deleteTimers.current.has(journeyId)) return;
+      const forDevice = deviceId;
+      setPendingDeletes((prev) => new Set(prev).add(journeyId));
+      deleteTimers.current.set(
+        journeyId,
+        window.setTimeout(() => void commitDelete(journeyId, forDevice), UNDO_MS),
+      );
     },
-    [deviceId],
+    [deviceId, commitDelete],
   );
+
+  const handleUndoDelete = useCallback((journeyId: string) => {
+    const timer = deleteTimers.current.get(journeyId);
+    if (timer !== undefined) window.clearTimeout(timer);
+    deleteTimers.current.delete(journeyId);
+    setPendingDeletes((prev) => {
+      const next = new Set(prev);
+      next.delete(journeyId);
+      return next;
+    });
+  }, []);
+
+  // A pending delete must not be lost to the app being backgrounded or closed inside its window:
+  // on pagehide the remaining ones are sent at once (deleteJourney uses `keepalive`).
+  useEffect(() => {
+    const flush = () => {
+      const forDevice = deviceId;
+      if (!forDevice) return;
+      for (const [journeyId, timer] of [...deleteTimers.current]) {
+        window.clearTimeout(timer);
+        void commitDelete(journeyId, forDevice);
+      }
+    };
+    window.addEventListener('pagehide', flush);
+    return () => window.removeEventListener('pagehide', flush);
+  }, [deviceId, commitDelete]);
 
   // Last step of «Slett alt», reached only after the server confirmed. The only place the stored
   // id is removed — never on the failure path, where it is exactly what a retry needs.
@@ -228,6 +290,11 @@ export default function App({ brand }: { brand: Brand }) {
   // an empty list rather than journeys the server no longer has — the throw then propagates to
   // VarselStatus, which reports it in the card.
   const handleDeletedAll = useCallback(() => {
+    // Whatever was inside an undo window is gone with everything else; the timers would only
+    // DELETE journeys the server no longer has.
+    for (const timer of deleteTimers.current.values()) window.clearTimeout(timer);
+    deleteTimers.current.clear();
+    setPendingDeletes(new Set());
     try {
       forgetDeviceId(localStorage);
     } finally {
@@ -256,11 +323,14 @@ export default function App({ brand }: { brand: Brand }) {
       <main id="main-content" className="av-main">
         {/* T1 and T2 sit above and below the intro, before the loading branch, so the experiment
             caveat and the privacy line are on screen without scrolling or a single tap — which is
-            the acceptance criterion, and the point of giving art. 13 information at collection. */}
+            the acceptance criterion, and the point of giving art. 13 information at collection.
+            Both are one line each since 2026-09-02: measured on a 375×812 phone, «Legg til reise»
+            sat 1 026 px down, below 191 of the page's 214 words (design review 2026-09-01, finding
+            29). The task now comes first; the push controls follow it. */}
         <EksperimentNotis />
 
         <LeadParagraph className="av-intro">
-          Registrer kollektivreisene dine, så varsler vi deg når et avvik kan ramme en av dem.
+          Registrer reisene dine, så varsler vi deg når et avvik kan ramme en av dem.
         </LeadParagraph>
 
         <PersonvernLinje brandId={brand.id} />
@@ -271,12 +341,58 @@ export default function App({ brand }: { brand: Brand }) {
           </div>
         ) : (
           <>
-            {/* Above the push controls, and below T1/T2 — which must stay on screen without
+            {/* Above the journeys, and below T1/T2 — which must stay on screen without
                 scrolling. On a red morning this is what the traveller opened the app to find out.
                 Renders nothing at all unless the server says this device is notified about a rush
                 that is still ahead. */}
             <RushOutlook rushes={rushes} brand={brand} />
 
+            {error && (
+              <SmallAlertBox variant="negative" width="fluid">
+                {error}
+              </SmallAlertBox>
+            )}
+
+            <section className="av-section" aria-labelledby="mine-reiser">
+              <div className="av-section-head">
+                <Heading3 as="h2" id="mine-reiser" margin="none">
+                  Mine reiser
+                </Heading3>
+                {/* Medium and full-width on a phone (finding 27): the page's one action was a
+                    133×32 px small button beside the heading. */}
+                <PrimaryButton className="av-add-journey" onClick={() => setModalOpen(true)}>
+                  <AddIcon /> Legg til reise
+                </PrimaryButton>
+              </div>
+
+              {journeys.length === 0 ? (
+                <div className="av-card av-empty">
+                  <Paragraph margin="none">
+                    Du har ingen registrerte reiser ennå. Legg til en strekning og et tidsrom for å
+                    komme i gang.
+                  </Paragraph>
+                </div>
+              ) : (
+                <ul className="av-journey-list">
+                  {journeys.map((j) => (
+                    <JourneyCard
+                      key={j.journey_id}
+                      journey={j}
+                      notificationSituation={
+                        j.journey_id === notificationJourney ? notificationSituation : null
+                      }
+                      pendingDelete={pendingDeletes.has(j.journey_id)}
+                      onDelete={() => handleDelete(j.journey_id)}
+                      onUndo={() => handleUndoDelete(j.journey_id)}
+                    />
+                  ))}
+                </ul>
+              )}
+            </section>
+
+            {/* The push controls, below the task they serve (finding 41): turning notifications on
+                is the second step, and the card explaining the mechanism stood between the reader
+                and the first. */}
             {config && (
               <VarselStatus
                 config={config}
@@ -306,45 +422,6 @@ export default function App({ brand }: { brand: Brand }) {
                 )}
               </SmallAlertBox>
             )}
-
-            {error && (
-              <SmallAlertBox variant="negative" width="fluid">
-                {error}
-              </SmallAlertBox>
-            )}
-
-            <section className="av-section" aria-labelledby="mine-reiser">
-              <div className="av-section-head">
-                <Heading3 as="h2" id="mine-reiser" margin="none">
-                  Mine reiser
-                </Heading3>
-                <PrimaryButton size="small" onClick={() => setModalOpen(true)}>
-                  <AddIcon /> Legg til reise
-                </PrimaryButton>
-              </div>
-
-              {journeys.length === 0 ? (
-                <div className="av-card av-empty">
-                  <Paragraph margin="none">
-                    Du har ingen registrerte reiser ennå. Legg til en strekning og et tidsrom for å
-                    komme i gang.
-                  </Paragraph>
-                </div>
-              ) : (
-                <ul className="av-journey-list">
-                  {journeys.map((j) => (
-                    <JourneyCard
-                      key={j.journey_id}
-                      journey={j}
-                      notificationSituation={
-                        j.journey_id === notificationJourney ? notificationSituation : null
-                      }
-                      onDelete={() => void handleDelete(j.journey_id)}
-                    />
-                  ))}
-                </ul>
-              )}
-            </section>
           </>
         )}
       </main>

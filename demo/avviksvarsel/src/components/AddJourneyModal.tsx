@@ -1,12 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type FocusEvent } from 'react';
 import { Modal } from '@entur/modal';
 import { SearchableDropdown, type NormalizedDropdownItemType } from '@entur/dropdown';
 import { TextField } from '@entur/form';
 import { ChoiceChip, ChoiceChipGroup, FilterChip } from '@entur/chip';
-import { BusIcon, TrainIcon } from '@entur/icons';
-import { PrimaryButton, SecondaryButton } from '@entur/button';
+import { BusIcon, TrainIcon, VerticalSwitchIcon } from '@entur/icons';
+import { IconButton, PrimaryButton, SecondaryButton } from '@entur/button';
 import { SmallAlertBox } from '@entur/alert';
-import { Label } from '@entur/typography';
+import { Label, SmallText } from '@entur/typography';
 import type { NewJourney, StopItem } from '../api';
 import type { BrandId } from '../brand';
 import { CONSENT_TEXT_VERSION } from '../personvern';
@@ -23,6 +23,11 @@ const DEFAULT_DAYS = [0, 1, 2, 3, 4];
 // makes SearchableDropdown skip its own label filter, so the resolver's ranking is what shows.
 const MAX_SHOWN = 60;
 
+// A registered window longer than this earns a hint, not a refusal (design review 2026-09-01,
+// finding 38): 07:00–22:00 makes the window useless as a noise filter and multiplies the pushes,
+// but a shift worker's day is legitimately long, so the form says so and lets them decide.
+const LONG_WINDOW_MIN = 6 * 60;
+
 function modeIcons(mode: string) {
   const icons = [];
   if (mode.includes('Tog')) icons.push(TrainIcon);
@@ -31,10 +36,11 @@ function modeIcons(mode: string) {
 }
 
 // Names that belong to more than one physical place ("Sentrum", "Kirken", ~1 300 of them). Those
-// rows get their county appended, because a bare name repeated in a list is a coin flip: picking the
-// wrong one registers a stop the traveller's trip never calls at, and the journey then reports
-// "ingen aktive avvik akkurat nå" forever. Co-located refs are already merged server-side, so what
-// is left here really is several different stops that happen to share a name.
+// rows get their municipality appended (the county until 2026-09-02, which offered «Sandvika
+// (Troms)» six times over — design review 2026-09-01, finding 2), because a bare name repeated in a
+// list is a coin flip: picking the wrong one registers a stop the traveller's trip never calls at,
+// and the journey then reports "ingen aktive avvik akkurat nå" forever. Co-located refs are already
+// merged server-side, so what is left here really is several different stops sharing a name.
 function ambiguousNames(stops: StopItem[]): Set<string> {
   const places = new Map<string, Set<string>>();
   for (const s of stops) {
@@ -89,6 +95,29 @@ function rankItems(pool: StopItem[], query: string, ambiguous: Set<string>): Ite
   return items;
 }
 
+// Validation names the FIELD, not just the fault (design review 2026-09-01, findings 6 and 19).
+// One cascade returning one string rendered as one alert box at the bottom of the modal, whichever
+// field was missing, and a screen-reader user who pressed «Lagre reise» heard nothing at all: no
+// aria-invalid, no aria-describedby, no live region. The message now renders under the field it
+// is about (Linje's `variant`/`feedback` wire the aria attributes), focus moves there, and the
+// wording is the traveller's language rather than the form's.
+type Field = 'from' | 'to' | 'time' | 'days';
+
+interface Problem {
+  field: Field;
+  message: string;
+}
+
+function minutesBetween(begin: string, end: string): number | null {
+  const parse = (hhmm: string) => {
+    const [h, m] = hhmm.split(':').map(Number);
+    return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : null;
+  };
+  const a = parse(begin);
+  const b = parse(end);
+  return a === null || b === null ? null : b - a;
+}
+
 export default function AddJourneyModal({
   open,
   onClose,
@@ -124,8 +153,14 @@ export default function AddJourneyModal({
   const [begin, setBegin] = useState('07:00');
   const [end, setEnd] = useState('09:00');
   const [days, setDays] = useState<number[]>(DEFAULT_DAYS);
-  const [error, setError] = useState<string | null>(null);
+  const [problem, setProblem] = useState<Problem | null>(null);
+  const [serverError, setServerError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  const fromRef = useRef<HTMLInputElement>(null);
+  const toRef = useRef<HTMLInputElement>(null);
+  const beginRef = useRef<HTMLInputElement>(null);
+  const daysRef = useRef<HTMLFieldSetElement>(null);
 
   // Reset the form each time the modal opens.
   useEffect(() => {
@@ -136,33 +171,49 @@ export default function AddJourneyModal({
       setBegin('07:00');
       setEnd('09:00');
       setDays(DEFAULT_DAYS);
-      setError(null);
+      setProblem(null);
+      setServerError(null);
       setSaving(false);
     }
   }, [open]);
 
+  // A problem clears as soon as the field it names changes — the reader fixed it, and a stale red
+  // message under a now-valid field would make the form look broken.
+  const clearProblem = (field: Field) => {
+    setProblem((current) => (current?.field === field ? null : current));
+  };
+
   function toggleDay(d: number) {
+    clearProblem('days');
     setDays((prev) => (prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d].sort((a, b) => a - b)));
   }
 
-  function validate(): string | null {
-    if (!from) return 'Velg et fra-stopp.';
-    if (!to) return 'Velg et til-stopp.';
-    if (from.value === to.value) return 'Fra- og til-stopp må være ulike.';
-    if (!begin || !end) return 'Velg tidsrom.';
-    if (begin >= end) return 'Tidsrommet må starte før det slutter.';
-    if (days.length === 0) return 'Velg minst én ukedag.';
+  function validate(): Problem | null {
+    if (!from) return { field: 'from', message: 'Du må velge hvor du reiser fra.' };
+    if (!to) return { field: 'to', message: 'Du må velge hvor du reiser til.' };
+    if (from.value === to.value) {
+      return { field: 'to', message: 'Reisen må gå mellom to ulike stopp.' };
+    }
+    if (!begin || !end) return { field: 'time', message: 'Du må velge når reisen starter og slutter.' };
+    if (begin >= end) return { field: 'time', message: 'Tidsrommet må starte før det slutter.' };
+    if (days.length === 0) return { field: 'days', message: 'Du må velge minst én ukedag.' };
     return null;
   }
 
+  function focusField(field: Field) {
+    const target = { from: fromRef, to: toRef, time: beginRef, days: daysRef }[field].current;
+    target?.focus();
+  }
+
   async function submit() {
-    const problem = validate();
-    if (problem) {
-      setError(problem);
+    const found = validate();
+    if (found) {
+      setProblem(found);
+      focusField(found.field);
       return;
     }
     setSaving(true);
-    setError(null);
+    setServerError(null);
     try {
       // The plain registry name, not the picker label: the label may carry a county suffix added
       // only to tell two same-named stops apart, and this name is what the journey card and the
@@ -181,15 +232,54 @@ export default function AddJourneyModal({
       });
       onClose();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setServerError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
   }
 
+  // Typing a stop and tapping away without picking from the list used to leave the field EMPTY:
+  // Linje's combobox resets the input to the selected item on blur, and there was none. The first
+  // suggestion is drawn highlighted and reads as chosen, so on blur it is (design review
+  // 2026-09-01, question 47 — answered: adopt the first item). A click on a list item blurs the
+  // input first and selects the clicked item afterwards, so that selection wins over this one.
+  function adoptFirstMatch(
+    event: FocusEvent<HTMLInputElement>,
+    current: Item | null,
+    set: (item: Item) => void,
+  ) {
+    const typed = event.target.value.trim();
+    if (current || !typed) return;
+    const [first] = items(typed);
+    if (first) set(first);
+  }
+
+  // The return trip is the same two stops the other way round (finding 40).
+  function swap() {
+    const previousFrom = from;
+    setFrom(to);
+    setTo(previousFrom);
+    setProblem(null);
+  }
+
+  const windowMinutes = minutesBetween(begin, end);
+  const longWindow = windowMinutes !== null && windowMinutes > LONG_WINDOW_MIN;
+  const fieldProps = (field: Field) =>
+    problem?.field === field ? { variant: 'negative' as const, feedback: problem.message } : {};
+
   return (
     <Modal open={open} onDismiss={onClose} size="medium" title="Legg til reise">
-      <div className="av-form">
+      {/* A real <form>, so Enter submits from any field (finding 28): both buttons were
+          type="submit" with no form around them, and a keyboard user had to tab past every field
+          to reach «Lagre reise». `noValidate` because the messages below are ours. */}
+      <form
+        className="av-form"
+        noValidate
+        onSubmit={(event) => {
+          event.preventDefault();
+          void submit();
+        }}
+      >
         <ChoiceChipGroup
           name="stop-mode"
           label="Transportmiddel"
@@ -201,40 +291,77 @@ export default function AddJourneyModal({
           <ChoiceChip value="buss">Buss</ChoiceChip>
         </ChoiceChipGroup>
         <SearchableDropdown
+          ref={fromRef}
           label="Fra"
           items={items}
           debounceTimeout={0}
           selectedItem={from}
-          onChange={(item) => setFrom(item)}
+          onChange={(item) => {
+            clearProblem('from');
+            setFrom(item);
+          }}
+          onBlur={(event) => adoptFirstMatch(event, from, setFrom)}
           placeholder="Søk etter stopp"
           clearable
+          {...fieldProps('from')}
         />
+        <div className="av-form-swap">
+          <IconButton type="button" aria-label="Bytt om fra og til" onClick={swap}>
+            <VerticalSwitchIcon aria-hidden="true" />
+          </IconButton>
+        </div>
         <SearchableDropdown
+          ref={toRef}
           label="Til"
           items={items}
           debounceTimeout={0}
           selectedItem={to}
-          onChange={(item) => setTo(item)}
+          onChange={(item) => {
+            clearProblem('to');
+            setTo(item);
+          }}
+          onBlur={(event) => adoptFirstMatch(event, to, setTo)}
           placeholder="Søk etter stopp"
           clearable
+          {...fieldProps('to')}
         />
 
         <div className="av-form-times">
           <TextField
+            ref={beginRef}
             label="Fra klokkeslett"
             type="time"
             value={begin}
-            onChange={(e) => setBegin(e.target.value)}
+            onChange={(e) => {
+              clearProblem('time');
+              setBegin(e.target.value);
+            }}
+            {...fieldProps('time')}
           />
           <TextField
             label="Til klokkeslett"
             type="time"
             value={end}
-            onChange={(e) => setEnd(e.target.value)}
+            onChange={(e) => {
+              clearProblem('time');
+              setEnd(e.target.value);
+            }}
           />
         </div>
+        {longWindow && (
+          <SmallText as="p" className="av-form-hint">
+            Et langt tidsrom gir flere varsler. Reiser du til og fra jobb, gir to reiser med hvert
+            sitt tidsrom mer treffsikre varsler.
+          </SmallText>
+        )}
 
-        <fieldset className="av-form-days">
+        <fieldset
+          ref={daysRef}
+          className="av-form-days"
+          tabIndex={-1}
+          aria-invalid={problem?.field === 'days' || undefined}
+          aria-describedby={problem?.field === 'days' ? 'weekday-error' : undefined}
+        >
           <Label as="legend">Ukedager</Label>
           <div className="av-chips" role="group" aria-label="Ukedager">
             {WEEKDAYS.map((d) => (
@@ -250,11 +377,17 @@ export default function AddJourneyModal({
               </FilterChip>
             ))}
           </div>
+          {problem?.field === 'days' && (
+            <SmallText as="p" id="weekday-error" role="alert" className="av-field-error">
+              {problem.message}
+            </SmallText>
+          )}
         </fieldset>
 
-        {error && (
+        {/* Only what the server said: a field problem is shown under its field above. */}
+        {serverError && (
           <SmallAlertBox variant="negative" width="fluid">
-            {error}
+            {serverError}
           </SmallAlertBox>
         )}
 
@@ -264,14 +397,14 @@ export default function AddJourneyModal({
         <RegistreringsNotis brandId={brandId} />
 
         <div className="av-form-actions">
-          <SecondaryButton onClick={onClose} disabled={saving}>
+          <SecondaryButton type="button" onClick={onClose} disabled={saving}>
             Avbryt
           </SecondaryButton>
-          <PrimaryButton onClick={submit} loading={saving}>
+          <PrimaryButton type="submit" loading={saving}>
             Lagre reise
           </PrimaryButton>
         </div>
-      </div>
+      </form>
     </Modal>
   );
 }

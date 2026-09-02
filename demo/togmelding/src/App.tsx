@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { SkipToContent } from '@entur/a11y';
 import { SmallAlertBox } from '@entur/alert';
+import { ExpandableText } from '@entur/expand';
 import { Contrast } from '@entur/layout';
 import { Loader } from '@entur/loader';
 import { Logo } from '@entur/menu';
@@ -13,8 +14,15 @@ import {
   SmallText,
   SubParagraph,
 } from '@entur/typography';
-import { fetchConfig, fetchTogmelding, type Togmelding } from './api';
-import { CLS_LABEL, issueTime, issueTimeList, osloTime } from './format';
+import { fetchConfig, fetchTogmelding, type KnownDeviation, type Togmelding } from './api';
+import {
+  CLS_LABEL,
+  count,
+  issueTime,
+  issueTimeList,
+  osloDateTime,
+  relativeTime,
+} from './format';
 import {
   TOGMELDING_DISCLAIMER,
   TOGMELDING_PERSONVERN_HREF,
@@ -27,14 +35,65 @@ import IssueCard from './components/IssueCard';
 // /togmelding-api/today. Entur-branded and laid out like the Avviksvarsel PWA (/varsel) on
 // purpose — a traveller arrives here by tapping a rush-forecast push from that app, and two
 // surfaces of one product should not look like two products.
+//
+// Order on the page (design review 2026-09-01, findings 29-31): the level first, then what is
+// known, then how fresh it is and how the forecast works, then the way onward. The answer used to
+// be the third card, under an intro that held four clock times and the skill note.
 
 const REFRESH_MS = 5 * 60 * 1000;
+// Where the pushes that bring people here are registered — and the page's way back (finding 5:
+// the only link used to be the privacy footer, which made the page a dead end).
+const VARSEL_URL = '/varsel/';
+
+// The «kjente avvik» rows grouped under one tag each (finding 3 and 20): the server already
+// collapses messages saying the same thing; this puts the eleven «Kortere tog» rows under one
+// «Kortere tog» tag instead of repeating it eleven times beside eleven near-identical summaries.
+function groupDeviations(deviations: KnownDeviation[]): { label: string; rows: KnownDeviation[] }[] {
+  const groups = new Map<string, KnownDeviation[]>();
+  for (const deviation of deviations) {
+    const label = deviation.planned ? 'Planlagt' : (CLS_LABEL[deviation.cls] ?? 'Avvik');
+    const rows = groups.get(label) ?? [];
+    rows.push(deviation);
+    groups.set(label, rows);
+  }
+  return [...groups].map(([label, rows]) => ({ label, rows }));
+}
+
+// «11 avganger i morgenrushet, 3 i ettermiddagsrushet, 11 meldinger» — with agreement (finding 4).
+function deviationCounts(deviation: KnownDeviation): string | null {
+  const parts: string[] = [];
+  if (deviation.n_am_rush_journeys > 0) {
+    parts.push(`${count(deviation.n_am_rush_journeys, 'avgang', 'avganger')} i morgenrushet`);
+  }
+  if (deviation.n_pm_rush_journeys > 0) {
+    parts.push(
+      parts.length > 0
+        ? `${deviation.n_pm_rush_journeys} i ettermiddagsrushet`
+        : `${count(deviation.n_pm_rush_journeys, 'avgang', 'avganger')} i ettermiddagsrushet`,
+    );
+  }
+  if ((deviation.n_situations ?? 1) > 1) {
+    parts.push(count(deviation.n_situations!, 'melding', 'meldinger'));
+  }
+  return parts.length > 0 ? parts.join(', ') : null;
+}
+
+// A summary that only repeats its own tag («Buss for tog» under «Buss for tog») says nothing the
+// tag has not said (finding 20) — the row then carries the counts alone.
+function summaryLine(deviation: KnownDeviation, label: string): string | null {
+  const summary = deviation.summary?.trim();
+  if (!summary) return null;
+  return summary.toLowerCase() === label.toLowerCase() ? null : summary;
+}
 
 export default function App() {
   const [melding, setMelding] = useState<Togmelding | null>(null);
   const [environment, setEnvironment] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
+  // For «oppdatert for 8 minutter siden»: ticks once a minute so the relative time ages between
+  // polls instead of jumping at each one.
+  const [now, setNow] = useState(() => new Date());
 
   const load = useCallback(async () => {
     try {
@@ -48,6 +107,7 @@ export default function App() {
       setError(true);
     } finally {
       setLoading(false);
+      setNow(new Date());
     }
   }, []);
 
@@ -65,6 +125,7 @@ export default function App() {
   // notification and then left sitting on a phone, where a stale level is worse than none.
   useEffect(() => {
     const timer = window.setInterval(() => void load(), REFRESH_MS);
+    const tick = window.setInterval(() => setNow(new Date()), 60_000);
     const onVisible = () => {
       if (document.visibilityState === 'visible') void load();
     };
@@ -72,6 +133,7 @@ export default function App() {
     window.addEventListener('focus', onVisible);
     return () => {
       window.clearInterval(timer);
+      window.clearInterval(tick);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onVisible);
     };
@@ -88,6 +150,7 @@ export default function App() {
   // Newest first: the reader's question is "what does it say now", and the follow-up that
   // superseded a baseline is the one that answers it.
   const newestFirst = [...issues].reverse();
+  const deviationGroups = groupDeviations(melding?.known_deviations ?? []);
 
   return (
     <>
@@ -103,28 +166,31 @@ export default function App() {
       </Contrast>
 
       <main id="main-content" className="tm-main">
-        {/* Deliberately does not open with the page's own name. It used to read «Rushtidsvarsel
-            for lokaltogene …» — the phrase the product name was then drawn from, so keeping it
-            would have the intro restate the heading instead of adding to it. It says what the
-            forecast covers instead. */}
+        <nav className="tm-nav" aria-label="Til Avviksvarsel">
+          <SmallText>
+            <Link href={VARSEL_URL}>‹ Til Avviksvarsel</Link>
+          </SmallText>
+        </nav>
+
+        {/* One sentence on what the forecast covers and one on when it changes. The four clock
+            times and the skill note that used to be in here are under «Om prognosen» below. It
+            still does not open with the page's own name (see the 2026-09-01 rename). */}
         <LeadParagraph className="tm-intro">
-          Hvordan lokaltogene i Oslo-området (Vy) ligger an i morgen- og ettermiddagsrushet. Nye
-          prognoser kl. 06:30, 07:00, 12:00 og 14:00 på hverdager; kl. 07:00 og 14:00 erstatter de
-          to tidligere.
-          {melding?.generated_at && ` Sist oppdatert ${osloTime(melding.generated_at)}.`}
+          Hvordan lokaltogene i Oslo-området (Vy) ligger an i morgen- og ettermiddagsrushet.
+          Oppdateres før begge rushene på hverdager.
         </LeadParagraph>
 
         {/* The published experiment disclaimer, after the intro and before the forecast — the
-            placement plan 2026-08-31-001 (U8) chose for this page, kept through the move onto
-            Linje, and now the same SmallAlertBox /varsel renders T1 in. Above the loading branch,
-            so the caveat is on screen without scrolling or a tap whatever the API is doing. */}
-        <SmallAlertBox variant="information" title={TOGMELDING_DISCLAIMER.title} width="fluid">
+            placement plan 2026-08-31-001 (U8) chose for this page: above the loading branch, so the
+            caveat is on screen without scrolling or a tap whatever the API is doing. One line and no
+            title since 2026-09-02, so the answer below it is still on the first screen. */}
+        <SmallAlertBox variant="information" width="fluid">
           {TOGMELDING_DISCLAIMER.body}
         </SmallAlertBox>
 
         {error && (
           <SmallAlertBox variant="negative" width="fluid">
-            Fikk ikke hentet togmeldingen. Prøv igjen om litt.
+            Fikk ikke hentet rushvarselet. Prøv igjen om litt.
           </SmallAlertBox>
         )}
 
@@ -214,42 +280,64 @@ export default function App() {
                   </section>
                 )}
 
-              {melding.known_deviations.length > 0 && (
+              {deviationGroups.length > 0 && (
                 <section className="tm-card">
                   <Heading3 as="h2" margin="none">
                     Kjente avvik i dag
                   </Heading3>
                   <ul className="tm-kjente">
-                    {melding.known_deviations.map((deviation, index) => (
-                      <li key={`${deviation.cls}-${index}`} className="tm-kjent">
-                        <span className="tm-tag">
-                          {deviation.planned ? 'Planlagt' : (CLS_LABEL[deviation.cls] ?? 'Avvik')}
-                        </span>
-                        <span>{deviation.summary}</span>
-                        {(deviation.n_am_rush_journeys > 0 ||
-                          deviation.n_pm_rush_journeys > 0) && (
-                          <SmallText as="p" className="tm-muted tm-kjent-count">
-                            {[
-                              deviation.n_am_rush_journeys > 0 &&
-                                `${deviation.n_am_rush_journeys} avganger i morgenrushet`,
-                              deviation.n_pm_rush_journeys > 0 &&
-                                `${deviation.n_pm_rush_journeys} i ettermiddagsrushet`,
-                            ]
-                              .filter(Boolean)
-                              .join(', ')}
-                          </SmallText>
-                        )}
+                    {deviationGroups.map((group) => (
+                      <li key={group.label} className="tm-kjent-group">
+                        <span className="tm-tag">{group.label}</span>
+                        <ul className="tm-kjent-rows">
+                          {group.rows.map((deviation, index) => {
+                            const summary = summaryLine(deviation, group.label);
+                            const counts = deviationCounts(deviation);
+                            return (
+                              <li key={`${deviation.cls}-${index}`} className="tm-kjent">
+                                {summary && <span>{summary}</span>}
+                                {counts && (
+                                  <SmallText as="p" className="tm-muted tm-kjent-count">
+                                    {counts}
+                                  </SmallText>
+                                )}
+                              </li>
+                            );
+                          })}
+                        </ul>
                       </li>
                     ))}
                   </ul>
                 </section>
               )}
 
-              {melding.skill_note && (
-                <SmallText as="p" className="tm-muted tm-skill">
-                  {melding.skill_note}
-                </SmallText>
-              )}
+              {/* Freshness is the whole point of a forecast, and «Sist oppdatert 22:14» looked the
+                  same today and last week (finding 32): relative time first, the date in brackets.
+                  The schedule and the skill note fold under «Om prognosen» (findings 30 and 9 —
+                  rates in the note, never multipliers). */}
+              <div className="tm-meta">
+                {melding.generated_at && (
+                  <SmallText as="p" className="tm-muted tm-updated">
+                    Oppdatert {relativeTime(melding.generated_at, now)} (
+                    {osloDateTime(melding.generated_at)}).
+                  </SmallText>
+                )}
+                <ExpandableText title="Om prognosen" titleElement="SubParagraph">
+                  <Paragraph margin="none">
+                    Nye prognoser kl. 06:30 og 07:00 for morgenrushet og kl. 12:00 og 14:00 for
+                    ettermiddagsrushet, på hverdager. Prognosen kl. 07:00 erstatter den fra
+                    06:30, og den kl. 14:00 erstatter den fra 12:00.
+                  </Paragraph>
+                  {melding.skill_note && <Paragraph margin="none">{melding.skill_note}</Paragraph>}
+                </ExpandableText>
+              </div>
+
+              {/* The way onward (finding 5): this is the page people share, and it had no route to
+                  the registration that produces the pushes it shows. */}
+              <Paragraph margin="none" className="tm-cta">
+                <Link href={VARSEL_URL}>Få rushvarselet som varsel på telefonen</Link> — registrer
+                reisene dine i Avviksvarsel.
+              </Paragraph>
             </>
           )
         )}
@@ -257,7 +345,7 @@ export default function App() {
 
       {/* T7 — the sender line. Outside <main> and outside the loading branch: art. 13(1)(a) makes
           the controller's identity non-optional, so it must be there on a day the forecast is
-          not. It is the only route from this page to the privacy page. */}
+          not. */}
       <footer className="tm-footer">
         <SubParagraph margin="none">
           {TOGMELDING_SENDER_LINE}{' '}
