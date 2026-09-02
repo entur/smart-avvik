@@ -142,6 +142,23 @@ app.include_router(varsel.router)
 client = TestClient(app)
 
 
+def _wording(payload: dict) -> str:
+    """The wording part of a push body (2026-09-02: the body leads with the route on its own line,
+    so the title can carry the fact about the train). The wording is what the decision log records
+    and what the two writers are compared on, so that is what these checks read."""
+    route, _, wording = payload["body"].partition("\n")
+    assert " → " in route, f"the body must lead with the route line, got {route!r}"
+    return wording
+
+
+def _expected_title(state: str = "kan bli innstilt", prefix: str = "") -> str:
+    """The SNAPSHOT train's push title. DEP is clock-relative, so the time is formatted here rather
+    than written out -- and run between 22:00 and 24:00 Oslo the train departs tomorrow, which the
+    title then says (design review 2026-09-01, finding 48)."""
+    tomorrow = " i morgen" if DEP.date() > datetime.now(tz=_OSLO).date() else ""
+    return f"{prefix}Tog R10 {DEP:%H:%M}{tomorrow} {state}"
+
+
 def _reset_state():
     with varsel._state_lock:
         varsel._devices.clear()
@@ -155,6 +172,10 @@ def _reset_state():
         # checking -- it reads as the give-up bug rather than as pollution.
         varsel._message_errors.clear()
         varsel._message_meta.clear()
+        # The per-train push memory and the daily cap ledger (2026-09-02). A leaked count reads
+        # exactly like the cap firing for no reason.
+        varsel._pushed_trains.clear()
+        varsel._daily_pushes.clear()
     # llm_message's backend latch is PROCESS-global and survives a monkeypatch undo, so a test that
     # drives both backends into `_latched_off` (the 404/configuration path) silently disables
     # generation for every test that runs after it. That was invisible until 2026-08-07, when
@@ -571,7 +592,8 @@ def test_notify_pushes_once_then_dedups(monkeypatch):
     journey_id = journey_response.json()["journey_id"]
     varsel.check_and_notify(SNAPSHOT)
     assert len(sent) == 1
-    assert sent[0]["title"] == "Oslo S → Lillehammer"
+    assert sent[0]["title"] == _expected_title()
+    assert sent[0]["body"].startswith("Oslo S → Lillehammer\n")
     assert sent[0]["url"] == (
         f"/varsel/?journey={journey_id}&situation=S1"
     )
@@ -629,7 +651,8 @@ def test_an_unbranded_device_is_pushed_its_own_icon_and_url(monkeypatch):
     )
     # The WORDING is brand-independent on purpose: it is what /historikk records, and text that
     # varied by variant would split every wording comparison along a second axis.
-    assert sent[0]["title"] == "Oslo S → Lillehammer"
+    assert sent[0]["title"] == _expected_title()
+    assert sent[0]["body"].startswith("Oslo S → Lillehammer\n")
     assert "82 % sjanse for innstilling" in sent[0]["body"]
 
 
@@ -735,7 +758,7 @@ def test_push_titles_carry_the_environment_on_non_prod(monkeypatch):
         varsel.check_and_notify(SNAPSHOT)
         assert client.post("/varsel-api/test", json={"device_id": DEVICE}).status_code == 200
     assert [p["title"] for p in sent] == [
-        "[dev] Oslo S → Lillehammer",
+        _expected_title(prefix="[dev] "),
         "[dev] Varsler er aktivert",
     ]
     assert "[dev]" not in sent[0]["body"]  # the tag belongs in the title, not in the wording
@@ -804,7 +827,7 @@ def test_same_journey_on_two_devices_shares_one_impact_call_and_one_message(monk
     varsel.check_and_notify(SNAPSHOT)
 
     assert len(sent) == 2, "both devices must be notified"
-    assert sent[0]["body"] == sent[1]["body"] == "Signalfeil ved Asker. Ta R10 kl 08:14 i stedet."
+    assert _wording(sent[0]) == _wording(sent[1]) == "Signalfeil ved Asker. Ta R10 kl 08:14 i stedet."
     assert len(written) == 1, "one written message per journey definition, not per device"
     # No window is scored twice. (A journey can legitimately span more than one window -- today's
     # and tomorrow's -- so the claim is "no duplicated work", not "exactly one call".)
@@ -908,7 +931,7 @@ def test_llm_call_cap_is_respected(monkeypatch):
 
     assert len(written) == 1, "the cap must bound written messages per cycle"
     assert len(sent) == 2, "both journeys are still pushed"
-    bodies = sorted(p["body"] for p in sent)
+    bodies = sorted(_wording(p) for p in sent)
     assert bodies[0] != bodies[1], "one written, one deterministic"
 
 
@@ -1414,7 +1437,7 @@ def test_every_train_a_cycle_pushes_about_gets_its_own_wording(monkeypatch):
     assert len(sent) == 2, "two disrupted trains is two pushes"
     # The point of the fix: BOTH bodies are written prose. Before it the milder train's push carried
     # the deterministic wording, which names the train and quotes the numbers but is not this text.
-    assert sorted(p["body"] for p in sent) == ["Skrevet om S1.", "Skrevet om S3."]
+    assert sorted(_wording(p) for p in sent) == ["Skrevet om S1.", "Skrevet om S3."]
 
 
 def test_the_writing_budget_follows_the_push_not_the_severity(monkeypatch):
@@ -1835,7 +1858,7 @@ def test_the_deterministic_wording_is_written_from_the_message_input(monkeypatch
     # Every part of this body came out of the input above -- none of it off the (rail, 82 %-cancel)
     # alert the snapshot actually produced. The input carries no `linje`, so the train falls back to
     # "Buss kl 09:30": less than the reader wants, but nothing that is untrue.
-    assert sent[0]["body"] == "Veiarbeid\nBuss kl 09:30: Typisk 4–9 min forsinket"
+    assert _wording(sent[0]) == "Veiarbeid\nBuss kl 09:30: Typisk 4–9 min forsinket"
 
 
 def test_the_push_names_the_train_by_its_line(monkeypatch):
@@ -1865,7 +1888,7 @@ def test_the_push_names_the_train_by_its_line(monkeypatch):
     _register(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
 
-    assert sent[0]["body"] == "Signalfeil\nTog L1 09:24: Typisk 4–9 min forsinket"
+    assert _wording(sent[0]) == "Signalfeil\nTog L1 09:24: Typisk 4–9 min forsinket"
 
 
 def test_the_wording_falls_back_to_the_alerts_own_line_when_the_input_cannot_be_built():
@@ -2005,7 +2028,7 @@ def test_delivery_off_still_writes_the_wording_but_pushes_the_template(monkeypat
 
     assert len(prompted) == 1, "the writer runs even though nothing it produces will be sent"
     assert list(varsel._messages.values()) == ["Toget ditt er innstilt. Ta R11 kl 08:24."]
-    assert sent[0]["body"] == varsel._deterministic_body(prompted[0]), (
+    assert _wording(sent[0]) == varsel._deterministic_body(prompted[0]), (
         "with delivery off the push must be the template wording, to the character"
     )
     row = next(r for r in log.rows if r["situation_number"] == "S1")
@@ -2051,7 +2074,7 @@ def test_a_withheld_wording_is_recorded_beside_the_one_that_was_sent(monkeypatch
     assert row["message_source"] == "deterministic", (
         "message_source says what was SENT, not that a wording exists"
     )
-    assert row["message"] == row["message_deterministic"] == sent[0]["body"], (
+    assert row["message"] == row["message_deterministic"] == _wording(sent[0]), (
         "and `message` is the text the push actually carried, to the character"
     )
     # The write itself went fine, and the row says so: `message_status` describes the WRITER, so it
@@ -2159,8 +2182,8 @@ def test_two_devices_share_one_write_with_delivery_off(monkeypatch):
     varsel.check_and_notify(SNAPSHOT)
 
     assert len(written) == 1, "one written message per journey definition, not per device"
-    assert len(sent) == 2 and sent[0]["body"] == sent[1]["body"]
-    assert sent[0]["body"] != "Skrevet melding.", "delivery is off; the template is what goes out"
+    assert len(sent) == 2 and _wording(sent[0]) == _wording(sent[1])
+    assert _wording(sent[0]) != "Skrevet melding.", "delivery is off; the template is what goes out"
 
 
 def test_a_broken_message_input_costs_its_own_column_not_the_cycle(monkeypatch):
@@ -2192,7 +2215,7 @@ def test_a_broken_message_input_costs_its_own_column_not_the_cycle(monkeypatch):
     # The degraded wording is recorded as a WORDING and never as an input: it came from
     # `_message_input_from_alert`, which no writer was ever shown, so message_deterministic is
     # populated (it is what the push said) beside a NULL message_input (nothing was built).
-    assert row["message_deterministic"] == sent[0]["body"]
+    assert row["message_deterministic"] == _wording(sent[0])
 
 
 def test_ensure_table_backs_off_after_a_failure(monkeypatch):
@@ -2973,6 +2996,85 @@ class _MonkeyPatch:
     def undo(self):
         for obj, name, old in reversed(self._undo):
             setattr(obj, name, old)
+
+
+# ---- design review 2026-09-01: one notification per train, and a daily cap --------------------
+
+
+def _cancelled_notice(situation: str) -> list:
+    """A second SX message about the SNAPSHOT train, t1, now DECLARED cancelled by ET."""
+    return [
+        FakeCall("t1", "A", 1, DEP, situation_number=situation, summary="Innstilt",
+                 et_declared_cancelled=True, p_cancel=1.0, p_impact_dep=1.0),
+        FakeCall("t1", "B", 5, None, situation_number=situation, summary="Innstilt",
+                 aimed_arr=DEP + timedelta(minutes=40)),
+    ]
+
+
+def test_a_cancellation_confirming_an_earlier_forecast_replaces_it_on_the_lock_screen(monkeypatch):
+    """Finding 14: the 65 % forecast and «er innstilt» about one train arrived as two unrelated
+    notifications. Both pushes now carry the same per-train tag, so the second replaces the first
+    (sw.js), its title says «Bekreftet:», and it does not count against the daily cap -- it adds
+    nothing to the tray."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    jid = _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert [p["title"] for p in sent] == [_expected_title()]
+    assert varsel._daily_pushes[jid][1] == 1
+
+    _use_snapshot({"S1": SNAPSHOT["S1"], "S2": _cancelled_notice("S2")})
+    varsel.check_and_notify(_active_snapshot["value"])
+    assert len(sent) == 2, "a NEW situation about the same train still reaches the phone"
+    assert sent[1]["title"] == _expected_title("er innstilt", prefix="Bekreftet: ")
+    assert sent[1]["tag"] == sent[0]["tag"] == f"{jid}|VYG|t1|A|1"
+    assert varsel._daily_pushes[jid][1] == 1, "a replacement is not a second notification"
+    _use_snapshot(SNAPSHOT)
+
+
+def test_alert_pushes_per_registration_are_capped_per_day_soonest_first(monkeypatch):
+    """Finding 15: six notifications in one day for three journeys, before a single real user. A
+    line suspension pushes once per cancelled train in the window; the cap bounds that per
+    registration and per Oslo day, spends itself on the soonest departures, records the withheld
+    alerts all the same, and forgets yesterday."""
+    _reset_state()
+    trains = {}
+    for i in range(6):
+        dep = DEP + timedelta(minutes=10 * i)
+        trains[f"S{i + 1}"] = [
+            FakeCall(f"t{i + 1}", "A", 1, dep, situation_number=f"S{i + 1}", p_cancel=0.82,
+                     p_impact_dep=0.9),
+            FakeCall(f"t{i + 1}", "B", 5, None, situation_number=f"S{i + 1}",
+                     aimed_arr=dep + timedelta(minutes=40)),
+        ]
+    _use_snapshot(trains)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    log = _use_decision_log(monkeypatch)
+    jid = _register(DEVICE)
+    cap = varsel._MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
+    varsel.check_and_notify(trains)
+    assert len(sent) == cap == 4
+    assert [p["title"] for p in sent] == [
+        f"Tog R10 {DEP + timedelta(minutes=10 * i):%H:%M}"
+        f"{' i morgen' if (DEP + timedelta(minutes=10 * i)).date() > datetime.now(tz=_OSLO).date() else ''}"
+        " kan bli innstilt"
+        for i in range(cap)
+    ], "the cap is spent on the soonest departures"
+    # Every decision is still recorded; the two withheld ones simply did not push.
+    pushed = {r["situation_number"] for r in log.rows if r["pushed"]}
+    assert pushed == {"S1", "S2", "S3", "S4"}
+    assert {r["situation_number"] for r in log.rows} >= {"S5", "S6"}
+    # Re-offered next cycle, still capped today ...
+    varsel.check_and_notify(trains)
+    assert len(sent) == cap
+    # ... and delivered once the ledger says it is a new day.
+    with varsel._state_lock:
+        varsel._daily_pushes[jid] = ("2000-01-01", cap)
+    varsel.check_and_notify(trains)
+    assert len(sent) == 6
+    _use_snapshot(SNAPSHOT)
 
 
 if __name__ == "__main__":

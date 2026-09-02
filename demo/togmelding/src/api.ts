@@ -24,12 +24,15 @@ export interface Issue {
   feedback_enabled?: boolean;
 }
 
+// One ROW of the «kjente avvik» list: every SX message of one class saying the same thing, with
+// the rush-journey counts summed (togvarsel.known_deviations_for aggregates since 2026-09-02).
 export interface KnownDeviation {
   summary: string | null;
   cls: string;
   planned: boolean;
   n_am_rush_journeys: number;
   n_pm_rush_journeys: number;
+  n_situations?: number; // messages behind the row; optional so an older API still renders
 }
 
 export interface Togmelding {

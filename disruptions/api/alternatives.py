@@ -469,6 +469,15 @@ class AlternativeJourney(BaseModel):
         "nothing safer reached the destination in time — a wording that presents it as a clean "
         "escape would be wrong.",
     )
+    minutes_after_original: int | None = Field(
+        default=None,
+        description="How many minutes AFTER the traveller's planned arrival this gets them there — "
+        "the figure behind `arrives_before_original = false`, so a wording can say «34 min senere "
+        "enn planlagt» instead of leaving the reader to subtract two clock times on a lock screen "
+        "(design review 2026-09-01, finding 16). Same anchor as `arrives_before_original` (the "
+        "disrupted train's AIMED arrival), never `minutes_saved`'s predicted one. Null when the "
+        "alternative is in time, or when the selector had no aimed arrival to measure against.",
+    )
     legs: list[AlternativeLeg] = Field(
         default_factory=list, description="The legs to travel, in order."
     )
@@ -1518,6 +1527,13 @@ def select_best(
         # predicted later still — so the push said nothing and the model was free to write "du
         # rekker fram i tide" to somebody who does not.
         arrives_before_original=winner.arrival_time < original_arrival_time,
+        # The same anchor as the flag above, as a number: how late against the PLAN. Only carried
+        # when it is positive, i.e. exactly when the flag is False, so the two can never disagree.
+        minutes_after_original=(
+            round((winner.arrival_time - original_arrival_time).total_seconds() / 60)
+            if winner.arrival_time >= original_arrival_time
+            else None
+        ),
         at_risk=winner.risky,
         legs=list(winner.legs),
         # Carried off the winning candidate, where `impact.score_candidates` annotated them. This

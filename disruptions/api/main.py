@@ -111,19 +111,40 @@ _VARSEL_STOPS_BUS_QUERY = """
 # in the most reassuring way available: `to_stop` narrowing dropped every situation and the card
 # said "ingen aktive avvik akkurat nå".
 #
-# `topographicPlaceRef` carries the municipality number, whose first two digits are the county —
-# the disambiguator for the same-name stops that are NOT the same place (1 260 of those groups lie
-# over 20 km apart). Only the `KVE:` codespace is Kartverket's Norwegian numbering; `LAN:` (Sweden)
-# and `WOF:` refs are left unlabelled rather than mapped through a table that does not describe
-# them. Readable by any authenticated principal (the dataset grants allAuthenticatedUsers READER),
-# so this works in prd as well as dev.
+# `topographicPlaceRef` names the stop's MUNICIPALITY in the registry's own topographic-place table
+# — the disambiguator for the same-name stops that are NOT the same place (1 260 of those groups lie
+# over 20 km apart). The municipality, not the county, since 2026-09-02 (design review 2026-09-01,
+# finding 2): «Sandvika» is 29 different stops, eight of them in Troms, so a county suffix offered
+# «Sandvika (Troms)» six times over and the municipality is what tells Dyrøy from Tromsø. Measured
+# that day: 64 469 of 64 703 stop places resolve to a named municipality (99.6 %), every one of them
+# with a county parent, and the table carries both the current numbering and the pre-2020 codes
+# (`KVE:TopographicPlace:0219` and `:3201` both resolve to Bærum). The two-digit county prefix is
+# still read alongside, as the fallback for the 121 refs the table does not resolve — only the
+# `KVE:` codespace is Kartverket's numbering; `LAN:` (Sweden) and `WOF:` refs stay unlabelled rather
+# than mapped through a table that does not describe them. Readable by any authenticated principal
+# (the dataset grants allAuthenticatedUsers READER), so this works in prd as well as dev, and the
+# whole thing is ~3 MB per refresh.
 _VARSEL_STOP_PLACES_QUERY = """
-    SELECT id,
-           COALESCE(ANY_VALUE(parentRef.ref), id) AS place_id,
-           IF(STARTS_WITH(ANY_VALUE(topographicPlaceRef.ref), 'KVE:'),
-              SUBSTR(ANY_VALUE(topographicPlaceRef.ref), -4, 2), NULL) AS county_no
-    FROM `ent-data-sharing-ext-prd.national_stop_registry.stop_places_last_version`
-    GROUP BY id
+    WITH tp AS (
+      SELECT id, name, type, parentRef
+      FROM `ent-data-sharing-ext-prd.national_stop_registry.topographic_places_all_versions`
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY version DESC) = 1
+    ),
+    sp AS (
+      SELECT id,
+             COALESCE(ANY_VALUE(parentRef.ref), id) AS place_id,
+             ANY_VALUE(topographicPlaceRef.ref) AS tp_ref
+      FROM `ent-data-sharing-ext-prd.national_stop_registry.stop_places_last_version`
+      GROUP BY id
+    )
+    SELECT sp.id,
+           sp.place_id,
+           IF(STARTS_WITH(sp.tp_ref, 'KVE:'), SUBSTR(sp.tp_ref, -4, 2), NULL) AS county_no,
+           IF(tp.type = 'municipality', tp.name, NULL) AS municipality,
+           COALESCE(IF(tp.type = 'county', tp.name, NULL), parent.name) AS county
+    FROM sp
+    LEFT JOIN tp ON tp.id = sp.tp_ref
+    LEFT JOIN tp AS parent ON parent.id = tp.parentRef
 """
 # Municipality-number prefix -> county name. NSR carries both the current numbering and pre-2020
 # codes (Kambo is 0104, not 3103), so both generations are mapped, each to the county that exists
@@ -563,22 +584,30 @@ _varsel_stops_cache: list[dict] = []
 
 
 def _varsel_stop_places() -> dict[str, tuple[str, str | None]]:
-    """NSR ref -> (place_id, county name). Empty when the registry cannot be read.
+    """NSR ref -> (place_id, region label). Empty when the registry cannot be read.
 
-    Fails open like every other sub-query here: no registry means no grouping and no county
+    The region is the MUNICIPALITY name when the registry resolves one, else the county the
+    municipality number's prefix maps to, else None — so a ref the topographic table does not know
+    is labelled the way every ref was until 2026-09-02, not left bare. `getattr`, because the row
+    shape is also what the hermetic suite hands in, and an older fixture carries no municipality.
+
+    Fails open like every other sub-query here: no registry means no grouping and no region
     labels, which is what the picker did before this existed — not an empty stop list.
     """
     places: dict[str, tuple[str, str | None]] = {}
     try:
         for r in bq_client.query(_VARSEL_STOP_PLACES_QUERY).result():
-            places[r.id] = (
-                r.place_id,
-                _COUNTY_BY_MUNICIPALITY_PREFIX.get(r.county_no) if r.county_no else None,
+            county_no = getattr(r, "county_no", None)
+            region = (
+                getattr(r, "municipality", None)
+                or getattr(r, "county", None)
+                or (_COUNTY_BY_MUNICIPALITY_PREFIX.get(county_no) if county_no else None)
             )
+            places[r.id] = (r.place_id, region)
     except Exception:
         logger.exception(
             "The national stop registry could not be read; stops keep their own place ids "
-            "(same-named stops will be offered separately and carry no county)"
+            "(same-named stops will be offered separately and carry no region)"
         )
     return places
 
@@ -597,7 +626,8 @@ def refresh_varsel_stops() -> None:
     aliases — `varsel` rewrites registrations onto the primary so both surfaces agree on one ref per
     place. Grouping needs the name as well as the parent: a parent can hold genuinely different
     stops (Oslo S and Jernbanetorget), and merging those would answer a search for one with the
-    other.
+    other. `region` on each row is the municipality (see `_varsel_stop_places`), which the picker
+    appends to a name that belongs to several places.
     """
     merged: dict[str, dict] = {}
     for q in (_VARSEL_STOPS_QUERY, _VARSEL_STOPS_BUS_QUERY):

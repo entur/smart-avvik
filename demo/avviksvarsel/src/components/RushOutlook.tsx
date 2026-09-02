@@ -1,6 +1,7 @@
 import { Link, Paragraph, SmallText } from '@entur/typography';
 import type { RushForecast } from '../api';
 import { RUSH_NAME } from '../format';
+import { LEVEL_LABEL, LEVEL_TEXT } from '../levels';
 import type { Brand } from '../brand';
 
 // Today's Oslo rush-hour levels, at the top of the page — but only for a device the server
@@ -15,22 +16,10 @@ import type { Brand } from '../brand';
 // "kjente avvik" list live on /togmelding, which is one tap away.
 //
 // The level colours are Linje validation tokens (see styles.css), the same three the level cards
-// on /togmelding use, so the two surfaces cannot drift into different greens. The level TEXT below
-// is a third copy of the same three sentences (togvarsel._LEVEL_TEXT and
-// demo/togmelding/src/format.ts are the other two) — the mirror test pins the /togmelding one,
-// because that is what the persisted feedback snapshot has to match; reword this one with them.
-
-const LEVEL_LABEL: Record<string, string> = {
-  green: 'GRØNT',
-  yellow: 'GULT',
-  red: 'RØDT',
-};
-
-const LEVEL_TEXT: Record<string, string> = {
-  green: 'liten fare for forstyrrelser',
-  yellow: 'noe usikkert',
-  red: 'stor fare for forstyrrelser',
-};
+// on /togmelding use, so the two surfaces cannot drift into different greens. The level WORDS come
+// from levels.ts, a guarded duplicate of /togmelding's copy (disruptions/api/test_togvarsel.py
+// asserts the two files match and that the sentences equal togvarsel._LEVEL_TEXT, which the
+// persisted feedback snapshot quotes) — one vocabulary, where there used to be three drifting ones.
 
 export default function RushOutlook({
   rushes,

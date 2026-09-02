@@ -234,6 +234,18 @@ _TRANSIENT_FAILURES = frozenset({"error", "truncated"})
 # a bounded worst case. Trains past it take the deterministic wording and are recorded
 # `not_selected`, so what the cap costs stays countable rather than being inferred from a log line.
 _MAX_MESSAGES_PER_JOURNEY = 3
+# At most this many alert pushes per REGISTRATION per Oslo day (design review 2026-09-01, finding
+# 15: six notifications in one day for three journeys, before the service had a single real user).
+# A line suspension otherwise pushes once per cancelled train in the window -- 3-5 in ~27 % of cases
+# (the ET-relay multiplicity the team chose to watch on 2026-08-19) -- and fatigue is the one failure
+# a notification channel cannot recover from: the traveller mutes it, and the push that mattered goes
+# with the rest. Four rather than fewer because a long registered window (07:00-22:00 is common)
+# legitimately spans two rushes and the cap is per registration, not per rush. Spent SOONEST
+# DEPARTURE FIRST within a cycle, so the trains that can still be acted on win. A push that REPLACES
+# an earlier one about the same train (same notification tag, see `_notification_tag`) is exempt: it
+# adds nothing to the tray. A capped alert still reaches the decision log (`pushed=False`) and is
+# re-offered every cycle, so the cap suppresses delivery and nothing else.
+_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY = 4
 # Wall-clock ceiling for the whole message-writing pass. The call cap alone does not bound time:
 # one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
 # worst case. Trains past the budget take the deterministic wording and are re-tried next tick.
@@ -721,6 +733,19 @@ _message_errors: dict[tuple[str, str, str], int] = {}
 # because only this loop can tell a per-cycle cap from an exhausted retry from a model that refused,
 # and once the deterministic wording is stored all three look identical. See decisions.build_row.
 _message_meta: dict[tuple[str, str, str], dict[str, Any]] = {}
+# Trains a push has already reached each REGISTRATION about, {"<journey_id>|<train key>": departure
+# (UTC)} -- design review 2026-09-01, findings 14 and 15. Two readers. `_notification_title` prefixes
+# a later push about the same train with «Bekreftet:» (the 65 % forecast and «er innstilt» used to
+# arrive as two unrelated notifications about one train), and the delivery loop exempts such a push
+# from the daily cap, because it REPLACES the earlier one on the lock screen (same notification tag)
+# rather than adding to the pile. In memory only: a restart forgets it, which costs at most one
+# missing prefix and one extra counted push, while persisting it would grow the state blob by a key
+# per train. Pruned by departure time -- a train is done being pushed about once it has left.
+_pushed_trains: dict[str, datetime] = {}
+# Alert pushes sent per REGISTRATION on the current Oslo day, journey_id -> ("YYYY-MM-DD", count):
+# the ledger behind :data:`_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`. In memory for the same reason as
+# the dict above -- a restart resets the count, which errs towards sending.
+_daily_pushes: dict[str, tuple[str, int]] = {}
 
 # Togvarsel push round markers, {"<YYYY-MM-DD Oslo>": {"<issue>": {"level": str, "pushed": bool}}} —
 # togvarsel_notify's single state primitive (dedup + the follow-up baseline in one). Persisted in
@@ -1448,7 +1473,15 @@ def _alternative_phrase(message_input: dict) -> str | None:
     if arrival:
         phrase += f", framme kl {arrival}" if departure else f" framme kl {arrival}"
     if alt.get("ankommer_i_tide") is False:
-        phrase += " – senere enn planlagt ankomst"
+        # With the figure when the input carries one: «34 min senere enn planlagt ankomst» spares
+        # the reader subtracting two clock times on a lock screen (design review 2026-09-01,
+        # finding 16). `minutter_senere` is present only when positive -- see build_message_input.
+        later = alt.get("minutter_senere")
+        phrase += (
+            f" – {later} min senere enn planlagt ankomst"
+            if later
+            else " – senere enn planlagt ankomst"
+        )
     if alt.get("egen_risiko"):
         phrase += " (kan også bli rammet)"
     return phrase
@@ -1501,6 +1534,12 @@ def _deterministic_body(message_input: dict) -> str:
         train = _train_label(
             message_input.get("transportmiddel"), message_input.get("linje"), hhmm
         )
+        if message_input.get("i_morgen"):
+            # The departure is TOMORROW. The poller scores ~12 h ahead, so a push about a 07:18
+            # train routinely goes out the evening before -- by design, not by accident -- and read
+            # at 21:36 "Tog L1 07:18 er innstilt" sounds like tonight's train (design review
+            # 2026-09-01, finding 48). Same key the prompt is told about, so both writers say it.
+            train = f"{train} i morgen"
         detail = f"{train}: {detail}" if detail else train
     # The alternative comes LAST, after the cancellation or the delay: what has happened to the
     # traveller's own train is the news, and the replacement is the advice that follows from it.
@@ -1542,6 +1581,57 @@ def normalize_brand(brand: str | None) -> str:
     return brand if brand in _BRAND_ASSETS else DEFAULT_BRAND
 
 
+def _notification_title(
+    message_input: dict, from_name: str, to_name: str, *, confirmed: bool = False
+) -> str:
+    """The lock-screen title: the FACT about the train, never the registration's name.
+
+    It was «Asker stasjon → Lillestrøm stasjon» until 2026-09-02 -- the route the traveller already
+    knows, and one every phone truncated to «Asker stasjon → Lillestrøm s…» (design review
+    2026-09-01, finding 13). The title is the surface a lock screen is scanned by, so it now says
+    what happened, «Tog L1 07:18 er innstilt», and the route moved to the body's first line. Built
+    from the same message input as the body, so the two name the train identically; the route is
+    the fallback when the input names no departure.
+
+    `confirmed` prefixes a declared cancellation with «Bekreftet:» when an earlier push about the
+    same train already reached this registration (finding 14): the two arrive under one
+    notification tag, so the second REPLACES the first, and the prefix says that is what it is.
+    Only a cancellation earns it -- a second forecast about the same train is an update, not a
+    confirmation of anything.
+    """
+    hhmm = message_input.get("avgang_kl")
+    if not hhmm:
+        return f"{from_name} → {to_name}"
+    train = _train_label(message_input.get("transportmiddel"), message_input.get("linje"), hhmm)
+    if message_input.get("i_morgen"):
+        train = f"{train} i morgen"
+    if message_input.get("innstilt"):
+        title = f"{train} er innstilt"
+        return f"Bekreftet: {title}" if confirmed else title
+    if message_input.get("innstilling_prosent") is not None:
+        return f"{train} kan bli innstilt"
+    delay = message_input.get("forsinkelse_min") or {}
+    if delay.get("typisk") or delay.get("verstefall"):
+        return f"{train} kan bli forsinket"
+    return f"{train}: mulig avvik"
+
+
+def _notification_tag(journey_id: str | None, alert: Alert) -> str | None:
+    """One notification per TRAIN per registration on the lock screen (finding 14).
+
+    The service worker used the situation number as the tag, so a forecast and the cancellation
+    that confirmed it -- two SX messages, two situation numbers, one train -- stacked as two
+    notifications. Keyed on the train (`_train_key`, the same identity `one_alert_per_train`
+    collapses on), a later push about the same departure replaces the earlier one. `None` when the
+    alert cannot say which train it is about; the worker then falls back to the situation number,
+    which is what it always did.
+    """
+    key = _train_key(alert)
+    if journey_id is None or key is None:
+        return None
+    return f"{journey_id}|" + "|".join(str(part) for part in key)
+
+
 def _notification_payload(
     journey: dict,
     alert: Alert,
@@ -1550,17 +1640,24 @@ def _notification_payload(
     journey_id: str | None = None,
     message_input: dict | None = None,
     brand: str = DEFAULT_BRAND,
+    confirmed: bool = False,
 ) -> dict:
     """Norwegian Web Push payload for one journey×situation match.
 
     `message` is the LLM-written text when one was produced; the deterministic template is used
     otherwise, so a missing or failing message writer costs wording, never the notification. The
-    title, url and situation_number are unchanged either way — the notification stays recognisable
-    and the service worker's click-through keeps working.
+    url and situation_number are unchanged either way — the notification stays recognisable and
+    the service worker's click-through keeps working.
 
     `message_input` is this decision's message input (see :func:`_message_input`); `None` means it
     could not be built, and the template falls back to reconstructing the little of it the wording
     needs from the alert — a push must not be lost to a payload problem.
+
+    The BODY is the route on its own line followed by the wording, unchanged (2026-09-02). The
+    wording is what `/historikk` records and what the two writers are compared on, so the route
+    was added AROUND it when the title stopped carrying it (:func:`_notification_title`) rather
+    than written into it. `tag` is the train, see :func:`_notification_tag`; `confirmed` is
+    whether this registration was already pushed about that train.
 
     `brand` only ever moves the icon and the click-through url. The WORDING is deliberately
     identical across brands: it is what `/historikk` records, and a text that varied by variant
@@ -1573,16 +1670,21 @@ def _notification_payload(
     if journey_id:
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}{urlencode({'journey': journey_id, 'situation': alert.situation_number})}"
-    return {
-        # The journey alone, no "Avvik: " prefix (2026-08-20): the app that sent it is already
-        # named beside the title by the OS, the body says what the disruption is, and the two
-        # words cost the stop names room on a lock screen that truncates on the right.
-        "title": _tag_environment(f"{from_name} → {to_name}"),
-        "body": message or _deterministic_body(message_input or _message_input_from_alert(alert)),
+    message_input = message_input or _message_input_from_alert(alert)
+    wording = message or _deterministic_body(message_input)
+    payload = {
+        "title": _tag_environment(
+            _notification_title(message_input, from_name, to_name, confirmed=confirmed)
+        ),
+        "body": f"{from_name} → {to_name}\n{wording}",
         "url": url,
         "icon": assets["icon"],
         "situation_number": alert.situation_number,
     }
+    tag = _notification_tag(journey_id, alert)
+    if tag is not None:
+        payload["tag"] = tag
+    return payload
 
 
 def _send_push(subscription: dict, payload: dict) -> str:
@@ -1925,6 +2027,17 @@ def _local_line_code(line: str | None) -> str | None:
     return (line.rsplit(":", 1)[-1] or None) if line else None
 
 
+def _departs_tomorrow(departure: datetime | None, now: datetime | None = None) -> bool:
+    """Is this departure on a later Oslo calendar day than `now`? Mirrors `llm_message._departs_tomorrow`
+    without importing it, for the same reason `_local_hhmm` mirrors `_hhmm`."""
+    if departure is None:
+        return False
+    now = now or datetime.now(UTC)
+    # EXACTLY tomorrow. The poller scores ~12 h ahead so nothing further out reaches a wording, and
+    # for anything that somehow did, «i morgen» would be a false statement rather than a missing one.
+    return departure.astimezone(_OSLO).date() == now.astimezone(_OSLO).date() + timedelta(days=1)
+
+
 def _message_input_from_alert(alert: Alert) -> dict:
     """The alert's own figures in the message-input shape — a last resort for the *wording* only.
 
@@ -1945,6 +2058,8 @@ def _message_input_from_alert(alert: Alert) -> dict:
     # the key, and the two wording sources must not disagree about whether this train has a line.
     if line := _local_line_code(alert.line):
         body["linje"] = line
+    if _departs_tomorrow(alert.departure_time):
+        body["i_morgen"] = True
     if not alert.has_situation:
         # Same correction as build_message_input makes, restated here because this path exists for
         # exactly the moment that one has failed. `alert.summary` on a no-SX alert is text this
@@ -1976,6 +2091,11 @@ def _message_input_from_alert(alert: Alert) -> dict:
         }
         if alt.minutes_saved > 0:
             alternative["minutter_spart"] = alt.minutes_saved
+        # Same rule as build_message_input: the figure rides only when the alternative is late
+        # against the plan, so `_alternative_phrase` never says "0 min senere".
+        later = getattr(alt, "minutes_after_original", None)
+        if alt.arrives_before_original is False and later:
+            alternative["minutter_senere"] = later
         body["alternativ_reise"] = alternative
     # Same three-way split as build_message_input, for the same reason: a declared cancellation is
     # not a probability, and the conditional figures below it do not apply once the train is gone.
@@ -2381,6 +2501,15 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             _message_errors.pop(key, None)
         for key in [k for k in _message_meta if k[1] not in live]:
             _message_meta.pop(key, None)
+        # A train that left is done being pushed about (same grace as journey_windows, so a train
+        # still being advised as delayed-but-catchable keeps its entry), and the daily ledger
+        # forgets yesterday.
+        gone_by = datetime.now(UTC) - _WINDOW_CATCH_UP
+        for tag in [t for t, departed in _pushed_trains.items() if departed < gone_by]:
+            _pushed_trains.pop(tag, None)
+        oslo_today = datetime.now(_OSLO).date().isoformat()
+        for jid in [j for j, (day, _count) in _daily_pushes.items() if day != oslo_today]:
+            _daily_pushes.pop(jid, None)
         changed = bool(stale)
 
     # ---- Loop 1: one impact call per journey definition, one written message per train ---------
@@ -2670,7 +2799,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # Collect first, then fan out through deliver_to_devices -- parallel ACROSS devices, sequential
     # WITHIN one; the worker/timeout rationale lives on that helper, which the togvarsel rounds
     # share. One broad situation produces one send per registration in a single cycle.
-    per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str]]] = {}
+    per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str, bool]]] = {}
+    oslo_today = cycle_now.astimezone(_OSLO).date().isoformat()
+    # Pushes this cycle will attempt per registration, so the daily cap is judged against what is
+    # about to go out as well as what has gone: without the reservation a cycle with five cancelled
+    # trains on one journey would pass all five through a ledger that still read zero.
+    reserved: dict[str, int] = {}
+    capped: dict[str, int] = {}
     for jid, journey in journeys if push_on else []:
         device = None
         brand = DEFAULT_BRAND
@@ -2688,17 +2823,60 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         # to mean two notifications a minute apart, saying the same thing with different percentages
         # (2026-08-05). `_notified` still keys on the surviving situation_number, so the suppressed
         # one simply never notifies -- and `_record_decisions` below still sees both.
-        for alert in one_alert_per_train(alerts_by_key.get(key, [])):
-            if not alert.alertworthy:
-                continue
+        #
+        # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when the
+        # daily cap below binds, it must be spent on the trains the traveller can still act on.
+        trains = sorted(
+            (a for a in one_alert_per_train(alerts_by_key.get(key, [])) if a.alertworthy),
+            key=lambda a: (
+                a.departure_time is None,
+                a.departure_time.timestamp() if a.departure_time else 0.0,
+            ),
+        )
+        for alert in trains:
             with _state_lock:
                 if f"{jid}|{alert.situation_number}" in _notified:
                     continue
+                tag = _notification_tag(jid, alert)
+                # An earlier push about this TRAIN (another situation about it) already reached
+                # this registration: the new one replaces it on the lock screen under the same tag,
+                # so it is not counted against the cap and its title may say «Bekreftet:».
+                replaces = tag is not None and tag in _pushed_trains
+                day, count = _daily_pushes.get(jid, (oslo_today, 0))
+                sent_today = count if day == oslo_today else 0
+            if (
+                not replaces
+                and sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
+            ):
+                capped[jid] = capped.get(jid, 0) + 1
+                continue
+            if not replaces:
+                reserved[jid] = reserved.get(jid, 0) + 1
             per_device.setdefault(journey["device_id"], []).append(
-                (jid, device, journey, alert, key, brand)
+                (jid, device, journey, alert, key, brand, replaces)
             )
+    if capped:
+        # Once per cycle. The alerts themselves are still recorded below with pushed=False and are
+        # re-offered next cycle, so this line is the only place the suppression is visible.
+        logger.info(
+            "Daily push cap (%d per registration) withheld %d alert push(es) across %d "
+            "registration(s) this cycle",
+            _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
+            sum(capped.values()),
+            len(capped),
+            extra={
+                "fields": {
+                    "event": "push_capped",
+                    "withheld": sum(capped.values()),
+                    "registrations": len(capped),
+                    "cap": _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
+                }
+            },
+        )
 
-    def _prepare_alert(item: tuple[str, dict, dict, Alert, str, str]) -> tuple[dict, dict] | None:
+    def _prepare_alert(
+        item: tuple[str, dict, dict, Alert, str, str, bool],
+    ) -> tuple[dict, dict] | None:
         """One pending alert → (subscription, payload), run on the fan-out's worker thread.
 
         ``None`` means "the registration went away; skip the send". The collection loop above
@@ -2710,7 +2888,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         the latest point that still precedes the network call. It takes `_state_lock` for two dict
         lookups and never across `_send_push`.
         """
-        jid, device, journey, alert, key, brand = item
+        jid, device, journey, alert, key, brand, replaces = item
         with _state_lock:
             if jid not in _journeys or journey["device_id"] not in _devices:
                 return None
@@ -2725,13 +2903,14 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             journey_id=jid,
             message_input=message_inputs.get(message_key),
             brand=brand,
+            confirmed=replaces,
         )
         return device, payload
 
     pushed_keys: set[tuple[str, str]] = set()
     if per_device:
         for _device_id, item, result, payload in deliver_to_devices(per_device, _prepare_alert):
-            jid, _device, journey, alert, _key, _brand = item
+            jid, _device, journey, alert, _key, _brand, replaces = item
             _log_push("alert", result, journey["device_id"], payload, journey_id=jid, alert=alert)
             if result == "sent":
                 with _state_lock:
@@ -2741,6 +2920,15 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                     if jid in _journeys:
                         _notified.add(f"{jid}|{alert.situation_number}")
                         changed = True
+                        tag = _notification_tag(jid, alert)
+                        if tag is not None and alert.departure_time is not None:
+                            _pushed_trains[tag] = alert.departure_time
+                        if not replaces:
+                            day, count = _daily_pushes.get(jid, (oslo_today, 0))
+                            _daily_pushes[jid] = (
+                                oslo_today,
+                                (count if day == oslo_today else 0) + 1,
+                            )
                 pushed_keys.add((journey_key(journey), alert.situation_number))
             elif result == "gone":
                 if handle_gone_device(journey["device_id"]):
@@ -2797,9 +2985,10 @@ class StopItem(BaseModel):
     region: str | None = Field(
         default=None,
         description=(
-            "County, from the registry's municipality number. Pickers append it when a name is "
-            "offered by more than one place; NULL when the registry does not place the stop in a "
-            "Norwegian county."
+            "Where the stop is: the municipality from the National Stop Register (the county only "
+            "for the few refs the registry's topographic table does not resolve). Pickers append it "
+            "when a name is offered by more than one place; NULL when the registry cannot place the "
+            "stop at all."
         ),
     )
 
@@ -3171,7 +3360,9 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
                 snapshot = {
                     "display_source": source,
                     "displayed_text": alert.message if alert.message is not None else alert.summary,
-                    "detail_text": _feedback_detail(alert),
+                    # None beside a written message: the card hides the line there (finding 18),
+                    # and the snapshot must say what the traveller read, not what it could have.
+                    "detail_text": None if alert.message is not None else _feedback_detail(alert),
                     "observation_text": _feedback_observation(obs),
                     "situation_number": alert.situation_number,
                     "operator": alert.operator,
@@ -3220,16 +3411,21 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
 
 
 def _feedback_detail(alert: Alert) -> str:
-    """Literal detail line mirrored from the current React renderer."""
+    """Literal detail line mirrored from the current React renderer (JourneyCard's `AlertLine`).
+
+    The card shows this line only under the operator's SUMMARY; beside a written message it said the
+    same thing twice (design review 2026-09-01, finding 18), so `_journey_model` records None in that
+    case. The train label gains « i morgen» exactly as the card's `trainLabel` does."""
     parts: list[str] = []
     if alert.departure_time:
-        parts.append(
-            _train_label(
-                alert.mode,
-                _local_line_code(alert.line),
-                _local_hhmm(alert.departure_time) or "",
-            )
+        train = _train_label(
+            alert.mode,
+            _local_line_code(alert.line),
+            _local_hhmm(alert.departure_time) or "",
         )
+        if _departs_tomorrow(alert.departure_time):
+            train = f"{train} i morgen"
+        parts.append(train)
     if alert.cancelled:
         parts.append("Innstilt")
     elif alert.cancel_probability >= _CANCEL_LIKELY:

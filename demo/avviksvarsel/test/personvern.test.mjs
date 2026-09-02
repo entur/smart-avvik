@@ -27,8 +27,8 @@ import {
 // block, with the reason attached — the same derived-version reasoning as
 // disruptions/api/llm_message.py's PROMPT_VERSION.
 const PINNED_CONSENT = {
-  version: '2026-08-31.1',
-  hash: '0d049fa7',
+  version: '2026-09-02.1',
+  hash: '3cb83e56',
 };
 
 /** sha256[:8] of the exact corpus a registering user consents to, version included. */
@@ -68,20 +68,30 @@ test('CONSENT_TEXT_VERSION is a dated version string', () => {
   assert.match(CONSENT_TEXT_VERSION, /^\d{4}-\d{2}-\d{2}\.\d+$/);
 });
 
-test('required phrases: sender line, experiment disclaimer, and all nine T5 sections', () => {
+test('required phrases: sender line, experiment disclaimer, and all ten T5 sections', () => {
   assert.ok(T7_AVSENDER.prose.includes('Entur AS'), 'the sender line must name Entur AS');
-  assert.ok(T1_EKSPERIMENT.body.includes('eksperiment'), 'T1 must say this is an experiment');
+  assert.ok(
+    T1_EKSPERIMENT.body.toLowerCase().includes('eksperiment'),
+    'T1 must say this is an experiment',
+  );
+  assert.ok(
+    T1_EKSPERIMENT.body.includes('ikke planlegg reisen din på dem alene'),
+    'T1 keeps the one warning that matters on the first screen',
+  );
   assert.equal(T5_PAGE_HEADING, 'Personvern i Avviksvarsel');
+  // The reader's order, not the regulation's (design review 2026-09-01, finding 45), with the
+  // evaluation pages as their own section (finding 46).
   assert.deepEqual(
     T5_SECTIONS.map((section) => section.title),
     [
-      'Behandlingsansvarlig',
       'Hva vi lagrer',
       'Hvorfor',
-      'Rettslig grunnlag',
       'Hvem som kan se opplysningene',
+      'Åpne evalueringssider',
       'Hvor lenge',
       'Rettighetene dine',
+      'Rettslig grunnlag',
+      'Behandlingsansvarlig',
       'Klage',
       'Overføring ut av EØS',
     ],
@@ -89,6 +99,34 @@ test('required phrases: sender line, experiment disclaimer, and all nine T5 sect
   for (const section of T5_SECTIONS) {
     assert.ok(section.body.length > 0, `T5 section «${section.title}» must have a body`);
   }
+});
+
+test('the privacy page answers where to go: complaint, controller, evaluation pages (finding 43)', () => {
+  const links = Object.fromEntries(
+    T5_SECTIONS.flatMap((section) => (section.links ?? []).map((link) => [section.title, link.href])),
+  );
+  assert.match(links['Klage'], /^https:\/\/www\.datatilsynet\.no\//);
+  assert.match(links['Behandlingsansvarlig'], /^https:\/\/entur\.no\/personvern\//);
+  const evaluation = T5_SECTIONS.find((section) => section.title === 'Åpne evalueringssider');
+  assert.deepEqual(
+    evaluation.links.map((link) => link.href),
+    ['/historikk', '/meldinger'],
+  );
+  for (const section of T5_SECTIONS) {
+    for (const link of section.links ?? []) {
+      assert.ok(link.text.length > 0 && link.href.length > 0, `${section.title}: empty link`);
+    }
+  }
+});
+
+test('the legal basis names the plain-language meaning beside each letter (finding 45)', () => {
+  const basis = T5_SECTIONS.find((section) => section.title === 'Rettslig grunnlag').body;
+  assert.ok(basis.includes('bokstav a (samtykke)'));
+  assert.ok(basis.includes('bokstav f (berettiget interesse)'));
+  const retention = T5_SECTIONS.find((section) => section.title === 'Hvor lenge').body;
+  assert.ok(!retention.includes('fast periode'), 'art. 13(2)(a) wants the period, not «en fast periode»');
+  const controller = T5_SECTIONS.find((section) => section.title === 'Behandlingsansvarlig').body;
+  assert.ok(controller.includes('\n'), 'controller and DPO are two art. 13 items on two lines');
 });
 
 test('T4 scopes «Skru av» to the varselabonnement and reserves key deletion for «Slett alt»', () => {
