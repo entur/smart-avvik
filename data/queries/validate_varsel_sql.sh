@@ -180,4 +180,30 @@ check "meldinger_summary.sql"       "$API/meldinger_summary.sql" \
 # merely emptying a dropdown. Deliberately not narrowed by the other filters, hence three parameters.
 check "meldinger_filters.sql"       "$API/meldinger_filters.sql" "${MELDINGER_PARAMS[@]}"
 
+# ---- /rushhistorikk: the Rushvarsel feedback loop -------------------------------------------
+#
+# The first togvarsel SQL this script covers. The twelve files under data/queries/togvarsel/ and
+# disruptions/api/togvarsel_features_today.sql are still unvalidated -- a separate, overdue pass.
+#
+# PREREQUISITE, and it is not optional: disruptions.togvarsel_rounds and
+# disruptions.togvarsel_outcomes must EXIST in the project. Both are created from Python at startup
+# (togvarsel_notify.ensure_table / togvarsel_outcomes.ensure_table), and a dry run resolves table
+# references -- so run this against an environment the app has started in, or the two rushhistorikk
+# checks report FAILED and the files go UNVALIDATED, which is the exact failure this script exists
+# to prevent.
+#
+# Measured 2026-09-01 against ent-kixavvik-dev: settled 32.5 MB for one day, provisional 3.4 MB,
+# the day query 305 bytes. The usual caveat applies harder than the byte counts suggest -- a too-narrow
+# date bound drops rows SILENTLY and shows up here as a CHEAPER query, i.e. as success.
+check "togvarsel_outcomes_settled.sql" "$API/togvarsel_outcomes_settled.sql" \
+  --parameter=from_date:DATE:2026-08-28 --parameter=to_date:DATE:2026-08-28
+# @scopes is never empty -- the caller passes ("am","amrest") or ("pm") -- so this is a plain
+# IN UNNEST and NOT the IFNULL(ARRAY_LENGTH(...), 0) = 0 idiom the /historikk filters need. That
+# idiom exists for "an empty array means no filter"; there is no no-filter case here, and adding it
+# would silently widen the pass to scopes whose rush has not ended.
+check "togvarsel_outcomes_provisional.sql" "$API/togvarsel_outcomes_provisional.sql" \
+  --parameter=day:DATE:2026-09-01 '--parameter=scopes:ARRAY<STRING>:["am","amrest"]'
+check "rushhistorikk_days.sql"      "$API/rushhistorikk_days.sql" \
+  --parameter=from_date:DATE:2026-08-01
+
 exit "$fail"

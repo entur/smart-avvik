@@ -3,8 +3,11 @@
 Togvarsel (togvarsel.py) issues four green/yellow/red prognoses per weekday: 0630 and 0700 for
 the morning rush, 1200 and 1400 for the afternoon. This module decides which of those rounds
 notify /varsel subscribers. The policy core below is pure functions over plain data — issue
-dicts, a marker map, an explicit Oslo-aware `now` — so every decision is reproducible from
-durable inputs (the issued level, the marker state, the clock) without rows in a decisions table.
+dicts, a marker map, an explicit Oslo-aware `now` — so a decision is a function of its inputs
+rather than of anything ambient. That is NOT the same as being reconstructible after the fact, and
+the Round Record section below is where the difference is argued: what the markers do not preserve
+is which rounds were never evaluated at all, so every round is recorded to
+`disruptions.togvarsel_outcomes`' sibling table as it is decided.
 
 The gates, in order, per round:
 
@@ -77,7 +80,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Collection, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -91,6 +94,9 @@ _OSLO = ZoneInfo("Europe/Oslo")
 
 # togvarsel's level vocabulary; anything else is a malformed round and is refused loudly.
 _LEVELS = ("green", "yellow", "red")
+
+# Blast-radius bound on the round-record MERGE, matching rushhistorikk._MAX_BYTES_BILLED.
+_MAX_BYTES_BILLED = 2 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,11 @@ class Decision:
     marker: dict[str, Any]
     kind: str | None = None  # set iff push
     reason: str | None = None  # set iff not push
+    # The level this round's baseline left in force (_effective_baseline), or None for a baseline
+    # round. Carried on the Decision rather than recomputed later because /rushhistorikk grades an
+    # unsent follow-up on the level the traveller actually holds, not on the forecast nobody saw —
+    # and recording it here is what keeps that off a second row's survival (see _record_round).
+    baseline_level: str | None = None
 
 
 def _marker(level: str, pushed: bool) -> dict[str, Any]:
@@ -156,10 +167,22 @@ def decide_issue(issue: Mapping[str, Any], markers: Mapping[str, Any], now: date
     if level not in _LEVELS:
         raise ValueError(f"issue {key}: unknown level {level!r}")
 
+    # Resolved before the deadline check, not inside the change branch: an UNTIMELY follow-up
+    # leaves its baseline's warning standing, and /rushhistorikk grades it on that level. Pure
+    # read of the markers, so hoisting it changes no decision.
+    base = _effective_baseline(spec, markers) if spec.baseline is not None else None
+
     now = now.astimezone(_OSLO)
     now_h = now.hour + now.minute / 60 + now.second / 3600
     if now_h >= spec.deadline_h:  # strictly-before cutoff: 07:00:00 sharp is already too late
-        return Decision(key, level, push=False, marker=_marker(level, False), reason="untimely")
+        return Decision(
+            key,
+            level,
+            push=False,
+            marker=_marker(level, False),
+            reason="untimely",
+            baseline_level=base,
+        )
 
     if spec.baseline is None:
         if level == "green":
@@ -168,16 +191,25 @@ def decide_issue(issue: Mapping[str, Any], markers: Mapping[str, Any], now: date
             )
         return Decision(key, level, push=True, marker=_marker(level, True), kind="warning")
 
-    base = _effective_baseline(spec, markers)
+    assert base is not None  # spec.baseline is set, so the hoisted resolution ran
     if level == base:
-        return Decision(key, level, push=False, marker=_marker(level, False), reason="no_change")
+        return Decision(
+            key,
+            level,
+            push=False,
+            marker=_marker(level, False),
+            reason="no_change",
+            baseline_level=base,
+        )
     if level == "green":
         kind = "all_clear"  # dropped back to green after a pushed warning
     elif base == "green":
         kind = "warning"  # the baseline pushed nothing, so there is nothing to "update"
     else:
         kind = "update"  # yellow <-> red transition against a pushed baseline
-    return Decision(key, level, push=True, marker=_marker(level, True), kind=kind)
+    return Decision(
+        key, level, push=True, marker=_marker(level, True), kind=kind, baseline_level=base
+    )
 
 
 def _due_order(issue: Mapping[str, Any]) -> tuple[float, str]:
@@ -214,6 +246,140 @@ def decide_rounds(
         markers[decision.issue] = decision.marker
         decisions.append(decision)
     return decisions
+
+
+# ---- Round record -----------------------------------------------------------------------
+#
+# What /rushhistorikk scores. The round markers in the /varsel state blob are the runtime
+# primitive, but `varsel.store_togvarsel_rounds` keeps EXACTLY ONE DATE — the first write after
+# midnight destroys yesterday's — so they are not a history. This table is, and it records every
+# round including the ones that decided NOT to push, plus the reason: a suppressed round is a real
+# outcome for the traveller, and a page that cannot see it has to guess.
+#
+# It is not re-derivable. `decide_issue` is a pure function of (level, marker state, clock), so
+# reconstructing it at query time looks feasible and is not: it cannot see a round the gate closed
+# before evaluating (which writes no markers at all), cannot see the `untimely` verdict on a
+# back-filled round, and cannot see how many devices matched. Same rule as /meldinger's `pushed`.
+#
+# `baseline_level` is the value _effective_baseline computed, stored here rather than read off the
+# BASELINE's row at query time. That indirection would make one swallowed best-effort write invert
+# a verdict: a 06:30 red that pushed and was right reads as a miss if only its own MERGE failed.
+#
+# PARTITION BY d with no expiry, deliberately: the device counts below are the only sensitive
+# columns and /rushhistorikk never projects them, while the page's whole value is longitudinal —
+# expiring partitions would delete the history it exists to show.
+_ROUNDS_DDL = """
+CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_rounds` (
+  d DATE OPTIONS(description="Oslo date of the rush the round is about."),
+  issue STRING OPTIONS(description="Issue time, HHMM: 0630 | 0700 | 1200 | 1400."),
+  level STRING OPTIONS(description="The level this issue forecast: green | yellow | red."),
+  baseline_level STRING OPTIONS(description="For a follow-up, the level its baseline left in force (_effective_baseline); NULL for a baseline round."),
+  sent BOOL OPTIONS(description="A push was ISSUED here. The policy decision, not delivery: a round can match zero devices."),
+  kind STRING OPTIONS(description="warning | update | all_clear when sent; NULL when suppressed."),
+  reason STRING OPTIONS(description="untimely | no_change | green_baseline when suppressed; NULL when sent."),
+  decided_at TIMESTAMP OPTIONS(description="When the round was evaluated — the push time Varslingstid measures from."),
+  matched_journeys INT64 OPTIONS(description="Registered journeys matched. Never served by /rushhistorikk-api."),
+  matched_devices INT64 OPTIONS(description="Devices matched. Never served by /rushhistorikk-api."),
+  n_sent INT64 OPTIONS(description="Deliveries that succeeded. Never served. NULL when the fan-out raised."),
+  n_error INT64 OPTIONS(description="Deliveries that errored. Never served."),
+  n_gone INT64 OPTIONS(description="Subscriptions reported gone. Never served.")
+)
+PARTITION BY d
+OPTIONS(description="One row per Rushvarsel notification round as it was DECIDED, pushes and suppressions alike. Read by /rushhistorikk-api. Never CREATE OR REPLACE and never copied dev->prd: each environment records its own rounds.")
+"""
+# First write per (d, issue) wins, matching togvarsel_issued. A marked round never re-fires, so a
+# second write would mean a duplicate rather than a refinement.
+_ROUNDS_MERGE = """
+MERGE `disruptions.togvarsel_rounds` t
+USING (SELECT @d AS d, @issue AS issue) s
+ON t.d = s.d AND t.issue = s.issue
+WHEN NOT MATCHED THEN
+  INSERT (d, issue, level, baseline_level, sent, kind, reason, decided_at,
+          matched_journeys, matched_devices, n_sent, n_error, n_gone)
+  VALUES (@d, @issue, @level, @baseline_level, @sent, @kind, @reason, @decided_at,
+          @matched_journeys, @matched_devices, @n_sent, @n_error, @n_gone)
+"""
+_rounds_table_ready = False
+
+
+def ensure_table() -> None:
+    """Create disruptions.togvarsel_rounds if absent. Called once from main.lifespan.
+
+    Not left to the first write, and that is the whole point: _evaluate returns before deciding
+    anything while TOGVARSEL_NOTIFY_ENABLED is off — permanently true in tst — so a lazily created
+    table would never exist there, and /rushhistorikk's LEFT JOIN would 503 the entire page in the
+    one environment that never notifies. Failure is logged, never raised: BigQuery must not block
+    startup, and the per-write latch below still recovers.
+    """
+    global _rounds_table_ready
+    if _bq_client is None or _rounds_table_ready:
+        return
+    try:
+        _bq_client.query(_ROUNDS_DDL).result(timeout=60)
+        _rounds_table_ready = True
+    except Exception:
+        logger.exception("togvarsel_notify: creating togvarsel_rounds failed; retrying on write")
+
+
+def _record_round(
+    d: date, decision: Decision, decided_at: datetime, summary: Mapping[str, Any] | None
+) -> None:
+    """Record one round for /rushhistorikk. Best-effort: a BigQuery problem never costs a push.
+
+    `summary` is push_round's return for a pushing round, or None when the round was suppressed or
+    its fan-out raised. `sent` follows decision.push either way — it records that a push was
+    ISSUED, which is what the page's taxonomy grades; the counts say whether anyone got it.
+
+    What a swallowed failure costs the page: that issue reads "ikke vurdert", which the API splits
+    on the earliest decided_at so it is not mistaken for the pre-launch backlog.
+    """
+    global _rounds_table_ready
+    try:
+        # Deferred import so hermetic tests need no google libs.
+        from google.cloud import bigquery
+
+        if not _rounds_table_ready:
+            _bq_client.query(_ROUNDS_DDL).result(timeout=60)
+            _rounds_table_ready = True
+        cfg = bigquery.QueryJobConfig(
+            # The same blast-radius bound every other BigQuery job in this repo carries. It cannot
+            # catch a pruning regression on a MERGE this small — it is there so a mistyped table
+            # reference cannot reach a ~10 TiB ET partition from the poller thread.
+            maximum_bytes_billed=_MAX_BYTES_BILLED,
+            query_parameters=[
+                bigquery.ScalarQueryParameter("d", "DATE", d),
+                bigquery.ScalarQueryParameter("issue", "STRING", decision.issue),
+                bigquery.ScalarQueryParameter("level", "STRING", decision.level),
+                bigquery.ScalarQueryParameter("baseline_level", "STRING", decision.baseline_level),
+                bigquery.ScalarQueryParameter("sent", "BOOL", decision.push),
+                bigquery.ScalarQueryParameter("kind", "STRING", decision.kind),
+                bigquery.ScalarQueryParameter("reason", "STRING", decision.reason),
+                bigquery.ScalarQueryParameter("decided_at", "TIMESTAMP", decided_at),
+                *(
+                    bigquery.ScalarQueryParameter(name, "INT64", value)
+                    for name, value in (
+                        ("matched_journeys", (summary or {}).get("matched_journeys")),
+                        ("matched_devices", (summary or {}).get("matched_devices")),
+                        ("n_sent", (summary or {}).get("sent")),
+                        ("n_error", (summary or {}).get("error")),
+                        ("n_gone", (summary or {}).get("gone")),
+                    )
+                ),
+            ]
+        )
+        _bq_client.query(_ROUNDS_MERGE, job_config=cfg).result(timeout=60)
+    except Exception:
+        logger.exception(
+            "togvarsel_notify: recording round %s failed (the push itself is unaffected)",
+            decision.issue,
+            extra={
+                "fields": {
+                    "event": "togvarsel_notify_round_record_failed",
+                    "d": str(d),
+                    "issue": decision.issue,
+                }
+            },
+        )
 
 
 # ---- Station set ------------------------------------------------------------------------
@@ -803,12 +969,13 @@ def _evaluate(now: datetime) -> None:
     pushes = [d for d in decisions if d.push]
     issue_by_key = {str(issue["issue"]): issue for issue in issues}
     journeys = s["journeys"]() if pushes else {}
+    summaries: dict[str, Mapping[str, Any]] = {}
     for decision in pushes:
         try:
             matched, devices = match_journeys(
                 decision.issue, journeys, stations, s["expand_refs"], now
             )
-            push_round(
+            summaries[decision.issue] = push_round(
                 decision,
                 issue_by_key[decision.issue],
                 matched,
@@ -830,6 +997,20 @@ def _evaluate(now: datetime) -> None:
         s["store_markers"](date_str, markers)
     if not pushes:
         s["store_markers"](date_str, markers)  # suppression-only pass: the markers still count
+
+    # Record EVERY decision, here and nowhere else. One loop after both store_markers sites,
+    # because neither of them reaches a suppression: the sites above are inside the `pushes` loop
+    # and in the `not pushes` branch, so on a MIXED pass — a restart back-fill that suppresses
+    # 0630 as untimely and pushes 0700 in one tick, the case the marker ordering above exists for
+    # — a hook attached to either site would silently drop the suppressed round, and the page
+    # would read it as "never evaluated" rather than as the outcome it was.
+    #
+    # Deliberately NOT called from push_round: POST /togmelding-api/test-notify reaches that
+    # function directly on the public dev host with a caller-supplied device_id and a synthetic
+    # 0630 decision, and on a first-write-wins MERGE that write would take the day's row and the
+    # real 06:30 round would be lost for good.
+    for decision in decisions:
+        _record_round(now.date(), decision, now, summaries.get(decision.issue))
 
 
 # ---- HTTP surfaces --------------------------------------------------------------------------

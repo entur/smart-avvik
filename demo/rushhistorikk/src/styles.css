@@ -1,0 +1,364 @@
+/* Rushhistorikk — did the rush forecasts land, and did we tell anybody? An internal tuning
+   surface, so it leans on Linje tokens rather than the brand-neutral styling /demo uses. Layout
+   only; colours come from @entur/tokens.
+
+   Forked from demo/varselhistorikk/src/styles.css, not shared: this page is /historikk's sibling
+   and should read as one, but the repo's convention for these surfaces is deliberate duplication
+   (only historikk_stop_places.sql is shared between /historikk and /meldinger). A fix to a
+   primitive here has to be mirrored by hand.
+
+   COLOURS COME FROM --basecolors-*, NOT --colors-greys-*. The legacy grey scale is a LIGHTNESS
+   ramp — grey10 is #2a2a2a (near-black) and grey90 is #f8f8f8 — the opposite direction from the
+   Tailwind-style convention it looks like. /historikk was written against that guess and every
+   muted chip rendered charcoal while the hint text sat at roughly 1.4:1 against white. The
+   role-named replacements cannot be inverted by guessing which end of a scale is dark, and they are
+   the only theme-aware ones. Fallbacks are kept, each one that site's ORIGINAL intent.
+
+   TWO COLOUR SYSTEMS ON ONE PAGE, deliberately, and the shapes keep them apart:
+
+     VERDICT chips  — /historikk's flat pastel fills (#c9f0d2 etc). Borderless.
+     RUSH LEVEL     — /togmelding's Linje validation tokens (--stroke-success / --fill-success-muted
+                      and the warning/negative pairs), as a RINGED pill: tint fill plus a 2px
+                      stroke.
+
+   The rush levels are the same product's levels as /togmelding's, and two surfaces of one product
+   must not disagree about what red looks like — so they keep those tokens rather than being
+   re-expressed in this page's palette. The ring is what stops the two "warning" ambers (Linje's
+   canary tint vs #ffe9c2) reading as an accidental mismatch when they sit in the same cell: level is
+   ringed, verdict is flat, and the distinction is on purpose. Dark ink on a light tint at all three
+   levels, as /togmelding does — Linje's canary is too light for white text and too light to darken
+   without leaving the palette. */
+
+body {
+  margin: 0;
+  background: var(--basecolors-frame-tint, #f5f5f5);
+  color: var(--colors-brand-blue, #181c56);
+}
+
+.rh-page {
+  max-width: 76rem; /* wider than /historikk's 60rem: the day table carries seven columns */
+  margin: 0 auto;
+  padding: 1.5rem 1rem 4rem;
+}
+
+.rh-header {
+  margin-bottom: 1.25rem;
+}
+
+.rh-intro {
+  max-width: 46rem;
+}
+
+/* The four things a reader otherwise gets wrong, stated in prose rather than hidden in tooltips:
+   the page is mostly "ikke vurdert" for its first weeks, Varslingstid is measured from each rush's
+   own start, a provisional outcome can change overnight, and the table covers settled days only. */
+.rh-caveats {
+  max-width: 46rem;
+  margin: 0.75rem 0 1.5rem;
+  padding-left: 1.1rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  font-size: 0.875rem;
+}
+
+.rh-caveats li {
+  margin-bottom: 0.3rem;
+}
+
+/* ---- the time picker (the page's only control) -------------------------------------------- */
+
+.rh-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 1.5rem;
+}
+
+.rh-filter-group {
+  display: inline-flex;
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+  border-radius: 0.25rem;
+  overflow: hidden;
+  background: #fff;
+}
+
+.rh-toggle {
+  border: 0;
+  background: transparent;
+  padding: 0.5rem 0.9rem;
+  font: inherit;
+  cursor: pointer;
+  color: inherit;
+}
+
+.rh-toggle.is-active {
+  background: var(--colors-brand-blue, #181c56);
+  color: #fff;
+}
+
+/* ---- «Slik har varslene truffet» ---------------------------------------------------------- */
+
+.rh-summary {
+  background: #fff;
+  border-radius: 0.5rem;
+  padding: 1.25rem;
+  margin-bottom: 1.5rem;
+}
+
+/* Wide content scrolls inside its own container, never the page body. Both tables on this page are
+   wider than a phone. */
+.rh-scroll {
+  overflow-x: auto;
+}
+
+.rh-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9rem;
+}
+
+.rh-table th,
+.rh-table td {
+  text-align: left;
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--basecolors-frame-tint, #f5f5f5);
+  vertical-align: top;
+}
+
+.rh-table th {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Figures line up down a column only with tabular figures — the default proportional ones make a
+   percentage column look ragged. */
+.rh-num {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* A row header still has to read as a label rather than as a column heading: .rh-table th is
+   uppercase, nowrap and subdued, which would shout the slot name and force the population line onto
+   one very wide line. Undone here rather than by demoting the cell to a td — the semantics are what
+   let a screen reader say which slot a figure belongs to. */
+.rh-table th.rh-row-label {
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: normal;
+  font-size: 0.9rem;
+  color: inherit;
+}
+
+/* The total row is a different kind of row from the four slot rows, and KD6 exists because the
+   blended figure and the segments answer different questions. */
+.rh-row-total td,
+.rh-row-total th.rh-row-label {
+  font-weight: 600;
+  border-bottom: 2px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+}
+
+/* Each stats row names the population its figures are over — three of them are different, and a
+   reader who assumes one denominator across the row reads the page wrong. */
+.rh-population {
+  font-size: 0.7rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  font-weight: 400;
+}
+
+/* ---- the 3x3 confusion matrix ------------------------------------------------------------- */
+
+/* Forecast down, realized across, both axes labelled: a matrix whose orientation is implicit gets
+   read backwards. Each cell prints its COUNT as text inside the tint — colour marks the direction
+   of the miss, the number carries the magnitude, and without it the two structurally different
+   misses (forecast red / realized yellow vs forecast yellow / realized red) render identically and
+   the matrix stops being a confusion matrix at all. */
+.rh-matrix {
+  display: grid;
+  grid-template-columns: auto repeat(3, 2.1rem);
+  gap: 2px;
+  font-size: 0.7rem;
+}
+
+.rh-matrix-axis {
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  padding: 0 0.25rem;
+  align-self: center;
+  white-space: nowrap;
+}
+
+.rh-cell {
+  text-align: center;
+  padding: 0.25rem 0;
+  border-radius: 0.15rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Diagonal, adjacent, far — the same three-step reading as the verdict chips, so the matrix and the
+   badges beside it cannot suggest different things about one day. */
+.rh-cell--hit { background: #c9f0d2; }
+.rh-cell--near { background: #ffe9c2; }
+.rh-cell--far { background: #ffd4d4; }
+.rh-cell--empty { background: var(--basecolors-frame-subdued, #ededed); }
+
+/* The calibration reference beside the matrix: §14a's measured bad-day rate per forecast level
+   (6 / 21 / 55 %). The diagonal compares two differently-scaled categoricals — forecast red lands
+   on 13 % of days, realized red on 6.4 % — so a well-calibrated red forecast sits in "traff nesten"
+   more often than in "traff", and the reference is what stops that reading as a defect. */
+.rh-calibration {
+  font-size: 0.7rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  margin-top: 0.35rem;
+}
+
+/* ---- the day table ------------------------------------------------------------------------ */
+
+.rh-day-date {
+  white-space: nowrap;
+  font-weight: 600;
+}
+
+.rh-day-weekday {
+  display: block;
+  font-weight: 400;
+  font-size: 0.75rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+/* An issue cell carries four things, and the hierarchy is stated rather than left to the
+   implementer: the VERDICT is primary and bold because it answers the page's question, and the
+   level chip, probability and what-was-communicated marker sit under it as one smaller subordinate
+   line. Four same-weight fragments across four cells and hundreds of rows is an unreadable wall. */
+.rh-issue {
+  min-width: 8.5rem;
+}
+
+.rh-issue-verdict {
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.rh-issue-detail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.rh-issue--empty {
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+/* ---- rush level badges: /togmelding's tokens, ringed ------------------------------------- */
+
+.rh-level {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 1rem;
+  border: 2px solid var(--rh-level-accent, var(--basecolors-stroke-subduedalt, #c5c5c5));
+  background: var(--rh-level-tint, var(--basecolors-frame-subdued, #ededed));
+  white-space: nowrap;
+}
+
+.rh-level--green {
+  --rh-level-accent: var(--stroke-success);
+  --rh-level-tint: var(--fill-success-muted);
+}
+
+.rh-level--yellow {
+  --rh-level-accent: var(--stroke-warning);
+  --rh-level-tint: var(--fill-warning-muted);
+}
+
+.rh-level--red {
+  --rh-level-accent: var(--stroke-negative);
+  --rh-level-tint: var(--fill-negative-muted);
+}
+
+/* ---- verdict chips: /historikk's flat fills --------------------------------------------- */
+
+.rh-badge {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.2rem 0.6rem;
+  border-radius: 1rem;
+  white-space: nowrap;
+}
+
+.rh-badge--success { background: #c9f0d2; }
+
+/* `traff nesten` is a NEAR-SUCCESS and `falsk alarm` is an outright failure, so they must not share
+   a chip. /historikk's own VERDICT_VARIANT gives every verdict its own variant; this page has seven
+   states against four fills, and this is the pair where collapsing them would destroy exactly the
+   distinction the taxonomy exists for — a reader scanning for bad days would read one as the other.
+   Outlined against the solid warning fill: same hue, different weight, and it stays legible where
+   colour alone would not (the tints land near 4:1 at this size). */
+.rh-badge--near {
+  background: transparent;
+  border: 2px solid #e8a33d;
+  padding: 0.1rem 0.45rem;
+}
+
+.rh-badge--warning { background: #ffe9c2; }
+.rh-badge--negative { background: #ffd4d4; }
+/* No colour override on the fills: they carry their meaning in the fill and inherit the page's text
+   colour, and subdued-on-subdued lands at 4.0:1 — under AA for 0.75rem text. */
+.rh-badge--muted {
+  background: var(--basecolors-frame-subdued, #ededed);
+  cursor: help;
+}
+
+/* ---- qualifiers ------------------------------------------------------------------------- */
+
+/* Outlined rather than filled, /historikk's `.vh-tag` convention: a note ABOUT a value must not be
+   mistakeable for the value's own chip sitting next to it. Both users of this are qualifiers a
+   reader has to see — a provisional outcome that can still change overnight, and a forecast issued
+   after its own cutoff, which is excluded from Presisjon but kept in Dekning. */
+.rh-tag {
+  font-size: 0.65rem;
+  padding: 0.1rem 0.4rem;
+  border: 1px solid var(--basecolors-stroke-subduedalt, #c5c5c5);
+  border-radius: 1rem;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+  white-space: nowrap;
+  cursor: help;
+}
+
+.rh-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+}
+
+.rh-count {
+  padding: 0.2rem 0.6rem;
+  border-radius: 1rem;
+  background: var(--basecolors-frame-subdued, #ededed);
+  white-space: nowrap;
+}
+
+/* ---- states ----------------------------------------------------------------------------- */
+
+/* Faded rather than hidden while a new window loads, so the page keeps its height. */
+.rh-days.is-stale {
+  opacity: 0.45;
+  transition: opacity 0.15s ease-in;
+}
+
+.rh-loading {
+  padding: 2rem 0;
+}
+
+.rh-empty {
+  margin: 1.5rem 0;
+}

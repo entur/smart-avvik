@@ -68,6 +68,8 @@ logger = logging.getLogger(__name__)
 PROTECTED_PREFIXES = (
     "/historikk",
     "/historikk-api",
+    "/rushhistorikk",
+    "/rushhistorikk-api",
     "/meldinger",
     "/meldinger-api",
     "/demo",

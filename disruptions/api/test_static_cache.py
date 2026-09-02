@@ -159,7 +159,9 @@ def test_immutability_is_claimed_only_for_files_under_assets():
 
 
 def test_every_real_static_mount_uses_the_caching_subclass():
-    """A guard on the mounts themselves, so a fifth front-end cannot quietly opt out.
+    """A guard on the mounts themselves, so a NEW front-end cannot quietly opt out.
+    Deliberately counted by nothing: the assertion iterates the real mounts, so it picks up a sixth
+    or seventh surface without an edit — only this sentence used to need one.
 
     Vacuous where the generated directories are absent (a fresh checkout, CI) — hence the checks
     above, which build their own. It earns its keep locally and in the image, where the mounts do

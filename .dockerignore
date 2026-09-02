@@ -2,7 +2,8 @@
 # Docker's .dockerignore is NOT gitignore syntax: use **/ to match nested paths.
 #
 # Kept (needed by the build): demo/reisedemo, demo/avviksvarsel,
-# demo/varselhistorikk, demo/meldinger, demo/togmelding (front-end sources),
+# demo/varselhistorikk, demo/meldinger, demo/togmelding, demo/rushhistorikk
+# (front-end sources),
 # disruptions/api (API + *.sql + committed eval_static/), Dockerfile.
 
 .git
@@ -30,6 +31,7 @@ disruptions/api/varsel_static/
 disruptions/api/historikk_static/
 disruptions/api/meldinger_static/
 disruptions/api/togmelding_static/
+disruptions/api/rushhistorikk_static/
 
 # Local-only avviksvarsel state (durable state lives in the GCS bucket in prod).
 disruptions/api/varsel_state.json

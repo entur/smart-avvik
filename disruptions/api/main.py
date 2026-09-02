@@ -23,9 +23,11 @@ import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
+import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
+import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -1107,6 +1109,7 @@ async def lifespan(app: FastAPI):
     feedback_contexts.configure(bq_client=bq_client)
     feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
+    rushhistorikk.configure(bq_client=bq_client)
     # /meldinger reads the same decision log and replays each row's stored message_input through
     # today's prompt. The template writer is passed in rather than imported by the module —
     # varsel.py is 147 KB of poller state, and _deterministic_body is a pure function of the
@@ -1152,6 +1155,16 @@ async def lifespan(app: FastAPI):
         load_markers=varsel.togvarsel_rounds_for,
         store_markers=varsel.store_togvarsel_rounds,
     )
+    # The round log /rushhistorikk scores, created here rather than on first write: evaluate()
+    # returns before deciding anything while TOGVARSEL_NOTIFY_ENABLED is off — permanently true in
+    # tst — so a lazily created table would never exist there and /rushhistorikk-api would 503 the
+    # whole page in the one environment that never notifies. Same reasoning as decisions.py above.
+    togvarsel_notify.ensure_table()
+    # The realized rush outcome /rushhistorikk scores against. Created at startup for the same
+    # reason as the round log: the page LEFT JOINs it on every request, so a missing table 503s the
+    # whole surface until the first rush resolves — which is every environment on the day it ships.
+    togvarsel_outcomes.configure(bq_client=bq_client)
+    togvarsel_outcomes.ensure_table()
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,
@@ -1256,6 +1269,17 @@ app.include_router(historikk.router)
 # (a chart change, since trafficType is set once), not a shorter SELECT list. A page built on
 # hypothetical journeys rather than registrations would retire the question outright.
 app.include_router(meldinger.router)
+
+# Rushhistorikk API (did the rush forecasts land, and did we tell anybody?). Registered before
+# the /rushhistorikk static mount, like the routers above.
+#
+# What this publishes, since the SSO prefixes it registers gate nothing today (SSO_REQUIRED is
+# "false" in every environment and no environment wires the OAuth client): a rush forecast is one
+# product-wide prognosis over a fixed 39-station geography, so there is no journey, route, device or
+# departure behind any row — the one way this surface is simpler than /historikk and /meldinger. The
+# five subscriber-derived counts on togvarsel_rounds are the exception, and rushhistorikk_days.sql
+# never names them.
+app.include_router(rushhistorikk.router)
 
 # Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
@@ -1413,6 +1437,24 @@ else:
 # The Meldinger UI (demo/meldinger) — the same decisions, replayed through today's prompt.
 # Same generated-directory pattern as the mounts above; its data comes from /meldinger-api, which
 # is registered unconditionally beside it (see the router above for what the surface publishes).
+# The Rushhistorikk UI (demo/rushhistorikk) — did the rush forecasts land, and did we tell
+# anybody? Same generated-directory pattern as the mounts above; its data comes from
+# /rushhistorikk-api, registered unconditionally beside it.
+_RUSHHISTORIKK_STATIC_DIR = Path(__file__).parent / "rushhistorikk_static"
+if _RUSHHISTORIKK_STATIC_DIR.is_dir():
+    app.mount(
+        "/rushhistorikk",
+        _VersionedStaticFiles(directory=_RUSHHISTORIKK_STATIC_DIR, html=True),
+        name="rushhistorikk",
+    )
+    logger.info("Mounted rushhistorikk UI at /rushhistorikk from %s", _RUSHHISTORIKK_STATIC_DIR)
+else:
+    logger.info(
+        "No rushhistorikk_static/ directory; /rushhistorikk not mounted "
+        "(run demo/rushhistorikk/build.sh)"
+    )
+
+
 _MELDINGER_STATIC_DIR = Path(__file__).parent / "meldinger_static"
 if _MELDINGER_STATIC_DIR.is_dir():
     app.mount(
@@ -1478,6 +1520,15 @@ def poll_for_changes(
             togvarsel_notify.evaluate()
         except Exception:
             logger.exception("Togvarsel notify failed this tick; retrying on next tick")
+        # The rush outcome resolves on the same wall-clock tick, and for the same reason: a rush
+        # ends at its hour whether or not SX moved. Both of its passes are due-gated internally
+        # (provisional 09:20/18:20 Oslo, authoritative after 04:00 UTC), so this is a cheap no-op on
+        # all but a few ticks a day. Isolated like the two above: a fasit failure costs
+        # /rushhistorikk a day of verdicts, never the feed, the forecast or the notifications.
+        try:
+            togvarsel_outcomes.refresh()
+        except Exception:
+            logger.exception("Togvarsel outcome refresh failed this tick; retrying on next tick")
         if stop_event is not None:
             if stop_event.wait(interval):
                 return
