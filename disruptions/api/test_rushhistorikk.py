@@ -12,6 +12,7 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -241,9 +242,11 @@ def test_a_confirming_follow_up_is_graded_on_the_standing_level():
 # ---- the three kinds of "we do not know" ------------------------------------------------------
 
 
-def test_an_issue_with_no_round_record_is_ikke_vurdert_and_in_no_denominator():
-    _reset([_row(has_round=False, sent=False, round_level=None, kind=None,
-                 decided_at=None, first_recorded_day=None)])
+def test_an_issue_with_no_round_record_and_no_computed_at_is_ikke_vurdert():
+    """The one way an issue still reads `ikke vurdert` now that missing rounds are reconstructed:
+    the forecast row carries no computed_at, so there is no instant to replay the policy at."""
+    _reset([_row(has_round=False, sent=False, round_level=None, kind=None, decided_at=None,
+                 computed_at=None, first_recorded_day=None)])
     body = _days().json()
     issue = body["days"][0]["issues"][0]
     assert issue["verdict"] == "ikke_vurdert" and issue["scored"] is False
@@ -317,7 +320,8 @@ def test_every_stats_row_carries_a_full_three_by_three_matrix():
 
 def test_a_rate_over_an_empty_denominator_is_null_never_zero():
     """A rate over nothing is not 0 %, and rendering it as one reads as "we got everything wrong"."""
-    _reset([_row(has_round=False, sent=False, round_level=None, kind=None, decided_at=None)])
+    _reset([_row(has_round=False, sent=False, round_level=None, kind=None, decided_at=None,
+                 computed_at=None)])
     total = _days().json()["stats"][0]
     for key in ("presisjon", "dekning", "varslingstid_min"):
         assert total[key] is None, key
@@ -378,14 +382,15 @@ def test_the_response_carries_exactly_the_expected_keys():
         "am_provisional_level", "pm_provisional_level", "eligible",
     }
     assert set(body["days"][0]["issues"][0]) == {
-        "issue", "rush", "forecast_level", "p", "late", "recorded", "sent", "kind", "reason",
-        "baseline_level", "decided_at", "actual_level", "actual_trouble10", "provisional",
-        "verdict", "lead_min", "scored",
+        "issue", "rush", "forecast_level", "p", "late", "recorded", "reconstructed", "sent", "kind",
+        "reason", "baseline_level", "decided_at", "actual_level", "actual_trouble10",
+        "provisional", "verdict", "lead_min", "scored",
     }
     assert set(body["stats"][0]) == {
         "slot", "presisjon", "dekning", "dekning_den", "varslingstid_min", "varslingstid_n",
-        "varsler_sendt", "n_scored", "n_venter", "n_ukjent", "n_ikke_vurdert",
-        "n_ikke_vurdert_etter_start", "n_late", "n_untimely", "matrix",
+        "varsler_sendt", "varsler_rekonstruert", "n_scored", "n_venter", "n_ukjent",
+        "n_ikke_vurdert", "n_reconstructed", "n_reconstructed_after_start", "n_late",
+        "n_untimely", "matrix",
     }
 
 
@@ -503,7 +508,7 @@ def test_the_vacuous_settled_default_is_not_reintroduced():
 
 
 def test_a_missing_round_after_the_log_started_is_counted_apart_from_the_backlog():
-    """`ikke vurdert` has two causes and only one is benign, so the SQL selects
+    """A reconstruction has two causes and only one is benign, so the SQL selects
     `first_recorded_day` and the page splits on it. Without the split a lost best-effort write is
     invisible during exactly the weeks the pre-launch backlog is large enough to hide it.
 
@@ -520,8 +525,9 @@ def test_a_missing_round_after_the_log_started_is_counted_apart_from_the_backlog
         _row(d=date(2026, 8, 26), has_round=False, sent=False, first_recorded_day=first),
     ])
     total = _days().json()["stats"][0]
-    assert total["n_ikke_vurdert"] == 3
-    assert total["n_ikke_vurdert_etter_start"] == 1
+    assert total["n_ikke_vurdert"] == 0  # all three were reconstructed, not left blank
+    assert total["n_reconstructed"] == 3
+    assert total["n_reconstructed_after_start"] == 1
 
 
 def test_every_served_rate_carries_its_own_denominator():
@@ -577,6 +583,109 @@ def test_the_verdict_labels_are_mirrored_verbatim_in_the_front_end():
     # as a chip nothing can ever show — `riktig_stille` was folded into `traff` on 2026-09-02.
     block = ts.split("export const VERDICT_LABEL", 1)[1].split("};", 1)[0]
     assert set(re.findall(r"^\s*(\w+):", block, re.MULTILINE)) == set(verdicts.VERDICTS)
+
+
+# ---- reconstruction: what the policy would have decided ---------------------------------------
+
+_UNRECORDED = {"has_round": False, "sent": False, "round_level": None, "kind": None,
+               "reason": None, "decided_at": None, "first_recorded_day": None}
+
+
+def test_a_round_nobody_recorded_is_reconstructed_from_the_forecast_log():
+    """The page judges the MODEL, and the push policy is a pure function of the forecast, so a day
+    before the round log existed is scored on what the policy would have decided — replayed at each
+    forecast's own computed_at, baseline before follow-up, so the 0700 reads the 0630's marker.
+    Every such issue is flagged, counted, and never a sent push."""
+    _reset([
+        _row(issue="0630", forecast_level="yellow", am_level="yellow",
+             computed_at=datetime(2026, 8, 31, 4, 30, tzinfo=UTC), **_UNRECORDED),
+        _row(issue="0700", forecast_level="yellow", amrest_level="yellow",
+             computed_at=datetime(2026, 8, 31, 5, 0, tzinfo=UTC), **_UNRECORDED),
+        _row(issue="1200", forecast_level="green", pm_level="red", pm_trouble10=0.4,
+             computed_at=datetime(2026, 8, 31, 10, 0, tzinfo=UTC), **_UNRECORDED),
+        _row(issue="1400", forecast_level="red", pm_level="red", pm_trouble10=0.4,
+             computed_at=datetime(2026, 8, 31, 12, 0, tzinfo=UTC), **_UNRECORDED),
+    ])
+    body = _days().json()
+    issues = {i["issue"]: i for i in body["days"][0]["issues"]}
+    assert all(i["reconstructed"] and i["recorded"] for i in issues.values())
+    a, b, c, d = (issues[k] for k in ("0630", "0700", "1200", "1400"))
+    assert (a["sent"], a["kind"], a["verdict"]) == (True, "warning", "traff")
+    # the follow-up confirms a reconstructed baseline it never saw recorded
+    assert (b["sent"], b["reason"], b["baseline_level"], b["verdict"]) == (
+        False, "no_change", "yellow", "traff"
+    )
+    assert (c["sent"], c["reason"], c["verdict"]) == (False, "green_baseline", "bom")
+    assert (d["sent"], d["kind"], d["baseline_level"], d["verdict"]) == (
+        True, "warning", "green", "traff"
+    )
+    # the replayed push time is the forecast's own, so Varslingstid means "when we could have"
+    assert d["decided_at"].startswith("2026-08-31T12:00:00")
+    assert d["lead_min"] is not None and round(d["lead_min"]) == 60
+    total = body["stats"][0]
+    assert total["n_reconstructed"] == 4 and total["n_ikke_vurdert"] == 0
+    assert total["n_scored"] == 4 and total["presisjon"] == 0.75
+    assert total["varsler_sendt"] == 0 and total["varsler_rekonstruert"] == 2
+
+
+def test_a_recorded_round_is_never_overridden_by_the_reconstruction():
+    """The real record wins wherever it exists; the replay fills gaps only. The recorded 0630 here
+    was suppressed `untimely` — a fact about the poller's clock the replay cannot know, since the
+    forecast itself was on time — and the missing 0700 is reconstructed against ITS marker: an
+    unpushed baseline, so the yellow follow-up is a fresh warning rather than a confirmation."""
+    _reset([
+        _row(issue="0630", sent=False, kind=None, reason="untimely", round_level="yellow",
+             decided_at=datetime(2026, 8, 31, 5, 2, tzinfo=UTC)),
+        _row(issue="0700", forecast_level="yellow", amrest_level="yellow",
+             computed_at=datetime(2026, 8, 31, 5, 0, tzinfo=UTC), **_UNRECORDED),
+    ])
+    issues = {i["issue"]: i for i in _days().json()["days"][0]["issues"]}
+    assert issues["0630"]["reconstructed"] is False
+    assert (issues["0630"]["sent"], issues["0630"]["reason"]) == (False, "untimely")
+    assert issues["0700"]["reconstructed"] is True
+    assert (issues["0700"]["sent"], issues["0700"]["kind"], issues["0700"]["baseline_level"]) == (
+        True, "warning", "green"
+    )
+
+
+def test_a_reconstruction_is_untimely_when_the_forecast_itself_came_after_the_deadline():
+    """The replay is evaluated at computed_at, so a forecast that only existed after its round's
+    deadline reconstructs as the round it would have been: suppressed, out of Presisjon, still in
+    Dekning — where the bad rush it left unwarned counts against it."""
+    _reset([_row(issue="0630", forecast_level="yellow", am_level="yellow",
+                 computed_at=datetime(2026, 8, 31, 5, 10, tzinfo=UTC), **_UNRECORDED)])  # 07:10 Oslo
+    body = _days().json()
+    issue = body["days"][0]["issues"][0]
+    assert issue["reconstructed"] is True and issue["sent"] is False
+    assert issue["reason"] == "untimely" and issue["verdict"] == "bom"
+    total = body["stats"][0]
+    assert total["n_untimely"] == 1 and total["n_scored"] == 0
+    assert total["dekning"] == 0.0 and total["dekning_den"] == 1
+
+
+def test_the_day_table_reads_a_standing_warning_as_yellow_or_red_never_as_truthiness():
+    """The policy records `baseline_level` on EVERY follow-up — "green" when the baseline pushed
+    nothing — so a front-end test of `issue.baseline_level &&` marked the ordinary calm weekday
+    «Sto ved lag» on both follow-up cells, with a tooltip claiming a warning at green level still
+    stood. The day table must mirror rushhistorikk_verdicts.standing(): yellow or red, nothing else.
+    A grep, because this repo has no TypeScript test runner; the shape is the vacuous-boolean trap
+    the outcomes pivot already fell into once."""
+    tsx = (
+        Path(_API_DIR).parent.parent / "demo/rushhistorikk/src/components/DayTable.tsx"
+    ).read_text()
+    assert "issue.baseline_level &&" not in tsx, "truthiness of baseline_level is not 'standing'"
+    assert "function standing(issue: IssueRow): boolean" in tsx
+    assert "issue.baseline_level === 'yellow' || issue.baseline_level === 'red'" in tsx
+
+
+def test_the_reconstruction_replays_the_policy_and_defines_none_of_its_own():
+    """One push policy. The replay must call togvarsel_notify.decide_issue rather than restate its
+    rules here — a second copy is how the page and the pusher come to disagree about what would
+    have been sent."""
+    src = inspect.getsource(rushhistorikk.reconstruct_rounds)
+    assert "togvarsel_notify.decide_issue(" in src
+    for token in ("green_baseline", "no_change", "all_clear", "deadline_h", "_WARNING"):
+        assert token not in src, f"the replay restates the policy ({token})"
 
 
 # ---- the surface is actually served -----------------------------------------------------------

@@ -305,12 +305,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `disruptions.togvarsel_rounds` records every notification round as it was DECIDED — pushes and
     suppressions alike, plus the reason — and `disruptions.togvarsel_outcomes` records what the rush
     actually did. `togvarsel_issued` had no reader in the repo before this.
-  - **No notification history can be backfilled.** `varsel.store_togvarsel_rounds` keeps a SINGLE
-    date (the first write after midnight destroys yesterday's) and the `togvarsel_notify_round` log
-    event carries no Oslo date and no BigQuery sink. The page starts at the deploy and fills
-    forward, so it reads mostly `ikke vurdert` for its first weeks and says so in prose.
-  - **The round is recorded, never re-derived** (`/meldinger`'s `pushed` rule): reconstruction cannot
-    see a round the gate closed before evaluating, the `untimely` verdict on a back-fill, or how many
+  - **No round history can be backfilled as a record** — `varsel.store_togvarsel_rounds` keeps a
+    SINGLE date and the `togvarsel_notify_round` log event has no BigQuery sink — so since
+    2026-09-02 the page **reconstructs** the rounds nobody recorded: `rushhistorikk.
+    reconstruct_rounds` replays `togvarsel_notify.decide_issue` at each forecast's own `computed_at`
+    (baseline before follow-up, recorded rounds seeding the markers), grades the result like a
+    recorded round, flags it (`reconstructed`), counts it (`n_reconstructed`,
+    `n_reconstructed_after_start` = the lost-write detector) and keeps its pushes out of
+    `varsler_sendt` (→ `varsler_rekonstruert`). The page judges the MODEL, and for that the forecast
+    plus the policy is the whole input. A recorded row always wins.
+  - **A recorded round is never re-derived** (`/meldinger`'s `pushed` rule): a replay cannot see a
+    round the gate closed before evaluating, the `untimely` verdict on a back-fill, or how many
     devices matched. `baseline_level` rides on the `Decision` — reading it off the baseline's row
     would let one swallowed write invert a verdict — so `_effective_baseline` resolves BEFORE the
     deadline check; the recording loop sits at the END of `_evaluate`, because neither
@@ -323,7 +328,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     because both provisional sources are TTL-gated (15/60 min) off the SX rebuild. The provisional
     pass's four skews are named in its file header, and `provisional_trouble10`/`_level`/`_at` are
     **never overwritten** — the overnight disagreement rate is what decides whether that pass earns
-    its keep.
+    its keep. The settled work set reaches back `_BACKFILL_DAYS` (60) for issued days with NO
+    outcome row, so a fresh environment initialises from the forecast log, and the range SELECT is
+    cut into 14-calendar-day spans because the whole horizon in one job sits at
+    `_MAX_BYTES_BILLED` and would fail every retry.
   - **Rounding is PER SCOPE**, and uniform rounding breaks the identity the page rests on:
     `03_day_windows.sql` rounds to 4 dp (carried into `am_t10`/`pm_t10`) while
     `08_features_cat.sql` leaves `am_t10_rest0700` raw — and it is the only file defining the
@@ -340,6 +348,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     follow-up sends nothing yet the traveller holds a warning at the BASELINE's level, and that is
     what gets graded — without the rule, 0700 and 1400 read `bom` on every warned day. `sent` is the
     policy decision, not delivery.
+  - **A standing warning is a yellow/red `baseline_level`, never a truthy one**: the policy records
+    `"green"` on every follow-up after an unpushed baseline, and `issue.baseline_level &&` showed
+    «Sto ved lag» on every calm weekday. The day table's `standing()` mirrors the taxonomy's, a grep
+    refuses the truthiness form, and every `untimely` round now carries «For sent».
   - **Three populations**: `scored` (Presisjon and the matrix), `delivered` (Dekning — late and
     untimely INCLUDED, because a rush nobody was warned about is a coverage miss whatever
     contaminated the forecast), `recorded` (every issue; what `Varsler sendt` counts pushes
@@ -349,8 +361,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     not issues.
   - **Three kinds of "we do not know", kept apart**: `venter` (still retried), `ukjent`
     (unestablishable, or the day failed the training chain's DAY-level eligibility `am_n > 300 AND
-    pm_n > 300`) and `ikke vurdert` (no round recorded). `ikke vurdert` is split on the earliest
-    `decided_at`, or a lost write is indistinguishable from the launch backlog.
+    pm_n > 300`) and `ikke vurdert` (no round recorded and none reconstructable — rare). The
+    reconstructions are split on the earliest recorded day (`n_reconstructed_after_start`), or a
+    lost write is indistinguishable from the launch backlog.
   - **Varslingstid is measured from each issue's own `NOTIFY_SPECS.scope_start_h`** (6.5/7.0/15/15,
     identical to the label windows), positive when the push preceded the rush — so 1200 leads ~180
     min while 0630 and 0700 land ~1 min INTO their rush. A product finding, not a number to massage.

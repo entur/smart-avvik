@@ -12,9 +12,21 @@ Two things this module is deliberate about:
   classifies and aggregates. That is one definition of "traff", unit-testable without BigQuery.
 * **Silence has three different meanings and the page keeps them apart.** ``venter`` is an outcome
   still being retried, ``ukjent`` one that can no longer be established (or a day whose call volume
-  disqualifies it), and ``ikke vurdert`` an issue for which no notification round was ever recorded
-  — the gate was closed, or the day predates the round log. Folding any of them into a verdict
-  would manufacture skill out of missing data, in one direction or the other.
+  disqualifies it), and ``ikke vurdert`` an issue for which no notification round exists and none
+  could be reconstructed. Folding any of them into a verdict would manufacture skill out of missing
+  data, in one direction or the other.
+* **A round nobody recorded is reconstructed from the forecast log, and labelled** (2026-09-02).
+  The page exists to judge the MODEL, and the push policy is a pure function of the forecast level,
+  the baseline's decision and the clock — so for an issue with no ``togvarsel_rounds`` row,
+  :func:`reconstruct_rounds` replays :func:`togvarsel_notify.decide_issue` at the forecast's own
+  ``computed_at`` and grades the result like any recorded round. A recorded row always wins; the
+  replay fills gaps only. That is not a retreat from "recorded, never re-derived": what the replay
+  cannot see (a gate closed before evaluating, how many devices matched) is exactly what the
+  model-quality reading does not need, and what it changes is stated on every row
+  (``reconstructed``), counted beside the rates (``n_reconstructed``), and kept out of
+  ``varsler_sendt``, which says "sent" and means it. Before this, the page read «ikke vurdert» for
+  every issue before the round log existed and would have for weeks — in tst, where the gate is
+  permanently closed, forever.
 
 **Nothing here is redacted, and that is a claim about the FORECAST fields only.** This page carries
 no traveller data: a rush forecast is one product-wide prognosis over a fixed 39-station geography,
@@ -42,12 +54,14 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import rushhistorikk_verdicts as verdicts
+import togvarsel_notify
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -124,8 +138,15 @@ class IssueRow(BaseModel):
         "reality. Excluded from Presisjon, kept in Dekning."
     )
     recorded: bool = Field(
-        description="A notification round was recorded for this issue. False means 'ikke vurdert': "
-        "the notify gate was closed, or the day predates the round log."
+        description="A notification round exists for this issue — recorded, or reconstructed from "
+        "the forecast log (see `reconstructed`). False means 'ikke vurdert': none was recorded and "
+        "none could be reconstructed."
+    )
+    reconstructed: bool = Field(
+        description="The round is not a record: no togvarsel_rounds row existed, so the push policy "
+        "(togvarsel_notify.decide_issue) was replayed on the forecast at its own computed_at — what "
+        "would have been decided with delivery on and on time. Graded like a recorded round, because "
+        "the page judges the model; counted apart, and never a sent push."
     )
     sent: bool = Field(
         description="A push was ISSUED — the policy decision, not delivery. A round can match zero "
@@ -225,16 +246,28 @@ class StatsRow(BaseModel):
     )
     varslingstid_n: int = Field(description="Pushes behind that median.")
     varsler_sendt: int = Field(
-        description="Pushes issued in this row's window, friskmeldinger included: one per round that "
-        "sent, over every issue whatever became of its day. The notification-volume figure."
+        description="Pushes issued in this row's window, friskmeldinger included: one per RECORDED "
+        "round that sent, over every issue whatever became of its day. The notification-volume "
+        "figure. Reconstructed rounds are counted apart, in varsler_rekonstruert."
+    )
+    varsler_rekonstruert: int = Field(
+        description="Pushes a reconstructed round would have issued. Apart from varsler_sendt "
+        "because that column says sent and these never were."
     )
     n_scored: int = Field(description="Issues in the Presisjon population.")
     n_venter: int = Field(description="Outcome not settled yet.")
     n_ukjent: int = Field(description="Outcome unestablishable, or the day was ineligible.")
-    n_ikke_vurdert: int = Field(description="No notification round recorded.")
-    n_ikke_vurdert_etter_start: int = Field(
+    n_ikke_vurdert: int = Field(
+        description="No notification round recorded and none reconstructable (no computed_at on the "
+        "forecast, or the policy refused the row)."
+    )
+    n_reconstructed: int = Field(
+        description="Issues whose round was reconstructed from the forecast log rather than "
+        "recorded. Orthogonal to the buckets: a reconstructed round is scored like a recorded one."
+    )
+    n_reconstructed_after_start: int = Field(
         description="Of those, the ones on a day the round log already covered — so a lost "
-        "best-effort write is tellable apart from the pre-launch backlog."
+        "best-effort write or a closed gate is tellable apart from the pre-launch backlog."
     )
     n_late: int = Field(description="Forecast issued after its own cutoff.")
     n_untimely: int = Field(description="Round evaluated past its delivery deadline.")
@@ -253,9 +286,9 @@ class DaysResponse(BaseModel):
     days: list[DayRow] = Field(description="Newest first.")
     stats: list[StatsRow] = Field(description="The total row first, then one per issue slot.")
     recording_started: date | None = Field(
-        description="The earliest day a notification round was ever recorded. An 'ikke vurdert' "
-        "issue BEFORE this is the expected pre-launch backlog; one at or after it can only mean a "
-        "lost write or a closed gate."
+        description="The earliest day a notification round was ever recorded. A reconstructed "
+        "round BEFORE this is the expected pre-launch backlog; one after it can only mean a lost "
+        "write or a closed gate."
     )
 
 
@@ -342,6 +375,7 @@ def _issue_from_row(row: Any, today: date) -> verdicts.Issue:
         reason=row["reason"],
         baseline_level=row["baseline_level"],
         decided_at=row["decided_at"],
+        computed_at=row["computed_at"],
         eligible=row["eligible"],
         outcome=verdicts.resolve_outcome_state(
             settled=settled,
@@ -376,6 +410,7 @@ def _issue_row(row: Any, issue: verdicts.Issue) -> IssueRow:
         p=row["p"],
         late=issue.late,
         recorded=issue.recorded,
+        reconstructed=issue.reconstructed,
         sent=issue.sent,
         kind=issue.kind,
         reason=issue.reason,
@@ -388,6 +423,80 @@ def _issue_row(row: Any, issue: verdicts.Issue) -> IssueRow:
         lead_min=verdicts.lead_minutes(issue.issue, issue.decided_at) if issue.sent else None,
         scored=verdicts.population(issue) == verdicts.BUCKET_SCORED,
     )
+
+
+def reconstruct_rounds(day_issues: list[verdicts.Issue]) -> list[verdicts.Issue]:
+    """One day's issues with every missing round replaced by what the policy would have decided.
+
+    The page judges the MODEL, and the push policy is a pure function of the forecast level, the
+    baseline's marker and the clock — so for an issue with no round record the policy is replayed on
+    the forecast at its own `computed_at`, the instant the real round would have been evaluated at,
+    with the day's other rounds as its marker state. Baseline before follow-up, in issue order, so
+    a reconstructed 0700 reads the reconstructed 0630's marker exactly as the real pass would have.
+
+    Three rules. A RECORDED round is never touched: its marker seeds the replay and its row stands,
+    including the facts a replay could not know (a suppression caused by the poller's own clock, how
+    many devices matched). The replay calls `togvarsel_notify.decide_issue` and restates none of
+    its rules — one policy, so the page and the pusher cannot disagree about what would have gone
+    out. And an issue the replay cannot serve — no `computed_at`, or a level the policy refuses —
+    stays as it came, i.e. `ikke vurdert`, logged rather than silently scored.
+    """
+    order = {slot: index for index, slot in enumerate(verdicts.SLOTS)}
+    markers: dict[str, Any] = {
+        issue.issue: {"level": issue.level, "pushed": issue.sent}
+        for issue in day_issues
+        if issue.recorded and issue.level in verdicts.LEVELS
+    }
+    out: list[verdicts.Issue] = []
+    for issue in sorted(day_issues, key=lambda i: order.get(i.issue, len(order))):
+        if issue.recorded or issue.computed_at is None or issue.level not in verdicts.LEVELS:
+            out.append(issue)
+            continue
+        computed_at = issue.computed_at
+        if computed_at.tzinfo is None:  # BigQuery hands back aware UTC; a naive value is a fixture
+            computed_at = computed_at.replace(tzinfo=UTC)
+        try:
+            decision = togvarsel_notify.decide_issue(
+                {"issue": issue.issue, "level": issue.level}, markers, computed_at
+            )
+        except Exception:
+            logger.warning(
+                "rushhistorikk: could not reconstruct the %s round for %s; left as ikke vurdert",
+                issue.issue,
+                issue.d,
+                exc_info=True,
+            )
+            out.append(issue)
+            continue
+        markers[issue.issue] = decision.marker
+        out.append(
+            replace(
+                issue,
+                recorded=True,
+                reconstructed=True,
+                sent=decision.push,
+                kind=decision.kind,
+                reason=decision.reason,
+                baseline_level=decision.baseline_level,
+                decided_at=computed_at,
+            )
+        )
+    return out
+
+
+def _with_reconstructed_rounds(issues: list[verdicts.Issue]) -> list[verdicts.Issue]:
+    """`reconstruct_rounds` applied per day, returned in the caller's order so the (row, issue)
+    pairing the response is built from survives. (d, issue) is unique: togvarsel_issued is keyed on
+    it and the round join is one-to-one on the same key."""
+    by_day: dict[date, list[verdicts.Issue]] = {}
+    for issue in issues:
+        by_day.setdefault(issue.d, []).append(issue)
+    filled = {
+        (issue.d, issue.issue): issue
+        for group in by_day.values()
+        for issue in reconstruct_rounds(group)
+    }
+    return [filled[(issue.d, issue.issue)] for issue in issues]
 
 
 def _matrix_rows(matrix: dict[str, dict[str, int]]) -> list[MatrixRow]:
@@ -412,11 +521,13 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
             varslingstid_min=row.varslingstid_min,
             varslingstid_n=row.varslingstid_n,
             varsler_sendt=row.varsler_sendt,
+            varsler_rekonstruert=row.varsler_rekonstruert,
             n_scored=row.counts.n_scored,
             n_venter=row.counts.n_venter,
             n_ukjent=row.counts.n_ukjent + row.counts.n_ineligible,
             n_ikke_vurdert=row.counts.n_ikke_vurdert,
-            n_ikke_vurdert_etter_start=row.counts.n_ikke_vurdert_etter_start,
+            n_reconstructed=row.counts.n_reconstructed,
+            n_reconstructed_after_start=row.counts.n_reconstructed_after_start,
             n_late=row.counts.n_late,
             n_untimely=row.counts.n_untimely,
             matrix=_matrix_rows(row.matrix),
@@ -470,7 +581,7 @@ def days(
     # togvarsel.ISSUE_SPECS reaches togvarsel_issued long before it reaches this page. Logged
     # rather than silent, because a dropped row is a real gap in what the page reports.
     rows = [row for row in rows if _known_slot(row)]
-    issues = [_issue_from_row(row, today) for row in rows]
+    issues = _with_reconstructed_rounds([_issue_from_row(row, today) for row in rows])
     stats = verdicts.summarize(issues)
 
     by_day: dict[date, list[tuple[Any, verdicts.Issue]]] = {}

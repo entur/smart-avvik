@@ -26,8 +26,8 @@ oppfølgingene (bare rødt, nivå per bruker) er terskelendringer ingen kan begr
 
 1. **Slå sammen de tre måtene å ikke vite.** `venter` (fasiten prøves fortsatt), `ukjent` (den kan
    ikke fastslås mer, eller dagen strøk på kvalifiseringstesten) og `ikke vurdert` (ingen runde ble
-   noensinne vurdert — porten var lukket, eller dagen er eldre enn loggen). Å slå to av dem sammen
-   lager ferdighet av manglende data, i den ene eller andre retningen.
+   registrert, og den kunne heller ikke rekonstrueres). Å slå to av dem sammen lager ferdighet av
+   manglende data, i den ene eller andre retningen.
 2. **Vise et foreløpig utfall som avklart.** Utfallet fra samme dag har fire kjente skjevheter
    (se toppen av `disruptions/api/togvarsel_outcomes_provisional.sql`) og kan endre seg over natten.
    Det vises på dagraden, merket «foreløpig», og holdes utenfor hver eneste rate.
@@ -70,6 +70,23 @@ Presisjon — og siden 82 % av dagene er grønne leste tallet 0 % en god måned,
 Logikken ligger i `disruptions/api/rushhistorikk_verdicts.py` — rene funksjoner, uten I/O, med 37
 sjekker og en enumerasjon over alle nåbare kombinasjoner. Den finnes bare ett sted nettopp fordi
 tabellen har fjorten grener; skrevet en gang til i SQL blir det to definisjoner av «traff».
+
+## Rekonstruerte runder
+
+Runde-loggen (`togvarsel_rounds`) begynte å skrives 2. september 2026, mens prognoseloggen
+(`togvarsel_issued`) går lenger tilbake — og siden skal først og fremst bedømme **modellen**. For en
+utstedelse uten registrert runde kjører derfor API-et (`rushhistorikk.reconstruct_rounds`) selve
+push-regelverket, `togvarsel_notify.decide_issue`, på prognosen slik den forelå, ved prognosens eget
+`computed_at`, grunnvarsel før oppfølging, med dagens registrerte runder som markørtilstand.
+Resultatet vurderes som en vanlig runde, men er merket «rekonstruert» på dagraden, telt for seg under
+tabellen («Rekonstruert», og «Mangler runde» for dem på dager loggen allerede dekket), og aldri regnet
+som et sendt varsel: «Varsler sendt» teller bare registrerte push, og viser de rekonstruerte i
+parentes.
+
+En registrert runde overstyres aldri. Det en rekonstruksjon ikke kan se — en runde porten lukket før
+den ble vurdert, hvor mange enheter som ble truffet — er akkurat det modellbedømmelsen ikke trenger.
+Fasit for eldre dager fylles inn av den autoritative passeringen, som rekker 60 dager tilbake for
+dager uten utfallsrad (`togvarsel_outcomes._BACKFILL_DAYS`).
 
 ## Tallene i «Slik har varslene truffet»
 

@@ -256,10 +256,14 @@ def decide_rounds(
 # round including the ones that decided NOT to push, plus the reason: a suppressed round is a real
 # outcome for the traveller, and a page that cannot see it has to guess.
 #
-# It is not re-derivable. `decide_issue` is a pure function of (level, marker state, clock), so
-# reconstructing it at query time looks feasible and is not: it cannot see a round the gate closed
-# before evaluating (which writes no markers at all), cannot see the `untimely` verdict on a
-# back-filled round, and cannot see how many devices matched. Same rule as /meldinger's `pushed`.
+# It is not re-derivable AS A RECORD. `decide_issue` is a pure function of (level, marker state,
+# clock), so reconstructing it at query time looks feasible and, for the record, is not: it cannot
+# see a round the gate closed before evaluating (which writes no markers at all), cannot see the
+# `untimely` verdict on a back-filled round, and cannot see how many devices matched. Same rule as
+# /meldinger's `pushed`. What /rushhistorikk DOES do (2026-09-02, `rushhistorikk.reconstruct_rounds`)
+# is replay decide_issue for issues with NO row here — labelled `reconstructed`, never counted as a
+# sent push — because its purpose is to judge the model, and for that the forecast plus this policy
+# is the whole input. A row here always wins over the replay.
 #
 # `baseline_level` is the value _effective_baseline computed, stored here rather than read off the
 # BASELINE's row at query time. That indirection would make one swallowed best-effort write invert
