@@ -197,7 +197,11 @@ skal bety noe – den er for lang og for uklar på en låseskjerm, og kortformen
 for forsinkelse») sier noe annet enn det tallet måler. Skriv heller hva som kan skje, med \
 `forsinkelse_min` – og med `innstilling_prosent` når den finnes.
 - `forsinkelse_min` (`typisk` og `verstefall`) er et ANSLAG som bare gjelder HVIS avgangen faktisk \
-kjører. Skriv «kan bli … forsinket», aldri «er … forsinket».
+kjører. Skriv «kan bli … forsinket», aldri «er … forsinket». Oppgi intervallet på samme form som \
+kortet i appen: «typisk 3–9 min forsinket» (typisk–verstefall), ikke «3 til 9 minutter».
+- `i_morgen: true` betyr at avgangen går I MORGEN, ikke i dag – varselet sendes ofte kvelden før. \
+Skriv da «i morgen» rett etter avgangen, f.eks. «… tog L1 07:18 i morgen er innstilt». Uten det \
+leser mottakeren varselet som om det gjelder i kveld.
 - `mest_sannsynlig_innstilt: true` betyr at innstilling er det mest sannsynlige utfallet – da er \
 det innstillingen som er hovedpoenget, ikke forsinkelsen.
 - `innstilling_prosent` er bare med i det tilfellet, og er da sjansen for innstilling i prosent.
@@ -219,7 +223,9 @@ form som over: linja i FØRSTE etappe i `alternativ_reise.reisevei` sammen med \
 `alternativ_reise.avgang_kl`, f.eks. «Ta tog R11 08:24». Senere etapper er bytter underveis – \
 nevn dem bare hvis det er plass, og aldri i stedet for den første.
 - `alternativ_reise.ankommer_i_tide: false` betyr at alternativet er FRAMME ETTER den planlagte \
-ankomsten. Si det rett ut: dette er neste mulighet, og den er senere enn planlagt ankomst.
+ankomsten. Si det rett ut: dette er neste mulighet, og den er senere enn planlagt ankomst. Finnes \
+`alternativ_reise.minutter_senere`, oppgi tallet – «34 min senere enn planlagt» – ikke bare \
+«senere enn planlagt»: ingen skal regne i hodet på en låseskjerm.
 - Skriv aldri om spart tid, og bruk aldri uttrykk som «i tide», «rekker fram», «sparer deg for» \
 eller «X minutter raskere» – heller ikke når `ankommer_i_tide: true`. Vi vet ikke hva den reisende \
 skal rekke, så det er ikke vårt å love. `minutter_spart` skal aldri siteres; avgangstiden og \
@@ -771,7 +777,25 @@ def _canonical_stop_name(stop_place: object) -> str | None:
     return None
 
 
-def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
+def _departs_tomorrow(departure: datetime | None, now: datetime | None = None) -> bool:
+    """Is `departure` on a later Oslo calendar day than `now`?
+
+    The poller scores ~12 h ahead, so a push about a 07:18 train routinely goes out the evening
+    before -- by design -- and a wording that does not say so reads as tonight's train (design
+    review 2026-09-01, finding 48). Calendar days in Oslo, not a 24 h distance: 23:50 -> 00:10 is
+    "i morgen" too, and that is what the reader means by it.
+    """
+    if departure is None:
+        return False
+    now = now or datetime.now(UTC)
+    # EXACTLY tomorrow. The poller scores ~12 h ahead so nothing further out reaches a wording, and
+    # for anything that somehow did, «i morgen» would be a false statement rather than a missing one.
+    return departure.astimezone(_OSLO).date() == now.astimezone(_OSLO).date() + timedelta(days=1)
+
+
+def build_message_input(
+    journey: dict, impact: Any, alert: Any, *, now: datetime | None = None
+) -> dict:
     """The trimmed, pre-rounded view of one journey × situation every message is written from.
 
     Three consumers, one document: the model is prompted with it, ``varsel._deterministic_body``
@@ -864,6 +888,11 @@ def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
     alert_line_code = line_code(_bounded_text(alert_line, _NAME_MAX_CHARS))
     if alert_line_code:
         payload["linje"] = alert_line_code
+    # Present only when true, like every optional key here: a `"i_morgen": false` is a key the
+    # model can quote and the template must guard. `now` is injectable for tests; the poller reads
+    # the clock.
+    if _departs_tomorrow(getattr(alert, "departure_time", None), now):
+        payload["i_morgen"] = True
     # NO SX MESSAGE EXISTS FOR THIS TRAIN. `situasjoner` is documented to the model as the
     # OPERATOR'S OWN words, and the no-SX path fills summary/description with text this codebase
     # wrote about itself ("Ingen situasjonsmelding er publisert..."). Leaving that in the list would
@@ -945,6 +974,13 @@ def build_message_input(journey: dict, impact: Any, alert: Any) -> dict:
         saved = alt.minutes_saved
         if saved is not None and saved > 0:
             alternative["minutter_spart"] = saved
+        # The figure behind `ankommer_i_tide: false`, so the wording can say «34 min senere enn
+        # planlagt» (design review 2026-09-01, finding 16). Same anchor as the flag -- the planned
+        # arrival -- and carried only when positive, so the two can never disagree. `getattr`
+        # because the selector may be older than this field.
+        later = getattr(alt, "minutes_after_original", None)
+        if not alt.arrives_before_original and later:
+            alternative["minutter_senere"] = later
         payload["alternativ_reise"] = alternative
     return payload
 

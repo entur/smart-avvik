@@ -162,9 +162,10 @@ svarene bør inn i personvernvurderingen — og to av dem kan kreve en tekstjust
    deklarert i `terraform/`. Beholdes tidligere generasjoner av `varsel_state.json`, kan reiser
    gjenopprettes etter «Slett alt», og T6 må enten få en livssyklusregel bak seg eller mykere
    ordlyd.
-2. **Faktisk lagringstid for driftslogger** i `ent-kixavvik-{dev,prd}`. Teksten sier i dag at
-   driftslogger slettes automatisk etter en fast periode og ikke omfattes av «Slett alt». Erstatt
-   med det verifiserte tallet når det er kjent.
+2. ~~**Faktisk lagringstid for driftslogger**~~ — avklart 2026-09-02: `gcloud logging buckets
+   list` viser 30 dager på `_Default`-bøtta (europe-west1) i både `ent-kixavvik-dev` og
+   `ent-kixavvik-prd` (den 400-dagers, låste bøtta er `_Required`, som bare holder
+   admin-aktivitetslogger). T5 «Hvor lenge» sier nå «30 dager».
 3. **PostHogs konfigurerte lagringstid** i EU-instansen. «Inntil 45 dager» er verifisert for
    BigQuery-kontekstene; bekreft at PostHog ligger på eller under samme grense.
 4. **Overføringsgrunnlaget for Web Push-endepunktet** (nytt 1. september 2026, se rettelsen i

@@ -716,7 +716,16 @@ def _push_body(alternative: alternatives.AlternativeJourney | None = None, **boa
         alerts[0].alternative_journey = alternative
     message_input = _message_input(journey, alerts[0])
     assert message_input is not None, "the wording's source must actually be buildable"
-    return _notification_payload(journey, alerts[0], message_input=message_input)["body"]
+    # The body is the route on its own first line, then the wording (2026-09-02); the wording is
+    # what these checks are about, and what the decision log records.
+    return _wording(_notification_payload(journey, alerts[0], message_input=message_input))
+
+
+def _wording(payload: dict) -> str:
+    """The wording part of a push body: everything after the route line the body leads with."""
+    route, _, wording = payload["body"].partition("\n")
+    assert " → " in route, f"the body must lead with the route line, got {route!r}"
+    return wording
 
 
 def test_push_body_leads_with_the_alerting_score():
@@ -1352,6 +1361,87 @@ def test_store_togvarsel_rounds_prunes_to_the_given_date_saves_and_copies():
     finally:
         varsel._save_state = save_state
         varsel._apply_state(saved_raw)
+
+
+# ---- design review 2026-09-01: the title, the tag, «i morgen» and «N min senere» ----------------
+
+
+def test_the_push_title_is_the_fact_about_the_train_and_the_body_leads_with_the_route():
+    """Finding 13: the title was the registration's name, which every phone truncated. It now says
+    what happened to which train; the route moved to the body's first line, ABOVE the wording, so
+    the wording itself -- what /historikk records -- is byte-for-byte what it was."""
+    journey = _journey()
+    alerts = match(journey, {"S1": _train(MON_0800, p_cancel=0.82, p_impact_dep=0.9)})
+    message_input = _message_input(journey, alerts[0])
+    payload = _notification_payload(journey, alerts[0], message_input=message_input, journey_id="j1")
+    assert payload["title"] == "Tog R10 08:00 kan bli innstilt"
+    route, _, wording = payload["body"].partition("\n")
+    assert route == "Oslo S → Lillehammer"
+    assert wording == _deterministic_body(message_input)
+    # One tag per TRAIN per registration (finding 14), the key one_alert_per_train collapses on.
+    assert payload["tag"] == "j1|VYG|t1|A|1"
+
+    cancelled = match(journey, {"S1": _train(MON_0800, et_declared_cancelled=True, p_cancel=1.0)})
+    assert varsel._notification_title(_message_input(journey, cancelled[0]), "A", "B") == (
+        "Tog R10 08:00 er innstilt"
+    )
+    assert varsel._notification_title(
+        _message_input(journey, cancelled[0]), "A", "B", confirmed=True
+    ) == "Bekreftet: Tog R10 08:00 er innstilt"
+    # Only a cancellation is a confirmation; a second forecast about the train is not.
+    assert varsel._notification_title(message_input, "A", "B", confirmed=True) == (
+        "Tog R10 08:00 kan bli innstilt"
+    )
+    delayed = match(journey, {"S1": _train(MON_0800, p_cancel=0.1, p_impact_dep=0.9)})
+    assert varsel._notification_title(_message_input(journey, delayed[0]), "A", "B") == (
+        "Tog R10 08:00 kan bli forsinket"
+    )
+    # No departure in the input: the route is the fallback, exactly the old title.
+    assert varsel._notification_title({}, "Oslo S", "Lillehammer") == "Oslo S → Lillehammer"
+
+
+def test_a_train_that_leaves_tomorrow_is_said_to():
+    """Finding 48: the poller scores ~12 h ahead, so a push about the 07:18 goes out the evening
+    before by design -- and read at 21:36 it sounded like tonight's train. Both wording sources say
+    «i morgen», and the title with them; exactly tomorrow, never further out."""
+    tomorrow_0800 = MON_0800 + timedelta(days=1)
+    journey = _journey()
+    alerts = match(journey, {"S1": _train(tomorrow_0800, et_declared_cancelled=True, p_cancel=1.0)})
+    from_alert = varsel._message_input_from_alert(alerts[0])
+    # `_departs_tomorrow` reads the wall clock, so pin its answer through the input directly.
+    assert varsel._departs_tomorrow(tomorrow_0800, now=NOW) is True
+    assert varsel._departs_tomorrow(MON_0800, now=NOW) is False
+    assert varsel._departs_tomorrow(MON_0800 + timedelta(days=2), now=NOW) is False
+    from_alert["i_morgen"] = True
+    assert _deterministic_body(from_alert) == "Signalfeil\nTog R10 08:00 i morgen: Innstilt"
+    assert varsel._notification_title(from_alert, "A", "B") == "Tog R10 08:00 i morgen er innstilt"
+
+
+def test_the_template_quotes_how_late_the_replacement_is_against_the_plan():
+    """Finding 16: «ankomst 18:54, som er senere enn planlagt» made the reader subtract two clock
+    times on a lock screen. With `minutter_senere` in the input the template says the number; the
+    figure rides only when the alternative is late, so an in-time one never gets a «0 min»."""
+    late = _alternative(arrives_before_original=False, minutes_saved=-18, minutes_after_original=34)
+    body = _push_body(late, **_DELAYED)
+    assert body.endswith("Alternativ tog R11 08:24, framme kl 09:05 – 34 min senere enn planlagt ankomst")
+    body = _deterministic_body(varsel._message_input_from_alert(_cancelled_alert(late)))
+    assert body.endswith("– 34 min senere enn planlagt ankomst")
+    # An input predating the figure keeps the wording it had.
+    without = _alternative(arrives_before_original=False, minutes_saved=-18)
+    assert _push_body(without, **_DELAYED).endswith(
+        "Alternativ tog R11 08:24, framme kl 09:05 – senere enn planlagt ankomst"
+    )
+    in_time = varsel._message_input_from_alert(_cancelled_alert(_alternative(minutes_after_original=None)))
+    assert "minutter_senere" not in in_time["alternativ_reise"]
+
+
+def _cancelled_alert(alternative):
+    return Alert(
+        situation_number="S1", summary="Signalfeil", operator="VYG", line="VYG:Line:R10",
+        departure_time=MON_0800, cancelled=True, cancel_probability=1.0,
+        delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
+        alternative_journey=alternative,
+    )
 
 
 if __name__ == "__main__":

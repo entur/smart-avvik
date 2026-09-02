@@ -68,8 +68,9 @@ def _bus(stop_place, stop_name, n_calls, operator_is_goa=False):
                            has_rail=operator_is_goa, has_bus=not operator_is_goa)
 
 
-def _nsr(ref, place_id, county_no=None):
-    return SimpleNamespace(id=ref, place_id=place_id, county_no=county_no)
+def _nsr(ref, place_id, county_no=None, municipality=None, county=None):
+    return SimpleNamespace(id=ref, place_id=place_id, county_no=county_no,
+                           municipality=municipality, county=county)
 
 
 def _refresh(fake, monkeypatch):
@@ -130,6 +131,28 @@ def test_county_comes_from_the_municipality_prefix(monkeypatch):
     assert stops["513"]["region"] == "Østfold"
     assert stops["57123"]["region"] == "Finnmark"
     assert stops["99"]["region"] is None
+
+
+def test_the_region_is_the_municipality_when_the_registry_names_one(monkeypatch):
+    """Design review 2026-09-01, finding 2: «Sandvika» is 29 different stops and eight of them are
+    in Troms, so a county suffix offered «Sandvika (Troms)» six times over. The municipality tells
+    them apart; the county prefix is only the fallback for a ref the topographic table does not
+    resolve, and an unresolved ref with no prefix stays unlabelled."""
+    fake = _FakeBQ(
+        bus=[_bus("52722", "Sandvika", 10), _bus("52702", "Sandvika", 12), _bus("999", "Sandvika", 3),
+             _bus("77", "Sandvika", 1)],
+        registry=[
+            _nsr("52722", "52722", "55", municipality="Dyrøy", county="Troms"),
+            _nsr("52702", "52702", "55", municipality="Tromsø", county="Troms"),
+            _nsr("999", "999", "55"),  # dangling topographic ref: prefix fallback
+            _nsr("77", "77", None),
+        ],
+    )
+    stops = _refresh(fake, monkeypatch)
+    assert stops["52722"]["region"] == "Dyrøy"
+    assert stops["52702"]["region"] == "Tromsø"
+    assert stops["999"]["region"] == "Troms"
+    assert stops["77"]["region"] is None
 
 
 def test_an_unreadable_registry_leaves_the_list_as_it_was(monkeypatch):

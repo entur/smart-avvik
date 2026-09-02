@@ -12,6 +12,7 @@
     "@entur/a11y": "^0.2.113",
     "@entur/alert": "^0.19.4",
     "@entur/button": "^4.0.11",
+    "@entur/expand": "^3.7.12",
     "@entur/form": "^9.3.8",
     "@entur/icons": "^9.0.4",
     "@entur/layout": "^3.7.5",

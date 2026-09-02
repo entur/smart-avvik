@@ -30,7 +30,7 @@ export interface StopItem {
   mode: string; // 'Tog' | 'Buss' | 'Tog/Buss' — which families serve the stop today
   n_calls: number; // scheduled calls today — traffic signal for ranking picker matches
   place_id: string; // the physical place; refs sharing one are the same stop registered twice
-  region: string | null; // county — shown when a name belongs to more than one place
+  region: string | null; // municipality (county as fallback) — shown when a name belongs to more than one place
 }
 
 // What has actually been observed on the line, as opposed to predicted. `observed_at` is the aimed
@@ -54,13 +54,21 @@ export interface AlternativeLeg {
   end_time: string | null;
 }
 
-// A faster way from from_stop to to_stop than the affected train, from the Journey Planner.
+// The best remaining way from from_stop to to_stop, from the Journey Planner — not necessarily a
+// faster one: for a cancelled train it is legitimately the next possibility, which lands later
+// than the timetable promised. Every field after `legs` is optional so an older API still renders.
 export interface AlternativeJourney {
   departure_time: string | null;
   arrival_time: string | null;
   duration_min: number | null;
-  minutes_saved: number;
+  minutes_saved: number; // SIGNED, against the disrupted train's PREDICTED arrival — informational
   legs: AlternativeLeg[];
+  // Against the traveller's PLANNED arrival: do they still get there when they meant to?
+  arrives_before_original?: boolean;
+  // How many minutes after the planned arrival this lands; present only when it is late.
+  minutes_after_original?: number | null;
+  // The replacement is itself predicted to be in trouble — offered because nothing safer arrived.
+  at_risk?: boolean;
 }
 
 // Every field added after `alertworthy` is optional, so a PWA build can be newer or older than the
@@ -83,6 +91,9 @@ export interface Alert {
   impact_probability: number | null; // P(innstilling eller >= 10 min forsinkelse) — the alert score
   alert_threshold: number; // the operator's cut applied to impact_probability
   alertworthy: boolean; // impact_probability >= alert_threshold, i.e. a push is/was sent
+  // When this match was last evaluated (UTC). The card's timestamp fallback when nothing has been
+  // observed on the line yet (design review 2026-09-01, finding 33).
+  decided_at?: string | null;
   latest_observation?: LatestObservation | null;
   alternative_journey?: AlternativeJourney | null;
   // The model-written message for this journey × situation — identical for every device on the
@@ -256,10 +267,12 @@ export function createJourney(deviceId: string, journey: NewJourney): Promise<Jo
   return request('/varsel-api/journeys', jsonPost({ device_id: deviceId, ...journey }));
 }
 
+// `keepalive`: the delete is deferred behind an undo window (App.tsx), and the flush on `pagehide`
+// must survive the page being backgrounded or closed in the same instant.
 export function deleteJourney(journeyId: string, deviceId: string): Promise<void> {
   return request(
     `/varsel-api/journeys/${encodeURIComponent(journeyId)}?device_id=${encodeURIComponent(deviceId)}`,
-    { method: 'DELETE' },
+    { method: 'DELETE', keepalive: true },
   );
 }
 

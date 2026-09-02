@@ -28,8 +28,14 @@ self.addEventListener('push', (event) => {
     // Not branded: Android draws the badge as a silhouette, so it has no colour to carry.
     badge: '/varsel/icons/badge-72.png',
     lang: 'nb',
-    // Same situation replaces its previous notification instead of stacking.
-    tag: data.situation_number || undefined,
+    // One notification per TRAIN: the server tags a push with the registration and the train it is
+    // about (varsel._notification_tag), so a cancellation that confirms an earlier forecast about
+    // the same departure REPLACES it on the lock screen instead of stacking beside it (design
+    // review 2026-09-01, finding 14). Older payloads carry no tag; the situation number then does
+    // what it always did -- the same situation replaces its own previous notification.
+    tag: data.tag || data.situation_number || undefined,
+    // A replacement must still be noticed: without this a same-tag notification updates silently.
+    renotify: Boolean(data.tag || data.situation_number),
     data: { url: data.url || '/varsel/' },
     // Chromium-based Android browsers render this as a button. Safari ignores unsupported
     // notification actions, so tapping the notification itself remains the complete iPhone path.

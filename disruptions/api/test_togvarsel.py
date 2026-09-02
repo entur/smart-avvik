@@ -147,8 +147,18 @@ def test_quiet_morning_gets_the_fallback_reason():
 def test_pm_reasons_read_the_features():
     row = _feature_row(et_cx_1400=7, sx_pmj_inn_1400=3)
     reasons = togvarsel._pm_reasons(row, "1400", [])
-    assert "7 innstilte avganger så langt i dag" in reasons
-    assert "3 avganger i ettermiddagsrushet er allerede innstilt" in reasons
+    # ONE cancellation figure, scoped to the reader's rush (design review 2026-09-01, finding 17):
+    # the day total and the rush count used to sit side by side in one push.
+    assert reasons[0] == "3 avganger i ettermiddagsrushet er allerede innstilt"
+    assert "7 innstilte avganger så langt i dag" not in reasons
+    # Without a rush-scoped cancellation the day total is the figure that remains.
+    assert "7 innstilte avganger så langt i dag" in togvarsel._pm_reasons(
+        _feature_row(et_cx_1400=7), "1400", []
+    )
+    # Singular agreement (finding 4): never «1 avganger».
+    assert togvarsel._pm_reasons(_feature_row(sx_pmj_inn_1400=1), "1400", [])[0] == (
+        "1 avgang i ettermiddagsrushet er allerede innstilt"
+    )
 
 
 def test_pm_outlook_is_deterministic_until_the_pm_issues_exist():
@@ -174,6 +184,26 @@ def test_known_deviations_filter():
     got = togvarsel.known_deviations_for(sx)
     assert [k.summary for k in got] == ["Buss for tog", "Planlagt arbeid"]
     assert got[0].n_am_rush_journeys == 2
+    assert got[0].n_situations == 1
+
+
+def test_known_deviations_saying_the_same_thing_collapse_into_one_row():
+    """Eleven «Færre vogner» messages are one row with the counts summed (design review
+    2026-09-01, finding 3) -- and a different class or summary is still its own row."""
+    sx = [
+        {"oslo": True, "cls": "faerre_vogner", "planned": False, "summary": "Færre vogner", "n_amj": 1, "n_pmj": 0},
+        {"oslo": True, "cls": "faerre_vogner", "planned": False, "summary": "Færre vogner ", "n_amj": 1, "n_pmj": 1},
+        {"oslo": True, "cls": "faerre_vogner", "planned": False, "summary": "færre vogner", "n_amj": 0, "n_pmj": 1},
+        {"oslo": True, "cls": "stengt", "planned": False, "summary": "Stengt: Ski", "n_amj": 3, "n_pmj": 0},
+        {"oslo": True, "cls": "faerre_vogner", "planned": False, "summary": "Kortere tog Lillestrøm", "n_amj": 1},
+    ]
+    got = togvarsel.known_deviations_for(sx)
+    assert [(k.cls, k.summary, k.n_situations) for k in got] == [
+        ("faerre_vogner", "Færre vogner", 3),
+        ("stengt", "Stengt: Ski", 1),
+        ("faerre_vogner", "Kortere tog Lillestrøm", 1),
+    ]
+    assert (got[0].n_am_rush_journeys, got[0].n_pm_rush_journeys) == (2, 2)
 
 
 def test_skill_note_is_seasonal():
@@ -528,7 +558,8 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
         assert snapshot["situation_number"] == f"KIX:Togvarsel:{first['date']}:0700"
         # the literal page rendering, JS-rounded (0.34 -> 34; >= RED_MIN 0.30 -> red)
         assert snapshot["displayed_text"] == "stor fare for forstyrrelser (ca. 34 % sjanse for mye trøbbel)"
-        assert snapshot["detail_text"] == "Kl. 07:00 — morgenrushet 07:00–09:00"
+        # the card's heading, rush + level (the issue time is a small line under it since 2026-09-02)
+        assert snapshot["detail_text"] == "Morgenrushet 07:00–09:00 — rødt nivå"
         assert snapshot["operator"] == "VYG"
         assert snapshot["journey_context"] is None and snapshot["message_input"] is None
         assert snapshot["prediction"]["level"] == "red" and snapshot["prediction"]["reasons"]
@@ -605,6 +636,30 @@ def test_feedback_snapshot_mirrors_the_page():
     assert " % sjanse for mye trøbbel)" in page
     assert "/varsel-api/feedback" in page
     assert "feedback_context_id" in page and "feedback_enabled" in page
+
+
+def test_the_level_vocabulary_is_one_copy_per_app_and_the_copies_agree():
+    """/varsel and /togmelding each carry `src/levels.ts` — a guarded duplicate, like personvern.ts,
+    because each front-end is its own npm app and the image's node stage copies only its own
+    directory. Until 2026-09-02 the two apps had drifted into GRØNT/GULT/RØDT vs GRØNN/GUL/RØD for
+    one concept, and the middle sentence («noe usikkert») measured something else than the two
+    beside it (design review 2026-09-01, findings 11 and 12). Byte-identical, and each sentence is
+    the server's, which is what the persisted feedback snapshot quotes."""
+    demo = Path(togvarsel.__file__).parents[2] / "demo"
+    varsel_copy = (demo / "avviksvarsel" / "src" / "levels.ts").read_text()
+    togmelding_copy = (demo / "togmelding" / "src" / "levels.ts").read_text()
+    assert varsel_copy == togmelding_copy, "demo/*/src/levels.ts have drifted apart; edit both"
+    for text in togvarsel._LEVEL_TEXT.values():
+        assert f"'{text}'" in togmelding_copy, f"levels.ts no longer carries {text!r}"
+    for adjective in togvarsel.LEVEL_ADJ.values():
+        assert f"'{adjective}'" in togmelding_copy, f"levels.ts no longer carries {adjective!r}"
+    assert "'noe usikkert'" not in togmelding_copy
+    for label in ("GRØNT", "GULT", "RØDT"):
+        assert f"'{label}'" in togmelding_copy
+    # the /varsel panel and the /togmelding card both read the copy rather than their own literals
+    for page in (demo / "avviksvarsel" / "src" / "components" / "RushOutlook.tsx",
+                 demo / "togmelding" / "src" / "components" / "IssueCard.tsx"):
+        assert "levels'" in page.read_text() or "./format'" in page.read_text(), page
 
 
 def test_issued_today_snapshots_plain_dicts_for_the_notify_seam():

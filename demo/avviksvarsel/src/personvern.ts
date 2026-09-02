@@ -28,7 +28,19 @@
 /** Version of the registration-visible texts, persisted on each journey record
  * as `consent_text_version`. Format: YYYY-MM-DD.n — bump the date (or the
  * counter for a same-day change) whenever a text in REGISTRATION_TEXTS changes. */
-export const CONSENT_TEXT_VERSION = '2026-08-31.1';
+export const CONSENT_TEXT_VERSION = '2026-09-02.1';
+
+/** The version's date as a Norwegian date, for «Sist oppdatert» on the privacy page (design
+ * review 2026-09-01, finding 44): the same value every registration is stamped with, so the page
+ * can never claim a date the records do not carry. */
+export function consentTextDate(version: string = CONSENT_TEXT_VERSION): string {
+  const [year, month, day] = version.split('.')[0].split('-').map(Number);
+  const months = [
+    'januar', 'februar', 'mars', 'april', 'mai', 'juni',
+    'juli', 'august', 'september', 'oktober', 'november', 'desember',
+  ];
+  return `${day}. ${months[month - 1]} ${year}`;
+}
 
 /** Canonical path of the privacy page. In-app links use the trailing-slash form
  * so the server never has to answer with a redirect. */
@@ -58,19 +70,24 @@ export interface LinkedText {
 
 const PERSONVERN_LINK_TEXT = 'Slik behandler vi opplysningene';
 
-/** T1 — experiment disclaimer at the top of /varsel. */
+/** T1 — experiment disclaimer at the top of /varsel. One line since 2026-09-02 (design review
+ * 2026-09-01, finding 29: on a phone the first screen was caveats, and «Legg til reise» sat 1.26
+ * screen heights down). The dropped sentences — «Vi tester om varsler før avviket rammer er til
+ * nytte» and «Tjenesten kan endres eller avsluttes på kort varsel» — moved to the privacy page's
+ * intro (T5_INTRO), one tap away; the warning that matters on the first screen, «ikke planlegg
+ * reisen din på dem alene», is kept word for word. No title: the sentence is its own headline. */
 export const T1_EKSPERIMENT = {
-  title: 'Dette er et eksperiment',
   body:
-    'Avviksvarsel er et eksperiment fra Enturs KI-lab. Vi tester om varsler før avviket rammer ' +
-    'er til nytte. Tjenesten kan endres eller avsluttes på kort varsel, og varslene er anslag ' +
-    'som ikke alltid treffer — ikke planlegg reisen din på dem alene.',
+    'Eksperiment fra Enturs KI-lab. Varslene er anslag som ikke alltid treffer – ikke planlegg ' +
+    'reisen din på dem alene.',
 };
 
-/** T2 — privacy line under the intro. */
+/** T2 — privacy line under the intro. Its link text is deliberately NOT the footer's «Slik
+ * behandler vi opplysningene»: a screen reader listing links used to read three identical entries
+ * to one page (finding 42). */
 export const T2_PERSONVERNLINJE: LinkedText = {
   prose: 'Entur AS lagrer reisene du registrerer, slik at vi kan varsle deg.',
-  linkText: PERSONVERN_LINK_TEXT,
+  linkText: 'Hva vi lagrer om deg',
 };
 
 /** T3 — registration text in «Legg til reise», above the buttons. */
@@ -83,7 +100,14 @@ export const T3_REGISTRERING: LinkedText = {
 
 /** T4 — notification card. Deliberately claims only that «Skru av» deletes the
  * varselabonnement: the technical key survives «Skru av» (in localStorage and
- * on every journey record) and is deleted by «Slett alt». */
+ * on every journey record) and is deleted by «Slett alt».
+ *
+ * Rendered behind an expandable heading since 2026-09-02 (design review
+ * 2026-09-01, finding 41): the 54 words are still there, unchanged, but folded,
+ * because they explained the whole mechanism before the reader had decided to
+ * turn anything on. The title below is the fold's label. */
+export const T4_TITTEL = 'Hva vi lagrer for å sende varsler';
+
 export const T4_VARSELKORT =
   'For å sende varsler lagrer vi et varselabonnement for denne nettleseren. Det brukes bare ' +
   'til å varsle om reisene dine, og slettes når du trykker «Skru av». Den tekniske nøkkelen ' +
@@ -94,19 +118,38 @@ export const T4_VARSELKORT =
 export const T5_PAGE_HEADING = 'Personvern i Avviksvarsel';
 
 export const T5_INTRO =
-  'Avviksvarsel er et eksperiment fra Enturs KI-lab. Denne siden forklarer hvilke opplysninger ' +
-  'vi behandler når du bruker tjenesten.';
+  'Avviksvarsel er et eksperiment fra Enturs KI-lab: vi tester om varsler før avviket rammer er ' +
+  'til nytte. Tjenesten kan endres eller avsluttes på kort varsel. Denne siden forklarer hvilke ' +
+  'opplysninger vi behandler når du bruker den.';
+
+/** «Sist oppdatert» label on the privacy page; the date comes from CONSENT_TEXT_VERSION. */
+export const T5_LAST_UPDATED_LABEL = 'Sist oppdatert';
+
+export interface PersonvernLink {
+  text: string;
+  href: string;
+}
 
 export interface PersonvernSection {
   title: string;
+  /** May contain '\n' — the page renders line breaks, so two art. 13 items (controller, DPO)
+   * can sit on two lines inside one section. */
   body: string;
+  /** Rendered after the body as real links: «Du kan klage til Datatilsynet» without saying
+   * where was half an answer (finding 43). */
+  links?: readonly PersonvernLink[];
 }
 
+/** The two public evaluation pages the section below refers to, and the two external bodies. */
+export const DATATILSYNET_HREF = 'https://www.datatilsynet.no/';
+export const ENTUR_PERSONVERN_HREF = 'https://entur.no/personvern/';
+export const HISTORIKK_HREF = '/historikk';
+export const MELDINGER_HREF = '/meldinger';
+
 export const T5_SECTIONS: readonly PersonvernSection[] = [
-  {
-    title: 'Behandlingsansvarlig',
-    body: 'Entur AS, Postboks 1800, 0048 Oslo. Personvernombudet nås på personvern@entur.org.',
-  },
+  // Order is the reader's, not the regulation's (design review 2026-09-01, finding 45): what we
+  // store, why, who sees it, for how long, your rights — then the legal basis, the controller,
+  // the complaint route and the transfer note.
   {
     title: 'Hva vi lagrer',
     body:
@@ -125,24 +168,32 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
       'varslene.',
   },
   {
-    title: 'Rettslig grunnlag',
-    body:
-      'Registrering av reiser og varsler behandles på grunnlag av ditt samtykke, jf. ' +
-      'personvernforordningen art. 6 nr. 1 bokstav a. Du gir samtykket ved å registrere en ' +
-      'reise, og trekker det tilbake ved å slette den. Forbedring av varslene skjer på grunnlag ' +
-      'av vår berettigede interesse i å vite om tjenesten er til nytte, jf. art. 6 nr. 1 ' +
-      'bokstav f.',
-  },
-  {
     title: 'Hvem som kan se opplysningene',
     body:
       'Ansatte i Entur som arbeider med tjenesten kan se hvilke reiser som er registrert, for å ' +
-      'vurdere om varslene treffer. Vurderingene av varslene — med strekning og avgangstid, men ' +
-      'uten noe som identifiserer deg eller enheten din — vises også på åpne evalueringssider. ' +
-      'Google Cloud drifter tjenesten på Enturs vegne, i EU. Varselteksten skrives av en ' +
-      'språkmodell hos Google i EU, som får vite hvilken strekning og avgang varselet gjelder. ' +
-      'Tilbakemeldinger du sender behandles i analyseverktøyet PostHog i EU, på Enturs vegne. ' +
-      'Tjenesten som leverer varselet til telefonen din ser ikke innholdet — det er kryptert.',
+      'vurdere om varslene treffer. Google Cloud drifter tjenesten på Enturs vegne, i EU. ' +
+      'Varselteksten skrives av en språkmodell hos Google i EU, som får vite hvilken strekning og ' +
+      'avgang varselet gjelder. Tilbakemeldinger du sender behandles i analyseverktøyet PostHog i ' +
+      'EU, på Enturs vegne. Tjenesten som leverer varselet til telefonen din ser ikke innholdet — ' +
+      'det er kryptert.',
+  },
+  // Its own section, not a clause (finding 46): this is the most far-reaching sentence on the
+  // page, and it had the least room. What the pages show is the strekning, avgangstid and verdict
+  // of every alert — without anything that identifies you or your device. Whether that is
+  // sufficiently anonymous on a thin route is an open question for the data protection officer
+  // (see docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md §5); the text
+  // states what is shown rather than promising anonymity.
+  {
+    title: 'Åpne evalueringssider',
+    body:
+      'For å vise hvordan tjenesten treffer, publiserer vi vurderingene av varslene på to åpne ' +
+      'sider: hvilken strekning og avgang varselet gjaldt, hva som ble sendt, og om det slo til. ' +
+      'Sidene viser ikke noe som identifiserer deg eller enheten din, men på strekninger med få ' +
+      'reisende kan en strekning og et tidsrom i seg selv si noe om hvem som reiser der.',
+    links: [
+      { text: 'Varselhistorikk', href: HISTORIKK_HREF },
+      { text: 'Meldinger', href: MELDINGER_HREF },
+    ],
   },
   {
     title: 'Hvor lenge',
@@ -150,8 +201,8 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
       'Reiser du har registrert lagres til du sletter dem. Varselabonnementet slettes når du ' +
       'skrur av varsler eller bruker «Slett alt». Loggen over varsler vi har vurdert å sende ' +
       'lagres så lenge eksperimentet pågår; den identifiserer ikke enheten din. Driftslogger ' +
-      'slettes automatisk etter en fast periode og omfattes ikke av «Slett alt». ' +
-      'Tilbakemeldinger du sender lagres i inntil 45 dager.',
+      'slettes automatisk etter 30 dager og omfattes ikke av «Slett alt». Tilbakemeldinger du ' +
+      'sender lagres i inntil 45 dager.',
   },
   {
     title: 'Rettighetene dine',
@@ -162,10 +213,28 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
       'enheten du registrerte reisene fra for at vi skal kunne finne dem.',
   },
   {
+    title: 'Rettslig grunnlag',
+    body:
+      'Registrering av reiser og varsler behandles på grunnlag av ditt samtykke, jf. ' +
+      'personvernforordningen art. 6 nr. 1 bokstav a (samtykke). Du gir samtykket ved å ' +
+      'registrere en reise, og trekker det tilbake ved å slette den. Forbedring av varslene skjer ' +
+      'på grunnlag av vår berettigede interesse i å vite om tjenesten er til nytte, jf. art. 6 ' +
+      'nr. 1 bokstav f (berettiget interesse).',
+  },
+  {
+    title: 'Behandlingsansvarlig',
+    // Two art. 13 items, two lines: the controller and the data protection officer.
+    body:
+      'Behandlingsansvarlig: Entur AS, Postboks 1800, 0048 Oslo.\n' +
+      'Personvernombud: personvern@entur.org.',
+    links: [{ text: 'Enturs personvernerklæring', href: ENTUR_PERSONVERN_HREF }],
+  },
+  {
     title: 'Klage',
     body:
       'Mener du at vi behandler opplysningene dine i strid med regelverket, kan du klage til ' +
       'Datatilsynet.',
+    links: [{ text: 'Datatilsynet', href: DATATILSYNET_HREF }],
   },
   // The unqualified «Behandlingen skjer i EU/EØS» was false, and contradicted the
   // sentence two sections up: a Web Push is POSTed to an endpoint the browser vendor
@@ -214,12 +283,16 @@ export const T7_AVSENDER: LinkedText = {
 export const TOGMELDING_SENDER_LINE = T7_AVSENDER.prose;
 export const TOGMELDING_PERSONVERN_LINK_TEXT = T7_AVSENDER.linkText;
 export const TOGMELDING_PERSONVERN_HREF = PERSONVERN_PATH;
+// One line, since 2026-09-02: the two dropped sentences («Vi tester om …», «kan endres eller
+// avsluttes på kort varsel») live on the privacy page, and on a phone they stood between the
+// reader and the level they came for (design review 2026-09-01, findings 29-31). The comment sits
+// OUTSIDE the literal: test_personvern_texts.py's literal reader resolves the object's fields and
+// does not skip comments.
 export const TOGMELDING_DISCLAIMER = {
   title: 'Dette er et eksperiment',
   body:
-    'Rushvarsel er et eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid ' +
-    'treffer — ikke planlegg reisen din på dem alene. Tjenesten kan endres eller avsluttes på ' +
-    'kort varsel.',
+    'Eksperiment fra Enturs KI-lab. Prognosene er anslag som ikke alltid treffer – ikke planlegg ' +
+    'reisen din på dem alene.',
 };
 
 /** The texts a registering user sees and consents to: the on-page notices T1
@@ -228,7 +301,6 @@ export const TOGMELDING_DISCLAIMER = {
  * so changing any entry breaks the digest, and the pin block that has to be
  * touched to green it again is the one holding the version literal. */
 export const REGISTRATION_TEXTS: readonly string[] = [
-  T1_EKSPERIMENT.title,
   T1_EKSPERIMENT.body,
   T2_PERSONVERNLINJE.prose,
   T2_PERSONVERNLINJE.linkText,

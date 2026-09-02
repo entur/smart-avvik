@@ -71,3 +71,23 @@ body {
   flex-direction: column;
   gap: 0.35rem;
 }
+
+/* The date line sits tight under the intro, as a footnote to it rather than a block of its own. */
+.pv-updated {
+  margin-top: -1rem;
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+/* Section bodies may carry '\n' (controller and DPO on two lines); render the breaks. */
+.pv-body {
+  white-space: pre-line;
+}
+
+.pv-links {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.25rem;
+}

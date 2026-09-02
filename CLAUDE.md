@@ -242,6 +242,37 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Skøyen" — the cancelled *segment*, straight out of the situation text. A prompt rule now scopes
   the advice to `reise.fra`/`reise.til` and says place names inside `situasjoner` are where on the
   line the disruption applies, not the traveller's route.
+  **The 2026-09-01 design review landed on 2026-09-02** (`docs/design-review/2026-09-01/`, 48
+  findings; the answers to its two open questions were: 47 — on blur with typed text and no pick,
+  adopt the first suggestion; 48 — an evening push about tomorrow's train is by design and must
+  say «i morgen»). What it changed that a later reader has to know: the **push title is the fact
+  about the train** («Tog L1 07:18 er innstilt», `varsel._notification_title`) and the **body
+  leads with the route** on its own line, then the wording — the wording itself is unchanged, so
+  `/historikk`'s `message` and every wording comparison are untouched, but anything reading a push
+  body byte-for-byte now strips the first line (`_wording()` in the test suites). Pushes carry a
+  **`tag` per train per registration** (`_notification_tag`, keyed like `one_alert_per_train`),
+  so a declared cancellation REPLACES the earlier forecast about the same train on the lock screen
+  and is titled «Bekreftet:»; `_pushed_trains` is the in-memory record behind that prefix (a
+  restart loses only the prefix). **At most `_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY` (4) alert
+  pushes per registration per Oslo day**, spent soonest-departure-first; a replacement is exempt,
+  a capped alert is still recorded (`pushed=False`) and re-offered next cycle, and the suppression
+  is logged once per cycle as `event="push_capped"`. The message input gained `i_morgen` (exactly
+  tomorrow, Oslo calendar) and `alternativ_reise.minutter_senere` (from the new
+  `AlternativeJourney.minutes_after_original`, anchored on the PLANNED arrival like
+  `arrives_before_original`), both writers say them, and the prompt asks for the card's delay
+  register («typisk 3–9 min forsinket»). The card now renders `alternative_journey` as its own
+  box, hides the detail line beside a written message (mirrored in the feedback snapshot's
+  `detail_text`), falls back to «Vurdert kl HH:MM» when nothing has been observed, and defers a
+  delete behind an 8 s undo. The privacy texts moved to `CONSENT_TEXT_VERSION = 2026-09-02.1`
+  (T1 is one line, T5 is in the reader's order with links and a dated «Sist oppdatert»); the level
+  vocabulary is `demo/*/src/levels.ts`, a guarded duplicate like `personvern.ts`
+  (`test_the_level_vocabulary_is_one_copy_per_app_and_the_copies_agree`), yellow now reads «moderat
+  fare for forstyrrelser». Rushvarsel's `known_deviations` are aggregated per (planned, class,
+  summary) with `n_situations`, its `skill_note` quotes rates rather than multipliers, and the
+  card heading is «Morgenrushet 07:00–09:00 — gult nivå» (mirrored in `detail_text`). The picker's
+  `region` is now the **municipality** from NSR's `topographic_places_all_versions` (latest version
+  per id, joined on `topographicPlaceRef.ref`; 99.6 % of stop places resolve, the county prefix is
+  the fallback for the rest), so «Sandvika (Troms)» ×6 reads Dyrøy, Harstad, Tromsø ….
   **`?brand=none` renders the app unbranded** (2026-08-19), for showing the concept to an audience
   that should not read it as an Entur product; no parameter — or an unrecognised one — renders
   Entur exactly as before. A brand is four things, and leaving any one out still reads as Entur:

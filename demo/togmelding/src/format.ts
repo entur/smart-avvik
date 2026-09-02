@@ -1,28 +1,23 @@
-// Display vocabulary and formatting for Togmeldingen.
+// Display vocabulary and formatting for Rushvarsel.
 //
-// LEVEL_TEXT and the percentage phrase below are MIRRORED server-side by
-// togvarsel._LEVEL_TEXT / togvarsel._feedback_snapshot: the feedback context persists the exact
-// text the traveller read, so an edit here has to be made there too.
-// disruptions/api/test_togvarsel.py greps this file for both and fails if they drift.
+// The level vocabulary lives in levels.ts (shared with /varsel as a guarded duplicate) and is
+// re-exported here so existing imports keep working. LEVEL_TEXT and the percentage phrase below
+// are MIRRORED server-side by togvarsel._LEVEL_TEXT / togvarsel._feedback_snapshot: the feedback
+// context persists the exact text the traveller read, so an edit there has to be made in levels.ts
+// too. disruptions/api/test_togvarsel.py greps these sources for both and fails if they drift.
 
-export const LEVEL_LABEL: Record<string, string> = {
-  green: 'GRØNN',
-  yellow: 'GUL',
-  red: 'RØD',
-};
+import { LEVEL_ADJ, LEVEL_LABEL, LEVEL_TEXT, capitalize } from './levels';
 
-export const LEVEL_TEXT: Record<string, string> = {
-  green: 'liten fare for forstyrrelser',
-  yellow: 'noe usikkert',
-  red: 'stor fare for forstyrrelser',
-};
+export { LEVEL_ADJ, LEVEL_LABEL, LEVEL_TEXT, capitalize };
 
 // The announced-deviation classes togvarsel.known_deviations_for lets through.
 export const CLS_LABEL: Record<string, string> = {
   buss_for_tog: 'Buss for tog',
   stengt: 'Stengt strekning',
   faerre_avganger: 'Færre avganger',
-  innstilt: 'Innstillinger',
+  // «Innstilte tog», not «Innstillinger»: the latter means *settings* everywhere else in Entur
+  // (design review 2026-09-01, finding 8).
+  innstilt: 'Innstilte tog',
   faerre_vogner: 'Kortere tog',
   ny_kjoererute: 'Ny kjørerute',
 };
@@ -55,6 +50,38 @@ export function osloTime(iso: string): string {
     minute: '2-digit',
     timeZone: 'Europe/Oslo',
   });
+}
+
+/** «1. sep. kl. 14:02» — date AND time, for a timestamp that has to be distinguishable from the
+ *  same time a week ago (design review 2026-09-01, finding 32: «Sist oppdatert 22:14» looked the
+ *  same today and last Tuesday). */
+export function osloDateTime(iso: string): string {
+  const d = new Date(iso);
+  const date = d.toLocaleDateString('no-NO', {
+    day: 'numeric',
+    month: 'short',
+    timeZone: 'Europe/Oslo',
+  });
+  return `${date} kl. ${osloTime(iso)}`;
+}
+
+/** «for 8 minutter siden», «for 3 timer siden», «i går» … — relative first, because freshness is
+ *  the whole point of a forecast. `now` is injectable for tests. */
+export function relativeTime(iso: string, now: Date = new Date()): string {
+  const diffMin = Math.round((now.getTime() - new Date(iso).getTime()) / 60_000);
+  if (diffMin < 1) return 'akkurat nå';
+  if (diffMin === 1) return 'for 1 minutt siden';
+  if (diffMin < 60) return `for ${diffMin} minutter siden`;
+  const hours = Math.round(diffMin / 60);
+  if (hours === 1) return 'for 1 time siden';
+  if (hours < 24) return `for ${hours} timer siden`;
+  const days = Math.round(hours / 24);
+  return days === 1 ? 'i går' : `for ${days} dager siden`;
+}
+
+/** «1 avgang» / «3 avganger» — never «1 avganger» (design review 2026-09-01, finding 4). */
+export function count(n: number, singular: string, plural: string): string {
+  return `${n} ${n === 1 ? singular : plural}`;
 }
 
 /** 'kl. 06:30 og kl. 07:00' — the overdue list, read as prose. */

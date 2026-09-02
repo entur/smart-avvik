@@ -33,6 +33,11 @@ Served by the disruptions API at **`/varsel`**; data + push endpoints are **`/va
   exceedance-stack `p50–p90` interval — the figures `/demo` shows. It deliberately does not quote
   `dep_delay_typ_min`: that raw regression reads ~2 min on boardings whose calibrated impact is
   > 90 %, which made real alerts look trivial (fixed 2026-07-27).
+- **A push's title is the fact about the train** («Tog L1 07:18 er innstilt»), its body the route
+  on one line and the wording under it, and its `tag` the train — so a cancellation confirming an
+  earlier forecast replaces it on the lock screen («Bekreftet:») rather than stacking. At most
+  four alert pushes per registration per day, soonest departure first; a push about a train that
+  leaves tomorrow says «i morgen» (design review 2026-09-01, findings 13-15 and 48).
 - Subscriptions + journeys are keyed by a client-generated `device_id` (no login — prototype).
   State persists to a GCS blob so it survives redeploys.
 - **Rush-hour outlook at the top of the page** (`components/RushOutlook.tsx`): today's Oslo

@@ -181,11 +181,21 @@ class Issue(BaseModel):
 
 
 class KnownDeviation(BaseModel):
+    """One ROW of the «kjente avvik» list: every situation of one class saying the same thing.
+
+    Aggregated since 2026-09-02 (design review 2026-09-01, finding 3): Vy publishes one SX message
+    per shortened train, so a morning with eleven «Færre vogner» situations rendered eleven
+    near-identical rows and the list looked like a rendering bug. Rows are grouped on (planned,
+    class, summary) with the rush-journey counts summed, and `n_situations` says how many messages
+    stand behind the row.
+    """
+
     summary: str | None
     cls: str
     planned: bool
     n_am_rush_journeys: int
     n_pm_rush_journeys: int
+    n_situations: int = Field(default=1, description="SX messages collapsed into this row.")
 
 
 class Togmelding(BaseModel):
@@ -303,12 +313,23 @@ def _pm_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
         out.append("forsinkelser gjennom dagen så langt")
     pmj_inn = int(_f(row, f"sx_pmj_inn_{suffix}"))
     if pmj_inn >= 1:
-        out.append(f"{pmj_inn} avganger i ettermiddagsrushet er allerede innstilt")
+        # ONE cancellation figure, scoped to the reader's rush. The day-total above and this one
+        # used to sit side by side («24 innstilte avganger så langt i dag. 1 avganger i
+        # ettermiddagsrushet er allerede innstilt»), two numbers with two scopes in one push (design
+        # review 2026-09-01, finding 17). The rush-scoped one is the one that concerns the reader, so
+        # it replaces the day count when both would fire; the model still saw both features.
+        out = [r for r in out if not r.endswith("innstilte avganger så langt i dag")]
+        out.insert(0, f"{_count(pmj_inn, 'avgang', 'avganger')} i ettermiddagsrushet er allerede innstilt")
     if _f(row, f"sx_big_{suffix}") >= 1:
         out.append("større avvik annonsert (buss for tog / stengt strekning)")
     if not out:
         out.append("normal drift så langt i dag")
     return out[:4]
+
+
+def _count(n: int, singular: str, plural: str) -> str:
+    """«1 avgang», «2 avganger» — never «1 avganger» (design review 2026-09-01, finding 4)."""
+    return f"{n} {singular if n == 1 else plural}"
 
 
 def reasons_for(spec: _IssueSpec, row: dict, sx: list[dict]) -> list[str]:
@@ -324,9 +345,16 @@ def skill_note_for(d: date) -> str:
             "Vinterhalvåret er vanskeligere å varsle: plutselige infrastrukturfeil kommer oftere "
             "og uten forvarsel, så regn med flere bomvarsler enn om sommeren."
         )
+    # Rates, not multipliers (design review 2026-09-01, finding 9): «~2× tryggere» is not a figure
+    # a reader can place, while «6 av 100» is. The numbers are the three-level bins measured on the
+    # pooled rolling predictions (docs/togvarsel/02-findings-2026-08-27.md §14a: green 6 %, yellow
+    # 21 %, red 55 % bad mornings against a 20 % base rate) -- re-state them here after a retrain
+    # that moves them.
     return (
-        "Treffsikkerheten er omtrent som et par dagers værvarsel: grønne morgener er ~2× "
-        "tryggere enn snittet, røde ~3× verre. Plutselige feil etter utsendelse fanges ikke."
+        "Treffsikkerheten er omtrent som et par dagers værvarsel. Målt på tidligere morgener: etter "
+        "en grønn prognose fikk omtrent 6 av 100 likevel mye trøbbel, etter en gul omtrent 20 og "
+        "etter en rød omtrent 55 – mot 20 av 100 morgener i snitt. Plutselige feil etter "
+        "utsendelse fanges ikke."
     )
 
 
@@ -355,22 +383,34 @@ _DEVIATION_CLASSES = frozenset(
 
 
 def known_deviations_for(sx: list[dict]) -> list[KnownDeviation]:
-    out = []
+    """The deterministic «kjente avvik» list, one row per (planned, class, summary).
+
+    Situations saying the same thing about the same class collapse into one row with their
+    rush-journey counts summed -- see :class:`KnownDeviation`. Order is first appearance, which is
+    the SX creation order the query returns, so the earliest-announced deviation stays on top.
+    """
+    rows: dict[tuple[bool, str, str], KnownDeviation] = {}
     for s in sx:
         if not s.get("oslo"):
             continue
         if not (s.get("planned") or s.get("cls") in _DEVIATION_CLASSES):
             continue
-        out.append(
-            KnownDeviation(
-                summary=s.get("summary"),
+        summary = (s.get("summary") or "").strip() or None
+        key = (bool(s.get("planned")), str(s.get("cls")), (summary or "").casefold())
+        row = rows.get(key)
+        if row is None:
+            rows[key] = KnownDeviation(
+                summary=summary,
                 cls=str(s.get("cls")),
                 planned=bool(s.get("planned")),
                 n_am_rush_journeys=int(s.get("n_amj") or 0),
                 n_pm_rush_journeys=int(s.get("n_pmj") or 0),
             )
-        )
-    return out[:12]
+        else:
+            row.n_am_rush_journeys += int(s.get("n_amj") or 0)
+            row.n_pm_rush_journeys += int(s.get("n_pmj") or 0)
+            row.n_situations += 1
+    return list(rows.values())[:12]
 
 
 def _rows(query: str) -> list[dict]:
@@ -629,9 +669,14 @@ def build_melding(now: datetime) -> Togmelding:
 # test_feedback_snapshot_mirrors_the_page pins the mirror.
 _LEVEL_TEXT = {
     "green": "liten fare for forstyrrelser",
-    "yellow": "noe usikkert",
+    # «moderat fare», not «noe usikkert» (design review 2026-09-01, finding 11): the middle level
+    # used to measure something else than the two beside it, so a reader could not place it.
+    "yellow": "moderat fare for forstyrrelser",
     "red": "stor fare for forstyrrelser",
 }
+# The level as an adjective on «nivå», for the card heading the snapshot mirrors below. The same
+# three words togvarsel_notify uses in push titles («gult nivå for morgenrushet»).
+LEVEL_ADJ = {"green": "grønt", "yellow": "gult", "red": "rødt"}
 
 
 def _feedback_snapshot(issue: Issue, d: date) -> dict[str, Any]:
@@ -651,7 +696,11 @@ def _feedback_snapshot(issue: Issue, d: date) -> dict[str, Any]:
         # uses ties-to-even and would make the persisted "exact" text disagree at half percents.
         "displayed_text": f"{_LEVEL_TEXT.get(issue.level, issue.level)}"
         f" (ca. {int(issue.p * 100 + 0.5)} % sjanse for mye trøbbel)",
-        "detail_text": f"Kl. {issue.issue[:2]}:{issue.issue[2:]} — {issue.scope}",
+        # The card's <h2> since 2026-09-02: the rush and its level, «Morgenrushet 07:00–09:00 —
+        # gult nivå» (design review 2026-09-01, finding 25: the page's answer was in no heading).
+        # Mirrors IssueCard.tsx's heading; the issue time moved to a small line under it.
+        "detail_text": f"{issue.scope[:1].upper()}{issue.scope[1:]} — "
+        f"{LEVEL_ADJ.get(issue.level, issue.level)} nivå",
         "observation_text": None,
         "situation_number": f"KIX:Togvarsel:{d.isoformat()}:{issue.issue}",
         "operator": "VYG",  # the forecast's whole scope: Vy's Oslo locals
