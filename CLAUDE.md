@@ -1216,7 +1216,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `togvarsel_notify_round` log event carries no Oslo date and has no BigQuery sink. So no round
     HISTORY can be backfilled as a record. What the page does instead, since 2026-09-02, is
     **reconstruct** the rounds nobody recorded from the forecast log — next bullet — so it fills
-    back to the first issued forecast rather than starting at the deploy.
+    back to the first issued forecast rather than starting at the deploy. The three days before the
+    round table existed (31 Aug – 2 Sep 2026) were **backfilled from the `togvarsel_notify_round`
+    log events** in both dev and prd on 2026-09-02
+    (`data/queries/backfill_togvarsel_rounds_from_log.sql`, 10 and 11 rows) — a copy of the app's
+    own record, not a replay, and it agreed with the reconstruction on every round, so no verdict
+    moved; only «Varsler sendt» did. Those events live in the GKE **cluster** project
+    (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project — `gcloud logging read
+    --project=ent-kixavvik-prd` returns nothing for them, silently — and expire after 30 days.
   - **A recorded round is never re-derived, and a round nobody recorded is reconstructed and
     labelled** (the second half since 2026-09-02). `decide_issue` is a pure function of (level,
     marker state, clock), so replaying it looks like a substitute for the record and is not: it
@@ -1348,7 +1355,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     day eligible, outcome settled and resolvable, forecast not late, round not untimely) is
     Presisjon's and the matrix's; `delivered` is the same with late and untimely INCLUDED and is
     Dekning's; `recorded` is every issue, and is what `Varsler sendt` counts pushes across — a push
-    on a day that never settled still reached a phone. That split is what keeps a **late**
+    on a day that never settled still reached a phone. Beside that count the page prints «N
+    venter» (`varsler_venter`, 2026-09-02): the pushes among them on days not yet settled, in the
+    count and not yet in the matrix — the reason a same-day view's count exceeds its matrix, and
+    the first question the page got asked in prd. That split is what keeps a **late**
     forecast out of Presisjon (it saw post-cutoff reality — `03-implementasjon.md` says such
     forecasts "skal utelates fra etterprøving av treffsikkerhet") while keeping it in Dekning, since
     a rush nobody was warned about is a coverage miss whatever contaminated the forecast; dropping it
