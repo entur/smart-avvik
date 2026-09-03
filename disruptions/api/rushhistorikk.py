@@ -154,8 +154,9 @@ class IssueRow(BaseModel):
     )
     kind: str | None = Field(description="warning | update | all_clear when sent.")
     reason: str | None = Field(
-        description="untimely | no_change | green_baseline | yellow_baseline when the round decided "
-        "not to push (yellow_baseline since 2026-09-02, when baselines went red-only)."
+        description="untimely | no_change | green_baseline when the round decided not to push; "
+        "yellow_baseline on a row from the red-only window (2026-09-02 evening to 2026-09-03, "
+        "PR #130, reverted)."
     )
     baseline_level: str | None = Field(
         description="For a follow-up, the level its baseline left in force — the level a confirming "
