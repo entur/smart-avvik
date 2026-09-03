@@ -131,6 +131,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `topographicPlaceRef`, `KVE:` codespace only. The registry read fails open: no registry means no
   grouping and no counties, exactly as before it existed. It is readable from both environments (the
   dataset grants `allAuthenticatedUsers` READER) and costs ~3 MB per refresh.
+  **The client de-duplicates too, and it must use the SAME key** (2026-09-03): the picker's resolver
+  (`demo/avviksvarsel/src/components/stopResolver.ts`) folds ranked matches defensively, and it did
+  so on `place_id` alone — so «Nationaltheatret stasjon» (rail, 591 calls) lost to «Nationaltheatret»
+  (bus/tram/metro, 1887 calls) under their shared NSR parent, and the picker offered the station as
+  bus only; Ski stasjon and Oslo lufthavn stasjon were hidden the same way (three of the 161 places
+  prd serves more than one row for). Different names under one parent are separate rows on purpose
+  (Oslo S and Jernbanetorget), so the client's key is now (place, name) like the server's, and
+  `test/stopResolver.test.mjs` pins it.
   **A registration nothing can ever alert on says so** (2026-08-04): `POST /varsel-api/journeys`
   asks whether any planned trip today runs between the two places (`main._varsel_connectivity` over
   `{rail,bus}_calls_planned_today`, every ref of both places, MIN/MAX per side so a circular route is
