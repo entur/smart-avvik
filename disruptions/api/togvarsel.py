@@ -38,7 +38,9 @@ days like them.
 
 Every issued forecast lands in disruptions.togvarsel_issued — MERGE, first write per (d, issue)
 wins — so realized skill can be audited later against the training chain's labels (§14k item 8:
-claims come with verification, and the first product-side claim is the forecast itself).
+claims come with verification, and the first product-side claim is the forecast itself). Since
+2026-09-03 the row also carries the scope text and the reasons list exactly as served, so the
+WHY behind a level can be read back beside the verdict (/rushhistorikk joins on (d, issue)).
 
 No import of main (the package rule): main injects the BigQuery client via :func:`configure`.
 BigQuery writes touch only this module's own tables (the *_today pair and togvarsel_issued).
@@ -79,10 +81,47 @@ FROM ML.PREDICT(MODEL `disruptions.togvarsel_m_{model}`,
 UNNEST(t.predicted_label_probs) AS p
 WHERE LOWER(CAST(p.label AS STRING)) = 'true'
 """
-_ISSUED_DDL = """
-CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_issued` (
-  d DATE, issue STRING, model STRING, p FLOAT64, level STRING, computed_at TIMESTAMP, late BOOL
+# The two text columns were added on 2026-09-03. Until then the row knew only the level and the
+# probability, while the reasons — the traveller-facing WHY («2 tog er innstilt før kl. 06:30»,
+# «forsinkelser i lokaltrafikken den siste halvtimen») — lived in _state and were gone at the
+# next issue or restart; and the feature row they are read from is CREATE OR REPLACEd on every
+# rebuild, so they could not be recomputed either. The only durable copy was the feedback snapshot,
+# written only when a traveller pressed the widget. Rows before that date carry NULL in both.
+_SCOPE_DESC = (
+    "The rush the forecast is about, as the card and the push word it (_IssueSpec.scope, e.g. "
+    "'morgenrushet 07:00–09:00'). NULL on rows written before 2026-09-03."
 )
+_REASONS_DESC = (
+    "The rule-based reasons served with the forecast, in card order (togvarsel.reasons_for): "
+    "direct readings of features the model saw and that raise its probability, never a model output. The leading ones are the "
+    "push body (togvarsel_notify.compose_message). Never empty — both rule sets end in a fallback "
+    "sentence. NULL on rows written before 2026-09-03."
+)
+_ISSUED_DDL = f"""
+CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_issued` (
+  d DATE,
+  issue STRING,
+  model STRING,
+  p FLOAT64,
+  level STRING,
+  computed_at TIMESTAMP,
+  late BOOL,
+  scope STRING OPTIONS(description="{_SCOPE_DESC}"),
+  reasons ARRAY<STRING> OPTIONS(description="{_REASONS_DESC}")
+)
+"""
+# CREATE ... IF NOT EXISTS is inert on a table that exists, and it exists in every environment, so
+# the columns added after launch also ride an ALTER. It is run behind the SAME readiness latch as
+# the CREATE, not as a forgiven best-effort half the way decisions.ensure_table splits off its
+# description refresh: this is structure, the MERGE below names both columns, and against a table
+# lacking them every write would fail — logged, forecast still served, and the spine of
+# /rushhistorikk quietly stops growing. One metadata update per process start, well under
+# BigQuery's 5-per-10-s cap. test_the_issued_write_names_every_column_it_declares pins that the
+# ALTER adds every column the CREATE has beyond the original seven.
+_ISSUED_ALTER = f"""
+ALTER TABLE `disruptions.togvarsel_issued`
+  ADD COLUMN IF NOT EXISTS scope STRING OPTIONS(description="{_SCOPE_DESC}"),
+  ADD COLUMN IF NOT EXISTS reasons ARRAY<STRING> OPTIONS(description="{_REASONS_DESC}")
 """
 # First write per (d, issue) wins: a restart or failure-path recompute must neither duplicate
 # nor rewrite the forecast as it was originally served.
@@ -91,8 +130,8 @@ MERGE `disruptions.togvarsel_issued` t
 USING (SELECT @d AS d, @issue AS issue) s
 ON t.d = s.d AND t.issue = s.issue
 WHEN NOT MATCHED THEN
-  INSERT (d, issue, model, p, level, computed_at, late)
-  VALUES (@d, @issue, @model, @p, @level, @computed_at, @late)
+  INSERT (d, issue, model, p, level, computed_at, late, scope, reasons)
+  VALUES (@d, @issue, @model, @p, @level, @computed_at, @late, @scope, @reasons)
 """
 # The rollover probe: is today a holiday? Tiny lookup, so the page can say "helligdag" from the
 # first tick of the day instead of first learning it from the 06:30 feature row.
@@ -267,11 +306,22 @@ def level_for(p: float) -> str:
     return "red"
 
 
-def _am_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
+def _am_reasons(row: dict, suffix: str) -> list[str]:
     """Why the morning probability is what it is, in the features' own terms.
 
     Rule-based and threshold-y on purpose: every sentence is a direct reading of a feature the
-    model actually uses, so the reason can never say something the forecast did not see."""
+    model actually uses, so the reason can never say something the forecast did not see — and,
+    since 2026-09-03, only of a feature that RAISES the probability, so a sentence never argues
+    for a level it in fact pulled down. Two sentences went for that reason. «Større avvik
+    annonsert (buss for tog / stengt strekning)» read `sx_big`, whose weight is NEGATIVE in all
+    four live models (−0.36 at 06:30, −0.15 to −0.17 in the other three, ML.WEIGHTS on dev
+    2026-09-03): on an announced replacement day the trains that do run, run on time
+    (02-findings, "two surprises"). «Manglende togsett meldt» read `sx_mt_0630`, weight +0.09 —
+    one message moves the odds by ~7 % — with 20.5 % vs 17.3 % bad mornings with/without one over
+    343 training days, i.e. nothing; short trains are a crowding problem ET cannot see. Both facts
+    still reach the traveller, where the findings said they belong: as rows of the «kjente avvik»
+    list (known_deviations_for), stated as facts and not as causes of the level. The model still
+    sees both features; only the wording stopped quoting them."""
     cut = f"{suffix[:2]}:{suffix[2:]}"
     out: list[str] = []
     cxj = int(_f(row, f"et_cxj_{suffix}"))
@@ -284,17 +334,10 @@ def _am_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
     amj = int(_f(row, f"sx_amj_rest_{suffix}") if suffix == "0700" else _f(row, f"sx_amj_{suffix}"))
     if amj >= 2:
         out.append(f"{amj} rushtidsavganger er allerede flagget i avviksmeldingene")
-    if _f(row, f"sx_big_{suffix}") >= 1:
-        big = next((s for s in sx if s.get("oslo") and s.get("cls") in
-                    ("buss_for_tog", "stengt", "faerre_avganger") and s.get("summary")), None)
-        out.append(f"større avvik annonsert: «{big['summary']}»" if big
-                   else "større avvik annonsert (buss for tog / stengt strekning)")
     if _f(row, f"catj_infra_am_{suffix}") >= 1:
         out.append("meldt infrastrukturproblem som rammer rushtidstog")
     if _f(row, f"cat_drift_personale_{suffix}") >= 1:
         out.append("personalmangel meldt")
-    if suffix == "0630" and _f(row, "sx_mt_0630") >= 1:
-        out.append("manglende togsett meldt")
     if _f(row, "prev_eve_t5") >= 0.25:
         out.append("problemer i togtrafikken i går kveld")
     if not out:
@@ -302,7 +345,9 @@ def _am_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
     return out[:4]
 
 
-def _pm_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
+def _pm_reasons(row: dict, suffix: str) -> list[str]:
+    """The afternoon counterpart of _am_reasons; same rule, including the 2026-09-03 cut — `sx_big`
+    is −0.17 / −0.15 in the two PM models, so «større avvik annonsert» went from here too."""
     out: list[str] = []
     cx = int(_f(row, f"et_cx_{suffix}"))
     if cx >= 5:
@@ -320,8 +365,6 @@ def _pm_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
         # it replaces the day count when both would fire; the model still saw both features.
         out = [r for r in out if not r.endswith("innstilte avganger så langt i dag")]
         out.insert(0, f"{_count(pmj_inn, 'avgang', 'avganger')} i ettermiddagsrushet er allerede innstilt")
-    if _f(row, f"sx_big_{suffix}") >= 1:
-        out.append("større avvik annonsert (buss for tog / stengt strekning)")
     if not out:
         out.append("normal drift så langt i dag")
     return out[:4]
@@ -332,10 +375,10 @@ def _count(n: int, singular: str, plural: str) -> str:
     return f"{n} {singular if n == 1 else plural}"
 
 
-def reasons_for(spec: _IssueSpec, row: dict, sx: list[dict]) -> list[str]:
+def reasons_for(spec: _IssueSpec, row: dict) -> list[str]:
     if spec.kind == "am":
-        return _am_reasons(row, spec.suffix, sx)
-    return _pm_reasons(row, spec.suffix, sx)
+        return _am_reasons(row, spec.suffix)
+    return _pm_reasons(row, spec.suffix)
 
 
 def skill_note_for(d: date) -> str:
@@ -429,6 +472,7 @@ def _record_issue(d: date, issue: Issue, model: str) -> None:
 
         if not _issued_table_ready:
             _bq_client.query(_ISSUED_DDL).result(timeout=60)
+            _bq_client.query(_ISSUED_ALTER).result(timeout=60)
             _issued_table_ready = True
         cfg = bigquery.QueryJobConfig(
             query_parameters=[
@@ -439,6 +483,11 @@ def _record_issue(d: date, issue: Issue, model: str) -> None:
                 bigquery.ScalarQueryParameter("level", "STRING", issue.level),
                 bigquery.ScalarQueryParameter("computed_at", "TIMESTAMP", issue.computed_at),
                 bigquery.ScalarQueryParameter("late", "BOOL", issue.late),
+                bigquery.ScalarQueryParameter("scope", "STRING", issue.scope),
+                # Never empty (reasons_for always ends in a fallback sentence) — which matters,
+                # because the Python client serializes an empty array as {'arrayValues': []} and
+                # BigQuery reads that as NULL, not as an empty ARRAY (historikk's @refs lesson).
+                bigquery.ArrayQueryParameter("reasons", "STRING", list(issue.reasons)),
             ]
         )
         _bq_client.query(_ISSUED_MERGE, job_config=cfg).result(timeout=60)
@@ -554,7 +603,7 @@ def refresh(now: datetime | None = None) -> None:
             scope=spec.scope,
             p=round(p, 3),
             level=level_for(p),
-            reasons=reasons_for(spec, row, sx),
+            reasons=reasons_for(spec, row),
             computed_at=now,
             late=now_h > spec.due_h + _GRACE_H,
         )

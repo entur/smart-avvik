@@ -12,6 +12,7 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -23,6 +24,7 @@ from fastapi.testclient import TestClient
 _OSLO = ZoneInfo("Europe/Oslo")
 
 # 2026-08-31 is a Monday; 2026-09-05 a Saturday.
+MONDAY_0635 = datetime(2026, 8, 31, 6, 35, tzinfo=_OSLO)  # only 06:30 is due
 MONDAY_0710 = datetime(2026, 8, 31, 7, 10, tzinfo=_OSLO)
 MONDAY_1430 = datetime(2026, 8, 31, 14, 30, tzinfo=_OSLO)
 SATURDAY = datetime(2026, 9, 5, 8, 0, tzinfo=_OSLO)
@@ -77,6 +79,8 @@ class _FakeBQ:
         self.fail_rebuild = fail_rebuild
         self.queries: list[str] = []
         self.inserted: list[str] = []
+        self.merge_params: list[dict] = []  # per MERGE: {name: QueryParameter}
+        self.ddl: list[str] = []
 
     def query(self, sql, job_config=None):
         self.queries.append(sql)
@@ -87,8 +91,11 @@ class _FakeBQ:
             raise _FakeNotFound("model not found")
         if "MERGE" in sql:
             self.inserted.append(sql)
+            params = job_config.query_parameters if job_config is not None else []
+            self.merge_params.append({q.name: q for q in params})
             return _FakeJob([])
-        if "CREATE TABLE IF NOT EXISTS" in sql:
+        if "CREATE TABLE IF NOT EXISTS" in sql or sql.lstrip().startswith("ALTER TABLE"):
+            self.ddl.append(sql)
             return _FakeJob([])
         if sql.strip().startswith("SELECT") and "togvarsel_calendar" in sql:
             return _FakeJob(
@@ -106,6 +113,9 @@ class _FakeBQ:
 
 def _reset(fake) -> None:
     togvarsel.configure(bq_client=fake)
+    # The readiness latch is a module global: left True by an earlier test, the CREATE/ALTER
+    # pair never re-runs and a test about table readiness passes or fails on suite ORDER.
+    togvarsel._issued_table_ready = False
     with togvarsel._lock:
         togvarsel._state.clear()
 
@@ -130,33 +140,50 @@ def test_due_issues_respect_the_clock_and_what_is_done():
 
 
 def test_am_reasons_read_the_features():
-    row = _feature_row(et_cxj_0630=2, sx_big_0630=1, prev_eve_t5=0.4)
-    sx = [{"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika"}]
-    reasons = togvarsel._am_reasons(row, "0630", sx)
+    row = _feature_row(et_cxj_0630=2, prev_eve_t5=0.4)
+    reasons = togvarsel._am_reasons(row, "0630")
     assert "2 tog er innstilt før kl. 06:30" in reasons
-    assert any("Buss for tog Asker–Sandvika" in r for r in reasons)
+    assert "problemer i togtrafikken i går kveld" in reasons
     assert len(reasons) <= 4
 
 
+def test_facts_the_model_does_not_credit_stay_out_of_the_reasons():
+    """`sx_big` has a NEGATIVE weight in every live model and `sx_mt_0630` one of +0.09 with no
+    lift in the training data (2026-09-03 measurement, _am_reasons' docstring), so a sentence
+    reading either would argue for a level it did not raise. Both remain visible as FACTS — rows
+    of the «kjente avvik» list — which is where 02-findings placed them."""
+    row = _feature_row(sx_big_0630=1, sx_mt_0630=1, sx_big_1400=1)
+    assert togvarsel._am_reasons(row, "0630") == ["ingen tegn til trøbbel i morgentimene"]
+    assert togvarsel._pm_reasons(row, "1400") == ["normal drift så langt i dag"]
+    sx = [
+        {"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika",
+         "planned": True, "n_amj": 3, "n_pmj": 0},
+        {"oslo": True, "cls": "faerre_vogner", "summary": "Færre vogner – vi mangler et togsett",
+         "planned": False, "n_amj": 1, "n_pmj": 0},
+    ]
+    assert [k.summary for k in togvarsel.known_deviations_for(sx)] == [
+        "Buss for tog Asker–Sandvika", "Færre vogner – vi mangler et togsett",
+    ]
+
+
 def test_quiet_morning_gets_the_fallback_reason():
-    assert togvarsel._am_reasons(_feature_row(), "0630", []) == [
+    assert togvarsel._am_reasons(_feature_row(), "0630") == [
         "ingen tegn til trøbbel i morgentimene"
     ]
 
 
 def test_pm_reasons_read_the_features():
     row = _feature_row(et_cx_1400=7, sx_pmj_inn_1400=3)
-    reasons = togvarsel._pm_reasons(row, "1400", [])
+    reasons = togvarsel._pm_reasons(row, "1400")
     # ONE cancellation figure, scoped to the reader's rush (design review 2026-09-01, finding 17):
     # the day total and the rush count used to sit side by side in one push.
     assert reasons[0] == "3 avganger i ettermiddagsrushet er allerede innstilt"
     assert "7 innstilte avganger så langt i dag" not in reasons
     # Without a rush-scoped cancellation the day total is the figure that remains.
     assert "7 innstilte avganger så langt i dag" in togvarsel._pm_reasons(
-        _feature_row(et_cx_1400=7), "1400", []
-    )
+        _feature_row(et_cx_1400=7), "1400")
     # Singular agreement (finding 4): never «1 avganger».
-    assert togvarsel._pm_reasons(_feature_row(sx_pmj_inn_1400=1), "1400", [])[0] == (
+    assert togvarsel._pm_reasons(_feature_row(sx_pmj_inn_1400=1), "1400")[0] == (
         "1 avgang i ettermiddagsrushet er allerede innstilt"
     )
 
@@ -232,6 +259,60 @@ def test_refresh_computes_due_issues_and_records_them():
     assert len(scripts) == 1
     assert len(fake.inserted) == 2
     assert all("MERGE" in q and "WHEN NOT MATCHED" in q for q in fake.inserted)
+
+
+def _columns_declared(ddl: str) -> list[str]:
+    """Column names in a one-column-per-line CREATE TABLE body."""
+    body = ddl.split("(", 1)[1]
+    return re.findall(r"^\s*(\w+)\s+(?:DATE|STRING|FLOAT64|TIMESTAMP|BOOL|ARRAY<STRING>)(?=[\s,)])",
+                      body, re.MULTILINE)
+
+
+def test_the_issued_write_names_every_column_it_declares():
+    """CREATE ... IF NOT EXISTS is inert on the table every environment already has, so a column
+    added to the DDL that the ALTER does not also add fails EVERY write against a deployed table —
+    logged, forecast still served, and /rushhistorikk's spine quietly stops growing. Three things
+    must agree: the columns the CREATE declares, the columns the MERGE inserts (each from a
+    same-named parameter), and the columns the ALTER adds beyond the original seven."""
+    declared = _columns_declared(togvarsel._ISSUED_DDL)
+    insert_cols = re.search(r"INSERT \(([^)]*)\)", togvarsel._ISSUED_MERGE).group(1)
+    values = re.search(r"VALUES \(([^)]*)\)", togvarsel._ISSUED_MERGE).group(1)
+    inserted = [c.strip() for c in insert_cols.split(",")]
+    assert inserted == declared
+    assert [v.strip() for v in values.split(",")] == [f"@{c}" for c in inserted]
+    original = ["d", "issue", "model", "p", "level", "computed_at", "late"]
+    assert declared[: len(original)] == original
+    altered = re.findall(r"ADD COLUMN IF NOT EXISTS (\w+)", togvarsel._ISSUED_ALTER)
+    assert altered == declared[len(original):] == ["scope", "reasons"]
+
+
+def test_the_recorded_forecast_carries_its_scope_and_reasons():
+    """The reasons are the traveller-facing WHY, and until 2026-09-03 nothing durable held them:
+    they lived in _state and the feature row they read was CREATE OR REPLACEd on the next rebuild.
+    Now they ride the issued row exactly as served — same order, same text — and every
+    @placeholder in the MERGE has a same-named parameter behind it. The buss-for-tog situation on
+    the same morning lands in the «kjente avvik» list and NOT in the reasons (2026-09-03)."""
+    row = _feature_row(et_cxj_0630=2, sx_big_0630=1)
+    sx = [{"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika",
+           "planned": True, "n_amj": 3, "n_pmj": 0}]
+    fake = _FakeBQ(feature_row=row, sx_rows=sx, probs={"am0630": 0.42})
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_0635)
+    with togvarsel._lock:
+        issue = togvarsel._state["issues"]["0630"]
+        listed = [k.summary for k in togvarsel._state["sx"]]
+    assert issue.reasons == ["2 tog er innstilt før kl. 06:30"]
+    assert listed == ["Buss for tog Asker–Sandvika"]
+    # the table was made ready before the first write: CREATE, then the ALTER for existing tables
+    assert [d.lstrip().split()[0] for d in fake.ddl] == ["CREATE", "ALTER"]
+    assert len(fake.merge_params) == 1
+    params = fake.merge_params[0]
+    placeholders = set(re.findall(r"@(\w+)", togvarsel._ISSUED_MERGE))
+    assert set(params) == placeholders
+    assert params["scope"].value == "morgenrushet 06:30–09:00" == issue.scope
+    assert params["reasons"].array_type == "STRING"
+    assert params["reasons"].values == issue.reasons
+    assert issue.reasons  # never an empty array: the client would send it as NULL
 
 
 def test_refresh_is_idempotent_within_the_day():
