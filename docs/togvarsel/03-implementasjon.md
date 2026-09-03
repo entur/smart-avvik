@@ -25,7 +25,7 @@ menneskelesbare featurene, og en deterministisk «kjente avvik»-liste.
 | statuspanel i /varsel | `disruptions/api/togvarsel_notify.py` (`GET /togmelding-api/outlook`) | samme prognose smalnet til én enhet: rushene den faktisk varsles om og som ikke er over ennå, med lenke til `/togmelding`. Push-policyen lest-bare — samme match-tester og samme supersession — men avgrenset av rushets slutt (09:00 / 18:00), ikke av reisevinduet, og leser pollerens stasjonscache uten å spørre BigQuery |
 | personverntekster | `demo/togmelding/src/personvern.ts` | duplikat av `demo/avviksvarsel/src/personvern.ts` (appen kan ikke importere den: Docker-steget kopierer bare sin egen katalog), sikret av `disruptions/api/test_personvern_texts.py` — som sammenligner begge modulenes oppløste konstanter og krever at appen faktisk rendrer dem |
 | tester | `disruptions/api/test_togvarsel.py` | hermetiske; portene (helg/helligdag/klokkeslett), regelsetningene, feil-/backoff-banene |
-| utstedte prognoser | `disruptions.togvarsel_issued` | én rad per (dato, prognose) — MERGE, første skriving vinner; `late` flagger etterberegnede (restart/backoff) som etterprøvingen skal utelate |
+| utstedte prognoser | `disruptions.togvarsel_issued` | én rad per (dato, prognose) — MERGE, første skriving vinner; `late` flagger etterberegnede (restart/backoff) som etterprøvingen skal utelate; `scope` og `reasons` (fra 2026-09-03) er teksten og begrunnelsene slik kortet og pushen viste dem — NULL på eldre rader |
 
 ## Beslutninger som følger §14k, punkt for punkt
 

@@ -1058,13 +1058,24 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   implementation is `docs/togvarsel/03-implementasjon.md`). Four weekday issues (06:30, 07:00 for
   the AM rush; 12:00, 14:00 for the PM rush), each a tuned `LOGISTIC_REG` probability on the
   product bar (cancelled OR ≥ 10 min) mapped to green/yellow/red at fixed cuts (0.10/0.30), with
-  rule-based reasons and a deterministic "kjente avvik" list. `togvarsel.refresh()` runs on
+  rule-based reasons and a deterministic "kjente avvik" list. **A reason names only a feature
+  that RAISES the probability** (2026-09-03): «større avvik annonsert (buss for tog / stengt
+  strekning)» read `sx_big`, which is *negative* in all four live models (−0.36 at 06:30), and
+  «manglende togsett meldt» read `sx_mt_0630`, weight +0.09 and no lift over 343 training
+  mornings (20.5 % vs 17.3 % bad) — both dropped from the reasons, both still rows of «kjente
+  avvik», which is where `02-findings` placed them ("as a known fact, not as a probability").
+  `togvarsel.refresh()` runs on
   every poll tick (wall-clock — an issue is due at its cutoff whether or not SX moved) and
   computes due issues (one rebuild of `togvarsel_features_today` + one `ML.PREDICT` per issue —
   a handful of BQ jobs per weekday; failures back off per issue and give up after 8 tries/day);
   weekends/holidays get no forecast, and issued forecasts land in `disruptions.togvarsel_issued`
   (MERGE, first write per (d, issue) wins; `late` marks back-fills — per-environment, not copied
-  to prd). Retrain monthly with `data/queries/togvarsel/retrain.sh` (≈ $1.5; trains candidates,
+  to prd). **Since 2026-09-03 the row also carries `scope` and `reasons`** — the rule-based
+  reason sentences exactly as the card and push served them. Until then nothing durable held
+  them: they lived in process memory, the feature row they read is `CREATE OR REPLACE`d every
+  rebuild, and the only copy was the feedback snapshot, written only when a traveller pressed
+  the widget. Rows before that date are NULL in both; the columns reach existing tables via an
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS` behind the same readiness latch as the CREATE. Retrain monthly with `data/queries/togvarsel/retrain.sh` (≈ $1.5; trains candidates,
   promotes all four `togvarsel_m_*` only on full success), then `copy_runtime_to_prd.sh` copies
   models + tables to prd. Holidays/low season live in ONE place: `disruptions.togvarsel_calendar`
   (`data/queries/togvarsel/00_calendar.sql`) — extend yearly; serving ERRORs loudly past its
