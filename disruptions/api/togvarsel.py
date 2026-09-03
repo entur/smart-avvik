@@ -82,8 +82,8 @@ UNNEST(t.predicted_label_probs) AS p
 WHERE LOWER(CAST(p.label AS STRING)) = 'true'
 """
 # The two text columns were added on 2026-09-03. Until then the row knew only the level and the
-# probability, while the reasons — the traveller-facing WHY («større avvik annonsert (buss for tog /
-# stengt strekning)», «2 tog er innstilt før kl. 06:30») — lived in _state and were gone at the
+# probability, while the reasons — the traveller-facing WHY («2 tog er innstilt før kl. 06:30»,
+# «forsinkelser i lokaltrafikken den siste halvtimen») — lived in _state and were gone at the
 # next issue or restart; and the feature row they are read from is CREATE OR REPLACEd on every
 # rebuild, so they could not be recomputed either. The only durable copy was the feedback snapshot,
 # written only when a traveller pressed the widget. Rows before that date carry NULL in both.
@@ -93,7 +93,7 @@ _SCOPE_DESC = (
 )
 _REASONS_DESC = (
     "The rule-based reasons served with the forecast, in card order (togvarsel.reasons_for): "
-    "direct readings of the features the model saw, never a model output. The leading ones are the "
+    "direct readings of features the model saw and that raise its probability, never a model output. The leading ones are the "
     "push body (togvarsel_notify.compose_message). Never empty — both rule sets end in a fallback "
     "sentence. NULL on rows written before 2026-09-03."
 )
@@ -306,11 +306,22 @@ def level_for(p: float) -> str:
     return "red"
 
 
-def _am_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
+def _am_reasons(row: dict, suffix: str) -> list[str]:
     """Why the morning probability is what it is, in the features' own terms.
 
     Rule-based and threshold-y on purpose: every sentence is a direct reading of a feature the
-    model actually uses, so the reason can never say something the forecast did not see."""
+    model actually uses, so the reason can never say something the forecast did not see — and,
+    since 2026-09-03, only of a feature that RAISES the probability, so a sentence never argues
+    for a level it in fact pulled down. Two sentences went for that reason. «Større avvik
+    annonsert (buss for tog / stengt strekning)» read `sx_big`, whose weight is NEGATIVE in all
+    four live models (−0.36 at 06:30, −0.15 to −0.17 in the other three, ML.WEIGHTS on dev
+    2026-09-03): on an announced replacement day the trains that do run, run on time
+    (02-findings, "two surprises"). «Manglende togsett meldt» read `sx_mt_0630`, weight +0.09 —
+    one message moves the odds by ~7 % — with 20.5 % vs 17.3 % bad mornings with/without one over
+    343 training days, i.e. nothing; short trains are a crowding problem ET cannot see. Both facts
+    still reach the traveller, where the findings said they belong: as rows of the «kjente avvik»
+    list (known_deviations_for), stated as facts and not as causes of the level. The model still
+    sees both features; only the wording stopped quoting them."""
     cut = f"{suffix[:2]}:{suffix[2:]}"
     out: list[str] = []
     cxj = int(_f(row, f"et_cxj_{suffix}"))
@@ -323,17 +334,10 @@ def _am_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
     amj = int(_f(row, f"sx_amj_rest_{suffix}") if suffix == "0700" else _f(row, f"sx_amj_{suffix}"))
     if amj >= 2:
         out.append(f"{amj} rushtidsavganger er allerede flagget i avviksmeldingene")
-    if _f(row, f"sx_big_{suffix}") >= 1:
-        big = next((s for s in sx if s.get("oslo") and s.get("cls") in
-                    ("buss_for_tog", "stengt", "faerre_avganger") and s.get("summary")), None)
-        out.append(f"større avvik annonsert: «{big['summary']}»" if big
-                   else "større avvik annonsert (buss for tog / stengt strekning)")
     if _f(row, f"catj_infra_am_{suffix}") >= 1:
         out.append("meldt infrastrukturproblem som rammer rushtidstog")
     if _f(row, f"cat_drift_personale_{suffix}") >= 1:
         out.append("personalmangel meldt")
-    if suffix == "0630" and _f(row, "sx_mt_0630") >= 1:
-        out.append("manglende togsett meldt")
     if _f(row, "prev_eve_t5") >= 0.25:
         out.append("problemer i togtrafikken i går kveld")
     if not out:
@@ -341,7 +345,9 @@ def _am_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
     return out[:4]
 
 
-def _pm_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
+def _pm_reasons(row: dict, suffix: str) -> list[str]:
+    """The afternoon counterpart of _am_reasons; same rule, including the 2026-09-03 cut — `sx_big`
+    is −0.17 / −0.15 in the two PM models, so «større avvik annonsert» went from here too."""
     out: list[str] = []
     cx = int(_f(row, f"et_cx_{suffix}"))
     if cx >= 5:
@@ -359,8 +365,6 @@ def _pm_reasons(row: dict, suffix: str, sx: list[dict]) -> list[str]:
         # it replaces the day count when both would fire; the model still saw both features.
         out = [r for r in out if not r.endswith("innstilte avganger så langt i dag")]
         out.insert(0, f"{_count(pmj_inn, 'avgang', 'avganger')} i ettermiddagsrushet er allerede innstilt")
-    if _f(row, f"sx_big_{suffix}") >= 1:
-        out.append("større avvik annonsert (buss for tog / stengt strekning)")
     if not out:
         out.append("normal drift så langt i dag")
     return out[:4]
@@ -371,10 +375,10 @@ def _count(n: int, singular: str, plural: str) -> str:
     return f"{n} {singular if n == 1 else plural}"
 
 
-def reasons_for(spec: _IssueSpec, row: dict, sx: list[dict]) -> list[str]:
+def reasons_for(spec: _IssueSpec, row: dict) -> list[str]:
     if spec.kind == "am":
-        return _am_reasons(row, spec.suffix, sx)
-    return _pm_reasons(row, spec.suffix, sx)
+        return _am_reasons(row, spec.suffix)
+    return _pm_reasons(row, spec.suffix)
 
 
 def skill_note_for(d: date) -> str:
@@ -599,7 +603,7 @@ def refresh(now: datetime | None = None) -> None:
             scope=spec.scope,
             p=round(p, 3),
             level=level_for(p),
-            reasons=reasons_for(spec, row, sx),
+            reasons=reasons_for(spec, row),
             computed_at=now,
             late=now_h > spec.due_h + _GRACE_H,
         )

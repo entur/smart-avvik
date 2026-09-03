@@ -140,33 +140,50 @@ def test_due_issues_respect_the_clock_and_what_is_done():
 
 
 def test_am_reasons_read_the_features():
-    row = _feature_row(et_cxj_0630=2, sx_big_0630=1, prev_eve_t5=0.4)
-    sx = [{"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika"}]
-    reasons = togvarsel._am_reasons(row, "0630", sx)
+    row = _feature_row(et_cxj_0630=2, prev_eve_t5=0.4)
+    reasons = togvarsel._am_reasons(row, "0630")
     assert "2 tog er innstilt før kl. 06:30" in reasons
-    assert any("Buss for tog Asker–Sandvika" in r for r in reasons)
+    assert "problemer i togtrafikken i går kveld" in reasons
     assert len(reasons) <= 4
 
 
+def test_facts_the_model_does_not_credit_stay_out_of_the_reasons():
+    """`sx_big` has a NEGATIVE weight in every live model and `sx_mt_0630` one of +0.09 with no
+    lift in the training data (2026-09-03 measurement, _am_reasons' docstring), so a sentence
+    reading either would argue for a level it did not raise. Both remain visible as FACTS — rows
+    of the «kjente avvik» list — which is where 02-findings placed them."""
+    row = _feature_row(sx_big_0630=1, sx_mt_0630=1, sx_big_1400=1)
+    assert togvarsel._am_reasons(row, "0630") == ["ingen tegn til trøbbel i morgentimene"]
+    assert togvarsel._pm_reasons(row, "1400") == ["normal drift så langt i dag"]
+    sx = [
+        {"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika",
+         "planned": True, "n_amj": 3, "n_pmj": 0},
+        {"oslo": True, "cls": "faerre_vogner", "summary": "Færre vogner – vi mangler et togsett",
+         "planned": False, "n_amj": 1, "n_pmj": 0},
+    ]
+    assert [k.summary for k in togvarsel.known_deviations_for(sx)] == [
+        "Buss for tog Asker–Sandvika", "Færre vogner – vi mangler et togsett",
+    ]
+
+
 def test_quiet_morning_gets_the_fallback_reason():
-    assert togvarsel._am_reasons(_feature_row(), "0630", []) == [
+    assert togvarsel._am_reasons(_feature_row(), "0630") == [
         "ingen tegn til trøbbel i morgentimene"
     ]
 
 
 def test_pm_reasons_read_the_features():
     row = _feature_row(et_cx_1400=7, sx_pmj_inn_1400=3)
-    reasons = togvarsel._pm_reasons(row, "1400", [])
+    reasons = togvarsel._pm_reasons(row, "1400")
     # ONE cancellation figure, scoped to the reader's rush (design review 2026-09-01, finding 17):
     # the day total and the rush count used to sit side by side in one push.
     assert reasons[0] == "3 avganger i ettermiddagsrushet er allerede innstilt"
     assert "7 innstilte avganger så langt i dag" not in reasons
     # Without a rush-scoped cancellation the day total is the figure that remains.
     assert "7 innstilte avganger så langt i dag" in togvarsel._pm_reasons(
-        _feature_row(et_cx_1400=7), "1400", []
-    )
+        _feature_row(et_cx_1400=7), "1400")
     # Singular agreement (finding 4): never «1 avganger».
-    assert togvarsel._pm_reasons(_feature_row(sx_pmj_inn_1400=1), "1400", [])[0] == (
+    assert togvarsel._pm_reasons(_feature_row(sx_pmj_inn_1400=1), "1400")[0] == (
         "1 avgang i ettermiddagsrushet er allerede innstilt"
     )
 
@@ -272,17 +289,20 @@ def test_the_issued_write_names_every_column_it_declares():
 def test_the_recorded_forecast_carries_its_scope_and_reasons():
     """The reasons are the traveller-facing WHY, and until 2026-09-03 nothing durable held them:
     they lived in _state and the feature row they read was CREATE OR REPLACEd on the next rebuild.
-    Now they ride the issued row exactly as served — same order, same text, including the quoted
-    SX summary — and every @placeholder in the MERGE has a same-named parameter behind it."""
+    Now they ride the issued row exactly as served — same order, same text — and every
+    @placeholder in the MERGE has a same-named parameter behind it. The buss-for-tog situation on
+    the same morning lands in the «kjente avvik» list and NOT in the reasons (2026-09-03)."""
     row = _feature_row(et_cxj_0630=2, sx_big_0630=1)
     sx = [{"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika",
-           "planned": True, "n_am_rush_journeys": 3, "n_pm_rush_journeys": 0}]
+           "planned": True, "n_amj": 3, "n_pmj": 0}]
     fake = _FakeBQ(feature_row=row, sx_rows=sx, probs={"am0630": 0.42})
     _reset(fake)
     togvarsel.refresh(now=MONDAY_0635)
     with togvarsel._lock:
         issue = togvarsel._state["issues"]["0630"]
-    assert any("Buss for tog Asker–Sandvika" in r for r in issue.reasons)
+        listed = [k.summary for k in togvarsel._state["sx"]]
+    assert issue.reasons == ["2 tog er innstilt før kl. 06:30"]
+    assert listed == ["Buss for tog Asker–Sandvika"]
     # the table was made ready before the first write: CREATE, then the ALTER for existing tables
     assert [d.lstrip().split()[0] for d in fake.ddl] == ["CREATE", "ALTER"]
     assert len(fake.merge_params) == 1
