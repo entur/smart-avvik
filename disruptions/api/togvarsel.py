@@ -38,7 +38,9 @@ days like them.
 
 Every issued forecast lands in disruptions.togvarsel_issued — MERGE, first write per (d, issue)
 wins — so realized skill can be audited later against the training chain's labels (§14k item 8:
-claims come with verification, and the first product-side claim is the forecast itself).
+claims come with verification, and the first product-side claim is the forecast itself). Since
+2026-09-03 the row also carries the scope text and the reasons list exactly as served, so the
+WHY behind a level can be read back beside the verdict (/rushhistorikk joins on (d, issue)).
 
 No import of main (the package rule): main injects the BigQuery client via :func:`configure`.
 BigQuery writes touch only this module's own tables (the *_today pair and togvarsel_issued).
@@ -79,10 +81,47 @@ FROM ML.PREDICT(MODEL `disruptions.togvarsel_m_{model}`,
 UNNEST(t.predicted_label_probs) AS p
 WHERE LOWER(CAST(p.label AS STRING)) = 'true'
 """
-_ISSUED_DDL = """
-CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_issued` (
-  d DATE, issue STRING, model STRING, p FLOAT64, level STRING, computed_at TIMESTAMP, late BOOL
+# The two text columns were added on 2026-09-03. Until then the row knew only the level and the
+# probability, while the reasons — the traveller-facing WHY («større avvik annonsert (buss for tog /
+# stengt strekning)», «2 tog er innstilt før kl. 06:30») — lived in _state and were gone at the
+# next issue or restart; and the feature row they are read from is CREATE OR REPLACEd on every
+# rebuild, so they could not be recomputed either. The only durable copy was the feedback snapshot,
+# written only when a traveller pressed the widget. Rows before that date carry NULL in both.
+_SCOPE_DESC = (
+    "The rush the forecast is about, as the card and the push word it (_IssueSpec.scope, e.g. "
+    "'morgenrushet 07:00–09:00'). NULL on rows written before 2026-09-03."
 )
+_REASONS_DESC = (
+    "The rule-based reasons served with the forecast, in card order (togvarsel.reasons_for): "
+    "direct readings of the features the model saw, never a model output. The leading ones are the "
+    "push body (togvarsel_notify.compose_message). Never empty — both rule sets end in a fallback "
+    "sentence. NULL on rows written before 2026-09-03."
+)
+_ISSUED_DDL = f"""
+CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_issued` (
+  d DATE,
+  issue STRING,
+  model STRING,
+  p FLOAT64,
+  level STRING,
+  computed_at TIMESTAMP,
+  late BOOL,
+  scope STRING OPTIONS(description="{_SCOPE_DESC}"),
+  reasons ARRAY<STRING> OPTIONS(description="{_REASONS_DESC}")
+)
+"""
+# CREATE ... IF NOT EXISTS is inert on a table that exists, and it exists in every environment, so
+# the columns added after launch also ride an ALTER. It is run behind the SAME readiness latch as
+# the CREATE, not as a forgiven best-effort half the way decisions.ensure_table splits off its
+# description refresh: this is structure, the MERGE below names both columns, and against a table
+# lacking them every write would fail — logged, forecast still served, and the spine of
+# /rushhistorikk quietly stops growing. One metadata update per process start, well under
+# BigQuery's 5-per-10-s cap. test_the_issued_write_names_every_column_it_declares pins that the
+# ALTER adds every column the CREATE has beyond the original seven.
+_ISSUED_ALTER = f"""
+ALTER TABLE `disruptions.togvarsel_issued`
+  ADD COLUMN IF NOT EXISTS scope STRING OPTIONS(description="{_SCOPE_DESC}"),
+  ADD COLUMN IF NOT EXISTS reasons ARRAY<STRING> OPTIONS(description="{_REASONS_DESC}")
 """
 # First write per (d, issue) wins: a restart or failure-path recompute must neither duplicate
 # nor rewrite the forecast as it was originally served.
@@ -91,8 +130,8 @@ MERGE `disruptions.togvarsel_issued` t
 USING (SELECT @d AS d, @issue AS issue) s
 ON t.d = s.d AND t.issue = s.issue
 WHEN NOT MATCHED THEN
-  INSERT (d, issue, model, p, level, computed_at, late)
-  VALUES (@d, @issue, @model, @p, @level, @computed_at, @late)
+  INSERT (d, issue, model, p, level, computed_at, late, scope, reasons)
+  VALUES (@d, @issue, @model, @p, @level, @computed_at, @late, @scope, @reasons)
 """
 # The rollover probe: is today a holiday? Tiny lookup, so the page can say "helligdag" from the
 # first tick of the day instead of first learning it from the 06:30 feature row.
@@ -429,6 +468,7 @@ def _record_issue(d: date, issue: Issue, model: str) -> None:
 
         if not _issued_table_ready:
             _bq_client.query(_ISSUED_DDL).result(timeout=60)
+            _bq_client.query(_ISSUED_ALTER).result(timeout=60)
             _issued_table_ready = True
         cfg = bigquery.QueryJobConfig(
             query_parameters=[
@@ -439,6 +479,11 @@ def _record_issue(d: date, issue: Issue, model: str) -> None:
                 bigquery.ScalarQueryParameter("level", "STRING", issue.level),
                 bigquery.ScalarQueryParameter("computed_at", "TIMESTAMP", issue.computed_at),
                 bigquery.ScalarQueryParameter("late", "BOOL", issue.late),
+                bigquery.ScalarQueryParameter("scope", "STRING", issue.scope),
+                # Never empty (reasons_for always ends in a fallback sentence) — which matters,
+                # because the Python client serializes an empty array as {'arrayValues': []} and
+                # BigQuery reads that as NULL, not as an empty ARRAY (historikk's @refs lesson).
+                bigquery.ArrayQueryParameter("reasons", "STRING", list(issue.reasons)),
             ]
         )
         _bq_client.query(_ISSUED_MERGE, job_config=cfg).result(timeout=60)
