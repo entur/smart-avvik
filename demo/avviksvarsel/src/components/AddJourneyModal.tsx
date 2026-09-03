@@ -12,16 +12,11 @@ import type { BrandId } from '../brand';
 import { CONSENT_TEXT_VERSION } from '../personvern';
 import { RegistreringsNotis } from './PersonvernNotis';
 import { WEEKDAYS, WEEKDAY_SHORT } from '../format';
+import { ambiguousNames, rankStops, stopLabel } from './stopResolver';
 
 type Item = NormalizedDropdownItemType<string>;
 
 const DEFAULT_DAYS = [0, 1, 2, 3, 4];
-
-// The all-operator stop list runs to ~20k+ entries, so the dropdowns get their items from a
-// ranked resolver (prefix matches first, then word-start, then substring; busiest stops first)
-// capped at MAX_SHOWN — the full list is never rendered. Passing a function as `items` also
-// makes SearchableDropdown skip its own label filter, so the resolver's ranking is what shows.
-const MAX_SHOWN = 60;
 
 // A registered window longer than this earns a hint, not a refusal (design review 2026-09-01,
 // finding 38): 07:00–22:00 makes the window useless as a noise filter and multiplies the pushes,
@@ -33,66 +28,6 @@ function modeIcons(mode: string) {
   if (mode.includes('Tog')) icons.push(TrainIcon);
   if (mode.includes('Buss')) icons.push(BusIcon);
   return icons;
-}
-
-// Names that belong to more than one physical place ("Sentrum", "Kirken", ~1 300 of them). Those
-// rows get their municipality appended (the county until 2026-09-02, which offered «Sandvika
-// (Troms)» six times over — design review 2026-09-01, finding 2), because a bare name repeated in a
-// list is a coin flip: picking the wrong one registers a stop the traveller's trip never calls at,
-// and the journey then reports "ingen aktive avvik akkurat nå" forever. Co-located refs are already
-// merged server-side, so what is left here really is several different stops sharing a name.
-function ambiguousNames(stops: StopItem[]): Set<string> {
-  const places = new Map<string, Set<string>>();
-  for (const s of stops) {
-    const name = (s.stop_name ?? '').trim().toLowerCase();
-    if (!name) continue;
-    let seen = places.get(name);
-    if (!seen) places.set(name, (seen = new Set()));
-    seen.add(s.place_id ?? s.stop_place);
-  }
-  return new Set([...places].filter(([, refs]) => refs.size > 1).map(([name]) => name));
-}
-
-function stopLabel(s: StopItem, ambiguous: Set<string>): string {
-  const name = s.stop_name ?? s.stop_place;
-  const key = (s.stop_name ?? '').trim().toLowerCase();
-  return s.region && ambiguous.has(key) ? `${name} (${s.region})` : name;
-}
-
-function rankItems(pool: StopItem[], query: string, ambiguous: Set<string>): Item[] {
-  const q = query.trim().toLowerCase();
-  const scored: { s: StopItem; rank: number }[] = [];
-  for (const s of pool) {
-    const name = (s.stop_name ?? s.stop_place).toLowerCase();
-    if (q === '') {
-      scored.push({ s, rank: 2 });
-      continue;
-    }
-    const idx = name.indexOf(q);
-    if (idx === -1) continue;
-    // prefix match > start of a later word > anywhere in the name
-    const rank = idx === 0 ? 0 : name[idx - 1] === ' ' || name[idx - 1] === '(' ? 1 : 2;
-    scored.push({ s, rank });
-  }
-  scored.sort((a, b) => a.rank - b.rank || b.s.n_calls - a.s.n_calls);
-  // One row per place, defensively: the server already collapses co-located refs, but an older
-  // deploy (or an unreadable stop registry, which makes it fall back to one place per ref) would
-  // otherwise put the duplicate rows straight back into the picker.
-  const items: Item[] = [];
-  const seen = new Set<string>();
-  for (const { s } of scored) {
-    const place = s.place_id ?? s.stop_place;
-    if (seen.has(place)) continue;
-    seen.add(place);
-    items.push({
-      value: s.stop_place,
-      label: stopLabel(s, ambiguous),
-      icons: modeIcons(s.mode),
-      itemKey: s.stop_place,
-    });
-    if (items.length >= MAX_SHOWN) break;
-  }
-  return items;
 }
 
 // Validation names the FIELD, not just the fault (design review 2026-09-01, findings 6 and 19).
@@ -140,8 +75,21 @@ export default function AddJourneyModal({
   // Ambiguity is a property of the whole list, not of the current facet: a name stays labelled the
   // same way whether or not the Tog/Buss filter happens to hide its twin.
   const ambiguous = useMemo(() => ambiguousNames(stops), [stops]);
-  // New resolver identity per pool change → the dropdowns re-resolve when the facet toggles.
-  const items = useMemo(() => (text: string) => rankItems(pool, text, ambiguous), [pool, ambiguous]);
+  // The dropdowns get their items from the ranked resolver in stopResolver.ts (prefix matches
+  // first, then word-start, then substring; busiest stops first; capped), so the full ~30k-row
+  // list is never rendered. Passing a function as `items` also makes SearchableDropdown skip its
+  // own label filter, so the resolver's ranking is what shows. New resolver identity per pool
+  // change → the dropdowns re-resolve when the facet toggles.
+  const items = useMemo(
+    () => (text: string): Item[] =>
+      rankStops(pool, text).map((s) => ({
+        value: s.stop_place,
+        label: stopLabel(s, ambiguous),
+        icons: modeIcons(s.mode),
+        itemKey: s.stop_place,
+      })),
+    [pool, ambiguous],
+  );
   const nameByRef = useMemo(
     () => new Map(stops.map((s) => [s.stop_place, s.stop_name ?? s.stop_place])),
     [stops],
