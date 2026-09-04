@@ -176,6 +176,9 @@ def _reset_state():
         # exactly like the cap firing for no reason.
         varsel._pushed_trains.clear()
         varsel._daily_pushes.clear()
+        # Why a record went away (2026-09-04). A leaked tombstone makes a fresh registration in the
+        # next test inherit an old `created_ts`, which reads like the restore logic misfiring.
+        varsel._device_tombstones.clear()
     # llm_message's backend latch is PROCESS-global and survives a monkeypatch undo, so a test that
     # drives both backends into `_latched_off` (the 404/configuration path) silently disables
     # generation for every test that runs after it. That was invisible until 2026-08-07, when
@@ -2782,6 +2785,129 @@ def test_delete_device_keeps_journeys():
     assert DEVICE not in varsel._devices
     listing = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
     assert [j["journey_id"] for j in listing] == [jid]
+
+
+def _age_device(device: str, minutes: int) -> None:
+    """Back-date a device record past `_SUBSCRIPTION_GRACE`, so a gone result actually drops it."""
+    with varsel._state_lock:
+        varsel._devices[device]["created_ts"] = (
+            datetime.now(UTC) - timedelta(minutes=minutes)
+        ).isoformat()
+
+
+def test_turning_push_off_leaves_a_tombstone_that_explains_the_kept_journeys():
+    """«Skru av» keeps the journeys (previous test) and, since 2026-09-04, records WHY the record
+    is gone. Without it the device report cannot tell a traveller who turned notifications off
+    from one who never turned them on — and prd's orphaned journeys are mostly the latter."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    signup = varsel._devices[DEVICE]["created_ts"]
+    _register_journey(DEVICE)
+    _register_journey(DEVICE)
+    assert client.delete(f"/varsel-api/devices/{DEVICE}").status_code == 200
+    tomb = varsel._device_tombstones[DEVICE]
+    assert tomb["reason"] == "turned_off"
+    assert tomb["created_ts"] == signup
+    assert tomb["journeys"] == 2
+    assert tomb["ts"] >= signup
+
+
+def test_an_expired_subscription_leaves_a_tombstone_with_the_expired_reason():
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    # Inside the grace window a gone result is treated as propagation delay and drops nothing.
+    assert varsel.handle_gone_device(DEVICE) is False
+    assert DEVICE in varsel._devices and DEVICE not in varsel._device_tombstones
+    _age_device(DEVICE, minutes=60)
+    assert varsel.handle_gone_device(DEVICE) is True
+    assert DEVICE not in varsel._devices
+    assert varsel._device_tombstones[DEVICE]["reason"] == "expired"
+    assert varsel._device_tombstones[DEVICE]["journeys"] == 1
+
+
+def test_a_record_with_no_journeys_leaves_no_tombstone():
+    """Nothing to explain, so nothing is kept — or the map would accumulate an id per device that
+    ever turned notifications off, forever."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    assert client.delete(f"/varsel-api/devices/{DEVICE}").status_code == 200
+    assert DEVICE not in varsel._device_tombstones
+
+
+def test_re_registering_restores_the_original_signup_and_clears_the_tombstone():
+    """A lapse — «Skru av» then «Slå på varsler», or an expired subscription the service worker
+    renews — must not read as a new signup on the device report."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _age_device(DEVICE, minutes=60)
+    signup = varsel._devices[DEVICE]["created_ts"]
+    _register_journey(DEVICE)
+    client.delete(f"/varsel-api/devices/{DEVICE}")
+    assert DEVICE in varsel._device_tombstones
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    assert varsel._devices[DEVICE]["created_ts"] == signup
+    assert DEVICE not in varsel._device_tombstones
+
+
+def test_the_tombstone_goes_with_the_last_journey():
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    first = _register_journey(DEVICE)
+    second = _register_journey(DEVICE)
+    client.delete(f"/varsel-api/devices/{DEVICE}")
+    assert client.delete(f"/varsel-api/journeys/{first}?device_id={DEVICE}").status_code == 200
+    assert DEVICE in varsel._device_tombstones, "one journey is still left to explain"
+    assert client.delete(f"/varsel-api/journeys/{second}?device_id={DEVICE}").status_code == 200
+    assert DEVICE not in varsel._device_tombstones
+
+
+def test_delete_all_erases_the_tombstone_too():
+    """An art. 17 erasure keeps no marker of what it erased — and a stale marker alone is still
+    worth a save, so the empty-work shortcut must not skip it."""
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    client.delete(f"/varsel-api/devices/{DEVICE}")
+    assert DEVICE in varsel._device_tombstones
+    r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert r.status_code == 200 and r.json()["journeys_deleted"] == 1
+    assert DEVICE not in varsel._device_tombstones
+    # Erasing a device that still holds its record writes none either.
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert DEVICE not in varsel._device_tombstones and DEVICE not in varsel._devices
+
+
+def test_a_failed_erasure_restores_the_tombstone_with_everything_else(monkeypatch):
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    client.delete(f"/varsel-api/devices/{DEVICE}")
+    before = dict(varsel._device_tombstones[DEVICE])
+    monkeypatch.setattr(varsel, "_save_state", lambda: False)
+    assert client.delete(f"/varsel-api/devices/{DEVICE}/data").status_code == 503
+    assert varsel._device_tombstones[DEVICE] == before
+    assert len([j for j in varsel._journeys.values() if j["device_id"] == DEVICE]) == 1
+
+
+def test_tombstones_round_trip_the_state_blob():
+    _reset_state()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    client.delete(f"/varsel-api/devices/{DEVICE}")
+    expected = dict(varsel._device_tombstones)
+    blob = varsel._serialize_state()
+    assert json.loads(blob)["device_tombstones"] == expected
+    varsel._device_tombstones.clear()
+    varsel._apply_state(blob)
+    assert varsel._device_tombstones == expected
+    # A blob written before the key existed loads as "no tombstones", not as an error.
+    old = json.loads(blob)
+    del old["device_tombstones"]
+    varsel._apply_state(json.dumps(old))
+    assert varsel._device_tombstones == {}
 
 
 def test_consent_text_version_is_stored_echoed_and_survives_a_reload():
