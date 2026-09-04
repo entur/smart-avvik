@@ -45,6 +45,29 @@ export async function getExistingSubscription(): Promise<PushSubscription | null
   return reg ? reg.pushManager.getSubscription() : null;
 }
 
+/** The VAPID public key in the form `pushManager.subscribe` takes — and the form the service
+ *  worker stores for renewing the subscription on its own (see pushIdentity.ts). */
+export function applicationServerKey(vapidPublicKey: string): Uint8Array<ArrayBuffer> {
+  return urlBase64ToUint8Array(vapidPublicKey);
+}
+
+/** Subscribe this browser, reusing an existing subscription when there is one. Needs permission
+ *  to be `granted` already; no prompt is shown. This is the half `enablePush` runs after asking,
+ *  and the whole of the silent repair VarselStatus performs when permission is granted but the
+ *  browser has lost its subscription (2026-09-04). */
+export async function subscribePush(vapidPublicKey: string): Promise<PushSubscription> {
+  const reg = await registerServiceWorker();
+  await navigator.serviceWorker.ready;
+  const existing = await reg.pushManager.getSubscription();
+  return (
+    existing ??
+    (await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: applicationServerKey(vapidPublicKey),
+    }))
+  );
+}
+
 /** Ask for permission (from a user gesture) and subscribe. Returns the subscription JSON to POST
  *  to the server, or throws with a Norwegian message the UI can show. */
 export async function enablePush(vapidPublicKey: string): Promise<PushSubscriptionJSON> {
@@ -52,16 +75,7 @@ export async function enablePush(vapidPublicKey: string): Promise<PushSubscripti
   if (permission !== 'granted') {
     throw new Error('Du må tillate varsler for at appen skal kunne varsle deg.');
   }
-  const reg = await registerServiceWorker();
-  await navigator.serviceWorker.ready;
-  const existing = await reg.pushManager.getSubscription();
-  const subscription =
-    existing ??
-    (await reg.pushManager.subscribe({
-      userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(vapidPublicKey),
-    }));
-  return subscription.toJSON();
+  return (await subscribePush(vapidPublicKey)).toJSON();
 }
 
 export async function disablePush(): Promise<void> {

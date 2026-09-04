@@ -1,8 +1,10 @@
 /* Avviksvarsel service worker (scope /varsel/).
  *
- * Two jobs only — there is no offline/caching layer (the app is a thin online client):
- *   push              show the notification the server pushed (title/body/url/icon in the payload)
- *   notificationclick focus an already-open app window, or open the url the payload named
+ * Three jobs — there is no offline/caching layer (the app is a thin online client):
+ *   push                    show the notification the server pushed (title/body/url/icon in the payload)
+ *   notificationclick       focus an already-open app window, or open the url the payload named
+ *   pushsubscriptionchange  re-subscribe when the browser replaces or revokes the subscription, and
+ *                           tell the server (2026-09-04) — see renewSubscription below
  *
  * ONE service worker serves every brand: the scope is /varsel/, and ?brand= is a query parameter
  * inside it. So the brand cannot be baked in here — it rides on the payload, which the server
@@ -86,4 +88,96 @@ self.addEventListener('notificationclick', (event) => {
         return self.clients.openWindow ? self.clients.openWindow(url) : undefined;
       }),
   );
+});
+
+/* ---- Subscription renewal --------------------------------------------------------------------
+ *
+ * The push service can retire a subscription at any time (endpoint rotation, an expired
+ * subscription, a reinstalled browser). The server's next push then gets a 404/410 and, after a
+ * grace window, forgets the device — and the traveller notices nothing, because a missing
+ * notification looks exactly like a calm day. The browser announces the change HERE, with no page
+ * open, so this is the only code that can repair it in time. The page stores what the repair needs
+ * in IndexedDB (src/pushIdentity.ts — the four names below are its copy, and
+ * test/pushIdentity.test.mjs pins them equal): the device id, the brand and the VAPID key as bytes.
+ * No record means nothing was registered from this browser, or «Skru av»/«Slett alt» ended it,
+ * and then the right answer is to do nothing — never to resurrect a registration the user ended.
+ */
+
+const PUSH_DB_NAME = 'avviksvarsel';
+const PUSH_DB_VERSION = 1;
+const PUSH_STORE = 'push';
+const PUSH_IDENTITY_KEY = 'identity';
+
+function readPushIdentity() {
+  return new Promise((resolve) => {
+    if (typeof indexedDB === 'undefined') return resolve(null);
+    let open;
+    try {
+      open = indexedDB.open(PUSH_DB_NAME, PUSH_DB_VERSION);
+    } catch (_error) {
+      return resolve(null);
+    }
+    open.onupgradeneeded = () => {
+      // First open on this browser creates the store; there is then nothing in it to read.
+      if (!open.result.objectStoreNames.contains(PUSH_STORE)) {
+        open.result.createObjectStore(PUSH_STORE);
+      }
+    };
+    open.onerror = () => resolve(null);
+    open.onsuccess = () => {
+      const db = open.result;
+      let get;
+      try {
+        get = db.transaction(PUSH_STORE, 'readonly').objectStore(PUSH_STORE).get(PUSH_IDENTITY_KEY);
+      } catch (_error) {
+        db.close();
+        return resolve(null);
+      }
+      get.onerror = () => {
+        db.close();
+        resolve(null);
+      };
+      get.onsuccess = () => {
+        db.close();
+        resolve(get.result || null);
+      };
+    };
+  });
+}
+
+async function renewSubscription(event) {
+  const identity = await readPushIdentity();
+  if (!identity || !identity.device_id) return;
+  // Some browsers hand over the replacement; the rest expect us to subscribe again, with the key
+  // the old subscription used. `oldSubscription` is not always provided either, hence the copy.
+  let subscription = event.newSubscription || null;
+  if (!subscription) {
+    const applicationServerKey =
+      (event.oldSubscription &&
+        event.oldSubscription.options &&
+        event.oldSubscription.options.applicationServerKey) ||
+      identity.application_server_key;
+    if (!applicationServerKey) return;
+    subscription = await self.registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey,
+    });
+  }
+  // The same upsert the page performs. The server keys on device_id, so the new endpoint simply
+  // replaces the dead one — and a record it had already dropped comes back under its original
+  // signup time (varsel.upsert_device reads it off the tombstone).
+  const response = await fetch('/varsel-api/devices', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      device_id: identity.device_id,
+      subscription: subscription.toJSON(),
+      brand: identity.brand || 'entur',
+    }),
+  });
+  if (!response.ok) throw new Error('re-registering the device failed: ' + response.status);
+}
+
+self.addEventListener('pushsubscriptionchange', (event) => {
+  event.waitUntil(renewSubscription(event));
 });

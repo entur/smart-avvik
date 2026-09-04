@@ -31,8 +31,9 @@ export type DeleteAllOutcome = { status: 'deleted' } | { status: 'failed'; messa
  * VarselStatus's subscription-reconciliation effect is a plain `useEffect`, not one of the
  * busy-gated button handlers, so nothing in «Slett alt» would otherwise suspend it: its
  * `getExistingSubscription()` promise can already be in flight when the user confirms, and when it
- * resolves it calls `registerDevice`. The server's upsert has no tombstone, so that recreates the
- * device record — with a live push subscription — seconds after the dialog said «Alt er slettet»,
+ * resolves it calls `registerDevice`. The server's upsert never refuses a write (its tombstones,
+ * added 2026-09-04, only record WHY a record went — they do not block its return), so that
+ * recreates the device record — with a live push subscription — seconds after the dialog said «Alt er slettet»,
  * and invisibly: the call's rejection is swallowed, and the DELETE it undid genuinely succeeded.
  *
  * The flow owns the window rather than the component so that "closed before the first await, and

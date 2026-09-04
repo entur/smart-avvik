@@ -22,7 +22,7 @@ import {
 } from './api';
 import { isPushSupported, registerServiceWorker } from './push';
 import type { Brand } from './brand';
-import VarselStatus from './components/VarselStatus';
+import VarselStatus, { type DeliveryStatus } from './components/VarselStatus';
 import RushOutlook from './components/RushOutlook';
 import JourneyCard from './components/JourneyCard';
 import AddJourneyModal from './components/AddJourneyModal';
@@ -60,6 +60,10 @@ export default function App({ brand }: { brand: Brand }) {
   // in place of the card. The timers live in a ref: they must survive re-renders and be cancellable.
   const [pendingDeletes, setPendingDeletes] = useState<ReadonlySet<string>>(() => new Set());
   const deleteTimers = useRef(new Map<string, number>());
+  // Whether a push can reach this device, as VarselStatus reports it. The journey list uses it to
+  // say — next to the journeys it affects — that they will not alert until notifications are on
+  // (2026-09-04). The card itself explains how; this only points there.
+  const [deliveryStatus, setDeliveryStatus] = useState<DeliveryStatus>('unknown');
   const notificationParams = new URLSearchParams(location.search);
   const notificationJourney = notificationParams.get('journey');
   const notificationSituation = notificationParams.get('situation');
@@ -365,6 +369,23 @@ export default function App({ brand }: { brand: Brand }) {
                 </PrimaryButton>
               </div>
 
+              {/* Journeys exist, and nothing can alert on them from this device. Registering a
+                  journey never required notifications to be on — the page works as a live
+                  dashboard without them — so this is the one place the two facts meet: measured
+                  in prd on 2026-09-04, 79 of 186 registered journeys were on devices that had
+                  never turned notifications on, and the page said nothing about it. Not shown
+                  while the subscription is still being looked up, nor where the traveller can do
+                  nothing about it (the card says why in those states). The link lands on the card
+                  below, which knows the right instruction for this device — a button here would
+                  have to repeat its iPhone/blocked/default branching. */}
+              {journeys.length > 0 && deliveryStatus === 'action-needed' && (
+                <SmallAlertBox variant="warning" title="Reisene dine gir ingen varsler ennå" width="fluid">
+                  Varsler er ikke slått på for denne enheten. Du ser avvikene her når du åpner
+                  appen, men får ingen beskjed når de oppstår.{' '}
+                  <Link href="#varsel-status">Slå på varsler</Link>
+                </SmallAlertBox>
+              )}
+
               {journeys.length === 0 ? (
                 <div className="av-card av-empty">
                   <Paragraph margin="none">
@@ -400,6 +421,7 @@ export default function App({ brand }: { brand: Brand }) {
                 ensureDeviceId={ensureDeviceId}
                 onDeletedAll={handleDeletedAll}
                 brand={brand}
+                onDeliveryStatus={setDeliveryStatus}
               />
             )}
 
