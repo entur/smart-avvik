@@ -704,6 +704,18 @@ _state_lock = threading.RLock()
 _devices: dict[str, dict] = {}  # device_id -> {"subscription": {...}, "created_ts": iso}
 _journeys: dict[str, dict] = {}  # journey_id -> journey record (see POST /journeys)
 _notified: set[str] = set()  # {"journey_id|situationNumber"} — dedup, pruned when a situation ends
+# Why a device record went away while its journeys stayed (2026-09-04):
+# device_id -> {"reason": "expired" | "turned_off", "ts": iso, "created_ts": <the record's original
+# signup>, "journeys": <count left behind>}. Two writers, `_drop_device` (the push service answered
+# 404/410) and `delete_device` («Skru av»), and it is what tells those two apart from the third and
+# — measured in prd on 2026-09-04 — much larger population: a journey registered by a device that
+# never turned notifications on at all, which has no record to lose and so no tombstone. Nothing
+# durable held that distinction before, so the device report could only guess. Written only when
+# journeys remain (a record with none leaves nothing to explain), removed when the device
+# re-registers (`upsert_device`, which also restores the original `created_ts` so a lapse does not
+# read as a new signup), when its last journey is deleted, and by «Slett alt» — an erasure keeps no
+# marker of what it erased. Persisted in the state blob beside the journeys it annotates.
+_device_tombstones: dict[str, dict[str, Any]] = {}
 # {"journey_key|situationNumber" -> written message}. Keyed on the journey *definition*, not the
 # registration, so every device on the same trip gets the same text and one message is written per
 # journey × situation rather than one per device. In-memory only: a redeploy re-writes messages
@@ -758,7 +770,7 @@ _togvarsel_rounds: dict[str, dict[str, Any]] = {}
 # insurance): a key written by a future feature must survive THIS build rewriting the blob, so a
 # rollback-and-forward does not silently erase that feature's state.
 _state_extra: dict[str, Any] = {}
-_STATE_KEYS = frozenset({"devices", "journeys", "notified", "togvarsel_rounds"})
+_STATE_KEYS = frozenset({"devices", "journeys", "notified", "togvarsel_rounds", "device_tombstones"})
 
 _STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
 _STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
@@ -778,6 +790,7 @@ def _serialize_state() -> str:
                 "journeys": _journeys,
                 "notified": sorted(_notified),
                 "togvarsel_rounds": _togvarsel_rounds,
+                "device_tombstones": _device_tombstones,
             }
         )
 
@@ -785,11 +798,12 @@ def _serialize_state() -> str:
 def _apply_state(raw: str) -> None:
     data = json.loads(raw)
     with _state_lock:
-        global _devices, _journeys, _notified, _togvarsel_rounds, _state_extra
+        global _devices, _journeys, _notified, _togvarsel_rounds, _device_tombstones, _state_extra
         _devices = dict(data.get("devices", {}))
         _journeys = dict(data.get("journeys", {}))
         _notified = set(data.get("notified", []))
         _togvarsel_rounds = dict(data.get("togvarsel_rounds", {}))
+        _device_tombstones = dict(data.get("device_tombstones", {}))
         _state_extra = {k: v for k, v in data.items() if k not in _STATE_KEYS}
 
 
@@ -2285,12 +2299,53 @@ def device_subscription(device_id: str) -> tuple[dict, str] | None:
     return subscription, brand
 
 
+def _record_device_gone(device_id: str, record: dict, reason: str) -> int:
+    """Leave a tombstone for a device record that was just removed while its journeys stay.
+
+    Caller holds `_state_lock` and has already popped `record` from `_devices`. Returns the
+    number of journeys left behind; with none there is nothing a later reader needs explained, so
+    no tombstone is written (see `_device_tombstones`). Also emits the structured event the device
+    report and the log can be joined on — the plain text line each caller logs predates it and is
+    kept, since a saved log query may match on it.
+    """
+    journeys = sum(1 for rec in _journeys.values() if rec["device_id"] == device_id)
+    if journeys:
+        _device_tombstones[device_id] = {
+            "reason": reason,
+            "ts": _now_iso(),
+            "created_ts": record.get("created_ts"),
+            "journeys": journeys,
+        }
+    else:
+        _device_tombstones.pop(device_id, None)
+    logger.info(
+        "Device %s lost its push subscription (%s), %d journeys kept",
+        device_id,
+        reason,
+        journeys,
+        extra={
+            "fields": {
+                "event": "varsel_device_gone",
+                "device_id": device_id,
+                "reason": reason,
+                "journeys": journeys,
+            }
+        },
+    )
+    return journeys
+
+
 def _drop_device(device_id: str) -> None:
     """Forget a device whose push subscription is gone (404/410). Journeys are kept — the client
-    re-attaches its subscription (same device_id) if the user re-enables notifications."""
+    re-attaches its subscription (same device_id) if the user re-enables notifications, and since
+    2026-09-04 the service worker does so by itself on `pushsubscriptionchange`. A tombstone
+    records the reason (`_record_device_gone`), or the journeys would later read as registered by
+    someone who never turned notifications on."""
     with _state_lock:
-        if _devices.pop(device_id, None) is not None:
+        record = _devices.pop(device_id, None)
+        if record is not None:
             logger.info("Dropped expired push subscription for device %s", device_id)
+            _record_device_gone(device_id, record, "expired")
 
 
 def _device_is_fresh(device_id: str) -> bool:
@@ -3171,9 +3226,18 @@ def upsert_device(body: DeviceIn) -> dict:
                 extra={"fields": {"event": "varsel_capacity", "kind": "devices"}},
             )
             raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
+        # A device coming back after «Skru av» or an expired subscription keeps its original
+        # signup: the tombstone carried it (2026-09-04), and it is what the device report calls
+        # "signed up". Without this a lapse reads as a brand-new device.
+        tombstone = _device_tombstones.pop(body.device_id, None)
+        created_ts = (
+            existing["created_ts"]
+            if existing
+            else (tombstone or {}).get("created_ts") or _now_iso()
+        )
         _devices[body.device_id] = {
             "subscription": body.subscription,
-            "created_ts": existing["created_ts"] if existing else _now_iso(),
+            "created_ts": created_ts,
             # Refreshed on every registration, so a device that reopens the app under a different
             # ?brand= has its notifications follow it rather than keeping the brand it first used.
             "brand": normalize_brand(body.brand),
@@ -3189,7 +3253,9 @@ def delete_device(device_id: str) -> dict:
     Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
     """
     with _state_lock:
-        _devices.pop(device_id, None)
+        record = _devices.pop(device_id, None)
+        if record is not None:
+            _record_device_gone(device_id, record, "turned_off")
         _save_state()
     return {"status": "ok"}
 
@@ -3257,8 +3323,12 @@ def delete_device_data(
     """
     with _state_lock:
         device = _devices.pop(device_id, None)
+        # The tombstone (see `_device_tombstones`) goes too: an art. 17 erasure keeps no record
+        # of what it erased, not even the reason the record was gone. Popped before the empty
+        # check so a lone stale marker is also cleaned up — that path still saves.
+        tombstone = _device_tombstones.pop(device_id, None)
         deleted = [jid for jid, rec in _journeys.items() if rec["device_id"] == device_id]
-        if device is None and not deleted:
+        if device is None and tombstone is None and not deleted:
             return {"status": "ok", "journeys_deleted": 0}
         removed_journeys = {jid: _journeys.pop(jid) for jid in deleted}
         gone = set(deleted)
@@ -3280,6 +3350,8 @@ def delete_device_data(
             # write queue sorts by departure), and this is a failure path.
             if device is not None:
                 _devices[device_id] = device
+            if tombstone is not None:
+                _device_tombstones[device_id] = tombstone
             _journeys.update(removed_journeys)
             _notified.update(removed_notified)
             logger.error(
@@ -3628,6 +3700,12 @@ def delete_journey(
         if rec is None or rec["device_id"] != device_id:
             raise HTTPException(status_code=404, detail="Reise ikke funnet.")
         del _journeys[journey_id]
+        # A tombstone explains journeys a vanished record left behind; with the last of them gone
+        # there is nothing left to explain, and keeping it would accumulate ids forever.
+        if device_id in _device_tombstones and not any(
+            j["device_id"] == device_id for j in _journeys.values()
+        ):
+            del _device_tombstones[device_id]
         _save_state()
     return {"status": "ok"}
 
