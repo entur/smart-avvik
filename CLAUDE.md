@@ -333,6 +333,35 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   plus a `Brand` in that script; note `none` is a *removal* needing no assets, while `vy`/`goa`
   would need their artwork and permission to serve it, and that token overrides carry colour and
   logo but not design language.
+  **A journey never needed notifications to be on, and the page now says so** (2026-09-04). The
+  device report (`scripts/make_device_report.py`, which downloads the prd state blob and renders
+  every device with its signup and journeys) found 79 of prd's 186 registered journeys on 41
+  device ids with no push subscription — and the logs over the days most of them registered showed
+  **zero** expired subscriptions and no relevant «Skru av», so they are overwhelmingly devices that
+  registered a journey and never turned notifications on (an iPhone opening the link in Safari
+  without installing is the likely bulk). Such a journey is not dead: `list_journeys` runs the
+  matcher live regardless of the device record, so the page works as a dashboard for it, and the
+  poller's first pass matches it too — only the delivery loop skips it. Four things changed, and
+  the journeys are deliberately kept. (1) `App.tsx` shows a warning on the journey list when
+  journeys exist and `VarselStatus` reports `DeliveryStatus` `action-needed`, linking to the card
+  (`#varsel-status`), which knows the right instruction per device; `unknown` while the browser
+  subscription is being looked up and `unavailable` where the traveller can do nothing suppress it.
+  (2) **Silent repair**: permission `granted` with no browser subscription used to ask for a second
+  tap; the reconcile effect now calls `push.subscribePush` itself — gated on
+  `components/pushOptOut.ts`, because «Skru av» leaves the permission at `granted` too and the
+  repair would otherwise undo it at the next visit. (3) **`sw.js` handles `pushsubscriptionchange`**:
+  the page stores device id, brand and the VAPID key as bytes in IndexedDB (`src/pushIdentity.ts`;
+  the worker keeps its own copy of the four store names, parity-pinned by
+  `test/pushIdentity.test.mjs`), the worker re-subscribes and POSTs the same upsert; «Skru av» and
+  «Slett alt» clear the record so the worker never resurrects an ended registration. Browser
+  support for the event is uneven and it cannot be triggered on purpose, so it is a net under the
+  page-open repair, not a replacement. (4) **`varsel._device_tombstones`** in the state blob:
+  `_drop_device` (`expired`) and `delete_device` (`turned_off`) record reason, time, the original
+  `created_ts` and the journeys left behind — written only when journeys remain, cleared by
+  `upsert_device` (which restores the original signup so a lapse is not a new device), by the
+  last journey's deletion and by «Slett alt», which keeps no marker. Rows before that date have
+  no tombstone and read as "never turned on" in the report, so the split is meaningful only from
+  2026-09-04.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports

@@ -6,10 +6,21 @@ import { Paragraph, SubParagraph } from '@entur/typography';
 import type { Brand } from '../brand';
 import type { Config } from '../api';
 import { deleteAllData, deleteDevice, registerDevice, sendTestPush } from '../api';
-import { disablePush, enablePush, getExistingSubscription, isIOS, isPushSupported, isStandalone } from '../push';
+import {
+  applicationServerKey,
+  disablePush,
+  enablePush,
+  getExistingSubscription,
+  isIOS,
+  isPushSupported,
+  isStandalone,
+  subscribePush,
+} from '../push';
+import { forgetPushIdentity, rememberPushIdentity } from '../pushIdentity';
 import { T6_SLETT_ALT } from '../personvern';
 import { runDeleteAll } from './deleteAllFlow';
 import { isStoredDeviceId } from './deviceIdentity';
+import { clearPushOff, isPushOff, markPushOff } from './pushOptOut';
 import { VarselkortNotis } from './PersonvernNotis';
 
 type State =
@@ -19,6 +30,17 @@ type State =
   | 'default' // permission not yet requested
   | 'granted' // subscribed and ready
   | 'denied'; // permission blocked
+
+/**
+ * Can a push reach this device right now? Reported upwards so the journey list can say so next
+ * to the journeys it affects (2026-09-04) — measured in prd that day, 79 of 186 registered
+ * journeys belonged to devices that had never turned notifications on, and nothing on the page
+ * connected the two facts. `unknown` while the browser subscription is still being looked up, so
+ * a subscribed device does not flash a warning on every load; `unavailable` where the traveller
+ * can do nothing here (no VAPID keys on the server, a browser without the Push API), which the
+ * card already explains and a second notice would only repeat.
+ */
+export type DeliveryStatus = 'unknown' | 'deliverable' | 'action-needed' | 'unavailable';
 
 function computeState(config: Config): State {
   if (!config.push_enabled || !config.vapid_public_key) return 'server-off';
@@ -55,6 +77,7 @@ export default function VarselStatus({
   ensureDeviceId,
   onDeletedAll,
   brand,
+  onDeliveryStatus,
 }: {
   config: Config;
   /** Null right after «Slett alt», and for a visitor who has never registered anything. */
@@ -65,9 +88,15 @@ export default function VarselStatus({
   /** Last step of «Slett alt»: App forgets the id and everything keyed to it. */
   onDeletedAll: () => void;
   brand: Brand;
+  /** See `DeliveryStatus`. Called whenever the answer changes. */
+  onDeliveryStatus?: (status: DeliveryStatus) => void;
 }) {
   const [state, setState] = useState<State>(() => computeState(config));
-  const [subscribed, setSubscribed] = useState(false);
+  // null = not yet looked up. Only the `granted` state has anything to look up; every other
+  // state knows it is not subscribed without asking the browser.
+  const [subscribed, setSubscribed] = useState<boolean | null>(() =>
+    computeState(config) === 'granted' ? null : false,
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -81,19 +110,58 @@ export default function VarselStatus({
   // is running" is one flag rather than two that can disagree.
   const deleting = useRef(false);
 
+  // What the service worker needs to renew the subscription by itself on `pushsubscriptionchange`
+  // (pushIdentity.ts). Written after every successful registration, so it follows a brand change
+  // and a rotated key. Best-effort: a browser that refuses IndexedDB simply gets no unattended
+  // renewal, which is where every browser was before 2026-09-04.
+  const remember = useCallback(
+    (id: string) => {
+      if (!config.vapid_public_key) return;
+      void rememberPushIdentity({
+        device_id: id,
+        brand: brand.id,
+        application_server_key: applicationServerKey(config.vapid_public_key),
+      }).catch(() => undefined);
+    },
+    [config.vapid_public_key, brand],
+  );
+
   // Reconcile the button state with the actual subscription (e.g. after reload, or if the user
   // granted permission earlier). Re-registering the device is cheap and keeps the server's copy
   // of the subscription fresh across browser subscription rotations.
   useEffect(() => {
     if (state !== 'granted') return;
     let cancelled = false;
-    getExistingSubscription().then((sub) => {
+    const vapidPublicKey = config.vapid_public_key;
+    (async () => {
+      let sub = await getExistingSubscription();
       if (cancelled) return;
       // This is a background effect, not one of the busy-gated handlers, so «Slett alt» has to
       // suspend it explicitly: the lookup above can already be in flight when the user confirms,
-      // and the server's device upsert has no tombstone — a write landing here would recreate the
-      // record, with a live push subscription, seconds after the dialog said «Alt er slettet».
+      // and a write landing here would recreate the record, with a live push subscription,
+      // seconds after the dialog said «Alt er slettet».
       if (deleting.current) return;
+      // Silent repair (2026-09-04): permission is granted but the browser holds no subscription —
+      // the push service retired it, or storage was cleared. Subscribing again needs no gesture
+      // once permission is granted, so asking the user to tap «Slå på varsler» a second time only
+      // left devices dark until they happened to notice. NOT after «Skru av»: that leaves the
+      // permission granted too, and undoing the user's choice on their next visit is the one
+      // thing this must never do — pushOptOut.ts is that memory. And never without a stored
+      // device id: with none there are no journeys to alert on, and minting one here would
+      // recreate the identity «Slett alt» erased.
+      if (
+        !sub &&
+        vapidPublicKey &&
+        !isPushOff(localStorage) &&
+        isStoredDeviceId(deviceId, localStorage)
+      ) {
+        try {
+          sub = await subscribePush(vapidPublicKey);
+        } catch {
+          sub = null;
+        }
+        if (cancelled || deleting.current) return;
+      }
       setSubscribed(Boolean(sub));
       // Re-registering also refreshes the stored brand, so opening the app under a different
       // ?brand= moves this device's notifications with it rather than stranding them. With no
@@ -105,13 +173,15 @@ export default function VarselStatus({
       // not yet re-rendered with the null one. `isStoredDeviceId` reads storage, which «Slett
       // alt» clears synchronously, so it is already false there.
       if (sub && isStoredDeviceId(deviceId, localStorage)) {
-        void registerDevice(deviceId, sub.toJSON(), brand.id).catch(() => undefined);
+        void registerDevice(deviceId, sub.toJSON(), brand.id)
+          .then(() => remember(deviceId))
+          .catch(() => undefined);
       }
-    });
+    })();
     return () => {
       cancelled = true;
     };
-  }, [state, deviceId, brand]);
+  }, [state, deviceId, brand, config.vapid_public_key, remember]);
 
   const enable = useCallback(async () => {
     setBusy(true);
@@ -119,7 +189,10 @@ export default function VarselStatus({
     setNotice(null);
     try {
       const subscription = await enablePush(config.vapid_public_key!);
-      await registerDevice(ensureDeviceId(), subscription, brand.id);
+      const id = ensureDeviceId();
+      await registerDevice(id, subscription, brand.id);
+      clearPushOff(localStorage);
+      remember(id);
       setSubscribed(true);
       setState('granted');
       setNotice('Varsler er slått på.');
@@ -129,7 +202,7 @@ export default function VarselStatus({
     } finally {
       setBusy(false);
     }
-  }, [config, ensureDeviceId, brand]);
+  }, [config, ensureDeviceId, brand, remember]);
 
   const test = useCallback(async () => {
     if (!deviceId) return; // unreachable: the button renders only when `deliverable`, i.e. with an id
@@ -154,6 +227,10 @@ export default function VarselStatus({
     try {
       await disablePush();
       await deleteDevice(deviceId);
+      // Both memories, or the choice is undone: the silent repair would re-subscribe on the next
+      // visit (permission stays granted), and the worker would re-register on the next rotation.
+      markPushOff(localStorage);
+      void forgetPushIdentity().catch(() => undefined);
       setSubscribed(false);
       setState('default');
     } catch (e) {
@@ -183,6 +260,10 @@ export default function VarselStatus({
           deleteServerData: () => deleteAllData(deviceId),
           unsubscribePush: disablePush,
           forgetDevice: () => {
+            // The worker's renewal record goes with the id it names — kept, a later
+            // `pushsubscriptionchange` would re-register the device this erasure just removed.
+            void forgetPushIdentity().catch(() => undefined);
+            clearPushOff(localStorage);
             setSubscribed(false);
             setState('default');
             onDeletedAll();
@@ -214,10 +295,24 @@ export default function VarselStatus({
   // that both early-return on the null id and do nothing at all. Falling back to the unfinished-
   // setup branch is honest and actionable: «Slå på varsler» mints an id and re-registers the
   // subscription that is already there.
-  const deliverable = subscribed && deviceId !== null;
+  const deliverable = subscribed === true && deviceId !== null;
+
+  const deliveryStatus: DeliveryStatus =
+    state === 'server-off' || state === 'unsupported'
+      ? 'unavailable'
+      : state === 'granted' && subscribed === null
+        ? 'unknown'
+        : deliverable
+          ? 'deliverable'
+          : 'action-needed';
+  useEffect(() => {
+    onDeliveryStatus?.(deliveryStatus);
+  }, [deliveryStatus, onDeliveryStatus]);
 
   return (
-    <div className="av-card av-status">
+    // The id is the target of the journey list's «Slå på varsler» link (App.tsx), shown there when
+    // journeys exist that no push can reach.
+    <div className="av-card av-status" id="varsel-status">
       {state === 'server-off' && (
         <SmallAlertBox variant="information" width="fluid">
           Varsler er ikke aktivert på tjeneren ennå. Du kan registrere reiser, men får ikke
