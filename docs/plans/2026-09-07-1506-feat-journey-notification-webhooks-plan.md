@@ -12,8 +12,8 @@ execution: code
 
 ## Goal Capsule
 
-- **Objective:** Partner apps can warn travellers about predicted disruption to an exact journey or recurring commute, with little BFF integration work and without repeating cancellations from an existing alert service.
-- **Means:** A versioned subscription API, durable HTTPS webhooks and a supplied TypeScript/Firebase adapter with shared cancellation arbitration (KTD1–KTD10).
+- **Objective:** Partner apps can warn travellers about predicted disruption to an exact journey or recurring commute, with little BFF integration work. Existing cancellation notifications can continue independently.
+- **Means:** A versioned subscription API, durable HTTPS webhooks and a supplied TypeScript/Firebase adapter with duplicate prevention within our notification stream and configurable native confirmation display (KTD1–KTD10).
 - **Authority:** The user request governs scope. Requirements own product behavior; KTDs own implementation mechanisms. Repository instructions govern code and deployment conventions.
 - **Execution profile:** Characterize the current matcher before extracting shared functions. Prove identity, lifecycle and crash recovery with fixtures, pure tests and emulator integration before live callbacks.
 - **Stop conditions:** Do not enable a provider whose exact identity cannot be proved. Never substitute nearby departures, expose partner records through public history pages, or equate webhook acknowledgement with phone delivery.
@@ -27,17 +27,17 @@ execution: code
 
 A partner configures one callback destination per environment and registers exact journeys or recurring origin–destination windows. Our service monitors those subscriptions and delivers complete notification events. The BFF retains its user/device mapping and owns native delivery.
 
-The first integration includes a Firebase receiver, durable event handling and one BFF decision path shared with existing Ukur cancellation notifications. Other BFFs can implement the HTTPS contract without a Google Cloud account.
+The first integration includes a Firebase receiver and durable event handling for our stream. It displays predictive warnings and processes our confirmed-cancellation events silently; existing Ukur cancellation notifications continue independently. Cross-source arbitration is optional follow-up work. Other BFFs can implement the HTTPS contract without a Google Cloud account and can opt in to displaying our confirmed cancellations.
 
 ### Problem Frame
 
-The current `/varsel-api` supports browser subscriptions and recurring journeys, but not partner callbacks or dated itineraries. Requiring the engineering-constrained partner to poll, interpret probabilities, write notification text and reconcile competing sources would move most of the work onto that team.
+The current `/varsel-api` supports browser subscriptions and recurring journeys, but not partner callbacks or dated itineraries. Supply registration, ready-to-display events and reliable receipt so the engineering-constrained partner need not implement prediction interpretation, webhook cryptography or delivery recovery. Integrating the existing cancellation feed is not an onboarding prerequisite.
 
 ### Key Decisions
 
 - **Deliver through the BFF.** HTTPS callbacks preserve native delivery ownership across hosting platforms. Governs R1, R9, R16. (session-settled: user-approved — chosen over polling and direct native delivery after their tradeoffs were discussed.)
 - **Support both exact journeys and recurring windows.** These require different selection rules. Governs R2–R5. (session-settled: user-directed — chosen over offering only the recurring registration available in `/varsel`.)
-- **Reconcile existing cancellation alerts.** Shared departure identity and BFF arbitration are deliverables. Governs R11–R13. (session-settled: user-approved — chosen over independent notification streams that can repeat the same cancellation.)
+- **Defer mandatory cross-source arbitration.** Prevent duplicates within our stream and preserve identity/source metadata for future integration. The first partner displays our predictions and handles our confirmations silently alongside its existing cancellation notifications; independent streams may overlap or arrive out of order. Governs R11–R13. (session-settled: user-approved scope reduction, 2026-09-07 — supersedes the earlier mandatory shared-arbitration decision.)
 
 ### Actors
 
@@ -63,9 +63,9 @@ The current `/varsel-api` supports browser subscriptions and recurring journeys,
 
 - R9. Deliver structured facts and ready-to-display Norwegian title/body with the BFF's opaque reference; normal receipt needs no extra prediction query.
 - R10. Persist accepted subscriptions and generated events across restarts; retry delivery until accepted or expired, expose terminal failure and isolate slow destinations.
-- R11. Distinguish predicted disruption from confirmed cancellation; include stable affected-departure identity, immutable event ID and ordered alert revision.
-- R12. A BFF can reconcile retries, overlapping subscriptions and separate cancellation sources for the same recipient/departure; a confirmed cancellation suppresses later predictions only for journeys affected by its call/segment scope.
-- R13. The supplied adapter handles both cancellation arrival orders and concurrent arrivals; BFF policy can notify once on confirmation or remain silent after a prior prediction.
+- R11. Distinguish predicted disruption from confirmed cancellation; include stable affected-departure identity, immutable event ID, ordered alert revision, source references/timestamps and affected call/segment scope so BFFs can add cross-source reconciliation later.
+- R12. The supplied adapter prevents duplicate decisions from retries, concurrent delivery and overlapping subscriptions within our stream. Our confirmed cancellations invalidate obsolete predictions only for affected legs. Matching, deduplication and ordering against a separate cancellation source are not v1 guarantees.
+- R13. The first partner displays predictive warnings and processes our confirmed cancellations silently, leaving existing cancellation notifications independent. Other BFFs can explicitly enable native confirmation display; that policy does not depend on whether a prediction was delivered. Both modes consume our complete event lifecycle.
 - R14. Deletion, expiry or replacement prevents later claims for that registration version; an already-in-flight request may complete, so the BFF rechecks local eligibility before native dispatch.
 - R15. Distinguish event creation, durable BFF acceptance and native provider acceptance; do not promise exactly-once phone display.
 
@@ -88,31 +88,31 @@ The current `/varsel-api` supports browser subscriptions and recurring journeys,
 | AE4 | Same bus ServiceJourney on two days, one boarding after midnight | Distinct occurrences; operating date is not inferred from boarding date | R2, R8 |
 | AE5 | Repeated stop visit or cancellation only at destination | Select intended visit and retain relevant cancellation even without another endpoint's prediction | R8 |
 | AE6 | Same webhook delivered concurrently and again after restart | One inbox record and one normal native decision | R10–R12 |
-| AE7 | Ukur cancellation precedes prediction for overlapping watches | Cancellation can notify; later prediction is suppressed | R12, R13 |
-| AE8 | Prediction first, then both sources confirm | One prediction and at most one confirmation under `notify_once` | R11–R13 |
-| AE9 | Confirmation revision arrives before older prediction | Confirmation wins; no predictive downgrade | R11, R12 |
+| AE7 | Same prediction reaches a recipient through overlapping exact/recurring watches and concurrent retries | One predictive native intent for that recipient/departure within our stream | R12, R20 |
+| AE8 | Prediction first, then our confirmation and an existing Ukur cancellation | First-partner mode handles our confirmation silently; Ukur follows its existing path. A BFF with confirmation display enabled can create one own-stream confirmation intent for the affected scope | R11–R13 |
+| AE9 | Our confirmation revision arrives before our older prediction | Confirmation updates state even in silent mode; no predictive downgrade for the affected leg | R11–R13 |
 | AE10 | Cache loses a train or becomes stale after warning | Expose missing coverage; no inferred withdrawal/reinstatement | R6 |
 | AE11 | Callback 503, then watch deleted before retry | Cancel retry; other partners continue | R10, R14 |
 | AE12 | Register already-disrupted journey while SX stays unchanged | Mutation/clock wakeup evaluates it | R5 |
 | AE13 | Crash after FCM acceptance before success record | Mark ambiguous delivery; no exactly-once claim or blind resend | R15 |
 | AE14 | Partner B requests A's event, or anonymous reader opens history | No A data; partner prose never enters public history/replay | R1, R18 |
 | AE15 | Same boarding departure, two destinations; only the farther destination is cancelled | Confirm the affected leg; its cancellation does not suppress a prediction for the shorter, operating leg | R8, R12 |
-| AE16 | Prediction is queued or definitively rejected when cancellation arrives | Supersede unsent prediction and deliver confirmation; `silent_after_prediction` does not treat a queued intent as provider acceptance | R13, R15 |
+| AE16 | Prediction is queued or definitively rejected when our confirmation arrives | Supersede affected unsent prediction; handle confirmation silently for the first partner or notify if explicitly enabled, regardless of prior prediction delivery outcome | R12–R15 |
 | AE17 | A line suspension affects thirteen departures in one recurring definition | All thirteen remain visible as events; supplied native prediction policy admits at most four interruptions that Oslo day, shared across duplicate registrations | R20 |
 | AE18 | Traveller enables ticket-journey alerts or registers a recurring origin/destination window, then disables it | Native inputs reach the BFF intact; disabling invalidates pending work, with no API credentials in the app | R2, R4, R14, R21 |
-| AE19 | Legacy cancellation was delivered before predictive enrollment | Proven prior delivery seeds scoped arbitration state before activation; enrolling does not repeat that cancellation | R12, R13 |
+| AE19 | Ukur cancellation is delivered before predictive enrollment or before our delayed prediction | No legacy-history import or reconciliation gate. Our confirmation is silent in first-partner mode; a prediction may still appear before our path learns the cancellation or if already in flight. The independent-stream ordering limitation is documented | R12, R13 |
 
 ### Scope Boundaries
 
-**Included:** exact transit legs, recurring direct origin–destination windows, coverage status, predictive/confirmed lifecycle events, integration with existing cancellations, minimal pilot enrollment wiring and managed-pilot operations.
+**Included:** exact transit legs, recurring direct origin–destination windows, coverage status, predictive/confirmed lifecycle events, duplicate prevention within our stream, configurable native confirmation display, minimal pilot enrollment wiring and managed-pilot operations.
 
-**Deferred to Follow-Up Work:** missed-connection/end-to-end arrival modelling, automatic replanning, additional languages, self-service onboarding UI, new model/operator coverage and new native itinerary-detail screens. Initially reuse the existing stop-departures tap action.
+**Deferred to Follow-Up Work:** cross-source cancellation arbitration, Ukur identity normalization/history import, policies conditional on prior prediction delivery, missed-connection/end-to-end arrival modelling, automatic replanning, additional languages, self-service onboarding UI, new model/operator coverage and new native itinerary-detail screens. Initially reuse the existing stop-departures tap action. Cross-source work is not a prerequisite for the pilot or for another BFF to adopt the API.
 
 **Outside this product's identity:** partner device/account management in kix, native FCM/APNs delivery from kix, and replacing the authoritative cancellation feed.
 
 ### Success Criteria
 
-A Firebase BFF developer follows the supplied quickstart, registers each subscription kind and sees a synthetic notification on a test phone without implementing prediction logic, webhook cryptography or duplicate arbitration. AE1–AE19 have evidence, including the existing cancellation path and native enrollment. A non-Firebase HTTPS receiver passes the wire-contract suite and consumes the same pure arbitration policy; a production BFF on another stack supplies transactional persistence through the documented adapter contract. A second production database adapter is follow-up work.
+A Firebase BFF developer follows the supplied quickstart, registers each subscription kind and sees a synthetic notification on a test phone without implementing prediction logic, webhook cryptography or duplicate prevention within our stream. AE1–AE19 have evidence, including silent confirmation handling, independent cancellation behavior and native enrollment. A non-Firebase HTTPS receiver passes the wire-contract suite and consumes the same pure notification policy; a production BFF on another stack supplies transactional persistence through the documented adapter contract. A second production database adapter is follow-up work.
 
 Publish supported identity/operator coverage and measured evaluation-to-callback latency. Source age and delivery latency are separate measures so fast callbacks cannot disguise old predictions.
 
@@ -127,7 +127,8 @@ Before real-user enablement, compare the new dated-leg selection against realize
 - Managed onboarding and one destination per partner/environment suffice initially; additional destinations can be provisioned explicitly.
 - The BFF supplies ordered transit legs. Walk legs need no monitoring; connection feasibility is not inferred.
 - Recurring windows initially use `Europe/Oslo`, named weekdays and `/varsel`'s inclusive minute boundaries. Reject overnight recurring windows in v1; support exact journeys crossing midnight.
-- Native confirmation defaults to `notify_once`: a forecast may be followed by one factual cancellation notification for the affected scope. Equivalent or subsumed cancellation facts do not notify again; a materially different affected scope is not a duplicate. Offer `silent_after_prediction` as a BFF setting.
+- Native confirmation display defaults to `silent` in the supplied adapter and is pinned to `silent` for the first partner. Other BFFs can opt in to `notify`: one own-stream confirmation intent for equivalent affected scope, regardless of prior prediction delivery. Both modes persist confirmations and invalidate affected obsolete predictions. Changing modes does not replay historical confirmations.
+- The pilot accepts a predictive warning followed by an existing cancellation alert, and possible reverse ordering while the two streams disagree or delivery is delayed. No cross-source exactly-once or ordering guarantee is made. Identity metadata enables future integration but does not itself prove equality with another source.
 - The supplied BFF adapter initially permits four recurring predictive interruptions per recipient and normalized recurring definition per Oslo day, following the existing `/varsel` cap. Duplicate registrations share the allowance; exact watches and authoritative cancellations keep their separate policies.
 - Firestore Native is new internal infrastructure, with provisioning, IAM, indexes and worker deployment included. The public contract exposes no Google SDK or identity requirement.
 - Initial admission ceilings are planning defaults, not measured capacity: 1,000 active watches per partner and 5,000 total. Qualify evaluation lag against the full simultaneously active distinct-definition population; a 100-definition microbenchmark does not establish a 5,000-watch envelope. Start with lower measured admission limits and require a full active-population revisit within 30 seconds under the admitted load before raising them.
@@ -141,9 +142,9 @@ Before real-user enablement, compare the new dated-leg selection against realize
 - KTD5. **Transactional Firestore subject/event/outbox persistence.** Commit the next revision, immutable event and delivery record together, with no HTTP or LLM calls inside retryable transactions. Do not extend the GCS registration blob or use BigQuery as a queue. [Transaction semantics](https://firebase.google.com/docs/firestore/manage-data/transactions). Governs R5, R10, R14.
 - KTD6. **Independent evaluation and HTTP delivery.** A bounded API-process evaluator reads immutable prediction/topology snapshots and wakes on snapshot, watch and clock changes. It stays beside the in-memory cache to avoid adding a separate prediction transport/store. A separate Kubernetes worker leases outbox records and imports no prediction poller. Keep the API at one replica with its existing recreate deployment. Bound partner request rate and concurrent work separately from public endpoints. Governs R5, R10, R19.
 - KTD7. **Standard Webhooks signing.** Sign immutable raw bytes with a fresh attempt timestamp and stable `webhook-id`; supply Python/TypeScript verification vectors and overlapping rotation keys. The operator transfers initial/replacement signing secrets through the partner's agreed secret channel, and the BFF stores them in its own secret manager. Verify a test delivery signed with the new key before retiring the old key; overlapping signatures alone do not prove the receiver installed the replacement. Persistent event dedup outlives signature tolerance. [Specification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md). Governs R10, R11, R16.
-- KTD8. **One BFF arbiter for prediction and Ukur.** A Firestore transaction keyed by recipient plus canonical departure writes scoped evidence, the notification decision and native intent together. It also reserves recurring interruption allowance atomically when applicable. Confirmation precedence applies only to candidate legs affected by that evidence. Both sources/all participating watch types enter it. Observed facts, queued intents and per-target provider outcomes remain separate. The current recent-message lookup plus concurrent send/store is not atomic dedup. Governs R12, R13, R15, R20.
+- KTD8. **Duplicate prevention and display policy within our stream.** Use service-issued departure IDs and per-alert revisions directly; a Firestore transaction keyed by recipient plus departure records the own-stream decision and native intent, reserving recurring interruption allowance when applicable. Persist our confirmations and suppress affected obsolete predictions even when confirmation display is silent. Existing Ukur ingress, identity/history and notification decisions do not enter this transaction. Keep native provider outcomes for delivery recovery, without using prior prediction delivery to choose confirmation behavior. Governs R12, R13, R15, R20.
 - KTD9. **Durable Firebase acceptance and recoverable processing.** Verify and persist an inbox record before 2xx. Retry-enabled Firestore processing and a recovery sweep handle native work. Never finish the HTTP function with unawaited work remaining. [Function lifetime](https://firebase.google.com/docs/functions/tips), [retries](https://firebase.google.com/docs/functions/retries). Governs R10, R15, R16.
-- KTD10. **Small portable TypeScript package plus real BFF integration.** Keep HTTP/schema/signature helpers and the pure arbitration policy independent of Firebase; add a Firebase persistence adapter implementing the transaction/claim contract. U8 supplies source normalization and native integration, not a fork of the policy. A pinned workspace-vendored package is acceptable for the first pilot if publication is not ready, with one contract source and a CI version/content check. Governs R12, R13, R16, R17, R20.
+- KTD10. **Small portable TypeScript package plus real BFF integration.** Keep HTTP/schema/signature helpers and the pure own-stream notification policy independent of Firebase; add a Firebase persistence adapter implementing the transaction/claim contract. U8 supplies watch mapping and native integration, consuming the shared implementation. A pinned workspace-vendored package is acceptable for the first pilot if publication is not ready, with one contract source and a CI version/content check. Governs R12, R13, R16, R17, R20.
 - KTD11. **Constrained managed destinations.** Require verified HTTPS hosts; reject redirects, userinfo, fragments and arbitrary headers. Validate all IPv4/IPv6 results at each connection and connect to a validated address with original TLS hostname verification. Block private/link-local/metadata addresses and bound responses. [SSRF guidance](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html). Governs R1, R10, R18.
 - KTD12. **Separate protected partner audit.** Do not place partner input/prose in `varsel_decisions`, `/meldinger`, feedback contexts or static exports. Use partner collections, prompt logging off and the existing EU Vertex endpoint when model wording is enabled. Governs R18, R19.
 
@@ -164,10 +165,11 @@ flowchart TB
     Eval --> Store
     Store --> Worker[Independent webhook worker]
     Worker --> Inbox[BFF verified durable inbox]
-    Inbox --> Arbiter[Recipient and departure arbiter]
-    Ukur[Existing cancellation feed] --> Arbiter
-    Arbiter --> Jobs[BFF native delivery intents]
+    Inbox --> Policy[Own-stream deduplication and display policy]
+    Policy --> Jobs[BFF native delivery intents]
     Jobs --> FCM[Native push provider]
+    Ukur[Existing cancellation feed] --> Legacy[Existing cancellation notification path]
+    Legacy --> FCM
     FCM --> App
 ```
 
@@ -214,23 +216,24 @@ stateDiagram-v2
     end note
 ```
 
-**BFF decision order (R12, R13)**
+**BFF decision order for our events (R12, R13)**
 
 ```mermaid
 flowchart TB
-    In[Prediction or cancellation candidate] --> Valid{Recipient, watch and event valid?}
+    In[Our verified event] --> Valid{Recipient, watch and event valid?}
     Valid -->|no| Drop[Record suppression]
-    Valid -->|yes| Resolve{Canonical departure resolved?}
-    Resolve -->|no: prediction| Defer[Defer prediction; expose gap]
-    Resolve -->|no: cancellation| Legacy[Preserve authoritative cancellation and raw evidence]
-    Resolve -->|yes| Tx[Read recipient and departure ledger in transaction]
-    Tx --> Fact{Candidate confirms cancellation?}
-    Fact -->|yes| Confirm[Merge scoped facts; suppress covered evidence; apply delivery-aware policy]
-    Fact -->|no| Confirmed{Recorded fact invalidates this candidate leg?}
-    Confirmed -->|yes| Drop
-    Confirmed -->|no| Seen{Prediction intent exists or candidate stale?}
+    Valid -->|yes| Tx[Read own-stream state in transaction]
+    Tx --> Seen{Duplicate event or stale alert revision?}
     Seen -->|yes| Drop
-    Seen -->|no| Budget{Exact watch or recurring allowance available?}
+    Seen -->|no| Update[Persist latest alert state]
+    Update --> Fact{Our event confirms cancellation?}
+    Fact -->|yes| Confirm[Invalidate affected unsent predictions]
+    Confirm --> Display{Confirmation display enabled and scope not already handled?}
+    Display -->|yes| Notify[Create confirmation intent]
+    Display -->|no| Silent[Record silent handling]
+    Fact -->|no| Predictable{First predictive warning and no own confirmation affecting leg?}
+    Predictable -->|no| Silent
+    Predictable -->|yes| Budget{Exact watch or recurring allowance available?}
     Budget -->|no| Drop
     Budget -->|yes| Predict[Reserve allowance if recurring and create predictive intent]
 ```
@@ -299,7 +302,7 @@ Implement KTD2–KTD3 before exposing exact watches:
 4. Assign opaque `departure_id` to the resolved run and boarding visit. Preserve original/current aimed timestamps and quays as aliases only where verified continuity proves identity. A platform change does not create a new subject; unexplained ref/sequence changes remain unresolved. A traffic-dependent picker-primary StopPlace is not the sole durable key.
 5. Join planned topology to predictions and ET facts. Cancellation-only UNION rows must not lose a cancelled destination because the boarding prediction is absent. Do not generalize a cancellation outside the ridden segment to the subscribed leg.
 6. Enumerate every eligible dated departure for recurring watches and consolidate contributing situations per departure. Keep each departure's own destination facts; legacy adapters retain their current summary choice.
-7. Return aliases with events/resolution. Preserve Ukur frame, journey, visit and aimed-time fields in the BFF and cache mappings from the same resolver. Shared Python/TypeScript vectors define equality; line plus approximate time never authorizes suppression.
+7. Return available source aliases, authoritative occurrence/visit fields, affected scope and source timestamps with events/resolution. Shared Python/TypeScript fixtures define our identity contract. Exact registration must preserve its source references through BFF order conversion; normal webhook receipt uses our issued IDs directly and needs no external-feed resolution. Future cross-source integrations must prove alias equality; line plus approximate time never authorizes suppression. Ukur mapping/fixture support is deferred.
 
 Future exact registrations can persist as `pending` before entering the realtime horizon. Syntactic validity does not imply supported coverage. Service-ref plus service-date inputs require a verified bridge to the dated cache; never fabricate one from train numbers.
 
@@ -311,30 +314,28 @@ Use `journey.alert.created`, `journey.alert.updated` and `journey.alert.withdraw
 
 The first Predicted or Confirmed state emits `created`; subsequent material transitions, including Withdrawn→Confirmed, emit `updated`; Predicted→Withdrawn emits `withdrawn`. Ended emits no advice event. The BFF records withdrawal and renewed prediction silently, preserving earlier interruption history; v1 has no traveller-facing all-clear or renewed-forecast banner.
 
-Default user-facing bounds are one prediction per recipient/departure and one confirmation for equivalent affected cancellation scope under its configured policy. A renewed forecast after withdrawal updates state without another predictive native notification. Normalize cancellation evidence to canonical affected call visits/segments: equivalent or subsumed already-notified facts are duplicates; newly affected scope is not. Withdrawal/expiry does not erase scoped confirmation evidence for that dated departure.
+Default user-facing bounds within our stream are one prediction per recipient/departure and no native confirmations. With confirmation display explicitly set to `notify`, create at most one confirmation intent for equivalent affected cancellation scope; equivalent or subsumed already-handled facts are duplicates, while newly affected scope can produce a new confirmation. A renewed forecast after withdrawal updates state without another predictive native notification. Neither policy consults the existing cancellation feed or prior prediction delivery outcomes.
 
-The recipient/departure ledger is a transaction boundary, not a blanket cancelled-train boolean. Compare each candidate's ridden calls/segment with stored evidence before applying precedence. A cancelled destination beyond a shorter leg cannot suppress that leg; only proven whole-run or shared boarding-call cancellation covers every watch boarding there. Apply the same scope checks when importing unresolved evidence and claiming native work.
+Keep own-stream event deduplication, latest per-alert revisions and recipient/departure interruption state durable. Our confirmed events carry normalized affected call visits/segments; invalidate only predictions whose ridden segment is affected. A cancelled destination beyond a shorter leg cannot suppress that leg. Silent confirmations must update this state before acknowledgement of processing, and withdrawal/expiry must not erase it while advice for that dated departure can still arrive. This uses our event identities directly; no Ukur resolver, raw-evidence store or historical feed import is required.
 
 | BFF state | Incoming candidate | Default decision |
 |---|---|---|
-| No prior native intent | Prediction | Record facts and create one predictive intent |
-| No prior native intent | Confirmed cancellation from either source | Record scoped fact and create confirmation intent |
+| No prior predictive intent; no relevant own confirmation | Eligible first prediction | Reserve recurring allowance when applicable and create one predictive intent |
+| Any valid state | Our confirmed cancellation | Record affected scope and invalidate obsolete unsent predictions; handle silently by default, or create one confirmation intent if display is enabled and that scope has not been handled |
 | Prediction intent exists | Retry, another situation or overlapping watch | Reuse existing decision; no duplicate intent |
-| Prediction queued or definitively rejected | Relevant confirmation | Supersede unsent prediction and create confirmation work under either policy |
-| Prediction accepted by provider | Relevant confirmation | Notify once, or stay silent under `silent_after_prediction` |
-| Prediction outcome unknown | Relevant confirmation | `notify_once` may send a distinct confirmation; `silent_after_prediction` suppresses it conservatively and records ambiguity |
-| Scoped confirmation recorded | Prediction, withdrawal or older event in that scope | Suppress; never downgrade |
-| Scoped confirmation recorded | Equivalent/subsumed confirmation | Suppress regardless of source |
-| Scoped confirmation recorded | Candidate outside that affected scope | Evaluate normally; no departure-wide suppression |
+| Prediction queued or definitively rejected | Our relevant confirmation | Supersede affected unsent prediction; confirmation display follows configuration |
+| Prediction accepted or outcome unknown | Our relevant confirmation | Confirmation display still follows configuration; prior prediction delivery does not change the decision |
+| Our scoped confirmation recorded | Our prediction, withdrawal or older event in that scope | Suppress predictive downgrade |
+| Our scope already handled | Equivalent/subsumed own confirmation, retry or mode change | No new intent; changing display mode does not replay previously handled confirmations |
+| Our scoped confirmation recorded | Candidate outside that affected scope | Evaluate normally; no departure-wide suppression |
 | Any | Inactive watch or expired event | Suppress |
-| Unknown identity | Prediction | Defer automatic notification; expose resolution gap |
-| Unknown identity | Authoritative cancellation | Preserve existing delivery and retain raw evidence |
+| Any | Existing Ukur cancellation | Outside this policy; follows the existing cancellation path |
 
-Apply provider-acceptance and ambiguity rules per native target, so one accepted token does not turn another token's rejected prediction into a delivered warning. Unresolved authoritative cancellation must seed a raw-evidence ledger. Later successful resolution imports that evidence and its affected scope into the canonical ledger transactionally before admitting a delayed prediction. Do not claim cross-source duplicate prevention where identity remains unproven. Order our revisions within each alert only; source timestamps/explicit cancellation facts, not our sequence numbers, govern cross-source precedence.
+Normal receipt needs no extra cancellation lookup. Order revisions within each of our alerts and use our normalized scope for own-stream suppression; do not compare those revision numbers with another feed. Keep per-target provider results solely for reliable native delivery and budget accounting, so accepted targets are not retried because another target failed.
 
-Enrollment is also an arbitration boundary. Begin recording canonical/raw cancellation evidence and delivery outcomes for eligible BFF recipients independently of whether they have a predictive watch. Before activating a new predictive watch, import retained legacy history only where full identity/scope can be proved, and close the import-versus-new-cancellation race through the common transaction path. Do not infer canonical history from the legacy approximate minute key. If the earlier active-horizon history is incomplete, expose pending reconciliation and retain the existing cancellation path; enable our native stream for a departure only once its history is proven or it falls in a fully observed horizon. Never fill that gap by replaying a possibly delivered cancellation.
+Registration persists valid input with consent and can remain pending until supported coverage becomes available; activation has no existing-cancellation-history reconciliation gate. The first partner handles our confirmations silently even if the previous Ukur notification predates enrollment. A prediction can still arrive after an independent cancellation if our service has not observed it or the prediction is already in flight. Each component invalidates affected pending work it still controls when it learns the relevant cancellation; no ordering or deduplication guarantee spans the independent paths. Future cross-source arbitration can consume retained identity/source metadata, but implementing it and proving source equivalence are separate work.
 
-For recurring predictions, reserve the daily interruption allowance in the same arbitration transaction as the intent. Identical origin/destination/schedule definitions share a budget across registrations; a batch spends it on the soonest still-useful departures first. Retries reuse the reservation. Release it only when every target is provably unsent or definitively rejected; an accepted or unknown target consumes it conservatively. Reaching the cap suppresses native prediction work, not events or factual cancellation handling. Keep this policy configurable in the supplied adapter.
+For recurring predictions, reserve the daily interruption allowance in the same own-stream decision transaction as the intent. Identical origin/destination/schedule definitions share a budget across registrations; a batch spends it on the soonest still-useful departures first. Retries reuse the reservation. Release it only when every target is provably unsent or definitively rejected; an accepted or unknown target consumes it conservatively. Reaching the cap suppresses native prediction work, not events or confirmation-state processing. Keep this policy configurable in the supplied adapter.
 
 ### Persistence, Delivery and Deletion
 
@@ -346,17 +347,17 @@ The evaluator wakes within 30 seconds of successful mutation and on source/clock
 
 **Webhook worker:** query indexed due records and claim with a transaction/lease token. Lease duration exceeds the HTTP deadline; completions are fenced by token and expired leases recover after crash. Initially deploy one worker replica with recreate deployment/no autoscaling, so process-wide bounds mean 16 requests globally and 2 per destination. Use a 5-second total and 2-second connect timeout. Scaling workers requires shared concurrency limits first. Retry at 5 seconds with exponential backoff/jitter up to a 5-minute interval; honor bounded `Retry-After` before expiry. Retry network failure, timeout, 408, 429 and 5xx. Other 4xx are terminal/configuration failures; 410 pauses the destination and alerts its owner. Refuse redirects and cap response bytes.
 
-Event validity is capped by watch lifetime and the last useful advice time. For a boarding warning use the current expected departure; for confirmed cancellation use aimed departure; cap exact legs by `monitor_until`. Recurring departures can remain catchable within the existing 90-minute grace after the boarding window. A newer confirmation supersedes older unaccepted predictions. Recheck current watch/destination/revision before claim and send; the adapter handles requests already in flight.
+Event validity is capped by watch lifetime and the last useful advice time. For a boarding warning use the current expected departure; for confirmed cancellation use aimed departure; cap exact legs by `monitor_until`. Recurring departures can remain catchable within the existing 90-minute grace after the boarding window. A newer own-stream confirmation supersedes affected older unaccepted predictions. Recheck current watch/destination/revision before claim and send; the adapter handles requests already in flight.
 
 Manual retry preserves ID/bytes and cannot resurrect expired, deleted or superseded advice. Test events get fresh IDs and short expiry. Delivery states are `pending`, `leased`, `accepted`, `expired`, `superseded`, `cancelled` and `failed`; acceptance means the BFF persisted the event.
 
-**BFF processing:** persist inbox before acknowledgement. Transactionally verify validity, recipient membership, local watch version, scoped source facts and recipient/departure ledger, then create native intent. Enable trigger retries and sweep abandoned pending records after retry exhaustion. Both paths use the same exclusive per-target dispatch claims and fenced completions; a unique intent alone does not stop concurrent sends. Inspect each FCM target result; retry known transient failures only and retire invalid tokens through existing token management.
+**BFF processing:** persist inbox before acknowledgement, including confirmed/withdrawn events that will not display. Transactionally verify validity, recipient membership, local watch version and own-stream revision/duplicate state, then apply display policy and create native intent when eligible. Enable trigger retries and sweep abandoned pending records after retry exhaustion. Both paths use the same exclusive per-target dispatch claims and fenced completions; a unique intent alone does not stop concurrent sends. Inspect each FCM target result; retry known transient failures only and retire invalid tokens through existing token management. The existing cancellation sender does not enter this processing path.
 
-Native targets progress through `pending → claimed → dispatching → accepted / rejected / unknown`. Persist `dispatching` before provider I/O. Recover expired claims that never reached dispatching; abandoned dispatching attempts become unknown and must not be blindly resent. Immediately before that transition, transactionally recheck watch/version/recipient/expiry and scoped confirmation evidence, cancelling obsolete pending predictions. A request already in provider I/O may still complete; retain that boundary explicitly.
+Native targets progress through `pending → claimed → dispatching → accepted / rejected / unknown`. Persist `dispatching` before provider I/O. Recover expired claims that never reached dispatching; abandoned dispatching attempts become unknown and must not be blindly resent. Immediately before that transition, transactionally recheck watch/version/recipient/expiry and our latest alert/affected-scope state, cancelling obsolete pending predictions. A request already in provider I/O may still complete; retain that boundary explicitly.
 
 Record per-target intent before network I/O. A crash/transport failure after dispatch without a definitive provider result is `unknown`. Default to no automatic blind resend of unknown targets, with diagnostics; known rejection may retry before expiry. Native collapse IDs help presentation but do not guarantee no repeated banner. Set Android TTL and APNs expiration from event validity, rechecking eligibility immediately before sending. [FCM lifespan](https://firebase.google.com/docs/cloud-messaging/customize-messages/setting-message-lifespan), [ordering/collapse behavior](https://firebase.google.com/docs/cloud-messaging/customize-messages/collapsible-message-types).
 
-**Retention:** planning defaults are seven days for complete event/delivery history, and canonical/arbitration tombstones until 48 hours after the last relevant event expires. Active recurring watches persist until deletion/effective end. Deletion immediately disables routing and starts an explicit purge, with a 24-hour completion target for that watch's prose, routing references and event payloads and reference-aware cleanup for shared identity records. Do not rely on Firestore TTL to meet that target. A non-sensitive purge status remains queryable; minimal non-reversible tombstones block replay. BFF unsubscribe/account deletion performs corresponding mapping/inbox cleanup. Retention/purge targets must match the documented implementation before real-user onboarding.
+**Retention:** planning defaults are seven days for complete event/delivery history, and canonical identity/own-stream deduplication tombstones until 48 hours after the last relevant event expires. Active recurring watches persist until deletion/effective end. Deletion immediately disables routing and starts an explicit purge, with a 24-hour completion target for that watch's prose, routing references and event payloads and reference-aware cleanup for shared identity records. Do not rely on Firestore TTL to meet that target. A non-sensitive purge status remains queryable; minimal non-reversible tombstones block replay. BFF unsubscribe/account deletion performs corresponding mapping/inbox cleanup. No additional legacy cancellation history is collected for this integration. Retention/purge targets must match the documented implementation before real-user onboarding.
 
 Use separate partner evaluation/delivery/model-wording switches and per-partner suspension. Delivery-off pauses claims; resume only current valid events. Durable-store failure rejects partner mutations without harming existing public read services. No browser push fallback.
 
@@ -366,7 +367,8 @@ Use separate partner evaluation/delivery/model-wording switches and per-partner 
 - BFF order-leg conversion drops dated refs/destination. Preserve them at creation and add compatible predictive-watch input when a client lacks them. Do not reconstruct exact itineraries from line/origin/minute.
 - ET frame/service-day semantics differ by provider; U1 fixtures must prove mapping. Unsupported mappings remain visible rather than being repaired with train-number heuristics.
 - `varsel` message generation is coupled to browser delivery. Extract typed seams under characterization coverage and keep partner inputs out of public decision tables.
-- The BFF sender currently ignores settled-promise/per-token failures. The participating native path must become result-aware; wrapping `sendMessageToCustomer` unchanged is insufficient.
+- The BFF sender currently ignores settled-promise/per-token failures. Supply a result-aware native sender for our stream; wrapping `sendMessageToCustomer` unchanged is insufficient. An additive helper may reuse transport settings, but the existing cancellation path need not adopt the new outbox or change its notification decisions.
+- Independent streams can overlap or arrive out of order. Silent handling of our confirmations prevents a second cancellation notification from our stream in the first partner's configuration, but cannot stop a late predictive warning after an Ukur alert. Keep this limitation in onboarding and pilot expectations.
 - Every unresolved/new definition has potential resolution cost. Bound resolver batches, aliases, request size, pagination and repeated unavailable lookups. Measure the admission envelope before expanding it.
 
 ### Alternatives Considered
@@ -375,15 +377,17 @@ The GCS state blob would be a small initial diff but cannot provide concurrent t
 
 Callbacks inside `check_and_notify` would inherit browser gating and expose the poller to partner outages. A narrow `/impact?at=` lookup still has lossy selection. KTD2 and KTD6 address these limitations without changing public summary contracts.
 
+Mandatory shared cancellation arbitration would coordinate identity, scope, history and delivery decisions across Ukur and our service. The user deferred it to reduce integration work. V1 supplies ordinary own-stream duplicate prevention and silent confirmations for the first partner; cross-source reconciliation remains possible through the event metadata and a future integration.
+
 ---
 
 ## Implementation Units
 
-Prepare the enrollment input examples and SDK contract first, so the partner can review its small integration surface while server work proceeds. After U1 fixes identity and U4 fixes API schemas, the client/example portion of U7 can proceed alongside U3–U6; U7's final delivery qualification still depends on U6. U10 starts with native input tracing at that same contract checkpoint and finishes after the BFF integration in U8. No live predictive cohort is enabled before common cancellation arbitration.
+Prepare the enrollment input examples and SDK contract first, so the partner can review its small integration surface while server work proceeds. After U1 fixes identity and U4 fixes API schemas, the client/example portion of U7 can proceed alongside U3–U6; U7's final delivery qualification still depends on U6. U10 starts with native input tracing at that same contract checkpoint and finishes after the BFF integration in U8. Qualify our receiver, duplicate prevention and silent-confirmation mode before the pilot; no Ukur migration or cancellation-history gate is required.
 
 ### U1. Preserve and resolve dated journey/call identity
 
-**Goal:** Both sources can identify the same dated boarding call without approximation.
+**Goal:** Exact registration, evaluation and event consumers identify the same dated boarding call without approximation.
 
 **Requirements:** R2, R3, R6–R8, R11; KTD2, KTD3. **Dependencies:** None.
 
@@ -391,7 +395,7 @@ Prepare the enrollment input examples and SDK contract first, so the partner can
 
 **Approach:** Preserve occurrence/visit metadata before upstream dedup discards it, including every scoring join and cancellation UNION. Publish immutable dated topology/prediction indexes. Implement the identity contract and legacy lookup adapters. Follow `demo_journeys.sql` for service-day/call-date distinction.
 
-**Execution note:** Begin with characterization and failing identity fixtures. Verify sanitized representative rail, GOA and bus/overnight ET/OTP/Ukur payloads during implementation. Use `bq` schema/dry-run operations before bounded SQL execution.
+**Execution note:** Begin with characterization and failing identity fixtures. Verify sanitized representative rail, GOA and bus/overnight ET/OTP and exact-registration payloads during implementation. Use `bq` schema/dry-run operations before bounded SQL execution. Ukur feed mapping is not a provider-enablement prerequisite.
 
 **Test scenarios:**
 
@@ -505,7 +509,7 @@ Prepare the enrollment input examples and SDK contract first, so the partner can
 3. Cross-language signatures, tampered bytes, stale timestamp and key rotation behave as specified.
 4. Redirects, mixed DNS answers, IPv6/private/metadata addresses and rebinding cannot bypass validation.
 5. 429/Retry-After, bounded response, timeout, terminal 4xx and 410 pause are observable.
-6. New confirmation supersedes pending prediction; already-in-flight old event remains safe downstream.
+6. Our new confirmation supersedes affected pending prediction; an already-in-flight old event is rejected downstream if the receiver has processed the newer state. No ordering against Ukur is assumed.
 
 **Verification:** Generic HTTPS receiver passes retry/rotation/failure tests. Helm shows one ingestion replica and independent worker with correct image/SA/secrets.
 
@@ -515,9 +519,9 @@ Prepare the enrollment input examples and SDK contract first, so the partner can
 
 **Requirements:** R9–R17, R20; KTD7–KTD10. **Dependencies:** U4, U6 for completed qualification; schema/policy work starts at the early contract checkpoint.
 
-**Files:** New `integrations/notifications-client/{package.json,src/client.ts,src/contracts.ts,src/verify.ts,src/identity.ts,src/arbitration.ts,src/ledger.ts,src/*.test.ts}`; `integrations/firebase-notifications/{package.json,src/receiver.ts,src/inbox.ts,src/ledger.ts,src/recovery.ts,src/*.test.ts,README.md}`; `.github/workflows/ci.yml` for package/emulator coverage.
+**Files:** New `integrations/notifications-client/{package.json,src/client.ts,src/contracts.ts,src/verify.ts,src/identity.ts,src/notificationPolicy.ts,src/ledger.ts,src/*.test.ts}`; `integrations/firebase-notifications/{package.json,src/receiver.ts,src/inbox.ts,src/ledger.ts,src/recovery.ts,src/*.test.ts,README.md}`; `.github/workflows/ci.yml` for package/emulator coverage.
 
-**Approach:** Generate types from versioned schemas and reuse signed identity fixtures. Supply the pure scoped-arbitration/confirmation/budget policy, an explicit transactional ledger/claim contract and its Firebase implementation, receiver configuration, persistence, retry-enabled processing, recovery sweep, expiry/cleanup and test routing. Keep Firebase dependency out of the base client. Deny mobile-client access to inbox, ledger and native-outbox collections; verification secrets live only in the BFF secret manager.
+**Approach:** Generate types from versioned schemas and reuse signed identity fixtures. Supply the own-stream duplicate/revision/budget policy, `silent`/`notify` native confirmation configuration, an explicit transactional ledger/claim contract and its Firebase implementation, receiver configuration, persistence, retry-enabled processing, recovery sweep, expiry/cleanup and test routing. Always process our complete lifecycle, even when native confirmations are silent. No existing-feed adapter, cross-source policy or legacy-history import is included. Keep Firebase dependency out of the base client. Deny mobile-client access to inbox, ledger and native-outbox collections; verification secrets live only in the BFF secret manager.
 
 **Test scenarios:**
 
@@ -526,40 +530,41 @@ Prepare the enrollment input examples and SDK contract first, so the partner can
 3. Invalid signature/body/partner or expired test event produces no native work.
 4. Recovery sweep processes valid pending work after trigger retry exhaustion.
 5. Deleted watch or old version is suppressed before native handoff.
-6. Shared policy vectors cover both cancellation arrival orders, partial scope, per-target confirmation policy and recurring allowance; the BFF consumes this implementation without reimplementing those decisions.
+6. Shared policy vectors cover overlapping watches, concurrent/older own events, scoped invalidation, silent/notify confirmation display and recurring allowance; the BFF consumes this implementation without reimplementing those decisions.
+7. Silent confirmations update state and supersede affected pending predictions; `notify` creates at most one intent for equivalent own-stream scope. Prior prediction acceptance, rejection or ambiguity does not alter the configured display policy, and mode changes do not replay handled confirmations.
 
 **Verification:** Firebase example uses the BFF's supported current versions; generic Node receiver passes the same contract without Firebase. Package publication is not a pilot dependency.
 
-### U8. Integrate shared cancellation arbitration in the partner BFF
+### U8. Integrate subscriptions and predictive notifications in the partner BFF
 
-**Goal:** Existing cancellations and new predictions share identity, decision state and native delivery.
+**Goal:** The partner can register watches and display our predictions through a supplied reliable receiver, while its existing cancellation notifications continue independently.
 
 **Requirements:** R2–R5, R8, R11–R16, R20; KTD3, KTD8–KTD10. **Dependencies:** U1, U4, U7.
 
-**Files in `entur/entur-clients`:** `bff/functionGroups/deviation/src/{functions,deviation,deviation.test}.ts`; `bff/domains/ukur/src/client.ts`; `bff/domains/pushSubscription/src/{pushSubscription.model,logic,service,timeWindows}.ts` and corresponding tests; `bff/functionGroups/pushSubscriptions/src/functions.ts`; `bff/domains/pushNotification/src/{service,message,pushNotificationMessage.model,types}.ts` and tests; `bff/utils/firestore/src/types.ts`; new `bff/domains/predictedDisruptions/src/{subscriptions,arbitration,nativeOutbox}.ts` and tests; new `bff/functionGroups/predictedDisruptions/src/functions.ts`; function discovery, indexes/TTL and Apigee routes.
+**Files in `entur/entur-clients`:** `bff/domains/pushSubscription/src/{pushSubscription.model,logic,service,timeWindows}.ts` and corresponding tests; `bff/functionGroups/pushSubscriptions/src/functions.ts`; `bff/domains/pushNotification/src/{service,message,pushNotificationMessage.model,types}.ts` and tests only as needed for an additive result-aware sender; `bff/utils/firestore/src/types.ts`; new `bff/domains/predictedDisruptions/src/{subscriptions,notifications,nativeOutbox}.ts` and tests; new `bff/functionGroups/predictedDisruptions/src/functions.ts`; function discovery, indexes/TTL and Apigee routes. Existing deviation/Ukur ingress needs no implementation changes; its current tests remain compatibility evidence.
 
 **Approach:**
 
-1. Preserve source refs/visits/destination/legs through watch creation and Ukur mapping. Add compatible predictive-watch input where current line watches lack destination. Keep customer/device IDs only in BFF mappings.
+1. Preserve source refs/visits/destination/legs through exact watch creation and order conversion. Add compatible predictive-watch input where current line watches lack destination. Keep customer/device IDs only in BFF mappings.
 2. Integrate the supplied package with opaque references and durable reconciliation of failed registration/deletion. Tombstone local mapping first on unsubscribe/account deletion.
-3. Route both sources through the supplied policy/transaction adapter, including enrollment-history reconciliation, unresolved-evidence migration and per-target native intents. The local `arbitration.ts` is integration wiring, not another policy implementation.
-4. Make participating sender result-aware. Retain Android deviation channel, APNs settings and existing stop-departures tap action. Store notification history consistently with the intent.
+3. Route our webhook events through the supplied adapter, using issued departure IDs directly, and pin confirmation display to `silent`. Persist confirmations/withdrawals and own-stream suppression decisions without creating native banners. The local `notifications.ts` is integration wiring, consuming the shared policy. Registration does not wait for existing cancellation history.
+4. Supply result-aware native sending for our intents. Retain Android deviation channel, APNs settings and existing stop-departures tap action. Store notification history consistently with the intent. Existing cancellation ingress, deduplication and sending remain on their current path.
 
 **Test scenarios:**
 
-1. Covers AE7–AE9: both arrival orders, simultaneous sources, duplicate situations, stale revisions and overlapping watches yield the policy decisions.
-2. Partial cancellation scope, nearby departure, next-day bus and different recipient do not contaminate each other.
+1. Covers AE7–AE9: duplicate situations, concurrent retries, stale own-stream revisions and overlapping watches yield one predictive intent; our confirmations are silent and still update state.
+2. Our partial cancellation scope, nearby departure, next-day bus and different recipient do not contaminate each other.
 3. Named weekday/end-minute conversion matches BFF selection, including Sunday and DST.
-4. Resolution outage preserves authoritative cancellation/deferred prediction; later resolution imports cancellation before prediction.
+4. Resolution outage exposes pending/unavailable predictive coverage without blocking existing cancellation behavior; successful resolution requires no Ukur import or lookup.
 5. Covers AE13: crash after provider acceptance, ambiguous request and partial multicast failures are distinct; retries target known failures only.
 6. Expiry/deletion/recipient removal/version changes invalidate unsent native work; Android/APNs lifetimes match event expiry.
 7. Existing cancellation-only users keep behavior; existing clients can test the supported tap action.
-8. Covers AE15/AE16: same boarding visit with different destinations retains cancellation scope; queued/rejected/accepted/unknown predictions apply the documented confirmation policy per target.
-9. Trigger and sweeper race for one target; only one reaches dispatching. Pre-dispatch crash recovers; post-dispatch crash becomes unknown, and a newly confirmed cancellation supersedes pending predictive work.
+8. Covers AE15/AE16: same boarding visit with different destinations retains own-event cancellation scope; our confirmation supersedes affected queued/rejected prediction work and remains silent regardless of prior provider outcome. Exercise opt-in confirmation display in the supplied adapter example.
+9. Trigger and sweeper race for one target; only one reaches dispatching. Pre-dispatch crash recovers; post-dispatch crash becomes unknown, and our newly confirmed cancellation supersedes affected pending predictive work.
 10. Covers AE17: thirteen recurring departures, concurrent duplicate registrations and restart share the four-interruption allowance; retries do not spend twice, and authoritative cancellation behavior is preserved.
-11. Covers AE19: legacy cancellation precedes enrollment, including concurrent enrollment/feed arrival; proven history suppresses repeat delivery and unprovable history never becomes a fabricated canonical match.
+11. Covers AE19: an existing cancellation before enrollment or before our delayed prediction adds no registration gate/history import. Our confirmation stays silent; the test records the allowed late-prediction sequence rather than asserting cross-source suppression.
 
-**Verification:** Firebase emulator tests exercise actual HTTP/Firestore/Ukur/sender wiring. Test iOS/Android devices receive the intended sequence; document platform display/ambiguous-send limitations.
+**Verification:** Firebase emulator tests exercise actual registration/HTTP/Firestore/new-sender wiring; existing cancellation compatibility checks pass. Test iOS/Android devices receive the intended own-stream sequence; document independent-stream ordering and platform display/ambiguous-send limitations.
 
 ### U10. Complete minimal native enrollment wiring
 
@@ -589,7 +594,7 @@ The predictive variant asks for origin, destination and schedule, with no line s
 
 **Files:** New `docs/integrations/notification-api.md`, `docs/integrations/firebase-bff.md`, `docs/operations/partner-notifications.md`; `README.md`, `AGENTS.md`; new `disruptions/api/test_partner_notification_contract.py`, `integrations/firebase-notifications/src/endToEnd.test.ts`, `eval/evaluate_partner_alerts.py`; both repositories' relevant CI/deploy configuration.
 
-**Approach:** Publish onboarding, examples, policy/coverage semantics and a synthetic test flow. Implement the named operational metrics in the service/worker/adapter, including request rejection and purge lag. Qualify load and delivery faults before dev-phone testing and managed pilot. Run the bounded dated-leg outcome replay against the documented calibration populations; keep partner audit/results private. Test the cloud-neutral wire contract and shared policy with a generic HTTPS receiver.
+**Approach:** Publish onboarding, examples, policy/coverage semantics and a synthetic test flow. Document own-stream duplicate prevention, first-partner silent confirmations, opt-in confirmation display for other BFFs and the absence of cross-source ordering/deduplication guarantees. Implement the named operational metrics in the service/worker/adapter, including request rejection and purge lag. Qualify load and delivery faults before dev-phone testing and managed pilot. Run the bounded dated-leg outcome replay against the documented calibration populations; keep partner audit/results private. Test the cloud-neutral wire contract and own-stream policy with a generic HTTPS receiver.
 
 **Test scenarios:**
 
@@ -599,7 +604,7 @@ The predictive variant asks for origin, destination and schedule, with no line s
 4. Partner overload/slow callbacks leave others and existing `/varsel` within measured envelope.
 5. Delivery-off rollback preserves registrations and does not replay obsolete events after resume.
 
-**Verification:** Acceptance examples have evidence and docs match schemas. No missing adapter/dedup prerequisite is left as partner homework.
+**Verification:** Acceptance examples have evidence and docs match schemas. No missing own-stream adapter/dedup prerequisite is left as partner homework; cross-source coordination is explicitly optional follow-up work.
 
 ---
 
@@ -618,21 +623,21 @@ These checks belong to implementation; none is claimed executed during planning.
 | Infrastructure | Terraform format/validate/plan through current workflow; Helm lint/render dev/tst/prd; worker entrypoint/tag and IAM/secret references verified |
 | Compatibility | Existing matcher, browser notification, SSO tuple, redaction, LLM fallback and poller suites pass; frontend builds retain behavior |
 | Delivery faults | Retry/expiry/delete races, duplicate/concurrent/out-of-order events, signing/rotation and per-token FCM failures |
-| Partner trial | Exact and recurring test-phone evidence, both cancellation orders and a generic HTTPS receiver outside Firebase |
+| Partner trial | Exact and recurring test-phone evidence, silent confirmations, own-stream ordering/deduplication, independent cancellation coexistence and a generic HTTPS receiver outside Firebase with opt-in confirmation display |
 
 ### Operational and Rollout Notes
 
 Begin with managed test partners in dev and deterministic wording. Enable model wording separately after matching/delivery qualify, with EU endpoint and prompt logging pinned. Qualify identity per provider; do not silently enable ambiguous mappings.
 
-Deploy BFF evidence recording and arbitration before admitting predictive notifications. Existing Ukur-only users retain their notification behavior while their cancellation evidence becomes available for safe future enrollment. Require enrollment-history reconciliation before activating each departure in the common-policy cohort. Partner consent and native preferences remain BFF-owned.
+Deploy and qualify our BFF receiver, own-stream duplicate prevention and native delivery before admitting predictive notifications, with confirmation display pinned to `silent`. The existing Ukur path needs no migration or evidence collection, and enrollment has no legacy-history reconciliation gate. Demonstrate that our confirmations update state without a second cancellation banner, and document that a prediction may arrive after an independent cancellation alert. Partner consent and native preferences remain BFF-owned.
 
-Measure resolver coverage/source age, evaluation lag, oldest eligible outbox work, callback result, suppression reason, confirmation conflicts, native rejection/unknown state, request rejection, operator changes and purge lag. Application logs use route templates and partner/event IDs, without bodies, callback secrets or recipient references. Gateway access logs can contain the random opaque watch reference in the URL; it must never contain a customer/device ID, and follows the gateway's restricted access/retention policy. Administrative audit uses the same seven-day pilot retention as delivery history. Do not count BFF 2xx as phone display.
+Measure resolver coverage/source age, evaluation lag, oldest eligible outbox work, callback result, own-stream suppression reason, silent confirmation handling, native rejection/unknown state, request rejection, operator changes and purge lag. Application logs use route templates and partner/event IDs, without bodies, callback secrets or recipient references. Gateway access logs can contain the random opaque watch reference in the URL; it must never contain a customer/device ID, and follows the gateway's restricted access/retention policy. Administrative audit uses the same seven-day pilot retention as delivery history. Do not count BFF 2xx as phone display or claim measured cross-source deduplication without an integration.
 
 Rollback stops partner delivery claims first and preserves durable state. Resume only eligible current events. Revocation/destination suspension are independent. A schema-incompatible binary must fail the partner component closed without stopping public prediction service.
 
 ### Deferred Execution Checks
 
-- U1: validate provider frame/service-day and OTP/Ukur aliases with representative fixtures; this evidence gates provider enablement.
+- U1: validate provider frame/service-day and OTP/exact-registration aliases with representative fixtures; this evidence gates provider enablement. Ukur source mapping is deferred.
 - U3/U6: verify named Firestore availability, permitted EU region, runtime IAM and chart worker/image wiring; provision through repository conventions.
 - U8: verify supported BFF/native versions and deployment flags; clients missing exact refs/destination need compatible input before that watch is offered.
 - U9: measure capacity, source freshness, purge timing, prediction quality and phone outcomes; record settings as observed results rather than inferred guarantees. Real-user enablement requires a documented comparison against existing per-population calibration bars; sparse/unknown outcomes do not pass that gate by default.
@@ -643,11 +648,12 @@ Rollback stops partner delivery claims first and preserves durable state. Resume
 
 - U1–U10 meet verification outcomes; AE1–AE19 have test or dev evidence.
 - Both subscription kinds work; exact matching never chooses a neighbor and recurring matching retains every relevant departure.
-- Companion BFF changes are reviewable/tested, including existing cancellation ingress, common arbitration and result-aware native sending.
+- Companion BFF changes are reviewable/tested, including watch mapping, our durable receiver, own-stream duplicate prevention, silent confirmation handling and result-aware native sending; existing cancellation behavior remains compatible without an ingress migration.
 - Minimal native enrollment changes cover both pilot watch kinds; recurring bursts obey the supplied interruption policy without dropping webhook facts.
 - Partner auth, signing, durable recovery, expiry/deletion and rotation are implemented and documented.
 - Existing public interfaces remain compatible and partner data stays out of experiment history/replay surfaces.
-- The Firebase quickstart/adapter needs no partner implementation of missing reliability logic. The generic HTTPS example proves wire interoperability/shared policy and documents the transactional persistence adapter required outside Firebase.
+- The Firebase quickstart/adapter needs no partner implementation of missing own-stream reliability logic. The generic HTTPS example proves wire interoperability/own-stream policy, including opt-in confirmation display, and documents the transactional persistence adapter required outside Firebase.
+- Stable departure/event IDs, alert revisions, source references/timestamps and affected scope remain available for future cross-source reconciliation. Shared arbitration/history import is optional follow-up work, and independent-stream overlap/ordering limitations are documented.
 - Guarantees distinguish durable acceptance, provider acceptance and display; unresolved identity and ambiguous sends stay visible.
 - Remove abandoned prototypes, dead extraction paths, experimental credentials and unused dependencies. Record production enablement separately from code completion.
 
