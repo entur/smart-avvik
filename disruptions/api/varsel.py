@@ -3015,7 +3015,9 @@ class ConfigResponse(BaseModel):
         default=False,
         description=(
             "Whether subscriptions here also receive Oslo rush-hour forecast pushes "
-            "(TOGVARSEL_NOTIFY_ENABLED); the PWA shows its notice only when true."
+            "(SHOW_RUSHVARSEL and TOGVARSEL_NOTIFY_ENABLED, ANDed in main); the PWA shows its "
+            "notice AND its rush outlook panel only when true, so while the product is dark "
+            "/varsel mentions rushvarsel nowhere."
         ),
     )
 

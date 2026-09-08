@@ -12,10 +12,19 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
 
 from __future__ import annotations
 
+import os
 import re
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+# Rushvarsel's master gate, pinned ON before togvarsel is imported: every /togmelding-api route
+# carries a router-level dependency on it and 404s while it is off (which is the default, and the
+# posture every deployment is in today). Set at import, the way test_varsel_api pins
+# KIX_ENVIRONMENT — each suite is its own process, deliberately (see the CI note), so this cannot
+# leak into another. The 404 itself is checked by
+# test_the_whole_api_404s_while_the_master_gate_is_off below, which turns it back off.
+os.environ["SHOW_RUSHVARSEL"] = "true"
 
 import togvarsel
 from fastapi import FastAPI
@@ -580,6 +589,36 @@ def test_endpoint_serves():
     assert resp.status_code == 200
     body = resp.json()
     assert {"date", "forecast_day", "issues", "known_deviations", "skill_note"} <= set(body)
+
+
+def test_the_whole_api_404s_while_the_master_gate_is_off():
+    """SHOW_RUSHVARSEL off (its default) 404s EVERY route on this router, not just the payload.
+
+    Router-level, so /config goes with /today: while the product is dark the surface must be
+    indistinguishable from one that never shipped, and a /togmelding-api/config that answers 200
+    tells a reader the page exists and is merely empty. The parse is the delivery-flag allow-list
+    (deployment.show_rushvarsel), so "false", "" and anything unrecognised all read as off — the
+    closed direction.
+    """
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.05})
+    _reset(fake)
+    app = FastAPI()
+    app.include_router(togvarsel.router)
+    client = TestClient(app)
+    for value in ("false", "", "0", "off", "disabled"):
+        os.environ["SHOW_RUSHVARSEL"] = value
+        try:
+            assert client.get("/togmelding-api/today").status_code == 404, value
+            assert client.get("/togmelding-api/config").status_code == 404, value
+        finally:
+            os.environ["SHOW_RUSHVARSEL"] = "true"
+    # Unset is off too, and needs no helm value to be.
+    del os.environ["SHOW_RUSHVARSEL"]
+    try:
+        assert client.get("/togmelding-api/today").status_code == 404
+    finally:
+        os.environ["SHOW_RUSHVARSEL"] = "true"
+    assert client.get("/togmelding-api/today").status_code == 200  # and back on
 
 
 class _pinned_clock:

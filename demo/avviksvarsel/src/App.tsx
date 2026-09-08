@@ -119,9 +119,14 @@ export default function App({ brand }: { brand: Brand }) {
   // so emptying it here is what clears it after «Slett alt». The post-await staleness guard is
   // refreshJourneys' verbatim: a response dispatched before the deletion must not repaint a panel
   // about registrations the server no longer has.
+  //
+  // Not asked at all where /config says this deployment does not serve rushvarsel
+  // (SHOW_RUSHVARSEL off, or notifications off): /togmelding-api 404s wholesale there, and while
+  // the catch below would leave the panel empty anyway, a failing request named togmelding-api on
+  // every poll is itself a mention of a product that is meant to be invisible here.
   const refreshRushes = useCallback(async () => {
     const issuedFor = deviceId;
-    if (!issuedFor) {
+    if (!issuedFor || !config?.togvarsel_notify) {
       setRushes([]);
       return;
     }
@@ -132,7 +137,7 @@ export default function App({ brand }: { brand: Brand }) {
     } catch {
       // keep whatever was last shown
     }
-  }, [deviceId]);
+  }, [deviceId, config?.togvarsel_notify]);
 
   // Initial load: config, stops, journeys. Register the service worker up front so enabling
   // push later is a single tap.
@@ -163,8 +168,9 @@ export default function App({ brand }: { brand: Brand }) {
 
   // The rush panel's own first fetch, deliberately NOT folded into the load above: that effect
   // runs once by design (see its note), while this one must re-run when the device id moves — a
-  // fresh registration brings the panel to life, «Slett alt» empties it — and it must never be
-  // able to fail the page load or hold up the loading state.
+  // fresh registration brings the panel to life, «Slett alt» empties it — and when /config lands,
+  // which is what decides whether the panel is asked for at all. It must never be able to fail
+  // the page load or hold up the loading state.
   useEffect(() => {
     void refreshRushes();
   }, [refreshRushes]);

@@ -1100,11 +1100,28 @@ def _rebuild_all(timings: dict[str, int]) -> None:
 def _togvarsel_notify_enabled() -> bool:
     """The togvarsel push delivery gate, read per call so a check always reflects the environment.
 
-    Allow-list parse, the delivery-flag convention VARSEL_LLM_ENABLED established (llm_message.py
-    explains why the failure direction must be OFF) — but with UNSET parsing as off, deliberately
-    unlike that flag's default-"true" read: the code default matches the closed gate instead of
-    relying on helm values alone. While this is off, togvarsel_notify.evaluate() writes no
-    markers, so an enable-restart inside a timeliness window still delivers that round."""
+    TWO flags, ANDed, and the order of the words matters: deployment.show_rushvarsel() is the
+    master gate over the whole product (SHOW_RUSHVARSEL, unset = off), and TOGVARSEL_NOTIFY_ENABLED
+    stays what it always was — the per-environment delivery switch, with dev's and prd's "true"
+    left in place. So while the product is dark this reads False everywhere, and turning it back on
+    is that one value per environment rather than a set of flags to re-derive.
+
+    The AND is deliberately concentrated here rather than spread over three call sites, because
+    this one function is the seam for all THREE ways rushvarsel reaches a traveller:
+    togvarsel_notify.evaluate()'s `enabled` gate (no push, and no marker written),
+    /varsel-api/config's `togvarsel_notify` (which hides the PWA's «Nytt: Rushvarsel» notice) and
+    rush_outlook()'s own gate (which empties the outlook panel at the top of /varsel). The page
+    404s are the one thing NOT here — a static mount and a router cannot read a provider.
+
+    Allow-list parse on both, the delivery-flag convention VARSEL_LLM_ENABLED established
+    (llm_message.py explains why the failure direction must be OFF) — but with UNSET parsing as
+    off, deliberately unlike that flag's default-"true" read: the code default matches the closed
+    gate instead of relying on helm values alone. While this is off, togvarsel_notify.evaluate()
+    writes no markers, so an enable-restart inside a timeliness window still delivers that round —
+    a property that carries over to the master gate unchanged.
+    """
+    if not deployment.show_rushvarsel():
+        return False
     return os.environ.get("TOGVARSEL_NOTIFY_ENABLED", "").strip().lower() in llm_message._TRUTHY
 
 
@@ -1313,9 +1330,8 @@ app.include_router(rushhistorikk.router)
 
 # Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
-app.include_router(togvarsel.router)
-
-# Togvarsel-notify's two routes, both over the seams injected in lifespan above.
+#
+# Togvarsel-notify's two routes ride the same gate, both over the seams injected in lifespan above.
 # GET /togmelding-api/outlook is the status panel /varsel shows at the top of its page: today's
 # rush levels for a device, gated on the delivery flag and on the poller's station cache, so it
 # only ever claims "you are being notified about this" where that is true.
@@ -1323,7 +1339,25 @@ app.include_router(togvarsel.router)
 # through the same composition + delivery seams the real rounds use. It gates itself on
 # deployment.environment_label() == "dev" per call — tst, prd and unset labels get a plain 404 —
 # so mounting it everywhere is safe and keeps the image identical across environments.
-app.include_router(togvarsel_notify.router)
+#
+# Both routers are gated on SHOW_RUSHVARSEL (deployment.show_rushvarsel), and TWO mechanisms is
+# deliberate rather than belt-and-braces, because they close different things:
+#   - not INCLUDING them, here, is what keeps /togmelding-api out of the public OpenAPI schema.
+#     `docs_url` is FastAPI's default, so /docs lists every registered route: a router that is
+#     present but 404s would still publish the endpoint names of a product we are not showing, and
+#     a listing is itself a mention. Import-time, like the /togmelding mount below and for the
+#     same reason — an env flag only moves on a pod restart, which is when this line is re-read.
+#   - the router-level `deployment.require_rushvarsel` dependency inside each module is what makes
+#     the gate hold PER REQUEST wherever the router is mounted — the two test suites mount it on
+#     apps of their own, and it is what a future mount inherits without having to remember this
+#     block. It is also the only thing standing in front of the dev-only test trigger, which is
+#     deliberately NOT wired to the `enabled` seam (_TRIGGER_SEAMS omits it, so the pipe can be
+#     proven before the delivery flag opens) and would otherwise still send a real push.
+if deployment.show_rushvarsel():
+    app.include_router(togvarsel.router)
+    app.include_router(togvarsel_notify.router)
+else:
+    logger.info("SHOW_RUSHVARSEL is off; /togmelding-api not registered (404, and off /docs)")
 
 # The SSO login/callback/logout routes (public by construction — they are how a session is made).
 app.include_router(sso.router)
@@ -1450,8 +1484,18 @@ else:
 # /togmelding-api/today. Same generated-directory pattern as the mounts above: it was a single
 # COMMITTED hand-written HTML file until 2026-09-01, when it moved onto Entur Linje to match
 # /varsel — which means npm packages, and therefore a Vite bundle built in the image.
+#
+# Gated on SHOW_RUSHVARSEL (deployment.show_rushvarsel), the master gate over the whole product:
+# with it off the page is simply never mounted, so /togmelding and /togmelding/ both answer a
+# plain 404 because no route claims the path, exactly as if the surface had never shipped. Read at
+# import, unlike every other check on this flag — a mount cannot be conditioned per request
+# without a StaticFiles subclass, and Mount's own path regex would answer the bare /togmelding
+# with a 307 to the trailing slash BEFORE any per-request check could 404 it. An env flag only
+# changes on a pod restart anyway, which is also when this line is re-read.
 _TOGMELDING_STATIC_DIR = Path(__file__).parent / "togmelding_static"
-if _TOGMELDING_STATIC_DIR.is_dir():
+if not deployment.show_rushvarsel():
+    logger.info("SHOW_RUSHVARSEL is off; /togmelding not mounted (the whole surface 404s)")
+elif _TOGMELDING_STATIC_DIR.is_dir():
     app.mount(
         "/togmelding",
         _VersionedStaticFiles(directory=_TOGMELDING_STATIC_DIR, html=True),

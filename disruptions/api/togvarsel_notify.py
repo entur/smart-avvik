@@ -94,8 +94,9 @@ from datetime import date, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import deployment
 from deployment import environment_label
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -1029,7 +1030,12 @@ def _evaluate(now: datetime) -> None:
 
 # ---- HTTP surfaces --------------------------------------------------------------------------
 
-router = APIRouter()
+# Both routes gated on SHOW_RUSHVARSEL (deployment.require_rushvarsel), at router level for the
+# reason togvarsel.py's copy gives. That includes the dev-only test trigger below, which is
+# deliberately NOT wired to the `enabled` seam (_TRIGGER_SEAMS omits it, so the pipe can be proven
+# before the delivery flag opens) — so this dependency is the ONLY thing that stops it sending a
+# real rush-forecast push while the product is meant to be dark.
+router = APIRouter(dependencies=[Depends(deployment.require_rushvarsel)])
 
 
 @router.get(

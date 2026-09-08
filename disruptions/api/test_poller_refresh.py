@@ -16,6 +16,7 @@ checks for why the properties worth pinning are the exception-handling ones, not
 Run: uv run --with fastapi --with httpx --with pydantic python test_poller_refresh.py
 """
 
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
@@ -334,13 +335,37 @@ def test_evaluate_never_rides_the_sx_rebuild():
     assert poll.index("togvarsel.refresh()") < poll.index("togvarsel_notify.evaluate()")
 
 
-def test_togvarsel_notify_flag_is_an_allow_list_with_unset_off():
-    """R9: only true/1/yes/on enable (the delivery-flag convention), and UNSET is OFF — the code
-    default matches the closed gate, deliberately unlike VARSEL_LLM_ENABLED's default-"true"."""
+@contextmanager
+def _env(**values):
+    """Set env vars for the body and restore whatever was there (including absence) after."""
     import os
 
-    before = os.environ.pop("TOGVARSEL_NOTIFY_ENABLED", None)
+    before = {k: os.environ.get(k) for k in values}
     try:
+        for key, value in values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in before.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_togvarsel_notify_flag_is_an_allow_list_with_unset_off():
+    """R9: only true/1/yes/on enable (the delivery-flag convention), and UNSET is OFF — the code
+    default matches the closed gate, deliberately unlike VARSEL_LLM_ENABLED's default-"true".
+
+    Read with the master gate held OPEN, since 2026-09-08: the two flags are ANDed, and this check
+    is about the delivery flag's own parse. What the AND does is the next check.
+    """
+    import os
+
+    with _env(SHOW_RUSHVARSEL="true", TOGVARSEL_NOTIFY_ENABLED=None):
         assert main._togvarsel_notify_enabled() is False  # unset -> off, no helm value needed
         for value, want in (
             ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
@@ -349,11 +374,78 @@ def test_togvarsel_notify_flag_is_an_allow_list_with_unset_off():
         ):
             os.environ["TOGVARSEL_NOTIFY_ENABLED"] = value
             assert main._togvarsel_notify_enabled() is want, value
-    finally:
-        if before is None:
-            os.environ.pop("TOGVARSEL_NOTIFY_ENABLED", None)
-        else:
-            os.environ["TOGVARSEL_NOTIFY_ENABLED"] = before
+
+
+def test_the_master_gate_overrides_the_delivery_flag_in_both_directions():
+    """SHOW_RUSHVARSEL off means no rush-forecast push, whatever TOGVARSEL_NOTIFY_ENABLED says.
+
+    The AND is what lets dev's and prd's TOGVARSEL_NOTIFY_ENABLED="true" stay in place while the
+    product is dark, so re-enabling is one value per environment. Both directions are checked
+    because only one of them is the failure that would ship silently: an override that read the
+    master gate but not the delivery flag would turn pushes ON in tst the moment the product was
+    un-hidden, in the one environment that has never notified.
+
+    This one function is the seam for all three ways rushvarsel reaches a traveller — the push
+    round's `enabled` gate, /varsel-api/config's `togvarsel_notify` (the «Nytt: Rushvarsel»
+    notice) and rush_outlook()'s gate (the panel at the top of /varsel) — so the four cases here
+    are the whole matrix for every one of them.
+    """
+    for show, notify, want in (
+        ("true", "true", True),     # the product on, this environment delivering
+        ("true", "false", False),   # the product on, this environment silent (tst)
+        ("false", "true", False),   # dark: dev's and prd's delivery values stay, and do nothing
+        ("false", "false", False),
+        (None, "true", False),      # unset master gate is off, and needs no helm value to be
+    ):
+        with _env(SHOW_RUSHVARSEL=show, TOGVARSEL_NOTIFY_ENABLED=notify):
+            assert main._togvarsel_notify_enabled() is want, (show, notify)
+
+
+def test_neither_the_page_nor_the_api_answers_while_the_master_gate_is_off():
+    """With SHOW_RUSHVARSEL off, nothing under /togmelding answers on main's own app.
+
+    Both halves are gated at IMPORT time, unlike every other read of this flag, and for two
+    different reasons. The page: a Mount cannot be conditioned per request without first
+    answering the bare /togmelding with a 307 to the trailing slash, so it is gated by not being
+    mounted. The API: a router that is registered but 404s would still publish its endpoint names
+    on /docs (FastAPI's default docs_url), and a listing is itself a mention of a product we are
+    not showing — hence the schema assertion, which is the only one of these that /docs reflects.
+
+    Probed by ASKING rather than by scanning app.routes: this FastAPI version keeps an included
+    router as one opaque `_IncludedRouter` whose `path` is None, so a scan finds no
+    /togmelding-api route even when the router IS registered and would pass identically either
+    way (test_meldinger.py:2029 documents the same trap). /config endpoints need neither BigQuery
+    nor the lifespan, which is what makes 404-vs-200 a clean read on registration alone.
+
+    This suite imports main with SHOW_RUSHVARSEL unset, the posture every deployment is in today,
+    so what is asserted here is the shipped behaviour; the first line is what keeps that true if
+    an ambient value ever appears.
+    """
+    import os
+
+    from fastapi.testclient import TestClient
+
+    assert os.environ.get("SHOW_RUSHVARSEL", "").strip().lower() not in ("true", "1", "yes", "on")
+    client = TestClient(main.app)
+    # The API: every route, not just the payload one — /config answering 200 would tell a reader
+    # the page exists and is merely empty.
+    assert client.get("/togmelding-api/today").status_code == 404
+    assert client.get("/togmelding-api/config").status_code == 404
+    assert client.get("/togmelding-api/outlook", params={"device_id": "d-1"}).status_code == 404
+    # The page, on both spellings: a per-request gate inside a mounted StaticFiles would answer
+    # the first of these with a 307 to the second, which is why the mount is skipped instead.
+    assert client.get("/togmelding", follow_redirects=False).status_code == 404
+    assert client.get("/togmelding/").status_code == 404
+    # And off /docs: nothing under /togmelding is in the published schema.
+    schema = main.app.openapi()["paths"]
+    assert not [p for p in schema if p.startswith("/togmelding")], [
+        p for p in schema if p.startswith("/togmelding")
+    ]
+    # The gate is about ONE product: the sibling surfaces still answer and are still published.
+    assert client.get("/varsel-api/config").status_code == 200
+    assert "/varsel-api/config" in schema
+    # The page's directory constant is untouched, so flipping the flag needs no other change.
+    assert main._TOGMELDING_STATIC_DIR.name == "togmelding_static"
 
 
 if __name__ == "__main__":
