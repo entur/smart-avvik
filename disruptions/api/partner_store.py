@@ -145,6 +145,22 @@ MAX_ALERT_DELIVERIES_PER_DAY = 4
 # time first (see `_prune_marks` / `_prune_daily`), so hitting these means something is wrong.
 MAX_DELIVERED_MARKS = 500
 MAX_DAILY_COUNTERS = 14
+# What the partner API may SERVE of a subscription's current alert state, and what one request may
+# READ to compute it. Two numbers because they answer different questions.
+#
+# The served cap is `MAX_ALERT_DELIVERIES_PER_DAY`, deliberately the same number: R11 lets at most
+# four notifications about a subscription reach a traveller in an Oslo day, so a fifth subject is
+# not something anybody can be told about today, and a list that grew past it would be reporting
+# what the cap has already suppressed. AE3 is why a cap is needed at all -- one line suspension put
+# thirteen cancelled departures inside one subscription's window -- and the per-row COUNTS carry the
+# rest, so nothing is hidden, only unenumerated.
+#
+# The read ceiling bounds the whole request rather than a row: the list route reads every
+# subscription's subjects in ONE partner-scoped query and groups them in Python, because a query
+# per row would be a hundred queries on a hundred-row page. Past this ceiling the snapshot reports
+# `truncated`, and the counts are lower bounds rather than answers -- see `partner_alerts`.
+MAX_ALERTS_SERVED = 4
+MAX_SUBJECTS_PER_READ = 500
 # Consecutive below-threshold cycles before an alert is withdrawn. Two, not one: a single cycle's
 # dip below the gate is noise, and a withdrawal is itself a notification. A planning default -- the
 # reversal condition is a measurement of how often a withdrawn subject re-crosses the gate.
@@ -285,6 +301,26 @@ def _client() -> Any:
 
     _client_obj = firestore.Client(database=_database)
     return _client_obj
+
+
+def client() -> Any:
+    """The one Firestore client this process holds, built on first use.
+
+    Public so ``partner_auth`` -- the identity plane, which stores its accounts, credentials,
+    destinations and operator audit in the same named database -- does not open a second one. Two
+    clients means two gRPC channels and two connection pools in a single-replica deployment whose
+    poller already shares the thread, for no gain: there is one database and one process.
+
+    It is also what keeps **one place deciding which database is opened**. The project is never an
+    argument -- it comes from the ambient environment (``GOOGLE_CLOUD_PROJECT`` / ADC) -- and that
+    is what R1's environment isolation rests on: each environment is its own GCP project with its
+    own runtime identity, so a dev credential cannot name prd's data because nothing in this code
+    path can name a project at all.
+
+    Still lazy: a deployment with the channel switched off imports no library and needs no
+    credential, and nothing here runs at module import.
+    """
+    return _client()
 
 
 # ---- Time, expiry and the two per-subscription maps -------------------------------------------
@@ -563,6 +599,25 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         equality=("partner_id", "status"),
         order_by=(("created_at", "ASCENDING"),),
         why="a partner lists its own subscriptions, and the create-time ceiling count",
+    ),
+    QuerySpec(
+        name="subscription_alerts",
+        collection=SUBJECTS,
+        equality=("subscription_id",),
+        # `updated_at` DESCENDING, and the direction is the same argument
+        # `load_active_subscriptions` makes for its own: the page is truncated at a ceiling, so
+        # whichever end the ordering puts first is what survives. Most-recently-written first is
+        # what the current state is made of -- a subject document is rewritten on every lifecycle
+        # transition -- and it sheds subjects nothing has happened to before ones that just changed.
+        order_by=(("updated_at", "DESCENDING"),),
+        why="one subscription's current alert state, for the partner API",
+    ),
+    QuerySpec(
+        name="partner_alerts",
+        collection=SUBJECTS,
+        equality=("partner_id",),
+        order_by=(("updated_at", "DESCENDING"),),
+        why="every subscription's alert state in ONE query, for the partner API's list page",
     ),
     QuerySpec(
         name="pending_deliveries",
@@ -1919,6 +1974,276 @@ def get_subject(alert_id: str, *, now: datetime | None = None) -> AlertSubject |
     return _subject_from_doc(stored)
 
 
+# ---- Current alert state, as the partner API serves it -----------------------------------------
+
+
+@dataclass(frozen=True)
+class AlertState:
+    """One standing alert on one subscription: which train, which phase, which revision.
+
+    The display half of an :class:`AlertSubject`, with the train reassembled into a
+    :class:`TrainRef` so the API and an event describe a train the same way -- the six fields below
+    are exactly what ``event.schema.json`` carries, so a partner joining a card to an event is
+    comparing like with like.
+
+    ``delivered_revision`` is what the cap exemption reads at the next mint, and it is served
+    because it is the one field that answers "did this reach the traveller": a subject with a
+    revision and no ``delivered_revision`` is an alert we hold and they do not.
+    """
+
+    alert_id: str
+    subscription_id: str
+    phase: str
+    revision: int
+    delivered_revision: int | None
+    train: TrainRef
+    updated_at: datetime | None
+
+
+@dataclass(frozen=True)
+class AlertSnapshot:
+    """One subscription's current alert state, bounded.
+
+    ``truncated`` is the honest half and must be rendered rather than ignored: past
+    :data:`MAX_SUBJECTS_PER_READ` the counts are LOWER BOUNDS, so ``n_active == 0`` beside
+    ``truncated`` means "we could not establish this", never "all clear". Same rule R6 applies to
+    servability, applied to a second question -- and the reason the list route marks every row in a
+    page truncated when its one query was, rather than letting a quiet row read as calm.
+    """
+
+    subscription_id: str
+    as_of: datetime
+    n_active: int
+    n_confirmed: int
+    truncated: bool
+    subjects: tuple[AlertState, ...]
+
+
+#: Worst first: a declared cancellation outranks a forecast. `withdrawn` is listed for completeness
+#: and never reaches a snapshot -- see `_alert_state_from_doc`'s caller.
+_PHASE_RANK = {PHASE_CONFIRMED: 0, PHASE_PREDICTED: 1, PHASE_WITHDRAWN: 2}
+
+
+def _alert_state_from_doc(doc: Mapping[str, Any]) -> AlertState:
+    return AlertState(
+        alert_id=str(doc["alert_id"]),
+        subscription_id=str(doc["subscription_id"]),
+        phase=str(doc["phase"]),
+        revision=int(doc.get("revision") or 0),
+        delivered_revision=(
+            int(doc["delivered_revision"]) if doc.get("delivered_revision") is not None else None
+        ),
+        train=TrainRef(
+            operator=str(doc.get("operator") or ""),
+            line=str(doc.get("line") or ""),
+            journey_ref=str(doc.get("journey_ref") or ""),
+            call_date=str(doc.get("call_date") or ""),
+            stop_place=str(doc.get("stop_place") or ""),
+            stop_order=int(doc.get("stop_order") or 0),
+        ),
+        updated_at=_as_dt(doc.get("updated_at")),
+    )
+
+
+def _snapshot(
+    subscription_id: str,
+    rows: list[Mapping[str, Any]],
+    *,
+    now: datetime,
+    truncated: bool,
+) -> AlertSnapshot:
+    """Rank and bound one subscription's subject documents.
+
+    Three things happen here and each is a decision.
+
+    **A withdrawn subject is not served at all.** The question is what alerts STAND, and a
+    withdrawal is the retraction of one -- the partner's receiver already got the withdrawal event,
+    and re-offering it here would invite a card for a train we have said is fine.
+
+    **Ranking is phase first, then recency.** So a declared cancellation is never displaced by a
+    forecast that happened to change more recently, which is the one ordering mistake that would
+    make the cap hide the thing that matters. Ties break on ``alert_id`` so the list cannot flip
+    between two requests about unchanged data.
+
+    **The COUNTS are over everything read, the LIST over the cap.** That split is what makes the
+    cap safe: nothing is hidden, only unenumerated.
+    """
+    states: list[AlertState] = []
+    for doc in rows:
+        try:
+            state = _alert_state_from_doc(doc)
+        except Exception:
+            # One unreadable document is skipped rather than failing its collection (R20) -- the
+            # same per-document guard `active_subscriptions` applies.
+            logger.debug("Unreadable partner alert subject; skipping it", exc_info=True)
+            continue
+        if state.phase not in PHASES:
+            continue
+        states.append(state)
+    states.sort(
+        key=lambda s: (
+            _PHASE_RANK.get(s.phase, len(_PHASE_RANK)),
+            -(s.updated_at or _REVISION_EPOCH).timestamp(),
+            s.alert_id,
+        )
+    )
+    return AlertSnapshot(
+        subscription_id=subscription_id,
+        as_of=now,
+        n_active=len(states),
+        n_confirmed=sum(1 for s in states if s.phase == PHASE_CONFIRMED),
+        truncated=truncated,
+        subjects=tuple(states[:MAX_ALERTS_SERVED]),
+    )
+
+
+def _live_subject_rows(page: list[Any], now: datetime) -> tuple[list[dict[str, Any]], int]:
+    """The unexpired documents in a page, and how many were dropped.
+
+    Every read path tests the expiry field ITSELF, because TTL deletion runs up to ~24 h late and
+    an expired document is returned by queries and lookups until it does. Here that is not merely
+    hygiene: a subject document outlives the dated train it describes by up to a week
+    (:data:`HISTORY_DAYS`), so trusting TTL would show a partner last Tuesday's cancellation as a
+    standing alert.
+    """
+    rows: list[dict[str, Any]] = []
+    expired = 0
+    for snapshot in page:
+        stored = _doc(snapshot)
+        if not stored:
+            continue
+        if not _not_expired(stored, now):
+            expired += 1
+            continue
+        rows.append(stored)
+    return rows, expired
+
+
+def subscription_alerts(
+    subscription_id: str,
+    *,
+    partner_id: str | None = None,
+    limit: int = MAX_SUBJECTS_PER_READ,
+    now: datetime | None = None,
+) -> AlertSnapshot:
+    """One subscription's current alert state, in ONE query.
+
+    A read of what the emit path has already committed, never a re-evaluation: ``commit_event``
+    writes one document per (subscription, train) carrying its revision and lifecycle phase, and
+    that *is* the current state. Nothing here consults the matcher, ``/impact`` or a prediction
+    cache -- which is what makes it affordable on a request path at all.
+
+    Tenancy is checked here rather than left to the caller, like every other subscription-scoped
+    method in this module: a subject carries its own ``partner_id``, so a mismatch is
+    :class:`Forbidden` and one partner cannot read another's alert state through this.
+    """
+    instant = now or _now()
+    query = _query(
+        "subscription_alerts",
+        equality={"subscription_id": subscription_id},
+        limit=min(limit, MAX_SUBJECTS_PER_READ),
+    )
+    page = list(query.stream())
+    rows, _expired = _live_subject_rows(page, instant)
+    if partner_id is not None:
+        for row in rows:
+            if str(row.get("partner_id") or "") != partner_id:
+                raise Forbidden("alert subject belongs to another partner")
+    return _snapshot(
+        subscription_id, rows, now=instant, truncated=len(page) >= min(limit, MAX_SUBJECTS_PER_READ)
+    )
+
+
+@dataclass(frozen=True)
+class PartnerAlerts:
+    """Every snapshot one partner-scoped read produced, plus whether the read itself was bounded.
+
+    ``truncated`` is on the WRAPPER as well as on each snapshot, and that is not redundancy: a
+    subscription whose subjects fell outside the page is ABSENT from ``snapshots``, so without a
+    flag the caller could not tell "this one has no standing alert" from "this one was crowded
+    out". The API renders an absent row as unknown rather than calm whenever this is set.
+    """
+
+    snapshots: dict[str, AlertSnapshot]
+    truncated: bool
+
+
+def partner_alerts(
+    partner_id: str, *, limit: int = MAX_SUBJECTS_PER_READ, now: datetime | None = None
+) -> PartnerAlerts:
+    """Every one of a partner's subscriptions' alert state, in ONE query, keyed by subscription id.
+
+    **One query per request, not one per row.** The list page can hold hundreds of subscriptions,
+    and a per-row read would be a query and up to :data:`MAX_SUBJECTS_PER_READ` document reads
+    apiece -- which is the reason this is partner-scoped and grouped in Python rather than called in
+    a loop.
+
+    What that buys costs one thing, and it is reported rather than hidden: the ceiling is on the
+    whole request, so a partner with more live subjects than the ceiling gets a page in which
+    **every** snapshot is marked ``truncated``, including the rows whose own subjects happened to
+    fit. Marking only the rows that were cut would be worse and is the mistake to avoid: a
+    subscription whose subjects fell outside the page would then read ``n_active: 0``, which is
+    indistinguishable from calm. A caller seeing ``truncated`` asks about the subscription it cares
+    about through :func:`subscription_alerts`, which is scoped to one and cannot be crowded out.
+
+    A subscription with no live subjects is simply absent from the mapping; the API renders that as
+    an empty snapshot, which is the one case where "nothing" really does mean "no standing alert".
+    """
+    instant = now or _now()
+    ceiling = min(limit, MAX_SUBJECTS_PER_READ)
+    query = _query("partner_alerts", equality={"partner_id": partner_id}, limit=ceiling)
+    page = list(query.stream())
+    rows, expired = _live_subject_rows(page, instant)
+    truncated = len(page) >= ceiling
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("subscription_id") or ""), []).append(row)
+    if truncated or expired:
+        logger.warning(
+            "Partner alert-state read bounded: %d live, %d expired, truncated=%s",
+            len(rows),
+            expired,
+            truncated,
+            extra={
+                "fields": {
+                    "event": "partner_quota",
+                    "result": "alert_state",
+                    "partner_id": partner_id,
+                    "n": len(rows),
+                    "expired": expired,
+                    "truncated": truncated,
+                }
+            },
+        )
+    return PartnerAlerts(
+        snapshots={
+            subscription_id: _snapshot(
+                subscription_id, subject_rows, now=instant, truncated=truncated
+            )
+            for subscription_id, subject_rows in grouped.items()
+            if subscription_id
+        },
+        truncated=truncated,
+    )
+
+
+def empty_alert_snapshot(subscription_id: str, *, now: datetime | None = None) -> AlertSnapshot:
+    """The snapshot for a subscription with no live subjects. NOT the same as a failed read.
+
+    Its own function so the API cannot express "no standing alerts" and "we could not establish
+    this" with the same value: this one is ``truncated=False``, which is a claim, while a bounded or
+    failed read carries ``truncated=True`` and no claim at all.
+    """
+    return AlertSnapshot(
+        subscription_id=subscription_id,
+        as_of=now or _now(),
+        n_active=0,
+        n_confirmed=0,
+        truncated=False,
+        subjects=(),
+    )
+
+
 def _count_destination_deliveries(destination_id: str, *, state: str) -> int:
     """How many deliveries this destination holds in ``state``, bounded by the ceiling + 1.
 
@@ -2469,7 +2794,11 @@ def event_validity(
 
 
 __all__ = [
+    "MAX_ALERTS_SERVED",
+    "MAX_SUBJECTS_PER_READ",
     "QUERY_SPECS",
+    "AlertSnapshot",
+    "AlertState",
     "AlertSubject",
     "CleanupResult",
     "Conflict",
@@ -2482,6 +2811,7 @@ __all__ = [
     "LoadedSubscriptions",
     "NotConfigured",
     "NotFound",
+    "PartnerAlerts",
     "PartnerStoreError",
     "PendingDeliveries",
     "QuerySpec",
@@ -2494,11 +2824,13 @@ __all__ = [
     "cap_remaining",
     "claim_delivery",
     "cleanup_subscription",
+    "client",
     "commit_event",
     "configure",
     "create_subscription",
     "database_id",
     "delete_subscription",
+    "empty_alert_snapshot",
     "enabled",
     "event_id_for",
     "event_is_valid",
@@ -2514,12 +2846,14 @@ __all__ = [
     "mark_delivery_failed",
     "mark_delivery_sent",
     "oslo_day",
+    "partner_alerts",
     "pending_deliveries",
     "recipient_documents",
     "record_below_threshold",
     "replace_subscription",
     "reset_for_tests",
     "set_servability",
+    "subscription_alerts",
     "subscription_is_live",
     "touch_subscription",
 ]

@@ -1072,6 +1072,308 @@ def test_our_own_errors_are_terminal_and_transport_errors_are_not():
         assert partner_store.is_retryable(retryable), retryable
 
 
+# ---- Current alert state: the read the partner API serves ---------------------------------------
+
+
+def _alert_page(client: _FakeClient, docs: list[dict[str, Any]]) -> None:
+    """Put subject documents where BOTH new query specs will find them."""
+    for doc in docs:
+        client.put(partner_store.SUBJECTS, doc["alert_id"], doc)
+    rows = [(f"{partner_store.SUBJECTS}/{d['alert_id']}", d) for d in docs]
+    client.pages["subscription_alerts"] = rows
+    client.pages["partner_alerts"] = rows
+
+
+def _state(alert_id: str, phase: str, *, updated: datetime = NOW, **over: Any) -> dict[str, Any]:
+    doc = {
+        "alert_id": alert_id,
+        "subscription_id": SID,
+        "partner_id": PARTNER,
+        "destination_id": DEST,
+        "revision": 5,
+        "phase": phase,
+        "delivered_revision": None,
+        "operator": TRAIN.operator,
+        "line": TRAIN.line,
+        "journey_ref": TRAIN.journey_ref,
+        "call_date": TRAIN.call_date,
+        "stop_place": TRAIN.stop_place,
+        "stop_order": TRAIN.stop_order,
+        "created_at": NOW,
+        "updated_at": updated,
+        partner_store.TTL_FIELD: NOW + timedelta(days=partner_store.HISTORY_DAYS),
+    }
+    doc.update(over)
+    return doc
+
+
+def test_the_subject_document_the_emit_path_writes_is_readable_as_alert_state():
+    """The two halves have to agree, and the writer is the authority.
+
+    `commit_event` decides which fields a subject carries; this reads one back through the public
+    accessor rather than through a fixture, so a field the writer renames cannot pass here.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+        commit = partner_store.commit_event(_emit())
+        assert commit.status == "created"
+        stored = client.doc(partner_store.SUBJECTS, commit.alert_id)
+        _alert_page(client, [stored])
+        snapshot = partner_store.subscription_alerts(SID, partner_id=PARTNER)
+        assert snapshot.n_active == 1
+        assert snapshot.n_confirmed == 0
+        assert snapshot.truncated is False
+        state = snapshot.subjects[0]
+        assert state.alert_id == commit.alert_id
+        assert state.phase == partner_store.PHASE_PREDICTED
+        assert state.revision == commit.revision
+        assert state.delivered_revision is None
+        # The train comes back as the same TrainRef the caller emitted, which is what makes an API
+        # card and an event describe one train in one vocabulary.
+        assert state.train == TRAIN
+    finally:
+        _uninstall()
+
+
+def test_the_alert_state_read_consults_no_model_and_no_matcher():
+    """A read of what is already committed, not a re-evaluation.
+
+    Structural, because that is the claim: nothing in this module can reach the matcher, `/impact`
+    or a prediction cache -- it imports none of them -- and the two functions issue exactly one
+    query each through the spec helper.
+    """
+    for forbidden in ("import varsel", "import impact", "import main", "ML.PREDICT"):
+        assert forbidden not in MODULE_SOURCE, forbidden
+    client = _FakeClient()
+    _install(client)
+    try:
+        _alert_page(client, [_state("a", partner_store.PHASE_PREDICTED)])
+        client.query_calls.clear()
+        partner_store.subscription_alerts(SID)
+        assert [c[0] for c in client.query_calls] == ["subscription_alerts"]
+        client.query_calls.clear()
+        partner_store.partner_alerts(PARTNER)
+        assert [c[0] for c in client.query_calls] == ["partner_alerts"]
+    finally:
+        _uninstall()
+
+
+def test_a_withdrawn_subject_does_not_stand_and_is_never_served():
+    """The question is what alerts STAND. A withdrawal is the retraction of one, the partner's
+    receiver already has the withdrawal event, and re-offering it here would invite a card for a
+    train we have said is fine."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        _alert_page(
+            client,
+            [
+                _state("a", partner_store.PHASE_WITHDRAWN),
+                _state("b", partner_store.PHASE_PREDICTED),
+            ],
+        )
+        snapshot = partner_store.subscription_alerts(SID)
+        assert [s.alert_id for s in snapshot.subjects] == ["b"]
+        assert snapshot.n_active == 1
+    finally:
+        _uninstall()
+
+
+def test_the_worst_alert_survives_the_cap_and_the_order_cannot_flip():
+    """Phase first, then recency, then the id.
+
+    Phase first is the one ordering mistake that would matter: a declared cancellation displaced by
+    a forecast that happened to change more recently is exactly the case where the cap would hide
+    the thing worth seeing. The id tie-break is what keeps two requests about unchanged data from
+    returning two different lists.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        docs = [
+            _state(f"p{i}", partner_store.PHASE_PREDICTED, updated=NOW - timedelta(minutes=i))
+            for i in range(partner_store.MAX_ALERTS_SERVED + 3)
+        ]
+        # The confirmed one is the STALEST, so only a phase-first ranking keeps it.
+        docs.append(
+            _state("confirmed", partner_store.PHASE_CONFIRMED, updated=NOW - timedelta(hours=6))
+        )
+        _alert_page(client, docs)
+        snapshot = partner_store.subscription_alerts(SID)
+        assert len(snapshot.subjects) == partner_store.MAX_ALERTS_SERVED
+        assert snapshot.subjects[0].alert_id == "confirmed"
+        # The counts are over EVERYTHING read, so the cap hides nothing -- it only stops enumerating.
+        assert snapshot.n_active == len(docs)
+        assert snapshot.n_confirmed == 1
+        assert snapshot.truncated is False
+        again = partner_store.subscription_alerts(SID)
+        assert [s.alert_id for s in again.subjects] == [s.alert_id for s in snapshot.subjects]
+    finally:
+        _uninstall()
+
+
+def test_an_expired_subject_is_not_a_standing_alert():
+    """Every read path tests the expiry field itself, and here it is not hygiene.
+
+    A subject document outlives the dated train it describes by up to HISTORY_DAYS, and TTL runs up
+    to ~24 h late -- so trusting TTL would show last Tuesday's cancellation as a standing alert.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        _alert_page(
+            client,
+            [
+                _state("stale", partner_store.PHASE_CONFIRMED,
+                       **{partner_store.TTL_FIELD: NOW - timedelta(seconds=1)}),
+                _state("live", partner_store.PHASE_PREDICTED),
+                # An unreadable expiry reads as expired, the direction a retention promise must
+                # fail in.
+                _state("unreadable", partner_store.PHASE_PREDICTED,
+                       **{partner_store.TTL_FIELD: "not a timestamp"}),
+            ],
+        )
+        snapshot = partner_store.subscription_alerts(SID)
+        assert [s.alert_id for s in snapshot.subjects] == ["live"]
+        assert snapshot.n_active == 1
+    finally:
+        _uninstall()
+
+
+def test_one_partner_cannot_read_anothers_alert_state():
+    """Tenancy is checked here rather than left to the caller, like every other
+    subscription-scoped method in this module."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        _alert_page(client, [_state("a", partner_store.PHASE_PREDICTED)])
+        assert partner_store.subscription_alerts(SID, partner_id=PARTNER).n_active == 1
+        forbidden = False
+        try:
+            partner_store.subscription_alerts(SID, partner_id="someone-else")
+        except partner_store.Forbidden:
+            forbidden = True
+        assert forbidden
+    finally:
+        _uninstall()
+
+
+def test_the_partner_wide_read_is_one_query_grouped_by_subscription():
+    """R21's shape at the request layer: one query per REQUEST, never one per row.
+
+    A list page can hold hundreds of watches, and a per-row read would be hundreds of queries plus
+    up to MAX_SUBJECTS_PER_READ document reads apiece.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        docs = [
+            _state("a", partner_store.PHASE_PREDICTED),
+            _state("b", partner_store.PHASE_CONFIRMED, subscription_id="sub-2"),
+            _state("c", partner_store.PHASE_PREDICTED, subscription_id="sub-2"),
+        ]
+        _alert_page(client, docs)
+        client.query_calls.clear()
+        loaded = partner_store.partner_alerts(PARTNER)
+        assert len(client.query_calls) == 1
+        assert loaded.truncated is False
+        assert set(loaded.snapshots) == {SID, "sub-2"}
+        assert loaded.snapshots[SID].n_active == 1
+        assert loaded.snapshots["sub-2"].n_active == 2
+        assert loaded.snapshots["sub-2"].n_confirmed == 1
+    finally:
+        _uninstall()
+
+
+def test_a_bounded_read_marks_every_snapshot_and_the_wrapper():
+    """The truncation flag is the honest half, and it must survive an EMPTY mapping.
+
+    A subscription whose subjects fell outside the page is absent from `snapshots`, so without the
+    flag on the wrapper the caller could not tell "no standing alert" from "crowded out" -- and
+    rendering the second as the first is exactly the all-clear R6 forbids.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        docs = [
+            _state(f"a{i}", partner_store.PHASE_PREDICTED) for i in range(4)
+        ]
+        _alert_page(client, docs)
+        loaded = partner_store.partner_alerts(PARTNER, limit=2)
+        assert loaded.truncated is True
+        assert all(s.truncated for s in loaded.snapshots.values())
+        one = partner_store.subscription_alerts(SID, limit=2)
+        assert one.truncated is True
+        # And an empty page still carries the flag on the wrapper.
+        client.pages["partner_alerts"] = []
+        empty = partner_store.partner_alerts(PARTNER, limit=2)
+        assert empty.snapshots == {} and empty.truncated is False
+    finally:
+        _uninstall()
+
+
+def test_an_empty_snapshot_is_a_claim_and_a_bounded_one_is_not():
+    """The two must not be expressible with the same value: one says "no standing alert", the other
+    says "we do not know", and a client that cannot tell them apart shows the second as the
+    first."""
+    empty = partner_store.empty_alert_snapshot(SID, now=NOW)
+    assert empty.n_active == 0 and empty.n_confirmed == 0
+    assert empty.truncated is False
+    assert empty.subjects == ()
+    assert empty.as_of == NOW
+
+
+def test_an_unreadable_subject_is_skipped_rather_than_failing_its_collection():
+    """R20's per-document guard, the same one `active_subscriptions` applies."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        broken = _state("broken", partner_store.PHASE_PREDICTED)
+        broken.pop("alert_id")  # the one field `_alert_state_from_doc` cannot do without
+        # Registered by hand: `_alert_page` keys on alert_id, which this row deliberately lacks.
+        client.pages["subscription_alerts"] = [
+            (f"{partner_store.SUBJECTS}/broken", broken),
+            (f"{partner_store.SUBJECTS}/fine", _state("fine", partner_store.PHASE_PREDICTED)),
+        ]
+        snapshot = partner_store.subscription_alerts(SID)
+        assert [s.alert_id for s in snapshot.subjects] == ["fine"]
+    finally:
+        _uninstall()
+
+
+def test_the_read_ceiling_and_the_served_cap_are_separate_numbers():
+    """They answer different questions: what one request may READ, and what one row may SHOW.
+
+    The served cap is the daily notification allowance on purpose -- a fifth subject is not
+    something anybody can be told about today.
+    """
+    assert partner_store.MAX_ALERTS_SERVED == partner_store.MAX_ALERT_DELIVERIES_PER_DAY
+    assert partner_store.MAX_SUBJECTS_PER_READ > partner_store.MAX_ALERTS_SERVED
+
+
+def test_the_identity_plane_shares_this_modules_one_client():
+    """Two gRPC channels to one database in a single-replica process is a cost with no gain, and
+    `partner_auth` reads through the accessor below rather than opening a second one."""
+    import partner_auth
+
+    client = _FakeClient()
+    _install(client)
+    try:
+        assert partner_store.client() is client
+        # `partner_auth` names no database of its own, so there is one place that decides.
+        assert "database" not in inspect.signature(partner_auth.configure).parameters
+        assert "partner_store.client()" in pathlib.Path(
+            pathlib.Path(partner_auth.__file__)
+        ).read_text()
+        partner_auth.configure()
+        assert partner_auth.store_ready() is True
+    finally:
+        _uninstall()
+        partner_auth.reset_for_tests()
+
+
 # ---- Scenario 8: index coverage, both directions -----------------------------------------------
 
 

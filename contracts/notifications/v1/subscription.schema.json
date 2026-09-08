@@ -59,7 +59,11 @@
       "minItems": 1,
       "maxItems": 7,
       "uniqueItems": true,
-      "items": { "type": "integer", "minimum": 0, "maximum": 6 },
+      "items": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 6
+      },
       "description": "Weekdays the window applies on, 0 = Monday."
     },
     "partner_ref": {
@@ -80,15 +84,24 @@
     },
     "status": {
       "type": "string",
-      "enum": ["active", "deleted"],
+      "enum": [
+        "active",
+        "deleted"
+      ],
       "description": "Read-only. `deleted` is a tombstone written in a single transaction that stops routing; the events, deliveries and subjects behind it are then removed by a retryable cleanup task with an auditable completion state, and the tombstone's own route is redacted the moment that completes."
     },
     "servable": {
-      "type": ["boolean", "null"],
+      "type": [
+        "boolean",
+        "null"
+      ],
       "description": "Whether any planned direct trip runs between the two places. `null` means the answer could not be established -- an outage, a timeout -- and must never render as an all-clear. A subscription no direct trip can serve carries the caveat and is NEVER refused: weekend-only and seasonal routes are why a refusal would be wrong."
     },
     "servable_checked_at": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "format": "date-time",
       "description": "How fresh the servability answer is. Missing or stale data never reads as an all-clear."
     },
@@ -97,7 +110,119 @@
       "format": "date-time",
       "description": "Read-only. The earlier of a 180-day maximum lifetime from creation and a 60-day inactivity horizon from the last partner interaction. Both are enforced on READ as well as by the store's TTL, because TTL deletion runs up to ~24 hours late and a subscription that kept alerting for a day past its published expiry would be a broken promise rather than a slow cleanup."
     },
-    "created_at": { "type": "string", "format": "date-time" },
-    "updated_at": { "type": "string", "format": "date-time" }
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "alerts": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "required": [
+        "as_of",
+        "n_active",
+        "n_confirmed",
+        "truncated",
+        "subjects"
+      ],
+      "description": "Current alert state: what stands right now about this subscription, read from the notification service's own committed alert subjects rather than re-evaluated. Present on both GET routes; `null` on the response to a create or replace, which does not read it -- so `null` means \"not included in this response\" and never \"no standing alerts\". The latter is `n_active: 0` with `truncated: false`.",
+      "properties": {
+        "as_of": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this state was read."
+        },
+        "n_active": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Standing alerts -- predicted or confirmed. A withdrawn alert is not one and is not counted."
+        },
+        "n_confirmed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many of those are confirmed cancellations rather than forecasts."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "True when the read was bounded by its ceiling or could not be completed. The counts are then LOWER BOUNDS: `n_active: 0` beside this means \"we could not establish it\", never \"all clear\". On a list page it is set on every row whenever that page's single query was bounded, because a subscription crowded out of the page would otherwise read exactly like a calm one -- ask about it individually and the read is scoped to it alone."
+        },
+        "subjects": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "The worst few standing alerts, worst first: a confirmed cancellation ahead of a forecast, then most recently changed, ties broken on `alert_id` so the order cannot flip between two requests about unchanged data. Deliberately capped at the number of notifications one subscription can receive in an Oslo day -- a longer list would enumerate what that cap has already suppressed -- and the counts above carry the rest, so nothing is hidden, only unenumerated.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "alert_id",
+              "phase",
+              "revision",
+              "delivered_revision",
+              "operator",
+              "line",
+              "journey_ref",
+              "call_date",
+              "stop_place",
+              "stop_order",
+              "updated_at"
+            ],
+            "properties": {
+              "alert_id": {
+                "$ref": "./event.schema.json#/properties/alert_id"
+              },
+              "phase": {
+                "type": "string",
+                "enum": [
+                  "predicted",
+                  "confirmed"
+                ],
+                "description": "A withdrawn alert does not stand and is never listed."
+              },
+              "revision": {
+                "$ref": "./event.schema.json#/properties/revision"
+              },
+              "delivered_revision": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "The highest revision about this train that was delivered to you, or null if none has been -- an alert we hold and you do not."
+              },
+              "operator": {
+                "$ref": "./event.schema.json#/properties/operator"
+              },
+              "line": {
+                "$ref": "./event.schema.json#/properties/line"
+              },
+              "journey_ref": {
+                "$ref": "./event.schema.json#/properties/journey_ref"
+              },
+              "call_date": {
+                "$ref": "./event.schema.json#/properties/call_date"
+              },
+              "stop_place": {
+                "$ref": "./event.schema.json#/properties/stop_place"
+              },
+              "stop_order": {
+                "$ref": "./event.schema.json#/properties/stop_order"
+              },
+              "updated_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              }
+            }
+          }
+        }
+      }
+    }
   }
 }

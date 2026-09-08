@@ -1,0 +1,938 @@
+"""Checks for partner_auth.py and for the operator tool that drives it.
+
+Hermetic: no emulator, no socket, no credentials. Every store access in ``partner_auth`` goes
+through the four-method :class:`partner_auth._Docs` seam, so an in-memory implementation exercises
+the real hashing, the real two-tier limiter, the real negative cache and the real audit path -- and
+the operator tool takes its authorizer and its store by injection, which is what lets scenario 10
+run with no Google group and no GCP project.
+
+Two things this file deliberately checks by GREPPING source rather than by behaviour, because no
+runtime test can establish either. That ``partner_api`` never names the audit collection is R22's
+"no partner credential can read it", and it is a projection argument -- Firestore has no
+per-collection IAM (KTD5), so nothing at runtime distinguishes "the route cannot read it" from
+"this request happened not to". And that the audit collection is append-only is a property of every
+write site in the repo, not of a document.
+"""
+
+from __future__ import annotations
+
+import io
+import logging
+import os
+import pathlib
+import re
+import sys
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+import partner_auth
+
+HERE = pathlib.Path(__file__).resolve().parent
+REPO = HERE.parents[1]
+AUTH_SOURCE = (HERE / "partner_auth.py").read_text()
+API_SOURCE = (HERE / "partner_api.py").read_text()
+TOOL_PATH = REPO / "scripts" / "manage_notification_partner.py"
+TOOL_SOURCE = TOOL_PATH.read_text()
+
+if str(REPO / "scripts") not in sys.path:
+    sys.path.insert(0, str(REPO / "scripts"))
+
+import manage_notification_partner as tool
+
+NOW = datetime(2026, 9, 8, 6, 30, tzinfo=UTC)
+PARTNER = "acme"
+DEST = "acme-prod"
+#: 32 bytes exactly, which is `MIN_PEPPER_BYTES`: a shorter one must be refused, so the fixture
+#: sits on the bar rather than comfortably above it.
+PEPPER = "p" * 32
+#: A globally routable literal. `webhook_client.is_safe_address` refuses the RFC 5737
+#: documentation ranges, so "example" addresses do not work here -- its docstring says so.
+GOOD_URL = "https://hooks.acme.example.com/kix"
+
+
+# ---- The in-memory document seam --------------------------------------------------------------
+
+
+class _MemoryDocs:
+    """:class:`partner_auth._Docs` over a dict, counting reads so "costs no store read" is checkable.
+
+    ``fail_with`` is the store-outage injection: R20 wants a store failure to suppress the request
+    and nothing wider, and the only way to check that at this layer is to make the store raise.
+    """
+
+    def __init__(self) -> None:
+        self.data: dict[tuple[str, str], dict[str, Any]] = {}
+        self.reads = 0
+        self.writes: list[tuple[str, str]] = []
+        self.fail_with: BaseException | None = None
+
+    def _check(self) -> None:
+        if self.fail_with is not None:
+            raise self.fail_with
+
+    def get(self, collection: str, doc_id: str) -> dict[str, Any] | None:
+        self._check()
+        self.reads += 1
+        stored = self.data.get((collection, doc_id))
+        return dict(stored) if stored is not None else None
+
+    def set(self, collection: str, doc_id: str, doc: Any) -> None:
+        self._check()
+        self.writes.append((collection, doc_id))
+        self.data[(collection, doc_id)] = dict(doc)
+
+    def update(self, collection: str, doc_id: str, patch: Any) -> None:
+        self._check()
+        self.writes.append((collection, doc_id))
+        self.data.setdefault((collection, doc_id), {}).update(dict(patch))
+
+    def list_by(self, collection: str, field: str, value: Any, *, limit: int) -> list[dict]:
+        self._check()
+        self.reads += 1
+        rows = [
+            dict(doc)
+            for (coll, _), doc in self.data.items()
+            if coll == collection and doc.get(field) == value
+        ]
+        return rows[:limit]
+
+    def audit(self) -> list[dict[str, Any]]:
+        return [
+            doc
+            for (coll, _), doc in sorted(self.data.items())
+            if coll == partner_auth.ADMIN_AUDIT
+        ]
+
+
+def _install(docs: _MemoryDocs | None = None, *, pepper: str | None = PEPPER) -> _MemoryDocs:
+    store = docs or _MemoryDocs()
+    if pepper is None:
+        os.environ.pop(partner_auth.PEPPER_ENV, None)
+    else:
+        os.environ[partner_auth.PEPPER_ENV] = pepper
+    partner_auth.configure(docs=store, clock=lambda: NOW)
+    return store
+
+
+def _uninstall() -> None:
+    partner_auth.reset_for_tests()
+    os.environ.pop(partner_auth.PEPPER_ENV, None)
+
+
+def _provision(store: _MemoryDocs, *, url: str = GOOD_URL) -> str:
+    partner_auth.create_partner(PARTNER, name="Acme Reise AS", actor="operator@entur.org")
+    partner_auth.create_destination(
+        DEST, partner_id=PARTNER, callback_url=url, actor="operator@entur.org"
+    )
+    _credential, bearer = partner_auth.issue_credential(PARTNER, actor="operator@entur.org")
+    return bearer
+
+
+# ---- Configuration and the pepper -------------------------------------------------------------
+
+
+def test_an_unconfigured_deployment_is_not_a_bad_credential():
+    """No store or no pepper is a fact about THIS deployment, and must not read as a 401.
+
+    `authenticate` raises NotConfigured, which `partner_api._http` turns into 503 with a
+    Retry-After. The failure direction matters: a 401 here sends a partner hunting for a credential
+    problem that is ours.
+    """
+    _install(pepper=None)
+    try:
+        assert partner_auth.store_ready() is True
+        assert partner_auth.pepper_ready() is False
+        assert partner_auth.available() is False
+        raised = False
+        try:
+            partner_auth.authenticate("Bearer kixn_00000000000000000000.x")
+        except partner_auth.NotConfigured:
+            raised = True
+        assert raised, "an unusable pepper must raise NotConfigured, not AuthFailed"
+    finally:
+        _uninstall()
+
+
+def test_a_pepper_one_byte_short_is_refused():
+    _install(pepper="p" * (partner_auth.MIN_PEPPER_BYTES - 1))
+    try:
+        assert partner_auth.pepper_ready() is False
+    finally:
+        _uninstall()
+
+
+def test_a_pepper_written_with_echo_is_stripped_and_reported_once():
+    """A trailing newline re-hashes every credential at once and reports nothing on its own.
+
+    `feedback._env`'s lesson, and worse here: the eight silently dropped feedback submissions were
+    one endpoint, while this byte would 401 every partner simultaneously. Stripped rather than
+    refused (whitespace is a transport artefact of how the payload was written), and WARNED once so
+    the provisioning defect is findable.
+    """
+    _install(pepper=PEPPER + "\n")
+    try:
+        records: list[logging.LogRecord] = []
+        handler = logging.Handler()
+        handler.emit = records.append  # type: ignore[method-assign]
+        partner_auth.logger.addHandler(handler)
+        try:
+            assert partner_auth.pepper_ready() is True
+            first = partner_auth.secret_hash("kixn_0", "s")
+            second = partner_auth.secret_hash("kixn_0", "s")
+        finally:
+            partner_auth.logger.removeHandler(handler)
+        assert first == second
+        # The stripped value is what hashes, so the newline cannot change a single hash.
+        os.environ[partner_auth.PEPPER_ENV] = PEPPER
+        assert partner_auth.secret_hash("kixn_0", "s") == first
+        warnings = [r for r in records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, "warned once per process, not per read"
+    finally:
+        _uninstall()
+
+
+# ---- Hashing ----------------------------------------------------------------------------------
+
+
+def test_the_hash_is_bound_to_its_key_id():
+    """A hash lifted from one credential document must not verify under another `key-id`.
+
+    Without the id in the preimage, one stolen row authenticates as every partner whose row it is
+    pasted into -- and nothing about the store would look wrong.
+    """
+    _install()
+    try:
+        secret = "the-same-secret"
+        assert partner_auth.secret_hash("kixn_aaaaaaaaaaaaaaaaaaaa", secret) != (
+            partner_auth.secret_hash("kixn_bbbbbbbbbbbbbbbbbbbb", secret)
+        )
+    finally:
+        _uninstall()
+
+
+def test_the_hash_is_hmac_sha256_and_never_bcrypt_or_argon2():
+    """KTD8: HMAC-SHA256 under a pepper, because ~100 ms per comparison would be paid per request.
+
+    Checked structurally rather than by timing: the module must import `hmac` and `hashlib` and
+    must not name a password-hashing library at all.
+    """
+    assert "hmac.new(_pepper()" in AUTH_SOURCE
+    assert "hmac.compare_digest" in AUTH_SOURCE
+    # Over the IMPORT lines only. A bare substring search over the whole file matches the docstring
+    # that explains why none of these is used -- test_partner_store's `_uncommented` lesson, in the
+    # other direction: a negative grep that hits the explanation passes (or fails) for the wrong
+    # reason.
+    imports = [
+        line
+        for line in AUTH_SOURCE.splitlines()
+        if line.startswith(("import ", "from ")) or " import " in line
+    ]
+    for forbidden in ("bcrypt", "argon2", "passlib", "scrypt", "pbkdf2", "hashlib.scrypt"):
+        assert not any(forbidden in line.lower() for line in imports), forbidden
+    assert len(partner_auth.secret_hash.__doc__ or "") > 100
+
+
+def test_a_minted_credential_has_the_documented_shape():
+    key_id, secret = partner_auth.mint_credential()
+    assert partner_auth.KEY_ID_RE.match(key_id), key_id
+    assert key_id.startswith(partner_auth.KEY_ID_PREFIX)
+    assert len(secret) >= 40, "32 random bytes, urlsafe-base64 without padding"
+    assert partner_auth.bearer_credential(key_id, secret) == f"{key_id}.{secret}"
+
+
+# ---- The two-tier limiter and the negative cache ----------------------------------------------
+
+
+def test_a_malformed_header_costs_no_store_read_and_no_global_slot():
+    """The cheapest refusal in the path, and deliberately BEFORE the global tier.
+
+    A flood of garbage headers then cannot spend the budget that protects the credential lookup;
+    only a well-formed unknown key id reaches the tier designed to bound it.
+    """
+    store = _install()
+    try:
+        for header in (None, "", "Basic abc", "Bearer", "Bearer nodot", "Bearer bad.secret"):
+            failed = False
+            try:
+                partner_auth.authenticate(header)
+            except partner_auth.AuthFailed:
+                failed = True
+            assert failed, header
+        assert store.reads == 0
+        assert len(partner_auth._global_calls) == 0
+    finally:
+        _uninstall()
+
+
+def test_a_repeated_unknown_key_id_costs_one_store_read():
+    """Scenario 7, first half: the negative cache is what makes a bad credential cheap.
+
+    One read establishes that the key id is unknown; the next twenty are answered from memory. The
+    entry is short-lived (60 s) precisely because it is a negative cache on a security decision --
+    that bounds how long a freshly issued credential could be refused by a stale entry.
+    """
+    store = _install()
+    try:
+        header = "Bearer kixn_0123456789abcdef0123.whatever"
+        for _ in range(20):
+            try:
+                partner_auth.authenticate(header)
+            except partner_auth.AuthFailed:
+                pass
+        assert store.reads == 1, store.reads
+    finally:
+        _uninstall()
+
+
+def test_a_wrong_secret_for_a_known_key_is_never_cached():
+    """The other direction, and it must not be folded in with the one above.
+
+    Caching a wrong-secret refusal would let one bad attempt mask the RIGHT secret for a minute --
+    a self-inflicted outage triggered by anybody who can guess a key id.
+    """
+    store = _install()
+    bearer = _provision(store)
+    key_id = bearer.split(".")[0]
+    try:
+        before = store.reads
+        for _ in range(3):
+            try:
+                partner_auth.authenticate(f"Bearer {key_id}.wrong")
+            except partner_auth.AuthFailed as exc:
+                assert exc.reason == "secret"
+        assert store.reads - before == 3, "each wrong-secret attempt re-reads the credential"
+        # And the right secret still works immediately afterwards.
+        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
+    finally:
+        _uninstall()
+
+
+def test_an_anonymous_flood_cannot_spend_a_partners_own_budget():
+    """Scenario 7, second half. Two tiers, and the second is only reachable after authentication.
+
+    The flood exhausts the GLOBAL pre-lookup tier -- the accepted trade, which `/impact`'s limiter
+    already makes -- but spends none of the per-partner allowance, so the partner's budget is intact
+    the moment the global window rolls over.
+    """
+    store = _install()
+    bearer = _provision(store)
+    try:
+        seen_rate_limit = False
+        for n in range(partner_auth.GLOBAL_PRELOOKUP_PER_MIN + 5):
+            header = f"Bearer kixn_{n:020x}.nope"
+            try:
+                partner_auth.authenticate(header)
+            except partner_auth.RateLimited as exc:
+                seen_rate_limit = True
+                assert exc.tier == "global"
+                assert 0 < exc.retry_after_s <= 60
+            except partner_auth.AuthFailed:
+                pass
+        assert seen_rate_limit, "the global tier must bind"
+        assert partner_auth._partner_calls == {}, "no partner slot was spent by anonymous traffic"
+        # Roll the global window over; the partner still has its whole allowance.
+        partner_auth._global_calls.clear()
+        principal = partner_auth.authenticate(f"Bearer {bearer}")
+        for _ in range(partner_auth.PER_PARTNER_PER_MIN):
+            partner_auth.claim_partner_slot(principal.partner_id)
+        limited = False
+        try:
+            partner_auth.claim_partner_slot(principal.partner_id)
+        except partner_auth.RateLimited as exc:
+            limited = exc.tier == "partner"
+        assert limited
+    finally:
+        _uninstall()
+
+
+# ---- Credentials: rotation, revocation, suspension --------------------------------------------
+
+
+def test_several_credentials_live_at_once_and_revoking_one_leaves_the_other(
+):
+    """Scenario 6. KTD8's whole rotation story: a partner is never taken down to rotate a key."""
+    store = _install()
+    retiring = _provision(store)
+    try:
+        _new_record, replacement = partner_auth.issue_credential(
+            PARTNER, actor="operator@entur.org", label="rotation 2026-09"
+        )
+        assert retiring.split(".")[0] != replacement.split(".")[0]
+        assert partner_auth.authenticate(f"Bearer {retiring}").partner_id == PARTNER
+        assert partner_auth.authenticate(f"Bearer {replacement}").partner_id == PARTNER
+
+        partner_auth.revoke_credential(
+            retiring.split(".")[0], actor="operator@entur.org", reason="cutover complete"
+        )
+        revoked = False
+        try:
+            partner_auth.authenticate(f"Bearer {retiring}")
+        except partner_auth.AuthFailed as exc:
+            revoked = exc.reason == "revoked"
+        assert revoked
+        assert partner_auth.authenticate(f"Bearer {replacement}").partner_id == PARTNER
+
+        listed = partner_auth.list_credentials(PARTNER)
+        assert {c.status for c in listed} == {"active", "revoked"}
+        # An operator listing credentials never sees the material.
+        assert not any("secret" in c.__dataclass_fields__ for c in listed)
+    finally:
+        _uninstall()
+
+
+def test_a_suspended_partner_gets_403_not_401():
+    """A partner must be able to tell "my key is wrong" from "we have been switched off"."""
+    store = _install()
+    bearer = _provision(store)
+    try:
+        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
+        partner_auth.set_partner_suspended(
+            PARTNER, suspended=True, actor="operator@entur.org", reason="billing"
+        )
+        suspended = False
+        try:
+            partner_auth.authenticate(f"Bearer {bearer}")
+        except partner_auth.AuthSuspended:
+            suspended = True
+        assert suspended, "the account cache must be cleared by the suspension itself"
+        partner_auth.set_partner_suspended(PARTNER, suspended=False, actor="operator@entur.org")
+        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
+    finally:
+        _uninstall()
+
+
+def test_an_expired_credential_is_refused():
+    _install()
+    try:
+        partner_auth.create_partner(PARTNER, name="Acme", actor="op@entur.org")
+        _record, bearer = partner_auth.issue_credential(
+            PARTNER, actor="op@entur.org", expires_at=NOW - timedelta(seconds=1)
+        )
+        expired = False
+        try:
+            partner_auth.authenticate(f"Bearer {bearer}")
+        except partner_auth.AuthFailed as exc:
+            expired = exc.reason == "expired"
+        assert expired
+    finally:
+        _uninstall()
+
+
+def test_the_credential_ceiling_is_enforced_before_a_write():
+    store = _install()
+    try:
+        partner_auth.create_partner(PARTNER, name="Acme", actor="op@entur.org")
+        for _ in range(partner_auth.MAX_CREDENTIALS_PER_PARTNER):
+            partner_auth.issue_credential(PARTNER, actor="op@entur.org")
+        before = len(store.writes)
+        refused = False
+        try:
+            partner_auth.issue_credential(PARTNER, actor="op@entur.org")
+        except partner_auth.Conflict:
+            refused = True
+        assert refused
+        assert len(store.writes) == before, "the ceiling is checked before any write"
+    finally:
+        _uninstall()
+
+
+def test_the_secret_is_never_logged_and_the_key_id_always_is():
+    """KTD8's log rule, checked by capturing what a refusal actually emits."""
+    store = _install()
+    bearer = _provision(store)
+    key_id, secret = bearer.split(".", 1)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    root = logging.getLogger()
+    root.addHandler(handler)
+    previous = root.level
+    root.setLevel(logging.DEBUG)
+    try:
+        try:
+            partner_auth.authenticate(f"Bearer {key_id}.{secret}x")
+        except partner_auth.AuthFailed:
+            pass
+        rendered = "\n".join(
+            r.getMessage() + repr(getattr(r, "fields", {})) for r in records
+        )
+        assert key_id in rendered, "the key id is what an operator can act on"
+        assert secret not in rendered
+        assert secret[:16] not in rendered
+    finally:
+        root.setLevel(previous)
+        root.removeHandler(handler)
+        _uninstall()
+
+
+# ---- Destinations -----------------------------------------------------------------------------
+
+
+def test_an_unsafe_callback_url_is_refused_at_provisioning_and_audited():
+    """Scenario 8 / AE9. KTD9's syntactic gate runs while a human is present to fix it.
+
+    A refusal that leaves no trace is indistinguishable from an operator who never tried, so the
+    attempt, the actor and the reason land in the audit collection.
+    """
+    store = _install()
+    try:
+        partner_auth.create_partner(PARTNER, name="Acme", actor="op@entur.org")
+        for bad in (
+            "http://hooks.acme.example.com/kix",  # not HTTPS
+            "https://good.example@evil.example/kix",  # userinfo
+            "https://hooks.acme.example.com:8443/kix",  # non-default port
+            "https://hooks.acme.example.com/kix#frag",  # fragment
+            # The address test, on the half of it that needs no DNS. These are the URLs an operator
+            # actually pastes by mistake, and every one of them passes the syntactic checks above.
+            "https://169.254.169.254/kix",  # the metadata address
+            "https://10.0.0.5/kix",  # RFC 1918
+            "https://127.0.0.1/kix",  # loopback
+            "https://[::1]/kix",  # loopback, v6
+            # NAT64 and 6to4: global and non-private by every named range, while encoding
+            # 169.254.169.254. A deny-list is the wrong SHAPE for the claim, which is why
+            # webhook_client re-runs its positive test on what a prefix embeds.
+            "https://[64:ff9b::a9fe:a9fe]/kix",
+            "https://[2002:a9fe:a9fe::]/kix",
+        ):
+            refused = False
+            try:
+                partner_auth.create_destination(
+                    DEST, partner_id=PARTNER, callback_url=bad, actor="op@entur.org"
+                )
+            except partner_auth.Conflict as exc:
+                refused = "unsafe callback URL" in str(exc)
+            assert refused, bad
+            assert store.get(partner_auth.DESTINATIONS, DEST) is None, bad
+        refusals = [r for r in store.audit() if r["result"] == "refused"]
+        assert len(refusals) == 10
+        assert {r["action"] for r in refusals} == {"create_destination"}
+        assert all(r["actor"] == "op@entur.org" for r in refusals)
+        assert all(r["destination_id"] == DEST for r in refusals)
+    finally:
+        _uninstall()
+
+
+def test_a_destination_is_paused_on_410_and_only_an_operator_resumes_it():
+    """R12, and the field U3 left as an open question for U4.
+
+    `mark_delivery_failed(terminal_state="cancelled")` records what happened to the DELIVERY. The
+    pause is about the destination, lives here, and is what U6 reads before attempting one.
+    """
+    store = _install()
+    _provision(store)
+    try:
+        destination = partner_auth.destination_for_delivery(DEST)
+        assert destination is not None and destination.deliverable is True
+        assert destination.signing_generations == (1,)
+
+        paused = partner_auth.pause_destination(DEST, reason="410 Gone")
+        assert paused.paused is True and paused.deliverable is False
+        assert paused.paused_reason == "410 Gone"
+        assert partner_auth.destination_for_delivery(DEST).deliverable is False
+
+        # Idempotent: a backlog of pending deliveries against a gone endpoint must not fill the
+        # audit collection with one row per attempt.
+        audit_before = len(store.audit())
+        partner_auth.pause_destination(DEST, reason="410 Gone")
+        assert len(store.audit()) == audit_before
+
+        resumed = partner_auth.resume_destination(DEST, actor="op@entur.org")
+        assert resumed.paused is False and resumed.deliverable is True
+        actions = [r["action"] for r in store.audit()]
+        assert "pause_destination" in actions and "resume_destination" in actions
+    finally:
+        _uninstall()
+
+
+def test_two_signing_generations_are_live_across_a_rotation():
+    """R10: two valid at once so one can be rotated without a flag day and revoked alone."""
+    store = _install()
+    _provision(store)
+    try:
+        rotated = partner_auth.rotate_signing_generation(DEST, actor="op@entur.org")
+        assert rotated.active_generation == 2
+        assert rotated.retiring_generation == 1
+        assert rotated.signing_generations == (2, 1), "active first, as webhook_signing documents"
+        retired = partner_auth.retire_signing_generation(DEST, actor="op@entur.org")
+        assert retired.signing_generations == (2,)
+        # Idempotent once nothing is retiring.
+        assert partner_auth.retire_signing_generation(DEST, actor="op@entur.org").signing_generations == (2,)
+    finally:
+        _uninstall()
+
+
+def test_a_destination_belonging_to_another_partner_is_forbidden_inside_the_module():
+    """Kept apart HERE and collapsed into "missing" at the API edge, exactly as partner_store does.
+
+    The store's caller needs to tell a tenancy violation from a typo in order to log the former; a
+    partner must not be able to probe another's destination ids by the difference.
+    """
+    store = _install()
+    _provision(store)
+    try:
+        assert partner_auth.get_destination(DEST, partner_id=PARTNER) is not None
+        forbidden = False
+        try:
+            partner_auth.get_destination(DEST, partner_id="someone-else")
+        except partner_auth.Forbidden:
+            forbidden = True
+        assert forbidden
+        assert partner_auth.current_destination("someone-else") is None
+    finally:
+        _uninstall()
+
+
+def test_a_paused_destination_is_still_the_current_one():
+    """Pausing stops delivery, not ownership -- and a partner whose callback is paused most needs
+    to see it on /destinations/current."""
+    store = _install()
+    _provision(store)
+    try:
+        partner_auth.pause_destination(DEST, reason="410 Gone")
+        current = partner_auth.current_destination(PARTNER)
+        assert current is not None and current.destination_id == DEST and current.paused is True
+    finally:
+        _uninstall()
+
+
+def test_a_document_written_before_the_paused_field_existed_is_not_paused():
+    """The failure direction here is the OPPOSITE of partner_store's expiry test, on purpose.
+
+    A missing `paused` key means a document written by an older binary, and reading that as paused
+    would take every existing destination out of service on the deploy that added the field.
+    """
+    store = _install()
+    store.set(
+        partner_auth.DESTINATIONS,
+        DEST,
+        {
+            "destination_id": DEST,
+            "partner_id": PARTNER,
+            "callback_url": GOOD_URL,
+            "status": "active",
+            "generations": {"active": 1},
+        },
+    )
+    try:
+        destination = partner_auth.get_destination(DEST)
+        assert destination is not None
+        assert destination.paused is False and destination.deliverable is True
+        assert destination.retiring_generation is None
+    finally:
+        _uninstall()
+
+
+# ---- The audit collection ---------------------------------------------------------------------
+
+
+def test_every_operator_action_lands_in_the_audit_record():
+    """R22: provisioning, credential, destination and suspension actions, with actor and timestamp."""
+    store = _install()
+    try:
+        partner_auth.create_partner(PARTNER, name="Acme", actor="a@entur.org")
+        partner_auth.create_destination(
+            DEST, partner_id=PARTNER, callback_url=GOOD_URL, actor="a@entur.org"
+        )
+        _c, bearer = partner_auth.issue_credential(PARTNER, actor="a@entur.org")
+        partner_auth.revoke_credential(bearer.split(".")[0], actor="a@entur.org")
+        partner_auth.set_partner_suspended(PARTNER, suspended=True, actor="a@entur.org")
+        partner_auth.rotate_signing_generation(DEST, actor="a@entur.org")
+        partner_auth.amend_destination(
+            DEST, callback_url="https://hooks2.acme.example.com/kix", actor="a@entur.org"
+        )
+        rows = store.audit()
+        assert {r["action"] for r in rows} >= {
+            "create_partner",
+            "create_destination",
+            "issue_credential",
+            "revoke_credential",
+            "suspend_partner",
+            "rotate_signing_generation",
+            "amend_destination",
+        }
+        for row in rows:
+            assert row["actor"] == "a@entur.org"
+            assert isinstance(row["at"], datetime)
+            assert row["audit_id"]
+        # Chronological by document id, which is what makes a plain collection listing readable.
+        ids = [r["audit_id"] for r in rows]
+        assert ids == sorted(ids)
+        # And no secret material anywhere in it.
+        assert "secret_hash" not in {k for r in rows for k in r}
+        assert bearer.split(".", 1)[1] not in repr(rows)
+    finally:
+        _uninstall()
+
+
+def test_the_audit_collection_is_append_only_and_no_route_can_read_it():
+    """R22's second half, established by grepping both files -- see the module docstring.
+
+    Firestore has no per-collection IAM (KTD5 records the limit), so "no partner credential can
+    read it" cannot be a runtime property. What can be established is that the request-path module
+    never names the collection, which is `meldinger_decisions.sql`'s own argument: a query that
+    cannot name a column cannot leak it however the code above drifts.
+    """
+    assert partner_auth.ADMIN_AUDIT == "partner_admin_audit"
+    assert partner_auth.ADMIN_AUDIT not in API_SOURCE
+    assert "ADMIN_AUDIT" not in API_SOURCE
+    # Append-only: the audit collection is written by `set` and by nothing else.
+    for forbidden in (
+        f"update({partner_auth.ADMIN_AUDIT}",
+        "update(ADMIN_AUDIT",
+        "delete(ADMIN_AUDIT",
+    ):
+        assert forbidden not in AUTH_SOURCE, forbidden
+    assert AUTH_SOURCE.count("_store().set(ADMIN_AUDIT") == 1
+    assert "record_admin_action" not in API_SOURCE
+
+
+def test_a_store_outage_suppresses_the_action_and_nothing_wider():
+    """R20 at this layer: the failure propagates as itself, and no half-written record survives."""
+    store = _install()
+    try:
+        store.fail_with = RuntimeError("firestore unavailable")
+        raised = False
+        try:
+            partner_auth.create_partner("beta", name="Beta", actor="op@entur.org")
+        except RuntimeError:
+            raised = True
+        assert raised
+        store.fail_with = None
+        assert store.data == {}
+    finally:
+        _uninstall()
+
+
+# ---- The operator tool ------------------------------------------------------------------------
+
+
+def _allow(actor: str = "operator@entur.org"):
+    def authorizer(environment: str) -> tool.Authorization:
+        return tool.Authorization(
+            actor=actor, group=tool.OPERATOR_GROUPS[environment], allowed=True
+        )
+
+    return authorizer
+
+
+def _deny(reason: str = "not_a_member", actor: str = "outsider@entur.org"):
+    def authorizer(environment: str) -> tool.Authorization:
+        return tool.Authorization(
+            actor=actor, group=tool.OPERATOR_GROUPS[environment], allowed=False, reason=reason
+        )
+
+    return authorizer
+
+
+def _run(args: list[str], *, authorizer, store: _MemoryDocs) -> tuple[int, str]:
+    out = io.StringIO()
+    code = tool.main(args, authorizer=authorizer, store=store, out=out)
+    return code, out.getvalue()
+
+
+def test_an_operator_action_without_the_group_is_refused_and_audited():
+    """Scenario 10, second half. Refused with a non-zero exit, nothing written but the audit row.
+
+    The limitation is stated in the tool's docstring rather than hidden: if the group IS the IAM
+    grant, a non-member may also be unable to write this row, so it is best effort and a structured
+    stderr line always goes out. What the row proves is what was attempted and by whom it claimed to
+    be -- and it cannot be erased, because nothing updates or deletes this collection.
+    """
+    store = _install()
+    try:
+        code, _out = _run(
+            ["--environment", "prd", "create-partner", "--partner-id", "beta", "--name", "Beta"],
+            authorizer=_deny(),
+            store=store,
+        )
+        assert code == 3
+        assert store.get(partner_auth.ACCOUNTS, "beta") is None, "nothing was provisioned"
+        rows = store.audit()
+        assert len(rows) == 1
+        assert rows[0]["result"] == "refused"
+        assert rows[0]["action"] == "create-partner"
+        assert rows[0]["actor"] == "outsider@entur.org"
+        assert rows[0]["partner_id"] == "beta"
+        assert rows[0]["reason"] == "not_a_member"
+    finally:
+        _uninstall()
+
+
+def test_every_subcommand_is_authorized_including_the_reads():
+    """A destination's callback URL and a partner's key ids are exactly what a forger wants first."""
+    store = _install()
+    _provision(store)
+    try:
+        for args in (
+            ["show-partner", "--partner-id", PARTNER],
+            ["list-keys", "--partner-id", PARTNER],
+        ):
+            code, _out = _run(["--environment", "dev", *args], authorizer=_deny(), store=store)
+            assert code == 3, args
+    finally:
+        _uninstall()
+
+
+def test_the_tool_provisions_a_partner_a_destination_and_a_working_credential():
+    """The operator runbook, executed: create-partner, create-destination, issue-key, and the
+    credential the last one prints authenticates against the same store."""
+    store = _install()
+    try:
+        allow = _allow()
+        code, _ = _run(
+            ["--environment", "dev", "create-partner", "--partner-id", PARTNER, "--name", "Acme"],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0
+        code, _ = _run(
+            [
+                "--environment",
+                "dev",
+                "create-destination",
+                "--partner-id",
+                PARTNER,
+                "--destination-id",
+                DEST,
+                "--url",
+                GOOD_URL,
+            ],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0
+        code, printed = _run(
+            ["--environment", "dev", "issue-key", "--partner-id", PARTNER],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0
+        import json
+
+        result = json.loads(printed)
+        bearer = result["bearer"]
+        assert "Shown once" in result["note"]
+        # Re-configure exactly as the app does, then authenticate the printed credential.
+        partner_auth.configure(docs=store, clock=lambda: NOW)
+        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
+
+        code, _ = _run(
+            ["--environment", "dev", "revoke-key", "--key-id", bearer.split(".")[0]],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0
+        partner_auth.configure(docs=store, clock=lambda: NOW)
+        revoked = False
+        try:
+            partner_auth.authenticate(f"Bearer {bearer}")
+        except partner_auth.AuthFailed:
+            revoked = True
+        assert revoked
+    finally:
+        _uninstall()
+
+
+def test_the_tool_reports_a_refused_url_as_a_failure_rather_than_a_crash():
+    """An operator pasting the metadata address gets exit code 2 and an audited refusal.
+
+    Not a traceback, and not a stored destination: the refusal is the useful outcome, and the audit
+    row is what makes "somebody tried to point a partner at 169.254.169.254" visible later.
+    """
+    store = _install()
+    try:
+        allow = _allow()
+        _run(
+            ["--environment", "dev", "create-partner", "--partner-id", PARTNER, "--name", "Acme"],
+            authorizer=allow,
+            store=store,
+        )
+        code, _ = _run(
+            [
+                "--environment",
+                "dev",
+                "create-destination",
+                "--partner-id",
+                PARTNER,
+                "--destination-id",
+                DEST,
+                "--url",
+                "https://169.254.169.254/kix",
+            ],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 2
+        assert store.get(partner_auth.DESTINATIONS, DEST) is None
+        refusals = [r for r in store.audit() if r["result"] == "refused"]
+        assert len(refusals) == 1
+        assert refusals[0]["action"] == "create_destination"
+        assert "not a globally routable address" in refusals[0]["reason"]
+    finally:
+        _uninstall()
+
+
+def test_production_has_its_own_operator_group():
+    """R22: "separately for production". Two groups, and the prd one is not the other."""
+    assert set(tool.OPERATOR_GROUPS) == set(tool.ENVIRONMENTS)
+    assert tool.OPERATOR_GROUPS["prd"] != tool.OPERATOR_GROUPS["dev"]
+    assert tool.OPERATOR_GROUPS["prd"].endswith("@entur.org")
+    assert "prd" in tool.OPERATOR_GROUPS["prd"]
+
+
+def test_the_environment_is_never_inferred():
+    """A tool that guessed prd from an exported GOOGLE_CLOUD_PROJECT would be one stale shell
+    variable away from provisioning the wrong environment."""
+    assert "--environment" in TOOL_SOURCE
+    assert 'required=True, choices=ENVIRONMENTS' in TOOL_SOURCE.replace("\n", " ")
+    failed = False
+    stderr, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        tool._parser().parse_args(["create-partner", "--partner-id", "x", "--name", "y"])
+    except SystemExit:
+        failed = True
+    finally:
+        sys.stderr = stderr
+    assert failed
+
+
+def test_the_group_authorizer_fails_closed():
+    """Every failure path in the real authorizer answers "not allowed", never "allowed".
+
+    At Entur `groups.search` is denied to ordinary developers while `checkTransitiveMembership`
+    works, so an exception is at least as likely to mean "not a member" as "API problem" -- and
+    guessing "member" from an unreadable answer is the one guess that must not be made. Exercised
+    for real: with no googleapiclient/ADC reachable in this process, the call must still return a
+    refusal rather than raise.
+    """
+    verdict = tool.google_group_authorizer("prd")
+    assert verdict.allowed is False
+    assert verdict.group == tool.OPERATOR_GROUPS["prd"]
+    assert verdict.reason
+    assert re.search(r"membership_check_failed|not_a_member", verdict.reason)
+
+
+def test_the_tool_never_reaches_the_partner_api_or_a_partner_credential():
+    """R22's separation, structurally: the operator boundary is not a partner-authenticated route.
+
+    A partner credential authenticates a machine against /notification-api/v1 and can do none of
+    this; a group membership authorizes a human against the store and cannot register a
+    subscription.
+    """
+    assert "partner_api" not in TOOL_SOURCE
+    assert "authenticate(" not in TOOL_SOURCE
+    assert "Bearer" not in TOOL_SOURCE.split('"""', 2)[2]
+
+
+def _run_all() -> None:
+    tests = sorted(
+        (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
+    )
+    for name, fn in tests:
+        fn()
+        print(f"  ok  {name}")
+    print(f"\n{len(tests)} partner auth checks passed.")
+
+
+if __name__ == "__main__":
+    _run_all()

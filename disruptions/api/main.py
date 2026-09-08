@@ -22,6 +22,9 @@ import impact as impact_engine  # sibling module: the /impact matcher, shared wi
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
+import partner_api  # sibling module: the authenticated partner API (/notification-api/v1)
+import partner_auth  # sibling module: partner accounts, API keys, callback destinations, audit
+import partner_store  # sibling module: durable partner subscriptions, events and deliveries
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
@@ -1177,6 +1180,39 @@ async def lifespan(app: FastAPI):
         partner_enabled=_partner_notifications_enabled,
     )
     llm_message.configure(stop_name_provider=_varsel_stops)
+    # The partner notification channel's two Firestore-backed planes and the authenticated API over
+    # them. All three are wired UNCONDITIONALLY, and the flag above is deliberately not consulted
+    # here: `PARTNER_NOTIFICATIONS_ENABLED` gates the notification PASS -- whether the poller reads
+    # partner subscriptions and delivers events -- while provisioning a partner and letting it
+    # register watches is the step that comes first. Onboarding is otherwise circular: nothing can
+    # be registered until the pass is on, and turning the pass on with nothing registered is what
+    # a rollback is supposed to look like.
+    #
+    # What actually makes the API answer is store AND pepper, read at call time
+    # (`partner_auth.available()`): a deployment with no named database or no `PARTNER_KEY_PEPPER`
+    # answers 503 to every route rather than 401, because a 401 would tell a partner their
+    # credential is wrong when it is this deployment that is unconfigured. tst has neither today,
+    # so it serves 503 -- honest, and cheap: nothing here builds a Firestore client until a request
+    # arrives, so an unconfigured environment pays no import and needs no credential.
+    #
+    # ONE client for the whole channel: `partner_store.configure` is the only place that names the
+    # database, and `partner_auth` reads through `partner_store.client()` -- so there is one gRPC
+    # channel and one connection pool in a process whose poller already shares the thread. The
+    # `partner_auth.configure()` call still earns its place: it resets that module's in-process
+    # limiter ledgers, which must not survive a restart-in-place.
+    partner_store.configure(database=os.environ.get("PARTNER_FIRESTORE_DATABASE", "").strip() or None)
+    partner_auth.configure()
+    partner_api.configure(
+        store=partner_store,
+        auth=partner_auth,
+        # /varsel's own two, injected rather than imported by the module: `canonical_stop` so a
+        # partner ref the stop registry has collapsed lands on the same journey key a browser
+        # registration would, and `_service_verdict` so R5's servability caveat is the answer
+        # /varsel gives -- it expands both places to every ref and already fails open to None,
+        # which is what keeps "we could not establish it" from ever reading as "no trips run".
+        canonicalize=varsel.canonical_stop,
+        connectivity=varsel._service_verdict,
+    )
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody
     # runs build scripts against — without this the table would simply be missing there. Its own
@@ -1357,6 +1393,26 @@ app.include_router(meldinger.router)
 # five subscriber-derived counts on togvarsel_rounds are the exception, and rushhistorikk_days.sql
 # never names them.
 app.include_router(rushhistorikk.router)
+
+# Partner notification API (/notification-api/v1): the authenticated surface a partner BFF manages
+# its own commuter registrations through. Three things about this registration are deliberate.
+#
+# It is NOT behind sso.RequireSSO, and the partner prefix is deliberately absent from
+# sso.PROTECTED_PREFIXES: that gate answers an unconfigured deployment with 503 and an
+# unauthenticated *browser* with a 302, and a machine caller following a redirect into a Google
+# login screen gets an HTML page where it expected JSON. Its own credential dependency
+# (partner_auth.authenticate, KTD8) runs per request at router level instead, so a route added
+# later is gated even if its author forgets the parameter.
+#
+# It is registered unconditionally, unlike /togmelding-api: there is no product-secrecy gate here
+# and the whole point of the surface is a published contract, so a partner can be provisioned and
+# can register watches before the notification pass is switched on for that environment.
+# Availability is decided per request by partner_auth.available() — store plus pepper — which
+# answers 503 where either is missing.
+#
+# And it is registered before the static mounts, like every other API router: nothing serves
+# /notification-api as a page, but the ordering rule is the one this file follows throughout.
+app.include_router(partner_api.router)
 
 # Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
