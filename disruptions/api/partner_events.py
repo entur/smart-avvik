@@ -165,6 +165,15 @@ class EmitReport:
     capped: int = 0
     retryable: int = 0
     failed: int = 0
+    #: Withdrawal runs closed because the train cleared the gate again -- one write per genuine
+    #: recovery. `run_stale` counts runs left alone as already past `WITHDRAWAL_GAP_S`, where the
+    #: store starts a fresh run anyway; `run_clear_capped` counts resets deferred to the next cycle
+    #: by the budget. Apart from every other counter here because none of them is a notification
+    #: decision: these three say only how exact the NEXT withdrawal count will be.
+    run_cleared: int = 0
+    run_stale: int = 0
+    run_clear_capped: int = 0
+    run_clear_error: int = 0
     timed_out: bool = False
     ms: int = 0
 
@@ -266,6 +275,62 @@ def skip_reason(stored_phase: str | None, subject: PartnerSubject) -> str | None
     return None
 
 
+def _close_run(
+    alert_id: str,
+    known: _Standing,
+    *,
+    now: datetime,
+    budget: _EmitBudget,
+    counts: dict[str, int],
+) -> None:
+    """This train cleared the gate again: close any open withdrawal run. Usually writes nothing.
+
+    **What makes the withdrawal count truly CONSECUTIVE, and why it lives here rather than in the
+    store.** `partner_store._withdraw_body` cannot see an alert-worthy cycle at all -- `skip_reason`
+    skips the store call on one, deliberately, to save a transaction per standing subject per cycle
+    -- so the store closes runs by TIME (`WITHDRAWAL_GAP_S`), and that approximation still withdraws
+    on a dip / one recovered cycle / dip inside the window. A wrong withdrawal is a real
+    notification («varselet er trukket tilbake»), it is cap-exempt so nothing suppresses it, and the
+    next cycle re-alerts -- notification flapping, which this repo has rejected before.
+
+    The cost contract, because the cheap version of this is a write per standing cycle and that is
+    what the whole `skip_reason` optimisation exists to avoid:
+
+    * **an ordinary standing cycle writes nothing** -- `open_runs` is consulted first and is empty
+      for a subject with no open run, which is nearly all of them;
+    * **one write per genuine recovery**, not per cycle;
+    * **no per-subject read, ever** -- `open_runs` rides on the `partner_alerts` query `_standing`
+      already spends, so a failed pre-read simply loses the resets and falls back to the store's
+      time window (R20: an outage costs the optimisation, never correctness);
+    * a run already older than the gap is left alone, since the store would start a fresh run for
+      the next dip anyway and the write would buy nothing.
+
+    Budgeted like a mint, because it IS a store transaction and the deadline is a reservation
+    rather than a check. Its own counter, so a deferred clear never reads as a suppressed mint.
+    """
+    at = known.open_runs.get(alert_id)
+    if at is None:
+        return
+    if (now - at).total_seconds() > partner_store.WITHDRAWAL_GAP_S:
+        counts["run_stale"] = counts.get("run_stale", 0) + 1
+        return
+    if not budget.claim():
+        counts["run_clear_capped"] = counts.get("run_clear_capped", 0) + 1
+        return
+    try:
+        if partner_store.clear_below_threshold(alert_id, now=now):
+            counts["run_cleared"] = counts.get("run_cleared", 0) + 1
+    except Exception:
+        # Never fatal and never re-raised: what a failed clear costs is the exactness of ONE
+        # subject's withdrawal count, and the store's time window is still underneath it.
+        counts["run_clear_error"] = counts.get("run_clear_error", 0) + 1
+        logger.warning(
+            "Could not close a withdrawal run; the store's time window still applies",
+            exc_info=True,
+            extra={"fields": {"event": "partner_emit", "result": "run_clear_error"}},
+        )
+
+
 @dataclass(frozen=True)
 class _Standing:
     """What stands per subscription, and whether that is a claim or a guess.
@@ -280,6 +345,11 @@ class _Standing:
 
     phases: Mapping[str, str]
     complete: bool
+    #: alert_id -> `below_threshold_at` for this partner's subjects with an OPEN withdrawal run,
+    #: straight off `PartnerAlerts.open_below_threshold`. Carried even when `complete` is False,
+    #: because it is derived from the whole live page rather than from the four-row display list --
+    #: so a truncated snapshot still resets runs exactly, and only a FAILED read loses them.
+    open_runs: Mapping[str, datetime] = field(default_factory=dict)
 
 
 _INCOMPLETE = _Standing(phases={}, complete=False)
@@ -314,13 +384,16 @@ def _standing(subjects: Sequence[PartnerSubject], now: datetime) -> dict[str, _S
             if snapshot is None:
                 # Absent from a bounded read is "crowded out", not "calm" -- `partner_alerts`
                 # documents exactly that, which is why the wrapper carries its own `truncated`.
-                out[subject.subscription_id] = (
-                    _INCOMPLETE if alerts.truncated else _Standing(phases={}, complete=True)
+                out[subject.subscription_id] = _Standing(
+                    phases={},
+                    complete=not alerts.truncated,
+                    open_runs=alerts.open_below_threshold,
                 )
                 continue
             out[subject.subscription_id] = _Standing(
                 phases={state.alert_id: state.phase for state in snapshot.subjects},
                 complete=not snapshot.truncated and snapshot.n_active <= len(snapshot.subjects),
+                open_runs=alerts.open_below_threshold,
             )
     return out
 
@@ -416,10 +489,17 @@ def _run(
             counts["quota"] = counts.get("quota", 0) + 1
             continue
         known = standing.get(subject.subscription_id, _INCOMPLETE)
+        # Hoisted out of the `complete` branch: the withdrawal-run reset below needs it on both
+        # paths, and it is a pure hash of two strings.
+        alert_id = partner_store.alert_subject_id(subject.subscription_id, train)
         if known.complete:
-            alert_id = partner_store.alert_subject_id(subject.subscription_id, train)
             reason = skip_reason(known.phases.get(alert_id), subject)
             if reason is not None:
+                if reason == "unchanged":
+                    # THE recovery case: alert-worthy, standing in the same phase, minting nothing
+                    # -- so the store is about to hear nothing about a cycle that proves any open
+                    # withdrawal run is broken. This is the one place that can tell it.
+                    _close_run(alert_id, known, now=now, budget=budget, counts=counts)
                 counts[reason] = counts.get(reason, 0) + 1
                 continue
         if not budget.claim():
@@ -451,6 +531,12 @@ def _run(
         if commit.status == "created" and commit.event_type == partner_store.EVENT_WITHDRAWN:
             counts["withdrawn"] = counts.get("withdrawn", 0) + 1
         else:
+            if commit.status == "unchanged":
+                # Same recovery, reached the long way: the pre-read was truncated or missing, so
+                # the store was asked and said "no transition". A mint would have closed the run
+                # itself (`_mint` writes both counter fields), which is why only `unchanged` needs
+                # this -- on either path.
+                _close_run(alert_id, known, now=now, budget=budget, counts=counts)
             counts[commit.status] = counts.get(commit.status, 0) + 1
     return EmitReport(
         created=counts.get("created", 0),
@@ -464,6 +550,10 @@ def _run(
         capped=counts.get("capped", 0),
         retryable=counts.get("retryable", 0),
         failed=counts.get("failed", 0),
+        run_cleared=counts.get("run_cleared", 0),
+        run_stale=counts.get("run_stale", 0),
+        run_clear_capped=counts.get("run_clear_capped", 0),
+        run_clear_error=counts.get("run_clear_error", 0),
     )
 
 
@@ -547,6 +637,11 @@ def emit(
                 "unidentified": report.unidentified,
                 "quota": report.quota,
                 "capped": report.capped,
+                # Not notification decisions: these say how exact the next withdrawal count is.
+                "run_cleared": report.run_cleared,
+                "run_stale": report.run_stale,
+                "run_clear_capped": report.run_clear_capped,
+                "run_clear_error": report.run_clear_error,
                 "retryable": report.retryable,
                 "failed": report.failed,
                 "n": len(subjects),

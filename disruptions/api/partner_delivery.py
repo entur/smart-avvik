@@ -48,7 +48,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -127,6 +127,13 @@ class DeliveryReport:
     ``cancelled``, which is the state its record was just given, and ``paused`` answers the
     different question of how many destinations an operator has to resume.
 
+    ``capped`` and ``deadline`` are split for the same reason. ``capped`` is R11's daily allowance
+    refusing a notification -- a product decision, which the store records durably as a suppression
+    (``capped_at``/``capped_count``) and which KTD12 needs rows for. ``deadline`` is this pass
+    running out of clock or attempts, which nothing records anywhere and which the next cycle
+    simply re-offers. Counted together, AE3's expected nine suppressions could silently absorb a
+    deadline bind.
+
     ``sent`` counts FRESH successes only -- one notification the partner did not already have, one
     of R11's four slots spent. Two counters exist beside it because a late arrival writes nothing
     and must not be filed as a send. The pass abandons an attempt's thread when its bounded wait
@@ -154,6 +161,7 @@ class DeliveryReport:
     sent: int = 0
     already_resolved: int = 0
     superseded: int = 0
+    deadline: int = 0
     failed: int = 0
     retryable: int = 0
     expired: int = 0
@@ -362,7 +370,11 @@ def _attempt(
         return "skipped"
     # INSIDE the worker, as the task starts -- see `_DeliveryBudget`.
     if not budget.claim():
-        return "capped"
+        # `deadline`, NOT `capped`: R11's cap is a product decision the store records durably as a
+        # suppression, and this is the pass running out of clock or attempts, which nothing records
+        # anywhere. One counter for both let AE3's `capped == 9` absorb a deadline bind silently --
+        # the same "one number, two meanings" the `paused` counter was just fixed for.
+        return "deadline"
     destination = skips.destination(delivery.destination_id)
     if destination is None or not destination.deliverable:
         # R12's pause, read before the attempt rather than rediscovered by it. The delivery stays
@@ -546,6 +558,100 @@ def _store_step[T](step: str, delivery: partner_store.Delivery, call: Callable[[
         return None
 
 
+class _Counts:
+    """The pass's outcome tally, written by the workers as they go.
+
+    Not the futures' return values, and that is the point: with one future per DELIVERY an
+    unfinished future was one unattempted delivery, but a shard future holds a whole
+    subscription's deliveries, so collecting counts at the end would discard everything a
+    still-running shard had already completed when the bounded wait expired. Under a timeout that
+    is exactly when the numbers are worth having.
+    """
+
+    def __init__(self, **initial: int) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = dict(initial)
+
+    def add(self, key: str) -> None:
+        with self._lock:
+            self._counts[key] = self._counts.get(key, 0) + 1
+
+    def get(self, key: str) -> int:
+        with self._lock:
+            return self._counts.get(key, 0)
+
+
+def _shard_by_subscription(
+    ready: Sequence[partner_store.Delivery],
+) -> list[tuple[partner_store.Delivery, ...]]:
+    """One shard per subscription, each keeping the store's order, shards in soonest-first order.
+
+    **Why the unit of parallelism is a SUBSCRIPTION and not a delivery.** `claim_delivery` reserves
+    R11's slot on the subscription document in the transaction that admits the delivery -- which is
+    what closed the cap overspend -- so two concurrent claims for one subscription contend on one
+    document. Firestore's pessimistic concurrency serialises them, and past its retries the loser
+    surfaces as an exhausted transaction: measured on the emulator, 8 concurrent claims on one
+    subscription admitted 0-3 and turned the rest into retryable store errors with ZERO `capped`.
+    That lands on precisely the day the cap matters -- AE3's line suspension IS thirteen pending
+    deliveries on one subscription -- so a busy cycle would report a Firestore fault instead of the
+    suppressions the plan says to record, and delay real notifications by a pass period (~5 min).
+
+    Sharding removes the contention by construction rather than mitigating it: no two workers ever
+    touch one subscription document, because one worker owns the subscription. The pool still
+    parallelises across subscriptions, which is where a 200-deep backlog's breadth actually is.
+    Serialising globally was the alternative and remains wrong for the reason this module already
+    gave: a claim is a store call, and sequential claims for a 200-deep backlog are what the pool
+    exists to avoid.
+
+    Two things it costs, both accepted. Soonest-first becomes exact WITHIN a subscription -- the
+    grain R11 is defined at -- and per-shard across them; shards are ordered by their soonest
+    delivery so the pool still starts the most urgent first. And one subscription with a deep
+    backlog holds a worker for its whole shard, which the cap bounds the usefulness of and the
+    deadline reservation bounds the length of.
+    """
+    shards: dict[str, list[partner_store.Delivery]] = {}
+    for delivery in ready:
+        # `ready` is already in the store's soonest-first order, so appending preserves it inside
+        # each shard and the first key inserted is the soonest subscription.
+        shards.setdefault(delivery.subscription_id, []).append(delivery)
+    return [tuple(group) for group in shards.values()]
+
+
+def _deliver_shard(
+    deliveries: Sequence[partner_store.Delivery],
+    *,
+    counts: _Counts,
+    skips: _Skips,
+    budget: _DeliveryBudget,
+    sender: Sender,
+    timeout_s: float,
+    connect_timeout_s: float,
+    now: datetime,
+) -> None:
+    """One subscription's pending deliveries, in order, on one worker. Never raises."""
+    for delivery in deliveries:
+        try:
+            key = _attempt(
+                delivery,
+                skips=skips,
+                budget=budget,
+                sender=sender,
+                timeout_s=timeout_s,
+                connect_timeout_s=connect_timeout_s,
+                now=now,
+            )
+        except Exception:
+            # `_attempt` documents itself as never raising; this is the belt, because a raise here
+            # would abandon the REST of the shard rather than one delivery.
+            logger.warning(
+                "A partner delivery attempt raised; it is re-offered next cycle",
+                exc_info=True,
+                extra={"fields": {"event": "partner_delivery", "result": "error"}},
+            )
+            key = "store_errors"
+        counts.add(key)
+
+
 def _resolved_kind(outcome: Any) -> str | None:
     """Which counter a terminal write belongs to, or ``None`` for an ordinary fresh one.
 
@@ -641,19 +747,21 @@ def deliver_pending(
         return DeliveryReport(store_errors=1, ms=int((monotonic() - started) * 1000))
 
     expired, expire_errors = _expire_stale(pending.stale, now=instant, budget=budget)
-    counts: dict[str, int] = {"expired": expired, "store_errors": expire_errors}
+    counts = _Counts(expired=expired, store_errors=expire_errors)
     skips = _Skips()
     timed_out = False
 
-    if pending.ready:
+    shards = _shard_by_subscription(pending.ready)
+    if shards:
         pool = ThreadPoolExecutor(
-            max_workers=min(workers, len(pending.ready)), thread_name_prefix="partner-deliver"
+            max_workers=min(workers, len(shards)), thread_name_prefix="partner-deliver"
         )
         try:
             futures = [
                 pool.submit(
-                    _attempt,
-                    delivery,
+                    _deliver_shard,
+                    shard,
+                    counts=counts,
                     skips=skips,
                     budget=budget,
                     sender=send,
@@ -661,21 +769,10 @@ def deliver_pending(
                     connect_timeout_s=connect_timeout_s,
                     now=instant,
                 )
-                for delivery in pending.ready
+                for shard in shards
             ]
-            done, not_done = wait(futures, timeout=max(0.0, wait_s - (monotonic() - started)))
+            _, not_done = wait(futures, timeout=max(0.0, wait_s - (monotonic() - started)))
             timed_out = bool(not_done)
-            for future in done:
-                try:
-                    key = future.result()
-                except Exception:
-                    logger.warning(
-                        "A partner delivery attempt raised; it is re-offered next cycle",
-                        exc_info=True,
-                        extra={"fields": {"event": "partner_delivery", "result": "error"}},
-                    )
-                    key = "store_errors"
-                counts[key] = counts.get(key, 0) + 1
         finally:
             # NEVER wait: `__exit__` would call `shutdown(wait=True)` and block the poller until
             # whatever is hung finally returns, defeating the bound completely. An abandoned worker
@@ -686,20 +783,21 @@ def deliver_pending(
     ms = int((monotonic() - started) * 1000)
     report = DeliveryReport(
         ready=len(pending.ready),
-        sent=counts.get("sent", 0),
-        already_resolved=counts.get("already_resolved", 0),
-        superseded=counts.get("superseded", 0),
-        failed=counts.get("failed", 0),
-        retryable=counts.get("retryable", 0),
-        expired=counts.get("expired", 0),
-        cancelled=counts.get("cancelled", 0),
-        capped=counts.get("capped", 0),
-        gone=counts.get("gone", 0),
-        not_deliverable=counts.get("not_deliverable", 0),
+        sent=counts.get("sent"),
+        already_resolved=counts.get("already_resolved"),
+        superseded=counts.get("superseded"),
+        failed=counts.get("failed"),
+        retryable=counts.get("retryable"),
+        expired=counts.get("expired"),
+        cancelled=counts.get("cancelled"),
+        capped=counts.get("capped"),
+        deadline=counts.get("deadline"),
+        gone=counts.get("gone"),
+        not_deliverable=counts.get("not_deliverable"),
         paused=skips.paused_count(),
-        skipped=counts.get("skipped", 0),
+        skipped=counts.get("skipped"),
         skipped_destinations=skips.count(),
-        store_errors=counts.get("store_errors", 0),
+        store_errors=counts.get("store_errors"),
         truncated=pending.truncated,
         throttled=pending.throttled,
         timed_out=timed_out,
@@ -728,6 +826,9 @@ def deliver_pending(
                 "expired": report.expired,
                 "cancelled": report.cancelled,
                 "capped": report.capped,
+                # Apart from `capped`: R11's suppression is a product fact the store records; a
+                # deadline bind is this pass running out of clock and is recorded nowhere.
+                "deadline": report.deadline,
                 "not_deliverable": report.not_deliverable,
                 "paused": report.paused,
                 "skipped": report.skipped,

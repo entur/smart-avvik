@@ -575,23 +575,25 @@ def test_thirteen_pending_events_yield_four_notifications_and_nine_recorded_supp
         deliveries = _pending(client, n=13)
         assert len(deliveries) == 13
         report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
-        # The unconditional invariant: every one of the thirteen was accounted for.
+        # Every one of the thirteen accounted for, and the split exact — and BOTH are now
+        # unconditional, which they were not when this comment last changed.
         assert report.sent + report.capped == 13, report
-        assert report.sent == partner_store.MAX_ALERT_DELIVERIES_PER_DAY == 4
-        assert report.capped == 9
-        # WHY THOSE TWO ARE EXACT, because it is not unconditional and a reader who assumes it is
-        # will mis-diagnose the day it moves. R11's cap is READ by `claim_delivery` and SPENT by
-        # `mark_delivery_sent`, so concurrent claims can be admitted against the same last slot and
-        # the general bound is `MAX + workers - 1`, not `MAX`. It is exact here because the budget
-        # (4) and the pool width (4) are equal: the first wave of claims exhausts the allowance, and
-        # every later claim reads nothing left. Change either number and this becomes a range —
-        # and if it ever flakes, the claim/send window is the cause, not contamination. The
-        # looseness itself is a reported finding against the store's cap enforcement, not something
-        # to widen this assertion for: `<= 7` would quietly accept a traveller losing a slot.
-        assert partner_delivery._WORKERS == partner_store.MAX_ALERT_DELIVERIES_PER_DAY, (
-            "the two exact assertions above rest on these being equal; re-derive them, do not "
-            "relax them, if this fires"
-        )
+        assert report.sent == partner_store.MAX_ALERT_DELIVERIES_PER_DAY == 4, report
+        assert report.capped == 9, report
+        assert report.deadline == 0, report
+        # WHY THEY ARE EXACT, since the answer moved twice and the previous one is worth not
+        # re-deriving. It used to depend on the pool width EQUALLING the cap: `claim_delivery` read
+        # the allowance and `mark_delivery_sent` spent it, so a wave of concurrent claims could all
+        # pass the check against the same free slot and the real bound was `MAX + workers - 1`.
+        # Two changes closed that. The claim now RESERVES the slot in the transaction that admits
+        # the delivery, so a second claim reads the first's reservation instead of the same free
+        # slot — the cap is exact at any pool width. And these thirteen are one subscription, so
+        # they are ONE shard on one worker (`_shard_by_subscription`): the claims are sequential by
+        # construction, which is also what makes "spent on the soonest" exact here rather than
+        # approximately true. So there is no pool-width precondition left to assert, and the
+        # `_WORKERS == MAX_ALERT_DELIVERIES_PER_DAY` guard that used to stand here is gone with the
+        # coupling it was guarding. What remains worth knowing: if this ever moves, look at the
+        # reservation's confirm/release paths or at the sharding, never at contamination.
 
         stored = {d["delivery_id"]: client.doc(partner_store.DELIVERIES, d["delivery_id"]) for d in deliveries}
         sent = [d for d in stored.values() if d["state"] == "sent"]
@@ -763,9 +765,13 @@ def test_the_deadline_binds_before_the_backlog_does():
             workers=1,
         )
         elapsed = time.monotonic() - started
-        assert report.capped, f"the reservation must bind on a backlog this size; got {report}"
+        # `deadline`, not `capped`: the two used to share a counter, and the pass running out of
+        # clock is not R11 suppressing a notification. Nothing records a deadline bind, and the
+        # next cycle simply offers the delivery again.
+        assert report.deadline, f"the reservation must bind on a backlog this size; got {report}"
+        assert report.capped == 0, f"the daily allowance is untouched here; got {report}"
         assert elapsed < 1.5, f"and the pass ends inside its deadline; took {elapsed:.2f}s"
-        assert report.sent + report.capped + report.skipped == 20
+        assert report.sent + report.deadline + report.capped + report.skipped == 20
     finally:
         _uninstall()
 
@@ -1348,6 +1354,101 @@ def test_a_late_arrival_is_not_counted_as_a_fresh_delivery():
         client.docs[path]["retry_not_before"] = NOW
         ordinary = partner_delivery.deliver_pending(now=NOW, sender=_sender())
         assert ordinary.sent == 1 and ordinary.already_resolved == 0 and ordinary.superseded == 0
+    finally:
+        _uninstall()
+
+
+def test_one_subscriptions_claims_never_run_concurrently():
+    """The unit of parallelism is a SUBSCRIPTION, and this is the reason it had to become one.
+
+    `claim_delivery` reserves R11's slot ON THE SUBSCRIPTION DOCUMENT in the transaction that
+    admits the delivery — which is what closed the cap overspend — so two concurrent claims for one
+    subscription contend on one document. Firestore serialises them and past its retries the loser
+    surfaces as an exhausted transaction: measured on the emulator, 8 concurrent claims on one
+    subscription admitted 0-3 and turned the rest into retryable store errors with ZERO `capped`.
+    AE3's line suspension IS thirteen pending deliveries on one subscription, so on the one
+    scenario the plan writes down, a busy cycle would have reported a Firestore fault instead of
+    the suppressions and delayed real notifications by a pass period.
+
+    This suite cannot observe the contention itself — the fake serialises every transaction under
+    one lock, which is why the defect was invisible here and found on the emulator. So it asserts
+    the property that makes contention impossible instead: never more than one claim in flight for
+    a subscription. Instrumented on the real call rather than by counting threads, because a thread
+    count would be a scheduling observation of exactly the kind this suite has been burned by.
+    """
+    client = _install()
+    try:
+        _live(client)
+        _pending(client, n=8)
+        real = partner_store.claim_delivery
+        lock = threading.Lock()
+        live: dict[str, int] = {}
+        peak: dict[str, int] = {}
+
+        def watched(delivery_id: str, **kwargs: Any):
+            stored = client.doc(partner_store.DELIVERIES, delivery_id) or {}
+            sid = str(stored.get("subscription_id") or "")
+            with lock:
+                live[sid] = live.get(sid, 0) + 1
+                peak[sid] = max(peak.get(sid, 0), live[sid])
+            try:
+                time.sleep(0.02)  # widen the window a real claim's round trip would have
+                return real(delivery_id, **kwargs)
+            finally:
+                with lock:
+                    live[sid] -= 1
+
+        partner_store.claim_delivery = watched  # type: ignore[assignment]
+        try:
+            report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        finally:
+            partner_store.claim_delivery = real  # type: ignore[assignment]
+        assert peak.get(SID) == 1, (
+            f"one subscription's claims must be sequential; peak concurrency was {peak}"
+        )
+        # And the work still all happened: four delivered, four suppressed by R11, none lost to a
+        # store error — which is the outcome the contention destroyed.
+        assert report.sent == 4 and report.capped == 4, report
+        assert report.store_errors == 0, report
+    finally:
+        _uninstall()
+
+
+def test_two_subscriptions_are_still_delivered_in_parallel():
+    """Sharding must not become global serialisation, which is the failure mode it trades against.
+
+    Two subscriptions never touch the same document, so they SHOULD overlap — the pool's whole
+    value on a deep backlog is breadth across subscriptions. Asserted with a barrier rather than by
+    timing: both senders must arrive before either is released, so a serialised implementation
+    fails on the barrier's own timeout instead of on a threshold somebody has to tune.
+    """
+    client = _install()
+    try:
+        _live(client)
+        other = "sub-2"
+        _live(client, subscription_id=other)
+        _pending(client, n=1)
+        partner_events.emit(
+            [_subject(subscription_id=other, journey_ref="DatedServiceJourney:2000")], now=NOW
+        )
+        barrier = threading.Barrier(2, timeout=10)
+        inner = _sender()
+        overlapped = threading.Event()
+
+        def meeting(url, **kwargs):
+            try:
+                barrier.wait()
+                overlapped.set()
+            except threading.BrokenBarrierError:
+                pass
+            return inner(url, **kwargs)
+
+        report = partner_delivery.deliver_pending(now=NOW, sender=meeting, wait_s=30.0)
+        assert overlapped.is_set(), (
+            "two subscriptions must be attempted concurrently; the barrier timed out, so the "
+            "shards were run one after another"
+        )
+        assert report.sent == 2, report
     finally:
         _uninstall()
 

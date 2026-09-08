@@ -518,6 +518,117 @@ def test_two_below_threshold_cycles_withdraw_and_one_does_not():
         _uninstall()
 
 
+def test_a_recovered_cycle_breaks_the_run_so_a_later_dip_does_not_withdraw():
+    """Scenario 7's exact half: the count is CONSECUTIVE, not "two dips inside fifteen minutes".
+
+    The store cannot see this on its own. An alert-worthy cycle that mints nothing reaches no store
+    call at all — `skip_reason` skips it to save a transaction per standing subject per cycle — so
+    `_withdraw_body` closes runs by TIME, and dip / recover / dip inside `WITHDRAWAL_GAP_S` still
+    withdrew. That is not cosmetic: a wrong withdrawal is a real «varselet er trukket tilbake», it
+    is cap-exempt so nothing suppresses it, and the next cycle re-alerts — notification flapping.
+
+    So the recovery cycle now closes the run from here, where the information is, and the second dip
+    is a FIRST dip again. All three cycles are inside the gap, which is what makes this the case the
+    time window gets wrong.
+    """
+    client = _install()
+    try:
+        _live(client)
+        partner_events.emit([_subject()], now=NOW)
+        dip = partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        assert dip.counting == 1, dip
+
+        was = client.in_collection(partner_store.SUBJECTS)[0]
+        recovered = partner_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        assert recovered.unchanged == 1, "the same phase again: nothing is minted"
+        assert recovered.run_cleared == 1, f"and the open run is closed; got {recovered}"
+        subject = client.in_collection(partner_store.SUBJECTS)[0]
+        assert subject["below_threshold_cycles"] == 0 and subject["below_threshold_at"] is None
+        # A recovery is not a lifecycle transition: it must move neither, or it would mint an event
+        # and put a second notification about one train on a traveller's phone.
+        assert subject["phase"] == was["phase"] == partner_store.PHASE_PREDICTED
+        assert subject["revision"] == was["revision"]
+
+        # Well inside `WITHDRAWAL_GAP_S` of the first dip, so the time window alone would withdraw.
+        assert timedelta(minutes=3).total_seconds() < partner_store.WITHDRAWAL_GAP_S
+        second = partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=3))
+        assert second.withdrawn == 0 and second.counting == 1, (
+            f"the recovery made this a FIRST dip, not the second of a run; got {second}"
+        )
+        assert len(client.in_collection(partner_store.EVENTS)) == 1, "no withdrawal was minted"
+    finally:
+        _uninstall()
+
+
+def test_an_ordinary_standing_cycle_still_writes_nothing():
+    """The cost contract: the reset must not undo the optimisation it was built on top of.
+
+    A standing alert-worthy subject with NO open run is the overwhelming majority of cycles, and it
+    must still reach no store call whatever — `open_runs` is consulted first and is empty for it.
+    The measurement this protects is the 200-subject emit at ~12 ms, which a write per standing
+    subject per cycle would turn into a transaction per subject.
+    """
+    client = _install()
+    try:
+        _live(client)
+        partner_events.emit([_subject()], now=NOW)
+        before = client.transactions
+        report = partner_events.emit([_subject()], now=NOW + timedelta(minutes=1))
+        assert report.unchanged == 1 and client.transactions == before, (
+            f"an ordinary standing cycle writes nothing; "
+            f"{client.transactions - before} transaction(s) happened"
+        )
+        assert report.run_cleared == 0 and report.run_stale == 0
+    finally:
+        _uninstall()
+
+
+def test_a_run_already_past_the_gap_is_left_for_the_store_to_reset():
+    """A write that would buy nothing is not made: the store starts a fresh run for it anyway.
+
+    This is why `open_below_threshold` is a mapping rather than a set — the timestamp is what lets
+    the caller tell an open run from a stale one without a read.
+    """
+    client = _install()
+    try:
+        _live(client)
+        partner_events.emit([_subject()], now=NOW)
+        partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        later = NOW + timedelta(seconds=partner_store.WITHDRAWAL_GAP_S + 120)
+        before = client.transactions
+        report = partner_events.emit([_subject()], now=later)
+        assert report.run_stale == 1 and report.run_cleared == 0, report
+        assert client.transactions == before, "and it costs no transaction"
+    finally:
+        _uninstall()
+
+
+def test_a_failed_pre_read_loses_the_reset_and_never_reads_per_subject():
+    """R20, applied to the reset: an outage costs the optimisation's exactness, never a read.
+
+    A failed `partner_alerts` leaves `open_runs` empty, so no run is closed this cycle and the
+    store's time window is what protects the traveller. What must NOT happen is a per-subject read
+    to recover the information — that is the cost the whole pre-read exists to avoid.
+    """
+    client = _install()
+    try:
+        _live(client)
+        partner_events.emit([_subject()], now=NOW)
+        partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        client.query_fail_with["partner_alerts"] = RuntimeError("Firestore is unreachable")
+        mark = len(_SINK.records)
+        report = partner_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        assert report.run_cleared == 0 and report.run_stale == 0, report
+        assert report.unchanged == 1, "the store still answered the subject itself"
+        assert not any("get_subject" in str(r.msg) for r in _SINK.records[mark:])
+        # The run is still open, so the store's time window governs — the documented fallback.
+        subject = client.in_collection(partner_store.SUBJECTS)[0]
+        assert subject["below_threshold_at"] is not None
+    finally:
+        client.query_fail_with.pop("partner_alerts", None)
+        _uninstall()
+
+
 def test_a_below_threshold_train_with_nothing_standing_costs_no_transaction():
     """The pre-read's whole purpose, and the cheap half of scenario 7.
 
