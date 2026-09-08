@@ -1,0 +1,32 @@
+{
+  "$comment": [
+    "The declared consumption shape (KTD11), identical in kind to the client package's: compiled",
+    "CommonJS plus type declarations. See that file's comment for why package.json declares no",
+    "`type` field and why the three module-interop options below are load-bearing.",
+    "",
+    "This package resolves `@entur/kix-notifications-client` through the npm `file:` link to its",
+    "sibling, so it consumes the sibling's BUILT dist -- the same artifact a partner gets. That is",
+    "why `build:client` runs first in every script that compiles or tests: an unbuilt sibling is a",
+    "missing module, not a type error."
+  ],
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "node18",
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "erasableSyntaxOnly": true,
+    "rewriteRelativeImportExtensions": true,
+    "allowImportingTsExtensions": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts"]
+}

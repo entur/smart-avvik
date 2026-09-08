@@ -43,6 +43,20 @@ disruptions/api/rushhistorikk_static/
 demo/rushhistorikk/node_modules/
 demo/rushhistorikk/tsconfig.tsbuildinfo
 
+# The TypeScript packages a PARTNER vendors (integrations/). Neither goes into the image --
+# .dockerignore excludes the whole directory -- and neither is published: KTD11 vendors them for
+# the pilot. `dist/` is the DECLARED consumption shape (compiled CommonJS plus .d.ts) and is built
+# by `npm run build`, so committing it would ship a copy that goes stale against src/ the first time
+# anyone edits a source and forgets. The lockfiles ARE committed: the CI steps run `npm ci`, which
+# fails without one. `contracts/` inside the client package is committed too -- it is a vendored,
+# byte-parity-guarded copy of contracts/notifications/v1/, and the package must be self-contained
+# when a partner takes it.
+integrations/notifications-client/node_modules/
+integrations/notifications-client/dist/
+integrations/firebase-notifications/node_modules/
+integrations/firebase-notifications/dist/
+**/tsconfig.tsbuildinfo
+
 # Local avviksvarsel state file (durable state lives in the GCS bucket in prod).
 disruptions/api/varsel_state.json
 

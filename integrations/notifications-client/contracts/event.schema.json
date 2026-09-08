@@ -1,0 +1,143 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://kix-avvik.entur.io/contracts/notifications/v1/event.schema.json",
+  "title": "Partner notification event",
+  "description": "One revision of one alert about one train for one subscription. Delivery is at-least-once with no ordering guarantee, so a receiver MUST apply three suppression rules before it dispatches anything natively: drop a duplicate event_id; drop a revision not strictly newer than the highest applied for that alert_id; and never dispatch a `predicted` revision for a train already `confirmed`, whatever its revision. Duplicate suppression and revision ordering within our stream are supplied as a client policy, not left as homework.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "type",
+    "occurred_at",
+    "valid_until",
+    "subscription_id",
+    "subscription_version",
+    "alert_id",
+    "revision",
+    "phase",
+    "test",
+    "operator",
+    "line",
+    "journey_ref",
+    "call_date",
+    "stop_place",
+    "stop_order",
+    "payload"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Refuse a shape your receiver does not know rather than mis-parse it. Every partner step on our side fails closed the same way."
+    },
+    "event_id": {
+      "type": "string",
+      "description": "Immutable, and deterministic over (alert_id, revision) so a re-run of the same decision mints the same id and your inbox recognises the duplicate. It is NOT a capability: it must never become a lookup key or a bearer credential."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["journey.alert.created", "journey.alert.updated", "journey.alert.withdrawn"],
+      "description": "A new revision is minted only on a lifecycle transition -- first warning, predicted to confirmed, or withdrawal. A changed probability, delay figure or wording mints NOTHING, at any size: there is no materiality threshold, because minting on any changed figure would turn every ingestion cycle into a fresh revision and a second notification about the same train."
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["predicted", "confirmed", "withdrawn"],
+      "description": "`predicted` is a forecast from our models. `confirmed` is a cancellation the operator's own real-time feed has already declared -- a fact, not a forecast, which is why its probabilities are 1.0 and its delay figures are null (every one of them meant \"if it runs\"). `withdrawn` means the FORECAST changed, not that normal service is guaranteed."
+    },
+    "alert_id": {
+      "type": "string",
+      "description": "The canonical per-train subject key, and the only key the supplied policy deduplicates and orders on. The grain is (subscription, train): a partner serves many commuters through one receiver, and a per-train-only key would make the receiver's own revision rule suppress the SECOND commuter's notification about the same disrupted train. The train's own fields below ride along for display and for your joins; they are not the identity."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Strictly increasing per alert_id. Monotonicity is structural rather than a property of our clock: it is seeded from a UTC instant and then clamped to max(stored + 1, seed) inside the transaction, so it survives an autumn DST fall-back and an NTP step backwards. A revision formatted from a local timestamp would go backwards for an hour every October and a receiver ordering on it would silently discard every event for those subjects, a confirmed cancellation included."
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When we decided this revision, UTC."
+    },
+    "valid_until": {
+      "type": "string",
+      "format": "date-time",
+      "description": "How long this event is worth acting on: the earlier of a 60-minute horizon from occurred_at and the train's departure. WHERE EACH TERM IS ENFORCED, stated rather than implied -- those two are applied to the value you receive, while the subscription's own lifetime is enforced at dispatch instead: we re-read the live subscription immediately before every attempt and stop sending once it has ended. So for a subscription that expires inside this horizon you may hold an event whose valid_until outlives it by up to an hour. Nothing further is sent for it, and the value bounds YOUR dispatch window rather than asserting the subscription still exists. Past valid_until the event is expired rather than failed. The retry INTERVAL is deliberately not published as a constant: it is one attempt per notification pass, and the pass runs on SIRI ingestion changes -- measured at a ~296 s period on 2026-09-08, which is a measurement rather than a schedule."
+    },
+    "subscription_id": { "type": "string" },
+    "subscription_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The subscription version this event was authorised by. Deletion or expiry stops later claims, and we recheck eligibility immediately before dispatch -- but a request already in flight may complete, so your receiver rechecks the recipient mapping too."
+    },
+    "partner_ref": {
+      "type": "string",
+      "description": "Your own opaque reference from the subscription, echoed unchanged."
+    },
+    "test": {
+      "type": "boolean",
+      "description": "True for a synthetic test event. It rides INSIDE the signed body, so a receiver can refuse it before native dispatch; it is not a header a proxy can strip. Only subscriptions marked test-only at creation can produce one, and that marker is immutable."
+    },
+    "operator": { "type": "string", "description": "Codespace of the operator, e.g. VYG." },
+    "line": { "type": "string" },
+    "journey_ref": { "type": "string", "description": "The dated service journey reference." },
+    "call_date": { "type": "string", "format": "date" },
+    "stop_place": {
+      "type": "string",
+      "description": "The boarding stop place this alert is about -- the subscription's origin, or the ref of the same physical place the feed recorded the call on."
+    },
+    "stop_order": { "type": "integer", "minimum": 0 },
+    "situations": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "The contributing SIRI-SX situation numbers. Several situations about one disruption are collapsed to ONE event per train, so this can name more than one. A synthetic `KIX:`-prefixed number means there is no operator message behind the alert: either the real-time feed declared the cancellation with no situation published, or the alert rests on real-time data alone."
+    },
+    "payload": {
+      "type": "object",
+      "description": "The facts plus the Norwegian prose. Normal receipt needs no second request to us.",
+      "required": ["notification"],
+      "properties": {
+        "notification": {
+          "type": "object",
+          "required": ["title", "body"],
+          "properties": {
+            "title": {
+              "type": "string",
+              "description": "The fact about the train, e.g. «Tog L1 07:18 er innstilt». Norwegian, and identical to what /varsel would have pushed for the same journey."
+            },
+            "body": {
+              "type": "string",
+              "description": "The route on its own first line, then the wording. Norwegian. Never varies by branding: the wording is what our own feedback loop records, and text that varied per variant would split every wording comparison along a second axis."
+            },
+            "action": {
+              "type": ["object", "null"],
+              "description": "An optional deep link or label the partner may render."
+            }
+          }
+        },
+        "call": {
+          "type": "object",
+          "description": "The affected call: aimed and expected times, and whether boarding and alighting are permitted there. Calling at a stop is not the same as being usable from it -- long-distance runs are routinely sold boarding-only over their local stretch."
+        },
+        "probabilities": {
+          "type": "object",
+          "description": "Impact and cancellation probabilities. Both are 1.0 and the delay figures are null when `phase` is `confirmed`."
+        },
+        "delay": {
+          "type": ["object", "null"],
+          "description": "Delay figures, or null for a confirmed cancellation."
+        },
+        "effect": { "type": ["string", "null"] },
+        "situations": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "The contributing situations with their operator-authored summaries and source timestamps."
+        },
+        "alternative_journey": {
+          "type": ["object", "null"],
+          "description": "The best remaining way there, which is not necessarily a faster one: for a cancelled train it legitimately arrives later than the timetable promised, so read `arrives_before_original` rather than assuming a saving."
+        }
+      }
+    }
+  }
+}

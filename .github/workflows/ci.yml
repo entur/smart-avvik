@@ -58,7 +58,13 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: demo/avviksvarsel/package-lock.json
+          # Every lockfile this job runs `npm ci` against. The input is multi-line by design: naming
+          # only one means the other packages' installs are uncached, which is silent -- a slower job
+          # is not a failing job, so nothing would ever surface it.
+          cache-dependency-path: |
+            demo/avviksvarsel/package-lock.json
+            integrations/notifications-client/package-lock.json
+            integrations/firebase-notifications/package-lock.json
       - name: Install uv
         run: pip install uv
       - name: Install dependencies
@@ -133,6 +139,54 @@ jobs:
         run: |
           npm ci --no-fund --no-audit
           npm test
+      # The two `integrations/` packages -- the TypeScript helper a partner vendors, and the Firebase
+      # receiver built on it. A suite in a NEW top-level directory is invisible to every loop above:
+      # those enter disruptions/api, data/feedback and demo/avviksvarsel only. So these two steps are
+      # the whole reason those suites run at all, and each package greps THIS file for its own step
+      # (`test/ci.test.mjs`), the same self-grep discipline the emulator step above uses -- deleting a
+      # step fails the suite rather than quietly halving the build.
+      #
+      # `npm ci` needs a committed lockfile per package, which is why there is one in each.
+      #
+      # The client is BUILT here as well as tested. `npm test` runs `node --test` over the .ts
+      # sources through Node's type stripping, with no build step -- a convenience, and explicitly
+      # NOT the shape a partner consumes. `verify:dist` compiles to CommonJS plus type declarations
+      # and loads the artifact, which is the declared consumption shape (KTD11), on the Node major
+      # this job pins above.
+      - name: Run notification client tests
+        working-directory: integrations/notifications-client
+        run: |
+          set -euo pipefail
+          npm ci --no-fund --no-audit
+          npm test
+          npm run verify:dist
+      # The Firebase receiver: a plain suite, then the emulator suite that asserts the Firestore
+      # security rules actually deny a client SDK.
+      #
+      # Java and firebase-tools are already installed by the partner-store steps above; the guard
+      # below makes this step work on its own if those are ever removed or reordered, rather than
+      # failing with `firebase: command not found` in an unrelated part of the file.
+      #
+      # This package's firebase.json pins DIFFERENT emulator ports from the repo-root one --
+      # firestore 8572, the Firestore websocket 9151 and the hub 4401, against 8571, 9150 and the
+      # default 4400 -- and runs under its own demo project id. Two of those three are invisible in
+      # the root config: it names no hub, and neither file names the websocket port, which the CLI
+      # allocates separately and defaults to 9150 for every project.
+      #
+      # What that separation is for HERE is the sequential case, which is what this job does: a step
+      # stays clean when the previous one has not finished tearing down, and a Firestore emulator has
+      # been observed holding its port for minutes after its runner exited. It does NOT make two
+      # suites safe to start at the same instant -- the CLI's own hub startup is what fails then --
+      # so these two steps must stay sequential, which as separate steps they are.
+      - name: Run Firebase notification receiver tests
+        working-directory: integrations/firebase-notifications
+        run: |
+          set -euo pipefail
+          command -v firebase >/dev/null || npm install -g firebase-tools@15
+          npm ci --no-fund --no-audit
+          npm test
+          npm run test:emulator
+          npm run verify:dist
 
   # --- Docker Build, Scan, and Push ---
   # Only runs after all lints and tests pass to avoid wasting resources on broken builds

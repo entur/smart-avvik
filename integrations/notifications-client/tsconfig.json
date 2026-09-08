@@ -1,0 +1,7 @@
+{
+  "$comment": "Type-check only. The emitting configuration is tsconfig.build.json.",
+  "extends": "./tsconfig.build.json",
+  "compilerOptions": {
+    "noEmit": true
+  }
+}
