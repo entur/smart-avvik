@@ -256,10 +256,14 @@ def test_a_no_sx_departure_never_quotes_our_own_placeholder_as_an_operator():
 def test_a_partner_wording_needs_no_vapid_keypair_and_no_model():
     """KTD4's flat requirement: a partner wording does not depend on a VAPID keypair.
 
-    A deployment can hold no VAPID keypair at all — `varsel.push_enabled()` False, `check_and_notify`
-    a no-op — and a partner event still has to carry a ready-to-display Norwegian title and body
-    (R7). So does a deployment whose model backend is unreachable. The template is free and always
-    available, which is what makes both true rather than aspirational.
+    A deployment can hold no VAPID keypair at all — `varsel.push_enabled()` False, no browser
+    delivery attempted — and a partner event still has to carry a ready-to-display Norwegian title
+    and body (R7). So does a deployment whose model backend is unreachable. The template is free
+    and always available, which is what makes both true rather than aspirational.
+
+    "`check_and_notify` a no-op" is what this said when it was written, and U2 (2026-09-08) made it
+    false in the direction this test wanted: that pass now matches, writes and records for a
+    recipient on any channel, and only browser DELIVERY depends on the keypair.
     """
     import varsel
 

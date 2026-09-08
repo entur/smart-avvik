@@ -821,6 +821,105 @@ def test_the_survivor_of_a_tie_does_not_depend_on_input_order():
     assert varsel.one_alert_per_train([b, a])[0].situation_number == "S2"
 
 
+# ---- U2: pending-ness is per RECIPIENT, on either channel (KTD3/KTD4) ------------------------
+
+
+def test_pending_pushes_is_channel_neutral():
+    """One question, two ledgers, and the unit-level statement of KTD3.
+
+    `_notified` answers it for a browser registration (`"<journey_id>|<situation>"`, grown only on a
+    successful send) and `PartnerRecipient.delivered` answers it for a webhook subscription
+    (Firestore's copy, read once per cycle). A train is pending while ANY recipient on either
+    channel still needs telling, which is what makes one wording serve both.
+    """
+    varsel._notified.clear()
+    alerts = [_alert("S1"), _alert("S2", jkey="t2", dep=MON_0800 + timedelta(minutes=30))]
+    partner = varsel.PartnerRecipient("sub-1", {"from_stop": "A"}, frozenset({"S1"}))
+
+    # Browser only, nothing notified yet: both trains pending.
+    assert [a.situation_number for a in varsel._pending_pushes(["j1"], alerts)] == ["S1", "S2"]
+    # Browser told about S1: only S2 remains -- for that registration.
+    varsel._notified.add("j1|S1")
+    assert [a.situation_number for a in varsel._pending_pushes(["j1"], alerts)] == ["S2"]
+    # A SECOND registration on the same definition has heard nothing, so S1 is pending again.
+    assert [a.situation_number for a in varsel._pending_pushes(["j1", "j2"], alerts)] == [
+        "S1", "S2",
+    ]
+    # No browser recipient at all (which is what the caller passes when push is disabled) and a
+    # partner that has had S1: S2 alone, and it is the partner's ledger saying so.
+    assert [
+        a.situation_number for a in varsel._pending_pushes((), alerts, [partner])
+    ] == ["S2"]
+    # And a partner that has had both leaves nothing pending on any channel.
+    done = varsel.PartnerRecipient("sub-1", {"from_stop": "A"}, frozenset({"S1", "S2"}))
+    assert varsel._pending_pushes((), alerts, [done]) == []
+    varsel._notified.clear()
+
+
+def test_a_sub_threshold_train_is_never_pending_on_either_channel():
+    """The gate comes first, on both channels alike (KTD2/R3): a partner recipient must not earn a
+    wording for a train `/varsel` would not have alerted on. `alertworthy` is the whole test, and
+    it is applied before either ledger is consulted."""
+    varsel._notified.clear()
+    mild = _alert("S1", p_impact=0.2)
+    mild.alertworthy = False
+    partner = varsel.PartnerRecipient("sub-1", {"from_stop": "A"}, frozenset())
+    assert varsel._pending_pushes(["j1"], [mild], [partner]) == []
+
+
+def test_a_partner_recipient_carries_only_the_five_shared_registration_fields():
+    """R16 and KTD3: what enters the pass is a journey DEFINITION and a delivered set, nothing else.
+
+    The five fields are exactly what `journey_key`, `journey_windows` and `_impact` read off a
+    registration — `llm_message.build_message_input` resolves the two place NAMES from the stop
+    registry rather than from the record, which is why none is needed here. A partner's callback
+    URL, quota or opaque reference has no way into this pass, and a wider record is how one would
+    arrive.
+    """
+    recipient = varsel._parse_partner_recipient(
+        {
+            "recipient_id": "sub-1",
+            "from_stop": "A",
+            "to_stop": "B",
+            "begin": "07:00",
+            "end": "09:00",
+            "days": [4, 0, 0],
+            "delivered": ["S1", "S1"],
+            "callback_url": "https://partner.example.com/hook",
+        }
+    )
+    assert set(recipient.journey) == {"from_stop", "to_stop", "begin", "end", "days"}
+    assert recipient.journey["days"] == [0, 4], "de-duplicated and sorted, as JourneyIn does"
+    assert recipient.delivered == frozenset({"S1"})
+    assert "partner.example.com" not in str(recipient.journey)
+    # And the definition keys exactly as a browser registration with the same shape would.
+    assert varsel.journey_key(recipient.journey) == varsel.journey_key(
+        {"from_stop": "A", "to_stop": "B", "begin": "07:00", "end": "09:00", "days": [0, 4]}
+    )
+
+
+def test_the_partner_channel_is_off_without_both_seams():
+    """Un-wired means off, and it takes BOTH halves to be on.
+
+    The default is what makes an un-wired deployment byte-for-byte the code before the channel
+    existed, and it is asserted rather than assumed because it is the entire rollback story: a
+    provider with no flag, or a flag with no provider, must contribute nothing.
+    """
+    before = (varsel._partner_enabled, varsel._partner_provider)
+    try:
+        varsel._partner_enabled = varsel._partner_provider = None
+        assert varsel.partner_channel_enabled() is False
+        assert varsel._load_partner_recipients() == []
+        varsel._partner_enabled = lambda: True
+        assert varsel.partner_channel_enabled() is False, "a flag with no store is off"
+        varsel._partner_enabled, varsel._partner_provider = None, list
+        assert varsel.partner_channel_enabled() is False, "a store with no flag is off"
+        varsel._partner_enabled = lambda: True
+        assert varsel.partner_channel_enabled() is True
+    finally:
+        varsel._partner_enabled, varsel._partner_provider = before
+
+
 def test_push_body_states_a_declared_cancellation_instead_of_scoring_it():
     """The 2026-08-05 report. ET had already cancelled the 15:03 from Asker, and the push (and the
     card wording it) still said "91 % sjanse for innstilling" for a train the journey planner had

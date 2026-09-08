@@ -1087,9 +1087,15 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             varsel.recheck_service()
     except Exception:
         logger.exception("Varsel service re-check failed; existing warnings stand")
-    # Registered-journey push alerts: match every journey against the fresh snapshot and push any
-    # newly alert-worthy hit. Isolated (like the other steps) so a push failure never breaks the
-    # feed rebuild. No-op when VAPID is unconfigured.
+    # Registered-journey alerts: match every registration -- browser and, where the partner channel
+    # is wired, webhook subscriptions merged in under the same journey_key -- against the fresh
+    # snapshot and notify any newly alert-worthy hit. Isolated (like the other steps) so a delivery
+    # failure never breaks the feed rebuild.
+    #
+    # It is NOT a no-op without VAPID, and the comment here said it was until 2026-09-08. Scoring
+    # and decision recording have run regardless of the keypair since /historikk shipped, and since
+    # KTD4 the wording pass does too wherever a recipient on some channel can receive it. What a
+    # missing keypair still stops is browser delivery, and nothing else.
     try:
         with _phase("varsel_notify", timings):
             varsel.check_and_notify(_varsel_snapshot())
@@ -1125,6 +1131,24 @@ def _togvarsel_notify_enabled() -> bool:
     return os.environ.get("TOGVARSEL_NOTIFY_ENABLED", "").strip().lower() in llm_message._TRUTHY
 
 
+def _partner_notifications_enabled() -> bool:
+    """The partner (webhook) notification channel's gate, read per call.
+
+    ONE flag, deliberately — the convention above and not its shape. `_togvarsel_notify_enabled`
+    ANDs two because rushvarsel has a master product gate over three separate surfaces; the partner
+    channel has exactly one surface and one question, so a second flag would be a value nobody
+    varies and one more thing to re-derive when the channel is turned on.
+
+    What it keeps from that function is everything that matters: an allow-list parse (so a typo is
+    off rather than on), a call-time environment read (ci.yml:68-73 records what an import-time read
+    costs), and **unset = off**, so the code default matches the closed gate instead of relying on
+    helm values alone. It is injected into `varsel.configure` rather than read there, so the one
+    function is the seam — and `varsel` declines to touch the store at all while this reads False,
+    which is what makes "the flag is unset, so no partner state was read" a property of the pass.
+    """
+    return os.environ.get("PARTNER_NOTIFICATIONS_ENABLED", "").strip().lower() in llm_message._TRUTHY
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Eager initial load so /alert_profile works before the first ingestion change fires
@@ -1145,6 +1169,12 @@ async def lifespan(app: FastAPI):
         # /config tells the PWA whether rush-forecast pushes are delivered HERE, so the page's
         # notice can never promise a push class this environment's gate withholds.
         togvarsel_notify_provider=_togvarsel_notify_enabled,
+        # The partner channel's gate. Wired now and deliberately WITHOUT a recipient provider: the
+        # Firestore-backed store is a later unit, and until it is injected the pass has no partner
+        # subscriptions to match whatever this flag says. Both halves default to off, so a
+        # deployment that is missing either is byte for byte the pass that ran before the channel
+        # existed.
+        partner_enabled=_partner_notifications_enabled,
     )
     llm_message.configure(stop_name_provider=_varsel_stops)
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than

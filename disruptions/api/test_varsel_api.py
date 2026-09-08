@@ -200,6 +200,15 @@ def _reset_state():
     import notification_wording
 
     notification_wording.reset_state()
+    # The partner channel's two INJECTED SEAMS (U2, 2026-09-08). Not a ledger -- the pass holds no
+    # partner state at module level, deliberately (KTD3: Firestore is the only dedup ledger for that
+    # channel, and the snapshot `check_and_notify` matches from is pass-local) -- but a leaked stub
+    # store is the same class of pollution as a leaked budget and worse to read: every later test
+    # would quietly match one extra journey_key group, so a wording count or an /impact call count
+    # would be off by one with nothing in that test mentioning partners. Reset to the off default,
+    # which is what an un-wired deployment holds.
+    varsel._partner_enabled = None
+    varsel._partner_provider = None
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
@@ -2192,7 +2201,14 @@ def test_the_write_budgets_are_unchanged_by_the_delivery_switch(monkeypatch):
     _register(DEVICE)
     monkeypatch.setattr(varsel, "push_enabled", lambda: False)
     varsel.check_and_notify(SNAPSHOT)
-    assert writes == [], "no message writing without push -- text exists to be delivered"
+    # Still true after KTD4 (2026-09-08), and the reason is now stated rather than implied: the
+    # rule was never "no keypair, no writing" but "no reader, no writing", and with no partner
+    # channel wired -- this suite's default, and every deployment's until the store lands -- a
+    # missing keypair means there is no reader on any channel. The companion case, where a partner
+    # subscription IS the reader, is
+    # `test_a_partner_subscription_matches_and_is_written_for_without_a_keypair`.
+    assert writes == [], "no deliverable recipient on any channel -- text exists to be delivered"
+    assert varsel.partner_channel_enabled() is False
 
 
 def test_two_devices_share_one_write_with_delivery_off(monkeypatch):
@@ -3237,6 +3253,575 @@ def test_alert_pushes_per_registration_are_capped_per_day_soonest_first(monkeypa
     varsel.check_and_notify(trains)
     assert len(sent) == 6
     _use_snapshot(SNAPSHOT)
+
+
+# ---- U2: a partner subscription is a registration with a webhook channel (KTD3/KTD4) ----------
+#
+# The partner store itself is a later unit, so everything here drives the SEAM with stubs: a list
+# of raw documents, a provider that raises, a provider that hangs, and a document this binary
+# cannot read. That is deliberate and not a shortcut -- R20's claim is about what the PASS does
+# when the store misbehaves, and a stub is the only way to produce those four states on demand.
+
+PARTNER_DOC = {
+    "recipient_id": "sub-0001",
+    "from_stop": "A",
+    "to_stop": "B",
+    "begin": "00:00",
+    "end": "23:59",
+    "days": [0, 1, 2, 3, 4, 5, 6],
+}
+
+
+def _use_partner_store(monkeypatch, docs, *, enabled=True):
+    """Wire the partner channel's two seams and return the list its provider appends a call to.
+
+    `docs` may be a list or a zero-argument callable, so a test can make the store raise, hang or
+    page. Returns the call log rather than a count, so "the store was never consulted" is an
+    assertion about a list and not about a number that could also be zero by accident.
+    """
+    calls = []
+
+    def provider():
+        calls.append(1)
+        return docs() if callable(docs) else list(docs)
+
+    monkeypatch.setattr(varsel, "_partner_enabled", lambda: enabled)
+    monkeypatch.setattr(varsel, "_partner_provider", provider)
+    return calls
+
+
+def _capture_writes(monkeypatch, text="Toget er innstilt. Ta neste tog."):
+    """Record every subject the writer is asked about, as (journey_key, situation_number)."""
+    written = []
+
+    def fake_write(alert, *, journey_key, message_input, **_):
+        written.append((journey_key, alert.situation_number))
+        return text
+
+    monkeypatch.setattr(varsel, "_write_message", fake_write)
+    return written
+
+
+def test_a_registration_with_no_device_record_is_matched_and_written_for(monkeypatch):
+    """CHARACTERIZATION, taken before U2 changed anything: this shape already exists at scale.
+
+    79 of prd's 186 registrations sit on a device id with no push subscription behind it — an
+    iPhone that opened the link in Safari and never turned notifications on. `_journeys` keys the
+    per-recipient ledgers, not `_devices`, so the matcher already runs for such a journey, it is
+    already reported pending by `_pending_pushes` (which deliberately does not read device state),
+    a wording is already written for it, and only the delivery loop skips it.
+
+    That is exactly the shape a partner subscription has, which is why KTD3 calls one a
+    registration with a channel rather than a device. U2 leaves this behaviour untouched, and this
+    test is what says so: if the gate change had been written as "a live browser subscription
+    exists" rather than "push is enabled", every one of those 79 registrations would silently stop
+    attracting a wording and the in-app card would decay to the template for all of them.
+
+    Verified BOTH ways on 2026-09-08, which is the only thing that makes it characterization rather
+    than a description of the new code: it passes against the pre-U2 `varsel`/`main` as well as
+    against this one. A characterization test only run forwards proves the new behaviour and says
+    nothing about whether it changed.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+    provider_calls = _count_provider_calls(monkeypatch)
+    jid = _register(DEVICE)
+    with varsel._state_lock:
+        varsel._devices.pop(DEVICE)  # the journey stays; the device record is gone
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert provider_calls, "the matcher still runs for a journey with no device record"
+    assert [s for _k, s in written] == ["S1"], "and a wording is still written for it"
+    assert sent == [], "but nothing is delivered -- there is no subscription to deliver to"
+    assert not varsel._notified, "so no dedup key is written either; the next cycle re-offers it"
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["pushed"] is False
+    assert row["message_llm"] == "Toget er innstilt. Ta neste tog.", (
+        "the wording reached the decision log, so it demonstrably exists for the card to read"
+    )
+    assert jid in varsel._journeys and DEVICE not in varsel._devices
+
+
+def test_a_partner_subscription_matches_and_is_written_for_without_a_keypair(monkeypatch):
+    """U2 scenario 1 / AE10: no VAPID keypair, and the partner channel still works.
+
+    `push_enabled()` False is tst's real posture (it holds no keypair) and a webhook-only
+    deployment's by construction. Before KTD4 this cycle wrote nothing at all and recorded
+    `message_status='push_disabled'` on every row, because the writing pass was gated on the
+    keypair rather than on there being a reader.
+
+    Driven with TWO SX messages about one departure, so the collapse is exercised rather than
+    assumed: `one_alert_per_train` is what makes the count-of-one meaningful.
+
+    The EVENT half of the scenario ("produces an event") lands in U6, which owns event emission —
+    U2 has no event type and deliberately does not invent one. What this asserts is everything the
+    unit reaches: the match, the per-train collapse, the written wording, and that no browser
+    delivery was attempted.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+    calls = _use_partner_store(monkeypatch, [PARTNER_DOC])
+    _use_snapshot(SNAPSHOT_TWO_NOTICES)
+
+    varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
+
+    assert calls == [1], "the store is read exactly once per cycle, before pass 1a"
+    assert len(written) == 1, f"one wording per TRAIN, not per SX message; got {written}"
+    assert written[0][0] == "A|B|00:00|23:59|0,1,2,3,4,5,6", "keyed on the journey DEFINITION"
+    assert varsel._messages, "and cached, which is what U6's event will carry"
+    assert sent == [], "no keypair means no browser delivery was even attempted"
+
+
+def test_a_browser_and_a_partner_registration_share_one_match_and_one_wording(monkeypatch):
+    """U2 scenario 2 / AE1: one definition, two channels, ONE match and ONE wording.
+
+    Asserted BY CALL COUNT, which is the only way to assert it: comparing the two channels' outputs
+    would pass just as happily if the pass had matched twice and produced two identical answers, and
+    the cost R3 buys is precisely that it does not. A partner subscription costs this pass no
+    /impact call and no Vertex call of its own when a browser registration already covers its
+    definition; what it costs is one more entry in a list.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC])
+    _register(DEVICE)
+    # The counters go on AFTER registration, deliberately: `POST /journeys` annotates the created
+    # journey by running the matcher on the request path, so counting from before it would charge
+    # this cycle a call the cycle never made.
+    matches = []
+    real_match = varsel.match_journey
+
+    def counting_match(journey, *a, **kw):
+        matches.append(varsel.journey_key(journey))
+        return real_match(journey, *a, **kw)
+
+    monkeypatch.setattr(varsel, "match_journey", counting_match)
+    provider_calls = _count_provider_calls(monkeypatch)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    key = "A|B|00:00|23:59|0,1,2,3,4,5,6"
+    assert matches == [key], f"exactly one matcher call between the two channels; got {matches}"
+    assert written == [(key, "S1")], f"and exactly one written wording; got {written}"
+    # The verdicts are identical because there is only one set of them: both channels read the same
+    # `alerts_by_key` entry, which is what makes "identical verdicts" structural rather than checked.
+    assert len(varsel._messages) == 1
+    assert len(provider_calls) == len(
+        varsel.journey_windows(next(iter(varsel._journeys.values())), datetime.now(UTC))
+    ), "one /impact call per boarding window of the ONE group, not two groups' worth"
+
+
+def test_only_the_train_a_partner_still_needs_is_written_for_without_a_keypair(monkeypatch):
+    """U2 scenario 3, and the half of KTD4 that is easy to miss and expensive to get wrong.
+
+    Two disrupted departures on one definition, no keypair, and a partner subscription that has
+    already been delivered S1. The wording budget must go to S3 and to nothing else.
+
+    Both halves of the move are under test here. If the gate had been changed WITHOUT withholding
+    the browser jids from `_pending_pushes`, the browser registration would report BOTH trains
+    pending on every cycle — `_notified` only grows on a successful browser send, and there can
+    never be one here — so this cycle would write for two trains it can never deliver, on every
+    tick, competing with the one subject the partner is actually waiting for. And if the pending
+    set had not been extended to partner recipients at all, S3 would fall through to the
+    worst-train fallback, which picks S1 (the more severe) and hands the traveller the template for
+    the train they still need to hear about.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [{**PARTNER_DOC, "delivered": ["S1"]}])
+    _register(DEVICE)  # a browser registration on the same definition, undeliverable here
+    _use_snapshot(SNAPSHOT_TWO_DISRUPTED)
+
+    varsel.check_and_notify(SNAPSHOT_TWO_DISRUPTED)
+
+    assert [s for _k, s in written] == ["S3"], (
+        f"only the train the partner is still owed; got {written}"
+    )
+
+
+def test_a_keypair_less_cycle_writes_nothing_once_the_partner_has_been_told(monkeypatch):
+    """The other side of the same rule: nothing pending on any channel means no write.
+
+    A browser registration is present and disrupted, and it would report pending forever on this
+    deployment. It contributes nothing, because the browser channel cannot deliver at all here —
+    which is what stops a keypair-less deployment spending its whole budget re-wording trains that
+    reach nobody.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [{**PARTNER_DOC, "delivered": ["S1"]}])
+    _register(DEVICE)
+
+    for _ in range(3):  # three poller ticks on one live situation
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert written == [], f"no deliverable recipient on any channel; got {written}"
+
+
+def test_no_deliverable_recipient_on_any_channel_spends_no_vertex_call(monkeypatch):
+    """U2 scenario 4: a keypair-less deployment with the partner flag unset writes nothing.
+
+    This is the case every deployment is in today, and the one the old `if not push_on: continue`
+    got right. The gate had to keep it right while widening: the condition is now "a recipient on
+    some channel can receive this", and with no keypair and no partner store there is none.
+
+    `_generation_enabled` is asserted never to be consulted either, because that is where the spend
+    would begin — a cycle that reaches the writer's gate has already decided to write.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    log = _use_decision_log(monkeypatch)
+    written = _capture_writes(monkeypatch)
+    asked = []
+    monkeypatch.setattr(
+        varsel, "_generation_enabled", lambda: asked.append(1) or True
+    )
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert written == [] and asked == [], "no reader, no spend"
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_status"] == "push_disabled", (
+        "and `push_disabled` keeps its meaning for a browser subject -- every row this table gets "
+        "is one (KTD10 keeps partner subjects out), so the value still says exactly why"
+    )
+
+
+def test_the_partner_flag_unset_never_touches_the_store(monkeypatch):
+    """U2 scenario 5: with the flag unset the pass makes no store call at all.
+
+    Enforced in `varsel`, not in whoever wrote the provider: the flag is injected as its own seam
+    precisely so "the flag is off, so nothing was read" is a property of the pass. Both shapes of
+    off are checked — the flag reading False, and a flag reader that raises, which must also read
+    as off (the failure direction of a delivery switch is closed).
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    # The WRITER too, and not because this test cares what it says: push is enabled here, so the
+    # cycle reaches pass 1c, and nothing in this suite structurally fences `_write_message` the way
+    # `alternatives._post_json` fences the Journey Planner. Left unstubbed it makes a real Vertex
+    # call from CI -- two, one per backend, before the latch closes.
+    _capture_writes(monkeypatch)
+    _register(DEVICE)
+
+    calls = _use_partner_store(monkeypatch, [PARTNER_DOC], enabled=False)
+    varsel.check_and_notify(SNAPSHOT)
+    assert calls == [], "the flag is off, so the store must not be consulted"
+    assert varsel.partner_channel_enabled() is False
+
+    def boom():
+        raise RuntimeError("the flag could not be read")
+
+    monkeypatch.setattr(varsel, "_partner_enabled", boom)
+    assert varsel.partner_channel_enabled() is False, "a raising gate reads as OFF"
+    varsel.check_and_notify(SNAPSHOT)
+    assert calls == []
+    # And with no provider wired at all -- every deployment until the store lands.
+    monkeypatch.setattr(varsel, "_partner_enabled", lambda: True)
+    monkeypatch.setattr(varsel, "_partner_provider", None)
+    assert varsel.partner_channel_enabled() is False
+
+
+def test_a_broken_partner_store_costs_the_partner_channel_and_nothing_else(monkeypatch):
+    """U2 scenario 7 / AE14: the store raises, hangs, or hands over one unreadable document.
+
+    Three shapes in one test because they share the whole assertion: browser matching, wording,
+    delivery, decision recording and state persistence all complete, and only the partner channel's
+    own contribution is lost. Called bare instead of guarded, a raise here unwinds out of
+    `check_and_notify` entirely — loop 2 never runs, so no push at all goes out, and
+    `_record_decisions` never runs, so the decision log gains a hole no later cycle backfills.
+    """
+    import threading
+    from time import monotonic
+
+    # --- 1. the store raises -------------------------------------------------------------------
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+
+    def raising():
+        raise RuntimeError("Firestore is unreachable")
+
+    calls = _use_partner_store(monkeypatch, raising)
+    _register(DEVICE)
+    with _capture_varsel_logs() as records:
+        varsel.check_and_notify(SNAPSHOT)
+    assert calls == [1], "it was tried"
+    assert len(sent) == 1 and written and log.rows, "and the browser cycle completed regardless"
+    assert varsel._notified, "including the state the save persists"
+    assert [e["result"] for e in _events(records, "varsel_partner_load")] == ["error"]
+
+    # --- 2. the store hangs --------------------------------------------------------------------
+    # A real bound, not a mocked clock: the provider parks for `held` and the load is allowed 50 ms.
+    # The cycle must come back long before the provider does, which is the property KTD6 asks for --
+    # the poller thread is what ingestion for every other feature runs on.
+    _reset_state()
+    release = threading.Event()
+    monkeypatch.setattr(varsel, "_PARTNER_LOAD_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    sent.clear()
+    written = _capture_writes(monkeypatch)
+
+    def hanging():
+        release.wait(30)  # bounded so a failing assertion cannot wedge the suite
+        return [PARTNER_DOC]
+
+    _use_partner_store(monkeypatch, hanging)
+    _register(DEVICE)
+    started = monotonic()
+    try:
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        release.set()  # let the abandoned worker finish rather than leaking it into the next test
+    elapsed = monotonic() - started
+    assert elapsed < 5.0, f"a hanging store must not hold the poller thread; took {elapsed:.1f}s"
+    assert len(sent) == 1 and written, "and the browser cycle still completed"
+
+    # --- 3. one unreadable document among readable ones ----------------------------------------
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_partner_store(
+        monkeypatch,
+        [
+            {"recipient_id": "sub-broken"},  # no window, no stops: this binary cannot read it
+            {**PARTNER_DOC, "recipient_id": "sub-good"},
+        ],
+    )
+    with _capture_varsel_logs() as records:
+        varsel.check_and_notify(SNAPSHOT)
+    assert [s for _k, s in written] == ["S1"], (
+        "the readable subscription was matched and written for: one bad document must never fail "
+        "its collection (R20)"
+    )
+    loads = _events(records, "varsel_partner_load")
+    assert next(e for e in loads if e["result"] == "skipped")["skipped"] == 1
+    assert next(e for e in loads if e["result"] == "ok")["n"] == 1
+    # R16: the count and the exception class are logged, the document never is.
+    assert not any("sub-broken" in str(getattr(r, "msg", "")) for r in records)
+
+
+def test_a_cycle_with_partner_recipients_writes_a_byte_identical_state_blob(monkeypatch):
+    """U2 scenario 8, and KTD3's central invariant made testable rather than claimed.
+
+    `_journeys`, `_notified` and the GCS state blob never carry a partner id: the partner view is
+    merged at match time and thrown away with the cycle. That is what makes a rollback to
+    pre-feature code safe — `_save_state` writes known keys, so `_state_extra`'s round-trip could
+    not have protected partner state that had leaked into the blob, and a rolled-back binary would
+    silently erase it on its first save.
+
+    Both cycles start from the SAME serialized state (restored through `_apply_state`), because a
+    fresh registration mints a new `journey_id` and the two blobs would then differ for a reason
+    having nothing to do with partners.
+
+    U2's scenario says "matched **and delivered**". Partner DELIVERY is U6's — this unit has no
+    sender and deliberately invents none — so what is asserted here is a cycle in which the
+    subscriptions matched, earned a wording and had the browser channel deliver and save beside
+    them. U6 re-asserts the same equality across a cycle that also delivered a webhook, which is
+    where a partner id would most plausibly be written into the blob (its dedup ledger is
+    Firestore, and the temptation is to mirror it into `_notified`).
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _capture_writes(monkeypatch)
+    _register(DEVICE)
+    baseline = varsel._serialize_state()
+
+    def one_cycle() -> str:
+        varsel._apply_state(baseline)
+        with varsel._state_lock:
+            varsel._pushed_trains.clear()  # not in the blob, but it gates the daily cap
+            varsel._daily_pushes.clear()
+            varsel._messages.clear()
+        varsel.check_and_notify(SNAPSHOT)
+        return varsel._serialize_state()
+
+    _use_partner_store(
+        monkeypatch,
+        [PARTNER_DOC, {**PARTNER_DOC, "recipient_id": "sub-0002", "delivered": ["S1"]}],
+    )
+    with_partners = one_cycle()
+    assert "S1" in with_partners, "the cycle must really have delivered, or this proves nothing"
+
+    monkeypatch.setattr(varsel, "_partner_provider", None)
+    without_partners = one_cycle()
+
+    assert with_partners == without_partners
+    assert "sub-000" not in with_partners, "no partner id may reach the blob"
+    assert varsel._STATE_KEYS == frozenset(
+        {"devices", "journeys", "notified", "togvarsel_rounds", "device_tombstones"}
+    ), "the blob's key set is unchanged: the partner channel persists nothing here"
+    assert not any("sub-000" in json.dumps(rec) for rec in varsel._journeys.values())
+
+
+def test_a_partner_only_route_records_no_decision_row(monkeypatch):
+    """KTD10, and the limitation KTD12 records rather than hides.
+
+    `varsel_decisions` is published on public hosts, with resolved origin and destination names
+    since 2026-08-22 — accepted then because prd's registrations are the team's own test users.
+    Partner-app travellers are members of the public, so partner subjects stay out of that table
+    entirely, which `_record_decisions` gets for free by iterating the BROWSER grouping.
+
+    The cost is real and is the reason this is a test rather than a comment: a partner-only route
+    produces no row at all, so `/historikk` scores the definitions both channels share and nothing
+    else. Scoring partner-only routes is deferred work; the enablement gate is conditional on
+    `/historikk`'s per-operator verdicts with that gap written down.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC])  # and NO browser registration
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert [s for _k, s in written] == ["S1"], "the subscription was matched and written for"
+    assert log.rows == [], "and recorded nowhere in varsel_decisions"
+
+
+def test_a_partner_subscription_is_invisible_on_every_varsel_surface(monkeypatch):
+    """U2 scenario 6 for the /varsel side, and R16: nothing about a partner reaches the PWA.
+
+    A partner subscription is a view merged inside `check_and_notify` and thrown away with the
+    cycle (KTD3), so the journey list, the state file and the device registry must all read exactly
+    as they would with no partner channel at all. Asserted after a cycle in which the subscription
+    genuinely matched and earned a wording, since that is the only interesting moment: a view that
+    contributed nothing could not leak anything either.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC])
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert written, "the subscription really was matched and written for"
+    assert varsel._journeys == {} and varsel._devices == {}
+    assert varsel._notified == set()
+    listing = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    assert listing.status_code == 200 and listing.json()["journeys"] == []
+    # /config is the PWA's only other read of module state, and it says nothing about channels.
+    # What this is about, and not the exact key set: an unrelated future field would otherwise
+    # fail this test with a message about partners, which is the worst kind of failing assertion.
+    assert not any(
+        "partner" in key for key in client.get("/varsel-api/config").json()
+    ), "the PWA's config gains no partner field: the channel is not its business"
+
+
+def test_a_partner_document_naming_a_collapsed_stop_ref_groups_with_the_browser_journey(
+    monkeypatch,
+):
+    """The 2026-08-03 picker bug, one layer out — and it would have been silent.
+
+    `_canonicalize_journeys` only ever walks `_journeys`, so nothing would have rewritten a partner
+    document naming a ref the stop registry has since collapsed onto a primary. Left alone it
+    produces a DIFFERENT `journey_key` for the identical physical trip: two groups, two /impact
+    calls, two wordings, and AE1's claim quietly false with every assertion about a single channel
+    still passing.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _capture_writes(monkeypatch)
+    varsel.set_stop_aliases({"A2": "A"})  # A2 is the same physical place as A, collapsed onto A
+    try:
+        _use_partner_store(monkeypatch, [{**PARTNER_DOC, "from_stop": "A2"}])
+        _register(DEVICE)
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.set_stop_aliases({})
+
+    assert written == [("A|B|00:00|23:59|0,1,2,3,4,5,6", "S1")], (
+        f"one group, one wording, keyed on the canonical refs; got {written}"
+    )
+
+
+def test_the_partner_loader_refuses_exactly_what_the_registration_api_refuses():
+    """R2: a partner subscription is `/varsel`'s registration shape, including the refusals.
+
+    The loader restates `JourneyIn`'s three window rules rather than importing the model — a
+    partner subscription has no `device_id`, and a load step on the ingestion thread must be
+    indifferent to fields a NEWER binary added, which a model with a growing required set is not.
+    That restatement is exactly the kind of duplicate that drifts into being looser, so the two are
+    pinned against each other here: the same shapes, the same verdicts.
+    """
+    import pydantic
+
+    cases = [
+        ({}, True),                                   # the valid baseline
+        ({"begin": "24:00"}, False),
+        ({"end": "7:5"}, False),
+        ({"begin": "10:00", "end": "09:00"}, False),  # overnight windows are refused, not wrapped
+        ({"begin": "10:00", "end": "10:00"}, False),
+        ({"days": []}, False),
+        ({"days": [7]}, False),
+        ({"days": [-1]}, False),
+        ({"to_stop": "A"}, False),                    # from == to
+    ]
+    for overrides, want_ok in cases:
+        doc = {**PARTNER_DOC, **overrides}
+        loader_ok = True
+        try:
+            varsel._parse_partner_recipient(doc)
+        except (KeyError, TypeError, ValueError) as exc:
+            # The three classes a malformed document can reach here; anything else is a defect in
+            # the loader rather than a bad document, and this test must not paper over it.
+            loader_ok = False
+            assert str(exc), overrides
+        api_ok = True
+        try:
+            varsel.JourneyIn(device_id="dev-abc12345", **{k: v for k, v in doc.items()
+                                                          if k != "recipient_id"})
+        except pydantic.ValidationError:
+            api_ok = False
+        assert loader_ok is want_ok, f"loader disagreed on {overrides}"
+        assert api_ok is want_ok, f"JourneyIn disagreed on {overrides}"
+
+    # A field the running binary does not know is IGNORED, not refused: the store will grow columns
+    # (a destination, a quota, a test marker) and a load step that rejected unknown keys would stop
+    # matching the whole collection on the deploy that adds one.
+    kept = varsel._parse_partner_recipient({**PARTNER_DOC, "some_future_field": {"a": 1}})
+    assert set(kept.journey) == {"from_stop", "to_stop", "begin", "end", "days"}
+    assert kept.recipient_id == "sub-0001" and kept.delivered == frozenset()
+
+
+def test_the_partner_read_is_bounded_by_a_document_ceiling():
+    """R21: the per-cycle read cannot exceed the ceiling, and the ceiling binds on the PAGING.
+
+    `islice` is applied inside the worker thread, so a lazy cursor stops fetching at the ceiling
+    rather than being fetched whole and then trimmed — which is what makes this a bound on the read
+    and not merely on the result. Anything approaching it in a pilot is a store bug or a quota
+    breach, so truncating is the right failure and it is reported.
+    """
+    fetched = []
+
+    def endless():
+        for i in range(varsel._MAX_PARTNER_RECIPIENTS + 500):
+            fetched.append(i)
+            yield {**PARTNER_DOC, "recipient_id": f"sub-{i}"}
+
+    before = (varsel._partner_enabled, varsel._partner_provider)
+    varsel._partner_enabled, varsel._partner_provider = (lambda: True), endless
+    try:
+        loaded = varsel._load_partner_recipients()
+    finally:
+        varsel._partner_enabled, varsel._partner_provider = before
+    assert len(loaded) == varsel._MAX_PARTNER_RECIPIENTS
+    assert len(fetched) == varsel._MAX_PARTNER_RECIPIENTS, (
+        "the cursor must stop at the ceiling, not be drained and then trimmed"
+    )
 
 
 if __name__ == "__main__":
