@@ -100,6 +100,8 @@ from zoneinfo import ZoneInfo
 
 import feedback
 import feedback_contexts
+import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
+import partner_events  # the partner channel's typed hand-off type and its emit step
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
 # it back from here would be a cycle — see alert_policy's docstring). Bound at module level rather
@@ -418,17 +420,40 @@ class PartnerRecipient:
     ``from_stop``, ``to_stop``, ``begin``, ``end``, ``days`` — because those are what
     :func:`journey_key`, :func:`journey_windows` and :func:`_impact` consult, and
     ``llm_message.build_message_input`` resolves the two place NAMES from the stop registry rather
-    than from the record. Anything else a partner document holds (its reference, its destination,
-    its quotas) is the store's business and deliberately does not enter this pass.
+    than from the record.
 
     ``delivered`` mirrors :data:`_notified`'s grain exactly — situation numbers already delivered to
     THIS subscription — because that is the grain :func:`_pending_pushes` asks its question at.
     Firestore is the only dedup ledger for this channel; this is a read-only snapshot of it.
+
+    **The four routing fields ride along, and until 2026-09-08 they deliberately did not** — the
+    docstring here said a partner document's destination and quotas "deliberately do not enter this
+    pass", which was right while nothing in the process emitted an event. What changed the answer is
+    ``subscription_version``, and specifically WHY the emit transaction reads it: it exists so a
+    slow pass cannot commit obsolete work (``partner_store._subscription_obsolete``), which only
+    means anything if the version compared is **the one the match was computed against**. Re-reading
+    it at emit time would compare the stored value with itself — always equal, never refusing — and
+    an alert about a train matched for a route the partner has since amended would go out stamped
+    with the new version. So the version comes from the load snapshot, and the three ids beside it
+    come with it rather than earning a second store read each.
+
+    What has NOT changed is the invariant KTD3 rests on: none of these ever reaches
+    :data:`_journeys`, :data:`_notified`, the GCS state blob or a log line. They live in this
+    cycle's locals, are handed to the emit step as a return value, and are gone with the pass.
+    ``partner_ref`` — the partner's own opaque handle on a traveller — is carried for the event
+    envelope and is the one field R16 keeps out of even a structured log field.
     """
 
     recipient_id: str
     journey: dict
     delivered: frozenset[str] = frozenset()
+    # Appended after `delivered` on purpose: three suites construct this positionally, and every
+    # existing caller must keep working.
+    partner_id: str = ""
+    destination_id: str = ""
+    subscription_version: int = 0
+    partner_ref: str = ""
+    test: bool = False
 
 
 class PartnerRecipientProvider(Protocol):
@@ -665,6 +690,19 @@ def _parse_partner_recipient(doc: Mapping[str, Any]) -> PartnerRecipient:
             "days": days,
         },
         delivered=frozenset(str(s) for s in doc.get("delivered") or ()),
+        # Read PERMISSIVELY, unlike everything above it, and the asymmetry is the point. The fields
+        # above are what the pass MATCHES on: a document that cannot supply them cannot be matched
+        # at all, so it is refused and skipped. These four are what the pass ROUTES with, and a
+        # document missing one can still be matched — it still collapses onto its journey key, still
+        # shares the one /impact call and the one wording AE1 asserts. Refusing it would take a
+        # browser registration's own wording away over a partner field, so it is matched and simply
+        # not emitted for: `partner_events.train_ref` and `_partner_subjects` drop a subject that
+        # names no destination, and the count is logged.
+        partner_id=str(doc.get("partner_id") or ""),
+        destination_id=str(doc.get("destination_id") or ""),
+        subscription_version=int(doc.get("version") or 0),
+        partner_ref=str(doc.get("partner_ref") or ""),
+        test=bool(doc.get("test")),
     )
 
 
@@ -1756,6 +1794,36 @@ def _notification_tag(journey_id: str | None, alert: Alert) -> str | None:
     return f"{journey_id}|" + "|".join(str(part) for part in key)
 
 
+def notification_wording_for(
+    message_input: dict,
+    from_name: str,
+    to_name: str,
+    message: str | None,
+    *,
+    confirmed: bool = False,
+) -> tuple[str, str]:
+    """The title and body ONE notification carries, whatever channel carries it.
+
+    Extracted from :func:`_notification_payload` on 2026-09-08 so the partner channel's event
+    envelope is byte-identical to the Web Push by CONSTRUCTION rather than by a parallel builder
+    that agrees today. R7 states the claim ("the Norwegian title and body /varsel would have
+    pushed"), and a second copy of two f-strings is exactly the shape that drifts silently: nothing
+    crashes and no assertion fails when one of them stops prefixing the route.
+
+    The BODY is the route on its own line followed by the wording (2026-09-02). The wording is what
+    `/historikk` records and what the two writers are compared on, so the route was added AROUND it
+    when the title stopped carrying it rather than written into it. The TITLE carries the
+    environment tag — `[dev] `, leading because phones truncate on the right — and the body never
+    does, so the recorded wording is the same text in every environment.
+    """
+    return (
+        _tag_environment(
+            _notification_title(message_input, from_name, to_name, confirmed=confirmed)
+        ),
+        f"{from_name} → {to_name}\n{message or _deterministic_body(message_input)}",
+    )
+
+
 def _notification_payload(
     journey: dict,
     alert: Alert,
@@ -1795,12 +1863,12 @@ def _notification_payload(
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}{urlencode({'journey': journey_id, 'situation': alert.situation_number})}"
     message_input = message_input or _message_input_from_alert(alert)
-    wording = message or _deterministic_body(message_input)
+    title, body = notification_wording_for(
+        message_input, from_name, to_name, message, confirmed=confirmed
+    )
     payload = {
-        "title": _tag_environment(
-            _notification_title(message_input, from_name, to_name, confirmed=confirmed)
-        ),
-        "body": f"{from_name} → {to_name}\n{wording}",
+        "title": title,
+        "body": body,
         "url": url,
         "icon": assets["icon"],
         "situation_number": alert.situation_number,
@@ -2580,6 +2648,382 @@ def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
                 _forget_message(message_key)
 
 
+# ---- The partner channel's outgoing side: this cycle's subjects -------------------------------
+#
+# Everything below turns the SAME match, the SAME collapse and the SAME wording the browser channel
+# used into the shape `partner_events` commits. It is the last thing `check_and_notify` does and it
+# leaves nothing behind: the result is a return value (KTD3 -- a view merged at match time, never a
+# materialization), so `_journeys`, `_notified` and the state blob still carry no partner id and a
+# rollback to pre-feature code has nothing of this to lose.
+
+#: What a retraction says. Withdrawal means THE FORECAST CHANGED, not that normal service is
+#: guaranteed — the store's own `record_below_threshold` docstring makes that the wording's job, and
+#: it is the one sentence a traveller could most easily read as an all-clear. Norwegian, like every
+#: other traveller-facing string in this module, and deliberately brand-independent for the reason
+#: every push wording is: it is the text a comparison would be split by.
+_PARTNER_WITHDRAWAL_DETAIL = (
+    "Vi varsler ikke lenger om denne avgangen. Det betyr ikke at den er garantert i rute."
+)
+_PARTNER_WITHDRAWAL_TITLE = "varselet er trukket tilbake"
+
+
+def _partner_delivery_enabled() -> bool:
+    """Whether a PARTNER event carries the model's prose rather than the template.
+
+    :func:`notification_wording.partner_delivery_enabled` (``NOTIFICATION_PARTNER_LLM_ENABLED``,
+    unset = off), deliberately NOT :func:`_deliverable_message`, which is the BROWSER delivery gate
+    (``VARSEL_LLM_ENABLED``). The two are separate on purpose: the rollout turns the partner channel
+    on with the template wording first and model prose only once matching and delivery qualify, and
+    sharing one variable would flip partner prose on the moment it goes on for the PWA, in the same
+    deploy — precisely the coupling the 2026-08-07 generation/delivery split removed one layer down.
+
+    Read ONCE per cycle by the caller, like ``_record_decisions``' own two gate reads: a flag
+    re-read per subject could write for one train and not the next inside one pass.
+
+    A failure answers False — the template — for :func:`_deliverable_message`'s reason: an
+    unreadable switch is not evidence that a model's prose should go out.
+    """
+    try:
+        return bool(notification_wording.partner_delivery_enabled())
+    except Exception:
+        logger.warning(
+            "Could not read the partner wording-delivery switch; using the deterministic wording",
+            exc_info=True,
+            extra={"fields": {"event": "notification_wording", "result": "error"}},
+        )
+        return False
+
+
+def _partner_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str | None:
+    """The written wording a PARTNER event may carry, or None for the template.
+
+    Reads :data:`_messages` RAW, which is the whole reason this is not
+    :func:`_deliverable_message`: for a definition both channels share, that cache holds the ONE
+    wording AE1 asserts, and reading it through the browser's delivery gate would withhold it from a
+    partner in prd for a reason about ``VARSEL_LLM_ENABLED``.
+    """
+    if not enabled:
+        return None
+    with _state_lock:
+        return _messages.get(message_key)
+
+
+def _partner_withdrawal_wording(
+    message_input: dict, from_name: str, to_name: str
+) -> tuple[str, str]:
+    """Title and body for a retraction, in :func:`notification_wording_for`'s two shapes.
+
+    Not routed through that function, because there is no wording to retract *with*: the template
+    body describes the disruption, and a retraction that led with "91 % sjanse for innstilling"
+    would be the opposite of what it means. What it does keep is the two structural rules — the
+    train named exactly as every other notification names it (:func:`_train_label`, falling back to
+    the route when the input names no departure, which is :func:`notification_title`'s own
+    fallback), and the route on the body's first line.
+    """
+    hhmm = message_input.get("avgang_kl")
+    if hhmm:
+        train = _train_label(
+            message_input.get("transportmiddel"), message_input.get("linje"), hhmm
+        )
+        if message_input.get("i_morgen"):
+            train = f"{train} i morgen"
+        title = f"{train}: {_PARTNER_WITHDRAWAL_TITLE}"
+    else:
+        title = f"{from_name} → {to_name}: {_PARTNER_WITHDRAWAL_TITLE}"
+    return _tag_environment(title), f"{from_name} → {to_name}\n{_PARTNER_WITHDRAWAL_DETAIL}"
+
+
+def _partner_situations(alerts: list[Alert]) -> list[dict]:
+    """The contributing situations for one train, operator text included.
+
+    Built from the UNCOLLAPSED alerts about that train rather than from the one
+    :func:`one_alert_per_train` kept, because R8 asks for "the contributing situations" and because
+    operators routinely publish several messages about one disruption — Vy sent both "Ta neste tog"
+    and "Innstilt Drammen–Skøyen" for the same cancelled 15:03. The wording still comes from the
+    single most severe one; this is what a partner joins on and displays.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for alert in alerts:
+        number = alert.situation_number
+        if number in seen:
+            continue
+        seen.add(number)
+        out.append(
+            {
+                "situation_number": number,
+                "summary": alert.summary,
+                "description": alert.description,
+                # False means no SX message named this train at all, so `summary` is text this
+                # codebase wrote rather than an operator's. A receiver presenting it as an
+                # operator's statement would be making the 2026-08-20 mistake one layer out.
+                "has_situation": bool(alert.has_situation),
+            }
+        )
+    return out
+
+
+def _partner_payload(
+    alert: Alert,
+    contributing: list[Alert],
+    *,
+    message_input: dict,
+    title: str,
+    body: str,
+) -> dict:
+    """The event payload: the facts plus the Norwegian prose (R7).
+
+    "Normal receipt needs no second request to us" is a property of what this carries, which is why
+    the figures ride along beside the wording rather than behind a lookup.
+
+    Two shapes, split on a declared cancellation exactly as every other writer in this module splits
+    on it. When ET has already declared the call cancelled the probabilities are 1.0 by construction
+    (``impact._cancelled_prediction``) and the delay figures are **null**, because every one of them
+    meant "if it runs" — the same rule ``_deterministic_body`` and the message input follow, and the
+    same rule ``event.schema.json`` states for ``phase: confirmed``.
+    """
+    delay = (
+        None
+        if alert.cancelled
+        else {"typical_min": alert.delay_p50_min, "worst_case_min": alert.delay_p90_min}
+    )
+    alternative = getattr(alert, "alternative_journey", None)
+    dumped: Any = None
+    if alternative is not None:
+        try:
+            # `mode="json"` so the stored document holds JSON primitives: the event is serialized to
+            # the wire bytes the signature covers, and a datetime that survived into it would need a
+            # custom encoder on a path where a raise costs the delivery.
+            dumped = alternative.model_dump(mode="json")
+        except Exception:
+            logger.debug("Could not serialize an alternative journey for a partner event", exc_info=True)
+    return {
+        "notification": {"title": title, "body": body, "action": None},
+        "call": {
+            "stop_place": alert.stop_place,
+            "stop_order": alert.stop_order,
+            "aimed_departure_time": (
+                alert.departure_time.isoformat() if alert.departure_time else None
+            ),
+            "departs_tomorrow": bool(message_input.get("i_morgen")),
+        },
+        "probabilities": {
+            "impact": alert.impact_probability,
+            "cancellation": alert.cancel_probability,
+            "delay_ge10": alert.ge10_probability,
+            # The operator's own alerting bar, so a partner can see WHY this cleared it rather than
+            # inferring a threshold from the numbers. One gate serves both surfaces (KTD2).
+            "alert_threshold": alert.alert_threshold,
+        },
+        "delay": delay,
+        # A two-value vocabulary derived from what we actually know, `null` when neither is
+        # established. New wire vocabulary, so U7's typed client and U8's published contract have to
+        # match these two literals rather than invent their own.
+        "effect": (
+            "cancelled"
+            if alert.cancelled
+            else "delayed"
+            if (alert.delay_p50_min or alert.delay_p90_min)
+            else None
+        ),
+        "situations": _partner_situations(contributing),
+        "alternative_journey": dumped,
+    }
+
+
+def _partner_subjects(
+    partner_by_key: dict[str, list[PartnerRecipient]],
+    alerts_by_key: dict[str, list[Alert]],
+    match_targets: dict[str, dict],
+    message_inputs: dict[tuple[str, str, str], dict | None],
+    *,
+    partner_llm: bool,
+) -> list[partner_events.PartnerSubject]:
+    """This cycle's partner subjects — one per (subscription, train), alert-worthy or not.
+
+    Below-threshold trains are included on purpose: a withdrawal is a lifecycle transition and the
+    consecutive-below-threshold count that drives it lives on the alert subject, so the observation
+    has to reach the store to be counted. ``partner_events`` is what keeps that affordable — it
+    reads which subjects stand and spends a transaction only where one can be written.
+
+    The wording, the collapse and the payload are computed once per (definition, train) and shared
+    across the recipients on that definition, which is the same economy AE1 asserts for the match
+    and the wording: two recipients watching one trip see identical text.
+    """
+    subjects: list[partner_events.PartnerSubject] = []
+    unroutable = 0
+    failed = 0
+    for key, recipients in partner_by_key.items():
+        try:
+            unroutable += _subjects_for_key(
+                subjects,
+                key,
+                recipients,
+                alerts_by_key=alerts_by_key,
+                match_targets=match_targets,
+                message_inputs=message_inputs,
+                partner_llm=partner_llm,
+            )
+        except Exception:
+            # Per DEFINITION, the same rule `_reconcile_caches` and `_match` are guarded by: one
+            # journey's awkward payload must cost that journey's subjects, not the cycle's. What
+            # this touches is duck-typed -- an alternative journey from an injected provider, a
+            # pydantic dump -- so "it cannot raise" would be an assumption about somebody else's
+            # object, and the caller's outer guard would drop every OTHER partner's events with it.
+            failed += 1
+            logger.warning(
+                "Could not build partner subjects for a journey definition; the rest of the "
+                "cycle's partner work is unaffected",
+                exc_info=True,
+                extra={"fields": {"event": "partner_emit", "result": "subject_error"}},
+            )
+    if unroutable:
+        # The COUNT and never the document (R16). A subscription with no destination was still
+        # matched and still contributed to the shared wording; it simply cannot be routed.
+        logger.warning(
+            "%d partner subject(s) name no destination and were not emitted for",
+            unroutable,
+            extra={"fields": {"event": "partner_emit", "result": "unroutable", "n": unroutable}},
+        )
+    if failed:
+        logger.warning(
+            "%d journey definition(s) produced no partner subjects this cycle",
+            failed,
+            extra={"fields": {"event": "partner_emit", "result": "subjects_skipped", "n": failed}},
+        )
+    return subjects
+
+
+def _subjects_for_key(
+    out: list[partner_events.PartnerSubject],
+    key: str,
+    recipients: list[PartnerRecipient],
+    *,
+    alerts_by_key: dict[str, list[Alert]],
+    match_targets: dict[str, dict],
+    message_inputs: dict[tuple[str, str, str], dict | None],
+    partner_llm: bool,
+) -> int:
+    """One journey definition's subjects, appended to `out`. Returns the unroutable count.
+
+    Split out so the per-definition guard in :func:`_partner_subjects` has something to wrap.
+    """
+    unroutable = 0
+    alerts = alerts_by_key.get(key) or []
+    if not alerts:
+        return 0
+    journey = match_targets.get(key) or {}
+    contributing: dict[tuple, list[Alert]] = {}
+    for alert in alerts:
+        train = _train_key(alert)
+        if train is not None:
+            contributing.setdefault(train, []).append(alert)
+    for winner in one_alert_per_train(alerts):
+        train = _train_key(winner)
+        if train is None:
+            # No train identity, so no stable `alert_id`: two different trains would share one
+            # and the receiver's own revision rule would suppress the second recipient's
+            # notification. `partner_events.train_ref` refuses the same set and counts it.
+            continue
+        message_key = _message_key(key, winner)
+        message_input = message_inputs.get(message_key) or _message_input_from_alert(winner)
+        resolved = message_input.get("reise") or {}
+        # The traveller's own name for a stop when a browser registration on this definition
+        # supplied one (which makes the event byte-identical to that push), the stop registry's
+        # otherwise. A partner-only route has nobody to have typed a name, so the registry is
+        # the only source — the one documented place the two channels' text can differ.
+        from_name = journey.get("from_name") or resolved.get("fra") or journey.get("from_stop") or ""
+        to_name = journey.get("to_name") or resolved.get("til") or journey.get("to_stop") or ""
+        if winner.alertworthy:
+            title, body = notification_wording_for(
+                message_input,
+                from_name,
+                to_name,
+                _partner_wording(message_key, enabled=partner_llm),
+                # Always False, and structurally so. The browser's «Bekreftet:» prefix comes off
+                # `_pushed_trains`, which is per REGISTRATION and per device — a partner has no
+                # such record here, and the envelope carries the same fact better:
+                # `type=journey.alert.updated` with `phase=confirmed` says a revision replaces
+                # an earlier one about this train, which is what the prefix was standing in for.
+                confirmed=False,
+            )
+        else:
+            title, body = _partner_withdrawal_wording(message_input, from_name, to_name)
+        payload = _partner_payload(
+            winner,
+            contributing.get(train, [winner]),
+            message_input=message_input,
+            title=title,
+            body=body,
+        )
+        situations = tuple(s["situation_number"] for s in payload["situations"])
+        for recipient in recipients:
+            if not recipient.partner_id or not recipient.destination_id:
+                unroutable += 1
+                continue
+            out.append(
+                partner_events.PartnerSubject(
+                    subscription_id=recipient.recipient_id,
+                    partner_id=recipient.partner_id,
+                    destination_id=recipient.destination_id,
+                    subscription_version=recipient.subscription_version,
+                    partner_ref=recipient.partner_ref,
+                    test=recipient.test,
+                    alertworthy=bool(winner.alertworthy),
+                    cancelled=bool(winner.cancelled),
+                    situations=situations,
+                    operator=winner.operator,
+                    line=winner.line,
+                    journey_ref=winner.jkey,
+                    stop_place=winner.stop_place,
+                    stop_order=winner.stop_order,
+                    departure_time=winner.departure_time,
+                    title=title,
+                    body=body,
+                    payload=payload,
+                )
+            )
+    return unroutable
+
+
+@dataclass(frozen=True)
+class PassOutcome:
+    """What one notification pass produced for the steps that run AFTER it.
+
+    A RETURN VALUE, not a module-level snapshot, and that is a decision rather than a style: a
+    module-level ledger would need registering in `check_and_notify`'s per-cycle stale sweep and in
+    `test_varsel_api._reset_state`, and a leaked half-cycle snapshot reads exactly like the give-up
+    bug those sweeps exist to prevent. Additive, so every existing caller — `main`'s poller before
+    this change, and every suite — keeps working by ignoring it.
+
+    Handing it to `main` rather than acting on it here is what makes KTD6's ordering claim
+    structural: the partner emit and delivery steps run in their own `main._phase`, *after this
+    function has returned*, so a raise in either cannot unwind `_record_decisions` or `_save_state`
+    at all rather than merely being sequenced after them.
+    """
+
+    partner_subjects: tuple[partner_events.PartnerSubject, ...] = ()
+
+
+class _LockedPassBudget(notification_wording.PassBudget):
+    """`notification_wording.PassBudget` with a lock, because pass 1c is `_LLM_WORKERS`-wide.
+
+    That class documents itself as "not thread-shared: one pass, one counter", which is true of
+    `/meldinger`'s own sequential use and false here — `self.left -= 1` is a read-modify-write and
+    the GIL does not make it atomic. Unlocked, the ceiling could be overspent by up to one call per
+    worker. Small, and worth eight lines to remove: the shape is `_WriteBudget.claim`'s, which every
+    reader of this file already knows.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        super().__init__() if limit is None else super().__init__(limit)
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        with self._lock:
+            return super().take()
+
+
 class _WriteBudget:
     """This cycle's ceiling on written messages, claimable from several threads at once.
 
@@ -2621,8 +3065,30 @@ class _WriteBudget:
             self.claimed += 1
             return True
 
+    def claim_clock(self) -> bool:
+        """Reserve the wall clock WITHOUT spending the call allowance. What a partner subject claims.
 
-def check_and_notify(by_situation: dict[str, list]) -> None:
+        `notification_wording.PassBudget`'s docstring states the split and the reason, and it is not
+        a nicety: the CLOCK is a property of the pass — two surfaces writing inside one pass cannot
+        each have their own, and the whole point of the reservation is that the deadline bounds when
+        the pass ENDS — while the COUNT is a property of the surface. Merged, a partner with a few
+        hundred subscriptions would spend :data:`_MAX_LLM_CALLS_PER_CYCLE` on partner wordings and
+        silently retire the browser ones, which is that constant's own lesson read the other way
+        round (raising the count without the width just moves the binding constraint to the clock).
+        A partner call is charged to `notification_wording`'s per-pass budget and its caller-keyed
+        trailing hour/day instead.
+
+        `refused` is still incremented, so the one summary line per cycle reports what the clock
+        cost whichever surface paid it.
+        """
+        with self._lock:
+            if monotonic() + _WORST_CASE_CALL_S >= self._deadline:
+                self.refused += 1
+                return False
+            return True
+
+
+def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     """Send a push for every registered journey × newly alert-worthy situation.
 
     Called at the end of main's ingestion-change rebuild with the freshly-refreshed per-call
@@ -2664,6 +3130,16 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     on public hosts, and a partner-only route therefore produces no row at all, which is KTD12's
     recorded limitation rather than an oversight.
 
+    **The partner channel's writes and sends happen AFTER this returns** (KTD6). What this function
+    produces for them is a :class:`PassOutcome` — one subject per (subscription, train) with the
+    wording already resolved — which `main` hands to its own poller phase. Returning the work rather
+    than doing it is strictly stronger than KTD6's literal placement on KTD6's own stated reason: a
+    raise in a step that runs after this function has returned cannot unwind `_record_decisions` or
+    `_save_state` at all, rather than merely being sequenced after them, and it puts the step under
+    `main`'s existing per-step `try/except` and `_phase` isolation. Same thread, same cycle, same
+    process either way, so nothing KTD6 settled with the user is touched. The return value is
+    additive: every caller that ignores it behaves exactly as before.
+
     **Writing a wording and sending it are separate switches** (2026-08-07). A message is written
     whenever a backend can be tried (``llm_message.generation_enabled``); ``VARSEL_LLM_ENABLED``
     decides only which of the two wordings the traveller receives, on both surfaces, through
@@ -2673,6 +3149,10 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     recipient means no write at all, delivery off means write but send the template.
     """
     push_on = push_enabled()
+    # Read once for the whole cycle: whether a PARTNER event carries the model's prose. It decides
+    # both whether a partner-only definition is written for at all and which wording its event
+    # carries, and one pass must not answer that two ways.
+    partner_llm = _partner_delivery_enabled()
     with _state_lock:
         journeys = list(_journeys.items())
         # Prune notified entries and cached messages whose situation is no longer live. In-place
@@ -2757,6 +3237,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # rather than checked. This is the ingestion thread: every second here is a second /disruptions,
     # /journey, /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1.
     budget = _WriteBudget(_MAX_LLM_CALLS_PER_CYCLE, monotonic() + _MAX_LLM_SECONDS_PER_CYCLE)
+    # The PARTNER surface's own call allowance, spent inside this same pass and therefore under the
+    # same wall clock -- `notification_wording.PassBudget`'s docstring states that contract and this
+    # is the caller it was written for. The COUNT is deliberately separate from
+    # `_MAX_LLM_CALLS_PER_CYCLE`: the clock is a property of the pass and two surfaces writing inside
+    # one pass cannot each have their own, while the count is a property of the surface, and merging
+    # them would let a busy partner morning silently retire the browser wordings.
+    partner_budget = _LockedPassBudget()
     # One instant for the whole cycle, so "has this alternative departed?" cannot be answered
     # differently for two journeys scored a few seconds apart.
     cycle_now = datetime.now(UTC)
@@ -2809,10 +3296,28 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # of it blocks on anything. The split is behaviour-preserving -- `_reconcile_caches` for one
     # journey never reads another journey's alerts, and `_pending_pushes` reads `_notified`, which
     # only loop 2 writes.
-    write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int]] = []
+    write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int, bool]] = []
     for key, alerts in matched:
         journey = match_targets[key]
         alerts_by_key[key] = alerts
+        # WHICH WORDING POLICY writes for this definition, and the discriminator is `by_journey_key`
+        # itself -- browser-only by construction (KTD10), so "absent from it" is exactly "no browser
+        # registration holds this route". A partner-only subject must go through
+        # `notification_wording.PARTNER`, because the browser policy's prompt audit record carries
+        # the traveller's origin, destination and departure time at DEBUG wherever
+        # VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and R16 forbids that for partner data.
+        # PARTNER suppresses that record in CODE rather than by an environment variable, drops
+        # `message` from the INFO record, and latches against its own holder. Its FIRST bound is the
+        # partner delivery switch, so with partner prose undelivered — every deployment today — the
+        # writer is still invoked (AE10: a partner registration with no VAPID keypair matches and is
+        # written for) and answers with the template, asking no backend and charging nothing.
+        #
+        # A SHARED definition stays on the browser policy, unavoidably and by design: AE1 pins one
+        # match and one wording between the two channels, so there is one call and it is the
+        # browser's. The prompt record for that route would exist with no partner channel at all,
+        # because a browser registration holds the same route -- so R16's claim is about
+        # partner-ONLY routes plus every other partner field, and U8 publishes exactly that.
+        partner_only = key not in by_journey_key
         for alert in alerts:
             message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
         # ABOVE the early return, and over every alert: a superseded alternative most often goes
@@ -2898,7 +3403,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h
             # life. That thins exactly the written-but-withheld population prd's rollout is judged
             # on.
-            if not _generation_enabled():
+            #
+            # Asked for a BROWSER subject only. `_generation_enabled` reads `llm_message`'s
+            # module-global latch, which is the poller's own; the PARTNER policy latches against its
+            # own holder precisely so the two callers cannot disable each other, and consulting the
+            # browser latch for a partner-only subject would hand that isolation straight back.
+            # `write_wording` asks the same question against the right holder as its second bound.
+            if not partner_only and not _generation_enabled():
                 _remember_message_meta(message_key, status="llm_disabled")
                 continue
             if already_written:
@@ -2924,7 +3435,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 # and a rate computed across both measures neither.
                 _remember_message_meta(message_key, status="transient_exhausted")
                 continue
-            write_queue.append((key, subject, message_key, attempts, errors))
+            write_queue.append((key, subject, message_key, attempts, errors, partner_only))
 
     # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
     # until the budget could actually bind across journeys there was nothing to order. The queue
@@ -2952,12 +3463,69 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # `_MAX_LLM_CALLS_PER_CYCLE` of them run per cycle; sequentially that is the difference between
     # a budget of 8 (~18 s, all of the ceiling) and one of 64 (~140 s, absurd). Across
     # `_LLM_WORKERS` it is ~9 s.
-    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int, int]) -> None:
-        key, subject, message_key, attempts, errors = item
+    def _write_partner_only(
+        key: str, subject: Alert, message_key: tuple[str, str, str]
+    ) -> tuple[str | None, str | None]:
+        """One partner-ONLY definition's wording, through `notification_wording.PARTNER`.
+
+        Returns `(message, status)` in `_write_message`'s own vocabulary, so pass 1c's budget
+        bookkeeping below is one branch rather than two.
+
+        **Only an `llm`-sourced wording is a message.** `write_wording` never returns without a
+        wording -- every failure falls through to the template -- so returning its body unconditional
+        would cache the TEMPLATE in `_messages`, and the next cycle's `already_written` check would
+        then report `ok_cached` and never ask again. That is the give-up bug in a new place: with the
+        partner delivery switch off (every deployment today) it would freeze the first template
+        forever, and with it on it would freeze whatever a transient Vertex failure produced.
+
+        `subject_id` is the journey key, which is what `_write_message` passes on the browser path
+        and is protected the same way: `llm_message` hashes it (`key_digest`) before it reaches a
+        log field, so the pattern itself never leaves the process. `write_wording`'s docstring asks
+        for an opaque service-issued id and names that hashing as the reason varsel's own value is
+        acceptable; there is no departure id at this grain, and two conventions for one parameter
+        would be worse than one. What actually keeps a partner-only route out of the prompt audit
+        record is the POLICY -- `PARTNER.caller` suppresses the prompt/reply DEBUG record in code
+        and drops `message` from the INFO record -- not the shape of this argument.
+        """
+        message_input = message_inputs.get(message_key)
+        if message_input is None:
+            # Nothing to prompt with. Charges no retry budget, for `_write_message`'s reason: the
+            # absence of an input is not evidence about the model.
+            return None, "no_input"
+        try:
+            wording = notification_wording.write_wording(
+                notification_wording.Route(
+                    match_targets[key].get("from_stop"), match_targets[key].get("to_stop")
+                ),
+                notification_wording.DepartureWordingFacts(
+                    situation_number=subject.situation_number
+                ),
+                policy=notification_wording.PARTNER,
+                subject_id=key,
+                budget=partner_budget,
+                message_input=message_input,
+            )
+        except Exception:
+            logger.warning(
+                "Partner wording step raised; using the deterministic wording",
+                exc_info=True,
+                extra={"fields": {"event": "notification_wording", "result": "error",
+                                  "surface": "partner"}},
+            )
+            return None, "error"
+        _remember_message_meta(message_key, status=wording.status, message_input=message_input)
+        return (wording.body if wording.source == "llm" else None), wording.status
+
+    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int, int, bool]) -> None:
+        key, subject, message_key, attempts, errors, partner_only = item
         # Claimed here rather than filtered above, so the ceiling is spent on calls that actually
         # START. A pre-filter would hand the budget to the first N in the queue whether or not the
         # clock still allowed them.
-        if not budget.claim():
+        #
+        # A partner subject claims the CLOCK only -- see `_WriteBudget.claim_clock`. Its call
+        # allowance is `notification_wording`'s own, which is what keeps a partner with a few
+        # hundred subscriptions from spending the browser wordings' budget.
+        if not (budget.claim_clock() if partner_only else budget.claim()):
             _remember_message_meta(message_key, status="capped")
             return
         # _write_message catches Exception itself, so this is belt and braces for a future edit
@@ -2966,12 +3534,15 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         # loop 2 pushes independently and falls back to the deterministic wording.
         outcome: dict[str, Any] = {}
         try:
-            message = _write_message(
-                subject,
-                journey_key=key,
-                message_input=message_inputs.get(message_key),
-                outcome=outcome,
-            )
+            if partner_only:
+                message, outcome["status"] = _write_partner_only(key, subject, message_key)
+            else:
+                message = _write_message(
+                    subject,
+                    journey_key=key,
+                    message_input=message_inputs.get(message_key),
+                    outcome=outcome,
+                )
         except Exception:
             logger.warning(
                 "Written-message step raised for %s; using the deterministic wording",
@@ -3171,12 +3742,39 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 if handle_gone_device(journey["device_id"]):
                     changed = True
 
+    # BROWSER subjects only, and structurally so: this iterates `by_journey_key`, which is built
+    # from `_journeys` alone. KTD10 keeps partner subjects out of `varsel_decisions` entirely --
+    # /historikk and /meldinger publish that table on public hosts, with resolved place names since
+    # 2026-08-22, and partner-app travellers are members of the public. `pushed_keys` is likewise
+    # only ever written by loop 2 above: it is journey-DEFINITION grain, so a partner delivery
+    # recorded there would mark a browser registration's row `pushed` with no browser push behind
+    # it -- and `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed
+    # row. That is why the partner deliveries happen in a later phase entirely and not here.
     _record_decisions(
         by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
     )
 
     if changed:
         _save_state()
+
+    # LAST, after the cycle's two durable writes, and handed back rather than acted on: KTD6 orders
+    # every partner step that writes or sends after `_record_decisions` and `_save_state`, and
+    # returning the work means a raise in it runs after this function has returned and cannot unwind
+    # either of them at all. Guarded, because building a subject reads duck-typed objects (an
+    # alternative journey from an injected provider, a pydantic dump) and a raise here would cost the
+    # browser cycle its own tail for a partner field.
+    try:
+        subjects = _partner_subjects(
+            partner_by_key, alerts_by_key, match_targets, message_inputs, partner_llm=partner_llm
+        )
+    except Exception:
+        logger.warning(
+            "Could not build this cycle's partner subjects; no partner event is emitted for it",
+            exc_info=True,
+            extra={"fields": {"event": "partner_emit", "result": "build_error"}},
+        )
+        subjects = []
+    return PassOutcome(partner_subjects=tuple(subjects))
 
 
 # ---- API models ------------------------------------------------------------------------------

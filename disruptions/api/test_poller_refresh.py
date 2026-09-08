@@ -473,16 +473,22 @@ def test_the_partner_notifications_flag_is_an_allow_list_with_unset_off():
             assert main._partner_notifications_enabled() is want, value
 
 
-def test_the_partner_channel_adds_no_rebuild_phase_and_changes_no_step_isolation():
-    """U2 scenario 6: the cycle's phase set and every step's isolation are UNCHANGED.
+def test_the_partner_channel_adds_exactly_one_rebuild_phase_after_the_alerting_step():
+    """U6: the cycle gains ONE phase, `partner_webhooks`, and it is last.
 
-    The plan's U2 text says the phase set "gains one step". It does not, and it should not: KTD6
-    puts the partner read inside `check_and_notify`, immediately before pass 1a, because that is
-    what the subscriptions are matched from — and the orchestrator's injected-provider seam has
-    `varsel` calling the store, not `main` loading it and passing it down. A `main._phase` would
-    therefore have to time a call it does not make. So the load rides inside the existing
-    `varsel_notify` phase, which is the cycle's last, and its own cost is reported as one
-    `event="varsel_partner_load"` record per cycle instead.
+    Two halves of this were settled by U2 and by U6 respectively, and the difference matters.
+
+    The partner **load** rides inside the existing `varsel_notify` phase, because KTD6 puts it
+    immediately before pass 1a — that is what the subscriptions are matched from — and the seam has
+    `varsel` calling the store rather than `main` loading it and passing it down; a `main._phase`
+    would have to time a call it does not make. Its cost is one `event="varsel_partner_load"`
+    record per cycle.
+
+    The partner **emit and deliver** steps are their own phase, after `varsel_notify`. That is
+    strictly stronger than KTD6's literal "after `_record_decisions` and `_save_state`": running
+    after `check_and_notify` has RETURNED means a raise cannot unwind either of them at all. It
+    also gives the Verification Contract's cycle-budget row a real `poller_phase` reading, which is
+    the same number KTD6's reversal trigger is stated in.
 
     Pinned as an exact tuple rather than a containment check, in both directions: a phase silently
     added here is a cycle-timing change nobody asked for, and a phase silently REMOVED is how a
@@ -510,6 +516,7 @@ def test_the_partner_channel_adds_no_rebuild_phase_and_changes_no_step_isolation
         "varsel_stops",
         "varsel_recheck_service",
         "varsel_notify",
+        "partner_webhooks",
     ), phases
     # And the alerting step is still isolated exactly as it was: its own try/except, so a partner
     # store outage inside it degrades alerting alone and the feed rebuild above it is untouched.
@@ -523,13 +530,53 @@ def test_the_partner_channel_adds_no_rebuild_phase_and_changes_no_step_isolation
     )
 
 
-def test_the_partner_gate_is_injected_into_varsel_and_the_store_is_not_yet():
-    """U2's seam, asserted at the wiring rather than in prose.
+def test_the_partner_phase_is_gated_guarded_twice_and_fed_by_a_return_value():
+    """U6 scenario 8, at the wiring: what contains a partner failure, and what feeds the phase.
 
-    `main` injects the flag now and NO recipient provider: the Firestore-backed store is a later
-    unit, and both halves default to off, so this deployment matches no partner subscription
-    whatever the flag says. Checked over `lifespan`'s source because entering the lifespan starts
-    the poller thread, which this suite must never do (it spends real BigQuery money per cycle).
+    Four assertions, and each is about a failure that is silent if it is missing.
+
+    * The phase is gated on `varsel.partner_channel_enabled()`. Without it every environment with
+      no named Firestore database — tst today, and every deployment before the flag is set — logs a
+      `NotConfigured` traceback on every cycle from `pending_deliveries`, which is noise that trains
+      an operator to ignore this phase.
+    * Emit and deliver are guarded SEPARATELY (R20): an emit failure must not cost the deliveries
+      already committed on an earlier cycle.
+    * Delivery does not depend on `outcome`, so a cycle in which `check_and_notify` raised still
+      drains the pending set — which is Firestore's, not this cycle's.
+    * The subjects arrive as a RETURN VALUE. A module-level snapshot in `varsel` would need
+      registering in `check_and_notify`'s stale sweep and in `test_varsel_api._reset_state`, and a
+      leaked half-cycle snapshot reads exactly like the give-up bug those sweeps exist to prevent.
+    """
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    phase = source[source.index('_phase("partner_webhooks"') :]
+    assert "if varsel.partner_channel_enabled():" in source
+    assert source.index("if varsel.partner_channel_enabled():") < source.index(
+        '_phase("partner_webhooks"'
+    ), "the gate must be outside the phase, or an ungated cycle still times a step it skipped"
+    assert "outcome = varsel.check_and_notify(" in source, (
+        "the partner phase is fed by check_and_notify's return value, not by module state"
+    )
+    assert phase.count("except Exception:") == 2, phase
+    assert "Partner event emission failed" in phase
+    assert "Partner webhook delivery failed" in phase
+    deliver = phase[phase.index("partner_delivery.deliver_pending(") :]
+    assert "outcome" not in deliver, (
+        "delivery must run on a cycle whose notification pass raised: the pending set is the "
+        "store's committed delivery records, not this cycle's decisions"
+    )
+
+
+def test_the_partner_store_is_now_injected_into_varsel_as_the_recipient_provider():
+    """U6's seam, asserted at the wiring rather than in prose.
+
+    The mirror of U2's marker test, which asserted the provider was deliberately ABSENT while the
+    store was a later unit. Both halves are wired now, and `partner_channel_enabled()` still
+    requires both — so a deployment missing either is the pass that ran before the channel existed.
+
+    Checked over `lifespan`'s source because entering the lifespan starts the poller thread, which
+    this suite must never do (it spends real BigQuery money per cycle).
     """
     import inspect
 
@@ -537,9 +584,7 @@ def test_the_partner_gate_is_injected_into_varsel_and_the_store_is_not_yet():
     configure = source[source.index("varsel.configure(") :]
     configure = configure[: configure.index("llm_message.configure(")]
     assert "partner_enabled=_partner_notifications_enabled" in configure
-    assert "partner_recipients_provider" not in configure, (
-        "the store is a later unit; wiring it here would enable a channel with no reader"
-    )
+    assert "partner_recipients_provider=partner_store.recipient_documents" in configure
 
 
 if __name__ == "__main__":
