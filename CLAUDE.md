@@ -1208,7 +1208,34 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   entur-brand pushes click through to `/togmelding`. Delivery is gated by
   `TOGVARSEL_NOTIFY_ENABLED` (allow-list parse; **unset = off**; helm base off, dev on since
   launch, prd on since 2026-08-30, tst off), and while off nothing is evaluated and no state
-  written, so an enable-restart inside a window still delivers. Turning it on in an environment
+  written, so an enable-restart inside a window still delivers.
+  **`SHOW_RUSHVARSEL` is the master gate over the whole product, and it is OFF everywhere since
+  2026-09-08** (`deployment.show_rushvarsel`, allow-list parse, **unset = off**; base helm value
+  `"false"`, no environment overrides it). Rushvarsel is not ready to be seen — a partner finding
+  it would be noise — so while this is off: no rush-forecast push is sent (`main.
+  _togvarsel_notify_enabled` ANDs the two flags, and that one function is the seam for all THREE
+  ways rushvarsel reaches a traveller, so it also empties `/varsel-api/config`'s
+  `togvarsel_notify` and with it the PWA's «Nytt: Rushvarsel» notice and its `RushOutlook` panel);
+  `/togmelding` is never mounted and all of `/togmelding-api` 404s. That last one is closed
+  TWICE, and the two halves close different things: `main` skips `include_router` for both
+  routers, which is what keeps the endpoint names out of the OpenAPI schema behind FastAPI's
+  default `/docs` — a listing is itself a mention — while each module's own router-level
+  `deployment.require_rushvarsel` dependency is what holds the gate PER REQUEST wherever the
+  router is mounted, including the two test suites' own apps and the dev-only
+  `POST /togmelding-api/test-notify`, which is deliberately not wired to the `enabled` seam and
+  would otherwise still send a real push. Three things the gate deliberately does not do. It does **not replace**
+  `TOGVARSEL_NOTIFY_ENABLED` — dev's and prd's `"true"` stay exactly where they were, so turning
+  the product back on is this one value per environment and nothing else to re-derive. It does
+  **not** stop the forecast: `togvarsel.refresh()` and `togvarsel_outcomes.refresh()` keep issuing
+  and resolving on the poller tick, because /rushhistorikk is how the model earns its way back on,
+  and the BigQuery cost is unchanged. And it is read at call time everywhere except the static
+  mount, which is import-time by necessity — a `Mount` answers the bare `/togmelding` with a 307
+  to the trailing slash before any per-request check could 404 it, so the page is gated by not
+  being mounted at all. One consequence to expect on /rushhistorikk: with no round recorded,
+  every issue is RECONSTRUCTED, so the «Mangler runde» chip (`n_reconstructed_after_start`) fires
+  on every day the gate is closed — that is its documented "the gate was closed" cause, not a lost
+  write.
+  Turning it on in an environment
   needs more than the flag: the 39-station geography `disruptions.togvarsel_oslo_stations`
   (fetched once per Oslo day, DEFINES matching, never duplicated in Python) exists on prd only
   after `copy_runtime_to_prd.sh` — and existing subscribers opted into train-specific alerts, so
