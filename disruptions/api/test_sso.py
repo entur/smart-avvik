@@ -391,6 +391,41 @@ def test_main_wires_the_gate():
     )
 
 
+def test_the_partner_notification_api_is_deliberately_not_behind_this_gate():
+    """U4 scenario 9. The partner surface is authenticated, and NOT by this middleware.
+
+    Deliberate rather than forgotten, and the reason is the two answers this gate gives. Required
+    but unconfigured serves 503, which is right for a browser and wrong as a statement about a
+    machine caller's credential; and an unauthenticated navigation gets a 302 into a Google login
+    screen, so a partner BFF following it receives an HTML page where it expected JSON — and the
+    redirect discriminator is `text/html` in `accept`, which nothing stops a client sending.
+    KTD8 therefore puts the check in the router's own dependency
+    (`partner_auth.authenticate`, bearer only, never a cookie) and leaves this tuple alone.
+
+    Pinned as a NEGATIVE beside the exact tuple above rather than instead of it: this asserts that
+    the partner prefixes are absent and that nothing claims them by segment, so adding
+    "/notification-api" here later fails both checks and has to be an argued change.
+    """
+    assert not any(prefix.startswith("/notification") for prefix in sso.PROTECTED_PREFIXES)
+    for path in (
+        "/notification-api",
+        "/notification-api/v1",
+        "/notification-api/v1/subscriptions",
+        "/notification-api/v1/destinations/current",
+        "/notification-api/v1/test-events",
+    ):
+        assert not sso._is_protected(path), path
+    # And the gate really does let them through, rather than merely not listing them: with SSO
+    # required and configured, an unauthenticated partner request reaches the app (404 here,
+    # because this suite's app mounts no partner router) instead of being answered 302 or 401.
+    client = _app()
+    with _env(**_ENV_ON):
+        response = client.get(
+            "/notification-api/v1/subscriptions", headers={"accept": "text/html"}
+        )
+        assert response.status_code == 404, response.status_code
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
