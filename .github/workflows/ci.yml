@@ -82,9 +82,38 @@ jobs:
             echo "::group::$suite"
             uv run --with fastapi --with httpx --with pydantic \
                    --with google-cloud-bigquery --with google-cloud-storage \
-                   --with pywebpush python "$suite"
+                   --with pywebpush --with google-cloud-firestore python "$suite"
             echo "::endgroup::"
           done
+      # The partner store's EMULATOR-backed checks, which the loop above cannot run: it has no
+      # Java and no firebase CLI, so an emulator-dependent suite dropped into it would fail every
+      # run. test_partner_store.py therefore runs TWICE -- once in the loop with
+      # FIRESTORE_EMULATOR_HOST unset, where it prints a conspicuous line naming how many checks it
+      # skipped and exits 0, and once here with the emulator, where the full set runs.
+      #
+      # A `demo-` project id is what makes this credential-free: the Python server library picks up
+      # FIRESTORE_EMULATOR_HOST and skips ADC entirely, and a demo project can reach no real GCP
+      # service. `emulators:exec` exports the variable into the wrapped command's environment and
+      # tears the emulator down after it, so a non-zero exit is this step's exit.
+      #
+      # The suite itself greps THIS step (test_the_emulator_step_is_wired_in_ci): a loud skip that
+      # nobody ever un-skips is the same silent gap the loop above exists to close, so deleting
+      # this step fails the suite rather than quietly halving it.
+      - name: Set up Java for the Firestore emulator
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Run partner store tests against the Firestore emulator
+        working-directory: disruptions/api
+        run: |
+          set -euo pipefail
+          npm install -g firebase-tools@15
+          firebase emulators:exec --project demo-kix --only firestore \
+            --config ../../firebase.json \
+            'uv run --with fastapi --with httpx --with pydantic \
+                    --with google-cloud-bigquery --with google-cloud-storage \
+                    --with pywebpush --with google-cloud-firestore python test_partner_store.py'
       # Separate step, and separate from the loop above, because this suite lives outside
       # disruptions/api -- the loop's working-directory made it invisible, and it had no
       # `__main__` runner either, so it was unrun twice over. It guards the export of travellers'

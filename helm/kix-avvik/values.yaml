@@ -55,6 +55,30 @@ common:
       SHOW_RUSHVARSEL: "false"
       # Non-secret EU ingestion origin. Capture and review credentials stay separate.
       POSTHOG_HOST: https://eu.i.posthog.com
+      # Partner notification webhooks. Same flag convention as the three above: only true/1/yes/on
+      # enable, the code default for an UNSET value is also off, and this line states the closed
+      # posture where an operator looks. While it is off the notification pass does not touch the
+      # store at all -- main injects the gate and varsel declines to read -- so a deployment with
+      # this off is byte for byte the pass that ran before the channel existed, which is what the
+      # rollback story rests on.
+      #
+      # Turning it on in an environment needs more than the flag: the Firestore database and its
+      # indexes must exist (terraform/firestore.tf, applied per environment), the runtime SA needs
+      # roles/datastore.user (.entur/application.yaml -- verify the binding, a filtered role is
+      # dropped silently), and the two partner secrets below must exist in Secret Manager BEFORE
+      # their names are uncommented here.
+      PARTNER_NOTIFICATIONS_ENABLED: "false"
+      # The named Firestore database partner_store.py opens. THE SAME LITERAL LIVES IN
+      # terraform/variables.tf's partner_firestore_database default, and it is the one thing
+      # Terraform and the runtime cannot share -- disruptions/api/test_partner_store.py greps both
+      # files for it. A mismatch is invisible in the worst way: the poller's partner load is
+      # guarded, so it logs one warning per cycle and the deployment reads exactly like a healthy
+      # one with nothing registered.
+      #
+      # Same in every environment because each environment is its own GCP project. Not "(default)":
+      # co-managing that database collides with google_app_engine_application, which auto-provisions
+      # it as a side effect (see terraform/firestore.tf).
+      PARTNER_FIRESTORE_DATABASE: partner-notifications
       # Entur-SSO gate (sso.py) for the internal surfaces /historikk, /meldinger and /demo —
       # pages and APIs both. Same flag convention as the two above: only true/1/yes/on enables,
       # unset is

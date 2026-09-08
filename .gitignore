@@ -66,3 +66,15 @@ terraform/crash.log
 
 # Local linked worktrees.
 .worktrees/
+
+# Firebase emulator working files. The emulator is only ever started by
+# `firebase emulators:exec` around disruptions/api/test_partner_store.py -- from ci.yml's own
+# step, or by hand -- and it drops its debug logs in whatever directory it was started from,
+# which for that suite is disruptions/api/. firebase.json, firestore.rules and
+# firestore.indexes.json ARE committed: the last of those is also what terraform/firestore.tf
+# materialises every composite index from.
+**/firebase-debug.log
+**/firestore-debug.log
+**/ui-debug.log
+**/pubsub-debug.log
+.firebase/
