@@ -93,10 +93,54 @@ def test_no_sx_cut_sits_at_or_above_the_pre_screen_floor():
     assert alert_policy._NOSX_ALERT_THRESHOLD >= min_threshold()
 
 
+def test_the_gate_is_the_table_plus_the_comparison_and_nothing_else():
+    """`gate` is what every notification surface applies, so it must not be able to disagree with
+    the table it reads (U1 scenario 2).
+
+    Three populations, three bars, and each checked AT the bar, just below and just above — the
+    boundary is the whole content of a gate, and `>` where `>=` was meant retires every alert that
+    lands exactly on a tuned cut. Rail (VYG, the default 0.65 the family is validated at), bus
+    (RUT, an override at 0.75, so a gate that ignored the operator would read 0.65 here) and the
+    no-SX population (0.85, whose cut is selected by the POPULATION and not by the operator).
+
+    `None` is its own case and the one worth stating out loud: there is no calibrated score, and
+    reading its absence as "not bad" would be the manufactured all-clear this codebase refuses
+    everywhere else. It still reports the bar, because `alert_threshold` is recorded on the
+    decision row whether or not anything cleared it.
+    """
+    for operator, has_situation, bar in (
+        ("VYG", True, 0.65),
+        ("RUT", True, 0.75),
+        ("VYG", False, 0.85),
+        ("RUT", False, 0.85),
+    ):
+        expected = threshold_for(operator, has_situation=has_situation)
+        assert expected == bar, "the table itself moved; re-read the tuning note before editing"
+        for probability, alertworthy in (
+            (bar, True),  # AT the bar clears it
+            (bar - 0.01, False),
+            (bar + 0.01, True),
+            (None, False),
+            (0.0, False),
+            (1.0, True),
+        ):
+            result = alert_policy.gate(probability, operator, has_situation=has_situation)
+            assert result == (expected, alertworthy), (operator, has_situation, probability)
+            # Named fields, not just a 2-tuple: both halves are written to varsel_decisions and a
+            # positional swap would put the verdict in the threshold column.
+            assert (result.threshold, result.alertworthy) == result
+
+    # The keyword-only default matches `threshold_for`'s, so a caller that predates the second
+    # population keeps asking about the first.
+    assert alert_policy.gate(0.7, "VYG") == alert_policy.gate(0.7, "VYG", has_situation=True)
+
+
 def test_varsel_reexports_the_same_gate_not_a_copy():
     # Identity, not equality: a forked table would still compare equal today and drift tomorrow.
     assert varsel.threshold_for is alert_policy.threshold_for
     assert varsel.min_threshold is alert_policy.min_threshold
+    # `gate` joined them on 2026-09-08 and is the one `_collect_alerts` actually applies.
+    assert varsel.gate is alert_policy.gate
 
 
 def test_varsel_trouble_delay_min_still_resolves():

@@ -190,8 +190,44 @@ def _reset_state():
     import llm_message
 
     llm_message._STATE = llm_message._LatchState()
+    # `notification_wording`'s per-surface allowance and latch holders, for exactly the same reason
+    # one line up and with the same failure (U1, 2026-09-08). The module is not on the browser push
+    # path -- its browser slot is empty by construction -- so nothing this suite drives spends it
+    # today; it is registered here because the house rule is that every module-level budget a
+    # notification surface owns is reset from this one function, and because a suite that leaves a
+    # partly-spent allowance or a latched-off partner holder behind reads exactly like the give-up
+    # bug the tests downstream of it exist to pin.
+    import notification_wording
+
+    notification_wording.reset_state()
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
+
+
+def test_the_shared_reset_clears_the_notification_wording_allowance_and_holders():
+    """U1 scenario 7: one seam, called from this suite's own `_reset_state`.
+
+    Both halves leak, and only one of them is obvious. A partly-spent trailing hour makes a later
+    partner wording fall back to the template for a reason having nothing to do with what is being
+    checked; a latch holder driven off by a `_ConfigurationError` stays off for
+    `llm_message._LATCH_TTL` -- thirty minutes, i.e. the rest of the run -- and reports `disabled`
+    with nothing saying why. Asserted through the holder the surface actually hands out rather than
+    through the private field, so widening the seam cannot pass this while leaving a caller stale.
+    """
+    import notification_wording as nw
+
+    _reset_state()
+    nw._spend(nw._PARTNER_PATH)
+    nw._spend(nw._PARTNER_PATH)
+    before = nw.PARTNER.state()
+    assert nw.spent(nw._PARTNER_PATH) == (2, 2)
+    assert before is not None
+
+    _reset_state()
+
+    assert nw.spent(nw._PARTNER_PATH) == (0, 0)
+    assert nw.spent(nw._BROWSER_PATH) == (0, 0)
+    assert nw.PARTNER.state() is not before, "the latch holder must be rebuilt, not reused"
 
 
 def test_config_reports_push_enabled():

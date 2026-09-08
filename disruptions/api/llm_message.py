@@ -386,6 +386,21 @@ def new_replay_state() -> _LatchState:
     return _LatchState(seed_from=_STATE, cache_clients=True)
 
 
+def new_partner_state() -> _LatchState:
+    """A holder for the partner notification surface — same isolation, a third caller.
+
+    Identical in construction to :func:`new_replay_state` and deliberately a separate function
+    rather than a shared one: these are two independent callers, and a holder each is the whole
+    point. Sharing one would put `/meldinger`'s replay bursts and a partner evaluation pass behind
+    the same latch and the same mutex, which is the arrangement :class:`_LatchState` exists to
+    break — and the failure it produces is silent on both sides.
+
+    Seeded one-way from the module-global holder, so a partner pass does not re-discover a 404 the
+    poller already paid for and can never write a failure back onto the push path.
+    """
+    return _LatchState(seed_from=_STATE, cache_clients=True)
+
+
 @dataclass(frozen=True)
 class _CallContext:
     """Which holder the call running on this thread belongs to, and whether it is a replay.
@@ -400,6 +415,7 @@ class _CallContext:
 
     state: _LatchState
     replay: bool = False
+    caller: str | None = None
 
 
 _current_call: contextvars.ContextVar[_CallContext | None] = contextvars.ContextVar(
@@ -414,16 +430,35 @@ def _replaying() -> bool:
     return bool(call and call.replay)
 
 
-def _log_fields(replay: bool, **fields: Any) -> dict[str, Any]:
-    """The ``extra={"fields": ...}`` body for one record, marked when the call is a replay.
+def _calling_surface() -> str | None:
+    """Which non-browser surface the call running on this thread belongs to, if any.
+
+    The companion to :func:`_replaying`, and needed for the same reason: the records emitted deep
+    inside a backend cannot be handed the marker.
+    """
+    call = _current_call.get()
+    return call.caller if call else None
+
+
+def _log_fields(replay: bool, caller: str | None = None, **fields: Any) -> dict[str, Any]:
+    """The ``extra={"fields": ...}`` body for one record, marked when the call is not the poller's.
 
     A FIELD on the existing event, never a new event name. Operators are told to read
     ``jsonPayload.provider`` on ``event="llm_message"`` to learn which backend answered in prd, and
-    a separate event name would quietly drop replay traffic out of every query that already exists —
-    including the ones that would notice a replay burst. The field is *absent* rather than false on
-    a live call, so an existing query keeps matching exactly the records it always did.
+    a separate event name would quietly drop that traffic out of every query that already exists —
+    including the ones that would notice a burst. Both markers are *absent* rather than false or
+    empty on a live push wording, so an existing query keeps matching exactly the records it always
+    did.
+
+    `caller` names a non-browser surface (``"partner"``). Deliberately not spelled ``replay=True``
+    by such a surface: that flag means `/meldinger` in every saved query and dashboard, and
+    borrowing it would silently file partner traffic as replay.
     """
-    return {**fields, **({"replay": True} if replay else {})}
+    return {
+        **fields,
+        **({"replay": True} if replay else {}),
+        **({"caller": caller} if caller else {}),
+    }
 
 
 def _backend_client(name: str, build: Callable[[], Any]) -> Any:
@@ -500,7 +535,11 @@ def _claude_write(input_json: str) -> str:
             exc,
             extra={
                 "fields": _log_fields(
-                    _replaying(), event="llm_message", provider="claude", result="rejected"
+                    _replaying(),
+                    _calling_surface(),
+                    event="llm_message",
+                    provider="claude",
+                    result="rejected",
                 )
             },
         )
@@ -511,7 +550,11 @@ def _claude_write(input_json: str) -> str:
             "Claude declined this payload (stop_reason=refusal)",
             extra={
                 "fields": _log_fields(
-                    _replaying(), event="llm_message", provider="claude", result="refusal"
+                    _replaying(),
+                    _calling_surface(),
+                    event="llm_message",
+                    provider="claude",
+                    result="refusal",
                 )
             },
         )
@@ -526,7 +569,11 @@ def _claude_write(input_json: str) -> str:
             response.stop_reason,
             extra={
                 "fields": _log_fields(
-                    _replaying(), event="llm_message", provider="claude", result="truncated"
+                    _replaying(),
+                    _calling_surface(),
+                    event="llm_message",
+                    provider="claude",
+                    result="truncated",
                 )
             },
         )
@@ -590,7 +637,11 @@ def _gemini_write(input_json: str) -> str:
             finish,
             extra={
                 "fields": _log_fields(
-                    _replaying(), event="llm_message", provider="gemini", result="truncated"
+                    _replaying(),
+                    _calling_surface(),
+                    event="llm_message",
+                    provider="gemini",
+                    result="truncated",
                 )
             },
         )
@@ -1062,14 +1113,16 @@ def write_message(
     ).text
 
 
-def _call_backend(name: str, prompt: str, state: _LatchState, replay: bool) -> str:
+def _call_backend(
+    name: str, prompt: str, state: _LatchState, replay: bool, caller: str | None = None
+) -> str:
     """One backend call, with this caller's context ambient for the duration.
 
     The window is exactly the call: `_backend_client` and the log records emitted inside a backend
     need the holder and the replay marker, and `_BACKENDS[name](prompt)` cannot carry them (see
     :class:`_CallContext`).
     """
-    token = _current_call.set(_CallContext(state=state, replay=replay))
+    token = _current_call.set(_CallContext(state=state, replay=replay, caller=caller))
     try:
         return _BACKENDS[name](prompt)
     finally:
@@ -1083,6 +1136,7 @@ def write_message_detailed(
     situation_number: str = "",
     state: _LatchState | None = None,
     replay: bool = False,
+    caller: str | None = None,
 ) -> MessageResult:
     """A short Norwegian message for this message input, with the provenance of the attempt.
 
@@ -1104,6 +1158,18 @@ def write_message_detailed(
     ``VARSEL_LLM_LOG_PROMPTS`` today, and a replay surface would otherwise write a traveller's
     origin, destination and departure time to Cloud Logging at page-load volume rather than at the
     poller's few-per-cycle rate. Neither changes anything for a caller that passes neither.
+
+    ``caller`` names a non-browser surface (``"partner"``) and does three things, all of them
+    required by R16 and none of them left to an environment variable —
+    ``helm/kix-avvik/env/values-kub-ent-dev.yaml`` sets ``VARSEL_LLM_LOG_PROMPTS="true"`` in exactly
+    the environment this rollout starts in, and `/varsel` message debugging needs it left on:
+
+    * the prompt/reply DEBUG record is suppressed **in code**, regardless of that variable;
+    * the INFO record drops ``message``, so partner prose stays out of routine logs — the provider,
+      the model, the result and the hashed subject remain, which is what an operator diagnoses
+      with;
+    * every record carries ``caller=<surface>``, so partner traffic is countable without being
+      mistaken for the poller's or for `/meldinger`'s replay.
     """
     state = state or _STATE
     if not generation_enabled(state):
@@ -1118,14 +1184,15 @@ def write_message_detailed(
 
     for name in _candidates(state=state):
         try:
-            raw = _call_backend(name, prompt, state, replay)
+            raw = _call_backend(name, prompt, state, replay, caller)
         except _ConfigurationError:
             logger.exception(
                 "LLM backend %s cannot serve this project; latching it off for this process",
                 name,
                 extra={
                     "fields": _log_fields(
-                        replay, event="llm_message", provider=name, result="latched_off"
+                        replay, caller, event="llm_message", provider=name,
+                        result="latched_off"
                     )
                 },
             )
@@ -1144,7 +1211,7 @@ def write_message_detailed(
                 exc_info=True,
                 extra={
                     "fields": _log_fields(
-                        replay, event="llm_message", provider=name, result="error"
+                        replay, caller, event="llm_message", provider=name, result="error"
                     )
                 },
             )
@@ -1161,10 +1228,17 @@ def write_message_detailed(
                 extra={
                     "fields": _log_fields(
                         replay,
+                        caller,
                         event="llm_message",
                         provider=name,
                         result="ungrounded",
-                        reply=raw,
+                        # The discarded reply is prose written from the caller's own payload. It is
+                        # the single most useful field when a prompt edit starts producing
+                        # ungrounded answers, so it stays for the poller and for a replay -- and it
+                        # is withheld from a partner surface, whose prose must not enter routine
+                        # logs (R16). `MessageResult.discarded` still carries it back to that
+                        # caller in-process, which is where a partner diagnostic belongs.
+                        **({} if caller else {"reply": raw}),
                     )
                 },
             )
@@ -1183,7 +1257,7 @@ def write_message_detailed(
                 name,
                 extra={
                     "fields": _log_fields(
-                        replay, event="llm_message", provider=name, result="rejected"
+                        replay, caller, event="llm_message", provider=name, result="rejected"
                     )
                 },
             )
@@ -1198,30 +1272,59 @@ def write_message_detailed(
         # embeds the same origin/destination and departure time. With a small user base that is
         # quasi-identifying, and it sits in the same log as event="push" records carrying device_id.
         # Hash the key for correlation, and put the raw prompt behind VARSEL_LLM_LOG_PROMPTS.
-        logger.info(
-            "LLM message via %s for %s/%s: %s",
-            name,
-            key_digest(journey_key),
-            situation_number,
-            message,
-            extra={
-                "fields": _log_fields(
-                    replay,
-                    event="llm_message",
-                    provider=name,
-                    model=_model_of(name),
-                    result="ok",
-                    journey_digest=key_digest(journey_key),
-                    situation_number=situation_number,
-                    message=message,
-                )
-            },
-        )
-        # Never on the replay path, whatever VARSEL_LLM_LOG_PROMPTS says. The flag is a debugging
-        # affordance sized for the poller's handful of calls per cycle; a public request path
-        # replaying a day of stored inputs would turn it into bulk publication of origin,
-        # destination and departure time, and nobody setting it would have that in mind.
-        if _LOG_PROMPTS and not replay:
+        if caller:
+            # Same event, same fields minus the prose. A partner wording is written from a partner's
+            # own subscription and reaches its traveller through the partner's app, so it is exactly
+            # the "prose in routine logs" R16 keeps out; provider, model, result and the hashed
+            # subject are what an operator actually diagnoses with, and they stay.
+            logger.info(
+                "LLM message via %s for %s/%s (%s)",
+                name,
+                key_digest(journey_key),
+                situation_number,
+                caller,
+                extra={
+                    "fields": _log_fields(
+                        replay,
+                        caller,
+                        event="llm_message",
+                        provider=name,
+                        model=_model_of(name),
+                        result="ok",
+                        journey_digest=key_digest(journey_key),
+                        situation_number=situation_number,
+                    )
+                },
+            )
+        else:
+            logger.info(
+                "LLM message via %s for %s/%s: %s",
+                name,
+                key_digest(journey_key),
+                situation_number,
+                message,
+                extra={
+                    "fields": _log_fields(
+                        replay,
+                        event="llm_message",
+                        provider=name,
+                        model=_model_of(name),
+                        result="ok",
+                        journey_digest=key_digest(journey_key),
+                        situation_number=situation_number,
+                        message=message,
+                    )
+                },
+            )
+        # Never on the replay path, and never for a named surface, whatever
+        # VARSEL_LLM_LOG_PROMPTS says. The flag is a debugging affordance sized for the poller's
+        # handful of calls per cycle; a public request path replaying a day of stored inputs would
+        # turn it into bulk publication of origin, destination and departure time, and nobody
+        # setting it would have that in mind. A partner surface is the same shape of problem with a
+        # second party's data in it (R16), and the suppression is in code for the reason that
+        # requirement names: dev, where this rollout starts, sets the variable true and `/varsel`
+        # needs it.
+        if _LOG_PROMPTS and not replay and not caller:
             logger.debug(
                 "LLM prompt/reply for %s/%s",
                 key_digest(journey_key),
