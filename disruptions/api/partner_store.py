@@ -161,12 +161,51 @@ MAX_DAILY_COUNTERS = 14
 # `truncated`, and the counts are lower bounds rather than answers -- see `partner_alerts`.
 MAX_ALERTS_SERVED = 4
 MAX_SUBJECTS_PER_READ = 500
-# Consecutive below-threshold cycles before an alert is withdrawn. Two, not one: a single cycle's
-# dip below the gate is noise, and a withdrawal is itself a notification. A planning default -- the
-# reversal condition is a measurement of how often a withdrawn subject re-crosses the gate.
+# Below-threshold observations IN ONE RUN before an alert is withdrawn. Two, not one: a single
+# cycle's dip below the gate is noise, and a withdrawal is itself a notification. A planning
+# default -- the reversal condition is a measurement of how often a withdrawn subject re-crosses
+# the gate.
 WITHDRAWAL_CYCLES = 2
+# What closes a run of below-threshold observations. Two of them further apart than this start a
+# fresh count, so a dip, a long recovery and a second dip do not withdraw between them.
+#
+# Sized from the measurement, not chosen round: the notification pass runs on SIRI ingestion changes
+# rather than a schedule, measured at a ~296 s period on 2026-09-08, so this is ~3 periods and
+# tolerates two skipped or slow cycles inside one run. `_withdraw_body` explains why a time window
+# is what this can use at all, and states precisely what it does and does not observe -- it is an
+# approximation of "consecutive", and every way it is inaccurate errs toward NOT withdrawing.
+# Re-measure the period before changing it; the two numbers are one decision.
+WITHDRAWAL_GAP_S = 900
 # `Retry-After` is honoured but capped, at the lesser of the header, the time to departure and this.
 RETRY_AFTER_CAP_S = 300
+# HOW LONG A RESERVED CAP SLOT SURVIVES UNCONFIRMED, and this number is the whole of the scheme's
+# crash safety. `claim_delivery` reserves a slot, the terminal writes confirm or release it, and a
+# process that dies in between leaves a reservation nobody will ever report on. A reservation that
+# outlived the day would be strictly WORSE than the overspend it prevents -- it would burn one of a
+# traveller's four silently and permanently, and the plan is explicit that the slot is spent on
+# success ("otherwise a dead destination burns a subscription's four for the Oslo day with nothing
+# delivered").
+#
+# 120 s: comfortably longer than one attempt's worst case (`partner_delivery` reserves the outbound
+# timeout plus three store calls, ~11 s, under a 20 s bounded wait, and a client-retried transaction
+# can stretch that), and comfortably SHORTER than the pass period measured at ~296 s. That is the
+# property worth stating: a leaked reservation costs at most ONE cycle's worth of allowance, never
+# the day, and the next cycle reclaims it with no sweep and no repair job.
+RESERVATION_TTL_S = 120.0
+# THE DEADLINE ON EVERY INDIVIDUAL FIRESTORE CALL, and KTD6 requires it of the load step and the
+# emit transactions alike. It is NOT the same bound as the poller's wait: `varsel`'s own
+# `_PARTNER_LOAD_TIMEOUT_S` (5 s) bounds how long the ingestion thread WAITS on a worker, and a
+# worker parked past it is abandoned rather than killed -- Python cannot cancel a thread inside a
+# socket read. An abandoned thread is not free: `concurrent.futures.thread` registers an atexit hook
+# that JOINS its workers, so a store call with no deadline of its own delays pod termination by
+# however long it hangs. This is the deadline that stops that, and it belongs to the call rather
+# than to the caller for exactly that reason.
+#
+# 4 s, under `varsel._PARTNER_LOAD_TIMEOUT_S`, so a single hung call surfaces as this module's own
+# `DeadlineExceeded` -- retryable, logged, one cycle skipped -- rather than as the caller's timeout
+# with a thread still running behind it. A paged read spends it PER PAGE, which is the honest shape:
+# the whole-read bound is the caller's, and R21's document ceiling is what bounds the page count.
+_CALL_DEADLINE_S = 4.0
 
 # Lifecycle phases and the three event types the contract names.
 PHASE_PREDICTED = "predicted"
@@ -433,15 +472,57 @@ def _prune_marks(marks: Mapping[str, Any], now: datetime) -> dict[str, datetime]
     return dict(newest)
 
 
+def _live_reservations(doc: Mapping[str, Any], now: datetime) -> dict[str, dict[str, Any]]:
+    """The delivery ids holding a slot on THIS Oslo day whose reservation has not lapsed.
+
+    Keyed by delivery id, which is what makes the whole scheme idempotent: re-reserving the same
+    delivery replaces its own entry instead of consuming a second slot, so a retried claim -- or a
+    claim racing the abandoned thread of its own previous attempt -- cannot overspend.
+
+    A reservation older than :data:`RESERVATION_TTL_S` is ignored here and pruned by the next write.
+    That is the crash-safety property, and it is why an expiry exists at all: see
+    :func:`_reserve_slot`.
+    """
+    reservations = doc.get("daily_reservations")
+    if not isinstance(reservations, Mapping):
+        return {}
+    today = oslo_day(now)
+    live: dict[str, dict[str, Any]] = {}
+    for delivery_id, entry in reservations.items():
+        if not isinstance(entry, Mapping):
+            continue
+        at = _as_dt(entry.get("at"))
+        if at is None or (now - at).total_seconds() > RESERVATION_TTL_S:
+            continue
+        if str(entry.get("day") or "") != today:
+            continue
+        live[str(delivery_id)] = dict(entry)
+    return live
+
+
 def cap_remaining(doc: Mapping[str, Any], now: datetime) -> int:
-    """R11's remaining allowance for this subscription on this Oslo day."""
+    """R11's remaining allowance for this subscription on this Oslo day.
+
+    **Confirmed sends PLUS live reservations**, and counting only the first is the defect this
+    replaced. The allowance was READ here by ``claim_delivery`` and SPENT later by
+    ``mark_delivery_sent``, so with a delivery pool wider than the cap the first wave of claims all
+    read "slots left" before any of them spent one, and up to
+    ``MAX_ALERT_DELIVERIES_PER_DAY + workers - 1`` notifications could go out for one subscription
+    in one Oslo day. It did not bite only because ``partner_delivery._WORKERS`` (4) happens to equal
+    the cap (4) -- a coincidence, pinned by an assertion in that suite rather than relied on.
+    ``varsel._WriteBudget.claim`` is the precedent for the fix and its docstring records the same
+    read-then-act shape overshooting a 30 s ceiling by 16 s.
+
+    R11's four-per-registration grain is the whole of this plan's parity claim with /varsel, so an
+    overspend is not cosmetic.
+    """
     counters = doc.get("daily_deliveries") or {}
     spent = counters.get(oslo_day(now), 0) if isinstance(counters, Mapping) else 0
     try:
         spent_n = int(spent)
     except (TypeError, ValueError):
         spent_n = MAX_ALERT_DELIVERIES_PER_DAY  # unreadable counter = no allowance (fail closed)
-    return max(0, MAX_ALERT_DELIVERIES_PER_DAY - spent_n)
+    return max(0, MAX_ALERT_DELIVERIES_PER_DAY - spent_n - len(_live_reservations(doc, now)))
 
 
 # ---- Identity: alert subject, event id, revision seed -----------------------------------------
@@ -697,11 +778,11 @@ def _query(
 
 
 def _read(transaction: Any, ref: Any) -> Any:
-    return ref.get(transaction=transaction)
+    return ref.get(transaction=transaction, timeout=_CALL_DEADLINE_S)
 
 
 def _read_query(transaction: Any, query: Any) -> list[Any]:
-    return list(transaction.get(query))
+    return list(transaction.get(query, timeout=_CALL_DEADLINE_S))
 
 
 def _doc(snapshot: Any) -> dict[str, Any]:
@@ -879,6 +960,11 @@ class Subscription:
     servable: bool | None = None
     servable_checked_at: datetime | None = None
     daily_deliveries: Mapping[str, int] = field(default_factory=dict)
+    #: ``delivery_id`` -> ``{"day", "at"}`` for slots RESERVED and not yet confirmed or released.
+    #: Kept separate from ``daily_deliveries`` on purpose: that map stays the count of confirmed
+    #: sends, which is what an operator reads and what the delivery suite asserts on, while this one
+    #: is admission control with a lapse. :func:`cap_remaining` is the only thing that adds them.
+    daily_reservations: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     delivered: Mapping[str, datetime] = field(default_factory=dict)
     cleanup: Mapping[str, Any] = field(default_factory=dict)
 
@@ -947,6 +1033,11 @@ def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
         servable=doc.get("servable") if isinstance(doc.get("servable"), bool) else None,
         servable_checked_at=_as_dt(doc.get("servable_checked_at")),
         daily_deliveries=dict(doc.get("daily_deliveries") or {}),
+        daily_reservations={
+            str(k): dict(v)
+            for k, v in (doc.get("daily_reservations") or {}).items()
+            if isinstance(v, Mapping)
+        },
         delivered={k: v for k, v in (doc.get("delivered") or {}).items()},
         cleanup=dict(doc.get("cleanup") or {}),
     )
@@ -973,6 +1064,7 @@ def _new_subscription_doc(spec: SubscriptionSpec, now: datetime) -> dict[str, An
         "servable": None,
         "servable_checked_at": None,
         "daily_deliveries": {},
+        "daily_reservations": {},
         "delivered": {},
         "cleanup": {},
         **_horizons(now, now),
@@ -1285,7 +1377,7 @@ def get_subscription(
     another's records through any repository method.
     """
     instant = now or _now()
-    snapshot = _Refs(_client()).subscription(subscription_id).get()
+    snapshot = _Refs(_client()).subscription(subscription_id).get(timeout=_CALL_DEADLINE_S)
     stored = _doc(snapshot)
     if not stored:
         return None
@@ -1307,7 +1399,7 @@ def list_subscriptions(
         limit=min(limit, MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER),
     )
     out: list[Subscription] = []
-    for snapshot in query.stream():
+    for snapshot in query.stream(timeout=_CALL_DEADLINE_S):
         stored = _doc(snapshot)
         if not subscription_is_live(stored, instant):
             continue
@@ -1341,7 +1433,7 @@ def active_subscriptions(
     instant = now or _now()
     ceiling = min(limit, MAX_SUBSCRIPTIONS_PER_CYCLE)
     query = _query("load_active_subscriptions", equality={"status": "active"}, limit=ceiling)
-    page = list(query.stream())
+    page = list(query.stream(timeout=_CALL_DEADLINE_S))
     out: list[Subscription] = []
     skipped = expired = 0
     for snapshot in page:
@@ -1372,22 +1464,36 @@ def recipient_documents() -> list[dict[str, Any]]:
     """
     instant = _now()
     loaded = active_subscriptions(now=instant)
-    if loaded.truncated or loaded.skipped or loaded.expired:
+    # `expired` IS NOT A WARNING, and this used to warn on it. TTL deletes an expired document
+    # "typically within 24 hours", so during that documented lag a perfectly healthy deployment logs
+    # a warning on EVERY cycle -- and `terraform/firestore.tf`'s own header makes the argument
+    # against that better than a comment here can: a standing warning is how a real one stops being
+    # read. The two conditions worth waking someone for stay warnings: `truncated` is R21's ceiling
+    # binding, which at a pilot's volume is a store bug or a quota breach rather than growth, and
+    # `skipped` is a document this binary cannot read, which is a schema or deploy problem. The
+    # ordinary counts still go out on one DEBUG record under the same event name, so "is TTL keeping
+    # up?" is still answerable -- just not by a warning.
+    fields = {
+        "event": "partner_store_load",
+        "n": len(loaded.subscriptions),
+        "skipped": loaded.skipped,
+        "expired": loaded.expired,
+        "truncated": loaded.truncated,
+    }
+    if loaded.truncated or loaded.skipped:
         logger.warning(
-            "Partner subscription load: %d loaded, %d skipped, %d expired, truncated=%s",
+            "Partner subscription load bounded: %d loaded, %d skipped, truncated=%s",
             len(loaded.subscriptions),
             loaded.skipped,
-            loaded.expired,
             loaded.truncated,
-            extra={
-                "fields": {
-                    "event": "partner_store_load",
-                    "n": len(loaded.subscriptions),
-                    "skipped": loaded.skipped,
-                    "expired": loaded.expired,
-                    "truncated": loaded.truncated,
-                }
-            },
+            extra={"fields": fields},
+        )
+    else:
+        logger.debug(
+            "Partner subscription load: %d loaded, %d expired but not yet TTL-deleted",
+            len(loaded.subscriptions),
+            loaded.expired,
+            extra={"fields": fields},
         )
     return [s.as_recipient_document(instant) for s in loaded.subscriptions]
 
@@ -1455,6 +1561,7 @@ def _finish_cleanup_body(
                 "definition_digest": "",
                 "delivered": {},
                 "daily_deliveries": {},
+                "daily_reservations": {},
                 "redacted_at": now,
             }
         )
@@ -1480,7 +1587,7 @@ def cleanup_subscription(
     instant = now or _now()
     client = _client()
     refs = _Refs(client)
-    tombstone = _doc(refs.subscription(subscription_id).get())
+    tombstone = _doc(refs.subscription(subscription_id).get(timeout=_CALL_DEADLINE_S))
     if not tombstone:
         raise NotFound("no such subscription")
     if tombstone.get("status") != "deleted":
@@ -1494,7 +1601,7 @@ def cleanup_subscription(
         ("subjects", "cleanup_subjects"),
     ):
         query = _query(spec_name, equality={"subscription_id": subscription_id}, limit=batch)
-        page = list(query.stream())
+        page = list(query.stream(timeout=_CALL_DEADLINE_S))
         if page:
             writer = client.batch()
             for snapshot in page:
@@ -1568,6 +1675,9 @@ class AlertSubject:
     revision: int
     phase: str | None
     below_threshold_cycles: int
+    # When the run the count belongs to was last extended. `None` means no run is open, which is
+    # what a mint leaves behind and what a fresh subject starts as.
+    below_threshold_at: datetime | None
     last_event_id: str | None
     pending_delivery_id: str | None
     delivered_revision: int | None
@@ -1584,6 +1694,7 @@ def _subject_from_doc(doc: Mapping[str, Any]) -> AlertSubject:
         revision=int(doc.get("revision") or 0),
         phase=doc.get("phase") or None,
         below_threshold_cycles=int(doc.get("below_threshold_cycles") or 0),
+        below_threshold_at=_as_dt(doc.get("below_threshold_at")),
         last_event_id=doc.get("last_event_id") or None,
         pending_delivery_id=doc.get("pending_delivery_id") or None,
         delivered_revision=(
@@ -1765,7 +1876,12 @@ def _mint(
         "destination_id": request.destination_id,
         "revision": revision,
         "phase": phase,
+        # A mint closes any run of below-threshold observations: the subject has just changed phase,
+        # so whatever was counting toward a withdrawal is history. Both fields, not just the count --
+        # a stale `below_threshold_at` left behind would make the NEXT dip look like the
+        # continuation of a run that ended here.
         "below_threshold_cycles": 0,
+        "below_threshold_at": None,
         "last_event_id": event_id,
         "last_event_type": event_type,
         "pending_delivery_id": event_id,
@@ -1922,11 +2038,47 @@ def _withdraw_body(
     reason = _subscription_obsolete(subscription, request=request, now=now)
     if reason is not None:
         return EventCommit(status="obsolete", alert_id=request.alert_id, reason=reason)
-    count = int(subject.get("below_threshold_cycles") or 0) + 1
+    # THE COUNT IS A RUN, NOT A TOTAL, and getting that wrong made a single dip withdraw.
+    #
+    # The bug: an alert-worthy cycle that mints nothing (the same phase again -- the overwhelming
+    # majority of cycles for a standing alert) reaches no store call at all, because
+    # `partner_events.skip_reason` deliberately skips it to save a transaction per standing subject
+    # per cycle. So nothing reset the counter, and a dip, an hour of recovery and a second dip
+    # withdrew the alert -- which is a single-dip withdrawal in effect, exactly what
+    # `WITHDRAWAL_CYCLES` exists to prevent.
+    #
+    # The fix cannot be "reset it on an alert-worthy cycle": the store never sees that cycle. The
+    # two ways to make it see one are (a) have the pass call the store on every unchanged cycle,
+    # which is one transaction per standing subject per cycle and undoes precisely the optimisation
+    # `skip_reason` was written for -- AE3's line suspension is thirteen standing subjects on one
+    # subscription, so ~4 000 transactions a day for it alone -- or (b) a batched
+    # "these are still standing" write, one RPC per partner per cycle, which is cheap but is a
+    # CALLER change and so not this module's to make unilaterally.
+    #
+    # So the run is closed by TIME instead: two below-threshold observations belong to the same run
+    # when they are less than `WITHDRAWAL_GAP_S` apart. Be exact about what that is and is not. It
+    # does NOT observe consecutiveness -- an alert-worthy cycle inside the window is invisible, so a
+    # dip, one recovered cycle, and a dip still withdraws. It DOES deliver both ends the rule is for:
+    # a genuine run of dips one pass period apart withdraws on the second, and a recovery longer
+    # than the window starts a fresh run. Every inaccuracy is in the direction of NOT withdrawing,
+    # which is the safe one -- a withdrawal is itself a notification.
+    #
+    # A subject with no `below_threshold_at` -- a fresh one, or a row written before this field
+    # existed -- starts a new run, so a subject mid-run across the deploy restarts rather than
+    # withdrawing early.
+    previous_at = _as_dt(subject.get("below_threshold_at"))
+    same_run = (
+        previous_at is not None and (now - previous_at).total_seconds() <= WITHDRAWAL_GAP_S
+    )
+    count = int(subject.get("below_threshold_cycles") or 0) + 1 if same_run else 1
     if count < WITHDRAWAL_CYCLES:
         transaction.update(
             refs.subject(request.alert_id),
-            {"below_threshold_cycles": count, "updated_at": now},
+            {
+                "below_threshold_cycles": count,
+                "below_threshold_at": now,
+                "updated_at": now,
+            },
         )
         return EventCommit(
             status="counting",
@@ -1950,9 +2102,21 @@ def record_below_threshold(request: EmitRequest, *, now: datetime | None = None)
     """One cycle in which this train no longer clears the gate; withdraw after enough of them.
 
     Withdrawal means the forecast changed, not that normal service is guaranteed -- which is what
-    the wording in ``request.payload`` has to say. The consecutive count lives on the alert subject
-    and is reset by any :func:`commit_event` that mints a phase, so a train that dips below the gate
-    for one cycle and recovers is never withdrawn.
+    the wording in ``request.payload`` has to say.
+
+    **The count is a RUN, closed by time, and this docstring used to claim "consecutive" while the
+    code counted a lifetime total.** A run is two or more below-threshold observations less than
+    :data:`WITHDRAWAL_GAP_S` apart; a mint of any phase closes it, and so does a gap longer than
+    that. It is an approximation of "consecutive" and not the thing itself, because an alert-worthy
+    cycle that mints nothing never reaches this module at all -- ``partner_events.skip_reason``
+    skips the call to save a transaction per standing subject per cycle. ``_withdraw_body`` carries
+    the full reasoning, the exact-but-costlier alternatives, and what the approximation gets wrong
+    (a dip, ONE recovered cycle, and a dip inside the window still withdraws). Every inaccuracy is
+    in the direction of not withdrawing.
+
+    Takes the withdrawal payload on EVERY call even though it is used only on the last one. The
+    alternative -- returning "you would withdraw now, ask again with a payload" -- is two round
+    trips on the ingestion thread for a payload that is pure and cheap to build.
 
     Takes the withdrawal payload on EVERY call even though it is used only on the last one. The
     alternative -- returning "you would withdraw now, ask again with a payload" -- is two round
@@ -1966,9 +2130,57 @@ def record_below_threshold(request: EmitRequest, *, now: datetime | None = None)
     )
 
 
+def _clear_below_threshold_body(
+    transaction: Any, refs: _Refs, *, alert_id: str, now: datetime
+) -> bool:
+    subject = _doc(_read(transaction, refs.subject(alert_id)))
+    # NEVER creates a subject: this says "the run that was open is closed", which is meaningless
+    # for a subject that does not exist, and a `set` here would mint a phase-less document the
+    # snapshot readers would then have to skip.
+    if not subject or not _not_expired(subject, now):
+        return False
+    if _as_dt(subject.get("below_threshold_at")) is None:
+        # No run open, so no write. This is what makes U6's "zero writes on an ordinary standing
+        # cycle" affordable: the overwhelmingly common case costs one read and nothing else, and
+        # with `PartnerAlerts.open_below_threshold` in hand the caller does not even pay that.
+        return False
+    transaction.update(
+        refs.subject(alert_id),
+        {"below_threshold_cycles": 0, "below_threshold_at": None, "updated_at": now},
+    )
+    return True
+
+
+def clear_below_threshold(alert_id: str, *, now: datetime) -> bool:
+    """Close an open withdrawal run: this train cleared the gate again. Returns whether it wrote.
+
+    The other half of making the withdrawal count truly CONSECUTIVE. `_withdraw_body` cannot see an
+    alert-worthy cycle -- `partner_events.skip_reason` deliberately skips the store call on one, to
+    save a transaction per standing subject per cycle -- so it closes runs by time instead, and that
+    approximation withdraws on a dip / one recovered cycle / dip inside
+    :data:`WITHDRAWAL_GAP_S`. Calling this on a recovery removes the approximation for the case that
+    matters, at one write per GENUINE recovery rather than one per standing cycle.
+
+    Takes an **alert_id** and not an `EmitRequest`, because that is all the caller has at the point
+    it decides nothing needs minting -- it has already skipped building a request.
+
+    Touches no phase and no revision: a recovery is not a lifecycle transition and must not mint an
+    event or move the subject's revision. Returns ``False`` for a missing, expired, or
+    already-closed subject, so a caller can count real recoveries without a second read.
+    """
+    if not alert_id:
+        return False
+    refs = _Refs(_client())
+    return bool(
+        _run_transaction(
+            lambda txn: _clear_below_threshold_body(txn, refs, alert_id=alert_id, now=now)
+        )
+    )
+
+
 def get_subject(alert_id: str, *, now: datetime | None = None) -> AlertSubject | None:
     instant = now or _now()
-    stored = _doc(_Refs(_client()).subject(alert_id).get())
+    stored = _doc(_Refs(_client()).subject(alert_id).get(timeout=_CALL_DEADLINE_S))
     if not stored or not _not_expired(stored, instant):
         return None
     return _subject_from_doc(stored)
@@ -2143,7 +2355,7 @@ def subscription_alerts(
         equality={"subscription_id": subscription_id},
         limit=min(limit, MAX_SUBJECTS_PER_READ),
     )
-    page = list(query.stream())
+    page = list(query.stream(timeout=_CALL_DEADLINE_S))
     rows, _expired = _live_subject_rows(page, instant)
     if partner_id is not None:
         for row in rows:
@@ -2166,6 +2378,23 @@ class PartnerAlerts:
 
     snapshots: dict[str, AlertSnapshot]
     truncated: bool
+    #: ``alert_id`` -> ``below_threshold_at`` for every live subject in the page that has one: the
+    #: subjects with a withdrawal run OPEN against them. Exists so a caller can make the withdrawal
+    #: count truly consecutive -- the lifecycle diagram says "two FRESH below-threshold cycles", and
+    #: the time window `_withdraw_body` falls back to has exactly one failure mode (a dip, ONE
+    #: recovered cycle, and a dip inside `WITHDRAWAL_GAP_S`), which withdraws when it should not and
+    #: therefore sends a real «varselet er trukket tilbake» and then re-alerts.
+    #:
+    #: **UNCAPPED, and derived before `MAX_ALERTS_SERVED` truncates the display list.** A field on
+    #: `AlertState` would not do: the display cap of 4 would leave AE3's thirteen-subject line
+    #: suspension -- the case `_withdraw_body`'s own comment cites -- falling through to the time
+    #: window for nine of them. It is bounded by the page (`MAX_SUBJECTS_PER_READ`) and not by the
+    #: display, and it adds no RPC: the query is one `partner_alerts` already spends.
+    #:
+    #: A mapping rather than a set, so the caller can skip a clear whose run is already older than
+    #: :data:`WITHDRAWAL_GAP_S` -- the store would start a fresh run anyway, and the write would buy
+    #: nothing.
+    open_below_threshold: Mapping[str, datetime] = field(default_factory=dict)
 
 
 def partner_alerts(
@@ -2192,29 +2421,47 @@ def partner_alerts(
     instant = now or _now()
     ceiling = min(limit, MAX_SUBJECTS_PER_READ)
     query = _query("partner_alerts", equality={"partner_id": partner_id}, limit=ceiling)
-    page = list(query.stream())
+    page = list(query.stream(timeout=_CALL_DEADLINE_S))
     rows, expired = _live_subject_rows(page, instant)
     truncated = len(page) >= ceiling
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault(str(row.get("subscription_id") or ""), []).append(row)
-    if truncated or expired:
+    # `expired` IS NOT A WARNING -- see `recipient_documents` for the argument, which applies with
+    # more force here: the notification pass calls this once per partner per cycle, so during TTL's
+    # documented ~24 h delete lag every cycle logged `partner_quota` for an entirely expected
+    # condition. `truncated` keeps the warning, because that one changes the CALLER's behaviour
+    # (every snapshot is marked incomplete and the pass falls back to asking per subject), which is
+    # exactly the kind of thing an operator should see.
+    fields = {
+        "event": "partner_quota",
+        "result": "alert_state",
+        "partner_id": partner_id,
+        "n": len(rows),
+        "expired": expired,
+        "truncated": truncated,
+    }
+    if truncated:
         logger.warning(
-            "Partner alert-state read bounded: %d live, %d expired, truncated=%s",
+            "Partner alert-state read hit its ceiling: %d live, %d expired",
             len(rows),
             expired,
-            truncated,
-            extra={
-                "fields": {
-                    "event": "partner_quota",
-                    "result": "alert_state",
-                    "partner_id": partner_id,
-                    "n": len(rows),
-                    "expired": expired,
-                    "truncated": truncated,
-                }
-            },
+            extra={"fields": fields},
         )
+    elif expired:
+        logger.debug(
+            "Partner alert-state read skipped %d expired subject(s) not yet TTL-deleted",
+            expired,
+            extra={"fields": fields},
+        )
+    # Over `rows`, which is the whole live page -- deliberately not over the grouped snapshots,
+    # whose `subjects` tuples are already cut to `MAX_ALERTS_SERVED`.
+    open_below_threshold: dict[str, datetime] = {}
+    for row in rows:
+        at = _as_dt(row.get("below_threshold_at"))
+        alert_id = str(row.get("alert_id") or "")
+        if at is not None and alert_id:
+            open_below_threshold[alert_id] = at
     return PartnerAlerts(
         snapshots={
             subscription_id: _snapshot(
@@ -2224,6 +2471,7 @@ def partner_alerts(
             if subscription_id
         },
         truncated=truncated,
+        open_below_threshold=open_below_threshold,
     )
 
 
@@ -2266,11 +2514,11 @@ def _count_destination_deliveries(destination_id: str, *, state: str) -> int:
         limit=MAX_PENDING_EVENTS_PER_DESTINATION + 1,
     )
     try:
-        result = query.count(alias="n").get()
+        result = query.count(alias="n").get(timeout=_CALL_DEADLINE_S)
         return int(result[0][0].value)
     except Exception:
         logger.debug("count() aggregation unavailable; falling back to a stream", exc_info=True)
-        return sum(1 for _ in query.stream())
+        return sum(1 for _ in query.stream(timeout=_CALL_DEADLINE_S))
 
 
 # ---- Deliveries --------------------------------------------------------------------------------
@@ -2358,7 +2606,7 @@ def pending_deliveries(
         inequality={"retry_not_before": instant},
         limit=ceiling,
     )
-    page = list(query.stream())
+    page = list(query.stream(timeout=_CALL_DEADLINE_S))
     ready: list[Delivery] = []
     stale: list[str] = []
     for snapshot in page:
@@ -2427,8 +2675,42 @@ class DeliveryClaim:
     status: str
     delivery: Delivery | None = None
     subscription: Subscription | None = None
+    #: The allowance left AFTER this claim's own reservation, not before it. A `ready` claim has
+    #: already taken a slot -- that is the whole point of reserving inside the claim transaction --
+    #: so reporting the pre-claim figure would tell a caller a slot is available that it has itself
+    #: just consumed. A cap-exempt claim reserves nothing and this is unchanged by it.
     cap_remaining: int = 0
     reason: str | None = None
+
+
+def _reserve_slot(
+    subscription: Mapping[str, Any], *, delivery_id: str, now: datetime
+) -> dict[str, Any]:
+    """The subscription patch that reserves one of R11's slots for ``delivery_id``.
+
+    Keyed by delivery id so it is idempotent, and pruned to the live set on every write so a lapsed
+    reservation cannot accumulate. Never touches ``daily_deliveries``: that map stays the count of
+    CONFIRMED sends, which is what an operator reads and what the delivery suite asserts.
+    """
+    reservations = _live_reservations(subscription, now)
+    reservations[delivery_id] = {"day": oslo_day(now), "at": now}
+    return {"daily_reservations": reservations, "updated_at": now}
+
+
+def _release_slot(
+    subscription: Mapping[str, Any], *, delivery_id: str, now: datetime
+) -> dict[str, Any] | None:
+    """The patch that gives a reserved slot back, or ``None`` when there is nothing to give back.
+
+    ``None`` rather than an empty patch, so a terminal write for a delivery that never reserved
+    anything -- a cap-exempt one, or one whose reservation already lapsed -- costs no write to the
+    subscription document at all.
+    """
+    reservations = _live_reservations(subscription, now)
+    if delivery_id not in reservations:
+        return None
+    reservations.pop(delivery_id, None)
+    return {"daily_reservations": reservations, "updated_at": now}
 
 
 def _claim_body(
@@ -2478,7 +2760,8 @@ def _claim_body(
         )
         return "cancelled", delivery, subscription, 0, obsolete
     remaining = cap_remaining(subscription, now)
-    if remaining <= 0 and not delivery.get("cap_exempt"):
+    exempt = bool(delivery.get("cap_exempt"))
+    if remaining <= 0 and not exempt:
         # R11: a suppressed alert is RECORDED and re-offered. The state stays `pending` on purpose
         # -- the cap is a per-day allowance, not a verdict on this event -- so the next cycle inside
         # the event's validity offers it again, and the record is what makes the suppression visible
@@ -2493,7 +2776,17 @@ def _claim_body(
         )
         return "capped", delivery, subscription, remaining, "daily_cap"
     transaction.update(refs.delivery(delivery_id), {"claimed_at": now, "updated_at": now})
-    return "ready", delivery, subscription, remaining, None
+    if not exempt:
+        # RESERVE, in the same transaction that returns `ready`. That is the fix and the placement
+        # is the whole of it: two claims for one subscription both write this document, so Standard
+        # edition's pessimistic concurrency serialises them and the second reads the first's
+        # reservation instead of the same free slot. A reservation written anywhere later -- or read
+        # here and written by the caller -- is the read-then-act bug again with more steps.
+        transaction.update(
+            refs.subscription(str(delivery["subscription_id"])),
+            _reserve_slot(subscription, delivery_id=delivery_id, now=now),
+        )
+    return "ready", delivery, subscription, remaining - (0 if exempt else 1), None
 
 
 def claim_delivery(delivery_id: str, *, now: datetime | None = None) -> DeliveryClaim:
@@ -2519,16 +2812,25 @@ def claim_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery
 
 @dataclass(frozen=True)
 class DeliveryOutcome:
+    """What a terminal write did.
+
+    ``already_resolved`` says the delivery was NOT ``pending`` when the write arrived, so nothing was
+    written and ``state`` is the state it already held. Additive and defaulted, so a caller that
+    ignores it behaves exactly as before -- but a caller counting fresh successes should read it: an
+    abandoned attempt thread completing a cycle late is an ordinary event on this path, not an error.
+    """
+
     delivery_id: str
     state: str
     attempts: int
     slot_spent: bool = False
     retry_not_before: datetime | None = None
+    already_resolved: bool = False
 
 
 def _sent_body(
     transaction: Any, refs: _Refs, *, delivery_id: str, now: datetime
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool, bool]:
     """Record a successful attempt, and spend R11's slot in the SAME transaction.
 
     Three states change together and must not be splittable: the delivery becomes ``sent``, the
@@ -2540,10 +2842,29 @@ def _sent_body(
     Dedup is on SUCCESS, exactly as /varsel's is: an attempt that errors leaves no mark and is
     re-offered next cycle, and the cap slot is spent here for the same reason -- otherwise a dead
     destination burns a subscription's four for the Oslo day with nothing delivered.
+
+    **THE TRANSITION IS CONDITIONAL ON `pending`, and leaving that out double-spent R11's cap.**
+    Observed live in U6's measurement harness as a stray `NotFound` from an abandoned thread, and
+    the sequence is ordinary rather than exotic: the delivery pass abandons an attempt's thread when
+    its bounded wait expires (it cannot kill a thread parked in a socket read), the next cycle
+    legitimately re-sends the same still-`pending` event, and the abandoned thread then returns and
+    marks the same delivery sent. Unguarded, `attempts` double-increments -- cosmetic -- and the
+    subscription's Oslo-day counter is spent TWICE for one notification, so a traveller silently
+    loses one of their four. R11's grain is the whole of this plan's parity claim with /varsel, so
+    that is not cosmetic.
+
+    A non-`pending` delivery therefore writes NOTHING and comes back
+    ``already_resolved=True, slot_spent=False``, carrying the state it actually holds. It is not an
+    error -- the partner did receive the event, and raising would log a store failure and read as an
+    outage -- but it must not read as a fresh success either, which is why the flag exists rather
+    than returning a plain `sent`. Note the guard is what `_terminal_body` has had all along; its
+    absence here and in `_failed_body` was the oversight, not the presence of it there.
     """
     delivery = _doc(_read(transaction, refs.delivery(delivery_id)))
     if not delivery:
         raise NotFound("no such delivery")
+    if delivery.get("state") != "pending":
+        return delivery, False, True
     subscription_id = str(delivery["subscription_id"])
     subscription = _doc(_read(transaction, refs.subscription(subscription_id)))
     alert_id = str(delivery.get("alert_id") or "")
@@ -2563,7 +2884,19 @@ def _sent_body(
     if subscription:
         counters = _prune_daily(subscription.get("daily_deliveries") or {}, now)
         marks = _prune_marks(subscription.get("delivered") or {}, now)
+        # CONFIRM the reservation: drop this delivery's entry and add one to the day's confirmed
+        # count. Dropping it is what makes the count and the reservations disjoint, so
+        # `cap_remaining`'s sum over both cannot double-count the slot it is about to charge.
+        reservations = _live_reservations(subscription, now)
+        reservations.pop(delivery_id, None)
         if not delivery.get("cap_exempt"):
+            # The increment does NOT require a reservation to have survived. A slot is spent on
+            # SUCCESS -- the plan says so, and for the reason it gives: otherwise a dead destination
+            # burns a subscription's four with nothing delivered. So a delivery whose reservation
+            # lapsed (a slow attempt, a restart) still charges its slot here, and the reservation is
+            # only ever an admission control on top. That combination is what makes the scheme
+            # self-correcting rather than a counter that can drift in either direction, and the
+            # `pending` guard above is what stops it charging twice.
             day = oslo_day(now)
             counters[day] = int(counters.get(day, 0)) + 1
             spent = True
@@ -2573,6 +2906,7 @@ def _sent_body(
             refs.subscription(subscription_id),
             {
                 "daily_deliveries": counters,
+                "daily_reservations": reservations,
                 "delivered": _prune_marks(marks, now),
                 "last_delivery_at": now,
                 "updated_at": now,
@@ -2599,20 +2933,27 @@ def _sent_body(
         if subject.get("pending_delivery_id") == delivery_id:
             subject_patch["pending_delivery_id"] = None
         transaction.update(refs.subject(alert_id), subject_patch)
-    return {**delivery, **delivery_patch}, spent
+    return {**delivery, **delivery_patch}, spent, False
 
 
 def mark_delivery_sent(delivery_id: str, *, now: datetime | None = None) -> DeliveryOutcome:
+    """Record that the partner received this event. Idempotent, and it spends R11's slot once.
+
+    ``state`` is read back from the document rather than asserted to be ``"sent"``: a delivery some
+    other pass already resolved keeps the state it holds, and claiming ``"sent"`` for a
+    ``superseded`` or ``cancelled`` record would misreport it to whoever reads the outcome.
+    """
     instant = now or _now()
     refs = _Refs(_client())
-    doc, spent = _run_transaction(
+    doc, spent, already_resolved = _run_transaction(
         lambda txn: _sent_body(txn, refs, delivery_id=delivery_id, now=instant)
     )
     return DeliveryOutcome(
         delivery_id=delivery_id,
-        state="sent",
+        state=str(doc.get("state") or ""),
         attempts=int(doc.get("attempts") or 0),
         slot_spent=spent,
+        already_resolved=already_resolved,
     )
 
 
@@ -2626,10 +2967,24 @@ def _failed_body(
     retry_after_s: float | None,
     terminal_state: str,
     now: datetime,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
+    # Conditional on `pending` for the same reason as `_sent_body`, and here the unguarded version
+    # is the WORSE of the two: an abandoned attempt thread from the previous cycle, returning after
+    # this cycle has already marked the delivery `sent`, would set the state back to `pending` with
+    # a `retry_not_before` -- resurrecting a delivery the partner has already received, so the next
+    # cycle sends it a second time. The receiver's inbox suppresses the duplicate (R12 is
+    # at-least-once), which is exactly why this would never have been noticed.
     delivery = _doc(_read(transaction, refs.delivery(delivery_id)))
     if not delivery:
         raise NotFound("no such delivery")
+    if delivery.get("state") != "pending":
+        return delivery, True
+    # RELEASE, on the retryable branch as much as the terminal one. A retryable failure leaves the
+    # delivery `pending` for the next cycle, and holding its slot until the reservation lapses would
+    # withhold the allowance from a delivery that could use it NOW -- the cap is spent on success,
+    # and a failed attempt is not one.
+    subscription = _doc(_read(transaction, refs.subscription(str(delivery["subscription_id"]))))
+    release = _release_slot(subscription, delivery_id=delivery_id, now=now)
     attempts = int(delivery.get("attempts") or 0) + 1
     patch: dict[str, Any] = {
         "attempts": attempts,
@@ -2655,7 +3010,9 @@ def _failed_body(
         patch["state"] = terminal_state
         patch["failed_at"] = now
     transaction.update(refs.delivery(delivery_id), patch)
-    return {**delivery, **patch}
+    if release is not None:
+        transaction.update(refs.subscription(str(delivery["subscription_id"])), release)
+    return {**delivery, **patch}, False
 
 
 def mark_delivery_failed(
@@ -2678,7 +3035,7 @@ def mark_delivery_failed(
         raise Conflict(f"terminal_state must be one of {DELIVERY_STATES}")
     instant = now or _now()
     refs = _Refs(_client())
-    doc = _run_transaction(
+    doc, already_resolved = _run_transaction(
         lambda txn: _failed_body(
             txn,
             refs,
@@ -2695,6 +3052,7 @@ def mark_delivery_failed(
         state=str(doc.get("state") or ""),
         attempts=int(doc.get("attempts") or 0),
         retry_not_before=_as_dt(doc.get("retry_not_before")),
+        already_resolved=already_resolved,
     )
 
 
@@ -2706,6 +3064,12 @@ def _terminal_body(
         raise NotFound("no such delivery")
     if delivery.get("state") != "pending":
         return delivery
+    # RELEASE. Every path that ends an attempt without a delivery gives the reserved slot back, or
+    # the reservation is just the overspend traded for an underspend -- and an underspend is the
+    # worse trade, because it suppresses a notification the traveller was owed rather than sending
+    # one they were not. Read before write, as everywhere in this module.
+    subscription = _doc(_read(transaction, refs.subscription(str(delivery["subscription_id"]))))
+    release = _release_slot(subscription, delivery_id=delivery_id, now=now)
     patch = {
         "state": state,
         "updated_at": now,
@@ -2713,6 +3077,8 @@ def _terminal_body(
         f"{state}_reason": reason,
     }
     transaction.update(refs.delivery(delivery_id), patch)
+    if release is not None:
+        transaction.update(refs.subscription(str(delivery["subscription_id"])), release)
     return {**delivery, **patch}
 
 
@@ -2759,7 +3125,7 @@ def mark_delivery_cancelled(
 
 def get_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery | None:
     instant = now or _now()
-    stored = _doc(_Refs(_client()).delivery(delivery_id).get())
+    stored = _doc(_Refs(_client()).delivery(delivery_id).get(timeout=_CALL_DEADLINE_S))
     if not stored or not _not_expired(stored, instant):
         return None
     return _delivery_from_doc(stored)
@@ -2768,7 +3134,7 @@ def get_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery |
 def get_event(event_id: str, *, now: datetime | None = None) -> dict[str, Any] | None:
     """One stored event, or ``None`` when it is missing or past its retention window."""
     instant = now or _now()
-    stored = _doc(_Refs(_client()).event(event_id).get())
+    stored = _doc(_Refs(_client()).event(event_id).get(timeout=_CALL_DEADLINE_S))
     if not stored or not _not_expired(stored, instant):
         return None
     return stored
@@ -2785,7 +3151,24 @@ def event_is_valid(doc: Mapping[str, Any], now: datetime) -> bool:
 def event_validity(
     *, occurred_at: datetime, departure_at: datetime | None, subscription_expires_at: datetime | None
 ) -> datetime:
-    """The earlier of the 60-minute horizon, the departure, and the subscription's lifetime."""
+    """The earlier of the 60-minute horizon, the departure, and the subscription's lifetime.
+
+    **The third term is optional here, and on the notification pass it is not supplied**, because
+    the pass does not have it: a matched recipient carries the five journey fields plus its routing
+    ids, not the subscription's own expiry. What that leaves is a published `valid_until` that can
+    outlive the subscription by up to the horizon -- so the contract states where each term is
+    enforced rather than implying all three land here (``contracts/notifications/v1/
+    event.schema.json``, and ``test_the_published_validity_wording_matches_where_each_term_is_
+    enforced`` holds the two together).
+
+    Carrying it in would not retire that wording anyway, which is the reason for choosing the
+    wording over the field: the value is computed at emit, so it could only ever be a SNAPSHOT of
+    the expiry taken when the pass loaded its recipients, already stale by the length of the pass.
+    :func:`claim_delivery` re-reads the LIVE subscription immediately before dispatch and cancels a
+    delivery whose subscription has ended (R13), which is strictly tighter than any snapshot and is
+    what actually guarantees nothing is *sent* past expiry. The parameter stays for the callers that
+    do hold a live subscription -- the partner API's own synthetic test-event path is one.
+    """
     candidates = [occurred_at + timedelta(minutes=EVENT_VALIDITY_MINUTES)]
     for candidate in (departure_at, subscription_expires_at):
         if candidate is not None:
@@ -2824,6 +3207,7 @@ __all__ = [
     "cap_remaining",
     "claim_delivery",
     "cleanup_subscription",
+    "clear_below_threshold",
     "client",
     "commit_event",
     "configure",

@@ -25,6 +25,7 @@ import pathlib
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -61,7 +62,12 @@ class _Ref:
     def __init__(self, client: Any, path: str) -> None:
         self.client, self.path = client, path
 
-    def get(self, transaction: Any = None) -> _Snap:
+    def get(self, transaction: Any = None, timeout: float | None = None) -> _Snap:
+        # `timeout` is accepted and ignored: every read in `partner_store` now carries its own
+        # Firestore deadline (KTD6 -- an abandoned worker thread with no call deadline delays
+        # pod termination via `concurrent.futures`' atexit join). `test_partner_store` is where
+        # the deadline is asserted; this double only has to tolerate the kwarg.
+        del timeout
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
 
 
@@ -77,7 +83,8 @@ class _Page:
     def __init__(self, client: Any, rows: list[tuple[str, dict[str, Any]]]) -> None:
         self.client, self.rows = client, rows
 
-    def stream(self) -> list[_Snap]:
+    def stream(self, timeout: float | None = None) -> list[_Snap]:
+        del timeout
         return [_Snap(path, data, self.client) for path, data in self.rows]
 
 
@@ -94,7 +101,8 @@ class _Txn:
     def delete(self, ref: _Ref) -> None:
         self.writes.append(("delete", ref.path, None))
 
-    def get(self, query: Any) -> list[_Snap]:
+    def get(self, query: Any, timeout: float | None = None) -> list[_Snap]:
+        del timeout
         return list(query.stream())
 
 
@@ -129,6 +137,40 @@ class _Fake:
 
 
 _saved: dict[str, Any] = {}
+_pools: list[ThreadPoolExecutor] = []
+_DRAIN_TIMEOUT_S = 5.0
+
+
+class _RecordingPool(ThreadPoolExecutor):
+    """Every pool `emit` creates, kept so a test can drain the workers it ABANDONED.
+
+    `emit` calls `shutdown(wait=False)` on purpose -- a thread parked inside a Firestore call
+    cannot be killed, and joining it would defeat the bounded wait entirely. Right in production,
+    and in a suite it means the hung-store test's worker runs on into whatever executes next,
+    writing through a fake that has already been uninstalled. `test_partner_delivery` had the same
+    shape and it cost one failing run in nine there; this one had not surfaced yet, which is the
+    only difference between them.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        _pools.append(self)
+
+
+def _drain_pools() -> None:
+    """Join every worker the step walked away from, so none of them outlives its test."""
+    stragglers: list[str] = []
+    for pool in _pools:
+        # `_threads` is private; a test double is where reaching for it is honest, since the public
+        # `shutdown(wait=True)` takes no timeout and a wedged worker would hang the suite rather
+        # than report a leak.
+        for thread in list(getattr(pool, "_threads", ())):
+            thread.join(timeout=_DRAIN_TIMEOUT_S)
+            if thread.is_alive():
+                stragglers.append(thread.name)
+    _pools.clear()
+    if stragglers:
+        raise AssertionError(f"worker thread(s) outlived the test that abandoned them: {stragglers}")
 
 
 def _sortable(value: Any) -> Any:
@@ -142,8 +184,11 @@ def _install() -> _Fake:
             "client": partner_store._client,
             "run": partner_store._run_transaction,
             "query": partner_store._query,
+            "pool": partner_events.ThreadPoolExecutor,
         }
     )
+    partner_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
+    _pools.clear()
     partner_store._client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
@@ -196,7 +241,9 @@ def _install() -> _Fake:
 
 
 def _uninstall() -> None:
+    _drain_pools()
     if _saved:
+        partner_events.ThreadPoolExecutor = _saved["pool"]  # type: ignore[misc]
         partner_store._client = _saved["client"]  # type: ignore[assignment]
         partner_store._run_transaction = _saved["run"]  # type: ignore[assignment]
         partner_store._query = _saved["query"]  # type: ignore[assignment]
@@ -259,6 +306,11 @@ def _subject(**over: Any) -> partner_events.PartnerSubject:
     return partner_events.PartnerSubject(**base)
 
 
+# See `test_partner_delivery`'s copy for the full argument: every fault this suite injects is
+# logged by the code under test with `exc_info=True`, and with no handler in the hierarchy
+# `logging.lastResort` printed the record and its traceback to stderr -- so a passing run ended in
+# a stack trace, and a standing traceback is how a real one stops being read. A collecting sink
+# rather than a `NullHandler`, so a fault can be ASSERTED rather than merely hidden.
 class _Records(logging.Handler):
     def __init__(self) -> None:
         super().__init__()
@@ -266,6 +318,13 @@ class _Records(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
+
+
+_SINK = _Records()
+for _name in ("partner_events", "partner_store"):
+    _sink_logger = logging.getLogger(_name)
+    _sink_logger.setLevel(logging.INFO)
+    _sink_logger.addHandler(_SINK)
 
 
 def _capture() -> _Records:
@@ -785,8 +844,14 @@ def test_an_exhausted_transaction_is_classified_retryable_not_terminal():
         assert any(e["result"] == "retryable" for e in _events(handler, "partner_emit"))
 
         client.fail_with = ValueError("something else entirely")
+        mark = len(_SINK.records)
         report = partner_events.emit([_subject()], now=NOW)
         assert report.failed == 1 and report.retryable == 0
+        # Asserted rather than printed: `_events` above removed the per-test handler, so this
+        # second injection's record fell through to `lastResort` and put a traceback on stderr on
+        # every run of a green suite.
+        [record] = [r for r in _SINK.records[mark:] if r.exc_info]
+        assert isinstance(record.exc_info[1], ValueError)
     finally:
         _uninstall()
 

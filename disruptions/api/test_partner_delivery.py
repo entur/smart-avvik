@@ -28,6 +28,7 @@ import logging
 import pathlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -85,7 +86,12 @@ class _Ref:
     def __init__(self, client: Any, path: str) -> None:
         self.client, self.path = client, path
 
-    def get(self, transaction: Any = None) -> _Snap:
+    def get(self, transaction: Any = None, timeout: float | None = None) -> _Snap:
+        # `timeout` is accepted and ignored: every read in `partner_store` now carries its own
+        # Firestore deadline (KTD6 -- an abandoned worker thread with no call deadline delays
+        # pod termination via `concurrent.futures`' atexit join). `test_partner_store` is where
+        # the deadline is asserted; this double only has to tolerate the kwarg.
+        del timeout
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
 
 
@@ -101,7 +107,8 @@ class _Page:
     def __init__(self, client: Any, rows: list[tuple[str, dict[str, Any]]]) -> None:
         self.client, self.rows = client, rows
 
-    def stream(self) -> list[_Snap]:
+    def stream(self, timeout: float | None = None) -> list[_Snap]:
+        del timeout
         return [_Snap(path, data, self.client) for path, data in self.rows]
 
 
@@ -118,7 +125,8 @@ class _Txn:
     def delete(self, ref: _Ref) -> None:
         self.writes.append(("delete", ref.path, None))
 
-    def get(self, query: Any) -> list[_Snap]:
+    def get(self, query: Any, timeout: float | None = None) -> list[_Snap]:
+        del timeout
         return list(query.stream())
 
 
@@ -173,6 +181,59 @@ class _MemoryDocs:
 _saved: dict[str, Any] = {}
 _sent: list[dict[str, Any]] = []
 _result: dict[str, Any] = {}
+_pools: list[ThreadPoolExecutor] = []
+# How long a released worker gets to finish before the drain calls it a leak. Generous, because it
+# only has a fake dict write and a stub sender left to do once the hang is released; a thread still
+# alive after this is a real defect and failing on it beats polluting whatever runs next.
+_DRAIN_TIMEOUT_S = 5.0
+
+
+class _RecordingPool(ThreadPoolExecutor):
+    """Every pool the module under test creates, kept so a test can drain what it ABANDONED.
+
+    `deliver_pending` calls `shutdown(wait=False)` on purpose and must keep doing so: a thread
+    parked in a socket read cannot be killed, and waiting for it would defeat the exact bound the
+    pass exists to hold. Right in production, unacceptable in a suite -- the released worker ran on
+    into the NEXT test. It appended to the module-global `_sent`, which made
+    `test_a_store_failure_writes_nothing_and_re_offers_the_delivery`'s `not _sent` fail about one
+    run in nine (measured: 2 of 18 under parallel load, 0 of 12 unloaded -- so a serial re-run
+    "proving" it fixed proves nothing), and it wrote through a fake that `_uninstall` had already
+    swapped out, printing a `NotFound` traceback on every single run.
+
+    Draining costs the tests nothing they were asserting: every bound is asserted BEFORE
+    `_uninstall` runs, so the property under test is still that the PASS returned inside its
+    deadline while its workers were still parked.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        _pools.append(self)
+
+
+def _drain_pools(client: Any) -> None:
+    """Release any injected hang, then join every worker the pass walked away from."""
+    if client is not None and getattr(client, "hang", None) is not None:
+        # Before the join, never after: the fake's own `hang.wait(30)` would otherwise be what
+        # bounds the drain, and a 30 s pause per hang test reads as a hung suite.
+        client.hang.set()
+    if client is not None:
+        client.delay_s = 0.0
+    stragglers: list[str] = []
+    for pool in _pools:
+        # `_threads` is private, and a test double is where reaching for it is honest: the public
+        # API offers only `shutdown(wait=True)`, which takes no timeout, so a worker that never
+        # returns would wedge the suite instead of reporting a leak.
+        for thread in list(getattr(pool, "_threads", ())):
+            thread.join(timeout=_DRAIN_TIMEOUT_S)
+            if thread.is_alive():
+                stragglers.append(thread.name)
+    _pools.clear()
+    if stragglers:
+        raise AssertionError(
+            "worker thread(s) outlived the test that abandoned them: "
+            f"{stragglers}. A straggler mutates whatever runs next, which is how this suite came "
+            "to fail one run in nine with every check passing."
+        )
 
 
 def _sortable(value: Any) -> Any:
@@ -188,8 +249,18 @@ def _install() -> _Fake:
             "client": partner_store._client,
             "run": partner_store._run_transaction,
             "query": partner_store._query,
+            "pool": partner_delivery.ThreadPoolExecutor,
+            "emit_pool": partner_events.ThreadPoolExecutor,
+            "fake": client,
         }
     )
+    # BOTH pools, because `_pending()` reaches the real emit path and `partner_events.emit` makes
+    # its own. No test here hangs the client before `_pending`, so an emit worker cannot straggle
+    # today -- and closing it costs one line, where discovering it later costs another afternoon of
+    # bisecting a suite that fails one run in nine.
+    partner_delivery.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
+    partner_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
+    _pools.clear()
     partner_store._client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
@@ -255,7 +326,10 @@ def _install() -> _Fake:
 def _uninstall() -> None:
     import os
 
+    _drain_pools(_saved.get("fake"))
     if _saved:
+        partner_delivery.ThreadPoolExecutor = _saved["pool"]  # type: ignore[misc]
+        partner_events.ThreadPoolExecutor = _saved["emit_pool"]  # type: ignore[misc]
         partner_store._client = _saved["client"]  # type: ignore[assignment]
         partner_store._run_transaction = _saved["run"]  # type: ignore[assignment]
         partner_store._query = _saved["query"]  # type: ignore[assignment]
@@ -354,6 +428,33 @@ class _Records(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         self.records.append(record)
+
+
+# Every fault this suite injects is logged by the code under test with `exc_info=True`, which is
+# correct of the code and was being PRINTED: with no handler anywhere in the hierarchy, `logging`
+# falls back to `lastResort`, which writes the record and its traceback to stderr. So a green run
+# ended in a stack trace -- and a standing traceback in the log is how a real one stops being read,
+# which is the argument `_store_step` itself makes about swallowing store failures.
+#
+# A collecting sink, not a `NullHandler`: it satisfies `callHandlers` so `lastResort` never fires,
+# AND it keeps the record, so the two tests that inject a fault assert it was logged rather than
+# merely stopping it being seen. Attached to the loggers this suite drives -- both the module under
+# test and the store it calls, since `partner_store` warns on its own paths too.
+_SINK = _Records()
+for _name in ("partner_delivery", "partner_store"):
+    _sink_logger = logging.getLogger(_name)
+    _sink_logger.setLevel(logging.INFO)
+    _sink_logger.addHandler(_SINK)
+
+
+def _sink_since(mark: int, name: str) -> list[dict]:
+    """The structured fields of records the sink collected after `mark`."""
+    out = []
+    for record in _SINK.records[mark:]:
+        fields = getattr(record, "fields", None)
+        if isinstance(fields, dict) and fields.get("event") == name:
+            out.append(fields)
+    return out
 
 
 def _capture() -> _Records:
@@ -474,8 +575,23 @@ def test_thirteen_pending_events_yield_four_notifications_and_nine_recorded_supp
         deliveries = _pending(client, n=13)
         assert len(deliveries) == 13
         report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        # The unconditional invariant: every one of the thirteen was accounted for.
+        assert report.sent + report.capped == 13, report
         assert report.sent == partner_store.MAX_ALERT_DELIVERIES_PER_DAY == 4
         assert report.capped == 9
+        # WHY THOSE TWO ARE EXACT, because it is not unconditional and a reader who assumes it is
+        # will mis-diagnose the day it moves. R11's cap is READ by `claim_delivery` and SPENT by
+        # `mark_delivery_sent`, so concurrent claims can be admitted against the same last slot and
+        # the general bound is `MAX + workers - 1`, not `MAX`. It is exact here because the budget
+        # (4) and the pool width (4) are equal: the first wave of claims exhausts the allowance, and
+        # every later claim reads nothing left. Change either number and this becomes a range —
+        # and if it ever flakes, the claim/send window is the cause, not contamination. The
+        # looseness itself is a reported finding against the store's cap enforcement, not something
+        # to widen this assertion for: `<= 7` would quietly accept a traveller losing a slot.
+        assert partner_delivery._WORKERS == partner_store.MAX_ALERT_DELIVERIES_PER_DAY, (
+            "the two exact assertions above rest on these being equal; re-derive them, do not "
+            "relax them, if this fires"
+        )
 
         stored = {d["delivery_id"]: client.doc(partner_store.DELIVERIES, d["delivery_id"]) for d in deliveries}
         sent = [d for d in stored.values() if d["state"] == "sent"]
@@ -543,8 +659,8 @@ def test_a_hanging_destination_is_skipped_and_the_pass_ends_inside_its_deadline(
     """AE7: the callback hangs and thirty events are pending for it.
 
     Two mechanisms, both required. The per-attempt ceiling bounds ONE attempt; the pass-local skip
-    is what stops the other twenty-nine being attempted at all after the first failure, which is the
-    difference between one timeout and thirty. Skipped rather than recorded: they stay pending and
+    is what stops the rest being attempted at all after the first failure, which is the difference
+    between at most one timeout per worker and thirty of them. Skipped rather than recorded: they stay pending and
     the next cycle asks again.
 
     The skip is deliberately PASS-local. Module-level and swept it would pause a destination
@@ -565,9 +681,18 @@ def test_a_hanging_destination_is_skipped_and_the_pass_ends_inside_its_deadline(
         )
         elapsed = time.monotonic() - started
         assert elapsed < 2.0, f"the pass must end inside its deadline; took {elapsed:.2f}s"
-        assert len(_sent) == 1, f"one attempt, then the destination is out; got {len(_sent)}"
-        assert report.retryable == 1 and report.skipped_destinations == 1
-        assert report.skipped == 29, f"the rest are skipped rather than attempted; got {report}"
+        # The INVARIANT is that every one of the thirty events was accounted for and that the
+        # destination went out after its first failure — not the split between the two, which is
+        # how many workers had already been dispatched when that first failure landed. Bounded
+        # above by the pool width and never by one: measured with the real 5 s per-attempt ceiling
+        # this pass makes FOUR attempts and skips 26, so the `== 1` this used to assert was reading
+        # the unloaded interleaving of a narrow timeout as a property of the mechanism.
+        assert 1 <= len(_sent) <= partner_delivery._WORKERS, (
+            f"at least one attempt, at most one per worker; got {len(_sent)}"
+        )
+        assert report.retryable == len(_sent), report
+        assert report.retryable + report.skipped == 30, report
+        assert report.skipped_destinations == 1, report
         # And nothing terminal was written for the skipped ones.
         states = {d["state"] for d in client.in_collection(partner_store.DELIVERIES)}
         assert states == {"pending"}, states
@@ -728,8 +853,27 @@ def test_a_410_pauses_the_destination_until_an_operator_resumes_it():
                 ok=False, status=410, retryable=False, terminal_state="cancelled",
                 pause_destination=True, error="http_410",
             ),
+            # ONE worker, so this pass is about R12's pause and not about how four of them
+            # interleave. With the default width both events are dispatched at once and it is the
+            # scheduler that decides whether the second is attempted or skipped — which leaves the
+            # second delivery's state, and therefore the resume assertion at the end, riding on
+            # timing. The race itself is covered where it belongs: by the invariant just below and
+            # by `test_a_hanging_destination_is_skipped_and_the_pass_ends_inside_its_deadline`.
+            workers=1,
         )
-        assert report.paused == 1
+        # Both numbers are invariants of the WORK, not of how the four workers interleaved:
+        # two pending events against one gone endpoint, one destination for an operator to resume.
+        # `paused` counted pause CALLS until this was found flaky under load — the second worker's
+        # skip-set check races the first worker's write — so it now counts distinct destinations off
+        # a set, and the per-event outcome moved to `cancelled`.
+        assert report.paused == 1, report
+        # The invariant is the SUM: two pending events, each either attempted or skipped because
+        # the destination went out. Asserted in that shape deliberately, because at the default
+        # pool width the split is decided by whether the second worker reached the skip check
+        # before or after the first wrote it — an artefact of scheduling, not a property of the
+        # code, and `paused` itself used to be counted that way and flaked one run in six.
+        assert report.cancelled + report.skipped == 2, report
+        assert (report.cancelled, report.skipped) == (1, 1), report
         assert client.doc(partner_store.DELIVERIES, deliveries[0]["delivery_id"])["state"] == "cancelled"
         destination = partner_auth.destination_for_delivery(DEST)
         assert destination.paused is True and destination.deliverable is False
@@ -855,7 +999,12 @@ def test_a_destination_that_failed_in_one_cycle_is_attempted_again_in_the_next()
         first = partner_delivery.deliver_pending(
             now=NOW, sender=_sender(ok=False, retryable=True, error="TimeoutError")
         )
-        assert first.skipped_destinations == 1 and first.skipped == 1
+        # The sum, not the split: two events against one failing destination, and whether the
+        # second was attempted or skipped depends on whether it reached the skip check before the
+        # first worker wrote it. `skipped_destinations` is the invariant that matters here — the
+        # destination went out — and the next pass proves the skip did not outlive the cycle.
+        assert first.skipped_destinations == 1, first
+        assert first.retryable + first.skipped == 2, first
         _sent.clear()
         second = partner_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender())
         assert second.sent == 2, f"both are attempted on the next cycle; got {second}"
@@ -935,12 +1084,18 @@ def test_a_store_failure_writes_nothing_and_re_offers_the_delivery():
             raise ValueError(f"{prefix} 5 attempts.")
 
         partner_store.claim_delivery = exhausted  # type: ignore[assignment]
+        mark = len(_SINK.records)
         try:
             handler = _capture()
             report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
         finally:
             partner_store.claim_delivery = real  # type: ignore[assignment]
+        # `not _sent` is the assertion a straggler from the previous test used to break: the
+        # slow-store test abandons four workers, its `finally` releases the hang, and they dialled
+        # the stub in here. `_drain_pools` is what makes this deterministic.
         assert report.store_errors == 1 and not _sent
+        [record] = [r for r in _SINK.records[mark:] if r.exc_info]
+        assert isinstance(record.exc_info[1], ValueError), "an exhausted transaction, not an API error"
         assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["state"] == "pending"
         assert [f["step"] for f in _fields(handler, "partner_delivery")] == ["claim"]
 
@@ -960,11 +1115,18 @@ def test_an_unreadable_pending_set_attempts_nothing_and_raises_nothing():
             raise RuntimeError("Firestore is unreachable")
 
         partner_store.pending_deliveries = failing  # type: ignore[assignment]
+        mark = len(_SINK.records)
         try:
             report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
         finally:
             partner_store.pending_deliveries = real  # type: ignore[assignment]
         assert report.store_errors == 1 and report.ready == 0 and not _sent
+        # The fault is ASSERTED, not printed. It is logged with `exc_info=True` on purpose, so
+        # without a handler it reached `lastResort` and put a traceback on stderr on every run of
+        # a passing suite.
+        [record] = [r for r in _SINK.records[mark:] if r.exc_info]
+        assert isinstance(record.exc_info[1], RuntimeError)
+        assert [f["result"] for f in _sink_since(mark, "partner_delivery")] == ["pending_error"]
     finally:
         _uninstall()
 
@@ -1122,6 +1284,70 @@ def test_the_wire_envelope_is_exactly_the_published_schemas_properties():
         sent = json.loads(attempt["body"].decode())
         assert set(sent) <= properties, sorted(set(sent) - properties)
         assert set(schema["required"]) <= set(sent)
+    finally:
+        _uninstall()
+
+
+def test_a_late_arrival_is_not_counted_as_a_fresh_delivery():
+    """The abandoned-thread race, from this side: the write is refused and the COUNT must follow.
+
+    `partner_store.mark_delivery_sent` now refuses a write to a delivery that is no longer
+    `pending` and answers `already_resolved` with the state it actually holds, so R11's cap is no
+    longer double-spent. That leaves the report as the thing that is wrong: `_attempt` returned
+    "sent" whenever the write did not raise, so an attempt thread the previous cycle abandoned would
+    report a second delivery of one notification. `partner_delivery_round` is published as
+    operational telemetry, so `sent` has to mean a notification the partner did not already have.
+
+    The state is flipped INSIDE the sender, which is where the race actually sits: a delivery that
+    is already resolved when the pass starts is never offered by `pending_deliveries` at all, so
+    setting it up front would test nothing. Here the record is pending when it is read and claimed,
+    and another pass resolves it while this attempt is on the wire -- exactly the window an
+    abandoned thread returns into.
+
+    Both resolved cases, because they mean different things to a reader: an already-`sent` record is
+    a duplicate the receiver's inbox drops, while a `superseded` one was replaced by a newer
+    revision that spends its own slot.
+    """
+    client = _install()
+    try:
+        _live(client)
+        [delivery] = _pending(client)
+        path = f"{partner_store.DELIVERIES}/{delivery['delivery_id']}"
+
+        def resolving(state: str):
+            """A sender that succeeds, and while it is on the wire another pass resolves the row."""
+            inner = _sender()
+
+            def send(url, **kwargs):
+                result = inner(url, **kwargs)
+                client.docs[path]["state"] = state
+                return result
+
+            return send
+
+        report = partner_delivery.deliver_pending(now=NOW, sender=resolving("sent"))
+        assert report.sent == 0, "a late arrival is not a fresh delivery"
+        assert report.already_resolved == 1 and report.superseded == 0, report
+        assert len(_sent) == 1, "the HTTP call did happen; it is the ACCOUNTING that changed"
+        subscription = client.doc(partner_store.SUBSCRIPTIONS, SID)
+        assert subscription.get("daily_deliveries", {}) == {}, "and no slot was spent"
+        assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["attempts"] == 0, (
+            "and NOTHING was written: the refused write leaves `attempts` alone too, which is the "
+            "cosmetic half of the same double-count"
+        )
+
+        # A newer revision replaced it instead: still not a send, and counted apart because that
+        # replacement spends R11's slot itself.
+        client.docs[path]["state"] = "pending"
+        client.docs[path]["retry_not_before"] = NOW
+        third = partner_delivery.deliver_pending(now=NOW, sender=resolving("superseded"))
+        assert third.superseded == 1 and third.sent == 0 and third.already_resolved == 0, third
+
+        # And the guard must not turn an ordinary send into a late arrival.
+        client.docs[path]["state"] = "pending"
+        client.docs[path]["retry_not_before"] = NOW
+        ordinary = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        assert ordinary.sent == 1 and ordinary.already_resolved == 0 and ordinary.superseded == 0
     finally:
         _uninstall()
 

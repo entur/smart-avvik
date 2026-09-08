@@ -162,7 +162,12 @@ class _Ref:
         self.client = client
         self.path = path
 
-    def get(self, transaction: Any = None) -> _Snap:
+    def get(self, transaction: Any = None, timeout: float | None = None) -> _Snap:
+        # `timeout` is accepted and ASSERTED rather than ignored: every read in the module carries
+        # its own Firestore deadline (KTD6), and a fake that silently swallowed the kwarg would let
+        # a read lose its deadline with nothing failing -- which is how an abandoned worker thread
+        # comes to delay pod termination.
+        assert timeout == partner_store._CALL_DEADLINE_S, f"read without a deadline: {self.path}"
         if transaction is not None:
             transaction.ops.append(("read", self.path))
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
@@ -199,7 +204,8 @@ class _Page:
         self.client = client
         self.rows = rows
 
-    def stream(self) -> list[_Snap]:
+    def stream(self, timeout: float | None = None) -> list[_Snap]:
+        assert timeout == partner_store._CALL_DEADLINE_S, "query stream without a deadline"
         return [_Snap(path, data, self.client) for path, data in self.rows]
 
 
@@ -222,9 +228,10 @@ class _Txn:
         self.ops.append(("delete", ref.path))
         self.writes.append(("delete", ref.path, None))
 
-    def get(self, query: Any) -> list[_Snap]:
+    def get(self, query: Any, timeout: float | None = None) -> list[_Snap]:
+        assert timeout == partner_store._CALL_DEADLINE_S, "in-transaction query without a deadline"
         self.ops.append(("read_query", getattr(query, "name", "page")))
-        return list(query.stream())
+        return list(query.stream(timeout=timeout))
 
 
 class _FakeClient:
@@ -270,13 +277,20 @@ def _install(client: _FakeClient) -> None:
     """
     global _fake
     _fake = client
-    _saved.update(
-        {
-            "client": partner_store._client,
-            "run": partner_store._run_transaction,
-            "query": partner_store._query,
-        }
-    )
+    # ONLY on the first install, and this is not defensiveness -- it is a bug that shipped. A second
+    # `_install` in one test (two `_emitted()` fixtures, say) used to overwrite `_saved` with the
+    # ALREADY-PATCHED functions, so `_uninstall` then "restored" the fakes permanently and every
+    # later test in the process ran against them. The hermetic half cannot detect that: those tests
+    # want the fake. It surfaced only in the emulator half, as a fake transaction runner inside
+    # `emulator_test_a_withdrawal_is_minted_...`, which is the argument for running both modes.
+    if not _saved:
+        _saved.update(
+            {
+                "client": partner_store._client,
+                "run": partner_store._run_transaction,
+                "query": partner_store._query,
+            }
+        )
     partner_store._client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
@@ -417,7 +431,7 @@ def test_no_body_that_increments_a_counter_is_retry_sensitive():
     show up as an alert cap spending two of a traveller's four slots for one notification, or a
     revision jumping by two, neither of which fails anything.
 
-    Six bodies increment something (`version`, `attempts`, `revision`, `below_threshold_cycles`,
+    Eight bodies increment or conditionally rewrite something (`version`, `attempts`, `revision`, `below_threshold_cycles`,
     `capped_count`, `cleanup.attempts`, the Oslo-day counter). Each is run twice against one fake
     transaction with a raising clock and a raising logger; identical writes is the proof.
     """
@@ -458,6 +472,18 @@ def test_no_body_that_increments_a_counter_is_retry_sensitive():
                 retry_after_s=30,
                 terminal_state="failed",
                 now=NOW,
+            ),
+        ),
+        lambda c: (
+            partner_store._Refs(c),
+            lambda t, r: partner_store._terminal_body(
+                t, r, delivery_id=_DELIVERY, state="expired", reason="validity", now=NOW
+            ),
+        ),
+        lambda c: (
+            partner_store._Refs(c),
+            lambda t, r: partner_store._clear_below_threshold_body(
+                t, r, alert_id=_emit().alert_id, now=NOW
             ),
         ),
         lambda c: (
@@ -515,6 +541,7 @@ def _counting_fixture() -> _FakeClient:
             "phase": partner_store.PHASE_PREDICTED,
             "revision": 41,
             "below_threshold_cycles": 1,
+            "below_threshold_at": NOW - timedelta(seconds=60),
             "last_event_id": "old-event",
             "pending_delivery_id": _DELIVERY,
             "delivered_revision": None,
@@ -1592,12 +1619,27 @@ def test_a_sent_delivery_is_never_superseded_after_the_fact():
     assert client.doc(partner_store.DELIVERIES, delivery_id)["state"] == "sent"
 
 
-def test_a_late_sent_does_not_clobber_a_newer_pending_delivery():
+def test_a_late_sent_on_a_superseded_delivery_writes_nothing():
     """An attempt takes seconds, and a newer revision can be minted inside them.
 
-    Clearing `pending_delivery_id` unconditionally would drop the subject's pointer to the NEWER
-    pending delivery, and the next mint would then fail to supersede it -- two boxes about one train
-    on a lock screen, which is the 2026-08-05 defect one channel over.
+    The rule, which changed when `_sent_body` gained its `pending` guard and is worth stating
+    because the guard makes it rather than a separate decision: a delivery that is no longer
+    ``pending`` when its attempt finally returns records NOTHING. It spends no cap slot, writes no
+    delivered mark, and leaves the subject alone.
+
+    That is deliberate and not merely a side effect. A superseded delivery is one we have already
+    decided is obsolete and minted a replacement for, and the replacement will spend its own slot
+    when it lands -- so counting both would spend TWO of a subscription's four for one train in one
+    cycle, which is worse than counting one. The cost is that a notification the partner genuinely
+    received goes unrecorded, and under-counting R11's cap is the safe direction: failing open costs
+    at most an extra notification, while failing closed suppresses a confirmed cancellation.
+
+    The `pending_delivery_id` assertion below is now defensive rather than load-bearing -- minting a
+    revision marks the previous delivery superseded in the SAME transaction, so a `pending` delivery
+    and a newer pending delivery cannot coexist for one subject -- and it is kept because the
+    clobber it guards against is silent: it would drop the subject's pointer to the newer pending
+    delivery, and the next mint would then fail to supersede it, putting two boxes about one train on
+    a lock screen (the 2026-08-05 defect, one channel over).
     """
     client, request = _emitted()
     first = client.doc(partner_store.SUBJECTS, request.alert_id)["pending_delivery_id"]
@@ -1605,16 +1647,82 @@ def test_a_late_sent_does_not_clobber_a_newer_pending_delivery():
         _emit(phase=partner_store.PHASE_CONFIRMED), now=NOW + timedelta(minutes=2)
     )
     assert newer.delivery_id != first
+    assert client.doc(partner_store.DELIVERIES, first)["state"] == "superseded"
+    before = dict(client.docs)
     # The old attempt returns AFTER the new revision was minted.
-    partner_store.mark_delivery_sent(first, now=NOW + timedelta(minutes=3))
+    late = partner_store.mark_delivery_sent(first, now=NOW + timedelta(minutes=3))
+    assert late.already_resolved is True and late.slot_spent is False
+    assert late.state == "superseded", "it must report the state it actually holds"
+    assert client.docs == before, "a resolved delivery is not re-resolved"
     subject = client.doc(partner_store.SUBJECTS, request.alert_id)
     assert subject["pending_delivery_id"] == newer.delivery_id
-    # And the recorded delivered revision is the one actually delivered, clamped forward only.
-    assert subject["delivered_revision"] == client.doc(partner_store.DELIVERIES, first)["revision"]
-    partner_store.mark_delivery_sent(newer.delivery_id, now=NOW + timedelta(minutes=4))
+    assert subject["delivered_revision"] is None
+    assert client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_deliveries"] == {}
+
+    # The replacement lands normally and is the one that spends the slot.
+    sent = partner_store.mark_delivery_sent(newer.delivery_id, now=NOW + timedelta(minutes=4))
+    assert sent.already_resolved is False and sent.slot_spent is True and sent.state == "sent"
     subject = client.doc(partner_store.SUBJECTS, request.alert_id)
     assert subject["delivered_revision"] == newer.revision
     assert subject["pending_delivery_id"] is None
+
+
+def test_a_late_sent_cannot_double_spend_the_daily_cap():
+    """The defect U6 hit live, as a stray `NotFound` from an abandoned attempt thread.
+
+    The sequence is ordinary: the delivery pass abandons an attempt's thread when its bounded wait
+    expires -- it cannot kill a thread parked in a socket read -- the next cycle legitimately
+    re-sends the same still-`pending` event, and the abandoned thread then returns and marks the
+    same delivery sent. Unguarded, `attempts` double-increments and R11's Oslo-day counter is spent
+    TWICE for one notification, so a traveller silently loses one of their four. R11's grain is the
+    whole of this plan's parity claim with /varsel.
+    """
+    client, request = _emitted()
+    delivery_id = client.doc(partner_store.SUBJECTS, request.alert_id)["pending_delivery_id"]
+    first = partner_store.mark_delivery_sent(delivery_id, now=NOW)
+    assert first.slot_spent is True and first.attempts == 1 and first.already_resolved is False
+    after_first = dict(client.docs)
+
+    second = partner_store.mark_delivery_sent(delivery_id, now=NOW + timedelta(minutes=5))
+    assert second.already_resolved is True, "a second sent must not read as a fresh success"
+    assert second.slot_spent is False and second.state == "sent"
+    assert second.attempts == 1, "attempts must not double-increment"
+    assert client.docs == after_first, "the second write must touch nothing at all"
+    counters = client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_deliveries"]
+    assert counters[partner_store.oslo_day(NOW)] == 1, "one notification spends one slot"
+    assert partner_store.cap_remaining(
+        client.doc(partner_store.SUBSCRIPTIONS, SID), NOW
+    ) == partner_store.MAX_ALERT_DELIVERIES_PER_DAY - 1
+
+
+def test_a_late_failure_cannot_resurrect_a_delivered_event():
+    """The same race on the other write, and the worse of the two.
+
+    An abandoned attempt thread from the previous cycle, returning after this cycle has marked the
+    delivery `sent`, would put the state back to `pending` with a `retry_not_before` -- resurrecting
+    a delivery the partner has already received, so the next cycle sends it again. The receiver's
+    inbox suppresses the duplicate (R12 is at-least-once), which is exactly why this would never
+    have been noticed. `_terminal_body` has had this guard all along; its absence in `_sent_body`
+    and `_failed_body` was the oversight.
+    """
+    client, request = _emitted()
+    delivery_id = client.doc(partner_store.SUBJECTS, request.alert_id)["pending_delivery_id"]
+    partner_store.mark_delivery_sent(delivery_id, now=NOW)
+    after_sent = dict(client.docs)
+    late = partner_store.mark_delivery_failed(
+        delivery_id, error="connection reset", retryable=True, retry_after_s=30, now=NOW
+    )
+    assert late.already_resolved is True and late.state == "sent"
+    assert client.docs == after_sent
+    assert client.doc(partner_store.DELIVERIES, delivery_id)["state"] == "sent"
+    # And it is not re-offered, which is a property of the QUERY rather than of the reader -- so it
+    # is asserted on the spec. The fake's `_query` does not implement filters (it serves a
+    # registered page verbatim), so feeding it a `sent` row and watching the reader drop it would
+    # test nothing that runs in production.
+    spec = next(s for s in partner_store.QUERY_SPECS if s.name == "pending_deliveries")
+    assert spec.equality == ("state",)
+    partner_store.pending_deliveries(now=NOW)
+    assert client.query_calls[-1][1] == {"state": "pending"}
 
 
 def test_the_pending_event_ceiling_is_counted_with_an_aggregation():
@@ -1625,11 +1733,12 @@ def test_the_pending_event_ceiling_is_counted_with_an_aggregation():
     price -- so a build without aggregation support degrades in cost rather than refusing to emit.
     """
     assert "query.count(alias=" in MODULE_SOURCE
-    assert "sum(1 for _ in query.stream())" in MODULE_SOURCE, "the fallback is deliberate"
+    assert "sum(1 for _ in query.stream(" in MODULE_SOURCE, "the fallback is deliberate"
     calls: list[int] = []
 
     class _Agg:
-        def get(self) -> list[list[Any]]:
+        def get(self, timeout: float | None = None) -> list[list[Any]]:
+            assert timeout == partner_store._CALL_DEADLINE_S, "aggregation without a deadline"
             calls.append(1)
 
             class _Value:
@@ -1642,7 +1751,7 @@ def test_the_pending_event_ceiling_is_counted_with_an_aggregation():
             assert alias == "n"
             return _Agg()
 
-        def stream(self) -> list[_Snap]:
+        def stream(self, timeout: float | None = None) -> list[_Snap]:
             raise AssertionError("the aggregation path must be preferred over a stream")
 
     client = _FakeClient()
@@ -1659,24 +1768,215 @@ def test_the_pending_event_ceiling_is_counted_with_an_aggregation():
     assert calls == [1], "exactly one aggregation per emit"
 
 
-def test_a_withdrawal_needs_consecutive_below_threshold_cycles():
+_WITHDRAWAL = _emit(payload={"notification": {"title": "Varselet er trukket", "body": "x"}})
+# One pass period, measured at ~296 s on 2026-09-08. Used rather than a round number so these
+# checks describe the cadence the code is sized against.
+_PERIOD = timedelta(seconds=296)
+
+
+def test_a_withdrawal_needs_two_below_threshold_cycles_in_one_run():
     client, request = _emitted()
-    withdrawal = _emit(payload={"notification": {"title": "Varselet er trukket", "body": "x"}})
-    for cycle in range(1, partner_store.WITHDRAWAL_CYCLES):
-        outcome = partner_store.record_below_threshold(withdrawal, now=NOW + timedelta(minutes=cycle))
-        assert outcome.status == "counting" and outcome.below_threshold_cycles == cycle
-    final = partner_store.record_below_threshold(withdrawal, now=NOW + timedelta(minutes=9))
+    first = partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD)
+    assert first.status == "counting" and first.below_threshold_cycles == 1
+    final = partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + 2 * _PERIOD)
     assert final.status == "created" and final.event_type == partner_store.EVENT_WITHDRAWN
     subject = client.doc(partner_store.SUBJECTS, request.alert_id)
     assert subject["phase"] == partner_store.PHASE_WITHDRAWN
+    # A mint closes the run: BOTH fields, or the next dip continues a run that ended here.
     assert subject["below_threshold_cycles"] == 0
-    # A dip that recovers is never withdrawn: an observation with a phase resets the count.
-    partner_store.commit_event(_emit(), now=NOW + timedelta(minutes=10))
-    assert client.doc(partner_store.SUBJECTS, request.alert_id)["below_threshold_cycles"] == 0
-    assert (
-        partner_store.record_below_threshold(withdrawal, now=NOW + timedelta(minutes=11)).status
-        == "counting"
+    assert subject["below_threshold_at"] is None
+
+
+def test_a_dip_a_recovery_and_a_second_dip_withdraw_nothing():
+    """The defect: the count was a lifetime TOTAL while the docstring said consecutive.
+
+    An alert-worthy cycle that mints nothing reaches no store call at all -- `partner_events.
+    skip_reason` skips it to save a transaction per standing subject per cycle -- so nothing ever
+    reset the counter, and a dip, an hour of recovery and a second dip withdrew the alert. That is a
+    single-dip withdrawal in effect, which is exactly what `WITHDRAWAL_CYCLES` exists to prevent.
+    """
+    client, request = _emitted()
+    first = partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD)
+    assert first.status == "counting" and first.below_threshold_cycles == 1
+    # An hour of recovered, alert-worthy cycles. Each one mints nothing and -- this is the whole
+    # point -- reaches the store not at all, so nothing here writes.
+    recovered = NOW + timedelta(hours=1)
+    before = dict(client.docs)
+    assert partner_store.commit_event(_emit(), now=recovered).status == "unchanged"
+    assert client.docs == before, "an unchanged cycle writes nothing; the fix cannot rely on one"
+    # The next dip must START A NEW RUN rather than complete the old one.
+    again = partner_store.record_below_threshold(_WITHDRAWAL, now=recovered + _PERIOD)
+    assert again.status == "counting", "a dip an hour after a dip is not a run"
+    assert again.below_threshold_cycles == 1
+    subject = client.doc(partner_store.SUBJECTS, request.alert_id)
+    assert subject["phase"] == partner_store.PHASE_PREDICTED, "nothing was withdrawn"
+    # ... and the new run withdraws on ITS second observation, so the rule still fires.
+    final = partner_store.record_below_threshold(_WITHDRAWAL, now=recovered + 2 * _PERIOD)
+    assert final.status == "created" and final.event_type == partner_store.EVENT_WITHDRAWN
+
+
+def test_the_run_is_closed_by_the_gap_and_the_boundary_is_the_constant():
+    _emitted()
+    partner_store.record_below_threshold(_WITHDRAWAL, now=NOW)
+    # Exactly at the boundary is still one run (`<=`); one second past it is not.
+    at_edge = NOW + timedelta(seconds=partner_store.WITHDRAWAL_GAP_S)
+    assert partner_store.record_below_threshold(_WITHDRAWAL, now=at_edge).status == "created"
+
+    _emitted()
+    partner_store.record_below_threshold(_WITHDRAWAL, now=NOW)
+    past_edge = NOW + timedelta(seconds=partner_store.WITHDRAWAL_GAP_S + 1)
+    restarted = partner_store.record_below_threshold(_WITHDRAWAL, now=past_edge)
+    assert restarted.status == "counting" and restarted.below_threshold_cycles == 1
+    # The window is ~3 pass periods, so a run survives two skipped or slow cycles.
+    assert partner_store.WITHDRAWAL_GAP_S >= 3 * _PERIOD.total_seconds()
+
+
+def test_a_subject_with_no_run_anchor_starts_a_fresh_run():
+    """Rows written before `below_threshold_at` existed must restart, never withdraw early."""
+    client, request = _emitted()
+    stored = dict(client.doc(partner_store.SUBJECTS, request.alert_id))
+    stored["below_threshold_cycles"] = partner_store.WITHDRAWAL_CYCLES - 1
+    stored.pop("below_threshold_at", None)
+    client.put(partner_store.SUBJECTS, request.alert_id, stored)
+    outcome = partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD)
+    assert outcome.status == "counting" and outcome.below_threshold_cycles == 1
+
+
+def test_open_runs_are_served_uncapped_and_before_the_display_cap():
+    """AE3's thirteen-subject line suspension is the case a field on `AlertState` would miss.
+
+    `partner_alerts` enumerates at most `MAX_ALERTS_SERVED` (4) subjects per subscription for
+    DISPLAY, so nine of those thirteen would fall through to the time window -- the very case
+    `_withdraw_body`'s own comment cites. `open_below_threshold` is therefore derived from the whole
+    live page and capped only by `MAX_SUBJECTS_PER_READ`.
+    """
+    client = _FakeClient()
+    _install(client)
+    rows = []
+    for i in range(13):
+        rows.append(
+            {
+                "alert_id": f"a{i:02d}",
+                "subscription_id": SID,
+                "partner_id": PARTNER,
+                "destination_id": DEST,
+                "phase": partner_store.PHASE_PREDICTED,
+                "revision": 1,
+                "updated_at": NOW,
+                partner_store.TTL_FIELD: NOW + timedelta(days=7),
+                # Every other one has a run open.
+                **({"below_threshold_at": NOW - timedelta(seconds=60)} if i % 2 == 0 else {}),
+            }
+        )
+    client.page("partner_alerts", partner_store.SUBJECTS, rows)
+    alerts = partner_store.partner_alerts(PARTNER, now=NOW)
+    # The DISPLAY list is capped ...
+    assert len(alerts.snapshots[SID].subjects) == partner_store.MAX_ALERTS_SERVED
+    assert alerts.snapshots[SID].n_active == 13, "the counts are over everything read"
+    # ... and the open-run mapping is not.
+    assert set(alerts.open_below_threshold) == {f"a{i:02d}" for i in range(0, 13, 2)}
+    assert len(alerts.open_below_threshold) == 7 > partner_store.MAX_ALERTS_SERVED
+    # A mapping, not a set: the caller can skip a clear whose run the store would restart anyway.
+    stale = alerts.open_below_threshold["a00"]
+    assert isinstance(stale, datetime)
+    assert (NOW - stale).total_seconds() < partner_store.WITHDRAWAL_GAP_S
+
+    # An expired subject contributes nothing: every read path tests the expiry field itself.
+    client.page(
+        "partner_alerts",
+        partner_store.SUBJECTS,
+        [dict(rows[0], **{partner_store.TTL_FIELD: NOW - timedelta(hours=1)})],
     )
+    assert partner_store.partner_alerts(PARTNER, now=NOW).open_below_threshold == {}
+
+
+def test_clearing_a_run_writes_once_and_touches_no_phase_or_revision():
+    client, request = _emitted()
+    before = dict(client.doc(partner_store.SUBJECTS, request.alert_id))
+    # Nothing open: no write at all. This is what makes "zero writes on an ordinary standing
+    # cycle" affordable for the caller.
+    assert partner_store.clear_below_threshold(request.alert_id, now=NOW) is False
+    assert client.doc(partner_store.SUBJECTS, request.alert_id) == before
+    assert client.transactions[-1].writes == []
+
+    # A run open: exactly one write, and only the two run fields plus the timestamp.
+    partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD)
+    opened = dict(client.doc(partner_store.SUBJECTS, request.alert_id))
+    assert opened["below_threshold_cycles"] == 1 and opened["below_threshold_at"] is not None
+    assert partner_store.clear_below_threshold(request.alert_id, now=NOW + 2 * _PERIOD) is True
+    writes = client.transactions[-1].writes
+    assert len(writes) == 1 and writes[0][0] == "update"
+    assert set(writes[0][2]) == {"below_threshold_cycles", "below_threshold_at", "updated_at"}
+    cleared = client.doc(partner_store.SUBJECTS, request.alert_id)
+    assert cleared["below_threshold_cycles"] == 0 and cleared["below_threshold_at"] is None
+    # No lifecycle movement: a recovery is not a transition and must mint nothing.
+    assert cleared["phase"] == opened["phase"] == partner_store.PHASE_PREDICTED
+    assert cleared["revision"] == opened["revision"]
+    assert cleared["last_event_id"] == opened["last_event_id"]
+    assert len([p for p in client.docs if p.startswith(partner_store.EVENTS)]) == 1
+
+    # Idempotent: a second clear writes nothing.
+    assert partner_store.clear_below_threshold(request.alert_id, now=NOW + 3 * _PERIOD) is False
+    assert client.transactions[-1].writes == []
+
+
+def test_clearing_never_creates_a_subject_and_answers_false_for_a_missing_one():
+    client = _FakeClient()
+    client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    before = dict(client.docs)
+    assert partner_store.clear_below_threshold("no-such-alert", now=NOW) is False
+    assert partner_store.clear_below_threshold("", now=NOW) is False
+    assert client.docs == before, "a clear must never mint a phase-less subject document"
+    # An expired subject is a missing one, here as everywhere else.
+    request = _emit()
+    client.put(
+        partner_store.SUBJECTS,
+        request.alert_id,
+        {
+            "alert_id": request.alert_id,
+            "phase": partner_store.PHASE_PREDICTED,
+            "below_threshold_at": NOW - timedelta(seconds=60),
+            partner_store.TTL_FIELD: NOW - timedelta(hours=1),
+        },
+    )
+    assert partner_store.clear_below_threshold(request.alert_id, now=NOW) is False
+
+
+def test_a_cleared_run_makes_the_next_dip_a_first_dip():
+    """The two new pieces together remove the time window's one failure mode.
+
+    Dip, one recovered cycle, dip inside `WITHDRAWAL_GAP_S`: the window alone withdraws, which
+    sends a real «varselet er trukket tilbake» and then re-alerts. With the recovery cleared, the
+    second dip is a first dip.
+    """
+    client, request = _emitted()
+    assert partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD).status == "counting"
+    # One recovered cycle, inside the window -- the case the window gets wrong.
+    recovered = NOW + 2 * _PERIOD
+    assert recovered - (NOW + _PERIOD) < timedelta(seconds=partner_store.WITHDRAWAL_GAP_S)
+    assert partner_store.clear_below_threshold(request.alert_id, now=recovered) is True
+    again = partner_store.record_below_threshold(_WITHDRAWAL, now=recovered + _PERIOD)
+    assert again.status == "counting" and again.below_threshold_cycles == 1
+    assert client.doc(partner_store.SUBJECTS, request.alert_id)["phase"] == (
+        partner_store.PHASE_PREDICTED
+    )
+
+
+def test_the_withdrawal_docstring_states_what_the_code_does():
+    """The repo's own recurring defect: prose beside the code stating the opposite rule.
+
+    This one had it -- "the consecutive count ... is reset by any commit_event that mints a phase"
+    beside a counter that no unchanged cycle could ever reset. So the docstring must now name the
+    approximation rather than the ideal, and must not claim consecutiveness.
+    """
+    doc = partner_store.record_below_threshold.__doc__ or ""
+    assert "RUN" in doc and "WITHDRAWAL_GAP_S" in doc
+    assert "approximation of" in doc
+    body = inspect.getsource(partner_store._withdraw_body)
+    assert "WITHDRAWAL_GAP_S" in body and "below_threshold_at" in body
+    # The exact-but-costlier alternatives are recorded where the next reader will look.
+    assert "skip_reason" in body and "CALLER change" in body
 
 
 def test_a_below_threshold_observation_about_an_unwarned_train_writes_nothing():
@@ -1796,6 +2096,181 @@ def test_a_capped_delivery_is_recorded_and_left_pending():
     stored = client.doc(partner_store.DELIVERIES, delivery_id)
     assert stored["state"] == "pending", "a suppressed alert is re-offered next cycle"
     assert stored["capped_count"] == 1, "and it is recorded rather than silently dropped"
+
+
+def _many_pending(client: _FakeClient, n: int) -> list[str]:
+    """`n` pending deliveries for one subscription, each its own train, all cap-eligible."""
+    ids: list[str] = []
+    for i in range(n):
+        train = partner_store.TrainRef(**{**TRAIN.__dict__, "stop_order": 10 + i})
+        commit = partner_store.commit_event(_emit(train=train), now=NOW)
+        assert commit.delivery_id is not None
+        ids.append(commit.delivery_id)
+    return ids
+
+
+def test_a_claim_reserves_the_slot_so_a_concurrent_claim_cannot_read_it_free():
+    """R11 could be OVERSPENT, masked by a coincidence.
+
+    The allowance was READ by `claim_delivery` and SPENT by `mark_delivery_sent`, so with a delivery
+    pool wider than the cap the first wave of claims all read "slots left" before any of them spent
+    one: up to `MAX_ALERT_DELIVERIES_PER_DAY + workers - 1` notifications for one subscription in one
+    Oslo day. It did not bite only because `partner_delivery._WORKERS` (4) happens to equal the cap
+    (4). `varsel._WriteBudget.claim` is the precedent for the fix, and its docstring records the
+    same read-then-act shape overshooting a 30 s ceiling by 16 s.
+
+    Claiming without ever reporting back is what a concurrent pool does: every worker claims, then
+    sends. So claiming five times in a row -- no sends at all -- must be refused on the fifth.
+    """
+    client = _FakeClient()
+    client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    ids = _many_pending(client, partner_store.MAX_ALERT_DELIVERIES_PER_DAY + 3)
+
+    statuses = [partner_store.claim_delivery(d, now=NOW).status for d in ids]
+    assert statuses[: partner_store.MAX_ALERT_DELIVERIES_PER_DAY] == ["ready"] * 4
+    assert set(statuses[partner_store.MAX_ALERT_DELIVERIES_PER_DAY :]) == {"capped"}, statuses
+    # Nothing has been SENT, so the confirmed count is still zero -- the refusal comes entirely
+    # from the reservations, which is the property the old code lacked.
+    stored = client.doc(partner_store.SUBSCRIPTIONS, SID)
+    assert stored["daily_deliveries"] == {}
+    assert len(stored["daily_reservations"]) == partner_store.MAX_ALERT_DELIVERIES_PER_DAY
+    assert partner_store.cap_remaining(stored, NOW) == 0
+    # And each reservation is keyed by ITS delivery id, so re-claiming one is idempotent rather
+    # than consuming a second slot.
+    assert set(stored["daily_reservations"]) == set(ids[:4])
+    partner_store.claim_delivery(ids[0], now=NOW)
+    assert len(client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_reservations"]) == 4
+
+
+def test_a_reserved_slot_is_confirmed_by_a_send_and_released_by_every_other_ending():
+    client = _FakeClient()
+    client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    ids = _many_pending(client, 4)
+
+    def _reservations() -> dict[str, Any]:
+        return client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_reservations"]
+
+    def _confirmed() -> int:
+        return client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_deliveries"].get(
+            partner_store.oslo_day(NOW), 0
+        )
+
+    # CONFIRM: the reservation becomes a confirmed send, and the two are disjoint so the slot is
+    # charged exactly once.
+    assert partner_store.claim_delivery(ids[0], now=NOW).status == "ready"
+    assert set(_reservations()) == {ids[0]}
+    assert partner_store.mark_delivery_sent(ids[0], now=NOW).slot_spent is True
+    assert _reservations() == {} and _confirmed() == 1
+
+    # RELEASE on a retryable failure: the delivery stays pending for the next cycle and must not
+    # hold the allowance while it waits.
+    assert partner_store.claim_delivery(ids[1], now=NOW).status == "ready"
+    partner_store.mark_delivery_failed(ids[1], error="reset", retryable=True, now=NOW)
+    assert _reservations() == {} and _confirmed() == 1
+
+    # RELEASE on expiry and on cancellation.
+    assert partner_store.claim_delivery(ids[2], now=NOW).status == "ready"
+    partner_store.mark_delivery_expired(ids[2], now=NOW)
+    assert _reservations() == {}
+    assert partner_store.claim_delivery(ids[3], now=NOW).status == "ready"
+    partner_store.mark_delivery_cancelled(ids[3], reason="deleted", now=NOW)
+    assert _reservations() == {}
+    # One send, three endings that delivered nothing: one slot spent.
+    assert _confirmed() == 1
+    assert partner_store.cap_remaining(client.doc(partner_store.SUBSCRIPTIONS, SID), NOW) == 3
+
+
+def test_a_reservation_nobody_reports_on_is_reclaimed_on_the_next_cycle():
+    """The crash case, and the reason the reservation carries an expiry at all.
+
+    A reservation nobody releases is WORSE than the overspend it prevents: it would burn one of a
+    traveller's four silently and permanently, and the plan is explicit that the slot is spent on
+    success ("otherwise a dead destination burns a subscription's four for the Oslo day with nothing
+    delivered"). So a lapsed reservation is ignored by `cap_remaining` and pruned by the next write
+    -- no sweep, no repair job, and bounded at ONE cycle's worth of allowance because
+    `RESERVATION_TTL_S` (120 s) is well under the ~296 s pass period.
+    """
+    client = _FakeClient()
+    client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    ids = _many_pending(client, 4)
+    for delivery_id in ids:
+        assert partner_store.claim_delivery(delivery_id, now=NOW).status == "ready"
+    stored = client.doc(partner_store.SUBSCRIPTIONS, SID)
+    assert partner_store.cap_remaining(stored, NOW) == 0
+    # THE PROCESS DIES HERE. Nothing confirms, nothing releases; four reservations stand.
+    assert len(stored["daily_reservations"]) == 4
+
+    # Still held one attempt later -- the reservation has to outlive a slow attempt, or it would be
+    # no admission control at all.
+    soon = NOW + timedelta(seconds=partner_store.RESERVATION_TTL_S - 1)
+    assert partner_store.cap_remaining(stored, soon) == 0
+    # Reclaimed past the TTL, which the next cycle reaches.
+    next_cycle = NOW + timedelta(seconds=296)
+    assert next_cycle - NOW > timedelta(seconds=partner_store.RESERVATION_TTL_S), (
+        "the TTL must be shorter than the pass period, or a leak costs more than one cycle"
+    )
+    assert partner_store.cap_remaining(stored, next_cycle) == (
+        partner_store.MAX_ALERT_DELIVERIES_PER_DAY
+    )
+    # And the next write prunes them rather than letting them accumulate.
+    assert partner_store.claim_delivery(ids[0], now=next_cycle).status == "ready"
+    assert set(client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_reservations"]) == {ids[0]}
+
+
+def test_a_lapsed_reservation_does_not_stop_a_success_spending_its_slot():
+    """A slot is spent on SUCCESS, reservation or no reservation.
+
+    The reservation is admission control on top, never the authority for the charge -- otherwise a
+    slow attempt whose reservation lapsed would deliver a notification the cap never counted, and
+    the traveller could receive five.
+    """
+    client = _FakeClient()
+    client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    delivery_id = _many_pending(client, 1)[0]
+    assert partner_store.claim_delivery(delivery_id, now=NOW).status == "ready"
+    late = NOW + timedelta(seconds=partner_store.RESERVATION_TTL_S + 60)
+    sent = partner_store.mark_delivery_sent(delivery_id, now=late)
+    assert sent.slot_spent is True
+    stored = client.doc(partner_store.SUBSCRIPTIONS, SID)
+    assert stored["daily_deliveries"][partner_store.oslo_day(late)] == 1
+    assert stored["daily_reservations"] == {}, "the lapsed entry is pruned, not left behind"
+
+
+def test_a_cap_exempt_delivery_reserves_nothing():
+    client = _FakeClient()
+    client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    forecast = partner_store.commit_event(_emit(), now=NOW)
+    partner_store.mark_delivery_sent(forecast.delivery_id, now=NOW)
+    confirmed = partner_store.commit_event(
+        _emit(phase=partner_store.PHASE_CONFIRMED), now=NOW + timedelta(minutes=1)
+    )
+    assert confirmed.cap_exempt is True
+    claim = partner_store.claim_delivery(confirmed.delivery_id, now=NOW + timedelta(minutes=1))
+    assert claim.status == "ready"
+    stored = client.doc(partner_store.SUBSCRIPTIONS, SID)
+    assert stored["daily_reservations"] == {}, "an exempt claim takes no slot to reserve"
+    # And it is admitted even with the whole day's allowance already spent.
+    client.put(
+        partner_store.SUBSCRIPTIONS,
+        SID,
+        dict(
+            stored,
+            daily_deliveries={
+                partner_store.oslo_day(NOW): partner_store.MAX_ALERT_DELIVERIES_PER_DAY
+            },
+        ),
+    )
+    assert (
+        partner_store.claim_delivery(
+            confirmed.delivery_id, now=NOW + timedelta(minutes=1)
+        ).status
+        == "ready"
+    )
 
 
 def test_an_unreadable_cap_counter_grants_no_allowance():
@@ -2222,6 +2697,191 @@ def test_the_stored_event_carries_the_envelope_the_contract_names():
 # ---- Configuration guards ----------------------------------------------------------------------
 
 
+def test_installing_the_fake_twice_still_restores_the_real_functions():
+    """A guard on this suite's own harness, after it leaked once.
+
+    Two `_install` calls in one test overwrote `_saved` with the already-patched functions, so
+    `_uninstall` restored the FAKES and every later test in the process ran against them -- and the
+    hermetic half cannot notice, because those tests want the fake. It showed up only as a fake
+    transaction runner inside an emulator test. A leaked harness reads exactly like a real bug in
+    the module, which is the trap this repo has written up for module-level ledgers.
+    """
+    real_run = partner_store._run_transaction
+    real_query = partner_store._query
+    real_client = partner_store._client
+    _install(_FakeClient())
+    _install(_FakeClient())
+    _uninstall()
+    assert partner_store._run_transaction is real_run
+    assert partner_store._query is real_query
+    assert partner_store._client is real_client
+
+
+def test_every_firestore_call_carries_its_own_deadline():
+    """KTD6 requires a per-CALL deadline, and the poller's wait is not one.
+
+    ``varsel._PARTNER_LOAD_TIMEOUT_S`` bounds how long the ingestion thread WAITS on a worker; a
+    worker parked past it is abandoned, not killed, because Python cannot cancel a thread inside a
+    socket read. An abandoned thread is not free -- ``concurrent.futures.thread`` registers an atexit
+    hook that JOINS its workers, so a store call with no deadline of its own delays pod termination
+    by however long it hangs. That is what this deadline stops.
+
+    Checked two ways, because either alone is weak. Statically: no read in the module reaches the
+    client without ``timeout=``. Dynamically: the fake's ``get``/``stream``/``count`` all ASSERT the
+    kwarg, so every path the suite exercises would fail rather than silently lose its deadline --
+    which is why this is also the reason those fakes assert instead of accepting ``**kwargs``.
+    """
+    assert 0 < partner_store._CALL_DEADLINE_S < 5.0, (
+        "it must sit under varsel._PARTNER_LOAD_TIMEOUT_S so a hung call surfaces as this "
+        "module's own retryable DeadlineExceeded rather than as the caller's timeout"
+    )
+    varsel_wait = re.search(r"_PARTNER_LOAD_TIMEOUT_S\s*=\s*([0-9.]+)", VARSEL_SOURCE)
+    assert varsel_wait, "varsel._PARTNER_LOAD_TIMEOUT_S not found -- was it renamed?"
+    assert partner_store._CALL_DEADLINE_S < float(varsel_wait.group(1))
+    # Every read site. `.get(` also matches the aggregation's and the dataclass helpers', so the
+    # test is over the READ calls the module makes on a ref, a query or an aggregation.
+    reads = re.findall(
+        r"(?:\.stream\(|\.count\(alias=\"n\"\)\.get\(|ref\.get\(|transaction\.get\(|"
+        r"\.(?:subscription|subject|delivery|event)\([a-z_]+\)\.get\()([^)]*)",
+        MODULE_SOURCE,
+    )
+    assert len(reads) >= 12, f"only found {len(reads)} read sites -- did the shape change?"
+    for args in reads:
+        assert "_CALL_DEADLINE_S" in args, f"read without a deadline: {args!r}"
+
+
+def test_an_ordinary_ttl_lag_is_not_logged_as_a_warning():
+    """`expired > 0` is an ORDINARY condition and warning on it made every cycle noisy.
+
+    TTL deletes an expired document "typically within 24 hours", so during that documented lag a
+    perfectly healthy deployment warned on every cycle -- once per partner per cycle for the
+    standing-alert read, which the notification pass calls. `terraform/firestore.tf`'s own header
+    makes the argument: a standing warning is how a real one stops being read.
+
+    What must still warn is the pair that changes someone's behaviour: `truncated` (R21's ceiling
+    binding -- and for the alert-state read it also switches the caller to its slow per-subject
+    path) and `skipped` (a document this binary cannot read).
+    """
+    records: list[tuple[str, dict[str, Any]]] = []
+
+    class _Recorder:
+        def __getattr__(self, level: str):
+            def _log(_msg: str, *_args: Any, **kwargs: Any) -> None:
+                records.append((level, dict((kwargs.get("extra") or {}).get("fields") or {})))
+
+            return _log
+
+    saved = partner_store.logger
+    partner_store.logger = _Recorder()  # type: ignore[assignment]
+    try:
+        client = _FakeClient()
+        _install(client)
+        # Expired rows only: the ordinary TTL lag.
+        client.page(
+            "load_active_subscriptions",
+            partner_store.SUBSCRIPTIONS,
+            [
+                _live_doc(subscription_id="live"),
+                _live_doc(subscription_id="idle", now=NOW - timedelta(days=120)),
+            ],
+        )
+        partner_store.recipient_documents()
+        # Only the records carrying structured fields are the load summary; a skipped document also
+        # emits a bare DEBUG traceback with no `extra`, which is not what this test is about.
+        summaries = [(level, fields) for level, fields in records if fields]
+        assert [level for level, _ in summaries] == ["debug"], records
+        assert summaries[0][1]["expired"] == 1
+        assert summaries[0][1]["event"] == "partner_store_load", "still queryable under one name"
+
+        # A document this binary cannot read still WARNS. It has to be LIVE but unparseable: the
+        # liveness test runs before the parse, so a doc missing its horizons is counted as expired
+        # and never reaches the parser at all -- which is how the first version of this fixture
+        # quietly tested the wrong branch.
+        records.clear()
+        unreadable = _live_doc(subscription_id="bad")
+        del unreadable["days"]
+        client.page(
+            "load_active_subscriptions",
+            partner_store.SUBSCRIPTIONS,
+            [_live_doc(subscription_id="good"), unreadable],
+        )
+        partner_store.recipient_documents()
+        summaries = [(level, fields) for level, fields in records if fields]
+        assert [level for level, _ in summaries] == ["warning"], records
+        assert summaries[0][1]["skipped"] == 1 and summaries[0][1]["expired"] == 0
+
+        # And so does R21's ceiling binding, on its own.
+        records.clear()
+        client.page(
+            "load_active_subscriptions",
+            partner_store.SUBSCRIPTIONS,
+            [_live_doc(subscription_id=f"s{i}") for i in range(3)],
+        )
+        partner_store.active_subscriptions(limit=2, now=NOW)
+        records.clear()
+        client.pages["load_active_subscriptions"] = client.pages["load_active_subscriptions"][:1]
+        saved_ceiling = partner_store.MAX_SUBSCRIPTIONS_PER_CYCLE
+        try:
+            partner_store.MAX_SUBSCRIPTIONS_PER_CYCLE = 1
+            partner_store.recipient_documents()
+        finally:
+            partner_store.MAX_SUBSCRIPTIONS_PER_CYCLE = saved_ceiling
+        summaries = [(level, fields) for level, fields in records if fields]
+        assert [level for level, _ in summaries] == ["warning"], records
+        assert summaries[0][1]["truncated"] is True
+    finally:
+        partner_store.logger = saved  # type: ignore[assignment]
+
+
+def test_the_published_validity_wording_matches_where_each_term_is_enforced():
+    """R19's rule applied to the event contract: the schema must not promise a term the value omits.
+
+    Validity is "the earlier of a 60-minute horizon, the departure, and the subscription's
+    lifetime", and at emit only the first two are applied -- the notification pass does not hold the
+    subscription's own expiry. The third is enforced DURABLY and more tightly instead:
+    `claim_delivery` re-reads the LIVE subscription immediately before dispatch and cancels a
+    delivery whose subscription has ended, which a value computed at emit could never do (it would
+    be a snapshot taken when the pass loaded its recipients, already stale by the length of the
+    pass). So the published wording says where each term is enforced rather than implying all three
+    land on the wire.
+    """
+    schema = json.loads(
+        (REPO / "contracts" / "notifications" / "v1" / "event.schema.json").read_text()
+    )
+    text = schema["properties"]["valid_until"]["description"]
+    assert "60-minute horizon" in text and "departure" in text
+    assert "WHERE EACH TERM IS ENFORCED" in text
+    assert "enforced at dispatch" in text, "the lifetime term must be attributed, not implied"
+    assert "outlives it by up to an hour" in text, "the residual has to be stated, not hidden"
+    # And the function still takes the term, for the callers that hold a live subscription.
+    horizon = partner_store.event_validity(
+        occurred_at=NOW, departure_at=None, subscription_expires_at=None
+    )
+    assert horizon == NOW + timedelta(minutes=partner_store.EVENT_VALIDITY_MINUTES)
+    lifetime = NOW + timedelta(minutes=5)
+    assert (
+        partner_store.event_validity(
+            occurred_at=NOW, departure_at=None, subscription_expires_at=lifetime
+        )
+        == lifetime
+    )
+    doc = partner_store.event_validity.__doc__ or ""
+    assert "claim_delivery" in doc and "snapshot" in doc
+
+
+def test_a_delivery_whose_subscription_expired_is_cancelled_at_dispatch():
+    """The durable half of the validity contract, which is what makes the wording above true."""
+    client, request = _emitted()
+    delivery_id = client.doc(partner_store.SUBJECTS, request.alert_id)["pending_delivery_id"]
+    # The subscription passes its inactivity horizon while the event is still valid.
+    client.put(
+        partner_store.SUBSCRIPTIONS, SID, _live_doc(now=NOW - timedelta(days=400))
+    )
+    claim = partner_store.claim_delivery(delivery_id, now=NOW)
+    assert claim.status == "cancelled" and claim.reason == "expired"
+    assert client.doc(partner_store.DELIVERIES, delivery_id)["state"] == "cancelled"
+
+
 def test_the_emulator_step_is_wired_in_ci():
     """Without this, the loud skip below quietly becomes permanent.
 
@@ -2577,11 +3237,19 @@ def emulator_test_the_full_delivery_lifecycle_spends_the_cap_once():
     pending = partner_store.pending_deliveries(now=NOW)
     assert [d.delivery_id for d in pending.ready] == [commit.delivery_id]
     claim = partner_store.claim_delivery(commit.delivery_id, now=NOW)
-    assert claim.status == "ready" and claim.cap_remaining == 4
+    # The claim RESERVED a slot, so the allowance it reports is what is left after it: 3, not 4.
+    assert claim.status == "ready" and claim.cap_remaining == 3
     failure = partner_store.mark_delivery_failed(
         commit.delivery_id, error="timeout", retryable=True, retry_after_s=30, now=NOW
     )
     assert failure.state == "pending" and failure.attempts == 1
+    # ... and the failure RELEASED it, so nothing is held while the delivery waits for its retry.
+    held = partner_store.get_subscription(SID, partner_id=PARTNER, now=NOW)
+    assert held is not None and partner_store.cap_remaining(
+        {"daily_deliveries": dict(held.daily_deliveries),
+         "daily_reservations": dict(held.daily_reservations)},
+        NOW,
+    ) == 4
     # The backoff is a QUERY filter, so it survives this cycle boundary.
     assert partner_store.pending_deliveries(now=NOW).ready == ()
     later = NOW + timedelta(seconds=31)
@@ -2598,6 +3266,119 @@ def emulator_test_the_full_delivery_lifecycle_spends_the_cap_once():
     assert list(subscription.delivered) == ["ENT:SituationNumber:1"]
     assert partner_store.pending_deliveries(now=later).ready == ()
     assert client is not None
+
+
+def emulator_test_concurrent_claims_cannot_overspend_the_daily_cap():
+    """The defect's own shape, against a real store: claims wider than the cap, all at once.
+
+    This is the check the fake cannot make. The reservation works because two claims for one
+    subscription both WRITE that document, so Standard edition's pessimistic concurrency serialises
+    them and the second reads the first's reservation instead of the same free slot -- a property of
+    the transaction, not of the code, and only a real client exercises it.
+
+    Asserted as the CONTRACT rather than an outcome, for the reason
+    `emulator_test_concurrent_emissions_converge_on_one_event` records at length: a contended
+    transaction legitimately exhausts the client's five attempts, so a caller either commits or
+    raises something retryable. What holds unconditionally is the bound -- **never more than the cap
+    is admitted** -- which is the thing that was broken.
+    """
+    client = _emulator_setup()
+    partner_store.create_subscription(_spec(), now=NOW)
+    ids: list[str] = []
+    for i in range(partner_store.MAX_ALERT_DELIVERIES_PER_DAY + 4):
+        train = partner_store.TrainRef(**{**TRAIN.__dict__, "stop_order": 20 + i})
+        commit = partner_store.commit_event(_emit(train=train), now=NOW)
+        assert commit.delivery_id is not None
+        ids.append(commit.delivery_id)
+
+    ready: dict[str, str] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _claim(delivery_id: str) -> None:
+        try:
+            ready[delivery_id] = partner_store.claim_delivery(delivery_id, now=NOW).status
+        except BaseException as exc:  # noqa: BLE001 - classified below
+            errors[delivery_id] = exc
+
+    threads = [threading.Thread(target=_claim, args=(d,)) for d in ids]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    assert len(ready) + len(errors) == len(ids), "a thread neither returned nor raised"
+    for delivery_id, exc in errors.items():
+        assert partner_store.is_retryable(exc), f"{delivery_id}: {exc!r}"
+    admitted = [d for d, status in ready.items() if status == "ready"]
+    assert set(ready.values()) <= {"ready", "capped"}, ready
+    # THE BOUND. Before the reservation this could reach `cap + workers - 1`.
+    assert len(admitted) <= partner_store.MAX_ALERT_DELIVERIES_PER_DAY, (
+        f"{len(admitted)} claims admitted against a cap of "
+        f"{partner_store.MAX_ALERT_DELIVERIES_PER_DAY}"
+    )
+    stored = client.collection(partner_store.SUBSCRIPTIONS).document(SID).get().to_dict()
+    assert len(stored.get("daily_reservations") or {}) == len(admitted)
+    assert partner_store.cap_remaining(stored, NOW) == (
+        partner_store.MAX_ALERT_DELIVERIES_PER_DAY - len(admitted)
+    ), "the allowance must agree with what was admitted, whatever the scheduler admitted"
+    print(f"      ({len(admitted)} admitted, {len(ready) - len(admitted)} capped, "
+          f"{len(errors)} retryable)")
+
+    # Every admitted claim now sends, and the confirmed count matches exactly -- no double charge.
+    # `.get(day, 0)` and `or {}`, because `len(admitted)` can legitimately be ZERO: every claim
+    # contending on one subscription document can exhaust the client's five attempts, and an
+    # assertion that indexed the day's key outright failed on exactly that regime the first time
+    # this ran. Same lesson as the emission check above -- assert the contract, never the outcome
+    # the scheduler picked.
+    for delivery_id in admitted:
+        assert partner_store.mark_delivery_sent(delivery_id, now=NOW).slot_spent is True
+    settled = client.collection(partner_store.SUBSCRIPTIONS).document(SID).get().to_dict()
+    assert (settled.get("daily_deliveries") or {}).get(partner_store.oslo_day(NOW), 0) == len(
+        admitted
+    )
+    assert (settled.get("daily_reservations") or {}) == {}
+
+
+def emulator_test_an_unreported_claim_is_reclaimed_next_cycle():
+    """The crash case against a real store: claim, never report, then the next cycle."""
+    client = _emulator_setup()
+    partner_store.create_subscription(_spec(), now=NOW)
+    commit = partner_store.commit_event(_emit(), now=NOW)
+    assert partner_store.claim_delivery(commit.delivery_id, now=NOW).status == "ready"
+    stored = client.collection(partner_store.SUBSCRIPTIONS).document(SID).get().to_dict()
+    assert len(stored["daily_reservations"]) == 1
+    assert partner_store.cap_remaining(stored, NOW) == (
+        partner_store.MAX_ALERT_DELIVERIES_PER_DAY - 1
+    )
+    # Nothing confirms and nothing releases. One cycle later the slot is free again, and the next
+    # claim's own write prunes the lapsed entry.
+    next_cycle = NOW + timedelta(seconds=296)
+    assert partner_store.cap_remaining(stored, next_cycle) == (
+        partner_store.MAX_ALERT_DELIVERIES_PER_DAY
+    )
+    assert partner_store.claim_delivery(commit.delivery_id, now=next_cycle).status == "ready"
+    reclaimed = client.collection(partner_store.SUBSCRIPTIONS).document(SID).get().to_dict()
+    assert set(reclaimed["daily_reservations"]) == {commit.delivery_id}
+
+
+def emulator_test_clearing_a_run_survives_the_real_client():
+    _emulator_setup()
+    partner_store.create_subscription(_spec(), now=NOW)
+    partner_store.commit_event(_emit(), now=NOW)
+    alert_id = _emit().alert_id
+    assert partner_store.clear_below_threshold(alert_id, now=NOW) is False
+    assert partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD).status == "counting"
+    alerts = partner_store.partner_alerts(PARTNER, now=NOW + _PERIOD)
+    assert set(alerts.open_below_threshold) == {alert_id}
+    assert partner_store.clear_below_threshold(alert_id, now=NOW + 2 * _PERIOD) is True
+    assert partner_store.partner_alerts(PARTNER, now=NOW + 2 * _PERIOD).open_below_threshold == {}
+    subject = partner_store.get_subject(alert_id, now=NOW + 2 * _PERIOD)
+    assert subject is not None
+    assert subject.below_threshold_cycles == 0 and subject.below_threshold_at is None
+    assert subject.phase == partner_store.PHASE_PREDICTED, "a recovery is not a transition"
+    # So the next dip is a FIRST dip, inside the window the approximation would have got wrong.
+    again = partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + 3 * _PERIOD)
+    assert again.status == "counting" and again.below_threshold_cycles == 1
 
 
 def emulator_test_a_confirmation_supersedes_the_forecast_and_is_cap_exempt():
@@ -2676,20 +3457,37 @@ def emulator_test_cleanup_deletes_every_related_document_and_redacts_the_tombsto
     assert tombstone["subscription_id"] == SID
 
 
-def emulator_test_a_withdrawal_is_minted_after_consecutive_below_threshold_cycles():
+def emulator_test_a_withdrawal_needs_a_run_and_a_recovery_breaks_it():
+    """Both halves of the run rule against the real client, not just the counting half.
+
+    The dip/recover/dip case is the behaviour that CHANGED, so it belongs here as well as in the
+    hermetic half: the count was a lifetime total, and a recovery in the middle of it withdrew an
+    alert on what was effectively a single dip.
+    """
     _emulator_setup()
     partner_store.create_subscription(_spec(), now=NOW)
     partner_store.commit_event(_emit(), now=NOW)
-    withdrawal = _emit(payload={"notification": {"title": "Varselet er trukket", "body": "x"}})
-    for cycle in range(1, partner_store.WITHDRAWAL_CYCLES):
-        assert (
-            partner_store.record_below_threshold(withdrawal, now=NOW + timedelta(minutes=cycle)).status
-            == "counting"
-        )
-    final = partner_store.record_below_threshold(withdrawal, now=NOW + timedelta(minutes=9))
+    alert_id = _emit().alert_id
+
+    # A run of two: withdrawn on the second.
+    assert partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD).status == "counting"
+    final = partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + 2 * _PERIOD)
     assert final.status == "created" and final.event_type == partner_store.EVENT_WITHDRAWN
-    subject = partner_store.get_subject(_emit().alert_id, now=NOW + timedelta(minutes=9))
+    subject = partner_store.get_subject(alert_id, now=NOW + 2 * _PERIOD)
     assert subject is not None and subject.phase == partner_store.PHASE_WITHDRAWN
+    assert subject.below_threshold_cycles == 0 and subject.below_threshold_at is None
+
+    # A fresh alert, then a dip, an hour of recovery, and a dip: nothing is withdrawn.
+    _emulator_setup()
+    partner_store.create_subscription(_spec(), now=NOW)
+    partner_store.commit_event(_emit(), now=NOW)
+    assert partner_store.record_below_threshold(_WITHDRAWAL, now=NOW + _PERIOD).status == "counting"
+    recovered = NOW + timedelta(hours=1)
+    assert partner_store.commit_event(_emit(), now=recovered).status == "unchanged"
+    again = partner_store.record_below_threshold(_WITHDRAWAL, now=recovered + _PERIOD)
+    assert again.status == "counting" and again.below_threshold_cycles == 1
+    subject = partner_store.get_subject(alert_id, now=recovered + _PERIOD)
+    assert subject is not None and subject.phase == partner_store.PHASE_PREDICTED
 
 
 # ---- Runner ------------------------------------------------------------------------------------
