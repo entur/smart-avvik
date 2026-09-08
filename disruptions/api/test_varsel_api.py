@@ -3270,6 +3270,20 @@ PARTNER_DOC = {
     "end": "23:59",
     "days": [0, 1, 2, 3, 4, 5, 6],
 }
+# The same document as the store's `as_recipient_document` actually writes it: the four ROUTING
+# fields as well as the five the pass matches on. `PARTNER_DOC` above keeps only the matching ones
+# on purpose -- it is what a document written by a binary that predates the routing fields looks
+# like, and `test_a_subscription_with_no_destination_is_matched_but_never_emitted_for` is the
+# assertion that such a document is still matched.
+PARTNER_DOC_ROUTED = {
+    **PARTNER_DOC,
+    "subscription_id": "sub-0001",
+    "partner_id": "partner-a",
+    "destination_id": "dest-a",
+    "version": 1,
+    "partner_ref": "commuter-42",
+    "test": False,
+}
 
 
 def _use_partner_store(monkeypatch, docs, *, enabled=True):
@@ -3291,14 +3305,39 @@ def _use_partner_store(monkeypatch, docs, *, enabled=True):
 
 
 def _capture_writes(monkeypatch, text="Toget er innstilt. Ta neste tog."):
-    """Record every subject the writer is asked about, as (journey_key, situation_number)."""
+    """Record every subject EITHER writer is asked about, as (journey_key, situation_number).
+
+    Both, since U6 (2026-09-08): a definition a browser registration holds goes through
+    `varsel._write_message` (the browser wording policy) and a **partner-only** definition goes
+    through `notification_wording.write_wording` under `notification_wording.PARTNER`, whose prompt
+    audit record is suppressed in code — R16 forbids the browser policy's record for partner data,
+    and dev runs `VARSEL_LLM_LOG_PROMPTS=true`.
+
+    Stubbing only one of the two would make every partner-only assertion here read "nothing was
+    written for it", which is exactly the shape of the failure these tests exist to catch. Both
+    stubs return prose, so the caller caches it as the model's — `write_wording`'s `source` is what
+    decides that, so `"llm"` is the value a returned text has to carry.
+    """
+    import notification_wording
+
     written = []
 
     def fake_write(alert, *, journey_key, message_input, **_):
         written.append((journey_key, alert.situation_number))
         return text
 
+    def fake_partner_write(route, facts, *, subject_id="", message_input=None, **_):
+        written.append((subject_id, facts.situation_number))
+        return notification_wording.Wording(
+            title="Tog L1 07:18 er innstilt",
+            body=text,
+            source="llm",
+            status="ok",
+            message_input=message_input or {},
+        )
+
     monkeypatch.setattr(varsel, "_write_message", fake_write)
+    monkeypatch.setattr(notification_wording, "write_wording", fake_partner_write)
     return written
 
 
@@ -3690,6 +3729,389 @@ def test_a_partner_only_route_records_no_decision_row(monkeypatch):
 
     assert [s for _k, s in written] == ["S1"], "the subscription was matched and written for"
     assert log.rows == [], "and recorded nowhere in varsel_decisions"
+
+
+# ---- U6: the pass outcome -- what the partner phase is handed --------------------------------
+
+
+def test_two_situations_about_one_train_yield_one_partner_subject_carrying_both(monkeypatch):
+    """U6 scenario 1 / AE2, on the varsel side: one TRAIN is one subject, not one per SX message.
+
+    Operators routinely publish several situations about one disruption — Vy sent both "Ta neste
+    tog" and "Innstilt Drammen–Skøyen" for the same cancelled 15:03, which is what put "91 %" and
+    "87 %" for one train two boxes apart on a card in 2026-08. `one_alert_per_train` collapses them
+    for every traveller-facing surface, and the partner channel is one.
+
+    **Both situation numbers ride on the subject**, and that half is easy to miss and expensive:
+    `partner_store._sent_body` writes a delivered mark per situation number, and
+    `_pending_pushes` tests the collapsed WINNER's number against those marks. Carrying only the
+    winner's would let a winner flip between cycles re-pend a train already delivered and re-spend
+    the wording budget on it. R8 calls them "the contributing situations" for the same reason.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _use_snapshot(SNAPSHOT_TWO_NOTICES)
+
+    outcome = varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
+
+    assert len(outcome.partner_subjects) == 1, (
+        f"one subject per TRAIN, not per SX message; got {outcome.partner_subjects}"
+    )
+    subject = outcome.partner_subjects[0]
+    assert set(subject.situations) == {"S1", "S2"}, subject.situations
+    assert [s["situation_number"] for s in subject.payload["situations"]] == list(subject.situations)
+    # The subject carries the routing the emit step needs, from the LOAD snapshot's version.
+    assert subject.subscription_id == "sub-0001" and subject.subscription_version == 1
+    assert subject.alertworthy is True
+
+
+def test_a_partner_subject_carries_byte_identical_wording_to_the_web_push(monkeypatch):
+    """R7: "the Norwegian title and body /varsel would have pushed", asserted byte for byte.
+
+    Both go through `varsel.notification_wording_for`, which is what makes this true by
+    construction rather than by two f-strings that agree today: the route on the body's own first
+    line, the environment tag on the title only, and the wording itself untouched.
+
+    **Two documented divergences, and both are deliberate.** The ROUTE's names: a browser
+    registration supplies `from_name`/`to_name`, and a partner-only route has nobody to have typed
+    them, so the event falls back to the stop registry's. And the WORDING, while the two delivery
+    switches disagree — the rollout turns the partner channel on with the template first
+    (`NOTIFICATION_PARTNER_LLM_ENABLED` unset) while the PWA is already receiving the model's prose,
+    so during that window the event carries the template and the push does not. Both switches are
+    on below, which is the state R7's claim is about, and the second half of this test asserts the
+    divergence rather than pretending it does not exist.
+    """
+    import notification_wording
+
+    _reset_state()
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(notification_wording, "partner_delivery_enabled", lambda: True)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _register(DEVICE)
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert len(sent) == 1 and len(outcome.partner_subjects) == 1
+    subject = outcome.partner_subjects[0]
+    assert subject.title == sent[0]["title"], (subject.title, sent[0]["title"])
+    assert subject.body == sent[0]["body"], (subject.body, sent[0]["body"])
+    assert subject.body.startswith("Oslo S → Lillehammer\n"), subject.body
+    assert subject.payload["notification"] == {
+        "title": subject.title,
+        "body": subject.body,
+        "action": None,
+    }
+
+    # The other side: with the partner switch OFF the event carries the TEMPLATE while the push
+    # carries the model's prose. Asserted so the rollout window is a checked property rather than a
+    # surprise the first partner reports.
+    _reset_state()
+    sent.clear()
+    monkeypatch.setattr(notification_wording, "partner_delivery_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _register(DEVICE)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." in sent[0]["body"]
+    assert "Toget er innstilt. Ta neste tog." not in outcome.partner_subjects[0].body
+    assert outcome.partner_subjects[0].title == sent[0]["title"], "the TITLE never varies"
+
+
+def test_a_below_threshold_train_carries_a_retraction_wording_not_the_alert_one(monkeypatch):
+    """Scenario 7's wording half: a withdrawal must not lead with the disruption it retracts.
+
+    "Withdrawal means the forecast changed, not that normal service is guaranteed" — the store's own
+    `record_below_threshold` makes that the wording's job, and it is the one sentence a traveller
+    could most easily read as an all-clear. A retraction worded from the alert template would open
+    "82 % sjanse for innstilling", which is the opposite of what it means.
+
+    The train is still named exactly as every other notification names it, because the retraction is
+    about a specific departure and a partner has to be able to match it to the alert it replaces.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    # A snapshot whose one call is well below the alert gate.
+    mild = {
+        "S1": [
+            FakeCall("t1", "A", 1, DEP, p_cancel=0.02, p_impact_dep=0.05),
+            FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+        ]
+    }
+    _use_snapshot(mild)
+
+    outcome = varsel.check_and_notify(mild)
+
+    assert len(outcome.partner_subjects) == 1
+    subject = outcome.partner_subjects[0]
+    assert subject.alertworthy is False
+    assert varsel._PARTNER_WITHDRAWAL_TITLE in subject.title, subject.title
+    # `A → B`, the raw refs, because a partner-ONLY route has no traveller-supplied name and this
+    # suite's stop registry resolves neither. In prd the registry supplies both; the structure --
+    # the route on its own first line, then the retraction -- is what has to hold either way.
+    assert subject.body == f"A → B\n{varsel._PARTNER_WITHDRAWAL_DETAIL}", subject.body
+    assert "innstilling" not in subject.body and "%" not in subject.body
+
+
+def test_a_declared_cancellation_carries_no_delay_figures_in_its_payload(monkeypatch):
+    """The three-way split every writer in this module makes, applied to the event payload.
+
+    When ET has already declared the call cancelled the probabilities are 1.0 by construction
+    (`impact._cancelled_prediction`) and every delay figure meant "if it runs" — so `delay` is
+    null, exactly as `event.schema.json` states for `phase: confirmed` and exactly as
+    `_deterministic_body` and the message input already do it.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    cancelled = {"S1": _cancelled_notice("S1")}
+    _use_snapshot(cancelled)
+
+    outcome = varsel.check_and_notify(cancelled)
+
+    [subject] = outcome.partner_subjects
+    assert subject.cancelled is True
+    assert subject.payload["delay"] is None
+    assert subject.payload["probabilities"]["cancellation"] == 1.0
+    assert subject.payload["effect"] == "cancelled"
+
+
+def test_a_partner_delivery_can_never_enter_pushed_keys(monkeypatch):
+    """U6 scenario 5 / KTD10's second leak, closed structurally rather than by care.
+
+    `pushed_keys` is journey-DEFINITION grain, so a partner delivery recorded there would mark a
+    browser registration's row `pushed` with no browser push behind it — and
+    `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed row, so the
+    page would quote a wording nobody received. That is the 2026-08-21 defect, re-created from the
+    other side.
+
+    What makes it impossible is WHERE the delivery happens: `check_and_notify` returns before any
+    partner event is sent, so there is no moment at which a partner outcome could reach that set.
+    Asserted both ways — a shared definition with push off records `pushed=False` while the partner
+    subject exists, and the source of the delivery module names neither symbol.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _register(DEVICE)  # a browser registration on the SAME definition
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert outcome.partner_subjects, "the partner subject exists"
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["pushed"] is False, (
+        "the browser row must not read `pushed` on the strength of a partner delivery"
+    )
+    import pathlib
+
+    text = (pathlib.Path(varsel.__file__).parent / "partner_delivery.py").read_text()
+    assert "pushed_keys" not in text and "import varsel" not in text
+
+
+def test_the_decision_log_and_the_state_blob_are_written_before_the_outcome_is_built(monkeypatch):
+    """U6 scenario 8: a failure in the partner work cannot cost the browser cycle's durable writes.
+
+    KTD6 orders every partner step that writes or sends after `_record_decisions` and `_save_state`.
+    Building the outcome LAST and handing it back is strictly stronger on KTD6's own stated reason:
+    the emit and delivery steps run after this function has returned, so a raise in them cannot
+    unwind either write at all. This asserts the weaker half that is still checkable here — a raise
+    while BUILDING the subjects leaves both writes intact and the cycle reports no subjects.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    saves: list[int] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_save_state", lambda: saves.append(1) or True)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _register(DEVICE)
+
+    import pathlib
+
+    def raising(*_a, **_k):
+        raise RuntimeError("a duck-typed payload bit back")
+
+    monkeypatch.setattr(varsel, "_partner_payload", raising)
+    with _capture_varsel_logs() as records:
+        outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert outcome.partner_subjects == (), "no partner work this cycle"
+    assert log.rows, "and the decision log was still written"
+    assert saves, "and the state blob was still saved"
+    # Caught PER DEFINITION, not by the outer backstop: one journey's awkward payload must cost
+    # that journey's subjects rather than every other partner's events in the same cycle.
+    results = [e["result"] for e in _events(records, "partner_emit")]
+    assert results == ["subject_error", "subjects_skipped"], results
+    assert _events(records, "partner_emit")[1]["n"] == 1
+    # And the outer guard is still there as the backstop for a raise the loop itself cannot reach.
+    assert '"result": "build_error"' in pathlib.Path(varsel.__file__).read_text()
+
+
+def test_a_subscription_with_no_destination_is_matched_but_never_emitted_for(monkeypatch):
+    """R20's per-document rule applied to the four ROUTING fields, one layer past the loader.
+
+    The loader reads them permissively on purpose: the fields it REFUSES on are the ones the pass
+    matches with, and a document missing a destination can still be matched — it still collapses
+    onto its journey key and still shares the one /impact call and the one wording AE1 asserts.
+    Refusing it would take a browser registration's own wording away over a partner field. So it is
+    matched and simply not emitted for, and the COUNT is logged (never the document — R16).
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC])  # no partner_id, no destination_id
+
+    with _capture_varsel_logs() as records:
+        outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert [s for _k, s in written] == ["S1"], "matched and written for"
+    assert outcome.partner_subjects == (), "and not emitted for"
+    assert _events(records, "partner_emit")[0]["result"] == "unroutable"
+
+
+def test_a_partner_only_definition_is_written_for_through_the_partner_policy(monkeypatch):
+    """The R16 exposure U2 left open, and the half of it U6 closes.
+
+    A `journey_key` reaching `varsel._write_message` reaches `llm_message.write_message_detailed`,
+    which emits `event="llm_message"` — and under `VARSEL_LLM_LOG_PROMPTS=true`, which dev runs, the
+    full prompt at DEBUG, carrying the traveller's origin, destination and departure time. R16
+    forbids that for partner data, so a definition NO browser registration holds is routed through
+    `notification_wording.PARTNER`, which suppresses that record in code rather than by an
+    environment variable.
+
+    The discriminator is `by_journey_key`, which U2 kept browser-only precisely so this question has
+    a cheap answer. The shared case is unavoidable and by design — AE1 pins one match and one
+    wording between the channels, so there is one call and it is the browser's — and this asserts
+    both halves, because asserting only the partner-only one would pass just as happily if every
+    subject went through PARTNER and AE1 were quietly false.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    browser_calls: list[str] = []
+    partner_calls: list[str] = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, *, journey_key, message_input, **_: browser_calls.append(journey_key)
+        or "Skrevet av modellen.",
+    )
+
+    def partner_write(route, facts, *, subject_id="", message_input=None, **_):
+        partner_calls.append(subject_id)
+        return notification_wording.Wording(
+            title="t", body="b", source="llm", status="ok", message_input=message_input or {}
+        )
+
+    monkeypatch.setattr(notification_wording, "write_wording", partner_write)
+
+    # 1. partner-ONLY: the PARTNER policy, and the browser writer is never reached.
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    varsel.check_and_notify(SNAPSHOT)
+    assert partner_calls and not browser_calls, (partner_calls, browser_calls)
+
+    # 2. SHARED: the browser writer, once, and the partner writer not at all.
+    _reset_state()
+    partner_calls.clear()
+    browser_calls.clear()
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(browser_calls) == 1 and not partner_calls, (browser_calls, partner_calls)
+
+
+def test_the_partner_wording_gate_is_the_partner_switch_not_varsel_llm_enabled(monkeypatch):
+    """The two delivery switches stay separate, which is the rollout order's whole point.
+
+    "Enable the partner flag in dev first, with deterministic wording, then model wording once
+    matching and delivery qualify." Sharing `VARSEL_LLM_ENABLED` would flip partner prose on the
+    moment it goes on for the PWA, in the same deploy — precisely the coupling the 2026-08-07
+    generation/delivery split removed one layer down.
+
+    Read ONCE per cycle, like `_record_decisions`' own two gate reads: a flag re-read per subject
+    could write for one train and not the next inside one pass.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _register(DEVICE)
+
+    # Partner prose OFF (the default everywhere today): the event carries the template.
+    monkeypatch.setattr(notification_wording, "partner_delivery_enabled", lambda: False)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    template_body = outcome.partner_subjects[0].body
+    assert "Toget er innstilt. Ta neste tog." not in template_body
+
+    # Partner prose ON: the same cached wording the browser card would show.
+    monkeypatch.setattr(notification_wording, "partner_delivery_enabled", lambda: True)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." in outcome.partner_subjects[0].body
+
+    # And a switch that raises reads as OFF -- the failure direction of a delivery gate is closed.
+    def boom() -> bool:
+        raise RuntimeError("unreadable")
+
+    monkeypatch.setattr(notification_wording, "partner_delivery_enabled", boom)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." not in outcome.partner_subjects[0].body
+
+
+def test_the_write_budgets_clock_is_shared_and_its_call_allowance_is_not(monkeypatch):
+    """`notification_wording.PassBudget`'s stated split, at the one call site that has to honour it.
+
+    The CLOCK is a property of the pass — two surfaces writing inside one pass cannot each have
+    their own, and the reservation is what makes the deadline a ceiling on when the pass ENDS. The
+    COUNT is a property of the surface: merged, a partner with a few hundred subscriptions would
+    spend `_MAX_LLM_CALLS_PER_CYCLE` on partner wordings and silently retire the browser ones, which
+    is that constant's own lesson read the other way round.
+    """
+    budget = varsel._WriteBudget(1, varsel.monotonic() + 3600)
+    assert budget.claim_clock() is True and budget.claimed == 0, "the clock only"
+    assert budget.claim() is True and budget.claimed == 1
+    assert budget.claim() is False, "the count binds for the browser surface"
+    assert budget.claim_clock() is True, "and not for the partner one"
+
+    spent = varsel._WriteBudget(9, varsel.monotonic() - 1)
+    assert spent.claim_clock() is False, "an expired clock binds for BOTH"
+    assert spent.claim() is False
+
+
+def test_the_locked_pass_budget_is_safe_across_the_write_pool(monkeypatch):
+    """`PassBudget` documents itself as not thread-shared, and pass 1c is `_LLM_WORKERS`-wide.
+
+    `self.left -= 1` is a read-modify-write and the GIL does not make it atomic, so unlocked the
+    ceiling could be overspent by up to one call per worker. Driven from more threads than the limit
+    allows, the number of successful takes must be exactly the limit.
+    """
+    import threading
+
+    budget = varsel._LockedPassBudget(5)
+    taken: list[bool] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        got = budget.take()
+        with lock:
+            taken.append(got)
+
+    threads = [threading.Thread(target=worker) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(taken) == 5, f"exactly the limit, got {sum(taken)}"
 
 
 def test_a_partner_subscription_is_invisible_on_every_varsel_surface(monkeypatch):

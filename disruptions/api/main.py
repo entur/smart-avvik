@@ -24,6 +24,8 @@ import logging_setup  # noqa: F401  (import side effect: golden-path JSON loggin
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
 import partner_api  # sibling module: the authenticated partner API (/notification-api/v1)
 import partner_auth  # sibling module: partner accounts, API keys, callback destinations, audit
+import partner_delivery  # sibling module: one bounded webhook attempt per pending partner event
+import partner_events  # sibling module: this cycle's observations turned into committed events
 import partner_store  # sibling module: durable partner subscriptions, events and deliveries
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
@@ -1099,11 +1101,47 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # and decision recording have run regardless of the keypair since /historikk shipped, and since
     # KTD4 the wording pass does too wherever a recipient on some channel can receive it. What a
     # missing keypair still stops is browser delivery, and nothing else.
+    outcome: varsel.PassOutcome | None = None
     try:
         with _phase("varsel_notify", timings):
-            varsel.check_and_notify(_varsel_snapshot())
+            outcome = varsel.check_and_notify(_varsel_snapshot())
     except Exception:
         logger.exception("Avviksvarsel notify failed")
+    # The partner (webhook) channel's two WRITING steps, in their own phase and deliberately after
+    # the one above (KTD6, plus the orchestrator's resolution of where the phase reading goes).
+    #
+    # Three things this placement buys, and each of them was a choice.
+    #
+    # It runs after `check_and_notify` has RETURNED, so it is strictly later than KTD6's literal
+    # "after `_record_decisions` and `_save_state`" — a raise here cannot unwind the decision log
+    # write or the state save at all, rather than merely being sequenced after them. Same thread,
+    # same cycle, same process, so nothing KTD6 settled with the user (decide and deliver in the
+    # pass, not in a separate Kubernetes worker) is touched.
+    #
+    # It is a `_phase`, so the Verification Contract's cycle-budget row has a real `poller_phase`
+    # reading — which is also the number KTD6's own reversal trigger is stated in ("move delivery
+    # out when the webhook phase exceeds 30 s of measured phase time on any cycle in a week"). The
+    # two steps' own ceilings add to 28 s, so that trigger means what it says.
+    #
+    # And it is fed by a RETURN VALUE rather than a module-level snapshot in `varsel`: a new
+    # module-level ledger there would need registering in `check_and_notify`'s per-cycle stale sweep
+    # and in `test_varsel_api._reset_state`, and a leaked half-cycle snapshot reads exactly like the
+    # give-up bug those sweeps exist to prevent.
+    #
+    # Guarded like every other step here, and the two halves are guarded separately (R20): an emit
+    # failure must not cost the deliveries already committed. Delivery runs even when the pass above
+    # raised and `outcome` is None — the pending set is Firestore's, not this cycle's.
+    if varsel.partner_channel_enabled():
+        with _phase("partner_webhooks", timings):
+            try:
+                if outcome is not None:
+                    partner_events.emit(outcome.partner_subjects)
+            except Exception:
+                logger.exception("Partner event emission failed")
+            try:
+                partner_delivery.deliver_pending()
+            except Exception:
+                logger.exception("Partner webhook delivery failed")
 
 
 def _togvarsel_notify_enabled() -> bool:
@@ -1172,12 +1210,21 @@ async def lifespan(app: FastAPI):
         # /config tells the PWA whether rush-forecast pushes are delivered HERE, so the page's
         # notice can never promise a push class this environment's gate withholds.
         togvarsel_notify_provider=_togvarsel_notify_enabled,
-        # The partner channel's gate. Wired now and deliberately WITHOUT a recipient provider: the
-        # Firestore-backed store is a later unit, and until it is injected the pass has no partner
-        # subscriptions to match whatever this flag says. Both halves default to off, so a
-        # deployment that is missing either is byte for byte the pass that ran before the channel
-        # existed.
+        # The partner channel's two halves, both now wired. `partner_channel_enabled()` requires
+        # BOTH, so a deployment missing either — every deployment until the flag is set, and tst,
+        # which has no named database — is byte for byte the pass that ran before the channel
+        # existed. The flag is injected separately from the store so `varsel` can decline to touch
+        # the store at all, which is what makes "the flag is unset, so no partner state was read" a
+        # property of the pass rather than of whoever wrote the provider.
+        #
+        # `recipient_documents` returns RAW documents on purpose (R20): only the reader can decide
+        # what "unreadable" means for the schema the running binary knows, so the store hands over
+        # the shape and `varsel._parse_partner_recipient` validates it one document at a time. What
+        # bounds the poller's WAIT on it is `varsel._PARTNER_LOAD_TIMEOUT_S` (5 s, on a worker
+        # thread that is abandoned rather than joined); the store call itself carries no deadline of
+        # its own, so a hung read costs a leaked thread and a delayed pod termination.
         partner_enabled=_partner_notifications_enabled,
+        partner_recipients_provider=partner_store.recipient_documents,
     )
     llm_message.configure(stop_name_provider=_varsel_stops)
     # The partner notification channel's two Firestore-backed planes and the authenticated API over
