@@ -87,9 +87,11 @@ import os
 import re
 import threading
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
+from itertools import islice
 from pathlib import Path
 from time import monotonic
 from typing import Annotated, Any, Protocol
@@ -402,10 +404,69 @@ class ConnectivityProvider(Protocol):
     ) -> tuple[bool, bool] | None: ...
 
 
+@dataclass(frozen=True)
+class PartnerRecipient:
+    """One partner subscription as this pass sees it: a registration whose channel is a webhook.
+
+    KTD3's whole shape in three fields. It is a **view merged at match time, never a
+    materialization** — nothing here is ever written into :data:`_journeys`, :data:`_notified` or
+    the GCS state blob, which is what makes a rollback to pre-feature code safe (`_save_state`
+    writes known keys, so `_state_extra`'s round-trip could not have protected partner state that
+    had leaked into the blob).
+
+    ``journey`` carries exactly the five fields the shared work reads off a registration —
+    ``from_stop``, ``to_stop``, ``begin``, ``end``, ``days`` — because those are what
+    :func:`journey_key`, :func:`journey_windows` and :func:`_impact` consult, and
+    ``llm_message.build_message_input`` resolves the two place NAMES from the stop registry rather
+    than from the record. Anything else a partner document holds (its reference, its destination,
+    its quotas) is the store's business and deliberately does not enter this pass.
+
+    ``delivered`` mirrors :data:`_notified`'s grain exactly — situation numbers already delivered to
+    THIS subscription — because that is the grain :func:`_pending_pushes` asks its question at.
+    Firestore is the only dedup ledger for this channel; this is a read-only snapshot of it.
+    """
+
+    recipient_id: str
+    journey: dict
+    delivered: frozenset[str] = frozenset()
+
+
+class PartnerRecipientProvider(Protocol):
+    """The partner subscriptions this cycle should match, as RAW documents.
+
+    A Protocol for the same reason as :class:`ImpactProvider`: it is a cross-module contract whose
+    drift is quiet. A partner recipient that silently stops being matched looks exactly like a
+    healthy deployment with nothing disrupted, which is the failure mode this whole surface exists
+    to avoid.
+
+    Raw documents rather than parsed records, deliberately. R20 wants an unreadable document
+    skipped rather than failing its collection, and only the reader can decide what "unreadable"
+    means for the schema the *running binary* knows: a store adapter written against a newer
+    document shape must be able to hand this pass something it refuses, one document at a time. So
+    the provider's job is to read the store and this module's job is to validate
+    (:func:`_parse_partner_recipient`).
+
+    Returning a lazy iterable is fine and expected — a Firestore cursor is one — because
+    :func:`_load_partner_recipients` materializes it INSIDE the bounded step, so both the wall-clock
+    ceiling and the :data:`_MAX_PARTNER_RECIPIENTS` count ceiling apply to the paging as well as to
+    the first call. The provider must still carry its own per-call deadline (KTD6): the bound here
+    is on how long the poller WAITS, not on when the store gives up.
+    """
+
+    def __call__(self) -> Iterable[Mapping[str, Any]]: ...
+
+
 _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 _connectivity_provider: ConnectivityProvider | None = None
 _togvarsel_notify_provider: Callable[[], bool] | None = None
+# The partner channel's two seams, both defaulting to "no partner recipients" so an un-wired
+# deployment -- which is every deployment until the store lands -- behaves byte for byte as it did
+# before this existed. `_partner_enabled` is main's flag read, injected rather than read here for
+# `_togvarsel_notify_enabled`'s reason: one function is the seam, and it is consulted at CALL time
+# so an environment change needs no import-time dance.
+_partner_enabled: Callable[[], bool] | None = None
+_partner_provider: PartnerRecipientProvider | None = None
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -418,6 +479,8 @@ def configure(
     stops_provider: Callable[[], list[dict]],
     connectivity_provider: ConnectivityProvider | None = None,
     togvarsel_notify_provider: Callable[[], bool] | None = None,
+    partner_enabled: Callable[[], bool] | None = None,
+    partner_recipients_provider: PartnerRecipientProvider | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -425,12 +488,22 @@ def configure(
     what every deploy did before the check existed. `togvarsel_notify_provider` is main's
     TOGVARSEL_NOTIFY_ENABLED read, surfaced through /config so the PWA can announce the rush
     forecasts only where they are actually delivered; absent reads as off.
+
+    `partner_enabled` and `partner_recipients_provider` are the partner channel (KTD3). Both are
+    optional and both default to off, which is not laziness about defaults: an un-wired deployment
+    must be indistinguishable from the code before the channel existed, and it is the pair being
+    absent — not a flag value — that guarantees it. The flag is injected separately from the store
+    so the pass can decline to touch the store at all, which is what makes "the flag is unset, so
+    nothing was read" a property of this module rather than of whoever wrote the provider.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
+    global _partner_enabled, _partner_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
+    _partner_enabled = partner_enabled
+    _partner_provider = partner_recipients_provider
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -498,6 +571,206 @@ def _canonicalize_journeys() -> None:
             canonical_stop(old_to),
             extra={"fields": {"event": "varsel_stop_alias", "result": "rewritten"}},
         )
+
+
+# ---- Partner channel: subscriptions as registrations with a webhook ---------------------------
+#
+# R21's read ceiling. A partner subscription costs this pass one journey_key group at most (they
+# collapse onto the browser groups they duplicate), and pass 1a is already 16-wide, so the number
+# that matters is not "how many can we match" but "how much can one bad store answer make the
+# poller carry". Deliberately the same order as `_MAX_JOURNEYS` (20 000) divided down: a pilot is
+# one partner and a few hundred subscriptions, so anything approaching this is a store bug or a
+# quota breach rather than growth, and truncating it is the right failure. Truncation is logged.
+_MAX_PARTNER_RECIPIENTS = 2000
+# How long the poller waits for the whole load -- the first call AND every page of a lazy cursor.
+# It is a bound on the WAIT and not on the store: the provider carries its own per-call deadline
+# (KTD6), and a thread parked past this one is abandoned rather than killed, because Python has no
+# way to kill it. Sized against the cycle it sits in: `check_and_notify` is the last phase of a
+# cycle measured at 50-63 s on a period measured at ~296 s (2026-08-21 / 2026-09-08), and this runs
+# BEFORE `_WriteBudget`'s 30 s clock starts, so a slow store costs the cycle its own tail and
+# never the wordings.
+_PARTNER_LOAD_TIMEOUT_S = 5.0
+
+
+def partner_channel_enabled() -> bool:
+    """Is the partner channel live in this deployment? Read at CALL time, never latched.
+
+    Two things have to be true, and they are deliberately separate: main's flag (unset = off, the
+    `_togvarsel_notify_enabled` convention) and a store to read. Either missing means the channel
+    contributes nothing, and a cycle then reduces to exactly the pass that ran before the channel
+    existed — which is the property the whole feature's rollback story rests on.
+    """
+    if _partner_provider is None or _partner_enabled is None:
+        return False
+    try:
+        return bool(_partner_enabled())
+    except Exception:
+        # A flag reader that raises must read as OFF, like every other gate in this repo: the
+        # failure direction of a delivery switch is closed (llm_message.py argues it at length).
+        logger.warning(
+            "Partner channel flag could not be read; treating the channel as off this cycle",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_partner_load", "result": "flag_error"}},
+        )
+        return False
+
+
+def _parse_partner_recipient(doc: Mapping[str, Any]) -> PartnerRecipient:
+    """One raw partner document → a :class:`PartnerRecipient`, raising on anything unreadable.
+
+    Restates :class:`JourneyIn`'s three window rules (HH:MM, a non-empty subset of 0..6, and
+    ``begin < end`` so overnight windows are refused) rather than importing that model, for two
+    reasons that both matter. `JourneyIn` requires a ``device_id``, which a partner subscription by
+    definition does not have; and this runs on the ingestion thread against documents written by a
+    possibly NEWER binary, so it must validate the fields the pass actually reads and be
+    indifferent to fields it does not — a model whose required set grows would start refusing every
+    document in the collection on the deploy that adds a field.
+    ``test_the_partner_loader_refuses_exactly_what_the_registration_api_refuses`` pins the two
+    against each other so the restatement cannot drift into being looser.
+
+    **The stop refs are canonicalized here** (:func:`canonical_stop`), and that is not a tidy-up.
+    `_canonicalize_journeys` only ever walks `_journeys`, so a partner document naming a ref the
+    stop registry has since collapsed onto a primary would produce a DIFFERENT `journey_key` than
+    the browser registration for the identical physical trip — two groups, two /impact calls, two
+    wordings, and AE1's whole claim quietly false. Same defect as the 2026-08-03 picker bug, one
+    layer out.
+
+    Raises rather than returning None: the caller's per-document guard is what turns a bad document
+    into a skipped document, and a sentinel return would let a future edit forget to check it.
+    """
+    recipient_id = str(doc["recipient_id"])
+    if not recipient_id:
+        raise ValueError("recipient_id must be a non-empty string")
+    from_stop = canonical_stop(str(doc["from_stop"]))
+    to_stop = canonical_stop(str(doc["to_stop"]))
+    if not from_stop or not to_stop:
+        raise ValueError("from_stop and to_stop must be non-empty")
+    if from_stop == to_stop:
+        raise ValueError("from_stop and to_stop must differ")
+    begin, end = str(doc["begin"]), str(doc["end"])
+    if not _HHMM_RE.match(begin) or not _HHMM_RE.match(end):
+        raise ValueError("begin/end must be HH:MM (24h)")
+    if _parse_hhmm(begin) >= _parse_hhmm(end):
+        raise ValueError("begin must be before end (overnight windows are not supported)")
+    days = sorted({int(d) for d in doc["days"]})
+    if not days or any(d < 0 or d > 6 for d in days):
+        raise ValueError("days must be a non-empty subset of 0..6 (0=Monday)")
+    return PartnerRecipient(
+        recipient_id=recipient_id,
+        journey={
+            "from_stop": from_stop,
+            "to_stop": to_stop,
+            "begin": begin,
+            "end": end,
+            "days": days,
+        },
+        delivered=frozenset(str(s) for s in doc.get("delivered") or ()),
+    )
+
+
+def _load_partner_recipients() -> list[PartnerRecipient]:
+    """This cycle's partner subscriptions, or an empty list — the single guarded, bounded read.
+
+    The ONE place this pass reads partner state (KTD6): passes 1a and 1b work off the snapshot it
+    returns and never go back to the store, which is what keeps 1b free to stay sequential (it
+    mutates module state and blocks on nothing).
+
+    Three failure shapes, three treatments, and the middle one is what a naive version gets wrong:
+
+    * **the store raises** — this cycle has no partner recipients, logged once, and the browser
+      half of the pass is untouched. Guarded in the shape of the `_reconcile_caches` guard below,
+      and for a strictly bigger blast radius: called bare, a raise here unwinds out of
+      `check_and_notify` entirely, so loop 2 never runs (no pushes at all) and `_record_decisions`
+      never runs (no rows either).
+    * **the store is slow** — bounded by :data:`_PARTNER_LOAD_TIMEOUT_S` on a worker thread. The
+      executor is deliberately NOT used as a context manager: `__exit__` calls
+      `shutdown(wait=True)`, which would block the poller until the slow call finally returned and
+      defeat the timeout completely. `shutdown(wait=False)` abandons the thread instead, which is
+      the honest trade — Python cannot cancel a thread parked in a socket read, and one leaked
+      thread per bad cycle is far cheaper than a stalled ingestion thread. What abandoning it still
+      costs is interpreter shutdown: `concurrent.futures.thread` registers an atexit hook that
+      joins its workers, so a provider with NO deadline of its own would delay a pod termination by
+      however long it hangs. That is the second reason KTD6 puts a per-call deadline on the
+      provider rather than treating this ceiling as the only bound.
+    * **one document is unreadable** — skipped, per document, never allowed to fail its collection
+      (R20). The count and the exception CLASS are logged and the document body never is (R16): a
+      partner subscription is a route with times, and this log line is not the place for it.
+
+    Materializing the iterable happens inside the worker (`list(islice(...))`), so a lazy Firestore
+    cursor's paging is under the same clock as the first call and :data:`_MAX_PARTNER_RECIPIENTS`
+    bounds the read rather than merely the result.
+    """
+    if not partner_channel_enabled():
+        return []
+    provider = _partner_provider
+    if provider is None:  # narrowed for the type checker; partner_channel_enabled already said so
+        return []
+    started = monotonic()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="partner-load")
+    try:
+        future = pool.submit(lambda: list(islice(provider(), _MAX_PARTNER_RECIPIENTS)))
+        docs = future.result(timeout=_PARTNER_LOAD_TIMEOUT_S)
+    except Exception:
+        logger.warning(
+            "Partner subscriptions could not be read this cycle; matching browser registrations "
+            "only",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_partner_load", "result": "error"}},
+        )
+        return []
+    finally:
+        # Never wait: see the docstring. A thread still inside a slow provider call outlives this
+        # cycle and is collected when the call returns.
+        pool.shutdown(wait=False)
+
+    recipients: list[PartnerRecipient] = []
+    skipped: dict[str, int] = {}
+    for doc in docs:
+        try:
+            recipients.append(_parse_partner_recipient(doc))
+        except Exception as exc:
+            # The traceback at DEBUG, the COUNT at WARNING below. Never the document: a partner
+            # subscription is a route with times and weekdays, and R16 keeps that out of routine
+            # logs -- which a per-document warning quoting the record would defeat. Bounded by
+            # `_MAX_PARTNER_RECIPIENTS`, and the exception messages reachable here are either a
+            # missing key name or one of this function's own sentences, so the traceback is safe.
+            logger.debug("Unreadable partner subscription document; skipping it", exc_info=True)
+            skipped[type(exc).__name__] = skipped.get(type(exc).__name__, 0) + 1
+    if skipped:
+        logger.warning(
+            "Skipped %d unreadable partner subscription document(s) this cycle (%s); the rest of "
+            "the collection was matched",
+            sum(skipped.values()),
+            ", ".join(f"{name} x{n}" for name, n in sorted(skipped.items())),
+            extra={
+                "fields": {
+                    "event": "varsel_partner_load",
+                    "result": "skipped",
+                    "skipped": sum(skipped.values()),
+                }
+            },
+        )
+    logger.info(
+        "Loaded %d partner subscription(s) in %.0f ms (%d skipped)",
+        len(recipients),
+        (monotonic() - started) * 1000,
+        sum(skipped.values()),
+        extra={
+            "fields": {
+                "event": "varsel_partner_load",
+                "result": "ok",
+                "n": len(recipients),
+                "skipped": sum(skipped.values()),
+                "ms": int((monotonic() - started) * 1000),
+                # `>=`, so a collection of exactly the ceiling reports truncated. That is not a
+                # rounding error to fix: the read stops AT the ceiling (R21 -- it may not exceed
+                # it), so this cycle genuinely cannot tell a full collection from a clipped one,
+                # and claiming otherwise would need one more document than the ceiling allows.
+                "truncated": len(docs) >= _MAX_PARTNER_RECIPIENTS,
+            }
+        },
+    )
+    return recipients
 
 
 # Shown on the card of a journey no planned trip connects today. Deliberately a warning and never a
@@ -1328,8 +1601,10 @@ def _train_key(alert: Alert) -> tuple | None:
     return None
 
 
-def _pending_pushes(jids, alerts: list[Alert]) -> list[Alert]:
-    """The alert-worthy trains a push is still coming for, worst-first.
+def _pending_pushes(
+    jids, alerts: list[Alert], partner_recipients: Sequence[PartnerRecipient] = ()
+) -> list[Alert]:
+    """The alert-worthy trains a notification is still coming for, worst-first — on ANY channel.
 
     This is what the writing budget is spent on.
 
@@ -1339,7 +1614,19 @@ def _pending_pushes(jids, alerts: list[Alert]) -> list[Alert]:
     "Still coming" is per REGISTRATION, because `_notified` is: two devices on one trip are notified
     separately, so a train the first device already heard about is still pending for the second
     and its wording can still change what somebody sees. A journey definition nobody is registered
-    on any more yields nothing, which is correct — there is no push to write for.
+    on any more yields nothing, which is correct — there is no notification to write for.
+
+    **A partner subscription is another registration** (KTD3), so it is asked the same question
+    against its own ledger: `PartnerRecipient.delivered` is Firestore's copy of `_notified` at the
+    same grain, read once per cycle in `_load_partner_recipients`. Never the store itself — this is
+    called from pass 1b, which is sequential precisely because it blocks on nothing.
+
+    **The caller passes NO browser jids when `push_enabled()` is false**, and that half is easy to
+    miss and expensive to get wrong (KTD4). `_notified` only grows on a successful browser send, so
+    without it a keypair-less deployment (tst has no keypair) would report every alert-worthy train
+    as pending for every browser registration on every cycle, and spend the whole write budget
+    re-wording trains it can never deliver — competing with exactly the partner subjects the gate
+    change exists to serve.
 
     Deliberately approximate in one direction only. It does not check that each registration
     still has a live subscription (loop 2 does, and drops the device if the endpoint is gone), so
@@ -1354,7 +1641,13 @@ def _pending_pushes(jids, alerts: list[Alert]) -> list[Alert]:
         alert
         for alert in one_alert_per_train(alerts)
         if alert.alertworthy
-        and any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
+        and (
+            any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
+            or any(
+                alert.situation_number not in recipient.delivered
+                for recipient in partner_recipients
+            )
+        )
     ]
 
 
@@ -2021,8 +2314,8 @@ def _record_decisions(
                     written = _messages.get(message_key)
                     meta = dict(_message_meta.get(message_key) or {})
                 # No meta means the writer was never reached for this alert, and why is knowable
-                # from the state that decided it: below the threshold, push (and with it the writer)
-                # switched off, no backend available to ask — or alert-worthy but not among the
+                # from the state that decided it: below the threshold, no deliverable recipient on
+                # any channel, no backend available to ask — or alert-worthy but not among the
                 # trains this journey wrote for this cycle (`not_selected`). Since 2026-08-21 that
                 # last value is much narrower: a second situation about a train another situation
                 # already covers (`one_alert_per_train` collapsed it), a train with no push pending
@@ -2034,6 +2327,13 @@ def _record_decisions(
                     if not alert.alertworthy:
                         status = "not_alertworthy"
                     elif not push_on:
+                        # Unchanged on purpose (KTD4): every row `_record_decisions` writes is a
+                        # BROWSER subject (it iterates the browser grouping -- KTD10 keeps partner
+                        # subjects out of this table), so "no keypair" is still exactly why this
+                        # subject got no wording, and the value keeps the meaning every existing row
+                        # in `varsel_decisions` carries. What changed above is only that a partner
+                        # subscription can now earn a wording the browser channel could not deliver
+                        # -- and where one did, `meta` is set and this branch is never reached.
                         status = "push_disabled"
                     elif not generation_on:
                         # Kept as "llm_disabled" -- the value is an established column in
@@ -2345,17 +2645,32 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     **Scoring and recording run even when push is disabled**; only delivery is gated. The decision
     log's guarantee is "every decision, not every push", and an early return here quietly broke it:
     an environment without VAPID keys recorded nothing at all, so /historikk looked like a broken
-    deployment rather than an un-provisioned one. The LLM stays gated on push, though — writing
-    traveller-facing prose nobody can receive at all is spend with no reader, and the deterministic
-    body already captures what the decision was.
+    deployment rather than an un-provisioned one.
+
+    **Wording depends on a deliverable RECIPIENT, not on a VAPID keypair** (KTD4, 2026-09-08). This
+    used to skip the whole writing pass on ``push_enabled()``, and the reason it gave was right —
+    writing traveller-facing prose nobody can receive is spend with no reader — while the condition
+    was wrong: it read "no keypair" as "no reader". A webhook-only deployment, and tst which holds no
+    keypair at all, therefore wrote nothing and recorded ``message_status='push_disabled'`` on every
+    row. The gate is now the condition it was reaching for: at least one deliverable recipient on
+    any channel — browser push enabled, or a partner subscription with a delivery still pending for
+    that train. A journey with no deliverable channel still writes nothing, so
+    ``message_status='push_disabled'`` keeps its meaning for browser subjects.
+
+    **Partner subscriptions are registrations with a webhook channel** (KTD3), merged into pass 1a
+    under :func:`journey_key` so one match and one wording serve both channels. It is a view, not a
+    materialization: `_journeys`, `_notified` and the state blob never carry a partner id. Note
+    `_record_decisions` is handed the BROWSER grouping only (KTD10) — the decision log is published
+    on public hosts, and a partner-only route therefore produces no row at all, which is KTD12's
+    recorded limitation rather than an oversight.
 
     **Writing a wording and sending it are separate switches** (2026-08-07). A message is written
     whenever a backend can be tried (``llm_message.generation_enabled``); ``VARSEL_LLM_ENABLED``
     decides only which of the two wordings the traveller receives, on both surfaces, through
     :func:`_deliverable_message`. So prd — delivery off — writes the model's version, pushes the
     deterministic one, and records both, which is the only way the two can be compared on prd's own
-    traffic instead of on dev's. Note "gated on push" above is still true and is the wider gate:
-    push off means no write at all, delivery off means write but send the template.
+    traffic instead of on dev's. Note the recipient gate above is the wider one: no deliverable
+    recipient means no write at all, delivery off means write but send the template.
     """
     push_on = push_enabled()
     with _state_lock:
@@ -2384,7 +2699,24 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         oslo_today = datetime.now(_OSLO).date().isoformat()
         for jid in [j for j, (day, _count) in _daily_pushes.items() if day != oslo_today]:
             _daily_pushes.pop(jid, None)
+        # NOTHING FOR THE PARTNER CHANNEL SWEEPS HERE, and that is a property worth stating rather
+        # than an omission. The partner snapshot loaded below is a pass-local list, and Firestore is
+        # the only dedup ledger for that channel (KTD3), so this pass holds no partner state to go
+        # stale. Anything a later unit adds at module level -- a per-cycle counter, a budget -- goes
+        # here AND in `test_varsel_api._reset_state`: a leaked half-spent budget is indistinguishable
+        # from a give-up bug. The per-destination delivery skip is the deliberate exception and must
+        # stay pass-local, or one failure pauses a destination permanently (KTD6).
         changed = bool(stale)
+
+    # ---- The one partner read: BEFORE pass 1a, and before the write budget's clock starts -----
+    #
+    # KTD6: the load necessarily precedes 1a, because that is what partner subscriptions are matched
+    # from, and it is the ONLY partner read passes 1a and 1b depend on. Placed outside the
+    # `_state_lock` block above (no store I/O under that lock, `_prepare_alert`'s rule) and before
+    # `_WriteBudget` is constructed below, so a slow store spends the cycle's own tail rather than
+    # silently eating the 30 s wording ceiling. Empty list when the channel is off, unreachable or
+    # slow -- every failure shape is inside the helper.
+    partner_recipients = _load_partner_recipients()
 
     # ---- Loop 1: one impact call per journey definition, one written message per train ---------
     by_journey_key: dict[str, dict] = {}
@@ -2397,6 +2729,23 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         _key = journey_key(journey)
         by_journey_key.setdefault(_key, journey)
         jids_by_key.setdefault(_key, []).append(_jid)
+
+    # The same grouping for the webhook channel, and the merged set pass 1a actually matches.
+    # `by_journey_key` stays BROWSER-ONLY on purpose: it is what `_record_decisions` iterates, and
+    # KTD10 keeps partner subjects out of `varsel_decisions` entirely (that table is published, with
+    # resolved place names, on public hosts). So a definition both channels share is matched once and
+    # recorded once, exactly as today, while a partner-only definition is matched and never recorded.
+    #
+    # `setdefault` order matters: the browser record wins for a shared key. A browser registration
+    # carries `from_name`/`to_name`, the service caveat and the consent version, none of which the
+    # shared work reads -- but `_record_decisions` and `_notification_payload` do, and they must keep
+    # seeing the record the traveller actually registered rather than a partner's projection of it.
+    partner_by_key: dict[str, list[PartnerRecipient]] = {}
+    for recipient in partner_recipients:
+        partner_by_key.setdefault(journey_key(recipient.journey), []).append(recipient)
+    match_targets: dict[str, dict] = dict(by_journey_key)
+    for _key, _recipients in partner_by_key.items():
+        match_targets.setdefault(_key, _recipients[0].journey)
 
     alerts_by_key: dict[str, list[Alert]] = {}
     # What every message about this cycle's decisions is written from, one per journey definition x
@@ -2448,9 +2797,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             return key, []
 
     matched: list[tuple[str, list[Alert]]] = []
-    if by_journey_key:
-        with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(by_journey_key))) as pool:
-            matched = list(pool.map(_match, list(by_journey_key.items())))
+    if match_targets:
+        with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(match_targets))) as pool:
+            matched = list(pool.map(_match, list(match_targets.items())))
 
     # ---- Pass 1b: reconcile, and decide what to write for -- SEQUENTIALLY ----------------------
     #
@@ -2462,7 +2811,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # only loop 2 writes.
     write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int]] = []
     for key, alerts in matched:
-        journey = by_journey_key[key]
+        journey = match_targets[key]
         alerts_by_key[key] = alerts
         for alert in alerts:
             message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
@@ -2488,11 +2837,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 exc_info=True,
                 extra={"fields": {"event": "varsel_reconcile_error"}},
             )
-        if not push_on:
-            # No message writing without push: the text exists to be delivered, and the decision is
-            # recorded with the deterministic wording either way.
-            continue
-        # ONE WORDING PER TRAIN THIS CYCLE WILL PUSH ABOUT, not one per journey (2026-08-21).
+        # ONE WORDING PER TRAIN THIS CYCLE WILL NOTIFY ABOUT, not one per journey (2026-08-21).
         #
         # Loop 2 delivers per train -- `one_alert_per_train`, the same collapse applied here --
         # while this loop wrote for `next(a for a in alerts if a.alertworthy)` alone. So a journey
@@ -2512,10 +2857,28 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         # train is still written for, because the in-app journey card reads these same wordings
         # through `_deliverable_message` and would otherwise decay to the template as soon as
         # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
-        pending = _pending_pushes(jids_by_key.get(key, ()), alerts)
-        subjects = (pending or [a for a in one_alert_per_train(alerts) if a.alertworthy][:1])[
-            :_MAX_MESSAGES_PER_JOURNEY
-        ]
+        # It is gated on `push_on` because the CARD is the reader it exists for, and the card is
+        # the browser channel; a partner subject with nothing pending has already been told.
+        #
+        # KTD4's gate, expressed as three lines rather than a boolean somewhere else. `jids` are
+        # withheld when push is off -- see `_pending_pushes` for why that half is load-bearing --
+        # so `pending` is exactly "a recipient on some channel still needs telling about this
+        # train", and `push_on or pending` is exactly "some channel can deliver". With no partner
+        # recipients (every deployment until the store lands, and every existing test) both
+        # predicates reduce to what they were: `pending` is the browser list, and the guard below
+        # is the old `if not push_on: continue`.
+        pending = _pending_pushes(
+            jids_by_key.get(key, ()) if push_on else (), alerts, partner_by_key.get(key, ())
+        )
+        if not push_on and not pending:
+            # No deliverable recipient on ANY channel: a keypair-less deployment with no partner
+            # subscription pending for this journey. The decision is still recorded below, with the
+            # deterministic wording, and `message_status` still reads `push_disabled` for it.
+            continue
+        subjects = (
+            pending
+            or ([a for a in one_alert_per_train(alerts) if a.alertworthy][:1] if push_on else [])
+        )[:_MAX_MESSAGES_PER_JOURNEY]
         for subject in subjects:
             message_key = _message_key(key, subject)
             with _state_lock:

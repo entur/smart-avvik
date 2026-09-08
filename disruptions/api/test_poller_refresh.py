@@ -448,6 +448,100 @@ def test_neither_the_page_nor_the_api_answers_while_the_master_gate_is_off():
     assert main._TOGMELDING_STATIC_DIR.name == "togmelding_static"
 
 
+# --- The partner notification channel's gate and its (non-)effect on the cycle -------------------
+
+
+def test_the_partner_notifications_flag_is_an_allow_list_with_unset_off():
+    """U2 scenario 5, the flag half: only true/1/yes/on enable, and UNSET is OFF.
+
+    ONE flag, unlike `_togvarsel_notify_enabled`'s two — rushvarsel has a master product gate over
+    three surfaces and the partner channel has one. What is copied is the parse and the failure
+    direction, which is what actually matters: a typo reads as off, and the code default matches
+    the closed gate rather than relying on a helm value being present. Read at CALL time, so this
+    can set the environment per case without an import dance.
+    """
+    import os
+
+    with _env(PARTNER_NOTIFICATIONS_ENABLED=None):
+        assert main._partner_notifications_enabled() is False, "unset must be off"
+        for value, want in (
+            ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
+            (" true ", True), ("false", False), ("", False), ("off", False), ("disabled", False),
+            ("0", False),
+        ):
+            os.environ["PARTNER_NOTIFICATIONS_ENABLED"] = value
+            assert main._partner_notifications_enabled() is want, value
+
+
+def test_the_partner_channel_adds_no_rebuild_phase_and_changes_no_step_isolation():
+    """U2 scenario 6: the cycle's phase set and every step's isolation are UNCHANGED.
+
+    The plan's U2 text says the phase set "gains one step". It does not, and it should not: KTD6
+    puts the partner read inside `check_and_notify`, immediately before pass 1a, because that is
+    what the subscriptions are matched from — and the orchestrator's injected-provider seam has
+    `varsel` calling the store, not `main` loading it and passing it down. A `main._phase` would
+    therefore have to time a call it does not make. So the load rides inside the existing
+    `varsel_notify` phase, which is the cycle's last, and its own cost is reported as one
+    `event="varsel_partner_load"` record per cycle instead.
+
+    Pinned as an exact tuple rather than a containment check, in both directions: a phase silently
+    added here is a cycle-timing change nobody asked for, and a phase silently REMOVED is how a
+    step stops being timed while `poller_cycle`'s `phases` breakdown still looks complete.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(main._rebuild_all)
+    phases = tuple(re.findall(r'_phase\(\s*"([a-z_]+)"', source))
+    assert phases == (
+        "rail_calls",
+        "disruptions_sql",
+        "categories",
+        "predict_sql",
+        "disruptions_cache",
+        "impact_lookup",
+        "svv_baselines",
+        "rail_planned_calls",
+        "predict_calls_rail",
+        "disruptions_bus_sql",
+        "bus_planned_calls",
+        "predict_calls_bus",
+        "call_predictions_cache",
+        "varsel_stops",
+        "varsel_recheck_service",
+        "varsel_notify",
+    ), phases
+    # And the alerting step is still isolated exactly as it was: its own try/except, so a partner
+    # store outage inside it degrades alerting alone and the feed rebuild above it is untouched.
+    # `_phase` re-raises by design (test_phase_does_not_swallow_the_exception), so the try/except
+    # around the `with` is the only thing that contains it.
+    notify = source[source.index('_phase("varsel_notify"') :]
+    assert "except Exception:" in notify and "Avviksvarsel notify failed" in notify
+    assert "No-op when VAPID is unconfigured" not in source, (
+        "the comment was false before this change and is more so now: scoring, recording and -- "
+        "where any channel can deliver -- wording all run without a keypair"
+    )
+
+
+def test_the_partner_gate_is_injected_into_varsel_and_the_store_is_not_yet():
+    """U2's seam, asserted at the wiring rather than in prose.
+
+    `main` injects the flag now and NO recipient provider: the Firestore-backed store is a later
+    unit, and both halves default to off, so this deployment matches no partner subscription
+    whatever the flag says. Checked over `lifespan`'s source because entering the lifespan starts
+    the poller thread, which this suite must never do (it spends real BigQuery money per cycle).
+    """
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    configure = source[source.index("varsel.configure(") :]
+    configure = configure[: configure.index("llm_message.configure(")]
+    assert "partner_enabled=_partner_notifications_enabled" in configure
+    assert "partner_recipients_provider" not in configure, (
+        "the store is a later unit; wiring it here would enable a channel with no reader"
+    )
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
