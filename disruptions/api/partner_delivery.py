@@ -114,12 +114,46 @@ class DeliveryReport:
 
     ``skipped_destinations`` is the count of destinations that stopped being attempted this cycle,
     which with ``failed`` is what tells "one endpoint is unwell" from "every endpoint is".
-    ``paused`` is the 410 count: an operator has to resume those, so they must not read as ordinary
-    failures.
+
+    **Two grains, and mixing them made a report field depend on thread interleaving.** Every
+    counter here except ``paused`` and ``skipped_destinations`` is per EVENT -- an invariant of the
+    work, so N pending events against a gone endpoint is N of them. Those two are per DESTINATION,
+    counted off sets. ``paused`` used to be incremented per attempt that answered 410, so two
+    events against one gone endpoint reported ``paused=2`` when the workers overlapped and
+    ``paused=1`` when they did not: the second worker's `_Skips` check races the first worker's
+    write, and the pool is four wide. Nothing was broken -- `partner_auth.pause_destination` is
+    idempotent -- but a field whose value the scheduler decides is a bad operational signal, and
+    this record is what a human reads during an incident. A 410 event is now counted as
+    ``cancelled``, which is the state its record was just given, and ``paused`` answers the
+    different question of how many destinations an operator has to resume.
+
+    ``sent`` counts FRESH successes only -- one notification the partner did not already have, one
+    of R11's four slots spent. Two counters exist beside it because a late arrival writes nothing
+    and must not be filed as a send. The pass abandons an attempt's thread when its bounded wait
+    expires (it cannot kill a thread parked in a socket read); the next cycle legitimately re-sends
+    the same still-pending event; and the abandoned thread then returns and asks the store to
+    record a success that has already been recorded. ``partner_store`` now refuses that write and
+    answers ``already_resolved`` -- so this side has to stop counting it, or the log record U8
+    publishes as operational telemetry over-reports deliveries by however many threads were
+    abandoned.
+
+    ``superseded`` is split out from ``already_resolved`` rather than folded into it because it
+    means something different to a reader: a newer revision replaced the delivery, so nothing was
+    recorded here AND the replacement spends its own slot. ``already_resolved`` is every other
+    terminal state the record turned out to hold -- already ``sent``, ``cancelled``, ``expired``,
+    ``failed``. All three are mutually exclusive with ``sent`` and with each other.
+
+    Both counters can also rise on an attempt that FAILED at the socket, which is deliberate and
+    would otherwise surprise a reader: the store refuses a terminal failure write to a resolved
+    record too, so nothing was written and nothing will be retried, and counting that ``retryable``
+    would be a false promise. The destination is still skipped for the rest of the cycle -- the
+    endpoint really did misbehave.
     """
 
     ready: int = 0
     sent: int = 0
+    already_resolved: int = 0
+    superseded: int = 0
     failed: int = 0
     retryable: int = 0
     expired: int = 0
@@ -187,6 +221,7 @@ class _Skips:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._out: set[str] = set()
+        self._paused: set[str] = set()
         self._records: dict[str, partner_auth.Destination | None] = {}
 
     def is_out(self, destination_id: str) -> bool:
@@ -200,6 +235,21 @@ class _Skips:
     def count(self) -> int:
         with self._lock:
             return len(self._out)
+
+    def pause_recorded(self, destination_id: str) -> None:
+        """Note that this destination was successfully paused during this pass.
+
+        A SET, so the report says how many destinations were paused rather than how many attempts
+        happened to call `pause_destination` -- see :class:`DeliveryReport`. Recorded only on
+        success, so the number means "an operator now has this to resume", which is what makes it
+        worth a human's attention during an incident.
+        """
+        with self._lock:
+            self._paused.add(destination_id)
+
+    def paused_count(self) -> int:
+        with self._lock:
+            return len(self._paused)
 
     def destination(self, destination_id: str) -> partner_auth.Destination | None:
         """The destination record, read at most once per pass.
@@ -394,21 +444,29 @@ def _attempt(
         # Recording nothing is the right direction -- the next cycle re-sends and the receiver's own
         # inbox suppresses the duplicate, which is the contract (R12, at-least-once). Marking it
         # failed would be a lie about what happened.
-        if _store_step(
+        outcome = _store_step(
             "sent",
             delivery,
             lambda: partner_store.mark_delivery_sent(delivery.delivery_id, now=now),
-        ) is None:
+        )
+        if outcome is None:
             return "store_errors"
-        return "sent"
+        # The write is idempotent and says so. A late arrival from a thread the previous cycle
+        # abandoned found the delivery already resolved, wrote nothing, and spent no slot -- so it
+        # is not a send, however successful the HTTP call it just made was. See `DeliveryReport`.
+        return _resolved_kind(outcome) or "sent"
 
     if attempt.pause_destination:
         # R12: a 410 pauses the DESTINATION until an operator resumes it. Idempotent in
-        # `partner_auth`, so a backlog against a gone endpoint cannot fill the audit collection.
+        # `partner_auth`, so a backlog against a gone endpoint cannot fill the audit collection --
+        # and it is still called per attempt rather than claimed once under the lock, so that a
+        # pause which FAILS can be retried by the next of this cycle's attempts instead of being
+        # swallowed by a claim nobody releases.
         try:
             partner_auth.pause_destination(
                 delivery.destination_id, reason=f"delivery {attempt.error or 'gone'}"
             )
+            skips.pause_recorded(delivery.destination_id)
         except Exception:
             logger.warning(
                 "Could not pause a destination that answered 410; it is re-attempted next cycle",
@@ -416,7 +474,7 @@ def _attempt(
                 extra={"fields": {"event": "partner_delivery", "result": "pause_failed",
                                   "destination_id": delivery.destination_id}},
             )
-    if _store_step(
+    failure = _store_step(
         "failed",
         delivery,
         lambda: partner_store.mark_delivery_failed(
@@ -429,14 +487,27 @@ def _attempt(
             terminal_state=attempt.terminal_state or "failed",
             now=now,
         ),
-    ) is None:
+    )
+    if failure is None:
         return "store_errors"
     # FIRST failure, and the destination is out for the rest of the cycle. What that protects is not
     # tidiness: `http.client`'s read timeout is per-recv, so N pending events against one hung
     # endpoint is N multiples of it on the poller's own thread.
     skips.drop(delivery.destination_id)
+    # The endpoint really did misbehave, so the destination is out for the rest of the cycle either
+    # way -- but `retryable` would be a false promise for a record another pass has already
+    # resolved: nothing was written and nothing will be retried. This is the failure half of the
+    # same late-arrival race as the success branch, and `_failed_body` guards against it for a
+    # sharper reason: unguarded it set an already-`sent` delivery back to `pending`, so the next
+    # cycle sent the partner a second copy.
+    resolved = _resolved_kind(failure)
+    if resolved is not None:
+        return resolved
     if attempt.pause_destination:
-        return "paused"
+        # The EVENT's outcome, which is what the per-attempt counters are about: `cancelled` is the
+        # state just written to its record, so the report and the store agree. How many
+        # DESTINATIONS were paused is a different question and is counted off a set.
+        return "cancelled"
     return "retryable" if attempt.retryable else "failed"
 
 
@@ -473,6 +544,28 @@ def _store_step[T](step: str, delivery: partner_store.Delivery, call: Callable[[
             },
         )
         return None
+
+
+def _resolved_kind(outcome: Any) -> str | None:
+    """Which counter a terminal write belongs to, or ``None`` for an ordinary fresh one.
+
+    ``partner_store`` refuses a terminal write to a delivery that is no longer ``pending`` and
+    answers ``already_resolved=True`` with the state the record actually holds. That is not an
+    error -- the partner did receive the event, and raising would log a store failure and read as
+    an outage -- but it is not a fresh delivery either, so it gets its own counter.
+
+    ``superseded`` is separated because the slot accounting differs: a newer revision replaced this
+    delivery and spends R11's slot itself, where every other resolved state means the slot question
+    was settled when the record first reached it.
+
+    ``getattr`` rather than attribute access, deliberately: the field is additive on
+    ``DeliveryOutcome`` and this keeps the module working against a store that predates it -- the
+    same defensive read `CallPred` uses for the SIRI boarding activities, and for the same reason,
+    which is the cycle immediately after a deploy where one side is newer than the other.
+    """
+    if not getattr(outcome, "already_resolved", False):
+        return None
+    return "superseded" if getattr(outcome, "state", "") == "superseded" else "already_resolved"
 
 
 def _expire_stale(stale: tuple[str, ...], *, now: datetime, budget: _DeliveryBudget) -> tuple[int, int]:
@@ -594,6 +687,8 @@ def deliver_pending(
     report = DeliveryReport(
         ready=len(pending.ready),
         sent=counts.get("sent", 0),
+        already_resolved=counts.get("already_resolved", 0),
+        superseded=counts.get("superseded", 0),
         failed=counts.get("failed", 0),
         retryable=counts.get("retryable", 0),
         expired=counts.get("expired", 0),
@@ -601,7 +696,7 @@ def deliver_pending(
         capped=counts.get("capped", 0),
         gone=counts.get("gone", 0),
         not_deliverable=counts.get("not_deliverable", 0),
-        paused=counts.get("paused", 0),
+        paused=skips.paused_count(),
         skipped=counts.get("skipped", 0),
         skipped_destinations=skips.count(),
         store_errors=counts.get("store_errors", 0),
@@ -624,6 +719,10 @@ def deliver_pending(
                 "result": "timeout" if timed_out else "ok",
                 "ready": report.ready,
                 "sent": report.sent,
+                # Beside `sent` rather than added into it: U8 publishes this record as operational
+                # telemetry, so "we delivered N notifications" has to mean that.
+                "already_resolved": report.already_resolved,
+                "superseded": report.superseded,
                 "failed": report.failed,
                 "retryable": report.retryable,
                 "expired": report.expired,

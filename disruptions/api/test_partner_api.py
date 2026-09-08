@@ -169,8 +169,12 @@ class _Ref:
         self.client = client
         self.path = path
 
-    def get(self, transaction: Any = None) -> _Snap:
-        del transaction
+    def get(self, transaction: Any = None, timeout: float | None = None) -> _Snap:
+        # `timeout` is accepted and ignored: every read in `partner_store` now carries its own
+        # Firestore deadline (KTD6 -- an abandoned worker thread with no call deadline delays
+        # pod termination via `concurrent.futures`' atexit join). `test_partner_store` is where
+        # the deadline is asserted; this double only has to tolerate the kwarg.
+        del transaction, timeout
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
 
 
@@ -203,7 +207,8 @@ class _Page:
         self.client = client
         self.rows = rows
 
-    def stream(self) -> list[_Snap]:
+    def stream(self, timeout: float | None = None) -> list[_Snap]:
+        del timeout
         return [_Snap(path, data, self.client) for path, data in self.rows]
 
 
@@ -221,7 +226,8 @@ class _Txn:
     def delete(self, ref: _Ref) -> None:
         self.writes.append(("delete", ref.path, None))
 
-    def get(self, query: Any) -> list[_Snap]:
+    def get(self, query: Any, timeout: float | None = None) -> list[_Snap]:
+        del timeout
         return list(query.stream())
 
 
