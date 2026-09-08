@@ -13,6 +13,12 @@ def _(mo):
     residue filtered out. PostHog holds the isolated response; BigQuery holds the exact
     alert the traveller was looking at; `context_id` is the only join key.
 
+    It opens on **prd** over the **last 30 days, today included**, and fetches as soon as it
+    loads — there is nothing to set and nothing to press. That is PostHog's whole retention
+    window, so the default view is every response that still exists. The controls below are
+    the override; **Refresh** asks the same window again, which is how feedback that arrived
+    since the page loaded appears.
+
     **This notebook must never move to `eval/`.** `disruptions/api/export_eval.sh` globs
     `eval/*.py`, renders every notebook it finds to static HTML, and that directory is
     *committed* and shipped in the image — which would put travellers' free text and their
@@ -85,18 +91,38 @@ def imports():
 
 @app.cell(hide_code=True)
 def controls(TARGETS, date, mo, timedelta):
+    # Defaults are what this page is opened for: prd, the last thirty days including today.
+    # The window ran two days on dev behind a "Run export" button until 2026-09-08, which meant
+    # three widgets and a click before anything appeared — and the pre-click state renders as
+    # `mo.stop`'s "an ancestor was stopped" on every downstream cell, which reads like a broken
+    # notebook rather than like a prompt. The fetch now runs on load and on any change to these
+    # three, so the controls are the override rather than the entry fee. `date.today()` is the
+    # LOCAL date against a window labelled UTC; the exclusive end is today + 1, so today is
+    # covered whichever of the two calendars is a few hours ahead.
+    #
+    # Thirty and not seven because the feedback is SPARSE — six responses in the trailing week of
+    # prd on 2026-09-08 — so a week-wide default is mostly an empty table. Thirty is also the whole
+    # of PostHog's 30-day event retention, which makes this the widest default that can return
+    # anything: a longer one would only add days the project has already deleted, and would leave
+    # no room under the exporter's own 31-day cap. Contexts are retained 45 days, so every response
+    # in this window can still be joined to the alert behind it — the reason `expired_context`
+    # should stay absent from `issues` at this width.
     _today = date.today()
     environment = mo.ui.dropdown(
-        options=list(TARGETS), value="dev", label="Environment"
+        options=list(TARGETS), value="prd", label="Environment"
     )
-    from_date = mo.ui.date(value=_today - timedelta(days=1), label="From (UTC, inclusive)")
+    from_date = mo.ui.date(value=_today - timedelta(days=29), label="From (UTC, inclusive)")
     to_date = mo.ui.date(value=_today + timedelta(days=1), label="To (UTC, **exclusive**)")
-    run = mo.ui.run_button(label="Run export")
+    # Not a gate any more: the fetch re-runs on its own when the window changes, and this only
+    # forces the same window to be asked again. Worth having because `fetch_posthog` sets
+    # force_blocking — asking twice is how newly ingested feedback appears, not a repeat of a
+    # cached answer.
+    refresh = mo.ui.run_button(label="Refresh")
     mo.vstack([
         mo.hstack([environment, from_date, to_date], justify="start", gap=1),
-        run,
+        refresh,
     ])
-    return environment, from_date, run, to_date
+    return environment, from_date, refresh, to_date
 
 
 @app.cell(hide_code=True)
@@ -104,8 +130,11 @@ def target(TARGETS, environment, from_date, mo, to_date):
     project, posthog_project_id = TARGETS[environment.value]
     _days = (to_date.value - from_date.value).days
     # The tool's own bounds, checked here so a bad window costs a message rather than a
-    # traceback halfway through a network call.
-    _problem = (
+    # traceback halfway through a network call. It is RETURNED, not just rendered: nothing
+    # stands between these widgets and the network any more, so a window the user is halfway
+    # through editing (To moved before From, or dragged past 31 days) reaches the fetch on the
+    # keystroke. A message read by a human was enough while a button separated the two.
+    window_problem = (
         "`To` must be after `From` (it is exclusive)." if _days <= 0
         else "The window is limited to 31 days." if _days > 31
         else None
@@ -113,9 +142,9 @@ def target(TARGETS, environment, from_date, mo, to_date):
     mo.md(
         f"**{environment.value}** → BigQuery `{project}` · PostHog project `{posthog_project_id}`"
         f" · {_days} day(s)"
-        + (f"\n\n/// attention | Fix the window\n{_problem}\n///" if _problem else "")
+        + (f"\n\n/// attention | Fix the window\n{window_problem}\n///" if window_problem else "")
     )
-    return posthog_project_id, project
+    return posthog_project_id, project, window_problem
 
 
 @app.cell
@@ -129,13 +158,17 @@ def fetch(
     os,
     posthog_project_id,
     project,
-    run,
+    refresh,
     timedelta,
     to_date,
+    window_problem,
 ):
+    # Read so that pressing Refresh re-runs this cell. The button resets itself to False
+    # without notifying, so reading it cannot make the fetch fire twice.
+    refresh.value
     mo.stop(
-        not run.value,
-        mo.md("Set the window above and press **Run export**."),
+        window_problem is not None,
+        mo.md("_Fix the window above before anything is fetched._"),
     )
     _token = os.environ.get(exporter.TOKEN_ENV)
     mo.stop(
