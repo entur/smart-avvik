@@ -57,15 +57,19 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import deployment
 import feedback  # the /varsel feedback stack; gates and mints are shared, see togmelding_today
 import feedback_contexts
 from deployment import environment_label
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+# Every route here is gated on SHOW_RUSHVARSEL (deployment.show_rushvarsel): while the product is
+# dark, all of /togmelding-api answers a plain 404. At ROUTER level rather than per route, so a
+# route added below is gated by construction rather than by remembering to add a decorator.
+router = APIRouter(dependencies=[Depends(deployment.require_rushvarsel)])
 
 _OSLO = ZoneInfo("Europe/Oslo")
 

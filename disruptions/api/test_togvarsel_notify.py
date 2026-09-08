@@ -25,6 +25,12 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+# Rushvarsel's master gate, pinned ON before the module is imported: both routes here carry a
+# router-level dependency on it and 404 while it is off (its default). Set at import, the way
+# test_varsel_api pins KIX_ENVIRONMENT — each suite is its own process. The policy core needs no
+# such pin: `enabled` is an injected seam, and main.py is where the two flags are ANDed.
+os.environ["SHOW_RUSHVARSEL"] = "true"
+
 import togvarsel_notify
 import varsel
 from fastapi import FastAPI
@@ -1325,6 +1331,37 @@ def test_the_outlook_endpoint_serves_the_panel(monkeypatch):
     assert asked == ["dev-1"]
     assert body == {"rushes": [{"rush": "am", "issue": "0700",
                                 "scope": "morgenrushet 07:00–09:00", "level": "red", "p": 0.44}]}
+
+
+def test_both_routes_404_while_the_master_gate_is_off(monkeypatch):
+    """SHOW_RUSHVARSEL off (its default) 404s the outlook panel AND the dev-only test trigger.
+
+    The trigger is the one that matters, and it is why the gate had to be at router level rather
+    than folded into the `enabled` seam: _TRIGGER_SEAMS deliberately omits `enabled` so the pipe
+    can be proven before the delivery flag opens, which means nothing else here would stop it
+    sending a real rush-forecast push while the product is meant to be dark. Checked in dev, where
+    it is otherwise reachable — anywhere else its own environment gate 404s it regardless, which
+    would make this pass for the wrong reason.
+    """
+    monkeypatch.setattr(togvarsel_notify, "rush_outlook", lambda device_id, now=None: [])
+    app = FastAPI()
+    app.include_router(togvarsel_notify.router)
+    with _deployed_as("ent-kixavvik-dev"), TestClient(app) as client:
+        for value in ("false", "", "0", "off", "disabled"):
+            os.environ["SHOW_RUSHVARSEL"] = value
+            try:
+                assert client.get(
+                    "/togmelding-api/outlook", params={"device_id": "dev-1"}
+                ).status_code == 404, value
+                assert client.post(
+                    "/togmelding-api/test-notify", json={"device_id": "dev-trig-1"}
+                ).status_code == 404, value
+            finally:
+                os.environ["SHOW_RUSHVARSEL"] = "true"
+        # And on again: the outlook answers, so the 404s above are the gate and not a broken app.
+        assert client.get(
+            "/togmelding-api/outlook", params={"device_id": "dev-1"}
+        ).status_code == 200
 
 
 # ---- The round record /rushhistorikk scores ------------------------------------------------
