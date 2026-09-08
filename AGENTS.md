@@ -280,6 +280,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   published privacy texts stay duplicated in `demo/togmelding/src/personvern.ts` (the app cannot
   import /varsel's module: its Docker stage copies only its own directory), guarded by
   `disruptions/api/test_personvern_texts.py`, which compares both modules' resolved constants.
+  **`SHOW_RUSHVARSEL` (`deployment.show_rushvarsel`) is the master gate, OFF in every environment
+  since 2026-09-08** — the product is not ready to be shown. While off: no rush-forecast push,
+  `/togmelding` unmounted and all of `/togmelding-api` 404 — closed twice, by `main` skipping
+  `include_router` (which is what keeps it off `/docs`) and by a router-level
+  `deployment.require_rushvarsel` (which holds per request, including the dev test trigger) —
+  and `/varsel` mentions rushvarsel nowhere (both surfaces follow
+  `/config`'s `togvarsel_notify`, which `main._togvarsel_notify_enabled` ANDs with it). It does not
+  replace `TOGVARSEL_NOTIFY_ENABLED` — dev's and prd's `"true"` stay, so re-enabling is one value
+  per environment — and it does not stop `togvarsel.refresh()`/`togvarsel_outcomes.refresh()`, so
+  /rushhistorikk keeps measuring the model (expect every issue to read as reconstructed there).
   `GET /togmelding-api/outlook?device_id=…` (`togvarsel_notify.rush_outlook`) is the same forecast
   narrowed to a device, for the status panel at the top of `/varsel` — the push policy read-only,
   bounded by the rush's end rather than the registration's, and reading the poller's station cache

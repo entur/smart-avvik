@@ -44,6 +44,15 @@ common:
       # states the posture where an operator looks. Dev opts in; tst/prd stay off (prd would
       # additionally need the runtime tables, see data/queries/copy_runtime_to_prd.sh).
       TOGVARSEL_NOTIFY_ENABLED: "false"
+      # Rushvarsel's MASTER gate (deployment.show_rushvarsel), above the flag just above it: while
+      # this is off no rush-forecast push is sent, /togmelding and every /togmelding-api route
+      # answer 404, and /varsel mentions rushvarsel nowhere. Off in every environment since
+      # 2026-09-08 — the product is not ready to be shown, and a partner finding it would be
+      # noise. Turning it back on is this one value per environment: the per-environment
+      # TOGVARSEL_NOTIFY_ENABLED values above are deliberately left as they were, and the forecast
+      # itself keeps being issued and scored either way, so /rushhistorikk keeps measuring the
+      # model while the product is dark.
+      SHOW_RUSHVARSEL: "false"
       # Non-secret EU ingestion origin. Capture and review credentials stay separate.
       POSTHOG_HOST: https://eu.i.posthog.com
       # Entur-SSO gate (sso.py) for the internal surfaces /historikk, /meldinger and /demo —
