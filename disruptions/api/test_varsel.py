@@ -20,6 +20,7 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import alert_policy
 import alternatives
 import impact
 import main
@@ -938,10 +939,10 @@ def test_push_body_names_an_in_time_alternative():
 def test_the_vehicle_noun_is_capitalized_only_where_it_heads_a_line():
     """"Alternativ tog R11 08:24", not "Alternativ Tog R11 08:24" (2026-08-20).
 
-    Both labels come from `_train_label`, but they land in different places: the traveller's own
-    train heads its own line, where the capital is the sentence's, and the alternative sits
-    mid-clause after "Alternativ", where bokmål wants an ordinary common noun. `_LEG_MODE_NOUN`
-    carries the lower-case form for exactly that reason — the alert's `mode` ("Tog") is a label in
+    Both labels come from `notification_wording.train_label`, but they land in different places:
+    the traveller's own train heads its own line, where the capital is the sentence's, and the
+    alternative sits mid-clause after "Alternativ", where bokmål wants an ordinary common noun.
+    `notification_wording._LEG_MODE_NOUN` carries the lower-case form for exactly that reason — the alert's `mode` ("Tog") is a label in
     the payload, not a spelling. The system prompt asks the model for the same thing, so the two
     writers stay comparable on this axis rather than differing by orthography.
     """
@@ -973,9 +974,10 @@ def test_the_alternative_names_the_leg_the_traveller_has_to_catch():
 
 
 def test_an_alternative_this_codebase_has_no_noun_for_still_names_its_line():
-    """Each missing part costs only itself. A mode outside `_LEG_MODE_NOUN` yields no vehicle noun
-    -- a guessed one would put the wrong vehicle on a lock screen -- while the line and the time
-    still identify the departure, and a leg with neither falls back to the time alone."""
+    """Each missing part costs only itself. A mode outside `notification_wording._LEG_MODE_NOUN`
+    yields no vehicle noun -- a guessed one would put the wrong vehicle on a lock screen -- while
+    the line and the time still identify the departure, and a leg with neither falls back to the
+    time alone."""
     unknown_mode = _alternative(legs=[
         alternatives.AlternativeLeg(mode="funicular", line="X:Line:F1", public_code="F1"),
     ])
@@ -1231,7 +1233,8 @@ def test_an_alternative_that_became_risky_drops_the_written_message():
     assert dropped is None, "a clean escape that stopped being one is different advice"
 
     # The same for the other flag a wording states: arriving after the planned time is the caveat
-    # `_alternative_phrase` adds, and it must not survive on a journey that now arrives in time.
+    # `notification_wording.alternative_phrase` adds, and it must not survive on a journey that
+    # now arrives in time.
     _, dropped, _ = _reconcile_cycle(
         cached=_alternative(**_LATE_ALTERNATIVE),
         fresh=_alternative(**{**_LATE_ALTERNATIVE, "arrives_before_original": True}),
@@ -1442,6 +1445,90 @@ def _cancelled_alert(alternative):
         delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
         alternative_journey=alternative,
     )
+
+
+# ---- the extraction is a no-op for /varsel (U1 characterization) -------------------------------
+def test_every_field_of_a_matched_alert_is_what_it_was_before_the_wording_moved():
+    """The full row, not a spot check.
+
+    U1 moved the wording out of this module and routed the alert gate through `alert_policy.gate`.
+    Both are meant to be no-ops for `/varsel`, and a no-op is only demonstrable against the whole
+    object: `alert_threshold` and `alertworthy` are recorded on every `varsel_decisions` row and
+    are what `/historikk`'s precision is computed over, `jkey` / `stop_place` / `stop_order` are
+    the ET join key the nightly labelling job uses, and `mode` is read straight into two wordings.
+    A silent change in any of them is a changed decision log.
+    """
+    install({"S1": _train(MON_0800, jkey="j1")})
+    alerts = varsel.match_journey(_journey(), NOW)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.model_dump(
+        include={
+            "situation_number", "summary", "operator", "mode", "has_situation", "line",
+            "departure_time", "jkey", "stop_place", "stop_order", "cancelled",
+            "cancel_probability", "delay_p50_min", "delay_p90_min", "ge10_probability",
+            "impact_probability", "alert_threshold", "alertworthy",
+        }
+    ) == {
+        "situation_number": "S1",
+        "summary": "Signalfeil",
+        "operator": "VYG",
+        "mode": "Tog",
+        "has_situation": True,
+        "line": "VYG:Line:R10",
+        "departure_time": MON_0800,
+        "jkey": "j1",
+        "stop_place": "A",
+        "stop_order": 1,
+        "cancelled": False,
+        "cancel_probability": 0.5,
+        "delay_p50_min": 3,
+        "delay_p90_min": 12,
+        "ge10_probability": 0.8,
+        "impact_probability": 0.9,
+        "alert_threshold": 0.65,
+        "alertworthy": True,
+    }
+    assert alert.decided_at == NOW
+
+
+def test_the_gate_is_reached_rather_than_restated_at_this_surface():
+    """One threshold contract, two adapters (KTD1/KTD2).
+
+    `alert_policy.gate` is `threshold_for` plus the comparison — including the rule that a missing
+    probability is never alert-worthy. Restating `>= threshold` here is how a second surface
+    quietly acquires a cancellation-probability fallback, or starts reading a NULL as a low score;
+    the two severity orders drifted exactly that way before `impact` was extracted.
+
+    Both halves matter, so both are asserted: the threshold this surface RECORDS and the verdict it
+    APPLIES come out of one call. Asking twice is how the recorded bar and the applied bar come to
+    be two different numbers on one decision row.
+    """
+    import inspect
+
+    source = inspect.getsource(varsel._collect_alerts)
+    assert "gate(impact_p, sit.operator" in source
+    assert ">= threshold" not in source
+    assert varsel.gate is alert_policy.gate, "reached, not copied"
+
+    install({"S1": _train(MON_0800, jkey="j1", p_impact_dep=0.9)})
+    alert = varsel.match_journey(_journey(), NOW)[0]
+    assert (alert.alert_threshold, alert.alertworthy) == alert_policy.gate(
+        alert.impact_probability, alert.operator, has_situation=alert.has_situation
+    )
+
+
+def test_the_wording_varsel_sends_is_the_shared_one_and_not_a_copy():
+    """`main` injects `varsel._deterministic_body` into `/meldinger`, and two suites assert push
+    bodies against it. The alias must BE the shared function: two implementations that agree today
+    would split every wording comparison in the decision log the first time one of them changed."""
+    import notification_wording
+
+    assert varsel._deterministic_body is notification_wording.deterministic_body
+    assert varsel._notification_title is notification_wording.notification_title
+    assert varsel._train_label is notification_wording.train_label
+    assert varsel._delay_phrase is notification_wording.delay_phrase
+    assert varsel.mode_label is notification_wording.mode_label
 
 
 if __name__ == "__main__":
