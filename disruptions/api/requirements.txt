@@ -11,6 +11,11 @@ tzdata>=2026.3
 # subscription/journey state in a GCS blob so it survives redeploys.
 pywebpush>=2.3.0
 google-cloud-storage>=3.13.0
+# Partner notification webhooks (partner_store.py): subscriptions, events and delivery state in
+# Firestore Native, one named database per environment (KTD5). gRPC only -- there is no REST
+# fallback -- and the import is LAZY (inside _client()), so a deployment that has not enabled the
+# channel neither imports it nor needs credentials for it.
+google-cloud-firestore>=2.30.0
 # Avviksvarsel push text (llm_message.py): Claude Sonnet 5 on Vertex AI, with Gemini on Vertex as
 # the fallback when the project cannot serve Anthropic publisher models. Both authenticate with the
 # runtime SA's ADC (roles/aiplatform.user, already granted for AI.CLASSIFY) -- no API keys. Neither
