@@ -67,6 +67,24 @@ POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" \
 uv run marimo edit data/feedback/review_feedback.py
 ```
 
+It opens on **prd** over the **last 30 days including today** and fetches on load: there is no
+window to set and no button to press. Thirty because the feedback is sparse — six responses in the
+trailing week of prd on 2026-09-08 — and because it is the whole of PostHog's 30-day event
+retention, so the default view is every response that still exists and a wider one would only ask
+for days the project has already deleted. It also sits one day under the exporter's own 31-day cap,
+and comfortably inside the 45-day context retention, which is why `expired_context` should stay
+absent from `issues` at this width. That replaced a two-day dev default behind a **Run export**
+button on 2026-09-08 — the pre-click state is `mo.stop`, which renders as "this cell wasn't run
+because an ancestor was stopped" on every cell below it, so the page a reviewer met most often was
+one that looked broken. The three controls remain as the override, and **Refresh** asks the same
+window again, which is how feedback ingested since the page loaded appears (`fetch_posthog` sets
+`force_blocking`, so a repeat is a real query rather than PostHog's cached answer). Two things the
+button had been quietly doing had to be replaced rather than dropped: the window bounds are now
+returned from the `target` cell and stop the fetch, because a half-edited window reaches the network
+on the keystroke once nothing stands between them; and `fetch_contexts` returns `[]` without a
+BigQuery call when the window holds no events, which is what makes firing on every dropdown change
+cheap.
+
 It calls the exporter's own `collapse_events`, `fetch_contexts` and `enrich` by loading this
 directory's script by path, rather than reimplementing them — a divergent copy would be worse than no
 notebook, since it would look like the export without being it. It skips only `write_json`, because
@@ -82,7 +100,11 @@ ended in their own `mo.md(...)`, which renders **nothing** — marimo only displ
 trailing expression, so the button would have looked inert whether it wrote the file or refused to.
 Ruff and the interpreter are both happy with that code. Note also that current marimo closes every
 cell with a `return`, including display-only ones, and re-adds them on save; `pyproject.toml` exempts
-this file from `PLR1711` for that reason rather than fighting the formatter.
+this file from `PLR1711` for that reason rather than fighting the formatter. Neither checker
+covers the defect a hand-edit most plausibly leaves behind: a cell signature naming a variable no
+cell produces. `marimo check` passed on a copy with exactly that, so **run the notebook** after
+editing it — `python data/feedback/review_feedback.py` executes every cell — rather than trusting
+either linter to have exercised the dataflow.
 
 **It must never move to `eval/`.** `disruptions/api/export_eval.sh` globs `eval/*.py`, renders every
 notebook there to static HTML, and `eval_static/` is committed and served publicly at `/eval` — which
