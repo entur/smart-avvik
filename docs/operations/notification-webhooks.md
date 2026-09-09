@@ -27,7 +27,7 @@ on every cycle rather than latched at import.
 `helm/kix-avvik/values.yaml`, uncommented, `notifications` in all three environments.
 Read once at startup by `main.lifespan` → `notification_store.configure(database=...)`.
 
-`notification_store._client()` **raises `NotConfigured` when it is empty and never falls back to
+`notification_store._firestore_client()` **raises `NotConfigured` when it is empty and never falls back to
 `(default)`** — the safe direction, and the reason this base value must stay where it is: remove it
 and a live flag flip becomes a no-op that logs one warning per cycle and reads exactly like a healthy
 deployment with nothing registered.

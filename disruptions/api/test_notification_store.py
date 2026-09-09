@@ -286,12 +286,12 @@ def _install(client: _FakeClient) -> None:
     if not _saved:
         _saved.update(
             {
-                "client": notification_store._client,
+                "client": notification_store._firestore_client,
                 "run": notification_store._run_transaction,
                 "query": notification_store._query,
             }
         )
-    notification_store._client = lambda: client  # type: ignore[assignment]
+    notification_store._firestore_client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
         if client.fail_with is not None:
@@ -329,7 +329,7 @@ def _install(client: _FakeClient) -> None:
 def _uninstall() -> None:
     global _fake
     if _saved:
-        notification_store._client = _saved["client"]  # type: ignore[assignment]
+        notification_store._firestore_client = _saved["client"]  # type: ignore[assignment]
         notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
         notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
@@ -1047,7 +1047,7 @@ def test_the_store_has_no_import_time_side_effect_and_no_reverse_dependency():
     """
     notification_store.reset_for_tests()
     assert notification_store.enabled() is False
-    assert notification_store._client_obj is None
+    assert notification_store._firestore_client_obj is None
     for forbidden in ("import varsel", "import main", "import impact", "import decisions"):
         assert forbidden not in MODULE_SOURCE
     assert "def _load_webhook_recipients" in VARSEL_SOURCE
@@ -1429,10 +1429,10 @@ def test_the_identity_plane_shares_this_modules_one_client():
     client = _FakeClient()
     _install(client)
     try:
-        assert notification_store.client() is client
+        assert notification_store.firestore_client() is client
         # `notification_auth` names no database of its own, so there is one place that decides.
         assert "database" not in inspect.signature(notification_auth.configure).parameters
-        assert "notification_store.client()" in pathlib.Path(
+        assert "notification_store.firestore_client()" in pathlib.Path(
             pathlib.Path(notification_auth.__file__)
         ).read_text()
         notification_auth.configure()
@@ -2785,13 +2785,13 @@ def test_installing_the_fake_twice_still_restores_the_real_functions():
     """
     real_run = notification_store._run_transaction
     real_query = notification_store._query
-    real_client = notification_store._client
+    real_client = notification_store._firestore_client
     _install(_FakeClient())
     _install(_FakeClient())
     _uninstall()
     assert notification_store._run_transaction is real_run
     assert notification_store._query is real_query
-    assert notification_store._client is real_client
+    assert notification_store._firestore_client is real_client
 
 
 def test_every_firestore_call_carries_its_own_deadline():

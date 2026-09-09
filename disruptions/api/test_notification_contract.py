@@ -499,7 +499,7 @@ def test_the_channel_gate_is_read_at_call_time_and_the_wording_flag_at_import():
 def test_the_named_database_never_falls_back_to_the_default_one():
     """The safe direction, and the reason the base Helm value must stay where it is.
 
-    `notification_store._client()` raises rather than opening `(default)`. That is what makes an empty
+    `notification_store._firestore_client()` raises rather than opening `(default)`. That is what makes an empty
     `NOTIFICATION_FIRESTORE_DATABASE` a loud failure instead of a silent one — and it is also what makes
     removing the base chart value dangerous, since a live flag flip would then become a no-op that
     logs one warning per cycle and reads exactly like a healthy deployment with nothing registered.
@@ -508,12 +508,12 @@ def test_the_named_database_never_falls_back_to_the_default_one():
     assert notification_store.database_id() is None
     assert notification_store.enabled() is False
     try:
-        notification_store._client()
+        notification_store._firestore_client()
     except notification_store.NotConfigured:
         pass
     else:  # pragma: no cover - the assertion below is the report
         raise AssertionError(
-            "notification_store._client() no longer raises NotConfigured with no database configured. "
+            "notification_store._firestore_client() no longer raises NotConfigured with no database configured. "
             "A fallback to `(default)` would write client records into a database no Terraform "
             "manages, with no TTL field config and no composite indexes."
         )
