@@ -262,13 +262,18 @@ committed statement the emulator enforces.
 Two planes, and only one of them has retention.
 
 **Notification plane** — `subscriptions`, `alert_subjects`, `events`,
-`deliveries`. All four TTL on `expires_at`. All four **top level**, carrying a
+`deliveries`. Every subscription document carries `channel` (`webhook` today; `web_push` is the value
+`/varsel`'s registrations take when they move into this store, named now so that move is a new value
+and not a backfill) and `daily_cap` (the client's, copied on every client write). All four TTL on
+`expires_at`. All four **top level**, carrying a
 `subscription_id`, because a document delete does not remove subcollections and a TTL field does not
 cascade into them — as subcollections they would be orphaned by a delete and the delivery query would
 keep returning them forever.
 
 **Identity plane** — `clients`, `credentials`, `destinations`,
-`admin_audit`. **No TTL field config, no index entry, no Terraform, no retention.**
+`admin_audit`. `clients` carries the three quota fields (`max_active_subscriptions`,
+`requests_per_minute`, `daily_cap`); a document without them reads as the defaults. **No TTL field
+config, no index entry, no Terraform, no retention.**
 `credentials` carries an `expires_at` that is a validity check in code, not a TTL.
 `admin_audit` is append-only and unbounded, deliberately.
 
@@ -300,6 +305,7 @@ Check that first when somebody who *is* in the group is refused.
 | `create-client` | the account. Idempotent on (id, name) |
 | `suspend-client` / `resume-client` | credentials answer 403 while suspended; takes effect within 60 s |
 | `show-client` | account, credentials, current destination — **prints the callback URL to stdout** |
+| `set-quotas` | raises or lowers a client's three ceilings — `--max-active-subscriptions`, `--requests-per-minute`, `--daily-cap`; unnamed ones keep their value; bounded by `notification_auth.QUOTA_BOUNDS`; audited as `set_client_quotas` with the requested values in `reason`. `create-client` takes the same flags for a NEW account |
 | `issue-key` | mints a credential and **prints the bearer secret once**. No reversible copy exists |
 | `revoke-key` | terminal, effective on the caller's next request |
 | `list-keys` | key ids and state, never a secret |
@@ -501,6 +507,59 @@ notification on a phone.**
 
 ---
 
+## Scaling beyond the pilot
+
+The contract and the store's document model carry a hundred thousand commuters as they are: the
+event grain (`alert_id` per subscription and train), the revision rules, the signing scheme and the
+eight collections need no change, and the nullable `servable` already tolerates an asynchronous
+answer. What does **not** carry that far is the runtime topology, and it is pilot-grade on purpose:
+every ceiling above is a constant sized for one poller thread and a few hundred subscriptions. These
+are the moves, in the order they will bind, each behind a seam that already exists. None of them
+touches the wire contract, which is why the pilot could ship without them.
+
+1. **The matcher, once per place pair rather than once per definition.** `impact._trip_cells` scans
+   every scored call of every situation per journey definition at ~40 ms each; ten thousand
+   definitions is minutes per cycle, for both channels. Evaluate each (from, to) pair once against
+   the situations, then apply the definitions' windows. Outside this channel's code and the first
+   thing that binds — a single client at 500 subscriptions already costs ~20 s of matcher per cycle.
+2. **A mirror instead of a full read.** `varsel._load_webhook_recipients` reads every active
+   subscription every cycle through the provider callable, capped at `MAX_SUBSCRIPTIONS_PER_CYCLE`
+   (2 000) because a full read is what it is. Past that the provider becomes an in-memory mirror
+   synced on an `updated_at` watermark (or a listener), with a full read only at startup. The seam is
+   the callable; `varsel` does not change.
+3. **Emit and delivery as their own Deployment.** Both run on the poller thread today, bounded at
+   `_MAX_EMITS_PER_CYCLE` (120) and `MAX_DELIVERY_ATTEMPTS_PER_CYCLE` (200) so a bad morning cannot
+   stall the cycle. At scale a bad morning is tens of thousands of events an hour, which one thread
+   cannot deliver at 5 s per attempt. `deliveries` is already a queue with transactional claims and a
+   `RESERVATION_TTL_S` lease, so a second Deployment can drain it safely; the one thing that changes
+   meaning is the pending-event ceiling, which is exact only because emit has one writer and becomes
+   best-effort with two.
+4. **Servability for every pending pair in one query per cycle.** Today a create asks BigQuery
+   inline under a 15/min budget and `notification_servability` re-asks four subscriptions a cycle
+   (~1 150 a day). Distinct stop pairs number in the thousands where subscriptions number in the
+   hundreds of thousands, and the planned tables already answer all of them in one query at cents.
+5. **A `count()` aggregation for the active-subscription ceiling.** `_create_body` counts a client's
+   live subscriptions by reading them inside the create transaction, up to the ceiling, which is why
+   `QUOTA_BOUNDS` caps `max_active_subscriptions` at 10 000. Above that the count has to be an
+   aggregation over an `expires_at` inequality (a new composite index), so the quota a very large
+   client needs is unlocked by this item, not by `set-quotas` alone.
+
+Two costs that arrive with larger caps rather than with volume: `notification_events._standing`'s
+client-wide pre-read enumerates at most `MAX_SUBJECTS_PER_READ` (500) subjects and falls back to one
+transaction per subject when it is incomplete, which a client with many subscriptions and a high
+`daily_cap` will hit more often (correct, slower); and the model wording is written per journey
+definition under a per-cycle budget, so at scale most events carry the template unless the wording
+is re-keyed on (place pair, train). Neither changes what a client receives, only how much prose and
+how fast.
+
+Two things that do NOT need to change for a hundred thousand commuters: the one-subscription-per-
+commuter grain (a client that prefers one subscription per route can already use the API that way,
+with `daily_cap` raised and its own per-user caps, and the receiver's dispatch hook already fans one
+event out to many recipients), and the single API replica, whose request load at that scale is tens
+of requests a second once the matcher is indexed.
+
+---
+
 ## Retention and deletion, clause by clause (R19)
 
 Every published clause below is stated beside the function that makes it true. Where the code did not
@@ -531,6 +590,13 @@ Every number this feature publishes, beside the constant that defines it.
 `disruptions/api/test_notification_contract.py` parses **this table** and compares each row against the
 module, so a constant that moves without this document moving fails the build — which is what turns
 R19's clause-by-clause check from a one-off reading into something that keeps holding.
+
+Three of these are **defaults** rather than ceilings since 2026-09-09: `MAX_ALERT_DELIVERIES_PER_DAY`,
+`MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` and `PER_CLIENT_PER_MIN` seed a new client's own values
+(`notification_auth.Quotas`, stored on the `clients` document, changed with `set-quotas`, bounded by
+`notification_auth.QUOTA_BOUNDS` at 1 000 / 10 000 / 10 000). The table states the default; a client's
+effective values are on its account. The daily cap is also copied onto each subscription document
+(`daily_cap`) at create, replace and touch, which is where `cap_remaining` reads it.
 
 | constant | value |
 |---|---|
@@ -756,7 +822,7 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
   unconditionally and `docs_url` is FastAPI's default. **By decision (product owner, 2026-09-09):
   this is a public API**, and the plan's own risk register already accepted that the surface is
   publicly reachable.
-- **Ordering of a subscription's four daily notifications is soonest-departure-first and *exact only
+- **Ordering of a subscription's daily notifications (four by default) is soonest-departure-first and *exact only
   within a subscription*.** Across subscriptions it is approximate, and outside the 60-minute validity
   horizon a train can be missing from the ordering entirely.
 - **`cap_exempt` is decided at mint, not at send.** A `confirmed` minted before its `predicted` was

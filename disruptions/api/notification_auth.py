@@ -159,6 +159,81 @@ _ACCOUNT_MAX = 1_000
 #: a caller to come back later than that would be a longer outage than the limiter causes.
 RETRY_AFTER_S = 60
 
+# ---- Per-client quotas ------------------------------------------------------------------------
+#
+# Three ceilings that were module constants until 2026-09-09 and are now DEFAULTS: every client
+# account carries its own values, read on each authenticated request through the same cached
+# account lookup that answers "is this client suspended?", so a raised quota costs no extra read.
+# The first consumer is the Entur app and the second a trial operator, one number cannot fit
+# both, and a constant published in the contract becomes the number a client builds around. The
+# bounds are why the fields are not simply "any positive integer":
+#
+#   max_active_subscriptions  bounded at 10 000 because `notification_store._create_body` COUNTS
+#                             the client's live subscriptions by READING them inside the create
+#                             transaction, up to the ceiling -- a bounded read at 500, and a
+#                             10 000-document read under pessimistic locks on every create at the
+#                             bound. Past it the count has to become a `count()` aggregation over
+#                             an `expires_at` inequality index (the operations document's
+#                             scale-out list), so raising this bound without that work only moves
+#                             the cost onto every create the client makes.
+#   requests_per_minute       bounded at 10 000. Tier two of KTD8's limiter, spent after
+#                             authentication; tier one (`GLOBAL_PRELOOKUP_PER_MIN`) is unchanged and
+#                             is what bounds the credential lookup an anonymous flood can reach.
+#   daily_cap                 bounded at 1 000, which is "effectively uncapped" for a client that
+#                             registers one subscription per ROUTE and enforces per-user caps on
+#                             its own side. It is copied onto each subscription document at
+#                             create, replace and touch (`notification_store.cap_remaining` reads
+#                             it there, so the delivery pass needs no second lookup), which means a
+#                             change reaches a subscription the next time the client writes it --
+#                             the idempotent re-PUT included.
+QUOTA_BOUNDS: dict[str, tuple[int, int]] = {
+    "max_active_subscriptions": (1, 10_000),
+    "requests_per_minute": (1, 10_000),
+    "daily_cap": (1, 1_000),
+}
+
+
+@dataclass(frozen=True)
+class Quotas:
+    """One client's ceilings. The defaults are the constants the pilot was sized with."""
+
+    max_active_subscriptions: int = notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
+    requests_per_minute: int = PER_CLIENT_PER_MIN
+    daily_cap: int = notification_store.MAX_ALERT_DELIVERIES_PER_DAY
+
+    def validate(self) -> None:
+        for name, (low, high) in QUOTA_BOUNDS.items():
+            value = getattr(self, name)
+            if not _is_int(value) or not low <= value <= high:
+                raise Conflict(f"{name} must be an integer between {low} and {high}")
+
+    def as_fields(self) -> dict[str, int]:
+        return {name: int(getattr(self, name)) for name in QUOTA_BOUNDS}
+
+
+DEFAULT_QUOTAS = Quotas()
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _quotas_from_doc(doc: Mapping[str, Any]) -> Quotas:
+    """A stored account's quotas. A missing, unreadable or out-of-bounds field is the DEFAULT.
+
+    Default rather than refuse, in both directions: accounts written before the fields existed
+    carry none, and a hand-repaired document with a bad value must not lock its client out of a
+    surface the default would have served. Out-of-bounds reads as the default too, because the
+    bounds exist to protect the create transaction (see :data:`QUOTA_BOUNDS`) and a value that
+    bypassed :meth:`Quotas.validate` must not bypass the reason for it.
+    """
+    values: dict[str, int] = {}
+    for name, default in DEFAULT_QUOTAS.as_fields().items():
+        raw = doc.get(name)
+        low, high = QUOTA_BOUNDS[name]
+        values[name] = int(raw) if _is_int(raw) and low <= raw <= high else default
+    return Quotas(**values)
+
 
 # ---- Errors -----------------------------------------------------------------------------------
 
@@ -326,7 +401,7 @@ _lock = threading.Lock()
 _global_calls: deque[float] = deque()
 _client_calls: dict[str, deque[float]] = {}
 _unknown: dict[str, float] = {}
-_accounts: dict[str, tuple[float, str | None]] = {}
+_accounts: dict[str, tuple[float, str | None, Quotas]] = {}
 _WHITESPACE_REPORTED: set[str] = set()
 
 
@@ -520,17 +595,21 @@ def _claim_global(now: float) -> None:
             raise RateLimited("global")
 
 
-def claim_client_slot(client_id: str, *, now: float | None = None) -> None:
+def claim_client_slot(
+    client_id: str, *, limit: int | None = None, now: float | None = None
+) -> None:
     """Tier two: spend one of this client's per-minute slots, or raise :class:`RateLimited`.
 
     Public because ``notification_api`` spends it AFTER authentication and BEFORE any store write, which
     is what approach 4's "reject excess before creating anything" means. Keyed on the client, not
-    the key id -- see :data:`PER_CLIENT_PER_MIN`.
+    the key id -- see :data:`PER_CLIENT_PER_MIN`, which is the default ``limit``; the router passes
+    the client's own (:attr:`Principal.quotas`).
     """
     instant = _monotonic() if now is None else now
+    ceiling = PER_CLIENT_PER_MIN if limit is None else limit
     with _lock:
         bucket = _client_calls.setdefault(client_id, deque())
-        if not claim_window(bucket, PER_CLIENT_PER_MIN, instant):
+        if not claim_window(bucket, ceiling, instant):
             raise RateLimited("client")
         # Bounded for the reason `feedback._claim` bounds its own per-context map: the key is
         # client-controlled only in the sense that an operator creates it, but a pod that never
@@ -581,6 +660,7 @@ class Principal:
 
     client_id: str
     key_id: str
+    quotas: Quotas = DEFAULT_QUOTAS
 
 
 def authenticate(header: str | None) -> Principal:
@@ -626,14 +706,14 @@ def authenticate(header: str | None) -> Principal:
         _log_refusal(key_id, "expired")
         raise AuthFailed("expired")
     client_id = str(stored.get("client_id") or "")
-    status = _account_status(client_id, now)
+    status, quotas = _account_state(client_id, now)
     if status is None:
         _log_refusal(key_id, "no_account")
         raise AuthFailed("no_account")
     if status != _ACCOUNT_ACTIVE:
         _log_refusal(key_id, "suspended")
         raise AuthSuspended(client_id)
-    return Principal(client_id=client_id, key_id=key_id)
+    return Principal(client_id=client_id, key_id=key_id, quotas=quotas)
 
 
 def _log_refusal(key_id: str, reason: str) -> None:
@@ -658,21 +738,26 @@ def _log_refusal(key_id: str, reason: str) -> None:
     )
 
 
-def _account_status(client_id: str, now: float) -> str | None:
-    """The account's status, cached for one limiter window. ``None`` when there is no account."""
+def _account_state(client_id: str, now: float) -> tuple[str | None, Quotas]:
+    """The account's status and quotas, cached together for one limiter window.
+
+    Status ``None`` when there is no account. One cache entry carries both, so a client's quotas
+    ride on every :class:`Principal` for the price of the status read this already paid.
+    """
     if not client_id:
-        return None
+        return None, DEFAULT_QUOTAS
     with _lock:
         hit = _accounts.get(client_id)
         if hit is not None and now - hit[0] < _ACCOUNT_TTL_S:
-            return hit[1]
+            return hit[1], hit[2]
     stored = _store().get(ACCOUNTS, client_id)
     status = str(stored.get("status") or "") if stored else None
+    quotas = _quotas_from_doc(stored) if stored else DEFAULT_QUOTAS
     with _lock:
         while len(_accounts) >= _ACCOUNT_MAX:
             _accounts.pop(next(iter(_accounts)))
-        _accounts[client_id] = (now, status)
-    return status
+        _accounts[client_id] = (now, status, quotas)
+    return status, quotas
 
 
 def _as_dt(value: Any) -> datetime | None:
@@ -787,6 +872,7 @@ class Account:
     updated_at: datetime | None
     suspended_at: datetime | None = None
     suspended_reason: str | None = None
+    quotas: Quotas = DEFAULT_QUOTAS
 
     @property
     def active(self) -> bool:
@@ -802,6 +888,7 @@ def _account_from_doc(doc: Mapping[str, Any]) -> Account:
         updated_at=_as_dt(doc.get("updated_at")),
         suspended_at=_as_dt(doc.get("suspended_at")),
         suspended_reason=doc.get("suspended_reason") or None,
+        quotas=_quotas_from_doc(doc),
     )
 
 
@@ -811,13 +898,25 @@ def get_account(client_id: str) -> Account | None:
 
 
 def create_client(
-    client_id: str, *, name: str, actor: str, now: datetime | None = None
+    client_id: str,
+    *,
+    name: str,
+    actor: str,
+    quotas: Quotas | None = None,
+    now: datetime | None = None,
 ) -> Account:
-    """Provision a client. Idempotent on (id, name); a different name under a live id is refused."""
+    """Provision a client. Idempotent on (id, name); a different name under a live id is refused.
+
+    ``quotas`` applies to a NEW account only. An existing account keeps what it has -- the
+    idempotency key is (id, name), and a quota change is :func:`set_client_quotas`, which is
+    audited as one.
+    """
     if not CLIENT_ID_RE.match(client_id or ""):
         raise Conflict("client_id must be lowercase alphanumeric with hyphens, 2-63 characters")
     if not name.strip():
         raise Conflict("a client needs a name")
+    effective = quotas or DEFAULT_QUOTAS
+    effective.validate()
     instant = now or _now()
     existing = _store().get(ACCOUNTS, client_id)
     if existing:
@@ -839,6 +938,7 @@ def create_client(
         "updated_at": instant,
         "suspended_at": None,
         "suspended_reason": None,
+        **effective.as_fields(),
     }
     _store().set(ACCOUNTS, client_id, doc)
     record_admin_action(
@@ -892,6 +992,63 @@ def set_client_suspended(
         result="ok",
         client_id=client_id,
         reason=reason,
+        now=instant,
+    )
+    return _account_from_doc({**stored, **patch})
+
+
+def set_client_quotas(
+    client_id: str,
+    *,
+    actor: str,
+    max_active_subscriptions: int | None = None,
+    requests_per_minute: int | None = None,
+    daily_cap: int | None = None,
+    now: datetime | None = None,
+) -> Account:
+    """Raise or lower one client's ceilings; unnamed ones keep their value.
+
+    The rate and the subscription ceiling take effect within :data:`_ACCOUNT_TTL_S` (the cache
+    entry is cleared here, as a suspension clears it). The daily cap reaches each subscription the
+    next time the client WRITES it -- create, replace or the idempotent re-PUT -- because it is
+    stored on the subscription document, where the delivery pass reads it without a second lookup.
+    Audited as ``set_client_quotas`` with the requested values in ``reason``; they carry no
+    personal data.
+    """
+    instant = now or _now()
+    stored = _store().get(ACCOUNTS, client_id)
+    if not stored:
+        record_admin_action(
+            actor=actor,
+            action="set_client_quotas",
+            result="not_found",
+            client_id=client_id,
+            now=instant,
+        )
+        raise NotFound("no such client")
+    requested = {
+        name: value
+        for name, value in (
+            ("max_active_subscriptions", max_active_subscriptions),
+            ("requests_per_minute", requests_per_minute),
+            ("daily_cap", daily_cap),
+        )
+        if value is not None
+    }
+    if not requested:
+        raise Conflict("name at least one quota to change")
+    updated = Quotas(**{**_quotas_from_doc(stored).as_fields(), **requested})
+    updated.validate()
+    patch: dict[str, Any] = {**updated.as_fields(), "updated_at": instant}
+    _store().update(ACCOUNTS, client_id, patch)
+    with _lock:
+        _accounts.pop(client_id, None)
+    record_admin_action(
+        actor=actor,
+        action="set_client_quotas",
+        result="ok",
+        client_id=client_id,
+        reason=", ".join(f"{name}={value}" for name, value in sorted(requested.items())),
         now=instant,
     )
     return _account_from_doc({**stored, **patch})
@@ -1428,12 +1585,14 @@ __all__ = [
     "ACCOUNTS",
     "ADMIN_AUDIT",
     "CREDENTIALS",
+    "DEFAULT_QUOTAS",
     "DESTINATIONS",
     "GLOBAL_PRELOOKUP_PER_MIN",
     "MAX_CREDENTIALS_PER_CLIENT",
     "MAX_DESTINATIONS_PER_CLIENT",
     "PEPPER_ENV",
     "PER_CLIENT_PER_MIN",
+    "QUOTA_BOUNDS",
     "RETRY_AFTER_S",
     "Account",
     "AuditRecord",
@@ -1447,6 +1606,7 @@ __all__ = [
     "NotConfigured",
     "NotFound",
     "Principal",
+    "Quotas",
     "RateLimited",
     "amend_destination",
     "authenticate",
@@ -1474,6 +1634,7 @@ __all__ = [
     "revoke_credential",
     "rotate_signing_generation",
     "secret_hash",
+    "set_client_quotas",
     "set_client_suspended",
     "store_ready",
 ]

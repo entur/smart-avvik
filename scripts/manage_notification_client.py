@@ -300,8 +300,29 @@ def _serialise(value: Any) -> Any:
     return value
 
 
+def _quotas_from_args(args: argparse.Namespace) -> dict[str, int]:
+    """The quota flags that were given, by field name. Validation is the module's, not argparse's."""
+    return {
+        name: value
+        for name, value in (
+            ("max_active_subscriptions", args.max_active_subscriptions),
+            ("requests_per_minute", args.requests_per_minute),
+            ("daily_cap", args.daily_cap),
+        )
+        if value is not None
+    }
+
+
 def _cmd_create_client(args: argparse.Namespace, actor: str) -> Any:
-    return notification_auth.create_client(args.client_id, name=args.name, actor=actor)
+    given = _quotas_from_args(args)
+    quotas = notification_auth.Quotas(**given) if given else None
+    return notification_auth.create_client(
+        args.client_id, name=args.name, actor=actor, quotas=quotas
+    )
+
+
+def _cmd_set_quotas(args: argparse.Namespace, actor: str) -> Any:
+    return notification_auth.set_client_quotas(args.client_id, actor=actor, **_quotas_from_args(args))
 
 
 def _cmd_suspend_client(args: argparse.Namespace, actor: str) -> Any:
@@ -441,6 +462,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace, str], Any]] = {
     "suspend-client": _cmd_suspend_client,
     "resume-client": _cmd_resume_client,
     "show-client": _cmd_show_client,
+    "set-quotas": _cmd_set_quotas,
     "issue-key": _cmd_issue_key,
     "revoke-key": _cmd_revoke_key,
     "list-keys": _cmd_list_keys,
@@ -478,9 +500,41 @@ def _parser() -> argparse.ArgumentParser:
     def add(name: str, **kwargs: Any) -> argparse.ArgumentParser:
         return subparsers.add_parser(name, **kwargs)
 
-    p = add("create-client", help="Provision a client. Idempotent on (id, name).")
+    def quota_flags(p: argparse.ArgumentParser) -> None:
+        bounds = notification_auth.QUOTA_BOUNDS
+        defaults = notification_auth.DEFAULT_QUOTAS
+        p.add_argument(
+            "--max-active-subscriptions",
+            type=int,
+            default=None,
+            help=f"Active subscriptions this client may hold (default "
+            f"{defaults.max_active_subscriptions}, at most "
+            f"{bounds['max_active_subscriptions'][1]} -- above that the create transaction's "
+            "count read needs the aggregation the operations document describes).",
+        )
+        p.add_argument(
+            "--requests-per-minute",
+            type=int,
+            default=None,
+            help=f"Authenticated requests per minute (default {defaults.requests_per_minute}, "
+            f"at most {bounds['requests_per_minute'][1]}).",
+        )
+        p.add_argument(
+            "--daily-cap",
+            type=int,
+            default=None,
+            help=f"Alert deliveries per subscription per Oslo day (default {defaults.daily_cap}, "
+            f"at most {bounds['daily_cap'][1]}). Copied onto each subscription when the client "
+            "writes it, so a change reaches existing subscriptions on their next PUT.",
+        )
+
+    p = add(
+        "create-client",
+        help="Provision a client. Idempotent on (id, name); quota flags apply to a NEW account only.",
+    )
     p.add_argument("--client-id", required=True)
     p.add_argument("--name", required=True)
+    quota_flags(p)
 
     p = add("suspend-client", help="Refuse this client's credentials with 403.")
     p.add_argument("--client-id", required=True)
@@ -491,6 +545,12 @@ def _parser() -> argparse.ArgumentParser:
 
     p = add("show-client", help="Account, credentials (never secrets) and current destination.")
     p.add_argument("--client-id", required=True)
+    p = add(
+        "set-quotas",
+        help="Raise or lower a client's ceilings; unnamed ones keep their value. Audited.",
+    )
+    p.add_argument("--client-id", required=True)
+    quota_flags(p)
 
     p = add("issue-key", help="Mint a credential. The secret is printed ONCE.")
     p.add_argument("--client-id", required=True)

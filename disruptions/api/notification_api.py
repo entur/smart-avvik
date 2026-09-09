@@ -303,11 +303,12 @@ class AlertSubjectOut(BaseModel):
 class AlertStateOut(BaseModel):
     """This watch's current alert state: a summary, plus the worst few subjects.
 
-    **Bounded on purpose.** ``subjects`` carries at most ``MAX_ALERTS_SERVED`` entries, worst first
-    -- a declared cancellation ahead of a forecast, then most recently changed. One line suspension
-    can put a dozen cancelled departures inside a single window (AE3), and at most four
-    notifications about a watch reach a traveller in an Oslo day, so a longer list would enumerate
-    what the cap has already suppressed. The COUNTS are over everything read, so nothing is hidden
+    **Bounded on purpose.** ``subjects`` carries at most your daily cap's worth of entries
+    (``MAX_ALERTS_SERVED``, 4, unless your client's cap is higher), worst first -- a declared
+    cancellation ahead of a forecast, then most recently changed. One line suspension can put a
+    dozen cancelled departures inside a single window (AE3), and at most that many notifications
+    about a watch reach a traveller in an Oslo day, so a longer list would enumerate what the cap
+    has already suppressed. The COUNTS are over everything read, so nothing is hidden
     -- only unenumerated.
 
     ``truncated`` is the honest field and must be rendered rather than ignored: when it is true the
@@ -533,10 +534,18 @@ def _throttled(principal: _Principal) -> notification_auth.Principal:
     can already exhaust.
     """
     try:
-        _auth.claim_client_slot(principal.client_id)
+        _auth.claim_client_slot(principal.client_id, limit=principal.quotas.requests_per_minute)
     except Exception as exc:
         raise _http(exc) from exc
     return principal
+
+
+def _served(principal: notification_auth.Principal) -> int:
+    """How many alert subjects a response enumerates for this client: its daily cap, never fewer
+    than :data:`notification_store.MAX_ALERTS_SERVED`. The list is bounded by the cap because a
+    subject past it is one the cap has already suppressed; a client with a larger cap sees a
+    correspondingly longer list. The COUNTS are over everything read either way."""
+    return max(notification_store.MAX_ALERTS_SERVED, principal.quotas.daily_cap)
 
 
 #: The tag vocabulary, shared with `contracts/notifications/v1/openapi.json` and pinned against it
@@ -786,7 +795,9 @@ def _expected_version(if_match: str | None) -> int | None:
         raise HTTPException(status_code=400, detail="if_match_must_be_a_version_integer") from exc
 
 
-def _one_snapshot(document_id: str, client_id: str) -> AlertStateOut:
+def _one_snapshot(
+    document_id: str, client_id: str, *, served: int = notification_store.MAX_ALERTS_SERVED
+) -> AlertStateOut:
     """One watch's alert state: ONE indexed query, and never a reason to fail the request.
 
     A read of what the notification pass has already committed -- ``alert_subjects`` holds
@@ -799,7 +810,9 @@ def _one_snapshot(document_id: str, client_id: str) -> AlertStateOut:
     is a state the response can express.
     """
     try:
-        return _alerts_out(_store.subscription_alerts(document_id, client_id=client_id))
+        return _alerts_out(
+            _store.subscription_alerts(document_id, client_id=client_id, served=served)
+        )
     except Exception:
         logger.warning(
             "Client alert-state read failed; serving it as unknown",
@@ -885,13 +898,17 @@ def create_or_replace_subscription(
         if _same_definition(spec, existing):
             try:
                 touched = _store.touch_subscription(
-                    spec.subscription_id, client_id=principal.client_id
+                    spec.subscription_id,
+                    client_id=principal.client_id,
+                    daily_cap=principal.quotas.daily_cap,
                 )
             except Exception as exc:
                 raise _http(exc) from exc
             return _out(principal.client_id, touched)
         try:
-            replaced = _store.replace_subscription(spec, expected_version=expected)
+            replaced = _store.replace_subscription(
+                spec, expected_version=expected, daily_cap=principal.quotas.daily_cap
+            )
         except Exception as exc:
             raise _http(exc) from exc
         # A changed route is a different servability question, and the store has already retired the
@@ -906,7 +923,11 @@ def create_or_replace_subscription(
         # would silently ignore a precondition the caller asked for.
         raise HTTPException(status_code=409, detail="version_conflict")
     try:
-        created = _store.create_subscription(spec)
+        created = _store.create_subscription(
+            spec,
+            max_active=principal.quotas.max_active_subscriptions,
+            daily_cap=principal.quotas.daily_cap,
+        )
     except notification_store.QuotaExceeded as exc:
         # R21's "a breach is visible to an operator". The store logs its pending-events ceiling and
         # its delivery ceilings itself; the active-subscription one is refused inside a transaction
@@ -917,7 +938,7 @@ def create_or_replace_subscription(
         logger.warning(
             "Client %s is at the active-subscription ceiling (%d): %s",
             principal.client_id,
-            notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT,
+            principal.quotas.max_active_subscriptions,
             exc,
             extra={
                 "fields": {
@@ -925,7 +946,7 @@ def create_or_replace_subscription(
                     "result": "subscriptions",
                     "client_id": principal.client_id,
                     "key_id": principal.key_id,
-                    "n": notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT,
+                    "n": principal.quotas.max_active_subscriptions,
                 }
             },
         )
@@ -993,7 +1014,7 @@ def list_subscriptions(
     # EVERY row truncated -- including the rows whose own subjects fitted -- because a watch crowded
     # out of the page would otherwise be indistinguishable from a calm one.
     try:
-        loaded = _store.client_alerts(principal.client_id)
+        loaded = _store.client_alerts(principal.client_id, served=_served(principal))
         snapshots, alerts_truncated = loaded.snapshots, loaded.truncated
     except Exception:
         logger.warning(
@@ -1051,7 +1072,11 @@ def get_subscription(
         raise _http(exc) from exc
     if sub is None:
         raise HTTPException(status_code=404, detail="not_found")
-    return _out(principal.client_id, sub, _one_snapshot(sub.subscription_id, principal.client_id))
+    return _out(
+        principal.client_id,
+        sub,
+        _one_snapshot(sub.subscription_id, principal.client_id, served=_served(principal)),
+    )
 
 
 @router.delete(

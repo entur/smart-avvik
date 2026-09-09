@@ -668,6 +668,20 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   a **withdrawal** — a retraction the cap suppressed leaves the traveller holding a warning we have
   withdrawn, the friskmelding argument. That widening is **an open product-owner question**, flagged
   in the operations document rather than presented as settled.
+  **The cap, the active-subscription ceiling and the per-minute rate are per-client DEFAULTS since
+  2026-09-09** (`notification_auth.Quotas`, three fields on the `clients` document seeded from the
+  constants, bounded by `QUOTA_BOUNDS` at 1 000 / 10 000 / 10 000, set with the operator tool's
+  `set-quotas` and read on every request through the cached account lookup, so they ride on the
+  `Principal` for free). The cap is copied onto each subscription document (`daily_cap`) at create,
+  replace and touch — the idempotent re-PUT included — which is where `cap_remaining` reads it, so a
+  changed cap reaches a subscription at the client's next write and a document without the field
+  reads as four. The bound on the subscription ceiling is not arbitrary: `_create_body` counts a
+  client's live subscriptions by READING them inside the create transaction, so a ceiling above
+  10 000 needs the `count()` aggregation named in the operations document's "Scaling beyond the
+  pilot" section, which lists what has to move before 100 000 commuters (matcher per place pair,
+  mirror instead of full read, emit and delivery as their own Deployment, batched servability, the
+  aggregation) and states that none of it touches the wire contract. Every subscription document
+  also carries `channel` (`webhook`; `web_push` is reserved for `/varsel`'s move).
   **Signing is Standard Webhooks, fresh per attempt, per destination** (KTD7). HMAC-SHA256 over
   `webhook-id.webhook-timestamp.<raw body>` with stdlib `hmac` and no new dependency; the body bytes
   are stored once and signed unmodified, because re-serializing signs a document the receiver did not

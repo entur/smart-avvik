@@ -3640,6 +3640,99 @@ def emulator_test_a_withdrawal_needs_a_run_and_a_recovery_breaks_it():
 # ---- Runner ------------------------------------------------------------------------------------
 
 
+
+# ---- Per-client ceilings and the channel field (2026-09-09) -----------------------------------
+
+
+def test_the_active_subscription_ceiling_is_the_callers_when_given():
+    """`notification_auth.Quotas.max_active_subscriptions` is what the API passes; the module
+    constant is only the default, resolved at call time."""
+    client = _FakeClient()
+    refs = notification_store._Refs(client)
+    rows = [
+        (f"{notification_store.SUBSCRIPTIONS}/s{i}", _live_doc(subscription_id=f"s{i}"))
+        for i in range(2)
+    ]
+    txn = _Txn()
+    try:
+        with _NoClockNoLog():
+            notification_store._create_body(
+                txn, refs, _Page(client, rows), spec=_spec(), now=NOW, max_active=2
+            )
+    except notification_store.QuotaExceeded as exc:
+        assert "(ceiling 2)" in str(exc), str(exc)
+    else:
+        raise AssertionError("two live subscriptions against a ceiling of two must refuse a third")
+    assert txn.writes == [], "the refusal must precede every write"
+    with _NoClockNoLog():
+        outcome, doc = notification_store._create_body(
+            txn, refs, _Page(client, rows), spec=_spec(), now=NOW, max_active=3, daily_cap=9
+        )
+    assert outcome == "created"
+    assert doc["daily_cap"] == 9 and doc["channel"] == notification_store.CHANNEL_WEBHOOK
+
+
+def test_the_create_ceiling_query_limit_is_the_callers_ceiling():
+    client = _FakeClient()
+    _install(client)
+    notification_store.create_subscription(_spec(), now=NOW, max_active=7)
+    _name, _equality, _ineq, limit = client.query_calls[0]
+    assert limit == 7, "R21: the count read is bounded by the ceiling it enforces"
+
+
+def test_the_daily_cap_is_written_read_and_refreshed_on_every_client_write():
+    client = _FakeClient()
+    _install(client)
+    created = notification_store.create_subscription(_spec(), now=NOW, daily_cap=6)
+    stored = client.doc(notification_store.SUBSCRIPTIONS, SID)
+    assert stored["daily_cap"] == 6 and created.daily_cap == 6
+    assert notification_store.cap_remaining(stored, NOW) == 6
+    # Replace and touch carry the client's cap of the day; neither touches it when not given.
+    replaced = notification_store.replace_subscription(_spec(end="09:00"), now=NOW, daily_cap=2)
+    assert replaced.daily_cap == 2
+    assert client.doc(notification_store.SUBSCRIPTIONS, SID)["daily_cap"] == 2
+    touched = notification_store.touch_subscription(SID, client_id=CLIENT, now=NOW, daily_cap=3)
+    assert touched.daily_cap == 3
+    untouched = notification_store.touch_subscription(SID, client_id=CLIENT, now=NOW)
+    assert untouched.daily_cap == 3
+    # A document written before the field existed keeps /varsel's four -- never zero.
+    legacy = {k: v for k, v in stored.items() if k != "daily_cap"}
+    default = notification_store.MAX_ALERT_DELIVERIES_PER_DAY
+    assert notification_store.daily_cap_of(legacy) == default
+    assert notification_store.cap_remaining(legacy, NOW) == default
+    assert notification_store._subscription_from_doc(legacy).daily_cap == default
+    assert notification_store.daily_cap_of({"daily_cap": "seven"}) == default
+    assert notification_store.daily_cap_of({"daily_cap": 0}) == default
+    assert notification_store.daily_cap_of({"daily_cap": True}) == default
+    # An unreadable counter still fails closed -- against the document's own cap.
+    assert notification_store.cap_remaining({"daily_cap": 6, "daily_deliveries": {notification_store.oslo_day(NOW): "x"}}, NOW) == 0
+
+
+def test_a_subscription_document_names_its_channel_and_an_old_one_reads_as_webhook():
+    doc = _live_doc()
+    assert doc["channel"] == notification_store.CHANNEL_WEBHOOK == "webhook"
+    assert notification_store._subscription_from_doc(doc).channel == "webhook"
+    legacy = {k: v for k, v in doc.items() if k != "channel"}
+    assert notification_store._subscription_from_doc(legacy).channel == "webhook"
+    assert notification_store.CHANNELS == ("webhook", "web_push")
+    # The recipient document the poller reads is unchanged: `varsel` pins its exact key set.
+    recipient = notification_store._subscription_from_doc(doc).as_recipient_document(NOW)
+    assert "channel" not in recipient and "daily_cap" not in recipient
+
+
+def test_the_served_list_grows_with_the_clients_cap_and_never_shrinks_below_the_default():
+    client = _FakeClient()
+    _install(client)
+    _alert_page(client, [_state(f"a{i}", notification_store.PHASE_PREDICTED) for i in range(6)])
+    default = len(notification_store.subscription_alerts(SID, client_id=CLIENT, now=NOW).subjects)
+    assert default == notification_store.MAX_ALERTS_SERVED == 4
+    wider = notification_store.subscription_alerts(SID, client_id=CLIENT, served=6, now=NOW)
+    assert len(wider.subjects) == 6 and wider.n_active == 6
+    narrower = notification_store.subscription_alerts(SID, client_id=CLIENT, served=1, now=NOW)
+    assert len(narrower.subjects) == 4, "a cap below the default never hides more than the default"
+    grouped = notification_store.client_alerts(CLIENT, served=6, now=NOW)
+    assert len(grouped.snapshots[SID].subjects) == 6
+
 def _run() -> None:
     plain = sorted(
         (name, fn)
