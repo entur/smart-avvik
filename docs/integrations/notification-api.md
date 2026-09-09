@@ -19,6 +19,7 @@ disagree:
 | `contracts/notifications/v1/subscription.schema.json` | the subscription request and response |
 | `contracts/notifications/v1/event.schema.json` | the event envelope (`additionalProperties: false`) |
 | `contracts/notifications/v1/signing-vectors.json` | seven cross-language signing vectors, self-describing |
+| `contracts/notifications/v1/test-event-sample.json` | one synthetic event, **generated** from `_synthetic_event` rather than authored — the worked example of a real payload, and what the vendored receiver's end-to-end scenario reads. Regenerate it; do not edit it |
 
 ---
 
@@ -234,6 +235,14 @@ namespaced form, so accepting only the bare reference meant a 422 from a value t
 just served. Refused with **409 `not_a_test_subscription`** unless the watch was created
 `test: true`.
 
+`TestEventRequest.subscription_id` is therefore the one property in `openapi.json` stated inline
+rather than `$ref`-ed into `subscription.schema.json`: that file's definition is the **create-side**
+constraint (128 characters, no `~`) and is correctly strict there, since a create body must never
+name the namespaced form. Until 2026-09-09 this request body referenced it, so a partner generating
+or validating against the published schema refused the namespaced id client-side — the same bug the
+server had already been fixed for, one layer out. **Do not widen the shared definition to reconcile
+them**; they are two different constraints.
+
 Sent synchronously and **nothing is stored** — no event, no delivery, no alert subject, no cap slot.
 That is not convenience: the pending-event ceiling is exact rather than best-effort *because the emit
 path has exactly one writer*, and a route that minted an event would falsify every quota check in the
@@ -291,9 +300,21 @@ Validation refusals carry prose rather than a code, and it is the prose `/varsel
 `"subscription id already exists with a different definition"`, `f"version is {n}, not {m}"`.
 
 **One shape this page cannot flatten:** a schema-level 422 — an unknown body field under
-`extra="forbid"`, a `subscription_id` failing its pattern, `limit` out of range — is FastAPI's default,
-where `detail` is an **array of objects** (`type`/`loc`/`msg`/`input`), not a string. Parse `detail`
-defensively.
+`extra="forbid"`, a `subscription_id` failing its pattern, `limit` out of range, a path segment over
+its 257-character bound — is FastAPI's default, where `detail` is an **array of objects**
+(`type`/`loc`/`msg`/`input`, plus `ctx` where there is a constraint to quote), not a string. Parse
+`detail` defensively: branch on its type.
+
+The OpenAPI document publishes both shapes rather than promising only the string one, which it did
+until 2026-09-09: `ValidationError` is the array shape, `Error` the string, and every documented 422
+is one or the other — `oneOf` on `POST /subscriptions`, which is the only route with a refusal of its
+own at that status, and `ValidationError` alone on the four routes where the framework is the only
+thing that can return it (both `GET`s, the `DELETE`, and `POST /test-events`). `GET /destinations/current`
+documents no 422 because it constrains nothing: no body, no query, no path parameter. Flattening the
+array into `Error` would need a `RequestValidationError` handler, and FastAPI registers those per
+application rather than per router — this API shares a process with `/varsel-api`, `/historikk-api`
+and `/meldinger-api`, whose validation bodies would silently change shape with it. Two honest shapes,
+not one uniform shape bought at that price.
 
 ---
 

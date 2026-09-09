@@ -17,9 +17,17 @@ least-privilege Google group, and production has its own:
 
 The group is what holds ``roles/datastore.user`` on that environment's GCP project, which is what
 makes the IAM environment-scoped rather than global: each environment is its own project with its
-own runtime identity (KTD5), so membership of the dev group cannot reach prd's data even if the
-tool were pointed at it. Reads are gated too, deliberately: a destination's callback URL and a
+own runtime identity (KTD5). Reads are gated too, deliberately: a destination's callback URL and a
 partner's key ids are exactly what an attacker would want before trying to forge one.
+
+**``--environment`` picks the target as well as the gate**, and until 2026-09-09 it picked only the
+gate: ``--project`` chose which project was read and written with no comparison between the two, so
+``--environment dev --project ent-kixavvik-prd`` was authorized against the dev group and then acted
+on prd -- ``show-signing-secret`` printing a live prd receiver credential, ``suspend-partner``
+silencing a real partner. What refused it was prd project IAM, not this tool, so R22's separate prd
+group held only while that group was the sole holder of ``roles/datastore.user`` there. The tool now
+resolves the project from the environment (:data:`PROJECTS`) and exits 2 when a flag or an exported
+``GOOGLE_CLOUD_PROJECT`` disagrees, and IAM backs that rather than being it.
 
 Separate for production, and separately from partner keys: a partner credential authenticates a
 machine against ``/notification-api/v1`` and can do none of this, while a group membership
@@ -121,6 +129,18 @@ OPERATOR_GROUPS = {
     "tst": "kix-avvik-notification-operators@entur.org",
     "prd": "kix-avvik-notification-operators-prd@entur.org",
 }
+
+#: WHICH PROJECT EACH ENVIRONMENT IS, so the gate and the target cannot be chosen separately.
+#: `--environment` picks the group membership is checked against and `--project` used to pick, with
+#: no comparison between them, which project was then read and written -- so `--environment dev
+#: --project ent-kixavvik-prd` was authorized against the dev group and acted on prd, including
+#: `show-signing-secret` (prints a live prd receiver credential) and `suspend-partner` (silences a
+#: real partner). What stopped it was prd project IAM rather than this tool, while the module
+#: docstring claimed the stronger property; now the tool refuses first and IAM backs it.
+#:
+#: The naming assumption is `ent-kixavvik-<env>`, which is what `.entur/application.yaml`'s own
+#: verification recipe uses. If a project is ever renamed this map is the one place to change.
+PROJECTS = {environment: f"ent-kixavvik-{environment}" for environment in ENVIRONMENTS}
 
 #: The named database `partner_store` and `partner_auth` open. The same literal lives in the Helm
 #: chart's `PARTNER_FIRESTORE_DATABASE` and in `terraform/variables.tf`; it is read from the
@@ -444,8 +464,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--project",
         default=None,
-        help="GCP project to talk to. Defaults to the ambient GOOGLE_CLOUD_PROJECT / ADC, exactly "
-        "as the app resolves it; pass it when your shell's project and --environment disagree.",
+        help="GCP project to talk to. Must be --environment's own project (ent-kixavvik-<env>); "
+        "anything else is refused with exit 2. Pass it to override an exported "
+        "GOOGLE_CLOUD_PROJECT that names a different environment.",
     )
     parser.add_argument(
         "--database",
@@ -528,8 +549,27 @@ def main(
     """
     args = _parser().parse_args(argv)
     stream = out or sys.stdout
-    if args.project:
-        os.environ["GOOGLE_CLOUD_PROJECT"] = args.project
+    # THE GATE AND THE TARGET ARE ONE CHOICE. Resolved exactly as the app resolves it -- the flag,
+    # then the ambient variable, then the environment's own project -- and refused when the answer
+    # is not the project `--environment` was authorized against. That also removes the failure mode
+    # `--project` was added for (a stale shell variable) rather than papering over it: an exported
+    # `GOOGLE_CLOUD_PROJECT` from another environment now stops the run instead of silently
+    # redirecting it.
+    expected = PROJECTS[args.environment]
+    project = args.project or os.environ.get("GOOGLE_CLOUD_PROJECT") or expected
+    if project != expected:
+        print(
+            f"--environment {args.environment} is authorized against "
+            f"{OPERATOR_GROUPS[args.environment]} and acts on {expected}; refusing to run against "
+            f"{project}.",
+            file=sys.stderr,
+        )
+        return 2
+    os.environ["GOOGLE_CLOUD_PROJECT"] = project
+    # `--database` deliberately keeps its free choice: a Firestore database is scoped INSIDE a
+    # project, so it cannot reach another environment's data and the refusal above already bounds
+    # what any value of it can touch. Naming the wrong database in the right project reads as an
+    # empty store, which is loud enough.
     if store is not None:
         partner_auth.configure(docs=store)
     else:
@@ -546,15 +586,24 @@ def main(
     # The signing root, checked the same way and for the same reason: a failure deeper in raises
     # `SigningNotConfigured`, whose message is about provisioning Secret Manager and the chart's
     # secret group -- the wrong hint for a human at a terminal who has simply not exported it.
-    if args.command == "show-signing-secret" and not webhook_signing.configured():
-        print(
-            f"{webhook_signing.SIGNING_ROOT_ENV} is unset (or under "
-            f"{webhook_signing.MIN_ROOT_BYTES} bytes). show-signing-secret DERIVES the secret from "
-            "it, so export this environment's value from Secret Manager for this one command -- "
-            "see the module docstring.",
-            file=sys.stderr,
-        )
-        return 2
+    if args.command == "show-signing-secret":
+        try:
+            webhook_signing.signing_root()
+        except webhook_signing.SigningNotConfigured as exc:
+            # The module's OWN message, not a paraphrase: there are two reasons the root is
+            # unusable and they need different actions. "Unset or too short" is a missing export;
+            # "set to the example root published in signing-vectors.json" is a paste of the
+            # documented value -- and THIS command is where that paste happens, because the runbook
+            # tells an operator to export the variable by hand for it. A single restated
+            # "is unset (or under N bytes)" told the second operator the variable they had plainly
+            # set was missing.
+            print(
+                f"{exc} show-signing-secret DERIVES the secret from it, so export this "
+                "environment's value from Secret Manager for this one command -- see the module "
+                "docstring.",
+                file=sys.stderr,
+            )
+            return 2
     if args.command == "issue-key" and not partner_auth.pepper_ready():
         print(
             f"{partner_auth.PEPPER_ENV} is unset (or under {partner_auth.MIN_PEPPER_BYTES} bytes). "

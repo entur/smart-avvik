@@ -94,6 +94,53 @@ def test_an_absent_or_short_root_fails_closed_and_loudly():
     assert ws.signing_root() == b"x" * ws.MIN_ROOT_BYTES
 
 
+def test_the_published_test_root_is_refused_by_name():
+    """A root anyone can read out of this repository must not be a root any deployment can use.
+
+    `contracts/notifications/v1/signing-vectors.json` publishes `test_root` so a partner can
+    reproduce a signature by hand -- which is what the file is for -- and it is 48 bytes, so it
+    cleared `MIN_ROOT_BYTES` and every readiness check passed for it: `configured()` answered True,
+    `/destinations/current` reported `ready: true`, `/test-events` answered 200, and every delivery
+    signed and verified normally. The secrets that root derives are committed in the same file and
+    vendored again under `integrations/`, so anyone could forge a cancellation or a withdrawal about
+    a real train against a receiver whose only authentication IS the signature.
+
+    The runbook tells an operator to export `PARTNER_SIGNING_ROOT` by hand for `show-signing-secret`,
+    which is precisely the moment a documented example value gets pasted -- so this is a plausible
+    provisioning slip rather than a hypothetical, and it produced no fault report anywhere.
+
+    The literal is read OUT of the vectors file rather than restated here, so the module's refusal
+    and the published value cannot drift apart. Regenerating the vectors under a different root is
+    fine; regenerating them under one this refuses is what must stay impossible.
+    """
+    _reset()
+    published = VECTORS["derivation"]["test_root"].encode()
+    assert published == ws._PUBLISHED_TEST_ROOT, (
+        "the module refuses one literal and the contract publishes another"
+    )
+    assert len(published) >= ws.MIN_ROOT_BYTES, (
+        "the length test alone admits it -- which is why a rejected-value check is needed at all"
+    )
+    os.environ[ws.SIGNING_ROOT_ENV] = published.decode()
+    try:
+        assert ws.configured() is False
+        try:
+            ws.signing_root()
+        except ws.SigningNotConfigured as exc:
+            # Naming the file is the whole value of the message: an operator who pasted it needs to
+            # recognise WHERE from, not be told the variable is unset when it plainly is not.
+            assert "signing-vectors" in str(exc), str(exc)
+        else:
+            raise AssertionError("the published example root must raise")
+    finally:
+        _reset()
+    # And the injection path is untouched: the vectors are still reproducible with `root=`, which is
+    # what the file is published for.
+    assert ws.sign(
+        destination_id=DEST_A, generations=[1], webhook_id="dlv_1", body=BODY, root=published
+    ).headers[ws.HEADER_SIGNATURE]
+
+
 def test_surrounding_whitespace_is_stripped_and_warned_about_once(caplog=None):
     # The chart's own note: a payload written with `echo` rather than `printf '%s'` carries a
     # trailing newline, which here would re-derive EVERY destination's secret -- so every partner's
@@ -296,7 +343,13 @@ def test_sign_mints_a_fresh_timestamp_when_none_is_given():
 
 
 def test_sign_reads_the_environment_when_no_root_is_passed():
-    os.environ[ws.SIGNING_ROOT_ENV] = ROOT.decode()
+    # NOT `ROOT`: that is the value the contract publishes and `signing_root()` now refuses it by
+    # name, so an environment read of it raises rather than signing. The other suites' fixtures
+    # ('r' * 40 in test_partner_auth and test_partner_api, 'r' * 48 in test_partner_delivery) are
+    # arbitrary for the same reason. `ROOT` stays as the module-level constant for the `root=`
+    # injection path, which is what re-derives the published vectors.
+    env_root = b"e" * 40
+    os.environ[ws.SIGNING_ROOT_ENV] = env_root.decode()
     signed = ws.sign(
         destination_id=DEST_A,
         generations=[2],
@@ -310,7 +363,7 @@ def test_sign_reads_the_environment_when_no_root_is_passed():
         webhook_id="dlv_1",
         body=BODY,
         timestamp=1789197300,
-        root=ROOT,
+        root=env_root,
     ).headers[ws.HEADER_SIGNATURE]
 
 

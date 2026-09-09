@@ -401,10 +401,16 @@ class ConnectivityProvider(Protocol):
 
     Returns (from→to runs, to→from runs), or None when the question could not be answered — an
     outage, a timeout, the rate limit. None is not "no service".
+
+    ``path`` names whose per-minute budget the question spends. The provider owns the vocabulary and
+    the ceilings (`main._CONNECTIVITY_PARTNER_PATH` and its neighbours); this module only forwards
+    the tag it was handed, so an unrecognised one is charged the public budget rather than minting a
+    new one. It is keyword-only and defaulted so a caller that does not care — and every existing
+    one — is unchanged.
     """
 
     def __call__(
-        self, from_refs: Sequence[str], to_refs: Sequence[str]
+        self, from_refs: Sequence[str], to_refs: Sequence[str], *, path: str = ...
     ) -> tuple[bool, bool] | None: ...
 
 
@@ -857,12 +863,24 @@ def _service_check_due(rec: dict, now: datetime) -> bool:
         return True
 
 
-def _service_verdict(from_stop: str, to_stop: str) -> tuple[bool, bool] | None:
-    """Ask the injected provider about every ref of both places. None when unavailable."""
+def _service_verdict(
+    from_stop: str, to_stop: str, *, path: str | None = None
+) -> tuple[bool, bool] | None:
+    """Ask the injected provider about every ref of both places. None when unavailable.
+
+    ``path`` is forwarded to the provider only when a caller names one, and that is not a style
+    choice: a provider is an INJECTED seam, several suites supply two-positional fakes, and this
+    function swallows every exception into ``None``. Passing ``path=`` unconditionally would turn
+    each of those fakes into a silent "could not establish" — which is the exact failure this seam
+    exists to avoid, arriving with a green test suite. `partner_api` and `partner_servability` are
+    wired with a partial that names the partner budget (see `main.lifespan`).
+    """
     if _connectivity_provider is None:
         return None
     try:
-        return _connectivity_provider(place_refs(from_stop), place_refs(to_stop))
+        if path is None:
+            return _connectivity_provider(place_refs(from_stop), place_refs(to_stop))
+        return _connectivity_provider(place_refs(from_stop), place_refs(to_stop), path=path)
     except Exception:
         # Same rule as the provider's own failure path: an unanswerable question never blocks a
         # registration, and never becomes a warning either.
@@ -2936,7 +2954,26 @@ def _subjects_for_key(
                 message_input,
                 from_name,
                 to_name,
-                _partner_wording(message_key, enabled=partner_llm),
+                # NO CACHED WORDING FOR A DECLARED CANCELLATION. `_message_key` is
+                # (journey_key, situation_number, departure) and carries no `cancelled` flag, so a
+                # wording written while the train was merely at risk shares one entry with the
+                # reading taken after ET declared it gone -- and nothing forgets it in between:
+                # `_reconcile_caches`' only unconditional forget is the below-threshold one, a
+                # declared cancellation stays alert-worthy at (1.0, 1.0), and the write pass
+                # short-circuits on `message_key in _messages`. The title is rebuilt from THIS
+                # cycle's input, so the event read «Tog L1 07:18 er innstilt» over «91 % sjanse for
+                # innstilling, typisk 15-27 min forsinket» beside `delay: null` and
+                # `effect: "cancelled"` in the same payload. The template is the documented correct
+                # wording here -- `_deterministic_body` renders «Innstilt» and carries no delay
+                # figures, which is `impact._cancelled_prediction`'s own rule -- so refusing the
+                # cache costs nothing and states the certainty.
+                #
+                # The BROWSER card reads the same entry through `_deliverable_message` and still
+                # shows the stale text; that half is pre-existing and needs its own pass over
+                # `_messages`, `_message_meta`, `_alternatives` and `_message_attempts`. What this
+                # narrows is the one consumer that turns a stale cache entry into a DELIVERED
+                # notification a partner's traveller then acts on.
+                None if winner.cancelled else _partner_wording(message_key, enabled=partner_llm),
                 # Always False, and structurally so. The browser's «Bekreftet:» prefix comes off
                 # `_pushed_trains`, which is per REGISTRATION and per device — a partner has no
                 # such record here, and the envelope carries the same fact better:

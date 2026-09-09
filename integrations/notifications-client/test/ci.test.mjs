@@ -23,14 +23,56 @@ function workflow() {
   return fs.readFileSync(WORKFLOW, "utf8");
 }
 
+/**
+ * Just the named step's own text, from its `- name:` line to the next list item.
+ *
+ * Asserting against the WHOLE file is what this check looked like first, and it was worth nothing
+ * for the line it cared about most: `npm run verify:dist` appears TWICE in ci.yml -- here and in the
+ * Firebase receiver's step, which legitimately needs it too -- so removing it from this package's
+ * step left the assertion matching the sibling's copy and the suite green, silently losing the
+ * KTD11 declared-consumption-shape build this file exists to guard. The same bounded-slice
+ * technique `disruptions/api/test_poller_refresh.py` uses on its own source inspections.
+ *
+ * A missing step THROWS rather than yielding an empty slice: a regex failing against `""` reports
+ * "the workflow does not run verify:dist" when the real fact is "the step was renamed", and those
+ * are different repairs.
+ *
+ * The end of the step is found by INDENTATION, not by the next `- ` list item, and the difference is
+ * not academic. Scanning for the next list item ran this step's slice on through the comment block
+ * introducing the next one, and ran the LAST step's slice to the end of the file -- the `docker`
+ * jobs below it open no list item, so there was nothing to stop at. Both slices then covered text
+ * belonging to somebody else, which is the whole defect being fixed. A YAML block ends at the first
+ * non-blank line indented no further than the `-` that opened it; comments in this file sit at
+ * exactly that column, which is what closes the first case.
+ */
+function stepText(text, name) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.trimStart().startsWith(`- name: ${name}`));
+  if (start === -1) {
+    throw new Error(`.github/workflows/ci.yml has no step named ${JSON.stringify(name)}`);
+  }
+  const indentOf = (line) => line.length - line.trimStart().length;
+  const opened = indentOf(lines[start]);
+  const step = [lines[start]];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() !== "" && indentOf(line) <= opened) {
+      break;
+    }
+    step.push(line);
+  }
+  return step.join("\n");
+}
+
 test("ci.yml runs this package's suite from this package's directory", () => {
   const text = workflow();
   if (text === null) {
     console.log("skipping: no .github/workflows/ci.yml -- this is a vendored copy");
     return;
   }
-  assert.match(text, /working-directory: integrations\/notifications-client/);
-  assert.match(text, /npm run verify:dist/, "the declared consumption shape is built and loaded");
+  const step = stepText(text, "Run notification client tests");
+  assert.match(step, /working-directory: integrations\/notifications-client/);
+  assert.match(step, /npm test\b/);
+  assert.match(step, /npm run verify:dist/, "the declared consumption shape is built and loaded");
 });
 
 test("ci.yml runs the Firebase receiver's suite and its emulator suite", () => {
@@ -42,8 +84,9 @@ test("ci.yml runs the Firebase receiver's suite and its emulator suite", () => {
   if (text === null) {
     return;
   }
-  assert.match(text, /working-directory: integrations\/firebase-notifications/);
-  assert.match(text, /npm run test:emulator/);
+  const step = stepText(text, "Run Firebase notification receiver tests");
+  assert.match(step, /working-directory: integrations\/firebase-notifications/);
+  assert.match(step, /npm run test:emulator/);
 });
 
 test("the image never ships either integrations/ or contracts/", () => {

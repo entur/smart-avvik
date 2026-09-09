@@ -49,6 +49,7 @@ class _Store:
         self.write_errors = write_errors or {}
         self.loads = 0
         self.writes: list[tuple[str, bool | None]] = []
+        self.versions: list[tuple[str, int]] = []
 
     def active_subscriptions(self, **_: Any) -> partner_store.LoadedSubscriptions:
         self.loads += 1
@@ -62,10 +63,18 @@ class _Store:
         )
 
     def set_servability(
-        self, subscription_id: str, *, servable: bool | None, now: datetime | None = None
+        self,
+        subscription_id: str,
+        *,
+        servable: bool | None,
+        expected_version: int,
+        now: datetime | None = None,
     ) -> None:
         del now
+        # Recorded, so "the verdict is written for the version it was asked about" is an assertion
+        # about a value rather than about the absence of a crash.
         self.writes.append((subscription_id, servable))
+        self.versions.append((subscription_id, expected_version))
         error = self.write_errors.get(subscription_id)
         if error is not None:
             raise error
@@ -321,6 +330,32 @@ def test_a_subscription_deleted_while_we_were_asking_is_skipped_not_resurrected(
     # how a real one stops being read.
     assert "vanished" in store.levels and "write_failed" not in store.levels, store.levels
     assert store.levels["vanished"] < logging.WARNING
+
+
+def test_a_route_replaced_mid_check_is_superseded_rather_than_stamped():
+    """The verdict is about a ROUTE, and the question outlives the definition it was asked about.
+
+    A check is a ~20 s BigQuery question and a replace is one partner request, so they interleave.
+    Without the version guard this pass would stamp the CURRENT record with a verdict about the
+    route it has just stopped watching, and date it now -- `servable` reading as an answer beside a
+    fresh `servable_checked_at` is the exact pair R6 publishes so a caveat's age can be judged.
+
+    Named as its own outcome, below WARNING, for `vanished`'s reason: the replace retired the answer
+    and its stamp deliberately, and the record comes back round on the next cadence with nothing
+    established -- so there is nothing to repair and nothing to warn about.
+    """
+    store = _Store(
+        [_sub("s1", checked_at=None), _sub("s2", checked_at=NOW - timedelta(hours=7))],
+        write_errors={"s1": partner_store.Conflict("version is 2, not 1")},
+    )
+    fields = _run(store, verdicts=(True, True))
+    assert [w[0] for w in store.writes] == ["s1", "s2"], "the second record is still processed"
+    # The version travels with the question, so the store can refuse a writer that is behind.
+    assert store.versions == [("s1", 1), ("s2", 1)], store.versions
+    summary = [f for f in fields if f["result"] == "swept"]
+    assert summary and summary[0]["cleared"] == 1, "a superseded record is not a cleared one"
+    assert "superseded" in store.levels and "write_failed" not in store.levels, store.levels
+    assert store.levels["superseded"] < logging.WARNING
 
 
 def test_one_failing_write_does_not_end_the_sweep():

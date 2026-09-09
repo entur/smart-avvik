@@ -27,10 +27,16 @@ one byte per second can hold a worker for several multiples of the read timeout 
 ``webhook_client``'s docstring states that and delegates the containment here. ``partner_store``
 bounds every READ with ``_CALL_DEADLINE_S`` but a transactional COMMIT carries no timeout the Python
 client can express, so a hung store WRITE still has no ceiling of its own. Both are contained the
-same way: every task is submitted to the pool and the pool is awaited
+same way: every task is submitted to a pool and the pool is awaited
 for :data:`_DELIVERY_WAIT_S`, then abandoned with ``shutdown(wait=False)``. The reservation budget
 is what bounds the *ordinary* pass; the bounded wait is what bounds a pass with something hung in
 it. They are different failures and neither one catches both.
+
+**"Every task" includes the stale sweep, and did not until 2026-09-09.** ``_expire_stale`` is a loop
+of ``mark_delivery_expired`` commits and it ran on the CALLING thread, before the delivery pool was
+created -- outside the only bound that can contain a commit. A store call that hangs on a poller
+thread outside a bounded wait is not a slow cycle, it is the end of ingestion: the web server's
+request threads are separate, so nothing crashes and no liveness probe fires.
 
 **Dedup is on success, exactly as /varsel's is.** An attempt that errors leaves no mark and is
 re-offered next cycle, and R11's daily cap slot is spent inside the transaction that records the
@@ -672,6 +678,12 @@ def _expire_stale(stale: tuple[str, ...], *, now: datetime, budget: _DeliveryBud
     nothing ever resolves is a document the delivery query keeps returning for its whole seven-day
     retention. Charged against the same budget as an attempt: these are store writes on the poller's
     thread and a backlog of them is exactly as expensive as a backlog of anything else.
+
+    **Runs on a worker, never on the calling thread** -- see :func:`deliver_pending`. The budget
+    bounds the COUNT of these writes and when the last one may start; it cannot bound how long one
+    takes, because ``mark_delivery_expired`` is a transactional commit and a commit carries no
+    timeout the Python client can express. Only the bounded wait can, and it only reaches what is
+    submitted to a pool.
     """
     expired = errors = 0
     for delivery_id in stale:
@@ -708,18 +720,21 @@ def deliver_pending(
     already sorted the way ``/varsel`` spends its own budget, and re-sorting or re-deriving it here
     would be a second definition of what is pending.
 
-    **Two things loosen R11's "spent soonest-departure-first", and both are limits rather than
-    details.** The order is ``valid_until``, which is ``min(occurred_at + 60 min, departure)``:
+    **One thing loosens R11's "spent soonest-departure-first", and it is a limit rather than a
+    detail.** The order is ``valid_until``, which is ``min(occurred_at + 60 min, departure)``:
     exact for every train departing inside the horizon -- the ones a traveller can still act on --
     and clamped to the horizon beyond it, so among trains further out it falls back to the delivery
     id. Nothing on a delivery record carries the departure, so improving that means a field the
-    store does not have. And the daily cap is READ by ``claim_delivery`` and SPENT by
-    ``mark_delivery_sent``, so up to ``workers`` claims can pass the check before any increment
-    lands: measured on AE3's shape (thirteen departures, cap four) the delivered four were the 1st,
-    2nd, 3rd and 6th soonest. The COUNT is exact either way -- Firestore's counter is authoritative,
-    and the store records every suppression -- and the loosening is bounded by the pool width.
-    Tightening it would mean claiming sequentially, and a claim is a store call: sequential claims
-    for a two-hundred-deep backlog are exactly what the pool exists to avoid.
+    store does not have.
+
+    **The daily cap does not loosen it, and this docstring claimed it did until 2026-09-09.** That
+    reading described a version of the store where ``claim_delivery`` READ the allowance and
+    ``mark_delivery_sent`` spent it, so up to ``workers`` claims could pass against one free slot.
+    The claim now RESERVES the slot in the transaction that admits the delivery
+    (``partner_store._claim_body``), and :func:`_shard_by_subscription` puts one subscription on one
+    worker -- so a subscription's claims are sequential by construction and the cap is exact at any
+    pool width, which is also what makes "spent on the soonest" exact rather than approximately
+    true.
     """
     instant = (now or datetime.now(UTC)).astimezone(UTC)
     send = sender if sender is not None else webhook_client.deliver
@@ -737,12 +752,44 @@ def deliver_pending(
         )
         return DeliveryReport(store_errors=1, ms=int((monotonic() - started) * 1000))
 
-    expired, expire_errors = _expire_stale(pending.stale, now=instant, budget=budget)
+    # THE STALE SWEEP IS A POOL TOO, and it was not until 2026-09-09. It is a loop of store WRITES
+    # on the poller's thread, which is the one class of call this module's docstring says has no
+    # ceiling of its own -- and it ran BEFORE the delivery pool existed, so the
+    # `wait(futures, timeout=...)` below never reached it. The budget bounded the count and the
+    # start time; nothing bounded the duration, so one hung `mark_delivery_expired` commit held the
+    # ingestion thread for as long as Firestore took and blew the 28 s ceiling KTD6's 30 s reversal
+    # trigger is sized against. `partner_events.emit`'s shape, for the same reason and with the same
+    # residual: one leaked thread per bad cycle, which Python cannot cancel and which is far cheaper
+    # than a stalled poller.
+    expired = expire_errors = 0
+    timed_out = False
+    if pending.stale:
+        sweep = ThreadPoolExecutor(max_workers=1, thread_name_prefix="partner-expire")
+        try:
+            expired, expire_errors = sweep.submit(
+                _expire_stale, pending.stale, now=instant, budget=budget
+            ).result(timeout=max(0.0, wait_s - (monotonic() - started)))
+        except Exception:
+            logger.warning(
+                "The partner stale-delivery sweep did not finish inside its budget; the records "
+                "stay pending and the next cycle re-offers them",
+                exc_info=True,
+                extra={"fields": {"event": "partner_delivery", "result": "expire_timeout"}},
+            )
+            timed_out = True
+        finally:
+            # NEVER wait, for `deliver_pending`'s own reason two blocks down.
+            sweep.shutdown(wait=False)
     counts = _Counts(expired=expired, store_errors=expire_errors)
     skips = _Skips()
-    timed_out = False
 
-    shards = _shard_by_subscription(pending.ready)
+    # A sweep that timed out means the store is demonstrably not answering, and the wait budget it
+    # spent is gone. Dialling four more claims into it would leak four more threads to arrive at the
+    # same `not_done`, so this cycle stops here and the next one asks again -- which is this
+    # module's retry model for everything else.
+    shards: list[tuple[partner_store.Delivery, ...]] = (
+        [] if timed_out else _shard_by_subscription(pending.ready)
+    )
     if shards:
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(shards)), thread_name_prefix="partner-deliver"
@@ -763,7 +810,10 @@ def deliver_pending(
                 for shard in shards
             ]
             _, not_done = wait(futures, timeout=max(0.0, wait_s - (monotonic() - started)))
-            timed_out = bool(not_done)
+            # `or`, not `=`: the sweep above can already have set it, and although the guard on
+            # `shards` makes that unreachable today, an assignment here would silently un-report a
+            # sweep timeout the day that guard changes.
+            timed_out = timed_out or bool(not_done)
         finally:
             # NEVER wait: `__exit__` would call `shutdown(wait=True)` and block the poller until
             # whatever is hung finally returns, defeating the bound completely. An abandoned worker

@@ -66,6 +66,8 @@ import secrets
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
@@ -114,6 +116,13 @@ _LIST_MAX = partner_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER
 #: turn this app into a request amplifier against a partner-supplied host.
 _TEST_EVENTS_PER_MIN = 6
 _TEST_EVENTS_WINDOW_S = 60
+
+#: How long the route waits on the one worker its delivery runs on. `webhook_client`'s own two
+#: ceilings plus one second for the DNS resolution that precedes both of them and that neither can
+#: bound -- see the comment at the call site. It has to EXCEED the attempt's worst case, or this
+#: backstop would fire on an ordinary slow partner and report `timeout` where their own status,
+#: error or refusal is the diagnosis the endpoint exists to give.
+_TEST_EVENT_WAIT_S = webhook_client.DEFAULT_TIMEOUT_S + webhook_client.CONNECT_TIMEOUT_S + 1.0
 
 #: `Retry-After` on an R21 ceiling. Bounded, and deliberately longer than the limiter's 60 s: a
 #: subscription-count ceiling does not clear when a window rolls over, so telling the caller to
@@ -700,7 +709,9 @@ def _same_definition(spec: partner_store.SubscriptionSpec, sub: partner_store.Su
     )
 
 
-def _record_servability(spec: partner_store.SubscriptionSpec) -> partner_store.Subscription | None:
+def _record_servability(
+    spec: partner_store.SubscriptionSpec, *, expected_version: int
+) -> partner_store.Subscription | None:
     """Ask /varsel's connectivity seam and record R5's caveat. Never fails the request.
 
     Two things it deliberately does not do. It does not write when the verdict could not be
@@ -716,6 +727,13 @@ def _record_servability(spec: partner_store.SubscriptionSpec) -> partner_store.S
     folding them would mean either a wider store API or a caveat computed inside a transaction body
     -- and a transaction body may run more than once, which is the last place a 20-second BigQuery
     question belongs.
+
+    ``expected_version`` is the version the QUESTION was asked about, and it is what keeps the
+    answer about a route rather than about an id: the question takes up to
+    ``main._CONNECTIVITY_TIMEOUT_S`` (20 s) while a replace is one request, so a concurrent replace
+    can land in between and this would otherwise stamp the new route with the old route's verdict,
+    freshly timestamped. The store enforces it inside the transaction; a conflict here means the
+    definition moved and the verdict is discarded, exactly as an unestablished one is.
     """
     if _connectivity is None:
         return None
@@ -731,7 +749,24 @@ def _record_servability(spec: partner_store.SubscriptionSpec) -> partner_store.S
     if verdict is None:
         return None
     try:
-        return _store.set_servability(spec.subscription_id, servable=bool(verdict[0]))
+        return _store.set_servability(
+            spec.subscription_id, servable=bool(verdict[0]), expected_version=expected_version
+        )
+    except partner_store.Conflict:
+        # The route was replaced while we were asking. Not a failure and not an error: the newer
+        # definition retired the answer AND its stamp on purpose, and `partner_servability.recheck`
+        # picks a never-established record up on its own cadence.
+        logger.info(
+            "A partner servability verdict arrived after the route was replaced; discarded",
+            extra={
+                "fields": {
+                    "event": "partner_servability",
+                    "result": "superseded",
+                    "subscription_id": spec.subscription_id,
+                }
+            },
+        )
+        return None
     except Exception:
         logger.warning(
             "Partner servability write failed; the record keeps its null caveat",
@@ -786,7 +821,12 @@ def _one_snapshot(document_id: str, partner_id: str) -> AlertStateOut:
         401: {"description": "Missing, unknown, revoked or wrong credential."},
         403: {"description": "The partner is suspended."},
         409: {"description": "The reference is tombstoned, or the version moved under you."},
-        422: {"description": "Malformed window, weekdays, stops or destination."},
+        # TWO shapes at this status, and the authored contract now says so -- this string is
+        # the copy FastAPI renders into the app's own /docs, and it named only the first.
+        # `Error` with a string `detail` is a refusal this application made; the framework's
+        # own array shape reaches a caller before any handler here runs.
+        422: {"description": "Malformed window, weekdays, stops or destination (Error), or "
+                             "a schema refusal the framework made first (ValidationError)."},
         429: {"description": "A limiter tier or an R21 ceiling. Retry-After is bounded."},
         503: {"description": "The channel is not configured here, or the store is unavailable."},
     },
@@ -856,7 +896,10 @@ def create_or_replace_subscription(
             raise _http(exc) from exc
         # A changed route is a different servability question, and the store has already retired the
         # old answer, so this re-asks rather than carrying a stale verdict forward (R6).
-        return _out(principal.partner_id, _record_servability(spec) or replaced)
+        return _out(
+            principal.partner_id,
+            _record_servability(spec, expected_version=replaced.version) or replaced,
+        )
 
     if expected is not None:
         # An If-Match on a reference that does not exist cannot be satisfied, and creating anyway
@@ -890,7 +933,10 @@ def create_or_replace_subscription(
     except Exception as exc:
         raise _http(exc) from exc
     response.status_code = 201
-    return _out(principal.partner_id, _record_servability(spec) or created)
+    return _out(
+        principal.partner_id,
+        _record_servability(spec, expected_version=created.version) or created,
+    )
 
 
 @router.get(
@@ -909,16 +955,37 @@ def list_subscriptions(
 ) -> SubscriptionList:
     """Every live watch this credential owns, oldest first.
 
-    Paged in Python over an already-bounded read: the store's query is capped at
-    ``MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER`` (500) and the cursor is the previous page's last
-    reference, so paging is a slice rather than an offset scan. That is affordable exactly because
-    the whole set is bounded -- and the bound is R21's, not a display choice. A cursor the current
-    set does not contain is a 400 rather than an empty page, for ``historikk._checked_choice``'s
-    reason: "that watch is gone" and "nothing matched" are different answers and a client that
-    cannot tell them apart will show the second when it means the first.
+    **The caller's page size reaches the query**, through a real Firestore cursor on the ordering
+    ``partner_subscriptions`` already declares. Until 2026-09-09 it did not: the store streamed up
+    to ``MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER`` (500) subscription documents and this function
+    sliced afterwards, so `?limit=1` -- the natural shape for a paginated dashboard -- cost exactly
+    what `?limit=500` did. Against ``partner_auth.PER_PARTNER_PER_MIN`` (120) that is a read
+    amplification a partner drives with their own polling and cannot see.
+
+    **What one page costs now, as a number**: one document to resolve ``after`` (none on the first
+    page), ``limit + 1`` subscription documents -- the extra one is what detects ``next_cursor``
+    without a second query -- and up to ``MAX_SUBJECTS_PER_READ`` (500) alert-subject documents from
+    the one partner-scoped alert-state query below. That last read is deliberately NOT narrowed to
+    the page: one query for every row's state is the trade recorded beside it, and narrowing it
+    would buy back the documents at the price of N+1 queries.
+
+    A cursor the current set does not contain is a 400 rather than an empty page, for
+    ``historikk._checked_choice``'s reason: "that watch is gone" and "nothing matched" are different
+    answers and a client that cannot tell them apart will show the second when it means the first.
+    The store answers that with ``NotFound``, which is why it is caught by name here -- through
+    ``_http`` it would become a 404 about the listing rather than a 400 about the cursor.
     """
     try:
-        subs = _store.list_subscriptions(partner_id=principal.partner_id)
+        # `limit + 1`: one row past the page is what says there IS a next page, and it costs one
+        # document rather than a second query. `_LIST_MAX` is the store's own ceiling, so the `+ 1`
+        # cannot push the read past what R21 already allows.
+        subs = _store.list_subscriptions(
+            partner_id=principal.partner_id,
+            limit=min(limit + 1, _LIST_MAX),
+            after=_requested_id(principal.partner_id, after) if after is not None else None,
+        )
+    except partner_store.NotFound as exc:
+        raise HTTPException(status_code=400, detail="unknown_cursor") from exc
     except Exception as exc:
         raise _http(exc) from exc
     # ONE query for every row's alert state, never one per row: a page can hold hundreds of
@@ -949,11 +1016,6 @@ def list_subscriptions(
         )
         for s in subs
     ]
-    if after is not None:
-        ids = [r.subscription_id for r in rows]
-        if after not in ids:
-            raise HTTPException(status_code=400, detail="unknown_cursor")
-        rows = rows[ids.index(after) + 1 :]
     page = rows[:limit]
     return SubscriptionList(
         count=len(page),
@@ -1203,8 +1265,14 @@ def _synthetic_event(
                 "aimed_departure_time": aimed.isoformat(),
                 "departs_tomorrow": False,
             },
-            # A declared cancellation reads (1.0, 1.0, 1.0) by construction, and the threshold is
+            # A declared cancellation reads (1.0, 1.0, NULL) by construction, and the threshold is
             # carried so a partner can see WHY it cleared the bar rather than inferring one.
+            #
+            # `delay_ge10` is the null, and it stated 1.0 until 2026-09-09. `impact
+            # ._cancelled_prediction` serves `ge10_probability=None` for every declared-cancelled
+            # call, because every delay figure meant "if it runs" -- so a real confirmed event
+            # carries null there and this taught a combination no real event produces, in the one
+            # body a partner types their receiver against before a real disruption.
             #
             # `has_situation=False`, matching the situation below, and the pair is the whole point:
             # a real event's `alert_threshold` is `alert.alert_threshold`, which is
@@ -1215,7 +1283,7 @@ def _synthetic_event(
             "probabilities": {
                 "impact": 1.0,
                 "cancellation": 1.0,
-                "delay_ge10": 1.0,
+                "delay_ge10": None,
                 "alert_threshold": alert_policy.threshold_for("VYG", has_situation=False),
             },
             # Null, because every delay figure meant "if it runs".
@@ -1321,12 +1389,50 @@ def send_test_event(principal: _Principal, body: TestEventIn) -> TestEventOut:
         webhook_id=event["event_id"],
         body=payload,
     )
+    # ON A ONE-WIDE POOL, NOT INLINE, and the reason is DNS. `webhook_client`'s two ceilings are
+    # `socket.settimeout` values on a connection that already exists, and `_default_resolver` calls
+    # `socket.getaddrinfo` before either applies -- a blocking C call with no deadline the Python
+    # layer can express and no way to interrupt it. The delivery PASS contains that inside its own
+    # bounded wait; this route is a plain `def` sharing the ~40-slot anyio worker pool with
+    # `/varsel-api`'s registration writes and `/impact`, so a stalled resolver held one of those
+    # workers for as long as the resolver took, and `_TEST_EVENTS_PER_MIN` bounds REQUESTS rather
+    # than workers held. `partner_events.emit`'s shape, with the same honest residual: the thread is
+    # abandoned rather than killed, because Python cannot cancel one parked in a syscall -- and here
+    # the per-partner ceiling is also what bounds how many can be leaked.
+    #
+    # The wait is the attempt's own worst case plus a small margin for the resolution that precedes
+    # it, so an ordinary slow partner still reports THEIR failure (a 500, a timeout, a refusal) and
+    # only a hang this module cannot otherwise see reaches the backstop.
     deliver = _deliver or webhook_client.deliver
-    attempt = deliver(
-        destination.callback_url,
-        body=signed.body,
-        headers={**signed.headers, "Content-Type": "application/json"},
-    )
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="partner-test-event")
+    try:
+        attempt = pool.submit(
+            deliver,
+            destination.callback_url,
+            body=signed.body,
+            headers={**signed.headers, "Content-Type": "application/json"},
+        ).result(timeout=_TEST_EVENT_WAIT_S)
+    except FuturesTimeout:
+        # A 200 carrying the outcome, like every other delivery failure on this route: the request
+        # succeeded and the diagnosis is that their endpoint did not answer. A 504 here would read
+        # as OUR failure, which is the opposite of what this endpoint is for.
+        logger.warning(
+            "A partner test event did not return inside its wait; the worker was abandoned",
+            extra={
+                "fields": {
+                    "event": "partner_test_event",
+                    "result": "timeout",
+                    "partner_id": principal.partner_id,
+                    "key_id": principal.key_id,
+                    "destination_id": destination.destination_id,
+                }
+            },
+        )
+        attempt = webhook_client.DeliveryAttempt(ok=False, retryable=True, error="timeout")
+    finally:
+        # NEVER wait: `shutdown(wait=True)` would block this request until the stalled call returned
+        # and defeat the bound completely.
+        pool.shutdown(wait=False)
     logger.info(
         "Partner test event to %s: ok=%s status=%s",
         destination.destination_id,

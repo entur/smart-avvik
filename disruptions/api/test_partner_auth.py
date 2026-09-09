@@ -16,6 +16,7 @@ write site in the repo, not of a document.
 
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import logging
@@ -27,6 +28,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import partner_auth
+import partner_store
 import webhook_signing
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -729,7 +731,19 @@ def _deny(reason: str = "not_a_member", actor: str = "outsider@entur.org"):
 
 def _run(args: list[str], *, authorizer, store: _MemoryDocs) -> tuple[int, str]:
     out = io.StringIO()
-    code = tool.main(args, authorizer=authorizer, store=store, out=out)
+    # GOOGLE_CLOUD_PROJECT is POPPED for the run, and that is not tidiness. The tool refuses a
+    # project that is not `--environment`'s own (exit 2), and a developer reproducing prd behaviour
+    # locally has `GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev` exported -- which would fail every
+    # `--environment prd` case here for a reason about their shell. `test_varsel_api` pins
+    # `KIX_ENVIRONMENT` at import for the same class of leak.
+    saved = os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+    try:
+        code = tool.main(args, authorizer=authorizer, store=store, out=out)
+    finally:
+        if saved is None:
+            os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+        else:
+            os.environ["GOOGLE_CLOUD_PROJECT"] = saved
     return code, out.getvalue()
 
 
@@ -899,6 +913,75 @@ def test_the_environment_is_never_inferred():
     assert failed
 
 
+def test_the_gate_and_the_target_cannot_be_chosen_separately():
+    """R22's separate prd group was bypassable by a flag, and only prd IAM stopped it.
+
+    `--environment` picks the group membership is checked against; `--project` picked which project
+    was then read and written, with no comparison between the two. So `--environment dev --project
+    ent-kixavvik-prd` was authorized against the dev group and acted on prd -- `show-signing-secret`
+    printing a live prd receiver credential, `suspend-partner` and `revoke-key` silencing a real
+    partner. The audit row lands in the project that was targeted, so the action IS recorded; it is
+    recorded as authorized.
+
+    Refused BEFORE the store is configured and before the group is checked, so nothing is opened and
+    nothing is read on the way to the refusal. Exit 2, the tool's "your invocation is wrong" code,
+    distinct from 3 ("you are not in the group") -- an operator who IS a member and typed the wrong
+    project must not be told they lack membership.
+    """
+    store = _MemoryDocs()
+    saved = os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+    stderr, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        code = tool.main(
+            [
+                "--environment",
+                "dev",
+                "--project",
+                "ent-kixavvik-prd",
+                "create-partner",
+                "--partner-id",
+                "acme",
+                "--name",
+                "Acme",
+            ],
+            authorizer=_allow(),
+            store=store,
+            out=io.StringIO(),
+        )
+        message = sys.stderr.getvalue()
+    finally:
+        sys.stderr = stderr
+        if saved is not None:
+            os.environ["GOOGLE_CLOUD_PROJECT"] = saved
+    assert code == 2, code
+    assert store.data == {}, "refused before anything was written, audit row included"
+    # The message names both halves, because the operator has to know which one to change.
+    assert tool.OPERATOR_GROUPS["dev"] in message and "ent-kixavvik-dev" in message
+    assert "ent-kixavvik-prd" in message
+    # And a stale exported variable is refused the same way rather than silently redirecting the
+    # run -- which is the failure `--project` was added for in the first place.
+    saved = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-prd"
+    stderr, sys.stderr = sys.stderr, io.StringIO()
+    try:
+        code = tool.main(
+            ["--environment", "dev", "create-partner", "--partner-id", "acme", "--name", "Acme"],
+            authorizer=_allow(),
+            store=_MemoryDocs(),
+            out=io.StringIO(),
+        )
+    finally:
+        sys.stderr = stderr
+        if saved is None:
+            os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+        else:
+            os.environ["GOOGLE_CLOUD_PROJECT"] = saved
+    assert code == 2, code
+    # Every environment has a project and the map is the one place the naming lives.
+    assert set(tool.PROJECTS) == set(tool.ENVIRONMENTS)
+    assert tool.PROJECTS["prd"] != tool.PROJECTS["dev"]
+
+
 def test_the_group_authorizer_fails_closed():
     """Every failure path in the real authorizer answers "not allowed", never "allowed".
 
@@ -1037,6 +1120,27 @@ def test_a_missing_signing_root_is_one_line_rather_than_a_provisioning_lecture()
         # Refused BEFORE the group check, so a missing variable is not reported as an authorization
         # problem -- and nothing was disclosed or audited as disclosed.
         assert [r for r in store.audit() if r["action"] == "show_signing_secret"] == []
+        # AND the message distinguishes the two reasons the root can be unusable, because they need
+        # different actions. THIS command is where the second one happens: the runbook tells an
+        # operator to export the variable by hand for it, which is exactly the moment the example
+        # root published in `signing-vectors.json` gets pasted -- and "is unset (or under 32 bytes)"
+        # would tell them the variable they have plainly set is missing.
+        os.environ[webhook_signing.SIGNING_ROOT_ENV] = webhook_signing._PUBLISHED_TEST_ROOT.decode()
+        stderr, sys.stderr = sys.stderr, io.StringIO()
+        try:
+            code, printed = _run(
+                ["--environment", "dev", "show-signing-secret", "--destination-id", DEST],
+                authorizer=_allow(),
+                store=store,
+            )
+            message = sys.stderr.getvalue()
+        finally:
+            sys.stderr = stderr
+            os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
+        assert code == 2
+        assert printed == ""
+        assert "signing-vectors" in message, message
+        assert [r for r in store.audit() if r["action"] == "show_signing_secret"] == []
     finally:
         _uninstall()
 
@@ -1049,6 +1153,95 @@ def test_the_disclosure_command_says_what_it_prints():
     assert "must\nnot go into a ticket" in TOOL_SOURCE or "not go into a ticket" in TOOL_SOURCE
     assert "rotate-signing" in TOOL_SOURCE
 
+
+
+def test_every_identity_plane_firestore_call_carries_its_own_deadline():
+    """KTD6's per-CALL deadline, on the plane it was missing from.
+
+    ``partner_store`` bounds every read at ``_CALL_DEADLINE_S`` and
+    ``test_partner_store.test_every_firestore_call_carries_its_own_deadline`` pins it. The identity
+    plane inherited none of that: all four ``_FirestoreDocs`` operations passed no ``timeout=``, and
+    the one at :meth:`partner_auth._FirestoreDocs.get` is the credential lookup ``authenticate``
+    performs on EVERY authenticated request -- on a plain ``def`` route sharing the anyio worker pool
+    with ``/varsel-api`` and ``/impact``. A Firestore stall therefore parked one shared worker per
+    request, behind nothing but a 300/min pre-lookup tier, until the gRPC layer gave up on its own.
+
+    Checked DYNAMICALLY as well as statically, and the dynamic half is the one that matters: this
+    class is the production seam, so every suite in this directory injects
+    :class:`_MemoryDocs` instead and no behavioural test reaches it at all. The fake below asserts
+    the kwarg the way ``test_partner_store``'s does, for the same stated reason -- a double that
+    accepted ``**kwargs`` would let a path silently lose its deadline.
+    """
+    seen: list[str] = []
+
+    class _Ref:
+        def get(self, timeout: float | None = None) -> Any:
+            assert timeout == partner_store._CALL_DEADLINE_S, "get without a deadline"
+            seen.append("get")
+            return _Snap()
+
+        def set(self, doc: Any, timeout: float | None = None) -> None:
+            assert timeout == partner_store._CALL_DEADLINE_S, "set without a deadline"
+            seen.append("set")
+
+        def update(self, patch: Any, timeout: float | None = None) -> None:
+            assert timeout == partner_store._CALL_DEADLINE_S, "update without a deadline"
+            seen.append("update")
+
+    class _Snap:
+        exists = True
+
+        def to_dict(self) -> dict[str, Any]:
+            return {"partner_id": PARTNER}
+
+    class _Query:
+        def where(self, **_kwargs: Any) -> Any:
+            return self
+
+        def limit(self, _n: int) -> Any:
+            return self
+
+        def stream(self, timeout: float | None = None) -> list[Any]:
+            assert timeout == partner_store._CALL_DEADLINE_S, "stream without a deadline"
+            seen.append("stream")
+            return [_Snap()]
+
+    class _Collection:
+        def document(self, _doc_id: str) -> Any:
+            return _Ref()
+
+        def where(self, **kwargs: Any) -> Any:
+            return _Query().where(**kwargs)
+
+    class _Client:
+        def collection(self, _name: str) -> Any:
+            return _Collection()
+
+    saved = partner_store.client
+    partner_store.client = lambda: _Client()  # type: ignore[assignment]
+    try:
+        docs = partner_auth._FirestoreDocs()
+        assert docs.get(partner_auth.ACCOUNTS, PARTNER) == {"partner_id": PARTNER}
+        docs.set(partner_auth.ACCOUNTS, PARTNER, {"partner_id": PARTNER})
+        docs.update(partner_auth.ACCOUNTS, PARTNER, {"suspended": True})
+        assert docs.list_by(partner_auth.CREDENTIALS, "partner_id", PARTNER, limit=5) == [
+            {"partner_id": PARTNER}
+        ]
+    finally:
+        partner_store.client = saved  # type: ignore[assignment]
+    assert seen == ["get", "set", "update", "stream"], seen
+    # And statically, over the seam's own source, so a FIFTH operation cannot dodge it: every call
+    # this class makes on the client is one of the four names above, and each must name the
+    # constant. Scoped to the class rather than grepped over the module, because `_Docs`' own
+    # `get`/`set`/`update`/`list_by` are called all over `partner_auth` and carry no timeout by
+    # design -- the seam is the abstraction, and only its Firestore implementation dials anything.
+    seam = inspect.getsource(partner_auth._FirestoreDocs)
+    assert seam.count("timeout=partner_store._CALL_DEADLINE_S") == 4, seam
+    assert len(re.findall(r"self\._c\(\)", seam)) == 4, "one client call per operation, no more"
+    assert "_CALL_DEADLINE_S" not in AUTH_SOURCE.replace(seam, ""), (
+        "the deadline belongs to the seam's four calls; a fifth mention elsewhere means a client "
+        "call escaped the class"
+    )
 
 
 def _run_all() -> None:

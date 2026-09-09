@@ -148,6 +148,18 @@ reproduce first: a signed synthetic event becomes one native notification, with 
 no emulator. It runs in the plain `npm test` for that reason — behind `test:emulator` the first thing
 a partner runs would need Java.
 
+**Its event body is READ from `contracts/test-event-sample.json`, never transcribed** (2026-09-09).
+That file is dumped from `partner_api._synthetic_event`, so the scenario runs on the bytes the route
+really sends. It was a hand-written copy of that function until then — announced as one "field for
+field" — and had drifted from it in eight places, `probabilities.cancel` for `cancellation` and
+`call.aimed_departure` for `aimed_departure_time` among them: keys no producer has ever emitted,
+sitting in the one file a partner reads to learn the shape. Nothing failed, because `payload.call`
+and `payload.probabilities` are deliberately open objects in `event.schema.json` and a misnamed key
+inside them is schema-**valid**. One consequence to expect while reading the scenario: a test event
+is a **confirmed** cancellation, so `defaultDisplay` gives it `silent` rather than `alert` — a
+confirmation updates a warning the traveller already holds. The old fixture asserted `alert` on the
+strength of a `phase` no producer sends.
+
 **The two emulator suites in this repository cannot be started at the same instant.** This package
 pins its own Firestore port (8572), websocket port (9151), hub port (4401) and demo project id, which
 is what makes the *sequential* case safe — CI runs them one after another, and a Firestore emulator

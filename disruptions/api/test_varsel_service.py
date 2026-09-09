@@ -130,9 +130,43 @@ def test_the_rate_limit_does_not_apply_to_cached_pairs(monkeypatch):
     fake = _FakeBQ(_row(True, False))
     _install(fake, monkeypatch)
     main._varsel_connectivity(["A"], ["B"])
-    main._connectivity_calls[:] = [main._connectivity_calls[0]] * main._CONNECTIVITY_MAX_PER_MIN
+    spent = main._connectivity_calls[main._CONNECTIVITY_REQUEST_PATH]
+    spent[:] = [spent[0]] * main._CONNECTIVITY_MAX_PER_MIN
     assert main._varsel_connectivity(["A"], ["B"]) == (True, False)
     assert main._varsel_connectivity(["C"], ["D"]) is None
+
+
+def test_a_partner_onboarding_burst_cannot_spend_a_travellers_budget(monkeypatch):
+    """`alternatives._POLLER_FETCH_MAX_PER_MIN`'s split, for the same reason and one layer over.
+
+    The 30/min ceiling is an ABUSE-CONTROL number: /varsel-api is unauthenticated, and it bounds a
+    caller who keeps inventing pairs. The partner channel then arrived and spent the same tally --
+    `partner_api._record_servability` on every create and replace (a partner may issue 120 of those
+    a minute) and `partner_servability.recheck` on the poller's cadence. A bulk onboarding of an
+    existing commuter base, which is exactly what this channel is for, therefore exhausted a
+    traveller-facing budget as a side effect, and the degradation is silent: `None` means "could not
+    establish", so a real traveller's journey registers with no no-direct-service caveat at all.
+
+    Two tallies, never one, and the ceilings are deliberately different -- see the constants.
+    """
+    fake = _FakeBQ(_row(True, False))
+    _install(fake, monkeypatch)
+    for i in range(main._PARTNER_CONNECTIVITY_MAX_PER_MIN):
+        assert main._varsel_connectivity([f"P{i}"], ["B"], path=main._CONNECTIVITY_PARTNER_PATH) == (
+            True,
+            False,
+        )
+    assert main._varsel_connectivity(["P-over"], ["B"], path=main._CONNECTIVITY_PARTNER_PATH) is None
+    # The traveller's own budget is untouched: a full partner minute buys a full traveller minute.
+    for i in range(main._CONNECTIVITY_MAX_PER_MIN):
+        assert main._varsel_connectivity([f"T{i}"], ["B"]) == (True, False)
+    assert main._varsel_connectivity(["T-over"], ["B"]) is None
+
+
+def test_the_partner_path_is_the_smaller_share(monkeypatch):
+    """A partner's onboarding is a batch that can take longer; a traveller is waiting on a page."""
+    del monkeypatch
+    assert 0 < main._PARTNER_CONNECTIVITY_MAX_PER_MIN < main._CONNECTIVITY_MAX_PER_MIN
 
 
 def test_the_query_asks_both_call_sources(monkeypatch):
