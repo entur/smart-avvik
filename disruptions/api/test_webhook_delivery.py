@@ -246,7 +246,7 @@ def _install() -> _Fake:
     client = _Fake()
     _saved.update(
         {
-            "client": notification_store._client,
+            "client": notification_store._firestore_client,
             "run": notification_store._run_transaction,
             "query": notification_store._query,
             "pool": webhook_delivery.ThreadPoolExecutor,
@@ -261,7 +261,7 @@ def _install() -> _Fake:
     webhook_delivery.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
     notification_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
     _pools.clear()
-    notification_store._client = lambda: client  # type: ignore[assignment]
+    notification_store._firestore_client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
         if client.hang is not None:
@@ -338,7 +338,7 @@ def _uninstall() -> None:
     if _saved:
         webhook_delivery.ThreadPoolExecutor = _saved["pool"]  # type: ignore[misc]
         notification_events.ThreadPoolExecutor = _saved["emit_pool"]  # type: ignore[misc]
-        notification_store._client = _saved["client"]  # type: ignore[assignment]
+        notification_store._firestore_client = _saved["client"]  # type: ignore[assignment]
         notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
         notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()

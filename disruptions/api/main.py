@@ -1331,7 +1331,7 @@ async def lifespan(app: FastAPI):
     # arrives, so an unconfigured environment pays no import and needs no credential.
     #
     # ONE client for the whole channel: `notification_store.configure` is the only place that names the
-    # database, and `notification_auth` reads through `notification_store.client()` -- so there is one gRPC
+    # database, and `notification_auth` reads through `notification_store.firestore_client()` -- so there is one gRPC
     # channel and one connection pool in a process whose poller already shares the thread. The
     # `notification_auth.configure()` call still earns its place: it resets that module's in-process
     # limiter ledgers, which must not survive a restart-in-place.

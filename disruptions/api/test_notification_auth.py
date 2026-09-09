@@ -1217,8 +1217,8 @@ def test_every_identity_plane_firestore_call_carries_its_own_deadline():
         def collection(self, _name: str) -> Any:
             return _Collection()
 
-    saved = notification_store.client
-    notification_store.client = lambda: _Client()  # type: ignore[assignment]
+    saved = notification_store.firestore_client
+    notification_store.firestore_client = lambda: _Client()  # type: ignore[assignment]
     try:
         docs = notification_auth._FirestoreDocs()
         assert docs.get(notification_auth.ACCOUNTS, CLIENT) == {"client_id": CLIENT}
@@ -1228,7 +1228,7 @@ def test_every_identity_plane_firestore_call_carries_its_own_deadline():
             {"client_id": CLIENT}
         ]
     finally:
-        notification_store.client = saved  # type: ignore[assignment]
+        notification_store.firestore_client = saved  # type: ignore[assignment]
     assert seen == ["get", "set", "update", "stream"], seen
     # And statically, over the seam's own source, so a FIFTH operation cannot dodge it: every call
     # this class makes on the client is one of the four names above, and each must name the

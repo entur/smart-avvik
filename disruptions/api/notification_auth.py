@@ -38,7 +38,7 @@ it is got backwards.
    per-collection IAM (KTD5 records the limit), so a projection argument is the only one available.
 
 **One Firestore client per process, and it is ``notification_store``'s.** These four collections live in
-the same named database as the subscriptions, so :func:`notification_store.client` is called rather than
+the same named database as the subscriptions, so :func:`notification_store.firestore_client` is called rather than
 a second client built here: two clients means two gRPC channels and two connection pools in a
 single-replica deployment whose poller already shares the thread, for no gain at all. It also keeps
 **one place deciding which database is opened** -- this module takes no database argument, so
@@ -255,7 +255,7 @@ class _Docs(Protocol):
 class _FirestoreDocs:
     """:class:`_Docs` over the process's one Firestore client.
 
-    The client is ``notification_store``'s (:func:`notification_store.client`), built lazily on first use --
+    The client is ``notification_store``'s (:func:`notification_store.firestore_client`), built lazily on first use --
     so a deployment with the channel off neither imports the library nor holds a credential for it,
     and there is exactly one gRPC channel to the one database. The PROJECT is never an argument: it
     comes from the ambient environment, which is what R1's environment isolation rests on.
@@ -278,7 +278,7 @@ class _FirestoreDocs:
     """
 
     def _c(self) -> Any:
-        return notification_store.client()
+        return notification_store.firestore_client()
 
     def get(self, collection: str, doc_id: str) -> dict[str, Any] | None:
         snapshot = (

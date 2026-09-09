@@ -337,12 +337,12 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
 
     _saved.update(
         {
-            "client": notification_store._client,
+            "client": notification_store._firestore_client,
             "run": notification_store._run_transaction,
             "query": notification_store._query,
         }
     )
-    notification_store._client = lambda: client  # type: ignore[assignment]
+    notification_store._firestore_client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
         if client.fail_with is not None:
@@ -427,7 +427,7 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
 def _uninstall() -> None:
     global _fake, _auth_docs
     if _saved:
-        notification_store._client = _saved["client"]  # type: ignore[assignment]
+        notification_store._firestore_client = _saved["client"]  # type: ignore[assignment]
         notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
         notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()

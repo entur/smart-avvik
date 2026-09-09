@@ -277,7 +277,7 @@ class QuotaExceeded(NotificationStoreError):
 
 # ---- Configuration ----------------------------------------------------------------------------
 
-_client_obj: Any | None = None
+_firestore_client_obj: Any | None = None
 _database: str | None = None
 _clock: Callable[[], datetime] = lambda: datetime.now(UTC)
 
@@ -299,15 +299,15 @@ def configure(
     ``clock`` is injectable because a transaction body may run more than once and must therefore
     read no clock: every public method takes its instant ONCE, here, and passes it down.
     """
-    global _client_obj, _database, _clock
-    _client_obj = client
+    global _firestore_client_obj, _database, _clock
+    _firestore_client_obj = client
     _database = database
     _clock = clock or (lambda: datetime.now(UTC))
 
 
 def enabled() -> bool:
     """Is there anything to read? A client was injected, or a database id was named."""
-    return _client_obj is not None or bool(_database)
+    return _firestore_client_obj is not None or bool(_database)
 
 
 def database_id() -> str | None:
@@ -327,10 +327,10 @@ def _now() -> datetime:
     return now.astimezone(UTC) if now.tzinfo else now.replace(tzinfo=UTC)
 
 
-def _client() -> Any:
-    global _client_obj
-    if _client_obj is not None:
-        return _client_obj
+def _firestore_client() -> Any:
+    global _firestore_client_obj
+    if _firestore_client_obj is not None:
+        return _firestore_client_obj
     if not _database:
         raise NotConfigured("notification_store.configure() was never called with a database id")
     # Lazy, like llm_message's Vertex clients and for the same reason: a deployment with the channel
@@ -338,11 +338,11 @@ def _client() -> Any:
     # ~200 ms of gRPC machinery nothing else in this process wants.
     from google.cloud import firestore
 
-    _client_obj = firestore.Client(database=_database)
-    return _client_obj
+    _firestore_client_obj = firestore.Client(database=_database)
+    return _firestore_client_obj
 
 
-def client() -> Any:
+def firestore_client() -> Any:
     """The one Firestore client this process holds, built on first use.
 
     Public so ``notification_auth`` -- the identity plane, which stores its accounts, credentials,
@@ -359,7 +359,7 @@ def client() -> Any:
     Still lazy: a deployment with the channel switched off imports no library and needs no
     credential, and nothing here runs at module import.
     """
-    return _client()
+    return _firestore_client()
 
 
 # ---- Time, expiry and the two per-subscription maps -------------------------------------------
@@ -767,7 +767,7 @@ def _query(
     spec = _SPECS_BY_NAME[name]
     from google.cloud.firestore_v1.base_query import FieldFilter
 
-    query = _client().collection(spec.collection)
+    query = _firestore_client().collection(spec.collection)
     for field_path in spec.equality:
         query = query.where(filter=FieldFilter(field_path, "==", (equality or {})[field_path]))
     for field_path, op in spec.inequality:
@@ -832,7 +832,7 @@ def _run_transaction(body: Callable[[Any], Any]) -> Any:
     """
     from google.cloud import firestore
 
-    client = _client()
+    client = _firestore_client()
     transaction = client.transaction()
 
     @firestore.transactional
@@ -1140,7 +1140,7 @@ def create_subscription(spec: SubscriptionSpec, *, now: datetime | None = None) 
     """Register a subscription. Idempotent on (id, definition); refused past the ceiling."""
     spec.validate()
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     count_query = _query(
         "subscriptions",
         equality={"client_id": spec.client_id, "status": "active"},
@@ -1230,7 +1230,7 @@ def replace_subscription(
 ) -> Subscription:
     spec.validate()
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _replace_body(
             txn, refs, spec=spec, expected_version=expected_version, now=instant
@@ -1282,7 +1282,7 @@ def delete_subscription(
 ) -> Subscription | None:
     """Tombstone a subscription. Returns ``None`` if it never existed."""
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _delete_body(
             txn, refs, subscription_id=subscription_id, client_id=client_id, now=instant
@@ -1328,7 +1328,7 @@ def touch_subscription(
 ) -> Subscription:
     """Record that the client is still interested -- R5's inactivity horizon moves with this."""
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _touch_body(
             txn, refs, subscription_id=subscription_id, client_id=client_id, now=instant
@@ -1390,7 +1390,7 @@ def set_servability(
     outside it is the same race one layer up.
     """
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _servability_body(
             txn,
@@ -1414,7 +1414,7 @@ def get_subscription(
     another's records through any repository method.
     """
     instant = now or _now()
-    snapshot = _Refs(_client()).subscription(subscription_id).get(timeout=_CALL_DEADLINE_S)
+    snapshot = _Refs(_firestore_client()).subscription(subscription_id).get(timeout=_CALL_DEADLINE_S)
     stored = _doc(snapshot)
     if not stored:
         return None
@@ -1457,7 +1457,7 @@ def list_subscriptions(
     ceiling = min(limit, MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT)
     cursor: Any = None
     if after is not None:
-        snapshot = _Refs(_client()).subscription(after).get(timeout=_CALL_DEADLINE_S)
+        snapshot = _Refs(_firestore_client()).subscription(after).get(timeout=_CALL_DEADLINE_S)
         stored = _doc(snapshot)
         if (
             not stored
@@ -1671,7 +1671,7 @@ def cleanup_subscription(
     in place, so nothing routes to the subscription while this runs.
     """
     instant = now or _now()
-    client = _client()
+    client = _firestore_client()
     refs = _Refs(client)
     tombstone = _doc(refs.subscription(subscription_id).get(timeout=_CALL_DEADLINE_S))
     if not tombstone:
@@ -2065,7 +2065,7 @@ def commit_event(request: EmitRequest, *, now: datetime | None = None) -> EventC
         raise Conflict(f"phase must be one of {PHASES}, not {request.phase!r}")
     instant = now or _now()
     seed = revision_seed(instant)
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     pending = _count_destination_deliveries(request.destination_id, state="pending")
     if pending >= MAX_PENDING_EVENTS_PER_DESTINATION:
         logger.warning(
@@ -2206,7 +2206,7 @@ def record_below_threshold(request: EmitRequest, *, now: datetime | None = None)
     """
     instant = now or _now()
     seed = revision_seed(instant)
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     return _run_transaction(
         lambda txn: _withdraw_body(txn, refs, request=request, now=instant, seed=seed)
     )
@@ -2252,7 +2252,7 @@ def clear_below_threshold(alert_id: str, *, now: datetime) -> bool:
     """
     if not alert_id:
         return False
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     return bool(
         _run_transaction(
             lambda txn: _clear_below_threshold_body(txn, refs, alert_id=alert_id, now=now)
@@ -2262,7 +2262,7 @@ def clear_below_threshold(alert_id: str, *, now: datetime) -> bool:
 
 def get_subject(alert_id: str, *, now: datetime | None = None) -> AlertSubject | None:
     instant = now or _now()
-    stored = _doc(_Refs(_client()).subject(alert_id).get(timeout=_CALL_DEADLINE_S))
+    stored = _doc(_Refs(_firestore_client()).subject(alert_id).get(timeout=_CALL_DEADLINE_S))
     if not stored or not _not_expired(stored, instant):
         return None
     return _subject_from_doc(stored)
@@ -2879,7 +2879,7 @@ def claim_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery
     claim that finds one writes the terminal state itself, so nothing re-offers the delivery.
     """
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     status, delivery, subscription, remaining, reason = _run_transaction(
         lambda txn: _claim_body(txn, refs, delivery_id=delivery_id, now=instant)
     )
@@ -3026,7 +3026,7 @@ def mark_delivery_sent(delivery_id: str, *, now: datetime | None = None) -> Deli
     ``superseded`` or ``cancelled`` record would misreport it to whoever reads the outcome.
     """
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc, spent, already_resolved = _run_transaction(
         lambda txn: _sent_body(txn, refs, delivery_id=delivery_id, now=instant)
     )
@@ -3116,7 +3116,7 @@ def mark_delivery_failed(
     if terminal_state not in DELIVERY_STATES:
         raise Conflict(f"terminal_state must be one of {DELIVERY_STATES}")
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc, already_resolved = _run_transaction(
         lambda txn: _failed_body(
             txn,
@@ -3174,7 +3174,7 @@ def mark_delivery_expired(
     destination inside ordinary expiry.
     """
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _terminal_body(
             txn, refs, delivery_id=delivery_id, state="expired", reason=reason, now=instant
@@ -3192,7 +3192,7 @@ def mark_delivery_cancelled(
 ) -> DeliveryOutcome:
     """R13: the subscription is gone, so this delivery is cancelled and never re-offered."""
     instant = now or _now()
-    refs = _Refs(_client())
+    refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _terminal_body(
             txn, refs, delivery_id=delivery_id, state="cancelled", reason=reason, now=instant
@@ -3207,7 +3207,7 @@ def mark_delivery_cancelled(
 
 def get_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery | None:
     instant = now or _now()
-    stored = _doc(_Refs(_client()).delivery(delivery_id).get(timeout=_CALL_DEADLINE_S))
+    stored = _doc(_Refs(_firestore_client()).delivery(delivery_id).get(timeout=_CALL_DEADLINE_S))
     if not stored or not _not_expired(stored, instant):
         return None
     return _delivery_from_doc(stored)
@@ -3216,7 +3216,7 @@ def get_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery |
 def get_event(event_id: str, *, now: datetime | None = None) -> dict[str, Any] | None:
     """One stored event, or ``None`` when it is missing or past its retention window."""
     instant = now or _now()
-    stored = _doc(_Refs(_client()).event(event_id).get(timeout=_CALL_DEADLINE_S))
+    stored = _doc(_Refs(_firestore_client()).event(event_id).get(timeout=_CALL_DEADLINE_S))
     if not stored or not _not_expired(stored, instant):
         return None
     return stored
@@ -3290,7 +3290,6 @@ __all__ = [
     "claim_delivery",
     "cleanup_subscription",
     "clear_below_threshold",
-    "client",
     "client_alerts",
     "commit_event",
     "configure",
@@ -3302,6 +3301,7 @@ __all__ = [
     "event_id_for",
     "event_is_valid",
     "event_validity",
+    "firestore_client",
     "get_delivery",
     "get_event",
     "get_subject",
