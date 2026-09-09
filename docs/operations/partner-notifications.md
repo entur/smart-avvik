@@ -365,14 +365,14 @@ silently.
 | `partner_emit` | the emit step | `result` (`ok`, `timeout`, `retryable`, `failed`, `standing_error`, `run_clear_error`), `created`, `withdrawn`, `unchanged`, `obsolete`, `quota`, `capped`, `retryable`, `ms` |
 | `partner_event` | one committed revision | `result` = the event type, `partner_id`, `destination_id`, `alert_id`, `revision`, `superseded` |
 | `partner_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms` |
-| `partner_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`), `destination_id` |
+| `partner_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`), `destination_id`. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `partner_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count |
 | `partner_subscription` | a create, no-op or tombstone | `result`, `partner_id`, `subscription_id` |
 | `partner_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
 | `partner_auth` | a refused credential | `reason`, `key_id`. **The secret is logged nowhere at any level** |
 | `partner_admin` | an operator action | `action`, `result`, `actor`, `partner_id`, `destination_id`, `key_id`. `action="show_signing_secret"` with `result="disclosed"` is a **credential read** — the audit document beside it carries the generation numbers in `reason`, never the secret |
-| `partner_test_event` | a synthetic send | `partner_id`, `key_id`, `destination_id`, `status` |
-| `partner_servability` | the six-hourly re-check sweep, and its per-record faults | `result`: `swept` (a clean pass), `capped` / `deadline` (a bound bound — logged at WARNING, because a ceiling nobody can see binding is not a ceiling anybody can size), `load_failed` (the store could not be read; every caveat stands), `vanished` (deleted while we were asking), `error` (the seam raised or timed out) and `write_failed`. A sweep record also carries `due`, `checked`, `cleared`, `unservable`, `truncated`, `ms`. **`error` and `write_failed` now come from two call sites**: the create path logs neither id, the re-check logs `partner_id` and `subscription_id` — both of which `partner_subscription` already logs, so this adds no new class of identifier |
+| `partner_test_event` | a synthetic send | `partner_id`, `key_id`, `destination_id`, `result` (`ok`, `failed`, `timeout`), `status`. **`result="timeout"`** — a WARNING, and the only one of the three without a `status`, because no response was received — means the bounded wait around the whole delivery elapsed — DNS is the reason it exists, since `socket.getaddrinfo` is reached by no deadline in `webhook_client`. The route still answers **200** with `delivered: false`; a 504 would read as our failure when it is the destination's |
+| `partner_servability` | the six-hourly re-check sweep, and its per-record faults | `result`: `swept` (a clean pass), `capped` / `deadline` (a bound bound — logged at WARNING, because a ceiling nobody can see binding is not a ceiling anybody can size), `load_failed` (the store could not be read; every caveat stands), `vanished` (deleted while we were asking), `superseded` (the route was replaced while the check ran, so the verdict describes a definition that no longer exists and is discarded rather than stamped — logged at DEBUG here on the poller's cadence and at INFO on the request path, where an operator may correlate it with a partner's report), `error` (the seam raised or timed out) and `write_failed`. A sweep record also carries `due`, `checked`, `cleared`, `unservable`, `truncated`, `ms`. **`error` and `write_failed` now come from two call sites**: the create path logs neither id, the re-check logs `partner_id` and `subscription_id` — both of which `partner_subscription` already logs, so this adds no new class of identifier |
 | `partner_alert_state` | a failed alert-state read behind a subscription response | `result` (`error`) |
 | `partner_delivery_refused` | an outbound refusal | `reason` |
 | `partner_delivery_response_truncated` | a 2xx body over the response cap | `limit` |
@@ -397,7 +397,8 @@ and the fourth entry below is why it needs one.
 - **A partner subscription's origin and destination DO reach Cloud Logging — under `/varsel`'s event
   name, not a partner one.** `main._varsel_connectivity` writes both stop refs into the *message* of
   an INFO record (`event="varsel_service_check"`, `result="ok"`) on every established verdict. Its
-  structured `fields` carry only `event`, `result`, `forward` and `reverse`, which is why the claim
+  structured `fields` carry only `event`, `result`, `forward`, `reverse` and — since the budget was
+  split per caller — `path` (`request` or `partner`), which is why the claim
   above stays literally true — and a reader who stopped there would be misled, which this document's
   posture does not allow. The partner channel reaches it at **create time** (it always did) and now
   again **every six hours per unservable subscription**, through `partner_servability`. It is

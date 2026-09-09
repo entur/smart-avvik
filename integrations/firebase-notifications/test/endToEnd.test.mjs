@@ -3,9 +3,11 @@
 //
 // "With no real disruption" is `POST /notification-api/v1/test-events` (R15): a synthetic event for
 // a subscription created `test: true`, signed over exactly the bytes the route emits, dialled at the
-// partner's callback. So the body below is a transcription of `disruptions/api/partner_api.py`'s
-// `_synthetic_event` rather than an invented fixture -- a fixture that drifted from that function
-// would prove the package works on an event nobody sends.
+// partner's callback. So the body below is `disruptions/api/partner_api.py`'s `_synthetic_event`
+// itself, READ from the sample that function was dumped into (`contracts/test-event-sample.json`)
+// rather than transcribed -- a fixture that drifted from that function would prove the package
+// works on an event nobody sends, which is exactly what this one did until 2026-09-09. See the
+// block above `SAMPLE` for the eight fields it had drifted in and why nothing caught them.
 //
 // WHY THIS FILE IS IN `npm test` AND NOT IN `test/emulator/`, decided rather than defaulted:
 //
@@ -27,65 +29,112 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
 
 import { signatureHeader } from "@entur/kix-notifications-client";
 
 import { createInboxWorker, createNotificationReceiver } from "../src/receiver.ts";
 import { NOW, TEST_SECRET, encode, fakeResponse, memoryAdapters } from "./helpers/adapters.mjs";
 
-const FROM_STOP = "NSR:StopPlace:337";
+/**
+ * The sample event, dumped from the real producer and shipped in the client package's `contracts/`.
+ *
+ * **It is read rather than transcribed, and that is the whole point of this block.** The fixture
+ * below WAS a hand-written transcription of `disruptions/api/partner_api.py::_synthetic_event`,
+ * announced as one "field for field" in its own docstring -- and by 2026-09-09 it had drifted from
+ * that function in eight places: `call.aimed_departure` for `aimed_departure_time`, invented
+ * `call.operator`/`call.line`, missing `call.stop_order`/`departs_tomorrow`,
+ * `probabilities.cancel` for `cancellation`, missing `delay_ge10`/`alert_threshold`, `phase:
+ * "predicted"` where the producer sends `confirmed`, `effect: null` where it sends `"cancelled"`,
+ * two empty `situations` lists that are never empty, a `valid_until` an hour out, and a title and
+ * body neither producer writes. Nothing failed: `payload.call` and `payload.probabilities` are
+ * deliberately OPEN objects in `event.schema.json`, so a wrongly named key inside them is
+ * schema-VALID -- which makes this file, read by a partner as the worked example of a real payload,
+ * the last place a transcription belongs.
+ *
+ * Resolved through `@entur/kix-notifications-client` rather than through the repository, because
+ * that dependency is present in a vendored copy of this package and the repository is not.
+ */
+const SAMPLE = JSON.parse(
+  fs.readFileSync(
+    path.join(
+      path.dirname(
+        createRequire(import.meta.url).resolve("@entur/kix-notifications-client/package.json"),
+      ),
+      "contracts",
+      "test-event-sample.json",
+    ),
+    "utf8",
+  ),
+);
+
+const FROM_STOP = SAMPLE.event.stop_place;
 const TO_STOP = "NSR:StopPlace:59872";
+const SAMPLE_NOTIFICATION = SAMPLE.event.payload.notification;
 
 /**
- * The body `POST /test-events` emits, field for field.
+ * The body `POST /test-events` emits, re-stamped onto this suite's clock.
  *
- * `event_id`, `alert_id` and `journey_ref` are random on that route (`test-<nonce>` /
- * `KIX:Test:<nonce>`) precisely so two test events cannot be read as two revisions of one train; the
- * nonce is a parameter here for the same reason.
+ * Two substitutions, and only two. `event_id`, `alert_id` and `journey_ref` are minted per call on
+ * that route (`test-<nonce>` / `KIX:Test:<nonce>`) precisely so two test events cannot be read as
+ * two revisions of one train, so the nonce is a parameter here for the same reason. And the sample's
+ * instants are moved onto `NOW` **preserving the producer's own offsets** -- `valid_until` is the
+ * earlier of `occurred_at + 60 min` and the departure, which for this event is the departure -- so a
+ * change to that rule travels here rather than being restated as a literal.
  */
 function syntheticEvent(nonce = "0123456789ab") {
+  const occurred = Date.parse(SAMPLE.event.occurred_at);
+  const restamp = (iso) => new Date(NOW.getTime() + (Date.parse(iso) - occurred)).toISOString();
+  const validUntil = restamp(SAMPLE.event.valid_until);
   return {
-    schema_version: "1",
+    ...SAMPLE.event,
     event_id: `test-${nonce}`,
-    type: "journey.alert.created",
-    phase: "predicted",
     alert_id: `test-${nonce}`,
-    revision: 21_000_000,
-    occurred_at: NOW.toISOString(),
-    valid_until: new Date(NOW.getTime() + 60 * 60 * 1000).toISOString(),
-    subscription_id: "morgentur",
-    subscription_version: 1,
-    partner_ref: "commuter-4711",
-    test: true,
-    operator: "VYG",
-    line: "VYG:Line:L1",
     journey_ref: `KIX:Test:${nonce}`,
-    call_date: "2026-09-09",
-    stop_place: FROM_STOP,
-    stop_order: 1,
-    situations: [],
+    occurred_at: NOW.toISOString(),
+    valid_until: validUntil,
+    call_date: validUntil.slice(0, 10),
+    situations: [`KIX:TestEvent:${nonce}`],
     payload: {
-      notification: {
-        title: "Testvarsel: Tog L1 07:18 er innstilt",
-        body:
-          "Dette er et testvarsel fra Entur. " +
-          `${FROM_STOP} → ${TO_STOP}. Ingen avganger er berørt.`,
-        action: null,
-      },
+      ...SAMPLE.event.payload,
       call: {
-        operator: "VYG",
-        line: "VYG:Line:L1",
-        stop_place: FROM_STOP,
-        aimed_departure: NOW.toISOString(),
+        ...SAMPLE.event.payload.call,
+        aimed_departure_time: restamp(SAMPLE.event.payload.call.aimed_departure_time),
       },
-      probabilities: { impact: 1.0, cancel: 1.0 },
-      delay: null,
-      effect: null,
-      situations: [],
-      alternative_journey: null,
+      situations: SAMPLE.event.payload.situations.map((situation) => ({
+        ...situation,
+        situation_number: `KIX:TestEvent:${nonce}`,
+      })),
     },
   };
 }
+
+test("the fixture is the producer's event, not a second description of it", () => {
+  // The transcription that used to live here drifted silently for want of exactly this. Key sets
+  // rather than values, because the two substitutions above are deliberate and the keys are what a
+  // partner types their receiver against.
+  const built = syntheticEvent();
+  assert.deepEqual(Object.keys(built), Object.keys(SAMPLE.event));
+  assert.deepEqual(Object.keys(built.payload), Object.keys(SAMPLE.event.payload));
+  for (const part of ["notification", "call", "probabilities"]) {
+    assert.deepEqual(
+      Object.keys(built.payload[part]),
+      Object.keys(SAMPLE.event.payload[part]),
+      part,
+    );
+  }
+  // The three fields the producer states as a coherent confirmed cancellation, asserted here so a
+  // regenerated sample that lost the coherence fails in the package a partner reads first.
+  assert.equal(built.phase, "confirmed");
+  assert.equal(built.payload.effect, "cancelled");
+  assert.equal(built.payload.probabilities.delay_ge10, null);
+  assert.equal(built.payload.delay, null);
+  // And the substitutions really are only the ones documented.
+  assert.equal(Date.parse(built.valid_until) - NOW.getTime(), 45 * 60 * 1000);
+  assert.equal(built.payload.call.aimed_departure_time, built.valid_until);
+});
 
 /**
  * The request the sender puts on the wire.
@@ -195,12 +244,19 @@ test("scenario 1: a signed synthetic event becomes one native notification", asy
 
   // 3. The notification is ready to display: the Norwegian title and body are the sender's, byte for
   //    byte, and no second request to us was needed to render them (R7).
-  assert.equal(call.display, "alert", "a predicted disruption is presented as an alert");
-  assert.equal(call.event.payload.notification.title, "Testvarsel: Tog L1 07:18 er innstilt");
-  assert.equal(
-    call.event.payload.notification.body,
-    `Dette er et testvarsel fra Entur. ${FROM_STOP} → ${TO_STOP}. Ingen avganger er berørt.`,
-  );
+  //
+  //    `silent`, not `alert`, and the reason is worth knowing before it looks like a bug. The route
+  //    emits a coherent CONFIRMED cancellation -- both probabilities 1.0, every delay figure null --
+  //    and `defaultDisplay` maps `predicted` to `alert` and every terminal phase to `silent`: a
+  //    confirmation updates a warning the traveller already holds rather than raising a new one. The
+  //    fixture claimed `predicted` with 1.0/1.0 and a null delay until 2026-09-09, which is a
+  //    combination no producer emits, and this assertion read `alert` on the strength of it.
+  assert.equal(call.display, "silent", "a confirmed cancellation updates rather than alerts");
+  assert.equal(call.event.payload.notification.title, SAMPLE_NOTIFICATION.title);
+  assert.equal(call.event.payload.notification.body, SAMPLE_NOTIFICATION.body);
+  // The body names both ends of the trip, which is what makes it renderable with no second call.
+  assert.ok(call.event.payload.notification.body.includes(FROM_STOP));
+  assert.ok(call.event.payload.notification.body.includes(TO_STOP));
   assert.equal(call.event.partner_ref, "commuter-4711", "the partner's own handle rides along");
   assert.equal(await stores.inbox.get(event.event_id).then((r) => r.status), "dispatched");
 });

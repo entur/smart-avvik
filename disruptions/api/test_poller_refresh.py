@@ -667,15 +667,28 @@ def test_the_servability_seam_is_the_same_one_the_partner_api_answers_from():
     module cannot import. Under-state it and the reservation stops being a ceiling on when the phase
     ends -- which is the whole reason it reserves rather than measures.
 
+    Since 2026-09-09 the seam is `_service_verdict` bound to the PARTNER connectivity budget rather
+    than the bare function. Both halves take the same bound object, which is what still makes them
+    one answer -- and it is also what keeps a partner's bulk onboarding out of the traveller-facing
+    30/min tally the seam used to spend (`main._PARTNER_CONNECTIVITY_MAX_PER_MIN`). One partial, not
+    two: two would be two tallies, and the sweep exists to backfill what the create path could not
+    establish.
+
     Checked over `lifespan`'s source because entering the lifespan starts the poller thread, which
     this suite must never do (it spends real BigQuery money per cycle).
     """
     import inspect
 
     source = inspect.getsource(main.lifespan)
-    assert "partner_servability.configure(connectivity=varsel._service_verdict)" in source
+    bound = (
+        "partner_connectivity = functools.partial(\n"
+        "        varsel._service_verdict, path=_CONNECTIVITY_PARTNER_PATH\n"
+        "    )"
+    )
+    assert bound in source, "the partner seam must name the partner budget, not the default one"
+    assert "partner_servability.configure(connectivity=partner_connectivity)" in source
     api = source[source.index("partner_api.configure(") :]
-    assert "connectivity=varsel._service_verdict," in api[: api.index(")")]
+    assert "connectivity=partner_connectivity," in api[: api.index(")")]
     assert partner_servability._WORST_CASE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
     assert partner_servability._DEADLINE_S > partner_servability._WORST_CASE_CHECK_S, (
         "a deadline equal to the worst case admits exactly one check, making the count ceiling "

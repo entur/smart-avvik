@@ -21,14 +21,53 @@ function workflow() {
   return fs.existsSync(WORKFLOW) ? fs.readFileSync(WORKFLOW, "utf8") : null;
 }
 
+/**
+ * Just the named step's own text, from its `- name:` line to the next list item.
+ *
+ * Bounded, not whole-file, and the sibling package is where that mattered first: `npm run
+ * verify:dist` appears in both integrations steps, so its check could pass on this step's copy of
+ * the string. No line asserted HERE has a live duplicate in ci.yml today -- `npm run test:emulator`
+ * appears once and this working directory once -- so the fix is pre-emptive on this side. It is
+ * still the right shape: the two steps deliberately run the same commands, and the next one added
+ * is the one that makes a whole-file match meaningless.
+ *
+ * A missing step THROWS: a regex failing against `""` reports "CI never runs the emulator" when the
+ * fact is "the step was renamed", and those are different repairs.
+ *
+ * The end of the step is found by INDENTATION rather than by the next `- ` list item. This step is
+ * the LAST one in its job, and the `docker` jobs below it open no list item at all -- so scanning
+ * for one ran the slice to the end of the file, which is barely a slice. A YAML block ends at the
+ * first non-blank line indented no further than the `-` that opened it.
+ */
+function stepText(text, name) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => line.trimStart().startsWith(`- name: ${name}`));
+  if (start === -1) {
+    throw new Error(`.github/workflows/ci.yml has no step named ${JSON.stringify(name)}`);
+  }
+  const indentOf = (line) => line.length - line.trimStart().length;
+  const opened = indentOf(lines[start]);
+  const step = [lines[start]];
+  for (const line of lines.slice(start + 1)) {
+    if (line.trim() !== "" && indentOf(line) <= opened) {
+      break;
+    }
+    step.push(line);
+  }
+  return step.join("\n");
+}
+
 test("ci.yml runs this package's plain suite AND its emulator suite", () => {
   const text = workflow();
   if (text === null) {
     console.log("skipping: no .github/workflows/ci.yml -- this is a vendored copy");
     return;
   }
-  assert.match(text, /working-directory: integrations\/firebase-notifications/);
-  assert.match(text, /npm run test:emulator/, "the rules deny assertions never run");
+  const step = stepText(text, "Run Firebase notification receiver tests");
+  assert.match(step, /working-directory: integrations\/firebase-notifications/);
+  assert.match(step, /npm test\b/);
+  assert.match(step, /npm run test:emulator/, "the rules deny assertions never run");
+  assert.match(step, /npm run verify:dist/, "the declared consumption shape is built and loaded");
 });
 
 test("every port this emulator binds differs from the repo-root config's -- all THREE of them", () => {

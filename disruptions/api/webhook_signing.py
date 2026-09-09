@@ -137,9 +137,26 @@ def _env(name: str) -> str:
     return value
 
 
+#: The root `contracts/notifications/v1/signing-vectors.json` publishes so a partner can reproduce a
+#: signature by hand. It is 48 bytes, so the length test alone ADMITTED it -- `configured()` answered
+#: True, `/destinations/current` reported ready, `/test-events` answered 200, and every delivery
+#: signed and verified normally, while every `whsec_` secret that root derives is committed in the
+#: same file and vendored again under `integrations/`. The signature is the only authentication a
+#: partner receiver has, so a deployment carrying this value would accept injected cancellations and
+#: withdrawals about real trains with nothing on our side reporting a fault.
+#:
+#: A plausible slip rather than a hypothetical: the runbook tells an operator to export
+#: `PARTNER_SIGNING_ROOT` by hand for `show-signing-secret`, which is exactly the moment a documented
+#: example gets pasted. Restated here rather than read from the contract at runtime, because
+#: `contracts/` is not in the image; `test_webhook_signing` reads the literal OUT of the JSON and
+#: compares, so the two cannot drift.
+_PUBLISHED_TEST_ROOT = b"kix-test-signing-root-not-used-in-any-deployment"
+
+
 def configured() -> bool:
     """Is there a usable root secret? A cheap probe that never raises and never logs the value."""
-    return len(_env(SIGNING_ROOT_ENV).encode()) >= MIN_ROOT_BYTES
+    value = _env(SIGNING_ROOT_ENV).encode()
+    return len(value) >= MIN_ROOT_BYTES and value != _PUBLISHED_TEST_ROOT
 
 
 def signing_root() -> bytes:
@@ -150,6 +167,14 @@ def signing_root() -> bytes:
     import-time read would also freeze the value against a restart-free secret rotation.
     """
     value = _env(SIGNING_ROOT_ENV).encode()
+    if value == _PUBLISHED_TEST_ROOT:
+        # Named separately from "unset or too short", because the two need different actions and the
+        # wrong message sends an operator hunting for a missing secret they have plainly set.
+        raise SigningNotConfigured(
+            f"{SIGNING_ROOT_ENV} is set to the example root published in "
+            "contracts/notifications/v1/signing-vectors.json. Every secret it derives is committed "
+            "in that file, so it signs forgeable webhooks; provision a real root in Secret Manager."
+        )
     if len(value) < MIN_ROOT_BYTES:
         raise SigningNotConfigured(
             f"{SIGNING_ROOT_ENV} is unset or shorter than {MIN_ROOT_BYTES} bytes; partner webhook "

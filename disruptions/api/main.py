@@ -1,3 +1,4 @@
+import functools
 import logging
 import os
 import re
@@ -766,38 +767,85 @@ _CONNECTIVITY_CACHE_MAX = 512
 # reports "unknown" and registration proceeds unvalidated — the same degradation as a BigQuery
 # outage, which is the right way for a guard-rail to fail.
 _CONNECTIVITY_MAX_PER_MIN = 30
+# ...and the PARTNER channel gets its own, smaller ceiling, because the paragraph above is an
+# argument about the public unauthenticated endpoint only. `alternatives._POLLER_FETCH_MAX_PER_MIN`
+# split from `_FETCH_MAX_PER_MIN` for exactly this reason — "an abuse-control number was setting the
+# alerting budget only by accident" — and this is the same mistake one layer over: partner
+# onboarding (`partner_api._record_servability`, on every create and replace) and the poller's
+# `partner_servability.recheck` both reached this seam and spent the traveller's tally. A partner may
+# issue `partner_auth.PER_PARTNER_PER_MIN` = 120 create/replace requests a minute, so a bulk
+# onboarding of an existing commuter base — which is what this channel is FOR — exhausted a
+# traveller-facing budget as a side effect, and did it silently: `None` reads as "could not
+# establish", so a real traveller's journey then registers with no no-direct-service caveat.
+#
+# 15, half the traveller's rather than equal to it, and the asymmetry is the point: a partner's
+# onboarding is a batch that may legitimately take longer, a traveller is waiting on a page. 15/min
+# is 900 distinct pairs an hour against a pilot measured in tens, and the sweep contributes at most
+# `partner_servability._MAX_CHECKS_PER_CYCLE` (4) per ~296 s cycle. The worst-case BigQuery draw
+# from this seam therefore goes 30/min -> 45/min, which is the honest cost of the split.
+_PARTNER_CONNECTIVITY_MAX_PER_MIN = 15
+_CONNECTIVITY_REQUEST_PATH = "request"
+_CONNECTIVITY_PARTNER_PATH = "partner"
 # This one runs on a request path, so it gets an explicit ceiling rather than "wait forever": a slow
 # BigQuery is not a reason for a traveller's registration to hang.
 _CONNECTIVITY_TIMEOUT_S = 20.0
 _connectivity_lock = threading.Lock()
+# ONE cache across both paths, deliberately: an established answer about a stop pair is the same
+# answer whoever asked, and splitting it would make a partner's onboarding re-ask questions a
+# traveller has already paid for. Only the BUDGET is per caller.
 _connectivity_cache: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[float, tuple[bool, bool]]] = {}
-_connectivity_calls: list[float] = []
+_connectivity_calls: dict[str, list[float]] = {
+    _CONNECTIVITY_REQUEST_PATH: [],
+    _CONNECTIVITY_PARTNER_PATH: [],
+}
 
 
 def _varsel_connectivity(
-    from_refs: Sequence[str], to_refs: Sequence[str]
+    from_refs: Sequence[str],
+    to_refs: Sequence[str],
+    *,
+    path: str = _CONNECTIVITY_REQUEST_PATH,
 ) -> tuple[bool, bool] | None:
     """(runs from→to today, runs to→from today), or None when it could not be established.
 
     Takes every ref of each place (varsel.place_refs), not just the canonical one: each feed records
     its calls on its own ref, so asking about one ref of a merged stop would report "no service" for
     a trip that plainly exists.
+
+    ``path`` names WHOSE per-minute budget this question spends — see
+    :data:`_PARTNER_CONNECTIVITY_MAX_PER_MIN`. It defaults to the public one, which is the safe
+    direction: a caller that forgets to name itself is charged the tighter, traveller-facing tally
+    rather than silently minting a budget of its own.
     """
+    ceiling = (
+        _PARTNER_CONNECTIVITY_MAX_PER_MIN
+        if path == _CONNECTIVITY_PARTNER_PATH
+        else _CONNECTIVITY_MAX_PER_MIN
+    )
     key = (tuple(sorted(from_refs)), tuple(sorted(to_refs)))
     now = monotonic()
     with _connectivity_lock:
         hit = _connectivity_cache.get(key)
         if hit is not None and now - hit[0] < _CONNECTIVITY_TTL_S:
             return hit[1]
-        _connectivity_calls[:] = [t for t in _connectivity_calls if now - t < 60]
-        if len(_connectivity_calls) >= _CONNECTIVITY_MAX_PER_MIN:
+        calls = _connectivity_calls.setdefault(path, [])
+        calls[:] = [t for t in calls if now - t < 60]
+        if len(calls) >= ceiling:
             logger.warning(
-                "Connectivity checks rate-limited (%d/min); registering without the check",
-                _CONNECTIVITY_MAX_PER_MIN,
-                extra={"fields": {"event": "varsel_service_check", "result": "rate_limited"}},
+                "Connectivity checks rate-limited on the %s path (%d/min); registering without "
+                "the check",
+                path,
+                ceiling,
+                extra={
+                    "fields": {
+                        "event": "varsel_service_check",
+                        "result": "rate_limited",
+                        "path": path,
+                    }
+                },
             )
             return None
-        _connectivity_calls.append(now)
+        calls.append(now)
     try:
         job = bq_client.query(
             _VARSEL_CONNECTIVITY_QUERY,
@@ -1289,6 +1337,13 @@ async def lifespan(app: FastAPI):
     # limiter ledgers, which must not survive a restart-in-place.
     partner_store.configure(database=os.environ.get("PARTNER_FIRESTORE_DATABASE", "").strip() or None)
     partner_auth.configure()
+    # The partner channel's own slice of the connectivity budget, bound ONCE here so neither partner
+    # module has to know the vocabulary and neither can forget the tag. Bound rather than defaulted
+    # because the default is the traveller-facing tally, which is what this seam was spending before
+    # `_PARTNER_CONNECTIVITY_MAX_PER_MIN` existed.
+    partner_connectivity = functools.partial(
+        varsel._service_verdict, path=_CONNECTIVITY_PARTNER_PATH
+    )
     partner_api.configure(
         store=partner_store,
         auth=partner_auth,
@@ -1298,14 +1353,14 @@ async def lifespan(app: FastAPI):
         # /varsel gives -- it expands both places to every ref and already fails open to None,
         # which is what keeps "we could not establish it" from ever reading as "no trips run".
         canonicalize=varsel.canonical_stop,
-        connectivity=varsel._service_verdict,
+        connectivity=partner_connectivity,
     )
     # The poller-side half of the same question (R6, AE13's second clause). The SAME seam object as
     # the line above, deliberately: a subscription's caveat and its re-check have to be the answer
     # one function gives, or the create-time verdict and the refresh could disagree about a pair
     # while both looked right. Unwired, `partner_servability.recheck()` returns before it reads the
     # store, so nothing here is a cost in a deployment that never sets the seam.
-    partner_servability.configure(connectivity=varsel._service_verdict)
+    partner_servability.configure(connectivity=partner_connectivity)
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody
     # runs build scripts against — without this the table would simply be missing there. Its own

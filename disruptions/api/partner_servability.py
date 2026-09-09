@@ -13,8 +13,8 @@ R5 forbids, with extra steps.
 **Four rules, and each is ``varsel.recheck_service``'s.**
 
 1. **A ``None`` verdict is never written.** The seam returns ``None`` for "could not be established"
-   -- a BigQuery outage, the 20 s timeout, the 30/min rate limit the public endpoint's own
-   unauthenticated surface needs. ``varsel`` ``continue``s on it; so does this. The edge is sharper
+   -- a BigQuery outage, the 20 s timeout, the partner channel's own per-minute ceiling on distinct
+   pairs. ``varsel`` ``continue``s on it; so does this. The edge is sharper
    here because ``partner_store.set_servability`` accepts ``None`` and would then move
    ``servable_checked_at``: calling it would convert "we do not know" into a freshly-stamped
    non-answer, and one blip into a caveat U4's docstring says must never be rendered as one. So a
@@ -41,7 +41,10 @@ volume is the difference between nothing and the ceiling below binding every cyc
 **Bounded, in numbers, because each bound protects a different resource.**
 
 * :data:`_MAX_CHECKS_PER_CYCLE` (4) bounds the BigQuery spend and this pass's share of the seam's
-  30/min limit. It is the bound that binds in ordinary operation.
+  per-minute limit -- since 2026-09-09 the PARTNER channel's own
+  (`main._PARTNER_CONNECTIVITY_MAX_PER_MIN`, 15), not the public unauthenticated endpoint's, so a
+  sweep cannot cost a real traveller their registration's no-direct-service caveat. It is the bound
+  that binds in ordinary operation.
 * :data:`_DEADLINE_S` (30 s) bounds the poller. It RESERVES the worst case
   (:data:`_WORST_CASE_CHECK_S`, the seam's own 20 s timeout) rather than measuring elapsed time --
   ``varsel._WriteBudget``'s shape -- so it bounds when the step ENDS and not when its last question
@@ -98,8 +101,8 @@ _WORST_CASE_CHECK_S = 20.0
 #: At most this many questions per cycle. Four is sized off the cadence rather than picked: at the
 #: measured ~296 s cycle period a subscription needs four checks a day to hold rule 2's six-hour
 #: interval, so four per cycle carries ~290 permanently-unservable subscriptions at full cadence --
-#: two orders of magnitude above a pilot, and still only four BigQuery questions of this pass's
-#: share of a 30/min limit it does not own.
+#: two orders of magnitude above a pilot, and still only four BigQuery questions of the partner
+#: channel's own 15/min share of a limit this module does not own.
 _MAX_CHECKS_PER_CYCLE = 4
 
 #: The step's clock, reserved rather than measured, and running from before the store read so what
@@ -220,9 +223,17 @@ def _record(subscription: partner_store.Subscription, servable: bool) -> bool:
     Guarded per record rather than per pass (R20): a subscription deleted between the read and the
     write is an ordinary outcome, and one failing write must not cost the pass the records behind
     it.
+
+    The version is the one the QUESTION was asked about -- the answer is about a ROUTE, and a
+    replace during a 20 s check would otherwise stamp the new route with the old route's verdict,
+    freshly timestamped. Same guard `partner_api._record_servability` uses, for the same race.
     """
     try:
-        partner_store.set_servability(subscription.subscription_id, servable=servable)
+        partner_store.set_servability(
+            subscription.subscription_id,
+            servable=servable,
+            expected_version=subscription.version,
+        )
         return True
     except partner_store.NotFound:
         # Deleted or tombstoned while we were asking. `set_servability` reads before it writes, so
@@ -233,6 +244,22 @@ def _record(subscription: partner_store.Subscription, servable: bool) -> bool:
                 "fields": {
                     "event": "partner_servability",
                     "result": "vanished",
+                    "partner_id": subscription.partner_id,
+                    "subscription_id": subscription.subscription_id,
+                }
+            },
+        )
+        return False
+    except partner_store.Conflict:
+        # Replaced while we were asking. The newer definition retired the answer and its stamp on
+        # purpose; a due record with nothing established is picked up on the next cadence, so this
+        # needs no repair -- only a name, so the counter does not read it as a write failure.
+        logger.debug(
+            "A partner subscription was replaced during its servability re-check; verdict dropped",
+            extra={
+                "fields": {
+                    "event": "partner_servability",
+                    "result": "superseded",
                     "partner_id": subscription.partner_id,
                     "subscription_id": subscription.subscription_id,
                 }

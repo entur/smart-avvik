@@ -208,7 +208,15 @@ def _install() -> _Fake:
                 client.docs.pop(path, None)
         return result
 
-    def _query(name: str, *, equality: Any = None, inequality: Any = None, limit: int) -> _Page:
+    def _query(
+        name: str,
+        *,
+        equality: Any = None,
+        inequality: Any = None,
+        limit: int,
+        # Accepted and unused: only the listing route pages, and no test here reaches it.
+        start_after: Any = None,
+    ) -> _Page:
         if name in client.query_fail_with:
             raise client.query_fail_with[name]
         client.queries.append(name)

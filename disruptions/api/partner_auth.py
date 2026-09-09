@@ -263,22 +263,43 @@ class _FirestoreDocs:
     Stateless, so one module-level instance serves every request; the client behind it is resolved
     per call rather than captured, which is what lets a test reconfigure ``partner_store`` between
     checks without leaving a stale channel behind.
+
+    **Every one of the four carries the data plane's own per-call deadline**
+    (``partner_store._CALL_DEADLINE_S``), and none of them did until 2026-09-09. That is not
+    symmetry for its own sake -- it is a sharper requirement here than in ``partner_store``, whose
+    calls run on the poller thread inside an outer bounded wait. These run on a REQUEST thread: the
+    lookup in :meth:`get` is the credential read :func:`authenticate` performs on every
+    authenticated request, from a plain ``def`` route sharing the ~40-slot anyio worker pool with
+    ``/varsel-api``'s registration writes and ``/impact``. With no deadline, a Firestore stall parks
+    one of those shared workers per in-flight partner request until gRPC gives up on its own, and
+    the limiters here cap requests per window rather than workers held -- so a traveller's
+    registration queues behind a partner's stalled credential lookup. There is no outer wait on this
+    plane to fall back on, which is exactly why the bound has to belong to the call.
     """
 
     def _c(self) -> Any:
         return partner_store.client()
 
     def get(self, collection: str, doc_id: str) -> dict[str, Any] | None:
-        snapshot = self._c().collection(collection).document(doc_id).get()
+        snapshot = (
+            self._c()
+            .collection(collection)
+            .document(doc_id)
+            .get(timeout=partner_store._CALL_DEADLINE_S)
+        )
         if not getattr(snapshot, "exists", False):
             return None
         return dict(snapshot.to_dict() or {})
 
     def set(self, collection: str, doc_id: str, doc: Mapping[str, Any]) -> None:
-        self._c().collection(collection).document(doc_id).set(dict(doc))
+        self._c().collection(collection).document(doc_id).set(
+            dict(doc), timeout=partner_store._CALL_DEADLINE_S
+        )
 
     def update(self, collection: str, doc_id: str, patch: Mapping[str, Any]) -> None:
-        self._c().collection(collection).document(doc_id).update(dict(patch))
+        self._c().collection(collection).document(doc_id).update(
+            dict(patch), timeout=partner_store._CALL_DEADLINE_S
+        )
 
     def list_by(
         self, collection: str, field: str, value: Any, *, limit: int
@@ -291,7 +312,10 @@ class _FirestoreDocs:
             .where(filter=FieldFilter(field, "==", value))
             .limit(limit)
         )
-        return [dict(s.to_dict() or {}) for s in query.stream()]
+        return [
+            dict(s.to_dict() or {})
+            for s in query.stream(timeout=partner_store._CALL_DEADLINE_S)
+        ]
 
 
 # ---- Configuration ---------------------------------------------------------------------------

@@ -308,7 +308,15 @@ def _install(client: _FakeClient) -> None:
                 client.docs.pop(path, None)
         return result
 
-    def _query(name: str, *, equality: Any = None, inequality: Any = None, limit: int) -> _Page:
+    def _query(
+        name: str,
+        *,
+        equality: Any = None,
+        inequality: Any = None,
+        limit: int,
+        # Accepted and unused: only the listing route pages, and no test here reaches it.
+        start_after: Any = None,
+    ) -> _Page:
         client.query_calls.append((name, dict(equality or {}), dict(inequality or {}), limit))
         rows = client.pages.get(name, [])[:limit]
         return _Page(client, rows)
@@ -397,7 +405,7 @@ def test_a_transaction_body_may_run_twice_and_writes_the_same_thing():
 
 
 def test_every_transaction_body_reads_before_it_writes():
-    """All four write paths, because the rule has to hold in each of them and not on average."""
+    """Every write path, because the rule has to hold in each of them and not on average."""
     client = _FakeClient()
     client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
     refs = partner_store._Refs(client)
@@ -412,6 +420,16 @@ def test_every_transaction_body_reads_before_it_writes():
         lambda t: partner_store._emit_body(t, refs, request=_emit(), now=NOW, seed=seed),
         lambda t: partner_store._delete_body(
             t, refs, subscription_id=SID, partner_id=PARTNER, now=NOW
+        ),
+        # The two the list did not name until 2026-09-09. `_touch_body` backs the partner keep-alive
+        # endpoint and `_servability_body` is called by the poller's own servability sweep on every
+        # due subscription of every cycle -- so both are as reachable as anything above them, and
+        # neither was covered by ANY of this suite's purity instruments.
+        lambda t: partner_store._touch_body(
+            t, refs, subscription_id=SID, partner_id=PARTNER, now=NOW
+        ),
+        lambda t: partner_store._servability_body(
+            t, refs, subscription_id=SID, servable=False, expected_version=1, now=NOW
         ),
     ]
     for body in bodies:
@@ -431,9 +449,15 @@ def test_no_body_that_increments_a_counter_is_retry_sensitive():
     show up as an alert cap spending two of a traveller's four slots for one notification, or a
     revision jumping by two, neither of which fails anything.
 
-    Eight bodies increment or conditionally rewrite something (`version`, `attempts`, `revision`, `below_threshold_cycles`,
-    `capped_count`, `cleanup.attempts`, the Oslo-day counter). Each is run twice against one fake
-    transaction with a raising clock and a raising logger; identical writes is the proof.
+    Ten bodies rewrite something derived (`version`, `attempts`, `revision`,
+    `below_threshold_cycles`, `capped_count`, `cleanup.attempts`, the Oslo-day counter, and R5's two
+    horizons). Each is run twice against one fake transaction with a raising clock and a raising
+    logger; identical writes is the proof.
+
+    The last two -- `_touch_body` and `_servability_body` -- increment nothing today, and that is
+    why they were missing until 2026-09-09 rather than why they should be. This instrument is what
+    catches the EDIT that adds a clock read or a counter to a body, so a body only inside it once it
+    already has one is a check that arrives after the defect it exists to prevent.
     """
     seed = partner_store.revision_seed(NOW)
     for build in (
@@ -495,6 +519,23 @@ def test_no_body_that_increments_a_counter_is_retry_sensitive():
                 now=NOW,
                 done=True,
                 deleted={"events": 2, "deliveries": 2, "subjects": 1},
+            ),
+        ),
+        # Neither of these increments anything TODAY -- both are deterministic patches over
+        # `stored` and `now` -- and that is exactly why they belong here: the instrument is what
+        # would catch the edit that adds a clock read or a counter to one of them, and until
+        # 2026-09-09 the two were named by no purity check in this file at all. `_touch_body`
+        # rewrites both of R5's horizons, which is the shape a counter takes here.
+        lambda c: (
+            partner_store._Refs(c),
+            lambda t, r: partner_store._touch_body(
+                t, r, subscription_id=SID, partner_id=PARTNER, now=NOW
+            ),
+        ),
+        lambda c: (
+            partner_store._Refs(c),
+            lambda t, r: partner_store._servability_body(
+                t, r, subscription_id=SID, servable=True, expected_version=1, now=NOW
             ),
         ),
     ):
@@ -2553,11 +2594,47 @@ def test_servability_never_refuses_and_records_its_freshness():
     client = _FakeClient()
     client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
     _install(client)
-    unservable = partner_store.set_servability(SID, servable=False, now=NOW)
+    unservable = partner_store.set_servability(SID, servable=False, expected_version=1, now=NOW)
     assert unservable.servable is False and unservable.status == "active"
-    unknown = partner_store.set_servability(SID, servable=None, now=NOW + timedelta(hours=6))
+    unknown = partner_store.set_servability(
+        SID, servable=None, expected_version=1, now=NOW + timedelta(hours=6)
+    )
     assert unknown.servable is None, "could not be established must never read as an all-clear"
     assert unknown.servable_checked_at == NOW + timedelta(hours=6)
+
+
+def test_a_servability_verdict_for_a_replaced_route_is_refused_not_stamped():
+    """The check is a ~20 s BigQuery question and a replace is one request; they can interleave.
+
+    Ask about Oslo S -> Drammen, the partner replaces the watch with Oslo S -> Ski while the
+    question is in flight, the answer comes back and is written. Nothing in the record then says it
+    is about the OLD route: `servable` reads as an answer and `servable_checked_at` reads as fresh,
+    which is exactly the pairing R6 publishes so a partner can judge a caveat's age. The partner is
+    told their new route has no direct service, with a timestamp from a second ago.
+
+    `version` is the guard rather than the definition digest because a replace bumps it and a
+    `touch` does not -- so a keep-alive during a slow check is correctly NOT a conflict, while every
+    route change is. Enforced INSIDE the transaction, since a read-then-write outside it is the same
+    race one layer up, and `expected_version` is REQUIRED rather than optional-with-a-default: an
+    unguarded write must not be reachable by omission.
+    """
+    client = _FakeClient()
+    client.put(partner_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    partner_store.replace_subscription(_spec(to_stop="NSR:StopPlace:999"), now=NOW)
+    assert client.doc(partner_store.SUBSCRIPTIONS, SID)["version"] == 2
+    try:
+        partner_store.set_servability(SID, servable=False, expected_version=1, now=NOW)
+    except partner_store.Conflict:
+        pass
+    else:
+        raise AssertionError("a verdict about a route that has since been replaced must not land")
+    after = client.doc(partner_store.SUBSCRIPTIONS, SID)
+    assert after["servable"] is None and after["servable_checked_at"] is None, (
+        "the replace retired the answer AND its stamp; the late verdict must not restore either"
+    )
+    # And the current version still answers, so the guard refuses a stale writer and nothing else.
+    assert partner_store.set_servability(SID, servable=True, expected_version=2, now=NOW).servable
 
 
 def test_a_tombstone_stops_routing_and_a_repeated_delete_writes_nothing():
@@ -3435,6 +3512,52 @@ def emulator_test_one_partner_cannot_list_or_touch_anothers_subscriptions():
     else:
         raise AssertionError("a foreign partner must not tombstone this record")
     assert partner_store.get_subscription("theirs", partner_id="partner-b", now=NOW) is not None
+
+
+def emulator_test_the_list_cursor_pages_against_the_real_client():
+    """`start_after` is the one Firestore API this module gained, and only a real client can say.
+
+    Everything else in the paged read is checkable against a fake, but the cursor's SEMANTICS are
+    not: the hermetic double models it as "everything after this path in my own sorted rows", which
+    is a claim about Firestore rather than a check of it. The three rows below are created at ONE
+    instant on purpose -- `created_at` is the only declared ordering, so the page boundary falls on
+    a tie, and a cursor built from field values alone could not cut it in one place. A snapshot
+    cursor carries `__name__` too, which is what makes the tie deterministic and the page
+    non-overlapping.
+
+    The route reaches this with `_requested_id`, so `after` is the stored DOCUMENT id -- which in the
+    store is the spec's own `subscription_id`; `partner_api` is where the `partner~ref` namespacing
+    happens.
+    """
+    _emulator_setup()
+    for reference in ("a", "b", "c"):
+        partner_store.create_subscription(_spec(subscription_id=reference), now=NOW)
+
+    first = partner_store.list_subscriptions(partner_id=PARTNER, limit=1, now=NOW)
+    assert [s.subscription_id for s in first] == ["a"], first
+    second = partner_store.list_subscriptions(partner_id=PARTNER, limit=1, after="a", now=NOW)
+    assert [s.subscription_id for s in second] == ["b"], second
+    # `limit + 1` is what the route asks for, so check the shape it actually uses.
+    rest = partner_store.list_subscriptions(partner_id=PARTNER, limit=2, after="a", now=NOW)
+    assert [s.subscription_id for s in rest] == ["b", "c"], rest
+    assert partner_store.list_subscriptions(partner_id=PARTNER, limit=2, after="c", now=NOW) == []
+
+    # A cursor that names nothing this partner can page from is `NotFound`, which the route turns
+    # into a 400: "that watch is gone" and "nothing matched" are different answers.
+    for missing in ("never-existed", "a-tombstoned-one"):
+        try:
+            partner_store.list_subscriptions(partner_id=PARTNER, limit=1, after=missing, now=NOW)
+        except partner_store.NotFound:
+            pass
+        else:
+            raise AssertionError(f"paging from {missing!r} must not silently return page one")
+    partner_store.delete_subscription("b", partner_id=PARTNER, now=NOW)
+    try:
+        partner_store.list_subscriptions(partner_id=PARTNER, limit=1, after="b", now=NOW)
+    except partner_store.NotFound:
+        pass
+    else:
+        raise AssertionError("a tombstoned cursor is gone, not the start of the listing")
 
 
 def emulator_test_cleanup_deletes_every_related_document_and_redacts_the_tombstone():

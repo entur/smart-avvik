@@ -174,9 +174,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   line, with a sharper text naming both stops when the pair is served *the other way* (a likely
   swap). Weekend-only and seasonal routes are why a refusal would be wrong, and why the poller
   re-asks every 6 h (`varsel.recheck_service`) and clears the caveat when service appears; a match
-  also suppresses it. `None` from the provider means "could not establish" — an outage, a timeout, the
-  30/min rate limit that exists because the endpoint is unauthenticated — and never becomes a
-  warning. Answers are cached 10 min.
+  also suppresses it. `None` from the provider means "could not establish" — an outage, a timeout, a
+  rate limit — and never becomes a warning. Answers are cached 10 min.
+  **That rate limit is TWO numbers since 2026-09-09**, keyed per caller in
+  `alternatives._fetch_calls`' shape: `main._CONNECTIVITY_MAX_PER_MIN` (30) for this public
+  unauthenticated path, and `_PARTNER_CONNECTIVITY_MAX_PER_MIN` (15) for the partner API's
+  create/replace. One shared list was `alternatives`' own 2026-08-21 lesson repeated a module over —
+  a partner may issue 120 create/replace requests a minute, and every one it spent came out of a
+  budget that exists as abuse control for a traveller's registration. What a traveller loses when it
+  binds is not an error: the caveat is simply not established, so the journey registers without it.
+  The *cache* stays shared, because an answer about a stop pair is an answer whoever asked.
   **Calling at a stop is not the same as being usable from it** (2026-09-01): a traveller wrote in
   after an Oslo S → Drammen registration was pushed «Tog F4 16:23 er innstilt» — the 16:23 is the
   Bergen train, which calls Drammen with **alighting closed**. Vy sells the local stretch of every
@@ -681,12 +688,30 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **What a reader sees in the logs**: `varsel_partner_load`, `partner_store_load`, `partner_emit`,
   `partner_event`, `partner_delivery_round`, `partner_delivery`, `partner_quota`,
   `partner_subscription`, `partner_cleanup`, `partner_auth`, `partner_admin`, `partner_test_event`,
-  `partner_delivery_refused`, `notification_wording`, and `poller_phase` with
-  `phase="partner_webhooks"`. None carries an origin, a destination, a departure time, a full callback
-  URL, a credential secret or any prose. Three do carry something and the operations document names
-  them rather than glossing: `subscription_id` embeds the partner's own reference,
-  `partner_delivery_refused.reason` can carry a refused destination's hostname and resolved addresses,
-  and `partner_admin.actor` is a named human. App logs live in the **cluster** project
+  `partner_servability`, `partner_alert_state`, `partner_delivery_refused`,
+  `partner_delivery_response_truncated`, `partner_auth_config` / `partner_signing_config`,
+  `notification_wording`, and `poller_phase` with `phase="partner_webhooks"` **or
+  `"partner_servability"`** — two phases, not one. `docs/operations/partner-notifications.md` carries
+  the table of what each field means and is grep-pinned against the code by
+  `test_partner_contract.py::test_the_operations_document_names_every_partner_log_event`; **nothing
+  pins this copy of the list**, so treat that table as the authority and this sentence as a summary
+  that can lag it.
+  No **`partner_*`** log line carries an origin, a destination, a departure time, a full callback
+  URL, a credential secret or any prose — read the qualifier, because the fourth carrier below is why
+  it needs one. Four things are carried and named rather than glossed, the first three inside that
+  namespace and the fourth deliberately outside it: `subscription_id` embeds the partner's own
+  reference, `partner_delivery_refused.reason` can carry a refused destination's hostname and its
+  resolved addresses, `partner_admin.actor` is a named human, and **a partner subscription's origin
+  and destination DO reach Cloud Logging, under `/varsel`'s event name rather than a partner one.**
+  `main._varsel_connectivity` writes both stop refs into the *message* of an INFO record
+  (`event="varsel_service_check"`, `result="ok"`) on every established verdict, while its structured
+  `fields` carry only `event`, `result`, `forward` and `reverse` — which is exactly why the claim
+  above is true as stated and would mislead anybody who stopped there. The partner channel reaches
+  that line at **create time** (it always did) and, since 2026-09-09, again **every six hours per
+  unservable subscription** through `partner_servability`. It is **pre-existing and shared with
+  `/varsel`'s own registrations**, so the honest framing is an accepted exposure this feature
+  *extends* rather than a new leak; if it is ever to be closed, the fix is `/varsel`'s log line, not
+  this channel's. App logs live in the **cluster** project
   (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
   **`NOTIFICATION_PARTNER_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
   other three flags; it is named in **no Helm values file** and defaults off, so the channel emits and

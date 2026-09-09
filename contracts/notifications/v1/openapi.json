@@ -4,7 +4,7 @@
     "title": "Entur journey notification partner API",
     "version": "1.0.0",
     "summary": "Register a commuter's recurring journey; receive a signed webhook when a disruption is predicted to hit it.",
-    "description": "The authenticated surface a partner BFF manages its own commuter registrations through, plus the outbound event contract under `webhooks` below.\n\n**This document renders the two authored schemas rather than restating them.** `subscription.schema.json` and `event.schema.json` sit beside this file and every property here is a `$ref` into one of them: two definitions of one payload is how they drift, and the partner's TypeScript types are generated from this document. OpenAPI 3.1 is JSON Schema 2020-12, so the references resolve without translation.\n\n**Authentication** is a bearer credential this app issued: `Authorization: Bearer <key-id>.<secret>`. The `key-id` is prefixed `kixn_`; the secret is 256 random bits, shown once at issue and stored here only as an HMAC-SHA256 hash under a pepper. Never a cookie: the app serves one global CORS policy allowing every origin, so a cookie would be sent from all of them. Several credentials are live at once, which is how rotation works -- a new `key-id` is issued, the partner cuts over, and the old one is revoked afterwards, so nothing is taken down for a rotation.\n\n**Ownership comes from the credential.** Every route acts on the authenticated partner's own records only, and `partner_id` in a request body is ignored. A record belonging to another partner is indistinguishable from one that does not exist: both are 404, and no response body names anything about another partner.\n\n**Statuses worth knowing before you write a client.** `401` is a credential problem and carries no detail about which; `403` means the partner is suspended, which is a conversation with an operator rather than a credential to rotate; `429` is a limiter tier or a quota ceiling and always carries a bounded `Retry-After`; `503` means this deployment has no partner channel configured, or its store is briefly unavailable -- both retryable, neither a statement about your credential.\n\n**Retention.** A subscription expires at the earlier of 180 days from creation and 60 days from your last interaction with it, and both horizons are enforced when it is read as well as by the store's own expiry -- so a subscription never keeps alerting past its published expiry. Events and delivery records are kept 7 days. A `DELETE` tombstones the subscription in one write that stops routing and then deletes its events, deliveries and alert subjects; where that has not completed the response says so and names the maximum residual window, after which expiry removes the remainder.",
+    "description": "The authenticated surface a partner BFF manages its own commuter registrations through, plus the outbound event contract under `webhooks` below.\n\n**This document renders the two authored schemas rather than restating them.** `subscription.schema.json` and `event.schema.json` sit beside this file and every property here is a `$ref` into one of them: two definitions of one payload is how they drift, and the partner's TypeScript types are generated from this document. OpenAPI 3.1 is JSON Schema 2020-12, so the references resolve without translation.\n\n**One property is inline rather than a `$ref`, on purpose:** `TestEventRequest.subscription_id`. A create body must carry your own reference and nothing else, while `POST /test-events` additionally accepts the opaque `subscription_id` an event carries -- so the two are genuinely different constraints, and referencing the stricter create-side one would publish a schema that refuses a value this API had itself just served. Widening the shared definition to match would be the same mistake pointing the other way.\n\n**Authentication** is a bearer credential this app issued: `Authorization: Bearer <key-id>.<secret>`. The `key-id` is prefixed `kixn_`; the secret is 256 random bits, shown once at issue and stored here only as an HMAC-SHA256 hash under a pepper. Never a cookie: the app serves one global CORS policy allowing every origin, so a cookie would be sent from all of them. Several credentials are live at once, which is how rotation works -- a new `key-id` is issued, the partner cuts over, and the old one is revoked afterwards, so nothing is taken down for a rotation.\n\n**Ownership comes from the credential.** Every route acts on the authenticated partner's own records only, and `partner_id` in a request body is ignored. A record belonging to another partner is indistinguishable from one that does not exist: both are 404, and no response body names anything about another partner.\n\n**Statuses worth knowing before you write a client.** `401` is a credential problem and carries no detail about which; `403` means the partner is suspended, which is a conversation with an operator rather than a credential to rotate; `429` is a limiter tier or a quota ceiling and always carries a bounded `Retry-After`; `503` means this deployment has no partner channel configured, or its store is briefly unavailable -- both retryable, neither a statement about your credential.\n\n**`422` has two body shapes, and the one you will meet first is the array.** A refusal this application made carries a string `detail` (`Error`); a refusal the framework made before any handler ran carries an array of objects (`ValidationError`) -- an out-of-range `limit`, an unknown body property, a `pattern` violation, a missing required property, an over-long path segment. Those are the errors you hit while writing the client, so branch on `detail`'s type rather than assuming a string. Every documented `422` here says which shapes it can be.\n\n**Retention.** A subscription expires at the earlier of 180 days from creation and 60 days from your last interaction with it, and both horizons are enforced when it is read as well as by the store's own expiry -- so a subscription never keeps alerting past its published expiry. Events and delivery records are kept 7 days. A `DELETE` tombstones the subscription in one write that stops routing and then deletes its events, deliveries and alert subjects; where that has not completed the response says so and names the maximum residual window, after which expiry removes the remainder.",
     "contact": {
       "name": "Entur - Team KI-eksperimentering"
     }
@@ -173,6 +173,9 @@
           "403": {
             "$ref": "#/components/responses/Suspended"
           },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
           "429": {
             "$ref": "#/components/responses/RateLimited"
           },
@@ -222,6 +225,9 @@
           "404": {
             "$ref": "#/components/responses/NotFound"
           },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
           "429": {
             "$ref": "#/components/responses/RateLimited"
           },
@@ -253,6 +259,9 @@
           },
           "403": {
             "$ref": "#/components/responses/Suspended"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
@@ -356,7 +365,7 @@
             }
           },
           "422": {
-            "$ref": "#/components/responses/Unprocessable"
+            "$ref": "#/components/responses/ValidationFailed"
           },
           "429": {
             "$ref": "#/components/responses/RateLimited"
@@ -686,6 +695,7 @@
       },
       "TestEventRequest": {
         "title": "Test event request",
+        "description": "The one place in this document whose property is stated inline instead of referenced. `subscription.schema.json`'s `subscription_id` is the CREATE-side constraint -- your own reference, 128 characters, no `~` -- and it is correctly strict there: a create body must never name the namespaced form. This route accepts that form as well, exactly as the two path routes do, so referencing the create-side definition published a schema that refuses the id an event carries in its own `subscription_id` field. A partner validating outbound requests against it would reproduce, in their own client, the 422 this API was fixed to stop returning.",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -693,7 +703,11 @@
         ],
         "properties": {
           "subscription_id": {
-            "$ref": "./subscription.schema.json#/properties/subscription_id"
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 257,
+            "pattern": "^[A-Za-z0-9._:~-]+$",
+            "description": "A subscription created with `test: true`. Your own reference, or the opaque `subscription_id` an event carries -- the same two forms the path routes accept, and the bound is theirs: `~` plus 128 characters either side. Anything else is refused."
           }
         }
       },
@@ -749,7 +763,7 @@
       },
       "Error": {
         "title": "Error",
-        "description": "Every failure has this shape. `detail` is a short stable code, not prose to show a traveller, and it deliberately says nothing about another partner's records.",
+        "description": "The shape of every failure THIS APPLICATION refuses: `detail` is a short stable code, not prose to show a traveller, and it deliberately says nothing about another partner's records.\n\n**It is not the only failure shape, and a client that assumes it is will throw on the first malformed request it sends.** A request refused before any handler runs -- an unknown body field under `additionalProperties: false`, a value failing its `pattern` or its length or numeric bound, a missing required property, a path segment over its bound, a body that is not an object -- is refused by the framework, whose `detail` is an ARRAY: see `ValidationError`. That is why every 422 documented here is a `oneOf` of the two, and why `GET`/`DELETE` routes that constrain a parameter document a 422 at all.",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -758,6 +772,55 @@
         "properties": {
           "detail": {
             "type": "string"
+          }
+        }
+      },
+      "ValidationError": {
+        "title": "Validation error",
+        "description": "FastAPI's own refusal, for a request no handler here ever saw. `detail` is an **array of objects** (`type`/`loc`/`msg`/`input`, plus `ctx` where the violated constraint has a value to quote), never a string -- so test `detail`'s type before reading it as one.\n\n**Published rather than flattened, deliberately.** Reshaping these into `Error` needs a `RequestValidationError` handler, and FastAPI registers those per APPLICATION, not per router: this API is mounted in a process that also serves `/varsel-api`, `/historikk-api`, `/meldinger-api` and more, so one handler would silently restate every one of their validation bodies too. Two honest shapes beat one uniform shape bought at that price. `docs/integrations/notification-api.md` says the same thing in prose.\n\nThe item's key set is Pydantic's rather than ours, so it is deliberately left open here. Measured against this app (FastAPI 0.140, Pydantic 2.13) over a query bound, a query type, a path length, a body pattern, a missing field, a forbidden extra field and a non-object body: every item carried `type`, `loc`, `msg` and `input`, and `ctx` appeared on the four that had a constraint to name.",
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "type",
+                "loc",
+                "msg",
+                "input"
+              ],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "Pydantic's error kind: `missing`, `extra_forbidden`, `string_pattern_mismatch`, `string_too_long`, `less_than_equal`, `int_parsing`, `model_attributes_type`, and others. Match on this rather than on `msg`."
+                },
+                "loc": {
+                  "type": "array",
+                  "description": "Where the offending value sits: `[\"query\", \"limit\"]`, `[\"path\", \"subscription_id\"]`, `[\"body\", \"from_stop\"]`, or `[\"body\"]` for a body that is not an object. An INTEGER element is an index into an array property -- `[\"body\", \"days\", 1]` -- which is why the items are string or integer and not string.",
+                  "items": {
+                    "type": [
+                      "string",
+                      "integer"
+                    ]
+                  }
+                },
+                "msg": {
+                  "type": "string",
+                  "description": "English prose from Pydantic. For your log, not for a traveller: it is neither Norwegian nor a stable code."
+                },
+                "input": {
+                  "description": "The value that was refused, as received -- any JSON type, and for `missing` it is the enclosing object. Required, and on the same footing as the three beside it: Pydantic declares `type`, `loc`, `msg` and `input` always present and `ctx` optional, and all seven refusals measured against this app agreed."
+                },
+                "ctx": {
+                  "type": "object",
+                  "description": "The constraint that was violated, when the error kind has one to quote: `{\"le\": 500}`, `{\"max_length\": 257}`, `{\"pattern\": \"^[A-Za-z0-9._:~-]+$\"}`. Absent for kinds with no constraint, such as `missing`."
+                }
+              }
+            }
           }
         }
       }
@@ -811,11 +874,28 @@
         }
       },
       "Unprocessable": {
-        "description": "The request body is malformed: a bad window, weekday set, stop pair or destination.",
+        "description": "The request body is malformed. **Two shapes, and you must handle both.** A refusal this application made -- a bad window, weekday set or stop pair, an unknown `destination_id` -- is `Error`, with `detail` a string. A refusal the framework made before the handler ran -- an unknown property, a value failing its pattern or bound, a missing required property -- is `ValidationError`, with `detail` an array. `detail`'s type is what tells them apart.",
         "content": {
           "application/json": {
             "schema": {
-              "$ref": "#/components/schemas/Error"
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/Error"
+                },
+                {
+                  "$ref": "#/components/schemas/ValidationError"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ValidationFailed": {
+        "description": "A parameter or body property failed its published schema, and no handler here ran. Only the framework's array shape reaches you on this route: it has no refusal of its own at this status.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ValidationError"
             }
           }
         }

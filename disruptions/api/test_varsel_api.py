@@ -4068,6 +4068,62 @@ def test_the_partner_wording_gate_is_the_partner_switch_not_varsel_llm_enabled(m
     assert "Toget er innstilt. Ta neste tog." not in outcome.partner_subjects[0].body
 
 
+def test_a_confirmed_cancellation_never_carries_the_wording_written_before_it(monkeypatch):
+    """The cancellation title over the pre-cancellation body, and why the cache cannot notice.
+
+    `_message_key` is (journey_key, situation_number, departure) and carries no `cancelled` flag, so
+    a wording written while the train was merely at risk shares one cache entry with the reading
+    taken after ET declared it gone. The TITLE is rebuilt from this cycle's `message_input`
+    (`innstilt: True`), the BODY is the cached string — so the partner event read «Tog L1 07:18 er
+    innstilt» over «91 % sjanse for innstilling, typisk 15-27 min forsinket», beside
+    `delay: null`, `effect: "cancelled"` and `probabilities.cancellation: 1.0` in the same payload.
+
+    Reachable under ONE situation number, which is what makes it the common case rather than a
+    corner: measured in dev on 2026-08-19, 70 of 90 declared-cancelled rail calls were named by an
+    SX situation that already existed — so the flip happens with the message key unchanged, and
+    `partner_store._transition('predicted', 'confirmed')` mints a real revision and a real delivery
+    for it. It is also the highest-value notification the channel sends: a `confirmed` revision is
+    cap-exempt and replaces a delivered one.
+
+    Nothing forgets the entry in between. `_reconcile_caches`' only unconditional `_forget_message`
+    is the below-threshold one, and a declared cancellation scores (1.0, 1.0) and stays alert-worthy
+    — and the write pass short-circuits on `message_key in _messages`, so it is never refreshed
+    either. The narrow fix is to refuse the cache for a declared cancellation: the template renders
+    «Innstilt» and carries no delay figures, which is the documented correct wording for a confirmed
+    call (`impact._cancelled_prediction`'s own rule). The browser card reads the same stale entry
+    through `_deliverable_message` and still does; that half is pre-existing and needs its own pass
+    over `_messages`/`_message_meta`/`_alternatives`/`_message_attempts`.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    monkeypatch.setattr(notification_wording, "partner_delivery_enabled", lambda: True)
+    _capture_writes(monkeypatch)
+    _use_partner_store(monkeypatch, [PARTNER_DOC_ROUTED])
+    _register(DEVICE)
+
+    # Cycle 1: at risk, not yet cancelled. The model's prose is written and cached.
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." in outcome.partner_subjects[0].body
+    assert varsel._messages, "the wording is cached, which is what the next cycle reuses"
+
+    # Cycle 2: the SAME situation now declares the train cancelled.
+    _use_snapshot({"S1": _cancelled_notice("S1")})
+    outcome = varsel.check_and_notify(_active_snapshot["value"])
+    [subject] = outcome.partner_subjects
+    assert subject.cancelled is True, "the reading this cycle is a declared cancellation"
+    assert "innstilt" in subject.title.lower(), subject.title
+    assert "Toget er innstilt. Ta neste tog." not in subject.body, (
+        "the body is this cycle's template, not the wording written before the cancellation"
+    )
+    assert "Innstilt" in subject.body, subject.body
+    # And the payload it rides in says the same thing, so the two cannot be read as disagreeing.
+    assert subject.payload["effect"] == "cancelled"
+    assert subject.payload["probabilities"]["delay_ge10"] is None
+    assert subject.payload["notification"]["body"] == subject.body
+
+
 def test_the_write_budgets_clock_is_shared_and_its_call_allowance_is_not(monkeypatch):
     """`notification_wording.PassBudget`'s stated split, at the one call site that has to honour it.
 

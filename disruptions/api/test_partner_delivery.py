@@ -284,7 +284,15 @@ def _install() -> _Fake:
                     client.docs.pop(path, None)
         return result
 
-    def _query(name: str, *, equality: Any = None, inequality: Any = None, limit: int) -> _Page:
+    def _query(
+        name: str,
+        *,
+        equality: Any = None,
+        inequality: Any = None,
+        limit: int,
+        # Accepted and unused: only the listing route pages, and no test here reaches it.
+        start_after: Any = None,
+    ) -> _Page:
         spec = partner_store._SPECS_BY_NAME[name]
         rows: list[tuple[str, dict[str, Any]]] = []
         for path, data in list(client.docs.items()):
@@ -553,21 +561,18 @@ def test_thirteen_pending_events_yield_four_notifications_and_nine_recorded_supp
     never happened, and KTD12 needs exactly those rows: this plan manufactures capped subjects by
     design, nine of thirteen here.
 
-    **What "spent on the soonest" can and cannot be asserted as, because two things loosen it and
-    both are real.** `pending_deliveries` sorts on `valid_until`, which IS the departure for a train
-    inside the 60-minute horizon and clamps to the horizon beyond it, so among trains further out
-    the order falls back to the delivery id — nothing on a delivery record carries the departure.
-    And the cap is READ by `claim_delivery` and SPENT by `mark_delivery_sent`, so across a 4-wide
-    pool up to `_WORKERS` claims can pass the check before any increment lands: measured on exactly
-    this shape, the four delivered were the 1st, 2nd, 3rd and 6th soonest rather than the first
-    four. The COUNT is exact — Firestore's counter is authoritative — and the loosening is bounded
-    by the pool width.
+    **The one thing that still loosens "spent on the soonest", and it is real.**
+    `pending_deliveries` sorts on `valid_until`, which IS the departure for a train inside the
+    60-minute horizon and clamps to the horizon beyond it — so among trains further out the order
+    falls back to the delivery id, because nothing on a delivery record carries the departure.
+
+    What is NOT loose any more, and the docstring said it was until 2026-09-09: the cap is reserved
+    inside `claim_delivery`'s own transaction rather than read there and spent at send, and
+    `_shard_by_subscription` puts one subscription on one worker. So these thirteen are one shard
+    claimed sequentially and the four delivered are the four soonest exactly, at any pool width.
 
     So this asserts what holds: exactly four notifications, nine recorded suppressions, a counter
-    reading four, and the soonest departure among the four (it is submitted first, and the first
-    round always has allowance). Tightening the *which* would mean claiming sequentially, and the
-    claim is a store call — sequential claims for a two-hundred-deep backlog are what the pool
-    exists to avoid.
+    reading four, and the four soonest by `valid_until`.
     """
     client = _install()
     try:
@@ -600,17 +605,16 @@ def test_thirteen_pending_events_yield_four_notifications_and_nine_recorded_supp
         capped = [d for d in stored.values() if d["state"] == "pending"]
         assert len(sent) == 4 and len(capped) == 9
         assert all(d.get("capped_count") == 1 for d in capped), "every suppression is recorded"
-        soonest = deliveries[0]["valid_until"]
-        assert soonest in [d["valid_until"] for d in sent], (
-            "the soonest departure is always among the four: it is submitted first and the first "
-            "round of claims always has allowance"
-        )
-        assert max(d["valid_until"] for d in sent) <= deliveries[
-            partner_store.MAX_ALERT_DELIVERIES_PER_DAY + partner_delivery._WORKERS - 1
-        ]["valid_until"], (
-            "and the loosening is bounded by the pool width -- see the docstring: the cap is read "
-            "at claim and spent at send, so up to `_WORKERS` claims pass before any increment lands"
-        )
+        # THE FOUR SOONEST, EXACTLY, and not "somewhere among the first seven". The loose bound
+        # this replaced (`MAX + _WORKERS - 1`) described a version of the code that no longer
+        # exists: the claim now RESERVES the slot inside the transaction that admits the delivery,
+        # and `_shard_by_subscription` puts one subscription on one worker, so the claims here are
+        # sequential by construction. Left loose, a regression of EITHER fix -- dropping the
+        # reservation, or sharding per delivery again -- would still have passed.
+        assert sorted(d["valid_until"] for d in sent) == [
+            d["valid_until"]
+            for d in deliveries[: partner_store.MAX_ALERT_DELIVERIES_PER_DAY]
+        ], sorted(d["valid_until"] for d in sent)
         assert client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_deliveries"] == {
             partner_store.oslo_day(NOW): 4
         }
@@ -735,6 +739,57 @@ def test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait():
         assert elapsed < 2.0, f"a hung store must not hold the poller thread; took {elapsed:.1f}s"
         assert report.timed_out is True and report.sent == 0
         assert not _sent, "nothing was dialled: the claim never returned"
+        assert {f["result"] for f in _fields(handler, "partner_delivery_round")} == {"timeout"}
+    finally:
+        if client.hang is not None:
+            client.hang.set()
+        _uninstall()
+
+
+def test_a_hung_store_cannot_hold_the_pass_inside_the_stale_sweep_either():
+    """The same slow-store failure one step EARLIER, on the path the bounded wait used to miss.
+
+    `_expire_stale` resolves the deliveries whose validity has passed, and it is a loop of store
+    WRITES — `mark_delivery_expired` — which is the class of call the module docstring says has no
+    ceiling of its own, because a transactional commit carries no timeout the Python client can
+    express. It ran directly on the calling thread, BEFORE the delivery pool existed, so the
+    `wait(futures, timeout=...)` that contains every other store call in this pass did not reach it
+    at all: one hung commit held the poller thread for as long as Firestore took, and with it the
+    28 s ceiling (`_EMIT_WAIT_S + _DELIVERY_WAIT_S`) that KTD6's 30 s reversal trigger is sized
+    against.
+
+    Deliberately the sibling of `test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait`
+    rather than a widening of it: that one hangs the store during `claim_delivery` on READY
+    deliveries and never puts a delivery into `pending.stale`, so it passes with this path
+    unbounded. Same real clock and real thread, for the same reason — the property is that the
+    ingestion thread comes back.
+    """
+    client = _install()
+    try:
+        _live(client)
+        deliveries = _pending(client, n=2)
+        # Past their validity, so `pending_deliveries` files them as `stale` rather than `ready`.
+        # Written straight onto the documents: emitting an already-expired event is not a shape the
+        # emit path produces, and `valid_until` is the only field this classification reads.
+        for delivery in deliveries:
+            client.docs[f"{partner_store.DELIVERIES}/{delivery['delivery_id']}"]["valid_until"] = (
+                NOW - timedelta(seconds=1)
+            )
+        client.hang = threading.Event()
+        handler = _capture()
+        started = time.monotonic()
+        report = partner_delivery.deliver_pending(
+            now=NOW,
+            sender=_sender(),
+            wait_s=0.15,
+            deadline_s=5.0,
+            timeout_s=0.05,
+            store_call_s=0.05,
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"a hung store must not hold the poller thread; took {elapsed:.1f}s"
+        assert report.timed_out is True, report
+        assert report.expired == 0, "the hung commit landed nothing, and says so"
         assert {f["result"] for f in _fields(handler, "partner_delivery_round")} == {"timeout"}
     finally:
         if client.hang is not None:

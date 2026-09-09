@@ -751,12 +751,18 @@ def _query(
     equality: Mapping[str, Any] | None = None,
     inequality: Mapping[str, Any] | None = None,
     limit: int,
+    start_after: Any = None,
 ) -> Any:
     """Build the query named by a :class:`QuerySpec`. **The only place this module filters.**
 
     ``test_every_filter_goes_through_the_query_helper`` asserts that ``.where(`` and ``.order_by(``
     appear nowhere else in this file, so a query added later cannot dodge the spec table -- and
     therefore cannot ship without an index declaration.
+
+    ``start_after`` is a document SNAPSHOT, never a field value: Firestore derives the cursor from
+    the ordering fields plus ``__name__``, so a page boundary that falls on two documents sharing a
+    ``created_at`` is still cut in one place. It needs no index of its own -- the cursor is
+    positional within an ordering the spec already declares.
     """
     spec = _SPECS_BY_NAME[name]
     from google.cloud.firestore_v1.base_query import FieldFilter
@@ -768,6 +774,8 @@ def _query(
         query = query.where(filter=FieldFilter(field_path, op, (inequality or {})[field_path]))
     for field_path, direction in spec.order_by:
         query = query.order_by(field_path, direction=direction)
+    if start_after is not None:
+        query = query.start_after(start_after)
     return query.limit(limit)
 
 
@@ -1335,6 +1343,7 @@ def _servability_body(
     *,
     subscription_id: str,
     servable: bool | None,
+    expected_version: int,
     now: datetime,
 ) -> dict[str, Any]:
     snapshot = _read(transaction, refs.subscription(subscription_id))
@@ -1343,25 +1352,53 @@ def _servability_body(
         raise NotFound("no such subscription")
     if stored.get("status") != "active":
         raise NotFound("subscription is deleted")
+    if int(stored.get("version") or 0) != expected_version:
+        raise Conflict(
+            f"version is {stored.get('version')}, not {expected_version}; the route was replaced "
+            "while this servability check was in flight"
+        )
     patch = {"servable": servable, "servable_checked_at": now, "updated_at": now}
     transaction.update(refs.subscription(subscription_id), patch)
     return {**stored, **patch}
 
 
 def set_servability(
-    subscription_id: str, *, servable: bool | None, now: datetime | None = None
+    subscription_id: str,
+    *,
+    servable: bool | None,
+    expected_version: int,
+    now: datetime | None = None,
 ) -> Subscription:
-    """Record R6's servability answer and its freshness.
+    """Record R6's servability answer and its freshness, for the route that was ASKED about.
 
     ``None`` means "could not be established" -- an outage, a timeout -- and is stored as such
     rather than as ``False``: a subscription is NEVER refused for being unservable (R5), the caveat
     simply rides on the record, and "we do not know" must not render as "no trips run".
+
+    ``expected_version`` is what makes the answer about a route rather than about an id. The check
+    is a ~20 s BigQuery question (`main._CONNECTIVITY_TIMEOUT_S`) and a replace is one request, so
+    they interleave: ask about Oslo S -> Drammen, the partner replaces the watch with Oslo S -> Ski,
+    the answer lands and stamps the CURRENT record with a verdict about the old route -- and nothing
+    in the document then says so, because `servable` reads as an answer and `servable_checked_at`
+    reads as fresh, which is the pair R6 publishes so a caveat's age can be judged.
+    ``_replace_subscription`` retires both fields for exactly this reason; a late writer must not
+    restore them.
+
+    REQUIRED, never ``None``-defaulted, and the version rather than the definition digest: a replace
+    bumps the version and a ``touch`` does not, so a keep-alive during a slow check is correctly not
+    a conflict while every route change is. Enforced INSIDE the transaction -- a read-then-compare
+    outside it is the same race one layer up.
     """
     instant = now or _now()
     refs = _Refs(_client())
     doc = _run_transaction(
         lambda txn: _servability_body(
-            txn, refs, subscription_id=subscription_id, servable=servable, now=instant
+            txn,
+            refs,
+            subscription_id=subscription_id,
+            servable=servable,
+            expected_version=expected_version,
+            now=instant,
         )
     )
     return _subscription_from_doc(doc)
@@ -1389,25 +1426,74 @@ def get_subscription(
 
 
 def list_subscriptions(
-    *, partner_id: str, limit: int = MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER, now: datetime | None = None
+    *,
+    partner_id: str,
+    limit: int = MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER,
+    after: str | None = None,
+    now: datetime | None = None,
 ) -> list[Subscription]:
-    """A partner's own live subscriptions, oldest first."""
+    """A partner's own live subscriptions, oldest first, starting after ``after``.
+
+    **``limit`` reaches the QUERY**, and did not until 2026-09-09: this streamed the whole bounded
+    set and the route sliced in Python, so a `?limit=1` page cost the same up-to-500-document read
+    as the whole listing -- against a per-credential ceiling of
+    ``partner_auth.PER_PARTNER_PER_MIN`` (120) that is a read amplification driven by a partner's
+    polling shape rather than by what they asked for. ``after`` is the document id of the last row
+    of the previous page; it is resolved to a snapshot (one document read) and handed to the query
+    as a cursor, so paging costs the page rather than the collection.
+
+    ``NotFound`` for a cursor that is missing, another partner's, or no longer live -- the route
+    turns that into a 400. "That watch is gone" and "nothing matched" are different answers and a
+    client that cannot tell them apart shows the second when it means the first.
+
+    **The loop is what keeps the page FULL**, and it is not decoration. Expiry is tested in Python
+    (``subscription_is_live``) because a query cannot express both horizons, and Firestore deletes an
+    expired document only "typically within 24 hours" -- so a page of ``limit`` documents can come
+    back with fewer live rows, and returning them alone would tell a client the listing had ended
+    while live rows remained. It reads ``limit`` at a time and stops at the collection's own
+    ceiling, so a healthy list still costs exactly one round.
+    """
     instant = now or _now()
-    query = _query(
-        "partner_subscriptions",
-        equality={"partner_id": partner_id, "status": "active"},
-        limit=min(limit, MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER),
-    )
-    out: list[Subscription] = []
-    for snapshot in query.stream(timeout=_CALL_DEADLINE_S):
+    ceiling = min(limit, MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER)
+    cursor: Any = None
+    if after is not None:
+        snapshot = _Refs(_client()).subscription(after).get(timeout=_CALL_DEADLINE_S)
         stored = _doc(snapshot)
-        if not subscription_is_live(stored, instant):
-            continue
-        try:
-            out.append(_subscription_from_doc(stored))
-        except Exception:
-            logger.debug("Unreadable partner subscription document; skipping it", exc_info=True)
-    return out
+        if (
+            not stored
+            or stored.get("partner_id") != partner_id
+            or not subscription_is_live(stored, instant)
+        ):
+            raise NotFound("no such subscription to page from")
+        cursor = snapshot
+    out: list[Subscription] = []
+    scanned = 0
+    while len(out) < ceiling and scanned < MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER:
+        requested = min(ceiling - len(out), MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER - scanned)
+        page = list(
+            _query(
+                "partner_subscriptions",
+                equality={"partner_id": partner_id, "status": "active"},
+                limit=requested,
+                start_after=cursor,
+            ).stream(timeout=_CALL_DEADLINE_S)
+        )
+        scanned += len(page)
+        for snapshot in page:
+            stored = _doc(snapshot)
+            if not subscription_is_live(stored, instant):
+                continue
+            try:
+                out.append(_subscription_from_doc(stored))
+            except Exception:
+                logger.debug("Unreadable partner subscription document; skipping it", exc_info=True)
+        # A short page means the collection is exhausted, so another round would read nothing --
+        # and "fewer subscriptions than the page size" is the ORDINARY case, so a speculative second
+        # query would add one to every list request rather than to the rare one that needs it.
+        if len(page) < requested:
+            break
+        cursor = page[-1]
+    return out[:ceiling]
 
 
 @dataclass(frozen=True)

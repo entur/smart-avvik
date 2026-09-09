@@ -24,6 +24,8 @@ import json
 import logging
 import os
 import pathlib
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -210,6 +212,10 @@ class _Page:
 
     def stream(self, timeout: float | None = None) -> list[_Snap]:
         del timeout
+        # Counted per DOCUMENT, not per query: `reads` above answers "how many queries", and the
+        # cost a paginated endpoint is judged on is how many documents each of them streams. A
+        # `?limit=1` page that reads five hundred rows makes exactly two queries.
+        self.client.documents_read += len(self.rows)
         return [_Snap(path, data, self.client) for path, data in self.rows]
 
 
@@ -245,6 +251,7 @@ class _FakeFirestore:
         self.docs: dict[str, dict[str, Any]] = {}
         self.log: list[str] = []
         self.reads = 0
+        self.documents_read = 0
         self.fail_with: BaseException | None = None
 
     def collection(self, name: str) -> _Collection:
@@ -352,7 +359,14 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
             client.log.append(f"{kind}:{path}")
         return result
 
-    def _query(name: str, *, equality: Any = None, inequality: Any = None, limit: int) -> _Page:
+    def _query(
+        name: str,
+        *,
+        equality: Any = None,
+        inequality: Any = None,
+        limit: int,
+        start_after: Any = None,
+    ) -> _Page:
         if client.fail_with is not None:
             raise client.fail_with
         client.reads += 1
@@ -376,6 +390,13 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
                 key=lambda row, f=field_path: _sortable(row[1].get(f)),
                 reverse=direction == "DESCENDING",
             )
+        if start_after is not None:
+            # Positional, as Firestore's own cursor is: everything strictly after the snapshot in
+            # THIS ordering. Matched on the document path, which is what `__name__` breaks a tie on
+            # when two rows share their ordering field.
+            paths = [path for path, _ in rows]
+            if start_after._path in paths:
+                rows = rows[paths.index(start_after._path) + 1 :]
         return _Page(client, rows[:limit])
 
     partner_store._run_transaction = _run  # type: ignore[assignment]
@@ -659,6 +680,47 @@ def test_a_changed_route_retires_the_old_servability_answer():
         ).json()
         assert second["servable"] is False
         assert second["version"] == 2
+    finally:
+        _uninstall()
+
+
+def test_a_verdict_that_arrives_after_a_replace_is_discarded_not_stamped():
+    """The route the question was asked about is not always the route the answer lands on.
+
+    The check takes up to `main._CONNECTIVITY_TIMEOUT_S` (20 s) while a replace is one request, so
+    they interleave -- and this path used to write whatever came back onto whatever the record now
+    was, freshly timestamped. A partner would then be told their NEW route has no direct service,
+    with `servable_checked_at` a second old, which is the pair R6 publishes so a caveat's age can be
+    judged. Simulated by replacing from inside the seam, which is the one place the interleaving is
+    reproducible without threads.
+
+    The registration itself is never failed for it: a discarded verdict is `servable: null`, exactly
+    as a provider timeout is, and `partner_servability.recheck` picks a never-established record up
+    on its own cadence.
+    """
+    state: dict[str, Any] = {}
+
+    def replace_then_answer(_from: str, _to: str) -> tuple[bool, bool]:
+        # The partner's concurrent replace, landing while "our" question is in flight.
+        if state.get("done") is None:
+            state["done"] = True
+            _client().post(
+                "/notification-api/v1/subscriptions",
+                json=_body(to_stop="NSR:StopPlace:591"),
+                headers=_headers(state["bearer"]),
+            )
+        return (False, False)
+
+    _install(connectivity=replace_then_answer)
+    state["bearer"] = _provision()
+    try:
+        payload = _client().post(
+            "/notification-api/v1/subscriptions", json=_body(), headers=_headers(state["bearer"])
+        ).json()
+        assert payload["servable"] is None, (
+            "a verdict about the pre-replace route must not be stamped onto the current one"
+        )
+        assert payload["servable_checked_at"] is None
     finally:
         _uninstall()
 
@@ -1141,6 +1203,68 @@ def test_a_test_event_reports_a_partners_own_failure_as_the_diagnosis():
         _uninstall()
 
 
+def test_a_test_event_delivery_that_never_returns_gives_the_worker_back():
+    """DNS is not bounded by a socket timeout, and this is the one route that dials on request.
+
+    `webhook_client`'s ceilings are `socket.settimeout` values on an already-open connection, and
+    `_default_resolver` calls `socket.getaddrinfo` BEFORE any of them apply -- a blocking C call
+    with no deadline the Python layer can express and no way to interrupt it. Every other caller of
+    `deliver` is the poller's delivery pass, which contains that inside its own bounded wait; this
+    one runs on a plain `def` route sharing the ~40-slot anyio worker pool with `/varsel-api` and
+    `/impact`. So a destination whose resolver stalls held one of those workers indefinitely, and
+    `_TEST_EVENTS_PER_MIN` (6) per partner is a ceiling on REQUESTS, not on workers held.
+
+    Bounded by running the whole delivery -- resolution included -- on a one-wide pool that is
+    ABANDONED on timeout: `partner_events.emit`'s shape, with the same honest residual, and here the
+    per-partner ceiling is also what bounds how many threads can be leaked.
+
+    Asserted with a real clock and a real thread, like `test_partner_delivery`'s two timeout tests:
+    the property is that the request thread comes back, and a mocked clock cannot fail that way.
+    """
+    # The real wait must EXCEED one whole attempt, or this backstop would fire on an ordinary slow
+    # partner and report `timeout` where their own status is the diagnosis. Asserted here and then
+    # shortened, so the property is checked without the suite paying eight seconds for it.
+    assert (
+        partner_api._TEST_EVENT_WAIT_S
+        > webhook_client.DEFAULT_TIMEOUT_S + webhook_client.CONNECT_TIMEOUT_S
+    )
+    _install()
+    bearer = _provision()
+    release = threading.Event()
+    saved_wait = partner_api._TEST_EVENT_WAIT_S
+    try:
+        client = _client()
+        client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(subscription_id="probe", test=True),
+            headers=_headers(bearer),
+        )
+
+        def hang(url: str, *, body: bytes, headers: Any, **_kw: Any) -> Any:
+            release.wait(30)  # bounded, so a failing assertion cannot wedge the suite
+            return webhook_client.DeliveryAttempt(ok=True, status=200)
+
+        partner_api.configure(deliver=hang)
+        partner_api._TEST_EVENT_WAIT_S = 0.15  # type: ignore[assignment]
+        started = time.monotonic()
+        response = client.post(
+            "/notification-api/v1/test-events",
+            json={"subscription_id": "probe"},
+            headers=_headers(bearer),
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"a stalled destination must not hold a worker; took {elapsed:.1f}s"
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["delivered"] is False
+        assert payload["status"] is None
+        assert payload["error"] == "timeout"
+    finally:
+        partner_api._TEST_EVENT_WAIT_S = saved_wait  # type: ignore[assignment]
+        release.set()
+        _uninstall()
+
+
 def test_the_test_event_route_is_rate_limited_on_its_own():
     """The one route that makes an outbound call, so it carries its own tight ceiling: this app must
     not become a request amplifier against a partner-supplied host."""
@@ -1431,6 +1555,86 @@ def test_listing_is_a_slice_of_a_bounded_read():
         _uninstall()
 
 
+def test_a_small_page_reads_a_small_page():
+    """The caller's `limit` reaches the QUERY, and did not until 2026-09-09.
+
+    `list_subscriptions` streamed up to `MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER` (500) subscription
+    documents and sliced in Python, so `?limit=1` cost the same as `?limit=500`. Against
+    `partner_auth.PER_PARTNER_PER_MIN` (120) that is a partner near the ceiling polling small pages
+    at up to 120 x 500 subscription reads a minute from one endpoint on one credential -- a read
+    amplification driven by their polling shape rather than by what they asked for.
+
+    Asserted as `limit + 1` and not "small": the extra one is what detects `next_cursor` without a
+    second query, and asserting the exact number is what makes the fix visible if the cursor is ever
+    dropped. The ALERT-state read stays partner-scoped and is excluded here on purpose -- one query
+    for every row's alert state is `test_the_list_page_reads_every_rows_alert_state_in_one_query`'s
+    deliberate trade, and narrowing it per page would trade it back for N+1 queries.
+    """
+    _install()
+    bearer = _provision()
+    try:
+        client = _client()
+        for index in range(8):
+            client.post(
+                "/notification-api/v1/subscriptions",
+                json=_body(subscription_id=f"ref-{index}"),
+                headers=_headers(bearer),
+            )
+        assert _fake is not None
+        # A page with a cursor: one document for the cursor, then `limit + 1` rows.
+        first = client.get(
+            "/notification-api/v1/subscriptions?limit=2", headers=_headers(bearer)
+        ).json()
+        _fake.documents_read = 0
+        second = client.get(
+            f"/notification-api/v1/subscriptions?limit=2&after={first['next_cursor']}",
+            headers=_headers(bearer),
+        ).json()
+        # 1 cursor resolution + 3 subscription rows + the partner's 0 alert subjects.
+        assert _fake.documents_read <= 4, _fake.documents_read
+        assert [s["subscription_id"] for s in second["subscriptions"]] == ["ref-2", "ref-3"]
+        assert second["next_cursor"] == "ref-3"
+    finally:
+        _uninstall()
+
+
+def test_a_page_of_expired_rows_does_not_end_the_listing_early():
+    """The cost of testing expiry in Python, and why the paged read fills rather than truncates.
+
+    `subscription_is_live` cannot be a query -- it tests BOTH of R5's horizons plus the tombstone --
+    and Firestore deletes an expired document only "typically within 24 hours", which the store's
+    own comments call an ordinary condition rather than a fault. So a page of `limit` documents can
+    come back with fewer LIVE rows, and serving those alone would tell the client the listing had
+    ended while live watches remained behind them: the client stops, and a watch it owns is simply
+    invisible until something else re-pages.
+
+    Two dead rows at the FRONT, because ordering is by `created_at` and that is where an aged-out
+    watch actually sits.
+    """
+    _install()
+    bearer = _provision()
+    try:
+        client = _client()
+        for index in range(4):
+            client.post(
+                "/notification-api/v1/subscriptions",
+                json=_body(subscription_id=f"ref-{index}"),
+                headers=_headers(bearer),
+            )
+        assert _fake is not None
+        for index in (0, 1):
+            _fake.docs[f"{partner_store.SUBSCRIPTIONS}/{PARTNER}~ref-{index}"][
+                "inactivity_expires_at"
+            ] = NOW - timedelta(days=1)
+        page = client.get(
+            "/notification-api/v1/subscriptions?limit=2", headers=_headers(bearer)
+        ).json()
+        assert [s["subscription_id"] for s in page["subscriptions"]] == ["ref-2", "ref-3"], page
+        assert page["next_cursor"] is None, "four rows, two dead, one page: there is no next"
+    finally:
+        _uninstall()
+
+
 def test_the_destination_response_carries_generation_numbers_and_never_a_secret():
     """"We do not store it" and "we do not serve it" are different claims, so both are checked."""
     _install()
@@ -1480,6 +1684,102 @@ def test_a_partner_with_no_destination_gets_404_rather_than_an_empty_record():
         assert response.json() == {"detail": "no_destination"}
     finally:
         _uninstall()
+
+
+def test_the_committed_test_event_sample_still_matches_the_producer():
+    """The sample a partner's fixture reads must be what `_synthetic_event` actually emits.
+
+    `contracts/notifications/v1/test-event-sample.json` exists because the vendored TypeScript
+    fixture was a HAND transcription of this producer and drifted from it in eight fields -- while
+    its own docstring claimed to be a copy "field for field" and its end-to-end test passed green
+    against a shape no producer sends. The sample removes the transcription; this check removes the
+    rot, by rebuilding the event from the inputs the file itself records and comparing.
+
+    Structure and non-volatile values, not bytes: `event_id`, `alert_id`, `journey_ref`, `revision`
+    and the three instants are derived per call and are meant to differ. Everything else is the
+    contract, and `payload`'s sub-objects carry no property list in the schema -- so a wrongly named
+    key inside them is schema-VALID and wrong, which is exactly why this compares producers rather
+    than validating against the schema.
+    """
+    import dataclasses
+
+    sample = json.loads((CONTRACTS / "test-event-sample.json").read_text())
+    recorded = sample["how_to_regenerate"]["inputs"]
+    event = sample["event"]
+
+    # Built generically from the recorded fields so a new `Subscription` field does not fail this
+    # for a reason that has nothing to do with the event.
+    names = {f.name for f in dataclasses.fields(partner_store.Subscription)}
+    kwargs = {k: v for k, v in recorded["subscription"].items() if k in names}
+    instant = datetime.fromisoformat(recorded["now"])
+    far = datetime(2027, 1, 1, tzinfo=UTC)
+    for name, value in (
+        ("created_at", instant), ("updated_at", instant), ("last_seen_at", instant),
+        ("lifetime_expires_at", far), ("inactivity_expires_at", far), ("expires_at", far),
+    ):
+        if name in names:
+            kwargs.setdefault(name, value)
+    for field in dataclasses.fields(partner_store.Subscription):
+        if (
+            field.name not in kwargs
+            and field.default is dataclasses.MISSING
+            and field.default_factory is dataclasses.MISSING
+        ):
+            kwargs[field.name] = None
+
+    live = partner_api._synthetic_event(
+        partner_store.Subscription(**kwargs), now=instant, nonce=recorded["nonce"]
+    )
+
+    def paths(node, prefix=""):
+        out = {}
+        if isinstance(node, dict):
+            for key, value in node.items():
+                here = f"{prefix}.{key}" if prefix else key
+                out[here] = type(value).__name__
+                out.update(paths(value, here))
+        return out
+
+    in_sample, in_live = paths(event), paths(live)
+    assert not set(in_sample) - set(in_live), sorted(set(in_sample) - set(in_live))
+    assert not set(in_live) - set(in_sample), sorted(set(in_live) - set(in_sample))
+    assert not [k for k in in_sample if in_sample[k] != in_live[k]], "a leaf changed type"
+
+    derived = {"event_id", "alert_id", "journey_ref", "revision", "occurred_at", "valid_until"}
+    for key, value in event.items():
+        if key in derived or isinstance(value, (dict, list)):
+            continue
+        assert value == live[key], f"{key}: sample {value!r} != producer {live[key]!r}"
+    # The two the drift actually turned on, named so a failure reads without a diff.
+    assert event["payload"]["probabilities"] == live["payload"]["probabilities"]
+    assert event["payload"]["call"] == live["payload"]["call"]
+
+
+def test_the_test_event_request_schema_accepts_the_id_the_route_accepts():
+    """`TestEventIn` widened to the namespaced form; the published schema has to agree.
+
+    It did not: `TestEventRequest.subscription_id` `$ref`ed `subscription.schema.json`'s CREATE-side
+    definition, which is correctly strict and is the wrong constraint here -- so the contract still
+    forbade the id `GET` hands back and an event carries. Pinning both bounds is what stops the
+    widening being applied to one artefact and not the other a second time.
+    """
+    published = OPENAPI["components"]["schemas"]["TestEventRequest"]["properties"]["subscription_id"]
+    assert "$ref" not in published, "the create-side definition is the wrong constraint here"
+    field = partner_api.TestEventIn.model_fields["subscription_id"]
+    bounds = {
+        "maxLength": next(
+            (m.max_length for m in field.metadata if getattr(m, "max_length", None) is not None),
+            None,
+        ),
+        "pattern": next(
+            (m.pattern for m in field.metadata if getattr(m, "pattern", None) is not None), None
+        ),
+    }
+    assert published["maxLength"] == bounds["maxLength"], (published, bounds)
+    assert published["pattern"] == bounds["pattern"], (published, bounds)
+    # And the create-side definition stays strict -- widening THAT would be the wrong fix.
+    create = SUBSCRIPTION_SCHEMA["properties"]["subscription_id"]
+    assert "~" not in create["pattern"], "the create body must keep refusing a namespaced id"
 
 
 def test_the_response_model_matches_the_published_schema_in_both_directions():
@@ -1935,6 +2235,20 @@ def test_the_synthetic_payload_has_the_same_shape_as_a_real_one():
         # down. `delay` and `alternative_journey` are null on both sides here by construction: this
         # synthetic event is a confirmed cancellation, and every delay figure meant "if it runs".
         assert _shape(synthetic) == _shape(real), (_shape(synthetic), _shape(real))
+        # THE PROBABILITY LEAVES' NULLABILITY, which `_shape` erases on purpose -- and the gap that
+        # erasure left is not hypothetical: the synthetic event stated `delay_ge10: 1.0` under
+        # `phase: confirmed` while every real one carries `null` there, because
+        # `impact._cancelled_prediction` drops every delay figure ("if it runs"). A partner typing
+        # that field as a number, or rendering it with no null guard, breaks on their first genuine
+        # cancelled train, in production, at go-live -- which is the exact failure this function was
+        # already fixed once to stop teaching. Compared for BOTH producers being null-or-not, never
+        # for equal values: the two are different disruptions and only the shape has to agree.
+        nullability = {k: v is None for k, v in synthetic["probabilities"].items()}
+        assert nullability == {k: v is None for k, v in real["probabilities"].items()}, (
+            nullability,
+            real["probabilities"],
+        )
+        assert nullability["delay_ge10"] is True, "a confirmed cancellation states no delay figure"
     finally:
         _uninstall()
 
@@ -1961,6 +2275,9 @@ def test_the_synthetic_event_is_a_coherent_confirmed_cancellation():
         assert event["phase"] == "confirmed"
         assert event["payload"]["probabilities"]["impact"] == 1.0
         assert event["payload"]["probabilities"]["cancellation"] == 1.0
+        # BOTH delay figures null, not just the one under `delay`: `probabilities.delay_ge10` is a
+        # delay figure too, and `impact._cancelled_prediction` drops it for the same stated reason.
+        assert event["payload"]["probabilities"]["delay_ge10"] is None
         assert event["payload"]["delay"] is None
         assert event["payload"]["effect"] == "cancelled"
         assert "innstilt" in event["payload"]["notification"]["title"].lower()

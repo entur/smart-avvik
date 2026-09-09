@@ -26,7 +26,14 @@ import {
   SCHEMA_VERSION,
   parseEvent,
 } from "../src/contracts.ts";
-import { EVENT_SCHEMA, PACKAGE_ROOT, REPO_ROOT, encode, makeEvent } from "./helpers/events.mjs";
+import {
+  EVENT_SCHEMA,
+  PACKAGE_ROOT,
+  REPO_ROOT,
+  encode,
+  makeEvent,
+  readVendoredContract,
+} from "./helpers/events.mjs";
 
 test("the wire field list is exactly the schema's top-level properties, in order", () => {
   assert.deepEqual([...EVENT_WIRE_FIELDS], Object.keys(EVENT_SCHEMA.properties));
@@ -146,7 +153,12 @@ test("the vendored contracts are byte-identical to the authored ones", () => {
     console.log("skipping: no contracts/notifications/v1 -- this is a vendored copy");
     return;
   }
-  for (const name of ["event.schema.json", "subscription.schema.json", "signing-vectors.json"]) {
+  for (const name of [
+    "event.schema.json",
+    "subscription.schema.json",
+    "signing-vectors.json",
+    "test-event-sample.json",
+  ]) {
     assert.equal(
       fs.readFileSync(path.join(PACKAGE_ROOT, "contracts", name), "utf8"),
       fs.readFileSync(path.join(authored, name), "utf8"),
@@ -162,4 +174,160 @@ test("the generated types are in step with the vendored schemas", () => {
     cwd: PACKAGE_ROOT,
     stdio: "pipe",
   });
+});
+
+test("the sample test event parses as a conforming envelope, and carries the open payload's real keys", () => {
+  // `contracts/test-event-sample.json` is dumped from `partner_api._synthetic_event` and is what the
+  // Firebase receiver's end-to-end scenario now reads instead of a hand-written transcription. Two
+  // things are pinned here, one layer below that.
+  //
+  // First, the envelope: `parseEvent` is the receiver's own allow-list, so a sample that failed it
+  // would be a published example a conforming receiver refuses.
+  //
+  // Second -- and this is the check nothing in either language had -- the two OPEN sub-objects.
+  // `payload.call` and `payload.probabilities` are bare `{"type": "object"}` in event.schema.json,
+  // deliberately: the payload is the sender's to grow. The cost of that openness is that a
+  // MISNAMED key inside them is schema-valid, which is how the receiver's fixture came to teach
+  // `probabilities.cancel` and `call.aimed_departure` -- keys no producer has ever emitted -- for as
+  // long as it did. Naming them here does not close the schema; it pins the sample, which is the
+  // one artefact both languages now read.
+  const sample = JSON.parse(readVendoredContract("test-event-sample.json"));
+  const parsed = parseEvent(encode(sample.event));
+  assert.equal(parsed.ok, true, JSON.stringify(parsed));
+  assert.deepEqual(Object.keys(sample.event.payload.call), [
+    "stop_place",
+    "stop_order",
+    "aimed_departure_time",
+    "departs_tomorrow",
+  ]);
+  assert.deepEqual(Object.keys(sample.event.payload.probabilities), [
+    "impact",
+    "cancellation",
+    "delay_ge10",
+    "alert_threshold",
+  ]);
+  // A confirmed phase and a delay figure are not independent: every delay number meant "if it
+  // runs", so a confirmed cancellation carries none. A sample regenerated from a producer that
+  // broke that rule would be teaching the combination the producer's own docstring forbids.
+  assert.equal(sample.event.phase, "confirmed");
+  assert.equal(sample.event.payload.probabilities.impact, 1.0);
+  assert.equal(sample.event.payload.probabilities.cancellation, 1.0);
+  assert.equal(sample.event.payload.probabilities.delay_ge10, null);
+  assert.equal(sample.event.payload.delay, null);
+  assert.equal(sample.event.payload.effect, "cancelled");
+  // Generated, not authored: the file says so, and says where from.
+  assert.match(sample.how_to_regenerate.producer, /_synthetic_event/);
+});
+
+// --- The published OpenAPI document, from the side that consumes it -----------------------------
+//
+// `openapi.json` is not vendored into this package -- nothing here reads it at runtime, and the
+// generator above renders types from the two JSON Schemas only. It is pinned from here anyway,
+// because this package is where a partner arrives and because both of the drifts below shipped: a
+// document can promise a shape the server never sends without a single test in either language
+// noticing.
+
+function authoredOpenApi() {
+  const authored = path.join(REPO_ROOT, "contracts", "notifications", "v1", "openapi.json");
+  if (!fs.existsSync(authored)) {
+    // A vendored copy with no repository around it. `ci.test.mjs` asserts the CI step that runs
+    // this suite in a full checkout, so this branch is not a skip nobody ever un-skips.
+    console.log("skipping: no contracts/notifications/v1/openapi.json -- this is a vendored copy");
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(authored, "utf8"));
+}
+
+test("the test-event request publishes the id form the route accepts, not the create-side one", () => {
+  // The create body must carry the partner's own reference and nothing else, so
+  // `subscription.schema.json`'s definition caps at 128 characters and excludes `~`. `POST
+  // /test-events` also accepts the opaque `subscription_id` an EVENT carries, which is
+  // `<partner_id>~<reference>` -- so while this property was a `$ref` into that stricter definition,
+  // the published schema refused a value the API had itself just served, and a partner validating
+  // outbound requests against it reproduced the server bug in their own client.
+  //
+  // Pinned against the PATH parameter rather than against a literal: the document already publishes
+  // the bound in one place, and the point of the check is that the two cannot drift apart.
+  const openapi = authoredOpenApi();
+  if (openapi === null) {
+    return;
+  }
+  const property =
+    openapi.components.schemas.TestEventRequest.properties.subscription_id;
+  assert.equal(property.$ref, undefined, "the create-side definition is the wrong constraint here");
+  const pathParameter = openapi.paths["/subscriptions/{subscription_id}"].parameters.find(
+    (parameter) => parameter.name === "subscription_id",
+  );
+  assert.equal(property.maxLength, pathParameter.schema.maxLength);
+  assert.equal(property.minLength, 1);
+  assert.ok(property.pattern.includes("~"), "the namespaced form must validate");
+  assert.ok(new RegExp(property.pattern).test("partner-a~morgentur"));
+  // And the create side stays strict: widening it to reconcile the two would be the same mistake
+  // pointing the other way. Read through the VENDORED copy, which needs no existence guard and is
+  // the file the byte-identity test above pins -- a second unguarded read of the authored directory
+  // would put back exactly the assumption `authoredOpenApi` exists to avoid.
+  const createSide = JSON.parse(
+    readVendoredContract("subscription.schema.json"),
+  ).properties.subscription_id;
+  assert.ok(!new RegExp(createSide.pattern).test("partner-a~morgentur"));
+  assert.equal(createSide.maxLength, 128);
+});
+
+test("every documented 422 admits the framework's array `detail`, and constrained routes document one", () => {
+  // `Error` (`detail: string`) is what a handler in this application returns. A request refused
+  // before any handler runs -- an out-of-range `limit`, an unknown body property, a `pattern`
+  // violation, an over-long path segment -- is refused by FastAPI, whose `detail` is an ARRAY of
+  // objects. The document declared only the string shape until 2026-09-09, so a generated client
+  // that read `detail` as a string threw on exactly the errors an integrator hits first.
+  //
+  // It is documented rather than reshaped: `RequestValidationError` handlers are registered per
+  // APPLICATION, not per router, and this API shares its process with `/varsel-api`,
+  // `/historikk-api` and `/meldinger-api`.
+  const openapi = authoredOpenApi();
+  if (openapi === null) {
+    return;
+  }
+  const detail = openapi.components.schemas.ValidationError.properties.detail;
+  assert.equal(detail.type, "array");
+  assert.deepEqual(detail.items.required, ["type", "loc", "msg", "input"]);
+  // `loc` carries an integer index into an array property (`["body", "days", 1]`), so a
+  // string-only item type would be false.
+  assert.deepEqual(detail.items.properties.loc.items.type, ["string", "integer"]);
+  // The item is deliberately NOT `additionalProperties: false`: the key set is Pydantic's, and
+  // closing a set we do not own would be a second false promise.
+  assert.equal(detail.items.additionalProperties, undefined);
+
+  const admitsArray = (response) => {
+    const schema = response.content["application/json"].schema;
+    const refs = (schema.oneOf ?? [schema]).map((entry) => entry.$ref);
+    return refs.includes("#/components/schemas/ValidationError");
+  };
+  for (const [name, response] of Object.entries(openapi.components.responses)) {
+    if (name === "Unprocessable" || name === "ValidationFailed") {
+      assert.ok(admitsArray(response), `${name} must admit the array shape`);
+    }
+  }
+
+  // Every operation that constrains a parameter or a body can be refused this way, so every one of
+  // them documents a 422. `/destinations/current` constrains nothing -- no body, no query, no path
+  // parameter -- and documenting one there would be the opposite error.
+  const constrained = new Set([
+    "/subscriptions|post",
+    "/subscriptions|get",
+    "/subscriptions/{subscription_id}|get",
+    "/subscriptions/{subscription_id}|delete",
+    "/test-events|post",
+  ]);
+  const documented = new Set();
+  for (const [route, operations] of Object.entries(openapi.paths)) {
+    for (const [method, operation] of Object.entries(operations)) {
+      if (!["get", "post", "put", "patch", "delete"].includes(method)) {
+        continue;
+      }
+      if (operation.responses["422"]) {
+        documented.add(`${route}|${method}`);
+      }
+    }
+  }
+  assert.deepEqual([...documented].sort(), [...constrained].sort());
 });
