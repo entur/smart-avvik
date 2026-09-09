@@ -604,7 +604,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   are unscored, deliberately.** Hence the Definition-of-Done term: no partner is enabled for an
   operator `/historikk`'s verdicts do not cover without that gap recorded and signed off, and nothing
   anywhere is a claim about any operator but **Vy rail** (21 308 of 21 331 replayed subjects were
-  VYG).
+  VYG). **Decided 2026-09-09: partner-only routes stay out until `/historikk` and `/meldinger` are
+  behind authentication, then go in** — and that is not a simplification of this channel: `pushed`
+  cannot tell a webhook from a Web Push, so the row needs a channel discriminator, and that column
+  reaches the groups view, the labelling INSERT and the scheduled-query re-registration in one
+  operation.
   **The R16 prompt-record claim has two halves and only one is closed**, published rather than
   asserted away. A **partner-only** definition — one absent from `by_journey_key`, which stays
   browser-only for exactly this — is written for through `notification_wording.PARTNER`, which
@@ -612,7 +616,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   it on) and drops `message` from the INFO record. A **shared** definition stays on the browser policy
   unavoidably: one wording between the channels means one call and it is the browser's, and that
   record would exist with no partner channel at all. So R16 is about partner-only routes plus every
-  other partner field; it is **not** "no partner route ever appears in the prompt log".
+  other partner field; it is **not** "no partner route ever appears in the prompt log". Accepted as
+  it stands on 2026-09-09: dashboard authentication, offered as a reason to drop R16 altogether, does
+  not reach this half — the record is in Cloud Logging, which project IAM gates — and the code behind
+  it is one field (`caller`) on the partner wording policy.
   **Decide in the pass, deliver in the pass, after the browser cycle is already durable** (KTD6).
   Emit and deliver are their own `main._rebuild_all` phase (`partner_webhooks`) placed after the
   `varsel_notify` phase and fed by a `PassOutcome` that `check_and_notify` returns — deliberately
@@ -676,7 +683,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   what it *carries* rather than refused outright; do not "fix" that into a blanket refusal.
   **The API mounts unconditionally**, independent of `PARTNER_NOTIFICATIONS_ENABLED`, because gating
   onboarding on the flag that needs onboarding is circular — availability is store plus pepper, read
-  per call, so tst answers 503 today. The consequence is accepted rather than overlooked:
+  per call, so tst answers 503 today. The consequence was put to the product owner and decided on
+  2026-09-09 — this is a public API:
   **`/notification-api/v1` appears in the public `/docs`**, since `docs_url` is FastAPI's default, and
   unlike Rushvarsel nothing here asks for the product to be unmentioned. The prefix is deliberately
   **not** in `sso.PROTECTED_PREFIXES`: that gate answers an unconfigured deployment with 503 and an
@@ -724,15 +732,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   (immutable), six composite indexes materialised with `for_each` keyed on each index's **content**
   rather than its array position, the four TTL field configs, and a prd-only backup schedule (five
   weeks, a chosen value: Firestore allows 14 weeks on both recurrences — checked 2026-09-09 — and
-  five is what PITR's seven days does not already cover). The
+  five is what PITR's seven days does not already cover) — and, since 2026-09-09, the deny-all
+  `firestore.rules` **released** as the named database's live rules (`google_firebaserules_ruleset` +
+  `_release`, named `cloud.firestore/<database>` per firebase-tools' own release code, not the bare
+  `cloud.firestore` the provider's documentation quotes). Until then the file was committed and
+  emulated but deployed by nothing, safe only because no Firebase app exists in these projects;
+  whether the Rules API accepts a release in a project that has never been a Firebase project is the
+  one thing the first apply answers, and the two resources are removable alone if it refuses. The
   runtime `roles/datastore.user` grant is the one part that **cannot** go there — a
   `google_project_iam_member` runs under a `projectIamAdmin` conditioned by `only_assignable_roles`,
   which carries no `roles/datastore.*` (note `terraform/oauth_iam.tf`'s own PARKED header diagnoses
   the identical 403 as an org-level deny policy instead, and the two readings are not reconciled —
   a conditioned grant and a deny policy refuse with the same wording); it goes in `.entur/application.yaml`, whose filter drops a
   non-matching role **silently**, so the binding is verified after `entur apply` rather than assumed.
-  Plan-time index drift rests on one config line that is present: `firestore.indexes.json` is in
-  **both** of `terraform.yml`'s `paths:` lists, without which a PR adding a query and its index would
+  Plan-time index drift rests on one config line that is present: `firestore.indexes.json` and
+  `firestore.rules` are in **both** of `terraform.yml`'s `paths:` lists, without which a PR adding a query and its index would
   pass the static test, merge, apply nothing and land a runtime `FailedPrecondition`.
   **The two TypeScript packages ship from here and are vendored, not published** (KTD11). Declared
   consumption shape: compiled CommonJS plus `.d.ts` on Node 24, and `package.json` deliberately

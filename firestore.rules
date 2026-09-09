@@ -13,6 +13,14 @@ rules_version = '2';
 // until that date passes. These four collections hold partner subscriptions, callback destinations
 // and the Norwegian prose of a traveller's disruption alert; none of it may be read by a browser.
 //
+// THIS FILE IS DEPLOYED, not only committed (2026-09-09). terraform/firestore.tf reads it into a
+// google_firebaserules_ruleset and releases that as `cloud.firestore/<database>` for the named
+// database, so a console edit towards the template above is drift the next apply reverts. The
+// emulator reads the same file through firebase.json, and .github/workflows/terraform.yml lists it
+// in both `paths:` lists so an edit here plans and applies like one to the indexes. Before that
+// date the file asserted a protection nothing deployed -- true only because no Firebase app has
+// ever been registered in these projects, which is exactly the state the release exists to survive.
+//
 // Note the partner receiver's OWN rules are a separate file in integrations/firebase-notifications/
 // and live in the PARTNER's project, not this one.
 service cloud.firestore {
