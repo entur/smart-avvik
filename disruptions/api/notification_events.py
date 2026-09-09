@@ -54,7 +54,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -95,6 +95,18 @@ _WORST_CASE_EMIT_S = 2.0
 #: tail instead of the cycle.
 _MAX_EMITS_PER_CYCLE = 120
 
+#: The least validity an observation the matcher admitted gets, in seconds past the emit instant.
+#: The match (pass 1a) and this emit are the same cycle but not the same instant -- the wording
+#: pass, the browser deliveries and two durable writes sit between them -- and the delivery step
+#: that classifies the event sits after this emit again. So a train the matcher judged catchable
+#: can have an expected departure a few seconds ahead, or already behind, by the time it is
+#: minted, and either way the event would be stale before its first attempt while the browser push
+#: about the same train went out. The floor applies to every expected departure LESS THAN two
+#: minutes ahead of the emit instant, the already-past ones included: `valid_until` is never
+#: earlier than `now + DEPARTURE_GRACE_S`. Two minutes covers the gap and is well under one pass
+#: period (~296 s measured 2026-09-08), so it cannot carry a departed train into a retry next cycle.
+DEPARTURE_GRACE_S = 120
+
 
 @dataclass(frozen=True)
 class WebhookSubject:
@@ -111,10 +123,11 @@ class WebhookSubject:
     /varsel would have pushed" is true by construction rather than by a parallel builder.
 
     ``situations`` carries **every** situation contributing to this train, not just the one
-    ``one_alert_per_train`` kept: ``notification_store._sent_body`` writes a delivered mark per situation
-    number, and ``varsel._pending_pushes`` tests the collapsed winner's number against those marks.
-    A winner flipping between cycles would otherwise re-pend a train already delivered and re-spend
-    the wording budget on it. R8 calls them "the contributing situations" for the same reason.
+    ``one_alert_per_train`` kept: R8 calls them "the contributing situations", and the event names
+    them all. The delivered mark ``notification_store._sent_body`` writes is keyed on the TRAIN --
+    the ``alert_id`` -- and not on any of these numbers (2026-09-10), so which situation wins the
+    collapse in a later cycle cannot re-pend a train already delivered, and a second departure under
+    an already-delivered situation is what it is: a new train, still owed its notification.
     """
 
     # Routing and the version the match was computed against. The version is the LOAD snapshot's,
@@ -147,6 +160,14 @@ class WebhookSubject:
     title: str = ""
     body: str = ""
     payload: Mapping[str, Any] = field(default_factory=dict)
+
+    # When the train is expected to actually leave: the aimed time plus the delay predicted for it,
+    # which is the matcher's own definition of "already gone" (`impact._expected_departure`). It is
+    # R12's departure term. The AIMED time is not: a train 25 minutes late is still catchable after
+    # its aimed time has passed -- the matcher keeps it and the browser pushes it -- and an event
+    # whose validity ended at the aimed time was stale at mint and never attempted. Appended last
+    # so positional constructors keep working; `None` falls back to `departure_time`.
+    expected_departure_time: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -193,8 +214,16 @@ class _EmitBudget(reserved_budget.ReservedBudget):
     """
 
 
-def train_ref(subject: WebhookSubject) -> notification_store.TrainRef | None:
-    """This observation's train, or ``None`` when it cannot be one.
+def train_ref_of(
+    *,
+    operator: object,
+    line: object,
+    journey_ref: object,
+    stop_place: object,
+    stop_order: object,
+    departure_time: datetime | None,
+) -> notification_store.TrainRef | None:
+    """The train these six fields name, or ``None`` when they cannot name one stably.
 
     ``alert_id`` is derived from these six fields, and the receiver's supplied policy deduplicates
     and orders on nothing else -- so an observation missing any of them cannot be a *stable* subject
@@ -205,21 +234,67 @@ def train_ref(subject: WebhookSubject) -> notification_store.TrainRef | None:
     derived from it and is the operating day the whole ET join key is built on. ``line`` is the one
     field allowed to be absent: ``journey_ref`` already identifies the dated train, and a line
     nobody published is a display gap rather than an identity one.
+
+    **The one derivation for both sides of the delivered mark.** :func:`train_ref` feeds the emit
+    step's ``alert_id`` from a :class:`WebhookSubject`; :func:`alert_id_for` feeds
+    ``varsel._pending_pushes``' admission test from an ``Alert``. If those two ever derived the id
+    differently -- ``line=""`` on one side and ``None`` on the other, say -- every delivered train
+    would stay pending forever and the wording budget would burn on it silently, which is why there
+    is one function here rather than one per caller.
     """
-    if subject.departure_time is None:
+    if departure_time is None:
         return None
-    if not subject.operator or not subject.journey_ref or not subject.stop_place:
+    if not operator or not journey_ref or not stop_place:
         return None
-    if subject.stop_order is None:
+    if stop_order is None:
         return None
     return notification_store.TrainRef(
-        operator=str(subject.operator),
-        line=str(subject.line or ""),
-        journey_ref=str(subject.journey_ref),
-        call_date=subject.departure_time.astimezone(OSLO).date().isoformat(),
-        stop_place=str(subject.stop_place),
-        stop_order=int(subject.stop_order),
+        operator=str(operator),
+        line=str(line or ""),
+        journey_ref=str(journey_ref),
+        call_date=departure_time.astimezone(OSLO).date().isoformat(),
+        stop_place=str(stop_place),
+        stop_order=int(stop_order),
     )
+
+
+def train_ref(subject: WebhookSubject) -> notification_store.TrainRef | None:
+    """This observation's train, or ``None`` when it cannot be one -- see :func:`train_ref_of`."""
+    return train_ref_of(
+        operator=subject.operator,
+        line=subject.line,
+        journey_ref=subject.journey_ref,
+        stop_place=subject.stop_place,
+        stop_order=subject.stop_order,
+        departure_time=subject.departure_time,
+    )
+
+
+def alert_id_for(
+    subscription_id: str,
+    *,
+    operator: object,
+    line: object,
+    journey_ref: object,
+    stop_place: object,
+    stop_order: object,
+    departure_time: datetime | None,
+) -> str | None:
+    """The ``alert_id`` the store would mint for this (subscription, train), or ``None``.
+
+    What ``varsel._pending_pushes`` tests a recipient's delivered marks against: the store keys those
+    marks on the ``alert_id`` (per train), and this is the same derivation the emit step's
+    :func:`train_ref` goes through, so a mark the store wrote is a mark the pass can read.
+    """
+    ref = train_ref_of(
+        operator=operator,
+        line=line,
+        journey_ref=journey_ref,
+        stop_place=stop_place,
+        stop_order=stop_order,
+        departure_time=departure_time,
+    )
+    return None if ref is None else notification_store.alert_subject_id(subscription_id, ref)
 
 
 def requested_phase(subject: WebhookSubject) -> str:
@@ -422,7 +497,18 @@ def _emit_one(
     expired (R13). So the horizon on the wire can be up to the subscription's remaining life too
     long, and nothing is ever *sent* past it. Stated rather than hidden because U8 publishes the
     horizon as a number.
+
+    The departure term is the EXPECTED departure (:attr:`WebhookSubject.expected_departure_time`,
+    the aimed time when none is carried), and never earlier than :data:`DEPARTURE_GRACE_S` past
+    ``now`` -- see both for why. :func:`notification_store.event_validity` itself is untouched: it
+    takes the terms it is given, and the synthetic test-event route gives it others.
     """
+    departure = subject.expected_departure_time or subject.departure_time
+    if departure is not None:
+        if departure.tzinfo is None:
+            departure = departure.replace(tzinfo=UTC)
+        floor = now + timedelta(seconds=DEPARTURE_GRACE_S)
+        departure = max(departure, floor)
     request = notification_store.EmitRequest(
         subscription_id=subject.subscription_id,
         client_id=subject.client_id,
@@ -434,7 +520,7 @@ def _emit_one(
         payload=dict(subject.payload),
         valid_until=notification_store.event_validity(
             occurred_at=now,
-            departure_at=subject.departure_time,
+            departure_at=departure,
             subscription_expires_at=None,
         ),
         external_ref=subject.external_ref,

@@ -430,9 +430,12 @@ class WebhookRecipient:
     ``llm_message.build_message_input`` resolves the two place NAMES from the stop registry rather
     than from the record.
 
-    ``delivered`` mirrors :data:`_notified`'s grain exactly — situation numbers already delivered to
-    THIS subscription — because that is the grain :func:`_pending_pushes` asks its question at.
-    Firestore is the only dedup ledger for this channel; this is a read-only snapshot of it.
+    ``delivered`` is this channel's counterpart of :data:`_notified` at the channel's OWN grain: the
+    ``alert_id`` of every (subscription, train) already delivered to THIS subscription, which is the
+    grain the store mints events at and therefore the grain :func:`_pending_pushes` asks its
+    question at through :func:`_webhook_pending`. Not the browser ledger's per-situation grain
+    (2026-09-10): a second train under a delivered situation is a new event here. Firestore is the
+    only dedup ledger for this channel; this is a read-only snapshot of it.
 
     **The four routing fields ride along, and until 2026-09-08 they deliberately did not** — the
     docstring here said a client document's destination and quotas "deliberately do not enter this
@@ -1675,9 +1678,12 @@ def _pending_pushes(
     on any more yields nothing, which is correct — there is no notification to write for.
 
     **A webhook subscription is another registration** (KTD3), so it is asked the same question
-    against its own ledger: `WebhookRecipient.delivered` is Firestore's copy of `_notified` at the
-    same grain, read once per cycle in `_load_webhook_recipients`. Never the store itself — this is
-    called from pass 1b, which is sequential precisely because it blocks on nothing.
+    against its own ledger: `WebhookRecipient.delivered`, Firestore's counterpart of `_notified`,
+    read once per cycle in `_load_webhook_recipients`. Never the store itself — this is called
+    from pass 1b, which is sequential precisely because it blocks on nothing. Its GRAIN is the
+    channel's own, not the browser's: per TRAIN (`_webhook_pending`), because that channel mints one
+    event per (subscription, train), where `_notified` is per situation because a browser is pushed
+    once per situation.
 
     **The caller passes NO browser jids when `push_enabled()` is false**, and that half is easy to
     miss and expensive to get wrong (KTD4). `_notified` only grows on a successful browser send, so
@@ -1701,12 +1707,32 @@ def _pending_pushes(
         if alert.alertworthy
         and (
             any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
-            or any(
-                alert.situation_number not in recipient.delivered
-                for recipient in webhook_recipients
-            )
+            or any(_webhook_pending(recipient, alert) for recipient in webhook_recipients)
         )
     ]
+
+
+def _webhook_pending(recipient: WebhookRecipient, alert: Alert) -> bool:
+    """Is a webhook notification about this TRAIN still coming for this subscription?
+
+    Per train, because the store mints one event per (subscription, train) -- the `alert_id` -- and
+    keys its delivered marks on it. Admitting on the situation number, as this did until
+    2026-09-10, refused a second departure under an already-delivered situation: its event still
+    went out (a new train is a new subject) but carried the template, while the first train's
+    carried the model's prose. The id is derived through `notification_events.alert_id_for`, the
+    same derivation the emit step's `train_ref` uses, so a mark the store wrote is a mark this
+    reads. A train that cannot be a stable subject is never minted and is therefore never pending.
+    """
+    train_id = notification_events.alert_id_for(
+        recipient.recipient_id,
+        operator=alert.operator,
+        line=alert.line,
+        journey_ref=alert.jkey,
+        stop_place=alert.stop_place,
+        stop_order=alert.stop_order,
+        departure_time=alert.departure_time,
+    )
+    return train_id is not None and train_id not in recipient.delivered
 
 
 def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
@@ -2943,12 +2969,19 @@ def _subjects_for_key(
         message_key = _message_key(key, winner)
         message_input = message_inputs.get(message_key) or _message_input_from_alert(winner)
         resolved = message_input.get("reise") or {}
-        # The traveller's own name for a stop when a browser registration on this definition
-        # supplied one (which makes the event byte-identical to that push), the stop registry's
-        # otherwise. A webhook-only route has nobody to have typed a name, so the registry is
-        # the only source — the one documented place the two channels' text can differ.
-        from_name = journey.get("from_name") or resolved.get("fra") or journey.get("from_stop") or ""
-        to_name = journey.get("to_name") or resolved.get("til") or journey.get("to_stop") or ""
+        # SERVER-SIDE names only, never a browser registration's `from_name`/`to_name`. Those are
+        # up to 120 characters of unauthenticated free text, and on a definition both channels
+        # share the browser record is what `match_targets` holds -- so until 2026-09-10 whoever
+        # registered a journey on `/varsel-api/journeys` first wrote the route line of a CLIENT's
+        # notification about the same trains. `llm_message.build_message_input` already refuses
+        # exactly this for the prompt (see the note above its `_canonical_stop_name`), and `reise`
+        # is its registry-resolved pair; the bare ref is the bounded fallback when the input had to
+        # be rebuilt off the alert (`_message_input_from_alert` carries no `reise`). The cost is
+        # stated rather than hidden: a push and an event about one train agree byte for byte only
+        # when the traveller's typed name equals the registry's, which is the ordinary case and
+        # `test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push` pins it.
+        from_name = resolved.get("fra") or journey.get("from_stop") or ""
+        to_name = resolved.get("til") or journey.get("to_stop") or ""
         if winner.alertworthy:
             title, body = notification_wording_for(
                 message_input,
@@ -3015,9 +3048,22 @@ def _subjects_for_key(
                     title=title,
                     body=body,
                     payload=payload,
+                    expected_departure_time=_expected_departure_of(winner),
                 )
             )
     return unroutable
+
+
+def _expected_departure_of(alert: Alert) -> datetime | None:
+    """When the train is expected to actually leave: aimed time plus the typical delay predicted
+    for it -- `impact._expected_departure`'s rule, restated on the Alert because the matcher's
+    `CallPred` is gone by now. This is what R12's "the departure" has to mean for the webhook
+    event's validity: the matcher keeps a late train past its aimed time on exactly this figure
+    (`catchable_after`), and an event that expired at the aimed time was never attempted for it.
+    A declared cancellation carries no delay figure, so its expected departure is its aimed one."""
+    if alert.departure_time is None:
+        return None
+    return alert.departure_time + timedelta(minutes=max(alert.delay_p50_min or 0, 0))
 
 
 @dataclass(frozen=True)

@@ -29,7 +29,7 @@
         "status": "active"
       }
     },
-    "owed": "A Python re-derivation check -- rebuild this event from `_synthetic_event` under the inputs above and compare, the way test_webhook_signing.py re-derives signing-vectors.json -- belongs in disruptions/api/test_notification_api.py and is NOT written yet. Until it is, this file can rot the way the fixture it replaced did."
+    "checked_by": "disruptions/api/test_notification_api.py::test_the_committed_test_event_sample_still_matches_the_producer rebuilds this event from `_synthetic_event` under the inputs above and compares structure, leaf types, every non-derived top-level value and the three payload parts -- the way test_webhook_signing.py re-derives signing-vectors.json. A regenerated sample that drifts from the producer fails there before it can rot the way the fixture it replaced did."
   },
   "how_to_consume": {
     "timestamps": "`occurred_at`, `valid_until`, `call_date` and `payload.call.aimed_departure_time` are fixed instants from the generating run. A receiver test asserting on its own clock must re-stamp them and PRESERVE THE OFFSETS: `valid_until` is the earlier of occurred_at + 60 minutes and the departure, which here is the departure at occurred_at + 45 minutes.",

@@ -1635,6 +1635,67 @@ def test_a_page_of_expired_rows_does_not_end_the_listing_early():
         _uninstall()
 
 
+def test_a_raised_quota_can_page_past_the_default_ceiling():
+    """The list bound is the CLIENT's ceiling, not the module constant.
+
+    `list_subscriptions` used to clamp both its page and its scan at
+    `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` (500) and the route clamped `limit + 1` to the same number,
+    so a client whose quota had been raised past 500 got a full first page with no `next_cursor`
+    -- the page equalled the read -- and could never list its remaining watches. The second half is
+    the same clamp on the scan: 500 expired rows ahead of the live ones ended the scan on an empty
+    page, which reads as "you hold nothing" to a client that holds a watch.
+    """
+    _install()
+    bearer = _provision()
+    try:
+        notification_auth.set_client_quotas(CLIENT, actor="op@entur.org", max_active_subscriptions=600)
+        assert _fake is not None
+        n = notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT + 1
+        for index in range(n):
+            _fake.put(
+                notification_store.SUBSCRIPTIONS,
+                f"{CLIENT}~bulk-{index:04d}",
+                notification_store._new_subscription_doc(
+                    notification_store.SubscriptionSpec(
+                        subscription_id=f"{CLIENT}~bulk-{index:04d}",
+                        client_id=CLIENT,
+                        destination_id=DEST,
+                        from_stop=FROM,
+                        to_stop=TO,
+                        begin="06:45",
+                        end="08:30",
+                        days=(0,),
+                    ),
+                    NOW,
+                ),
+            )
+        client = _client()
+        first = client.get(
+            f"/notification-api/v1/subscriptions?limit={notification_api._LIST_MAX}",
+            headers=_headers(bearer),
+        ).json()
+        assert first["count"] == notification_api._LIST_MAX
+        assert first["next_cursor"] is not None, "501 live rows and a page of 500: there IS a next"
+        rest = client.get(
+            f"/notification-api/v1/subscriptions?limit={notification_api._LIST_MAX}"
+            f"&after={first['next_cursor']}",
+            headers=_headers(bearer),
+        ).json()
+        assert rest["count"] == 1 and rest["next_cursor"] is None
+        # And the scan bound: every row but the last expired, the last one still listed.
+        for index in range(n - 1):
+            _fake.docs[f"{notification_store.SUBSCRIPTIONS}/{CLIENT}~bulk-{index:04d}"][
+                "inactivity_expires_at"
+            ] = NOW - timedelta(days=1)
+        page = client.get(
+            "/notification-api/v1/subscriptions?limit=2", headers=_headers(bearer)
+        ).json()
+        assert [s["subscription_id"] for s in page["subscriptions"]] == [f"bulk-{n - 1:04d}"], page
+        assert page["next_cursor"] is None
+    finally:
+        _uninstall()
+
+
 def test_the_destination_response_carries_generation_numbers_and_never_a_secret():
     """"We do not store it" and "we do not serve it" are different claims, so both are checked."""
     _install()
@@ -1753,6 +1814,14 @@ def test_the_committed_test_event_sample_still_matches_the_producer():
     # The two the drift actually turned on, named so a failure reads without a diff.
     assert event["payload"]["probabilities"] == live["payload"]["probabilities"]
     assert event["payload"]["call"] == live["payload"]["call"]
+    # `situations` is a LIST, and `paths()` above deliberately descends into dicts only -- so until
+    # 2026-09-10 its items were never compared at all, and they are hand-built on both sides
+    # (`_synthetic_event` here, `varsel._webhook_situations` on the live path): exactly the drift
+    # class this check exists for. Whole items, because the recorded nonce makes every value
+    # reproducible, and the top-level list of numbers beside them.
+    assert event["payload"]["situations"] == live["payload"]["situations"]
+    assert event["payload"]["situations"], "the sample carries at least one situation"
+    assert event["situations"] == live["situations"]
 
 
 def test_the_test_event_request_schema_accepts_the_id_the_route_accepts():
@@ -1806,8 +1875,12 @@ def test_the_response_model_matches_the_published_schema_in_both_directions():
     subject = alerts["properties"]["subjects"]["items"]
     assert set(notification_api.AlertSubjectOut.model_fields) == set(subject["properties"])
     assert set(subject["required"]) == set(subject["properties"])
-    # The cap is published, not implied, and it is the store's own number.
-    assert alerts["properties"]["subjects"]["maxItems"] == notification_store.MAX_ALERTS_SERVED
+    # The published bound is the LARGEST cap an operator can set, never the default: `_served()`
+    # enumerates up to the client's own daily cap, so a bound equal to the default would be
+    # violated by the first raised cap -- a client's generated types would then refuse a response
+    # this API sent on purpose.
+    assert alerts["properties"]["subjects"]["maxItems"] == notification_auth.QUOTA_BOUNDS["daily_cap"][1]
+    assert alerts["properties"]["subjects"]["maxItems"] >= notification_store.MAX_ALERTS_SERVED
     # `null` is a legal value: a create response does not read the alert state.
     assert "null" in published_schema["type"]
     # The train's fields are REFERENCED from the event schema rather than restated, so a card and a

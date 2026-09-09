@@ -187,6 +187,37 @@ def _run(
 # ---- Rule 1: an unestablished answer is never written -------------------------------------------
 
 
+def test_the_re_check_reuses_the_notification_passs_read_and_reads_for_itself_when_stale():
+    """One read of `subscriptions` per cycle, not two. The pass reads the collection for matching
+    (`notification_store.recipient_documents`) and this re-check walked it again for a question
+    due on a handful of documents every six hours. The snapshot is reused inside `_LOAD_REUSE_S`
+    and not past it -- and a re-check with nothing to reuse (a pass that raised, a cycle the flag
+    skipped the pass on) still reads for itself, which is what keeps the poller wiring free of a
+    dependency on the pass's return value."""
+    store = _Store([_sub("sub-1", servable=False, checked_at=None)])
+    before = (notification_store.active_subscriptions, notification_store.set_servability)
+    notification_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
+    notification_store.set_servability = store.set_servability  # type: ignore[assignment]
+    notification_store.configure(clock=lambda: NOW)
+    notification_servability.configure(connectivity=lambda _f, _t: (True, False))
+    try:
+        notification_store.recipient_documents()
+        assert store.loads == 1
+        notification_servability.recheck(now=NOW + timedelta(seconds=45))
+        assert store.loads == 1, "the same cycle's read is reused"
+        assert [w for w in store.writes] == [("sub-1", True)], store.writes
+        late = NOW + timedelta(seconds=notification_servability._LOAD_REUSE_S + 1)
+        notification_servability.recheck(now=late)
+        assert store.loads == 2, "past the reuse window the re-check reads for itself"
+        notification_store.forget_recent_load()
+        notification_servability.recheck(now=NOW + timedelta(seconds=45))
+        assert store.loads == 3, "nothing to reuse: read for itself"
+    finally:
+        notification_store.active_subscriptions, notification_store.set_servability = before  # type: ignore[assignment]
+        notification_servability.reset_for_tests()
+        notification_store.reset_for_tests()
+
+
 def test_a_verdict_that_could_not_be_established_writes_nothing_at_all():
     """The rule with the sharpest edge here. `set_servability` ACCEPTS None and would stamp it, so
     calling it on a provider failure would convert "we do not know" into a freshly-dated

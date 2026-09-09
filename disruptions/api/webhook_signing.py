@@ -86,7 +86,7 @@ SECRET_BYTES = 32
 
 # ---- Root secret -------------------------------------------------------------------------------
 #
-# The name is fixed by the Helm chart's commented `client:` secret group, which also records why
+# The name is fixed by the Helm chart's commented `notifications:` secret group, which also records why
 # the value is written with `printf '%s'`: a trailing newline in a 49-byte token silently dropped
 # eight of this app's feedback submissions, and every hash check missed it because they were all
 # written `| tr -d '\n' | shasum`, which deletes the byte at fault. Here the same byte would
@@ -179,7 +179,7 @@ def signing_root() -> bytes:
         raise SigningNotConfigured(
             f"{SIGNING_ROOT_ENV} is unset or shorter than {MIN_ROOT_BYTES} bytes; webhook "
             "signing cannot proceed. Provision it in Secret Manager and uncomment the chart's "
-            "`client:` secret group."
+            "`notifications:` secret group."
         )
     return value
 

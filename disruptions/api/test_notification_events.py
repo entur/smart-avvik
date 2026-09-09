@@ -214,7 +214,6 @@ def _install() -> _Fake:
         equality: Any = None,
         inequality: Any = None,
         limit: int,
-        # Accepted and unused: only the listing route pages, and no test here reaches it.
         start_after: Any = None,
     ) -> _Page:
         if name in client.query_fail_with:
@@ -240,6 +239,12 @@ def _install() -> _Fake:
                 key=lambda row, f=field_path: _sortable(row[1].get(f)),
                 reverse=direction == "DESCENDING",
             )
+        if start_after is not None:
+            # Positional, as Firestore's own cursor is: everything strictly after the snapshot in
+            # THIS ordering. `pending_deliveries` pages past a throttled destination this way.
+            paths = [path for path, _ in rows]
+            if start_after._path in paths:
+                rows = rows[paths.index(start_after._path) + 1 :]
         return _Page(client, rows[:limit])
 
     notification_store._run_transaction = _run  # type: ignore[assignment]
@@ -750,6 +755,67 @@ def test_the_revision_survives_the_oslo_dst_fall_back_and_a_clock_step_backwards
         )
         revisions = sorted(e["revision"] for e in client.in_collection(notification_store.EVENTS))
         assert revisions[-1] == first + 1, f"strictly increasing, got {revisions}"
+    finally:
+        _uninstall()
+
+
+def test_validity_follows_the_expected_departure_and_is_floored_when_already_past():
+    """R12's departure term is the EXPECTED departure, the matcher's own catchability figure.
+
+    A train 25 minutes late is kept by the matcher past its aimed time (`catchable_after` compares
+    the expected departure) and pushed to browsers -- and until 2026-09-10 its event's validity was
+    clamped to the AIMED time, so it was stale at mint and `pending_deliveries` retired it before
+    any attempt. The second half is the match-to-emit gap: an expected departure less than
+    `DEPARTURE_GRACE_S` ahead at emit -- a few seconds behind, or a few seconds ahead -- is floored
+    to it, so the observation is attempted once in this cycle rather than expiring before the
+    delivery step classifies it, and the grace is under one pass period so it cannot carry a
+    departed train into a retry.
+    """
+    client = _install()
+    try:
+        _live(client)
+        late = _subject(
+            journey_ref="DatedServiceJourney:late",
+            departure_time=NOW - timedelta(minutes=5),
+            expected_departure_time=NOW + timedelta(minutes=20),
+        )
+        gone = _subject(
+            journey_ref="DatedServiceJourney:gone",
+            departure_time=NOW - timedelta(minutes=10),
+            expected_departure_time=NOW - timedelta(seconds=30),
+        )
+        imminent = _subject(
+            journey_ref="DatedServiceJourney:imminent",
+            departure_time=NOW - timedelta(minutes=10),
+            expected_departure_time=NOW + timedelta(seconds=30),
+        )
+        aimed_only = _subject(
+            journey_ref="DatedServiceJourney:aimed", departure_time=NOW + timedelta(minutes=12)
+        )
+        notification_events.emit([late, gone, imminent, aimed_only], now=NOW)
+        events = {e["event_id"]: e for e in client.in_collection(notification_store.EVENTS)}
+        by_ref = {
+            events[d["event_id"]]["journey_ref"]: d
+            for d in client.in_collection(notification_store.DELIVERIES)
+        }
+        assert by_ref["DatedServiceJourney:late"]["valid_until"] == NOW + timedelta(minutes=20)
+        assert by_ref["DatedServiceJourney:gone"]["valid_until"] == NOW + timedelta(
+            seconds=notification_events.DEPARTURE_GRACE_S
+        )
+        assert by_ref["DatedServiceJourney:imminent"]["valid_until"] == NOW + timedelta(
+            seconds=notification_events.DEPARTURE_GRACE_S
+        ), "a term still ahead but inside the grace is floored too, not only one already past"
+        assert by_ref["DatedServiceJourney:aimed"]["valid_until"] == NOW + timedelta(minutes=12), (
+            "no expected departure carried: the aimed time is the term, unchanged"
+        )
+        # And both are deliverable at the instant they were minted, which is the whole point.
+        pending = notification_store.pending_deliveries(now=NOW)
+        assert {d.valid_until for d in pending.ready} >= {
+            NOW + timedelta(minutes=20),
+            NOW + timedelta(seconds=notification_events.DEPARTURE_GRACE_S),
+        }
+        assert pending.stale == ()
+        assert notification_events.DEPARTURE_GRACE_S < 296, "under one measured pass period"
     finally:
         _uninstall()
 

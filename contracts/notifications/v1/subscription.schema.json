@@ -154,8 +154,8 @@
         },
         "subjects": {
           "type": "array",
-          "maxItems": 4,
-          "description": "The worst few standing alerts, worst first: a confirmed cancellation ahead of a forecast, then most recently changed, ties broken on `alert_id` so the order cannot flip between two requests about unchanged data. Deliberately capped at the number of notifications one subscription can receive in an Oslo day -- a longer list would enumerate what that cap has already suppressed -- and the counts above carry the rest, so nothing is hidden, only unenumerated.",
+          "maxItems": 1000,
+          "description": "The worst few standing alerts, worst first: a confirmed cancellation ahead of a forecast, then most recently changed, ties broken on `alert_id` so the order cannot flip between two requests about unchanged data. Deliberately capped at the number of notifications one subscription can receive in an Oslo day -- your client's daily cap, 4 by default and never fewer than 4 -- because a longer list would enumerate what that cap has already suppressed; the counts above carry the rest, so nothing is hidden, only unenumerated. `maxItems` is the largest daily cap an operator can set, not the default, so a raised cap never makes a response violate this schema.",
           "items": {
             "type": "object",
             "additionalProperties": false,

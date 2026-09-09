@@ -372,7 +372,17 @@ def _attempt(
         # anywhere. One counter for both let AE3's `capped == 9` absorb a deadline bind silently --
         # the same "one number, two meanings" the `paused` counter was just fixed for.
         return "deadline"
-    destination = skips.destination(delivery.destination_id)
+    # The one store read `_attempt` used to make OUTSIDE `_store_step`: a raise here reached the
+    # caller's outer guard with a poorer log line and no classification. Wrapped in a tuple for
+    # `get_event`'s reason -- `None` is a legitimate answer ("no such record") that must resolve
+    # the delivery, while a raise is a fact about the store and must not. Nothing is cached on a
+    # raise (`_Skips.destination` records only a completed read), so the next attempt re-asks.
+    looked_up = _store_step(
+        "destination", delivery, lambda: (skips.destination(delivery.destination_id),)
+    )
+    if looked_up is None:
+        return "store_errors"
+    (destination,) = looked_up
     if destination is None or not destination.deliverable:
         # R12's pause, read before the attempt rather than rediscovered by it. The delivery stays
         # `pending` and expires at its own validity: a paused destination is an operator's to
@@ -532,8 +542,9 @@ def _store_step[T](step: str, delivery: notification_store.Delivery, call: Calla
     failed for, and never deliver.
 
     ``None`` is unambiguous here because no store call this module makes returns ``None`` on
-    success: the two that could (``get_event``, ``destination_for_delivery``) are handled by their
-    own callers, and the rest return a dataclass.
+    success: the two that could (``get_event``, ``destination_for_delivery``) are wrapped in a
+    one-tuple by their callers, so "the read failed" and "there is no such record" stay
+    distinguishable, and the rest return a dataclass.
     """
     try:
         return call()

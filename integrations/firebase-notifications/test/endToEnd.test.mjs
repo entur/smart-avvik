@@ -125,6 +125,18 @@ test("the fixture is the producer's event, not a second description of it", () =
       part,
     );
   }
+  // `situations` is a list the loop above cannot reach: one element per contributing situation,
+  // each with the sample's own key set, and the nonce substitution touching the number alone.
+  assert.equal(built.payload.situations.length, SAMPLE.event.payload.situations.length);
+  assert.ok(built.payload.situations.length > 0, "a test event names at least one situation");
+  built.payload.situations.forEach((situation, index) => {
+    const recorded = SAMPLE.event.payload.situations[index];
+    assert.deepEqual(Object.keys(situation), Object.keys(recorded), `situations[${index}]`);
+    for (const key of Object.keys(recorded)) {
+      if (key !== "situation_number") assert.deepEqual(situation[key], recorded[key], key);
+    }
+  });
+  assert.deepEqual(built.situations, built.payload.situations.map((s) => s.situation_number));
   // The three fields the producer states as a coherent confirmed cancellation, asserted here so a
   // regenerated sample that lost the coherence fails in the package a client reads first.
   assert.equal(built.phase, "confirmed");
