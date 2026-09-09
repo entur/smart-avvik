@@ -312,7 +312,7 @@ def test_a_wrong_secret_for_a_known_key_is_never_cached():
         _uninstall()
 
 
-def test_an_anonymous_flood_cannot_spend_a_partners_own_budget():
+def test_an_anonymous_flood_cannot_spend_a_clients_own_budget():
     """Scenario 7, second half. Two tiers, and the second is only reachable after authentication.
 
     The flood exhausts the GLOBAL pre-lookup tier -- the accepted trade, which `/impact`'s limiter
@@ -385,7 +385,7 @@ def test_several_credentials_live_at_once_and_revoking_one_leaves_the_other(
         _uninstall()
 
 
-def test_a_suspended_partner_gets_403_not_401():
+def test_a_suspended_client_gets_403_not_401():
     """A client must be able to tell "my key is wrong" from "we have been switched off"."""
     store = _install()
     bearer = _provision(store)
@@ -566,7 +566,7 @@ def test_two_signing_generations_are_live_across_a_rotation():
         _uninstall()
 
 
-def test_a_destination_belonging_to_another_partner_is_forbidden_inside_the_module():
+def test_a_destination_belonging_to_another_client_is_forbidden_inside_the_module():
     """Kept apart HERE and collapsed into "missing" at the API edge, exactly as notification_store does.
 
     The store's caller needs to tell a tenancy violation from a typo in order to log the former; a
@@ -790,7 +790,7 @@ def test_every_subcommand_is_authorized_including_the_reads():
         _uninstall()
 
 
-def test_the_tool_provisions_a_partner_a_destination_and_a_working_credential():
+def test_the_tool_provisions_a_client_a_destination_and_a_working_credential():
     """The operator runbook, executed: create-client, create-destination, issue-key, and the
     credential the last one prints authenticates against the same store."""
     store = _install()
@@ -998,7 +998,7 @@ def test_the_group_authorizer_fails_closed():
     assert re.search(r"membership_check_failed|not_a_member", verdict.reason)
 
 
-def test_the_tool_never_reaches_the_notification_api_or_a_partner_credential():
+def test_the_tool_never_reaches_the_notification_api_or_a_client_credential():
     """R22's separation, structurally: the operator boundary is not a client-authenticated route.
 
     A client credential authenticates a machine against /notification-api/v1 and can do none of
@@ -1010,7 +1010,7 @@ def test_the_tool_never_reaches_the_notification_api_or_a_partner_credential():
     assert "Bearer" not in TOOL_SOURCE.split('"""', 2)[2]
 
 
-def test_the_operator_can_hand_a_partner_its_verification_secret():
+def test_the_operator_can_hand_a_client_its_verification_secret():
     """There is otherwise NO path to it, and the quickstart's promise depends on one.
 
     `webhook_signing.derive_secret` is called only by the signer, and `GET /destinations/current`

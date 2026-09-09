@@ -504,7 +504,7 @@ def test_a_revoked_credential_stops_working():
         _uninstall()
 
 
-def test_a_suspended_partner_gets_403_so_it_can_tell_the_two_apart():
+def test_a_suspended_client_gets_403_so_it_can_tell_the_two_apart():
     _install()
     bearer = _provision()
     try:
@@ -516,7 +516,7 @@ def test_a_suspended_partner_gets_403_so_it_can_tell_the_two_apart():
         _uninstall()
 
 
-def test_one_partner_cannot_reach_anothers_records_and_the_body_names_nothing():
+def test_one_client_cannot_reach_anothers_records_and_the_body_names_nothing():
     """AE11's second half. Ownership comes from the credential, so the reference is namespaced.
 
     Three probes, one answer. Client A asking for B's own reference gets A's namespace and finds
@@ -1176,7 +1176,7 @@ def test_a_paused_destination_refuses_a_test_event():
         _uninstall()
 
 
-def test_a_test_event_reports_a_partners_own_failure_as_the_diagnosis():
+def test_a_test_event_reports_a_clients_own_failure_as_the_diagnosis():
     _install()
     bearer = _provision()
     try:
@@ -1672,7 +1672,7 @@ def test_the_destination_response_carries_generation_numbers_and_never_a_secret(
         _uninstall()
 
 
-def test_a_partner_with_no_destination_gets_404_rather_than_an_empty_record():
+def test_a_client_with_no_destination_gets_404_rather_than_an_empty_record():
     _install()
     try:
         notification_auth.create_client(CLIENT, name="Acme", actor="op@entur.org")

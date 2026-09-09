@@ -318,10 +318,16 @@ def test_the_operations_document_names_every_notification_log_event():
                     and key.value == "event"
                     and isinstance(value, ast.Constant)
                     and isinstance(value.value, str)
-                    and (value.value.startswith("partner_") or value.value == "varsel_webhook_load")
+                    and (
+                        value.value.startswith(("notification_", "webhook_"))
+                        or value.value == "varsel_webhook_load"
+                    )
                 ):
                     emitted.add(value.value)
-    assert emitted, "no client log event names were found; the AST walk matched nothing"
+    # A floor, not just non-emptiness: after the 2026-09-09 rename this filter still said
+    # `partner_` and matched only `varsel_webhook_load`, so the test passed while checking one
+    # event of nineteen. The number is the size of the log table this test exists to keep whole.
+    assert len(emitted) >= 18, f"only {len(emitted)} client log events were found: {sorted(emitted)}"
     text = OPERATIONS_DOC.read_text(encoding="utf-8")
     missing = sorted(name for name in emitted if f"`{name}`" not in text)
     assert not missing, (
