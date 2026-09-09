@@ -507,7 +507,7 @@ def _pepper() -> bytes:
         raise NotConfigured(
             f"{PEPPER_ENV} is unset or shorter than {MIN_PEPPER_BYTES} bytes; client credentials "
             "cannot be verified. Provision it in Secret Manager and uncomment the chart's "
-            "`client:` secret group."
+            "`notifications:` secret group."
         )
     return value
 
@@ -760,19 +760,11 @@ def _account_state(client_id: str, now: float) -> tuple[str | None, Quotas]:
     return status, quotas
 
 
-def _as_dt(value: Any) -> datetime | None:
-    """Coerce a stored timestamp to aware UTC, or ``None``. ``notification_store._as_dt``'s three cases:
-    the client's ``DatetimeWithNanoseconds``, a plain (possibly naive) ``datetime``, and an
-    ISO-8601 string from a hand-repaired document."""
-    if isinstance(value, datetime):
-        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
-    if isinstance(value, str):
-        try:
-            parsed = datetime.fromisoformat(value)
-        except ValueError:
-            return None
-        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
-    return None
+# The store's own coercion, not a copy of it: both modules read documents the same three writers
+# produce (the client's ``DatetimeWithNanoseconds``, a plain possibly-naive ``datetime``, an ISO-8601
+# string from a hand-repaired document), and a second implementation was a second place for those
+# cases to drift apart.
+_as_dt = notification_store._as_dt
 
 
 # ---- The audit record -------------------------------------------------------------------------
@@ -1103,10 +1095,18 @@ def issue_credential(
     account = get_account(client_id)
     if account is None:
         raise NotFound("no such client")
-    live = [c for c in list_credentials(client_id) if c.status == _CREDENTIAL_ACTIVE]
+    # Live means what `authenticate` means by it: `active` AND not past `expires_at`. An expired
+    # credential is refused on every request already, so counting it here would make an operator
+    # revoke credentials that can no longer be used before minting the replacement -- exactly the
+    # rotation step this ceiling is sized to avoid.
+    live = [
+        c
+        for c in list_credentials(client_id)
+        if c.status == _CREDENTIAL_ACTIVE and (c.expires_at is None or c.expires_at > instant)
+    ]
     if len(live) >= MAX_CREDENTIALS_PER_CLIENT:
         raise Conflict(
-            f"client already holds {len(live)} active credentials "
+            f"client already holds {len(live)} live credentials "
             f"(ceiling {MAX_CREDENTIALS_PER_CLIENT}); revoke one first"
         )
     key_id, secret = mint_credential()

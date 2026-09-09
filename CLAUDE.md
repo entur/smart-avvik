@@ -682,6 +682,29 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   mirror instead of full read, emit and delivery as their own Deployment, batched servability, the
   aggregation) and states that none of it touches the wire contract. Every subscription document
   also carries `channel` (`webhook`; `web_push` is reserved for `/varsel`'s move).
+  **Four semantics moved on 2026-09-10, on the full review's findings, and each is the kind a later
+  reader would otherwise assume the other way.** (1) The delivered marks on a subscription document
+  are keyed on the **`alert_id`** — one per delivered (subscription, train) — not on situation
+  numbers: the store mints per train, so `varsel._pending_pushes` asks per train for a webhook
+  recipient (`_webhook_pending`, through `notification_events.alert_id_for`, the same derivation the
+  emit step's `train_ref` uses), while the browser ledger `_notified` stays per situation because a
+  browser is pushed once per situation. Per-situation marks refused the wording pass to a second
+  departure under a delivered situation whose event still went out. No migration: the channel is off
+  everywhere. (2) `valid_until`'s departure term is the **expected** departure (aimed plus predicted
+  typical delay, `WebhookSubject.expected_departure_time`), never earlier than `DEPARTURE_GRACE_S`
+  (120 s) past the emit instant (a term less than that far ahead, already past included, is floored
+  to it) — the matcher keeps a late train on exactly that figure, and the aimed-time clamp minted
+  events that were stale before their first attempt. (3) The create-time
+  ceiling counts through its own `subscription_count` query ordered `expires_at DESC` (a seventh
+  composite index): through the listing's `created_at ASC` the page filled with expired rows first
+  and under-counted. (4) The webhook event's route line always carries the stop **registry's** names,
+  never a browser registration's typed `from_name`/`to_name` — unauthenticated free text that reached
+  a client's notification through a shared definition; `test_varsel_api` now wires the registry
+  provider exactly as `main` does. Beside those: `pending_deliveries` pages past a throttled
+  destination up to `MAX_DELIVERY_SCAN_PER_CYCLE`, the served-subjects bound and the list ceiling
+  follow the client's quota (`subjects.maxItems` is `QUOTA_BOUNDS["daily_cap"]`'s 1 000), the
+  servability re-check reuses the pass's read of `subscriptions` when under `_LOAD_REUSE_S` (600 s)
+  old, and the delivery attempt's destination lookup goes through `_store_step` like every other read.
   **Signing is Standard Webhooks, fresh per attempt, per destination** (KTD7). HMAC-SHA256 over
   `webhook-id.webhook-timestamp.<raw body>` with stdlib `hmac` and no new dependency; the body bytes
   are stored once and signed unmodified, because re-serializing signs a document the receiver did not
@@ -749,7 +772,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   switches agree.
   **Infrastructure is this repo's own Terraform** (`terraform/firestore.tf`, the directory's first
   non-IAM resource): the API, one named Firestore database per environment in `europe-west1`
-  (immutable), six composite indexes materialised with `for_each` keyed on each index's **content**
+  (immutable), seven composite indexes materialised with `for_each` keyed on each index's **content**
   rather than its array position, the four TTL field configs, and a prd-only backup schedule (five
   weeks, a chosen value: Firestore allows 14 weeks on both recurrences — checked 2026-09-09 — and
   five is what PITR's seven days does not already cover) — and, since 2026-09-09, the deny-all

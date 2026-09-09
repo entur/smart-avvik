@@ -538,12 +538,17 @@ bytes, never over string length.**
 
 ## Delivery semantics
 
-**Validity is the earlier of a 60-minute horizon from `occurred_at`, the train's departure, and the
-subscription's lifetime** — and the three terms are not enforced in the same place, which the contract
-states rather than implies:
+**Validity is the earlier of a 60-minute horizon from `occurred_at`, the train's expected departure,
+and the subscription's lifetime** — and the three terms are not enforced in the same place, which the
+contract states rather than implies:
 
-- the **60-minute horizon** and the **departure** are computed at emit and are what `valid_until`
-  carries;
+- the **60-minute horizon** and the **expected departure** are computed at emit and are what
+  `valid_until` carries. Expected, not aimed: the aimed time plus the delay we predict for the train,
+  which is the same figure that decides whether it can still be caught, so a train running
+  25 minutes late is still valid — and still notified — after its aimed time. An expected departure
+  less than two minutes ahead of `occurred_at` when the event is minted (already past included) is
+  floored to two minutes ahead, so an observation made moments before the train leaves is attempted
+  once rather than expiring unsent — `valid_until` is never earlier than `occurred_at` + 2 min;
 - the **subscription's lifetime** is enforced at dispatch, on a live read immediately before the
   attempt. So a published `valid_until` can outlive the subscription by up to an hour, while nothing
   is ever *sent* past its expiry. This is strictly tighter than a snapshot taken at emit would be.

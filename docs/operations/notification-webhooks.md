@@ -279,7 +279,7 @@ config, no index entry, no Terraform, no retention.**
 
 ### Indexes (`firestore.indexes.json`, repo root)
 
-Six composite indexes, one file read by three consumers — the emulator, the static coverage test and
+Seven composite indexes, one file read by three consumers — the emulator, the static coverage test and
 Terraform. The three cleanup queries filter on `subscription_id` alone and are served by automatic
 single-field indexes; they are declared as query specs with empty index fields and are deliberately
 absent from this file.
@@ -390,7 +390,7 @@ silently.
 | `notification_event` | one committed revision | `result` = the event type, `client_id`, `destination_id`, `alert_id`, `revision`, `superseded` |
 | `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms` |
 | `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`), `destination_id`. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
-| `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count |
+| `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
 | `notification_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
 | `notification_auth` | a refused credential | `reason`, `key_id`. **The secret is logged nowhere at any level** |
@@ -612,6 +612,8 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `notification_store.MAX_PENDING_EVENTS_PER_DESTINATION` | 500 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_CYCLE` | 200 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE` | 50 |
+| `notification_store.MAX_DELIVERY_SCAN_PER_CYCLE` | 1000 |
+| `notification_events.DEPARTURE_GRACE_S` | 120 |
 | `notification_store.MAX_ALERTS_SERVED` | 4 |
 | `notification_store.MAX_SUBJECTS_PER_READ` | 500 |
 | `notification_store.WITHDRAWAL_CYCLES` | 2 |
@@ -720,7 +722,7 @@ the repository root; Python suites are `disruptions/api/`, TypeScript ones `inte
 | AE8 | `test_webhook_signing.py::test_two_attempts_share_the_webhook_id_and_differ_in_timestamp_and_signature` and `::test_a_stale_timestamp_is_refused_for_the_timestamp_and_not_for_the_mac`; receiver side in `notifications-client/test/signingVectors.test.mjs` | yes |
 | AE9 | `test_webhook_sender.py` — the named ranges, NAT64, 6to4, multicast, both families, connect-time refusal, one resolution, the validated literal with the original SNI; provisioning gate and audit in `test_notification_auth.py::test_an_unsafe_callback_url_is_refused_at_provisioning_and_audited` | yes |
 | AE10 | `test_varsel_api.py::test_a_webhook_subscription_matches_and_is_written_for_without_a_keypair` and the two budget tests beside it; `test_notification_wording.py::test_a_webhook_wording_needs_no_vapid_keypair_and_no_model`; the delivery half is structural and is now pinned by `test_notification_contract.py::test_the_store_and_delivery_modules_import_no_poller_state` | yes |
-| AE11 | `test_notification_api.py::test_a_missing_or_wrong_credential_reads_nothing` and `::test_one_client_cannot_reach_anothers_records_and_the_body_names_nothing`; `test_notification_store.py` tenant isolation; `test_llm_message.py::test_a_webhook_call_keeps_prose_and_the_prompt_out_of_the_log`; `test_varsel_api.py::test_a_webhook_only_route_records_no_decision_row`; and whole-tree in `test_partner_contract.py` (no client field in any `data/queries` SQL, any front-end bundle, the decision-log DDL or any structured log field). **Shape note:** the `/historikk` and `/meldinger` half is a grep over the uncommented SQL — the repo's idiom, structurally stronger than a response assertion, but not a rendered-page check | yes |
+| AE11 | `test_notification_api.py::test_a_missing_or_wrong_credential_reads_nothing` and `::test_one_client_cannot_reach_anothers_records_and_the_body_names_nothing`; `test_notification_store.py` tenant isolation; `test_llm_message.py::test_a_webhook_call_keeps_prose_and_the_prompt_out_of_the_log`; `test_varsel_api.py::test_a_webhook_only_route_records_no_decision_row`; and whole-tree in `test_notification_contract.py` (no client field in any `data/queries` SQL, any front-end bundle, the decision-log DDL or any structured log field). **Shape note:** the `/historikk` and `/meldinger` half is a grep over the uncommented SQL — the repo's idiom, structurally stronger than a response assertion, but not a rendered-page check | yes |
 | AE12 | `test_webhook_delivery.py::test_a_departed_train_becomes_expired_rather_than_failed_and_is_not_retried`; `test_notification_store.py::test_event_validity_is_the_earliest_of_three_things` | yes |
 | AE13 | **Stored with the caveat:** `test_notification_api.py::test_an_unservable_pair_is_stored_and_carries_the_caveat`, `::test_a_provider_timeout_stores_no_caveat_rather_than_a_false_one`, `::test_a_changed_route_retires_the_old_servability_answer`. **Re-checked as service appears:** `test_notification_servability.py` (27 checks) — `::test_service_that_appeared_clears_the_caveat`, `::test_a_never_established_answer_is_due`, `::test_an_unchanged_answer_still_moves_the_stamp`, `::test_a_verdict_that_could_not_be_established_writes_nothing_at_all`, `::test_the_interval_is_varsels_own`; wired and gated in `test_poller_refresh.py` | yes |
 | AE14 | `test_varsel_api.py::test_a_broken_notification_store_costs_the_webhook_channel_and_nothing_else` (raises, hangs and one unreadable document, in one test, asserting browser matching, wording, delivery, decision recording **and** state persistence all complete); `test_webhook_delivery.py::test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait`; `test_notification_events.py::test_a_hung_store_cannot_extend_the_step_past_its_bounded_wait` | yes |
@@ -830,7 +832,13 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
 - **`valid_until` carries two of its three terms.** The 60-minute horizon and the departure are
   computed at emit; the subscription's lifetime is enforced at `claim_delivery` on a live read, which
   is strictly tighter than any snapshot. The published wording says where each term is enforced rather
-  than implying all three land in the field.
+  than implying all three land in the field. **The departure term is the EXPECTED departure** (aimed
+  plus the predicted typical delay — the matcher's own catchability figure, carried on
+  `WebhookSubject.expected_departure_time`), and never earlier than
+  `notification_events.DEPARTURE_GRACE_S` (120 s) past the emit instant — a term less than that far
+  ahead, already past included, is floored to it. Until 2026-09-10 it was the aimed time, so a delayed but
+  still catchable train — kept by the matcher and pushed to browsers — minted an event that was stale
+  before its first attempt.
 - **The withdrawal run's "consecutive" count is closed by time**, not by a per-cycle observation: two
   below-threshold observations further apart than `WITHDRAWAL_GAP_S` (900 s, ~3 pass periods) start a
   fresh count. Sized from the measured ~296 s period; **re-measure the period before changing either

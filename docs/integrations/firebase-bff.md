@@ -171,6 +171,6 @@ for it to listen, then start the other.
 approach" and mirrors neither production concurrency nor its indexes. Atomicity is argued from the
 transaction contract; index coverage is a static check against the **package's own**
 `integrations/firebase-notifications/firestore.indexes.json` — one entry, for the sweep's query, and
-a different file from the repo-root `firestore.indexes.json`, which declares the six indexes of our own `notifications` database
+a different file from the repo-root `firestore.indexes.json`, which declares the seven indexes of our own `notifications` database
 indexes. It runs in both directions: a query with no index fails, and an index no query needs fails
 too, because a stale index is paid for on every write to that collection forever.

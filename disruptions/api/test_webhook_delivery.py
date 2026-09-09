@@ -290,7 +290,6 @@ def _install() -> _Fake:
         equality: Any = None,
         inequality: Any = None,
         limit: int,
-        # Accepted and unused: only the listing route pages, and no test here reaches it.
         start_after: Any = None,
     ) -> _Page:
         spec = notification_store._SPECS_BY_NAME[name]
@@ -313,6 +312,12 @@ def _install() -> _Fake:
                 key=lambda row, f=field_path: _sortable(row[1].get(f)),
                 reverse=direction == "DESCENDING",
             )
+        if start_after is not None:
+            # Positional, as Firestore's own cursor is: everything strictly after the snapshot in
+            # THIS ordering. `pending_deliveries` pages past a throttled destination this way.
+            paths = [path for path, _ in rows]
+            if start_after._path in paths:
+                rows = rows[paths.index(start_after._path) + 1 :]
         return _Page(client, rows[:limit])
 
     notification_store._run_transaction = _run  # type: ignore[assignment]
@@ -506,7 +511,7 @@ def test_a_pending_delivery_is_signed_sent_once_and_recorded_sent():
         assert stored["state"] == "sent" and stored["attempts"] == 1
         subscription = client.doc(notification_store.SUBSCRIPTIONS, SID)
         assert subscription["daily_deliveries"] == {notification_store.oslo_day(NOW): 1}
-        assert "ENT:SituationNumber:1" in subscription["delivered"]
+        assert list(subscription["delivered"]) == [delivery["alert_id"]], "one mark, per TRAIN"
 
         [attempt] = _sent
         assert attempt["url"] == URL
@@ -893,6 +898,38 @@ def test_a_departed_train_becomes_expired_rather_than_failed_and_is_not_retried(
         report = webhook_delivery.deliver_pending(now=horizon + timedelta(seconds=1), sender=_sender())
         assert report.expired == 1 and not _sent
     finally:
+        _uninstall()
+
+
+def test_a_failed_destination_read_is_a_store_error_and_leaves_the_delivery_pending():
+    """The destination lookup is a store read like the claim and the event read, and it was the one
+    `_attempt` made outside `_store_step`: a raise there escaped to the caller's outer guard with
+    no classification, and the report could not say the store was the problem. Now it counts as
+    `store_errors`, nothing is sent, nothing is written, and the record is NOT cached as missing --
+    a cached `None` would read as "no such destination" for the rest of the pass."""
+    client = _install()
+    real = notification_auth.destination_for_delivery
+    calls = 0
+
+    def failing(destination_id: str):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("store unavailable")
+
+    try:
+        _live(client)
+        [delivery] = _pending(client)
+        notification_auth.destination_for_delivery = failing  # type: ignore[assignment]
+        report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
+        assert report.store_errors == 1 and not _sent, report
+        assert report.not_deliverable == 0, "a failed read is not a paused destination"
+        assert client.doc(notification_store.DELIVERIES, delivery["delivery_id"])["state"] == "pending"
+        # The next pass re-asks rather than serving the failure from the pass-local cache.
+        notification_auth.destination_for_delivery = real  # type: ignore[assignment]
+        report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
+        assert report.sent == 1 and calls == 1, report
+    finally:
+        notification_auth.destination_for_delivery = real  # type: ignore[assignment]
         _uninstall()
 
 

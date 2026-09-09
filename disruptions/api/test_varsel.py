@@ -831,10 +831,32 @@ def test_pending_pushes_is_channel_neutral():
     successful send) and `WebhookRecipient.delivered` answers it for a webhook subscription
     (Firestore's copy, read once per cycle). A train is pending while ANY recipient on either
     channel still needs telling, which is what makes one wording serve both.
+
+    The two ledgers are NOT at one grain, and that is the channel's own shape rather than an
+    accident: the browser is pushed once per situation, so `_notified` is per situation; the store
+    mints one event per (subscription, train), so `delivered` holds `alert_id`s and the question is
+    asked per train (`_webhook_pending`). The marks here are derived through the same
+    `notification_events.alert_id_for` the store's `_sent_body` keys on.
     """
+    import notification_events
+
     varsel._notified.clear()
     alerts = [_alert("S1"), _alert("S2", jkey="t2", dep=MON_0800 + timedelta(minutes=30))]
-    client = varsel.WebhookRecipient("sub-1", {"from_stop": "A"}, frozenset({"S1"}))
+
+    def mark(alert):
+        train_id = notification_events.alert_id_for(
+            "sub-1",
+            operator=alert.operator,
+            line=alert.line,
+            journey_ref=alert.jkey,
+            stop_place=alert.stop_place,
+            stop_order=alert.stop_order,
+            departure_time=alert.departure_time,
+        )
+        assert train_id is not None
+        return train_id
+
+    client = varsel.WebhookRecipient("sub-1", {"from_stop": "A"}, frozenset({mark(alerts[0])}))
 
     # Browser only, nothing notified yet: both trains pending.
     assert [a.situation_number for a in varsel._pending_pushes(["j1"], alerts)] == ["S1", "S2"]
@@ -851,8 +873,15 @@ def test_pending_pushes_is_channel_neutral():
         a.situation_number for a in varsel._pending_pushes((), alerts, [client])
     ] == ["S2"]
     # And a client that has had both leaves nothing pending on any channel.
-    done = varsel.WebhookRecipient("sub-1", {"from_stop": "A"}, frozenset({"S1", "S2"}))
+    done = varsel.WebhookRecipient(
+        "sub-1", {"from_stop": "A"}, frozenset({mark(alerts[0]), mark(alerts[1])})
+    )
     assert varsel._pending_pushes((), alerts, [done]) == []
+    # A situation NUMBER in the ledger marks nothing: the client's grain is the train.
+    by_situation = varsel.WebhookRecipient("sub-1", {"from_stop": "A"}, frozenset({"S1", "S2"}))
+    assert [a.situation_number for a in varsel._pending_pushes((), alerts, [by_situation])] == [
+        "S1", "S2",
+    ]
     varsel._notified.clear()
 
 

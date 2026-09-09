@@ -441,6 +441,27 @@ def test_the_credential_ceiling_is_enforced_before_a_write():
         _uninstall()
 
 
+def test_an_expired_credential_does_not_count_toward_the_ceiling():
+    """`authenticate` refuses an expired credential, so the ceiling must not count it either: an
+    operator replacing a batch of expired credentials would otherwise have to revoke what can no
+    longer be used before minting anything new, which is the rotation step the ceiling exists to
+    spare them."""
+    _install()
+    try:
+        notification_auth.create_client(CLIENT, name="Acme", actor="op@entur.org")
+        gone = NOW - timedelta(days=1)
+        for _ in range(notification_auth.MAX_CREDENTIALS_PER_CLIENT):
+            notification_auth.issue_credential(CLIENT, actor="op@entur.org", expires_at=gone, now=NOW)
+        record, _bearer = notification_auth.issue_credential(CLIENT, actor="op@entur.org", now=NOW)
+        assert record.status == notification_auth._CREDENTIAL_ACTIVE
+        # Still `active` in the store, still listed for the operator, still not live.
+        listed = notification_auth.list_credentials(CLIENT)
+        assert len(listed) == notification_auth.MAX_CREDENTIALS_PER_CLIENT + 1
+        assert sum(1 for c in listed if c.expires_at is None) == 1
+    finally:
+        _uninstall()
+
+
 def test_the_secret_is_never_logged_and_the_key_id_always_is():
     """KTD8's log rule, checked by capturing what a refusal actually emits."""
     store = _install()

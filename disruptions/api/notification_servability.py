@@ -282,8 +282,23 @@ def _record(subscription: notification_store.Subscription, servable: bool) -> bo
         return False
 
 
+#: How old the notification pass's read of `subscriptions` may be for this re-check to reuse it
+#: rather than read the collection again. One pass sits between the two in a healthy cycle (~296 s
+#: measured 2026-09-08, and the pass is bounded well under that), so ten minutes reuses every
+#: same-cycle read and never one from the cycle before. Past it -- or when the pass raised before
+#: reading, or the channel's flag was off for the pass -- the re-check reads for itself.
+_LOAD_REUSE_S = 600.0
+
+
 def _load(now: datetime) -> notification_store.LoadedSubscriptions | None:
-    """This environment's live subscriptions, or ``None`` when the store could not be read."""
+    """This environment's live subscriptions, or ``None`` when the store could not be read.
+
+    The notification pass's own read is reused when it is fresh (:data:`_LOAD_REUSE_S`): both walk
+    every live subscription, and two full reads per cycle bought nothing but a second bounded stream.
+    """
+    reused = notification_store.recent_load(now=now, max_age_s=_LOAD_REUSE_S)
+    if reused is not None:
+        return reused
     try:
         return notification_store.active_subscriptions(now=now)
     except Exception:
@@ -299,8 +314,9 @@ def recheck(*, now: datetime | None = None) -> None:
     """Re-ask about webhook subscriptions whose servability answer is stale, and clear the ones
     that now have service.
 
-    Called from the poller's refresh cycle, in its own phase after ``notification_webhooks``. Costs one
-    bounded store read on every cycle and nothing else on a healthy list. ``now`` is injectable for
+    Called from the poller's refresh cycle, in its own phase after ``notification_webhooks``. Costs
+    nothing on a healthy list beyond reusing the notification pass's read of the same collection --
+    one bounded store read of its own only when that read is stale or absent (:data:`_LOAD_REUSE_S`). ``now`` is injectable for
     the same reason every ``notification_store`` entry point's is: staleness is the whole rule here, and
     a suite that could not pin the clock could only assert it by sleeping.
     """

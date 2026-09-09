@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -110,8 +111,9 @@ TTL_RESIDUAL_HOURS = 24
 # `_notified` exactly -- it drops a key the moment its situation stops being live -- which a store
 # cannot do without reading the live set, so this is a bound instead of an exact rule. 48 h is the
 # generous side on purpose: a situation reaches 12 h from ITS onset and the poller scores ~12 h
-# forward, so a mark that outlives its situation costs one map entry, while a mark that expires
-# EARLY re-notifies a train the traveller has already been told about.
+# forward, so a mark that outlives its train's day costs one map entry, while a mark that expires
+# EARLY re-notifies a train the traveller has already been told about. The key is the `alert_id`
+# -- one mark per delivered (subscription, train) -- since 2026-09-10; see `_sent_body`.
 DELIVERED_MARK_TTL_H = 48
 
 
@@ -137,6 +139,15 @@ MAX_PENDING_EVENTS_PER_DESTINATION = 500
 # single backlogged client spending the whole pass; the total is what bounds the query.
 MAX_DELIVERY_ATTEMPTS_PER_CYCLE = 200
 MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE = 50
+# Pending documents `pending_deliveries` may READ in one cycle while filling its attempt set. Larger
+# than the attempt ceiling for one reason: the per-destination ceiling is applied to what a page
+# holds, and a page is chosen by retry order, so a destination with more pending rows than the page
+# (`MAX_PENDING_EVENTS_PER_DESTINATION` is 500 against a page of 200) whose rows never advance --
+# paused after a 410, or skipped for the rest of a pass after one failure -- owned the whole page and
+# every other client's deliveries never entered it. The read pages past throttled rows up to this
+# bound, five pages of the attempt ceiling: enough for two such destinations to be paged past with
+# room to spare, and small enough that the read stays a bounded, predictable cost per cycle.
+MAX_DELIVERY_SCAN_PER_CYCLE = MAX_DELIVERY_ATTEMPTS_PER_CYCLE * 5
 # R11's cap: /varsel's `_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`, at /varsel's grain (per
 # registration per Oslo day) because R3's parity is the whole point. A commuter who registers a
 # morning and an evening journey has an allowance for each, exactly as they would in /varsel.
@@ -325,6 +336,7 @@ def database_id() -> str | None:
 
 def reset_for_tests() -> None:
     configure(client=None, database=None, clock=None)
+    forget_recent_load()
 
 
 def _now() -> datetime:
@@ -702,7 +714,22 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         collection=SUBSCRIPTIONS,
         equality=("client_id", "status"),
         order_by=(("created_at", "ASCENDING"),),
-        why="a client lists its own subscriptions, and the create-time ceiling count",
+        why="a client lists its own subscriptions",
+    ),
+    QuerySpec(
+        name="subscription_count",
+        collection=SUBSCRIPTIONS,
+        equality=("client_id", "status"),
+        # `expires_at` DESCENDING, for `load_active_subscriptions`' reason one client down. The
+        # create-time ceiling is counted from a page bounded AT the ceiling, and liveness is tested in
+        # Python, so the page must shed dead rows before live ones. Counted through the listing's
+        # `created_at` ordering until 2026-09-10, the page filled with the OLDEST rows first -- which
+        # is exactly where the rows TTL has not caught up with sit -- so the count under-read and a
+        # create past the ceiling was admitted (R21). Descending on expiry puts every live row ahead
+        # of every dead one, so a page of `ceiling` rows that holds fewer than `ceiling` live rows
+        # has counted them all.
+        order_by=(("expires_at", "DESCENDING"),),
+        why="the create-time ceiling count",
     ),
     QuerySpec(
         name="subscription_alerts",
@@ -1009,9 +1036,11 @@ class Subscription:
         validates the fields the pass reads and is indifferent to the rest, so a store that adds a
         field does not start failing every document in the collection.
 
-        ``delivered`` is Firestore's copy of ``varsel._notified`` at the same grain -- situation
-        numbers already delivered to THIS subscription -- and the marks whose window has passed are
-        dropped here rather than stored forever.
+        ``delivered`` is Firestore's counterpart of ``varsel._notified`` for this channel, at the
+        grain events are minted at: the ``alert_id`` of every (subscription, train) already delivered
+        to THIS subscription. Not the browser ledger's per-situation grain -- a second train under a
+        delivered situation is a new event here and must read as pending. Marks whose window has
+        passed are dropped here rather than stored forever.
         """
         return {
             "recipient_id": self.subscription_id,
@@ -1135,7 +1164,9 @@ def _create_body(
     up to ``MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT`` read locks under Standard edition's pessimistic
     concurrency -- bounded, and paid on a create, which a commuter does once.
 
-    R21's "the read cannot exceed the ceiling" is literally the query's ``limit``.
+    R21's "the read cannot exceed the ceiling" is literally the query's ``limit`` -- and that is why
+    the query is ``subscription_count`` and not the listing's: bounded at the ceiling, WHICH rows the
+    page holds decides the count, and its ordering puts live rows first (see the spec).
     """
     existing = _read(transaction, refs.subscription(spec.subscription_id))
     stored = _doc(existing)
@@ -1191,7 +1222,7 @@ def create_subscription(
     ceiling = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT if max_active is None else max_active
     refs = _Refs(_firestore_client())
     count_query = _query(
-        "subscriptions",
+        "subscription_count",
         equality={"client_id": spec.client_id, "status": "active"},
         limit=ceiling,
     )
@@ -1512,8 +1543,15 @@ def list_subscriptions(
     limit: int = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT,
     after: str | None = None,
     now: datetime | None = None,
+    max_active: int | None = None,
 ) -> list[Subscription]:
     """A client's own live subscriptions, oldest first, starting after ``after``.
+
+    ``max_active`` is the CLIENT's ceiling (``notification_auth.Quotas``), the module constant when
+    ``None``. It bounds both the page and the scan below, and it has to be the client's own: bounded
+    by the constant, a client whose quota was raised past 500 could never page past its first 500
+    live rows -- the page equalled the read, so no cursor was ever emitted -- and 500 expired rows
+    ahead of its live ones would end the scan on an empty page.
 
     **``limit`` reaches the QUERY**, and did not until 2026-09-09: this streamed the whole bounded
     set and the route sliced in Python, so a `?limit=1` page cost the same up-to-500-document read
@@ -1535,7 +1573,8 @@ def list_subscriptions(
     ceiling, so a healthy list still costs exactly one round.
     """
     instant = now or _now()
-    ceiling = min(limit, MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT)
+    bound = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT if max_active is None else max_active
+    ceiling = min(limit, bound)
     cursor: Any = None
     if after is not None:
         snapshot = _Refs(_firestore_client()).subscription(after).get(timeout=_CALL_DEADLINE_S)
@@ -1549,8 +1588,8 @@ def list_subscriptions(
         cursor = snapshot
     out: list[Subscription] = []
     scanned = 0
-    while len(out) < ceiling and scanned < MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT:
-        requested = min(ceiling - len(out), MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT - scanned)
+    while len(out) < ceiling and scanned < bound:
+        requested = min(ceiling - len(out), bound - scanned)
         page = list(
             _query(
                 "subscriptions",
@@ -1583,6 +1622,43 @@ class LoadedSubscriptions:
     truncated: bool
     skipped: int
     expired: int
+
+
+# The notification pass's read of the collection, kept for the servability re-check that runs later
+# in the SAME cycle (`notification_servability.recheck`). Both walk every live subscription, and
+# until 2026-09-10 each read the collection for itself -- two full reads per cycle, the second for
+# a question that is due on a handful of documents every six hours. This is a stamped snapshot with
+# an age bound, not a ledger: nothing writes through it, and the re-check reads for itself when it
+# is stale or absent, so a cycle whose pass raised still re-checks. Under a lock because the pass
+# reads on a worker thread (`varsel._load_webhook_recipients`) and the re-check on the poller's.
+_recent_load_lock = threading.Lock()
+_recent_load: tuple[datetime, LoadedSubscriptions] | None = None
+
+
+def _remember_load(loaded_at: datetime, loaded: LoadedSubscriptions) -> None:
+    global _recent_load
+    with _recent_load_lock:
+        _recent_load = (loaded_at, loaded)
+
+
+def recent_load(*, now: datetime, max_age_s: float) -> LoadedSubscriptions | None:
+    """The pass's read of the live subscriptions if it is at most ``max_age_s`` old, else ``None``.
+
+    Strictly non-negative age: a clock that has gone backwards (an injected test clock, a
+    corrected node) makes the snapshot unusable rather than "very fresh".
+    """
+    with _recent_load_lock:
+        if _recent_load is None:
+            return None
+        loaded_at, loaded = _recent_load
+    age = (now - loaded_at).total_seconds()
+    return loaded if 0 <= age <= max_age_s else None
+
+
+def forget_recent_load() -> None:
+    global _recent_load
+    with _recent_load_lock:
+        _recent_load = None
 
 
 def active_subscriptions(
@@ -1631,6 +1707,7 @@ def recipient_documents() -> list[dict[str, Any]]:
     """
     instant = _now()
     loaded = active_subscriptions(now=instant)
+    _remember_load(instant, loaded)
     # `expired` IS NOT A WARNING, and this used to warn on it. TTL deletes an expired document
     # "typically within 24 hours", so during that documented lag a perfectly healthy deployment logs
     # a warning on EVERY cycle -- and `terraform/firestore.tf`'s own header makes the argument
@@ -2748,8 +2825,10 @@ class PendingDeliveries:
     leave a pending document nothing ever resolves.
 
     ``throttled`` names destinations whose per-cycle attempt ceiling bound the set, and
-    ``truncated`` says the query's own ceiling did. Both are visible to an operator (R21) instead of
-    looking like a quiet day.
+    ``truncated`` says the read stopped before the collection was drained -- the attempt ceiling
+    was reached with a full page still in hand, or the scan bound (``MAX_DELIVERY_SCAN_PER_CYCLE``)
+    was hit -- so deliverable rows may remain that this cycle never saw. Both are visible to an
+    operator (R21) instead of looking like a quiet day.
     """
 
     ready: tuple[Delivery, ...]
@@ -2769,69 +2848,100 @@ def pending_deliveries(
     a restart. The RESULT is then re-sorted by validity in Python, because /varsel spends its budget
     soonest-departure-first across registrations and this must too: insertion order handed the whole
     budget to the earliest-registered travellers every busy morning. The consequence to know is that
-    at the ceiling the PAGE is chosen by retry order and only its contents are ordered by departure.
+    at the ceiling the PAGES are chosen by retry order and only their contents are ordered by
+    departure.
+
+    **The read pages past a throttled destination** (2026-09-10). The per-destination ceiling is
+    applied to what a page holds, and a paused or skipped destination's rows never advance their
+    ``retry_not_before`` -- so with more pending rows than one page they sorted first on every cycle,
+    filled it, and every other client's deliveries waited behind rows that were never attempted.
+    So when the page is full and the attempt set is not, the next page is read from a cursor,
+    bounded by ``MAX_DELIVERY_SCAN_PER_CYCLE``. The per-destination ceiling is spent within each
+    page soonest-departure-first, which is what the single-page version did.
     """
     instant = now or _now()
     ceiling = min(limit, MAX_DELIVERY_ATTEMPTS_PER_CYCLE)
-    query = _query(
-        "pending_deliveries",
-        equality={"state": "pending"},
-        inequality={"retry_not_before": instant},
-        limit=ceiling,
-    )
-    page = list(query.stream(timeout=_CALL_DEADLINE_S))
     ready: list[Delivery] = []
     stale: list[str] = []
-    for snapshot in page:
-        stored = _doc(snapshot)
-        try:
-            delivery = _delivery_from_doc(stored)
-        except Exception:
-            logger.debug("Unreadable webhook delivery document; skipping it", exc_info=True)
-            continue
-        # Every read path tests the expiry field itself: a delivery TTL has not caught up with is
-        # not claimable, and one past its validity is expired rather than deliverable.
-        if not _not_expired(stored, instant):
-            continue
-        if delivery.valid_until is None or delivery.valid_until <= instant:
-            stale.append(delivery.delivery_id)
-            continue
-        if delivery.retry_not_before is not None and delivery.retry_not_before > instant:
-            continue
-        ready.append(delivery)
+    per_destination: dict[str, int] = {}
+    throttled: set[str] = set()
+    seen: set[str] = set()
+    scanned = 0
+    cursor: Any = None
+    exhausted = False
+    while len(ready) < ceiling and scanned < MAX_DELIVERY_SCAN_PER_CYCLE:
+        requested = min(ceiling, MAX_DELIVERY_SCAN_PER_CYCLE - scanned)
+        query = _query(
+            "pending_deliveries",
+            equality={"state": "pending"},
+            inequality={"retry_not_before": instant},
+            limit=requested,
+            start_after=cursor,
+        )
+        page = list(query.stream(timeout=_CALL_DEADLINE_S))
+        scanned += len(page)
+        candidates: list[Delivery] = []
+        for snapshot in page:
+            stored = _doc(snapshot)
+            try:
+                delivery = _delivery_from_doc(stored)
+            except Exception:
+                logger.debug("Unreadable webhook delivery document; skipping it", exc_info=True)
+                continue
+            # A cursor is exact on the real client; the guard is against a page source that is not
+            # (a fake that cannot page), where the same row would otherwise be attempted twice.
+            if delivery.delivery_id in seen:
+                continue
+            seen.add(delivery.delivery_id)
+            # Every read path tests the expiry field itself: a delivery TTL has not caught up with is
+            # not claimable, and one past its validity is expired rather than deliverable.
+            if not _not_expired(stored, instant):
+                continue
+            if delivery.valid_until is None or delivery.valid_until <= instant:
+                stale.append(delivery.delivery_id)
+                continue
+            if delivery.retry_not_before is not None and delivery.retry_not_before > instant:
+                continue
+            candidates.append(delivery)
+        candidates.sort(key=lambda d: (d.valid_until, d.delivery_id))
+        for delivery in candidates:
+            if len(ready) >= ceiling:
+                break
+            spent = per_destination.get(delivery.destination_id, 0)
+            if spent >= MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE:
+                throttled.add(delivery.destination_id)
+                continue
+            per_destination[delivery.destination_id] = spent + 1
+            ready.append(delivery)
+        if len(page) < requested:
+            exhausted = True  # the collection is drained: another page would read nothing
+            break
+        cursor = page[-1]
 
     ready.sort(key=lambda d: (d.valid_until, d.delivery_id))
-    per_destination: dict[str, int] = {}
-    kept: list[Delivery] = []
-    throttled: set[str] = set()
-    for delivery in ready:
-        spent = per_destination.get(delivery.destination_id, 0)
-        if spent >= MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE:
-            throttled.add(delivery.destination_id)
-            continue
-        per_destination[delivery.destination_id] = spent + 1
-        kept.append(delivery)
-    if throttled or len(page) >= ceiling:
+    truncated = not exhausted
+    if throttled or truncated:
         logger.warning(
             "Webhook delivery set bounded: %d ready, %d throttled destination(s), truncated=%s",
-            len(kept),
+            len(ready),
             len(throttled),
-            len(page) >= ceiling,
+            truncated,
             extra={
                 "fields": {
                     "event": "notification_quota",
                     "result": "delivery_attempts",
-                    "n": len(kept),
+                    "n": len(ready),
                     "throttled": sorted(throttled),
-                    "truncated": len(page) >= ceiling,
+                    "truncated": truncated,
+                    "scanned": scanned,
                 }
             },
         )
     return PendingDeliveries(
-        ready=tuple(kept),
+        ready=tuple(ready),
         stale=tuple(stale),
         throttled=tuple(sorted(throttled)),
-        truncated=len(page) >= ceiling,
+        truncated=truncated,
     )
 
 
@@ -3073,8 +3183,14 @@ def _sent_body(
             day = oslo_day(now)
             counters[day] = int(counters.get(day, 0)) + 1
             spent = True
-        for situation in delivery.get("situations") or ():
-            marks[str(situation)] = now + timedelta(hours=DELIVERED_MARK_TTL_H)
+        # PER TRAIN, keyed on the `alert_id`, never per situation number (2026-09-10). Events are
+        # minted per (subscription, train), so the question `varsel._pending_pushes` asks of these
+        # marks -- "is a notification about this train still coming?" -- is a per-train question: a
+        # second departure under an already-delivered situation is a NEW event, and a per-situation
+        # mark admitted it to the wording pass never, so its event carried the template while the
+        # first train's carried the model's prose.
+        if alert_id:
+            marks[alert_id] = now + timedelta(hours=DELIVERED_MARK_TTL_H)
         transaction.update(
             refs.subscription(subscription_id),
             {

@@ -998,12 +998,15 @@ def list_subscriptions(
     """
     try:
         # `limit + 1`: one row past the page is what says there IS a next page, and it costs one
-        # document rather than a second query. `_LIST_MAX` is the store's own ceiling, so the `+ 1`
-        # cannot push the read past what R21 already allows.
+        # document rather than a second query. NOT clamped to `_LIST_MAX` here: the store bounds
+        # the read by the client's own `max_active_subscriptions`, which is the ceiling R21 states
+        # -- clamped to the default, a client with a raised quota and more than 500 live watches
+        # got a full page with no cursor and could never list the rest.
         subs = _store.list_subscriptions(
             client_id=principal.client_id,
-            limit=min(limit + 1, _LIST_MAX),
+            limit=limit + 1,
             after=_requested_id(principal.client_id, after) if after is not None else None,
+            max_active=principal.quotas.max_active_subscriptions,
         )
     except notification_store.NotFound as exc:
         raise HTTPException(status_code=400, detail="unknown_cursor") from exc

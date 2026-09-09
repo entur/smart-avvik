@@ -314,12 +314,17 @@ def _install(client: _FakeClient) -> None:
         equality: Any = None,
         inequality: Any = None,
         limit: int,
-        # Accepted and unused: only the listing route pages, and no test here reaches it.
         start_after: Any = None,
     ) -> _Page:
         client.query_calls.append((name, dict(equality or {}), dict(inequality or {}), limit))
-        rows = client.pages.get(name, [])[:limit]
-        return _Page(client, rows)
+        rows = client.pages.get(name, [])
+        # Positional, as Firestore's own cursor is: everything strictly after the snapshot in the
+        # page's ordering. `pending_deliveries` pages past a throttled destination this way.
+        if start_after is not None:
+            paths = [path for path, _ in rows]
+            if start_after._path in paths:
+                rows = rows[paths.index(start_after._path) + 1 :]
+        return _Page(client, rows[:limit])
 
     notification_store._run_transaction = _run  # type: ignore[assignment]
     notification_store._query = _query  # type: ignore[assignment]
@@ -688,9 +693,48 @@ def test_the_create_ceiling_query_is_bounded_by_the_ceiling():
     _install(client)
     notification_store.create_subscription(_spec(), now=NOW)
     name, equality, _ineq, limit = client.query_calls[0]
-    assert name == "subscriptions"
+    assert name == "subscription_count"
     assert equality == {"client_id": CLIENT, "status": "active"}
     assert limit == notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
+
+
+def test_the_create_count_sheds_dead_rows_before_live_ones():
+    """The count is bounded AT the ceiling, so which rows the page holds IS the count.
+
+    Liveness is tested in Python, so an expired-but-not-yet-deleted row is returned by the query
+    and discarded after the fact. Counted through the listing's `created_at ASCENDING` ordering
+    (as it was until 2026-09-10), the page filled with the OLDEST rows first -- exactly where the
+    rows TTL has not caught up with sit -- so `ceiling` dead rows hid every live one, the count read
+    zero, and a client past its ceiling was admitted another subscription (R21). Ordered
+    `expires_at DESCENDING`, every live row precedes every dead one, so a page holding fewer than
+    `ceiling` live rows has counted them all. The fake cannot order, so the direction is pinned on
+    the spec the way `test_the_load_query_sheds_dead_rows_before_live_ones` pins its sibling.
+    """
+    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "subscription_count")
+    assert spec.order_by == (("expires_at", "DESCENDING"),)
+    assert spec.equality == ("client_id", "status")
+    listing = next(s for s in notification_store.QUERY_SPECS if s.name == "subscriptions")
+    assert listing.order_by == (("created_at", "ASCENDING"),), "the published list order is unchanged"
+    # And the page the body counts from really is the one the store asks for: a page of `ceiling`
+    # rows, live ones first, refuses; the same rows dead-first would have admitted.
+    client = _FakeClient()
+    refs = notification_store._Refs(client)
+    ceiling = notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
+    dead = _live_doc(subscription_id="old", now=NOW - timedelta(days=400))
+    live_first = [
+        (f"{notification_store.SUBSCRIPTIONS}/s{i}", _live_doc(subscription_id=f"s{i}"))
+        for i in range(ceiling)
+    ] + [(f"{notification_store.SUBSCRIPTIONS}/d0", dict(dead, subscription_id="d0"))]
+    txn = _Txn()
+    try:
+        with _NoClockNoLog():
+            notification_store._create_body(
+                txn, refs, _Page(client, live_first[:ceiling]), spec=_spec(), now=NOW
+            )
+    except notification_store.QuotaExceeded:
+        pass
+    else:
+        raise AssertionError("a page that is live rows up to the ceiling must refuse")
 
 
 def test_the_per_cycle_load_is_bounded_by_the_ceiling_and_reports_truncation():
@@ -765,6 +809,64 @@ def test_the_delivery_set_is_bounded_per_cycle_and_per_destination():
     assert pending.throttled == (DEST,)
     # Soonest departure first, across the whole set.
     assert [d.valid_until for d in pending.ready] == sorted(d.valid_until for d in pending.ready)
+
+
+def test_a_stuck_destinations_backlog_cannot_starve_another_clients_deliveries():
+    """Two destinations, one backlog. X holds more pending rows than a page, all sorting first by
+    retry order because nothing ever advances them (paused after a 410, or skipped for the rest of
+    each pass after one failure); Y holds three rows behind them. Until 2026-09-10 the read was one
+    page of `MAX_DELIVERY_ATTEMPTS_PER_CYCLE`, so X owned the page, the per-destination ceiling
+    kept 50 of X's rows, and Y's three never entered the set on any cycle. The read now pages past
+    the throttled rows up to `MAX_DELIVERY_SCAN_PER_CYCLE`."""
+    client = _FakeClient()
+    _install(client)
+
+    def row(i: int, destination: str) -> dict[str, Any]:
+        return {
+            "delivery_id": f"del-{destination}-{i:04d}",
+            "event_id": f"evt-{destination}-{i:04d}",
+            "alert_id": f"alert-{destination}-{i:04d}",
+            # One commuter per row, as a real backlog is: many subscriptions, one destination.
+            "subscription_id": f"sub-{destination}-{i:04d}",
+            "subscription_version": 1,
+            "client_id": f"client-{destination}",
+            "destination_id": destination,
+            "state": "pending",
+            "attempts": 0,
+            # X's rows are OLDER in retry order, so they fill the first page.
+            "retry_not_before": NOW - timedelta(minutes=30 if destination == "X" else 1),
+            "valid_until": NOW + timedelta(minutes=30 + (i % 20)),
+            notification_store.TTL_FIELD: NOW + timedelta(days=7),
+            "situations": ["ENT:1"],
+        }
+
+    backlog = notification_store.MAX_DELIVERY_ATTEMPTS_PER_CYCLE + 40
+    rows = [row(i, "X") for i in range(backlog)] + [row(i, "Y") for i in range(3)]
+    client.page("pending_deliveries", notification_store.DELIVERIES, rows)
+    pending = notification_store.pending_deliveries(now=NOW)
+    per_destination: dict[str, int] = {}
+    for delivery in pending.ready:
+        per_destination[delivery.destination_id] = per_destination.get(delivery.destination_id, 0) + 1
+    assert per_destination == {
+        "X": notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE,
+        "Y": 3,
+    }, per_destination
+    assert pending.throttled == ("X",)
+    assert len({d.delivery_id for d in pending.ready}) == len(pending.ready), "no row twice"
+    assert not pending.truncated, "the collection was drained, so nothing deliverable was left behind"
+    # Two pages were read: the full first one and the short one that drained the collection.
+    pages = [c for c in client.query_calls if c[0] == "pending_deliveries"]
+    assert len(pages) == 2, pages
+    # And the scan bound holds: a backlog past it leaves the read truncated, never unbounded.
+    client.page(
+        "pending_deliveries",
+        notification_store.DELIVERIES,
+        [row(i, "X") for i in range(notification_store.MAX_DELIVERY_SCAN_PER_CYCLE + 5)],
+    )
+    client.query_calls.clear()
+    bounded = notification_store.pending_deliveries(now=NOW)
+    assert bounded.truncated and bounded.throttled == ("X",)
+    assert len([c for c in client.query_calls if c[0] == "pending_deliveries"]) == 5
 
 
 # ---- Scenario 4: expired but not yet TTL-deleted ----------------------------------------------
@@ -2333,14 +2435,21 @@ def test_the_cap_is_keyed_on_the_oslo_day_not_utc():
     assert notification_store.MAX_ALERT_DELIVERIES_PER_DAY == 4, "/varsel's own per-registration cap"
 
 
-def test_the_delivered_marks_are_the_notified_grain_varsel_reads():
+def test_the_delivered_marks_are_per_train_the_grain_the_pass_admits_at():
+    """One mark per delivered (subscription, train) -- the `alert_id` -- never one per situation.
+
+    Events are minted per train, so `varsel._pending_pushes`' question of these marks is a per-train
+    question. Keyed per situation (as they were until 2026-09-10), a second departure under an
+    already-delivered situation was refused the wording pass while its event still went out.
+    """
     client, request = _emitted(situations=("ENT:SituationNumber:1", "NSB:SituationNumber:9"))
     delivery_id = client.doc(notification_store.SUBJECTS, request.alert_id)["pending_delivery_id"]
     notification_store.mark_delivery_sent(delivery_id, now=NOW)
     stored = client.doc(notification_store.SUBSCRIPTIONS, SID)
-    assert set(stored["delivered"]) == {"ENT:SituationNumber:1", "NSB:SituationNumber:9"}
+    assert set(stored["delivered"]) == {request.alert_id}, stored["delivered"]
+    assert "ENT:SituationNumber:1" not in stored["delivered"], "a situation number is not a train"
     document = notification_store._subscription_from_doc(stored).as_recipient_document(NOW)
-    assert document["delivered"] == ["ENT:SituationNumber:1", "NSB:SituationNumber:9"]
+    assert document["delivered"] == [request.alert_id]
     # And a mark whose window has passed drops out rather than suppressing forever.
     later = NOW + timedelta(hours=notification_store.DELIVERED_MARK_TTL_H + 1)
     assert notification_store._subscription_from_doc(stored).as_recipient_document(later)[
@@ -3364,7 +3473,7 @@ def emulator_test_the_full_delivery_lifecycle_spends_the_cap_once():
     assert notification_store.cap_remaining(
         {"daily_deliveries": dict(subscription.daily_deliveries)}, later
     ) == 3
-    assert list(subscription.delivered) == ["ENT:SituationNumber:1"]
+    assert list(subscription.delivered) == [commit.alert_id]
     assert notification_store.pending_deliveries(now=later).ready == ()
     assert client is not None
 

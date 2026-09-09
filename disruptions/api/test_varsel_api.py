@@ -124,6 +124,13 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
 
 
 varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
+# The stop REGISTRY the message input resolves its place names from, wired exactly as `main` wires
+# it (`llm_message.configure(stop_name_provider=_varsel_stops)`). Unwired, every `reise.fra` here
+# read as the bare ref -- which the browser push hid behind the registration's own typed names and
+# the webhook event, which must never use those, does not.
+import llm_message
+
+llm_message.configure(stop_name_provider=lambda: STOPS)
 
 # Suite-wide: this provider calls the REAL impact.for_trip, which calls
 # alternatives.fetch_candidates whenever with_alternative=True. Individual tests stubbing it are not
@@ -3286,6 +3293,26 @@ WEBHOOK_DOC_ROUTED = {
 }
 
 
+def _delivered_mark(recipient_id: str, call: FakeCall) -> str:
+    """The delivered mark the store writes for this recipient x train: the `alert_id`, derived
+    through the one derivation the emit step and the admission test share
+    (`notification_events.alert_id_for`). A test that hand-wrote a situation number here would be
+    testing the browser ledger's grain against the webhook channel's."""
+    import notification_events
+
+    mark = notification_events.alert_id_for(
+        recipient_id,
+        operator=call.operator,
+        line=call.line,
+        journey_ref=call.jkey,
+        stop_place=call.stop_place,
+        stop_order=call.stop_order,
+        departure_time=call.aimed_dep,
+    )
+    assert mark is not None
+    return mark
+
+
 def _use_notification_store(monkeypatch, docs, *, enabled=True):
     """Wire the webhook channel's two seams and return the list its provider appends a call to.
 
@@ -3476,7 +3503,10 @@ def test_only_the_train_a_client_still_needs_is_written_for_without_a_keypair(mo
     _reset_state()
     monkeypatch.setattr(varsel, "push_enabled", lambda: False)
     written = _capture_writes(monkeypatch)
-    _use_notification_store(monkeypatch, [{**WEBHOOK_DOC, "delivered": ["S1"]}])
+    _use_notification_store(
+        monkeypatch,
+        [{**WEBHOOK_DOC, "delivered": [_delivered_mark("sub-0001", SNAPSHOT_TWO_DISRUPTED["S1"][0])]}],
+    )
     _register(DEVICE)  # a browser registration on the same definition, undeliverable here
     _use_snapshot(SNAPSHOT_TWO_DISRUPTED)
 
@@ -3485,6 +3515,55 @@ def test_only_the_train_a_client_still_needs_is_written_for_without_a_keypair(mo
     assert [s for _k, s in written] == ["S3"], (
         f"only the train the client is still owed; got {written}"
     )
+
+
+def test_a_second_train_under_a_delivered_situation_is_still_written_for_a_client(monkeypatch):
+    """Admission is per TRAIN for a webhook recipient, because that channel mints one event per
+    (subscription, train). `match_journey` yields one alert per situation -- the worst train in the
+    window -- so the case is two cycles of one situation: the 07:xx was delivered (its mark is on
+    the recipient), it has since left, and the same situation now names the next departure. That is
+    a NEW event for the client, and it is still owed a wording. Admitting on the situation number
+    (as until 2026-09-10) wrote nothing here, so the second train's event went out with the template
+    while the first's had carried the model's prose. With the second train's mark present as well,
+    nothing is written, which is the other half of the same rule."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    first = SNAPSHOT["S1"][0]
+    second = FakeCall("t2", "A", 1, DEP + timedelta(minutes=30), p_cancel=0.82, p_impact_dep=0.9)
+    later = {
+        "S1": [second, FakeCall("t2", "B", 5, None, aimed_arr=DEP + timedelta(minutes=70))]
+    }
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch, [{**WEBHOOK_DOC, "delivered": [_delivered_mark("sub-0001", first)]}]
+    )
+    _use_snapshot(later)
+    try:
+        varsel.check_and_notify(later)
+        assert [s for _k, s in written] == ["S1"], f"the second train is owed; got {written}"
+        assert any(key[2] == second.aimed_dep.isoformat() for key in varsel._messages), (
+            "the wording written is the SECOND train's",
+            list(varsel._messages),
+        )
+
+        _reset_state()
+        written = _capture_writes(monkeypatch)
+        _use_notification_store(
+            monkeypatch,
+            [
+                {
+                    **WEBHOOK_DOC,
+                    "delivered": [
+                        _delivered_mark("sub-0001", first),
+                        _delivered_mark("sub-0001", second),
+                    ],
+                }
+            ],
+        )
+        varsel.check_and_notify(later)
+        assert written == [], f"both trains delivered: nothing owed; got {written}"
+    finally:
+        _use_snapshot(SNAPSHOT)
 
 
 def test_a_keypair_less_cycle_writes_nothing_once_the_client_has_been_told(monkeypatch):
@@ -3498,7 +3577,9 @@ def test_a_keypair_less_cycle_writes_nothing_once_the_client_has_been_told(monke
     _reset_state()
     monkeypatch.setattr(varsel, "push_enabled", lambda: False)
     written = _capture_writes(monkeypatch)
-    _use_notification_store(monkeypatch, [{**WEBHOOK_DOC, "delivered": ["S1"]}])
+    _use_notification_store(
+        monkeypatch, [{**WEBHOOK_DOC, "delivered": [_delivered_mark("sub-0001", SNAPSHOT["S1"][0])]}]
+    )
     _register(DEVICE)
 
     for _ in range(3):  # three poller ticks on one live situation
@@ -3690,7 +3771,14 @@ def test_a_cycle_with_webhook_recipients_writes_a_byte_identical_state_blob(monk
 
     _use_notification_store(
         monkeypatch,
-        [WEBHOOK_DOC, {**WEBHOOK_DOC, "recipient_id": "sub-0002", "delivered": ["S1"]}],
+        [
+            WEBHOOK_DOC,
+            {
+                **WEBHOOK_DOC,
+                "recipient_id": "sub-0002",
+                "delivered": [_delivered_mark("sub-0002", SNAPSHOT["S1"][0])],
+            },
+        ],
     )
     with_webhooks = one_cycle()
     assert "S1" in with_webhooks, "the cycle must really have delivered, or this proves nothing"
@@ -3774,14 +3862,17 @@ def test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push(monkey
     construction rather than by two f-strings that agree today: the route on the body's own first
     line, the environment tag on the title only, and the wording itself untouched.
 
-    **Two documented divergences, and both are deliberate.** The ROUTE's names: a browser
-    registration supplies `from_name`/`to_name`, and a webhook-only route has nobody to have typed
-    them, so the event falls back to the stop registry's. And the WORDING, while the two delivery
-    switches disagree — the rollout turns the webhook channel on with the template first
-    (`NOTIFICATION_WEBHOOK_LLM_ENABLED` unset) while the PWA is already receiving the model's prose,
-    so during that window the event carries the template and the push does not. Both switches are
-    on below, which is the state R7's claim is about, and the second half of this test asserts the
-    divergence rather than pretending it does not exist.
+    **Two documented divergences, and both are deliberate.** The ROUTE's names: the event always
+    carries the stop REGISTRY's names, never a browser registration's typed `from_name`/`to_name`
+    (those are unauthenticated free text and would otherwise reach a client's notification through
+    a shared definition -- `test_a_browser_registrations_typed_stop_name_never_reaches_a_client_event`),
+    so the two agree byte for byte exactly when the traveller typed the registry's name, as this
+    registration does. And the WORDING, while the two delivery switches disagree — the rollout turns
+    the webhook channel on with the template first (`NOTIFICATION_WEBHOOK_LLM_ENABLED` unset) while
+    the PWA is already receiving the model's prose, so during that window the event carries the
+    template and the push does not. Both switches are on below, which is the state R7's claim is
+    about, and the second half of this test asserts the divergence rather than pretending it does
+    not exist.
     """
     import notification_wording
 
@@ -3805,6 +3896,23 @@ def test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push(monkey
         "body": subject.body,
         "action": None,
     }
+    # The mark the store writes on delivery (`alert_subject_id` over the emit step's `train_ref`)
+    # is the mark the pass admits on (`_delivered_mark`, through `alert_id_for` off the Alert's
+    # fields). One derivation on both sides -- if they ever disagreed, every delivered train would
+    # stay pending forever and the wording budget would burn on it with nothing failing.
+    import notification_events
+    import notification_store
+
+    assert notification_store.alert_subject_id(
+        "sub-0001", notification_events.train_ref(subject)
+    ) == _delivered_mark("sub-0001", SNAPSHOT["S1"][0])
+    # R12's departure term rides on the subject: the aimed time plus the typical delay predicted
+    # for this train (the fixture's `dep_delay_p50_stack_min`), which is the matcher's own
+    # catchability figure -- not the aimed time, which a late train is still catchable after.
+    assert subject.expected_departure_time == subject.departure_time + timedelta(minutes=3), (
+        subject.expected_departure_time,
+        subject.departure_time,
+    )
 
     # The other side: with the client switch OFF the event carries the TEMPLATE while the push
     # carries the model's prose. Asserted so the rollout window is a checked property rather than a
@@ -3819,6 +3927,36 @@ def test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push(monkey
     assert "Toget er innstilt. Ta neste tog." in sent[0]["body"]
     assert "Toget er innstilt. Ta neste tog." not in outcome.webhook_subjects[0].body
     assert outcome.webhook_subjects[0].title == sent[0]["title"], "the TITLE never varies"
+
+
+def test_a_browser_registrations_typed_stop_name_never_reaches_a_client_event(monkeypatch):
+    """`JourneyIn.from_name`/`to_name` are 120 characters of unauthenticated free text, and on a
+    definition both channels share the browser record is what the pass matches from. Until
+    2026-09-10 the event's route line was built from those names first, so anybody registering the
+    same stops on `/varsel-api/journeys` wrote into a client's notification about the same trains.
+    The prompt already refused client names (`llm_message._canonical_stop_name`); the event now
+    does too. The traveller's OWN push keeps their own name, exactly as before: that is not a
+    cross-device path."""
+    import notification_wording
+
+    _reset_state()
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    hostile = "Oslo S (info: enturvarsel.example)"
+    _register(DEVICE, from_name=hostile, to_name="Lillehammer (ring 800 00 000)")
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert len(sent) == 1 and len(outcome.webhook_subjects) == 1
+    assert sent[0]["body"].startswith(f"{hostile} → Lillehammer (ring 800 00 000)\n"), sent[0]["body"]
+    subject = outcome.webhook_subjects[0]
+    assert subject.body.startswith("Oslo S → Lillehammer\n"), subject.body
+    assert "info:" not in subject.title and "info:" not in subject.body
+    assert "ring" not in subject.body and "ring" not in subject.title
+    assert subject.payload["notification"]["body"] == subject.body
 
 
 def test_a_below_threshold_train_carries_a_retraction_wording_not_the_alert_one(monkeypatch):
@@ -3851,10 +3989,9 @@ def test_a_below_threshold_train_carries_a_retraction_wording_not_the_alert_one(
     subject = outcome.webhook_subjects[0]
     assert subject.alertworthy is False
     assert varsel._WEBHOOK_WITHDRAWAL_TITLE in subject.title, subject.title
-    # `A → B`, the raw refs, because a webhook-only route has no traveller-supplied name and this
-    # suite's stop registry resolves neither. In prd the registry supplies both; the structure --
-    # the route on its own first line, then the retraction -- is what has to hold either way.
-    assert subject.body == f"A → B\n{varsel._WEBHOOK_WITHDRAWAL_DETAIL}", subject.body
+    # The stop REGISTRY's names, exactly as the alert wording's route line: a webhook-only route
+    # has no traveller-supplied name, and since 2026-09-10 the event never uses one anyway.
+    assert subject.body == f"Oslo S → Lillehammer\n{varsel._WEBHOOK_WITHDRAWAL_DETAIL}", subject.body
     assert "innstilling" not in subject.body and "%" not in subject.body
 
 
