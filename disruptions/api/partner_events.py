@@ -43,7 +43,8 @@ the slow path and the correct one.
 (:class:`_EmitBudget`, ``varsel._WriteBudget``'s shape) makes :data:`_EMIT_DEADLINE_S` a ceiling on
 when the step *ends* under bounded slowness; an outer bounded wait on a worker thread
 (:data:`_EMIT_WAIT_S`) is the backstop for a store call that hangs, which the reservation cannot
-see because ``partner_store`` takes no per-call deadline. Both numbers are sized so this step plus
+see: ``partner_store`` plumbs :data:`~partner_store._CALL_DEADLINE_S` into every READ, a transaction's
+reads included, but a transactional COMMIT carries no timeout at all. Both numbers are sized so this step plus
 :mod:`partner_delivery`'s stay under KTD6's own 30 s reversal trigger for the phase.
 """
 
@@ -68,10 +69,13 @@ OSLO = ZoneInfo("Europe/Oslo")
 # ---- Bounds ------------------------------------------------------------------------------------
 #
 # KTD6: "The load step and the emit transactions each carry a per-call Firestore deadline and a
-# whole-step budget reserved the way the delivery deadline is." The per-call half is the one thing
-# `partner_store` cannot express -- it plumbs no `timeout=` into the client -- so what stands in for
-# it is the outer bounded wait below, in the shape `varsel._load_partner_recipients` already uses
-# for the load step, and the residual is a leaked thread rather than a stalled poller.
+# whole-step budget reserved the way the delivery deadline is." The per-call half is now real for
+# READS -- `partner_store._CALL_DEADLINE_S` (4.0 s, under this module's own `_EMIT_WAIT_S` so a hung
+# read surfaces as the store's own retryable `DeadlineExceeded` rather than as our timeout with a
+# thread still running) -- and is still unexpressible for the COMMIT, which the Python client's
+# `@firestore.transactional` offers no way to bound. So the outer bounded wait below still stands in
+# for it, in the shape `varsel._load_partner_recipients` already uses for the load step, and the
+# residual is a leaked thread rather than a stalled poller.
 #
 # Sized against the phase, not against this step: `partner_delivery` reserves 20 s (KTD6's number,
 # not ours to move) and the two run in one `main._phase`, whose measured `ms` is the number KTD6's

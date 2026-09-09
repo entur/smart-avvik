@@ -25,6 +25,7 @@ from google.cloud import bigquery as _bq
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
 import main
+import partner_servability
 
 
 class _RecordingClient:
@@ -473,8 +474,8 @@ def test_the_partner_notifications_flag_is_an_allow_list_with_unset_off():
             assert main._partner_notifications_enabled() is want, value
 
 
-def test_the_partner_channel_adds_exactly_one_rebuild_phase_after_the_alerting_step():
-    """U6: the cycle gains ONE phase, `partner_webhooks`, and it is last.
+def test_the_partner_channel_adds_exactly_two_rebuild_phases_after_the_alerting_step():
+    """U6: the cycle gains `partner_webhooks`, and AE13's second clause adds `partner_servability`.
 
     Two halves of this were settled by U2 and by U6 respectively, and the difference matters.
 
@@ -489,6 +490,13 @@ def test_the_partner_channel_adds_exactly_one_rebuild_phase_after_the_alerting_s
     after `check_and_notify` has RETURNED means a raise cannot unwind either of them at all. It
     also gives the Verification Contract's cycle-budget row a real `poller_phase` reading, which is
     the same number KTD6's reversal trigger is stated in.
+
+    The **servability re-check** (R6, AE13's second clause) is a THIRD phase and not a fold into
+    either neighbour. Not into `varsel_recheck_service`, whose analogue it is, because a Firestore
+    read inside the browser phase blurs both the timing attribution and KTD6's ordering guarantee.
+    And not into `partner_webhooks`, because that phase's `ms` is what KTD6's reversal trigger
+    reads: its two steps reserve 28 s against a 30 s trigger, so a third reservation inside it would
+    fire the trigger on a healthy cycle.
 
     Pinned as an exact tuple rather than a containment check, in both directions: a phase silently
     added here is a cycle-timing change nobody asked for, and a phase silently REMOVED is how a
@@ -517,6 +525,7 @@ def test_the_partner_channel_adds_exactly_one_rebuild_phase_after_the_alerting_s
         "varsel_recheck_service",
         "varsel_notify",
         "partner_webhooks",
+        "partner_servability",
     ), phases
     # And the alerting step is still isolated exactly as it was: its own try/except, so a partner
     # store outage inside it degrades alerting alone and the feed rebuild above it is untouched.
@@ -550,7 +559,13 @@ def test_the_partner_phase_is_gated_guarded_twice_and_fed_by_a_return_value():
     import inspect
 
     source = inspect.getsource(main._rebuild_all)
-    phase = source[source.index('_phase("partner_webhooks"') :]
+    # Bounded at the NEXT phase, not run to the end of the function. `partner_servability` follows
+    # this one and carries a guard of its own, so an unbounded slice would count three
+    # `except Exception:` and pass only if the count assertion below were weakened -- which would
+    # retire the thing it checks, that emit and deliver are guarded separately.
+    phase = source[
+        source.index('_phase("partner_webhooks"') : source.index('_phase("partner_servability"')
+    ]
     assert "if varsel.partner_channel_enabled():" in source
     assert source.index("if varsel.partner_channel_enabled():") < source.index(
         '_phase("partner_webhooks"'
@@ -585,6 +600,72 @@ def test_the_partner_store_is_now_injected_into_varsel_as_the_recipient_provider
     configure = configure[: configure.index("llm_message.configure(")]
     assert "partner_enabled=_partner_notifications_enabled" in configure
     assert "partner_recipients_provider=partner_store.recipient_documents" in configure
+
+
+def test_the_servability_phase_is_gated_guarded_and_last():
+    """AE13's second clause at the wiring: what gates it, what contains it, and where it sits.
+
+    Four assertions, each about a failure that is silent without it.
+
+    * It is GATED on `varsel.partner_channel_enabled()`. Ungated, every deployment that has
+      onboarded nobody -- and tst, which has no named Firestore database -- would read the store on
+      every cycle and log a `NotConfigured` traceback for an empty population, which is the same
+      noise the phase above is gated to avoid. The cost of gating is stated rather than hidden: a
+      partner onboarded before the flag is set reads the create-time answer with
+      `servable_checked_at` publishing its age.
+    * It is GUARDED, so a store outage inside it cannot reach the cycle. `_phase` re-raises by
+      design, so the try/except around the `with` is the only thing that contains it.
+    * It is LAST, after `partner_webhooks`. Ahead of it, a servability re-check that ran long would
+      eat the delivery phase's reserved clock; behind it, nothing partner-side can unwind the
+      browser cycle's durable writes.
+    * It names no `outcome`. This phase is fed by the store, not by the notification pass, and
+      taking a dependency on the pass's return value would make a cycle whose alerting raised skip
+      a re-check that has nothing to do with it.
+    """
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    phase = source[source.index('_phase("partner_servability"') :]
+    assert source.index('_phase("partner_webhooks"') < source.index('_phase("partner_servability"')
+    gates = [i for i in range(len(source)) if source.startswith("if varsel.partner_channel_enabled():", i)]
+    assert len(gates) == 2, "each partner phase carries its own gate"
+    assert gates[1] < source.index('_phase("partner_servability"'), (
+        "the gate must be outside the phase, or an ungated cycle still times a step it skipped"
+    )
+    assert phase.count("except Exception:") == 1, phase
+    assert "partner_servability.recheck()" in phase
+    assert "Partner servability re-check failed" in phase
+    assert "outcome" not in phase, (
+        "the re-check is fed by the store, not by this cycle's notification pass"
+    )
+
+
+def test_the_servability_seam_is_the_same_one_the_partner_api_answers_from():
+    """One seam object for both halves of R6, and one number for the worst case.
+
+    `partner_api._record_servability` answers at create/replace and `partner_servability.recheck`
+    re-answers on the cadence; wiring them to two different callables would let the caveat a
+    partner is shown and the re-check that clears it disagree about the same pair.
+
+    The second half is a parity pin `partner_servability` cannot make itself: its reservation budget
+    reserves the seam's own worst case, and the seam's timeout lives in `main`, which a poller-side
+    module cannot import. Under-state it and the reservation stops being a ceiling on when the phase
+    ends -- which is the whole reason it reserves rather than measures.
+
+    Checked over `lifespan`'s source because entering the lifespan starts the poller thread, which
+    this suite must never do (it spends real BigQuery money per cycle).
+    """
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    assert "partner_servability.configure(connectivity=varsel._service_verdict)" in source
+    api = source[source.index("partner_api.configure(") :]
+    assert "connectivity=varsel._service_verdict," in api[: api.index(")")]
+    assert partner_servability._WORST_CASE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
+    assert partner_servability._DEADLINE_S > partner_servability._WORST_CASE_CHECK_S, (
+        "a deadline equal to the worst case admits exactly one check, making the count ceiling "
+        "decoration"
+    )
 
 
 if __name__ == "__main__":

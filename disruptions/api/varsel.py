@@ -878,7 +878,7 @@ def recheck_service() -> None:
     """Re-ask about journeys flagged as having no direct service, and clear the ones that now do.
 
     Called from the poller's refresh cycle. Bounded by design: only flagged journeys are re-asked, and
-    each at most once per :data:`_SERVICE_RECHECK_S`, so this costs nothing on a healthy list.
+    each at most once per :data:`_SERVICE_RECHECK`, so this costs nothing on a healthy list.
     """
     now = datetime.now(UTC)
     with _state_lock:

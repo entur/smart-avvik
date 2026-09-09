@@ -26,6 +26,7 @@ import partner_api  # sibling module: the authenticated partner API (/notificati
 import partner_auth  # sibling module: partner accounts, API keys, callback destinations, audit
 import partner_delivery  # sibling module: one bounded webhook attempt per pending partner event
 import partner_events  # sibling module: this cycle's observations turned into committed events
+import partner_servability  # sibling module: R6's freshness half, re-asked on the poller's cadence
 import partner_store  # sibling module: durable partner subscriptions, events and deliveries
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
@@ -1142,6 +1143,40 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                 partner_delivery.deliver_pending()
             except Exception:
                 logger.exception("Partner webhook delivery failed")
+    # R6's freshness half, and AE13's second clause: partner subscriptions carrying a stale "no
+    # direct service" caveat -- or one that was never established -- are re-asked, and the caveat is
+    # dropped from any pair a later timetable does connect. `varsel.recheck_service` above does
+    # exactly this for browser registrations and cannot reach these: it walks `varsel._journeys`,
+    # which is browser-only by design. Without it a weekend-only or seasonal pair carries its caveat
+    # for the life of the subscription, which is the refusal R5 forbids with extra steps.
+    #
+    # ITS OWN PHASE, and not folded into either neighbour. Not into `varsel_recheck_service`,
+    # because a Firestore read and a partner write inside the browser phase would blur both the
+    # timing attribution and KTD6's guarantee that partner work runs after the browser cycle's
+    # durable writes. And not into `partner_webhooks`, for a sharper reason: that phase's measured
+    # `ms` is the number KTD6's reversal trigger is stated in ("move delivery out when the webhook
+    # phase exceeds 30 s of measured phase time"), its two steps reserve 28 s of ceiling against it,
+    # and adding this step's own reservation would make that trigger fire on a healthy cycle.
+    #
+    # What that reservation is, stated as the number it actually is:
+    # `partner_servability._DEADLINE_S` (30 s) plus one `set_servability`, because the budget
+    # reserves the BigQuery question and not the store write that follows it. The module's own
+    # `_DEADLINE_S` comment carries why the residual is left rather than reserved. Typical is ~0:
+    # nothing is due on a healthy list, and a due one costs ~2 s.
+    #
+    # Gated on the same `partner_channel_enabled()` as the phase above, deliberately, even though
+    # `/notification-api/v1` mounts unconditionally and serves the caveat whether or not the channel
+    # is on. Gating it keeps "the flag is unset, so no partner state was read" a property of the
+    # poller; ungated, every deployment that has onboarded nobody -- and tst, which has no named
+    # database -- would read Firestore and ask BigQuery on every cycle for a population that is
+    # empty. What a partner sees in the onboarding window is the create-time answer with
+    # `servable_checked_at` publishing its age, which is R6's "how fresh" rather than an all-clear.
+    if varsel.partner_channel_enabled():
+        with _phase("partner_servability", timings):
+            try:
+                partner_servability.recheck()
+            except Exception:
+                logger.exception("Partner servability re-check failed; existing caveats stand")
 
 
 def _togvarsel_notify_enabled() -> bool:
@@ -1260,6 +1295,12 @@ async def lifespan(app: FastAPI):
         canonicalize=varsel.canonical_stop,
         connectivity=varsel._service_verdict,
     )
+    # The poller-side half of the same question (R6, AE13's second clause). The SAME seam object as
+    # the line above, deliberately: a subscription's caveat and its re-check have to be the answer
+    # one function gives, or the create-time verdict and the refresh could disagree about a pair
+    # while both looked right. Unwired, `partner_servability.recheck()` returns before it reads the
+    # store, so nothing here is a cost in a deployment that never sets the seam.
+    partner_servability.configure(connectivity=varsel._service_verdict)
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody
     # runs build scripts against — without this the table would simply be missing there. Its own

@@ -25,8 +25,9 @@ below is one of the five bounds KTD6 names against it:
 deadline, and ``http.client`` reads response headers a line at a time, so a partner drip-feeding
 one byte per second can hold a worker for several multiples of the read timeout --
 ``webhook_client``'s docstring states that and delegates the containment here. ``partner_store``
-plumbs no ``timeout=`` into the Firestore client either, so a hung store call has no ceiling of its
-own. Both are contained the same way: every task is submitted to the pool and the pool is awaited
+bounds every READ with ``_CALL_DEADLINE_S`` but a transactional COMMIT carries no timeout the Python
+client can express, so a hung store WRITE still has no ceiling of its own. Both are contained the
+same way: every task is submitted to the pool and the pool is awaited
 for :data:`_DELIVERY_WAIT_S`, then abandoned with ``shutdown(wait=False)``. The reservation budget
 is what bounds the *ordinary* pass; the bounded wait is what bounds a pass with something hung in
 it. They are different failures and neither one catches both.
