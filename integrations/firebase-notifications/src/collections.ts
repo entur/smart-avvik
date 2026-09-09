@@ -4,7 +4,7 @@
 // and `firestore.rules`. Four of them are TypeScript and one is not, so a constant cannot make the
 // rules file follow -- what it does is make the disagreement checkable, and the emulator suite
 // asserts every name here is denied to a client SDK. A collection added in code and forgotten in the
-// rules is readable by any signed-in user of the partner's own app, and there is nothing in a
+// rules is readable by any signed-in user of the client's own app, and there is nothing in a
 // TypeScript build that would notice.
 
 export const COLLECTIONS = {
@@ -29,7 +29,7 @@ export const ALL_COLLECTIONS: readonly CollectionName[] = Object.values(COLLECTI
  * A document id may not contain `/`, may not be `.` or `..`, and is capped at 1500 bytes. Two of the
  * three ids here come off the wire: `alert_id` is opaque -- the sender composes it from a
  * subscription and a train and publishes no format at all -- and `event_id`, while today a 40-character
- * hex digest on the sending side (`partner_store.event_id_for`, SHA-256 truncated), is documented
+ * hex digest on the sending side (`notification_store.event_id_for`, SHA-256 truncated), is documented
  * only as "immutable and deterministic over (alert_id, revision)". A receiver that hard-codes today's
  * shape is a receiver that breaks silently the day it changes, and a `/` slipping into a document id
  * does not error: it creates a SUBCOLLECTION, so the write appears to succeed and the read finds

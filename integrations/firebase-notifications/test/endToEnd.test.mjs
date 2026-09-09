@@ -3,7 +3,7 @@
 //
 // "With no real disruption" is `POST /notification-api/v1/test-events` (R15): a synthetic event for
 // a subscription created `test: true`, signed over exactly the bytes the route emits, dialled at the
-// partner's callback. So the body below is `disruptions/api/partner_api.py`'s `_synthetic_event`
+// client's callback. So the body below is `disruptions/api/notification_api.py`'s `_synthetic_event`
 // itself, READ from the sample that function was dumped into (`contracts/test-event-sample.json`)
 // rather than transcribed -- a fixture that drifted from that function would prove the package
 // works on an event nobody sends, which is exactly what this one did until 2026-09-09. See the
@@ -16,10 +16,10 @@
 //     `test/emulator/` exists for the Firestore-backed adapters' transaction semantics, which is a
 //     different question, and one the plan itself says an emulator cannot settle ("a simple locking
 //     approach ... does not mirror production concurrency").
-//   * This is the first thing a partner runs. Behind `test:emulator` it would need Java 21+ and the
+//   * This is the first thing a client runs. Behind `test:emulator` it would need Java 21+ and the
 //     Firebase CLI to answer "does the quickstart work at all?", which is exactly the barrier the
 //     vendored package exists to remove.
-//   * The "declared partner runtime" half (KTD11: compiled CommonJS, `.d.ts`, Node >= 24) is already
+//   * The "declared client runtime" half (KTD11: compiled CommonJS, `.d.ts`, Node >= 24) is already
 //     half-covered right here and fully covered next door. `test/helpers/adapters.mjs` imports
 //     `@entur/kix-notifications-client` through the npm `file:` link, whose `main` is
 //     `./dist/index.js` and which `pretest` builds -- so every client-side symbol this file touches
@@ -42,7 +42,7 @@ import { NOW, TEST_SECRET, encode, fakeResponse, memoryAdapters } from "./helper
  * The sample event, dumped from the real producer and shipped in the client package's `contracts/`.
  *
  * **It is read rather than transcribed, and that is the whole point of this block.** The fixture
- * below WAS a hand-written transcription of `disruptions/api/partner_api.py::_synthetic_event`,
+ * below WAS a hand-written transcription of `disruptions/api/notification_api.py::_synthetic_event`,
  * announced as one "field for field" in its own docstring -- and by 2026-09-09 it had drifted from
  * that function in eight places: `call.aimed_departure` for `aimed_departure_time`, invented
  * `call.operator`/`call.line`, missing `call.stop_order`/`departs_tomorrow`,
@@ -51,7 +51,7 @@ import { NOW, TEST_SECRET, encode, fakeResponse, memoryAdapters } from "./helper
  * two empty `situations` lists that are never empty, a `valid_until` an hour out, and a title and
  * body neither producer writes. Nothing failed: `payload.call` and `payload.probabilities` are
  * deliberately OPEN objects in `event.schema.json`, so a wrongly named key inside them is
- * schema-VALID -- which makes this file, read by a partner as the worked example of a real payload,
+ * schema-VALID -- which makes this file, read by a client as the worked example of a real payload,
  * the last place a transcription belongs.
  *
  * Resolved through `@entur/kix-notifications-client` rather than through the repository, because
@@ -114,7 +114,7 @@ function syntheticEvent(nonce = "0123456789ab") {
 test("the fixture is the producer's event, not a second description of it", () => {
   // The transcription that used to live here drifted silently for want of exactly this. Key sets
   // rather than values, because the two substitutions above are deliberate and the keys are what a
-  // partner types their receiver against.
+  // client types their receiver against.
   const built = syntheticEvent();
   assert.deepEqual(Object.keys(built), Object.keys(SAMPLE.event));
   assert.deepEqual(Object.keys(built.payload), Object.keys(SAMPLE.event.payload));
@@ -126,7 +126,7 @@ test("the fixture is the producer's event, not a second description of it", () =
     );
   }
   // The three fields the producer states as a coherent confirmed cancellation, asserted here so a
-  // regenerated sample that lost the coherence fails in the package a partner reads first.
+  // regenerated sample that lost the coherence fails in the package a client reads first.
   assert.equal(built.phase, "confirmed");
   assert.equal(built.payload.effect, "cancelled");
   assert.equal(built.payload.probabilities.delay_ge10, null);
@@ -257,7 +257,7 @@ test("scenario 1: a signed synthetic event becomes one native notification", asy
   // The body names both ends of the trip, which is what makes it renderable with no second call.
   assert.ok(call.event.payload.notification.body.includes(FROM_STOP));
   assert.ok(call.event.payload.notification.body.includes(TO_STOP));
-  assert.equal(call.event.partner_ref, "commuter-4711", "the partner's own handle rides along");
+  assert.equal(call.event.external_ref, "commuter-4711", "the client's own handle rides along");
   assert.equal(await stores.inbox.get(event.event_id).then((r) => r.status), "dispatched");
 });
 
@@ -275,7 +275,7 @@ test("the integrator implements no signature, idempotency, ordering or suppressi
   for (const provided of ["inbox", "ledger", "suppressions"]) {
     assert.ok(
       !supplied.has(provided),
-      `${provided} comes from the package (createMemoryStores / createFirestore*), not the partner`,
+      `${provided} comes from the package (createMemoryStores / createFirestore*), not the client`,
     );
     assert.ok(adapters[provided], `${provided} must still be wired`);
   }
@@ -323,7 +323,7 @@ test("without an opt-in test recipient map, a synthetic event reaches nobody", a
 });
 
 test("the same synthetic event delivered again produces no second notification", async () => {
-  // At-least-once dispatch is the sender's published contract, so a partner WILL see a repeat: a
+  // At-least-once dispatch is the sender's published contract, so a client WILL see a repeat: a
   // retry crossing a cycle boundary, a crash between our attempt and its `sent` write, the trigger
   // re-running. One decision, replayed.
   const { adapters, stores, dispatched } = harness();

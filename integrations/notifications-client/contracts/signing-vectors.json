@@ -1,5 +1,5 @@
 {
-  "$comment": "Cross-language signing vectors for the partner notification channel. Produced by disruptions/api/webhook_signing.py and re-derived by disruptions/api/test_webhook_signing.py, so this file cannot drift from the code that signs. Consumed by integrations/notifications-client (TypeScript, via the `standardwebhooks` npm package). Every secret and the root below are TEST VALUES and appear in no deployment.",
+  "$comment": "Cross-language signing vectors for the webhook channel. Produced by disruptions/api/webhook_signing.py and re-derived by disruptions/api/test_webhook_signing.py, so this file cannot drift from the code that signs. Consumed by integrations/notifications-client (TypeScript, via the `standardwebhooks` npm package). Every secret and the root below are TEST VALUES and appear in no deployment.",
   "version": 1,
   "scheme": {
     "name": "Standard Webhooks",
@@ -19,26 +19,26 @@
     "webhook_id": "the delivery id: STABLE across every attempt at one delivery, so a receiver may dedupe on it. The timestamp and signature are regenerated per attempt."
   },
   "derivation": {
-    "$comment": "How a destination's secret is produced, so no signing material is stored anywhere. A partner never needs this -- they are handed the secret -- but an operator reproducing a signature does.",
+    "$comment": "How a destination's secret is produced, so no signing material is stored anywhere. A client never needs this -- they are handed the secret -- but an operator reproducing a signature does.",
     "algorithm": "HMAC-SHA256(root, material)",
     "material": "'kix.webhook.signing.v1' + '|' + <byte length of destination_id in utf-8> + '|' + <destination_id> + '|' + <generation>",
     "material_encoding": "utf-8",
     "why_length_framed": "a destination id is an operator-supplied string, so ('a', 11) and ('a1', 1) must not share a preimage; a bare separator only holds while no id contains that separator",
     "secret_format": "'whsec_' + base64(the 32 raw HMAC bytes), standard alphabet, padded",
-    "root_env_var": "PARTNER_SIGNING_ROOT",
+    "root_env_var": "WEBHOOK_SIGNING_ROOT",
     "test_root": "kix-test-signing-root-not-used-in-any-deployment",
     "examples": [
       {
-        "destination_id": "dst_partner_a_prod",
+        "destination_id": "dst_client_a_prod",
         "generation": 2,
-        "material": "kix.webhook.signing.v1|18|dst_partner_a_prod|2",
-        "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8="
+        "material": "kix.webhook.signing.v1|17|dst_client_a_prod|2",
+        "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU="
       },
       {
-        "destination_id": "dst_partner_b_prod",
+        "destination_id": "dst_client_b_prod",
         "generation": 2,
-        "material": "kix.webhook.signing.v1|18|dst_partner_b_prod|2",
-        "secret": "whsec_8Z8dFhFl9JvobGMFBq8xXJtCRY6HCJLMQ42ZbXZ62DU="
+        "material": "kix.webhook.signing.v1|17|dst_client_b_prod|2",
+        "secret": "whsec_4+Xz+/xL5w4gEw90+h/EtKrxx18nHya9keAq20AySz4="
       }
     ]
   },
@@ -52,7 +52,7 @@
     },
     "python_reference": "webhook_signing.verify(secret=..., webhook_id=..., timestamp=..., body=..., header=..., now=...) -- `now` is injectable, which is how the stale vector is proved to fail for the timestamp rather than for the MAC.",
     "per_secret_fields": {
-      "secret": "the whsec_ value a partner would hold",
+      "secret": "the whsec_ value a client would hold",
       "signature": "that secret's own 'v1,<base64>' entry over this vector's content",
       "verifies": "whether this secret must accept `signature_header`. False means it must be rejected -- a revoked generation, or another destination's key."
     },
@@ -63,7 +63,7 @@
     {
       "name": "plain",
       "why": "The base case. One live generation, a fresh timestamp, an ASCII body. If this vector fails, nothing else in this file will tell you why.",
-      "destination_id": "dst_partner_a_prod",
+      "destination_id": "dst_client_a_prod",
       "webhook_id": "dlv_01J9Z4KQ7X",
       "webhook_timestamp": "1789197300",
       "body": "{\"schema_version\":\"1\",\"event_id\":\"7f3c1a\",\"type\":\"journey.alert.created\",\"alert_id\":\"a1b2\",\"revision\":351,\"phase\":\"predicted\",\"test\":false}",
@@ -71,23 +71,23 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,sp6Wctx953axNvI2kMS4JFEiERxnhRi5nrgmjv0m878=",
+      "signature_header": "v1,WrZ6Y4MdLgU/2UenHJtx0NaDQQ5jzAlIty/MVyZveaE=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
       "secrets": [
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8=",
-          "signature": "v1,sp6Wctx953axNvI2kMS4JFEiERxnhRi5nrgmjv0m878=",
+          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
+          "signature": "v1,WrZ6Y4MdLgU/2UenHJtx0NaDQQ5jzAlIty/MVyZveaE=",
           "verifies": true
         },
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 1,
-          "secret": "whsec_yZTA27wMraTYPC33Wsh2OCPni8keqrcJnDK6JGKzqyY=",
-          "signature": "v1,7nS0EuqyBP1PW2VbT3iViEv/lKimJvNxgJ30CQ8nUYA=",
+          "secret": "whsec_cSAKKovoN4ANi5kMAoC5TSLCewviq/xzSDIlu9PyxNU=",
+          "signature": "v1,aSfuHZctxTMgxxEPZ6oUbQDmJ/k8sb2cEyp7ukqsJMw=",
           "verifies": false
         }
       ]
@@ -95,7 +95,7 @@
     {
       "name": "retry-same-id-new-timestamp",
       "why": "The SECOND attempt at the same delivery. `webhook_id` is identical to the `plain` vector -- a receiver dedupes on it -- while the timestamp and therefore the signature differ. Reusing the first attempt's timestamp would put a retry outside the 300 s replay window, so a correct receiver would drop our own retry as an attack.",
-      "destination_id": "dst_partner_a_prod",
+      "destination_id": "dst_client_a_prod",
       "webhook_id": "dlv_01J9Z4KQ7X",
       "webhook_timestamp": "1789197597",
       "body": "{\"schema_version\":\"1\",\"event_id\":\"7f3c1a\",\"type\":\"journey.alert.created\",\"alert_id\":\"a1b2\",\"revision\":351,\"phase\":\"predicted\",\"test\":false}",
@@ -103,16 +103,16 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,SQz/+0x9kjeJrOJPWlGXYOy/0yp734OlQXDWnZF0C1c=",
+      "signature_header": "v1,E6j0aII5zsr2JB8GRXeWOeoCUfkr5UJG68FFwuN5fn0=",
       "verify_at_unix_seconds": "1789197597",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
       "secrets": [
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8=",
-          "signature": "v1,SQz/+0x9kjeJrOJPWlGXYOy/0yp734OlQXDWnZF0C1c=",
+          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
+          "signature": "v1,E6j0aII5zsr2JB8GRXeWOeoCUfkr5UJG68FFwuN5fn0=",
           "verifies": true
         }
       ],
@@ -121,7 +121,7 @@
     {
       "name": "rotated-pair",
       "why": "A rotation in progress. The header carries TWO entries, active generation first; each verifies on its own, so either can be revoked without a flag day. A revoked older generation must not verify.",
-      "destination_id": "dst_partner_a_prod",
+      "destination_id": "dst_client_a_prod",
       "webhook_id": "dlv_01J9Z5R2M4",
       "webhook_timestamp": "1789197300",
       "body": "{\"schema_version\":\"1\",\"event_id\":\"7f3c1a\",\"type\":\"journey.alert.created\",\"alert_id\":\"a1b2\",\"revision\":351,\"phase\":\"predicted\",\"test\":false}",
@@ -129,38 +129,38 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,erii9g29nqUbEBkxt52UG3bP0Bm8rfDBv6dJORJ/4ns= v1,qAm/CgtdCBI2tIEM/+y1zHI69J4yc58Wd8B2BnepSws=",
+      "signature_header": "v1,GAR/qmAZLgxye+8VNiafZs3D7t+DKciv7TrXNbQevDQ= v1,jwHL7+lLIRtXOFay2hPJ/O/EzcM75HRukZqWo9LvxGA=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
       "secrets": [
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 3,
-          "secret": "whsec_RPljTBg368DvjbJ7Jj7O33x5V+/LL+PPThk19+WTFMg=",
-          "signature": "v1,erii9g29nqUbEBkxt52UG3bP0Bm8rfDBv6dJORJ/4ns=",
+          "secret": "whsec_6oWMkBdb7zwj7psLi7OlMG+VGeLlNLHlrvB9eL8ambs=",
+          "signature": "v1,GAR/qmAZLgxye+8VNiafZs3D7t+DKciv7TrXNbQevDQ=",
           "verifies": true
         },
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8=",
-          "signature": "v1,qAm/CgtdCBI2tIEM/+y1zHI69J4yc58Wd8B2BnepSws=",
+          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
+          "signature": "v1,jwHL7+lLIRtXOFay2hPJ/O/EzcM75HRukZqWo9LvxGA=",
           "verifies": true
         },
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 1,
-          "secret": "whsec_yZTA27wMraTYPC33Wsh2OCPni8keqrcJnDK6JGKzqyY=",
-          "signature": "v1,6rWM0Dlq2XcHQATO7LJS/IgZ1UZ7dIBp1CNHzzXPdro=",
+          "secret": "whsec_cSAKKovoN4ANi5kMAoC5TSLCewviq/xzSDIlu9PyxNU=",
+          "signature": "v1,clGnX4hLuvatyaSpByG2EgZ9LS9v1vtyZLVhIap7y7I=",
           "verifies": false
         }
       ]
     },
     {
       "name": "cross-destination-isolation",
-      "why": "The same message signed for destination A. Destination B's secret for the same generation must NOT verify it: each destination's key is derived from the root over its own id, so one partner's leaked receiver secret forges nothing for another.",
-      "destination_id": "dst_partner_a_prod",
+      "why": "The same message signed for destination A. Destination B's secret for the same generation must NOT verify it: each destination's key is derived from the root over its own id, so one client's leaked receiver secret forges nothing for another.",
+      "destination_id": "dst_client_a_prod",
       "webhook_id": "dlv_01J9Z6T8P1",
       "webhook_timestamp": "1789197300",
       "body": "{\"schema_version\":\"1\",\"event_id\":\"7f3c1a\",\"type\":\"journey.alert.created\",\"alert_id\":\"a1b2\",\"revision\":351,\"phase\":\"predicted\",\"test\":false}",
@@ -168,23 +168,23 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,4jkEI+bsD+XAhx8y+hsqHQjgQoATkGLoE1g0fLWbats=",
+      "signature_header": "v1,RaoVmpPooUJdD4vNlBiMeHi8PrTxPAz6KXamM0GiQwA=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
       "secrets": [
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8=",
-          "signature": "v1,4jkEI+bsD+XAhx8y+hsqHQjgQoATkGLoE1g0fLWbats=",
+          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
+          "signature": "v1,RaoVmpPooUJdD4vNlBiMeHi8PrTxPAz6KXamM0GiQwA=",
           "verifies": true
         },
         {
-          "destination_id": "dst_partner_b_prod",
+          "destination_id": "dst_client_b_prod",
           "generation": 2,
-          "secret": "whsec_8Z8dFhFl9JvobGMFBq8xXJtCRY6HCJLMQ42ZbXZ62DU=",
-          "signature": "v1,koM7s1vdiWw2MC1umcx3PiK8F3QmZwRyopHVmNR+TFg=",
+          "secret": "whsec_4+Xz+/xL5w4gEw90+h/EtKrxx18nHya9keAq20AySz4=",
+          "signature": "v1,1HmUN8Q2XYVLHup/MyfZGBAVNmKlyCyVE+hMdmvDMSw=",
           "verifies": false
         }
       ]
@@ -192,7 +192,7 @@
     {
       "name": "tampered-body",
       "why": "The header is a VALID signature over a different body (revision 351); the `body` field here is what a man in the middle changed it to (revision 352). Verification must fail. This is also the vector that catches a receiver verifying a re-serialized object instead of the raw bytes.",
-      "destination_id": "dst_partner_a_prod",
+      "destination_id": "dst_client_a_prod",
       "webhook_id": "dlv_01J9Z7V0C9",
       "webhook_timestamp": "1789197300",
       "body": "{\"schema_version\":\"1\",\"event_id\":\"7f3c1a\",\"type\":\"journey.alert.created\",\"alert_id\":\"a1b2\",\"revision\":352,\"phase\":\"predicted\",\"test\":false}",
@@ -200,16 +200,16 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "20fc156096909dbe35d38eb5859c46da3aa31569cd17c69d19f6dc6bb74de67d",
-      "signature_header": "v1,bOhxohWKWn3rzgMO8DM0dYUs+txqx83x39mQ71Yt7Qw=",
+      "signature_header": "v1,ZHkhsk9gLWTHU5NpFfdsssO5d736tt69mmScKl9Th4M=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": false,
       "secrets": [
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8=",
-          "signature": "v1,/lgFl2d+DB3+QlL1+sn2voHV5BYqG6GJHg4UkK0WUmM=",
+          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
+          "signature": "v1,TTNtMey4xm1iupvJzJ18utiiyMGcsRxsLexyaGVvO4c=",
           "verifies": false
         }
       ],
@@ -218,7 +218,7 @@
     {
       "name": "stale-timestamp",
       "why": "The signature is CORRECT over this timestamp -- only the timestamp is old (2026-01-01). So a verifier must reject it for the replay window and not for the MAC, which is what isolates the two failures. Feed this one to a verifier that reads the wall clock: it will stay stale forever.",
-      "destination_id": "dst_partner_a_prod",
+      "destination_id": "dst_client_a_prod",
       "webhook_id": "dlv_01J9Z8W3H7",
       "webhook_timestamp": "1767225600",
       "body": "{\"schema_version\":\"1\",\"event_id\":\"7f3c1a\",\"type\":\"journey.alert.created\",\"alert_id\":\"a1b2\",\"revision\":351,\"phase\":\"predicted\",\"test\":false}",
@@ -226,16 +226,16 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,2n4cNgmHPF77+wtmMHo9jbjxNGLIPTwFfpu+7OTmpKY=",
+      "signature_header": "v1,YsEyBUg+A8/iMiWhdlXHVtvD27XQ76rGlwvTaUOHdUg=",
       "verify_at_unix_seconds": "1767225901",
       "verify_at_note": "301 s past its own timestamp -- OUTSIDE the tolerance, which is what this vector tests. `mac_is_correct` is true: verify at `webhook_timestamp` itself and it passes, which is what isolates a replay-window refusal from a wrong-key refusal.",
       "mac_is_correct": true,
       "secrets": [
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8=",
-          "signature": "v1,2n4cNgmHPF77+wtmMHo9jbjxNGLIPTwFfpu+7OTmpKY=",
+          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
+          "signature": "v1,YsEyBUg+A8/iMiWhdlXHVtvD27XQ76rGlwvTaUOHdUg=",
           "verifies": false
         }
       ],
@@ -244,7 +244,7 @@
     {
       "name": "norwegian-body",
       "why": "The wording is Norwegian, so the body carries multi-byte characters (æøåÅ, an en dash, an em dash, an arrow) plus an escaped newline. Its UTF-8 byte length and its UTF-16 code-unit length DISAGREE -- see the two length fields -- which is the live failure mode when one side measures or re-encodes the string instead of hashing the UTF-8 bytes. Every character is BMP, so JavaScript's `.length` equals the UTF-16 count and is SMALLER than the byte count; a signature computed over anything but the bytes will not match.",
-      "destination_id": "dst_partner_a_prod",
+      "destination_id": "dst_client_a_prod",
       "webhook_id": "dlv_01J9Z9Y6D2",
       "webhook_timestamp": "1789197300",
       "body": "{\"schema_version\":\"1\",\"event_id\":\"9d0e2b\",\"type\":\"journey.alert.updated\",\"alert_id\":\"c3d4\",\"revision\":352,\"phase\":\"confirmed\",\"test\":false,\"notification\":{\"title\":\"Tog L1 07:18 er innstilt\",\"body\":\"Åsgårdstrand → Oslo S\\nToget kl. 07:18 er innstilt. Ta L1 kl. 07:33 — den ankommer 11 min senere. Må du være der før kl. 08:00, bør du reise nå. Typisk 3–9 min forsinket på strekningen.\"}}",
@@ -252,23 +252,23 @@
       "body_utf8_byte_length": 400,
       "body_utf16_code_unit_length": 386,
       "body_sha256_hex": "5ca1cbc553aecb711e6b8c3299e6260d79dba99daa4eccec77311450f6869b1d",
-      "signature_header": "v1,g8G5UhlkzM95H9KxfLIC5oWbaDpVlaPbnTOeIJel9VQ= v1,k9i60RlWzGJlw2WJovPMJY+f1tkSyp0ahLTDycCv0sc=",
+      "signature_header": "v1,b8O4VmOo7xwnWH+tCuyuE55AHtZmlTYTpgE4UPl303s= v1,ePZS3PHMe+j1IaYzxNm2kg891Bqe3+tsLP+hOBYwl5E=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
       "secrets": [
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 3,
-          "secret": "whsec_RPljTBg368DvjbJ7Jj7O33x5V+/LL+PPThk19+WTFMg=",
-          "signature": "v1,g8G5UhlkzM95H9KxfLIC5oWbaDpVlaPbnTOeIJel9VQ=",
+          "secret": "whsec_6oWMkBdb7zwj7psLi7OlMG+VGeLlNLHlrvB9eL8ambs=",
+          "signature": "v1,b8O4VmOo7xwnWH+tCuyuE55AHtZmlTYTpgE4UPl303s=",
           "verifies": true
         },
         {
-          "destination_id": "dst_partner_a_prod",
+          "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_BkAJ0Xm6KdFJFqTHtWVZNVkRbPfjySIekSHQGgGwbX8=",
-          "signature": "v1,k9i60RlWzGJlw2WJovPMJY+f1tkSyp0ahLTDycCv0sc=",
+          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
+          "signature": "v1,ePZS3PHMe+j1IaYzxNm2kg891Bqe3+tsLP+hOBYwl5E=",
           "verifies": true
         }
       ]

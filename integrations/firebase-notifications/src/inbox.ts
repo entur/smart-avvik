@@ -26,7 +26,7 @@ import { COLLECTIONS, encodeDocumentId } from "./collections.ts";
  *
  * A static check is the only kind available. The Firestore emulator tracks NO composite indexes: a
  * query missing its production index answers perfectly happily in every test here and throws
- * `FAILED_PRECONDITION` on the partner's first deployed sweep. That is the same trap the sending
+ * `FAILED_PRECONDITION` on the client's first deployed sweep. That is the same trap the sending
  * side closes with `test_every_query_in_the_module_has_a_checked_in_index`, and this is the same
  * shape of guard.
  */

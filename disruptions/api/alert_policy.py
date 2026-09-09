@@ -18,10 +18,10 @@ imported, like :mod:`deployment`.
 dependency graph is exactly what it was, and the module is still importable from either side of the
 ``varsel``/``impact`` pair in either order. What it adds is that the **comparison** now has one
 statement too, rather than one per surface. That matters because a second notification surface is
-being built beside `/varsel` (KTD1/KTD2 of the partner-notification plan): two surfaces each
+being built beside `/varsel` (KTD1/KTD2 of the client-notification plan): two surfaces each
 restating ``impact_p >= threshold`` is how one of them quietly acquires a cancellation-probability
 fallback, or starts reading a missing probability as a low one, and a widened gate on one surface
-would show a partner recipient alerts a `/varsel` user never sees. Note the alert-worthiness of a
+would show a webhook recipient alerts a `/varsel` user never sees. Note the alert-worthiness of a
 train is the one thing here a caller must not re-derive; the raw numbers stay public because /demo
 and the pre-screen legitimately need the bar without a probability to compare to it.
 

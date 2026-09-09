@@ -169,10 +169,10 @@ function render() {
   out.push(" * The wire envelope is EXACTLY this set and no more. `event.schema.json` is");
   out.push(" * `additionalProperties: false`, so a body carrying one extra field is a body a conforming");
   out.push(" * receiver refuses -- and the sender's store legitimately holds three fields it must not put on");
-  out.push(" * the wire (`partner_id` and `destination_id`, its own routing; `expires_at`, a retention");
+  out.push(" * the wire (`client_id` and `destination_id`, its own routing; `expires_at`, a retention");
   out.push(" * decision that is not validity). The sender projects onto an allow-list for that reason;");
   out.push(" * `parseEvent` in `contracts.ts` refuses the same set from this side, so a projection that");
-  out.push(" * regressed to a deny-list fails here rather than reaching a partner's phone.");
+  out.push(" * regressed to a deny-list fails here rather than reaching a client's phone.");
   out.push(" */");
   out.push(
     `export const EVENT_WIRE_FIELDS = [\n${Object.keys(event.properties)

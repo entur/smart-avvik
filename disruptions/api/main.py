@@ -23,12 +23,11 @@ import impact as impact_engine  # sibling module: the /impact matcher, shared wi
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
-import partner_api  # sibling module: the authenticated partner API (/notification-api/v1)
-import partner_auth  # sibling module: partner accounts, API keys, callback destinations, audit
-import partner_delivery  # sibling module: one bounded webhook attempt per pending partner event
-import partner_events  # sibling module: this cycle's observations turned into committed events
-import partner_servability  # sibling module: R6's freshness half, re-asked on the poller's cadence
-import partner_store  # sibling module: durable partner subscriptions, events and deliveries
+import notification_api  # sibling module: the authenticated notification API (/notification-api/v1)
+import notification_auth  # sibling module: client accounts, API keys, callback destinations, audit
+import notification_events  # sibling module: this cycle's observations turned into committed events
+import notification_servability  # sibling module: R6's freshness half, re-asked on the poller's cadence
+import notification_store  # sibling module: durable webhook subscriptions, events and deliveries
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
@@ -36,6 +35,7 @@ import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togme
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
 import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
+import webhook_delivery  # sibling module: one bounded webhook attempt per pending notification event
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -767,36 +767,36 @@ _CONNECTIVITY_CACHE_MAX = 512
 # reports "unknown" and registration proceeds unvalidated — the same degradation as a BigQuery
 # outage, which is the right way for a guard-rail to fail.
 _CONNECTIVITY_MAX_PER_MIN = 30
-# ...and the PARTNER channel gets its own, smaller ceiling, because the paragraph above is an
+# ...and the Webhook channel gets its own, smaller ceiling, because the paragraph above is an
 # argument about the public unauthenticated endpoint only. `alternatives._POLLER_FETCH_MAX_PER_MIN`
 # split from `_FETCH_MAX_PER_MIN` for exactly this reason — "an abuse-control number was setting the
-# alerting budget only by accident" — and this is the same mistake one layer over: partner
-# onboarding (`partner_api._record_servability`, on every create and replace) and the poller's
-# `partner_servability.recheck` both reached this seam and spent the traveller's tally. A partner may
-# issue `partner_auth.PER_PARTNER_PER_MIN` = 120 create/replace requests a minute, so a bulk
+# alerting budget only by accident" — and this is the same mistake one layer over: client
+# onboarding (`notification_api._record_servability`, on every create and replace) and the poller's
+# `notification_servability.recheck` both reached this seam and spent the traveller's tally. A client may
+# issue `notification_auth.PER_CLIENT_PER_MIN` = 120 create/replace requests a minute, so a bulk
 # onboarding of an existing commuter base — which is what this channel is FOR — exhausted a
 # traveller-facing budget as a side effect, and did it silently: `None` reads as "could not
 # establish", so a real traveller's journey then registers with no no-direct-service caveat.
 #
-# 15, half the traveller's rather than equal to it, and the asymmetry is the point: a partner's
+# 15, half the traveller's rather than equal to it, and the asymmetry is the point: a client's
 # onboarding is a batch that may legitimately take longer, a traveller is waiting on a page. 15/min
 # is 900 distinct pairs an hour against a pilot measured in tens, and the sweep contributes at most
-# `partner_servability._MAX_CHECKS_PER_CYCLE` (4) per ~296 s cycle. The worst-case BigQuery draw
+# `notification_servability._MAX_CHECKS_PER_CYCLE` (4) per ~296 s cycle. The worst-case BigQuery draw
 # from this seam therefore goes 30/min -> 45/min, which is the honest cost of the split.
-_PARTNER_CONNECTIVITY_MAX_PER_MIN = 15
+_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN = 15
 _CONNECTIVITY_REQUEST_PATH = "request"
-_CONNECTIVITY_PARTNER_PATH = "partner"
+_CONNECTIVITY_NOTIFICATION_API_PATH = "notification_api"
 # This one runs on a request path, so it gets an explicit ceiling rather than "wait forever": a slow
 # BigQuery is not a reason for a traveller's registration to hang.
 _CONNECTIVITY_TIMEOUT_S = 20.0
 _connectivity_lock = threading.Lock()
 # ONE cache across both paths, deliberately: an established answer about a stop pair is the same
-# answer whoever asked, and splitting it would make a partner's onboarding re-ask questions a
+# answer whoever asked, and splitting it would make a client's onboarding re-ask questions a
 # traveller has already paid for. Only the BUDGET is per caller.
 _connectivity_cache: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[float, tuple[bool, bool]]] = {}
 _connectivity_calls: dict[str, list[float]] = {
     _CONNECTIVITY_REQUEST_PATH: [],
-    _CONNECTIVITY_PARTNER_PATH: [],
+    _CONNECTIVITY_NOTIFICATION_API_PATH: [],
 }
 
 
@@ -813,13 +813,13 @@ def _varsel_connectivity(
     a trip that plainly exists.
 
     ``path`` names WHOSE per-minute budget this question spends — see
-    :data:`_PARTNER_CONNECTIVITY_MAX_PER_MIN`. It defaults to the public one, which is the safe
+    :data:`_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`. It defaults to the public one, which is the safe
     direction: a caller that forgets to name itself is charged the tighter, traveller-facing tally
     rather than silently minting a budget of its own.
     """
     ceiling = (
-        _PARTNER_CONNECTIVITY_MAX_PER_MIN
-        if path == _CONNECTIVITY_PARTNER_PATH
+        _NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN
+        if path == _CONNECTIVITY_NOTIFICATION_API_PATH
         else _CONNECTIVITY_MAX_PER_MIN
     )
     key = (tuple(sorted(from_refs)), tuple(sorted(to_refs)))
@@ -1141,7 +1141,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             varsel.recheck_service()
     except Exception:
         logger.exception("Varsel service re-check failed; existing warnings stand")
-    # Registered-journey alerts: match every registration -- browser and, where the partner channel
+    # Registered-journey alerts: match every registration -- browser and, where the webhook channel
     # is wired, webhook subscriptions merged in under the same journey_key -- against the fresh
     # snapshot and notify any newly alert-worthy hit. Isolated (like the other steps) so a delivery
     # failure never breaks the feed rebuild.
@@ -1156,7 +1156,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             outcome = varsel.check_and_notify(_varsel_snapshot())
     except Exception:
         logger.exception("Avviksvarsel notify failed")
-    # The partner (webhook) channel's two WRITING steps, in their own phase and deliberately after
+    # The client (webhook) channel's two WRITING steps, in their own phase and deliberately after
     # the one above (KTD6, plus the orchestrator's resolution of where the phase reading goes).
     #
     # Three things this placement buys, and each of them was a choice.
@@ -1180,23 +1180,23 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # Guarded like every other step here, and the two halves are guarded separately (R20): an emit
     # failure must not cost the deliveries already committed. Delivery runs even when the pass above
     # raised and `outcome` is None — the pending set is Firestore's, not this cycle's.
-    # Read ONCE for the cycle, and used by both partner phases below. Two reads cannot disagree in
+    # Read ONCE for the cycle, and used by both notification phases below. Two reads cannot disagree in
     # practice -- the flag is an environment variable and a container does not change one while it
-    # runs -- but `partner_channel_enabled` catches and logs a raise from the injected reader, so a
+    # runs -- but `webhook_channel_enabled` catches and logs a raise from the injected reader, so a
     # broken reader wrote the same warning with the same traceback twice on every cycle.
-    partner_channel = varsel.partner_channel_enabled()
-    if partner_channel:
-        with _phase("partner_webhooks", timings):
+    webhook_channel = varsel.webhook_channel_enabled()
+    if webhook_channel:
+        with _phase("notification_webhooks", timings):
             try:
                 if outcome is not None:
-                    partner_events.emit(outcome.partner_subjects)
+                    notification_events.emit(outcome.webhook_subjects)
             except Exception:
-                logger.exception("Partner event emission failed")
+                logger.exception("Notification event emission failed")
             try:
-                partner_delivery.deliver_pending()
+                webhook_delivery.deliver_pending()
             except Exception:
-                logger.exception("Partner webhook delivery failed")
-    # R6's freshness half, and AE13's second clause: partner subscriptions carrying a stale "no
+                logger.exception("Webhook delivery failed")
+    # R6's freshness half, and AE13's second clause: webhook subscriptions carrying a stale "no
     # direct service" caveat -- or one that was never established -- are re-asked, and the caveat is
     # dropped from any pair a later timetable does connect. `varsel.recheck_service` above does
     # exactly this for browser registrations and cannot reach these: it walks `varsel._journeys`,
@@ -1204,32 +1204,32 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # for the life of the subscription, which is the refusal R5 forbids with extra steps.
     #
     # ITS OWN PHASE, and not folded into either neighbour. Not into `varsel_recheck_service`,
-    # because a Firestore read and a partner write inside the browser phase would blur both the
-    # timing attribution and KTD6's guarantee that partner work runs after the browser cycle's
-    # durable writes. And not into `partner_webhooks`, for a sharper reason: that phase's measured
+    # because a Firestore read and a client write inside the browser phase would blur both the
+    # timing attribution and KTD6's guarantee that client work runs after the browser cycle's
+    # durable writes. And not into `notification_webhooks`, for a sharper reason: that phase's measured
     # `ms` is the number KTD6's reversal trigger is stated in ("move delivery out when the webhook
     # phase exceeds 30 s of measured phase time"), its two steps reserve 28 s of ceiling against it,
     # and adding this step's own reservation would make that trigger fire on a healthy cycle.
     #
     # What that reservation is, stated as the number it actually is:
-    # `partner_servability._DEADLINE_S` (30 s) plus one `set_servability`, because the budget
+    # `notification_servability._DEADLINE_S` (30 s) plus one `set_servability`, because the budget
     # reserves the BigQuery question and not the store write that follows it. The module's own
     # `_DEADLINE_S` comment carries why the residual is left rather than reserved. Typical is ~0:
     # nothing is due on a healthy list, and a due one costs ~2 s.
     #
-    # Gated on the same `partner_channel_enabled()` as the phase above, deliberately, even though
+    # Gated on the same `webhook_channel_enabled()` as the phase above, deliberately, even though
     # `/notification-api/v1` mounts unconditionally and serves the caveat whether or not the channel
-    # is on. Gating it keeps "the flag is unset, so no partner state was read" a property of the
+    # is on. Gating it keeps "the flag is unset, so no notification state was read" a property of the
     # poller; ungated, every deployment that has onboarded nobody -- and tst, which has no named
     # database -- would read Firestore and ask BigQuery on every cycle for a population that is
-    # empty. What a partner sees in the onboarding window is the create-time answer with
+    # empty. What a client sees in the onboarding window is the create-time answer with
     # `servable_checked_at` publishing its age, which is R6's "how fresh" rather than an all-clear.
-    if partner_channel:
-        with _phase("partner_servability", timings):
+    if webhook_channel:
+        with _phase("notification_servability", timings):
             try:
-                partner_servability.recheck()
+                notification_servability.recheck()
             except Exception:
-                logger.exception("Partner servability re-check failed; existing caveats stand")
+                logger.exception("Client servability re-check failed; existing caveats stand")
 
 
 def _togvarsel_notify_enabled() -> bool:
@@ -1260,11 +1260,11 @@ def _togvarsel_notify_enabled() -> bool:
     return os.environ.get("TOGVARSEL_NOTIFY_ENABLED", "").strip().lower() in llm_message._TRUTHY
 
 
-def _partner_notifications_enabled() -> bool:
-    """The partner (webhook) notification channel's gate, read per call.
+def _notification_webhooks_enabled() -> bool:
+    """The client (webhook) notification channel's gate, read per call.
 
     ONE flag, deliberately — the convention above and not its shape. `_togvarsel_notify_enabled`
-    ANDs two because rushvarsel has a master product gate over three separate surfaces; the partner
+    ANDs two because rushvarsel has a master product gate over three separate surfaces; the client
     channel has exactly one surface and one question, so a second flag would be a value nobody
     varies and one more thing to re-derive when the channel is turned on.
 
@@ -1273,9 +1273,9 @@ def _partner_notifications_enabled() -> bool:
     costs), and **unset = off**, so the code default matches the closed gate instead of relying on
     helm values alone. It is injected into `varsel.configure` rather than read there, so the one
     function is the seam — and `varsel` declines to touch the store at all while this reads False,
-    which is what makes "the flag is unset, so no partner state was read" a property of the pass.
+    which is what makes "the flag is unset, so no notification state was read" a property of the pass.
     """
-    return os.environ.get("PARTNER_NOTIFICATIONS_ENABLED", "").strip().lower() in llm_message._TRUTHY
+    return os.environ.get("NOTIFICATION_WEBHOOKS_ENABLED", "").strip().lower() in llm_message._TRUTHY
 
 
 @asynccontextmanager
@@ -1298,69 +1298,69 @@ async def lifespan(app: FastAPI):
         # /config tells the PWA whether rush-forecast pushes are delivered HERE, so the page's
         # notice can never promise a push class this environment's gate withholds.
         togvarsel_notify_provider=_togvarsel_notify_enabled,
-        # The partner channel's two halves, both now wired. `partner_channel_enabled()` requires
+        # The webhook channel's two halves, both now wired. `webhook_channel_enabled()` requires
         # BOTH, so a deployment missing either — every deployment until the flag is set, and tst,
         # which has no named database — is byte for byte the pass that ran before the channel
         # existed. The flag is injected separately from the store so `varsel` can decline to touch
-        # the store at all, which is what makes "the flag is unset, so no partner state was read" a
+        # the store at all, which is what makes "the flag is unset, so no notification state was read" a
         # property of the pass rather than of whoever wrote the provider.
         #
         # `recipient_documents` returns RAW documents on purpose (R20): only the reader can decide
         # what "unreadable" means for the schema the running binary knows, so the store hands over
-        # the shape and `varsel._parse_partner_recipient` validates it one document at a time. What
-        # bounds the poller's WAIT on it is `varsel._PARTNER_LOAD_TIMEOUT_S` (5 s, on a worker
+        # the shape and `varsel._parse_webhook_recipient` validates it one document at a time. What
+        # bounds the poller's WAIT on it is `varsel._WEBHOOK_LOAD_TIMEOUT_S` (5 s, on a worker
         # thread that is abandoned rather than joined); the store call itself carries no deadline of
         # its own, so a hung read costs a leaked thread and a delayed pod termination.
-        partner_enabled=_partner_notifications_enabled,
-        partner_recipients_provider=partner_store.recipient_documents,
+        webhook_enabled=_notification_webhooks_enabled,
+        webhook_recipients_provider=notification_store.recipient_documents,
     )
     llm_message.configure(stop_name_provider=_varsel_stops)
-    # The partner notification channel's two Firestore-backed planes and the authenticated API over
+    # The webhook channel's two Firestore-backed planes and the authenticated API over
     # them. All three are wired UNCONDITIONALLY, and the flag above is deliberately not consulted
-    # here: `PARTNER_NOTIFICATIONS_ENABLED` gates the notification PASS -- whether the poller reads
-    # partner subscriptions and delivers events -- while provisioning a partner and letting it
+    # here: `NOTIFICATION_WEBHOOKS_ENABLED` gates the notification PASS -- whether the poller reads
+    # webhook subscriptions and delivers events -- while provisioning a client and letting it
     # register watches is the step that comes first. Onboarding is otherwise circular: nothing can
     # be registered until the pass is on, and turning the pass on with nothing registered is what
     # a rollback is supposed to look like.
     #
     # What actually makes the API answer is store AND pepper, read at call time
-    # (`partner_auth.available()`): a deployment with no named database or no `PARTNER_KEY_PEPPER`
-    # answers 503 to every route rather than 401, because a 401 would tell a partner their
+    # (`notification_auth.available()`): a deployment with no named database or no `NOTIFICATION_KEY_PEPPER`
+    # answers 503 to every route rather than 401, because a 401 would tell a client their
     # credential is wrong when it is this deployment that is unconfigured. tst has neither today,
     # so it serves 503 -- honest, and cheap: nothing here builds a Firestore client until a request
     # arrives, so an unconfigured environment pays no import and needs no credential.
     #
-    # ONE client for the whole channel: `partner_store.configure` is the only place that names the
-    # database, and `partner_auth` reads through `partner_store.client()` -- so there is one gRPC
+    # ONE client for the whole channel: `notification_store.configure` is the only place that names the
+    # database, and `notification_auth` reads through `notification_store.client()` -- so there is one gRPC
     # channel and one connection pool in a process whose poller already shares the thread. The
-    # `partner_auth.configure()` call still earns its place: it resets that module's in-process
+    # `notification_auth.configure()` call still earns its place: it resets that module's in-process
     # limiter ledgers, which must not survive a restart-in-place.
-    partner_store.configure(database=os.environ.get("PARTNER_FIRESTORE_DATABASE", "").strip() or None)
-    partner_auth.configure()
-    # The partner channel's own slice of the connectivity budget, bound ONCE here so neither partner
+    notification_store.configure(database=os.environ.get("NOTIFICATION_FIRESTORE_DATABASE", "").strip() or None)
+    notification_auth.configure()
+    # The webhook channel's own slice of the connectivity budget, bound ONCE here so neither client
     # module has to know the vocabulary and neither can forget the tag. Bound rather than defaulted
     # because the default is the traveller-facing tally, which is what this seam was spending before
-    # `_PARTNER_CONNECTIVITY_MAX_PER_MIN` existed.
-    partner_connectivity = functools.partial(
-        varsel._service_verdict, path=_CONNECTIVITY_PARTNER_PATH
+    # `_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN` existed.
+    notification_api_connectivity = functools.partial(
+        varsel._service_verdict, path=_CONNECTIVITY_NOTIFICATION_API_PATH
     )
-    partner_api.configure(
-        store=partner_store,
-        auth=partner_auth,
+    notification_api.configure(
+        store=notification_store,
+        auth=notification_auth,
         # /varsel's own two, injected rather than imported by the module: `canonical_stop` so a
-        # partner ref the stop registry has collapsed lands on the same journey key a browser
+        # client ref the stop registry has collapsed lands on the same journey key a browser
         # registration would, and `_service_verdict` so R5's servability caveat is the answer
         # /varsel gives -- it expands both places to every ref and already fails open to None,
         # which is what keeps "we could not establish it" from ever reading as "no trips run".
         canonicalize=varsel.canonical_stop,
-        connectivity=partner_connectivity,
+        connectivity=notification_api_connectivity,
     )
     # The poller-side half of the same question (R6, AE13's second clause). The SAME seam object as
     # the line above, deliberately: a subscription's caveat and its re-check have to be the answer
     # one function gives, or the create-time verdict and the refresh could disagree about a pair
-    # while both looked right. Unwired, `partner_servability.recheck()` returns before it reads the
+    # while both looked right. Unwired, `notification_servability.recheck()` returns before it reads the
     # store, so nothing here is a cost in a deployment that never sets the seam.
-    partner_servability.configure(connectivity=partner_connectivity)
+    notification_servability.configure(connectivity=notification_api_connectivity)
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody
     # runs build scripts against — without this the table would simply be missing there. Its own
@@ -1542,25 +1542,25 @@ app.include_router(meldinger.router)
 # never names them.
 app.include_router(rushhistorikk.router)
 
-# Partner notification API (/notification-api/v1): the authenticated surface a partner BFF manages
+# Webhook notification API (/notification-api/v1): the authenticated surface a client BFF manages
 # its own commuter registrations through. Three things about this registration are deliberate.
 #
-# It is NOT behind sso.RequireSSO, and the partner prefix is deliberately absent from
+# It is NOT behind sso.RequireSSO, and the client prefix is deliberately absent from
 # sso.PROTECTED_PREFIXES: that gate answers an unconfigured deployment with 503 and an
 # unauthenticated *browser* with a 302, and a machine caller following a redirect into a Google
 # login screen gets an HTML page where it expected JSON. Its own credential dependency
-# (partner_auth.authenticate, KTD8) runs per request at router level instead, so a route added
+# (notification_auth.authenticate, KTD8) runs per request at router level instead, so a route added
 # later is gated even if its author forgets the parameter.
 #
 # It is registered unconditionally, unlike /togmelding-api: there is no product-secrecy gate here
-# and the whole point of the surface is a published contract, so a partner can be provisioned and
+# and the whole point of the surface is a published contract, so a client can be provisioned and
 # can register watches before the notification pass is switched on for that environment.
-# Availability is decided per request by partner_auth.available() — store plus pepper — which
+# Availability is decided per request by notification_auth.available() — store plus pepper — which
 # answers 503 where either is missing.
 #
 # And it is registered before the static mounts, like every other API router: nothing serves
 # /notification-api as a page, but the ordering rule is the one this file follows throughout.
-app.include_router(partner_api.router)
+app.include_router(notification_api.router)
 
 # Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.

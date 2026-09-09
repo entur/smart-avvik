@@ -10,10 +10,10 @@
  * The wire envelope is EXACTLY this set and no more. `event.schema.json` is
  * `additionalProperties: false`, so a body carrying one extra field is a body a conforming
  * receiver refuses -- and the sender's store legitimately holds three fields it must not put on
- * the wire (`partner_id` and `destination_id`, its own routing; `expires_at`, a retention
+ * the wire (`client_id` and `destination_id`, its own routing; `expires_at`, a retention
  * decision that is not validity). The sender projects onto an allow-list for that reason;
  * `parseEvent` in `contracts.ts` refuses the same set from this side, so a projection that
- * regressed to a deny-list fails here rather than reaching a partner's phone.
+ * regressed to a deny-list fails here rather than reaching a client's phone.
  */
 export const EVENT_WIRE_FIELDS = [
   "schema_version",
@@ -26,7 +26,7 @@ export const EVENT_WIRE_FIELDS = [
   "valid_until",
   "subscription_id",
   "subscription_version",
-  "partner_ref",
+  "external_ref",
   "test",
   "operator",
   "line",
@@ -62,7 +62,7 @@ export const EVENT_REQUIRED_FIELDS = [
 ] as const;
 
 /**
- * Partner notification event. One revision of one alert about one train for one subscription.
+ * Webhook notification event. One revision of one alert about one train for one subscription.
  * Delivery is at-least-once with no ordering guarantee, so a receiver MUST apply three suppression
  * rules before it dispatches anything natively: drop a duplicate event_id; drop a revision not
  * strictly newer than the highest applied for that alert_id; and never dispatch a `predicted`
@@ -71,7 +71,7 @@ export const EVENT_REQUIRED_FIELDS = [
  */
 export interface NotificationEvent {
   /**
-   * Refuse a shape your receiver does not know rather than mis-parse it. Every partner step on our
+   * Refuse a shape your receiver does not know rather than mis-parse it. Every client step on our
    * side fails closed the same way.
    */
   schema_version: "1";
@@ -97,7 +97,7 @@ export interface NotificationEvent {
   phase: "predicted" | "confirmed" | "withdrawn";
   /**
    * The canonical per-train subject key, and the only key the supplied policy deduplicates and
-   * orders on. The grain is (subscription, train): a partner serves many commuters through one
+   * orders on. The grain is (subscription, train): a client serves many commuters through one
    * receiver, and a per-train-only key would make the receiver's own revision rule suppress the
    * SECOND commuter's notification about the same disrupted train. The train's own fields below
    * ride along for display and for your joins; they are not the identity.
@@ -140,7 +140,7 @@ export interface NotificationEvent {
   /**
    * Your own opaque reference from the subscription, echoed unchanged.
    */
-  partner_ref?: string;
+  external_ref?: string;
   /**
    * True for a synthetic test event. It rides INSIDE the signed body, so a receiver can refuse it
    * before native dispatch; it is not a header a proxy can strip. Only subscriptions marked
@@ -187,7 +187,7 @@ export interface NotificationEvent {
        */
       body: string;
       /**
-       * An optional deep link or label the partner may render.
+       * An optional deep link or label the client may render.
        */
       action?: { [key: string]: unknown } | null;
       [key: string]: unknown;
@@ -229,14 +229,14 @@ export interface NotificationEvent {
 }
 
 /**
- * Partner notification subscription. A partner registration: one commuter's recurring journey plus
+ * Webhook notification subscription. A client registration: one commuter's recurring journey plus
  * a callback destination. It is /varsel's own registration shape (origin place, destination place,
- * weekdays, a daily boarding window in Europe/Oslo) so that a partner subscription and a browser
+ * weekdays, a daily boarding window in Europe/Oslo) so that a webhook subscription and a browser
  * registration with the same definition see the same trains and cost one match and one wording
- * between them. Authored here and rendered as OpenAPI by the partner API rather than redefined
- * there. The recipient behind a subscription is a commuter on a monthly pass, not a ticket-holder
- * for one departure, which is why the grain is a recurring window and why the daily cap is per
- * subscription.
+ * between them. Authored here and rendered as OpenAPI by the notification API rather than
+ * redefined there. The recipient behind a subscription is a commuter on a monthly pass, not a
+ * ticket-holder for one departure, which is why the grain is a recurring window and why the daily
+ * cap is per subscription.
  */
 export interface Subscription {
   /**
@@ -246,15 +246,15 @@ export interface Subscription {
    */
   subscription_id: string;
   /**
-   * Read-only. Taken from the authenticated credential, never from the request body: a partner may
+   * Read-only. Taken from the authenticated credential, never from the request body: a client may
    * manage only its own subscriptions, and accepting this field from the caller would make that a
    * request-shaped choice.
    */
-  partner_id?: string;
+  client_id?: string;
   /**
    * Which provisioned callback destination this subscription's events are delivered to. One per
-   * environment per partner in the pilot. Signing secrets are per destination, so this is also
-   * what decides which secret an attempt is signed under.
+   * environment per client in the pilot. Signing secrets are per destination, so this is also what
+   * decides which secret an attempt is signed under.
    */
   destination_id: string;
   /**
@@ -273,7 +273,7 @@ export interface Subscription {
   begin: string;
   /**
    * End of the daily boarding window, HH:MM in Europe/Oslo. Must be strictly after begin:
-   * overnight windows are rejected here exactly as they are in /varsel, so a partner cannot
+   * overnight windows are rejected here exactly as they are in /varsel, so a client cannot
    * register a window /varsel would not.
    */
   end: string;
@@ -282,10 +282,10 @@ export interface Subscription {
    */
   days: number[];
   /**
-   * The partner's own opaque reference, echoed in every event so normal receipt needs no second
+   * The client's own opaque reference, echoed in every event so normal receipt needs no second
    * request to us. Opaque to us: never parsed, never logged, never used as a key.
    */
-  partner_ref?: string;
+  external_ref?: string;
   /**
    * Marks the subscription as test-only. IMMUTABLE -- changing it requires delete and re-create --
    * because it rides inside the signed event body and the receiver refuses a test event before
@@ -320,7 +320,7 @@ export interface Subscription {
   servable_checked_at?: string | null;
   /**
    * Read-only. The earlier of a 180-day maximum lifetime from creation and a 60-day inactivity
-   * horizon from the last partner interaction. Both are enforced on READ as well as by the store's
+   * horizon from the last client interaction. Both are enforced on READ as well as by the store's
    * TTL, because TTL deletion runs up to ~24 hours late and a subscription that kept alerting for
    * a day past its published expiry would be a broken promise rather than a slow cleanup.
    */

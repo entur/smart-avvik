@@ -18,7 +18,7 @@ import { NOW, makeEvent, memoryAdapters } from "./helpers/adapters.mjs";
 test("a pending record the trigger never processed is picked up and dispatched", async () => {
   // The record was accepted and nothing ever ran for it -- an Eventarc incident, a redeploy
   // mid-flight, a worker that exhausted the retry window against a store that was down all night.
-  // Nothing about that state is an error anywhere a partner would look, which is why the sweep
+  // Nothing about that state is an error anywhere a client would look, which is why the sweep
   // exists at all.
   const later = new Date(NOW.getTime() + DEFAULT_SWEEP_MIN_AGE_MS + 60_000);
   const harness = memoryAdapters({ now: () => later });

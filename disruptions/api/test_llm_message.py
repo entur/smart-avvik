@@ -1341,11 +1341,11 @@ def test_a_late_alternative_carries_the_minutes_after_the_plan():
     assert "minutter_senere" in llm_message._SYSTEM_PROMPT
 
 
-# ---- the partner surface: its own holder, its own marker, no prose in the log --------------------
-def test_a_partner_holder_is_isolated_from_the_live_push_path():
+# ---- the client surface: its own holder, its own marker, no prose in the log --------------------
+def test_a_webhook_holder_is_isolated_from_the_live_push_path():
     """Same isolation as the replay holder, and needed for the same reason (U1 scenarios 3 and 4).
 
-    A partner evaluation pass runs off the poller thread and can drive both backends into a
+    A client evaluation pass runs off the poller thread and can drive both backends into a
     configuration error in a burst. Shared, that burst makes `generation_enabled()` read False for
     the whole `_LATCH_TTL` on the push path: every real traveller's push silently falls back to the
     template AND the poller spends a message attempt per subject on each `None`. Nothing on the
@@ -1358,55 +1358,55 @@ def test_a_partner_holder_is_isolated_from_the_live_push_path():
 
     llm_message._BACKENDS["claude"] = unserved
     try:
-        partner = llm_message.new_partner_state()
+        client = llm_message.new_webhook_state()
         assert (
-            llm_message.write_message_detailed({"a": 1}, state=partner, caller="partner").text
+            llm_message.write_message_detailed({"a": 1}, state=client, caller="webhook").text
             is None
         )
-        assert llm_message.generation_enabled(partner) is False, (
-            "the partner caller must still learn what it discovered"
+        assert llm_message.generation_enabled(client) is False, (
+            "the client caller must still learn what it discovered"
         )
         assert llm_message.generation_enabled() is True, (
-            "a partner burst must leave the live push path able to write a wording"
+            "a client burst must leave the live push path able to write a wording"
         )
         assert llm_message.generation_enabled(llm_message._STATE) is True
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
-    # ...and two partner passes do not share a latch or a mutex either.
-    assert llm_message.new_partner_state().lock is not llm_message._STATE.lock
-    assert llm_message.new_partner_state().lock is not llm_message.new_partner_state().lock
+    # ...and two client passes do not share a latch or a mutex either.
+    assert llm_message.new_webhook_state().lock is not llm_message._STATE.lock
+    assert llm_message.new_webhook_state().lock is not llm_message.new_webhook_state().lock
 
 
-def test_a_partner_call_is_marked_as_its_own_surface_not_as_a_replay():
+def test_a_webhook_call_is_marked_as_its_own_surface_not_as_a_replay():
     """`replay: true` means `/meldinger` in every saved query and dashboard.
 
-    Borrowing it for a partner call would silently file partner traffic as replay — and replay is
+    Borrowing it for a client call would silently file client traffic as replay — and replay is
     the marker somebody greps to explain a Vertex spend, so the two must be countable apart. A
     third value on the same `event="llm_message"`, never a third event name.
     """
     _reset(provider="claude")
     llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
     try:
-        partner = _log_fields_of(
+        client = _log_fields_of(
             lambda: llm_message.write_message_detailed(
-                {"a": 1}, state=llm_message.new_partner_state(), caller="partner"
+                {"a": 1}, state=llm_message.new_webhook_state(), caller="webhook"
             )
         )
         live = _log_fields_of(lambda: llm_message.write_message_detailed({"a": 1}))
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
-    assert [f["event"] for f in partner] == ["llm_message"]
-    assert partner[0]["caller"] == "partner"
-    assert "replay" not in partner[0], "a partner call is not a replay"
-    assert partner[0]["provider"] == "claude", "the existing fields are untouched"
+    assert [f["event"] for f in client] == ["llm_message"]
+    assert client[0]["caller"] == "webhook"
+    assert "replay" not in client[0], "a client call is not a replay"
+    assert client[0]["provider"] == "claude", "the existing fields are untouched"
     assert "caller" not in live[0], "a live push wording must not carry the field at all"
 
 
-def test_a_partner_call_keeps_prose_and_the_prompt_out_of_the_log():
-    """R16: partner input and prose stay out of routine logs.
+def test_a_webhook_call_keeps_prose_and_the_prompt_out_of_the_log():
+    """R16: client input and prose stay out of routine logs.
 
     Two records, both of which the poller legitimately writes and neither of which may carry a
-    partner's data. The `event="llm_message"` INFO record logs the finished wording; the
+    client's data. The `event="llm_message"` INFO record logs the finished wording; the
     `llm_message_prompt` DEBUG record logs the whole input, which carries origin, destination and
     departure time. The suppression is IN CODE, not on `VARSEL_LLM_LOG_PROMPTS` — dev sets that
     variable true, `/varsel` debugging needs it left on, and dev is where this rollout starts.
@@ -1417,29 +1417,29 @@ def test_a_partner_call_keeps_prose_and_the_prompt_out_of_the_log():
     previous = llm_message._LOG_PROMPTS
     llm_message._LOG_PROMPTS = True
     try:
-        partner = _log_fields_of(
+        client = _log_fields_of(
             lambda: llm_message.write_message_detailed(
-                {"a": 1}, state=llm_message.new_partner_state(), caller="partner"
+                {"a": 1}, state=llm_message.new_webhook_state(), caller="webhook"
             )
         )
         live = _log_fields_of(lambda: llm_message.write_message_detailed({"a": 1}))
     finally:
         llm_message._LOG_PROMPTS = previous
         llm_message._BACKENDS["claude"] = llm_message._claude_write
-    assert not [f for f in partner if f["event"] == "llm_message_prompt"]
-    assert not any("message" in f for f in partner), "a partner wording must not reach the log"
+    assert not [f for f in client if f["event"] == "llm_message_prompt"]
+    assert not any("message" in f for f in client), "a webhook wording must not reach the log"
     assert [f for f in live if f["event"] == "llm_message_prompt"], (
         "the poller's own debugging records must be untouched"
     )
     assert any(f.get("message") == prose for f in live)
 
 
-def test_a_partner_ungrounded_reply_stays_out_of_the_log_but_comes_back_in_process():
+def test_a_webhook_ungrounded_reply_stays_out_of_the_log_but_comes_back_in_process():
     """The discarded reply is the single most useful field when a prompt starts drifting.
 
     It stays for the poller and for a replay, where it is our own traveller's wording, and is
-    withheld from a partner surface, where it is prose written from a second party's payload.
-    `MessageResult.discarded` still carries it to that caller in-process, which is where a partner
+    withheld from a client surface, where it is prose written from a second party's payload.
+    `MessageResult.discarded` still carries it to that caller in-process, which is where a client
     diagnostic belongs.
     """
     _reset(provider="claude")
@@ -1449,18 +1449,18 @@ def test_a_partner_ungrounded_reply_stays_out_of_the_log_but_comes_back_in_proce
         fields = _log_fields_of(
             lambda: llm_message.write_message_detailed(
                 build_message_input(JOURNEY, FakeImpact(), FakeAlert()),
-                state=llm_message.new_partner_state(),
-                caller="partner",
+                state=llm_message.new_webhook_state(),
+                caller="webhook",
             )
         )
         result = llm_message.write_message_detailed(
             build_message_input(JOURNEY, FakeImpact(), FakeAlert()),
-            state=llm_message.new_partner_state(),
-            caller="partner",
+            state=llm_message.new_webhook_state(),
+            caller="webhook",
         )
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
-    assert not any("reply" in f for f in fields), "a partner reply must not reach the log"
+    assert not any("reply" in f for f in fields), "a client reply must not reach the log"
     assert result.status == "ungrounded"
     assert result.discarded, "the caller still gets what was thrown away"
 

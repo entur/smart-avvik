@@ -3,7 +3,7 @@
 //
 // Two separate gaps, and both have precedent in this repository. A suite in a new top-level
 // directory is invisible to CI's three existing loops; and an emulator-dependent suite that is not
-// wrapped in `firebase emulators:exec` fails or, worse, silently skips. The Python partner-store
+// wrapped in `firebase emulators:exec` fails or, worse, silently skips. The Python notification store
 // suite greps its own CI step for exactly this reason, and so does this one.
 
 import { test } from "node:test";
@@ -106,7 +106,7 @@ test("the emulator runs under its OWN demo project id, not the repo root's", () 
   // emulator runs in `--single_project_mode`, where a disagreement is a refusal, not a stray write.
   const manifest = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8"));
   const mine = /--project (\S+)/.exec(manifest.scripts["test:emulator"])?.[1];
-  assert.equal(mine, "demo-kixpartner");
+  assert.equal(mine, "demo-kixclient");
 
   const workflow = fs.existsSync(WORKFLOW) ? fs.readFileSync(WORKFLOW, "utf8") : null;
   if (workflow) {
@@ -154,7 +154,7 @@ function specKey(spec) {
 test("every query in the module has a checked-in index", () => {
   // A static check, because it is the only kind available: the Firestore emulator tracks NO
   // composite indexes, so a query missing its production index answers happily in every test in
-  // this package and throws FAILED_PRECONDITION on the partner's first deployed sweep. The same
+  // this package and throws FAILED_PRECONDITION on the client's first deployed sweep. The same
   // shape of guard the sending side uses (`test_every_query_in_the_module_has_a_checked_in_index`),
   // and it is worth something here only because the query is BUILT from the spec it is checked
   // against -- a spec that merely described the query could go stale the first time the query moved.

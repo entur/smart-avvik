@@ -22,7 +22,7 @@ export {
  * The only `schema_version` this build understands.
  *
  * Refusing an unknown shape is the published contract in both directions -- the schema's own
- * description says so, and every partner step on the sending side fails closed the same way. A
+ * description says so, and every client step on the sending side fails closed the same way. A
  * receiver that mis-parses a version it does not know is worse than one that refuses it: the
  * refusal is visible, the mis-parse becomes a notification with a missing figure in it.
  */
@@ -73,7 +73,7 @@ const KINDS: Record<string, (value: unknown) => boolean> = {
   valid_until: isNonEmptyString,
   subscription_id: isNonEmptyString,
   subscription_version: (value) => isInteger(value) && (value as number) >= 1,
-  partner_ref: (value) => typeof value === "string",
+  external_ref: (value) => typeof value === "string",
   test: (value) => typeof value === "boolean",
   operator: isNonEmptyString,
   line: (value) => typeof value === "string",
@@ -117,7 +117,7 @@ function isPayload(value: unknown): boolean {
  * `additionalProperties: false`, so an extra top-level field is a body a conforming receiver
  * refuses; the sending side projects onto an allow-list for exactly that reason and its store holds
  * three fields it must never put on the wire. Accepting them here would hide a regression on the
- * sender that a partner running a stricter verifier would then be the first to discover -- in
+ * sender that a client running a stricter verifier would then be the first to discover -- in
  * production, on every event.
  */
 export function parseEvent(bytes: Uint8Array | string): ParseResult {

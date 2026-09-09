@@ -5,7 +5,7 @@
     "`type` field and why the three module-interop options below are load-bearing.",
     "",
     "This package resolves `@entur/kix-notifications-client` through the npm `file:` link to its",
-    "sibling, so it consumes the sibling's BUILT dist -- the same artifact a partner gets. That is",
+    "sibling, so it consumes the sibling's BUILT dist -- the same artifact a client gets. That is",
     "why `build:client` runs first in every script that compiles or tests: an unbuilt sibling is a",
     "missing module, not a type error."
   ],

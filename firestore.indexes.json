@@ -1,7 +1,7 @@
 {
   "indexes": [
     {
-      "collectionGroup": "partner_subscriptions",
+      "collectionGroup": "subscriptions",
       "queryScope": "COLLECTION",
       "fields": [
         {
@@ -15,11 +15,11 @@
       ]
     },
     {
-      "collectionGroup": "partner_subscriptions",
+      "collectionGroup": "subscriptions",
       "queryScope": "COLLECTION",
       "fields": [
         {
-          "fieldPath": "partner_id",
+          "fieldPath": "client_id",
           "order": "ASCENDING"
         },
         {
@@ -33,7 +33,7 @@
       ]
     },
     {
-      "collectionGroup": "partner_deliveries",
+      "collectionGroup": "deliveries",
       "queryScope": "COLLECTION",
       "fields": [
         {
@@ -47,7 +47,7 @@
       ]
     },
     {
-      "collectionGroup": "partner_deliveries",
+      "collectionGroup": "deliveries",
       "queryScope": "COLLECTION",
       "fields": [
         {
@@ -65,7 +65,7 @@
       ]
     },
     {
-      "collectionGroup": "partner_alert_subjects",
+      "collectionGroup": "alert_subjects",
       "queryScope": "COLLECTION",
       "fields": [
         {
@@ -79,11 +79,11 @@
       ]
     },
     {
-      "collectionGroup": "partner_alert_subjects",
+      "collectionGroup": "alert_subjects",
       "queryScope": "COLLECTION",
       "fields": [
         {
-          "fieldPath": "partner_id",
+          "fieldPath": "client_id",
           "order": "ASCENDING"
         },
         {

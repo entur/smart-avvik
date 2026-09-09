@@ -2,7 +2,7 @@
 //
 // One test imports this file and nothing else. Under Node's type stripping a value import of a
 // type-only symbol is not elided and throws at RUNTIME, where `tsc` is perfectly happy; importing
-// every module through one file is what turns that into a test failure rather than a partner's first
+// every module through one file is what turns that into a test failure rather than a client's first
 // deployment.
 
 export {

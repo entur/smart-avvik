@@ -7,9 +7,9 @@
 //
 // Keyed on `alert_id`, whose grain is (subscription, train) and NOT the train alone. A per-train key
 // would make rule 2 suppress the SECOND commuter's notification about the same disrupted train --
-// one partner serves many commuters through one receiver, and the highest revision seen for a train
+// one client serves many commuters through one receiver, and the highest revision seen for a train
 // says nothing about what a different subscription has been told. The event schema's `alert_id`
-// description records this; the train's own fields ride along for display and for a partner's joins,
+// description records this; the train's own fields ride along for display and for a client's joins,
 // and must never be used as the identity.
 //
 // No I/O, no clock, no Firebase: everything the decision needs is an argument. That is what lets the
@@ -19,17 +19,17 @@
 import type { EventPhase, NotificationEvent } from "./contracts.ts";
 
 /**
- * How the partner's own app should present a dispatched event.
+ * How the client's own app should present a dispatched event.
  *
  * `silent` means deliver the data without waking the traveller: the notification should replace what
  * is already on the lock screen rather than arrive as a second alarm. `alert` means present it.
- * The partner supplies the actual presentation; this is the DEFAULT the supplied policy chooses, and
- * a partner is free to override it.
+ * The client supplies the actual presentation; this is the DEFAULT the supplied policy chooses, and
+ * a client is free to override it.
  */
 export type Display = "alert" | "silent";
 
 /**
- * How a partner chooses presentation. Takes the whole event, not just the phase: an integrator may
+ * How a client chooses presentation. Takes the whole event, not just the phase: an integrator may
  * legitimately want to key on the operator, the line or the hour, and narrowing the argument here
  * would make that a fork of the package rather than a configuration.
  */
@@ -76,7 +76,7 @@ export type PolicyDecision =
  * A confirmation defaults to `silent`. The traveller has already been alerted by the forecast this
  * confirmation replaces -- that is what a confirmation IS -- so presenting it as a second alarm
  * charges them twice for one disruption. It still has to arrive, because the fact changed from "91 %
- * chance of cancellation" to "cancelled", and a partner replacing the visible notification in place
+ * chance of cancellation" to "cancelled", and a client replacing the visible notification in place
  * is the behaviour `/varsel` itself has: one notification tag per train per registration, so the
  * confirmation replaces the forecast on the lock screen rather than stacking beneath it.
  *

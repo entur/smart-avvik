@@ -20,7 +20,7 @@
 //
 // So: exactly one decision, at-least-once dispatch. That is the contract the sender publishes, and
 // the receiver cannot do better than it -- a crash between the dispatch and `settle()` re-dispatches,
-// which is the residual duplicate the partner's own notification tag absorbs.
+// which is the residual duplicate the client's own notification tag absorbs.
 
 import type { NotificationEvent } from "./contracts.ts";
 import { decideSuppression, type DisplayResolver, type PolicyDecision } from "./policy.ts";

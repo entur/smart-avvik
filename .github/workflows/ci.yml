@@ -91,9 +91,9 @@ jobs:
                    --with pywebpush --with google-cloud-firestore python "$suite"
             echo "::endgroup::"
           done
-      # The partner store's EMULATOR-backed checks, which the loop above cannot run: it has no
+      # The notification store's EMULATOR-backed checks, which the loop above cannot run: it has no
       # Java and no firebase CLI, so an emulator-dependent suite dropped into it would fail every
-      # run. test_partner_store.py therefore runs TWICE -- once in the loop with
+      # run. test_notification_store.py therefore runs TWICE -- once in the loop with
       # FIRESTORE_EMULATOR_HOST unset, where it prints a conspicuous line naming how many checks it
       # skipped and exits 0, and once here with the emulator, where the full set runs.
       #
@@ -110,7 +110,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '21'
-      - name: Run partner store tests against the Firestore emulator
+      - name: Run notification store tests against the Firestore emulator
         working-directory: disruptions/api
         run: |
           set -euo pipefail
@@ -119,7 +119,7 @@ jobs:
             --config ../../firebase.json \
             'uv run --with fastapi --with httpx --with pydantic \
                     --with google-cloud-bigquery --with google-cloud-storage \
-                    --with pywebpush --with google-cloud-firestore python test_partner_store.py'
+                    --with pywebpush --with google-cloud-firestore python test_notification_store.py'
       # Separate step, and separate from the loop above, because this suite lives outside
       # disruptions/api -- the loop's working-directory made it invisible, and it had no
       # `__main__` runner either, so it was unrun twice over. It guards the export of travellers'
@@ -139,7 +139,7 @@ jobs:
         run: |
           npm ci --no-fund --no-audit
           npm test
-      # The two `integrations/` packages -- the TypeScript helper a partner vendors, and the Firebase
+      # The two `integrations/` packages -- the TypeScript helper a client vendors, and the Firebase
       # receiver built on it. A suite in a NEW top-level directory is invisible to every loop above:
       # those enter disruptions/api, data/feedback and demo/avviksvarsel only. So these two steps are
       # the whole reason those suites run at all, and each package greps THIS file for its own step
@@ -150,7 +150,7 @@ jobs:
       #
       # The client is BUILT here as well as tested. `npm test` runs `node --test` over the .ts
       # sources through Node's type stripping, with no build step -- a convenience, and explicitly
-      # NOT the shape a partner consumes. `verify:dist` compiles to CommonJS plus type declarations
+      # NOT the shape a client consumes. `verify:dist` compiles to CommonJS plus type declarations
       # and loads the artifact, which is the declared consumption shape (KTD11), on the Node major
       # this job pins above.
       - name: Run notification client tests
@@ -163,7 +163,7 @@ jobs:
       # The Firebase receiver: a plain suite, then the emulator suite that asserts the Firestore
       # security rules actually deny a client SDK.
       #
-      # Java and firebase-tools are already installed by the partner-store steps above; the guard
+      # Java and firebase-tools are already installed by the notification store steps above; the guard
       # below makes this step work on its own if those are ever removed or reordered, rather than
       # failing with `firebase: command not found` in an unrelated part of the file.
       #

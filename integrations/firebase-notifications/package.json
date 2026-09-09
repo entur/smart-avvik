@@ -22,7 +22,7 @@
     "pretest": "node -e \"const fs = require('node:fs'); const files = fs.existsSync('test') ? fs.readdirSync('test').filter(file => file.endsWith('.test.mjs')) : []; if (files.length === 0) { console.error('No test/*.test.mjs files found'); process.exit(1); }\" && npm run build:client",
     "test": "node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON test/*.test.mjs",
     "pretest:emulator": "npm run build:client",
-    "test:emulator": "firebase emulators:exec --project demo-kixpartner --only firestore --config firebase.json \"node --test --test-concurrency=1 --test-timeout=60000 --disable-warning=MODULE_TYPELESS_PACKAGE_JSON test/emulator/*.test.mjs\"",
+    "test:emulator": "firebase emulators:exec --project demo-kixclient --only firestore --config firebase.json \"node --test --test-concurrency=1 --test-timeout=60000 --disable-warning=MODULE_TYPELESS_PACKAGE_JSON test/emulator/*.test.mjs\"",
     "verify:dist": "npm run build && node --test test/dist/*.test.mjs"
   },
   "dependencies": {

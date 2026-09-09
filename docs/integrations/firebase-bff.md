@@ -10,7 +10,7 @@ repeat them:
 | `integrations/firebase-notifications/` | [`README.md`](../../integrations/firebase-notifications/README.md) | the Firestore-backed inbox, ledger and suppression log, the Cloud Functions receiver, its security rules and a recovery sweep |
 
 Start there. The wire contract those packages implement is `notification-api.md` beside this file;
-the operator's side is `../operations/partner-notifications.md`.
+the operator's side is `../operations/notification-webhooks.md`.
 
 This page carries the things a reader of either README would still not know: what the packages
 deliberately do **not** guarantee, the two install steps that are required rather than advisory, and
@@ -20,9 +20,9 @@ three traps that were found by building this and are not visible from the outsid
 
 ## The packages are vendored, not published
 
-Copy both directories into the partner's repository, **keeping them as siblings** — the Firebase
+Copy both directories into the client's repository, **keeping them as siblings** — the Firebase
 package resolves the client through a `file:../notifications-client` dependency. Publishing to a
-registry is deferred work, so a partner upgrades by re-copying, and this repository is the source of
+registry is deferred work, so a client upgrades by re-copying, and this repository is the source of
 truth for both.
 
 Declared consumption shape (KTD11): **compiled CommonJS plus `.d.ts`, on Node 24**
@@ -31,7 +31,7 @@ artifact through `require()` — checking the exported symbols, `main`/`types` r
 files, the CommonJS emit, and the README quickstart. It is a *packaging* check: the wire and policy
 suites run against the `.ts` sources under `npm test` and are not re-run against `dist`. Testing
 imports `.ts` directly under Node's type stripping, which is a test convenience and **not** the
-partner's contract.
+client's contract.
 
 ---
 
@@ -43,9 +43,9 @@ two genuinely concurrent workers on one record can both dispatch, and a crash be
 and the settle re-dispatches.
 
 A lease was deliberately not added. It trades a duplicate for a *lost* notification whenever a
-leaseholder dies, the schema already promises at-least-once, and the partner's per-train collapse key
+leaseholder dies, the schema already promises at-least-once, and the client's per-train collapse key
 absorbs the duplicate on the device — which is what `/varsel` itself does, one notification tag per
-train per registration. Do not blur that distinction when quoting it to a partner: the acceptance
+train per registration. Do not blur that distinction when quoting it to a client: the acceptance
 example says "one native decision", and that is exactly what is met.
 
 **The 15-minute processing cutoff cannot tell a bug from an outage.** It bounds a *bug* — a dispatch
@@ -53,7 +53,7 @@ that throws on some payload would otherwise be redelivered by the trigger every 
 twenty-four hours, each run a chance of a duplicate about a train that left hours ago. But a **store
 outage longer than fifteen minutes expires every event accepted during it**, including ones with
 forty minutes of `valid_until` left. It is a product choice rather than a plan requirement, it is
-overridable per call (`processingCutoffMs`), and it is stated here so a partner does not discover it
+overridable per call (`processingCutoffMs`), and it is stated here so a client does not discover it
 during an incident.
 
 **"413 before buffering" is literal in one receiver and not in the other.** The ceiling itself is
@@ -85,14 +85,14 @@ open — and that is a *write* path into what a traveller is told, not only a di
 `notification_inbox` document injects one.
 
 The shipped file ends with its own catch-all denial. **Drop the catch-all when merging into a project
-that also serves the partner's app; keep the four blocks above it.** An emulator test in the package
+that also serves the client's app; keep the four blocks above it.** An emulator test in the package
 demonstrates the failure.
 
 ### The composite index must be deployed
 
 The recovery sweep queries `status == "pending"` with an inequality on `receivedAt`, which **requires
 a composite index in production**. The Firestore emulator tracks no composite indexes at all, so every
-test passes without it and the partner's first sweep throws `FAILED_PRECONDITION`. Deploying rules
+test passes without it and the client's first sweep throws `FAILED_PRECONDITION`. Deploying rules
 without indexes leaves the trap armed. This is the same trap `terraform/firestore.tf` closes on our
 side, one boundary out.
 
@@ -117,7 +117,7 @@ test.mjs` asserts it off the generated endpoint, with the naive overload's `fals
 and also pins the installed package version — re-verify before widening that pin.
 
 **2. The verification secret lives in the functions runtime configuration and never in a mobile
-bundle.** A client that holds it can forge an event for any commuter the partner serves, and a secret
+bundle.** A client that holds it can forge an event for any commuter the client serves, and a secret
 in a shipped app cannot be rotated. The receiver takes a `secrets(request)` **callback returning
 every live generation** — `readonly string[]`, resolved per request, so a rotation needs no redeploy
 and one receiver can serve several destinations by keying on the path. Several generations are live
@@ -143,17 +143,17 @@ npm --prefix integrations/firebase-notifications run verify:dist
 npm --prefix integrations/firebase-notifications run test:emulator   # needs Java 21+ and firebase-tools
 ```
 
-`test/endToEnd.test.mjs` in the Firebase package is the scenario a partner should be able to
+`test/endToEnd.test.mjs` in the Firebase package is the scenario a client should be able to
 reproduce first: a signed synthetic event becomes one native notification, with no real disruption and
 no emulator. It runs in the plain `npm test` for that reason — behind `test:emulator` the first thing
-a partner runs would need Java.
+a client runs would need Java.
 
 **Its event body is READ from `contracts/test-event-sample.json`, never transcribed** (2026-09-09).
-That file is dumped from `partner_api._synthetic_event`, so the scenario runs on the bytes the route
+That file is dumped from `notification_api._synthetic_event`, so the scenario runs on the bytes the route
 really sends. It was a hand-written copy of that function until then — announced as one "field for
 field" — and had drifted from it in eight places, `probabilities.cancel` for `cancellation` and
 `call.aimed_departure` for `aimed_departure_time` among them: keys no producer has ever emitted,
-sitting in the one file a partner reads to learn the shape. Nothing failed, because `payload.call`
+sitting in the one file a client reads to learn the shape. Nothing failed, because `payload.call`
 and `payload.probabilities` are deliberately open objects in `event.schema.json` and a misnamed key
 inside them is schema-**valid**. One consequence to expect while reading the scenario: a test event
 is a **confirmed** cancellation, so `defaultDisplay` gives it `silent` rather than `alert` — a
@@ -171,6 +171,6 @@ for it to listen, then start the other.
 approach" and mirrors neither production concurrency nor its indexes. Atomicity is argued from the
 transaction contract; index coverage is a static check against the **package's own**
 `integrations/firebase-notifications/firestore.indexes.json` — one entry, for the sweep's query, and
-a different file from the repo-root `firestore.indexes.json`, which declares our six `partner_*`
+a different file from the repo-root `firestore.indexes.json`, which declares the six indexes of our own `notifications` database
 indexes. It runs in both directions: a query with no index fails, and an index no query needs fails
 too, because a stale index is paid for on every write to that collection forever.

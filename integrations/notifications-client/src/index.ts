@@ -3,7 +3,7 @@
 // One test imports this file and nothing else, which is not decoration: under Node's type stripping
 // a value import of a type-only symbol is not elided and throws "does not provide an export named X"
 // at RUNTIME, where `tsc` is perfectly happy. Importing every module through one file is what turns
-// that into a test failure instead of a partner's first deployment.
+// that into a test failure instead of a client's first deployment.
 
 export {
   DEFAULT_MAX_BODY_BYTES,

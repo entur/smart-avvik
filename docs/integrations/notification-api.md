@@ -1,14 +1,14 @@
-# Journey notification webhooks — partner API
+# Journey notification webhooks — notification API
 
-`/notification-api/v1` lets a partner register the same kind of watch a traveller registers in
+`/notification-api/v1` lets a client register the same kind of watch a traveller registers in
 `/varsel` — origin, destination, weekdays and a boarding window — and receive one signed HTTPS
 webhook per disrupted train, carrying the ready-to-display Norwegian title and body `/varsel` would
 have pushed to its own browsers.
 
 This document is the contract. `firebase-bff.md` beside it is the integration guide for the two
-vendored TypeScript packages, which is where a partner should start; the operating contract — flags,
+vendored TypeScript packages, which is where a client should start; the operating contract — flags,
 rollout order, retention clauses checked against the code, and what an operator has to do — is
-`../operations/partner-notifications.md`.
+`../operations/notification-webhooks.md`.
 
 The machine-readable contracts are checked in and are the authority where this page and they
 disagree:
@@ -40,17 +40,17 @@ exactly-once, and deliberately so. See [What the packages guarantee](#what-the-p
 
 **Nothing here is a claim about alert quality**, and nothing anywhere is a claim about any operator
 but **Vy rail**. `/historikk` scores `/varsel`'s decision logic on the journey definitions a browser
-registration also holds; a partner-only route produces no decision row at all and is therefore
-**unscored, deliberately**. `../operations/partner-notifications.md` states the four limitations that
+registration also holds; a webhook-only route produces no decision row at all and is therefore
+**unscored, deliberately**. `../operations/notification-webhooks.md` states the four limitations that
 follow (KTD12) and the enablement condition they impose.
 
 ---
 
 ## Quickstart
 
-1. **Ask an operator to provision you.** There is no self-service. Provisioning creates the partner
+1. **Ask an operator to provision you.** There is no self-service. Provisioning creates the client
    account, one callback destination per environment, and one API credential; every action lands in
-   an append-only audit record. See `scripts/manage_notification_partner.py` and the operations doc.
+   an append-only audit record. See `scripts/manage_notification_client.py` and the operations doc.
    You get back a `key-id` and a secret **shown once** (from `issue-key`), and a `destination_id`.
    **You also need the verification secret your receiver checks signatures with**, and the operator
    prints it for you with `show-signing-secret` — once per live generation, and again after each
@@ -58,7 +58,7 @@ follow (KTD12) and the enablement condition they impose.
    secret fetchable over your own API credential is a secret that credential can be traded for, so
    `GET /destinations/current` gives you the generation *numbers* and never calls the derivation at
    all. The value is derived from the environment's signing root over the destination and
-   generation, so nothing stores it and one partner's leaked receiver secret forges nothing for
+   generation, so nothing stores it and one client's leaked receiver secret forges nothing for
    another. It is a live credential: take it the way you would take a password, not in a ticket or a
    chat message. Environments are separate GCP projects: a dev credential is worthless in prd.
 2. **Stand up a receiver.** `firebase-bff.md`. The vendored packages do the signature verification,
@@ -74,7 +74,7 @@ follow (KTD12) and the enablement condition they impose.
    {"subscription_id": "smoke-1", "destination_id": "acme-prod",
     "from_stop": "NSR:StopPlace:337", "to_stop": "NSR:StopPlace:59872",
     "begin": "07:00", "end": "09:00", "days": [0,1,2,3,4],
-    "partner_ref": "commuter-4711", "test": true}
+    "external_ref": "commuter-4711", "test": true}
    ```
 
    `test: true` is **immutable** — it cannot be set or cleared later, only deleted and re-created.
@@ -99,14 +99,14 @@ Authorization: Bearer <key-id>.<secret>
   `allow_origins=["*"]`, so every endpoint is reachable from every origin and a cookie would be sent
   from all of them.
 
-**Several credentials are live at once** (up to 8 active per partner), so a rotation is: issue a new
-one, cut over, revoke the old. Revocation takes effect on your next request. A partner-level
+**Several credentials are live at once** (up to 8 active per client), so a rotation is: issue a new
+one, cut over, revoke the old. Revocation takes effect on your next request. A client-level
 suspension takes effect within 60 s.
 
 Every failure — missing header, wrong scheme, unknown `key-id`, revoked credential, wrong secret,
 expired credential — answers the same **401 `{"detail": "unauthorized"}`** with
 `WWW-Authenticate: Bearer`. The reason is logged and never returned: "unknown key id" and "wrong
-secret" must not be distinguishable over the wire. A suspended partner gets **403 `partner_suspended`**.
+secret" must not be distinguishable over the wire. A suspended client gets **403 `client_suspended`**.
 
 **Reads are authenticated and throttled exactly like writes.** A GET is a Firestore query like any
 other.
@@ -118,16 +118,16 @@ other.
 | limit | value | breach |
 |---|---|---|
 | global pre-lookup, process-wide, 60 s sliding | 300 req/min | `429 rate_limited`, `Retry-After: 60` |
-| per partner, after authentication, 60 s sliding | 120 req/min | `429 rate_limited`, `Retry-After: 60` |
-| `POST /test-events`, per partner, on top of the above | 6 req/min | `429 test_events_rate_limited`, `Retry-After: 60` |
-| active subscriptions per partner | 500 | `429 quota_exceeded`, `Retry-After: 300` |
-| active credentials per partner | 8 | operator-side `Conflict` |
-| active destinations per partner | 4 | operator-side `Conflict` |
+| per client, after authentication, 60 s sliding | 120 req/min | `429 rate_limited`, `Retry-After: 60` |
+| `POST /test-events`, per client, on top of the above | 6 req/min | `429 test_events_rate_limited`, `Retry-After: 60` |
+| active subscriptions per client | 500 | `429 quota_exceeded`, `Retry-After: 300` |
+| active credentials per client | 8 | operator-side `Conflict` |
+| active destinations per client | 4 | operator-side `Conflict` |
 | list page size | default 100, max 500 | `422` outside 1–500 |
 
 The two limiter tiers exist because *verifying a credential is itself store work*: a repeated bad
 credential is refused by the global tier and a short-TTL negative cache before any Firestore read, so
-it cannot spend a real partner's budget. An anonymous flood can still exhaust the global tier — the
+it cannot spend a real client's budget. An anonymous flood can still exhaust the global tier — the
 same accepted trade `/impact`'s limiter makes.
 
 `Retry-After` on a quota breach is deliberately 300 s and not 60: a subscription-count ceiling does
@@ -150,7 +150,7 @@ gating onboarding on the flag that needs onboarding is circular. Two consequence
   inherited everywhere, so the pepper is the only discriminator and it exists in none of the three
   projects. Any other store fault answers **503 `store_unavailable`**.
 
-`PARTNER_NOTIFICATIONS_ENABLED` gates the *notification pass* — whether the poller matches
+`NOTIFICATION_WEBHOOKS_ENABLED` gates the *notification pass* — whether the poller matches
 subscriptions and delivers events — not the API. With it off you can register watches and read them
 back; no event is minted and nothing is delivered.
 
@@ -164,7 +164,7 @@ every one of them, before the handler.
 ### `POST /subscriptions` — create or replace a watch
 
 There is no PUT and no PATCH. Your own `subscription_id` is the idempotency key; the stored document
-id is `<partner_id>~<your reference>`, so two partners may use the same reference and neither can
+id is `<client_id>~<your reference>`, so two clients may use the same reference and neither can
 address the other's record.
 
 | field | type | required | rule |
@@ -176,7 +176,7 @@ address the other's record.
 | `begin` | string | yes | `HH:MM`, 24 h |
 | `end` | string | yes | `HH:MM`, strictly after `begin` — **overnight windows are refused**, as they are in `/varsel` |
 | `days` | array of int | yes | non-empty subset of 0–6, 0 = Monday. Order and duplicates are normalised |
-| `partner_ref` | string | no | ≤ 256 characters, opaque to us, echoed on every event |
+| `external_ref` | string | no | ≤ 256 characters, opaque to us, echoed on every event |
 | `test` | boolean | no | default `false`. **Immutable after creation** |
 
 `If-Match: <version>` is optional optimistic concurrency. A mismatch, or an `If-Match` on a reference
@@ -191,21 +191,21 @@ inactivity horizon, because re-POSTing *is* the "still interested" signal); **20
 `409 "subscription id was deleted or has passed one of its horizons; use a new id"`.
 
 The response is the stored subscription: the nine submitted fields (with `subscription_id` as your
-bare reference), plus `partner_id`, `version`, `status`, `servable`, `servable_checked_at`,
+bare reference), plus `client_id`, `version`, `status`, `servable`, `servable_checked_at`,
 `expires_at`, `created_at`, `updated_at`, and `alerts` — which is **always `null` on this route**.
 
 ### `GET /subscriptions` — list
 
 `limit` (1–500, default 100) and `after` (a previous page's `next_cursor`). A cursor the current set
 does not contain is **400 `unknown_cursor`**, deliberately rather than an empty page. Alert state for
-the whole page comes from one partner-scoped query; see [Alert state](#alert-state).
+the whole page comes from one client-scoped query; see [Alert state](#alert-state).
 
 Response: `count`, `limit`, `next_cursor` (`null` on the last page), `subscriptions`.
 
 ### `GET /subscriptions/{id}` — one watch
 
-Accepts the bare reference or the namespaced `<partner_id>~<reference>` form an event carries.
-Missing, tombstoned, expired and another partner's are all **404 `not_found`** — the difference
+Accepts the bare reference or the namespaced `<client_id>~<reference>` form an event carries.
+Missing, tombstoned, expired and another client's are all **404 `not_found`** — the difference
 between 403 and 404 would be an enumeration oracle.
 
 ### `DELETE /subscriptions/{id}` — stop a watch
@@ -229,7 +229,7 @@ to leak, and it never calls the derivation either.
 ### `POST /test-events` — one signed synthetic event
 
 `{"subscription_id": "<your reference>"}` — and, like the two path routes, the namespaced
-`<partner_id>~<reference>` form works too. That matters more than it sounds: the id you have to hand
+`<client_id>~<reference>` form works too. That matters more than it sounds: the id you have to hand
 is usually the one a `GET` response or an event your receiver just handled gave you, and that is the
 namespaced form, so accepting only the bare reference meant a 422 from a value this API had itself
 just served. Refused with **409 `not_a_test_subscription`** unless the watch was created
@@ -238,7 +238,7 @@ just served. Refused with **409 `not_a_test_subscription`** unless the watch was
 `TestEventRequest.subscription_id` is therefore the one property in `openapi.json` stated inline
 rather than `$ref`-ed into `subscription.schema.json`: that file's definition is the **create-side**
 constraint (128 characters, no `~`) and is correctly strict there, since a create body must never
-name the namespaced form. Until 2026-09-09 this request body referenced it, so a partner generating
+name the namespaced form. Until 2026-09-09 this request body referenced it, so a client generating
 or validating against the published schema refused the namespaced id client-side — the same bug the
 server had already been fixed for, one layer out. **Do not widen the shared definition to reconcile
 them**; they are two different constraints.
@@ -286,7 +286,7 @@ Every error this module raises itself is `{"detail": "<short stable string>"}`:
 |---|---|
 | 400 | `if_match_must_be_a_version_integer`, `unknown_cursor` |
 | 401 | `unauthorized` |
-| 403 | `partner_suspended` |
+| 403 | `client_suspended` |
 | 404 | `not_found`, `no_destination` |
 | 409 | `version_conflict`, `not_a_test_subscription`, `destination_missing`, `destination_paused` |
 | 422 | `unknown_destination` |
@@ -344,7 +344,7 @@ later, so the caveat clears by itself. Three properties of that sweep are worth 
   One BigQuery blip must not become a freshly-stamped non-answer.
 
 **One window where it does not run**, and it is worth knowing during onboarding: the sweep is gated
-on the same flag as delivery, so until the partner channel is enabled in that environment nothing
+on the same flag as delivery, so until the webhook channel is enabled in that environment nothing
 refreshes a caveat. Re-`POST`ing the *identical* definition does not re-ask either — that path is a
 liveness touch, and only a **changed** definition re-asks. So in that window you are looking at the
 create-time answer, with `servable_checked_at` telling you how old it is.
@@ -376,7 +376,7 @@ Two bounds, and they answer different questions:
   The **counts are over everything read**, so nothing is hidden, only unenumerated.
 - **At most 500 subject documents are read per request.** Past that, `truncated: true` and the counts
   are lower bounds. On a list page the flag is set on **every** row when that page's single query was
-  bounded, and it fires at 500 live subjects **across the whole partner**, not per subscription. Ask
+  bounded, and it fires at 500 live subjects **across the whole client**, not per subscription. Ask
   about one watch individually to scope the read to it.
 
 `truncated: true` also covers a failed read. Beside it, `n_active: 0` means *we could not establish
@@ -405,9 +405,9 @@ the envelope**; the nested objects under `payload` are deliberately open.
 | `revision` | int ≥ 1 | yes | strictly increasing per `alert_id` |
 | `occurred_at` | date-time | yes | when we decided this revision, UTC |
 | `valid_until` | date-time | yes | see [Delivery semantics](#delivery-semantics) |
-| `subscription_id` | string | yes | the **namespaced** form, `<partner_id>~<your reference>` |
+| `subscription_id` | string | yes | the **namespaced** form, `<client_id>~<your reference>` |
 | `subscription_version` | int ≥ 1 | yes | the version this event was authorised by |
-| `partner_ref` | string | no | your opaque reference, echoed unchanged |
+| `external_ref` | string | no | your opaque reference, echoed unchanged |
 | `test` | boolean | yes | inside the signed body, not a header |
 | `operator` | string | yes | codespace, e.g. `VYG` |
 | `line` | string | yes | |
@@ -511,7 +511,7 @@ signs a different document as soon as anything reorders a key.
   serve several destinations.
 - **Five minutes is the reference replay tolerance.**
 - Each destination's secret is derived as HMAC-SHA256 of a per-environment root over
-  `destination_id || generation`, so we store no signing material and one partner's leaked
+  `destination_id || generation`, so we store no signing material and one client's leaked
   verification secret forges nothing for another.
 - **The verification secret lives in your functions runtime configuration and never in a mobile
   bundle.** A client that holds it can forge an event for any commuter you serve, and a secret in a
@@ -625,7 +625,7 @@ Two numbers of the receiver's own, neither of them in the sender's contract:
 ## Retention and deletion
 
 The clauses below are checked against the code that implements them; the clause-by-clause table,
-naming the function behind each one, is in `../operations/partner-notifications.md`.
+naming the function behind each one, is in `../operations/notification-webhooks.md`.
 
 | what | kept | how |
 |---|---|---|
@@ -650,18 +650,18 @@ if you never re-issue, is the document's own 7-day retention plus that lag, so u
    subscription shares with any browser registration on the same route — so removing one
    subscription's wording would remove the other's. Those entries expire with the SIRI-SX situation
    they belong to (up to 12 h from its onset) and are dropped the first pass a subject stops being
-   alert-worthy. They hold prose, never a partner id, a callback URL or your reference.
-2. **Partner and event identifiers in cluster logs.** They have their own retention and access
+   alert-worthy. They hold prose, never a client id, a callback URL or your reference.
+2. **Client and event identifiers in cluster logs.** They have their own retention and access
    policy, which the operations doc states. No log line on this path carries an origin, a
    destination, a departure time, a full callback URL or any notification prose. Three things do
-   reach a log line and are named rather than glossed: your `partner_ref` never does, but your
-   **`subscription_id`** does (as `<partner_id>~<your reference>`, on `partner_subscription` and
-   `partner_cleanup`) and is hashed into `alert_id`; a **refused destination's hostname and its
-   resolved IP addresses** do, on `partner_delivery_refused`; and an operator's own email address
-   does, on `partner_admin`.
+   reach a log line and are named rather than glossed: your `external_ref` never does, but your
+   **`subscription_id`** does (as `<client_id>~<your reference>`, on `notification_subscription` and
+   `notification_cleanup`) and is hashed into `alert_id`; a **refused destination's hostname and its
+   resolved IP addresses** do, on `webhook_delivery_refused`; and an operator's own email address
+   does, on `notification_admin`.
 
 **The seven-day event retention is shorter than the ten-day window the nightly outcome-labelling job
-uses**, so retrospectively scoring partner alerts is foreclosed by this choice. That is a published
+uses**, so retrospectively scoring client alerts is foreclosed by this choice. That is a published
 contract, so lengthening it later is a contract change rather than a tuning edit.
 
 ---
@@ -688,5 +688,5 @@ Ukur cancellation feed; the companion BFF integration and native enrollment work
 surface a commuter registers a journey on**, and the subscription shape assumes it captures origin,
 destination, weekdays and hours as `/varsel`'s does; notifications tied to a specific ticket rather
 than a registered journey; publishing the helper packages to a registry; a delivery-status API or
-dashboard for partners; scored outcomes for partner-only route definitions; destination-ownership
+dashboard for clients; scored outcomes for webhook-only route definitions; destination-ownership
 verification; additional languages; self-service onboarding; new model or operator coverage.

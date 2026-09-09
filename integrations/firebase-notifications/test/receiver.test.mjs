@@ -154,7 +154,7 @@ test("a GET is 405 without touching anything", async () => {
 
 test("the outcome hook is given a status and an outcome, never the event or its prose", async () => {
   // The receiver's logging surface. Logging the event would put a traveller's origin, destination
-  // and departure time into the partner's log retention -- which is exactly what the sending side's
+  // and departure time into the client's log retention -- which is exactly what the sending side's
   // own log shapes are built to avoid.
   const harness = memoryAdapters();
   const reported = [];

@@ -1,6 +1,6 @@
 """What a notification about a disrupted departure SAYS — shared by every surface that sends one.
 
-Extracted from :mod:`varsel` on 2026-09-08 (U1 of the partner-notification-webhooks plan, KTD1:
+Extracted from :mod:`varsel` on 2026-09-08 (U1 of the client-notification-webhooks plan, KTD1:
 "Reuse by extraction, not reimplementation"). Every function here was already written to be a pure
 function of ONE document — the message input :func:`llm_message.build_message_input` produces — so
 the extraction is a move rather than a rewrite: `varsel` keeps module-level aliases and the bytes a
@@ -8,7 +8,7 @@ traveller receives are unchanged.
 
 What the move buys is that a second surface can produce the same Norwegian wording without
 importing the browser push path. `varsel` is 147 KB carrying the poller's mutable state, the VAPID
-keypair, the device registry and the decision-log writer; a partner event needs none of that and
+keypair, the device registry and the decision-log writer; a notification event needs none of that and
 must not be able to reach any of it (R16). The dependency therefore points one way:
 `varsel -> notification_wording`, never back.
 
@@ -17,13 +17,13 @@ Three things this module deliberately does NOT own, each left where it is for a 
 * **`varsel._notification_payload`** — a Web Push envelope: icon, click-through url, tag, brand.
   All of it is browser delivery state.
 * **`varsel._tag_environment`** — the `[dev]` title prefix exists because two PWA installs are
-  indistinguishable in a phone's tray. A partner event carries its environment in its credentials.
+  indistinguishable in a phone's tray. A notification event carries its environment in its credentials.
 * **`varsel._message_input_from_alert`** — the last-resort reconstruction for the moment
   :mod:`llm_message` itself has failed. It exists to have no dependency on that module, and giving
   it one here would defeat it.
 
 **Two policies, both read by code rather than described in a comment** (:data:`BROWSER` and
-:data:`PARTNER`). What genuinely differs between the surfaces is which switch decides that a
+:data:`WEBHOOK`). What genuinely differs between the surfaces is which switch decides that a
 traveller receives the *model's* prose rather than the template, and which allowance a model call
 is charged to. Everything else — the template itself, the title, the delay phrase, the label a
 train is named by — is one implementation, because a wording that varied by surface would split
@@ -133,7 +133,7 @@ def train_label_from_input(message_input: dict) -> str | None:
     the train would have gone. Choosing for them here would make one of the three wrong.
 
     It exists as a function because the rule was written out three times -- twice here and once in
-    ``varsel._partner_withdrawal_wording`` -- and a product rule that must never drift is exactly
+    ``varsel._webhook_withdrawal_wording`` -- and a product rule that must never drift is exactly
     the thing not to keep three copies of.
     """
     hhmm = message_input.get("avgang_kl")
@@ -329,7 +329,7 @@ class Route:
 class DepartureWordingFacts:
     """Everything a wording about one dated departure is written from — typed, surface-neutral.
 
-    The field names are `varsel.Alert`'s, not because the partner path is a browser path but
+    The field names are `varsel.Alert`'s, not because the notification API path is a browser path but
     because `build_message_input` reads exactly these names off whatever it is handed. Naming them
     anything else here would mean a translation layer whose only job is to rename fields, and a
     translation layer between a fact and a lock screen is where a figure quietly goes missing.
@@ -415,11 +415,11 @@ def build_message_input(
 
 
 # ---- Delivery and generation policy per surface --------------------------------------------------
-# The partner surface's own switch for whether a traveller receives the MODEL's prose rather than
+# The client surface's own switch for whether a traveller receives the MODEL's prose rather than
 # the template. Separate from VARSEL_LLM_ENABLED, and defaulting OFF, because the plan's rollout
-# order is explicit: "Enable the partner flag in dev first, with deterministic wording, then model
+# order is explicit: "Enable the client flag in dev first, with deterministic wording, then model
 # wording once matching and delivery qualify" — U8 step 3 states the same four steps. Sharing
-# `VARSEL_LLM_ENABLED` would mean turning model prose on for partners the moment it is on for the
+# `VARSEL_LLM_ENABLED` would mean turning model prose on for clients the moment it is on for the
 # PWA, in the same deploy, with one variable — which is precisely the coupling the 2026-08-07
 # generation/delivery split removed one layer down. The name and the default are U1's to introduce
 # and U8's to revisit when it writes the rollout document.
@@ -431,21 +431,21 @@ def build_message_input(
 # duplication by a reuse review and kept, with this note, so it is not
 # re-raised: the allow-list is four literals and the coupling it would buy costs more.
 _TRUTHY = ("true", "1", "yes", "on")
-_PARTNER_DELIVERY_ENABLED = (
-    os.environ.get("NOTIFICATION_PARTNER_LLM_ENABLED", "false").strip().lower() in _TRUTHY
+_WEBHOOK_DELIVERY_ENABLED = (
+    os.environ.get("NOTIFICATION_WEBHOOK_LLM_ENABLED", "false").strip().lower() in _TRUTHY
 )
 
 
-def partner_delivery_enabled() -> bool:
-    """Whether a partner event carries the model's prose rather than the template wording.
+def webhook_delivery_enabled() -> bool:
+    """Whether a notification event carries the model's prose rather than the template wording.
 
     Read through a function rather than off the constant so a test can monkeypatch one name, the
     shape :func:`llm_message.delivery_enabled` already has.
     """
-    return _PARTNER_DELIVERY_ENABLED
+    return _WEBHOOK_DELIVERY_ENABLED
 
 
-# How many backend calls one partner evaluation pass may make, and how many the surface may make
+# How many backend calls one client evaluation pass may make, and how many the surface may make
 # across a trailing hour and day. Sized like `/meldinger`'s and for the same reason, which is worth
 # restating because it is NOT about this surface's own latency: what is being bounded is the
 # per-project Vertex quota the POLLER shares. A burst that eats it makes a real push wording 429,
@@ -462,12 +462,12 @@ _DAY_WINDOW_S = 24.0 * 60 * 60
 # The tally, keyed BY CALLER in the shape `alternatives._fetch_calls` and `meldinger._replay_calls`
 # already use. The point of the keying is structural rather than arithmetic: the browser push path
 # does not call this module at all, so its slot stays empty by construction, and a later caller
-# cannot silently draw the partner allowance down (or be drawn down BY it — U1 scenario 3).
-_PARTNER_PATH = "partner"
+# cannot silently draw the client allowance down (or be drawn down BY it — U1 scenario 3).
+_WEBHOOK_PATH = "webhook"
 _BROWSER_PATH = "browser"
 _budget_lock = threading.Lock()
 _calls: dict[str, tuple[deque[float], deque[float]]] = {
-    _PARTNER_PATH: (deque(), deque()),
+    _WEBHOOK_PATH: (deque(), deque()),
     _BROWSER_PATH: (deque(), deque()),
 }
 
@@ -488,7 +488,7 @@ def _spend(path: str, *, now: float | None = None) -> bool:
         return True
 
 
-def spent(path: str = _PARTNER_PATH) -> tuple[int, int]:
+def spent(path: str = _WEBHOOK_PATH) -> tuple[int, int]:
     """(hour, day) calls currently charged to `path` — for tests and for a diagnostics route."""
     with _budget_lock:
         hour, day = _calls[path]
@@ -511,16 +511,16 @@ class WordingPolicy:
     instance rather than a branch.
 
     `deliver` is the delivery gate — `llm_message.delivery_enabled()` for the browser
-    (VARSEL_LLM_ENABLED), :func:`partner_delivery_enabled` for a partner. `path` names the
+    (VARSEL_LLM_ENABLED), :func:`webhook_delivery_enabled` for a client. `path` names the
     allowance a call is charged to. `state_factory` builds the backend-selection holder: the
     browser uses `llm_message`'s module-global one (the poller's own latch, which is the whole
-    point of it), while a partner takes its own, exactly as `/meldinger`'s replay path does — a
+    point of it), while a client takes its own, exactly as `/meldinger`'s replay path does — a
     burst that drives both backends into a configuration error must not be able to read
     `generation_enabled()` False on the push path for the next thirty minutes.
 
     **`push_enabled()` is not a field here and must never become one** (KTD4). Whether this
     deployment holds a VAPID keypair is a fact about Web Push and says nothing about whether a
-    partner event can be worded; a partner surface has to work in a deployment with no keypair at
+    notification event can be worded; a client surface has to work in a deployment with no keypair at
     all.
     """
 
@@ -561,22 +561,22 @@ def _browser_delivery_enabled() -> bool:
     return llm_message.delivery_enabled()
 
 
-def _new_partner_state() -> Any:
+def _new_webhook_state() -> Any:
     import llm_message
 
-    return llm_message.new_partner_state()
+    return llm_message.new_webhook_state()
 
 
 BROWSER = WordingPolicy(name="browser", deliver=_browser_delivery_enabled, path=_BROWSER_PATH)
-PARTNER = WordingPolicy(
-    name="partner",
-    deliver=partner_delivery_enabled,
-    path=_PARTNER_PATH,
-    caller="partner",
-    state_factory=_new_partner_state,
+WEBHOOK = WordingPolicy(
+    name="webhook",
+    deliver=webhook_delivery_enabled,
+    path=_WEBHOOK_PATH,
+    caller="webhook",
+    state_factory=_new_webhook_state,
 )
 
-_POLICIES = (BROWSER, PARTNER)
+_POLICIES = (BROWSER, WEBHOOK)
 
 
 def reset_state() -> None:
@@ -588,11 +588,11 @@ def reset_state() -> None:
     with what it is checking, which reads exactly like the give-up bug those tests exist to pin
     (`varsel._message_errors`, 2026-08-22, is the same lesson one module over). The latch holder is
     the half that is easy to forget and worse to leak: a test that drives every backend into a
-    `_ConfigurationError` latches THIS process's `PARTNER` holder off for `llm_message._LATCH_TTL`
-    — thirty minutes, i.e. the rest of the run — so every later partner wording is a template and
+    `_ConfigurationError` latches THIS process's `WEBHOOK` holder off for `llm_message._LATCH_TTL`
+    — thirty minutes, i.e. the rest of the run — so every later webhook wording is a template and
     nothing says why.
 
-    Iterates the policies rather than naming `PARTNER`, so a third surface's holder is cleared by
+    Iterates the policies rather than naming `WEBHOOK`, so a third surface's holder is cleared by
     existing on the tuple instead of by somebody remembering to add a line here.
     """
     _reset_budget()
@@ -622,17 +622,17 @@ class PassBudget:
     """How many backend calls one evaluation pass has left. Not thread-shared: one pass, one
     counter, checked before a call rather than after — the shape `varsel._WriteBudget` uses.
 
-    **Which budget a partner wording is to draw on, stated because it is two answers and not
+    **Which budget a webhook wording is to draw on, stated because it is two answers and not
     one.** Nothing in U1 calls this class: the caller arrives with U2, and this paragraph is the
-    contract it and U6 have to honour rather than a description of the tree. A partner subject is
+    contract it and U6 have to honour rather than a description of the tree. A webhook subject is
     to be written for inside the poller's existing writing pass (`check_and_notify`'s pass 1c), so
     it shares that pass's WALL-CLOCK deadline — `varsel._WriteBudget`, which reserves
     `_WORST_CASE_CALL_S` up front so the deadline stays a ceiling on when the pass *ends*. What it
     must NOT share is the CALL allowance: `varsel._MAX_LLM_CALLS_PER_CYCLE` (64) counts browser
-    wordings and is left alone, and a partner call is charged to this class plus the caller-keyed
+    wordings and is left alone, and a client call is charged to this class plus the caller-keyed
     trailing hour/day above. The split is deliberate. The clock is a property of the pass, and two
     surfaces writing inside one pass cannot each have their own; the count is a property of the
-    surface, and merging them would let a busy partner morning silently retire the browser
+    surface, and merging them would let a busy client morning silently retire the browser
     wordings — which is `_MAX_LLM_CALLS_PER_CYCLE`'s own lesson read the other way round (raising
     the count without the width just moves the binding constraint to the clock).
     """
@@ -651,7 +651,7 @@ def write_wording(
     route: Route,
     facts: DepartureWordingFacts,
     *,
-    policy: WordingPolicy = PARTNER,
+    policy: WordingPolicy = WEBHOOK,
     subject_id: str = "",
     now: datetime | None = None,
     budget: PassBudget | None = None,
@@ -667,9 +667,9 @@ def write_wording(
 
     1. **the surface's delivery gate**. Off means the model is not asked at all — there is nothing
        to compare against here (unlike `varsel`, which writes in prd precisely so the two wordings
-       can be compared on real traffic and records both). A partner event carries one wording.
+       can be compared on real traffic and records both). A notification event carries one wording.
     2. **`generation_enabled`** on this surface's own holder — which is where
-       `VARSEL_LLM_PROVIDER=off`, the egress kill switch, stops a partner call. That switch is
+       `VARSEL_LLM_PROVIDER=off`, the egress kill switch, stops a client call. That switch is
        process-wide by design: it means "no traveller data leaves for Vertex", and a surface that
        could opt out of it would make it a lie. Asked before anything is charged, so the kill
        switch reports `disabled` for as long as it is set rather than turning into
@@ -720,7 +720,7 @@ def write_wording(
         return template("capped")
     if not _spend(policy.path):
         logger.info(
-            "Partner wording allowance exhausted; using the deterministic wording",
+            "Webhook wording allowance exhausted; using the deterministic wording",
             extra={"fields": {"event": "notification_wording", "result": "rate_limited",
                               "surface": policy.name}},
         )

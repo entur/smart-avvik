@@ -2,11 +2,11 @@
 //
 // The sender projects its stored event onto an allow-list of exactly the schema's top-level
 // properties, and it does so because a deny-list would have shipped two extra fields that a
-// conforming receiver refuses -- on every event, for every partner. That is the sender's half. This
+// conforming receiver refuses -- on every event, for every client. That is the sender's half. This
 // is the receiver's half of the same pin, and the two halves are what make the claim symmetric:
 //
 //   * no field the schema does not declare is accepted (a regression on the sender fails HERE, in a
-//     test, rather than in production at a partner running a stricter verifier);
+//     test, rather than in production at a client running a stricter verifier);
 //   * every field the schema declares required is required (a projection that silently dropped one
 //     produces a body that declares it required and does not carry it, which fails at the receiver
 //     and not at the sender);
@@ -64,10 +64,10 @@ test("a valid event round-trips through parseEvent", () => {
 
 test("the three fields the sender's store holds but must never send are refused", () => {
   // Named individually rather than as "any extra field", because these three are the ones a
-  // deny-list regression on the sender would actually ship: `partner_id` and `destination_id` are
+  // deny-list regression on the sender would actually ship: `client_id` and `destination_id` are
   // its own routing, and `expires_at` is a retention decision that is NOT validity -- on the wire it
   // would invite a receiver to read it as one.
-  for (const field of ["partner_id", "destination_id", "expires_at"]) {
+  for (const field of ["client_id", "destination_id", "expires_at"]) {
     const body = { ...makeEvent(), [field]: "leaked" };
     const parsed = parseEvent(encode(body));
     assert.equal(parsed.ok, false, field);
@@ -97,7 +97,7 @@ test("a missing required field is refused, one field at a time", () => {
 
 test("an optional field may be absent", () => {
   const optional = EVENT_WIRE_FIELDS.filter((name) => !EVENT_REQUIRED_FIELDS.includes(name));
-  assert.deepEqual([...optional], ["partner_ref", "situations"]);
+  assert.deepEqual([...optional], ["external_ref", "situations"]);
   for (const field of optional) {
     const body = makeEvent();
     delete body[field];
@@ -142,7 +142,7 @@ test("a body that is not JSON, or not an object, is refused rather than thrown o
 });
 
 test("the vendored contracts are byte-identical to the authored ones", () => {
-  // The package ships its own copy so it is self-contained when vendored into the partner's repo.
+  // The package ships its own copy so it is self-contained when vendored into the client's repo.
   // That copy is a duplication, and this is the guard that keeps it from becoming a divergence --
   // the same arrangement `personvern.ts` already has in this repository.
   const authored = path.join(REPO_ROOT, "contracts", "notifications", "v1");
@@ -169,7 +169,7 @@ test("the vendored contracts are byte-identical to the authored ones", () => {
 
 test("the generated types are in step with the vendored schemas", () => {
   // `--check` re-renders in memory and exits non-zero on any difference, so an edit to the schema
-  // that nobody regenerated fails here rather than at a partner's compiler.
+  // that nobody regenerated fails here rather than at a client's compiler.
   execFileSync(process.execPath, ["scripts/generate-contracts.mjs", "--check"], {
     cwd: PACKAGE_ROOT,
     stdio: "pipe",
@@ -177,7 +177,7 @@ test("the generated types are in step with the vendored schemas", () => {
 });
 
 test("the sample test event parses as a conforming envelope, and carries the open payload's real keys", () => {
-  // `contracts/test-event-sample.json` is dumped from `partner_api._synthetic_event` and is what the
+  // `contracts/test-event-sample.json` is dumped from `notification_api._synthetic_event` and is what the
   // Firebase receiver's end-to-end scenario now reads instead of a hand-written transcription. Two
   // things are pinned here, one layer below that.
   //
@@ -223,7 +223,7 @@ test("the sample test event parses as a conforming envelope, and carries the ope
 //
 // `openapi.json` is not vendored into this package -- nothing here reads it at runtime, and the
 // generator above renders types from the two JSON Schemas only. It is pinned from here anyway,
-// because this package is where a partner arrives and because both of the drifts below shipped: a
+// because this package is where a client arrives and because both of the drifts below shipped: a
 // document can promise a shape the server never sends without a single test in either language
 // noticing.
 
@@ -239,11 +239,11 @@ function authoredOpenApi() {
 }
 
 test("the test-event request publishes the id form the route accepts, not the create-side one", () => {
-  // The create body must carry the partner's own reference and nothing else, so
+  // The create body must carry the client's own reference and nothing else, so
   // `subscription.schema.json`'s definition caps at 128 characters and excludes `~`. `POST
   // /test-events` also accepts the opaque `subscription_id` an EVENT carries, which is
-  // `<partner_id>~<reference>` -- so while this property was a `$ref` into that stricter definition,
-  // the published schema refused a value the API had itself just served, and a partner validating
+  // `<client_id>~<reference>` -- so while this property was a `$ref` into that stricter definition,
+  // the published schema refused a value the API had itself just served, and a client validating
   // outbound requests against it reproduced the server bug in their own client.
   //
   // Pinned against the PATH parameter rather than against a literal: the document already publishes
@@ -261,7 +261,7 @@ test("the test-event request publishes the id form the route accepts, not the cr
   assert.equal(property.maxLength, pathParameter.schema.maxLength);
   assert.equal(property.minLength, 1);
   assert.ok(property.pattern.includes("~"), "the namespaced form must validate");
-  assert.ok(new RegExp(property.pattern).test("partner-a~morgentur"));
+  assert.ok(new RegExp(property.pattern).test("client-a~morgentur"));
   // And the create side stays strict: widening it to reconcile the two would be the same mistake
   // pointing the other way. Read through the VENDORED copy, which needs no existence guard and is
   // the file the byte-identity test above pins -- a second unguarded read of the authored directory
@@ -269,7 +269,7 @@ test("the test-event request publishes the id form the route accepts, not the cr
   const createSide = JSON.parse(
     readVendoredContract("subscription.schema.json"),
   ).properties.subscription_id;
-  assert.ok(!new RegExp(createSide.pattern).test("partner-a~morgentur"));
+  assert.ok(!new RegExp(createSide.pattern).test("client-a~morgentur"));
   assert.equal(createSide.maxLength, 128);
 });
 

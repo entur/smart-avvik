@@ -1,8 +1,8 @@
-"""The hardened outbound client for partner webhook delivery (KTD9, R18).
+"""The hardened outbound client for webhook delivery (KTD9, R18).
 
 Built on :mod:`urllib.request`, this repo's outbound client (`alternatives._post_json`,
 `reisevalg._post_json`) -- no new dependency, and none is needed. What is different here is the
-destination: the Journey Planner is an Entur host in a constant, while a partner callback URL is a
+destination: the Journey Planner is an Entur host in a constant, while a client callback URL is a
 value somebody typed into a record. Everything below follows from that one difference.
 
 **The address test is POSITIVE, and that is the whole point.** An address is accepted only when it
@@ -43,16 +43,16 @@ pinning silently.
 
 **The test-network fence raises before any socket opens.** `alternatives._network_allowed`'s shape,
 and the reason is sharper here: a suite that forgets to stub the sender would dial a
-*partner-supplied host* from CI. The check sits immediately before ``socket.getaddrinfo`` and again
+*client-supplied host* from CI. The check sits immediately before ``socket.getaddrinfo`` and again
 inside the real transport, so stubbing only one of the two seams still trips it.
 
 **What this module does not do.** It looks nothing up, writes nothing durable and knows no
 destination record. It returns a classified :class:`DeliveryAttempt`; the caller (U6) persists the
-outcome through ``partner_store``. The delivery id and the ``webhook-id`` are the caller's to hold
+outcome through ``notification_store``. The delivery id and the ``webhook-id`` are the caller's to hold
 across attempts -- see :mod:`webhook_signing`.
 
 **Known bound, stated rather than fixed.** ``socket.settimeout`` is per-recv, not a total deadline,
-and ``http.client`` reads response headers a line at a time -- so a partner drip-feeding one byte
+and ``http.client`` reads response headers a line at a time -- so a client drip-feeding one byte
 per second can hold the calling thread for several multiples of the read timeout. Closing that
 properly means a non-blocking read loop, which is a rewrite of ``http.client``'s response parsing.
 What contains it instead is one layer up: KTD6's delivery pass reserves its worst case against a
@@ -77,14 +77,14 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 
-from partner_store import RETRY_AFTER_CAP_S
+from notification_store import RETRY_AFTER_CAP_S
 
 logger = logging.getLogger(__name__)
 
 # ---- Bounds ------------------------------------------------------------------------------------
 #
 # 5 s total and 2 s connect, per KTD6/KTD9. The pass that calls this is the poller's last phase and
-# runs 4-wide against a 20 s budget, so a per-attempt ceiling is what keeps a dead partner from
+# runs 4-wide against a 20 s budget, so a per-attempt ceiling is what keeps a dead client from
 # turning into cycle time.
 
 DEFAULT_TIMEOUT_S = 5.0
@@ -93,7 +93,7 @@ CONNECT_TIMEOUT_S = 2.0
 #: A response body is read only to be discarded -- nothing here parses it. The cap is ordinary
 #: resource-exhaustion hygiene rather than a webhook-specific practice (no provider documents one),
 #: so it TRUNCATES and logs instead of failing the attempt: the status line already told us the
-#: partner accepted the event, and turning that into a retry would re-send it every cycle for the
+#: client accepted the event, and turning that into a retry would re-send it every cycle for the
 #: event's whole 60-minute validity because of a byte count nobody reads.
 MAX_RESPONSE_BYTES = 64 * 1024
 
@@ -105,10 +105,10 @@ ALLOWED_SCHEME = "https"
 
 #: Only 443. A callback on another port is not refused because the port is dangerous; it is refused
 #: because a destination record naming one is more likely a mistake or an internal service than a
-#: partner's public endpoint, and R18's blast radius is worth more than that flexibility.
+#: client's public endpoint, and R18's blast radius is worth more than that flexibility.
 ALLOWED_PORT = 443
 
-USER_AGENT = "kix-avvik-partner-notifications/1"
+USER_AGENT = "kix-avvik-notifications/1"
 
 # ---- The test-network fence --------------------------------------------------------------------
 #
@@ -117,10 +117,10 @@ USER_AGENT = "kix-avvik-partner-notifications/1"
 #   * falsy  -> always blocked
 #   * unset  -> allowed only outside a test process.
 # The last line is what keeps the deployment safe: requiring the flag in prd would mean a forgotten
-# Helm value silently costs every partner delivery, forever, trading a loud test failure for a
+# Helm value silently costs every webhook delivery, forever, trading a loud test failure for a
 # silent production one. Detection covers both ways the suites run -- `python test_x.py` (CI) and
 # pytest (a developer).
-ALLOW_NETWORK_ENV = "KIX_ALLOW_PARTNER_NETWORK"
+ALLOW_NETWORK_ENV = "KIX_ALLOW_WEBHOOK_NETWORK"
 
 
 class UnsafeDestination(ValueError):
@@ -144,7 +144,7 @@ def _in_a_test_process() -> bool:
 
 
 def network_allowed() -> bool:
-    """Whether this process may dial a partner endpoint at all. See the note above."""
+    """Whether this process may dial a client endpoint at all. See the note above."""
     flag = os.environ.get(ALLOW_NETWORK_ENV)
     if flag is not None:
         return flag.strip().lower() in ("1", "true", "yes", "on")
@@ -154,9 +154,9 @@ def network_allowed() -> bool:
 def _require_network() -> None:
     if not network_allowed():
         raise NetworkBlocked(
-            "Refusing a live partner webhook request from a test process: stub "
-            f"webhook_client.deliver's `transport` and `resolver` (or set {ALLOW_NETWORK_ENV}=1 "
-            "to allow it). Unstubbed, this would dial a partner-supplied host from CI."
+            "Refusing a live webhook request from a test process: stub "
+            f"webhook_sender.deliver's `transport` and `resolver` (or set {ALLOW_NETWORK_ENV}=1 "
+            "to allow it). Unstubbed, this would dial a client-supplied host from CI."
         )
 
 
@@ -295,7 +295,7 @@ class ResolvedDestination:
         The first validated answer, in the resolver's own order -- which on a dual-stack host is the
         system's RFC 6724 preference. Only the first is tried: one attempt per cycle is this repo's
         retry model everywhere, and walking every answer would multiply the per-attempt ceiling by
-        the number of A/AAAA records a partner happens to publish.
+        the number of A/AAAA records a client happens to publish.
         """
         return self.addresses[0]
 
@@ -321,7 +321,7 @@ def resolve_and_validate(
 
     All-or-nothing on purpose. Picking the good answers out of a mixed set would accept a host whose
     DNS is already answering with an internal address, which is exactly the rebind this guards
-    against -- and it costs nothing, because a legitimate partner endpoint has no private answers.
+    against -- and it costs nothing, because a legitimate client endpoint has no private answers.
     """
     resolve = resolver or _default_resolver
     try:
@@ -384,7 +384,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
 #: ONE trust store for the process, not one per delivery attempt.
 #: ``ssl.create_default_context()`` loads and parses the platform CA bundle every time it is
 #: called, and it was called once per attempt -- inside the 5 s per-attempt ceiling that
-#: ``partner_delivery`` treats as scarce, for a bundle that is identical for every destination and
+#: ``webhook_delivery`` treats as scarce, for a bundle that is identical for every destination and
 #: changes only on a redeploy. An ``SSLContext`` is safe to share across threads and across
 #: connections, which is what makes this a memoization rather than a behaviour change: the same
 #: default verification, the same pinning path, the same everything except the parse.
@@ -456,7 +456,7 @@ def _send(
 # errors, timeouts, 408, 429 and 5xx are retryable. (Stripe retries all 4xx; the Standard Webhooks
 # spec does not; Svix's own docs disagree with each other. Do not average them.)
 #
-# 3xx is the one status the plan does not name. It is terminal: a redirect is a partner
+# 3xx is the one status the plan does not name. It is terminal: a redirect is a client
 # configuration fault, the next attempt gets the same redirect, and following it is what the whole
 # pinning exercise exists to prevent.
 
@@ -473,8 +473,8 @@ class DeliveryAttempt:
     signal and is about the DESTINATION record rather than this delivery, so only U4/U6 can act on
     it.
 
-    ``retry_after_s`` is already capped at :data:`partner_store.RETRY_AFTER_CAP_S`; the store caps it
-    again against the time to departure. RFC 9110 puts no ceiling on the header, so a partner can
+    ``retry_after_s`` is already capped at :data:`notification_store.RETRY_AFTER_CAP_S`; the store caps it
+    again against the time to departure. RFC 9110 puts no ceiling on the header, so a client can
     legally answer 999999 and the cap is purely our convention.
     """
 
@@ -513,7 +513,7 @@ def parse_retry_after(value: str | None, *, now: float | None = None) -> float |
     """``Retry-After`` as bounded seconds, or ``None`` when absent or unreadable.
 
     Both RFC 9110 forms: delta-seconds and an HTTP-date. Capped at
-    :data:`partner_store.RETRY_AFTER_CAP_S`, and never negative -- a date already in the past means
+    :data:`notification_store.RETRY_AFTER_CAP_S`, and never negative -- a date already in the past means
     "now", not "go back in time".
     """
     if not value:
@@ -555,9 +555,9 @@ def deliver(
     resolver: Resolver | None = None,
     transport: Transport | None = None,
 ) -> DeliveryAttempt:
-    """POST ``body`` to a partner callback, once, safely, and classify what happened.
+    """POST ``body`` to a client callback, once, safely, and classify what happened.
 
-    Never raises for a delivery outcome: every failure the partner or the network can cause comes
+    Never raises for a delivery outcome: every failure the client or the network can cause comes
     back as a :class:`DeliveryAttempt`, because the caller must record it and a raise on the poller
     thread is a hole in the pass. The two exceptions are deliberate and are both OUR faults rather
     than theirs -- :class:`NetworkBlocked` (a suite forgot to stub this) and a ``ValueError`` from
@@ -578,12 +578,12 @@ def deliver(
         resolved = resolve_and_validate(destination, resolver=resolver)
     except UnsafeDestination as exc:
         # Terminal, and NOT a reason to pause the destination: pausing is the 410 signal and means
-        # "the partner told us to stop". A destination record with a bad URL is an operator's to
+        # "the client told us to stop". A destination record with a bad URL is an operator's to
         # correct, and it is visible as a failed delivery with this reason on it.
         logger.warning(
-            "Refusing a partner callback URL: %s",
+            "Refusing a client callback URL: %s",
             exc,
-            extra={"fields": {"event": "partner_delivery_refused", "reason": str(exc)}},
+            extra={"fields": {"event": "webhook_delivery_refused", "reason": str(exc)}},
         )
         return DeliveryAttempt(
             ok=False,
@@ -646,11 +646,11 @@ def deliver(
     truncated = len(raw) > MAX_RESPONSE_BYTES
     if truncated:
         logger.warning(
-            "Partner response body exceeded %d bytes and was truncated",
+            "Client response body exceeded %d bytes and was truncated",
             MAX_RESPONSE_BYTES,
             extra={
                 "fields": {
-                    "event": "partner_delivery_response_truncated",
+                    "event": "webhook_delivery_response_truncated",
                     "limit": MAX_RESPONSE_BYTES,
                 }
             },
@@ -663,7 +663,7 @@ def deliver(
         terminal_state=terminal_state,
         pause_destination=pause,
         retry_after_s=retry_after if retryable else None,
-        # No partner-supplied response text on the record, ever: R16 keeps partner prose out of our
+        # No client-supplied response text on the record, ever: R16 keeps client prose out of our
         # surfaces, and the status is what an operator needs to tell a 500 from a 403.
         error=None if ok else f"http_{status}",
         duration_ms=elapsed_ms(),

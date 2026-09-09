@@ -35,8 +35,8 @@ VECTORS = json.loads(VECTORS_PATH.read_text())
 
 ROOT = b"kix-test-signing-root-not-used-in-any-deployment"
 OTHER_ROOT = b"a-completely-different-root-secret-for-comparison"
-DEST_A = "dst_partner_a_prod"
-DEST_B = "dst_partner_b_prod"
+DEST_A = "dst_client_a_prod"
+DEST_B = "dst_client_b_prod"
 BODY = b'{"event_id":"7f3c1a","revision":351}'
 
 
@@ -80,7 +80,7 @@ def test_an_absent_or_short_root_fails_closed_and_loudly():
         raise AssertionError("an unset root must raise")
     # Short is a provisioning mistake, and refusing it is the only moment anybody notices. There is
     # deliberately no ephemeral fallback here (unlike sso.py's session key, where a wrong-but-
-    # working key only logs somebody out): an unsigned or wrongly-signed partner request is a hole
+    # working key only logs somebody out): an unsigned or wrongly-signed client request is a hole
     # on their side and a retry storm on ours.
     os.environ[ws.SIGNING_ROOT_ENV] = "x" * (ws.MIN_ROOT_BYTES - 1)
     try:
@@ -97,7 +97,7 @@ def test_an_absent_or_short_root_fails_closed_and_loudly():
 def test_the_published_test_root_is_refused_by_name():
     """A root anyone can read out of this repository must not be a root any deployment can use.
 
-    `contracts/notifications/v1/signing-vectors.json` publishes `test_root` so a partner can
+    `contracts/notifications/v1/signing-vectors.json` publishes `test_root` so a client can
     reproduce a signature by hand -- which is what the file is for -- and it is 48 bytes, so it
     cleared `MIN_ROOT_BYTES` and every readiness check passed for it: `configured()` answered True,
     `/destinations/current` reported `ready: true`, `/test-events` answered 200, and every delivery
@@ -105,7 +105,7 @@ def test_the_published_test_root_is_refused_by_name():
     vendored again under `integrations/`, so anyone could forge a cancellation or a withdrawal about
     a real train against a receiver whose only authentication IS the signature.
 
-    The runbook tells an operator to export `PARTNER_SIGNING_ROOT` by hand for `show-signing-secret`,
+    The runbook tells an operator to export `WEBHOOK_SIGNING_ROOT` by hand for `show-signing-secret`,
     which is precisely the moment a documented example value gets pasted -- so this is a plausible
     provisioning slip rather than a hypothetical, and it produced no fault report anywhere.
 
@@ -143,7 +143,7 @@ def test_the_published_test_root_is_refused_by_name():
 
 def test_surrounding_whitespace_is_stripped_and_warned_about_once(caplog=None):
     # The chart's own note: a payload written with `echo` rather than `printf '%s'` carries a
-    # trailing newline, which here would re-derive EVERY destination's secret -- so every partner's
+    # trailing newline, which here would re-derive EVERY destination's secret -- so every client's
     # verification fails at once and nothing on our side reports a configuration fault.
     records: list[logging.LogRecord] = []
 
@@ -206,7 +206,7 @@ def test_the_material_carries_a_purpose_tag_like_ssos_tokens():
     # One key, disjoint messages: a future second use of the same root cannot collide with this one.
     material = ws.derivation_material(DEST_A, 2)
     assert material.startswith(b"kix.webhook.signing.v1|")
-    assert b"|18|dst_partner_a_prod|2" in material
+    assert b"|17|dst_client_a_prod|2" in material
 
 
 def test_a_bad_destination_id_or_generation_is_refused():
@@ -232,7 +232,7 @@ def test_a_secret_that_is_not_a_whsec_value_is_refused():
 def test_the_secret_body_is_standard_padded_base64_not_the_urlsafe_form():
     # A different contract from sso.py's cookie: the npm package base64-decodes this string with the
     # standard alphabet and expects padding. Reaching for urlsafe_b64encode or stripping '=' here
-    # would hand a partner a secret their own library cannot read.
+    # would hand a client a secret their own library cannot read.
     for generation in range(64):
         body = ws.derive_secret(DEST_A, generation, root=ROOT)[len(ws.SECRET_PREFIX) :]
         assert body.endswith("="), body
@@ -345,7 +345,7 @@ def test_sign_mints_a_fresh_timestamp_when_none_is_given():
 def test_sign_reads_the_environment_when_no_root_is_passed():
     # NOT `ROOT`: that is the value the contract publishes and `signing_root()` now refuses it by
     # name, so an environment read of it raises rather than signing. The other suites' fixtures
-    # ('r' * 40 in test_partner_auth and test_partner_api, 'r' * 48 in test_partner_delivery) are
+    # ('r' * 40 in test_notification_auth and test_notification_api, 'r' * 48 in test_webhook_delivery) are
     # arbitrary for the same reason. `ROOT` stays as the module-level constant for the `root=`
     # injection path, which is what re-derives the published vectors.
     env_root = b"e" * 40
@@ -490,7 +490,7 @@ def test_both_generations_verify_during_an_overlap_and_each_is_revocable_alone()
     assert check(retiring).ok is True, "a receiver still holding the old secret must keep working"
     assert not check(revoked)
     # Dropping generation 2 from the destination record revokes it and leaves 3 working: the header
-    # is simply re-signed with one entry. No flag day, and nothing to coordinate with the partner.
+    # is simply re-signed with one entry. No flag day, and nothing to coordinate with the client.
     single = ws.sign(
         destination_id=DEST_A,
         generations=[3],
@@ -841,7 +841,7 @@ def test_no_new_dependency_is_introduced():
 def test_the_module_looks_nothing_up():
     # The destination record is U4's. A signer that read it would need the store on the delivery
     # path, and R18 is about that path not depending on anything slow.
-    for forbidden in ("partner_store", "firestore", "requests", "urllib"):
+    for forbidden in ("notification_store", "firestore", "requests", "urllib"):
         assert forbidden not in MODULE_SOURCE, forbidden
 
 

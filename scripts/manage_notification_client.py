@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Operator tool for the partner notification channel: partners, credentials, destinations.
+"""Operator tool for the webhook channel: clients, credentials, destinations.
 
 R22's boundary, as a command-line tool rather than an API surface. Nothing here is reachable from
-the running app: provisioning a partner, issuing or revoking a credential, moving or pausing a
-callback destination and suspending a partner are operator actions, and putting any of them behind
-a partner credential would let a partner grant itself what an operator is supposed to decide.
+the running app: provisioning a client, issuing or revoking a credential, moving or pausing a
+callback destination and suspending a client are operator actions, and putting any of them behind
+a client credential would let a client grant itself what an operator is supposed to decide.
 
 **Authorization.** Every subcommand -- reads included -- is authorized against a NAMED
 least-privilege Google group, and production has its own:
@@ -18,23 +18,23 @@ least-privilege Google group, and production has its own:
 The group is what holds ``roles/datastore.user`` on that environment's GCP project, which is what
 makes the IAM environment-scoped rather than global: each environment is its own project with its
 own runtime identity (KTD5). Reads are gated too, deliberately: a destination's callback URL and a
-partner's key ids are exactly what an attacker would want before trying to forge one.
+client's key ids are exactly what an attacker would want before trying to forge one.
 
 **``--environment`` picks the target as well as the gate**, and until 2026-09-09 it picked only the
 gate: ``--project`` chose which project was read and written with no comparison between the two, so
 ``--environment dev --project ent-kixavvik-prd`` was authorized against the dev group and then acted
-on prd -- ``show-signing-secret`` printing a live prd receiver credential, ``suspend-partner``
-silencing a real partner. What refused it was prd project IAM, not this tool, so R22's separate prd
+on prd -- ``show-signing-secret`` printing a live prd receiver credential, ``suspend-client``
+silencing a real client. What refused it was prd project IAM, not this tool, so R22's separate prd
 group held only while that group was the sole holder of ``roles/datastore.user`` there. The tool now
 resolves the project from the environment (:data:`PROJECTS`) and exits 2 when a flag or an exported
 ``GOOGLE_CLOUD_PROJECT`` disagrees, and IAM backs that rather than being it.
 
-Separate for production, and separately from partner keys: a partner credential authenticates a
+Separate for production, and separately from client keys: a client credential authenticates a
 machine against ``/notification-api/v1`` and can do none of this, while a group membership
 authorizes a human against the store and cannot register a subscription.
 
-**Audit.** Every action lands in ``partner_admin_audit`` -- actor, action, partner, ``key-id``,
-timestamp -- through :func:`partner_auth.record_admin_action`, which every mutating function in
+**Audit.** Every action lands in ``admin_audit`` -- actor, action, client, ``key-id``,
+timestamp -- through :func:`notification_auth.record_admin_action`, which every mutating function in
 that module calls inside its own path. A REFUSAL is audited too (scenario 10), and that has one
 honest limitation: if the group IS the IAM grant, somebody who is not a member may also be unable
 to write the audit collection, so the refusal record is written best-effort and a structured line
@@ -46,32 +46,32 @@ updates or deletes a row in that collection.
 this repo -- nothing in the image talks to it, and adding it to ``pyproject.toml`` would put it in
 every developer's environment for a tool nobody runs from CI. So it is named on the command line:
 
-    uv run --with google-api-python-client python scripts/manage_notification_partner.py \\
-        --environment dev create-partner --partner-id acme --name "Acme Reise AS"
+    uv run --with google-api-python-client python scripts/manage_notification_client.py \\
+        --environment dev create-client --client-id acme --name "Acme Reise AS"
 
 Without that flag :func:`google_group_authorizer` cannot import the client and **fails closed** --
 it reports ``membership_check_failed`` and every subcommand is refused. That is the right failure
 direction and a confusing one to hit by accident, so the missing flag is the first thing to check
 when a command is refused for somebody who *is* in the group.
 
-**``issue-key`` additionally needs that environment's ``PARTNER_KEY_PEPPER`` exported**, because a
+**``issue-key`` additionally needs that environment's ``NOTIFICATION_KEY_PEPPER`` exported**, because a
 credential's secret is stored only as its HMAC under the pepper and there is nothing to hash
 without it. No other subcommand touches it. Fetch it from Secret Manager into the shell for the one
 command and drop it afterwards -- never paste it from a ticket, and never leave it exported:
 
-    PARTNER_KEY_PEPPER="$(gcloud secrets versions access latest \\
-        --secret=PARTNER_KEY_PEPPER --project=ent-kixavvik-dev)" \\
-      uv run --with google-api-python-client python scripts/manage_notification_partner.py \\
-        --environment dev issue-key --partner-id acme
+    NOTIFICATION_KEY_PEPPER="$(gcloud secrets versions access latest \\
+        --secret=NOTIFICATION_KEY_PEPPER --project=ent-kixavvik-dev)" \\
+      uv run --with google-api-python-client python scripts/manage_notification_client.py \\
+        --environment dev issue-key --client-id acme
 
 That is a real exposure and is named rather than buried: for the duration of one key issue the
 pepper is on an operator's machine. It is also why the pre-check below refuses early with a
 one-line message about the variable -- the alternative is a failure whose text talks about a Helm
 secret group, which is the wrong hint for a human at a terminal.
 
-**``show-signing-secret`` needs that environment's ``PARTNER_SIGNING_ROOT`` exported**, for the
+**``show-signing-secret`` needs that environment's ``WEBHOOK_SIGNING_ROOT`` exported**, for the
 same reason and with the same early pre-check. **It prints a live credential**: the value a
-partner's receiver verifies every webhook signature with. It is the ONE command whose output must
+client's receiver verifies every webhook signature with. It is the ONE command whose output must
 not go into a ticket, a chat message or a shell history file -- hand it over the way a password is
 handed over, and rotate the destination's generation (``rotate-signing``) if it has been anywhere
 else. It is audited like every other action here, because a credential disclosure is precisely what
@@ -79,7 +79,7 @@ an audit trail exists for: the row says who read it, for which destination, and 
 
 It exists because there is otherwise NO path to that value. `webhook_signing.derive_secret` is
 called only by the signer; ``GET /destinations/current`` serves generation NUMBERS and never
-derives, deliberately -- a secret fetchable over the partner's own credential is a secret their
+derives, deliberately -- a secret fetchable over the client's own credential is a secret their
 credential can be traded for. So an operator would have had to re-derive it by hand from the root,
 and the quickstart's promise that a Firebase developer sees a notification without writing signature
 verification cannot be kept without it.
@@ -109,16 +109,16 @@ from typing import Any
 
 # The tool lives in scripts/ and the modules it drives live in disruptions/api/, which is a flat
 # import root rather than a package (every module there imports its siblings by bare name). Adding
-# it to sys.path is what makes `import partner_auth` resolve the same way it does in the app.
+# it to sys.path is what makes `import notification_auth` resolve the same way it does in the app.
 _API = pathlib.Path(__file__).resolve().parents[1] / "disruptions" / "api"
 if str(_API) not in sys.path:
     sys.path.insert(0, str(_API))
 
-import partner_auth
-import partner_store
+import notification_auth
+import notification_store
 import webhook_signing
 
-logger = logging.getLogger("manage_notification_partner")
+logger = logging.getLogger("manage_notification_client")
 
 ENVIRONMENTS = ("dev", "tst", "prd")
 
@@ -134,20 +134,20 @@ OPERATOR_GROUPS = {
 #: `--environment` picks the group membership is checked against and `--project` used to pick, with
 #: no comparison between them, which project was then read and written -- so `--environment dev
 #: --project ent-kixavvik-prd` was authorized against the dev group and acted on prd, including
-#: `show-signing-secret` (prints a live prd receiver credential) and `suspend-partner` (silences a
-#: real partner). What stopped it was prd project IAM rather than this tool, while the module
+#: `show-signing-secret` (prints a live prd receiver credential) and `suspend-client` (silences a
+#: real client). What stopped it was prd project IAM rather than this tool, while the module
 #: docstring claimed the stronger property; now the tool refuses first and IAM backs it.
 #:
 #: The naming assumption is `ent-kixavvik-<env>`, which is what `.entur/application.yaml`'s own
 #: verification recipe uses. If a project is ever renamed this map is the one place to change.
 PROJECTS = {environment: f"ent-kixavvik-{environment}" for environment in ENVIRONMENTS}
 
-#: The named database `partner_store` and `partner_auth` open. The same literal lives in the Helm
-#: chart's `PARTNER_FIRESTORE_DATABASE` and in `terraform/variables.tf`; it is read from the
+#: The named database `notification_store` and `notification_auth` open. The same literal lives in the Helm
+#: chart's `NOTIFICATION_FIRESTORE_DATABASE` and in `terraform/variables.tf`; it is read from the
 #: environment here so a tool run against a differently-named database does not need a code change,
 #: and it defaults to the one every environment uses.
-DATABASE_ENV = "PARTNER_FIRESTORE_DATABASE"
-DEFAULT_DATABASE = "partner-notifications"
+DATABASE_ENV = "NOTIFICATION_FIRESTORE_DATABASE"
+DEFAULT_DATABASE = "notifications"
 
 
 class Refused(RuntimeError):
@@ -241,7 +241,7 @@ def _authorize(
     action: str,
     authorizer: Authorizer,
     *,
-    partner_id: str | None,
+    client_id: str | None,
     destination_id: str | None,
     key_id: str | None,
 ) -> str:
@@ -254,7 +254,7 @@ def _authorize(
     print(
         json.dumps(
             {
-                "event": "partner_admin",
+                "event": "notification_admin",
                 "result": "refused",
                 "action": action,
                 "actor": verdict.actor,
@@ -267,11 +267,11 @@ def _authorize(
         file=sys.stderr,
     )
     try:
-        partner_auth.record_admin_action(
+        notification_auth.record_admin_action(
             actor=verdict.actor,
             action=action,
             result="refused",
-            partner_id=partner_id,
+            client_id=client_id,
             destination_id=destination_id,
             key_id=key_id,
             reason=verdict.reason or "not_authorized",
@@ -300,113 +300,113 @@ def _serialise(value: Any) -> Any:
     return value
 
 
-def _cmd_create_partner(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.create_partner(args.partner_id, name=args.name, actor=actor)
+def _cmd_create_client(args: argparse.Namespace, actor: str) -> Any:
+    return notification_auth.create_client(args.client_id, name=args.name, actor=actor)
 
 
-def _cmd_suspend_partner(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.set_partner_suspended(
-        args.partner_id, suspended=True, actor=actor, reason=args.reason
+def _cmd_suspend_client(args: argparse.Namespace, actor: str) -> Any:
+    return notification_auth.set_client_suspended(
+        args.client_id, suspended=True, actor=actor, reason=args.reason
     )
 
 
-def _cmd_resume_partner(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.set_partner_suspended(args.partner_id, suspended=False, actor=actor)
+def _cmd_resume_client(args: argparse.Namespace, actor: str) -> Any:
+    return notification_auth.set_client_suspended(args.client_id, suspended=False, actor=actor)
 
 
-def _cmd_show_partner(args: argparse.Namespace, actor: str) -> Any:
+def _cmd_show_client(args: argparse.Namespace, actor: str) -> Any:
     del actor
-    account = partner_auth.get_account(args.partner_id)
+    account = notification_auth.get_account(args.client_id)
     if account is None:
-        raise partner_auth.NotFound("no such partner")
+        raise notification_auth.NotFound("no such client")
     return {
         "account": _serialise(account),
-        "credentials": _serialise(partner_auth.list_credentials(args.partner_id)),
-        "destination": _serialise(partner_auth.current_destination(args.partner_id)),
+        "credentials": _serialise(notification_auth.list_credentials(args.client_id)),
+        "destination": _serialise(notification_auth.current_destination(args.client_id)),
     }
 
 
 def _cmd_issue_key(args: argparse.Namespace, actor: str) -> Any:
-    credential, bearer = partner_auth.issue_credential(
-        args.partner_id, actor=actor, label=args.label or ""
+    credential, bearer = notification_auth.issue_credential(
+        args.client_id, actor=actor, label=args.label or ""
     )
     return {
         "credential": _serialise(credential),
         # The ONLY time this value exists. There is no reversible copy in the store -- only the
         # peppered hash -- so a lost credential is re-issued, never recovered. Hand it to the
-        # partner over a channel that is not this terminal's scrollback.
+        # client over a channel that is not this terminal's scrollback.
         "bearer": bearer,
         "note": (
-            "Shown once. Store it in the partner's secret manager, not in a ticket. Rotation is "
+            "Shown once. Store it in the client's secret manager, not in a ticket. Rotation is "
             "issue-key followed by revoke-key after cutover; several credentials are live at once "
-            "on purpose, so the partner is never down for a rotation."
+            "on purpose, so the client is never down for a rotation."
         ),
     }
 
 
 def _cmd_revoke_key(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.revoke_credential(args.key_id, actor=actor, reason=args.reason)
+    return notification_auth.revoke_credential(args.key_id, actor=actor, reason=args.reason)
 
 
 def _cmd_list_keys(args: argparse.Namespace, actor: str) -> Any:
     del actor
-    return _serialise(partner_auth.list_credentials(args.partner_id))
+    return _serialise(notification_auth.list_credentials(args.client_id))
 
 
 def _cmd_create_destination(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.create_destination(
+    return notification_auth.create_destination(
         args.destination_id,
-        partner_id=args.partner_id,
+        client_id=args.client_id,
         callback_url=args.url,
         actor=actor,
     )
 
 
 def _cmd_amend_destination(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.amend_destination(
+    return notification_auth.amend_destination(
         args.destination_id, callback_url=args.url, actor=actor
     )
 
 
 def _cmd_pause_destination(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.pause_destination(
+    return notification_auth.pause_destination(
         args.destination_id, reason=args.reason or "operator", actor=actor
     )
 
 
 def _cmd_resume_destination(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.resume_destination(args.destination_id, actor=actor)
+    return notification_auth.resume_destination(args.destination_id, actor=actor)
 
 
 def _cmd_show_signing_secret(args: argparse.Namespace, actor: str) -> Any:
     """Print every live generation's signing secret for one destination.
 
     EVERY live generation, not just the active one, because during a rotation two are valid at once
-    and "which one do I install" is the first question a partner asks. Both are printed with their
+    and "which one do I install" is the first question a client asks. Both are printed with their
     generation number beside them, and a receiver that accepts either is verifying exactly what we
     send -- each attempt carries one `v1,<sig>` entry per generation.
 
     Nothing is stored and nothing is looked up: the secret is DERIVED from the root over
     ``destination_id || generation``, which is why the store holds no signing material and why one
-    partner's leaked receiver secret forges nothing for another.
+    client's leaked receiver secret forges nothing for another.
 
     Audited before the value is produced, so a refusal partway through still leaves the row that
     says somebody asked.
     """
-    destination = partner_auth.get_destination(args.destination_id)
+    destination = notification_auth.get_destination(args.destination_id)
     if destination is None:
-        raise partner_auth.NotFound("no such destination")
-    partner_auth.record_admin_action(
+        raise notification_auth.NotFound("no such destination")
+    notification_auth.record_admin_action(
         actor=actor,
         action="show_signing_secret",
         result="disclosed",
-        partner_id=destination.partner_id or None,
+        client_id=destination.client_id or None,
         destination_id=destination.destination_id,
         reason=f"generations={list(destination.signing_generations)}",
     )
     return {
         "destination_id": destination.destination_id,
-        "partner_id": destination.partner_id,
+        "client_id": destination.client_id,
         "active_generation": destination.active_generation,
         "retiring_generation": destination.retiring_generation,
         "secrets": [
@@ -429,18 +429,18 @@ def _cmd_show_signing_secret(args: argparse.Namespace, actor: str) -> Any:
 
 
 def _cmd_rotate_signing(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.rotate_signing_generation(args.destination_id, actor=actor)
+    return notification_auth.rotate_signing_generation(args.destination_id, actor=actor)
 
 
 def _cmd_retire_signing(args: argparse.Namespace, actor: str) -> Any:
-    return partner_auth.retire_signing_generation(args.destination_id, actor=actor)
+    return notification_auth.retire_signing_generation(args.destination_id, actor=actor)
 
 
 _COMMANDS: dict[str, Callable[[argparse.Namespace, str], Any]] = {
-    "create-partner": _cmd_create_partner,
-    "suspend-partner": _cmd_suspend_partner,
-    "resume-partner": _cmd_resume_partner,
-    "show-partner": _cmd_show_partner,
+    "create-client": _cmd_create_client,
+    "suspend-client": _cmd_suspend_client,
+    "resume-client": _cmd_resume_client,
+    "show-client": _cmd_show_client,
     "issue-key": _cmd_issue_key,
     "revoke-key": _cmd_revoke_key,
     "list-keys": _cmd_list_keys,
@@ -456,7 +456,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace, str], Any]] = {
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="manage_notification_partner",
+        prog="manage_notification_client",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -478,33 +478,33 @@ def _parser() -> argparse.ArgumentParser:
     def add(name: str, **kwargs: Any) -> argparse.ArgumentParser:
         return subparsers.add_parser(name, **kwargs)
 
-    p = add("create-partner", help="Provision a partner. Idempotent on (id, name).")
-    p.add_argument("--partner-id", required=True)
+    p = add("create-client", help="Provision a client. Idempotent on (id, name).")
+    p.add_argument("--client-id", required=True)
     p.add_argument("--name", required=True)
 
-    p = add("suspend-partner", help="Refuse this partner's credentials with 403.")
-    p.add_argument("--partner-id", required=True)
+    p = add("suspend-client", help="Refuse this client's credentials with 403.")
+    p.add_argument("--client-id", required=True)
     p.add_argument("--reason", default=None)
 
-    p = add("resume-partner", help="Lift a suspension.")
-    p.add_argument("--partner-id", required=True)
+    p = add("resume-client", help="Lift a suspension.")
+    p.add_argument("--client-id", required=True)
 
-    p = add("show-partner", help="Account, credentials (never secrets) and current destination.")
-    p.add_argument("--partner-id", required=True)
+    p = add("show-client", help="Account, credentials (never secrets) and current destination.")
+    p.add_argument("--client-id", required=True)
 
     p = add("issue-key", help="Mint a credential. The secret is printed ONCE.")
-    p.add_argument("--partner-id", required=True)
+    p.add_argument("--client-id", required=True)
     p.add_argument("--label", default=None, help="Free text, e.g. 'rotation 2026-09'.")
 
     p = add("revoke-key", help="Revoke one key-id. Terminal.")
     p.add_argument("--key-id", required=True)
     p.add_argument("--reason", default=None)
 
-    p = add("list-keys", help="A partner's key ids and their state. Never a secret.")
-    p.add_argument("--partner-id", required=True)
+    p = add("list-keys", help="A client's key ids and their state. Never a secret.")
+    p.add_argument("--client-id", required=True)
 
     p = add("create-destination", help="Provision a callback. The URL is address-tested first.")
-    p.add_argument("--partner-id", required=True)
+    p.add_argument("--client-id", required=True)
     p.add_argument("--destination-id", required=True)
     p.add_argument("--url", required=True)
 
@@ -528,7 +528,7 @@ def _parser() -> argparse.ArgumentParser:
     p = add("rotate-signing", help="Mint the next signing generation; the current one retires.")
     p.add_argument("--destination-id", required=True)
 
-    p = add("retire-signing", help="Drop the retiring generation after the partner has cut over.")
+    p = add("retire-signing", help="Drop the retiring generation after the client has cut over.")
     p.add_argument("--destination-id", required=True)
     return parser
 
@@ -571,14 +571,14 @@ def main(
     # what any value of it can touch. Naming the wrong database in the right project reads as an
     # empty store, which is loud enough.
     if store is not None:
-        partner_auth.configure(docs=store)
+        notification_auth.configure(docs=store)
     else:
-        # `partner_store` is the one place that names the database -- `partner_auth` reads through
+        # `notification_store` is the one place that names the database -- `notification_auth` reads through
         # its client -- so the tool configures it exactly as `main.lifespan` does.
-        partner_store.configure(
+        notification_store.configure(
             database=args.database or os.environ.get(DATABASE_ENV) or DEFAULT_DATABASE
         )
-        partner_auth.configure()
+        notification_auth.configure()
     # The one subcommand that needs the pepper, checked BEFORE the group so the message an operator
     # gets is about the variable rather than about a Helm secret group they are not looking at.
     # Every other command works without it: the pepper hashes a new secret and verifies an existing
@@ -604,9 +604,9 @@ def main(
                 file=sys.stderr,
             )
             return 2
-    if args.command == "issue-key" and not partner_auth.pepper_ready():
+    if args.command == "issue-key" and not notification_auth.pepper_ready():
         print(
-            f"{partner_auth.PEPPER_ENV} is unset (or under {partner_auth.MIN_PEPPER_BYTES} bytes). "
+            f"{notification_auth.PEPPER_ENV} is unset (or under {notification_auth.MIN_PEPPER_BYTES} bytes). "
             "issue-key hashes the new secret under it, so export this environment's value from "
             "Secret Manager for this one command -- see the module docstring.",
             file=sys.stderr,
@@ -618,7 +618,7 @@ def main(
             args.environment,
             args.command,
             check,
-            partner_id=getattr(args, "partner_id", None),
+            client_id=getattr(args, "client_id", None),
             destination_id=getattr(args, "destination_id", None),
             key_id=getattr(args, "key_id", None),
         )
@@ -627,7 +627,7 @@ def main(
         return 3
     try:
         result = _COMMANDS[args.command](args, actor)
-    except partner_auth.PartnerAuthError as exc:
+    except notification_auth.ClientAuthError as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(_serialise(result), indent=2, ensure_ascii=False), file=stream)

@@ -1,6 +1,6 @@
 // A generic Node receiver: the same policy and the same wire contract, with no Firebase anywhere.
 //
-// Shipped rather than kept as a test fixture, for two reasons. It is the reference a partner who is
+// Shipped rather than kept as a test fixture, for two reasons. It is the reference a client who is
 // not on Firebase integrates against -- the Firebase adapter is one deployment shape, not the
 // contract -- and it is the only place the "413 before buffering" rule can be demonstrated
 // LITERALLY. A managed Functions runtime has already buffered the body before a handler is entered,

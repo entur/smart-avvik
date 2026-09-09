@@ -2,7 +2,7 @@
 //
 // Pure functions, no store, no clock: every one of these is a literal in and a literal out. That is
 // the point of extracting the rules -- the same assertions hold for a Firestore-backed receiver, a
-// generic Node one, and a partner who reimplements the adapter.
+// generic Node one, and a client who reimplements the adapter.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -108,7 +108,7 @@ test("a forecast after a WITHDRAWAL is dispatched -- rule 3 tracks the standing 
 test("AE17: two subscriptions about one train each carry their own allowance", () => {
   // `alert_id`'s grain is (subscription, train), NOT the train. A commuter's morning and evening
   // journeys are two subscriptions and each has its own four-per-day allowance, exactly as two
-  // /varsel registrations would; and a partner serving many commuters through one receiver must not
+  // /varsel registrations would; and a client serving many commuters through one receiver must not
   // have the second commuter's notification suppressed by the first commuter's revision number.
   const morning = "sub_morning:VYG:L1:2026-09-09:1";
   const evening = "sub_evening:VYG:L1:2026-09-09:1";

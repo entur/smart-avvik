@@ -1,8 +1,8 @@
-"""Checks for webhook_client.py -- KTD9's outbound hardening, R18's bounds.
+"""Checks for webhook_sender.py -- KTD9's outbound hardening, R18's bounds.
 
 **This suite opens no socket, and enforces that rather than promising it.** ``socket.getaddrinfo``
 and ``socket.create_connection`` are replaced at import with functions that raise, so any check that
-reaches the network fails loudly instead of dialing a partner-supplied host from CI. Address safety
+reaches the network fails loudly instead of dialing a client-supplied host from CI. Address safety
 is therefore tested against the RESOLVER -- a stub returning the addresses a hostile or misconfigured
 DNS would -- and never against a live lookup, which could not produce ``64:ff9b::a9fe:a9fe`` on
 demand anyway.
@@ -40,11 +40,11 @@ def _no_socket(*args, **kwargs):
 socket.getaddrinfo = _no_socket  # type: ignore[assignment]
 socket.create_connection = _no_socket  # type: ignore[assignment]
 
-import webhook_client as wc
+import webhook_sender as wc
 
 MODULE_SOURCE = pathlib.Path(wc.__file__).read_text()
 
-DEST_URL = "https://hooks.partner.example/kix/notifications"
+DEST_URL = "https://hooks.client.example/kix/notifications"
 
 # Real globally-routable addresses. The RFC 5737/3849 documentation ranges are NOT usable here --
 # 192.0.2.x, 198.51.100.x, 203.0.113.x and 2001:db8:: all report is_global=False -- which is the
@@ -133,9 +133,9 @@ def _deliver(**kwargs):
 
 def test_only_https_is_accepted():
     destination = wc.validate_url(DEST_URL)
-    assert destination.host == "hooks.partner.example"
+    assert destination.host == "hooks.client.example"
     assert destination.port == wc.ALLOWED_PORT == 443
-    for bad in ("http://hooks.partner.example/x", "ftp://h/x", "hooks.partner.example/x", ""):
+    for bad in ("http://hooks.client.example/x", "ftp://h/x", "hooks.client.example/x", ""):
         try:
             wc.validate_url(bad)
         except wc.UnsafeDestination:
@@ -148,8 +148,8 @@ def test_userinfo_is_refused_because_it_hides_the_real_host():
     # evil.example. That is the entire reason userinfo appears in a hostile URL.
     for bad in (
         "https://good.example@evil.example/hook",
-        "https://user:pass@hooks.partner.example/hook",
-        "https://@hooks.partner.example/hook",
+        "https://user:pass@hooks.client.example/hook",
+        "https://@hooks.client.example/hook",
     ):
         try:
             wc.validate_url(bad)
@@ -161,7 +161,7 @@ def test_userinfo_is_refused_because_it_hides_the_real_host():
 
 def test_a_fragment_is_refused():
     try:
-        wc.validate_url("https://hooks.partner.example/hook#frag")
+        wc.validate_url("https://hooks.client.example/hook#frag")
     except wc.UnsafeDestination as exc:
         assert "fragment" in str(exc)
         return
@@ -169,8 +169,8 @@ def test_a_fragment_is_refused():
 
 
 def test_a_non_default_port_is_refused_and_an_explicit_443_is_not():
-    assert wc.validate_url("https://hooks.partner.example:443/hook").port == 443
-    for bad in ("https://hooks.partner.example:8443/hook", "https://hooks.partner.example:80/hook"):
+    assert wc.validate_url("https://hooks.client.example:443/hook").port == 443
+    for bad in ("https://hooks.client.example:8443/hook", "https://hooks.client.example:80/hook"):
         try:
             wc.validate_url(bad)
         except wc.UnsafeDestination as exc:
@@ -189,7 +189,7 @@ def test_a_url_with_no_host_is_refused():
 
 
 def test_a_query_string_survives_validation():
-    # Nothing wrong with one, and a partner may well route on it.
+    # Nothing wrong with one, and a client may well route on it.
     assert wc.validate_url("https://h.example/hook?tenant=a").url.endswith("?tenant=a")
 
 
@@ -265,7 +265,7 @@ def test_globally_routable_unicast_is_accepted():
 
 
 def test_unparseable_addresses_are_refused_rather_than_raising():
-    for bad in ("", "not-an-ip", "999.1.1.1", "1.1.1", "hooks.partner.example"):
+    for bad in ("", "not-an-ip", "999.1.1.1", "1.1.1", "hooks.client.example"):
         assert not wc.is_safe_address(bad)
 
 
@@ -392,7 +392,7 @@ class _FakeContext:
 def test_the_connection_dials_the_validated_literal_but_keeps_the_hostname_for_host_and_sni():
     sock = _FakeSock()
     connection = wc._PinnedHTTPSConnection(
-        "hooks.partner.example", pinned_ip=GOOD_V6, deadline=time.monotonic() + 4.0, timeout=2.0
+        "hooks.client.example", pinned_ip=GOOD_V6, deadline=time.monotonic() + 4.0, timeout=2.0
     )
     dialed: list[tuple] = []
 
@@ -406,8 +406,8 @@ def test_the_connection_dials_the_validated_literal_but_keeps_the_hostname_for_h
 
     assert dialed == [((GOOD_V6, 443), 2.0)], "the socket must go to the pinned literal"
     # Host header and certificate verification both key on this, and neither may see the literal.
-    assert connection.host == "hooks.partner.example"
-    assert connection._context.server_hostname == "hooks.partner.example"
+    assert connection.host == "hooks.client.example"
+    assert connection._context.server_hostname == "hooks.client.example"
     # The read budget is what is left of the total after the connect.
     assert sock.timeouts and 3.0 < sock.timeouts[-1] <= 4.0
 
@@ -483,11 +483,11 @@ def test_a_redirect_is_terminal_and_never_followed():
 
 
 def test_retry_after_is_read_in_both_rfc_forms_and_bounded():
-    from partner_store import RETRY_AFTER_CAP_S
+    from notification_store import RETRY_AFTER_CAP_S
 
     assert wc.parse_retry_after("30") == 30.0
     assert wc.parse_retry_after(" 30 ") == 30.0
-    # RFC 9110 puts no ceiling on the header, so a partner can legally send this.
+    # RFC 9110 puts no ceiling on the header, so a client can legally send this.
     assert wc.parse_retry_after("999999") == float(RETRY_AFTER_CAP_S)
     assert wc.parse_retry_after("-5") == 0.0
     assert wc.parse_retry_after(None) is None
@@ -516,7 +516,7 @@ def test_retry_after_rides_on_a_retryable_attempt_only():
 
 
 def test_the_stores_retry_after_cap_is_the_one_this_module_applies():
-    from partner_store import RETRY_AFTER_CAP_S
+    from notification_store import RETRY_AFTER_CAP_S
 
     assert RETRY_AFTER_CAP_S == 300
     assert wc.parse_retry_after(str(RETRY_AFTER_CAP_S * 10)) == float(RETRY_AFTER_CAP_S)
@@ -579,7 +579,7 @@ def test_an_oversized_response_body_is_truncated_and_the_status_still_decides():
     attempt = _deliver(resolver=_resolver(GOOD_V4), transport=_Recorder(response))
     assert attempt.response_truncated is True
     assert attempt.response_bytes == wc.MAX_RESPONSE_BYTES + 1, "read is capped at limit + 1"
-    # The partner accepted the event; a byte count nobody reads must not turn that into a retry
+    # The client accepted the event; a byte count nobody reads must not turn that into a retry
     # every cycle for the event's whole 60-minute validity.
     assert attempt.ok is True and attempt.retryable is False
     small = _Response(200, body=b"ok")
@@ -589,9 +589,9 @@ def test_an_oversized_response_body_is_truncated_and_the_status_still_decides():
 
 
 def test_an_unsafe_destination_is_terminal_and_pauses_nothing():
-    # Pausing is the 410 signal -- "the partner told us to stop". A bad URL in a destination record
+    # Pausing is the 410 signal -- "the client told us to stop". A bad URL in a destination record
     # is an operator's to correct.
-    attempt = _deliver(url="http://hooks.partner.example/hook")
+    attempt = _deliver(url="http://hooks.client.example/hook")
     assert attempt.ok is False
     assert attempt.retryable is False
     assert attempt.terminal_state == "failed"
@@ -651,7 +651,7 @@ def test_a_signed_request_survives_delivery_and_verifies_at_the_receiver():
         '{"body":"Toget kl. 07:18 er innstilt — ta L1 07:33 fra Ås"}}'
     ).encode()
     signed = ws.sign(
-        destination_id="dst_partner_a_prod",
+        destination_id="dst_client_a_prod",
         generations=[3, 2],
         webhook_id="dlv_01J9Z4KQ7X",
         body=body,
@@ -669,7 +669,7 @@ def test_a_signed_request_survives_delivery_and_verifies_at_the_receiver():
     request = recorder.calls[0][1]
     for generation in (3, 2):
         assert ws.verify(
-            secret=ws.derive_secret("dst_partner_a_prod", generation, root=root),
+            secret=ws.derive_secret("dst_client_a_prod", generation, root=root),
             webhook_id=request.get_header("Webhook-id"),
             timestamp=request.get_header("Webhook-timestamp"),
             body=request.data,
@@ -703,7 +703,7 @@ def test_the_transport_receives_the_connect_ceiling_and_a_monotonic_deadline():
 
 
 def test_the_network_fence_raises_under_a_test_runner():
-    """Scenario 6. Unstubbed, this call would dial a partner-supplied host from CI."""
+    """Scenario 6. Unstubbed, this call would dial a client-supplied host from CI."""
     assert wc.network_allowed() is False
     try:
         _deliver()
@@ -748,7 +748,7 @@ def test_every_terminal_state_this_module_can_report_is_one_the_store_accepts():
     # `mark_delivery_failed` raises Conflict on a terminal_state outside DELIVERY_STATES, so a
     # vocabulary drift here would surface as a raise on the poller thread rather than as a bad
     # record -- but only for the status that drifted, on the cycle it first occurred.
-    from partner_store import DELIVERY_STATES
+    from notification_store import DELIVERY_STATES
 
     reported = {
         wc.classify_status(status)[2]
@@ -762,7 +762,7 @@ def test_every_terminal_state_this_module_can_report_is_one_the_store_accepts():
 
 def test_no_new_dependency_is_introduced():
     imports = set(re.findall(r"^(?:import|from)\s+([\w.]+)", MODULE_SOURCE, re.MULTILINE))
-    allowed_local = {"partner_store", "__future__"}
+    allowed_local = {"notification_store", "__future__"}
     for module in imports - allowed_local:
         root = module.split(".")[0]
         assert root in set(__import__("sys").stdlib_module_names), f"{module} is not stdlib"

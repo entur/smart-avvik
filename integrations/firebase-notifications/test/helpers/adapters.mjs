@@ -34,7 +34,7 @@ export function makeEvent(overrides = {}) {
     valid_until: "2026-09-09T06:00:00+00:00",
     subscription_id: "sub_a",
     subscription_version: 1,
-    partner_ref: "commuter-4711",
+    external_ref: "commuter-4711",
     test: false,
     operator: "VYG",
     line: "VYG:Line:L1",

@@ -100,8 +100,8 @@ from zoneinfo import ZoneInfo
 
 import feedback
 import feedback_contexts
+import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
-import partner_events  # the partner channel's typed hand-off type and its emit step
 import reserved_budget  # the one reserve-don't-check pass budget
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
@@ -112,7 +112,7 @@ import reserved_budget  # the one reserve-don't-check pass budget
 #
 # `gate` arrived on 2026-09-08 (U1) and is the one that matters for this module: it is
 # `threshold_for` plus the comparison, stated once, so this module's browser adapter and the
-# partner adapter being built beside it cannot come to disagree about what a threshold means. The
+# client adapter being built beside it cannot come to disagree about what a threshold means. The
 # per-operator table and the no-SX cut are unchanged, which is why `alert_threshold` still reads
 # exactly what it always did on every existing decision row.
 from alert_policy import (  # noqa: F401
@@ -131,7 +131,7 @@ from impact import AlternativeOutcome, ImpactResponse, LatestObservation, severi
 
 # The WORDING moved out on 2026-09-08 (U1) so a second notification surface can produce the same
 # Norwegian text without importing this module -- 147 KB of poller state, the device registry, the
-# VAPID keypair and the decision-log writer, none of which a partner event may reach (R16). Bound
+# VAPID keypair and the decision-log writer, none of which a notification event may reach (R16). Bound
 # at module level under their old names, not reached through `notification_wording.`, so every
 # caller that already reads `varsel._deterministic_body` off this module keeps resolving -- `main`
 # injects it into `/meldinger`, and two suites assert push bodies against it. A monkeypatch of one
@@ -160,7 +160,7 @@ _OSLO = ZoneInfo("Europe/Oslo")
 _CANCEL_LIKELY = 0.5
 
 # `mode_label` and its rail-codespace table moved to `notification_wording` with the wording that
-# reads them (2026-09-08): a partner event needs the vehicle noun and must not import this module
+# reads them (2026-09-08): a notification event needs the vehicle noun and must not import this module
 # for it. Re-exported above, so `varsel.mode_label` -- which `main` calls twice -- still resolves.
 
 
@@ -403,7 +403,7 @@ class ConnectivityProvider(Protocol):
     outage, a timeout, the rate limit. None is not "no service".
 
     ``path`` names whose per-minute budget the question spends. The provider owns the vocabulary and
-    the ceilings (`main._CONNECTIVITY_PARTNER_PATH` and its neighbours); this module only forwards
+    the ceilings (`main._CONNECTIVITY_NOTIFICATION_API_PATH` and its neighbours); this module only forwards
     the tag it was handed, so an unrecognised one is charged the public budget rather than minting a
     new one. It is keyword-only and defaulted so a caller that does not care — and every existing
     one — is unchanged.
@@ -415,13 +415,13 @@ class ConnectivityProvider(Protocol):
 
 
 @dataclass(frozen=True)
-class PartnerRecipient:
-    """One partner subscription as this pass sees it: a registration whose channel is a webhook.
+class WebhookRecipient:
+    """One webhook subscription as this pass sees it: a registration whose channel is a webhook.
 
     KTD3's whole shape in three fields. It is a **view merged at match time, never a
     materialization** — nothing here is ever written into :data:`_journeys`, :data:`_notified` or
     the GCS state blob, which is what makes a rollback to pre-feature code safe (`_save_state`
-    writes known keys, so `_state_extra`'s round-trip could not have protected partner state that
+    writes known keys, so `_state_extra`'s round-trip could not have protected notification state that
     had leaked into the blob).
 
     ``journey`` carries exactly the five fields the shared work reads off a registration —
@@ -435,20 +435,20 @@ class PartnerRecipient:
     Firestore is the only dedup ledger for this channel; this is a read-only snapshot of it.
 
     **The four routing fields ride along, and until 2026-09-08 they deliberately did not** — the
-    docstring here said a partner document's destination and quotas "deliberately do not enter this
+    docstring here said a client document's destination and quotas "deliberately do not enter this
     pass", which was right while nothing in the process emitted an event. What changed the answer is
     ``subscription_version``, and specifically WHY the emit transaction reads it: it exists so a
-    slow pass cannot commit obsolete work (``partner_store._subscription_obsolete``), which only
+    slow pass cannot commit obsolete work (``notification_store._subscription_obsolete``), which only
     means anything if the version compared is **the one the match was computed against**. Re-reading
     it at emit time would compare the stored value with itself — always equal, never refusing — and
-    an alert about a train matched for a route the partner has since amended would go out stamped
+    an alert about a train matched for a route the client has since amended would go out stamped
     with the new version. So the version comes from the load snapshot, and the three ids beside it
     come with it rather than earning a second store read each.
 
     What has NOT changed is the invariant KTD3 rests on: none of these ever reaches
     :data:`_journeys`, :data:`_notified`, the GCS state blob or a log line. They live in this
     cycle's locals, are handed to the emit step as a return value, and are gone with the pass.
-    ``partner_ref`` — the partner's own opaque handle on a traveller — is carried for the event
+    ``external_ref`` — the client's own opaque handle on a traveller — is carried for the event
     envelope and is the one field R16 keeps out of even a structured log field.
     """
 
@@ -457,18 +457,18 @@ class PartnerRecipient:
     delivered: frozenset[str] = frozenset()
     # Appended after `delivered` on purpose: three suites construct this positionally, and every
     # existing caller must keep working.
-    partner_id: str = ""
+    client_id: str = ""
     destination_id: str = ""
     subscription_version: int = 0
-    partner_ref: str = ""
+    external_ref: str = ""
     test: bool = False
 
 
-class PartnerRecipientProvider(Protocol):
-    """The partner subscriptions this cycle should match, as RAW documents.
+class WebhookRecipientProvider(Protocol):
+    """The webhook subscriptions this cycle should match, as RAW documents.
 
     A Protocol for the same reason as :class:`ImpactProvider`: it is a cross-module contract whose
-    drift is quiet. A partner recipient that silently stops being matched looks exactly like a
+    drift is quiet. A webhook recipient that silently stops being matched looks exactly like a
     healthy deployment with nothing disrupted, which is the failure mode this whole surface exists
     to avoid.
 
@@ -477,11 +477,11 @@ class PartnerRecipientProvider(Protocol):
     means for the schema the *running binary* knows: a store adapter written against a newer
     document shape must be able to hand this pass something it refuses, one document at a time. So
     the provider's job is to read the store and this module's job is to validate
-    (:func:`_parse_partner_recipient`).
+    (:func:`_parse_webhook_recipient`).
 
     Returning a lazy iterable is fine and expected — a Firestore cursor is one — because
-    :func:`_load_partner_recipients` materializes it INSIDE the bounded step, so both the wall-clock
-    ceiling and the :data:`_MAX_PARTNER_RECIPIENTS` count ceiling apply to the paging as well as to
+    :func:`_load_webhook_recipients` materializes it INSIDE the bounded step, so both the wall-clock
+    ceiling and the :data:`_MAX_WEBHOOK_RECIPIENTS` count ceiling apply to the paging as well as to
     the first call. The provider must still carry its own per-call deadline (KTD6): the bound here
     is on how long the poller WAITS, not on when the store gives up.
     """
@@ -493,13 +493,13 @@ _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 _connectivity_provider: ConnectivityProvider | None = None
 _togvarsel_notify_provider: Callable[[], bool] | None = None
-# The partner channel's two seams, both defaulting to "no partner recipients" so an un-wired
+# The webhook channel's two seams, both defaulting to "no webhook recipients" so an un-wired
 # deployment -- which is every deployment until the store lands -- behaves byte for byte as it did
-# before this existed. `_partner_enabled` is main's flag read, injected rather than read here for
+# before this existed. `_webhook_enabled` is main's flag read, injected rather than read here for
 # `_togvarsel_notify_enabled`'s reason: one function is the seam, and it is consulted at CALL time
 # so an environment change needs no import-time dance.
-_partner_enabled: Callable[[], bool] | None = None
-_partner_provider: PartnerRecipientProvider | None = None
+_webhook_enabled: Callable[[], bool] | None = None
+_webhook_provider: WebhookRecipientProvider | None = None
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -512,8 +512,8 @@ def configure(
     stops_provider: Callable[[], list[dict]],
     connectivity_provider: ConnectivityProvider | None = None,
     togvarsel_notify_provider: Callable[[], bool] | None = None,
-    partner_enabled: Callable[[], bool] | None = None,
-    partner_recipients_provider: PartnerRecipientProvider | None = None,
+    webhook_enabled: Callable[[], bool] | None = None,
+    webhook_recipients_provider: WebhookRecipientProvider | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -522,7 +522,7 @@ def configure(
     TOGVARSEL_NOTIFY_ENABLED read, surfaced through /config so the PWA can announce the rush
     forecasts only where they are actually delivered; absent reads as off.
 
-    `partner_enabled` and `partner_recipients_provider` are the partner channel (KTD3). Both are
+    `webhook_enabled` and `webhook_recipients_provider` are the webhook channel (KTD3). Both are
     optional and both default to off, which is not laziness about defaults: an un-wired deployment
     must be indistinguishable from the code before the channel existed, and it is the pair being
     absent — not a flag value — that guarantees it. The flag is injected separately from the store
@@ -530,13 +530,13 @@ def configure(
     nothing was read" a property of this module rather than of whoever wrote the provider.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
-    global _partner_enabled, _partner_provider
+    global _webhook_enabled, _webhook_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
-    _partner_enabled = partner_enabled
-    _partner_provider = partner_recipients_provider
+    _webhook_enabled = webhook_enabled
+    _webhook_provider = webhook_recipients_provider
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -606,15 +606,15 @@ def _canonicalize_journeys() -> None:
         )
 
 
-# ---- Partner channel: subscriptions as registrations with a webhook ---------------------------
+# ---- Webhook channel: subscriptions as registrations with a webhook ---------------------------
 #
-# R21's read ceiling. A partner subscription costs this pass one journey_key group at most (they
+# R21's read ceiling. A webhook subscription costs this pass one journey_key group at most (they
 # collapse onto the browser groups they duplicate), and pass 1a is already 16-wide, so the number
 # that matters is not "how many can we match" but "how much can one bad store answer make the
 # poller carry". Deliberately the same order as `_MAX_JOURNEYS` (20 000) divided down: a pilot is
-# one partner and a few hundred subscriptions, so anything approaching this is a store bug or a
+# one client and a few hundred subscriptions, so anything approaching this is a store bug or a
 # quota breach rather than growth, and truncating it is the right failure. Truncation is logged.
-_MAX_PARTNER_RECIPIENTS = 2000
+_MAX_WEBHOOK_RECIPIENTS = 2000
 # How long the poller waits for the whole load -- the first call AND every page of a lazy cursor.
 # It is a bound on the WAIT and not on the store: the provider carries its own per-call deadline
 # (KTD6), and a thread parked past this one is abandoned rather than killed, because Python has no
@@ -622,47 +622,47 @@ _MAX_PARTNER_RECIPIENTS = 2000
 # cycle measured at 50-63 s on a period measured at ~296 s (2026-08-21 / 2026-09-08), and this runs
 # BEFORE `_WriteBudget`'s 30 s clock starts, so a slow store costs the cycle its own tail and
 # never the wordings.
-_PARTNER_LOAD_TIMEOUT_S = 5.0
+_WEBHOOK_LOAD_TIMEOUT_S = 5.0
 
 
-def partner_channel_enabled() -> bool:
-    """Is the partner channel live in this deployment? Read at CALL time, never latched.
+def webhook_channel_enabled() -> bool:
+    """Is the webhook channel live in this deployment? Read at CALL time, never latched.
 
     Two things have to be true, and they are deliberately separate: main's flag (unset = off, the
     `_togvarsel_notify_enabled` convention) and a store to read. Either missing means the channel
     contributes nothing, and a cycle then reduces to exactly the pass that ran before the channel
     existed — which is the property the whole feature's rollback story rests on.
     """
-    if _partner_provider is None or _partner_enabled is None:
+    if _webhook_provider is None or _webhook_enabled is None:
         return False
     try:
-        return bool(_partner_enabled())
+        return bool(_webhook_enabled())
     except Exception:
         # A flag reader that raises must read as OFF, like every other gate in this repo: the
         # failure direction of a delivery switch is closed (llm_message.py argues it at length).
         logger.warning(
-            "Partner channel flag could not be read; treating the channel as off this cycle",
+            "Webhook channel flag could not be read; treating the channel as off this cycle",
             exc_info=True,
-            extra={"fields": {"event": "varsel_partner_load", "result": "flag_error"}},
+            extra={"fields": {"event": "varsel_webhook_load", "result": "flag_error"}},
         )
         return False
 
 
-def _parse_partner_recipient(doc: Mapping[str, Any]) -> PartnerRecipient:
-    """One raw partner document → a :class:`PartnerRecipient`, raising on anything unreadable.
+def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
+    """One raw client document → a :class:`WebhookRecipient`, raising on anything unreadable.
 
     Restates :class:`JourneyIn`'s three window rules (HH:MM, a non-empty subset of 0..6, and
     ``begin < end`` so overnight windows are refused) rather than importing that model, for two
-    reasons that both matter. `JourneyIn` requires a ``device_id``, which a partner subscription by
+    reasons that both matter. `JourneyIn` requires a ``device_id``, which a webhook subscription by
     definition does not have; and this runs on the ingestion thread against documents written by a
     possibly NEWER binary, so it must validate the fields the pass actually reads and be
     indifferent to fields it does not — a model whose required set grows would start refusing every
     document in the collection on the deploy that adds a field.
-    ``test_the_partner_loader_refuses_exactly_what_the_registration_api_refuses`` pins the two
+    ``test_the_webhook_loader_refuses_exactly_what_the_registration_api_refuses`` pins the two
     against each other so the restatement cannot drift into being looser.
 
     **The stop refs are canonicalized here** (:func:`canonical_stop`), and that is not a tidy-up.
-    `_canonicalize_journeys` only ever walks `_journeys`, so a partner document naming a ref the
+    `_canonicalize_journeys` only ever walks `_journeys`, so a client document naming a ref the
     stop registry has since collapsed onto a primary would produce a DIFFERENT `journey_key` than
     the browser registration for the identical physical trip — two groups, two /impact calls, two
     wordings, and AE1's whole claim quietly false. Same defect as the 2026-08-03 picker bug, one
@@ -688,7 +688,7 @@ def _parse_partner_recipient(doc: Mapping[str, Any]) -> PartnerRecipient:
     days = sorted({int(d) for d in doc["days"]})
     if not days or any(d < 0 or d > 6 for d in days):
         raise ValueError("days must be a non-empty subset of 0..6 (0=Monday)")
-    return PartnerRecipient(
+    return WebhookRecipient(
         recipient_id=recipient_id,
         journey={
             "from_stop": from_stop,
@@ -703,32 +703,32 @@ def _parse_partner_recipient(doc: Mapping[str, Any]) -> PartnerRecipient:
         # at all, so it is refused and skipped. These four are what the pass ROUTES with, and a
         # document missing one can still be matched — it still collapses onto its journey key, still
         # shares the one /impact call and the one wording AE1 asserts. Refusing it would take a
-        # browser registration's own wording away over a partner field, so it is matched and simply
-        # not emitted for: `partner_events.train_ref` and `_partner_subjects` drop a subject that
+        # browser registration's own wording away over a client field, so it is matched and simply
+        # not emitted for: `notification_events.train_ref` and `_webhook_subjects` drop a subject that
         # names no destination, and the count is logged.
-        partner_id=str(doc.get("partner_id") or ""),
+        client_id=str(doc.get("client_id") or ""),
         destination_id=str(doc.get("destination_id") or ""),
         subscription_version=int(doc.get("version") or 0),
-        partner_ref=str(doc.get("partner_ref") or ""),
+        external_ref=str(doc.get("external_ref") or ""),
         test=bool(doc.get("test")),
     )
 
 
-def _load_partner_recipients() -> list[PartnerRecipient]:
-    """This cycle's partner subscriptions, or an empty list — the single guarded, bounded read.
+def _load_webhook_recipients() -> list[WebhookRecipient]:
+    """This cycle's webhook subscriptions, or an empty list — the single guarded, bounded read.
 
-    The ONE place this pass reads partner state (KTD6): passes 1a and 1b work off the snapshot it
+    The ONE place this pass reads notification state (KTD6): passes 1a and 1b work off the snapshot it
     returns and never go back to the store, which is what keeps 1b free to stay sequential (it
     mutates module state and blocks on nothing).
 
     Three failure shapes, three treatments, and the middle one is what a naive version gets wrong:
 
-    * **the store raises** — this cycle has no partner recipients, logged once, and the browser
+    * **the store raises** — this cycle has no webhook recipients, logged once, and the browser
       half of the pass is untouched. Guarded in the shape of the `_reconcile_caches` guard below,
       and for a strictly bigger blast radius: called bare, a raise here unwinds out of
       `check_and_notify` entirely, so loop 2 never runs (no pushes at all) and `_record_decisions`
       never runs (no rows either).
-    * **the store is slow** — bounded by :data:`_PARTNER_LOAD_TIMEOUT_S` on a worker thread. The
+    * **the store is slow** — bounded by :data:`_WEBHOOK_LOAD_TIMEOUT_S` on a worker thread. The
       executor is deliberately NOT used as a context manager: `__exit__` calls
       `shutdown(wait=True)`, which would block the poller until the slow call finally returned and
       defeat the timeout completely. `shutdown(wait=False)` abandons the thread instead, which is
@@ -740,28 +740,28 @@ def _load_partner_recipients() -> list[PartnerRecipient]:
       provider rather than treating this ceiling as the only bound.
     * **one document is unreadable** — skipped, per document, never allowed to fail its collection
       (R20). The count and the exception CLASS are logged and the document body never is (R16): a
-      partner subscription is a route with times, and this log line is not the place for it.
+      webhook subscription is a route with times, and this log line is not the place for it.
 
     Materializing the iterable happens inside the worker (`list(islice(...))`), so a lazy Firestore
-    cursor's paging is under the same clock as the first call and :data:`_MAX_PARTNER_RECIPIENTS`
+    cursor's paging is under the same clock as the first call and :data:`_MAX_WEBHOOK_RECIPIENTS`
     bounds the read rather than merely the result.
     """
-    if not partner_channel_enabled():
+    if not webhook_channel_enabled():
         return []
-    provider = _partner_provider
-    if provider is None:  # narrowed for the type checker; partner_channel_enabled already said so
+    provider = _webhook_provider
+    if provider is None:  # narrowed for the type checker; webhook_channel_enabled already said so
         return []
     started = monotonic()
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="partner-load")
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="client-load")
     try:
-        future = pool.submit(lambda: list(islice(provider(), _MAX_PARTNER_RECIPIENTS)))
-        docs = future.result(timeout=_PARTNER_LOAD_TIMEOUT_S)
+        future = pool.submit(lambda: list(islice(provider(), _MAX_WEBHOOK_RECIPIENTS)))
+        docs = future.result(timeout=_WEBHOOK_LOAD_TIMEOUT_S)
     except Exception:
         logger.warning(
-            "Partner subscriptions could not be read this cycle; matching browser registrations "
+            "Webhook subscriptions could not be read this cycle; matching browser registrations "
             "only",
             exc_info=True,
-            extra={"fields": {"event": "varsel_partner_load", "result": "error"}},
+            extra={"fields": {"event": "varsel_webhook_load", "result": "error"}},
         )
         return []
     finally:
@@ -769,41 +769,41 @@ def _load_partner_recipients() -> list[PartnerRecipient]:
         # cycle and is collected when the call returns.
         pool.shutdown(wait=False)
 
-    recipients: list[PartnerRecipient] = []
+    recipients: list[WebhookRecipient] = []
     skipped: dict[str, int] = {}
     for doc in docs:
         try:
-            recipients.append(_parse_partner_recipient(doc))
+            recipients.append(_parse_webhook_recipient(doc))
         except Exception as exc:
-            # The traceback at DEBUG, the COUNT at WARNING below. Never the document: a partner
+            # The traceback at DEBUG, the COUNT at WARNING below. Never the document: a client
             # subscription is a route with times and weekdays, and R16 keeps that out of routine
             # logs -- which a per-document warning quoting the record would defeat. Bounded by
-            # `_MAX_PARTNER_RECIPIENTS`, and the exception messages reachable here are either a
+            # `_MAX_WEBHOOK_RECIPIENTS`, and the exception messages reachable here are either a
             # missing key name or one of this function's own sentences, so the traceback is safe.
-            logger.debug("Unreadable partner subscription document; skipping it", exc_info=True)
+            logger.debug("Unreadable webhook subscription document; skipping it", exc_info=True)
             skipped[type(exc).__name__] = skipped.get(type(exc).__name__, 0) + 1
     if skipped:
         logger.warning(
-            "Skipped %d unreadable partner subscription document(s) this cycle (%s); the rest of "
+            "Skipped %d unreadable webhook subscription document(s) this cycle (%s); the rest of "
             "the collection was matched",
             sum(skipped.values()),
             ", ".join(f"{name} x{n}" for name, n in sorted(skipped.items())),
             extra={
                 "fields": {
-                    "event": "varsel_partner_load",
+                    "event": "varsel_webhook_load",
                     "result": "skipped",
                     "skipped": sum(skipped.values()),
                 }
             },
         )
     logger.info(
-        "Loaded %d partner subscription(s) in %.0f ms (%d skipped)",
+        "Loaded %d webhook subscription(s) in %.0f ms (%d skipped)",
         len(recipients),
         (monotonic() - started) * 1000,
         sum(skipped.values()),
         extra={
             "fields": {
-                "event": "varsel_partner_load",
+                "event": "varsel_webhook_load",
                 "result": "ok",
                 "n": len(recipients),
                 "skipped": sum(skipped.values()),
@@ -812,7 +812,7 @@ def _load_partner_recipients() -> list[PartnerRecipient]:
                 # rounding error to fix: the read stops AT the ceiling (R21 -- it may not exceed
                 # it), so this cycle genuinely cannot tell a full collection from a clipped one,
                 # and claiming otherwise would need one more document than the ceiling allows.
-                "truncated": len(docs) >= _MAX_PARTNER_RECIPIENTS,
+                "truncated": len(docs) >= _MAX_WEBHOOK_RECIPIENTS,
             }
         },
     )
@@ -872,8 +872,8 @@ def _service_verdict(
     choice: a provider is an INJECTED seam, several suites supply two-positional fakes, and this
     function swallows every exception into ``None``. Passing ``path=`` unconditionally would turn
     each of those fakes into a silent "could not establish" — which is the exact failure this seam
-    exists to avoid, arriving with a green test suite. `partner_api` and `partner_servability` are
-    wired with a partial that names the partner budget (see `main.lifespan`).
+    exists to avoid, arriving with a green test suite. `notification_api` and `notification_servability` are
+    wired with a partial that names the client budget (see `main.lifespan`).
     """
     if _connectivity_provider is None:
         return None
@@ -1572,7 +1572,7 @@ def _collect_alerts(
         impact_p = dep.impact_probability
         # THE one gate, since 2026-09-08: `alert_policy.gate` states the comparison (and the
         # "None is never alert-worthy" rule) in a single place, so this browser adapter and the
-        # partner adapter being built beside it cannot come to disagree about what a threshold
+        # client adapter being built beside it cannot come to disagree about what a threshold
         # means. It is `threshold_for` underneath and nothing else -- the per-operator table and
         # the no-SX cut are unchanged, which is why `alert_threshold` still reads exactly what it
         # always did on every existing decision row.
@@ -1660,7 +1660,7 @@ def _train_key(alert: Alert) -> tuple | None:
 
 
 def _pending_pushes(
-    jids, alerts: list[Alert], partner_recipients: Sequence[PartnerRecipient] = ()
+    jids, alerts: list[Alert], webhook_recipients: Sequence[WebhookRecipient] = ()
 ) -> list[Alert]:
     """The alert-worthy trains a notification is still coming for, worst-first — on ANY channel.
 
@@ -1674,16 +1674,16 @@ def _pending_pushes(
     and its wording can still change what somebody sees. A journey definition nobody is registered
     on any more yields nothing, which is correct — there is no notification to write for.
 
-    **A partner subscription is another registration** (KTD3), so it is asked the same question
-    against its own ledger: `PartnerRecipient.delivered` is Firestore's copy of `_notified` at the
-    same grain, read once per cycle in `_load_partner_recipients`. Never the store itself — this is
+    **A webhook subscription is another registration** (KTD3), so it is asked the same question
+    against its own ledger: `WebhookRecipient.delivered` is Firestore's copy of `_notified` at the
+    same grain, read once per cycle in `_load_webhook_recipients`. Never the store itself — this is
     called from pass 1b, which is sequential precisely because it blocks on nothing.
 
     **The caller passes NO browser jids when `push_enabled()` is false**, and that half is easy to
     miss and expensive to get wrong (KTD4). `_notified` only grows on a successful browser send, so
     without it a keypair-less deployment (tst has no keypair) would report every alert-worthy train
     as pending for every browser registration on every cycle, and spend the whole write budget
-    re-wording trains it can never deliver — competing with exactly the partner subjects the gate
+    re-wording trains it can never deliver — competing with exactly the webhook subjects the gate
     change exists to serve.
 
     Deliberately approximate in one direction only. It does not check that each registration
@@ -1703,7 +1703,7 @@ def _pending_pushes(
             any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
             or any(
                 alert.situation_number not in recipient.delivered
-                for recipient in partner_recipients
+                for recipient in webhook_recipients
             )
         )
     ]
@@ -1824,7 +1824,7 @@ def notification_wording_for(
 ) -> tuple[str, str]:
     """The title and body ONE notification carries, whatever channel carries it.
 
-    Extracted from :func:`_notification_payload` on 2026-09-08 so the partner channel's event
+    Extracted from :func:`_notification_payload` on 2026-09-08 so the webhook channel's event
     envelope is byte-identical to the Web Push by CONSTRUCTION rather than by a parallel builder
     that agrees today. R7 states the claim ("the Norwegian title and body /varsel would have
     pushed"), and a second copy of two f-strings is exactly the shape that drifts silently: nothing
@@ -2416,10 +2416,10 @@ def _record_decisions(
                         status = "not_alertworthy"
                     elif not push_on:
                         # Unchanged on purpose (KTD4): every row `_record_decisions` writes is a
-                        # BROWSER subject (it iterates the browser grouping -- KTD10 keeps partner
+                        # BROWSER subject (it iterates the browser grouping -- KTD10 keeps client
                         # subjects out of this table), so "no keypair" is still exactly why this
                         # subject got no wording, and the value keeps the meaning every existing row
-                        # in `varsel_decisions` carries. What changed above is only that a partner
+                        # in `varsel_decisions` carries. What changed above is only that a client
                         # subscription can now earn a wording the browser channel could not deliver
                         # -- and where one did, `meta` is set and this branch is never reached.
                         status = "push_disabled"
@@ -2668,12 +2668,12 @@ def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
                 _forget_message(message_key)
 
 
-# ---- The partner channel's outgoing side: this cycle's subjects -------------------------------
+# ---- The webhook channel's outgoing side: this cycle's subjects -------------------------------
 #
 # Everything below turns the SAME match, the SAME collapse and the SAME wording the browser channel
-# used into the shape `partner_events` commits. It is the last thing `check_and_notify` does and it
+# used into the shape `notification_events` commits. It is the last thing `check_and_notify` does and it
 # leaves nothing behind: the result is a return value (KTD3 -- a view merged at match time, never a
-# materialization), so `_journeys`, `_notified` and the state blob still carry no partner id and a
+# materialization), so `_journeys`, `_notified` and the state blob still carry no client id and a
 # rollback to pre-feature code has nothing of this to lose.
 
 #: What a retraction says. Withdrawal means THE FORECAST CHANGED, not that normal service is
@@ -2681,20 +2681,20 @@ def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
 #: it is the one sentence a traveller could most easily read as an all-clear. Norwegian, like every
 #: other traveller-facing string in this module, and deliberately brand-independent for the reason
 #: every push wording is: it is the text a comparison would be split by.
-_PARTNER_WITHDRAWAL_DETAIL = (
+_WEBHOOK_WITHDRAWAL_DETAIL = (
     "Vi varsler ikke lenger om denne avgangen. Det betyr ikke at den er garantert i rute."
 )
-_PARTNER_WITHDRAWAL_TITLE = "varselet er trukket tilbake"
+_WEBHOOK_WITHDRAWAL_TITLE = "varselet er trukket tilbake"
 
 
-def _partner_delivery_enabled() -> bool:
-    """Whether a PARTNER event carries the model's prose rather than the template.
+def _webhook_delivery_enabled() -> bool:
+    """Whether a Notification event carries the model's prose rather than the template.
 
-    :func:`notification_wording.partner_delivery_enabled` (``NOTIFICATION_PARTNER_LLM_ENABLED``,
+    :func:`notification_wording.webhook_delivery_enabled` (``NOTIFICATION_WEBHOOK_LLM_ENABLED``,
     unset = off), deliberately NOT :func:`_deliverable_message`, which is the BROWSER delivery gate
-    (``VARSEL_LLM_ENABLED``). The two are separate on purpose: the rollout turns the partner channel
+    (``VARSEL_LLM_ENABLED``). The two are separate on purpose: the rollout turns the webhook channel
     on with the template wording first and model prose only once matching and delivery qualify, and
-    sharing one variable would flip partner prose on the moment it goes on for the PWA, in the same
+    sharing one variable would flip client prose on the moment it goes on for the PWA, in the same
     deploy — precisely the coupling the 2026-08-07 generation/delivery split removed one layer down.
 
     Read ONCE per cycle by the caller, like ``_record_decisions``' own two gate reads: a flag
@@ -2704,23 +2704,23 @@ def _partner_delivery_enabled() -> bool:
     unreadable switch is not evidence that a model's prose should go out.
     """
     try:
-        return bool(notification_wording.partner_delivery_enabled())
+        return bool(notification_wording.webhook_delivery_enabled())
     except Exception:
         logger.warning(
-            "Could not read the partner wording-delivery switch; using the deterministic wording",
+            "Could not read the webhook wording-delivery switch; using the deterministic wording",
             exc_info=True,
             extra={"fields": {"event": "notification_wording", "result": "error"}},
         )
         return False
 
 
-def _partner_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str | None:
-    """The written wording a PARTNER event may carry, or None for the template.
+def _webhook_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str | None:
+    """The written wording a Notification event may carry, or None for the template.
 
     Reads :data:`_messages` RAW, which is the whole reason this is not
     :func:`_deliverable_message`: for a definition both channels share, that cache holds the ONE
     wording AE1 asserts, and reading it through the browser's delivery gate would withhold it from a
-    partner in prd for a reason about ``VARSEL_LLM_ENABLED``.
+    client in prd for a reason about ``VARSEL_LLM_ENABLED``.
     """
     if not enabled:
         return None
@@ -2728,7 +2728,7 @@ def _partner_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str
         return _messages.get(message_key)
 
 
-def _partner_withdrawal_wording(
+def _webhook_withdrawal_wording(
     message_input: dict, from_name: str, to_name: str
 ) -> tuple[str, str]:
     """Title and body for a retraction, in :func:`notification_wording_for`'s two shapes.
@@ -2742,20 +2742,20 @@ def _partner_withdrawal_wording(
     """
     train = _train_label_from_input(message_input)
     if train:
-        title = f"{train}: {_PARTNER_WITHDRAWAL_TITLE}"
+        title = f"{train}: {_WEBHOOK_WITHDRAWAL_TITLE}"
     else:
-        title = f"{from_name} → {to_name}: {_PARTNER_WITHDRAWAL_TITLE}"
-    return _tag_environment(title), f"{from_name} → {to_name}\n{_PARTNER_WITHDRAWAL_DETAIL}"
+        title = f"{from_name} → {to_name}: {_WEBHOOK_WITHDRAWAL_TITLE}"
+    return _tag_environment(title), f"{from_name} → {to_name}\n{_WEBHOOK_WITHDRAWAL_DETAIL}"
 
 
-def _partner_situations(alerts: list[Alert]) -> list[dict]:
+def _webhook_situations(alerts: list[Alert]) -> list[dict]:
     """The contributing situations for one train, operator text included.
 
     Built from the UNCOLLAPSED alerts about that train rather than from the one
     :func:`one_alert_per_train` kept, because R8 asks for "the contributing situations" and because
     operators routinely publish several messages about one disruption — Vy sent both "Ta neste tog"
     and "Innstilt Drammen–Skøyen" for the same cancelled 15:03. The wording still comes from the
-    single most severe one; this is what a partner joins on and displays.
+    single most severe one; this is what a client joins on and displays.
     """
     seen: set[str] = set()
     out: list[dict] = []
@@ -2778,7 +2778,7 @@ def _partner_situations(alerts: list[Alert]) -> list[dict]:
     return out
 
 
-def _partner_payload(
+def _webhook_payload(
     alert: Alert,
     contributing: list[Alert],
     *,
@@ -2811,7 +2811,7 @@ def _partner_payload(
             # custom encoder on a path where a raise costs the delivery.
             dumped = alternative.model_dump(mode="json")
         except Exception:
-            logger.debug("Could not serialize an alternative journey for a partner event", exc_info=True)
+            logger.debug("Could not serialize an alternative journey for a notification event", exc_info=True)
     return {
         "notification": {"title": title, "body": body, "action": None},
         "call": {
@@ -2826,7 +2826,7 @@ def _partner_payload(
             "impact": alert.impact_probability,
             "cancellation": alert.cancel_probability,
             "delay_ge10": alert.ge10_probability,
-            # The operator's own alerting bar, so a partner can see WHY this cleared it rather than
+            # The operator's own alerting bar, so a client can see WHY this cleared it rather than
             # inferring a threshold from the numbers. One gate serves both surfaces (KTD2).
             "alert_threshold": alert.alert_threshold,
         },
@@ -2841,34 +2841,34 @@ def _partner_payload(
             if (alert.delay_p50_min or alert.delay_p90_min)
             else None
         ),
-        "situations": _partner_situations(contributing),
+        "situations": _webhook_situations(contributing),
         "alternative_journey": dumped,
     }
 
 
-def _partner_subjects(
-    partner_by_key: dict[str, list[PartnerRecipient]],
+def _webhook_subjects(
+    webhook_by_key: dict[str, list[WebhookRecipient]],
     alerts_by_key: dict[str, list[Alert]],
     match_targets: dict[str, dict],
     message_inputs: dict[tuple[str, str, str], dict | None],
     *,
-    partner_llm: bool,
-) -> list[partner_events.PartnerSubject]:
-    """This cycle's partner subjects — one per (subscription, train), alert-worthy or not.
+    webhook_llm: bool,
+) -> list[notification_events.WebhookSubject]:
+    """This cycle's webhook subjects — one per (subscription, train), alert-worthy or not.
 
     Below-threshold trains are included on purpose: a withdrawal is a lifecycle transition and the
     consecutive-below-threshold count that drives it lives on the alert subject, so the observation
-    has to reach the store to be counted. ``partner_events`` is what keeps that affordable — it
+    has to reach the store to be counted. ``notification_events`` is what keeps that affordable — it
     reads which subjects stand and spends a transaction only where one can be written.
 
     The wording, the collapse and the payload are computed once per (definition, train) and shared
     across the recipients on that definition, which is the same economy AE1 asserts for the match
     and the wording: two recipients watching one trip see identical text.
     """
-    subjects: list[partner_events.PartnerSubject] = []
+    subjects: list[notification_events.WebhookSubject] = []
     unroutable = 0
     failed = 0
-    for key, recipients in partner_by_key.items():
+    for key, recipients in webhook_by_key.items():
         try:
             unroutable += _subjects_for_key(
                 subjects,
@@ -2877,51 +2877,51 @@ def _partner_subjects(
                 alerts_by_key=alerts_by_key,
                 match_targets=match_targets,
                 message_inputs=message_inputs,
-                partner_llm=partner_llm,
+                webhook_llm=webhook_llm,
             )
         except Exception:
             # Per DEFINITION, the same rule `_reconcile_caches` and `_match` are guarded by: one
             # journey's awkward payload must cost that journey's subjects, not the cycle's. What
             # this touches is duck-typed -- an alternative journey from an injected provider, a
             # pydantic dump -- so "it cannot raise" would be an assumption about somebody else's
-            # object, and the caller's outer guard would drop every OTHER partner's events with it.
+            # object, and the caller's outer guard would drop every OTHER client's events with it.
             failed += 1
             logger.warning(
-                "Could not build partner subjects for a journey definition; the rest of the "
-                "cycle's partner work is unaffected",
+                "Could not build webhook subjects for a journey definition; the rest of the "
+                "cycle's client work is unaffected",
                 exc_info=True,
-                extra={"fields": {"event": "partner_emit", "result": "subject_error"}},
+                extra={"fields": {"event": "notification_emit", "result": "subject_error"}},
             )
     if unroutable:
         # The COUNT and never the document (R16). A subscription with no destination was still
         # matched and still contributed to the shared wording; it simply cannot be routed.
         logger.warning(
-            "%d partner subject(s) name no destination and were not emitted for",
+            "%d webhook subject(s) name no destination and were not emitted for",
             unroutable,
-            extra={"fields": {"event": "partner_emit", "result": "unroutable", "n": unroutable}},
+            extra={"fields": {"event": "notification_emit", "result": "unroutable", "n": unroutable}},
         )
     if failed:
         logger.warning(
-            "%d journey definition(s) produced no partner subjects this cycle",
+            "%d journey definition(s) produced no webhook subjects this cycle",
             failed,
-            extra={"fields": {"event": "partner_emit", "result": "subjects_skipped", "n": failed}},
+            extra={"fields": {"event": "notification_emit", "result": "subjects_skipped", "n": failed}},
         )
     return subjects
 
 
 def _subjects_for_key(
-    out: list[partner_events.PartnerSubject],
+    out: list[notification_events.WebhookSubject],
     key: str,
-    recipients: list[PartnerRecipient],
+    recipients: list[WebhookRecipient],
     *,
     alerts_by_key: dict[str, list[Alert]],
     match_targets: dict[str, dict],
     message_inputs: dict[tuple[str, str, str], dict | None],
-    partner_llm: bool,
+    webhook_llm: bool,
 ) -> int:
     """One journey definition's subjects, appended to `out`. Returns the unroutable count.
 
-    Split out so the per-definition guard in :func:`_partner_subjects` has something to wrap.
+    Split out so the per-definition guard in :func:`_webhook_subjects` has something to wrap.
     """
     unroutable = 0
     alerts = alerts_by_key.get(key) or []
@@ -2938,14 +2938,14 @@ def _subjects_for_key(
         if train is None:
             # No train identity, so no stable `alert_id`: two different trains would share one
             # and the receiver's own revision rule would suppress the second recipient's
-            # notification. `partner_events.train_ref` refuses the same set and counts it.
+            # notification. `notification_events.train_ref` refuses the same set and counts it.
             continue
         message_key = _message_key(key, winner)
         message_input = message_inputs.get(message_key) or _message_input_from_alert(winner)
         resolved = message_input.get("reise") or {}
         # The traveller's own name for a stop when a browser registration on this definition
         # supplied one (which makes the event byte-identical to that push), the stop registry's
-        # otherwise. A partner-only route has nobody to have typed a name, so the registry is
+        # otherwise. A webhook-only route has nobody to have typed a name, so the registry is
         # the only source — the one documented place the two channels' text can differ.
         from_name = journey.get("from_name") or resolved.get("fra") or journey.get("from_stop") or ""
         to_name = journey.get("to_name") or resolved.get("til") or journey.get("to_stop") or ""
@@ -2972,18 +2972,18 @@ def _subjects_for_key(
                 # shows the stale text; that half is pre-existing and needs its own pass over
                 # `_messages`, `_message_meta`, `_alternatives` and `_message_attempts`. What this
                 # narrows is the one consumer that turns a stale cache entry into a DELIVERED
-                # notification a partner's traveller then acts on.
-                None if winner.cancelled else _partner_wording(message_key, enabled=partner_llm),
+                # notification a client's traveller then acts on.
+                None if winner.cancelled else _webhook_wording(message_key, enabled=webhook_llm),
                 # Always False, and structurally so. The browser's «Bekreftet:» prefix comes off
-                # `_pushed_trains`, which is per REGISTRATION and per device — a partner has no
+                # `_pushed_trains`, which is per REGISTRATION and per device — a client has no
                 # such record here, and the envelope carries the same fact better:
                 # `type=journey.alert.updated` with `phase=confirmed` says a revision replaces
                 # an earlier one about this train, which is what the prefix was standing in for.
                 confirmed=False,
             )
         else:
-            title, body = _partner_withdrawal_wording(message_input, from_name, to_name)
-        payload = _partner_payload(
+            title, body = _webhook_withdrawal_wording(message_input, from_name, to_name)
+        payload = _webhook_payload(
             winner,
             contributing.get(train, [winner]),
             message_input=message_input,
@@ -2992,16 +2992,16 @@ def _subjects_for_key(
         )
         situations = tuple(s["situation_number"] for s in payload["situations"])
         for recipient in recipients:
-            if not recipient.partner_id or not recipient.destination_id:
+            if not recipient.client_id or not recipient.destination_id:
                 unroutable += 1
                 continue
             out.append(
-                partner_events.PartnerSubject(
+                notification_events.WebhookSubject(
                     subscription_id=recipient.recipient_id,
-                    partner_id=recipient.partner_id,
+                    client_id=recipient.client_id,
                     destination_id=recipient.destination_id,
                     subscription_version=recipient.subscription_version,
-                    partner_ref=recipient.partner_ref,
+                    external_ref=recipient.external_ref,
                     test=recipient.test,
                     alertworthy=bool(winner.alertworthy),
                     cancelled=bool(winner.cancelled),
@@ -3031,12 +3031,12 @@ class PassOutcome:
     this change, and every suite — keeps working by ignoring it.
 
     Handing it to `main` rather than acting on it here is what makes KTD6's ordering claim
-    structural: the partner emit and delivery steps run in their own `main._phase`, *after this
+    structural: the client emit and delivery steps run in their own `main._phase`, *after this
     function has returned*, so a raise in either cannot unwind `_record_decisions` or `_save_state`
     at all rather than merely being sequenced after them.
     """
 
-    partner_subjects: tuple[partner_events.PartnerSubject, ...] = ()
+    webhook_subjects: tuple[notification_events.WebhookSubject, ...] = ()
 
 
 class _LockedPassBudget(notification_wording.PassBudget):
@@ -3087,16 +3087,16 @@ class _WriteBudget(reserved_budget.ReservedBudget):
         super().__init__(max_calls, deadline, _WORST_CASE_CALL_S)
 
     def claim_clock(self) -> bool:
-        """Reserve the wall clock WITHOUT spending the call allowance. What a partner subject claims.
+        """Reserve the wall clock WITHOUT spending the call allowance. What a webhook subject claims.
 
         `notification_wording.PassBudget`'s docstring states the split and the reason, and it is not
         a nicety: the CLOCK is a property of the pass — two surfaces writing inside one pass cannot
         each have their own, and the whole point of the reservation is that the deadline bounds when
-        the pass ENDS — while the COUNT is a property of the surface. Merged, a partner with a few
-        hundred subscriptions would spend :data:`_MAX_LLM_CALLS_PER_CYCLE` on partner wordings and
+        the pass ENDS — while the COUNT is a property of the surface. Merged, a client with a few
+        hundred subscriptions would spend :data:`_MAX_LLM_CALLS_PER_CYCLE` on client wordings and
         silently retire the browser ones, which is that constant's own lesson read the other way
         round (raising the count without the width just moves the binding constraint to the clock).
-        A partner call is charged to `notification_wording`'s per-pass budget and its caller-keyed
+        A client call is charged to `notification_wording`'s per-pass budget and its caller-keyed
         trailing hour/day instead.
 
         `refused` is still incremented, so the one summary line per cycle reports what the clock
@@ -3140,18 +3140,18 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     was wrong: it read "no keypair" as "no reader". A webhook-only deployment, and tst which holds no
     keypair at all, therefore wrote nothing and recorded ``message_status='push_disabled'`` on every
     row. The gate is now the condition it was reaching for: at least one deliverable recipient on
-    any channel — browser push enabled, or a partner subscription with a delivery still pending for
+    any channel — browser push enabled, or a webhook subscription with a delivery still pending for
     that train. A journey with no deliverable channel still writes nothing, so
     ``message_status='push_disabled'`` keeps its meaning for browser subjects.
 
-    **Partner subscriptions are registrations with a webhook channel** (KTD3), merged into pass 1a
+    **Webhook subscriptions are registrations with a webhook channel** (KTD3), merged into pass 1a
     under :func:`journey_key` so one match and one wording serve both channels. It is a view, not a
-    materialization: `_journeys`, `_notified` and the state blob never carry a partner id. Note
+    materialization: `_journeys`, `_notified` and the state blob never carry a client id. Note
     `_record_decisions` is handed the BROWSER grouping only (KTD10) — the decision log is published
-    on public hosts, and a partner-only route therefore produces no row at all, which is KTD12's
+    on public hosts, and a webhook-only route therefore produces no row at all, which is KTD12's
     recorded limitation rather than an oversight.
 
-    **The partner channel's writes and sends happen AFTER this returns** (KTD6). What this function
+    **The webhook channel's writes and sends happen AFTER this returns** (KTD6). What this function
     produces for them is a :class:`PassOutcome` — one subject per (subscription, train) with the
     wording already resolved — which `main` hands to its own poller phase. Returning the work rather
     than doing it is strictly stronger than KTD6's literal placement on KTD6's own stated reason: a
@@ -3170,10 +3170,10 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     recipient means no write at all, delivery off means write but send the template.
     """
     push_on = push_enabled()
-    # Read once for the whole cycle: whether a PARTNER event carries the model's prose. It decides
-    # both whether a partner-only definition is written for at all and which wording its event
+    # Read once for the whole cycle: whether a Notification event carries the model's prose. It decides
+    # both whether a webhook-only definition is written for at all and which wording its event
     # carries, and one pass must not answer that two ways.
-    partner_llm = _partner_delivery_enabled()
+    webhook_llm = _webhook_delivery_enabled()
     with _state_lock:
         journeys = list(_journeys.items())
         # Prune notified entries and cached messages whose situation is no longer live. In-place
@@ -3200,24 +3200,24 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         oslo_today = datetime.now(_OSLO).date().isoformat()
         for jid in [j for j, (day, _count) in _daily_pushes.items() if day != oslo_today]:
             _daily_pushes.pop(jid, None)
-        # NOTHING FOR THE PARTNER CHANNEL SWEEPS HERE, and that is a property worth stating rather
-        # than an omission. The partner snapshot loaded below is a pass-local list, and Firestore is
-        # the only dedup ledger for that channel (KTD3), so this pass holds no partner state to go
+        # NOTHING FOR THE WEBHOOK CHANNEL SWEEPS HERE, and that is a property worth stating rather
+        # than an omission. The client snapshot loaded below is a pass-local list, and Firestore is
+        # the only dedup ledger for that channel (KTD3), so this pass holds no notification state to go
         # stale. Anything a later unit adds at module level -- a per-cycle counter, a budget -- goes
         # here AND in `test_varsel_api._reset_state`: a leaked half-spent budget is indistinguishable
         # from a give-up bug. The per-destination delivery skip is the deliberate exception and must
         # stay pass-local, or one failure pauses a destination permanently (KTD6).
         changed = bool(stale)
 
-    # ---- The one partner read: BEFORE pass 1a, and before the write budget's clock starts -----
+    # ---- The one client read: BEFORE pass 1a, and before the write budget's clock starts -----
     #
-    # KTD6: the load necessarily precedes 1a, because that is what partner subscriptions are matched
-    # from, and it is the ONLY partner read passes 1a and 1b depend on. Placed outside the
+    # KTD6: the load necessarily precedes 1a, because that is what webhook subscriptions are matched
+    # from, and it is the ONLY client read passes 1a and 1b depend on. Placed outside the
     # `_state_lock` block above (no store I/O under that lock, `_prepare_alert`'s rule) and before
     # `_WriteBudget` is constructed below, so a slow store spends the cycle's own tail rather than
     # silently eating the 30 s wording ceiling. Empty list when the channel is off, unreachable or
     # slow -- every failure shape is inside the helper.
-    partner_recipients = _load_partner_recipients()
+    webhook_recipients = _load_webhook_recipients()
 
     # ---- Loop 1: one impact call per journey definition, one written message per train ---------
     by_journey_key: dict[str, dict] = {}
@@ -3233,19 +3233,19 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
 
     # The same grouping for the webhook channel, and the merged set pass 1a actually matches.
     # `by_journey_key` stays BROWSER-ONLY on purpose: it is what `_record_decisions` iterates, and
-    # KTD10 keeps partner subjects out of `varsel_decisions` entirely (that table is published, with
+    # KTD10 keeps webhook subjects out of `varsel_decisions` entirely (that table is published, with
     # resolved place names, on public hosts). So a definition both channels share is matched once and
-    # recorded once, exactly as today, while a partner-only definition is matched and never recorded.
+    # recorded once, exactly as today, while a webhook-only definition is matched and never recorded.
     #
     # `setdefault` order matters: the browser record wins for a shared key. A browser registration
     # carries `from_name`/`to_name`, the service caveat and the consent version, none of which the
     # shared work reads -- but `_record_decisions` and `_notification_payload` do, and they must keep
-    # seeing the record the traveller actually registered rather than a partner's projection of it.
-    partner_by_key: dict[str, list[PartnerRecipient]] = {}
-    for recipient in partner_recipients:
-        partner_by_key.setdefault(journey_key(recipient.journey), []).append(recipient)
+    # seeing the record the traveller actually registered rather than a client's projection of it.
+    webhook_by_key: dict[str, list[WebhookRecipient]] = {}
+    for recipient in webhook_recipients:
+        webhook_by_key.setdefault(journey_key(recipient.journey), []).append(recipient)
     match_targets: dict[str, dict] = dict(by_journey_key)
-    for _key, _recipients in partner_by_key.items():
+    for _key, _recipients in webhook_by_key.items():
         match_targets.setdefault(_key, _recipients[0].journey)
 
     alerts_by_key: dict[str, list[Alert]] = {}
@@ -3258,13 +3258,13 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # rather than checked. This is the ingestion thread: every second here is a second /disruptions,
     # /journey, /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1.
     budget = _WriteBudget(_MAX_LLM_CALLS_PER_CYCLE, monotonic() + _MAX_LLM_SECONDS_PER_CYCLE)
-    # The PARTNER surface's own call allowance, spent inside this same pass and therefore under the
+    # The WEBHOOK surface's own call allowance, spent inside this same pass and therefore under the
     # same wall clock -- `notification_wording.PassBudget`'s docstring states that contract and this
     # is the caller it was written for. The COUNT is deliberately separate from
     # `_MAX_LLM_CALLS_PER_CYCLE`: the clock is a property of the pass and two surfaces writing inside
     # one pass cannot each have their own, while the count is a property of the surface, and merging
-    # them would let a busy partner morning silently retire the browser wordings.
-    partner_budget = _LockedPassBudget()
+    # them would let a busy client morning silently retire the browser wordings.
+    webhook_budget = _LockedPassBudget()
     # One instant for the whole cycle, so "has this alternative departed?" cannot be answered
     # differently for two journeys scored a few seconds apart.
     cycle_now = datetime.now(UTC)
@@ -3323,22 +3323,22 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         alerts_by_key[key] = alerts
         # WHICH WORDING POLICY writes for this definition, and the discriminator is `by_journey_key`
         # itself -- browser-only by construction (KTD10), so "absent from it" is exactly "no browser
-        # registration holds this route". A partner-only subject must go through
-        # `notification_wording.PARTNER`, because the browser policy's prompt audit record carries
+        # registration holds this route". A webhook-only subject must go through
+        # `notification_wording.WEBHOOK`, because the browser policy's prompt audit record carries
         # the traveller's origin, destination and departure time at DEBUG wherever
-        # VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and R16 forbids that for partner data.
-        # PARTNER suppresses that record in CODE rather than by an environment variable, drops
+        # VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and R16 forbids that for client data.
+        # WEBHOOK suppresses that record in CODE rather than by an environment variable, drops
         # `message` from the INFO record, and latches against its own holder. Its FIRST bound is the
-        # partner delivery switch, so with partner prose undelivered — every deployment today — the
-        # writer is still invoked (AE10: a partner registration with no VAPID keypair matches and is
+        # webhook delivery switch, so with client prose undelivered — every deployment today — the
+        # writer is still invoked (AE10: a client registration with no VAPID keypair matches and is
         # written for) and answers with the template, asking no backend and charging nothing.
         #
         # A SHARED definition stays on the browser policy, unavoidably and by design: AE1 pins one
         # match and one wording between the two channels, so there is one call and it is the
-        # browser's. The prompt record for that route would exist with no partner channel at all,
+        # browser's. The prompt record for that route would exist with no webhook channel at all,
         # because a browser registration holds the same route -- so R16's claim is about
-        # partner-ONLY routes plus every other partner field, and U8 publishes exactly that.
-        partner_only = key not in by_journey_key
+        # webhook-only routes plus every other client field, and U8 publishes exactly that.
+        webhook_only = key not in by_journey_key
         for alert in alerts:
             message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
         # ABOVE the early return, and over every alert: a superseded alternative most often goes
@@ -3384,20 +3384,20 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # through `_deliverable_message` and would otherwise decay to the template as soon as
         # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
         # It is gated on `push_on` because the CARD is the reader it exists for, and the card is
-        # the browser channel; a partner subject with nothing pending has already been told.
+        # the browser channel; a webhook subject with nothing pending has already been told.
         #
         # KTD4's gate, expressed as three lines rather than a boolean somewhere else. `jids` are
         # withheld when push is off -- see `_pending_pushes` for why that half is load-bearing --
         # so `pending` is exactly "a recipient on some channel still needs telling about this
-        # train", and `push_on or pending` is exactly "some channel can deliver". With no partner
+        # train", and `push_on or pending` is exactly "some channel can deliver". With no client
         # recipients (every deployment until the store lands, and every existing test) both
         # predicates reduce to what they were: `pending` is the browser list, and the guard below
         # is the old `if not push_on: continue`.
         pending = _pending_pushes(
-            jids_by_key.get(key, ()) if push_on else (), alerts, partner_by_key.get(key, ())
+            jids_by_key.get(key, ()) if push_on else (), alerts, webhook_by_key.get(key, ())
         )
         if not push_on and not pending:
-            # No deliverable recipient on ANY channel: a keypair-less deployment with no partner
+            # No deliverable recipient on ANY channel: a keypair-less deployment with no client
             # subscription pending for this journey. The decision is still recorded below, with the
             # deterministic wording, and `message_status` still reads `push_disabled` for it.
             continue
@@ -3426,11 +3426,11 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             # on.
             #
             # Asked for a BROWSER subject only. `_generation_enabled` reads `llm_message`'s
-            # module-global latch, which is the poller's own; the PARTNER policy latches against its
+            # module-global latch, which is the poller's own; the WEBHOOK policy latches against its
             # own holder precisely so the two callers cannot disable each other, and consulting the
-            # browser latch for a partner-only subject would hand that isolation straight back.
+            # browser latch for a webhook-only subject would hand that isolation straight back.
             # `write_wording` asks the same question against the right holder as its second bound.
-            if not partner_only and not _generation_enabled():
+            if not webhook_only and not _generation_enabled():
                 _remember_message_meta(message_key, status="llm_disabled")
                 continue
             if already_written:
@@ -3456,7 +3456,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                 # and a rate computed across both measures neither.
                 _remember_message_meta(message_key, status="transient_exhausted")
                 continue
-            write_queue.append((key, subject, message_key, attempts, errors, partner_only))
+            write_queue.append((key, subject, message_key, attempts, errors, webhook_only))
 
     # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
     # until the budget could actually bind across journeys there was nothing to order. The queue
@@ -3484,10 +3484,10 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # `_MAX_LLM_CALLS_PER_CYCLE` of them run per cycle; sequentially that is the difference between
     # a budget of 8 (~18 s, all of the ceiling) and one of 64 (~140 s, absurd). Across
     # `_LLM_WORKERS` it is ~9 s.
-    def _write_partner_only(
+    def _write_webhook_only(
         key: str, subject: Alert, message_key: tuple[str, str, str]
     ) -> tuple[str | None, str | None]:
-        """One partner-ONLY definition's wording, through `notification_wording.PARTNER`.
+        """One webhook-only definition's wording, through `notification_wording.WEBHOOK`.
 
         Returns `(message, status)` in `_write_message`'s own vocabulary, so pass 1c's budget
         bookkeeping below is one branch rather than two.
@@ -3496,7 +3496,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         wording -- every failure falls through to the template -- so returning its body unconditional
         would cache the TEMPLATE in `_messages`, and the next cycle's `already_written` check would
         then report `ok_cached` and never ask again. That is the give-up bug in a new place: with the
-        partner delivery switch off (every deployment today) it would freeze the first template
+        webhook delivery switch off (every deployment today) it would freeze the first template
         forever, and with it on it would freeze whatever a transient Vertex failure produced.
 
         `subject_id` is the journey key, which is what `_write_message` passes on the browser path
@@ -3504,8 +3504,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         log field, so the pattern itself never leaves the process. `write_wording`'s docstring asks
         for an opaque service-issued id and names that hashing as the reason varsel's own value is
         acceptable; there is no departure id at this grain, and two conventions for one parameter
-        would be worse than one. What actually keeps a partner-only route out of the prompt audit
-        record is the POLICY -- `PARTNER.caller` suppresses the prompt/reply DEBUG record in code
+        would be worse than one. What actually keeps a webhook-only route out of the prompt audit
+        record is the POLICY -- `WEBHOOK.caller` suppresses the prompt/reply DEBUG record in code
         and drops `message` from the INFO record -- not the shape of this argument.
         """
         message_input = message_inputs.get(message_key)
@@ -3521,32 +3521,32 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                 notification_wording.DepartureWordingFacts(
                     situation_number=subject.situation_number
                 ),
-                policy=notification_wording.PARTNER,
+                policy=notification_wording.WEBHOOK,
                 subject_id=key,
-                budget=partner_budget,
+                budget=webhook_budget,
                 message_input=message_input,
             )
         except Exception:
             logger.warning(
-                "Partner wording step raised; using the deterministic wording",
+                "Webhook wording step raised; using the deterministic wording",
                 exc_info=True,
                 extra={"fields": {"event": "notification_wording", "result": "error",
-                                  "surface": "partner"}},
+                                  "surface": "webhook"}},
             )
             return None, "error"
         _remember_message_meta(message_key, status=wording.status, message_input=message_input)
         return (wording.body if wording.source == "llm" else None), wording.status
 
     def _write_one(item: tuple[str, Alert, tuple[str, str, str], int, int, bool]) -> None:
-        key, subject, message_key, attempts, errors, partner_only = item
+        key, subject, message_key, attempts, errors, webhook_only = item
         # Claimed here rather than filtered above, so the ceiling is spent on calls that actually
         # START. A pre-filter would hand the budget to the first N in the queue whether or not the
         # clock still allowed them.
         #
-        # A partner subject claims the CLOCK only -- see `_WriteBudget.claim_clock`. Its call
-        # allowance is `notification_wording`'s own, which is what keeps a partner with a few
+        # A webhook subject claims the CLOCK only -- see `_WriteBudget.claim_clock`. Its call
+        # allowance is `notification_wording`'s own, which is what keeps a client with a few
         # hundred subscriptions from spending the browser wordings' budget.
-        if not (budget.claim_clock() if partner_only else budget.claim()):
+        if not (budget.claim_clock() if webhook_only else budget.claim()):
             _remember_message_meta(message_key, status="capped")
             return
         # _write_message catches Exception itself, so this is belt and braces for a future edit
@@ -3555,8 +3555,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # loop 2 pushes independently and falls back to the deterministic wording.
         outcome: dict[str, Any] = {}
         try:
-            if partner_only:
-                message, outcome["status"] = _write_partner_only(key, subject, message_key)
+            if webhook_only:
+                message, outcome["status"] = _write_webhook_only(key, subject, message_key)
             else:
                 message = _write_message(
                     subject,
@@ -3764,13 +3764,13 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                     changed = True
 
     # BROWSER subjects only, and structurally so: this iterates `by_journey_key`, which is built
-    # from `_journeys` alone. KTD10 keeps partner subjects out of `varsel_decisions` entirely --
+    # from `_journeys` alone. KTD10 keeps webhook subjects out of `varsel_decisions` entirely --
     # /historikk and /meldinger publish that table on public hosts, with resolved place names since
-    # 2026-08-22, and partner-app travellers are members of the public. `pushed_keys` is likewise
-    # only ever written by loop 2 above: it is journey-DEFINITION grain, so a partner delivery
+    # 2026-08-22, and client-app travellers are members of the public. `pushed_keys` is likewise
+    # only ever written by loop 2 above: it is journey-DEFINITION grain, so a webhook delivery
     # recorded there would mark a browser registration's row `pushed` with no browser push behind
     # it -- and `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed
-    # row. That is why the partner deliveries happen in a later phase entirely and not here.
+    # row. That is why the webhook deliveries happen in a later phase entirely and not here.
     _record_decisions(
         by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
     )
@@ -3779,23 +3779,23 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         _save_state()
 
     # LAST, after the cycle's two durable writes, and handed back rather than acted on: KTD6 orders
-    # every partner step that writes or sends after `_record_decisions` and `_save_state`, and
+    # every client step that writes or sends after `_record_decisions` and `_save_state`, and
     # returning the work means a raise in it runs after this function has returned and cannot unwind
     # either of them at all. Guarded, because building a subject reads duck-typed objects (an
     # alternative journey from an injected provider, a pydantic dump) and a raise here would cost the
-    # browser cycle its own tail for a partner field.
+    # browser cycle its own tail for a client field.
     try:
-        subjects = _partner_subjects(
-            partner_by_key, alerts_by_key, match_targets, message_inputs, partner_llm=partner_llm
+        subjects = _webhook_subjects(
+            webhook_by_key, alerts_by_key, match_targets, message_inputs, webhook_llm=webhook_llm
         )
     except Exception:
         logger.warning(
-            "Could not build this cycle's partner subjects; no partner event is emitted for it",
+            "Could not build this cycle's webhook subjects; no notification event is emitted for it",
             exc_info=True,
-            extra={"fields": {"event": "partner_emit", "result": "build_error"}},
+            extra={"fields": {"event": "notification_emit", "result": "build_error"}},
         )
         subjects = []
-    return PassOutcome(partner_subjects=tuple(subjects))
+    return PassOutcome(webhook_subjects=tuple(subjects))
 
 
 # ---- API models ------------------------------------------------------------------------------

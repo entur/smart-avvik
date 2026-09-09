@@ -1,20 +1,20 @@
-"""Checks for partner_api.py: the authenticated partner surface at /notification-api/v1.
+"""Checks for notification_api.py: the authenticated client surface at /notification-api/v1.
 
 Hermetic -- a ``TestClient`` over a FastAPI app carrying the real router, no emulator, no socket, no
-credentials -- and deliberately backed by the **real** ``partner_store`` running against an
+credentials -- and deliberately backed by the **real** ``notification_store`` running against an
 in-memory fake client rather than by a hand-written fake store. That choice is the point: the
 interesting behaviour on this surface is the mapping of the store's own verdicts onto status codes,
 so a fake store would be a second statement of the rules being checked, and every one of them
 (a tombstone is not resurrected, a version mismatch is a conflict, the test marker is immutable, the
 active-subscription ceiling is refused before any write) would then be true by construction of the
-fixture. The credential plane is the real ``partner_auth`` over its four-method document seam, so
+fixture. The credential plane is the real ``notification_auth`` over its four-method document seam, so
 the two-tier limiter, the negative cache and the 401/403/503 split are exercised end to end through
 HTTP.
 
-The one thing genuinely stubbed is the outbound call: ``webhook_client.deliver`` opens a socket and
+The one thing genuinely stubbed is the outbound call: ``webhook_sender.deliver`` opens a socket and
 refuses to do so from a test process at all, so ``/test-events`` gets an injected transport. The
 signing is real -- the synthetic event is signed by ``webhook_signing.sign`` over the exact bytes
-the route built, and one check verifies it the way a partner's receiver would.
+the route built, and one check verifies it the way a client's receiver would.
 """
 
 from __future__ import annotations
@@ -30,18 +30,18 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import alert_policy
-import partner_api
-import partner_auth
-import partner_store
+import notification_api
+import notification_auth
+import notification_store
 import sso
-import webhook_client
+import webhook_sender
 import webhook_signing
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-API_SOURCE = (HERE / "partner_api.py").read_text()
+API_SOURCE = (HERE / "notification_api.py").read_text()
 VARSEL_SOURCE = (HERE / "varsel.py").read_text()
 CONTRACTS = REPO / "contracts" / "notifications" / "v1"
 OPENAPI = json.loads((CONTRACTS / "openapi.json").read_text())
@@ -49,7 +49,7 @@ SUBSCRIPTION_SCHEMA = json.loads((CONTRACTS / "subscription.schema.json").read_t
 EVENT_SCHEMA = json.loads((CONTRACTS / "event.schema.json").read_text())
 
 NOW = datetime(2026, 9, 8, 6, 30, tzinfo=UTC)
-PARTNER = "acme"
+CLIENT = "acme"
 OTHER = "beta"
 DEST = "acme-prod"
 OTHER_DEST = "beta-prod"
@@ -68,7 +68,7 @@ COLLAPSED = "NSR:StopPlace:3247"
 def _code_only(source: str) -> str:
     """The executable half of a module: no comments, no docstrings.
 
-    Needed for the negative greps below, and the reason is `test_partner_store._uncommented`'s in
+    Needed for the negative greps below, and the reason is `test_notification_store._uncommented`'s in
     the other direction: this module's docstrings deliberately NAME what the code must not do
     ("a route that called `commit_event` would falsify every quota check"), so a bare substring
     search over the whole file matches the explanation and fails for the wrong reason.
@@ -101,16 +101,16 @@ API_CODE = _code_only(API_SOURCE)
 
 
 def _put_subject(document_id: str, alert_id: str, phase: str, **over: Any) -> dict[str, Any]:
-    """One alert-subject document, in the shape `partner_store._mint` writes.
+    """One alert-subject document, in the shape `notification_store._mint` writes.
 
     Written straight into the fake rather than by running an emit: the emit path is U6's and needs
     a whole cycle's inputs, while what this suite is checking is that the API SERVES what the pass
-    has already committed. `test_partner_store` pins the writer against the reader on its side.
+    has already committed. `test_notification_store` pins the writer against the reader on its side.
     """
     doc: dict[str, Any] = {
         "alert_id": alert_id,
         "subscription_id": document_id,
-        "partner_id": PARTNER,
+        "client_id": CLIENT,
         "destination_id": DEST,
         "revision": 7,
         "phase": phase,
@@ -123,10 +123,10 @@ def _put_subject(document_id: str, alert_id: str, phase: str, **over: Any) -> di
         "stop_order": 3,
         "created_at": NOW,
         "updated_at": NOW,
-        partner_store.TTL_FIELD: NOW + timedelta(days=partner_store.HISTORY_DAYS),
+        notification_store.TTL_FIELD: NOW + timedelta(days=notification_store.HISTORY_DAYS),
     }
     doc.update(over)
-    _fake.put(partner_store.SUBJECTS, alert_id, doc)
+    _fake.put(notification_store.SUBJECTS, alert_id, doc)
     return doc
 
 
@@ -139,7 +139,7 @@ def _body(**over: Any) -> dict[str, Any]:
         "begin": "06:45",
         "end": "08:30",
         "days": [0, 1, 2, 3, 4],
-        "partner_ref": "commuter-42",
+        "external_ref": "commuter-42",
         "test": False,
     }
     base.update(over)
@@ -173,9 +173,9 @@ class _Ref:
         self.path = path
 
     def get(self, transaction: Any = None, timeout: float | None = None) -> _Snap:
-        # `timeout` is accepted and ignored: every read in `partner_store` now carries its own
+        # `timeout` is accepted and ignored: every read in `notification_store` now carries its own
         # Firestore deadline (KTD6 -- an abandoned worker thread with no call deadline delays
-        # pod termination via `concurrent.futures`' atexit join). `test_partner_store` is where
+        # pod termination via `concurrent.futures`' atexit join). `test_notification_store` is where
         # the deadline is asserted; this double only has to tolerate the kwarg.
         del transaction, timeout
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
@@ -239,7 +239,7 @@ class _Txn:
 
 
 class _FakeFirestore:
-    """Enough Firestore for the real ``partner_store`` bodies, plus an ordered write log.
+    """Enough Firestore for the real ``notification_store`` bodies, plus an ordered write log.
 
     ``log`` is what makes "the tombstone lands before anything is deleted" checkable rather than
     asserted: every transactional write and every batch delete appends to it in order, so R13's
@@ -283,7 +283,7 @@ _delivery_result: dict[str, Any] = {}
 
 
 class _MemoryDocs:
-    """``partner_auth._Docs`` over a dict, counting reads."""
+    """``notification_auth._Docs`` over a dict, counting reads."""
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], dict[str, Any]] = {}
@@ -337,12 +337,12 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
 
     _saved.update(
         {
-            "client": partner_store._client,
-            "run": partner_store._run_transaction,
-            "query": partner_store._query,
+            "client": notification_store._client,
+            "run": notification_store._run_transaction,
+            "query": notification_store._query,
         }
     )
-    partner_store._client = lambda: client  # type: ignore[assignment]
+    notification_store._client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
         if client.fail_with is not None:
@@ -370,7 +370,7 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
         if client.fail_with is not None:
             raise client.fail_with
         client.reads += 1
-        spec = partner_store._SPECS_BY_NAME[name]
+        spec = notification_store._SPECS_BY_NAME[name]
         rows: list[tuple[str, dict[str, Any]]] = []
         for path, data in client.docs.items():
             if path.split("/", 1)[0] != spec.collection:
@@ -399,24 +399,24 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
                 rows = rows[paths.index(start_after._path) + 1 :]
         return _Page(client, rows[:limit])
 
-    partner_store._run_transaction = _run  # type: ignore[assignment]
-    partner_store._query = _query  # type: ignore[assignment]
-    partner_store.configure(client=client, clock=lambda: NOW)
+    notification_store._run_transaction = _run  # type: ignore[assignment]
+    notification_store._query = _query  # type: ignore[assignment]
+    notification_store.configure(client=client, clock=lambda: NOW)
 
     if pepper is None:
-        os.environ.pop(partner_auth.PEPPER_ENV, None)
+        os.environ.pop(notification_auth.PEPPER_ENV, None)
     else:
-        os.environ[partner_auth.PEPPER_ENV] = pepper
+        os.environ[notification_auth.PEPPER_ENV] = pepper
     os.environ[webhook_signing.SIGNING_ROOT_ENV] = SIGNING_ROOT
-    partner_auth.configure(docs=_auth_docs, clock=lambda: NOW)
+    notification_auth.configure(docs=_auth_docs, clock=lambda: NOW)
 
     def _deliver(url: str, *, body: bytes, headers: Any, **_kw: Any) -> Any:
         _deliveries.append({"url": url, "body": body, "headers": dict(headers)})
-        return webhook_client.DeliveryAttempt(**_delivery_result)
+        return webhook_sender.DeliveryAttempt(**_delivery_result)
 
-    partner_api.configure(
-        store=partner_store,
-        auth=partner_auth,
+    notification_api.configure(
+        store=notification_store,
+        auth=notification_auth,
         canonicalize=lambda ref: FROM if ref == COLLAPSED else ref,
         connectivity=connectivity if connectivity is not None else (lambda a, b: (True, True)),
         deliver=_deliver,
@@ -427,31 +427,31 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
 def _uninstall() -> None:
     global _fake, _auth_docs
     if _saved:
-        partner_store._client = _saved["client"]  # type: ignore[assignment]
-        partner_store._run_transaction = _saved["run"]  # type: ignore[assignment]
-        partner_store._query = _saved["query"]  # type: ignore[assignment]
+        notification_store._client = _saved["client"]  # type: ignore[assignment]
+        notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
+        notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
-    partner_store.reset_for_tests()
-    partner_auth.reset_for_tests()
-    partner_api.configure()
-    os.environ.pop(partner_auth.PEPPER_ENV, None)
+    notification_store.reset_for_tests()
+    notification_auth.reset_for_tests()
+    notification_api.configure()
+    os.environ.pop(notification_auth.PEPPER_ENV, None)
     os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
     _fake = None
     _auth_docs = None
 
 
-def _provision(partner: str = PARTNER, destination: str = DEST) -> str:
-    partner_auth.create_partner(partner, name=partner.title(), actor="op@entur.org")
-    partner_auth.create_destination(
-        destination, partner_id=partner, callback_url=GOOD_URL, actor="op@entur.org"
+def _provision(client: str = CLIENT, destination: str = DEST) -> str:
+    notification_auth.create_client(client, name=client.title(), actor="op@entur.org")
+    notification_auth.create_destination(
+        destination, client_id=client, callback_url=GOOD_URL, actor="op@entur.org"
     )
-    _record, bearer = partner_auth.issue_credential(partner, actor="op@entur.org")
+    _record, bearer = notification_auth.issue_credential(client, actor="op@entur.org")
     return bearer
 
 
 def _client() -> TestClient:
     app = FastAPI()
-    app.include_router(partner_api.router)
+    app.include_router(notification_api.router)
     return TestClient(app)
 
 
@@ -498,7 +498,7 @@ def test_a_revoked_credential_stops_working():
     try:
         client = _client()
         assert client.get("/notification-api/v1/subscriptions", headers=_headers(bearer)).status_code == 200
-        partner_auth.revoke_credential(bearer.split(".")[0], actor="op@entur.org")
+        notification_auth.revoke_credential(bearer.split(".")[0], actor="op@entur.org")
         assert client.get("/notification-api/v1/subscriptions", headers=_headers(bearer)).status_code == 401
     finally:
         _uninstall()
@@ -508,10 +508,10 @@ def test_a_suspended_partner_gets_403_so_it_can_tell_the_two_apart():
     _install()
     bearer = _provision()
     try:
-        partner_auth.set_partner_suspended(PARTNER, suspended=True, actor="op@entur.org")
+        notification_auth.set_client_suspended(CLIENT, suspended=True, actor="op@entur.org")
         response = _client().get("/notification-api/v1/subscriptions", headers=_headers(bearer))
         assert response.status_code == 403
-        assert response.json() == {"detail": "partner_suspended"}
+        assert response.json() == {"detail": "client_suspended"}
     finally:
         _uninstall()
 
@@ -519,13 +519,13 @@ def test_a_suspended_partner_gets_403_so_it_can_tell_the_two_apart():
 def test_one_partner_cannot_reach_anothers_records_and_the_body_names_nothing():
     """AE11's second half. Ownership comes from the credential, so the reference is namespaced.
 
-    Three probes, one answer. Partner A asking for B's own reference gets A's namespace and finds
+    Three probes, one answer. Client A asking for B's own reference gets A's namespace and finds
     nothing; A asking with B's namespaced id gets it treated as a reference (the prefix stripped is
-    only ever A's own) and finds nothing; and a record that somehow carries another partner_id
+    only ever A's own) and finds nothing; and a record that somehow carries another client_id
     raises Forbidden inside the store and is collapsed to 404 here.
     """
     _install()
-    a_bearer = _provision(PARTNER, DEST)
+    a_bearer = _provision(CLIENT, DEST)
     b_bearer = _provision(OTHER, OTHER_DEST)
     try:
         client = _client()
@@ -535,14 +535,14 @@ def test_one_partner_cannot_reach_anothers_records_and_the_body_names_nothing():
             headers=_headers(b_bearer),
         )
         assert created.status_code == 201, created.text
-        # Both partners may use the same reference; they are different records.
+        # Both clients may use the same reference; they are different records.
         mine = client.post(
             "/notification-api/v1/subscriptions",
             json=_body(subscription_id="shared-ref"),
             headers=_headers(a_bearer),
         )
         assert mine.status_code == 201
-        assert mine.json()["partner_id"] == PARTNER
+        assert mine.json()["client_id"] == CLIENT
         assert mine.json()["subscription_id"] == "shared-ref"
 
         for probe in (f"{OTHER}~shared-ref", "unknown-ref"):
@@ -553,12 +553,12 @@ def test_one_partner_cannot_reach_anothers_records_and_the_body_names_nothing():
             assert response.json() == {"detail": "not_found"}
             assert OTHER not in response.text
 
-        # A stored record carrying a foreign partner_id: Forbidden inside the store, 404 here.
-        _fake.docs[f"{partner_store.SUBSCRIPTIONS}/{PARTNER}~squatted"] = {
-            **partner_store._new_subscription_doc(
-                partner_store.SubscriptionSpec(
-                    subscription_id=f"{PARTNER}~squatted",
-                    partner_id=OTHER,
+        # A stored record carrying a foreign client_id: Forbidden inside the store, 404 here.
+        _fake.docs[f"{notification_store.SUBSCRIPTIONS}/{CLIENT}~squatted"] = {
+            **notification_store._new_subscription_doc(
+                notification_store.SubscriptionSpec(
+                    subscription_id=f"{CLIENT}~squatted",
+                    client_id=OTHER,
                     destination_id=OTHER_DEST,
                     from_stop=FROM,
                     to_stop=TO,
@@ -579,14 +579,14 @@ def test_one_partner_cannot_reach_anothers_records_and_the_body_names_nothing():
         _uninstall()
 
 
-def test_a_partner_id_in_the_body_is_rejected_rather_than_honoured():
+def test_a_client_id_in_the_body_is_rejected_rather_than_honoured():
     """Ownership is a property of the credential, never a request-shaped choice."""
     _install()
     bearer = _provision()
     try:
         response = _client().post(
             "/notification-api/v1/subscriptions",
-            json={**_body(), "partner_id": OTHER},
+            json={**_body(), "client_id": OTHER},
             headers=_headers(bearer),
         )
         assert response.status_code == 422
@@ -595,9 +595,9 @@ def test_a_partner_id_in_the_body_is_rejected_rather_than_honoured():
 
 
 def test_an_unknown_or_foreign_destination_is_one_answer():
-    """The same collapse as a foreign record: a partner must not learn another's destination ids."""
+    """The same collapse as a foreign record: a client must not learn another's destination ids."""
     _install()
-    a_bearer = _provision(PARTNER, DEST)
+    a_bearer = _provision(CLIENT, DEST)
     _provision(OTHER, OTHER_DEST)
     try:
         client = _client()
@@ -689,19 +689,19 @@ def test_a_verdict_that_arrives_after_a_replace_is_discarded_not_stamped():
 
     The check takes up to `main._CONNECTIVITY_TIMEOUT_S` (20 s) while a replace is one request, so
     they interleave -- and this path used to write whatever came back onto whatever the record now
-    was, freshly timestamped. A partner would then be told their NEW route has no direct service,
+    was, freshly timestamped. A client would then be told their NEW route has no direct service,
     with `servable_checked_at` a second old, which is the pair R6 publishes so a caveat's age can be
     judged. Simulated by replacing from inside the seam, which is the one place the interleaving is
     reproducible without threads.
 
     The registration itself is never failed for it: a discarded verdict is `servable: null`, exactly
-    as a provider timeout is, and `partner_servability.recheck` picks a never-established record up
+    as a provider timeout is, and `notification_servability.recheck` picks a never-established record up
     on its own cadence.
     """
     state: dict[str, Any] = {}
 
     def replace_then_answer(_from: str, _to: str) -> tuple[bool, bool]:
-        # The partner's concurrent replace, landing while "our" question is in flight.
+        # The client's concurrent replace, landing while "our" question is in flight.
         if state.get("done") is None:
             state["done"] = True
             _client().post(
@@ -733,7 +733,7 @@ def test_an_identical_retry_is_stable():
 
     The store's create path performs no write at all for this, so a retry cannot bump a version,
     reset a horizon or clear a spent cap slot. What the route adds is the inactivity touch -- a
-    partner re-POSTing its watch IS the "still interested" signal R5's horizon is measured from.
+    client re-POSTing its watch IS the "still interested" signal R5's horizon is measured from.
     """
     _install()
     bearer = _provision()
@@ -749,7 +749,7 @@ def test_an_identical_retry_is_stable():
         assert second.status_code == 200
         assert second.json()["version"] == first.json()["version"] == 1
         assert second.json()["created_at"] == first.json()["created_at"]
-        assert len(_fake.in_collection(partner_store.SUBSCRIPTIONS)) == 1
+        assert len(_fake.in_collection(notification_store.SUBSCRIPTIONS)) == 1
     finally:
         _uninstall()
 
@@ -833,20 +833,20 @@ def test_deletion_is_ordered_idempotent_and_reports_its_cleanup():
     try:
         client = _client()
         client.post("/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer))
-        document_id = f"{PARTNER}~commuter-42-morning"
+        document_id = f"{CLIENT}~commuter-42-morning"
         for index in range(3):
             _fake.put(
-                partner_store.EVENTS,
+                notification_store.EVENTS,
                 f"e{index}",
                 {"event_id": f"e{index}", "subscription_id": document_id},
             )
             _fake.put(
-                partner_store.DELIVERIES,
+                notification_store.DELIVERIES,
                 f"d{index}",
                 {"delivery_id": f"d{index}", "subscription_id": document_id},
             )
         _fake.put(
-            partner_store.SUBJECTS, "s0", {"alert_id": "s0", "subscription_id": document_id}
+            notification_store.SUBJECTS, "s0", {"alert_id": "s0", "subscription_id": document_id}
         )
         _fake.log.clear()
 
@@ -861,7 +861,7 @@ def test_deletion_is_ordered_idempotent_and_reports_its_cleanup():
         assert payload["cleanup"]["deleted_events"] == 3
         assert payload["cleanup"]["deleted_deliveries"] == 3
         assert payload["cleanup"]["deleted_subjects"] == 1
-        assert payload["cleanup"]["residual_hours"] == partner_store.TTL_RESIDUAL_HOURS
+        assert payload["cleanup"]["residual_hours"] == notification_store.TTL_RESIDUAL_HOURS
 
         tombstone_at = next(
             i for i, entry in enumerate(_fake.log) if entry.endswith(f"/{document_id}")
@@ -870,13 +870,13 @@ def test_deletion_is_ordered_idempotent_and_reports_its_cleanup():
         assert deletes, "the cleanup must actually have deleted something"
         assert tombstone_at < min(deletes), _fake.log
 
-        assert _fake.in_collection(partner_store.EVENTS) == []
-        assert _fake.in_collection(partner_store.DELIVERIES) == []
-        assert _fake.in_collection(partner_store.SUBJECTS) == []
+        assert _fake.in_collection(notification_store.EVENTS) == []
+        assert _fake.in_collection(notification_store.DELIVERIES) == []
+        assert _fake.in_collection(notification_store.SUBJECTS) == []
         # The tombstone's route is redacted the moment cleanup completes.
-        tombstone = _fake.doc(partner_store.SUBSCRIPTIONS, document_id)
+        tombstone = _fake.doc(notification_store.SUBSCRIPTIONS, document_id)
         assert tombstone["status"] == "deleted"
-        assert tombstone["from_stop"] == "" and tombstone["partner_ref"] == ""
+        assert tombstone["from_stop"] == "" and tombstone["external_ref"] == ""
         assert tombstone["cleanup"]["state"] == "done"
 
         # Repeated deletion succeeds, and so does deleting something that never existed.
@@ -900,7 +900,7 @@ def test_the_window_and_weekday_verdicts_are_varsels_own_word_for_word():
     """Scenario 4. Overnight windows, a bad weekday and from == to, refused as /varsel refuses them.
 
     The point is not that a 422 comes back -- it is that the SAME sentence does. R2's shape lives in
-    `partner_store.SubscriptionSpec.validate`, which restates /varsel's three rules and is pinned
+    `notification_store.SubscriptionSpec.validate`, which restates /varsel's three rules and is pinned
     against them by that module's own suite; this route reaches it rather than adding a fourth copy,
     and the strings below are checked against varsel.py so a divergence fails here too.
     """
@@ -932,8 +932,8 @@ def test_the_window_and_weekday_verdicts_are_varsels_own_word_for_word():
 def test_the_router_does_not_restate_the_window_rule():
     """The fourth copy is the failure mode, so its absence is checked rather than trusted.
 
-    `partner_store.SubscriptionSpec.validate` is statement three (JourneyIn and
-    `varsel._parse_partner_recipient` are one and two). A comparison of begin and end anywhere in
+    `notification_store.SubscriptionSpec.validate` is statement three (JourneyIn and
+    `varsel._parse_webhook_recipient` are one and two). A comparison of begin and end anywhere in
     this module would be a fourth, and the two surfaces would then drift silently.
     """
     for forbidden in ("begin >= ", "begin >=", "_parse_hhmm", "_HHMM_RE", "range(0, 7)"):
@@ -1043,7 +1043,7 @@ def test_a_replace_cannot_clear_or_set_the_test_marker():
         )
         assert promoted.status_code == 409
         assert "immutable" in promoted.json()["detail"]
-        assert _fake.doc(partner_store.SUBSCRIPTIONS, f"{PARTNER}~live")["test"] is False
+        assert _fake.doc(notification_store.SUBSCRIPTIONS, f"{CLIENT}~live")["test"] is False
     finally:
         _uninstall()
 
@@ -1052,7 +1052,7 @@ def test_a_test_event_is_signed_over_the_exact_bytes_and_stores_nothing():
     """R15, and the single-writer claim the whole store rests on.
 
     Nothing is written: no event, no delivery, no alert subject. That is not tidiness --
-    `partner_store`'s pending-event ceiling is exact rather than best-effort BECAUSE the emit path
+    `notification_store`'s pending-event ceiling is exact rather than best-effort BECAUSE the emit path
     has exactly one writer, so a route calling `commit_event` would falsify every quota check in
     that module.
 
@@ -1082,9 +1082,9 @@ def test_a_test_event_is_signed_over_the_exact_bytes_and_stores_nothing():
         assert payload["signed_generations"] == [1]
         assert payload["subscription_id"] == "probe"
 
-        assert _fake.in_collection(partner_store.EVENTS) == []
-        assert _fake.in_collection(partner_store.DELIVERIES) == []
-        assert _fake.in_collection(partner_store.SUBJECTS) == []
+        assert _fake.in_collection(notification_store.EVENTS) == []
+        assert _fake.in_collection(notification_store.DELIVERIES) == []
+        assert _fake.in_collection(notification_store.SUBJECTS) == []
         assert _fake.docs == before, "a test event writes nothing at all"
 
         assert len(_deliveries) == 1
@@ -1116,7 +1116,7 @@ def test_a_test_event_is_signed_over_the_exact_bytes_and_stores_nothing():
 
 def test_the_synthetic_event_conforms_to_the_published_event_schema():
     """U7 generates its receiver types from `event.schema.json`, so a test event that does not
-    conform teaches a partner the wrong shape at exactly the moment they are learning it."""
+    conform teaches a client the wrong shape at exactly the moment they are learning it."""
     _install()
     bearer = _provision()
     try:
@@ -1163,7 +1163,7 @@ def test_a_paused_destination_refuses_a_test_event():
             json=_body(subscription_id="probe", test=True),
             headers=_headers(bearer),
         )
-        partner_auth.pause_destination(DEST, reason="410 Gone")
+        notification_auth.pause_destination(DEST, reason="410 Gone")
         response = client.post(
             "/notification-api/v1/test-events",
             json={"subscription_id": "probe"},
@@ -1188,7 +1188,7 @@ def test_a_test_event_reports_a_partners_own_failure_as_the_diagnosis():
         )
         _delivery_result.clear()
         _delivery_result.update(
-            {"ok": False, "status": 500, "retryable": True, "error": "partner returned 500"}
+            {"ok": False, "status": 500, "retryable": True, "error": "client returned 500"}
         )
         response = client.post(
             "/notification-api/v1/test-events",
@@ -1198,7 +1198,7 @@ def test_a_test_event_reports_a_partners_own_failure_as_the_diagnosis():
         assert response.status_code == 200, "the request succeeded; the delivery did not"
         assert response.json()["delivered"] is False
         assert response.json()["status"] == 500
-        assert response.json()["error"] == "partner returned 500"
+        assert response.json()["error"] == "client returned 500"
     finally:
         _uninstall()
 
@@ -1206,32 +1206,32 @@ def test_a_test_event_reports_a_partners_own_failure_as_the_diagnosis():
 def test_a_test_event_delivery_that_never_returns_gives_the_worker_back():
     """DNS is not bounded by a socket timeout, and this is the one route that dials on request.
 
-    `webhook_client`'s ceilings are `socket.settimeout` values on an already-open connection, and
+    `webhook_sender`'s ceilings are `socket.settimeout` values on an already-open connection, and
     `_default_resolver` calls `socket.getaddrinfo` BEFORE any of them apply -- a blocking C call
     with no deadline the Python layer can express and no way to interrupt it. Every other caller of
     `deliver` is the poller's delivery pass, which contains that inside its own bounded wait; this
     one runs on a plain `def` route sharing the ~40-slot anyio worker pool with `/varsel-api` and
     `/impact`. So a destination whose resolver stalls held one of those workers indefinitely, and
-    `_TEST_EVENTS_PER_MIN` (6) per partner is a ceiling on REQUESTS, not on workers held.
+    `_TEST_EVENTS_PER_MIN` (6) per client is a ceiling on REQUESTS, not on workers held.
 
     Bounded by running the whole delivery -- resolution included -- on a one-wide pool that is
-    ABANDONED on timeout: `partner_events.emit`'s shape, with the same honest residual, and here the
-    per-partner ceiling is also what bounds how many threads can be leaked.
+    ABANDONED on timeout: `notification_events.emit`'s shape, with the same honest residual, and here the
+    per-client ceiling is also what bounds how many threads can be leaked.
 
-    Asserted with a real clock and a real thread, like `test_partner_delivery`'s two timeout tests:
+    Asserted with a real clock and a real thread, like `test_webhook_delivery`'s two timeout tests:
     the property is that the request thread comes back, and a mocked clock cannot fail that way.
     """
     # The real wait must EXCEED one whole attempt, or this backstop would fire on an ordinary slow
-    # partner and report `timeout` where their own status is the diagnosis. Asserted here and then
+    # client and report `timeout` where their own status is the diagnosis. Asserted here and then
     # shortened, so the property is checked without the suite paying eight seconds for it.
     assert (
-        partner_api._TEST_EVENT_WAIT_S
-        > webhook_client.DEFAULT_TIMEOUT_S + webhook_client.CONNECT_TIMEOUT_S
+        notification_api._TEST_EVENT_WAIT_S
+        > webhook_sender.DEFAULT_TIMEOUT_S + webhook_sender.CONNECT_TIMEOUT_S
     )
     _install()
     bearer = _provision()
     release = threading.Event()
-    saved_wait = partner_api._TEST_EVENT_WAIT_S
+    saved_wait = notification_api._TEST_EVENT_WAIT_S
     try:
         client = _client()
         client.post(
@@ -1242,10 +1242,10 @@ def test_a_test_event_delivery_that_never_returns_gives_the_worker_back():
 
         def hang(url: str, *, body: bytes, headers: Any, **_kw: Any) -> Any:
             release.wait(30)  # bounded, so a failing assertion cannot wedge the suite
-            return webhook_client.DeliveryAttempt(ok=True, status=200)
+            return webhook_sender.DeliveryAttempt(ok=True, status=200)
 
-        partner_api.configure(deliver=hang)
-        partner_api._TEST_EVENT_WAIT_S = 0.15  # type: ignore[assignment]
+        notification_api.configure(deliver=hang)
+        notification_api._TEST_EVENT_WAIT_S = 0.15  # type: ignore[assignment]
         started = time.monotonic()
         response = client.post(
             "/notification-api/v1/test-events",
@@ -1260,14 +1260,14 @@ def test_a_test_event_delivery_that_never_returns_gives_the_worker_back():
         assert payload["status"] is None
         assert payload["error"] == "timeout"
     finally:
-        partner_api._TEST_EVENT_WAIT_S = saved_wait  # type: ignore[assignment]
+        notification_api._TEST_EVENT_WAIT_S = saved_wait  # type: ignore[assignment]
         release.set()
         _uninstall()
 
 
 def test_the_test_event_route_is_rate_limited_on_its_own():
     """The one route that makes an outbound call, so it carries its own tight ceiling: this app must
-    not become a request amplifier against a partner-supplied host."""
+    not become a request amplifier against a client-supplied host."""
     _install()
     bearer = _provision()
     try:
@@ -1283,17 +1283,17 @@ def test_the_test_event_route_is_rate_limited_on_its_own():
                 json={"subscription_id": "probe"},
                 headers=_headers(bearer),
             ).status_code
-            for _ in range(partner_api._TEST_EVENTS_PER_MIN + 2)
+            for _ in range(notification_api._TEST_EVENTS_PER_MIN + 2)
         ]
-        assert statuses.count(200) == partner_api._TEST_EVENTS_PER_MIN
+        assert statuses.count(200) == notification_api._TEST_EVENTS_PER_MIN
         assert statuses[-1] == 429
-        assert len(_deliveries) == partner_api._TEST_EVENTS_PER_MIN
+        assert len(_deliveries) == notification_api._TEST_EVENTS_PER_MIN
     finally:
         _uninstall()
 
 
 def test_signing_that_is_not_configured_is_503_rather_than_an_unsigned_request():
-    """Fail closed and fail visible: a partner endpoint that accepts an unsigned request is a hole
+    """Fail closed and fail visible: a client endpoint that accepts an unsigned request is a hole
     on their side, and one that rejects it is a retry storm on ours."""
     _install()
     bearer = _provision()
@@ -1321,17 +1321,17 @@ def test_signing_that_is_not_configured_is_503_rather_than_an_unsigned_request()
 
 
 def test_both_credentials_authenticate_during_a_rotation():
-    """Scenario 6 through the surface a partner actually cuts over on."""
+    """Scenario 6 through the surface a client actually cuts over on."""
     _install()
     retiring = _provision()
     try:
         client = _client()
-        _record, replacement = partner_auth.issue_credential(PARTNER, actor="op@entur.org")
+        _record, replacement = notification_auth.issue_credential(CLIENT, actor="op@entur.org")
         for bearer in (retiring, replacement):
             assert client.get(
                 "/notification-api/v1/subscriptions", headers=_headers(bearer)
             ).status_code == 200
-        partner_auth.revoke_credential(retiring.split(".")[0], actor="op@entur.org")
+        notification_auth.revoke_credential(retiring.split(".")[0], actor="op@entur.org")
         assert client.get(
             "/notification-api/v1/subscriptions", headers=_headers(retiring)
         ).status_code == 401
@@ -1367,9 +1367,9 @@ def test_a_limiter_rejection_carries_a_bounded_retry_after():
     bearer = _provision()
     try:
         client = _client()
-        principal = partner_auth.authenticate(f"Bearer {bearer}")
-        for _ in range(partner_auth.PER_PARTNER_PER_MIN):
-            partner_auth.claim_partner_slot(principal.partner_id)
+        principal = notification_auth.authenticate(f"Bearer {bearer}")
+        for _ in range(notification_auth.PER_CLIENT_PER_MIN):
+            notification_auth.claim_client_slot(principal.client_id)
         response = client.get("/notification-api/v1/subscriptions", headers=_headers(bearer))
         assert response.status_code == 429
         assert response.json() == {"detail": "rate_limited"}
@@ -1386,16 +1386,16 @@ def test_a_limiter_rejection_carries_a_bounded_retry_after():
         _uninstall()
 
 
-# ---- Scenario 8 is partner_auth's; scenario 9: the SSO gate -----------------------------------
+# ---- Scenario 8 is notification_auth's; scenario 9: the SSO gate -----------------------------------
 
 
-def test_the_partner_prefix_is_deliberately_not_behind_the_browser_sso_gate():
+def test_the_notification_api_prefix_is_deliberately_not_behind_the_browser_sso_gate():
     """Scenario 9. That gate answers an unconfigured deployment with 503 and an unauthenticated
     BROWSER with a 302 -- and a machine caller following a redirect into a Google login screen gets
     an HTML page where it expected JSON. The credential dependency is the gate here."""
     assert len(sso.PROTECTED_PREFIXES) == 8
     assert not any(p.startswith("/notification") for p in sso.PROTECTED_PREFIXES)
-    assert sso._is_protected(partner_api.PREFIX) is False
+    assert sso._is_protected(notification_api.PREFIX) is False
     assert sso._is_protected("/notification-api/v1/subscriptions") is False
 
 
@@ -1406,7 +1406,7 @@ def test_a_store_outage_leaves_no_partial_subscription_and_no_event():
     """Scenario 10's first half. R20 at the API edge: 503, and nothing written.
 
     503 rather than 500 because it is retryable, and the traceback stays in the log rather than in
-    the response -- a partner debugging their own integration must not be reading our stack.
+    the response -- a client debugging their own integration must not be reading our stack.
     """
     _install()
     bearer = _provision()
@@ -1420,9 +1420,9 @@ def test_a_store_outage_leaves_no_partial_subscription_and_no_event():
         assert response.json() == {"detail": "store_unavailable"}
         assert int(response.headers["retry-after"]) > 0
         _fake.fail_with = None
-        assert _fake.in_collection(partner_store.SUBSCRIPTIONS) == []
-        assert _fake.in_collection(partner_store.EVENTS) == []
-        assert _fake.in_collection(partner_store.DELIVERIES) == []
+        assert _fake.in_collection(notification_store.SUBSCRIPTIONS) == []
+        assert _fake.in_collection(notification_store.EVENTS) == []
+        assert _fake.in_collection(notification_store.DELIVERIES) == []
     finally:
         _uninstall()
 
@@ -1456,14 +1456,14 @@ def test_the_active_subscription_ceiling_is_refused_before_any_write():
     bearer = _provision()
     try:
         client = _client()
-        for index in range(partner_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER):
+        for index in range(notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT):
             _fake.put(
-                partner_store.SUBSCRIPTIONS,
-                f"{PARTNER}~filler-{index}",
-                partner_store._new_subscription_doc(
-                    partner_store.SubscriptionSpec(
-                        subscription_id=f"{PARTNER}~filler-{index}",
-                        partner_id=PARTNER,
+                notification_store.SUBSCRIPTIONS,
+                f"{CLIENT}~filler-{index}",
+                notification_store._new_subscription_doc(
+                    notification_store.SubscriptionSpec(
+                        subscription_id=f"{CLIENT}~filler-{index}",
+                        client_id=CLIENT,
                         destination_id=DEST,
                         from_stop=FROM,
                         to_stop=TO,
@@ -1480,7 +1480,7 @@ def test_the_active_subscription_ceiling_is_refused_before_any_write():
         )
         assert response.status_code == 429
         assert response.json() == {"detail": "quota_exceeded"}
-        assert int(response.headers["retry-after"]) == partner_store.RETRY_AFTER_CAP_S
+        assert int(response.headers["retry-after"]) == notification_store.RETRY_AFTER_CAP_S
         assert len(_fake.docs) == before, "refused before any write"
         # R21's "a breach is visible to an operator". The ceiling is enforced inside a transaction
         # body, which logs nothing by design (a body may run more than once), so the route is the
@@ -1488,21 +1488,21 @@ def test_the_active_subscription_ceiling_is_refused_before_any_write():
         records: list[Any] = []
         handler = logging.Handler()
         handler.emit = records.append  # type: ignore[method-assign]
-        partner_api.logger.addHandler(handler)
+        notification_api.logger.addHandler(handler)
         try:
             client.post(
                 "/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer)
             )
         finally:
-            partner_api.logger.removeHandler(handler)
+            notification_api.logger.removeHandler(handler)
         breaches = [
             r
             for r in records
-            if getattr(r, "fields", {}).get("event") == "partner_quota"
+            if getattr(r, "fields", {}).get("event") == "notification_quota"
             and getattr(r, "fields", {}).get("result") == "subscriptions"
         ]
         assert len(breaches) == 1, records
-        assert breaches[0].fields["partner_id"] == PARTNER
+        assert breaches[0].fields["client_id"] == CLIENT
     finally:
         _uninstall()
 
@@ -1548,7 +1548,7 @@ def test_listing_is_a_slice_of_a_bounded_read():
         assert unknown.json() == {"detail": "unknown_cursor"}
         # And the page size is bounded by R21's own ceiling.
         assert client.get(
-            f"/notification-api/v1/subscriptions?limit={partner_api._LIST_MAX + 1}",
+            f"/notification-api/v1/subscriptions?limit={notification_api._LIST_MAX + 1}",
             headers=_headers(bearer),
         ).status_code == 422
     finally:
@@ -1558,15 +1558,15 @@ def test_listing_is_a_slice_of_a_bounded_read():
 def test_a_small_page_reads_a_small_page():
     """The caller's `limit` reaches the QUERY, and did not until 2026-09-09.
 
-    `list_subscriptions` streamed up to `MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER` (500) subscription
+    `list_subscriptions` streamed up to `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` (500) subscription
     documents and sliced in Python, so `?limit=1` cost the same as `?limit=500`. Against
-    `partner_auth.PER_PARTNER_PER_MIN` (120) that is a partner near the ceiling polling small pages
+    `notification_auth.PER_CLIENT_PER_MIN` (120) that is a client near the ceiling polling small pages
     at up to 120 x 500 subscription reads a minute from one endpoint on one credential -- a read
     amplification driven by their polling shape rather than by what they asked for.
 
     Asserted as `limit + 1` and not "small": the extra one is what detects `next_cursor` without a
     second query, and asserting the exact number is what makes the fix visible if the cursor is ever
-    dropped. The ALERT-state read stays partner-scoped and is excluded here on purpose -- one query
+    dropped. The ALERT-state read stays client-scoped and is excluded here on purpose -- one query
     for every row's alert state is `test_the_list_page_reads_every_rows_alert_state_in_one_query`'s
     deliberate trade, and narrowing it per page would trade it back for N+1 queries.
     """
@@ -1590,7 +1590,7 @@ def test_a_small_page_reads_a_small_page():
             f"/notification-api/v1/subscriptions?limit=2&after={first['next_cursor']}",
             headers=_headers(bearer),
         ).json()
-        # 1 cursor resolution + 3 subscription rows + the partner's 0 alert subjects.
+        # 1 cursor resolution + 3 subscription rows + the client's 0 alert subjects.
         assert _fake.documents_read <= 4, _fake.documents_read
         assert [s["subscription_id"] for s in second["subscriptions"]] == ["ref-2", "ref-3"]
         assert second["next_cursor"] == "ref-3"
@@ -1623,7 +1623,7 @@ def test_a_page_of_expired_rows_does_not_end_the_listing_early():
             )
         assert _fake is not None
         for index in (0, 1):
-            _fake.docs[f"{partner_store.SUBSCRIPTIONS}/{PARTNER}~ref-{index}"][
+            _fake.docs[f"{notification_store.SUBSCRIPTIONS}/{CLIENT}~ref-{index}"][
                 "inactivity_expires_at"
             ] = NOW - timedelta(days=1)
         page = client.get(
@@ -1654,14 +1654,14 @@ def test_the_destination_response_carries_generation_numbers_and_never_a_secret(
         assert webhook_signing.SECRET_PREFIX not in response.text
         assert SIGNING_ROOT not in response.text
 
-        partner_auth.rotate_signing_generation(DEST, actor="op@entur.org")
+        notification_auth.rotate_signing_generation(DEST, actor="op@entur.org")
         rotated = client.get(
             "/notification-api/v1/destinations/current", headers=_headers(bearer)
         ).json()
         assert rotated["signing_generations"] == {"active": 2, "retiring": 1}
         assert webhook_signing.SECRET_PREFIX not in json.dumps(rotated)
 
-        partner_auth.pause_destination(DEST, reason="410 Gone")
+        notification_auth.pause_destination(DEST, reason="410 Gone")
         paused = client.get(
             "/notification-api/v1/destinations/current", headers=_headers(bearer)
         ).json()
@@ -1675,8 +1675,8 @@ def test_the_destination_response_carries_generation_numbers_and_never_a_secret(
 def test_a_partner_with_no_destination_gets_404_rather_than_an_empty_record():
     _install()
     try:
-        partner_auth.create_partner(PARTNER, name="Acme", actor="op@entur.org")
-        _record, bearer = partner_auth.issue_credential(PARTNER, actor="op@entur.org")
+        notification_auth.create_client(CLIENT, name="Acme", actor="op@entur.org")
+        _record, bearer = notification_auth.issue_credential(CLIENT, actor="op@entur.org")
         response = _client().get(
             "/notification-api/v1/destinations/current", headers=_headers(bearer)
         )
@@ -1687,7 +1687,7 @@ def test_a_partner_with_no_destination_gets_404_rather_than_an_empty_record():
 
 
 def test_the_committed_test_event_sample_still_matches_the_producer():
-    """The sample a partner's fixture reads must be what `_synthetic_event` actually emits.
+    """The sample a client's fixture reads must be what `_synthetic_event` actually emits.
 
     `contracts/notifications/v1/test-event-sample.json` exists because the vendored TypeScript
     fixture was a HAND transcription of this producer and drifted from it in eight fields -- while
@@ -1709,7 +1709,7 @@ def test_the_committed_test_event_sample_still_matches_the_producer():
 
     # Built generically from the recorded fields so a new `Subscription` field does not fail this
     # for a reason that has nothing to do with the event.
-    names = {f.name for f in dataclasses.fields(partner_store.Subscription)}
+    names = {f.name for f in dataclasses.fields(notification_store.Subscription)}
     kwargs = {k: v for k, v in recorded["subscription"].items() if k in names}
     instant = datetime.fromisoformat(recorded["now"])
     far = datetime(2027, 1, 1, tzinfo=UTC)
@@ -1719,7 +1719,7 @@ def test_the_committed_test_event_sample_still_matches_the_producer():
     ):
         if name in names:
             kwargs.setdefault(name, value)
-    for field in dataclasses.fields(partner_store.Subscription):
+    for field in dataclasses.fields(notification_store.Subscription):
         if (
             field.name not in kwargs
             and field.default is dataclasses.MISSING
@@ -1727,8 +1727,8 @@ def test_the_committed_test_event_sample_still_matches_the_producer():
         ):
             kwargs[field.name] = None
 
-    live = partner_api._synthetic_event(
-        partner_store.Subscription(**kwargs), now=instant, nonce=recorded["nonce"]
+    live = notification_api._synthetic_event(
+        notification_store.Subscription(**kwargs), now=instant, nonce=recorded["nonce"]
     )
 
     def paths(node, prefix=""):
@@ -1765,7 +1765,7 @@ def test_the_test_event_request_schema_accepts_the_id_the_route_accepts():
     """
     published = OPENAPI["components"]["schemas"]["TestEventRequest"]["properties"]["subscription_id"]
     assert "$ref" not in published, "the create-side definition is the wrong constraint here"
-    field = partner_api.TestEventIn.model_fields["subscription_id"]
+    field = notification_api.TestEventIn.model_fields["subscription_id"]
     bounds = {
         "maxLength": next(
             (m.max_length for m in field.metadata if getattr(m, "max_length", None) is not None),
@@ -1784,8 +1784,8 @@ def test_the_test_event_request_schema_accepts_the_id_the_route_accepts():
 
 def test_the_response_model_matches_the_published_schema_in_both_directions():
     """`subscription.schema.json` is `additionalProperties: false` and U7 generates types from it,
-    so a field added on one side and not the other breaks a partner's build silently."""
-    served = set(partner_api.SubscriptionOut.model_fields)
+    so a field added on one side and not the other breaks a client's build silently."""
+    served = set(notification_api.SubscriptionOut.model_fields)
     published = set(SUBSCRIPTION_SCHEMA["properties"])
     assert served == published, (served - published, published - served)
     # Every property the published schema REQUIRES is served non-optionally in spirit: the writable
@@ -1794,20 +1794,20 @@ def test_the_response_model_matches_the_published_schema_in_both_directions():
         assert key in served, key
     # And the input model accepts exactly the writable half.
     writable = set(OPENAPI["components"]["schemas"]["SubscriptionCreate"]["properties"])
-    assert set(partner_api.SubscriptionIn.model_fields) == writable
+    assert set(notification_api.SubscriptionIn.model_fields) == writable
     assert "alerts" not in writable, "alert state is read-only; a request may not carry it"
 
     # The nested alert state, both directions too. It is two levels deep and
     # `additionalProperties: false` at each, so a field added on one side and not the other breaks
-    # a partner's generated types exactly as a top-level one would -- and more quietly.
+    # a client's generated types exactly as a top-level one would -- and more quietly.
     alerts = published_schema = SUBSCRIPTION_SCHEMA["properties"]["alerts"]
-    assert set(partner_api.AlertStateOut.model_fields) == set(alerts["properties"])
+    assert set(notification_api.AlertStateOut.model_fields) == set(alerts["properties"])
     assert set(alerts["required"]) == set(alerts["properties"])
     subject = alerts["properties"]["subjects"]["items"]
-    assert set(partner_api.AlertSubjectOut.model_fields) == set(subject["properties"])
+    assert set(notification_api.AlertSubjectOut.model_fields) == set(subject["properties"])
     assert set(subject["required"]) == set(subject["properties"])
     # The cap is published, not implied, and it is the store's own number.
-    assert alerts["properties"]["subjects"]["maxItems"] == partner_store.MAX_ALERTS_SERVED
+    assert alerts["properties"]["subjects"]["maxItems"] == notification_store.MAX_ALERTS_SERVED
     # `null` is a legal value: a create response does not read the alert state.
     assert "null" in published_schema["type"]
     # The train's fields are REFERENCED from the event schema rather than restated, so a card and a
@@ -1838,7 +1838,7 @@ def test_the_openapi_document_renders_the_authored_schemas_rather_than_restating
     assert webhook["requestBody"]["content"]["application/json"]["schema"] == {
         "$ref": "./event.schema.json"
     }
-    # The Standard Webhooks headers a receiver must verify are named where a partner will look.
+    # The Standard Webhooks headers a receiver must verify are named where a client will look.
     declared = {p["name"] for p in webhook["parameters"]}
     assert declared == {
         webhook_signing.HEADER_ID,
@@ -1846,22 +1846,22 @@ def test_the_openapi_document_renders_the_authored_schemas_rather_than_restating
         webhook_signing.HEADER_SIGNATURE,
     }
     # Bearer, never a cookie: one global CORS policy allows every origin.
-    scheme = OPENAPI["components"]["securitySchemes"]["partnerKey"]
+    scheme = OPENAPI["components"]["securitySchemes"]["clientKey"]
     assert scheme["type"] == "http" and scheme["scheme"] == "bearer"
     # Checked on the DECLARATION rather than by searching the text: the description says the word
     # "cookie" in order to rule it out, so a substring search would fail on the explanation.
     for declared in OPENAPI["components"]["securitySchemes"].values():
         assert declared.get("in") != "cookie", declared
         assert declared["type"] != "apiKey", declared
-    assert OPENAPI["security"] == [{"partnerKey": []}]
+    assert OPENAPI["security"] == [{"clientKey": []}]
 
 
 def test_the_openapi_paths_are_exactly_the_routers_routes():
-    """A published contract that has drifted from the router is worse than none: a partner writes a
+    """A published contract that has drifted from the router is worse than none: a client writes a
     client against it. Checked in both directions, and the six are the plan's own API table."""
     routes = {
-        (route.path[len(partner_api.PREFIX) :] or "/", method.lower())
-        for route in partner_api.router.routes
+        (route.path[len(notification_api.PREFIX) :] or "/", method.lower())
+        for route in notification_api.router.routes
         for method in route.methods
         if method not in ("HEAD", "OPTIONS")
     }
@@ -1874,20 +1874,20 @@ def test_the_openapi_paths_are_exactly_the_routers_routes():
     assert routes == published, (routes - published, published - routes)
     assert len(published) == 6
     for server in OPENAPI["servers"]:
-        assert server["url"].endswith(partner_api.PREFIX)
+        assert server["url"].endswith(notification_api.PREFIX)
 
 
 def test_every_route_is_gated_at_router_level_as_well_as_by_its_parameter():
     """Defence in depth, in the shape `deployment.require_rushvarsel` uses one surface over: a route
     added later is gated even if its author forgets the principal parameter. FastAPI caches an
     identical dependency within a request, so the credential is still verified once."""
-    dependencies = [d.dependency for d in partner_api.router.dependencies]
-    assert partner_api._authenticated in dependencies
-    assert partner_api._throttled in dependencies, (
+    dependencies = [d.dependency for d in notification_api.router.dependencies]
+    assert notification_api._authenticated in dependencies
+    assert notification_api._throttled in dependencies, (
         "tier two is spent by a router-level dependency, so 'before anything is created' is a "
         "property of the wiring rather than of whoever wrote the newest handler"
     )
-    for route in partner_api.router.routes:
+    for route in notification_api.router.routes:
         signature = getattr(route, "endpoint", None)
         assert signature is not None
         assert "principal" in signature.__code__.co_varnames
@@ -1901,7 +1901,7 @@ def test_every_route_is_a_plain_def():
     """
     import inspect
 
-    for route in partner_api.router.routes:
+    for route in notification_api.router.routes:
         assert not inspect.iscoroutinefunction(route.endpoint), route.path
 
 
@@ -1909,29 +1909,29 @@ def test_the_route_bodies_forbid_unknown_fields():
     """`extra="forbid"` on both sides: on the way in it stops a typo being silently ignored, and on
     the way out it is the drift guard against the published schema."""
     for model in (
-        partner_api.SubscriptionIn,
-        partner_api.SubscriptionOut,
-        partner_api.TestEventIn,
-        partner_api.TestEventOut,
-        partner_api.DestinationOut,
-        partner_api.DeleteResult,
-        partner_api.CleanupState,
-        partner_api.SubscriptionList,
-        partner_api.SigningGenerations,
+        notification_api.SubscriptionIn,
+        notification_api.SubscriptionOut,
+        notification_api.TestEventIn,
+        notification_api.TestEventOut,
+        notification_api.DestinationOut,
+        notification_api.DeleteResult,
+        notification_api.CleanupState,
+        notification_api.SubscriptionList,
+        notification_api.SigningGenerations,
     ):
         assert model.model_config.get("extra") == "forbid", model.__name__
 
 
 def test_the_module_never_reaches_the_decision_log_or_the_device_registry():
-    """KTD10 and R16: partner state is Firestore's. `varsel_decisions` is written for every match
+    """KTD10 and R16: notification state is Firestore's. `varsel_decisions` is written for every match
     including sub-threshold ones and is published on public hosts, and its `pushed` column cannot
-    tell a webhook from a Web Push -- so writing partner deliveries there would corrupt both
+    tell a webhook from a Web Push -- so writing webhook deliveries there would corrupt both
     /historikk's and /meldinger's meaning as well as their privacy claim."""
     for forbidden in ("decisions", "varsel_decisions", "import varsel", "journey_digest"):
         assert forbidden not in API_CODE, forbidden
     assert "commit_event" not in API_CODE, (
         "the emit path has exactly one writer; a route calling it falsifies every quota check in "
-        "partner_store"
+        "notification_store"
     )
 
 
@@ -1943,7 +1943,7 @@ def test_the_get_routes_serve_the_current_alert_state():
 
     A read of what the notification pass has already committed -- one document per (watch, train)
     with its revision and phase -- so nothing here consults the matcher or `/impact`. The train's
-    six fields are the ones an event carries, which is what lets a partner join a card to a
+    six fields are the ones an event carries, which is what lets a client join a card to a
     notification.
     """
     _install()
@@ -1951,10 +1951,10 @@ def test_the_get_routes_serve_the_current_alert_state():
     try:
         client = _client()
         client.post("/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer))
-        document_id = f"{PARTNER}~commuter-42-morning"
-        _put_subject(document_id, "alert-1", partner_store.PHASE_PREDICTED)
+        document_id = f"{CLIENT}~commuter-42-morning"
+        _put_subject(document_id, "alert-1", notification_store.PHASE_PREDICTED)
         _put_subject(
-            document_id, "alert-2", partner_store.PHASE_CONFIRMED, delivered_revision=7
+            document_id, "alert-2", notification_store.PHASE_CONFIRMED, delivered_revision=7
         )
 
         one = client.get(
@@ -1998,7 +1998,7 @@ def test_the_list_page_reads_every_rows_alert_state_in_one_query():
                 headers=_headers(bearer),
             )
             _put_subject(
-                f"{PARTNER}~ref-{index}", f"alert-{index}", partner_store.PHASE_PREDICTED
+                f"{CLIENT}~ref-{index}", f"alert-{index}", notification_store.PHASE_PREDICTED
             )
         before = _fake.reads
         page = client.get("/notification-api/v1/subscriptions", headers=_headers(bearer)).json()
@@ -2037,8 +2037,8 @@ def test_a_quiet_watch_says_so_and_a_bounded_read_does_not():
         def _boom(*_a: Any, **_k: Any):
             raise RuntimeError("firestore unavailable")
 
-        original = partner_store.subscription_alerts
-        partner_store.subscription_alerts = _boom  # type: ignore[assignment]
+        original = notification_store.subscription_alerts
+        notification_store.subscription_alerts = _boom  # type: ignore[assignment]
         try:
             degraded = client.get(
                 "/notification-api/v1/subscriptions/commuter-42-morning",
@@ -2048,16 +2048,16 @@ def test_a_quiet_watch_says_so_and_a_bounded_read_does_not():
             assert degraded.json()["alerts"]["truncated"] is True
             assert degraded.json()["alerts"]["n_active"] == 0
         finally:
-            partner_store.subscription_alerts = original  # type: ignore[assignment]
+            notification_store.subscription_alerts = original  # type: ignore[assignment]
 
-        original_many = partner_store.partner_alerts
-        partner_store.partner_alerts = _boom  # type: ignore[assignment]
+        original_many = notification_store.client_alerts
+        notification_store.client_alerts = _boom  # type: ignore[assignment]
         try:
             page = client.get("/notification-api/v1/subscriptions", headers=_headers(bearer))
             assert page.status_code == 200
             assert all(r["alerts"]["truncated"] is True for r in page.json()["subscriptions"])
         finally:
-            partner_store.partner_alerts = original_many  # type: ignore[assignment]
+            notification_store.client_alerts = original_many  # type: ignore[assignment]
     finally:
         _uninstall()
 
@@ -2073,12 +2073,12 @@ def test_the_served_list_of_subjects_is_capped_and_the_counts_are_not():
     try:
         client = _client()
         client.post("/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer))
-        document_id = f"{PARTNER}~commuter-42-morning"
+        document_id = f"{CLIENT}~commuter-42-morning"
         for index in range(13):
             _put_subject(
                 document_id,
                 f"alert-{index:02d}",
-                partner_store.PHASE_CONFIRMED,
+                notification_store.PHASE_CONFIRMED,
                 updated_at=NOW - timedelta(minutes=index),
             )
         alerts = client.get(
@@ -2086,8 +2086,8 @@ def test_the_served_list_of_subjects_is_capped_and_the_counts_are_not():
         ).json()["alerts"]
         assert alerts["n_active"] == 13
         assert alerts["n_confirmed"] == 13
-        assert len(alerts["subjects"]) == partner_store.MAX_ALERTS_SERVED
-        assert partner_store.MAX_ALERTS_SERVED == partner_store.MAX_ALERT_DELIVERIES_PER_DAY
+        assert len(alerts["subjects"]) == notification_store.MAX_ALERTS_SERVED
+        assert notification_store.MAX_ALERTS_SERVED == notification_store.MAX_ALERT_DELIVERIES_PER_DAY
         assert alerts["truncated"] is False, "capped for display is not a bounded read"
     finally:
         _uninstall()
@@ -2099,8 +2099,8 @@ def test_a_withdrawn_alert_is_not_served_as_standing():
     try:
         client = _client()
         client.post("/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer))
-        document_id = f"{PARTNER}~commuter-42-morning"
-        _put_subject(document_id, "gone", partner_store.PHASE_WITHDRAWN)
+        document_id = f"{CLIENT}~commuter-42-morning"
+        _put_subject(document_id, "gone", notification_store.PHASE_WITHDRAWN)
         alerts = client.get(
             "/notification-api/v1/subscriptions/commuter-42-morning", headers=_headers(bearer)
         ).json()["alerts"]
@@ -2125,16 +2125,16 @@ def test_a_create_response_carries_no_alert_state_and_says_so_with_null():
 
 
 def test_a_watch_cannot_be_shown_anothers_alert_state():
-    """The subject carries its own partner_id, and a mismatch is Forbidden in the store -- served
+    """The subject carries its own client_id, and a mismatch is Forbidden in the store -- served
     here as the same 404 every other tenancy check collapses to."""
     _install()
-    a_bearer = _provision(PARTNER, DEST)
+    a_bearer = _provision(CLIENT, DEST)
     _provision(OTHER, OTHER_DEST)
     try:
         client = _client()
         client.post("/notification-api/v1/subscriptions", json=_body(), headers=_headers(a_bearer))
-        document_id = f"{PARTNER}~commuter-42-morning"
-        _put_subject(document_id, "foreign", partner_store.PHASE_CONFIRMED, partner_id=OTHER)
+        document_id = f"{CLIENT}~commuter-42-morning"
+        _put_subject(document_id, "foreign", notification_store.PHASE_CONFIRMED, client_id=OTHER)
         response = client.get(
             "/notification-api/v1/subscriptions/commuter-42-morning", headers=_headers(a_bearer)
         )
@@ -2151,7 +2151,7 @@ def test_a_watch_cannot_be_shown_anothers_alert_state():
 
 
 def _real_payload() -> dict[str, Any]:
-    """One payload from the REAL producer, `varsel._partner_payload`.
+    """One payload from the REAL producer, `varsel._webhook_payload`.
 
     Imported here rather than mirrored: a fixture that restated the keys would agree with itself
     forever. `varsel` is heavy but importable (it logs "no VAPID keypair" and does nothing else at
@@ -2176,7 +2176,7 @@ def _real_payload() -> dict[str, Any]:
         alertworthy=True,
         cancelled=True,
     )
-    return varsel._partner_payload(
+    return varsel._webhook_payload(
         alert, [alert], message_input={"i_morgen": False}, title="t", body="b"
     )
 
@@ -2186,7 +2186,7 @@ def _shape(value: Any) -> Any:
 
     Compares what a client types against -- which keys exist and how they nest -- rather than what
     a particular disruption happened to contain. A list collapses to the shape of its first entry,
-    because the schema's arrays are homogeneous and a partner writes one row renderer.
+    because the schema's arrays are homogeneous and a client writes one row renderer.
     """
     if isinstance(value, dict):
         return {k: _shape(v) for k, v in sorted(value.items())}
@@ -2200,7 +2200,7 @@ def _shape(value: Any) -> Any:
 
 
 def test_the_synthetic_payload_has_the_same_shape_as_a_real_one():
-    """A partner types their receiver against a test event -- it is the only body they can see
+    """A client types their receiver against a test event -- it is the only body they can see
     before a real disruption -- so a synthetic payload with its own key names teaches a shape that
     breaks on the first real event, in production, at go-live.
 
@@ -2238,7 +2238,7 @@ def test_the_synthetic_payload_has_the_same_shape_as_a_real_one():
         # THE PROBABILITY LEAVES' NULLABILITY, which `_shape` erases on purpose -- and the gap that
         # erasure left is not hypothetical: the synthetic event stated `delay_ge10: 1.0` under
         # `phase: confirmed` while every real one carries `null` there, because
-        # `impact._cancelled_prediction` drops every delay figure ("if it runs"). A partner typing
+        # `impact._cancelled_prediction` drops every delay figure ("if it runs"). A client typing
         # that field as a number, or rendering it with no null guard, breaks on their first genuine
         # cancelled train, in production, at go-live -- which is the exact failure this function was
         # already fixed once to stop teaching. Compared for BOTH producers being null-or-not, never
@@ -2308,9 +2308,9 @@ def test_the_test_event_is_projected_and_serialized_by_the_delivery_pass():
     month's envelope. The serializer is the same one for the same reason: sorted keys, UTF-8, one
     timestamp rendering.
     """
-    import partner_delivery
+    import webhook_delivery
 
-    assert "partner_delivery.event_body(partner_delivery.wire_event(" in API_CODE
+    assert "webhook_delivery.event_body(webhook_delivery.wire_event(" in API_CODE
     assert "json.dumps" not in API_CODE, "there is one serializer, and it is not here"
     _install()
     bearer = _provision()
@@ -2333,14 +2333,14 @@ def test_the_test_event_is_projected_and_serialized_by_the_delivery_pass():
         assert set(EVENT_SCHEMA["required"]) <= set(event)
         # Byte-identical to what the delivery pass would send for the same document, which is the
         # property "one producer" actually means.
-        assert raw == partner_delivery.event_body(partner_delivery.wire_event(event))
+        assert raw == webhook_delivery.event_body(webhook_delivery.wire_event(event))
         assert list(event) == sorted(event), "sorted keys, so two attempts are byte-identical"
     finally:
         _uninstall()
 
 
 def test_a_test_event_accepts_the_same_ids_the_path_routes_do():
-    """A partner takes the id from a GET response -- or from the event their receiver just handled
+    """A client takes the id from a GET response -- or from the event their receiver just handled
     -- and posts it here. Rejecting the namespaced form was a 422 on a value this API had itself
     just served."""
     _install()
@@ -2352,7 +2352,7 @@ def test_a_test_event_accepts_the_same_ids_the_path_routes_do():
             json=_body(subscription_id="probe", test=True),
             headers=_headers(bearer),
         )
-        namespaced = f"{PARTNER}~probe"
+        namespaced = f"{CLIENT}~probe"
         for reference in ("probe", namespaced):
             response = client.post(
                 "/notification-api/v1/test-events",
@@ -2369,7 +2369,7 @@ def test_a_test_event_accepts_the_same_ids_the_path_routes_do():
             json={"subscription_id": stored},
             headers=_headers(bearer),
         ).status_code == 200
-        # Still bounded, and still no path to another partner: the prefix stripped is the caller's.
+        # Still bounded, and still no path to another client: the prefix stripped is the caller's.
         assert client.post(
             "/notification-api/v1/test-events",
             json={"subscription_id": f"{OTHER}~probe"},
@@ -2380,7 +2380,7 @@ def test_a_test_event_accepts_the_same_ids_the_path_routes_do():
 
 
 def test_the_openapi_tags_are_the_routers_own():
-    """The published document is what U7 generates from and what a partner reads; this app's /docs
+    """The published document is what U7 generates from and what a client reads; this app's /docs
     is what an operator reads. Two groupings for one surface is a difference somebody reconciles by
     hand, so they are one vocabulary, pinned in both directions."""
     published = {tag["name"] for tag in OPENAPI["tags"]}
@@ -2391,12 +2391,12 @@ def test_the_openapi_tags_are_the_routers_own():
         if method != "parameters"
         for tag in op["tags"]
     }
-    router_tags = {tag for route in partner_api.router.routes for tag in (route.tags or [])}
+    router_tags = {tag for route in notification_api.router.routes for tag in (route.tags or [])}
     assert published == used == router_tags
     assert router_tags == {
-        partner_api.TAG_SUBSCRIPTIONS,
-        partner_api.TAG_DESTINATIONS,
-        partner_api.TAG_TEST,
+        notification_api.TAG_SUBSCRIPTIONS,
+        notification_api.TAG_DESTINATIONS,
+        notification_api.TAG_TEST,
     }
     # Prefixed, because these six routes sit among three dozen paths in this app.
     assert all(tag.startswith("notification-") for tag in router_tags)
@@ -2404,10 +2404,10 @@ def test_the_openapi_tags_are_the_routers_own():
 
 def test_the_call_payload_promises_only_what_both_producers_emit():
     """A schema describing a richer document than exists is worse than one describing less: a
-    partner writes a renderer for the fields it names.
+    client writes a renderer for the fields it names.
 
     Read off the SCHEMA and the two producers, so re-adding the promise without emitting the fields
-    fails here rather than at a partner's first integration.
+    fails here rather than at a client's first integration.
     """
     description = EVENT_SCHEMA["properties"]["payload"]["properties"]["call"]["description"]
     emitted = set(_real_payload()["call"])
@@ -2432,7 +2432,7 @@ def _run_all() -> None:
     for name, fn in tests:
         fn()
         print(f"  ok  {name}")
-    print(f"\n{len(tests)} partner API checks passed.")
+    print(f"\n{len(tests)} notification API checks passed.")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,11 @@
-"""The partner alert lifecycle: this cycle's observations turned into committed events.
+"""The client alert lifecycle: this cycle's observations turned into committed events.
 
 Between :mod:`varsel` (which decides *what is true about a train* and what a traveller would be
-told) and :mod:`partner_store` (which owns the durable revision, the event and its delivery
+told) and :mod:`notification_store` (which owns the durable revision, the event and its delivery
 record). It holds the ordering, the bounds and the "is there anything to write?" question, and
 deliberately holds neither the transition rule nor any prose:
 
-* **The transition rule is `partner_store._transition`, called and never restated.** A new revision
+* **The transition rule is `notification_store._transition`, called and never restated.** A new revision
   is minted only on the lifecycle diagram's transitions -- none→phase, predicted→confirmed,
   withdrawn→{predicted, confirmed} -- and a changed probability, delay figure or wording mints
   nothing, at any size. There is no materiality threshold to tune: minting on a changed figure
@@ -17,7 +17,7 @@ deliberately holds neither the transition rule nor any prose:
   ``/varsel`` would have pushed for the same journey (R7). Nothing here composes Norwegian.
 
 **The pending set is read from Firestore, never re-derived from a cycle's decisions.** This module
-writes events; :mod:`partner_delivery` reads the committed delivery records. A re-derivation would
+writes events; :mod:`webhook_delivery` reads the committed delivery records. A re-derivation would
 mint a fresh revision and therefore a fresh ``event_id`` every cycle, which the receiver cannot
 recognise as a duplicate and would turn into a second notification about the same train.
 
@@ -25,15 +25,15 @@ recognise as a duplicate and would turn into a second notification about the sam
 transactions, and the population this runs over is mostly *nothing to do*: about 83 % of matched
 alerts are sub-threshold (`varsel_decisions`' own split), and an alert-worthy train whose phase has
 not changed is a transaction that reads two documents and returns ``unchanged`` on every one of the
-~300 cycles in a day. So one partner-scoped query (:func:`partner_store.partner_alerts`) answers
+~300 cycles in a day. So one client-scoped query (:func:`notification_store.client_alerts`) answers
 "which subjects stand, and in which phase" for the whole cycle, and the transactions are spent only
 where a write can actually happen. That is reading the store to decide what to write -- not
 re-deriving the pending set -- and it is exact rather than best-effort for the reason KTD6 names:
 the emit path has exactly one writer (one poller thread, no route invokes the pass, one replica
 under the Recreate strategy), so nothing can change a subject between the query and the commit.
 
-The pre-read has one honest limit and it is handled rather than assumed. ``partner_alerts`` serves
-at most :data:`partner_store.MAX_ALERTS_SERVED` subjects per subscription in its LIST while counting
+The pre-read has one honest limit and it is handled rather than assumed. ``client_alerts`` serves
+at most :data:`notification_store.MAX_ALERTS_SERVED` subjects per subscription in its LIST while counting
 all of them, so a subscription holding more standing alerts than that -- AE3's line suspension,
 thirteen cancelled departures inside one window -- reports a count this module cannot enumerate.
 :class:`_Standing` calls that *incomplete* and falls back to asking the store per subject, which is
@@ -43,9 +43,9 @@ the slow path and the correct one.
 (:class:`_EmitBudget`, ``varsel._WriteBudget``'s shape) makes :data:`_EMIT_DEADLINE_S` a ceiling on
 when the step *ends* under bounded slowness; an outer bounded wait on a worker thread
 (:data:`_EMIT_WAIT_S`) is the backstop for a store call that hangs, which the reservation cannot
-see: ``partner_store`` plumbs :data:`~partner_store._CALL_DEADLINE_S` into every READ, a transaction's
+see: ``notification_store`` plumbs :data:`~notification_store._CALL_DEADLINE_S` into every READ, a transaction's
 reads included, but a transactional COMMIT carries no timeout at all. Both numbers are sized so this step plus
-:mod:`partner_delivery`'s stay under KTD6's own 30 s reversal trigger for the phase.
+:mod:`webhook_delivery`'s stay under KTD6's own 30 s reversal trigger for the phase.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import partner_store
+import notification_store
 import reserved_budget
 
 logger = logging.getLogger(__name__)
@@ -70,14 +70,14 @@ OSLO = ZoneInfo("Europe/Oslo")
 #
 # KTD6: "The load step and the emit transactions each carry a per-call Firestore deadline and a
 # whole-step budget reserved the way the delivery deadline is." The per-call half is now real for
-# READS -- `partner_store._CALL_DEADLINE_S` (4.0 s, under this module's own `_EMIT_WAIT_S` so a hung
+# READS -- `notification_store._CALL_DEADLINE_S` (4.0 s, under this module's own `_EMIT_WAIT_S` so a hung
 # read surfaces as the store's own retryable `DeadlineExceeded` rather than as our timeout with a
 # thread still running) -- and is still unexpressible for the COMMIT, which the Python client's
 # `@firestore.transactional` offers no way to bound. So the outer bounded wait below still stands in
-# for it, in the shape `varsel._load_partner_recipients` already uses for the load step, and the
+# for it, in the shape `varsel._load_webhook_recipients` already uses for the load step, and the
 # residual is a leaked thread rather than a stalled poller.
 #
-# Sized against the phase, not against this step: `partner_delivery` reserves 20 s (KTD6's number,
+# Sized against the phase, not against this step: `webhook_delivery` reserves 20 s (KTD6's number,
 # not ours to move) and the two run in one `main._phase`, whose measured `ms` is the number KTD6's
 # reversal trigger reads -- "move delivery out when the webhook phase exceeds 30 s of measured phase
 # time on any cycle in a week". 8 + 20 = 28 s of ceiling leaves that trigger meaning what it says.
@@ -97,8 +97,8 @@ _MAX_EMITS_PER_CYCLE = 120
 
 
 @dataclass(frozen=True)
-class PartnerSubject:
-    """One (subscription, train) this cycle observed, with everything a partner would receive.
+class WebhookSubject:
+    """One (subscription, train) this cycle observed, with everything a client would receive.
 
     Built by ``varsel`` at the end of the notification pass and handed to this module through
     ``check_and_notify``'s return value -- deliberately a value rather than a module-level snapshot,
@@ -111,22 +111,22 @@ class PartnerSubject:
     /varsel would have pushed" is true by construction rather than by a parallel builder.
 
     ``situations`` carries **every** situation contributing to this train, not just the one
-    ``one_alert_per_train`` kept: ``partner_store._sent_body`` writes a delivered mark per situation
+    ``one_alert_per_train`` kept: ``notification_store._sent_body`` writes a delivered mark per situation
     number, and ``varsel._pending_pushes`` tests the collapsed winner's number against those marks.
     A winner flipping between cycles would otherwise re-pend a train already delivered and re-spend
     the wording budget on it. R8 calls them "the contributing situations" for the same reason.
     """
 
     # Routing and the version the match was computed against. The version is the LOAD snapshot's,
-    # never a fresh read: `partner_store._subscription_obsolete` compares it against what the
+    # never a fresh read: `notification_store._subscription_obsolete` compares it against what the
     # subscription holds at commit time, which is how "a slow pass cannot emit obsolete work" is
     # enforced. Re-reading it here would make that check compare a value with itself and emit an
-    # alert about a train matched for a route the partner has since changed.
+    # alert about a train matched for a route the client has since changed.
     subscription_id: str
-    partner_id: str
+    client_id: str
     destination_id: str
     subscription_version: int
-    partner_ref: str = ""
+    external_ref: str = ""
     test: bool = False
 
     # The observation.
@@ -134,7 +134,7 @@ class PartnerSubject:
     cancelled: bool = False
     situations: tuple[str, ...] = ()
 
-    # The train, flat rather than a `TrainRef`, so `varsel` needs no `partner_store` type and one
+    # The train, flat rather than a `TrainRef`, so `varsel` needs no `notification_store` type and one
     # function (:func:`train_ref`) owns "can this observation be a stable subject at all".
     operator: str | None = None
     line: str | None = None
@@ -143,7 +143,7 @@ class PartnerSubject:
     stop_order: int | None = None
     departure_time: datetime | None = None
 
-    # What a partner receives.
+    # What a client receives.
     title: str = ""
     body: str = ""
     payload: Mapping[str, Any] = field(default_factory=dict)
@@ -155,7 +155,7 @@ class EmitReport:
 
     Counts rather than a list of ids: at the pilot's volume the interesting question is always
     "did anything get written, and what stopped the rest", and a per-subject line would put a
-    partner's traffic shape into routine logs at cycle rate.
+    client's traffic shape into routine logs at cycle rate.
     """
 
     created: int = 0
@@ -193,7 +193,7 @@ class _EmitBudget(reserved_budget.ReservedBudget):
     """
 
 
-def train_ref(subject: PartnerSubject) -> partner_store.TrainRef | None:
+def train_ref(subject: WebhookSubject) -> notification_store.TrainRef | None:
     """This observation's train, or ``None`` when it cannot be one.
 
     ``alert_id`` is derived from these six fields, and the receiver's supplied policy deduplicates
@@ -212,7 +212,7 @@ def train_ref(subject: PartnerSubject) -> partner_store.TrainRef | None:
         return None
     if subject.stop_order is None:
         return None
-    return partner_store.TrainRef(
+    return notification_store.TrainRef(
         operator=str(subject.operator),
         line=str(subject.line or ""),
         journey_ref=str(subject.journey_ref),
@@ -222,39 +222,39 @@ def train_ref(subject: PartnerSubject) -> partner_store.TrainRef | None:
     )
 
 
-def requested_phase(subject: PartnerSubject) -> str:
+def requested_phase(subject: WebhookSubject) -> str:
     """``confirmed`` when ET has declared the call cancelled, otherwise ``predicted``.
 
     A declared cancellation is a fact rather than a forecast -- ``impact._cancelled_prediction``
     serves 1.0 and null delay figures for exactly that reason -- and the phase is what carries the
     difference onto the wire. Confirmed is terminal for advice: a prediction never reinstates a
-    cancelled call, which ``partner_store._transition`` enforces a layer earlier than the receiver.
+    cancelled call, which ``notification_store._transition`` enforces a layer earlier than the receiver.
     """
-    return partner_store.PHASE_CONFIRMED if subject.cancelled else partner_store.PHASE_PREDICTED
+    return notification_store.PHASE_CONFIRMED if subject.cancelled else notification_store.PHASE_PREDICTED
 
 
-def skip_reason(stored_phase: str | None, subject: PartnerSubject) -> str | None:
+def skip_reason(stored_phase: str | None, subject: WebhookSubject) -> str | None:
     """Why this subject needs no store call at all, or ``None`` when it does.
 
     Two answers, and both come from the store's own rule rather than from a copy of it:
 
-    * an alert-worthy subject whose ``partner_store._transition`` is ``None`` would mint nothing --
+    * an alert-worthy subject whose ``notification_store._transition`` is ``None`` would mint nothing --
       the same phase again, or a ``predicted`` for a train already ``confirmed``;
     * a below-threshold subject with no standing subject has nothing to withdraw, which
-      ``partner_store._withdraw_body`` answers with ``nothing_standing`` and no write.
+      ``notification_store._withdraw_body`` answers with ``nothing_standing`` and no write.
 
     The private ``_transition`` is called deliberately. Restating the transition table here is what
     the plan forbids ("call it, do not restate it"), and the failure of a restatement is silent: a
     copy that drifted would mint a revision on a changed probability and put a second notification
-    about one train on a traveller's phone. ``test_partner_events`` pins this function against
+    about one train on a traveller's phone. ``test_notification_events`` pins this function against
     ``_transition`` over the whole phase cross-product, so a client-side skip can never be looser
     than the store's own decision.
     """
     if subject.alertworthy:
-        if partner_store._transition(stored_phase, requested_phase(subject)) is None:
+        if notification_store._transition(stored_phase, requested_phase(subject)) is None:
             return "unchanged"
         return None
-    if stored_phase in (None, partner_store.PHASE_WITHDRAWN):
+    if stored_phase in (None, notification_store.PHASE_WITHDRAWN):
         return "nothing_standing"
     return None
 
@@ -270,7 +270,7 @@ def _close_run(
     """This train cleared the gate again: close any open withdrawal run. Usually writes nothing.
 
     **What makes the withdrawal count truly CONSECUTIVE, and why it lives here rather than in the
-    store.** `partner_store._withdraw_body` cannot see an alert-worthy cycle at all -- `skip_reason`
+    store.** `notification_store._withdraw_body` cannot see an alert-worthy cycle at all -- `skip_reason`
     skips the store call on one, deliberately, to save a transaction per standing subject per cycle
     -- so the store closes runs by TIME (`WITHDRAWAL_GAP_S`), and that approximation still withdraws
     on a dip / one recovered cycle / dip inside the window. A wrong withdrawal is a real
@@ -283,7 +283,7 @@ def _close_run(
     * **an ordinary standing cycle writes nothing** -- `open_runs` is consulted first and is empty
       for a subject with no open run, which is nearly all of them;
     * **one write per genuine recovery**, not per cycle;
-    * **no per-subject read, ever** -- `open_runs` rides on the `partner_alerts` query `_standing`
+    * **no per-subject read, ever** -- `open_runs` rides on the `client_alerts` query `_standing`
       already spends, so a failed pre-read simply loses the resets and falls back to the store's
       time window (R20: an outage costs the optimisation, never correctness);
     * a run already older than the gap is left alone, since the store would start a fresh run for
@@ -295,14 +295,14 @@ def _close_run(
     at = known.open_runs.get(alert_id)
     if at is None:
         return
-    if (now - at).total_seconds() > partner_store.WITHDRAWAL_GAP_S:
+    if (now - at).total_seconds() > notification_store.WITHDRAWAL_GAP_S:
         counts["run_stale"] = counts.get("run_stale", 0) + 1
         return
     if not budget.claim():
         counts["run_clear_capped"] = counts.get("run_clear_capped", 0) + 1
         return
     try:
-        if partner_store.clear_below_threshold(alert_id, now=now):
+        if notification_store.clear_below_threshold(alert_id, now=now):
             counts["run_cleared"] = counts.get("run_cleared", 0) + 1
     except Exception:
         # Never fatal and never re-raised: what a failed clear costs is the exactness of ONE
@@ -311,7 +311,7 @@ def _close_run(
         logger.warning(
             "Could not close a withdrawal run; the store's time window still applies",
             exc_info=True,
-            extra={"fields": {"event": "partner_emit", "result": "run_clear_error"}},
+            extra={"fields": {"event": "notification_emit", "result": "run_clear_error"}},
         )
 
 
@@ -319,8 +319,8 @@ def _close_run(
 class _Standing:
     """What stands per subscription, and whether that is a claim or a guess.
 
-    ``complete`` is the load-bearing half. ``partner_alerts`` counts every live subject and
-    enumerates at most :data:`partner_store.MAX_ALERTS_SERVED` of them, so past that ceiling the
+    ``complete`` is the load-bearing half. ``client_alerts`` counts every live subject and
+    enumerates at most :data:`notification_store.MAX_ALERTS_SERVED` of them, so past that ceiling the
     phases below are a subset and "absent" no longer means "nothing stands". Treating a subset as
     complete would skip a withdrawal that was owed and, worse, skip a ``confirmed`` mint for a train
     ET has cancelled -- so an incomplete answer falls back to asking the store per subject, which is
@@ -329,8 +329,8 @@ class _Standing:
 
     phases: Mapping[str, str]
     complete: bool
-    #: alert_id -> `below_threshold_at` for this partner's subjects with an OPEN withdrawal run,
-    #: straight off `PartnerAlerts.open_below_threshold`. Carried even when `complete` is False,
+    #: alert_id -> `below_threshold_at` for this client's subjects with an OPEN withdrawal run,
+    #: straight off `ClientAlerts.open_below_threshold`. Carried even when `complete` is False,
     #: because it is derived from the whole live page rather than from the four-row display list --
     #: so a truncated snapshot still resets runs exactly, and only a FAILED read loses them.
     open_runs: Mapping[str, datetime] = field(default_factory=dict)
@@ -339,34 +339,34 @@ class _Standing:
 _INCOMPLETE = _Standing(phases={}, complete=False)
 
 
-def _standing(subjects: Sequence[PartnerSubject], now: datetime) -> dict[str, _Standing]:
-    """One partner-scoped query per partner: which subjects stand, in which phase.
+def _standing(subjects: Sequence[WebhookSubject], now: datetime) -> dict[str, _Standing]:
+    """One client-scoped query per client: which subjects stand, in which phase.
 
-    Fails to :data:`_INCOMPLETE` for every subscription of a partner whose read raised (R20 -- a
-    store outage suppresses that partner's *optimisation*, never its correctness), which costs
+    Fails to :data:`_INCOMPLETE` for every subscription of a client whose read raised (R20 -- a
+    store outage suppresses that client's *optimisation*, never its correctness), which costs
     transactions rather than events.
     """
     out: dict[str, _Standing] = {}
-    for partner_id in sorted({s.partner_id for s in subjects if s.partner_id}):
+    for client_id in sorted({s.client_id for s in subjects if s.client_id}):
         try:
-            alerts = partner_store.partner_alerts(partner_id, now=now)
+            alerts = notification_store.client_alerts(client_id, now=now)
         except Exception:
             logger.warning(
-                "Could not read standing partner alerts; asking the store per subject this cycle",
+                "Could not read standing client alerts; asking the store per subject this cycle",
                 exc_info=True,
-                extra={"fields": {"event": "partner_emit", "result": "standing_error",
-                                  "partner_id": partner_id}},
+                extra={"fields": {"event": "notification_emit", "result": "standing_error",
+                                  "client_id": client_id}},
             )
             for subject in subjects:
-                if subject.partner_id == partner_id:
+                if subject.client_id == client_id:
                     out[subject.subscription_id] = _INCOMPLETE
             continue
         for subject in subjects:
-            if subject.partner_id != partner_id:
+            if subject.client_id != client_id:
                 continue
             snapshot = alerts.snapshots.get(subject.subscription_id)
             if snapshot is None:
-                # Absent from a bounded read is "crowded out", not "calm" -- `partner_alerts`
+                # Absent from a bounded read is "crowded out", not "calm" -- `client_alerts`
                 # documents exactly that, which is why the wrapper carries its own `truncated`.
                 out[subject.subscription_id] = _Standing(
                     phases={},
@@ -382,7 +382,7 @@ def _standing(subjects: Sequence[PartnerSubject], now: datetime) -> dict[str, _S
     return out
 
 
-def _sort_key(subject: PartnerSubject) -> tuple:
+def _sort_key(subject: WebhookSubject) -> tuple:
     """Alert-worthy first, then soonest departure, then a stable tie-break.
 
     Soonest-departure-first across subscriptions is ``/varsel``'s own rule for spending a bounded
@@ -406,12 +406,12 @@ def _sort_key(subject: PartnerSubject) -> tuple:
 
 
 def _emit_one(
-    subject: PartnerSubject,
+    subject: WebhookSubject,
     *,
-    train: partner_store.TrainRef,
+    train: notification_store.TrainRef,
     phase: str,
     now: datetime,
-) -> partner_store.EventCommit:
+) -> notification_store.EventCommit:
     """One observation, committed. The valid_until note is the only judgement here.
 
     R12's validity is "the earlier of a 60-minute horizon, the departure, and the subscription's
@@ -423,30 +423,30 @@ def _emit_one(
     long, and nothing is ever *sent* past it. Stated rather than hidden because U8 publishes the
     horizon as a number.
     """
-    request = partner_store.EmitRequest(
+    request = notification_store.EmitRequest(
         subscription_id=subject.subscription_id,
-        partner_id=subject.partner_id,
+        client_id=subject.client_id,
         destination_id=subject.destination_id,
         subscription_version=int(subject.subscription_version),
         train=train,
         phase=phase,
         situations=tuple(subject.situations),
         payload=dict(subject.payload),
-        valid_until=partner_store.event_validity(
+        valid_until=notification_store.event_validity(
             occurred_at=now,
             departure_at=subject.departure_time,
             subscription_expires_at=None,
         ),
-        partner_ref=subject.partner_ref,
+        external_ref=subject.external_ref,
         test=bool(subject.test),
     )
     if subject.alertworthy:
-        return partner_store.commit_event(request, now=now)
-    return partner_store.record_below_threshold(request, now=now)
+        return notification_store.commit_event(request, now=now)
+    return notification_store.record_below_threshold(request, now=now)
 
 
 def _run(
-    subjects: Sequence[PartnerSubject],
+    subjects: Sequence[WebhookSubject],
     *,
     now: datetime,
     deadline_s: float,
@@ -475,7 +475,7 @@ def _run(
         known = standing.get(subject.subscription_id, _INCOMPLETE)
         # Hoisted out of the `complete` branch: the withdrawal-run reset below needs it on both
         # paths, and it is a pure hash of two strings.
-        alert_id = partner_store.alert_subject_id(subject.subscription_id, train)
+        alert_id = notification_store.alert_subject_id(subject.subscription_id, train)
         if known.complete:
             reason = skip_reason(known.phases.get(alert_id), subject)
             if reason is not None:
@@ -491,7 +491,7 @@ def _run(
             continue
         try:
             commit = _emit_one(subject, train=train, phase=requested_phase(subject), now=now)
-        except partner_store.QuotaExceeded:
+        except notification_store.QuotaExceeded:
             # R21, and visible rather than silent: the store has already logged the breach with its
             # own count. Skipping the rest of this destination's subjects is a cost decision, not a
             # policy one -- they are re-offered on the next cycle.
@@ -499,20 +499,20 @@ def _run(
             counts["quota"] = counts.get("quota", 0) + 1
             continue
         except Exception as exc:
-            # `partner_store.is_retryable` and NOT a handler keyed on `google.api_core` exceptions:
+            # `notification_store.is_retryable` and NOT a handler keyed on `google.api_core` exceptions:
             # an exhausted transaction surfaces as a plain `ValueError` after five attempts, and
             # treating that as terminal would mark a contended subject failed and never deliver it.
-            bucket = "retryable" if partner_store.is_retryable(exc) else "failed"
+            bucket = "retryable" if notification_store.is_retryable(exc) else "failed"
             counts[bucket] = counts.get(bucket, 0) + 1
             logger.warning(
-                "Partner event could not be committed (%s); it is re-offered next cycle",
+                "Notification event could not be committed (%s); it is re-offered next cycle",
                 bucket,
                 exc_info=True,
-                extra={"fields": {"event": "partner_emit", "result": bucket,
-                                  "partner_id": subject.partner_id}},
+                extra={"fields": {"event": "notification_emit", "result": bucket,
+                                  "client_id": subject.client_id}},
             )
             continue
-        if commit.status == "created" and commit.event_type == partner_store.EVENT_WITHDRAWN:
+        if commit.status == "created" and commit.event_type == notification_store.EVENT_WITHDRAWN:
             counts["withdrawn"] = counts.get("withdrawn", 0) + 1
         else:
             if commit.status == "unchanged":
@@ -542,7 +542,7 @@ def _run(
 
 
 def emit(
-    subjects: Sequence[PartnerSubject],
+    subjects: Sequence[WebhookSubject],
     *,
     now: datetime | None = None,
     deadline_s: float = _EMIT_DEADLINE_S,
@@ -550,7 +550,7 @@ def emit(
     worst_case_s: float = _WORST_CASE_EMIT_S,
     max_calls: int = _MAX_EMITS_PER_CYCLE,
 ) -> EmitReport:
-    """Commit this cycle's partner events. Never raises for a store problem.
+    """Commit this cycle's notification events. Never raises for a store problem.
 
     ``now`` is captured ONCE, in **UTC**, by the caller of every transaction body -- which is what
     makes ``revision`` monotonic structurally rather than as a property of the clock. Three things
@@ -575,7 +575,7 @@ def emit(
         return EmitReport()
     instant = (now or datetime.now(UTC)).astimezone(UTC)
     started = monotonic()
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="partner-emit")
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="client-emit")
     try:
         future = pool.submit(
             _run,
@@ -589,10 +589,10 @@ def emit(
         timed_out = False
     except Exception:
         logger.warning(
-            "Partner event emission did not finish inside its budget; this cycle's remaining "
+            "Notification event emission did not finish inside its budget; this cycle's remaining "
             "observations are re-offered on the next one",
             exc_info=True,
-            extra={"fields": {"event": "partner_emit", "result": "timeout"}},
+            extra={"fields": {"event": "notification_emit", "result": "timeout"}},
         )
         report = EmitReport()
         timed_out = True
@@ -602,7 +602,7 @@ def emit(
     ms = int((monotonic() - started) * 1000)
     report = replace(report, timed_out=timed_out, ms=ms)
     logger.info(
-        "Partner emit: %d created, %d withdrawn, %d unchanged, %d skipped in %d ms",
+        "Client emit: %d created, %d withdrawn, %d unchanged, %d skipped in %d ms",
         report.created,
         report.withdrawn,
         report.unchanged,
@@ -610,7 +610,7 @@ def emit(
         ms,
         extra={
             "fields": {
-                "event": "partner_emit",
+                "event": "notification_emit",
                 "result": "timeout" if timed_out else "ok",
                 "created": report.created,
                 "withdrawn": report.withdrawn,
@@ -638,7 +638,7 @@ def emit(
 
 __all__ = [
     "EmitReport",
-    "PartnerSubject",
+    "WebhookSubject",
     "emit",
     "requested_phase",
     "skip_reason",

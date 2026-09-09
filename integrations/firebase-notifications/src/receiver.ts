@@ -32,10 +32,10 @@ export interface ReceiverOptions {
   /**
    * Every secret that may sign for the destination a request arrives on, active generation first.
    *
-   * A function rather than an array so a partner serving several destinations can key on the path,
+   * A function rather than an array so a client serving several destinations can key on the path,
    * and so the secret is read from the FUNCTIONS RUNTIME CONFIGURATION at call time. It must never
    * be compiled into a mobile bundle: a client that holds the verification secret can forge an event
-   * for any commuter the partner serves, and a secret in a shipped app cannot be rotated.
+   * for any commuter the client serves, and a secret in a shipped app cannot be rotated.
    */
   secrets(request: Request): readonly string[] | Promise<readonly string[]>;
   adapters: ProcessAdapters;
@@ -167,8 +167,8 @@ function report(
 ): void {
   // PROJECTED, not passed through, and the projection is the whole point. `receive()` returns the
   // parsed event on the accepted path -- deliberately, because the caller may need it -- and handing
-  // that object to a partner's logging hook would put a traveller's origin, destination, departure
-  // time and the Norwegian prose of their alert into the partner's log retention on every single
+  // that object to a client's logging hook would put a traveller's origin, destination, departure
+  // time and the Norwegian prose of their alert into the client's log retention on every single
   // event. The sending side's own log records are shaped to keep exactly those out; a receiver that
   // leaked them one layer down would make that work pointless.
   //

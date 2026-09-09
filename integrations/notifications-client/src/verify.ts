@@ -13,7 +13,7 @@
 //     clock-free comparison this module performs.
 //  2. **A reason, not an exception.** `verify()` throws one error type for a missing header, a stale
 //     timestamp and a wrong key alike. A receiver has to tell those apart -- a stale timestamp is a
-//     replay refusal, a wrong key is a credential problem, and a partner debugging an integration
+//     replay refusal, a wrong key is a credential problem, and a client debugging an integration
 //     needs to know which -- so the outcome is a value.
 //
 // Signing is over the exact bytes received. Never over a re-serialized object, and never over
@@ -141,7 +141,7 @@ export function signBody(input: {
 /**
  * The full `webhook-signature` header for a set of secrets: one entry per generation, joined by a
  * single space, in the order given. Used by the test suites to sign their own messages, and by a
- * partner reproducing a header by hand.
+ * client reproducing a header by hand.
  */
 export function signatureHeader(input: {
   secrets: readonly string[];

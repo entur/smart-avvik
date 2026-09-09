@@ -1,8 +1,8 @@
-"""Standard Webhooks signing for the partner notification channel (KTD7, R10).
+"""Standard Webhooks signing for the webhook channel (KTD7, R10).
 
 HMAC-SHA256 over ``webhook-id.webhook-timestamp.<raw body>``, emitted as space-delimited
 ``v1,<base64>`` entries in one ``webhook-signature`` header. The shape is the Standard Webhooks
-one deliberately: the partner verifies with the ``standardwebhooks`` npm package rather than
+one deliberately: the client verifies with the ``standardwebhooks`` npm package rather than
 hand-rolled HMAC (KTD11), so every framing detail here is a wire contract with a library we do not
 own. The four that are easy to get wrong, and that
 ``contracts/notifications/v1/signing-vectors.json`` pins in both languages:
@@ -28,7 +28,7 @@ own. The four that are easy to get wrong, and that
 
 **Per-destination derivation.** Each destination's secret is HMAC-SHA256 of a root secret over a
 length-framed ``(destination_id, generation)`` material, so the store holds no signing material at
-all and one partner's leaked receiver secret forges nothing for another. The framing is
+all and one client's leaked receiver secret forges nothing for another. The framing is
 length-prefixed rather than delimiter-joined because a destination id is an operator-supplied
 string: ``("a", 11)`` and ``("a1", 1)`` must not produce one message, and a bare separator only
 holds while no id contains that separator. Same idea as :mod:`sso`'s purpose tag one level up --
@@ -86,15 +86,15 @@ SECRET_BYTES = 32
 
 # ---- Root secret -------------------------------------------------------------------------------
 #
-# The name is fixed by the Helm chart's commented `partner:` secret group, which also records why
+# The name is fixed by the Helm chart's commented `client:` secret group, which also records why
 # the value is written with `printf '%s'`: a trailing newline in a 49-byte token silently dropped
 # eight of this app's feedback submissions, and every hash check missed it because they were all
 # written `| tr -d '\n' | shasum`, which deletes the byte at fault. Here the same byte would
-# re-derive EVERY destination's secret, so every partner's verification fails at once and nothing
+# re-derive EVERY destination's secret, so every client's verification fails at once and nothing
 # on our side reports a configuration fault -- just a wall of rejected deliveries. So the read
 # strips and warns once per process, exactly as `feedback._env` does.
 
-SIGNING_ROOT_ENV = "PARTNER_SIGNING_ROOT"
+SIGNING_ROOT_ENV = "WEBHOOK_SIGNING_ROOT"
 
 #: A root shorter than one HMAC block's worth of entropy is a provisioning mistake, not a policy
 #: choice; refusing it is the only moment anybody can notice.
@@ -108,7 +108,7 @@ _WHITESPACE_REPORTED: set[str] = set()
 class SigningNotConfigured(RuntimeError):
     """No usable root secret. Raised loudly rather than degrading to an unsigned request.
 
-    Fail closed and fail *visible*: a partner endpoint that accepts an unsigned or wrongly-signed
+    Fail closed and fail *visible*: a client endpoint that accepts an unsigned or wrongly-signed
     request is a security hole on their side, and one that rejects it produces a retry storm on
     ours. Neither is a state to reach by omission.
     """
@@ -130,23 +130,23 @@ def _env(name: str) -> str:
             "%s carried surrounding whitespace and was stripped before use; fix it at the source "
             "(a Secret Manager payload written with `echo` rather than `printf '%%s'` is the usual "
             "cause). Unstripped, it re-derives every destination's signing secret and every "
-            "partner's verification fails at once.",
+            "client's verification fails at once.",
             name,
-            extra={"fields": {"event": "partner_signing_config", "variable": name}},
+            extra={"fields": {"event": "webhook_signing_config", "variable": name}},
         )
     return value
 
 
-#: The root `contracts/notifications/v1/signing-vectors.json` publishes so a partner can reproduce a
+#: The root `contracts/notifications/v1/signing-vectors.json` publishes so a client can reproduce a
 #: signature by hand. It is 48 bytes, so the length test alone ADMITTED it -- `configured()` answered
 #: True, `/destinations/current` reported ready, `/test-events` answered 200, and every delivery
 #: signed and verified normally, while every `whsec_` secret that root derives is committed in the
 #: same file and vendored again under `integrations/`. The signature is the only authentication a
-#: partner receiver has, so a deployment carrying this value would accept injected cancellations and
+#: client receiver has, so a deployment carrying this value would accept injected cancellations and
 #: withdrawals about real trains with nothing on our side reporting a fault.
 #:
 #: A plausible slip rather than a hypothetical: the runbook tells an operator to export
-#: `PARTNER_SIGNING_ROOT` by hand for `show-signing-secret`, which is exactly the moment a documented
+#: `WEBHOOK_SIGNING_ROOT` by hand for `show-signing-secret`, which is exactly the moment a documented
 #: example gets pasted. Restated here rather than read from the contract at runtime, because
 #: `contracts/` is not in the image; `test_webhook_signing` reads the literal OUT of the JSON and
 #: compares, so the two cannot drift.
@@ -177,9 +177,9 @@ def signing_root() -> bytes:
         )
     if len(value) < MIN_ROOT_BYTES:
         raise SigningNotConfigured(
-            f"{SIGNING_ROOT_ENV} is unset or shorter than {MIN_ROOT_BYTES} bytes; partner webhook "
+            f"{SIGNING_ROOT_ENV} is unset or shorter than {MIN_ROOT_BYTES} bytes; webhook "
             "signing cannot proceed. Provision it in Secret Manager and uncomment the chart's "
-            "`partner:` secret group."
+            "`client:` secret group."
         )
     return value
 
@@ -228,7 +228,7 @@ def secret_key(secret: str) -> bytes:
     """The raw HMAC key inside a ``whsec_`` secret.
 
     The prefix is stripped and the remainder base64-decoded, which is what the npm package does to
-    the same string -- so a secret handed to a partner works in their verifier unchanged.
+    the same string -- so a secret handed to a client works in their verifier unchanged.
     """
     if not secret.startswith(SECRET_PREFIX):
         raise ValueError(f"a signing secret must start with {SECRET_PREFIX!r}")
@@ -386,7 +386,7 @@ def verify(
 ) -> Verification:
     """Verify one header under one secret, the way a receiver would.
 
-    Ours to *own*, not ours to ship: the partner verifies with the npm package. It exists so the
+    Ours to *own*, not ours to ship: the client verifies with the npm package. It exists so the
     vectors can be asserted against the implementation that produced them, and so a rotation can be
     checked from this side.
 
