@@ -2435,5 +2435,60 @@ def _run_all() -> None:
     print(f"\n{len(tests)} notification API checks passed.")
 
 
+
+# ---- Per-client quotas (2026-09-09) ------------------------------------------------------------
+
+
+def test_a_clients_own_quotas_govern_its_ceiling_its_rate_and_its_subscriptions_cap():
+    """The three pilot constants are per-client DEFAULTS: an operator raises or lowers them on the
+    account, the router reads them off the Principal, and nothing needs a deploy. The daily cap is
+    copied onto the subscription document, which is where the delivery pass reads it."""
+    _install()
+    bearer = _provision()
+    try:
+        notification_auth.set_client_quotas(
+            CLIENT,
+            actor="op@entur.org",
+            max_active_subscriptions=1,
+            requests_per_minute=4,
+            daily_cap=9,
+        )
+        client = _client()
+        first = client.post(
+            "/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer)
+        )
+        assert first.status_code == 201, first.text
+        stored = _fake.doc(
+            notification_store.SUBSCRIPTIONS, f"{CLIENT}~{_body()['subscription_id']}"
+        )
+        assert stored["daily_cap"] == 9 and stored["channel"] == "webhook"
+        second = client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(subscription_id="another"),
+            headers=_headers(bearer),
+        )
+        assert second.status_code == 429 and second.json() == {"detail": "quota_exceeded"}
+        # Two requests spent against a per-minute allowance of four: the fifth is refused.
+        codes = [
+            client.get("/notification-api/v1/subscriptions", headers=_headers(bearer)).status_code
+            for _ in range(3)
+        ]
+        assert codes == [200, 200, 429], codes
+        # The idempotent re-PUT is the write that carries a CHANGED cap to an existing subscription
+        # (the rate is raised alongside, since this client has just spent its four).
+        notification_auth.set_client_quotas(
+            CLIENT, actor="op@entur.org", requests_per_minute=100, daily_cap=5
+        )
+        again = client.post(
+            "/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer)
+        )
+        assert again.status_code == 200, again.text
+        refreshed = _fake.doc(
+            notification_store.SUBSCRIPTIONS, f"{CLIENT}~{_body()['subscription_id']}"
+        )
+        assert refreshed["daily_cap"] == 5 and refreshed["version"] == stored["version"]
+    finally:
+        _uninstall()
+
 if __name__ == "__main__":
     _run_all()

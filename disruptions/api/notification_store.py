@@ -221,6 +221,14 @@ EVENT_TYPES = (EVENT_CREATED, EVENT_UPDATED, EVENT_WITHDRAWN)
 # Delivery states, the six the contract names.
 DELIVERY_STATES = ("pending", "sent", "expired", "superseded", "cancelled", "failed")
 
+#: The channel a subscription is delivered on, written on every subscription document. Only one
+#: exists today; the second is the value /varsel's registrations take when they move into this
+#: store (decided 2026-09-09), named now so that move is a new value rather than a backfill of
+#: every document written before it. A document without the field reads as ``webhook``.
+CHANNEL_WEBHOOK = "webhook"
+CHANNEL_WEB_PUSH = "web_push"
+CHANNELS = (CHANNEL_WEBHOOK, CHANNEL_WEB_PUSH)
+
 # Revisions are seeded from whole MINUTES since this instant, in UTC. Two things this gets right
 # that the obvious version does not. UTC, never Oslo: a revision formatted from the Oslo decision
 # timestamp goes backwards for an hour at every autumn DST fall-back, and a receiver ordering on
@@ -500,6 +508,20 @@ def _live_reservations(doc: Mapping[str, Any], now: datetime) -> dict[str, dict[
     return live
 
 
+def daily_cap_of(doc: Mapping[str, Any]) -> int:
+    """The subscription's own daily cap, or :data:`MAX_ALERT_DELIVERIES_PER_DAY` without one.
+
+    Per client since 2026-09-09 (``notification_auth.Quotas.daily_cap``), copied onto the document
+    at create, replace and touch so the delivery pass reads it from the document it already holds.
+    A missing or unreadable field is the default, never zero: a document written before the field
+    existed must keep /varsel's four rather than lose its allowance.
+    """
+    raw = doc.get("daily_cap")
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+        return raw
+    return MAX_ALERT_DELIVERIES_PER_DAY
+
+
 def cap_remaining(doc: Mapping[str, Any], now: datetime) -> int:
     """R11's remaining allowance for this subscription on this Oslo day.
 
@@ -516,13 +538,14 @@ def cap_remaining(doc: Mapping[str, Any], now: datetime) -> int:
     R11's four-per-registration grain is the whole of this plan's parity claim with /varsel, so an
     overspend is not cosmetic.
     """
+    cap = daily_cap_of(doc)
     counters = doc.get("daily_deliveries") or {}
     spent = counters.get(oslo_day(now), 0) if isinstance(counters, Mapping) else 0
     try:
         spent_n = int(spent)
     except (TypeError, ValueError):
-        spent_n = MAX_ALERT_DELIVERIES_PER_DAY  # unreadable counter = no allowance (fail closed)
-    return max(0, MAX_ALERT_DELIVERIES_PER_DAY - spent_n - len(_live_reservations(doc, now)))
+        spent_n = cap  # unreadable counter = no allowance (fail closed)
+    return max(0, cap - spent_n - len(_live_reservations(doc, now)))
 
 
 # ---- Identity: alert subject, event id, revision seed -----------------------------------------
@@ -975,6 +998,8 @@ class Subscription:
     daily_reservations: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     delivered: Mapping[str, datetime] = field(default_factory=dict)
     cleanup: Mapping[str, Any] = field(default_factory=dict)
+    channel: str = CHANNEL_WEBHOOK
+    daily_cap: int = MAX_ALERT_DELIVERIES_PER_DAY
 
     def as_recipient_document(self, now: datetime) -> dict[str, Any]:
         """The raw document ``varsel.WebhookRecipientProvider`` is contracted to yield.
@@ -1048,14 +1073,19 @@ def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
         },
         delivered={k: v for k, v in (doc.get("delivered") or {}).items()},
         cleanup=dict(doc.get("cleanup") or {}),
+        channel=str(doc.get("channel") or CHANNEL_WEBHOOK),
+        daily_cap=daily_cap_of(doc),
     )
 
 
-def _new_subscription_doc(spec: SubscriptionSpec, now: datetime) -> dict[str, Any]:
+def _new_subscription_doc(
+    spec: SubscriptionSpec, now: datetime, *, daily_cap: int | None = None
+) -> dict[str, Any]:
     return {
         "subscription_id": spec.subscription_id,
         "client_id": spec.client_id,
         "destination_id": spec.destination_id,
+        "channel": CHANNEL_WEBHOOK,
         "from_stop": spec.from_stop,
         "to_stop": spec.to_stop,
         "begin": spec.begin,
@@ -1065,6 +1095,7 @@ def _new_subscription_doc(spec: SubscriptionSpec, now: datetime) -> dict[str, An
         "test": bool(spec.test),
         "version": 1,
         "status": "active",
+        "daily_cap": MAX_ALERT_DELIVERIES_PER_DAY if daily_cap is None else int(daily_cap),
         "definition_digest": _definition_digest(spec),
         "created_at": now,
         "updated_at": now,
@@ -1086,8 +1117,15 @@ def _create_body(
     *,
     spec: SubscriptionSpec,
     now: datetime,
+    max_active: int | None = None,
+    daily_cap: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Create one subscription, refusing past the ceiling BEFORE any write.
+
+    ``max_active`` and ``daily_cap`` are the CLIENT's (``notification_auth.Quotas``); ``None``
+    means the module constants, resolved here at call time so a test that moves the constant moves
+    the ceiling. The count read is bounded by the same ``max_active`` the caller passed as the
+    query's ``limit`` -- which is why ``notification_auth.QUOTA_BOUNDS`` caps it.
 
     The ceiling is counted inside the transaction from the client's own subscriptions rather than
     from a counter document, deliberately. A counter over-counts and drifts: a subscription past one
@@ -1126,28 +1164,41 @@ def _create_body(
     for snapshot in _read_query(transaction, count_query):
         if subscription_is_live(_doc(snapshot), now):
             live += 1
-    if live >= MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT:
+    ceiling = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT if max_active is None else max_active
+    if live >= ceiling:
         raise QuotaExceeded(
-            f"client already holds {live} active subscriptions "
-            f"(ceiling {MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT})"
+            f"client already holds {live} active subscriptions (ceiling {ceiling})"
         )
-    doc = _new_subscription_doc(spec, now)
+    doc = _new_subscription_doc(spec, now, daily_cap=daily_cap)
     transaction.set(refs.subscription(spec.subscription_id), doc)
     return "created", doc
 
 
-def create_subscription(spec: SubscriptionSpec, *, now: datetime | None = None) -> Subscription:
-    """Register a subscription. Idempotent on (id, definition); refused past the ceiling."""
+def create_subscription(
+    spec: SubscriptionSpec,
+    *,
+    max_active: int | None = None,
+    daily_cap: int | None = None,
+    now: datetime | None = None,
+) -> Subscription:
+    """Register a subscription. Idempotent on (id, definition); refused past the ceiling.
+
+    The ceiling and the daily cap are the client's own when the API passes them, and the module
+    constants otherwise (resolved here, not in the signature, so a test may move the constant).
+    """
     spec.validate()
     instant = now or _now()
+    ceiling = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT if max_active is None else max_active
     refs = _Refs(_firestore_client())
     count_query = _query(
         "subscriptions",
         equality={"client_id": spec.client_id, "status": "active"},
-        limit=MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT,
+        limit=ceiling,
     )
     outcome, doc = _run_transaction(
-        lambda txn: _create_body(txn, refs, count_query, spec=spec, now=instant)
+        lambda txn: _create_body(
+            txn, refs, count_query, spec=spec, now=instant, max_active=ceiling, daily_cap=daily_cap
+        )
     )
     logger.info(
         "Webhook subscription %s (%s)",
@@ -1173,6 +1224,7 @@ def _replace_body(
     spec: SubscriptionSpec,
     expected_version: int | None,
     now: datetime,
+    daily_cap: int | None = None,
 ) -> dict[str, Any]:
     """Amend a subscription, refusing an obsolete version and an immutable-field change.
 
@@ -1218,6 +1270,8 @@ def _replace_body(
     # could drive from the API. And `delivered`, because those marks are per situation number: a
     # mark for a train the new route does not ride simply never matches again and expires on its
     # own, while clearing them would re-notify every train already delivered today.
+    if daily_cap is not None:
+        patch["daily_cap"] = int(daily_cap)
     transaction.update(refs.subscription(spec.subscription_id), patch)
     return {**stored, **patch}
 
@@ -1226,6 +1280,7 @@ def replace_subscription(
     spec: SubscriptionSpec,
     *,
     expected_version: int | None = None,
+    daily_cap: int | None = None,
     now: datetime | None = None,
 ) -> Subscription:
     spec.validate()
@@ -1233,7 +1288,12 @@ def replace_subscription(
     refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _replace_body(
-            txn, refs, spec=spec, expected_version=expected_version, now=instant
+            txn,
+            refs,
+            spec=spec,
+            expected_version=expected_version,
+            now=instant,
+            daily_cap=daily_cap,
         )
     )
     return _subscription_from_doc(doc)
@@ -1306,9 +1366,19 @@ def delete_subscription(
 
 
 def _touch_body(
-    transaction: Any, refs: _Refs, *, subscription_id: str, client_id: str, now: datetime
+    transaction: Any,
+    refs: _Refs,
+    *,
+    subscription_id: str,
+    client_id: str,
+    now: datetime,
+    daily_cap: int | None = None,
 ) -> dict[str, Any]:
-    """Push the inactivity horizon out. Reads first, so it cannot resurrect a tombstone."""
+    """Push the inactivity horizon out. Reads first, so it cannot resurrect a tombstone.
+
+    ``daily_cap`` rides along when the API passes it: the idempotent re-PUT is the write a client
+    makes most often, so it is how a changed client cap reaches subscriptions that already exist.
+    """
     snapshot = _read(transaction, refs.subscription(subscription_id))
     stored = _doc(snapshot)
     if not stored:
@@ -1318,20 +1388,31 @@ def _touch_body(
     if not subscription_is_live(stored, now):
         raise NotFound("subscription is deleted or past one of its horizons")
     created = _as_dt(stored.get("created_at")) or now
-    patch = {"last_seen_at": now, "updated_at": now, **_horizons(created, now)}
+    patch: dict[str, Any] = {"last_seen_at": now, "updated_at": now, **_horizons(created, now)}
+    if daily_cap is not None:
+        patch["daily_cap"] = int(daily_cap)
     transaction.update(refs.subscription(subscription_id), patch)
     return {**stored, **patch}
 
 
 def touch_subscription(
-    subscription_id: str, *, client_id: str, now: datetime | None = None
+    subscription_id: str,
+    *,
+    client_id: str,
+    daily_cap: int | None = None,
+    now: datetime | None = None,
 ) -> Subscription:
     """Record that the client is still interested -- R5's inactivity horizon moves with this."""
     instant = now or _now()
     refs = _Refs(_firestore_client())
     doc = _run_transaction(
         lambda txn: _touch_body(
-            txn, refs, subscription_id=subscription_id, client_id=client_id, now=instant
+            txn,
+            refs,
+            subscription_id=subscription_id,
+            client_id=client_id,
+            now=instant,
+            daily_cap=daily_cap,
         )
     )
     return _subscription_from_doc(doc)
@@ -2345,6 +2426,7 @@ def _snapshot(
     *,
     now: datetime,
     truncated: bool,
+    served: int = MAX_ALERTS_SERVED,
 ) -> AlertSnapshot:
     """Rank and bound one subscription's subject documents.
 
@@ -2387,7 +2469,7 @@ def _snapshot(
         n_active=len(states),
         n_confirmed=sum(1 for s in states if s.phase == PHASE_CONFIRMED),
         truncated=truncated,
-        subjects=tuple(states[:MAX_ALERTS_SERVED]),
+        subjects=tuple(states[: max(served, MAX_ALERTS_SERVED)]),
     )
 
 
@@ -2418,6 +2500,7 @@ def subscription_alerts(
     *,
     client_id: str | None = None,
     limit: int = MAX_SUBJECTS_PER_READ,
+    served: int = MAX_ALERTS_SERVED,
     now: datetime | None = None,
 ) -> AlertSnapshot:
     """One subscription's current alert state, in ONE query.
@@ -2444,7 +2527,11 @@ def subscription_alerts(
             if str(row.get("client_id") or "") != client_id:
                 raise Forbidden("alert subject belongs to another client")
     return _snapshot(
-        subscription_id, rows, now=instant, truncated=len(page) >= min(limit, MAX_SUBJECTS_PER_READ)
+        subscription_id,
+        rows,
+        now=instant,
+        truncated=len(page) >= min(limit, MAX_SUBJECTS_PER_READ),
+        served=served,
     )
 
 
@@ -2480,7 +2567,11 @@ class ClientAlerts:
 
 
 def client_alerts(
-    client_id: str, *, limit: int = MAX_SUBJECTS_PER_READ, now: datetime | None = None
+    client_id: str,
+    *,
+    limit: int = MAX_SUBJECTS_PER_READ,
+    served: int = MAX_ALERTS_SERVED,
+    now: datetime | None = None,
 ) -> ClientAlerts:
     """Every one of a client's subscriptions' alert state, in ONE query, keyed by subscription id.
 
@@ -2547,7 +2638,7 @@ def client_alerts(
     return ClientAlerts(
         snapshots={
             subscription_id: _snapshot(
-                subscription_id, subject_rows, now=instant, truncated=truncated
+                subscription_id, subject_rows, now=instant, truncated=truncated, served=served
             )
             for subscription_id, subject_rows in grouped.items()
             if subscription_id
@@ -3259,6 +3350,9 @@ def event_validity(
 
 
 __all__ = [
+    "CHANNELS",
+    "CHANNEL_WEBHOOK",
+    "CHANNEL_WEB_PUSH",
     "MAX_ALERTS_SERVED",
     "MAX_SUBJECTS_PER_READ",
     "QUERY_SPECS",
@@ -3294,6 +3388,7 @@ __all__ = [
     "commit_event",
     "configure",
     "create_subscription",
+    "daily_cap_of",
     "database_id",
     "delete_subscription",
     "empty_alert_snapshot",

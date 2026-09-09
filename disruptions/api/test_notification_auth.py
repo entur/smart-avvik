@@ -1254,5 +1254,168 @@ def _run_all() -> None:
     print(f"\n{len(tests)} client auth checks passed.")
 
 
+
+# ---- Per-client quotas (2026-09-09) ------------------------------------------------------------
+
+
+def test_quotas_default_to_the_pilot_constants_and_ride_on_the_principal():
+    """A new account carries the three quota fields at the module defaults, and `authenticate`
+    hands them to the router on the Principal for the price of the account read it already pays."""
+    store = _install()
+    bearer = _provision(store)
+    try:
+        account = notification_auth.get_account(CLIENT)
+        assert account is not None and account.quotas == notification_auth.DEFAULT_QUOTAS
+        stored = store.get(notification_auth.ACCOUNTS, CLIENT)
+        assert stored is not None
+        assert stored["max_active_subscriptions"] == (
+            notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
+        )
+        assert stored["requests_per_minute"] == notification_auth.PER_CLIENT_PER_MIN
+        assert stored["daily_cap"] == notification_store.MAX_ALERT_DELIVERIES_PER_DAY
+        reads = store.reads
+        principal = notification_auth.authenticate(f"Bearer {bearer}")
+        assert principal.quotas == notification_auth.DEFAULT_QUOTAS
+        assert store.reads - reads == 2, "the credential and the account: no third read for quotas"
+        # A Principal built without quotas -- every existing test does this -- is the default.
+        assert notification_auth.Principal(client_id=CLIENT, key_id="k").quotas == (
+            notification_auth.DEFAULT_QUOTAS
+        )
+    finally:
+        _uninstall()
+
+
+def test_set_client_quotas_changes_only_what_it_names_and_is_audited():
+    store = _install()
+    bearer = _provision(store)
+    try:
+        assert notification_auth.authenticate(f"Bearer {bearer}").quotas.daily_cap == 4
+        account = notification_auth.set_client_quotas(
+            CLIENT, actor="operator@entur.org", max_active_subscriptions=2000, daily_cap=12
+        )
+        assert account.quotas == notification_auth.Quotas(
+            max_active_subscriptions=2000,
+            requests_per_minute=notification_auth.PER_CLIENT_PER_MIN,
+            daily_cap=12,
+        )
+        # The cache entry is cleared, so the very next authentication carries the change.
+        principal = notification_auth.authenticate(f"Bearer {bearer}")
+        assert principal.quotas == account.quotas
+        audit = [row for row in store.audit() if row.get("action") == "set_client_quotas"]
+        assert len(audit) == 1, audit
+        assert audit[0]["result"] == "ok" and audit[0]["client_id"] == CLIENT
+        assert audit[0]["reason"] == "daily_cap=12, max_active_subscriptions=2000"
+        # `create_client` with quotas is for a NEW account; an existing one keeps its values.
+        again = notification_auth.create_client(
+            CLIENT,
+            name="Acme Reise AS",
+            actor="operator@entur.org",
+            quotas=notification_auth.Quotas(daily_cap=1),
+        )
+        assert again.quotas.daily_cap == 12
+    finally:
+        _uninstall()
+
+
+def test_quota_values_outside_their_bounds_are_refused_and_bad_stored_values_read_as_defaults():
+    store = _install()
+    _provision(store)
+    try:
+        for bad in (
+            {"daily_cap": 0},
+            {"daily_cap": 1_001},
+            {"requests_per_minute": 0},
+            {"max_active_subscriptions": 10_001},
+            {"max_active_subscriptions": True},
+        ):
+            try:
+                notification_auth.set_client_quotas(CLIENT, actor="op@entur.org", **bad)
+            except notification_auth.Conflict:
+                pass
+            else:
+                raise AssertionError(f"{bad} must be refused")
+        try:
+            notification_auth.set_client_quotas(CLIENT, actor="op@entur.org")
+        except notification_auth.Conflict:
+            pass
+        else:
+            raise AssertionError("naming no quota must be refused")
+        try:
+            notification_auth.set_client_quotas("nobody", actor="op@entur.org", daily_cap=5)
+        except notification_auth.NotFound:
+            pass
+        else:
+            raise AssertionError("an unknown client must be NotFound")
+        # Unreadable, out-of-bounds and missing STORED values read as the default -- never as zero,
+        # and never above the bound that protects the create transaction.
+        store.update(
+            notification_auth.ACCOUNTS,
+            CLIENT,
+            {"daily_cap": "many", "requests_per_minute": 10**9},
+        )
+        account = notification_auth.get_account(CLIENT)
+        assert account is not None
+        assert account.quotas.daily_cap == notification_store.MAX_ALERT_DELIVERIES_PER_DAY
+        assert account.quotas.requests_per_minute == notification_auth.PER_CLIENT_PER_MIN
+        stored = store.get(notification_auth.ACCOUNTS, CLIENT)
+        assert stored is not None
+        store.set(
+            notification_auth.ACCOUNTS,
+            CLIENT,
+            {k: v for k, v in stored.items() if k not in notification_auth.QUOTA_BOUNDS},
+        )
+        legacy = notification_auth.get_account(CLIENT)
+        assert legacy is not None and legacy.quotas == notification_auth.DEFAULT_QUOTAS
+        # And the per-client limiter honours a limit below the module default.
+        notification_auth.claim_client_slot("tiny", limit=2)
+        notification_auth.claim_client_slot("tiny", limit=2)
+        try:
+            notification_auth.claim_client_slot("tiny", limit=2)
+        except notification_auth.RateLimited:
+            pass
+        else:
+            raise AssertionError("the third call against a limit of two must be refused")
+    finally:
+        _uninstall()
+
+
+def test_the_tool_sets_quotas_and_create_client_takes_them_for_a_new_account():
+    store = _install()
+    try:
+        allow = _allow()
+        base = ["--environment", "dev"]
+        code, out = _run(
+            [*base, "create-client", "--client-id", CLIENT, "--name", "Acme", "--daily-cap", "6"],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0, out
+        account = notification_auth.get_account(CLIENT)
+        assert account is not None and account.quotas.daily_cap == 6
+        code, out = _run(
+            [*base, "set-quotas", "--client-id", CLIENT, "--max-active-subscriptions", "2000"],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0, out
+        account = notification_auth.get_account(CLIENT)
+        assert account is not None
+        assert account.quotas.max_active_subscriptions == 2000 and account.quotas.daily_cap == 6
+        code, out = _run(
+            [*base, "set-quotas", "--client-id", CLIENT, "--daily-cap", "0"],
+            authorizer=allow,
+            store=store,
+        )
+        assert code != 0, "a value outside its bound must be refused, not stored"
+        code, out = _run([*base, "set-quotas", "--client-id", CLIENT], authorizer=allow, store=store)
+        assert code != 0, "naming no quota must be refused"
+        code, out = _run([*base, "show-client", "--client-id", CLIENT], authorizer=allow, store=store)
+        assert code == 0 and '"daily_cap": 6' in out and '"max_active_subscriptions": 2000' in out
+        assert [r["action"] for r in store.audit() if r["action"] == "set_client_quotas"] == [
+            "set_client_quotas"
+        ], "one audited change; the two refusals were refused before the audit row"
+    finally:
+        _uninstall()
+
 if __name__ == "__main__":
     _run_all()

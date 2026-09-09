@@ -115,12 +115,22 @@ other.
 
 ## Rate limits and quotas
 
+**The per-client values are pilot defaults, set per client.** Your operator can raise or lower three
+of them on your account without a deploy: active subscriptions, requests per minute, and the daily
+notification cap per subscription (4 by default, the same as `/varsel`'s per registration). Ask for the
+numbers your integration needs when you are provisioned. Two things about them worth knowing: a
+subscription ceiling above 10 000 needs work on our side first (the create transaction counts your
+live subscriptions by reading them, and past that the count has to become an aggregation), and your
+daily cap is copied onto each subscription when you write it, so a raised cap reaches an existing
+subscription on your next `POST` of it — the idempotent re-registration is enough.
+
 | limit | value | breach |
 |---|---|---|
 | global pre-lookup, process-wide, 60 s sliding | 300 req/min | `429 rate_limited`, `Retry-After: 60` |
-| per client, after authentication, 60 s sliding | 120 req/min | `429 rate_limited`, `Retry-After: 60` |
+| per client, after authentication, 60 s sliding | 120 req/min (default; per client) | `429 rate_limited`, `Retry-After: 60` |
 | `POST /test-events`, per client, on top of the above | 6 req/min | `429 test_events_rate_limited`, `Retry-After: 60` |
-| active subscriptions per client | 500 | `429 quota_exceeded`, `Retry-After: 300` |
+| active subscriptions per client | 500 (default; per client, at most 10 000) | `429 quota_exceeded`, `Retry-After: 300` |
+| alert deliveries per subscription per Oslo day | 4 (default; per client, at most 1 000) | the next is suppressed for the day, not queued |
 | active credentials per client | 8 | operator-side `Conflict` |
 | active destinations per client | 4 | operator-side `Conflict` |
 | list page size | default 100, max 500 | `422` outside 1–500 |
@@ -371,9 +381,10 @@ Each subject: `alert_id`, `phase` (`predicted` or `confirmed` — a withdrawn al
 
 Two bounds, and they answer different questions:
 
-- **At most 4 subjects are enumerated**, deliberately the daily notification cap: a fifth is one the
-  cap has already suppressed today, so listing it would be reporting what cannot be told to anybody.
-  The **counts are over everything read**, so nothing is hidden, only unenumerated.
+- **At most your daily cap's worth of subjects are enumerated** (4 unless your client's cap is
+  higher, never fewer than 4), deliberately: a subject past the cap is one it has already suppressed
+  today, so listing it would be reporting what cannot be told to anybody. The **counts are over
+  everything read**, so nothing is hidden, only unenumerated.
 - **At most 500 subject documents are read per request.** Past that, `truncated: true` and the counts
   are lower bounds. On a list page the flag is set on **every** row when that page's single query was
   bounded, and it fires at 500 live subjects **across the whole client**, not per subscription. Ask
@@ -543,7 +554,7 @@ One attempt per pending event per notification pass; the next pass is the retry.
 
 | your answer | ours |
 |---|---|
-| 2xx | success. The daily cap slot is spent here, on success — a dead endpoint must not burn your four |
+| 2xx | success. The daily cap slot is spent here, on success — a dead endpoint must not burn your day's allowance |
 | **410 Gone** | terminal for the event, and the **destination is paused until an operator resumes it** |
 | 408, 429, 5xx | retryable. `Retry-After` is honoured, capped at the lesser of the header, the time to departure, and 300 s, and persisted so the backoff survives a pass boundary and a restart |
 | other 4xx | terminal for that event only; other events and other destinations are unaffected |
@@ -556,7 +567,7 @@ there is one attempt per cycle, the next cycle repeats the cold start, and the e
 `expired`, which reads like ordinary expiry rather than a stuck destination. `minInstances: 1` on your
 receiver is the fix, and measuring that latency before enablement is a required pre-flight check.
 
-**At most four alert notifications per subscription per Oslo day**, spent soonest-departure-first —
+**At most your daily cap's worth of alert notifications per subscription per Oslo day** (four by default), spent soonest-departure-first —
 `/varsel`'s own cap at `/varsel`'s own grain. A commuter who registers a morning and an evening watch
 has an allowance for each; bounding a traveller's total across their watches is yours to add if you
 want one. A suppressed alert is recorded and re-offered on the next pass.
