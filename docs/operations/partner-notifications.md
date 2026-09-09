@@ -80,8 +80,23 @@ It gates the **notification pass**, not the API: with it off, the poller never l
 never mints an event and never delivers, while `/notification-api/v1` still serves. That asymmetry is
 deliberate — gating onboarding on the flag that needs onboarding is circular.
 
-With it off the `partner_webhooks` phase never enters, so `poller_cycle.phases` carries **no key for
-it at all**. An operator reading a cycle breakdown sees the key absent, not zero.
+With it off **neither** partner phase enters — `partner_webhooks` nor `partner_servability` — so
+`poller_cycle.phases` carries no key for either. An operator reading a cycle breakdown sees the keys
+absent, not zero.
+
+**That gating has one consequence to know during onboarding, and the reason for it is the interesting
+part.** `partner_servability` is what re-asks a stale or never-established servability answer every
+six hours and clears the caveat from a pair a later timetable connects. Gated, it does not run until
+this flag is on in that environment — so a partner who registers before enablement sees the
+**create-time** answer, with `servable_checked_at` publishing its age. That is R6's "how fresh"
+rather than an all-clear, and it is worth saying plainly because the obvious workaround does not
+work: an identical re-`PUT` is a `touch_subscription`, **not** a re-ask, and only a *changed*
+definition re-asks.
+
+Gating it anyway is the right trade. Ungated, every deployment that has onboarded nobody — all three
+today — and tst, which has no named database, would read Firestore and ask BigQuery on every cycle
+for an empty population. And "the flag is unset, so no partner state was read" would stop being a
+property of the poller, which is the sentence this document leans on everywhere else.
 
 ### 4. `NOTIFICATION_PARTNER_LLM_ENABLED` — partner wording
 
@@ -357,16 +372,17 @@ silently.
 | `partner_auth` | a refused credential | `reason`, `key_id`. **The secret is logged nowhere at any level** |
 | `partner_admin` | an operator action | `action`, `result`, `actor`, `partner_id`, `destination_id`, `key_id`. `action="show_signing_secret"` with `result="disclosed"` is a **credential read** — the audit document beside it carries the generation numbers in `reason`, never the secret |
 | `partner_test_event` | a synthetic send | `partner_id`, `key_id`, `destination_id`, `status` |
-| `partner_servability` | a servability check that failed or could not be written | `result` (`error`, `write_failed`) |
+| `partner_servability` | the six-hourly re-check sweep, and its per-record faults | `result`: `swept` (a clean pass), `capped` / `deadline` (a bound bound — logged at WARNING, because a ceiling nobody can see binding is not a ceiling anybody can size), `load_failed` (the store could not be read; every caveat stands), `vanished` (deleted while we were asking), `error` (the seam raised or timed out) and `write_failed`. A sweep record also carries `due`, `checked`, `cleared`, `unservable`, `truncated`, `ms`. **`error` and `write_failed` now come from two call sites**: the create path logs neither id, the re-check logs `partner_id` and `subscription_id` — both of which `partner_subscription` already logs, so this adds no new class of identifier |
 | `partner_alert_state` | a failed alert-state read behind a subscription response | `result` (`error`) |
 | `partner_delivery_refused` | an outbound refusal | `reason` |
 | `partner_delivery_response_truncated` | a 2xx body over the response cap | `limit` |
 | `partner_auth_config` / `partner_signing_config` | once per process: a secret arrived with whitespace and was stripped | `variable` — the **name only**, never the value |
 | `notification_wording` | a partner wording fault | `result` (`error`, `rate_limited`), `surface` |
-| `poller_phase` | the cycle breakdown | `phase="partner_webhooks"`, `ms`, `result` |
+| `poller_phase` | the cycle breakdown | `phase="partner_webhooks"` or `"partner_servability"`, `ms`, `result` |
 
-**What no partner log line carries:** an origin, a destination, a departure time, a full callback URL,
-a credential secret, or any notification prose.
+**What no `partner_*` log line carries:** an origin, a destination, a departure time, a full callback
+URL, a credential secret, or any notification prose. Read the qualifier — it is about these events,
+and the fourth entry below is why it needs one.
 
 **What some do carry, named rather than glossed** — this is the honest half of the retention claim:
 
@@ -378,6 +394,16 @@ a credential secret, or any notification prose.
   path or query, but not nothing.
 - **`partner_admin.actor` identifies a named human** — the operator's ADC identity, usually an email
   address, falling back to `$USER` and then to `"unknown"`.
+- **A partner subscription's origin and destination DO reach Cloud Logging — under `/varsel`'s event
+  name, not a partner one.** `main._varsel_connectivity` writes both stop refs into the *message* of
+  an INFO record (`event="varsel_service_check"`, `result="ok"`) on every established verdict. Its
+  structured `fields` carry only `event`, `result`, `forward` and `reverse`, which is why the claim
+  above stays literally true — and a reader who stopped there would be misled, which this document's
+  posture does not allow. The partner channel reaches it at **create time** (it always did) and now
+  again **every six hours per unservable subscription**, through `partner_servability`. It is
+  **pre-existing and shared with `/varsel`'s own registrations**, so the honest framing is an
+  accepted exposure this feature extends rather than a new leak; and if it is ever to be closed, the
+  fix is `/varsel`'s log line, not this channel's.
 
 Log retention and access are the cluster project's, not this repo's: nothing here configures a log
 bucket or a sink, so what applies is whatever `ent-kub-{dev,prd}` sets. **Verify it against the
@@ -604,15 +630,16 @@ the repository root; Python suites are `disruptions/api/`, TypeScript ones `inte
 | AE10 | `test_varsel_api.py::test_a_partner_subscription_matches_and_is_written_for_without_a_keypair` and the two budget tests beside it; `test_notification_wording.py::test_a_partner_wording_needs_no_vapid_keypair_and_no_model`; the delivery half is structural and is now pinned by `test_partner_contract.py::test_the_store_and_delivery_modules_import_no_poller_state` | yes |
 | AE11 | `test_partner_api.py::test_a_missing_or_wrong_credential_reads_nothing` and `::test_one_partner_cannot_reach_anothers_records_and_the_body_names_nothing`; `test_partner_store.py` tenant isolation; `test_llm_message.py::test_a_partner_call_keeps_prose_and_the_prompt_out_of_the_log`; `test_varsel_api.py::test_a_partner_only_route_records_no_decision_row`; and whole-tree in `test_partner_contract.py` (no partner field in any `data/queries` SQL, any front-end bundle, the decision-log DDL or any structured log field). **Shape note:** the `/historikk` and `/meldinger` half is a grep over the uncommented SQL — the repo's idiom, structurally stronger than a response assertion, but not a rendered-page check | yes |
 | AE12 | `test_partner_delivery.py::test_a_departed_train_becomes_expired_rather_than_failed_and_is_not_retried`; `test_partner_store.py::test_event_validity_is_the_earliest_of_three_things` | yes |
-| AE13 | `test_partner_api.py::test_an_unservable_pair_is_stored_and_carries_the_caveat`, `::test_a_provider_timeout_stores_no_caveat_rather_than_a_false_one`, `::test_a_changed_route_retires_the_old_servability_answer` | **partial, and the gap is behavioural** — "re-checked as service appears" holds for the amendment path only. `set_servability` has exactly one caller (create/replace); there is no poller-side sweep for partner subscriptions. Open question 4 below |
+| AE13 | **Stored with the caveat:** `test_partner_api.py::test_an_unservable_pair_is_stored_and_carries_the_caveat`, `::test_a_provider_timeout_stores_no_caveat_rather_than_a_false_one`, `::test_a_changed_route_retires_the_old_servability_answer`. **Re-checked as service appears:** `test_partner_servability.py` (27 checks) — `::test_service_that_appeared_clears_the_caveat`, `::test_a_never_established_answer_is_due`, `::test_an_unchanged_answer_still_moves_the_stamp`, `::test_a_verdict_that_could_not_be_established_writes_nothing_at_all`, `::test_the_interval_is_varsels_own`; wired and gated in `test_poller_refresh.py` | yes |
 | AE14 | `test_varsel_api.py::test_a_broken_partner_store_costs_the_partner_channel_and_nothing_else` (raises, hangs and one unreadable document, in one test, asserting browser matching, wording, delivery, decision recording **and** state persistence all complete); `test_partner_delivery.py::test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait`; `test_partner_events.py::test_a_hung_store_cannot_extend_the_step_past_its_bounded_wait` | yes |
 | AE15 | `test_partner_delivery.py::test_a_restart_between_commit_and_delivery_resends_the_original_id_and_revision`; `test_partner_store.py::test_only_a_lifecycle_transition_mints_a_revision` and `::test_a_changed_payload_mints_nothing`; the receiver's suppression in `notifications-client/test/process.test.mjs` | yes |
 | AE16 | `notifications-client/test/policy.test.mjs`, `test/process.test.mjs`, `test/genericReceiver.test.mjs` (over a socket) and `firebase-notifications/test/emulator/store.test.mjs` (through the transaction) | yes |
 | AE17 | `test_partner_store.py::test_the_daily_cap_is_spent_on_success_and_a_replacement_is_exempt` and `::test_the_cap_is_keyed_on_the_oslo_day_not_utc` (the counter is on the subscription document); receiver-side per-subscription ledger state in `notifications-client/test/policy.test.mjs` and `firebase-notifications/test/emulator/store.test.mjs` | **partial** — the grain is pinned structurally, but no sender-side test runs two disrupted subscriptions and asserts 4 + 4 in one Oslo day, and the TypeScript tests labelled AE17 prove per-subscription **ledger** state, which is a different claim |
 | AE18 | `test_partner_api.py::test_a_synthetic_event_is_refused_for_a_live_subscription`, `::test_a_replace_cannot_clear_or_set_the_test_marker`, `::test_a_test_event_is_signed_over_the_exact_bytes_and_stores_nothing`; the receiver refuses before native dispatch in `notifications-client/test/process.test.mjs`, and end to end in `firebase-notifications/test/endToEnd.test.mjs` | yes |
 
-**No AE is at zero coverage**, and none rests on a deferred manual check. The four partial rows carry
-a named uncovered clause each, and only AE13's is a behaviour gap rather than a test gap.
+**No AE is at zero coverage**, and none rests on a deferred manual check. Three rows remain partial,
+each with a named uncovered clause, and all three are test gaps rather than behaviour gaps — AE13's
+was the one behaviour gap and its second clause is now built.
 
 Two things no test can establish and that stay on the pre-flight checklist above: the **pilot
 destination's cold-start latency** against the 5 s per-attempt ceiling, and a **test-phone
@@ -635,10 +662,6 @@ Named here because they are decisions somebody has to make, not documentation ga
    hidden.
 3. **`NOTIFICATION_PARTNER_LLM_ENABLED` is in no chart.** Whether partner prose is the model's is a
    product decision, and the name lands in Helm when that decision is made.
-4. **There is no periodic servability re-check for a partner subscription.** `/varsel` re-asks every
-   6 h for its own registrations; the partner path sets the verdict on create and replace only, so a
-   weekend-only route reads `servable: false` until the partner re-POSTs. The published contract says
-   so; closing it is a follow-up.
 
 ---
 

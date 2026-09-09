@@ -50,8 +50,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   ~120 s of headroom, and BigQuery owns ~97 % of what is spent. The corollary matters when sizing
   anything user-facing: **the expensive part of a cycle does not scale with registrations**, and
   what does — `varsel_notify` — is 3 % of it.
-  A **sixth phase, `partner_webhooks`, exists since 2026-09-08** and is present only when the partner
-  channel's flag is on — with it off the key is *absent* from `poller_cycle.phases`, not zero. It runs
+  **Two partner phases exist since 2026-09-08**, `partner_webhooks` and — since 2026-09-09 —
+  `partner_servability` after it, and both are present only when the partner channel's flag is on:
+  with it off the keys are *absent* from `poller_cycle.phases`, not zero. `partner_webhooks` runs
   after `varsel_notify`, i.e. after `check_and_notify` has returned, so a raise inside it cannot
   unwind the decision-log write or the state save at all. Two of its worst cases are **ceilings**
   rather than timings and the distinction is worth keeping: a destination hanging forever costs
@@ -61,8 +62,15 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   timings beside them: a hanging destination ~5.0 s (one attempt at the 5 s per-attempt ceiling —
   since claims are sharded per subscription, 30 pending on one subscription are one shard and the
   first failure skips the rest), a healthy backlog of 200 pending in 7 ms, emit of 200 subjects in
-  14 ms. Note the period quoted above is **stale**: measured again on 2026-09-08 it is ~296 s,
-  against which the 28 s ceiling is ~9.5 % of one cycle.
+  14 ms. `partner_servability` is the six-hourly re-ask of a stale or never-established servability
+  answer (`varsel.recheck_service`'s partner copy, which cannot reach these because it walks
+  `_journeys`). Its own number is likewise a **ceiling**: `_DEADLINE_S` (30 s) **plus one
+  `set_servability`**, because the budget reserves the BigQuery question and not the store write that
+  follows it — typical is ~0, since nothing is due on a healthy list and a due one costs ~2 s. It is
+  its own phase rather than folded into `partner_webhooks` precisely because that phase's measured
+  `ms` is the unit KTD6's reversal trigger is stated in, and adding this reservation to its 28 s
+  would fire the trigger on a healthy cycle. Note the period quoted above is **stale**: measured
+  again on 2026-09-08 it is ~296 s, against which the 28 s ceiling is ~9.5 % of one cycle.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket

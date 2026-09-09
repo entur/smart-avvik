@@ -308,11 +308,25 @@ places today?", from `/varsel`'s own connectivity check.
   endpoint's own rate limit. It is never an all-clear, and it is never written as `false`.
 - The answer is retired and re-asked when you amend the definition.
 
-**Known gap, published rather than implied.** There is no periodic re-check for a partner
-subscription. `/varsel` re-asks every 6 h for its own registrations and clears the caveat when service
-appears; the partner path sets the verdict on create and replace only, so a weekend-only route reads
-`servable: false` until you re-POST it. Re-POSTing the identical definition is the workaround and it
-costs nothing. Tracked as a follow-up.
+**It is re-asked, and the cadence is `/varsel`'s own: every six hours per record.** A weekend-only
+ferry registered on a Friday evening, a seasonal route registered out of season and a pair whose
+timetable had not been published yet all answer "no direct service" at registration and start running
+later, so the caveat clears by itself. Three properties of that sweep are worth knowing:
+
+- **Only `false` and `null` are re-asked.** A `true` is never re-checked, deliberately: the harm is
+  one-directional — a stale `false` shows you a caveat about a watch that is working, while a stale
+  `true` renders nothing and publishes its own age in `servable_checked_at`, which is what R6 asks
+  for instead of a silent all-clear.
+- **The stamp moves on every established answer, including an unchanged `false`.** So
+  `servable_checked_at` is the age of the last *answer*, not of the last *change*.
+- **A check that could not be established writes nothing at all** — neither the value nor the stamp.
+  One BigQuery blip must not become a freshly-stamped non-answer.
+
+**One window where it does not run**, and it is worth knowing during onboarding: the sweep is gated
+on the same flag as delivery, so until the partner channel is enabled in that environment nothing
+refreshes a caveat. Re-`POST`ing the *identical* definition does not re-ask either — that path is a
+liveness touch, and only a **changed** definition re-asks. So in that window you are looking at the
+create-time answer, with `servable_checked_at` telling you how old it is.
 
 Related: `/varsel` rewrites stored registrations onto canonical stop refs when the stop registry
 rebuilds, and that rewrite reaches its own state blob and **not** Firestore. Your refs are
