@@ -272,18 +272,39 @@ Check that first when somebody who *is* in the group is refused.
 | `list-keys` | key ids and state, never a secret |
 | `create-destination` / `amend-destination` | the URL is address-tested before the write |
 | `pause-destination` / `resume-destination` | `resume` also lifts a pause a 410 caused |
+| `show-signing-secret` | prints **every live generation's** signing secret for a destination, each with its number and its `active`/`retiring` role. **Prints a live credential** — see below |
 | `rotate-signing` | mints the next generation; the current one retires, both live at once |
 | `retire-signing` | drops the retiring generation after cutover |
 
-**Nothing here prints a destination's verification secret, and a partner cannot integrate without
-it.** `webhook_signing.derive_secret` has exactly one caller — `webhook_signing.sign` — the tool
-imports only `partner_auth`, and `GET /destinations/current` serves generation *numbers* and never
-calls the derivation, which is what keeps "the API cannot produce a signing secret" a property of the
-code rather than of a response shape. That is the right posture for the API and it leaves onboarding
-with no shipped path: an operator holding `PARTNER_SIGNING_ROOT` must derive it by hand
-(`webhook_signing.derive_secret(destination_id, generation)`) and hand it over out of band, once per
-live generation, and again on each `rotate-signing`. A `show-signing-secret` subcommand — gated on the
-same group and audited like every other action — is the obvious closure and is not built.
+### `show-signing-secret` — the one command that prints a live credential
+
+It is the only path to a destination's verification secret, and there is deliberately no other:
+`GET /destinations/current` serves generation *numbers* and never calls the derivation, because a
+secret fetchable over the partner's own API credential is a secret that credential can be traded for.
+Nothing is stored or looked up — the value is **derived** from `PARTNER_SIGNING_ROOT` over
+`destination_id || generation`, which is why the store holds no signing material and one partner's
+leaked receiver secret forges nothing for another.
+
+**It needs that environment's `PARTNER_SIGNING_ROOT` exported**, like `issue-key` needs the pepper,
+and there is an early pre-check that says so. That pre-check runs **before** the group check, on
+purpose: without it a missing export would surface as `SigningNotConfigured`, whose message is about
+Secret Manager and the chart's secret group — the wrong hint for a human at a terminal who has simply
+not exported a variable — and worse, it would read as an authorization failure. A missing root exits
+**2** with a message about the variable and writes no audit row; an authorization refusal exits **3**
+and does.
+
+**It prints every live generation**, each with its number and its `active`/`retiring` role, not just
+the active one. During a rotation two verify at once and "which one do I install?" is the first
+question a partner asks: install the active one, keep accepting the retiring one until
+`retire-signing` runs.
+
+**Handling.** This is the one command whose output must not go into a ticket, a chat message or a
+shell history file. Hand it over the way a password is handed over. If the value has been anywhere it
+should not, `rotate-signing` the destination — that is what the two-generation overlap is for, and it
+costs the partner nothing but adding a string to the array their receiver already accepts. The read
+is audited before the value is produced (`action="show_signing_secret"`, `result="disclosed"`, with
+the generation numbers in `reason`), so a refusal partway through still leaves the row saying somebody
+asked; a credential disclosure is precisely what an append-only audit exists for.
 
 **Authorization** is a named group, checked transitively through Cloud Identity, with the actor taken
 from ADC and never from an argument:
@@ -302,9 +323,12 @@ service account. Provisioning both is a manual prerequisite.
 best-effort appends an audit row — best-effort because the same IAM that gates the action may gate
 the audit write, which is exactly why the stderr line always goes out.
 
-Exit codes: `0` success, `2` missing pepper or an auth-plane error, `3` refused. Note `issue-key`'s
-pepper pre-check runs **before** the group check, so a missing `PARTNER_KEY_PEPPER` exits 2 and writes
-**no audit row at all**.
+Exit codes: `0` success, `2` a missing secret or an auth-plane error, `3` refused. Two subcommands
+carry an early pre-check on the environment variable they need — `issue-key` on
+`PARTNER_KEY_PEPPER`, `show-signing-secret` on `PARTNER_SIGNING_ROOT` — and **both run before the
+group check**, so a missing export exits 2 with a message about the variable and writes **no audit
+row at all**. That ordering is deliberate: reported after the group check, a missing export would
+read as an authorization failure and send an operator to the wrong place entirely.
 
 The audit record — `audit_id` (a sortable millisecond timestamp plus random bytes), `actor`, `action`,
 `result`, `at`, `partner_id`, `destination_id`, `key_id`, `reason` — is append-only; nothing in this
@@ -331,7 +355,7 @@ silently.
 | `partner_subscription` | a create, no-op or tombstone | `result`, `partner_id`, `subscription_id` |
 | `partner_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
 | `partner_auth` | a refused credential | `reason`, `key_id`. **The secret is logged nowhere at any level** |
-| `partner_admin` | an operator action | `action`, `result`, `actor`, `partner_id`, `destination_id`, `key_id` |
+| `partner_admin` | an operator action | `action`, `result`, `actor`, `partner_id`, `destination_id`, `key_id`. `action="show_signing_secret"` with `result="disclosed"` is a **credential read** — the audit document beside it carries the generation numbers in `reason`, never the secret |
 | `partner_test_event` | a synthetic send | `partner_id`, `key_id`, `destination_id`, `status` |
 | `partner_servability` | a servability check that failed or could not be written | `result` (`error`, `write_failed`) |
 | `partner_alert_state` | a failed alert-state read behind a subscription response | `result` (`error`) |
@@ -643,10 +667,11 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
    branch — its dated-leg half is ~2 500 lines and +99.2 MB per bus prediction run that the next
    change would delete — and the wording seam was extracted by file rather than merged. The open PR
    is #136; close it rather than letting it rot open beside a branch that superseded it.
-6. **Hand the partner its verification secret out of band**, derived by hand from the environment's
-   signing root — no shipped command prints one (see the operator tool above). Repeat it on every
-   `rotate-signing`, and remember the receiver takes an **array**, so during a rotation the partner
-   holds both generations and revocation is removing one.
+6. **Hand the partner its verification secret out of band**, from `show-signing-secret` with that
+   environment's `PARTNER_SIGNING_ROOT` exported (see the operator tool above — it prints a live
+   credential, and the read is audited). Repeat it on every `rotate-signing`, and remember the
+   receiver's `secrets` callback returns a **list**, so during a rotation the partner holds both
+   generations and revocation is dropping one from what that callback returns.
 7. **Complete the KTD12 checklist** above before any partner is enabled: the per-operator verdict
    counts and go/no-go, the sign-off on any unmeasured operator, the cold-start measurement, and the
    pass measurement in the target environment.
