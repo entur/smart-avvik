@@ -50,6 +50,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   ~120 s of headroom, and BigQuery owns ~97 % of what is spent. The corollary matters when sizing
   anything user-facing: **the expensive part of a cycle does not scale with registrations**, and
   what does — `varsel_notify` — is 3 % of it.
+  A **sixth phase, `partner_webhooks`, exists since 2026-09-08** and is present only when the partner
+  channel's flag is on — with it off the key is *absent* from `poller_cycle.phases`, not zero. It runs
+  after `varsel_notify`, i.e. after `check_and_notify` has returned, so a raise inside it cannot
+  unwind the decision-log write or the state save at all. Two of its worst cases are **ceilings**
+  rather than timings and the distinction is worth keeping: a destination hanging forever costs
+  `_DELIVERY_WAIT_S` (20.0 s) and a hung store costs `_EMIT_WAIT_S` + `_DELIVERY_WAIT_S` = **28.0 s**,
+  2 s under KTD6's 30 s reversal trigger and pinned as such by
+  `test_partner_events.test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger`. The
+  timings beside them: a hanging destination ~5.0 s (one attempt at the 5 s per-attempt ceiling —
+  since claims are sharded per subscription, 30 pending on one subscription are one shard and the
+  first failure skips the rest), a healthy backlog of 200 pending in 7 ms, emit of 200 subjects in
+  14 ms. Note the period quoted above is **stale**: measured again on 2026-09-08 it is ~296 s,
+  against which the 28 s ceiling is ~9.5 % of one cycle.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket
@@ -116,6 +129,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Work is shared per journey *definition* (`varsel.journey_key`): two
   devices watching the same trip drive one `/impact` call and one written message and see identical
   text, while push dedup stays keyed on `journey_id` so each device is still notified once.
+  **Since 2026-09-09 that group can also contain a partner subscription** (KTD3, see the partner
+  channel's own section below): a webhook recipient is another registration in the same group, so one
+  match and one wording fan out to both channels. It is a **view merged at match time, never a
+  materialization** — `by_journey_key` stays browser-only because that is what `_record_decisions`
+  iterates, and `_journeys`, `_notified` and the GCS state blob never carry a partner id.
   **`to_stop` narrows `/impact`**: only trains that actually reach it are returned, so a caller
   passing it sees fewer situations than one that does not.
   **One picker row per physical place** (2026-08-03): `/varsel-api/stops` collapses stop refs that
@@ -367,6 +385,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
     `push_enabled=false`); the journey list still works. Regenerate with
     `uv run --with pywebpush python disruptions/api/gen_vapid.py`.
+    **The keypair no longer gates the writing pass** (KTD4, 2026-09-08). `check_and_notify` used to
+    skip loop 1c entirely when no keypair was loaded, on the reasoning that writing prose nobody can
+    receive is spend with no reader — the reasoning is right and the test was wrong, because it read
+    "no keypair" as "no reader" and so a webhook-only deployment, and tst which has no keypair, wrote
+    nothing at all. The condition is now **at least one deliverable recipient on any channel**:
+    browser push enabled, or a partner subscription with a pending delivery for that train. The other
+    half of the same move is the expensive one — a browser recipient is **not** pending when
+    `push_enabled()` is false, because `_pending_pushes` derives pending-ness from `_notified` and
+    `_notified` only grows on a successful browser send, so without that clause a keypair-less
+    deployment reports every alert-worthy train as pending for every browser registration on every
+    cycle and spends the whole write budget re-wording trains it can never deliver. A journey with no
+    deliverable channel still writes nothing and still records `message_status='push_disabled'`, so
+    that value keeps its meaning for browser subjects.
   - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
@@ -499,7 +530,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **The poller's two blocking passes run CONCURRENTLY** (2026-08-21), which is what makes a pilot
   ten times the size affordable. `check_and_notify`'s loop 1 is now three passes: **1a** matches
   every journey across `varsel._MATCH_WORKERS` (16) — carrying the Journey Planner lookups with it,
-  since those live inside `match_journey`; **1b** reconciles caches and picks what to write for,
+  since those live inside `match_journey`, and, since 2026-09-09, matching partner subscriptions in
+  the same pass as browser registrations grouped on `journey_key`; **1b** reconciles caches and picks what to write for,
   sequentially, because it only mutates module state and blocks on nothing; **1c** writes the
   wordings across `varsel._LLM_WORKERS` (16). Both ceilings moved with the widths and only make
   sense together — `_MAX_LLM_CALLS_PER_CYCLE` 8 → 64 and `alternatives._POLLER_FETCH_MAX_PER_MIN`
@@ -525,6 +557,166 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   nobody noticed while ~44 registrations rarely reached a cap of 8, but at ten times that the cap
   binds on every busy morning and would hand the whole budget to whichever travellers registered
   earliest, every cycle, forever.
+
+- The **partner notification channel** (`/notification-api/v1`, `disruptions/api/partner_*.py` +
+  `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external partner's BFF the alerts
+  `/varsel` already sends its own browsers, as signed HTTPS webhooks. The three documents are
+  `docs/integrations/notification-api.md` (the partner contract), `docs/integrations/firebase-bff.md`
+  (the two vendored TypeScript packages under `integrations/`) and
+  `docs/operations/partner-notifications.md` (the operating contract, which carries the
+  clause-by-clause retention check and the enablement conditions). **It is off in every environment**
+  and needs four values and two Secret Manager secrets that do not exist yet; the operations document
+  is the sequence.
+  **It is `/varsel`'s logic reused by extraction, not a second alerting stack.** Which trains alert,
+  which alerts clear the bar, the per-train collapse, the Norwegian wording and the daily cap are
+  `/varsel`'s, unchanged: a partner subscription is another registration whose channel is a webhook,
+  grouped under `journey_key`, so a partner and a browser holding the same definition see the same
+  trains and cost **one match and one wording between them** — asserted by call count, because that
+  parity is the whole premise and the thing most likely to drift silently. `alert_policy.gate` is the
+  one statement of the threshold and the comparison, so the two surfaces cannot come to disagree
+  about what a threshold means; `is_material` — the origin branch's widening of that gate by a
+  declared cancellation anywhere on the ridden segment — is **refused by name** and its absence is
+  pinned by a grep, because a widening only ever adds subjects and would therefore be silent.
+  **Partner state is Firestore's and never `varsel_decisions`'** (KTD10). That table is written for
+  every match including sub-threshold ones and `/historikk` and `/meldinger` publish it on public
+  hosts — including resolved origin and destination names since 2026-08-22, accepted then because
+  prd's registrations are the team's test users. Partner-app travellers are not, and `/meldinger`
+  measured 21 of 31 stop pairs isolating exactly one journey. Its `pushed` column is also
+  journey-definition grain and cannot tell a webhook from a Web Push, so writing partner deliveries
+  there would corrupt both pages' meaning as well as their privacy claim. **The consequence is the
+  fourth of KTD12's limitations and it is created by this feature rather than inherited: a
+  partner-only route produces no decision row at all, so its alerts are not thinly evidenced — they
+  are unscored, deliberately.** Hence the Definition-of-Done term: no partner is enabled for an
+  operator `/historikk`'s verdicts do not cover without that gap recorded and signed off, and nothing
+  anywhere is a claim about any operator but **Vy rail** (21 308 of 21 331 replayed subjects were
+  VYG).
+  **The R16 prompt-record claim has two halves and only one is closed**, published rather than
+  asserted away. A **partner-only** definition — one absent from `by_journey_key`, which stays
+  browser-only for exactly this — is written for through `notification_wording.PARTNER`, which
+  suppresses the prompt/reply DEBUG record **in code** regardless of `VARSEL_LLM_LOG_PROMPTS` (dev has
+  it on) and drops `message` from the INFO record. A **shared** definition stays on the browser policy
+  unavoidably: one wording between the channels means one call and it is the browser's, and that
+  record would exist with no partner channel at all. So R16 is about partner-only routes plus every
+  other partner field; it is **not** "no partner route ever appears in the prompt log".
+  **Decide in the pass, deliver in the pass, after the browser cycle is already durable** (KTD6).
+  Emit and deliver are their own `main._rebuild_all` phase (`partner_webhooks`) placed after the
+  `varsel_notify` phase and fed by a `PassOutcome` that `check_and_notify` returns — deliberately
+  stronger than "after `_record_decisions` and `_save_state`", since running after the function has
+  *returned* means a raise cannot unwind either write at all. A return value rather than a
+  module-level snapshot, because a leaked half-cycle snapshot reads exactly like the give-up bug the
+  stale sweep exists to prevent. The read-only load step necessarily precedes pass 1a and reports
+  `event="varsel_partner_load"`. Every bound is a number: one attempt per pending event per cycle
+  with the next cycle as the retry; a **4-wide** pool (`/meldinger`'s width, the repo's narrowest, not
+  `varsel`'s 16/16/32); 5 s per attempt and 2 s connect; 4 s per Firestore call, under `varsel`'s 5 s
+  wait so a hung call surfaces as the store's own retryable `DeadlineExceeded` rather than as the
+  caller's timeout with a thread still running; and deadlines that **reserve** the worst case rather
+  than check a clock. The per-destination skip is **pass-local**, the documented exception to the
+  stale-sweep rule: swept, one failure would pause a destination permanently, which is
+  indistinguishable from the intended 410 pause.
+  **The store's own rules, each with the failure that motivated it.** Four collections, all **top
+  level** carrying a subscription id — a document delete does not remove subcollections and a TTL
+  field does not cascade into them, so subcollections would be orphaned by the deletion path and the
+  delivery query would keep returning them. **TTL is a retention floor and never an access rule**:
+  Firestore deletes within roughly 24 h and expired documents stay queryable until it does, so every
+  read path tests `expires_at` itself and a *missing* one reads as expired. **A transaction body may
+  run more than once**, so every `_*_body` takes its clock and its revision seed as arguments, reads
+  before it writes, returns rather than appending to an outer list, and logs nothing — the suite runs
+  each body twice against one fake transaction with a clock that raises and a logger that raises on
+  attribute access. `alert_id`'s grain is **(subscription, train)**, not per train: a per-train id
+  would make the supplied receiver's "drop a revision not strictly newer" rule suppress the *second*
+  commuter's notification about the same train. **A revision is minted only on a lifecycle
+  transition** — a changed probability, delay figure or wording mints nothing at any size, because
+  minting on a changed figure would turn every cycle into a fresh revision and a second notification
+  about one train. Monotonicity is structural: a UTC instant captured once outside the transaction,
+  clamped inside to `max(stored + 1, derived)` — an Oslo-formatted revision goes backwards for an hour
+  at every autumn DST fall-back and the receiver then silently discards every event for those
+  subjects, a confirmed cancellation included.
+  **The daily cap is `/varsel`'s, at `/varsel`'s grain**, four per subscription per Oslo day, spent
+  soonest-departure-first and spent **on success** — a dead destination must not burn a subscription's
+  four. Two things about it are published because they are not what the requirement's wording implies.
+  `cap_exempt` is decided **at mint, not at send**, so a `confirmed` minted before its `predicted` was
+  ever delivered is *not* exempt: it is the first notification about that train. And the exemption is
+  **generalised beyond "a confirmation"** to any replacement of a *delivered* revision, which includes
+  a **withdrawal** — a retraction the cap suppressed leaves the traveller holding a warning we have
+  withdrawn, the friskmelding argument. That widening is **an open product-owner question**, flagged
+  in the operations document rather than presented as settled.
+  **Signing is Standard Webhooks, fresh per attempt, per destination** (KTD7). HMAC-SHA256 over
+  `webhook-id.webhook-timestamp.<raw body>` with stdlib `hmac` and no new dependency; the body bytes
+  are stored once and signed unmodified, because re-serializing signs a document the receiver did not
+  get. **The `webhook-id` is the delivery id and is what gets persisted; never persist the timestamp
+  or the signature** — a retry reusing the first attempt's timestamp lands outside the receiver's
+  five-minute replay window, where a *correct* receiver drops our own retry as an attack. Each
+  destination's secret is HMAC of a root over length-framed `destination_id || generation`, so the
+  store holds no signing material and one partner's leaked receiver secret forges nothing for another;
+  both live generations ride in one header, each revocable alone.
+  **The outbound client uses a POSITIVE address test, not a deny-list** (KTD9), and that is not
+  belt-and-braces: implemented first as the bare `is_global and not is_multicast`, the NAT64 form
+  `64:ff9b::a9fe:a9fe` was **accepted** — global, non-private, non-multicast, `ipv4_mapped` None, and
+  in none of the named ranges — while the address it carries is the metadata service. So the same test
+  is re-run on whatever a prefix embeds (`::ffff:0:0/96`, `2002::/16`, `64:ff9b::/96`), judging the
+  reachable host rather than the notation. The host is resolved **once**, every returned address in
+  both families is validated, and the connection dials a validated literal while still sending the
+  original SNI and Host — validate-then-request-by-hostname is a time-of-check race, which is how
+  CVE-2026-27129 and SVIXSEC-2026-0001 both happened this year. An IPv4-mapped address is judged by
+  what it *carries* rather than refused outright; do not "fix" that into a blanket refusal.
+  **The API mounts unconditionally**, independent of `PARTNER_NOTIFICATIONS_ENABLED`, because gating
+  onboarding on the flag that needs onboarding is circular — availability is store plus pepper, read
+  per call, so tst answers 503 today. The consequence is accepted rather than overlooked:
+  **`/notification-api/v1` appears in the public `/docs`**, since `docs_url` is FastAPI's default, and
+  unlike Rushvarsel nothing here asks for the product to be unmentioned. The prefix is deliberately
+  **not** in `sso.PROTECTED_PREFIXES`: that gate answers an unconfigured deployment with 503 and an
+  unauthenticated browser with a 302, and a machine caller following a redirect into a Google login
+  screen gets HTML where it expected JSON. `/test-events` writes **nothing at all**, because the
+  store's pending-event ceiling is exact rather than best-effort *only because the emit path has one
+  writer* — one poller thread, no route invoking the pass, one replica under Recreate — and a route
+  calling `commit_event` would falsify every quota check in that module.
+  **What a reader sees in the logs**: `varsel_partner_load`, `partner_store_load`, `partner_emit`,
+  `partner_event`, `partner_delivery_round`, `partner_delivery`, `partner_quota`,
+  `partner_subscription`, `partner_cleanup`, `partner_auth`, `partner_admin`, `partner_test_event`,
+  `partner_delivery_refused`, `notification_wording`, and `poller_phase` with
+  `phase="partner_webhooks"`. None carries an origin, a destination, a departure time, a full callback
+  URL, a credential secret or any prose. Three do carry something and the operations document names
+  them rather than glossing: `subscription_id` embeds the partner's own reference,
+  `partner_delivery_refused.reason` can carry a refused destination's hostname and resolved addresses,
+  and `partner_admin.actor` is a named human. App logs live in the **cluster** project
+  (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
+  **`NOTIFICATION_PARTNER_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
+  other three flags; it is named in **no Helm values file** and defaults off, so the channel emits and
+  delivers the deterministic template until somebody adds it. Expect one divergence during the
+  rollout window: with `VARSEL_LLM_ENABLED=true` beside it false, the push carries the model's prose
+  while the event carries the template, so the two channels are byte-identical only where both
+  switches agree.
+  **Infrastructure is this repo's own Terraform** (`terraform/firestore.tf`, the directory's first
+  non-IAM resource): the API, one named Firestore database per environment in `europe-west1`
+  (immutable), six composite indexes materialised with `for_each` keyed on each index's **content**
+  rather than its array position, the four TTL field configs, and a prd-only backup schedule (five
+  weeks, a chosen value: Firestore allows 14 weeks on both recurrences — checked 2026-09-09 — and
+  five is what PITR's seven days does not already cover). The
+  runtime `roles/datastore.user` grant is the one part that **cannot** go there — a
+  `google_project_iam_member` runs under a `projectIamAdmin` conditioned by `only_assignable_roles`,
+  which carries no `roles/datastore.*` (note `terraform/oauth_iam.tf`'s own PARKED header diagnoses
+  the identical 403 as an org-level deny policy instead, and the two readings are not reconciled —
+  a conditioned grant and a deny policy refuse with the same wording); it goes in `.entur/application.yaml`, whose filter drops a
+  non-matching role **silently**, so the binding is verified after `entur apply` rather than assumed.
+  Plan-time index drift rests on one config line that is present: `firestore.indexes.json` is in
+  **both** of `terraform.yml`'s `paths:` lists, without which a PR adding a query and its index would
+  pass the static test, merge, apply nothing and land a runtime `FailedPrecondition`.
+  **The two TypeScript packages ship from here and are vendored, not published** (KTD11). Declared
+  consumption shape: compiled CommonJS plus `.d.ts` on Node 24, and `package.json` deliberately
+  declares **no `type` field** — with none, Node's syntax detection loads a `.ts` source as ESM (what
+  `node --test` needs) while treating `dist/*.js` as CommonJS (what the artifact needs); an explicit
+  `"commonjs"`, which `npm install` adds if allowed, kills the `.ts` path and `"module"` kills the CJS
+  emit. Both were observed and a test pins the omission. Two answers only the TypeScript side knows:
+  `firebase-functions@7.3.2`'s `retry` is reachable **only** through the options-object overload of
+  `onDocumentCreated`, and the `document: string` overload every quickstart shows produces
+  `retry === false` — not an absent field — so it deploys, runs, and silently drops events on the
+  first store blip; and the shipped `firestore.rules` is **necessary and not sufficient**, because
+  Firestore evaluates rules as a **union** and a deny cannot override an allow, so a partner merging
+  the four blocks into a ruleset carrying a permissive catch-all still has an open database.
+  **The two emulator suites cannot be started at the same instant**: this repo's root `firebase.json`
+  binds Firestore on 8571 with the hub on its default 4400, and the partner package pins 8572 / 9151 /
+  4401 and its own demo project id, which makes the *sequential* case safe (CI's shape) but not two
+  simultaneous starts — the contention is inside `firebase-tools`' own hub startup.
 
 - The **Varselhistorikk** page at `/historikk` (`demo/varselhistorikk/`, React + Vite + Entur
   Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered
