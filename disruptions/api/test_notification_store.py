@@ -643,7 +643,7 @@ def _emitted(**over: Any) -> tuple[_FakeClient, notification_store.EmitRequest]:
 # ---- Scenario 9: ceilings, refused before any write --------------------------------------------
 
 
-def test_a_partner_at_its_ceiling_is_refused_before_any_write():
+def test_a_client_at_its_ceiling_is_refused_before_any_write():
     client = _FakeClient()
     refs = notification_store._Refs(client)
     rows = [
@@ -970,7 +970,7 @@ def test_a_claim_finds_a_delete_that_landed_after_the_pending_set_was_read():
 # ---- Scenario 5: tenant isolation --------------------------------------------------------------
 
 
-def test_one_partner_cannot_read_or_affect_anothers_records():
+def test_one_client_cannot_read_or_affect_anothers_records():
     client = _FakeClient()
     client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
     _install(client)
@@ -995,7 +995,7 @@ def test_one_partner_cannot_read_or_affect_anothers_records():
     assert commit.status == "obsolete" and commit.reason == "foreign"
 
 
-def test_the_partner_listing_is_filtered_by_the_authenticated_partner():
+def test_the_client_listing_is_filtered_by_the_authenticated_client():
     client = _FakeClient()
     _install(client)
     notification_store.list_subscriptions(client_id=CLIENT, now=NOW)
@@ -1310,7 +1310,7 @@ def test_an_expired_subject_is_not_a_standing_alert():
         _uninstall()
 
 
-def test_one_partner_cannot_read_anothers_alert_state():
+def test_one_client_cannot_read_anothers_alert_state():
     """Tenancy is checked here rather than left to the caller, like every other
     subscription-scoped method in this module."""
     client = _FakeClient()
@@ -3519,7 +3519,7 @@ def emulator_test_the_ceiling_binds_and_counts_only_live_rows():
     assert notification_store.get_subscription("b", client_id=CLIENT, now=NOW) is not None
 
 
-def emulator_test_one_partner_cannot_list_or_touch_anothers_subscriptions():
+def emulator_test_one_client_cannot_list_or_touch_anothers_subscriptions():
     _emulator_setup()
     notification_store.create_subscription(_spec(subscription_id="mine"), now=NOW)
     notification_store.create_subscription(
