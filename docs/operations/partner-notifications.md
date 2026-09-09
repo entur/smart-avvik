@@ -146,7 +146,9 @@ of what replaced the origin plan's dated-leg replay gate. It survives as four li
    *shared* definitions and nothing else. prd's own registrations are the team's test users, so a
    partner's route mix overlaps them only by accident. **Partner-only routes are not thinly
    evidenced; they are unscored, deliberately.** Scoring them is deferred work, and the seven-day
-   event retention below is the constraint that work would first have to lift.
+   event retention below is the constraint that work would first have to lift. **Deferred by
+   decision on 2026-09-09** until `/historikk` and `/meldinger` are behind authentication, and to be
+   done then — see [Open questions](#open-questions-and-product-decisions), item 4.
 
 Therefore: **no generalized alert-quality claim, no per-route claim, and no claim about any operator
 but Vy rail.**
@@ -214,6 +216,9 @@ The first non-IAM resource this directory creates.
 | `google_firestore_index.partner` | `for_each` over `firestore.indexes.json`, **keyed on the index's own content**, never its array position — reordering the file would otherwise destroy and recreate every index |
 | `google_firestore_field.partner_ttl` | `expires_at` on all four notification collections. **No `index_config {}` block** — an empty one disables all indexes on the field, which is not what it looks like |
 | `google_firestore_backup_schedule.partner_daily` | prd only, `daily_recurrence` with `retention = "3024000s"` — five weeks, a chosen value rather than a ceiling. Firestore allows up to 14 weeks for both daily and weekly recurrences (checked against Google's documentation, 2026-09-09). Five is what PITR does not already cover: PITR gives the last seven days at minute granularity, so the backup buys the month beyond it |
+| `google_project_service.firebaserules` | `firebaserules.googleapis.com`, `disable_on_destroy = false` — the Rules API the two resources below need |
+| `google_firebaserules_ruleset.partner_deny_all` | reads the repo-root `firestore.rules` — the same file the emulator enforces — with `create_before_destroy`, because a ruleset a release still points at cannot be deleted |
+| `google_firebaserules_release.partner_firestore` | `cloud.firestore/partner-notifications`: makes the deny-all ruleset the named database's live rules. Added 2026-09-09 — until then the file was committed and emulated but deployed by nothing, and a console edit towards the open template would have been invisible from this repository; now it is drift the next apply reverts |
 
 **Do not add an IAM grant to this file.** `roles/datastore.user` lives in `.entur/application.yaml`
 because the two paths meet two different guards: a `google_project_iam_member` here runs under a
@@ -229,8 +234,8 @@ at all. A conditioned grant and a deny policy refuse with the same wording, whic
 survive. Settling it is one line outside this plan; until then, do not quote either as established.
 
 **Plan-time index drift rests on one config line, and it is present:**
-`.github/workflows/terraform.yml` lists `firestore.indexes.json` beside `terraform/**` in **both** of
-its `paths:` lists. Without it, a PR adding a query and its index entry would touch neither
+`.github/workflows/terraform.yml` lists `firestore.indexes.json` **and `firestore.rules`** beside
+`terraform/**` in **both** of its `paths:` lists. Without it, a PR adding a query and its index entry would touch neither
 `terraform/` nor the workflow, pass the static coverage test, merge, apply nothing, and land a runtime
 `FailedPrecondition` in production. A missing composite index is never a deploy-time error and the
 emulator tracks no indexes at all, so this is the earliest anything can catch it.
@@ -238,6 +243,13 @@ emulator tracks no indexes at all, so this is the earliest anything can catch it
 Expect the **first apply in each project to need a re-run** if `firestore.googleapis.com` has not
 finished propagating by the time the database resource is created; the platform's own project module
 sleeps 60 s after enabling APIs for that reason.
+
+**The first apply also answers one thing nobody could verify beforehand**: whether the Rules API
+accepts a Firestore release in a project that has never been a Firebase project — none of the three
+has, and the check needed credentials that were stale on 2026-09-09. If it refuses,
+`google_firebaserules_ruleset.partner_deny_all` and `google_firebaserules_release.partner_firestore`
+are removable on their own — neither the database nor anything reading it depends on them — and
+`firestore.rules` goes back to being what it was, a committed statement the emulator enforces.
 
 ### Collections
 
@@ -610,6 +622,13 @@ R16 keeps partner records, credentials, callback URLs and generated prose out of
 **So R16's claim is about partner-only routes plus every other partner field. It is not "no partner
 route ever appears in the prompt log."**
 
+**Accepted as it stands on 2026-09-09.** The alternative put forward was dropping R16 altogether once
+`/historikk` and `/meldinger` are behind authentication. That retires the dashboard half of R16 and
+not this one: the prompt/reply record lives in **Cloud Logging**, which project IAM gates and page
+authentication never touches. And the code that closes the partner-only half is one field —
+`caller` on `notification_wording.PARTNER` — feeding a gate `llm_message` already has for
+`/meldinger`'s replay, so removing it would be a guard removed rather than complexity saved.
+
 ---
 
 ## Acceptance evidence (AE1–AE18)
@@ -648,21 +667,38 @@ notification** for a predicted and a confirmed event on the partner's own runtim
 
 ## Open questions and product decisions
 
-Named here because they are decisions somebody has to make, not documentation gaps.
+Named here because they are decisions somebody has to make, not documentation gaps. **Six were put
+to the product owner with the pull request and answered on 2026-09-09.** What was decided stands
+beside each; the ones still open say who owns them.
 
 1. **Who is the controller for partner-path data, and is a processing agreement needed?** The partner
    owns consent, which makes us a processor for the same origin/destination/window trio `/varsel`
    holds for its own users — and `/varsel`'s privacy texts name Entur AS because that registration is
-   ours. No agreement, legal basis or published notice for the partner path exists. A team and DPO
-   decision; it gates real-user enablement rather than implementation.
+   ours. No agreement, legal basis or published notice for the partner path exists. **Open (2026-09-09):
+   project management's to settle with the DPO, not the team's; the partners know the channel is
+   experimental. It gates real-user enablement rather than implementation.**
 2. **The daily cap's exemption is wider than the requirement's wording.** R11 exempts "a confirmation
    that replaces an earlier forecast about the same train". The store exempts **any replacement of a
    revision already delivered about that train**, which includes a **withdrawal**. The reasoning is
    that a retraction the cap suppressed leaves the traveller holding a warning we have withdrawn —
-   Rushvarsel's friskmelding argument. **This is a product-owner question**, flagged rather than
-   hidden.
+   Rushvarsel's friskmelding argument. **Decided 2026-09-09: the wider rule stands.**
 3. **`NOTIFICATION_PARTNER_LLM_ENABLED` is in no chart.** Whether partner prose is the model's is a
-   product decision, and the name lands in Helm when that decision is made.
+   product decision, and the name lands in Helm when that decision is made. **Open**: it is the
+   rollout order's second step, and the decision is made when that step is.
+4. **Partner-only routes are unscored** (the fourth KTD12 limitation above). **Decided 2026-09-09:
+   they stay out of `varsel_decisions` until `/historikk` and `/meldinger` are behind
+   authentication — planned, and expected before any real partner data — and go in once they are.**
+   Including them now was offered if it simplified the channel; it does not, it adds: `pushed` is
+   journey-definition grain and cannot tell a webhook from a Web Push (KTD10), so the row needs a
+   channel discriminator, and that column reaches `varsel_decision_groups`, the nightly labelling
+   INSERT and the scheduled-query re-registration in one operation.
+5. **R16's prompt-record claim is half-closed** ([above](#r16-and-the-half-of-it-that-is-not-what-it-looks-like)).
+   **Decided 2026-09-09: accepted as it stands**, and R16 is kept — dashboard authentication does
+   not reach the Cloud Logging half, and the code behind it is one field.
+6. **`/notification-api/v1` is discoverable in the public `/docs`.** **Decided 2026-09-09: by
+   design — this is a public API.**
+7. **`firestore.rules` asserted a protection nothing deployed.** **Decided 2026-09-09: wired** — see
+   [Terraform](#terraform-terraformfirestoretf).
 
 ---
 
@@ -711,8 +747,9 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
 ## Known limitations, recorded rather than smoothed over
 
 - **`/notification-api/v1` appears in the app's public `/docs`**, because the router mounts
-  unconditionally and `docs_url` is FastAPI's default. Accepted: the plan's own risk register already
-  accepts that this surface is publicly reachable.
+  unconditionally and `docs_url` is FastAPI's default. **By decision (product owner, 2026-09-09):
+  this is a public API**, and the plan's own risk register already accepted that the surface is
+  publicly reachable.
 - **Ordering of a subscription's four daily notifications is soonest-departure-first and *exact only
   within a subscription*.** Across subscriptions it is approximate, and outside the 60-minute validity
   horizon a train can be missing from the ordering entirely.

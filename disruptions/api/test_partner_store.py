@@ -3091,6 +3091,30 @@ def test_the_deny_all_rules_file_exists_and_denies():
     assert firebase["firestore"]["indexes"] == "firestore.indexes.json"
 
 
+def test_the_deny_all_rules_are_released_by_terraform_not_only_committed():
+    """Until 2026-09-09 the file above was asserted and emulated but deployed by nothing, so the
+    real database ran on whatever rules it was created with. The release is what turns a console
+    edit towards the open template into drift the next apply reverts. Pinned in three places, each
+    the one that would otherwise rot silently: the ruleset reads THIS file (a second copy under
+    terraform/ would drift from the one the emulator enforces), the release names the NAMED
+    database (a bare `cloud.firestore` would rule `(default)`, which does not exist here), and the
+    workflow triggers on the file (or an edit merges and applies nothing -- the indexes' own
+    lesson, one file over)."""
+    assert 'resource "google_firebaserules_ruleset"' in FIRESTORE_TF_CODE
+    assert 'resource "google_firebaserules_release"' in FIRESTORE_TF_CODE
+    assert 'content = file("${path.module}/../firestore.rules")' in FIRESTORE_TF_CODE
+    assert (
+        'name         = "cloud.firestore/${google_firestore_database.partner_notifications.name}"'
+        in FIRESTORE_TF_CODE
+    ), "a named database's release is cloud.firestore/<database>, never bare cloud.firestore"
+    assert 'service            = "firebaserules.googleapis.com"' in FIRESTORE_TF_CODE
+    # A ruleset a release points at cannot be deleted, so the replacement must exist first.
+    assert "create_before_destroy = true" in FIRESTORE_TF_CODE
+    assert TERRAFORM_YML.count("- 'firestore.rules'") == 2, (
+        "both of terraform.yml's paths: lists must carry firestore.rules, like firestore.indexes.json"
+    )
+
+
 # ---- Emulator-backed ---------------------------------------------------------------------------
 
 _EMULATOR_DB: str | None = None

@@ -571,27 +571,35 @@ def test_the_retention_table_names_only_symbols_that_exist():
         )
 
 
-def test_the_cap_exemptions_product_question_is_published_and_not_settled():
+def test_the_cap_exemptions_product_decision_is_published_beside_the_wider_code():
     """The exemption is wider than the requirement's wording, and that is a decision, not a detail.
 
     R11 exempts "a confirmation that replaces an earlier forecast about the same train". The store
     exempts any replacement of a DELIVERED revision, which includes a withdrawal — defensible (a
     retraction the cap suppressed leaves the traveller holding a warning we have withdrawn) and
-    still not what was asked for. It is flagged as an open product-owner question rather than
-    written up as settled, and this pins that it stays flagged for as long as the code is wider.
+    still not what was asked for. It was published as an open product-owner question with the pull
+    request and DECIDED on 2026-09-09 (the wider rule stands), so what this pins now is that the
+    operations document records that decision, dated, for as long as the code is the wider one —
+    a narrowing of the code without a re-decision, or a re-decision without the code moving, is
+    exactly the drift this exists to catch.
     """
     exempt = re.search(
         r"cap_exempt\s*=\s*(.+)", _source("partner_store.py")
     )
     assert exempt and "delivered_revision" in exempt.group(1), (
         "the cap exemption is no longer keyed on `delivered_revision`. If it has been narrowed to "
-        "a confirmation, the open product question in docs/operations/partner-notifications.md is "
-        "answered and should be removed rather than left standing."
+        "a confirmation, the 2026-09-09 decision in docs/operations/partner-notifications.md has been "
+        "reversed and the document must say so rather than keep recording the wider rule as decided."
     )
     text = OPERATIONS_DOC.read_text(encoding="utf-8")
-    assert "product-owner question" in text and "withdrawal" in text, (
-        "the operations document no longer flags the generalised cap exemption as an open "
-        "product-owner question"
+    assert "withdrawal" in text, "the operations document no longer names the withdrawal case"
+    assert "Decided 2026-09-09: the wider rule stands." in text, (
+        "the operations document no longer records the product owner's decision on the generalised "
+        "cap exemption beside the wider code"
+    )
+    assert "product-owner question" not in text, (
+        "the operations document still flags the cap exemption as an OPEN product-owner question, "
+        "which it stopped being on 2026-09-09"
     )
 
 
