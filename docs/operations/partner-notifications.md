@@ -244,12 +244,18 @@ Expect the **first apply in each project to need a re-run** if `firestore.google
 finished propagating by the time the database resource is created; the platform's own project module
 sleeps 60 s after enabling APIs for that reason.
 
-**The first apply also answers one thing nobody could verify beforehand**: whether the Rules API
-accepts a Firestore release in a project that has never been a Firebase project — none of the three
-has, and the check needed credentials that were stale on 2026-09-09. If it refuses,
-`google_firebaserules_ruleset.partner_deny_all` and `google_firebaserules_release.partner_firestore`
-are removable on their own — neither the database nor anything reading it depends on them — and
-`firestore.rules` goes back to being what it was, a committed statement the emulator enforces.
+**The Rules release is created in projects Firebase has never touched, and that was checked rather
+than assumed** (2026-09-09): none of the three projects has any `firebase*`/`firestore*` API enabled,
+and the Firebase Management API answers `SERVICE_DISABLED` for all three. It is expected to work all
+the same — Google's Firestore documentation deploys rules to a **named** database from the Google
+Cloud console (Databases → the database → Security → Firestore Rules → Publish) and needs the Firebase
+console for `(default)` only, and that console path uses the same Rules API Terraform does — and the
+CD account holds `roles/firebase.admin`, which carries all eleven `firebaserules.*` permissions. What
+only the first apply confirms is that the API accepts `cloud.firestore/<database>` as a release name
+from Terraform's client. If it refuses, `google_firebaserules_ruleset.partner_deny_all` and
+`google_firebaserules_release.partner_firestore` are removable on their own — neither the database
+nor anything reading it depends on them — and `firestore.rules` goes back to being what it was, a
+committed statement the emulator enforces.
 
 ### Collections
 

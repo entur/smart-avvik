@@ -736,9 +736,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `firestore.rules` **released** as the named database's live rules (`google_firebaserules_ruleset` +
   `_release`, named `cloud.firestore/<database>` per firebase-tools' own release code, not the bare
   `cloud.firestore` the provider's documentation quotes). Until then the file was committed and
-  emulated but deployed by nothing, safe only because no Firebase app exists in these projects;
-  whether the Rules API accepts a release in a project that has never been a Firebase project is the
-  one thing the first apply answers, and the two resources are removable alone if it refuses. The
+  emulated but deployed by nothing, safe only because no Firebase app exists in these projects. None
+  of the three projects is a Firebase project (checked 2026-09-09) and the release is expected to work
+  regardless — Google's own docs deploy rules to a *named* database from the Google Cloud console and
+  reserve the Firebase console for `(default)` — so what the first apply confirms is only that the API
+  takes `cloud.firestore/<database>` from Terraform's client; the two resources are removable alone if
+  it refuses. The
   runtime `roles/datastore.user` grant is the one part that **cannot** go there — a
   `google_project_iam_member` runs under a `projectIamAdmin` conditioned by `only_assignable_roles`,
   which carries no `roles/datastore.*` (note `terraform/oauth_iam.tf`'s own PARKED header diagnoses
