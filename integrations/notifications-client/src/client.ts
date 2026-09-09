@@ -306,7 +306,7 @@ export async function process(
   // permanently-failing record alive for the trigger's full 24-hour window.
   const stale = staleness(working, now, cutoffMs);
   if (stale) {
-    await settleExpired(adapters, working, stale);
+    await settleExpired(adapters, working, now, stale);
     return { outcome: "expired", detail: stale };
   }
 
@@ -391,6 +391,7 @@ function staleness(record: InboxRecord, now: Date, cutoffMs: number): string | n
 async function settleExpired(
   adapters: ProcessAdapters,
   record: InboxRecord,
+  now: Date,
   detail: string,
 ): Promise<void> {
   await adapters.suppressions.record({
@@ -398,7 +399,12 @@ async function settleExpired(
     alertId: record.event.alert_id,
     rule: "expired",
     detail,
-    at: new Date().toISOString(),
+    // The CALLER's clock, like `suppress` below and like everything else in `process()`. It read
+    // `new Date()` here, which is the two-clocks bug `recovery.ts` names by this repository's own
+    // incident: a record selected as stale against one clock and then stamped against another.
+    // Milliseconds apart in production and arbitrarily far apart under an injected clock, which is
+    // where a receiver's tests live.
+    at: now.toISOString(),
   });
   await adapters.inbox.settle(record.eventId, "expired", detail);
 }

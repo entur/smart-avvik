@@ -1132,7 +1132,12 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # Guarded like every other step here, and the two halves are guarded separately (R20): an emit
     # failure must not cost the deliveries already committed. Delivery runs even when the pass above
     # raised and `outcome` is None — the pending set is Firestore's, not this cycle's.
-    if varsel.partner_channel_enabled():
+    # Read ONCE for the cycle, and used by both partner phases below. Two reads cannot disagree in
+    # practice -- the flag is an environment variable and a container does not change one while it
+    # runs -- but `partner_channel_enabled` catches and logs a raise from the injected reader, so a
+    # broken reader wrote the same warning with the same traceback twice on every cycle.
+    partner_channel = varsel.partner_channel_enabled()
+    if partner_channel:
         with _phase("partner_webhooks", timings):
             try:
                 if outcome is not None:
@@ -1171,7 +1176,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # database -- would read Firestore and ask BigQuery on every cycle for a population that is
     # empty. What a partner sees in the onboarding window is the create-time answer with
     # `servable_checked_at` publishing its age, which is R6's "how fresh" rather than an all-clear.
-    if varsel.partner_channel_enabled():
+    if partner_channel:
         with _phase("partner_servability", timings):
             try:
                 partner_servability.recheck()

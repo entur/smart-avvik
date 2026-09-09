@@ -51,7 +51,6 @@ reads included, but a transactional COMMIT carries no timeout at all. Both numbe
 from __future__ import annotations
 
 import logging
-import threading
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -61,6 +60,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import partner_store
+import reserved_budget
 
 logger = logging.getLogger(__name__)
 
@@ -182,35 +182,15 @@ class EmitReport:
     ms: int = 0
 
 
-class _EmitBudget:
-    """This step's ceiling on store transactions -- ``varsel._WriteBudget`` with one call site.
+class _EmitBudget(reserved_budget.ReservedBudget):
+    """This step's ceiling on store transactions.
 
-    **The clock is RESERVED, not checked**, which is the whole reason that class exists and the one
-    thing a naive version gets wrong: ``monotonic() >= deadline`` bounds when the last transaction
-    *starts*, not when the step *ends*, so a call passing it with a millisecond to spare still runs
-    its full worst case afterwards. ``varsel._WriteBudget``'s docstring records the measurement --
-    a 30 s ceiling overshot to ~46 s. Reserving :data:`_WORST_CASE_EMIT_S` up front makes the
-    deadline a ceiling on when the step ends.
-
-    Locked even though this step is single-threaded: the lock costs nothing, and the shape is the
-    one every reader of ``_WriteBudget`` already knows.
+    The mechanism -- a count and a clock RESERVED rather than checked -- is
+    :class:`reserved_budget.ReservedBudget`'s, and its docstring carries why and the measurement
+    behind it. What is this step's own is the number: :data:`_WORST_CASE_EMIT_S` is what one commit
+    can cost, so reserving it up front makes :data:`_EMIT_DEADLINE_S` a ceiling on when the STEP
+    ends rather than on when its last transaction starts.
     """
-
-    def __init__(self, max_calls: int, deadline: float, worst_case_s: float) -> None:
-        self._lock = threading.Lock()
-        self._max_calls = max_calls
-        self._deadline = deadline
-        self._worst_case = worst_case_s
-        self.claimed = 0
-        self.refused = 0
-
-    def claim(self) -> bool:
-        with self._lock:
-            if self.claimed >= self._max_calls or monotonic() + self._worst_case >= self._deadline:
-                self.refused += 1
-                return False
-            self.claimed += 1
-            return True
 
 
 def train_ref(subject: PartnerSubject) -> partner_store.TrainRef | None:

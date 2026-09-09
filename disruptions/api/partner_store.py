@@ -2117,10 +2117,6 @@ def record_below_threshold(request: EmitRequest, *, now: datetime | None = None)
     Takes the withdrawal payload on EVERY call even though it is used only on the last one. The
     alternative -- returning "you would withdraw now, ask again with a payload" -- is two round
     trips on the ingestion thread for a payload that is pure and cheap to build.
-
-    Takes the withdrawal payload on EVERY call even though it is used only on the last one. The
-    alternative -- returning "you would withdraw now, ask again with a payload" -- is two round
-    trips on the ingestion thread for a payload that is pure and cheap to build.
     """
     instant = now or _now()
     seed = revision_seed(instant)

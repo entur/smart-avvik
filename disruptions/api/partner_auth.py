@@ -468,8 +468,21 @@ def _parse_bearer(header: str | None) -> tuple[str, str]:
 # ---- The limiter ------------------------------------------------------------------------------
 
 
-def _claim(bucket: deque[float], ceiling: int, now: float) -> bool:
-    while bucket and now - bucket[0] >= _WINDOW_S:
+def claim_window(
+    bucket: deque[float], ceiling: int, now: float, *, window_s: float = _WINDOW_S
+) -> bool:
+    """Spend one slot in a trailing window, or refuse. The caller owns the bucket and the lock.
+
+    Public and window-parameterised because ``partner_api._claim_test_event`` wrote the same three
+    lines again for the same feature -- a sliding window is exactly the kind of small algorithm that
+    is easy to write and easy to write *slightly* differently, and the difference between ``>`` and
+    ``>=`` here is a limit that admits one extra call per window forever.
+
+    ``window_s`` defaults to this module's own minute so both credential tiers keep reading as they
+    did; the test-event route passes its own, which happens to be the same number under a different
+    name and must stay free to change.
+    """
+    while bucket and now - bucket[0] >= window_s:
         bucket.popleft()
     if len(bucket) >= ceiling:
         return False
@@ -479,7 +492,7 @@ def _claim(bucket: deque[float], ceiling: int, now: float) -> bool:
 
 def _claim_global(now: float) -> None:
     with _lock:
-        if not _claim(_global_calls, GLOBAL_PRELOOKUP_PER_MIN, now):
+        if not claim_window(_global_calls, GLOBAL_PRELOOKUP_PER_MIN, now):
             raise RateLimited("global")
 
 
@@ -493,7 +506,7 @@ def claim_partner_slot(partner_id: str, *, now: float | None = None) -> None:
     instant = _monotonic() if now is None else now
     with _lock:
         bucket = _partner_calls.setdefault(partner_id, deque())
-        if not _claim(bucket, PER_PARTNER_PER_MIN, instant):
+        if not claim_window(bucket, PER_PARTNER_PER_MIN, instant):
             raise RateLimited("partner")
         # Bounded for the reason `feedback._claim` bounds its own per-context map: the key is
         # partner-controlled only in the sense that an operator creates it, but a pod that never
@@ -1416,6 +1429,7 @@ __all__ = [
     "available",
     "bearer_credential",
     "claim_partner_slot",
+    "claim_window",
     "configure",
     "create_destination",
     "create_partner",

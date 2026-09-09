@@ -1115,15 +1115,16 @@ def _claim_test_event(partner_id: str) -> None:
     now = time.monotonic()
     with _lock:
         bucket = _test_event_calls.setdefault(partner_id, deque())
-        while bucket and now - bucket[0] >= _TEST_EVENTS_WINDOW_S:
-            bucket.popleft()
-        if len(bucket) >= _TEST_EVENTS_PER_MIN:
+        # `partner_auth`'s window, not a third copy of it: this route's limiter is the same trailing
+        # window as the two credential tiers and had been written out again here.
+        if not partner_auth.claim_window(
+            bucket, _TEST_EVENTS_PER_MIN, now, window_s=_TEST_EVENTS_WINDOW_S
+        ):
             raise HTTPException(
                 status_code=429,
                 detail="test_events_rate_limited",
                 headers={"Retry-After": str(_TEST_EVENTS_WINDOW_S)},
             )
-        bucket.append(now)
         while len(_test_event_calls) > 1_000:
             _test_event_calls.pop(next(iter(_test_event_calls)))
 
