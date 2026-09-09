@@ -193,9 +193,15 @@ export interface NotificationEvent {
       [key: string]: unknown;
     };
     /**
-     * The affected call: aimed and expected times, and whether boarding and alighting are
-     * permitted there. Calling at a stop is not the same as being usable from it -- long-distance
-     * runs are routinely sold boarding-only over their local stretch.
+     * The affected call, as both producers actually emit it: `stop_place`, `stop_order`,
+     * `aimed_departure_time` and `departs_tomorrow`. AIMED, never expected -- the real-time
+     * estimate for this call is what the probabilities and the delay figures beside it are derived
+     * from, and restating it here as a second time would invite a receiver to display a figure the
+     * forecast has already superseded. Boarding and alighting permissions are not carried either:
+     * they gate the MATCH upstream (calling at a stop is not the same as being usable from it --
+     * long-distance runs are routinely sold boarding-only over their local stretch), so a call you
+     * receive is one the traveller may board and alight at, and repeating the flags would publish
+     * a rule instead of its result.
      */
     call?: { [key: string]: unknown };
     /**

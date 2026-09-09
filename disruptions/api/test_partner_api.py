@@ -27,6 +27,7 @@ import pathlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import alert_policy
 import partner_api
 import partner_auth
 import partner_store
@@ -1843,6 +1844,267 @@ def test_a_watch_cannot_be_shown_anothers_alert_state():
         assert OTHER not in response.text
     finally:
         _uninstall()
+
+
+
+# ---- The synthetic event is the real shape, not a lookalike ------------------------------------
+
+
+def _real_payload() -> dict[str, Any]:
+    """One payload from the REAL producer, `varsel._partner_payload`.
+
+    Imported here rather than mirrored: a fixture that restated the keys would agree with itself
+    forever. `varsel` is heavy but importable (it logs "no VAPID keypair" and does nothing else at
+    import), and this suite runs in its own process like every other.
+    """
+    import varsel
+
+    alert = varsel.Alert(
+        situation_number="ENT:SituationNumber:1",
+        summary="Innstilt",
+        line="VYG:Line:L1",
+        operator="VYG",
+        jkey="VYG:DatedServiceJourney:1234",
+        stop_place=FROM,
+        stop_order=1,
+        departure_time=NOW,
+        cancel_probability=1.0,
+        delay_p50_min=None,
+        delay_p90_min=None,
+        impact_probability=1.0,
+        alert_threshold=0.65,
+        alertworthy=True,
+        cancelled=True,
+    )
+    return varsel._partner_payload(
+        alert, [alert], message_input={"i_morgen": False}, title="t", body="b"
+    )
+
+
+def _shape(value: Any) -> Any:
+    """A value's KEY structure, with the leaves erased.
+
+    Compares what a client types against -- which keys exist and how they nest -- rather than what
+    a particular disruption happened to contain. A list collapses to the shape of its first entry,
+    because the schema's arrays are homogeneous and a partner writes one row renderer.
+    """
+    if isinstance(value, dict):
+        return {k: _shape(v) for k, v in sorted(value.items())}
+    if isinstance(value, list):
+        return [_shape(value[0])] if value else []
+    # Leaves are erased, not typed. A nullable figure IS nullable in the contract -- `delay_ge10` is
+    # null for a cancellation and a float for a delay, and a situation carries a description only
+    # when an operator wrote one -- so comparing leaf types would fail on per-disruption variation
+    # while catching nothing a client types against.
+    return "leaf"
+
+
+def test_the_synthetic_payload_has_the_same_shape_as_a_real_one():
+    """A partner types their receiver against a test event -- it is the only body they can see
+    before a real disruption -- so a synthetic payload with its own key names teaches a shape that
+    breaks on the first real event, in production, at go-live.
+
+    Compared PRODUCER TO PRODUCER, in both directions, because the schema cannot catch this:
+    `payload` declares no property list and its sub-objects are bare `type: object`, so
+    `probabilities.cancel` instead of `probabilities.cancellation` is schema-VALID and wrong. Same
+    class as the wire-envelope defect on the sending side, where a deny-list projection would have
+    shipped two fields our own verifier refuses -- and was caught only by comparing the projection
+    with the schema in both directions.
+    """
+    _install()
+    bearer = _provision()
+    try:
+        client = _client()
+        client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(subscription_id="probe", test=True),
+            headers=_headers(bearer),
+        )
+        client.post(
+            "/notification-api/v1/test-events",
+            json={"subscription_id": "probe"},
+            headers=_headers(bearer),
+        )
+        synthetic = json.loads(_deliveries[0]["body"])["payload"]
+        real = _real_payload()
+        assert set(synthetic) == set(real), (set(synthetic) ^ set(real))
+        for key in ("notification", "call", "probabilities"):
+            assert set(synthetic[key]) == set(real[key]), (key, set(synthetic[key]) ^ set(real[key]))
+        assert set(synthetic["situations"][0]) == set(real["situations"][0])
+        # And the whole nested structure, which is what actually catches a renamed key three levels
+        # down. `delay` and `alternative_journey` are null on both sides here by construction: this
+        # synthetic event is a confirmed cancellation, and every delay figure meant "if it runs".
+        assert _shape(synthetic) == _shape(real), (_shape(synthetic), _shape(real))
+    finally:
+        _uninstall()
+
+
+def test_the_synthetic_event_is_a_coherent_confirmed_cancellation():
+    """The schema's own rule: both probabilities are 1.0 and the delay figures null when `phase` is
+    `confirmed`. A synthetic event stating 1.0 under `predicted` with a null delay would teach a
+    combination no real event produces -- which is what this one did before."""
+    _install()
+    bearer = _provision()
+    try:
+        client = _client()
+        client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(subscription_id="probe", test=True),
+            headers=_headers(bearer),
+        )
+        client.post(
+            "/notification-api/v1/test-events",
+            json={"subscription_id": "probe"},
+            headers=_headers(bearer),
+        )
+        event = json.loads(_deliveries[0]["body"])
+        assert event["phase"] == "confirmed"
+        assert event["payload"]["probabilities"]["impact"] == 1.0
+        assert event["payload"]["probabilities"]["cancellation"] == 1.0
+        assert event["payload"]["delay"] is None
+        assert event["payload"]["effect"] == "cancelled"
+        assert "innstilt" in event["payload"]["notification"]["title"].lower()
+        # The top level carries situation NUMBERS and the payload the rich objects -- the store's
+        # own split, not two ways of saying one thing.
+        assert event["situations"] == [event["payload"]["situations"][0]["situation_number"]]
+        assert event["payload"]["situations"][0]["has_situation"] is False
+        # And the threshold agrees with that flag. A real event's `alert_threshold` is the gate's
+        # own, resolved with the situation's `has_situation` -- so an unnamed train carries the
+        # no-SX cut, never the published one. The shape test above cannot catch this: both are
+        # floats under the same key.
+        assert event["payload"]["probabilities"]["alert_threshold"] == alert_policy.threshold_for(
+            "VYG", has_situation=False
+        )
+        assert event["payload"]["probabilities"]["alert_threshold"] != alert_policy.threshold_for(
+            "VYG"
+        ), "the two cuts must differ, or this assertion proves nothing"
+    finally:
+        _uninstall()
+
+
+def test_the_test_event_is_projected_and_serialized_by_the_delivery_pass():
+    """One producer of wire bytes, not two.
+
+    The allow-list projection is what decides what leaves this process, and it is
+    `additionalProperties: false` on the other side -- so a field the store gains, or a property the
+    schema gains, has to change both paths at once rather than leaving the test route shipping last
+    month's envelope. The serializer is the same one for the same reason: sorted keys, UTF-8, one
+    timestamp rendering.
+    """
+    import partner_delivery
+
+    assert "partner_delivery.event_body(partner_delivery.wire_event(" in API_CODE
+    assert "json.dumps" not in API_CODE, "there is one serializer, and it is not here"
+    _install()
+    bearer = _provision()
+    try:
+        client = _client()
+        client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(subscription_id="probe", test=True),
+            headers=_headers(bearer),
+        )
+        client.post(
+            "/notification-api/v1/test-events",
+            json={"subscription_id": "probe"},
+            headers=_headers(bearer),
+        )
+        raw = _deliveries[0]["body"]
+        event = json.loads(raw)
+        # Exactly the published envelope: nothing the schema forbids, and every key it requires.
+        assert set(event) <= set(EVENT_SCHEMA["properties"])
+        assert set(EVENT_SCHEMA["required"]) <= set(event)
+        # Byte-identical to what the delivery pass would send for the same document, which is the
+        # property "one producer" actually means.
+        assert raw == partner_delivery.event_body(partner_delivery.wire_event(event))
+        assert list(event) == sorted(event), "sorted keys, so two attempts are byte-identical"
+    finally:
+        _uninstall()
+
+
+def test_a_test_event_accepts_the_same_ids_the_path_routes_do():
+    """A partner takes the id from a GET response -- or from the event their receiver just handled
+    -- and posts it here. Rejecting the namespaced form was a 422 on a value this API had itself
+    just served."""
+    _install()
+    bearer = _provision()
+    try:
+        client = _client()
+        client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(subscription_id="probe", test=True),
+            headers=_headers(bearer),
+        )
+        namespaced = f"{PARTNER}~probe"
+        for reference in ("probe", namespaced):
+            response = client.post(
+                "/notification-api/v1/test-events",
+                json={"subscription_id": reference},
+                headers=_headers(bearer),
+            )
+            assert response.status_code == 200, (reference, response.text)
+            assert response.json()["subscription_id"] == "probe"
+        # The namespaced form the GET route serves in an event body is the same one accepted here.
+        stored = json.loads(_deliveries[0]["body"])["subscription_id"]
+        assert stored == namespaced
+        assert client.post(
+            "/notification-api/v1/test-events",
+            json={"subscription_id": stored},
+            headers=_headers(bearer),
+        ).status_code == 200
+        # Still bounded, and still no path to another partner: the prefix stripped is the caller's.
+        assert client.post(
+            "/notification-api/v1/test-events",
+            json={"subscription_id": f"{OTHER}~probe"},
+            headers=_headers(bearer),
+        ).status_code == 404
+    finally:
+        _uninstall()
+
+
+def test_the_openapi_tags_are_the_routers_own():
+    """The published document is what U7 generates from and what a partner reads; this app's /docs
+    is what an operator reads. Two groupings for one surface is a difference somebody reconciles by
+    hand, so they are one vocabulary, pinned in both directions."""
+    published = {tag["name"] for tag in OPENAPI["tags"]}
+    used = {
+        tag
+        for operations in OPENAPI["paths"].values()
+        for method, op in operations.items()
+        if method != "parameters"
+        for tag in op["tags"]
+    }
+    router_tags = {tag for route in partner_api.router.routes for tag in (route.tags or [])}
+    assert published == used == router_tags
+    assert router_tags == {
+        partner_api.TAG_SUBSCRIPTIONS,
+        partner_api.TAG_DESTINATIONS,
+        partner_api.TAG_TEST,
+    }
+    # Prefixed, because these six routes sit among three dozen paths in this app.
+    assert all(tag.startswith("notification-") for tag in router_tags)
+
+
+def test_the_call_payload_promises_only_what_both_producers_emit():
+    """A schema describing a richer document than exists is worse than one describing less: a
+    partner writes a renderer for the fields it names.
+
+    Read off the SCHEMA and the two producers, so re-adding the promise without emitting the fields
+    fails here rather than at a partner's first integration.
+    """
+    description = EVENT_SCHEMA["properties"]["payload"]["properties"]["call"]["description"]
+    emitted = set(_real_payload()["call"])
+    assert emitted == {
+        "stop_place",
+        "stop_order",
+        "aimed_departure_time",
+        "departs_tomorrow",
+    }, emitted
+    for field in sorted(emitted):
+        assert field in description, field
+    # The two it used to promise and neither producer sends.
+    assert "expected times" not in description
+    assert "boarding_allowed" not in description
 
 
 

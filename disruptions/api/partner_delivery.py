@@ -276,8 +276,15 @@ class _Skips:
         return record
 
 
-def _event_body(event: dict[str, Any]) -> bytes:
+def event_body(event: dict[str, Any]) -> bytes:
     """The event as the exact bytes that are signed and sent.
+
+    **Public, because there are two producers of a partner-bound body and only one may decide what
+    the bytes look like.** The other is ``/notification-api/v1/test-events``, whose synthetic event
+    is signed and dialled on a request path; it builds a stored-shaped event and hands it to this
+    function and to :func:`wire_event`, so a partner writing a client against a test event is
+    reading exactly the serialization a real one arrives in -- key order, UTF-8 and timestamp
+    rendering included.
 
     Serialized ONCE and handed unchanged to ``webhook_signing.sign`` and to the transport.
     Re-serializing between signing and sending is the canonical webhook bug -- every provider's
@@ -341,8 +348,12 @@ _WIRE_FIELDS = (
 )
 
 
-def _wire_event(event: dict[str, Any]) -> dict[str, Any]:
+def wire_event(event: dict[str, Any]) -> dict[str, Any]:
     """The stored event projected onto the published envelope -- see ``_WIRE_FIELDS`` above.
+
+    Public for :func:`event_body`'s reason: the test-event route projects through this too, so the
+    allow-list decides what leaves this process on BOTH paths rather than on the one the poller
+    drives.
 
     A key the store has not written is left out rather than sent as null: every optional property is
     optional in the schema too, and a null where a receiver expects a string is a parse failure it
@@ -417,7 +428,7 @@ def _attempt(
             return "store_errors"
         return "expired"
 
-    body = _event_body(_wire_event(event))
+    body = event_body(wire_event(event))
     try:
         signed = webhook_signing.sign(
             destination_id=destination.destination_id,
@@ -847,4 +858,6 @@ __all__ = [
     "DeliveryReport",
     "Sender",
     "deliver_pending",
+    "event_body",
+    "wire_event",
 ]

@@ -1280,7 +1280,7 @@ def test_the_wire_envelope_is_exactly_the_published_schemas_properties():
                 f"{ours} is expected to be STORED — the test is worthless if the store stops "
                 "writing the very fields the projection exists to withhold"
             )
-        wire = partner_delivery._wire_event(stored)
+        wire = partner_delivery.wire_event(stored)
         assert set(wire) <= properties, sorted(set(wire) - properties)
         assert set(schema["required"]) <= set(wire), sorted(set(schema["required"]) - set(wire))
 

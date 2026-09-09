@@ -61,16 +61,17 @@ way it already does for ``historikk``, ``meldinger``, ``reisevalg`` and ``togvar
 
 from __future__ import annotations
 
-import json
 import logging
 import secrets
 import threading
 import time
 from collections import deque
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
+import alert_policy
 import partner_auth
+import partner_delivery
 import partner_store
 import webhook_client
 import webhook_signing
@@ -394,9 +395,16 @@ class TestEventIn(BaseModel):
 
     subscription_id: str = Field(
         min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9._:-]+$",
-        description="A subscription created with test: true. Anything else is refused.",
+        # The SAME two forms the two path routes accept, and the bound (`~` plus 128+128) is theirs
+        # too. It was the reference charset alone, which rejected the namespaced id an EVENT carries
+        # in its `subscription_id` -- so a partner who took the id from a GET response, or from the
+        # event their receiver had just handled, and posted it here got a 422 from a value this API
+        # had itself just served. `_requested_id` strips only the CALLER's own prefix, so widening
+        # the charset opens no path to another partner's record.
+        max_length=257,
+        pattern=r"^[A-Za-z0-9._:~-]+$",
+        description="A subscription created with test: true. Your own reference, or the "
+        "subscription_id an event carries. Anything else is refused.",
     )
 
 
@@ -522,9 +530,18 @@ def _throttled(principal: _Principal) -> partner_auth.Principal:
     return principal
 
 
+#: The tag vocabulary, shared with `contracts/notifications/v1/openapi.json` and pinned against it
+#: (`test_the_openapi_tags_are_the_routers_own`). Declared per ROUTE rather than on the router, so
+#: the published document and this app's own /docs group the six routes identically -- the OpenAPI
+#: file is what U7 generates types from and what a partner reads, and two groupings for one surface
+#: is a difference somebody has to reconcile by hand. Prefixed, because these names sit among 36
+#: paths here: a bare "subscriptions" tag in an app that also serves journeys says nothing.
+TAG_SUBSCRIPTIONS = "notification-subscriptions"
+TAG_DESTINATIONS = "notification-destinations"
+TAG_TEST = "notification-test"
+
 router = APIRouter(
     prefix=PREFIX,
-    tags=["notifications"],
     dependencies=[Depends(_authenticated), Depends(_throttled)],
 )
 
@@ -763,6 +780,7 @@ def _one_snapshot(document_id: str, partner_id: str) -> AlertStateOut:
 @router.post(
     "/subscriptions",
     response_model=SubscriptionOut,
+    tags=[TAG_SUBSCRIPTIONS],
     summary="Create or replace a watch by your own reference",
     responses={
         401: {"description": "Missing, unknown, revoked or wrong credential."},
@@ -878,6 +896,7 @@ def create_or_replace_subscription(
 @router.get(
     "/subscriptions",
     response_model=SubscriptionList,
+    tags=[TAG_SUBSCRIPTIONS],
     summary="Your own watches, with servability and freshness",
 )
 def list_subscriptions(
@@ -947,6 +966,7 @@ def list_subscriptions(
 @router.get(
     "/subscriptions/{subscription_id}",
     response_model=SubscriptionOut,
+    tags=[TAG_SUBSCRIPTIONS],
     summary="One watch",
     responses={404: {"description": "No such watch for this credential."}},
 )
@@ -975,6 +995,7 @@ def get_subscription(
 @router.delete(
     "/subscriptions/{subscription_id}",
     response_model=DeleteResult,
+    tags=[TAG_SUBSCRIPTIONS],
     summary="Stop a watch: tombstone, then durable cleanup",
 )
 def delete_subscription(
@@ -1057,6 +1078,7 @@ def delete_subscription(
 @router.get(
     "/destinations/current",
     response_model=DestinationOut,
+    tags=[TAG_DESTINATIONS],
     summary="Destination readiness and signing key ids",
     responses={404: {"description": "No destination is provisioned for this partner."}},
 )
@@ -1109,30 +1131,45 @@ def _claim_test_event(partner_id: str) -> None:
 def _synthetic_event(
     sub: partner_store.Subscription, *, now: datetime, nonce: str
 ) -> dict[str, Any]:
-    """One signed synthetic event body, conforming to ``event.schema.json``.
+    """One synthetic event, in the shape the store writes and the delivery pass projects.
 
     ``test: true`` rides INSIDE the body rather than in a header, which is the whole of R15: a
     header can be stripped by a proxy, while the marker inside the signed bytes is covered by the
     signature and a receiver can refuse it before native dispatch.
 
+    **The payload is the one `varsel._partner_payload` builds, key for key**, and that is the point
+    of this function rather than a detail of it. A partner writes their receiver against what a test
+    event contains -- it is the only body they can see before a real disruption -- so a synthetic
+    payload with its own key names teaches a shape that breaks on the first real event, in
+    production, at go-live. ``test_the_synthetic_payload_has_the_same_shape_as_a_real_one`` compares
+    the two producers directly, in both directions, because the schema alone cannot catch this:
+    ``payload`` is deliberately open (its sub-objects carry no property list), so a differently
+    named key is schema-VALID and wrong.
+
+    The event is a coherent **confirmed cancellation**, which is what the wording says. Not a
+    detail either: the schema's own rule is that both probabilities are 1.0 and the delay figures
+    null when ``phase`` is ``confirmed``, and a synthetic event that stated 1.0 under
+    ``predicted`` with a null delay would be teaching a combination no real event produces.
+
     ``alert_id`` and ``event_id`` are RANDOM here, unlike a real event's, which are deterministic
     over the subject and the revision. Deliberately: the supplied receiver policy drops a duplicate
     event id and a revision not strictly newer than the highest applied for that train, so two test
     events derived from the same synthetic train would give the partner exactly one notification
-    however many times they asked. The train itself is a ``KIX:Test:`` journey ref, so it can never
-    collide with a real subject.
+    however many times they asked. The train is a ``KIX:Test:`` journey ref, so it can never collide
+    with a real subject.
     """
-    revision = partner_store.revision_seed(now)
+    situation_number = f"KIX:TestEvent:{nonce}"
+    aimed = now + timedelta(minutes=45)
     return {
         "schema_version": partner_store.SCHEMA_VERSION,
         "event_id": f"test-{nonce}",
         "type": partner_store.EVENT_CREATED,
-        "phase": partner_store.PHASE_PREDICTED,
+        "phase": partner_store.PHASE_CONFIRMED,
         "alert_id": f"test-{nonce}",
-        "revision": revision,
+        "revision": partner_store.revision_seed(now),
         "occurred_at": now.isoformat(),
         "valid_until": partner_store.event_validity(
-            occurred_at=now, departure_at=None, subscription_expires_at=sub.expires_at
+            occurred_at=now, departure_at=aimed, subscription_expires_at=sub.expires_at
         ).isoformat(),
         "subscription_id": sub.subscription_id,
         "subscription_version": max(1, sub.version),
@@ -1141,32 +1178,63 @@ def _synthetic_event(
         "operator": "VYG",
         "line": "VYG:Line:L1",
         "journey_ref": f"KIX:Test:{nonce}",
-        "call_date": now.astimezone(partner_store.OSLO).date().isoformat(),
+        "call_date": aimed.astimezone(partner_store.OSLO).date().isoformat(),
         "stop_place": sub.from_stop,
         "stop_order": 1,
-        "situations": [],
+        # Strings at the top level, rich objects inside `payload.situations` -- the store's own
+        # split, not two ways of saying one thing.
+        "situations": [situation_number],
         "payload": {
             "notification": {
                 # Norwegian, like every traveller-facing string in this repo, and marked as a test
                 # in the text itself -- the same choice `/togmelding`'s test round makes, so a
                 # notification that reaches a real lock screen during integration says so.
-                "title": "Testvarsel: Tog L1 07:18 er innstilt",
+                "title": "Testvarsel: Tog L1 er innstilt",
                 "body": (
-                    "Dette er et testvarsel fra Entur. "
-                    f"{sub.from_stop} → {sub.to_stop}. Ingen avganger er berørt."
+                    f"{sub.from_stop} → {sub.to_stop}\n"
+                    "Dette er et testvarsel fra Entur. Ingen virkelige avganger er berørt."
                 ),
                 "action": None,
             },
             "call": {
-                "operator": "VYG",
-                "line": "VYG:Line:L1",
                 "stop_place": sub.from_stop,
-                "aimed_departure": now.isoformat(),
+                "stop_order": 1,
+                "aimed_departure_time": aimed.isoformat(),
+                "departs_tomorrow": False,
             },
-            "probabilities": {"impact": 1.0, "cancel": 1.0},
+            # A declared cancellation reads (1.0, 1.0, 1.0) by construction, and the threshold is
+            # carried so a partner can see WHY it cleared the bar rather than inferring one.
+            #
+            # `has_situation=False`, matching the situation below, and the pair is the whole point:
+            # a real event's `alert_threshold` is `alert.alert_threshold`, which is
+            # `alert_policy.gate(..., has_situation=sit.has_situation)`'s -- so an unnamed train
+            # carries the no-SX cut (0.85 for VYG) and never the published one (0.65). Stating 0.65
+            # beside `has_situation: false` would be a combination no real event produces, which is
+            # exactly what this function was fixed to stop teaching.
+            "probabilities": {
+                "impact": 1.0,
+                "cancellation": 1.0,
+                "delay_ge10": 1.0,
+                "alert_threshold": alert_policy.threshold_for("VYG", has_situation=False),
+            },
+            # Null, because every delay figure meant "if it runs".
             "delay": None,
-            "effect": None,
-            "situations": [],
+            "effect": "cancelled",
+            "situations": [
+                {
+                    "situation_number": situation_number,
+                    "summary": "Testvarsel fra Entur",
+                    "description": (
+                        "Syntetisk hendelse sendt fra /notification-api/v1/test-events. "
+                        "Ingen virkelige avganger er berørt."
+                    ),
+                    # False, and truthfully: no SX message named this train, so `summary` is text
+                    # this codebase wrote rather than an operator's. A receiver presenting it as an
+                    # operator statement would be making the 2026-08-20 mistake one layer out --
+                    # and a test event is exactly where that habit would be learned.
+                    "has_situation": False,
+                }
+            ],
             "alternative_journey": None,
         },
     }
@@ -1175,6 +1243,7 @@ def _synthetic_event(
 @router.post(
     "/test-events",
     response_model=TestEventOut,
+    tags=[TAG_TEST],
     summary="Send one signed synthetic event to your callback",
     responses={
         409: {"description": "The watch is not test-only, or the destination cannot be dialled."},
@@ -1236,11 +1305,14 @@ def send_test_event(principal: _Principal, body: TestEventIn) -> TestEventOut:
     now = datetime.now(UTC)
     nonce = secrets.token_hex(12)
     event = _synthetic_event(sub, now=now, nonce=nonce)
-    # The bytes are built ONCE and signed unmodified, which is KTD7's rule: a signature over
-    # re-serialised JSON is a signature over a different document as soon as anything reorders a
-    # key. `ensure_ascii=False` keeps the Norwegian text as UTF-8 rather than escapes, and the
-    # receiver verifies over exactly these bytes.
-    payload = json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    # Projected and serialized by the DELIVERY PASS's own two functions, not by a second copy here.
+    # `wire_event` is the allow-list that decides what leaves this process -- so a field added to
+    # the store's event, or a property added to the schema, changes both paths at once instead of
+    # leaving the test route shipping last month's envelope. `event_body` is the one serializer:
+    # sorted keys, UTF-8, timestamps rendered one way, and the bytes built ONCE and signed
+    # unmodified (KTD7 -- a signature over re-serialised JSON covers a document the receiver did
+    # not get, which is the canonical webhook bug every provider's documentation warns about).
+    payload = partner_delivery.event_body(partner_delivery.wire_event(event))
     signer = _signer or webhook_signing.sign
     signed = signer(
         destination_id=destination.destination_id,
@@ -1283,6 +1355,9 @@ def send_test_event(principal: _Principal, body: TestEventIn) -> TestEventOut:
 
 __all__ = [
     "PREFIX",
+    "TAG_DESTINATIONS",
+    "TAG_SUBSCRIPTIONS",
+    "TAG_TEST",
     "AlertStateOut",
     "AlertSubjectOut",
     "CleanupState",

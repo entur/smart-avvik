@@ -61,6 +61,21 @@ pepper is on an operator's machine. It is also why the pre-check below refuses e
 one-line message about the variable -- the alternative is a failure whose text talks about a Helm
 secret group, which is the wrong hint for a human at a terminal.
 
+**``show-signing-secret`` needs that environment's ``PARTNER_SIGNING_ROOT`` exported**, for the
+same reason and with the same early pre-check. **It prints a live credential**: the value a
+partner's receiver verifies every webhook signature with. It is the ONE command whose output must
+not go into a ticket, a chat message or a shell history file -- hand it over the way a password is
+handed over, and rotate the destination's generation (``rotate-signing``) if it has been anywhere
+else. It is audited like every other action here, because a credential disclosure is precisely what
+an audit trail exists for: the row says who read it, for which destination, and when.
+
+It exists because there is otherwise NO path to that value. `webhook_signing.derive_secret` is
+called only by the signer; ``GET /destinations/current`` serves generation NUMBERS and never
+derives, deliberately -- a secret fetchable over the partner's own credential is a secret their
+credential can be traded for. So an operator would have had to re-derive it by hand from the root,
+and the quickstart's promise that a Firebase developer sees a notification without writing signature
+verification cannot be kept without it.
+
 ``--environment`` is required and never inferred: a tool that guessed prd from an exported
 ``GOOGLE_CLOUD_PROJECT`` would be one stale shell variable away from provisioning the wrong
 environment. The Firestore project comes from the ambient ADC/``GOOGLE_CLOUD_PROJECT`` exactly as
@@ -93,6 +108,7 @@ if str(_API) not in sys.path:
 
 import partner_auth
 import partner_store
+import webhook_signing
 
 logger = logging.getLogger("manage_notification_partner")
 
@@ -342,6 +358,56 @@ def _cmd_resume_destination(args: argparse.Namespace, actor: str) -> Any:
     return partner_auth.resume_destination(args.destination_id, actor=actor)
 
 
+def _cmd_show_signing_secret(args: argparse.Namespace, actor: str) -> Any:
+    """Print every live generation's signing secret for one destination.
+
+    EVERY live generation, not just the active one, because during a rotation two are valid at once
+    and "which one do I install" is the first question a partner asks. Both are printed with their
+    generation number beside them, and a receiver that accepts either is verifying exactly what we
+    send -- each attempt carries one `v1,<sig>` entry per generation.
+
+    Nothing is stored and nothing is looked up: the secret is DERIVED from the root over
+    ``destination_id || generation``, which is why the store holds no signing material and why one
+    partner's leaked receiver secret forges nothing for another.
+
+    Audited before the value is produced, so a refusal partway through still leaves the row that
+    says somebody asked.
+    """
+    destination = partner_auth.get_destination(args.destination_id)
+    if destination is None:
+        raise partner_auth.NotFound("no such destination")
+    partner_auth.record_admin_action(
+        actor=actor,
+        action="show_signing_secret",
+        result="disclosed",
+        partner_id=destination.partner_id or None,
+        destination_id=destination.destination_id,
+        reason=f"generations={list(destination.signing_generations)}",
+    )
+    return {
+        "destination_id": destination.destination_id,
+        "partner_id": destination.partner_id,
+        "active_generation": destination.active_generation,
+        "retiring_generation": destination.retiring_generation,
+        "secrets": [
+            {
+                "generation": generation,
+                # Named as the receiver names it: the npm verifier and the Firebase adapter both
+                # take a `whsec_`-prefixed string.
+                "secret": webhook_signing.derive_secret(destination.destination_id, generation),
+                "role": "active" if generation == destination.active_generation else "retiring",
+            }
+            for generation in destination.signing_generations
+        ],
+        "note": (
+            "LIVE CREDENTIAL. Hand it over the way a password is handed over -- not in a ticket, "
+            "not in chat. During a rotation both generations verify; install the active one and "
+            "keep accepting the retiring one until retire-signing is run. If this value has been "
+            "anywhere it should not, rotate-signing the destination."
+        ),
+    }
+
+
 def _cmd_rotate_signing(args: argparse.Namespace, actor: str) -> Any:
     return partner_auth.rotate_signing_generation(args.destination_id, actor=actor)
 
@@ -363,6 +429,7 @@ _COMMANDS: dict[str, Callable[[argparse.Namespace, str], Any]] = {
     "pause-destination": _cmd_pause_destination,
     "resume-destination": _cmd_resume_destination,
     "rotate-signing": _cmd_rotate_signing,
+    "show-signing-secret": _cmd_show_signing_secret,
     "retire-signing": _cmd_retire_signing,
 }
 
@@ -431,6 +498,12 @@ def _parser() -> argparse.ArgumentParser:
     p = add("resume-destination", help="Lift a pause (including one a 410 caused).")
     p.add_argument("--destination-id", required=True)
 
+    p = add(
+        "show-signing-secret",
+        help="Print the live signing secret(s) for a destination. PRINTS A LIVE CREDENTIAL.",
+    )
+    p.add_argument("--destination-id", required=True)
+
     p = add("rotate-signing", help="Mint the next signing generation; the current one retires.")
     p.add_argument("--destination-id", required=True)
 
@@ -470,6 +543,18 @@ def main(
     # gets is about the variable rather than about a Helm secret group they are not looking at.
     # Every other command works without it: the pepper hashes a new secret and verifies an existing
     # one, and nothing here verifies.
+    # The signing root, checked the same way and for the same reason: a failure deeper in raises
+    # `SigningNotConfigured`, whose message is about provisioning Secret Manager and the chart's
+    # secret group -- the wrong hint for a human at a terminal who has simply not exported it.
+    if args.command == "show-signing-secret" and not webhook_signing.configured():
+        print(
+            f"{webhook_signing.SIGNING_ROOT_ENV} is unset (or under "
+            f"{webhook_signing.MIN_ROOT_BYTES} bytes). show-signing-secret DERIVES the secret from "
+            "it, so export this environment's value from Secret Manager for this one command -- "
+            "see the module docstring.",
+            file=sys.stderr,
+        )
+        return 2
     if args.command == "issue-key" and not partner_auth.pepper_ready():
         print(
             f"{partner_auth.PEPPER_ENV} is unset (or under {partner_auth.MIN_PEPPER_BYTES} bytes). "
