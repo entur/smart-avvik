@@ -14,7 +14,7 @@
 // `test/functionOptions.test.mjs` off `__endpoint.eventTrigger.retry`, because a silently
 // non-retrying trigger loses exactly the events a store outage was supposed to make recoverable.
 
-import { onRequest, type Request } from "firebase-functions/v2/https";
+import { type Request } from "firebase-functions/v2/https";
 import { onDocumentCreated } from "firebase-functions/v2/firestore";
 import type { Response } from "express";
 
@@ -132,7 +132,6 @@ export function createInboxWorker(
   );
 }
 
-export { onRequest };
 
 function declaredBytes(request: Request): number | null {
   const header = request.headers["content-length"];

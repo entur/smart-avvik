@@ -1054,7 +1054,11 @@ def test_the_module_imports_neither_varsel_nor_main():
     """
     imports = set(re.findall(r"^import (\w+)", MODULE_SOURCE, re.MULTILINE))
     assert "varsel" not in imports and "main" not in imports and "impact" not in imports
-    assert imports == {"logging", "threading", "partner_store"}, imports
+    # An EXACT set, never a containment check: the point is that nothing heavy can be added without
+    # a reader of this line deciding it is light. `reserved_budget` is the shared reserve-don't-check
+    # pass budget, stdlib-only (`threading`, `time.monotonic`), and it is why `threading` is no
+    # longer imported here directly -- the lock moved with the class that owns it.
+    assert imports == {"logging", "partner_store", "reserved_budget"}, imports
 
 
 if __name__ == "__main__":

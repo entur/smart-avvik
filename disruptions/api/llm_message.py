@@ -389,11 +389,14 @@ def new_replay_state() -> _LatchState:
 def new_partner_state() -> _LatchState:
     """A holder for the partner notification surface — same isolation, a third caller.
 
-    Identical in construction to :func:`new_replay_state` and deliberately a separate function
-    rather than a shared one: these are two independent callers, and a holder each is the whole
-    point. Sharing one would put `/meldinger`'s replay bursts and a partner evaluation pass behind
-    the same latch and the same mutex, which is the arrangement :class:`_LatchState` exists to
-    break — and the failure it produces is silent on both sides.
+    Identical in construction to :func:`new_replay_state`, and a separate function for a weaker
+    reason than an earlier version of this docstring claimed. It said sharing ONE factory would put
+    `/meldinger`'s replay bursts and a partner pass behind the same latch and the same mutex, which
+    is not true: a factory mints a new holder per call, so two callers of one factory are already
+    isolated from each other. What actually gives that isolation is CALLING it once per surface —
+    and the arrangement :class:`_LatchState` exists to break is a shared *instance*, which neither
+    shape produces. The two names are kept because they document the two surfaces that own a
+    holder, not because merging them would couple anything.
 
     Seeded one-way from the module-global holder, so a partner pass does not re-discover a 404 the
     poller already paid for and can never write a failure back onto the push path.

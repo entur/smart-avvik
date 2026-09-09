@@ -68,6 +68,7 @@ import os
 import socket
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -380,11 +381,34 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             self.sock.settimeout(read_timeout(self._deadline))
 
 
+#: ONE trust store for the process, not one per delivery attempt.
+#: ``ssl.create_default_context()`` loads and parses the platform CA bundle every time it is
+#: called, and it was called once per attempt -- inside the 5 s per-attempt ceiling that
+#: ``partner_delivery`` treats as scarce, for a bundle that is identical for every destination and
+#: changes only on a redeploy. An ``SSLContext`` is safe to share across threads and across
+#: connections, which is what makes this a memoization rather than a behaviour change: the same
+#: default verification, the same pinning path, the same everything except the parse.
+#:
+#: Built lazily rather than at import so a module import in an environment with no readable trust
+#: store fails when a delivery is attempted, where the error is diagnosable, rather than at import
+#: time on the poller thread.
+_default_context: ssl.SSLContext | None = None
+_context_lock = threading.Lock()
+
+
+def _shared_context() -> ssl.SSLContext:
+    global _default_context
+    with _context_lock:
+        if _default_context is None:
+            _default_context = ssl.create_default_context()
+        return _default_context
+
+
 class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
     """``HTTPSHandler`` that builds :class:`_PinnedHTTPSConnection` instead of the default."""
 
     def __init__(self, *, pinned_ip: str, deadline: float, context: ssl.SSLContext | None = None):
-        super().__init__(context=context or ssl.create_default_context())
+        super().__init__(context=context or _shared_context())
         self._pinned_ip = pinned_ip
         self._deadline = deadline
 

@@ -566,10 +566,21 @@ def test_the_partner_phase_is_gated_guarded_twice_and_fed_by_a_return_value():
     phase = source[
         source.index('_phase("partner_webhooks"') : source.index('_phase("partner_servability"')
     ]
-    assert "if varsel.partner_channel_enabled():" in source
-    assert source.index("if varsel.partner_channel_enabled():") < source.index(
+    # The flag is read ONCE for the cycle and both phases gate on that local. Read twice, a broken
+    # injected reader wrote the same warning and the same traceback twice per cycle.
+    assert source.count("varsel.partner_channel_enabled()") == 1, source
+    assert source.count("if partner_channel:") == 2, (
+        "both partner phases gate on the one read, and neither may run ungated"
+    )
+    assert source.index("varsel.partner_channel_enabled()") < source.index(
         '_phase("partner_webhooks"'
     ), "the gate must be outside the phase, or an ungated cycle still times a step it skipped"
+    assert source.index("if partner_channel:") < source.index('_phase("partner_webhooks"'), (
+        "same, for the first phase's own gate"
+    )
+    assert source.rindex("if partner_channel:") < source.index('_phase("partner_servability"'), (
+        "same, for the second phase's own gate"
+    )
     assert "outcome = varsel.check_and_notify(" in source, (
         "the partner phase is fed by check_and_notify's return value, not by module state"
     )
@@ -627,8 +638,12 @@ def test_the_servability_phase_is_gated_guarded_and_last():
     source = inspect.getsource(main._rebuild_all)
     phase = source[source.index('_phase("partner_servability"') :]
     assert source.index('_phase("partner_webhooks"') < source.index('_phase("partner_servability"')
-    gates = [i for i in range(len(source)) if source.startswith("if varsel.partner_channel_enabled():", i)]
+    # Two gates over ONE read: the flag is read once for the cycle (a broken injected reader logged
+    # its warning and its traceback twice when it was read per phase), and each phase still carries
+    # its own `if`, so neither can end up running inside the other's guard.
+    gates = [i for i in range(len(source)) if source.startswith("if partner_channel:", i)]
     assert len(gates) == 2, "each partner phase carries its own gate"
+    assert source.count("varsel.partner_channel_enabled()") == 1, "read once per cycle, not per phase"
     assert gates[1] < source.index('_phase("partner_servability"'), (
         "the gate must be outside the phase, or an ungated cycle still times a step it skipped"
     )

@@ -197,6 +197,13 @@ test("an event past valid_until expires at ENTRY: no policy, no dispatch, and no
   assert.equal(dispatched.length, 0);
   assert.equal(await stores.ledger.standing(event.alert_id), null, "no state was applied");
   assert.equal(stores.state.inbox.get(event.event_id).status, "expired");
+  // ONE clock. The suppression is stamped with the caller's `now`, not with wall-clock time: a
+  // record selected as stale against one clock and stamped against another is the two-clocks bug
+  // `recovery.ts` names by this repository's own incident, and it read `new Date()` here until a
+  // review caught it. Nothing else in `process()` would have shown it -- the outcome, the inbox
+  // status and the rule are all identical either way.
+  assert.equal(stores.state.suppressions.at(-1).rule, "expired");
+  assert.equal(stores.state.suppressions.at(-1).at, "2026-09-09T06:00:01.000Z");
 });
 
 test("the own staleness cutoff stops a permanently failing record retrying for a full day", async () => {

@@ -117,6 +117,32 @@ def train_label(mode: str | None, line: str | None, hhmm: str) -> str:
 # line. Case therefore belongs HERE, at the one call site whose position is fixed, and not in
 # `train_label`, which cannot know where its caller will put the result. "T-bane" keeps its capital
 # T in every position: it is an abbreviation, not a common noun.
+def train_label_from_input(message_input: dict) -> str | None:
+    """The traveller's own train as every notification names it, or ``None`` when the input has no
+    departure time to name one with.
+
+    Two things in one function because they are one rule. The label is
+    :func:`train_label`'s, read off the message input's own top level; and a departure that is
+    TOMORROW says so. The poller scores ~12 h ahead, so a push about an 07:18 train routinely goes
+    out the evening before -- by design (design review 2026-09-01, finding 48) -- and read at 21:36
+    "Tog L1 07:18 er innstilt" names tonight's train to anybody who does not already know the
+    forecast horizon.
+
+    ``None`` rather than a route fallback, because the three callers fall back differently: a title
+    falls back to the route, a body omits the label's line, and a withdrawal puts the route where
+    the train would have gone. Choosing for them here would make one of the three wrong.
+
+    It exists as a function because the rule was written out three times -- twice here and once in
+    ``varsel._partner_withdrawal_wording`` -- and a product rule that must never drift is exactly
+    the thing not to keep three copies of.
+    """
+    hhmm = message_input.get("avgang_kl")
+    if not hhmm:
+        return None
+    label = train_label(message_input.get("transportmiddel"), message_input.get("linje"), hhmm)
+    return f"{label} i morgen" if message_input.get("i_morgen") else label
+
+
 _LEG_MODE_NOUN = {
     "rail": "tog",
     "bus": "buss",
@@ -235,17 +261,8 @@ def deterministic_body(message_input: dict) -> str:
         detail = f"{cancel_pct} % sjanse for innstilling"
     else:
         detail = delay_phrase(message_input)
-    hhmm = message_input.get("avgang_kl")
-    if hhmm:
-        train = train_label(
-            message_input.get("transportmiddel"), message_input.get("linje"), hhmm
-        )
-        if message_input.get("i_morgen"):
-            # The departure is TOMORROW. The poller scores ~12 h ahead, so a push about a 07:18
-            # train routinely goes out the evening before -- by design, not by accident -- and read
-            # at 21:36 "Tog L1 07:18 er innstilt" sounds like tonight's train (design review
-            # 2026-09-01, finding 48). Same key the prompt is told about, so both writers say it.
-            train = f"{train} i morgen"
+    train = train_label_from_input(message_input)
+    if train:
         detail = f"{train}: {detail}" if detail else train
     # The alternative comes LAST, after the cancellation or the delay: what has happened to the
     # traveller's own train is the news, and the replacement is the advice that follows from it.
@@ -272,12 +289,9 @@ def notification_title(
     Only a cancellation earns it -- a second forecast about the same train is an update, not a
     confirmation of anything.
     """
-    hhmm = message_input.get("avgang_kl")
-    if not hhmm:
+    train = train_label_from_input(message_input)
+    if train is None:
         return f"{from_name} → {to_name}"
-    train = train_label(message_input.get("transportmiddel"), message_input.get("linje"), hhmm)
-    if message_input.get("i_morgen"):
-        train = f"{train} i morgen"
     if message_input.get("innstilt"):
         title = f"{train} er innstilt"
         return f"Bekreftet: {title}" if confirmed else title

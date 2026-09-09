@@ -102,6 +102,7 @@ import feedback
 import feedback_contexts
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
 import partner_events  # the partner channel's typed hand-off type and its emit step
+import reserved_budget  # the one reserve-don't-check pass budget
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
 # it back from here would be a cycle — see alert_policy's docstring). Bound at module level rather
@@ -140,6 +141,7 @@ from notification_wording import deterministic_body as _deterministic_body
 from notification_wording import mode_label
 from notification_wording import notification_title as _notification_title
 from notification_wording import train_label as _train_label
+from notification_wording import train_label_from_input as _train_label_from_input
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -2720,13 +2722,8 @@ def _partner_withdrawal_wording(
     the route when the input names no departure, which is :func:`notification_title`'s own
     fallback), and the route on the body's first line.
     """
-    hhmm = message_input.get("avgang_kl")
-    if hhmm:
-        train = _train_label(
-            message_input.get("transportmiddel"), message_input.get("linje"), hhmm
-        )
-        if message_input.get("i_morgen"):
-            train = f"{train} i morgen"
+    train = _train_label_from_input(message_input)
+    if train:
         title = f"{train}: {_PARTNER_WITHDRAWAL_TITLE}"
     else:
         title = f"{from_name} → {to_name}: {_PARTNER_WITHDRAWAL_TITLE}"
@@ -3024,7 +3021,7 @@ class _LockedPassBudget(notification_wording.PassBudget):
             return super().take()
 
 
-class _WriteBudget:
+class _WriteBudget(reserved_budget.ReservedBudget):
     """This cycle's ceiling on written messages, claimable from several threads at once.
 
     Two limits behind one `claim()`, because a caller must not be able to satisfy one and ignore the
@@ -3050,20 +3047,7 @@ class _WriteBudget:
     """
 
     def __init__(self, max_calls: int, deadline: float) -> None:
-        self._lock = threading.Lock()
-        self._max_calls = max_calls
-        self._deadline = deadline
-        self.claimed = 0
-        self.refused = 0
-
-    def claim(self) -> bool:
-        """Reserve one call, or refuse. Never blocks for longer than the dict operations here."""
-        with self._lock:
-            if self.claimed >= self._max_calls or monotonic() + _WORST_CASE_CALL_S >= self._deadline:
-                self.refused += 1
-                return False
-            self.claimed += 1
-            return True
+        super().__init__(max_calls, deadline, _WORST_CASE_CALL_S)
 
     def claim_clock(self) -> bool:
         """Reserve the wall clock WITHOUT spending the call allowance. What a partner subject claims.
@@ -3082,7 +3066,7 @@ class _WriteBudget:
         cost whichever surface paid it.
         """
         with self._lock:
-            if monotonic() + _WORST_CASE_CALL_S >= self._deadline:
+            if monotonic() + self._worst_case >= self._deadline:
                 self.refused += 1
                 return False
             return True

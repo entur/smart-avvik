@@ -58,6 +58,7 @@ from typing import Any, Protocol
 
 import partner_auth
 import partner_store
+import reserved_budget
 import webhook_client
 import webhook_signing
 
@@ -180,37 +181,15 @@ class DeliveryReport:
     ms: int = 0
 
 
-class _DeliveryBudget:
-    """This pass's ceiling on attempts, claimable from four threads at once.
+class _DeliveryBudget(reserved_budget.ReservedBudget):
+    """This pass's ceiling on attempts, claimed from four threads at once.
 
-    **The clock is RESERVED, not checked**, and the reservation covers the attempt *plus the durable
-    write that follows it*. ``varsel._WriteBudget``'s docstring records why: a naive
-    ``monotonic() >= deadline`` bounds when the last attempt *starts*, not when the pass *ends*, and
-    it overshot a documented 30 s ceiling by 16 s in exactly that shape. Concurrency does not weaken
-    it -- every worker reserves its own worst case before starting, so whatever is in flight when
-    the deadline nears was already paid for.
-
-    **Claimed inside the worker as its task starts, never at submit time.** Submitting is what
-    queues the work; if the claim ran there, every task would be admitted before the deadline was
-    consulted and the bound would guarantee nothing. That is ``/meldinger``'s recorded lesson, and
-    it is the one line of this class that is easy to move and fatal to move.
+    The mechanism is :class:`reserved_budget.ReservedBudget`'s -- including why the claim belongs
+    inside the worker as its task starts rather than at submit time, which is the one line here
+    that is easy to move and fatal to move. What is this pass's own is what the reservation covers:
+    the attempt PLUS the durable write that follows it, because a delivery that is not recorded is
+    a delivery that repeats.
     """
-
-    def __init__(self, max_calls: int, deadline: float, worst_case_s: float) -> None:
-        self._lock = threading.Lock()
-        self._max_calls = max_calls
-        self._deadline = deadline
-        self._worst_case = worst_case_s
-        self.claimed = 0
-        self.refused = 0
-
-    def claim(self) -> bool:
-        with self._lock:
-            if self.claimed >= self._max_calls or monotonic() + self._worst_case >= self._deadline:
-                self.refused += 1
-                return False
-            self.claimed += 1
-            return True
 
 
 class _Skips:
