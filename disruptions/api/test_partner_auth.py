@@ -17,6 +17,7 @@ write site in the repo, not of a document.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import os
 import pathlib
@@ -26,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import partner_auth
+import webhook_signing
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -48,6 +50,7 @@ PEPPER = "p" * 32
 #: A globally routable literal. `webhook_client.is_safe_address` refuses the RFC 5737
 #: documentation ranges, so "example" addresses do not work here -- its docstring says so.
 GOOD_URL = "https://hooks.acme.example.com/kix"
+SIGNING_ROOT = "r" * 40
 
 
 # ---- The in-memory document seam --------------------------------------------------------------
@@ -922,6 +925,130 @@ def test_the_tool_never_reaches_the_partner_api_or_a_partner_credential():
     assert "partner_api" not in TOOL_SOURCE
     assert "authenticate(" not in TOOL_SOURCE
     assert "Bearer" not in TOOL_SOURCE.split('"""', 2)[2]
+
+
+def test_the_operator_can_hand_a_partner_its_verification_secret():
+    """There is otherwise NO path to it, and the quickstart's promise depends on one.
+
+    `webhook_signing.derive_secret` is called only by the signer, and `GET /destinations/current`
+    serves generation NUMBERS and never derives -- deliberately, because a secret fetchable over the
+    partner's own credential is a secret their credential can be traded for. So the disclosure is an
+    OPERATOR action: same group, same audit, and the audit row is the point rather than a formality.
+    """
+    store = _install()
+    _provision(store)
+    os.environ[webhook_signing.SIGNING_ROOT_ENV] = SIGNING_ROOT
+    try:
+        code, printed = _run(
+            ["--environment", "dev", "show-signing-secret", "--destination-id", DEST],
+            authorizer=_allow(),
+            store=store,
+        )
+        assert code == 0
+        result = json.loads(printed)
+        assert result["destination_id"] == DEST
+        assert result["active_generation"] == 1
+        assert result["retiring_generation"] is None
+        assert [s["generation"] for s in result["secrets"]] == [1]
+        assert result["secrets"][0]["role"] == "active"
+        # The value a receiver verifies with, derived rather than stored -- so it is exactly what
+        # `webhook_signing.sign` will use, not a copy that can drift.
+        assert result["secrets"][0]["secret"] == webhook_signing.derive_secret(DEST, 1)
+        assert result["secrets"][0]["secret"].startswith(webhook_signing.SECRET_PREFIX)
+        assert "LIVE CREDENTIAL" in result["note"]
+
+        rows = [r for r in store.audit() if r["action"] == "show_signing_secret"]
+        assert len(rows) == 1
+        assert rows[0]["result"] == "disclosed"
+        assert rows[0]["actor"] == "operator@entur.org"
+        assert rows[0]["destination_id"] == DEST
+        # The audit row records the disclosure, never the disclosed value.
+        assert webhook_signing.derive_secret(DEST, 1) not in repr(rows)
+        assert SIGNING_ROOT not in repr(rows)
+    finally:
+        os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
+        _uninstall()
+
+
+def test_both_live_generations_are_printed_during_a_rotation():
+    """"Which one do I install" is the first question a partner asks, and during a rotation the
+    answer is "the active one, and keep accepting the retiring one"."""
+    store = _install()
+    _provision(store)
+    os.environ[webhook_signing.SIGNING_ROOT_ENV] = SIGNING_ROOT
+    try:
+        partner_auth.rotate_signing_generation(DEST, actor="op@entur.org")
+        code, printed = _run(
+            ["--environment", "dev", "show-signing-secret", "--destination-id", DEST],
+            authorizer=_allow(),
+            store=store,
+        )
+        assert code == 0
+        result = json.loads(printed)
+        assert [(s["generation"], s["role"]) for s in result["secrets"]] == [
+            (2, "active"),
+            (1, "retiring"),
+        ]
+        assert result["secrets"][0]["secret"] != result["secrets"][1]["secret"]
+        for entry in result["secrets"]:
+            assert entry["secret"] == webhook_signing.derive_secret(DEST, entry["generation"])
+    finally:
+        os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
+        _uninstall()
+
+
+def test_the_signing_secret_needs_the_group_like_every_other_action():
+    """A credential disclosure without the group would be the one action worth having a group for."""
+    store = _install()
+    _provision(store)
+    os.environ[webhook_signing.SIGNING_ROOT_ENV] = SIGNING_ROOT
+    try:
+        code, printed = _run(
+            ["--environment", "prd", "show-signing-secret", "--destination-id", DEST],
+            authorizer=_deny(),
+            store=store,
+        )
+        assert code == 3
+        assert SIGNING_ROOT not in printed
+        refusals = [r for r in store.audit() if r["result"] == "refused"]
+        assert len(refusals) == 1
+        assert refusals[0]["action"] == "show-signing-secret"
+        assert refusals[0]["destination_id"] == DEST
+    finally:
+        os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
+        _uninstall()
+
+
+def test_a_missing_signing_root_is_one_line_rather_than_a_provisioning_lecture():
+    """`issue-key`'s pre-check, for the other secret. Deeper in, the failure's message is about
+    Secret Manager and a Helm secret group -- the wrong hint for a human who has simply not
+    exported it, and one that reads as "this environment is broken"."""
+    store = _install()
+    _provision(store)
+    os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
+    try:
+        code, printed = _run(
+            ["--environment", "dev", "show-signing-secret", "--destination-id", DEST],
+            authorizer=_allow(),
+            store=store,
+        )
+        assert code == 2
+        assert printed == "", "nothing is printed on stdout when nothing could be derived"
+        # Refused BEFORE the group check, so a missing variable is not reported as an authorization
+        # problem -- and nothing was disclosed or audited as disclosed.
+        assert [r for r in store.audit() if r["action"] == "show_signing_secret"] == []
+    finally:
+        _uninstall()
+
+
+def test_the_disclosure_command_says_what_it_prints():
+    """The one command whose output must not go into a ticket, and the docstring has to say so
+    where somebody reading `--help` or the file will see it."""
+    assert "show-signing-secret" in TOOL_SOURCE
+    assert "PRINTS A LIVE CREDENTIAL" in TOOL_SOURCE
+    assert "must\nnot go into a ticket" in TOOL_SOURCE or "not go into a ticket" in TOOL_SOURCE
+    assert "rotate-signing" in TOOL_SOURCE
+
 
 
 def _run_all() -> None:

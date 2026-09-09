@@ -30,15 +30,15 @@
   ],
   "tags": [
     {
-      "name": "subscriptions",
+      "name": "notification-subscriptions",
       "description": "One commuter's recurring journey."
     },
     {
-      "name": "destinations",
+      "name": "notification-destinations",
       "description": "Your callback endpoint and its signing generations."
     },
     {
-      "name": "test",
+      "name": "notification-test",
       "description": "Signed synthetic events, restricted to test-only subscriptions."
     }
   ],
@@ -47,7 +47,7 @@
       "post": {
         "operationId": "createOrReplaceSubscription",
         "tags": [
-          "subscriptions"
+          "notification-subscriptions"
         ],
         "summary": "Create or replace a watch by your own reference",
         "description": "Idempotent on (reference, definition): an identical retry returns the stored record and changes nothing but the inactivity horizon, so an unacknowledged POST is safe to repeat. A different definition under the same reference amends it and bumps `version`. A reference that has been deleted is **not** resurrected -- the id is spent and its record is the audit trail -- which is a 409.\n\nThe window, the weekday set and the stop pair are validated exactly as Entur's own Avviksvarsel validates them, including the refusal of overnight windows: `begin` must be strictly before `end`, so a watch spanning midnight is registered as two.\n\nA stop pair that no direct trip serves is **stored, never refused** -- weekend-only and seasonal routes are why a refusal would be wrong -- and carries the caveat on `servable` with `servable_checked_at` beside it. `servable: null` means the answer could not be established and must never be rendered to a traveller as an all-clear.\n\n`alerts` is **null** on this response: a create or replace does not read the alert state. Null therefore means \"not included here\", never \"no standing alerts\" -- that is `n_active: 0` with `truncated: false`, from either GET route.",
@@ -126,7 +126,7 @@
       "get": {
         "operationId": "listSubscriptions",
         "tags": [
-          "subscriptions"
+          "notification-subscriptions"
         ],
         "summary": "Your own watches",
         "description": "Oldest first. The set is bounded by the per-partner ceiling on active subscriptions, so paging is a slice of one bounded read: pass a page's `next_cursor` back as `after`. A cursor the current set no longer contains is a 400 rather than an empty page, because \"that watch is gone\" and \"nothing matched\" are different answers.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\". A list page reads every row's state in ONE query, so a bounded read marks *every* row truncated -- including rows whose own subjects fitted, because a watch crowded out of the page would otherwise read exactly like a calm one. Ask about that watch individually and the read is scoped to it alone.",
@@ -198,7 +198,7 @@
       "get": {
         "operationId": "getSubscription",
         "tags": [
-          "subscriptions"
+          "notification-subscriptions"
         ],
         "summary": "One watch, with servability and freshness",
         "description": "Missing, deleted, expired and belonging to another partner are all 404: one answer for four states, so the difference cannot be used to enumerate anything.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\".",
@@ -233,7 +233,7 @@
       "delete": {
         "operationId": "deleteSubscription",
         "tags": [
-          "subscriptions"
+          "notification-subscriptions"
         ],
         "summary": "Stop a watch: tombstone, then durable cleanup",
         "description": "Ordered and durable. The tombstone lands first, in one write that stops routing, and only then are the watch's events, deliveries and alert subjects removed -- reversed, a partial failure would leave a routable watch whose events were already gone.\n\nRepeated deletion succeeds, and so does deleting a reference that never existed (`existed: false`). Where cleanup has not finished, `cleanup.state` is `pending` and a repeated `DELETE` resumes it; `cleanup.residual_hours` is the maximum window after which expiry removes whatever is left.\n\nDeletion deliberately does not reach the notification wording caches: those key on the journey definition, which is exactly what this watch shares with any other registration on the same route, and they expire with the disruption they describe.",
@@ -267,7 +267,7 @@
       "get": {
         "operationId": "getCurrentDestination",
         "tags": [
-          "destinations"
+          "notification-destinations"
         ],
         "summary": "Destination readiness and signing key ids",
         "description": "Your provisioned callback, whether it is currently deliverable, and which signing generations are live. **Generation numbers only, never a secret**: a signing secret is derived from a root over `destination_id || generation` and is stored nowhere, and this endpoint never derives one.\n\n`paused` is set automatically when your endpoint answers `410 Gone` -- the documented meaning of which is \"stop sending\" -- and is lifted only by an Entur operator. While it is paused, new watches can still be registered and events still queue; nothing is dialled.",
@@ -311,7 +311,7 @@
       "post": {
         "operationId": "sendTestEvent",
         "tags": [
-          "test"
+          "notification-test"
         ],
         "summary": "Send one signed synthetic event to your callback",
         "description": "Signs and dials one synthetic event, so a receiver can be verified end to end before a real disruption. **Restricted to a subscription created with `test: true`**, and that marker is immutable -- changing it needs delete and re-create -- because it rides inside the signed body and a receiver is expected to refuse a test event before dispatching a native notification. Anything else is 409.\n\nThe event's `test` field, `event_id` and `alert_id` are unique per call, so asking twice gives two notifications rather than one the receiver's duplicate rule discards. Nothing is stored: no event, no delivery record, and your daily notification allowance is untouched.\n\nAnswers 200 with the outcome even when your endpoint rejected the attempt -- the classification is the diagnosis. A refusal on Entur's side is a 4xx or 503 as usual.",
