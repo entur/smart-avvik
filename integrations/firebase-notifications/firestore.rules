@@ -5,9 +5,9 @@ rules_version = '2';
 // WHY THIS FILE EXISTS AT ALL. Cloud Functions here use the ADMIN SDK, which is authorized by IAM
 // and which Security Rules do not apply to -- so nothing in this file grants the receiver anything.
 // What it closes is the other door. A Firestore database in a project that has a Firebase app
-// registered (which a partner's mobile BFF certainly does) is reachable by an untrusted client SDK
+// registered (which a client's mobile BFF certainly does) is reachable by an untrusted client SDK
 // holding a public API key, and the console's default template opens the whole database to the world
-// until a date passes. Without these rules any signed-in user of the partner's own app can:
+// until a date passes. Without these rules any signed-in user of the client's own app can:
 //
 //   * READ every event -- the Norwegian prose of every commuter's disruption alert, with their
 //     origin, destination and departure time;

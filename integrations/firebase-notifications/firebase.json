@@ -1,7 +1,7 @@
 {
   "$comment": [
-    "This package's OWN emulator configuration, for the partner's project. It is not the repo-root",
-    "firebase.json, which configures the emulator kix-avvik's own partner store is tested against.",
+    "This package's OWN emulator configuration, for the client's project. It is not the repo-root",
+    "firebase.json, which configures the emulator kix-avvik's own notification store is tested against.",
     "",
     "WHAT THE SEPARATION IS FOR, at the strength it was measured at. CI runs the two emulator steps",
     "SEQUENTIALLY, and there the separation is what keeps a step clean when the previous one has not",
@@ -27,7 +27,7 @@
     "    port at start-up -- a race two simultaneous starts both win. Pinning it makes the separation",
     "    deterministic instead of probabilistic.",
     "",
-    "And the emulator runs under its OWN demo project id (`demo-kixpartner`, in package.json's",
+    "And the emulator runs under its OWN demo project id (`demo-kixclient`, in package.json's",
     "test:emulator script). The CLI keys its hub locator file on the project id and warns that two",
     "instances of one project `may result in unexpected behavior`; a distinct id answers that warning",
     "rather than tolerating it. The suites read the id from GCLOUD_PROJECT, which `emulators:exec",

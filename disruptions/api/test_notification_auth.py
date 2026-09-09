@@ -1,14 +1,14 @@
-"""Checks for partner_auth.py and for the operator tool that drives it.
+"""Checks for notification_auth.py and for the operator tool that drives it.
 
-Hermetic: no emulator, no socket, no credentials. Every store access in ``partner_auth`` goes
-through the four-method :class:`partner_auth._Docs` seam, so an in-memory implementation exercises
+Hermetic: no emulator, no socket, no credentials. Every store access in ``notification_auth`` goes
+through the four-method :class:`notification_auth._Docs` seam, so an in-memory implementation exercises
 the real hashing, the real two-tier limiter, the real negative cache and the real audit path -- and
 the operator tool takes its authorizer and its store by injection, which is what lets scenario 10
 run with no Google group and no GCP project.
 
 Two things this file deliberately checks by GREPPING source rather than by behaviour, because no
-runtime test can establish either. That ``partner_api`` never names the audit collection is R22's
-"no partner credential can read it", and it is a projection argument -- Firestore has no
+runtime test can establish either. That ``notification_api`` never names the audit collection is R22's
+"no client credential can read it", and it is a projection argument -- Firestore has no
 per-collection IAM (KTD5), so nothing at runtime distinguishes "the route cannot read it" from
 "this request happened not to". And that the audit collection is append-only is a property of every
 write site in the repo, not of a document.
@@ -27,29 +27,29 @@ import sys
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import partner_auth
-import partner_store
+import notification_auth
+import notification_store
 import webhook_signing
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-AUTH_SOURCE = (HERE / "partner_auth.py").read_text()
-API_SOURCE = (HERE / "partner_api.py").read_text()
-TOOL_PATH = REPO / "scripts" / "manage_notification_partner.py"
+AUTH_SOURCE = (HERE / "notification_auth.py").read_text()
+API_SOURCE = (HERE / "notification_api.py").read_text()
+TOOL_PATH = REPO / "scripts" / "manage_notification_client.py"
 TOOL_SOURCE = TOOL_PATH.read_text()
 
 if str(REPO / "scripts") not in sys.path:
     sys.path.insert(0, str(REPO / "scripts"))
 
-import manage_notification_partner as tool
+import manage_notification_client as tool
 
 NOW = datetime(2026, 9, 8, 6, 30, tzinfo=UTC)
-PARTNER = "acme"
+CLIENT = "acme"
 DEST = "acme-prod"
 #: 32 bytes exactly, which is `MIN_PEPPER_BYTES`: a shorter one must be refused, so the fixture
 #: sits on the bar rather than comfortably above it.
 PEPPER = "p" * 32
-#: A globally routable literal. `webhook_client.is_safe_address` refuses the RFC 5737
+#: A globally routable literal. `webhook_sender.is_safe_address` refuses the RFC 5737
 #: documentation ranges, so "example" addresses do not work here -- its docstring says so.
 GOOD_URL = "https://hooks.acme.example.com/kix"
 SIGNING_ROOT = "r" * 40
@@ -59,7 +59,7 @@ SIGNING_ROOT = "r" * 40
 
 
 class _MemoryDocs:
-    """:class:`partner_auth._Docs` over a dict, counting reads so "costs no store read" is checkable.
+    """:class:`notification_auth._Docs` over a dict, counting reads so "costs no store read" is checkable.
 
     ``fail_with`` is the store-outage injection: R20 wants a store failure to suppress the request
     and nothing wider, and the only way to check that at this layer is to make the store raise.
@@ -105,31 +105,31 @@ class _MemoryDocs:
         return [
             doc
             for (coll, _), doc in sorted(self.data.items())
-            if coll == partner_auth.ADMIN_AUDIT
+            if coll == notification_auth.ADMIN_AUDIT
         ]
 
 
 def _install(docs: _MemoryDocs | None = None, *, pepper: str | None = PEPPER) -> _MemoryDocs:
     store = docs or _MemoryDocs()
     if pepper is None:
-        os.environ.pop(partner_auth.PEPPER_ENV, None)
+        os.environ.pop(notification_auth.PEPPER_ENV, None)
     else:
-        os.environ[partner_auth.PEPPER_ENV] = pepper
-    partner_auth.configure(docs=store, clock=lambda: NOW)
+        os.environ[notification_auth.PEPPER_ENV] = pepper
+    notification_auth.configure(docs=store, clock=lambda: NOW)
     return store
 
 
 def _uninstall() -> None:
-    partner_auth.reset_for_tests()
-    os.environ.pop(partner_auth.PEPPER_ENV, None)
+    notification_auth.reset_for_tests()
+    os.environ.pop(notification_auth.PEPPER_ENV, None)
 
 
 def _provision(store: _MemoryDocs, *, url: str = GOOD_URL) -> str:
-    partner_auth.create_partner(PARTNER, name="Acme Reise AS", actor="operator@entur.org")
-    partner_auth.create_destination(
-        DEST, partner_id=PARTNER, callback_url=url, actor="operator@entur.org"
+    notification_auth.create_client(CLIENT, name="Acme Reise AS", actor="operator@entur.org")
+    notification_auth.create_destination(
+        DEST, client_id=CLIENT, callback_url=url, actor="operator@entur.org"
     )
-    _credential, bearer = partner_auth.issue_credential(PARTNER, actor="operator@entur.org")
+    _credential, bearer = notification_auth.issue_credential(CLIENT, actor="operator@entur.org")
     return bearer
 
 
@@ -139,19 +139,19 @@ def _provision(store: _MemoryDocs, *, url: str = GOOD_URL) -> str:
 def test_an_unconfigured_deployment_is_not_a_bad_credential():
     """No store or no pepper is a fact about THIS deployment, and must not read as a 401.
 
-    `authenticate` raises NotConfigured, which `partner_api._http` turns into 503 with a
-    Retry-After. The failure direction matters: a 401 here sends a partner hunting for a credential
+    `authenticate` raises NotConfigured, which `notification_api._http` turns into 503 with a
+    Retry-After. The failure direction matters: a 401 here sends a client hunting for a credential
     problem that is ours.
     """
     _install(pepper=None)
     try:
-        assert partner_auth.store_ready() is True
-        assert partner_auth.pepper_ready() is False
-        assert partner_auth.available() is False
+        assert notification_auth.store_ready() is True
+        assert notification_auth.pepper_ready() is False
+        assert notification_auth.available() is False
         raised = False
         try:
-            partner_auth.authenticate("Bearer kixn_00000000000000000000.x")
-        except partner_auth.NotConfigured:
+            notification_auth.authenticate("Bearer kixn_00000000000000000000.x")
+        except notification_auth.NotConfigured:
             raised = True
         assert raised, "an unusable pepper must raise NotConfigured, not AuthFailed"
     finally:
@@ -159,9 +159,9 @@ def test_an_unconfigured_deployment_is_not_a_bad_credential():
 
 
 def test_a_pepper_one_byte_short_is_refused():
-    _install(pepper="p" * (partner_auth.MIN_PEPPER_BYTES - 1))
+    _install(pepper="p" * (notification_auth.MIN_PEPPER_BYTES - 1))
     try:
-        assert partner_auth.pepper_ready() is False
+        assert notification_auth.pepper_ready() is False
     finally:
         _uninstall()
 
@@ -170,7 +170,7 @@ def test_a_pepper_written_with_echo_is_stripped_and_reported_once():
     """A trailing newline re-hashes every credential at once and reports nothing on its own.
 
     `feedback._env`'s lesson, and worse here: the eight silently dropped feedback submissions were
-    one endpoint, while this byte would 401 every partner simultaneously. Stripped rather than
+    one endpoint, while this byte would 401 every client simultaneously. Stripped rather than
     refused (whitespace is a transport artefact of how the payload was written), and WARNED once so
     the provisioning defect is findable.
     """
@@ -179,17 +179,17 @@ def test_a_pepper_written_with_echo_is_stripped_and_reported_once():
         records: list[logging.LogRecord] = []
         handler = logging.Handler()
         handler.emit = records.append  # type: ignore[method-assign]
-        partner_auth.logger.addHandler(handler)
+        notification_auth.logger.addHandler(handler)
         try:
-            assert partner_auth.pepper_ready() is True
-            first = partner_auth.secret_hash("kixn_0", "s")
-            second = partner_auth.secret_hash("kixn_0", "s")
+            assert notification_auth.pepper_ready() is True
+            first = notification_auth.secret_hash("kixn_0", "s")
+            second = notification_auth.secret_hash("kixn_0", "s")
         finally:
-            partner_auth.logger.removeHandler(handler)
+            notification_auth.logger.removeHandler(handler)
         assert first == second
         # The stripped value is what hashes, so the newline cannot change a single hash.
-        os.environ[partner_auth.PEPPER_ENV] = PEPPER
-        assert partner_auth.secret_hash("kixn_0", "s") == first
+        os.environ[notification_auth.PEPPER_ENV] = PEPPER
+        assert notification_auth.secret_hash("kixn_0", "s") == first
         warnings = [r for r in records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1, "warned once per process, not per read"
     finally:
@@ -202,14 +202,14 @@ def test_a_pepper_written_with_echo_is_stripped_and_reported_once():
 def test_the_hash_is_bound_to_its_key_id():
     """A hash lifted from one credential document must not verify under another `key-id`.
 
-    Without the id in the preimage, one stolen row authenticates as every partner whose row it is
+    Without the id in the preimage, one stolen row authenticates as every client whose row it is
     pasted into -- and nothing about the store would look wrong.
     """
     _install()
     try:
         secret = "the-same-secret"
-        assert partner_auth.secret_hash("kixn_aaaaaaaaaaaaaaaaaaaa", secret) != (
-            partner_auth.secret_hash("kixn_bbbbbbbbbbbbbbbbbbbb", secret)
+        assert notification_auth.secret_hash("kixn_aaaaaaaaaaaaaaaaaaaa", secret) != (
+            notification_auth.secret_hash("kixn_bbbbbbbbbbbbbbbbbbbb", secret)
         )
     finally:
         _uninstall()
@@ -224,7 +224,7 @@ def test_the_hash_is_hmac_sha256_and_never_bcrypt_or_argon2():
     assert "hmac.new(_pepper()" in AUTH_SOURCE
     assert "hmac.compare_digest" in AUTH_SOURCE
     # Over the IMPORT lines only. A bare substring search over the whole file matches the docstring
-    # that explains why none of these is used -- test_partner_store's `_uncommented` lesson, in the
+    # that explains why none of these is used -- test_notification_store's `_uncommented` lesson, in the
     # other direction: a negative grep that hits the explanation passes (or fails) for the wrong
     # reason.
     imports = [
@@ -234,15 +234,15 @@ def test_the_hash_is_hmac_sha256_and_never_bcrypt_or_argon2():
     ]
     for forbidden in ("bcrypt", "argon2", "passlib", "scrypt", "pbkdf2", "hashlib.scrypt"):
         assert not any(forbidden in line.lower() for line in imports), forbidden
-    assert len(partner_auth.secret_hash.__doc__ or "") > 100
+    assert len(notification_auth.secret_hash.__doc__ or "") > 100
 
 
 def test_a_minted_credential_has_the_documented_shape():
-    key_id, secret = partner_auth.mint_credential()
-    assert partner_auth.KEY_ID_RE.match(key_id), key_id
-    assert key_id.startswith(partner_auth.KEY_ID_PREFIX)
+    key_id, secret = notification_auth.mint_credential()
+    assert notification_auth.KEY_ID_RE.match(key_id), key_id
+    assert key_id.startswith(notification_auth.KEY_ID_PREFIX)
     assert len(secret) >= 40, "32 random bytes, urlsafe-base64 without padding"
-    assert partner_auth.bearer_credential(key_id, secret) == f"{key_id}.{secret}"
+    assert notification_auth.bearer_credential(key_id, secret) == f"{key_id}.{secret}"
 
 
 # ---- The two-tier limiter and the negative cache ----------------------------------------------
@@ -259,12 +259,12 @@ def test_a_malformed_header_costs_no_store_read_and_no_global_slot():
         for header in (None, "", "Basic abc", "Bearer", "Bearer nodot", "Bearer bad.secret"):
             failed = False
             try:
-                partner_auth.authenticate(header)
-            except partner_auth.AuthFailed:
+                notification_auth.authenticate(header)
+            except notification_auth.AuthFailed:
                 failed = True
             assert failed, header
         assert store.reads == 0
-        assert len(partner_auth._global_calls) == 0
+        assert len(notification_auth._global_calls) == 0
     finally:
         _uninstall()
 
@@ -281,8 +281,8 @@ def test_a_repeated_unknown_key_id_costs_one_store_read():
         header = "Bearer kixn_0123456789abcdef0123.whatever"
         for _ in range(20):
             try:
-                partner_auth.authenticate(header)
-            except partner_auth.AuthFailed:
+                notification_auth.authenticate(header)
+            except notification_auth.AuthFailed:
                 pass
         assert store.reads == 1, store.reads
     finally:
@@ -302,12 +302,12 @@ def test_a_wrong_secret_for_a_known_key_is_never_cached():
         before = store.reads
         for _ in range(3):
             try:
-                partner_auth.authenticate(f"Bearer {key_id}.wrong")
-            except partner_auth.AuthFailed as exc:
+                notification_auth.authenticate(f"Bearer {key_id}.wrong")
+            except notification_auth.AuthFailed as exc:
                 assert exc.reason == "secret"
         assert store.reads - before == 3, "each wrong-secret attempt re-reads the credential"
         # And the right secret still works immediately afterwards.
-        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
+        assert notification_auth.authenticate(f"Bearer {bearer}").client_id == CLIENT
     finally:
         _uninstall()
 
@@ -316,35 +316,35 @@ def test_an_anonymous_flood_cannot_spend_a_partners_own_budget():
     """Scenario 7, second half. Two tiers, and the second is only reachable after authentication.
 
     The flood exhausts the GLOBAL pre-lookup tier -- the accepted trade, which `/impact`'s limiter
-    already makes -- but spends none of the per-partner allowance, so the partner's budget is intact
+    already makes -- but spends none of the per-client allowance, so the client's budget is intact
     the moment the global window rolls over.
     """
     store = _install()
     bearer = _provision(store)
     try:
         seen_rate_limit = False
-        for n in range(partner_auth.GLOBAL_PRELOOKUP_PER_MIN + 5):
+        for n in range(notification_auth.GLOBAL_PRELOOKUP_PER_MIN + 5):
             header = f"Bearer kixn_{n:020x}.nope"
             try:
-                partner_auth.authenticate(header)
-            except partner_auth.RateLimited as exc:
+                notification_auth.authenticate(header)
+            except notification_auth.RateLimited as exc:
                 seen_rate_limit = True
                 assert exc.tier == "global"
                 assert 0 < exc.retry_after_s <= 60
-            except partner_auth.AuthFailed:
+            except notification_auth.AuthFailed:
                 pass
         assert seen_rate_limit, "the global tier must bind"
-        assert partner_auth._partner_calls == {}, "no partner slot was spent by anonymous traffic"
-        # Roll the global window over; the partner still has its whole allowance.
-        partner_auth._global_calls.clear()
-        principal = partner_auth.authenticate(f"Bearer {bearer}")
-        for _ in range(partner_auth.PER_PARTNER_PER_MIN):
-            partner_auth.claim_partner_slot(principal.partner_id)
+        assert notification_auth._client_calls == {}, "no client slot was spent by anonymous traffic"
+        # Roll the global window over; the client still has its whole allowance.
+        notification_auth._global_calls.clear()
+        principal = notification_auth.authenticate(f"Bearer {bearer}")
+        for _ in range(notification_auth.PER_CLIENT_PER_MIN):
+            notification_auth.claim_client_slot(principal.client_id)
         limited = False
         try:
-            partner_auth.claim_partner_slot(principal.partner_id)
-        except partner_auth.RateLimited as exc:
-            limited = exc.tier == "partner"
+            notification_auth.claim_client_slot(principal.client_id)
+        except notification_auth.RateLimited as exc:
+            limited = exc.tier == "client"
         assert limited
     finally:
         _uninstall()
@@ -355,29 +355,29 @@ def test_an_anonymous_flood_cannot_spend_a_partners_own_budget():
 
 def test_several_credentials_live_at_once_and_revoking_one_leaves_the_other(
 ):
-    """Scenario 6. KTD8's whole rotation story: a partner is never taken down to rotate a key."""
+    """Scenario 6. KTD8's whole rotation story: a client is never taken down to rotate a key."""
     store = _install()
     retiring = _provision(store)
     try:
-        _new_record, replacement = partner_auth.issue_credential(
-            PARTNER, actor="operator@entur.org", label="rotation 2026-09"
+        _new_record, replacement = notification_auth.issue_credential(
+            CLIENT, actor="operator@entur.org", label="rotation 2026-09"
         )
         assert retiring.split(".")[0] != replacement.split(".")[0]
-        assert partner_auth.authenticate(f"Bearer {retiring}").partner_id == PARTNER
-        assert partner_auth.authenticate(f"Bearer {replacement}").partner_id == PARTNER
+        assert notification_auth.authenticate(f"Bearer {retiring}").client_id == CLIENT
+        assert notification_auth.authenticate(f"Bearer {replacement}").client_id == CLIENT
 
-        partner_auth.revoke_credential(
+        notification_auth.revoke_credential(
             retiring.split(".")[0], actor="operator@entur.org", reason="cutover complete"
         )
         revoked = False
         try:
-            partner_auth.authenticate(f"Bearer {retiring}")
-        except partner_auth.AuthFailed as exc:
+            notification_auth.authenticate(f"Bearer {retiring}")
+        except notification_auth.AuthFailed as exc:
             revoked = exc.reason == "revoked"
         assert revoked
-        assert partner_auth.authenticate(f"Bearer {replacement}").partner_id == PARTNER
+        assert notification_auth.authenticate(f"Bearer {replacement}").client_id == CLIENT
 
-        listed = partner_auth.list_credentials(PARTNER)
+        listed = notification_auth.list_credentials(CLIENT)
         assert {c.status for c in listed} == {"active", "revoked"}
         # An operator listing credentials never sees the material.
         assert not any("secret" in c.__dataclass_fields__ for c in listed)
@@ -386,22 +386,22 @@ def test_several_credentials_live_at_once_and_revoking_one_leaves_the_other(
 
 
 def test_a_suspended_partner_gets_403_not_401():
-    """A partner must be able to tell "my key is wrong" from "we have been switched off"."""
+    """A client must be able to tell "my key is wrong" from "we have been switched off"."""
     store = _install()
     bearer = _provision(store)
     try:
-        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
-        partner_auth.set_partner_suspended(
-            PARTNER, suspended=True, actor="operator@entur.org", reason="billing"
+        assert notification_auth.authenticate(f"Bearer {bearer}").client_id == CLIENT
+        notification_auth.set_client_suspended(
+            CLIENT, suspended=True, actor="operator@entur.org", reason="billing"
         )
         suspended = False
         try:
-            partner_auth.authenticate(f"Bearer {bearer}")
-        except partner_auth.AuthSuspended:
+            notification_auth.authenticate(f"Bearer {bearer}")
+        except notification_auth.AuthSuspended:
             suspended = True
         assert suspended, "the account cache must be cleared by the suspension itself"
-        partner_auth.set_partner_suspended(PARTNER, suspended=False, actor="operator@entur.org")
-        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
+        notification_auth.set_client_suspended(CLIENT, suspended=False, actor="operator@entur.org")
+        assert notification_auth.authenticate(f"Bearer {bearer}").client_id == CLIENT
     finally:
         _uninstall()
 
@@ -409,14 +409,14 @@ def test_a_suspended_partner_gets_403_not_401():
 def test_an_expired_credential_is_refused():
     _install()
     try:
-        partner_auth.create_partner(PARTNER, name="Acme", actor="op@entur.org")
-        _record, bearer = partner_auth.issue_credential(
-            PARTNER, actor="op@entur.org", expires_at=NOW - timedelta(seconds=1)
+        notification_auth.create_client(CLIENT, name="Acme", actor="op@entur.org")
+        _record, bearer = notification_auth.issue_credential(
+            CLIENT, actor="op@entur.org", expires_at=NOW - timedelta(seconds=1)
         )
         expired = False
         try:
-            partner_auth.authenticate(f"Bearer {bearer}")
-        except partner_auth.AuthFailed as exc:
+            notification_auth.authenticate(f"Bearer {bearer}")
+        except notification_auth.AuthFailed as exc:
             expired = exc.reason == "expired"
         assert expired
     finally:
@@ -426,14 +426,14 @@ def test_an_expired_credential_is_refused():
 def test_the_credential_ceiling_is_enforced_before_a_write():
     store = _install()
     try:
-        partner_auth.create_partner(PARTNER, name="Acme", actor="op@entur.org")
-        for _ in range(partner_auth.MAX_CREDENTIALS_PER_PARTNER):
-            partner_auth.issue_credential(PARTNER, actor="op@entur.org")
+        notification_auth.create_client(CLIENT, name="Acme", actor="op@entur.org")
+        for _ in range(notification_auth.MAX_CREDENTIALS_PER_CLIENT):
+            notification_auth.issue_credential(CLIENT, actor="op@entur.org")
         before = len(store.writes)
         refused = False
         try:
-            partner_auth.issue_credential(PARTNER, actor="op@entur.org")
-        except partner_auth.Conflict:
+            notification_auth.issue_credential(CLIENT, actor="op@entur.org")
+        except notification_auth.Conflict:
             refused = True
         assert refused
         assert len(store.writes) == before, "the ceiling is checked before any write"
@@ -455,8 +455,8 @@ def test_the_secret_is_never_logged_and_the_key_id_always_is():
     root.setLevel(logging.DEBUG)
     try:
         try:
-            partner_auth.authenticate(f"Bearer {key_id}.{secret}x")
-        except partner_auth.AuthFailed:
+            notification_auth.authenticate(f"Bearer {key_id}.{secret}x")
+        except notification_auth.AuthFailed:
             pass
         rendered = "\n".join(
             r.getMessage() + repr(getattr(r, "fields", {})) for r in records
@@ -481,7 +481,7 @@ def test_an_unsafe_callback_url_is_refused_at_provisioning_and_audited():
     """
     store = _install()
     try:
-        partner_auth.create_partner(PARTNER, name="Acme", actor="op@entur.org")
+        notification_auth.create_client(CLIENT, name="Acme", actor="op@entur.org")
         for bad in (
             "http://hooks.acme.example.com/kix",  # not HTTPS
             "https://good.example@evil.example/kix",  # userinfo
@@ -495,19 +495,19 @@ def test_an_unsafe_callback_url_is_refused_at_provisioning_and_audited():
             "https://[::1]/kix",  # loopback, v6
             # NAT64 and 6to4: global and non-private by every named range, while encoding
             # 169.254.169.254. A deny-list is the wrong SHAPE for the claim, which is why
-            # webhook_client re-runs its positive test on what a prefix embeds.
+            # webhook_sender re-runs its positive test on what a prefix embeds.
             "https://[64:ff9b::a9fe:a9fe]/kix",
             "https://[2002:a9fe:a9fe::]/kix",
         ):
             refused = False
             try:
-                partner_auth.create_destination(
-                    DEST, partner_id=PARTNER, callback_url=bad, actor="op@entur.org"
+                notification_auth.create_destination(
+                    DEST, client_id=CLIENT, callback_url=bad, actor="op@entur.org"
                 )
-            except partner_auth.Conflict as exc:
+            except notification_auth.Conflict as exc:
                 refused = "unsafe callback URL" in str(exc)
             assert refused, bad
-            assert store.get(partner_auth.DESTINATIONS, DEST) is None, bad
+            assert store.get(notification_auth.DESTINATIONS, DEST) is None, bad
         refusals = [r for r in store.audit() if r["result"] == "refused"]
         assert len(refusals) == 10
         assert {r["action"] for r in refusals} == {"create_destination"}
@@ -526,22 +526,22 @@ def test_a_destination_is_paused_on_410_and_only_an_operator_resumes_it():
     store = _install()
     _provision(store)
     try:
-        destination = partner_auth.destination_for_delivery(DEST)
+        destination = notification_auth.destination_for_delivery(DEST)
         assert destination is not None and destination.deliverable is True
         assert destination.signing_generations == (1,)
 
-        paused = partner_auth.pause_destination(DEST, reason="410 Gone")
+        paused = notification_auth.pause_destination(DEST, reason="410 Gone")
         assert paused.paused is True and paused.deliverable is False
         assert paused.paused_reason == "410 Gone"
-        assert partner_auth.destination_for_delivery(DEST).deliverable is False
+        assert notification_auth.destination_for_delivery(DEST).deliverable is False
 
         # Idempotent: a backlog of pending deliveries against a gone endpoint must not fill the
         # audit collection with one row per attempt.
         audit_before = len(store.audit())
-        partner_auth.pause_destination(DEST, reason="410 Gone")
+        notification_auth.pause_destination(DEST, reason="410 Gone")
         assert len(store.audit()) == audit_before
 
-        resumed = partner_auth.resume_destination(DEST, actor="op@entur.org")
+        resumed = notification_auth.resume_destination(DEST, actor="op@entur.org")
         assert resumed.paused is False and resumed.deliverable is True
         actions = [r["action"] for r in store.audit()]
         assert "pause_destination" in actions and "resume_destination" in actions
@@ -554,72 +554,72 @@ def test_two_signing_generations_are_live_across_a_rotation():
     store = _install()
     _provision(store)
     try:
-        rotated = partner_auth.rotate_signing_generation(DEST, actor="op@entur.org")
+        rotated = notification_auth.rotate_signing_generation(DEST, actor="op@entur.org")
         assert rotated.active_generation == 2
         assert rotated.retiring_generation == 1
         assert rotated.signing_generations == (2, 1), "active first, as webhook_signing documents"
-        retired = partner_auth.retire_signing_generation(DEST, actor="op@entur.org")
+        retired = notification_auth.retire_signing_generation(DEST, actor="op@entur.org")
         assert retired.signing_generations == (2,)
         # Idempotent once nothing is retiring.
-        assert partner_auth.retire_signing_generation(DEST, actor="op@entur.org").signing_generations == (2,)
+        assert notification_auth.retire_signing_generation(DEST, actor="op@entur.org").signing_generations == (2,)
     finally:
         _uninstall()
 
 
 def test_a_destination_belonging_to_another_partner_is_forbidden_inside_the_module():
-    """Kept apart HERE and collapsed into "missing" at the API edge, exactly as partner_store does.
+    """Kept apart HERE and collapsed into "missing" at the API edge, exactly as notification_store does.
 
     The store's caller needs to tell a tenancy violation from a typo in order to log the former; a
-    partner must not be able to probe another's destination ids by the difference.
+    client must not be able to probe another's destination ids by the difference.
     """
     store = _install()
     _provision(store)
     try:
-        assert partner_auth.get_destination(DEST, partner_id=PARTNER) is not None
+        assert notification_auth.get_destination(DEST, client_id=CLIENT) is not None
         forbidden = False
         try:
-            partner_auth.get_destination(DEST, partner_id="someone-else")
-        except partner_auth.Forbidden:
+            notification_auth.get_destination(DEST, client_id="someone-else")
+        except notification_auth.Forbidden:
             forbidden = True
         assert forbidden
-        assert partner_auth.current_destination("someone-else") is None
+        assert notification_auth.current_destination("someone-else") is None
     finally:
         _uninstall()
 
 
 def test_a_paused_destination_is_still_the_current_one():
-    """Pausing stops delivery, not ownership -- and a partner whose callback is paused most needs
+    """Pausing stops delivery, not ownership -- and a client whose callback is paused most needs
     to see it on /destinations/current."""
     store = _install()
     _provision(store)
     try:
-        partner_auth.pause_destination(DEST, reason="410 Gone")
-        current = partner_auth.current_destination(PARTNER)
+        notification_auth.pause_destination(DEST, reason="410 Gone")
+        current = notification_auth.current_destination(CLIENT)
         assert current is not None and current.destination_id == DEST and current.paused is True
     finally:
         _uninstall()
 
 
 def test_a_document_written_before_the_paused_field_existed_is_not_paused():
-    """The failure direction here is the OPPOSITE of partner_store's expiry test, on purpose.
+    """The failure direction here is the OPPOSITE of notification_store's expiry test, on purpose.
 
     A missing `paused` key means a document written by an older binary, and reading that as paused
     would take every existing destination out of service on the deploy that added the field.
     """
     store = _install()
     store.set(
-        partner_auth.DESTINATIONS,
+        notification_auth.DESTINATIONS,
         DEST,
         {
             "destination_id": DEST,
-            "partner_id": PARTNER,
+            "client_id": CLIENT,
             "callback_url": GOOD_URL,
             "status": "active",
             "generations": {"active": 1},
         },
     )
     try:
-        destination = partner_auth.get_destination(DEST)
+        destination = notification_auth.get_destination(DEST)
         assert destination is not None
         assert destination.paused is False and destination.deliverable is True
         assert destination.retiring_generation is None
@@ -634,24 +634,24 @@ def test_every_operator_action_lands_in_the_audit_record():
     """R22: provisioning, credential, destination and suspension actions, with actor and timestamp."""
     store = _install()
     try:
-        partner_auth.create_partner(PARTNER, name="Acme", actor="a@entur.org")
-        partner_auth.create_destination(
-            DEST, partner_id=PARTNER, callback_url=GOOD_URL, actor="a@entur.org"
+        notification_auth.create_client(CLIENT, name="Acme", actor="a@entur.org")
+        notification_auth.create_destination(
+            DEST, client_id=CLIENT, callback_url=GOOD_URL, actor="a@entur.org"
         )
-        _c, bearer = partner_auth.issue_credential(PARTNER, actor="a@entur.org")
-        partner_auth.revoke_credential(bearer.split(".")[0], actor="a@entur.org")
-        partner_auth.set_partner_suspended(PARTNER, suspended=True, actor="a@entur.org")
-        partner_auth.rotate_signing_generation(DEST, actor="a@entur.org")
-        partner_auth.amend_destination(
+        _c, bearer = notification_auth.issue_credential(CLIENT, actor="a@entur.org")
+        notification_auth.revoke_credential(bearer.split(".")[0], actor="a@entur.org")
+        notification_auth.set_client_suspended(CLIENT, suspended=True, actor="a@entur.org")
+        notification_auth.rotate_signing_generation(DEST, actor="a@entur.org")
+        notification_auth.amend_destination(
             DEST, callback_url="https://hooks2.acme.example.com/kix", actor="a@entur.org"
         )
         rows = store.audit()
         assert {r["action"] for r in rows} >= {
-            "create_partner",
+            "create_client",
             "create_destination",
             "issue_credential",
             "revoke_credential",
-            "suspend_partner",
+            "suspend_client",
             "rotate_signing_generation",
             "amend_destination",
         }
@@ -672,17 +672,17 @@ def test_every_operator_action_lands_in_the_audit_record():
 def test_the_audit_collection_is_append_only_and_no_route_can_read_it():
     """R22's second half, established by grepping both files -- see the module docstring.
 
-    Firestore has no per-collection IAM (KTD5 records the limit), so "no partner credential can
+    Firestore has no per-collection IAM (KTD5 records the limit), so "no client credential can
     read it" cannot be a runtime property. What can be established is that the request-path module
     never names the collection, which is `meldinger_decisions.sql`'s own argument: a query that
     cannot name a column cannot leak it however the code above drifts.
     """
-    assert partner_auth.ADMIN_AUDIT == "partner_admin_audit"
-    assert partner_auth.ADMIN_AUDIT not in API_SOURCE
+    assert notification_auth.ADMIN_AUDIT == "admin_audit"
+    assert notification_auth.ADMIN_AUDIT not in API_SOURCE
     assert "ADMIN_AUDIT" not in API_SOURCE
     # Append-only: the audit collection is written by `set` and by nothing else.
     for forbidden in (
-        f"update({partner_auth.ADMIN_AUDIT}",
+        f"update({notification_auth.ADMIN_AUDIT}",
         "update(ADMIN_AUDIT",
         "delete(ADMIN_AUDIT",
     ):
@@ -698,7 +698,7 @@ def test_a_store_outage_suppresses_the_action_and_nothing_wider():
         store.fail_with = RuntimeError("firestore unavailable")
         raised = False
         try:
-            partner_auth.create_partner("beta", name="Beta", actor="op@entur.org")
+            notification_auth.create_client("beta", name="Beta", actor="op@entur.org")
         except RuntimeError:
             raised = True
         assert raised
@@ -758,31 +758,31 @@ def test_an_operator_action_without_the_group_is_refused_and_audited():
     store = _install()
     try:
         code, _out = _run(
-            ["--environment", "prd", "create-partner", "--partner-id", "beta", "--name", "Beta"],
+            ["--environment", "prd", "create-client", "--client-id", "beta", "--name", "Beta"],
             authorizer=_deny(),
             store=store,
         )
         assert code == 3
-        assert store.get(partner_auth.ACCOUNTS, "beta") is None, "nothing was provisioned"
+        assert store.get(notification_auth.ACCOUNTS, "beta") is None, "nothing was provisioned"
         rows = store.audit()
         assert len(rows) == 1
         assert rows[0]["result"] == "refused"
-        assert rows[0]["action"] == "create-partner"
+        assert rows[0]["action"] == "create-client"
         assert rows[0]["actor"] == "outsider@entur.org"
-        assert rows[0]["partner_id"] == "beta"
+        assert rows[0]["client_id"] == "beta"
         assert rows[0]["reason"] == "not_a_member"
     finally:
         _uninstall()
 
 
 def test_every_subcommand_is_authorized_including_the_reads():
-    """A destination's callback URL and a partner's key ids are exactly what a forger wants first."""
+    """A destination's callback URL and a client's key ids are exactly what a forger wants first."""
     store = _install()
     _provision(store)
     try:
         for args in (
-            ["show-partner", "--partner-id", PARTNER],
-            ["list-keys", "--partner-id", PARTNER],
+            ["show-client", "--client-id", CLIENT],
+            ["list-keys", "--client-id", CLIENT],
         ):
             code, _out = _run(["--environment", "dev", *args], authorizer=_deny(), store=store)
             assert code == 3, args
@@ -791,13 +791,13 @@ def test_every_subcommand_is_authorized_including_the_reads():
 
 
 def test_the_tool_provisions_a_partner_a_destination_and_a_working_credential():
-    """The operator runbook, executed: create-partner, create-destination, issue-key, and the
+    """The operator runbook, executed: create-client, create-destination, issue-key, and the
     credential the last one prints authenticates against the same store."""
     store = _install()
     try:
         allow = _allow()
         code, _ = _run(
-            ["--environment", "dev", "create-partner", "--partner-id", PARTNER, "--name", "Acme"],
+            ["--environment", "dev", "create-client", "--client-id", CLIENT, "--name", "Acme"],
             authorizer=allow,
             store=store,
         )
@@ -807,8 +807,8 @@ def test_the_tool_provisions_a_partner_a_destination_and_a_working_credential():
                 "--environment",
                 "dev",
                 "create-destination",
-                "--partner-id",
-                PARTNER,
+                "--client-id",
+                CLIENT,
                 "--destination-id",
                 DEST,
                 "--url",
@@ -819,7 +819,7 @@ def test_the_tool_provisions_a_partner_a_destination_and_a_working_credential():
         )
         assert code == 0
         code, printed = _run(
-            ["--environment", "dev", "issue-key", "--partner-id", PARTNER],
+            ["--environment", "dev", "issue-key", "--client-id", CLIENT],
             authorizer=allow,
             store=store,
         )
@@ -830,8 +830,8 @@ def test_the_tool_provisions_a_partner_a_destination_and_a_working_credential():
         bearer = result["bearer"]
         assert "Shown once" in result["note"]
         # Re-configure exactly as the app does, then authenticate the printed credential.
-        partner_auth.configure(docs=store, clock=lambda: NOW)
-        assert partner_auth.authenticate(f"Bearer {bearer}").partner_id == PARTNER
+        notification_auth.configure(docs=store, clock=lambda: NOW)
+        assert notification_auth.authenticate(f"Bearer {bearer}").client_id == CLIENT
 
         code, _ = _run(
             ["--environment", "dev", "revoke-key", "--key-id", bearer.split(".")[0]],
@@ -839,11 +839,11 @@ def test_the_tool_provisions_a_partner_a_destination_and_a_working_credential():
             store=store,
         )
         assert code == 0
-        partner_auth.configure(docs=store, clock=lambda: NOW)
+        notification_auth.configure(docs=store, clock=lambda: NOW)
         revoked = False
         try:
-            partner_auth.authenticate(f"Bearer {bearer}")
-        except partner_auth.AuthFailed:
+            notification_auth.authenticate(f"Bearer {bearer}")
+        except notification_auth.AuthFailed:
             revoked = True
         assert revoked
     finally:
@@ -854,13 +854,13 @@ def test_the_tool_reports_a_refused_url_as_a_failure_rather_than_a_crash():
     """An operator pasting the metadata address gets exit code 2 and an audited refusal.
 
     Not a traceback, and not a stored destination: the refusal is the useful outcome, and the audit
-    row is what makes "somebody tried to point a partner at 169.254.169.254" visible later.
+    row is what makes "somebody tried to point a client at 169.254.169.254" visible later.
     """
     store = _install()
     try:
         allow = _allow()
         _run(
-            ["--environment", "dev", "create-partner", "--partner-id", PARTNER, "--name", "Acme"],
+            ["--environment", "dev", "create-client", "--client-id", CLIENT, "--name", "Acme"],
             authorizer=allow,
             store=store,
         )
@@ -869,8 +869,8 @@ def test_the_tool_reports_a_refused_url_as_a_failure_rather_than_a_crash():
                 "--environment",
                 "dev",
                 "create-destination",
-                "--partner-id",
-                PARTNER,
+                "--client-id",
+                CLIENT,
                 "--destination-id",
                 DEST,
                 "--url",
@@ -880,7 +880,7 @@ def test_the_tool_reports_a_refused_url_as_a_failure_rather_than_a_crash():
             store=store,
         )
         assert code == 2
-        assert store.get(partner_auth.DESTINATIONS, DEST) is None
+        assert store.get(notification_auth.DESTINATIONS, DEST) is None
         refusals = [r for r in store.audit() if r["result"] == "refused"]
         assert len(refusals) == 1
         assert refusals[0]["action"] == "create_destination"
@@ -905,7 +905,7 @@ def test_the_environment_is_never_inferred():
     failed = False
     stderr, sys.stderr = sys.stderr, io.StringIO()
     try:
-        tool._parser().parse_args(["create-partner", "--partner-id", "x", "--name", "y"])
+        tool._parser().parse_args(["create-client", "--client-id", "x", "--name", "y"])
     except SystemExit:
         failed = True
     finally:
@@ -919,8 +919,8 @@ def test_the_gate_and_the_target_cannot_be_chosen_separately():
     `--environment` picks the group membership is checked against; `--project` picked which project
     was then read and written, with no comparison between the two. So `--environment dev --project
     ent-kixavvik-prd` was authorized against the dev group and acted on prd -- `show-signing-secret`
-    printing a live prd receiver credential, `suspend-partner` and `revoke-key` silencing a real
-    partner. The audit row lands in the project that was targeted, so the action IS recorded; it is
+    printing a live prd receiver credential, `suspend-client` and `revoke-key` silencing a real
+    client. The audit row lands in the project that was targeted, so the action IS recorded; it is
     recorded as authorized.
 
     Refused BEFORE the store is configured and before the group is checked, so nothing is opened and
@@ -938,8 +938,8 @@ def test_the_gate_and_the_target_cannot_be_chosen_separately():
                 "dev",
                 "--project",
                 "ent-kixavvik-prd",
-                "create-partner",
-                "--partner-id",
+                "create-client",
+                "--client-id",
                 "acme",
                 "--name",
                 "Acme",
@@ -965,7 +965,7 @@ def test_the_gate_and_the_target_cannot_be_chosen_separately():
     stderr, sys.stderr = sys.stderr, io.StringIO()
     try:
         code = tool.main(
-            ["--environment", "dev", "create-partner", "--partner-id", "acme", "--name", "Acme"],
+            ["--environment", "dev", "create-client", "--client-id", "acme", "--name", "Acme"],
             authorizer=_allow(),
             store=_MemoryDocs(),
             out=io.StringIO(),
@@ -998,14 +998,14 @@ def test_the_group_authorizer_fails_closed():
     assert re.search(r"membership_check_failed|not_a_member", verdict.reason)
 
 
-def test_the_tool_never_reaches_the_partner_api_or_a_partner_credential():
-    """R22's separation, structurally: the operator boundary is not a partner-authenticated route.
+def test_the_tool_never_reaches_the_notification_api_or_a_partner_credential():
+    """R22's separation, structurally: the operator boundary is not a client-authenticated route.
 
-    A partner credential authenticates a machine against /notification-api/v1 and can do none of
+    A client credential authenticates a machine against /notification-api/v1 and can do none of
     this; a group membership authorizes a human against the store and cannot register a
     subscription.
     """
-    assert "partner_api" not in TOOL_SOURCE
+    assert "notification_api" not in TOOL_SOURCE
     assert "authenticate(" not in TOOL_SOURCE
     assert "Bearer" not in TOOL_SOURCE.split('"""', 2)[2]
 
@@ -1015,7 +1015,7 @@ def test_the_operator_can_hand_a_partner_its_verification_secret():
 
     `webhook_signing.derive_secret` is called only by the signer, and `GET /destinations/current`
     serves generation NUMBERS and never derives -- deliberately, because a secret fetchable over the
-    partner's own credential is a secret their credential can be traded for. So the disclosure is an
+    client's own credential is a secret their credential can be traded for. So the disclosure is an
     OPERATOR action: same group, same audit, and the audit row is the point rather than a formality.
     """
     store = _install()
@@ -1054,13 +1054,13 @@ def test_the_operator_can_hand_a_partner_its_verification_secret():
 
 
 def test_both_live_generations_are_printed_during_a_rotation():
-    """"Which one do I install" is the first question a partner asks, and during a rotation the
+    """"Which one do I install" is the first question a client asks, and during a rotation the
     answer is "the active one, and keep accepting the retiring one"."""
     store = _install()
     _provision(store)
     os.environ[webhook_signing.SIGNING_ROOT_ENV] = SIGNING_ROOT
     try:
-        partner_auth.rotate_signing_generation(DEST, actor="op@entur.org")
+        notification_auth.rotate_signing_generation(DEST, actor="op@entur.org")
         code, printed = _run(
             ["--environment", "dev", "show-signing-secret", "--destination-id", DEST],
             authorizer=_allow(),
@@ -1158,10 +1158,10 @@ def test_the_disclosure_command_says_what_it_prints():
 def test_every_identity_plane_firestore_call_carries_its_own_deadline():
     """KTD6's per-CALL deadline, on the plane it was missing from.
 
-    ``partner_store`` bounds every read at ``_CALL_DEADLINE_S`` and
-    ``test_partner_store.test_every_firestore_call_carries_its_own_deadline`` pins it. The identity
+    ``notification_store`` bounds every read at ``_CALL_DEADLINE_S`` and
+    ``test_notification_store.test_every_firestore_call_carries_its_own_deadline`` pins it. The identity
     plane inherited none of that: all four ``_FirestoreDocs`` operations passed no ``timeout=``, and
-    the one at :meth:`partner_auth._FirestoreDocs.get` is the credential lookup ``authenticate``
+    the one at :meth:`notification_auth._FirestoreDocs.get` is the credential lookup ``authenticate``
     performs on EVERY authenticated request -- on a plain ``def`` route sharing the anyio worker pool
     with ``/varsel-api`` and ``/impact``. A Firestore stall therefore parked one shared worker per
     request, behind nothing but a 300/min pre-lookup tier, until the gRPC layer gave up on its own.
@@ -1169,30 +1169,30 @@ def test_every_identity_plane_firestore_call_carries_its_own_deadline():
     Checked DYNAMICALLY as well as statically, and the dynamic half is the one that matters: this
     class is the production seam, so every suite in this directory injects
     :class:`_MemoryDocs` instead and no behavioural test reaches it at all. The fake below asserts
-    the kwarg the way ``test_partner_store``'s does, for the same stated reason -- a double that
+    the kwarg the way ``test_notification_store``'s does, for the same stated reason -- a double that
     accepted ``**kwargs`` would let a path silently lose its deadline.
     """
     seen: list[str] = []
 
     class _Ref:
         def get(self, timeout: float | None = None) -> Any:
-            assert timeout == partner_store._CALL_DEADLINE_S, "get without a deadline"
+            assert timeout == notification_store._CALL_DEADLINE_S, "get without a deadline"
             seen.append("get")
             return _Snap()
 
         def set(self, doc: Any, timeout: float | None = None) -> None:
-            assert timeout == partner_store._CALL_DEADLINE_S, "set without a deadline"
+            assert timeout == notification_store._CALL_DEADLINE_S, "set without a deadline"
             seen.append("set")
 
         def update(self, patch: Any, timeout: float | None = None) -> None:
-            assert timeout == partner_store._CALL_DEADLINE_S, "update without a deadline"
+            assert timeout == notification_store._CALL_DEADLINE_S, "update without a deadline"
             seen.append("update")
 
     class _Snap:
         exists = True
 
         def to_dict(self) -> dict[str, Any]:
-            return {"partner_id": PARTNER}
+            return {"client_id": CLIENT}
 
     class _Query:
         def where(self, **_kwargs: Any) -> Any:
@@ -1202,7 +1202,7 @@ def test_every_identity_plane_firestore_call_carries_its_own_deadline():
             return self
 
         def stream(self, timeout: float | None = None) -> list[Any]:
-            assert timeout == partner_store._CALL_DEADLINE_S, "stream without a deadline"
+            assert timeout == notification_store._CALL_DEADLINE_S, "stream without a deadline"
             seen.append("stream")
             return [_Snap()]
 
@@ -1217,26 +1217,26 @@ def test_every_identity_plane_firestore_call_carries_its_own_deadline():
         def collection(self, _name: str) -> Any:
             return _Collection()
 
-    saved = partner_store.client
-    partner_store.client = lambda: _Client()  # type: ignore[assignment]
+    saved = notification_store.client
+    notification_store.client = lambda: _Client()  # type: ignore[assignment]
     try:
-        docs = partner_auth._FirestoreDocs()
-        assert docs.get(partner_auth.ACCOUNTS, PARTNER) == {"partner_id": PARTNER}
-        docs.set(partner_auth.ACCOUNTS, PARTNER, {"partner_id": PARTNER})
-        docs.update(partner_auth.ACCOUNTS, PARTNER, {"suspended": True})
-        assert docs.list_by(partner_auth.CREDENTIALS, "partner_id", PARTNER, limit=5) == [
-            {"partner_id": PARTNER}
+        docs = notification_auth._FirestoreDocs()
+        assert docs.get(notification_auth.ACCOUNTS, CLIENT) == {"client_id": CLIENT}
+        docs.set(notification_auth.ACCOUNTS, CLIENT, {"client_id": CLIENT})
+        docs.update(notification_auth.ACCOUNTS, CLIENT, {"suspended": True})
+        assert docs.list_by(notification_auth.CREDENTIALS, "client_id", CLIENT, limit=5) == [
+            {"client_id": CLIENT}
         ]
     finally:
-        partner_store.client = saved  # type: ignore[assignment]
+        notification_store.client = saved  # type: ignore[assignment]
     assert seen == ["get", "set", "update", "stream"], seen
     # And statically, over the seam's own source, so a FIFTH operation cannot dodge it: every call
     # this class makes on the client is one of the four names above, and each must name the
     # constant. Scoped to the class rather than grepped over the module, because `_Docs`' own
-    # `get`/`set`/`update`/`list_by` are called all over `partner_auth` and carry no timeout by
+    # `get`/`set`/`update`/`list_by` are called all over `notification_auth` and carry no timeout by
     # design -- the seam is the abstraction, and only its Firestore implementation dials anything.
-    seam = inspect.getsource(partner_auth._FirestoreDocs)
-    assert seam.count("timeout=partner_store._CALL_DEADLINE_S") == 4, seam
+    seam = inspect.getsource(notification_auth._FirestoreDocs)
+    assert seam.count("timeout=notification_store._CALL_DEADLINE_S") == 4, seam
     assert len(re.findall(r"self\._c\(\)", seam)) == 4, "one client call per operation, no more"
     assert "_CALL_DEADLINE_S" not in AUTH_SOURCE.replace(seam, ""), (
         "the deadline belongs to the seam's four calls; a fifth mention elsewhere means a client "
@@ -1251,7 +1251,7 @@ def _run_all() -> None:
     for name, fn in tests:
         fn()
         print(f"  ok  {name}")
-    print(f"\n{len(tests)} partner auth checks passed.")
+    print(f"\n{len(tests)} client auth checks passed.")
 
 
 if __name__ == "__main__":

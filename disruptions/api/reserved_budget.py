@@ -2,7 +2,7 @@
 
 Three passes in this repository bound themselves the same way, and they used to say so three times
 in three byte-identical classes -- ``varsel._WriteBudget`` (the original, which wrote the wordings),
-``partner_events._EmitBudget`` and ``partner_delivery._DeliveryBudget``. This module is that one
+``notification_events._EmitBudget`` and ``webhook_delivery._DeliveryBudget``. This module is that one
 implementation. Each caller keeps its own subclass docstring, because *why this pass has this
 deadline* is different every time and is the part worth reading; what must not differ is the
 arithmetic, whose failure is silent.

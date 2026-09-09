@@ -1,11 +1,11 @@
-"""Checks for partner_events.py: the alert lifecycle, its ordering and its two bounds.
+"""Checks for notification_events.py: the alert lifecycle, its ordering and its two bounds.
 
-Hermetic. The Firestore fake below runs ``partner_store``'s REAL transaction bodies and applies
+Hermetic. The Firestore fake below runs ``notification_store``'s REAL transaction bodies and applies
 their writes, so every assertion here is about the committed documents rather than about a mock's
 call log — which is the only way to check a revision, a cap exemption or a superseded delivery at
 all.
 
-**The fake is a third copy**, after ``test_partner_store``'s and ``test_partner_api``'s, and that is
+**The fake is a third copy**, after ``test_notification_store``'s and ``test_notification_api``'s, and that is
 this directory's convention rather than an oversight: CI runs every suite as its own process
 (`python test_x.py`, never pytest), so a shared helper module here would be a new import-time
 surface for all thirty of them, and a shared VAPID/pepper environment stub is exactly the leak that
@@ -14,7 +14,7 @@ convention exists to prevent. Each copy is trimmed to the queries its own module
 What is deliberately NOT asserted here: atomicity. The bodies converge on one committed outcome
 under this fake's single-threaded application of their writes, which is the same code path
 production runs, and that is a statement about shape and idempotency rather than about contention.
-``test_partner_store`` says the same thing about the emulator.
+``test_notification_store`` says the same thing about the emulator.
 """
 
 from __future__ import annotations
@@ -29,14 +29,14 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import partner_events
-import partner_store
+import notification_events
+import notification_store
 
 NOW = datetime(2026, 9, 8, 6, 30, tzinfo=UTC)
 SID = "sub-1"
-PARTNER = "partner-a"
+CLIENT = "client-a"
 DEST = "dest-a"
-MODULE_SOURCE = pathlib.Path(partner_events.__file__).read_text()
+MODULE_SOURCE = pathlib.Path(notification_events.__file__).read_text()
 
 
 # ---- A fake client that runs the real bodies ---------------------------------------------------
@@ -63,9 +63,9 @@ class _Ref:
         self.client, self.path = client, path
 
     def get(self, transaction: Any = None, timeout: float | None = None) -> _Snap:
-        # `timeout` is accepted and ignored: every read in `partner_store` now carries its own
+        # `timeout` is accepted and ignored: every read in `notification_store` now carries its own
         # Firestore deadline (KTD6 -- an abandoned worker thread with no call deadline delays
-        # pod termination via `concurrent.futures`' atexit join). `test_partner_store` is where
+        # pod termination via `concurrent.futures`' atexit join). `test_notification_store` is where
         # the deadline is asserted; this double only has to tolerate the kwarg.
         del timeout
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
@@ -147,7 +147,7 @@ class _RecordingPool(ThreadPoolExecutor):
     `emit` calls `shutdown(wait=False)` on purpose -- a thread parked inside a Firestore call
     cannot be killed, and joining it would defeat the bounded wait entirely. Right in production,
     and in a suite it means the hung-store test's worker runs on into whatever executes next,
-    writing through a fake that has already been uninstalled. `test_partner_delivery` had the same
+    writing through a fake that has already been uninstalled. `test_webhook_delivery` had the same
     shape and it cost one failing run in nine there; this one had not surfaced yet, which is the
     only difference between them.
     """
@@ -181,15 +181,15 @@ def _install() -> _Fake:
     client = _Fake()
     _saved.update(
         {
-            "client": partner_store._client,
-            "run": partner_store._run_transaction,
-            "query": partner_store._query,
-            "pool": partner_events.ThreadPoolExecutor,
+            "client": notification_store._client,
+            "run": notification_store._run_transaction,
+            "query": notification_store._query,
+            "pool": notification_events.ThreadPoolExecutor,
         }
     )
-    partner_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
+    notification_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
     _pools.clear()
-    partner_store._client = lambda: client  # type: ignore[assignment]
+    notification_store._client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
         if client.delay_s:
@@ -220,7 +220,7 @@ def _install() -> _Fake:
         if name in client.query_fail_with:
             raise client.query_fail_with[name]
         client.queries.append(name)
-        spec = partner_store._SPECS_BY_NAME[name]
+        spec = notification_store._SPECS_BY_NAME[name]
         rows: list[tuple[str, dict[str, Any]]] = []
         for path, data in client.docs.items():
             if path.split("/", 1)[0] != spec.collection:
@@ -242,38 +242,38 @@ def _install() -> _Fake:
             )
         return _Page(client, rows[:limit])
 
-    partner_store._run_transaction = _run  # type: ignore[assignment]
-    partner_store._query = _query  # type: ignore[assignment]
-    partner_store.configure(client=client, clock=lambda: NOW)
+    notification_store._run_transaction = _run  # type: ignore[assignment]
+    notification_store._query = _query  # type: ignore[assignment]
+    notification_store.configure(client=client, clock=lambda: NOW)
     return client
 
 
 def _uninstall() -> None:
     _drain_pools()
     if _saved:
-        partner_events.ThreadPoolExecutor = _saved["pool"]  # type: ignore[misc]
-        partner_store._client = _saved["client"]  # type: ignore[assignment]
-        partner_store._run_transaction = _saved["run"]  # type: ignore[assignment]
-        partner_store._query = _saved["query"]  # type: ignore[assignment]
+        notification_events.ThreadPoolExecutor = _saved["pool"]  # type: ignore[misc]
+        notification_store._client = _saved["client"]  # type: ignore[assignment]
+        notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
+        notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
-    partner_store.reset_for_tests()
+    notification_store.reset_for_tests()
 
 
-def _spec(**over: Any) -> partner_store.SubscriptionSpec:
+def _spec(**over: Any) -> notification_store.SubscriptionSpec:
     base: dict[str, Any] = {
         "subscription_id": SID,
-        "partner_id": PARTNER,
+        "client_id": CLIENT,
         "destination_id": DEST,
         "from_stop": "NSR:StopPlace:337",
         "to_stop": "NSR:StopPlace:418",
         "begin": "06:00",
         "end": "09:00",
         "days": (0, 1, 2, 3, 4, 5, 6),
-        "partner_ref": "commuter-42",
+        "external_ref": "commuter-42",
         "test": False,
     }
     base.update(over)
-    return partner_store.SubscriptionSpec(**base)
+    return notification_store.SubscriptionSpec(**base)
 
 
 def _live(client: _Fake, **over: Any) -> None:
@@ -285,17 +285,17 @@ def _live(client: _Fake, **over: Any) -> None:
     """
     spec = _spec(**over)
     client.put(
-        partner_store.SUBSCRIPTIONS, spec.subscription_id, partner_store._new_subscription_doc(spec, NOW)
+        notification_store.SUBSCRIPTIONS, spec.subscription_id, notification_store._new_subscription_doc(spec, NOW)
     )
 
 
-def _subject(**over: Any) -> partner_events.PartnerSubject:
+def _subject(**over: Any) -> notification_events.WebhookSubject:
     base: dict[str, Any] = {
         "subscription_id": SID,
-        "partner_id": PARTNER,
+        "client_id": CLIENT,
         "destination_id": DEST,
         "subscription_version": 1,
-        "partner_ref": "commuter-42",
+        "external_ref": "commuter-42",
         "test": False,
         "alertworthy": True,
         "cancelled": False,
@@ -311,10 +311,10 @@ def _subject(**over: Any) -> partner_events.PartnerSubject:
         "payload": {"notification": {"title": "t", "body": "b"}},
     }
     base.update(over)
-    return partner_events.PartnerSubject(**base)
+    return notification_events.WebhookSubject(**base)
 
 
-# See `test_partner_delivery`'s copy for the full argument: every fault this suite injects is
+# See `test_webhook_delivery`'s copy for the full argument: every fault this suite injects is
 # logged by the code under test with `exc_info=True`, and with no handler in the hierarchy
 # `logging.lastResort` printed the record and its traceback to stderr -- so a passing run ended in
 # a stack trace, and a standing traceback is how a real one stops being read. A collecting sink
@@ -329,7 +329,7 @@ class _Records(logging.Handler):
 
 
 _SINK = _Records()
-for _name in ("partner_events", "partner_store"):
+for _name in ("notification_events", "notification_store"):
     _sink_logger = logging.getLogger(_name)
     _sink_logger.setLevel(logging.INFO)
     _sink_logger.addHandler(_SINK)
@@ -337,7 +337,7 @@ for _name in ("partner_events", "partner_store"):
 
 def _capture() -> _Records:
     handler = _Records()
-    logger = logging.getLogger("partner_events")
+    logger = logging.getLogger("notification_events")
     # The level matters: the root logger defaults to WARNING, so without this the one INFO summary
     # per cycle -- the record an operator reads the cycle's counts off -- is dropped before any
     # handler sees it, and an assertion about it fails for a reason having nothing to do with the
@@ -360,7 +360,7 @@ def _events(handler: _Records, name: str) -> list[dict]:
         fields = getattr(record, "fields", None)
         if isinstance(fields, dict) and fields.get("event") == name:
             out.append(fields)
-    logging.getLogger("partner_events").removeHandler(handler)
+    logging.getLogger("notification_events").removeHandler(handler)
     return out
 
 
@@ -377,20 +377,20 @@ def test_an_alertworthy_train_mints_one_event_and_the_next_cycle_mints_nothing()
     client = _install()
     try:
         _live(client)
-        first = partner_events.emit([_subject()], now=NOW)
-        events = client.in_collection(partner_store.EVENTS)
+        first = notification_events.emit([_subject()], now=NOW)
+        events = client.in_collection(notification_store.EVENTS)
         assert first.created == 1 and len(events) == 1
-        assert events[0]["type"] == partner_store.EVENT_CREATED
-        assert events[0]["phase"] == partner_store.PHASE_PREDICTED
+        assert events[0]["type"] == notification_store.EVENT_CREATED
+        assert events[0]["phase"] == notification_store.PHASE_PREDICTED
         event_id, revision = events[0]["event_id"], events[0]["revision"]
 
         # A LATER cycle, with a different probability in the payload: the facts moved, the lifecycle
         # did not. Nothing is minted, at any size of change -- there is no materiality threshold.
-        second = partner_events.emit(
+        second = notification_events.emit(
             [_subject(payload={"probabilities": {"impact": 0.99}})], now=NOW + timedelta(minutes=5)
         )
         assert second.created == 0 and second.unchanged == 1
-        events = client.in_collection(partner_store.EVENTS)
+        events = client.in_collection(notification_store.EVENTS)
         assert len(events) == 1 and events[0]["event_id"] == event_id
         assert events[0]["revision"] == revision
     finally:
@@ -413,22 +413,22 @@ def test_a_confirmed_cancellation_mints_an_updated_revision_and_supersedes_the_f
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
-        first = client.in_collection(partner_store.EVENTS)[0]
-        partner_store.mark_delivery_sent(first["event_id"], now=NOW + timedelta(seconds=5))
+        notification_events.emit([_subject()], now=NOW)
+        first = client.in_collection(notification_store.EVENTS)[0]
+        notification_store.mark_delivery_sent(first["event_id"], now=NOW + timedelta(seconds=5))
 
-        partner_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
-        events = sorted(client.in_collection(partner_store.EVENTS), key=lambda e: e["revision"])
+        notification_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
+        events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
         assert len(events) == 2
         confirmed = events[-1]
         assert confirmed["alert_id"] == first["alert_id"], "the same subject, per (subscription, train)"
         assert confirmed["revision"] > first["revision"]
-        assert confirmed["type"] == partner_store.EVENT_UPDATED
-        assert confirmed["phase"] == partner_store.PHASE_CONFIRMED
-        assert client.doc(partner_store.DELIVERIES, first["event_id"])["state"] == "sent", (
+        assert confirmed["type"] == notification_store.EVENT_UPDATED
+        assert confirmed["phase"] == notification_store.PHASE_CONFIRMED
+        assert client.doc(notification_store.DELIVERIES, first["event_id"])["state"] == "sent", (
             "a delivery already on a phone is not superseded: there is nothing to withdraw"
         )
-        assert client.doc(partner_store.DELIVERIES, confirmed["event_id"])["cap_exempt"] is True
+        assert client.doc(notification_store.DELIVERIES, confirmed["event_id"])["cap_exempt"] is True
     finally:
         _uninstall()
 
@@ -443,17 +443,17 @@ def test_a_confirmation_whose_forecast_was_never_delivered_is_not_cap_exempt():
 
     And the supersede rule's other side: the forecast's delivery is still PENDING here, so it must be
     marked `superseded`. Without that a predicted and a confirmed about the same train both go out,
-    and the receiver's revision rule saves the partner only if they happen to arrive in order.
+    and the receiver's revision rule saves the webhook-only if they happen to arrive in order.
     """
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
-        first = client.in_collection(partner_store.EVENTS)[0]
-        partner_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
-        events = sorted(client.in_collection(partner_store.EVENTS), key=lambda e: e["revision"])
-        assert client.doc(partner_store.DELIVERIES, events[-1]["event_id"])["cap_exempt"] is False
-        assert client.doc(partner_store.DELIVERIES, first["event_id"])["state"] == "superseded"
+        notification_events.emit([_subject()], now=NOW)
+        first = client.in_collection(notification_store.EVENTS)[0]
+        notification_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
+        events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
+        assert client.doc(notification_store.DELIVERIES, events[-1]["event_id"])["cap_exempt"] is False
+        assert client.doc(notification_store.DELIVERIES, first["event_id"])["state"] == "superseded"
     finally:
         _uninstall()
 
@@ -463,7 +463,7 @@ def test_thirteen_departures_produce_thirteen_events_soonest_first():
 
     Thirteen cancelled departures are thirteen SUBJECTS — the grain is (subscription, train) — so
     thirteen events, each with its own `alert_id`. The cap is not applied here at all: it is spent
-    when a delivery SUCCEEDS (`test_partner_delivery`), because a dead destination must not burn a
+    when a delivery SUCCEEDS (`test_webhook_delivery`), because a dead destination must not burn a
     subscription's four for the Oslo day with nothing delivered.
 
     The ordering assertion is about the EMIT queue, which is soonest-departure-first exactly as
@@ -481,13 +481,13 @@ def test_thirteen_departures_produce_thirteen_events_soonest_first():
             )
             for i in range(13)
         ]
-        report = partner_events.emit(subjects, now=NOW)
+        report = notification_events.emit(subjects, now=NOW)
         assert report.created == 13
-        events = client.in_collection(partner_store.EVENTS)
+        events = client.in_collection(notification_store.EVENTS)
         assert len({e["alert_id"] for e in events}) == 13
         # Minted in departure order, which the revision (clamped to `stored + 1` per subject, seeded
         # from one instant) cannot show -- so read the order off the queue itself.
-        order = [s.journey_ref for s in sorted(subjects, key=partner_events._sort_key)]
+        order = [s.journey_ref for s in sorted(subjects, key=notification_events._sort_key)]
         assert order == [f"DatedServiceJourney:{2000 + i}" for i in range(12, -1, -1)]
     finally:
         _uninstall()
@@ -507,21 +507,21 @@ def test_two_below_threshold_cycles_withdraw_and_one_does_not():
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
-        one = partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        notification_events.emit([_subject()], now=NOW)
+        one = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         assert one.counting == 1 and one.withdrawn == 0, "one dip is noise"
-        assert len(client.in_collection(partner_store.EVENTS)) == 1
+        assert len(client.in_collection(notification_store.EVENTS)) == 1
 
         # A RESTART: the module holds nothing, the store holds the count.
         docs = dict(client.docs)
         _uninstall()
         client = _install()
         client.docs.update(docs)
-        two = partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=2))
+        two = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=2))
         assert two.withdrawn == 1, "the counter survived the restart"
-        events = sorted(client.in_collection(partner_store.EVENTS), key=lambda e: e["revision"])
-        assert events[-1]["type"] == partner_store.EVENT_WITHDRAWN
-        assert events[-1]["phase"] == partner_store.PHASE_WITHDRAWN
+        events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
+        assert events[-1]["type"] == notification_store.EVENT_WITHDRAWN
+        assert events[-1]["phase"] == notification_store.PHASE_WITHDRAWN
     finally:
         _uninstall()
 
@@ -542,28 +542,28 @@ def test_a_recovered_cycle_breaks_the_run_so_a_later_dip_does_not_withdraw():
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
-        dip = partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        notification_events.emit([_subject()], now=NOW)
+        dip = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         assert dip.counting == 1, dip
 
-        was = client.in_collection(partner_store.SUBJECTS)[0]
-        recovered = partner_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        was = client.in_collection(notification_store.SUBJECTS)[0]
+        recovered = notification_events.emit([_subject()], now=NOW + timedelta(minutes=2))
         assert recovered.unchanged == 1, "the same phase again: nothing is minted"
         assert recovered.run_cleared == 1, f"and the open run is closed; got {recovered}"
-        subject = client.in_collection(partner_store.SUBJECTS)[0]
+        subject = client.in_collection(notification_store.SUBJECTS)[0]
         assert subject["below_threshold_cycles"] == 0 and subject["below_threshold_at"] is None
         # A recovery is not a lifecycle transition: it must move neither, or it would mint an event
         # and put a second notification about one train on a traveller's phone.
-        assert subject["phase"] == was["phase"] == partner_store.PHASE_PREDICTED
+        assert subject["phase"] == was["phase"] == notification_store.PHASE_PREDICTED
         assert subject["revision"] == was["revision"]
 
         # Well inside `WITHDRAWAL_GAP_S` of the first dip, so the time window alone would withdraw.
-        assert timedelta(minutes=3).total_seconds() < partner_store.WITHDRAWAL_GAP_S
-        second = partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=3))
+        assert timedelta(minutes=3).total_seconds() < notification_store.WITHDRAWAL_GAP_S
+        second = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=3))
         assert second.withdrawn == 0 and second.counting == 1, (
             f"the recovery made this a FIRST dip, not the second of a run; got {second}"
         )
-        assert len(client.in_collection(partner_store.EVENTS)) == 1, "no withdrawal was minted"
+        assert len(client.in_collection(notification_store.EVENTS)) == 1, "no withdrawal was minted"
     finally:
         _uninstall()
 
@@ -579,9 +579,9 @@ def test_an_ordinary_standing_cycle_still_writes_nothing():
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
+        notification_events.emit([_subject()], now=NOW)
         before = client.transactions
-        report = partner_events.emit([_subject()], now=NOW + timedelta(minutes=1))
+        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=1))
         assert report.unchanged == 1 and client.transactions == before, (
             f"an ordinary standing cycle writes nothing; "
             f"{client.transactions - before} transaction(s) happened"
@@ -600,11 +600,11 @@ def test_a_run_already_past_the_gap_is_left_for_the_store_to_reset():
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
-        partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
-        later = NOW + timedelta(seconds=partner_store.WITHDRAWAL_GAP_S + 120)
+        notification_events.emit([_subject()], now=NOW)
+        notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        later = NOW + timedelta(seconds=notification_store.WITHDRAWAL_GAP_S + 120)
         before = client.transactions
-        report = partner_events.emit([_subject()], now=later)
+        report = notification_events.emit([_subject()], now=later)
         assert report.run_stale == 1 and report.run_cleared == 0, report
         assert client.transactions == before, "and it costs no transaction"
     finally:
@@ -614,26 +614,26 @@ def test_a_run_already_past_the_gap_is_left_for_the_store_to_reset():
 def test_a_failed_pre_read_loses_the_reset_and_never_reads_per_subject():
     """R20, applied to the reset: an outage costs the optimisation's exactness, never a read.
 
-    A failed `partner_alerts` leaves `open_runs` empty, so no run is closed this cycle and the
+    A failed `client_alerts` leaves `open_runs` empty, so no run is closed this cycle and the
     store's time window is what protects the traveller. What must NOT happen is a per-subject read
     to recover the information — that is the cost the whole pre-read exists to avoid.
     """
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
-        partner_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
-        client.query_fail_with["partner_alerts"] = RuntimeError("Firestore is unreachable")
+        notification_events.emit([_subject()], now=NOW)
+        notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        client.query_fail_with["client_alerts"] = RuntimeError("Firestore is unreachable")
         mark = len(_SINK.records)
-        report = partner_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=2))
         assert report.run_cleared == 0 and report.run_stale == 0, report
         assert report.unchanged == 1, "the store still answered the subject itself"
         assert not any("get_subject" in str(r.msg) for r in _SINK.records[mark:])
         # The run is still open, so the store's time window governs — the documented fallback.
-        subject = client.in_collection(partner_store.SUBJECTS)[0]
+        subject = client.in_collection(notification_store.SUBJECTS)[0]
         assert subject["below_threshold_at"] is not None
     finally:
-        client.query_fail_with.pop("partner_alerts", None)
+        client.query_fail_with.pop("client_alerts", None)
         _uninstall()
 
 
@@ -642,17 +642,17 @@ def test_a_below_threshold_train_with_nothing_standing_costs_no_transaction():
 
     ~83 % of matched alerts are sub-threshold. A `record_below_threshold` for a train nobody was
     ever warned about writes nothing (`nothing_standing`), so paying a Firestore transaction to
-    discover that on every cycle for every such train is the cost the one partner-scoped query
+    discover that on every cycle for every such train is the cost the one client-scoped query
     exists to avoid.
     """
     client = _install()
     try:
         _live(client)
         before = client.transactions
-        report = partner_events.emit([_subject(alertworthy=False)], now=NOW)
+        report = notification_events.emit([_subject(alertworthy=False)], now=NOW)
         assert report.nothing_standing == 1
         assert client.transactions == before, "no transaction was spent"
-        assert client.queries.count("partner_alerts") == 1, "one query for the whole cycle"
+        assert client.queries.count("client_alerts") == 1, "one query for the whole cycle"
     finally:
         _uninstall()
 
@@ -662,9 +662,9 @@ def test_an_unchanged_alertworthy_train_costs_no_transaction_either():
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject()], now=NOW)
+        notification_events.emit([_subject()], now=NOW)
         before = client.transactions
-        report = partner_events.emit([_subject()], now=NOW + timedelta(minutes=1))
+        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=1))
         assert report.unchanged == 1 and client.transactions == before
     finally:
         _uninstall()
@@ -673,7 +673,7 @@ def test_an_unchanged_alertworthy_train_costs_no_transaction_either():
 def test_a_truncated_or_over_full_pre_read_falls_back_to_asking_the_store():
     """The pre-read's one honest limit, handled rather than assumed.
 
-    `partner_alerts` COUNTS every live subject and enumerates at most `MAX_ALERTS_SERVED` of them,
+    `client_alerts` COUNTS every live subject and enumerates at most `MAX_ALERTS_SERVED` of them,
     so a subscription holding more than that reports a count this module cannot resolve to phases.
     Treating the subset as complete would skip a withdrawal that was owed and — worse — skip a
     `confirmed` mint for a train ET has cancelled, silently, for exactly the subscriptions a line
@@ -682,15 +682,15 @@ def test_a_truncated_or_over_full_pre_read_falls_back_to_asking_the_store():
     client = _install()
     try:
         _live(client)
-        served = partner_store.MAX_ALERTS_SERVED
+        served = notification_store.MAX_ALERTS_SERVED
         subjects = [
             _subject(journey_ref=f"DatedServiceJourney:{3000 + i}") for i in range(served + 2)
         ]
-        partner_events.emit(subjects, now=NOW)
-        assert len(client.in_collection(partner_store.SUBJECTS)) == served + 2
+        notification_events.emit(subjects, now=NOW)
+        assert len(client.in_collection(notification_store.SUBJECTS)) == served + 2
 
         before = client.transactions
-        report = partner_events.emit(subjects, now=NOW + timedelta(minutes=1))
+        report = notification_events.emit(subjects, now=NOW + timedelta(minutes=1))
         assert report.unchanged == len(subjects), "every one still resolves to `no transition`"
         assert client.transactions > before, (
             "and it cost transactions, because the pre-read could not enumerate them: an "
@@ -705,11 +705,11 @@ def test_a_failed_pre_read_costs_transactions_and_never_events():
     client = _install()
     try:
         _live(client)
-        client.query_fail_with["partner_alerts"] = RuntimeError("Firestore is unreachable")
+        client.query_fail_with["client_alerts"] = RuntimeError("Firestore is unreachable")
         handler = _capture()
-        report = partner_events.emit([_subject()], now=NOW)
+        report = notification_events.emit([_subject()], now=NOW)
         assert report.created == 1, "the event was still committed"
-        assert any(e["result"] == "standing_error" for e in _events(handler, "partner_emit"))
+        assert any(e["result"] == "standing_error" for e in _events(handler, "notification_emit"))
     finally:
         _uninstall()
 
@@ -729,26 +729,26 @@ def test_the_revision_survives_the_oslo_dst_fall_back_and_a_clock_step_backwards
     move it backwards by an unbounded amount. So the seed is only a seed and the transaction clamps
     to `max(stored + 1, seed)` — asserted with a second emit at an EARLIER instant than the first.
     """
-    oslo = partner_store.OSLO
+    oslo = notification_store.OSLO
     # 2026-10-25 03:00 CEST == 2026-10-25 02:00 CET: the repeated hour.
     before = datetime(2026, 10, 25, 0, 30, tzinfo=UTC)  # 02:30 CEST
     after = datetime(2026, 10, 25, 1, 30, tzinfo=UTC)  # 02:30 CET
     assert before.astimezone(oslo).strftime("%H:%M") == after.astimezone(oslo).strftime("%H:%M")
-    assert partner_store.revision_seed(after) > partner_store.revision_seed(before), (
+    assert notification_store.revision_seed(after) > notification_store.revision_seed(before), (
         "the seed is UTC: the same Oslo wall-clock time an hour apart must still move forward"
     )
 
     client = _install()
     try:
         _live(client)
-        partner_events.emit([_subject(departure_time=before + timedelta(minutes=20))], now=before)
-        first = client.in_collection(partner_store.EVENTS)[0]["revision"]
+        notification_events.emit([_subject(departure_time=before + timedelta(minutes=20))], now=before)
+        first = client.in_collection(notification_store.EVENTS)[0]["revision"]
         # A step BACKWARDS, further than the fall-back: the clamp is what holds now.
-        partner_events.emit(
+        notification_events.emit(
             [_subject(cancelled=True, departure_time=before + timedelta(minutes=20))],
             now=before - timedelta(days=2),
         )
-        revisions = sorted(e["revision"] for e in client.in_collection(partner_store.EVENTS))
+        revisions = sorted(e["revision"] for e in client.in_collection(notification_store.EVENTS))
         assert revisions[-1] == first + 1, f"strictly increasing, got {revisions}"
     finally:
         _uninstall()
@@ -764,20 +764,20 @@ def test_the_instant_is_captured_once_outside_the_transaction_and_in_utc():
     cycle reading the clock separately would order two subjects by a few microseconds of scheduling
     rather than by departure.
     """
-    source = inspect.getsource(partner_events.emit)
+    source = inspect.getsource(notification_events.emit)
     assert "astimezone(UTC)" in source, "the instant is normalised to UTC before anything sees it"
-    body = inspect.getsource(partner_events._run)
+    body = inspect.getsource(notification_events._run)
     assert "datetime.now" not in body, (
         "the emit loop must not read a wall clock: `now` arrives as an argument, captured once"
     )
-    assert "datetime.now" not in inspect.getsource(partner_events._emit_one)
+    assert "datetime.now" not in inspect.getsource(notification_events._emit_one)
 
 
 # ---- The transition rule is the store's, called and not restated ------------------------------
 
 
 def test_the_skip_predicate_is_the_stores_own_transition_rule():
-    """`skip_reason` may never be LOOSER than `partner_store._transition`, over every phase pair.
+    """`skip_reason` may never be LOOSER than `notification_store._transition`, over every phase pair.
 
     A client-side skip is what turns a cheap cycle into a correct one, and a restatement that
     drifted would fail silently in the worst direction: minting nothing for a train ET has just
@@ -785,21 +785,21 @@ def test_the_skip_predicate_is_the_stores_own_transition_rule():
     across the whole cross-product rather than trusting a comment, and a grep refuses a restatement
     of the table.
     """
-    phases = (None, partner_store.PHASE_PREDICTED, partner_store.PHASE_CONFIRMED, partner_store.PHASE_WITHDRAWN)
+    phases = (None, notification_store.PHASE_PREDICTED, notification_store.PHASE_CONFIRMED, notification_store.PHASE_WITHDRAWN)
     for stored in phases:
         for cancelled in (False, True):
             subject = _subject(alertworthy=True, cancelled=cancelled)
-            want = partner_store._transition(stored, partner_events.requested_phase(subject))
-            got = partner_events.skip_reason(stored, subject)
+            want = notification_store._transition(stored, notification_events.requested_phase(subject))
+            got = notification_events.skip_reason(stored, subject)
             assert (got is None) == (want is not None), (stored, cancelled, got, want)
     # A below-threshold observation writes nothing unless something stands.
     for stored, expect in (
         (None, "nothing_standing"),
-        (partner_store.PHASE_WITHDRAWN, "nothing_standing"),
-        (partner_store.PHASE_PREDICTED, None),
-        (partner_store.PHASE_CONFIRMED, None),
+        (notification_store.PHASE_WITHDRAWN, "nothing_standing"),
+        (notification_store.PHASE_PREDICTED, None),
+        (notification_store.PHASE_CONFIRMED, None),
     ):
-        assert partner_events.skip_reason(stored, _subject(alertworthy=False)) == expect
+        assert notification_events.skip_reason(stored, _subject(alertworthy=False)) == expect
     assert "_transition(" in MODULE_SOURCE, "called, not restated"
     code = "\n".join(
         line for line in MODULE_SOURCE.splitlines() if not line.strip().startswith("#")
@@ -810,9 +810,9 @@ def test_the_skip_predicate_is_the_stores_own_transition_rule():
 
 
 def test_requested_phase_is_confirmed_only_for_a_declared_cancellation():
-    assert partner_events.requested_phase(_subject()) == partner_store.PHASE_PREDICTED
+    assert notification_events.requested_phase(_subject()) == notification_store.PHASE_PREDICTED
     assert (
-        partner_events.requested_phase(_subject(cancelled=True)) == partner_store.PHASE_CONFIRMED
+        notification_events.requested_phase(_subject(cancelled=True)) == notification_store.PHASE_CONFIRMED
     )
 
 
@@ -828,17 +828,17 @@ def test_an_observation_that_cannot_name_a_train_is_never_a_subject():
     whole ET join key rests on.
     """
     for missing in ("operator", "journey_ref", "stop_place", "stop_order", "departure_time"):
-        assert partner_events.train_ref(_subject(**{missing: None})) is None, missing
+        assert notification_events.train_ref(_subject(**{missing: None})) is None, missing
     # A line nobody published is a DISPLAY gap, not an identity one: `journey_ref` already names the
     # dated train, so this must still be a subject.
-    ref = partner_events.train_ref(_subject(line=None))
+    ref = notification_events.train_ref(_subject(line=None))
     assert ref is not None and ref.line == ""
 
     client = _install()
     try:
         _live(client)
         before = client.transactions
-        report = partner_events.emit([_subject(stop_order=None)], now=NOW)
+        report = notification_events.emit([_subject(stop_order=None)], now=NOW)
         assert report.unidentified == 1 and client.transactions == before
     finally:
         _uninstall()
@@ -846,7 +846,7 @@ def test_an_observation_that_cannot_name_a_train_is_never_a_subject():
 
 def test_the_call_date_is_the_oslo_operating_day():
     """The one derived field, and the timezone every call table keys on."""
-    ref = partner_events.train_ref(
+    ref = notification_events.train_ref(
         _subject(departure_time=datetime(2026, 9, 8, 22, 30, tzinfo=UTC))
     )
     assert ref is not None and ref.call_date == "2026-09-09", "00:30 Oslo is the next day"
@@ -872,7 +872,7 @@ def test_the_reservation_stops_new_transactions_before_the_deadline_rather_than_
             _subject(journey_ref=f"DatedServiceJourney:{4000 + i}") for i in range(6)
         ]
         started = time.monotonic()
-        report = partner_events.emit(
+        report = notification_events.emit(
             subjects, now=NOW, deadline_s=0.2, wait_s=2.0, worst_case_s=0.12
         )
         elapsed = time.monotonic() - started
@@ -887,7 +887,7 @@ def test_a_hung_store_cannot_extend_the_step_past_its_bounded_wait():
     """Scenario 3's slow-store half, on the emit side.
 
     The reservation cannot see this failure: it reserves a worst case the call then exceeds without
-    limit, because `partner_store` plumbs no `timeout=` into the Firestore client. What bounds it is
+    limit, because `notification_store` plumbs no `timeout=` into the Firestore client. What bounds it is
     the outer wait on a worker thread that is ABANDONED rather than joined — `shutdown(wait=True)`
     would block the poller until the hung call finally returned and defeat the bound completely.
     """
@@ -898,16 +898,16 @@ def test_a_hung_store_cannot_extend_the_step_past_its_bounded_wait():
 
         def hanging(_body: Any) -> Any:
             release.wait(30)  # bounded so a failing assertion cannot wedge the suite
-            return partner_store.EventCommit(status="unchanged", alert_id="x")
+            return notification_store.EventCommit(status="unchanged", alert_id="x")
 
-        partner_store._run_transaction = hanging  # type: ignore[assignment]
+        notification_store._run_transaction = hanging  # type: ignore[assignment]
         handler = _capture()
         started = time.monotonic()
-        report = partner_events.emit([_subject()], now=NOW, wait_s=0.1)
+        report = notification_events.emit([_subject()], now=NOW, wait_s=0.1)
         elapsed = time.monotonic() - started
         assert elapsed < 2.0, f"a hung store must not hold the poller thread; took {elapsed:.1f}s"
         assert report.timed_out is True
-        assert {e["result"] for e in _events(handler, "partner_emit")} == {"timeout"}
+        assert {e["result"] for e in _events(handler, "notification_emit")} == {"timeout"}
     finally:
         release.set()
         _uninstall()
@@ -925,19 +925,19 @@ def test_a_destination_at_its_pending_ceiling_is_skipped_for_the_rest_of_the_ste
     client = _install()
     try:
         _live(client)
-        real = partner_store._count_destination_deliveries
-        partner_store._count_destination_deliveries = (  # type: ignore[assignment]
-            lambda destination_id, *, state: partner_store.MAX_PENDING_EVENTS_PER_DESTINATION
+        real = notification_store._count_destination_deliveries
+        notification_store._count_destination_deliveries = (  # type: ignore[assignment]
+            lambda destination_id, *, state: notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
         )
         subjects = [
             _subject(journey_ref=f"DatedServiceJourney:{5000 + i}") for i in range(4)
         ]
-        report = partner_events.emit(subjects, now=NOW)
+        report = notification_events.emit(subjects, now=NOW)
         assert report.quota == 4 and report.created == 0
         assert client.transactions == 0, "and only ONE of them paid for the discovery"
 
-        partner_store._count_destination_deliveries = real  # type: ignore[assignment]
-        assert partner_events.emit(subjects, now=NOW).created == 4, (
+        notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+        assert notification_events.emit(subjects, now=NOW).created == 4, (
             "the skip is pass-local: a drained destination is attempted again next cycle"
         )
     finally:
@@ -955,16 +955,16 @@ def test_an_exhausted_transaction_is_classified_retryable_not_terminal():
     client = _install()
     try:
         _live(client)
-        prefix = partner_store._exhausted_transaction_prefix()
+        prefix = notification_store._exhausted_transaction_prefix()
         client.fail_with = ValueError(f"{prefix} 5 attempts.")
         handler = _capture()
-        report = partner_events.emit([_subject()], now=NOW)
+        report = notification_events.emit([_subject()], now=NOW)
         assert report.retryable == 1 and report.failed == 0
-        assert any(e["result"] == "retryable" for e in _events(handler, "partner_emit"))
+        assert any(e["result"] == "retryable" for e in _events(handler, "notification_emit"))
 
         client.fail_with = ValueError("something else entirely")
         mark = len(_SINK.records)
-        report = partner_events.emit([_subject()], now=NOW)
+        report = notification_events.emit([_subject()], now=NOW)
         assert report.failed == 1 and report.retryable == 0
         # Asserted rather than printed: `_events` above removed the per-test handler, so this
         # second injection's record fell through to `lastResort` and put a traceback on stderr on
@@ -981,16 +981,16 @@ def test_an_obsolete_subscription_emits_nothing_and_says_which_kind():
     The pass matched against a snapshot taken before pass 1a, and a delete or an amendment can land
     in between. The version on the subject is the LOAD snapshot's for exactly this reason: compared
     against a fresh read it would always be equal, and an alert about a train matched for a route the
-    partner has since amended would go out stamped with the new version.
+    client has since amended would go out stamped with the new version.
     """
     client = _install()
     try:
         _live(client)
-        assert partner_events.emit([_subject(subscription_version=2)], now=NOW).obsolete == 1
-        assert client.in_collection(partner_store.EVENTS) == []
+        assert notification_events.emit([_subject(subscription_version=2)], now=NOW).obsolete == 1
+        assert client.in_collection(notification_store.EVENTS) == []
 
         client.docs.clear()
-        assert partner_events.emit([_subject()], now=NOW).obsolete == 1, "deleted subscription"
+        assert notification_events.emit([_subject()], now=NOW).obsolete == 1, "deleted subscription"
     finally:
         _uninstall()
 
@@ -998,10 +998,10 @@ def test_an_obsolete_subscription_emits_nothing_and_says_which_kind():
 # ---- R16: what never reaches a log line -------------------------------------------------------
 
 
-def test_no_partner_reference_route_or_prose_reaches_a_log_line():
+def test_no_external_reference_route_or_prose_reaches_a_log_line():
     """R16 on this module's own records: identifiers yes, the traveller's trip no.
 
-    `partner_ref` is the partner's own handle on a traveller and is carried for the envelope only.
+    `external_ref` is the client's own handle on a traveller and is carried for the envelope only.
     The route, the wording and the payload are what a routine log line must never hold — and the
     check is over the rendered message AND every structured field, because a field is exactly as
     published as the message.
@@ -1010,10 +1010,10 @@ def test_no_partner_reference_route_or_prose_reaches_a_log_line():
     try:
         _live(client)
         handler = _capture()
-        partner_events.emit(
+        notification_events.emit(
             [
                 _subject(
-                    partner_ref="commuter-42",
+                    external_ref="commuter-42",
                     title="Tog L1 08:50 kan bli innstilt",
                     body="Oslo S → Ski\nSignalfeil",
                 )
@@ -1021,17 +1021,17 @@ def test_no_partner_reference_route_or_prose_reaches_a_log_line():
             now=NOW,
         )
         records = handler.records
-        logging.getLogger("partner_events").removeHandler(handler)
+        logging.getLogger("notification_events").removeHandler(handler)
         rendered = " ".join(
             [r.getMessage() for r in records] + [str(getattr(r, "fields", "")) for r in records]
         )
         for forbidden in ("commuter-42", "Oslo S", "Signalfeil", "innstilt", "NSR:StopPlace"):
             assert forbidden not in rendered, f"{forbidden!r} reached a log line: {rendered}"
         # And what an operator actually diagnoses with IS there: the cycle's counts. Not the
-        # partner id -- one summary line covers every partner in the cycle, so a single id field
+        # client id -- one summary line covers every client in the cycle, so a single id field
         # would be wrong rather than private. The per-failure records carry it (see
-        # `test_a_failed_pre_read_...`), which is where a question about one partner starts.
-        summary = next(e for e in _events(_reattach(records), "partner_emit") if e["result"] == "ok")
+        # `test_a_failed_pre_read_...`), which is where a question about one client starts.
+        summary = next(e for e in _events(_reattach(records), "notification_emit") if e["result"] == "ok")
         assert summary["created"] == 1 and summary["n"] == 1
     finally:
         _uninstall()
@@ -1045,10 +1045,10 @@ def test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger():
     summed to 30 s or more would make the trigger fire on a bad morning by construction rather than
     because anything was wrong.
     """
-    import partner_delivery
+    import webhook_delivery
 
-    assert partner_events._EMIT_WAIT_S + partner_delivery._DELIVERY_WAIT_S < 30.0
-    assert partner_events._EMIT_DEADLINE_S < partner_events._EMIT_WAIT_S, (
+    assert notification_events._EMIT_WAIT_S + webhook_delivery._DELIVERY_WAIT_S < 30.0
+    assert notification_events._EMIT_DEADLINE_S < notification_events._EMIT_WAIT_S, (
         "the reservation must bind before the backstop, or the backstop is the only bound"
     )
 
@@ -1066,7 +1066,7 @@ def test_the_module_imports_neither_varsel_nor_main():
     # a reader of this line deciding it is light. `reserved_budget` is the shared reserve-don't-check
     # pass budget, stdlib-only (`threading`, `time.monotonic`), and it is why `threading` is no
     # longer imported here directly -- the lock moved with the class that owns it.
-    assert imports == {"logging", "partner_store", "reserved_budget"}, imports
+    assert imports == {"logging", "notification_store", "reserved_budget"}, imports
 
 
 if __name__ == "__main__":
@@ -1078,4 +1078,4 @@ if __name__ == "__main__":
             print(f"ok  {name}")
     # The COUNT, in every other suite's shape: a runner that silently collects nothing still exits
     # 0, so "it passed" is not the check -- "the number moved" is.
-    print(f"\n{_ran} partner event checks passed.")
+    print(f"\n{_ran} notification event checks passed.")

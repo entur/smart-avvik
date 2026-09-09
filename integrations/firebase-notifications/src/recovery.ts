@@ -1,7 +1,7 @@
 // The recovery sweep: work the trigger's retry window abandoned, plus a staleness cutoff of our own.
 //
 // Two independent ways an inbox record is left `pending` forever, and neither leaves an error
-// anywhere a partner would look.
+// anywhere a client would look.
 //
 //   1. **The trigger never fired, or gave up.** Eventarc delivery is at-least-once, not
 //      exactly-once, and its retry window is finite -- the plan states 24 hours. A record written

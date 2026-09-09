@@ -1,6 +1,6 @@
-// The DECLARED consumption shape, loaded the way a partner loads it.
+// The DECLARED consumption shape, loaded the way a client loads it.
 //
-// KTD11: `node --test` over the .ts sources is a test convenience; what a partner consumes is
+// KTD11: `node --test` over the .ts sources is a test convenience; what a client consumes is
 // compiled CommonJS plus type declarations on the Node major their Cloud Functions runtime pins.
 // Those are two different programs -- different module systems, a different resolver, different
 // runtime semantics for a type-only import -- so a suite that only ever exercised the sources would
@@ -42,7 +42,7 @@ test("the packaged manifest points at the artifact that exists", () => {
 });
 
 test("every source module has a declaration file beside it", () => {
-  // The second half of the declared shape. A partner without .d.ts gets `any` for the whole
+  // The second half of the declared shape. A client without .d.ts gets `any` for the whole
   // package, which is exactly the homework KTD11 says the helper exists to remove.
   const sources = fs
     .readdirSync(path.join(PACKAGE_ROOT, "src"))
@@ -62,7 +62,7 @@ test("the emitted JavaScript is CommonJS, with the .ts import extensions rewritt
 });
 
 test("the quickstart from the README runs against the built artifact", async () => {
-  // The quickstart is what a partner types first, and running it here is what stops it drifting from
+  // The quickstart is what a client types first, and running it here is what stops it drifting from
   // the API. It is the README's snippet, condensed: verify, persist, decide, dispatch.
   const {
     createMemoryStores,
@@ -84,7 +84,7 @@ test("the quickstart from the README runs against the built artifact", async () 
     valid_until: "2026-09-09T06:00:00+00:00",
     subscription_id: "sub_a",
     subscription_version: 1,
-    partner_ref: "commuter-4711",
+    external_ref: "commuter-4711",
     test: false,
     operator: "VYG",
     line: "VYG:Line:L1",

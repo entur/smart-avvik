@@ -1,17 +1,17 @@
-"""Durable partner state: subscriptions, alert subjects, events and delivery records.
+"""Durable notification state: subscriptions, alert subjects, events and delivery records.
 
 Firestore Native, one **named** database per environment, created by this repo's own Terraform
 (``terraform/firestore.tf``). Chosen over extending /varsel's GCS state blob, which is rewritten
-whole with no compare-and-set: a partner API writing a subscription while the poller saves a cycle
+whole with no compare-and-set: a notification API writing a subscription while the poller saves a cycle
 would silently lose one of the two, and that is precisely the write pattern this surface adds.
 
 Four collections, all **top level**, all carrying the ids that relate them:
 
 ===========================  ===============================================================
-``partner_subscriptions``    one per registration: a /varsel journey definition plus a channel
-``partner_alert_subjects``   one per (subscription, train): the revision and lifecycle phase
-``partner_events``           one per minted revision: the envelope a partner receives
-``partner_deliveries``       one per event per destination: attempt state, stable delivery id
+``subscriptions``    one per registration: a /varsel journey definition plus a channel
+``alert_subjects``   one per (subscription, train): the revision and lifecycle phase
+``events``           one per minted revision: the envelope a client receives
+``deliveries``       one per event per destination: attempt state, stable delivery id
 ===========================  ===============================================================
 
 **Events, deliveries and subjects are top-level collections carrying a subscription id, not
@@ -26,7 +26,7 @@ Three rules govern everything here, and each of them has a failure that is silen
    takes its ``now`` and its ``revision_seed`` as ARGUMENTS captured once by the caller, performs
    all its reads before any write, returns its result rather than appending to an outer list, and
    logs nothing. A clock read inside a body makes ``event_id`` irreproducible; a log line inside
-   one double-reports; an outer-list append double-counts. ``test_partner_store`` invokes each body
+   one double-reports; an outer-list append double-counts. ``test_notification_store`` invokes each body
    twice against one fake transaction, with a clock that RAISES and a logger that raises on any
    attribute access, which is what catches all three.
 2. **TTL deletes within roughly 24 hours of expiry, and expired documents stay queryable until it
@@ -44,7 +44,7 @@ Three rules govern everything here, and each of them has a failure that is silen
 
 What this module deliberately does NOT do: decide when to emit (that reads the notification pass),
 sign anything, or make an outbound call. It is the durable state and the transactions over it.
-Nothing here imports ``varsel``, ``main`` or ``impact``: a partner event may not reach the device
+Nothing here imports ``varsel``, ``main`` or ``impact``: a notification event may not reach the device
 registry, the VAPID keypair or the decision-log writer (R16), and the poller's load step calls
 :func:`recipient_documents` through an injected provider precisely so the dependency runs one way.
 """
@@ -66,10 +66,10 @@ OSLO = ZoneInfo("Europe/Oslo")
 
 # ---- Collections and the one TTL field per group ---------------------------------------------
 
-SUBSCRIPTIONS = "partner_subscriptions"
-SUBJECTS = "partner_alert_subjects"
-EVENTS = "partner_events"
-DELIVERIES = "partner_deliveries"
+SUBSCRIPTIONS = "subscriptions"
+SUBJECTS = "alert_subjects"
+EVENTS = "events"
+DELIVERIES = "deliveries"
 
 COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES)
 
@@ -81,15 +81,15 @@ COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES)
 TTL_FIELD = "expires_at"
 
 # The published contract version. `contracts/notifications/v1/` holds the two JSON schemas, and this
-# value is the `schema_version` in every envelope, so a partner can refuse a shape its receiver does
-# not know rather than mis-parse it (R20's fail-closed rule, on the partner's side of the wire).
+# value is the `schema_version` in every envelope, so a client can refuse a shape its receiver does
+# not know rather than mis-parse it (R20's fail-closed rule, on the client's side of the wire).
 SCHEMA_VERSION = "1"
 
 
 # ---- Retention, stated as numbers because R19 publishes them ----------------------------------
 
 # Events, deliveries and alert subjects. Shorter than the ten-day retry window the nightly
-# labelling job uses, which forecloses retrospectively scoring partner alerts -- a published
+# labelling job uses, which forecloses retrospectively scoring client alerts -- a published
 # retention choice, so lengthening it later is a contract change, not a tuning edit.
 HISTORY_DAYS = 7
 # R5's two subscription horizons. A subscription expires at the EARLIER of them, and both are
@@ -97,7 +97,7 @@ HISTORY_DAYS = 7
 # alerting for a day past its published expiry is a broken promise rather than a slow cleanup.
 SUBSCRIPTION_MAX_LIFETIME_DAYS = 180
 SUBSCRIPTION_INACTIVITY_DAYS = 60
-# R12's event validity horizon, quoted by U6, U8, AE12 and the partner documentation. Validity is
+# R12's event validity horizon, quoted by U6, U8, AE12 and the client documentation. Validity is
 # the EARLIER of this, the departure, and the subscription's lifetime; the retry *interval* is one
 # attempt per notification pass and is deliberately not a constant -- the pass runs on SIRI
 # ingestion changes, measured at a ~296 s period (2026-09-08).
@@ -117,13 +117,13 @@ DELIVERED_MARK_TTL_H = 48
 
 # ---- R21's ceilings, every one a number so it can be checked ----------------------------------
 
-# Active subscriptions per partner. A planning default rather than measured capacity: the superseded
-# plan proposed 1 000 per partner and 5 000 total and its own risk note said to "start with lower
+# Active subscriptions per client. A planning default rather than measured capacity: the superseded
+# plan proposed 1 000 per client and 5 000 total and its own risk note said to "start with lower
 # measured admission limits", so this is the lower one. Raising it needs a measurement of the pass
 # at the new population, not a judgement.
-MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER = 500
+MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT = 500
 # What one poller cycle may READ. R21 says the per-cycle read cannot exceed the ceiling, and this is
-# literally the query's `limit`. It must stay at or below `varsel._MAX_PARTNER_RECIPIENTS`, which
+# literally the query's `limit`. It must stay at or below `varsel._MAX_WEBHOOK_RECIPIENTS`, which
 # bounds the same read one layer out; `test_the_cycle_ceiling_does_not_exceed_varsels_own` parses
 # that constant out of varsel.py rather than trusting the two to be edited together.
 MAX_SUBSCRIPTIONS_PER_CYCLE = 2000
@@ -134,7 +134,7 @@ MAX_SUBSCRIPTIONS_PER_CYCLE = 2000
 # count and the commit.
 MAX_PENDING_EVENTS_PER_DESTINATION = 500
 # Delivery attempts per cycle, in total and per destination. The per-destination one is what stops a
-# single backlogged partner spending the whole pass; the total is what bounds the query.
+# single backlogged client spending the whole pass; the total is what bounds the query.
 MAX_DELIVERY_ATTEMPTS_PER_CYCLE = 200
 MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE = 50
 # R11's cap: /varsel's `_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`, at /varsel's grain (per
@@ -145,7 +145,7 @@ MAX_ALERT_DELIVERIES_PER_DAY = 4
 # time first (see `_prune_marks` / `_prune_daily`), so hitting these means something is wrong.
 MAX_DELIVERED_MARKS = 500
 MAX_DAILY_COUNTERS = 14
-# What the partner API may SERVE of a subscription's current alert state, and what one request may
+# What the notification API may SERVE of a subscription's current alert state, and what one request may
 # READ to compute it. Two numbers because they answer different questions.
 #
 # The served cap is `MAX_ALERT_DELIVERIES_PER_DAY`, deliberately the same number: R11 lets at most
@@ -156,9 +156,9 @@ MAX_DAILY_COUNTERS = 14
 # rest, so nothing is hidden, only unenumerated.
 #
 # The read ceiling bounds the whole request rather than a row: the list route reads every
-# subscription's subjects in ONE partner-scoped query and groups them in Python, because a query
+# subscription's subjects in ONE client-scoped query and groups them in Python, because a query
 # per row would be a hundred queries on a hundred-row page. Past this ceiling the snapshot reports
-# `truncated`, and the counts are lower bounds rather than answers -- see `partner_alerts`.
+# `truncated`, and the counts are lower bounds rather than answers -- see `client_alerts`.
 MAX_ALERTS_SERVED = 4
 MAX_SUBJECTS_PER_READ = 500
 # Below-threshold observations IN ONE RUN before an alert is withdrawn. Two, not one: a single
@@ -186,7 +186,7 @@ RETRY_AFTER_CAP_S = 300
 # success ("otherwise a dead destination burns a subscription's four for the Oslo day with nothing
 # delivered").
 #
-# 120 s: comfortably longer than one attempt's worst case (`partner_delivery` reserves the outbound
+# 120 s: comfortably longer than one attempt's worst case (`webhook_delivery` reserves the outbound
 # timeout plus three store calls, ~11 s, under a 20 s bounded wait, and a client-retried transaction
 # can stretch that), and comfortably SHORTER than the pass period measured at ~296 s. That is the
 # property worth stating: a leaked reservation costs at most ONE cycle's worth of allowance, never
@@ -194,14 +194,14 @@ RETRY_AFTER_CAP_S = 300
 RESERVATION_TTL_S = 120.0
 # THE DEADLINE ON EVERY INDIVIDUAL FIRESTORE CALL, and KTD6 requires it of the load step and the
 # emit transactions alike. It is NOT the same bound as the poller's wait: `varsel`'s own
-# `_PARTNER_LOAD_TIMEOUT_S` (5 s) bounds how long the ingestion thread WAITS on a worker, and a
+# `_WEBHOOK_LOAD_TIMEOUT_S` (5 s) bounds how long the ingestion thread WAITS on a worker, and a
 # worker parked past it is abandoned rather than killed -- Python cannot cancel a thread inside a
 # socket read. An abandoned thread is not free: `concurrent.futures.thread` registers an atexit hook
 # that JOINS its workers, so a store call with no deadline of its own delays pod termination by
 # however long it hangs. This is the deadline that stops that, and it belongs to the call rather
 # than to the caller for exactly that reason.
 #
-# 4 s, under `varsel._PARTNER_LOAD_TIMEOUT_S`, so a single hung call surfaces as this module's own
+# 4 s, under `varsel._WEBHOOK_LOAD_TIMEOUT_S`, so a single hung call surfaces as this module's own
 # `DeadlineExceeded` -- retryable, logged, one cycle skipped -- rather than as the caller's timeout
 # with a thread still running behind it. A paged read spends it PER PAGE, which is the honest shape:
 # the whole-read bound is the caller's, and R21's document ceiling is what bounds the page count.
@@ -238,40 +238,40 @@ _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 # `google.cloud.firestore_v1.base_transaction._EXCEED_ATTEMPTS_TEMPLATE`'s prefix; the constant is
 # private, so `is_retryable` prefers importing it and falls back to this, and
 # `test_the_exhausted_transaction_message_matches_the_installed_client` pins the two against each
-# other so a client upgrade that rewords it fails a test rather than a partner's delivery.
+# other so a client upgrade that rewords it fails a test rather than a client's delivery.
 _EXHAUSTED_TRANSACTION_PREFIX = "Failed to commit transaction in"
 
 
 # ---- Errors -----------------------------------------------------------------------------------
 
 
-class PartnerStoreError(Exception):
+class NotificationStoreError(Exception):
     """Base for every failure this module raises deliberately."""
 
 
-class NotConfigured(PartnerStoreError):
+class NotConfigured(NotificationStoreError):
     """No client and no database id: the channel is not wired in this deployment."""
 
 
-class NotFound(PartnerStoreError):
+class NotFound(NotificationStoreError):
     """The record does not exist, is tombstoned, or has passed one of its horizons."""
 
 
-class Forbidden(PartnerStoreError):
-    """The record exists and belongs to a different partner.
+class Forbidden(NotificationStoreError):
+    """The record exists and belongs to a different client.
 
     Deliberately distinct from :class:`NotFound` INSIDE the store and deliberately collapsed into
     it at the API edge (U4's job): the store's caller needs to tell a tenancy violation from a
-    missing document to log the former, while a partner must not be able to probe another's
+    missing document to log the former, while a client must not be able to probe another's
     subscription ids by the difference between a 403 and a 404.
     """
 
 
-class Conflict(PartnerStoreError):
+class Conflict(NotificationStoreError):
     """A version mismatch, an immutable field changed, or an id reused for a different definition."""
 
 
-class QuotaExceeded(PartnerStoreError):
+class QuotaExceeded(NotificationStoreError):
     """A ceiling in R21 would be breached. Raised before any write."""
 
 
@@ -332,7 +332,7 @@ def _client() -> Any:
     if _client_obj is not None:
         return _client_obj
     if not _database:
-        raise NotConfigured("partner_store.configure() was never called with a database id")
+        raise NotConfigured("notification_store.configure() was never called with a database id")
     # Lazy, like llm_message's Vertex clients and for the same reason: a deployment with the channel
     # switched off must neither import the library nor need credentials for it, and the import is
     # ~200 ms of gRPC machinery nothing else in this process wants.
@@ -345,7 +345,7 @@ def _client() -> Any:
 def client() -> Any:
     """The one Firestore client this process holds, built on first use.
 
-    Public so ``partner_auth`` -- the identity plane, which stores its accounts, credentials,
+    Public so ``notification_auth`` -- the identity plane, which stores its accounts, credentials,
     destinations and operator audit in the same named database -- does not open a second one. Two
     clients means two gRPC channels and two connection pools in a single-replica deployment whose
     poller already shares the thread, for no gain: there is one database and one process.
@@ -508,7 +508,7 @@ def cap_remaining(doc: Mapping[str, Any], now: datetime) -> int:
     ``mark_delivery_sent``, so with a delivery pool wider than the cap the first wave of claims all
     read "slots left" before any of them spent one, and up to
     ``MAX_ALERT_DELIVERIES_PER_DAY + workers - 1`` notifications could go out for one subscription
-    in one Oslo day. It did not bite only because ``partner_delivery._WORKERS`` (4) happens to equal
+    in one Oslo day. It did not bite only because ``webhook_delivery._WORKERS`` (4) happens to equal
     the cap (4) -- a coincidence, pinned by an assertion in that suite rather than relied on.
     ``varsel._WriteBudget.claim`` is the precedent for the fix and its docstring records the same
     read-then-act shape overshooting a 30 s ceiling by 16 s.
@@ -550,7 +550,7 @@ def alert_subject_id(subscription_id: str, train: TrainRef) -> str:
 
     **The grain is (subscription, train), not train alone**, and the plan does not state it, so
     here is the reasoning it rests on. `alert_id` is the only key the supplied receiver policy
-    deduplicates and orders on. A partner serves many commuters through one receiver; if two
+    deduplicates and orders on. A client serves many commuters through one receiver; if two
     subscriptions on the same disrupted train shared an `alert_id`, the receiver's own "drop a
     revision not strictly newer than the highest applied for that train" rule would suppress the
     SECOND commuter's notification entirely. Per subscription, the ordering claim stays exactly as
@@ -595,20 +595,20 @@ def revision_seed(now: datetime) -> int:
 def _definition_digest(spec: SubscriptionSpec) -> str:
     """What makes a create idempotent: the same id plus the same definition is the same request.
 
-    Covers exactly the fields a partner submits, so a retry of an unacknowledged POST returns the
+    Covers exactly the fields a client submits, so a retry of an unacknowledged POST returns the
     stored record instead of a conflict, and a genuinely different definition under a reused id is
     refused rather than silently overwriting a live subscription.
     """
     material = "|".join(
         (
-            spec.partner_id,
+            spec.client_id,
             spec.destination_id,
             spec.from_stop,
             spec.to_stop,
             spec.begin,
             spec.end,
             ",".join(str(d) for d in sorted(set(spec.days))),
-            spec.partner_ref,
+            spec.external_ref,
             "test" if spec.test else "live",
         )
     )
@@ -672,14 +672,14 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         # starve live subscriptions. Descending puts the furthest-from-expiry first, so truncation
         # sheds dead rows before live ones.
         order_by=(("expires_at", "DESCENDING"),),
-        why="the poller's one partner read per cycle",
+        why="the poller's one client read per cycle",
     ),
     QuerySpec(
-        name="partner_subscriptions",
+        name="subscriptions",
         collection=SUBSCRIPTIONS,
-        equality=("partner_id", "status"),
+        equality=("client_id", "status"),
         order_by=(("created_at", "ASCENDING"),),
-        why="a partner lists its own subscriptions, and the create-time ceiling count",
+        why="a client lists its own subscriptions, and the create-time ceiling count",
     ),
     QuerySpec(
         name="subscription_alerts",
@@ -691,14 +691,14 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         # what the current state is made of -- a subject document is rewritten on every lifecycle
         # transition -- and it sheds subjects nothing has happened to before ones that just changed.
         order_by=(("updated_at", "DESCENDING"),),
-        why="one subscription's current alert state, for the partner API",
+        why="one subscription's current alert state, for the notification API",
     ),
     QuerySpec(
-        name="partner_alerts",
+        name="client_alerts",
         collection=SUBJECTS,
-        equality=("partner_id",),
+        equality=("client_id",),
         order_by=(("updated_at", "DESCENDING"),),
-        why="every subscription's alert state in ONE query, for the partner API's list page",
+        why="every subscription's alert state in ONE query, for the notification API's list page",
     ),
     QuerySpec(
         name="pending_deliveries",
@@ -893,7 +893,7 @@ def _exhausted_transaction_prefix() -> str:
 
 @dataclass(frozen=True)
 class SubscriptionSpec:
-    """What a partner submits. /varsel's registration shape plus a channel.
+    """What a client submits. /varsel's registration shape plus a channel.
 
     ``subscription_id`` is caller-supplied so a create is safely retryable (R5): the same id with
     the same definition returns the stored record and writes nothing, while the same id with a
@@ -906,28 +906,28 @@ class SubscriptionSpec:
     """
 
     subscription_id: str
-    partner_id: str
+    client_id: str
     destination_id: str
     from_stop: str
     to_stop: str
     begin: str
     end: str
     days: tuple[int, ...]
-    partner_ref: str = ""
+    external_ref: str = ""
     test: bool = False
 
     def validate(self) -> None:
         """/varsel's own three window rules, restated rather than imported.
 
-        ``varsel.JourneyIn`` requires a ``device_id``, which a partner subscription by definition
-        does not have, and ``varsel._parse_partner_recipient`` restates the same three rules on the
+        ``varsel.JourneyIn`` requires a ``device_id``, which a webhook subscription by definition
+        does not have, and ``varsel._parse_webhook_recipient`` restates the same three rules on the
         read side for its own reason (it validates documents written by a possibly newer binary).
         This is the third statement and the suite pins all three against each other: overnight
-        windows are refused here exactly as they are in /varsel, or a partner could register a
+        windows are refused here exactly as they are in /varsel, or a client could register a
         window /varsel would not and R3's parity claim would be quietly false.
         """
-        if not self.subscription_id or not self.partner_id or not self.destination_id:
-            raise Conflict("subscription_id, partner_id and destination_id are required")
+        if not self.subscription_id or not self.client_id or not self.destination_id:
+            raise Conflict("subscription_id, client_id and destination_id are required")
         if not self.from_stop or not self.to_stop:
             raise Conflict("from_stop and to_stop must be non-empty")
         if self.from_stop == self.to_stop:
@@ -946,14 +946,14 @@ class Subscription:
     """A stored subscription as every reader sees it."""
 
     subscription_id: str
-    partner_id: str
+    client_id: str
     destination_id: str
     from_stop: str
     to_stop: str
     begin: str
     end: str
     days: tuple[int, ...]
-    partner_ref: str
+    external_ref: str
     test: bool
     version: int
     status: str
@@ -977,9 +977,9 @@ class Subscription:
     cleanup: Mapping[str, Any] = field(default_factory=dict)
 
     def as_recipient_document(self, now: datetime) -> dict[str, Any]:
-        """The raw document ``varsel.PartnerRecipientProvider`` is contracted to yield.
+        """The raw document ``varsel.WebhookRecipientProvider`` is contracted to yield.
 
-        Exactly the keys ``varsel._parse_partner_recipient`` reads, plus the ids U6 needs to route
+        Exactly the keys ``varsel._parse_webhook_recipient`` reads, plus the ids U6 needs to route
         a match back to a destination. The extra keys are safe by that function's own design: it
         validates the fields the pass reads and is indifferent to the rest, so a store that adds a
         field does not start failing every document in the collection.
@@ -991,9 +991,9 @@ class Subscription:
         return {
             "recipient_id": self.subscription_id,
             "subscription_id": self.subscription_id,
-            "partner_id": self.partner_id,
+            "client_id": self.client_id,
             "destination_id": self.destination_id,
-            "partner_ref": self.partner_ref,
+            "external_ref": self.external_ref,
             "version": self.version,
             "test": self.test,
             "from_stop": self.from_stop,
@@ -1014,21 +1014,21 @@ def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
     """
     days = tuple(sorted({int(d) for d in doc["days"]}))
     # Non-empty only while the subscription is ACTIVE. A completed cleanup deliberately redacts the
-    # tombstone -- route, window, weekdays, partner reference -- so requiring days here made the
+    # tombstone -- route, window, weekdays, client reference -- so requiring days here made the
     # SECOND delete of a fully cleaned-up subscription raise instead of being idempotent, which is a
     # 500 on a retry rather than the "already gone, nothing to do" the caller is owed.
     if not days and doc.get("status") == "active":
         raise ValueError("an active subscription must name at least one weekday")
     return Subscription(
         subscription_id=str(doc["subscription_id"]),
-        partner_id=str(doc["partner_id"]),
+        client_id=str(doc["client_id"]),
         destination_id=str(doc["destination_id"]),
         from_stop=str(doc["from_stop"]),
         to_stop=str(doc["to_stop"]),
         begin=str(doc["begin"]),
         end=str(doc["end"]),
         days=days,
-        partner_ref=str(doc.get("partner_ref") or ""),
+        external_ref=str(doc.get("external_ref") or ""),
         test=bool(doc.get("test")),
         version=int(doc.get("version") or 0),
         status=str(doc.get("status") or ""),
@@ -1054,14 +1054,14 @@ def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
 def _new_subscription_doc(spec: SubscriptionSpec, now: datetime) -> dict[str, Any]:
     return {
         "subscription_id": spec.subscription_id,
-        "partner_id": spec.partner_id,
+        "client_id": spec.client_id,
         "destination_id": spec.destination_id,
         "from_stop": spec.from_stop,
         "to_stop": spec.to_stop,
         "begin": spec.begin,
         "end": spec.end,
         "days": [int(d) for d in sorted(set(spec.days))],
-        "partner_ref": spec.partner_ref,
+        "external_ref": spec.external_ref,
         "test": bool(spec.test),
         "version": 1,
         "status": "active",
@@ -1089,12 +1089,12 @@ def _create_body(
 ) -> tuple[str, dict[str, Any]]:
     """Create one subscription, refusing past the ceiling BEFORE any write.
 
-    The ceiling is counted inside the transaction from the partner's own subscriptions rather than
+    The ceiling is counted inside the transaction from the client's own subscriptions rather than
     from a counter document, deliberately. A counter over-counts and drifts: a subscription past one
     of R5's horizons is still ``status == "active"`` until TTL deletes it up to ~24 h later, so a
-    partner would be locked out by dead rows, and a crash between the tombstone and the decrement
+    client would be locked out by dead rows, and a crash between the tombstone and the decrement
     would leave the counter permanently wrong with nothing to reconcile it against. Counting costs
-    up to ``MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER`` read locks under Standard edition's pessimistic
+    up to ``MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT`` read locks under Standard edition's pessimistic
     concurrency -- bounded, and paid on a create, which a commuter does once.
 
     R21's "the read cannot exceed the ceiling" is literally the query's ``limit``.
@@ -1102,8 +1102,8 @@ def _create_body(
     existing = _read(transaction, refs.subscription(spec.subscription_id))
     stored = _doc(existing)
     if stored:
-        if stored.get("partner_id") != spec.partner_id:
-            raise Forbidden("subscription id belongs to another partner")
+        if stored.get("client_id") != spec.client_id:
+            raise Forbidden("subscription id belongs to another client")
         # LIVENESS BEFORE THE DIGEST, or a tombstoned subscription is handed back through a 2xx as
         # an "unchanged" success -- with `status: "deleted"` on it. `_delete_body` does not clear
         # `definition_digest` (only the cleanup's redaction does), so the window where a delete and
@@ -1126,10 +1126,10 @@ def _create_body(
     for snapshot in _read_query(transaction, count_query):
         if subscription_is_live(_doc(snapshot), now):
             live += 1
-    if live >= MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER:
+    if live >= MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT:
         raise QuotaExceeded(
-            f"partner already holds {live} active subscriptions "
-            f"(ceiling {MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER})"
+            f"client already holds {live} active subscriptions "
+            f"(ceiling {MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT})"
         )
     doc = _new_subscription_doc(spec, now)
     transaction.set(refs.subscription(spec.subscription_id), doc)
@@ -1142,22 +1142,22 @@ def create_subscription(spec: SubscriptionSpec, *, now: datetime | None = None) 
     instant = now or _now()
     refs = _Refs(_client())
     count_query = _query(
-        "partner_subscriptions",
-        equality={"partner_id": spec.partner_id, "status": "active"},
-        limit=MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER,
+        "subscriptions",
+        equality={"client_id": spec.client_id, "status": "active"},
+        limit=MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT,
     )
     outcome, doc = _run_transaction(
         lambda txn: _create_body(txn, refs, count_query, spec=spec, now=instant)
     )
     logger.info(
-        "Partner subscription %s (%s)",
+        "Webhook subscription %s (%s)",
         spec.subscription_id,
         outcome,
         extra={
             "fields": {
-                "event": "partner_subscription",
+                "event": "notification_subscription",
                 "result": outcome,
-                "partner_id": spec.partner_id,
+                "client_id": spec.client_id,
                 "subscription_id": spec.subscription_id,
                 "test": bool(spec.test),
             }
@@ -1184,8 +1184,8 @@ def _replace_body(
     stored = _doc(snapshot)
     if not stored:
         raise NotFound("no such subscription")
-    if stored.get("partner_id") != spec.partner_id:
-        raise Forbidden("subscription belongs to another partner")
+    if stored.get("client_id") != spec.client_id:
+        raise Forbidden("subscription belongs to another client")
     if not subscription_is_live(stored, now):
         raise NotFound("subscription is deleted or past one of its horizons")
     if expected_version is not None and int(stored.get("version") or 0) != expected_version:
@@ -1202,7 +1202,7 @@ def _replace_body(
         "begin": spec.begin,
         "end": spec.end,
         "days": [int(d) for d in sorted(set(spec.days))],
-        "partner_ref": spec.partner_ref,
+        "external_ref": spec.external_ref,
         "definition_digest": _definition_digest(spec),
         "version": int(stored.get("version") or 0) + 1,
         "updated_at": now,
@@ -1240,7 +1240,7 @@ def replace_subscription(
 
 
 def _delete_body(
-    transaction: Any, refs: _Refs, *, subscription_id: str, partner_id: str, now: datetime
+    transaction: Any, refs: _Refs, *, subscription_id: str, client_id: str, now: datetime
 ) -> dict[str, Any] | None:
     """Tombstone first, in one transactional write that stops routing.
 
@@ -1256,8 +1256,8 @@ def _delete_body(
     stored = _doc(snapshot)
     if not stored:
         return None
-    if stored.get("partner_id") != partner_id:
-        raise Forbidden("subscription belongs to another partner")
+    if stored.get("client_id") != client_id:
+        raise Forbidden("subscription belongs to another client")
     if stored.get("status") == "deleted":
         return stored
     patch = {
@@ -1278,26 +1278,26 @@ def _delete_body(
 
 
 def delete_subscription(
-    subscription_id: str, *, partner_id: str, now: datetime | None = None
+    subscription_id: str, *, client_id: str, now: datetime | None = None
 ) -> Subscription | None:
     """Tombstone a subscription. Returns ``None`` if it never existed."""
     instant = now or _now()
     refs = _Refs(_client())
     doc = _run_transaction(
         lambda txn: _delete_body(
-            txn, refs, subscription_id=subscription_id, partner_id=partner_id, now=instant
+            txn, refs, subscription_id=subscription_id, client_id=client_id, now=instant
         )
     )
     if doc is None:
         return None
     logger.info(
-        "Partner subscription %s tombstoned",
+        "Webhook subscription %s tombstoned",
         subscription_id,
         extra={
             "fields": {
-                "event": "partner_subscription",
+                "event": "notification_subscription",
                 "result": "deleted",
-                "partner_id": partner_id,
+                "client_id": client_id,
                 "subscription_id": subscription_id,
             }
         },
@@ -1306,15 +1306,15 @@ def delete_subscription(
 
 
 def _touch_body(
-    transaction: Any, refs: _Refs, *, subscription_id: str, partner_id: str, now: datetime
+    transaction: Any, refs: _Refs, *, subscription_id: str, client_id: str, now: datetime
 ) -> dict[str, Any]:
     """Push the inactivity horizon out. Reads first, so it cannot resurrect a tombstone."""
     snapshot = _read(transaction, refs.subscription(subscription_id))
     stored = _doc(snapshot)
     if not stored:
         raise NotFound("no such subscription")
-    if stored.get("partner_id") != partner_id:
-        raise Forbidden("subscription belongs to another partner")
+    if stored.get("client_id") != client_id:
+        raise Forbidden("subscription belongs to another client")
     if not subscription_is_live(stored, now):
         raise NotFound("subscription is deleted or past one of its horizons")
     created = _as_dt(stored.get("created_at")) or now
@@ -1324,14 +1324,14 @@ def _touch_body(
 
 
 def touch_subscription(
-    subscription_id: str, *, partner_id: str, now: datetime | None = None
+    subscription_id: str, *, client_id: str, now: datetime | None = None
 ) -> Subscription:
-    """Record that the partner is still interested -- R5's inactivity horizon moves with this."""
+    """Record that the client is still interested -- R5's inactivity horizon moves with this."""
     instant = now or _now()
     refs = _Refs(_client())
     doc = _run_transaction(
         lambda txn: _touch_body(
-            txn, refs, subscription_id=subscription_id, partner_id=partner_id, now=instant
+            txn, refs, subscription_id=subscription_id, client_id=client_id, now=instant
         )
     )
     return _subscription_from_doc(doc)
@@ -1377,7 +1377,7 @@ def set_servability(
 
     ``expected_version`` is what makes the answer about a route rather than about an id. The check
     is a ~20 s BigQuery question (`main._CONNECTIVITY_TIMEOUT_S`) and a replace is one request, so
-    they interleave: ask about Oslo S -> Drammen, the partner replaces the watch with Oslo S -> Ski,
+    they interleave: ask about Oslo S -> Drammen, the client replaces the watch with Oslo S -> Ski,
     the answer lands and stamps the CURRENT record with a verdict about the old route -- and nothing
     in the document then says so, because `servable` reads as an answer and `servable_checked_at`
     reads as fresh, which is the pair R6 publishes so a caveat's age can be judged.
@@ -1405,12 +1405,12 @@ def set_servability(
 
 
 def get_subscription(
-    subscription_id: str, *, partner_id: str, now: datetime | None = None
+    subscription_id: str, *, client_id: str, now: datetime | None = None
 ) -> Subscription | None:
     """One subscription, or ``None`` when it is missing, tombstoned or past a horizon.
 
     Tenancy is checked here and not left to the caller: every subscription-scoped method in this
-    module takes ``partner_id`` and refuses a mismatch, so one partner cannot read or affect
+    module takes ``client_id`` and refuses a mismatch, so one client cannot read or affect
     another's records through any repository method.
     """
     instant = now or _now()
@@ -1418,8 +1418,8 @@ def get_subscription(
     stored = _doc(snapshot)
     if not stored:
         return None
-    if stored.get("partner_id") != partner_id:
-        raise Forbidden("subscription belongs to another partner")
+    if stored.get("client_id") != client_id:
+        raise Forbidden("subscription belongs to another client")
     if not subscription_is_live(stored, instant):
         return None
     return _subscription_from_doc(stored)
@@ -1427,22 +1427,22 @@ def get_subscription(
 
 def list_subscriptions(
     *,
-    partner_id: str,
-    limit: int = MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER,
+    client_id: str,
+    limit: int = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT,
     after: str | None = None,
     now: datetime | None = None,
 ) -> list[Subscription]:
-    """A partner's own live subscriptions, oldest first, starting after ``after``.
+    """A client's own live subscriptions, oldest first, starting after ``after``.
 
     **``limit`` reaches the QUERY**, and did not until 2026-09-09: this streamed the whole bounded
     set and the route sliced in Python, so a `?limit=1` page cost the same up-to-500-document read
     as the whole listing -- against a per-credential ceiling of
-    ``partner_auth.PER_PARTNER_PER_MIN`` (120) that is a read amplification driven by a partner's
+    ``notification_auth.PER_CLIENT_PER_MIN`` (120) that is a read amplification driven by a client's
     polling shape rather than by what they asked for. ``after`` is the document id of the last row
     of the previous page; it is resolved to a snapshot (one document read) and handed to the query
     as a cursor, so paging costs the page rather than the collection.
 
-    ``NotFound`` for a cursor that is missing, another partner's, or no longer live -- the route
+    ``NotFound`` for a cursor that is missing, another client's, or no longer live -- the route
     turns that into a 400. "That watch is gone" and "nothing matched" are different answers and a
     client that cannot tell them apart shows the second when it means the first.
 
@@ -1454,26 +1454,26 @@ def list_subscriptions(
     ceiling, so a healthy list still costs exactly one round.
     """
     instant = now or _now()
-    ceiling = min(limit, MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER)
+    ceiling = min(limit, MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT)
     cursor: Any = None
     if after is not None:
         snapshot = _Refs(_client()).subscription(after).get(timeout=_CALL_DEADLINE_S)
         stored = _doc(snapshot)
         if (
             not stored
-            or stored.get("partner_id") != partner_id
+            or stored.get("client_id") != client_id
             or not subscription_is_live(stored, instant)
         ):
             raise NotFound("no such subscription to page from")
         cursor = snapshot
     out: list[Subscription] = []
     scanned = 0
-    while len(out) < ceiling and scanned < MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER:
-        requested = min(ceiling - len(out), MAX_ACTIVE_SUBSCRIPTIONS_PER_PARTNER - scanned)
+    while len(out) < ceiling and scanned < MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT:
+        requested = min(ceiling - len(out), MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT - scanned)
         page = list(
             _query(
-                "partner_subscriptions",
-                equality={"partner_id": partner_id, "status": "active"},
+                "subscriptions",
+                equality={"client_id": client_id, "status": "active"},
                 limit=requested,
                 start_after=cursor,
             ).stream(timeout=_CALL_DEADLINE_S)
@@ -1486,7 +1486,7 @@ def list_subscriptions(
             try:
                 out.append(_subscription_from_doc(stored))
             except Exception:
-                logger.debug("Unreadable partner subscription document; skipping it", exc_info=True)
+                logger.debug("Unreadable webhook subscription document; skipping it", exc_info=True)
         # A short page means the collection is exhausted, so another round would read nothing --
         # and "fewer subscriptions than the page size" is the ORDINARY case, so a speculative second
         # query would add one to every list request rather than to the rare one that needs it.
@@ -1531,7 +1531,7 @@ def active_subscriptions(
             out.append(_subscription_from_doc(stored))
         except Exception:
             skipped += 1
-            logger.debug("Unreadable partner subscription document; skipping it", exc_info=True)
+            logger.debug("Unreadable webhook subscription document; skipping it", exc_info=True)
     return LoadedSubscriptions(
         subscriptions=tuple(out),
         truncated=len(page) >= ceiling,
@@ -1541,12 +1541,12 @@ def active_subscriptions(
 
 
 def recipient_documents() -> list[dict[str, Any]]:
-    """``varsel.PartnerRecipientProvider``: the raw documents this cycle should match.
+    """``varsel.WebhookRecipientProvider``: the raw documents this cycle should match.
 
     Raw documents rather than parsed records, because that Protocol is explicit about why: R20 wants
     an unreadable document skipped rather than failing its collection, and only the READER can
     decide what "unreadable" means for the schema the running binary knows. So this hands over the
-    shape and ``varsel._parse_partner_recipient`` validates it.
+    shape and ``varsel._parse_webhook_recipient`` validates it.
     """
     instant = _now()
     loaded = active_subscriptions(now=instant)
@@ -1560,7 +1560,7 @@ def recipient_documents() -> list[dict[str, Any]]:
     # ordinary counts still go out on one DEBUG record under the same event name, so "is TTL keeping
     # up?" is still answerable -- just not by a warning.
     fields = {
-        "event": "partner_store_load",
+        "event": "notification_store_load",
         "n": len(loaded.subscriptions),
         "skipped": loaded.skipped,
         "expired": loaded.expired,
@@ -1568,7 +1568,7 @@ def recipient_documents() -> list[dict[str, Any]]:
     }
     if loaded.truncated or loaded.skipped:
         logger.warning(
-            "Partner subscription load bounded: %d loaded, %d skipped, truncated=%s",
+            "Webhook subscription load bounded: %d loaded, %d skipped, truncated=%s",
             len(loaded.subscriptions),
             loaded.skipped,
             loaded.truncated,
@@ -1576,7 +1576,7 @@ def recipient_documents() -> list[dict[str, Any]]:
         )
     else:
         logger.debug(
-            "Partner subscription load: %d loaded, %d expired but not yet TTL-deleted",
+            "Webhook subscription load: %d loaded, %d expired but not yet TTL-deleted",
             len(loaded.subscriptions),
             loaded.expired,
             extra={"fields": fields},
@@ -1610,9 +1610,9 @@ def _finish_cleanup_body(
 
     Redaction rather than deletion of the tombstone: the residual record is what makes a repeated
     DELETE idempotent and the completion auditable, and once the events are gone it need carry no
-    route at all. So the route, window, weekdays, partner reference and both per-subscription maps
+    route at all. So the route, window, weekdays, client reference and both per-subscription maps
     are dropped and the ids and timestamps stay -- which is also what keeps the published retention
-    text true, since after this write nothing partner-identifying but the ids survives the TTL
+    text true, since after this write nothing client-identifying but the ids survives the TTL
     window.
     """
     snapshot = _read(transaction, refs.subscription(subscription_id))
@@ -1643,7 +1643,7 @@ def _finish_cleanup_body(
                 "begin": "",
                 "end": "",
                 "days": [],
-                "partner_ref": "",
+                "external_ref": "",
                 "definition_digest": "",
                 "delivered": {},
                 "daily_deliveries": {},
@@ -1662,7 +1662,7 @@ def cleanup_subscription(
 
     Retryable with an auditable completion state (R19): ``done=False`` means there was a full page
     left, so the caller re-runs; ``done=True`` records ``cleanup.completed_at`` and redacts the
-    tombstone. Best effort alone would leave partner data queryable while the published text said
+    tombstone. Best effort alone would leave client data queryable while the published text said
     otherwise, which is the exact failure R19 exists to prevent -- so where this has not completed,
     TTL is the fallback and :data:`TTL_RESIDUAL_HOURS` is the published residual.
 
@@ -1704,12 +1704,12 @@ def cleanup_subscription(
     )
     state = dict(doc.get("cleanup") or {})
     logger.info(
-        "Partner cleanup for %s: %s",
+        "Client cleanup for %s: %s",
         subscription_id,
         "done" if done else "more to do",
         extra={
             "fields": {
-                "event": "partner_cleanup",
+                "event": "notification_cleanup",
                 "result": "done" if done else "pending",
                 "subscription_id": subscription_id,
                 "deleted_events": deleted["events"],
@@ -1756,7 +1756,7 @@ def _transition(stored_phase: str | None, requested_phase: str) -> str | None:
 class AlertSubject:
     alert_id: str
     subscription_id: str
-    partner_id: str
+    client_id: str
     destination_id: str
     revision: int
     phase: str | None
@@ -1775,7 +1775,7 @@ def _subject_from_doc(doc: Mapping[str, Any]) -> AlertSubject:
     return AlertSubject(
         alert_id=str(doc.get("alert_id") or ""),
         subscription_id=str(doc.get("subscription_id") or ""),
-        partner_id=str(doc.get("partner_id") or ""),
+        client_id=str(doc.get("client_id") or ""),
         destination_id=str(doc.get("destination_id") or ""),
         revision=int(doc.get("revision") or 0),
         phase=doc.get("phase") or None,
@@ -1803,7 +1803,7 @@ class EmitRequest:
     """
 
     subscription_id: str
-    partner_id: str
+    client_id: str
     destination_id: str
     subscription_version: int
     train: TrainRef
@@ -1811,7 +1811,7 @@ class EmitRequest:
     situations: tuple[str, ...]
     payload: Mapping[str, Any]
     valid_until: datetime
-    partner_ref: str = ""
+    external_ref: str = ""
     test: bool = False
 
     @property
@@ -1854,7 +1854,7 @@ def _subscription_obsolete(
     """
     if not stored:
         return "missing"
-    if stored.get("partner_id") != request.partner_id:
+    if stored.get("client_id") != request.client_id:
         return "foreign"
     if stored.get("status") != "active":
         return "deleted"
@@ -1881,7 +1881,7 @@ def _mint(
     Starts with the ONE read left to do -- the subject's currently pending delivery -- so the
     reads-before-writes rule holds however this is reached. That read exists because minting a new
     revision must **supersede** the pending delivery of the old one: without it a predicted and a
-    confirmed about the same train both go out, and the receiver's revision rule saves the partner
+    confirmed about the same train both go out, and the receiver's revision rule saves the client
     only when the two arrive in order.
     """
     pending_id = subject.get("pending_delivery_id") or None
@@ -1910,9 +1910,9 @@ def _mint(
         "valid_until": request.valid_until,
         "subscription_id": request.subscription_id,
         "subscription_version": int(request.subscription_version),
-        "partner_id": request.partner_id,
+        "client_id": request.client_id,
         "destination_id": request.destination_id,
-        "partner_ref": request.partner_ref,
+        "external_ref": request.external_ref,
         "test": bool(request.test),
         "operator": request.train.operator,
         "line": request.train.line,
@@ -1934,7 +1934,7 @@ def _mint(
         "alert_id": request.alert_id,
         "subscription_id": request.subscription_id,
         "subscription_version": int(request.subscription_version),
-        "partner_id": request.partner_id,
+        "client_id": request.client_id,
         "destination_id": request.destination_id,
         # The event's own revision, carried here so `_sent_body` can advance the subject's
         # `delivered_revision` to THIS delivery's revision rather than to whatever the subject has
@@ -1958,7 +1958,7 @@ def _mint(
     subject_doc = {
         "alert_id": request.alert_id,
         "subscription_id": request.subscription_id,
-        "partner_id": request.partner_id,
+        "client_id": request.client_id,
         "destination_id": request.destination_id,
         "revision": revision,
         "phase": phase,
@@ -2075,7 +2075,7 @@ def commit_event(request: EmitRequest, *, now: datetime | None = None) -> EventC
             MAX_PENDING_EVENTS_PER_DESTINATION,
             extra={
                 "fields": {
-                    "event": "partner_quota",
+                    "event": "notification_quota",
                     "result": "pending_events",
                     "destination_id": request.destination_id,
                     "n": pending,
@@ -2091,15 +2091,15 @@ def commit_event(request: EmitRequest, *, now: datetime | None = None) -> EventC
     )
     if commit.status == "created":
         logger.info(
-            "Partner event %s revision %d (%s)",
+            "Notification event %s revision %d (%s)",
             commit.event_id,
             commit.revision,
             commit.event_type,
             extra={
                 "fields": {
-                    "event": "partner_event",
+                    "event": "notification_event",
                     "result": commit.event_type,
-                    "partner_id": request.partner_id,
+                    "client_id": request.client_id,
                     "destination_id": request.destination_id,
                     "alert_id": commit.alert_id,
                     "revision": commit.revision,
@@ -2128,7 +2128,7 @@ def _withdraw_body(
     #
     # The bug: an alert-worthy cycle that mints nothing (the same phase again -- the overwhelming
     # majority of cycles for a standing alert) reaches no store call at all, because
-    # `partner_events.skip_reason` deliberately skips it to save a transaction per standing subject
+    # `notification_events.skip_reason` deliberately skips it to save a transaction per standing subject
     # per cycle. So nothing reset the counter, and a dip, an hour of recovery and a second dip
     # withdrew the alert -- which is a single-dip withdrawal in effect, exactly what
     # `WITHDRAWAL_CYCLES` exists to prevent.
@@ -2138,7 +2138,7 @@ def _withdraw_body(
     # which is one transaction per standing subject per cycle and undoes precisely the optimisation
     # `skip_reason` was written for -- AE3's line suspension is thirteen standing subjects on one
     # subscription, so ~4 000 transactions a day for it alone -- or (b) a batched
-    # "these are still standing" write, one RPC per partner per cycle, which is cheap but is a
+    # "these are still standing" write, one RPC per client per cycle, which is cheap but is a
     # CALLER change and so not this module's to make unilaterally.
     #
     # So the run is closed by TIME instead: two below-threshold observations belong to the same run
@@ -2194,7 +2194,7 @@ def record_below_threshold(request: EmitRequest, *, now: datetime | None = None)
     code counted a lifetime total.** A run is two or more below-threshold observations less than
     :data:`WITHDRAWAL_GAP_S` apart; a mint of any phase closes it, and so does a gap longer than
     that. It is an approximation of "consecutive" and not the thing itself, because an alert-worthy
-    cycle that mints nothing never reaches this module at all -- ``partner_events.skip_reason``
+    cycle that mints nothing never reaches this module at all -- ``notification_events.skip_reason``
     skips the call to save a transaction per standing subject per cycle. ``_withdraw_body`` carries
     the full reasoning, the exact-but-costlier alternatives, and what the approximation gets wrong
     (a dip, ONE recovered cycle, and a dip inside the window still withdraws). Every inaccuracy is
@@ -2224,7 +2224,7 @@ def _clear_below_threshold_body(
     if _as_dt(subject.get("below_threshold_at")) is None:
         # No run open, so no write. This is what makes U6's "zero writes on an ordinary standing
         # cycle" affordable: the overwhelmingly common case costs one read and nothing else, and
-        # with `PartnerAlerts.open_below_threshold` in hand the caller does not even pay that.
+        # with `ClientAlerts.open_below_threshold` in hand the caller does not even pay that.
         return False
     transaction.update(
         refs.subject(alert_id),
@@ -2237,7 +2237,7 @@ def clear_below_threshold(alert_id: str, *, now: datetime) -> bool:
     """Close an open withdrawal run: this train cleared the gate again. Returns whether it wrote.
 
     The other half of making the withdrawal count truly CONSECUTIVE. `_withdraw_body` cannot see an
-    alert-worthy cycle -- `partner_events.skip_reason` deliberately skips the store call on one, to
+    alert-worthy cycle -- `notification_events.skip_reason` deliberately skips the store call on one, to
     save a transaction per standing subject per cycle -- so it closes runs by time instead, and that
     approximation withdraws on a dip / one recovered cycle / dip inside
     :data:`WITHDRAWAL_GAP_S`. Calling this on a recovery removes the approximation for the case that
@@ -2268,7 +2268,7 @@ def get_subject(alert_id: str, *, now: datetime | None = None) -> AlertSubject |
     return _subject_from_doc(stored)
 
 
-# ---- Current alert state, as the partner API serves it -----------------------------------------
+# ---- Current alert state, as the notification API serves it -----------------------------------------
 
 
 @dataclass(frozen=True)
@@ -2277,7 +2277,7 @@ class AlertState:
 
     The display half of an :class:`AlertSubject`, with the train reassembled into a
     :class:`TrainRef` so the API and an event describe a train the same way -- the six fields below
-    are exactly what ``event.schema.json`` carries, so a partner joining a card to an event is
+    are exactly what ``event.schema.json`` carries, so a client joining a card to an event is
     comparing like with like.
 
     ``delivered_revision`` is what the cap exemption reads at the next mint, and it is served
@@ -2351,7 +2351,7 @@ def _snapshot(
     Three things happen here and each is a decision.
 
     **A withdrawn subject is not served at all.** The question is what alerts STAND, and a
-    withdrawal is the retraction of one -- the partner's receiver already got the withdrawal event,
+    withdrawal is the retraction of one -- the client's receiver already got the withdrawal event,
     and re-offering it here would invite a card for a train we have said is fine.
 
     **Ranking is phase first, then recency.** So a declared cancellation is never displaced by a
@@ -2369,7 +2369,7 @@ def _snapshot(
         except Exception:
             # One unreadable document is skipped rather than failing its collection (R20) -- the
             # same per-document guard `active_subscriptions` applies.
-            logger.debug("Unreadable partner alert subject; skipping it", exc_info=True)
+            logger.debug("Unreadable client alert subject; skipping it", exc_info=True)
             continue
         if state.phase not in PHASES:
             continue
@@ -2397,7 +2397,7 @@ def _live_subject_rows(page: list[Any], now: datetime) -> tuple[list[dict[str, A
     Every read path tests the expiry field ITSELF, because TTL deletion runs up to ~24 h late and
     an expired document is returned by queries and lookups until it does. Here that is not merely
     hygiene: a subject document outlives the dated train it describes by up to a week
-    (:data:`HISTORY_DAYS`), so trusting TTL would show a partner last Tuesday's cancellation as a
+    (:data:`HISTORY_DAYS`), so trusting TTL would show a client last Tuesday's cancellation as a
     standing alert.
     """
     rows: list[dict[str, Any]] = []
@@ -2416,7 +2416,7 @@ def _live_subject_rows(page: list[Any], now: datetime) -> tuple[list[dict[str, A
 def subscription_alerts(
     subscription_id: str,
     *,
-    partner_id: str | None = None,
+    client_id: str | None = None,
     limit: int = MAX_SUBJECTS_PER_READ,
     now: datetime | None = None,
 ) -> AlertSnapshot:
@@ -2428,8 +2428,8 @@ def subscription_alerts(
     cache -- which is what makes it affordable on a request path at all.
 
     Tenancy is checked here rather than left to the caller, like every other subscription-scoped
-    method in this module: a subject carries its own ``partner_id``, so a mismatch is
-    :class:`Forbidden` and one partner cannot read another's alert state through this.
+    method in this module: a subject carries its own ``client_id``, so a mismatch is
+    :class:`Forbidden` and one client cannot read another's alert state through this.
     """
     instant = now or _now()
     query = _query(
@@ -2439,18 +2439,18 @@ def subscription_alerts(
     )
     page = list(query.stream(timeout=_CALL_DEADLINE_S))
     rows, _expired = _live_subject_rows(page, instant)
-    if partner_id is not None:
+    if client_id is not None:
         for row in rows:
-            if str(row.get("partner_id") or "") != partner_id:
-                raise Forbidden("alert subject belongs to another partner")
+            if str(row.get("client_id") or "") != client_id:
+                raise Forbidden("alert subject belongs to another client")
     return _snapshot(
         subscription_id, rows, now=instant, truncated=len(page) >= min(limit, MAX_SUBJECTS_PER_READ)
     )
 
 
 @dataclass(frozen=True)
-class PartnerAlerts:
-    """Every snapshot one partner-scoped read produced, plus whether the read itself was bounded.
+class ClientAlerts:
+    """Every snapshot one client-scoped read produced, plus whether the read itself was bounded.
 
     ``truncated`` is on the WRAPPER as well as on each snapshot, and that is not redundancy: a
     subscription whose subjects fell outside the page is ABSENT from ``snapshots``, so without a
@@ -2471,7 +2471,7 @@ class PartnerAlerts:
     #: `AlertState` would not do: the display cap of 4 would leave AE3's thirteen-subject line
     #: suspension -- the case `_withdraw_body`'s own comment cites -- falling through to the time
     #: window for nine of them. It is bounded by the page (`MAX_SUBJECTS_PER_READ`) and not by the
-    #: display, and it adds no RPC: the query is one `partner_alerts` already spends.
+    #: display, and it adds no RPC: the query is one `client_alerts` already spends.
     #:
     #: A mapping rather than a set, so the caller can skip a clear whose run is already older than
     #: :data:`WITHDRAWAL_GAP_S` -- the store would start a fresh run anyway, and the write would buy
@@ -2479,18 +2479,18 @@ class PartnerAlerts:
     open_below_threshold: Mapping[str, datetime] = field(default_factory=dict)
 
 
-def partner_alerts(
-    partner_id: str, *, limit: int = MAX_SUBJECTS_PER_READ, now: datetime | None = None
-) -> PartnerAlerts:
-    """Every one of a partner's subscriptions' alert state, in ONE query, keyed by subscription id.
+def client_alerts(
+    client_id: str, *, limit: int = MAX_SUBJECTS_PER_READ, now: datetime | None = None
+) -> ClientAlerts:
+    """Every one of a client's subscriptions' alert state, in ONE query, keyed by subscription id.
 
     **One query per request, not one per row.** The list page can hold hundreds of subscriptions,
     and a per-row read would be a query and up to :data:`MAX_SUBJECTS_PER_READ` document reads
-    apiece -- which is the reason this is partner-scoped and grouped in Python rather than called in
+    apiece -- which is the reason this is client-scoped and grouped in Python rather than called in
     a loop.
 
     What that buys costs one thing, and it is reported rather than hidden: the ceiling is on the
-    whole request, so a partner with more live subjects than the ceiling gets a page in which
+    whole request, so a client with more live subjects than the ceiling gets a page in which
     **every** snapshot is marked ``truncated``, including the rows whose own subjects happened to
     fit. Marking only the rows that were cut would be worse and is the mistake to avoid: a
     subscription whose subjects fell outside the page would then read ``n_active: 0``, which is
@@ -2502,7 +2502,7 @@ def partner_alerts(
     """
     instant = now or _now()
     ceiling = min(limit, MAX_SUBJECTS_PER_READ)
-    query = _query("partner_alerts", equality={"partner_id": partner_id}, limit=ceiling)
+    query = _query("client_alerts", equality={"client_id": client_id}, limit=ceiling)
     page = list(query.stream(timeout=_CALL_DEADLINE_S))
     rows, expired = _live_subject_rows(page, instant)
     truncated = len(page) >= ceiling
@@ -2510,29 +2510,29 @@ def partner_alerts(
     for row in rows:
         grouped.setdefault(str(row.get("subscription_id") or ""), []).append(row)
     # `expired` IS NOT A WARNING -- see `recipient_documents` for the argument, which applies with
-    # more force here: the notification pass calls this once per partner per cycle, so during TTL's
-    # documented ~24 h delete lag every cycle logged `partner_quota` for an entirely expected
+    # more force here: the notification pass calls this once per client per cycle, so during TTL's
+    # documented ~24 h delete lag every cycle logged `notification_quota` for an entirely expected
     # condition. `truncated` keeps the warning, because that one changes the CALLER's behaviour
     # (every snapshot is marked incomplete and the pass falls back to asking per subject), which is
     # exactly the kind of thing an operator should see.
     fields = {
-        "event": "partner_quota",
+        "event": "notification_quota",
         "result": "alert_state",
-        "partner_id": partner_id,
+        "client_id": client_id,
         "n": len(rows),
         "expired": expired,
         "truncated": truncated,
     }
     if truncated:
         logger.warning(
-            "Partner alert-state read hit its ceiling: %d live, %d expired",
+            "Client alert-state read hit its ceiling: %d live, %d expired",
             len(rows),
             expired,
             extra={"fields": fields},
         )
     elif expired:
         logger.debug(
-            "Partner alert-state read skipped %d expired subject(s) not yet TTL-deleted",
+            "Client alert-state read skipped %d expired subject(s) not yet TTL-deleted",
             expired,
             extra={"fields": fields},
         )
@@ -2544,7 +2544,7 @@ def partner_alerts(
         alert_id = str(row.get("alert_id") or "")
         if at is not None and alert_id:
             open_below_threshold[alert_id] = at
-    return PartnerAlerts(
+    return ClientAlerts(
         snapshots={
             subscription_id: _snapshot(
                 subscription_id, subject_rows, now=instant, truncated=truncated
@@ -2613,7 +2613,7 @@ class Delivery:
     alert_id: str
     subscription_id: str
     subscription_version: int
-    partner_id: str
+    client_id: str
     destination_id: str
     state: str
     attempts: int
@@ -2633,7 +2633,7 @@ def _delivery_from_doc(doc: Mapping[str, Any]) -> Delivery:
         alert_id=str(doc.get("alert_id") or ""),
         subscription_id=str(doc["subscription_id"]),
         subscription_version=int(doc.get("subscription_version") or 0),
-        partner_id=str(doc.get("partner_id") or ""),
+        client_id=str(doc.get("client_id") or ""),
         destination_id=str(doc["destination_id"]),
         state=str(doc.get("state") or ""),
         attempts=int(doc.get("attempts") or 0),
@@ -2696,7 +2696,7 @@ def pending_deliveries(
         try:
             delivery = _delivery_from_doc(stored)
         except Exception:
-            logger.debug("Unreadable partner delivery document; skipping it", exc_info=True)
+            logger.debug("Unreadable webhook delivery document; skipping it", exc_info=True)
             continue
         # Every read path tests the expiry field itself: a delivery TTL has not caught up with is
         # not claimable, and one past its validity is expired rather than deliverable.
@@ -2722,13 +2722,13 @@ def pending_deliveries(
         kept.append(delivery)
     if throttled or len(page) >= ceiling:
         logger.warning(
-            "Partner delivery set bounded: %d ready, %d throttled destination(s), truncated=%s",
+            "Webhook delivery set bounded: %d ready, %d throttled destination(s), truncated=%s",
             len(kept),
             len(throttled),
             len(page) >= ceiling,
             extra={
                 "fields": {
-                    "event": "partner_quota",
+                    "event": "notification_quota",
                     "result": "delivery_attempts",
                     "n": len(kept),
                     "throttled": sorted(throttled),
@@ -2811,14 +2811,14 @@ def _claim_body(
         return "expired", delivery, subscription, 0, "validity"
     # R13 is about DELETION OR EXPIRY stopping later claims, and deliberately not about amendment.
     # A version compare here would silently lose the pending alert on every amendment: emit at v1
-    # leaves D1 pending, the partner amends to v2, the next cycle's emission at v2 finds no
+    # leaves D1 pending, the client amends to v2, the next cycle's emission at v2 finds no
     # lifecycle transition and mints nothing, and this claim would then cancel D1 -- so the
     # traveller is never told about a train that is still cancelled, and nothing logs as wrong. The
     # version check belongs at EMIT (`_subscription_obsolete`), where an emission that read a stale
     # subscription must not commit against a newer one.
     #
     # What an amendment CAN invalidate is the destination: a pending delivery signed for and
-    # addressed to a callback the partner has since moved must not go to the old one.
+    # addressed to a callback the client has since moved must not go to the old one.
     obsolete = (
         "missing"
         if not subscription
@@ -2937,7 +2937,7 @@ def _sent_body(
 
     A non-`pending` delivery therefore writes NOTHING and comes back
     ``already_resolved=True, slot_spent=False``, carrying the state it actually holds. It is not an
-    error -- the partner did receive the event, and raising would log a store failure and read as an
+    error -- the client did receive the event, and raising would log a store failure and read as an
     outage -- but it must not read as a fresh success either, which is why the flag exists rather
     than returning a plain `sent`. Note the guard is what `_terminal_body` has had all along; its
     absence here and in `_failed_body` was the oversight, not the presence of it there.
@@ -3019,7 +3019,7 @@ def _sent_body(
 
 
 def mark_delivery_sent(delivery_id: str, *, now: datetime | None = None) -> DeliveryOutcome:
-    """Record that the partner received this event. Idempotent, and it spends R11's slot once.
+    """Record that the client received this event. Idempotent, and it spends R11's slot once.
 
     ``state`` is read back from the document rather than asserted to be ``"sent"``: a delivery some
     other pass already resolved keeps the state it holds, and claiming ``"sent"`` for a
@@ -3053,7 +3053,7 @@ def _failed_body(
     # Conditional on `pending` for the same reason as `_sent_body`, and here the unguarded version
     # is the WORSE of the two: an abandoned attempt thread from the previous cycle, returning after
     # this cycle has already marked the delivery `sent`, would set the state back to `pending` with
-    # a `retry_not_before` -- resurrecting a delivery the partner has already received, so the next
+    # a `retry_not_before` -- resurrecting a delivery the client has already received, so the next
     # cycle sends it a second time. The receiver's inbox suppresses the duplicate (R12 is
     # at-least-once), which is exactly why this would never have been noticed.
     delivery = _doc(_read(transaction, refs.delivery(delivery_id)))
@@ -3071,7 +3071,7 @@ def _failed_body(
     patch: dict[str, Any] = {
         "attempts": attempts,
         # Truncated: an error string is an upstream-supplied value and this document is read by an
-        # operator, not parsed. R16 keeps partner prose out of routine logs; a bounded excerpt on
+        # operator, not parsed. R16 keeps client prose out of routine logs; a bounded excerpt on
         # the record itself is what an operator needs to tell a TLS failure from a 500.
         "last_error": str(error)[:500],
         "last_attempt_at": now,
@@ -3249,7 +3249,7 @@ def event_validity(
     :func:`claim_delivery` re-reads the LIVE subscription immediately before dispatch and cancels a
     delivery whose subscription has ended (R13), which is strictly tighter than any snapshot and is
     what actually guarantees nothing is *sent* past expiry. The parameter stays for the callers that
-    do hold a live subscription -- the partner API's own synthetic test-event path is one.
+    do hold a live subscription -- the notification API's own synthetic test-event path is one.
     """
     candidates = [occurred_at + timedelta(minutes=EVENT_VALIDITY_MINUTES)]
     for candidate in (departure_at, subscription_expires_at):
@@ -3266,6 +3266,7 @@ __all__ = [
     "AlertState",
     "AlertSubject",
     "CleanupResult",
+    "ClientAlerts",
     "Conflict",
     "Delivery",
     "DeliveryClaim",
@@ -3276,8 +3277,7 @@ __all__ = [
     "LoadedSubscriptions",
     "NotConfigured",
     "NotFound",
-    "PartnerAlerts",
-    "PartnerStoreError",
+    "NotificationStoreError",
     "PendingDeliveries",
     "QuerySpec",
     "QuotaExceeded",
@@ -3291,6 +3291,7 @@ __all__ = [
     "cleanup_subscription",
     "clear_below_threshold",
     "client",
+    "client_alerts",
     "commit_event",
     "configure",
     "create_subscription",
@@ -3312,7 +3313,6 @@ __all__ = [
     "mark_delivery_failed",
     "mark_delivery_sent",
     "oslo_day",
-    "partner_alerts",
     "pending_deliveries",
     "recipient_documents",
     "record_below_threshold",

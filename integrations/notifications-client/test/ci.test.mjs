@@ -4,7 +4,7 @@
 // `demo/avviksvarsel` -- and a suite in a NEW top-level directory is invisible to all of them. That
 // gap has cost this repository twice already: a suite that nobody ran, in a job whose green tick
 // meant lint only. So the step is asserted from inside the package it runs, exactly as the Firestore
-// emulator step is asserted from inside `test_partner_store.py`. Deleting the step fails the suite
+// emulator step is asserted from inside `test_notification_store.py`. Deleting the step fails the suite
 // rather than quietly halving the build.
 
 import { test } from "node:test";
@@ -92,7 +92,7 @@ test("ci.yml runs the Firebase receiver's suite and its emulator suite", () => {
 test("the image never ships either integrations/ or contracts/", () => {
   // `.dockerignore` enumerates BY NAME -- there is no wildcard for "everything the API does not
   // import" -- so a new top-level directory is included in the build context until someone lists
-  // it. These two are a partner's vendored package and the authored schemas; nothing in the image
+  // it. These two are a client's vendored package and the authored schemas; nothing in the image
   // reads either, and the build context is copied whole.
   const dockerignore = path.join(REPO_ROOT, ".dockerignore");
   if (!fs.existsSync(dockerignore)) {

@@ -110,7 +110,7 @@ test("two workers racing on one record make ONE decision; dispatch stays at-leas
   // deliver at all, and the price of that is that two workers genuinely running at the same instant
   // can both dispatch. A lease would close the window and was deliberately not added: it trades a
   // duplicate for a LOST notification whenever a leaseholder dies, and this product exists to make
-  // sure a traveller hears about a cancelled train. The partner's own per-train notification tag
+  // sure a traveller hears about a cancelled train. The client's own per-train notification tag
   // absorbs the duplicate, which is what the published contract already tells them to expect.
   const { stores, adapters, dispatched } = harness();
   const event = makeEvent({ revision: 4 });

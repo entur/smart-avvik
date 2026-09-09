@@ -10,6 +10,16 @@ execution: code
 deepened: 2026-09-08
 ---
 
+> **Naming note (2026-09-09).** This plan is the dated record of what was decided and keeps its
+> vocabulary. The code shipped under different names, renamed on the branch before merge because
+> the first consumer is the Entur app and "partner" is Entur's word for an external party: the
+> credentialed caller is a **client** (`client_id`, `external_ref`, `clientKey`), the channel is
+> **webhook** (`webhook_delivery.py`, `webhook_sender.py`, `WEBHOOK_SIGNING_ROOT`), the shared
+> machinery is **notification** (`notification_store.py`, `notification_api.py`,
+> `notification_auth.py`, `notification_events.py`, `notification_servability.py`,
+> `NOTIFICATION_WEBHOOKS_ENABLED`), the Firestore database is `notifications` and its collections
+> carry no prefix. `docs/operations/notification-webhooks.md` is the operating contract.
+
 # Partner Notification Webhooks - Plan
 
 ## Goal Capsule

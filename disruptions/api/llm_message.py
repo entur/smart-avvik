@@ -386,19 +386,19 @@ def new_replay_state() -> _LatchState:
     return _LatchState(seed_from=_STATE, cache_clients=True)
 
 
-def new_partner_state() -> _LatchState:
-    """A holder for the partner notification surface — same isolation, a third caller.
+def new_webhook_state() -> _LatchState:
+    """A holder for the webhook notification surface — same isolation, a third caller.
 
     Identical in construction to :func:`new_replay_state`, and a separate function for a weaker
     reason than an earlier version of this docstring claimed. It said sharing ONE factory would put
-    `/meldinger`'s replay bursts and a partner pass behind the same latch and the same mutex, which
+    `/meldinger`'s replay bursts and a client pass behind the same latch and the same mutex, which
     is not true: a factory mints a new holder per call, so two callers of one factory are already
     isolated from each other. What actually gives that isolation is CALLING it once per surface —
     and the arrangement :class:`_LatchState` exists to break is a shared *instance*, which neither
     shape produces. The two names are kept because they document the two surfaces that own a
     holder, not because merging them would couple anything.
 
-    Seeded one-way from the module-global holder, so a partner pass does not re-discover a 404 the
+    Seeded one-way from the module-global holder, so a client pass does not re-discover a 404 the
     poller already paid for and can never write a failure back onto the push path.
     """
     return _LatchState(seed_from=_STATE, cache_clients=True)
@@ -453,9 +453,9 @@ def _log_fields(replay: bool, caller: str | None = None, **fields: Any) -> dict[
     empty on a live push wording, so an existing query keeps matching exactly the records it always
     did.
 
-    `caller` names a non-browser surface (``"partner"``). Deliberately not spelled ``replay=True``
+    `caller` names a non-browser surface (``"webhook"``). Deliberately not spelled ``replay=True``
     by such a surface: that flag means `/meldinger` in every saved query and dashboard, and
-    borrowing it would silently file partner traffic as replay.
+    borrowing it would silently file client traffic as replay.
     """
     return {
         **fields,
@@ -1162,16 +1162,16 @@ def write_message_detailed(
     origin, destination and departure time to Cloud Logging at page-load volume rather than at the
     poller's few-per-cycle rate. Neither changes anything for a caller that passes neither.
 
-    ``caller`` names a non-browser surface (``"partner"``) and does three things, all of them
+    ``caller`` names a non-browser surface (``"webhook"``) and does three things, all of them
     required by R16 and none of them left to an environment variable —
     ``helm/kix-avvik/env/values-kub-ent-dev.yaml`` sets ``VARSEL_LLM_LOG_PROMPTS="true"`` in exactly
     the environment this rollout starts in, and `/varsel` message debugging needs it left on:
 
     * the prompt/reply DEBUG record is suppressed **in code**, regardless of that variable;
-    * the INFO record drops ``message``, so partner prose stays out of routine logs — the provider,
+    * the INFO record drops ``message``, so client prose stays out of routine logs — the provider,
       the model, the result and the hashed subject remain, which is what an operator diagnoses
       with;
-    * every record carries ``caller=<surface>``, so partner traffic is countable without being
+    * every record carries ``caller=<surface>``, so client traffic is countable without being
       mistaken for the poller's or for `/meldinger`'s replay.
     """
     state = state or _STATE
@@ -1238,9 +1238,9 @@ def write_message_detailed(
                         # The discarded reply is prose written from the caller's own payload. It is
                         # the single most useful field when a prompt edit starts producing
                         # ungrounded answers, so it stays for the poller and for a replay -- and it
-                        # is withheld from a partner surface, whose prose must not enter routine
+                        # is withheld from a client surface, whose prose must not enter routine
                         # logs (R16). `MessageResult.discarded` still carries it back to that
-                        # caller in-process, which is where a partner diagnostic belongs.
+                        # caller in-process, which is where a client diagnostic belongs.
                         **({} if caller else {"reply": raw}),
                     )
                 },
@@ -1276,8 +1276,8 @@ def write_message_detailed(
         # quasi-identifying, and it sits in the same log as event="push" records carrying device_id.
         # Hash the key for correlation, and put the raw prompt behind VARSEL_LLM_LOG_PROMPTS.
         if caller:
-            # Same event, same fields minus the prose. A partner wording is written from a partner's
-            # own subscription and reaches its traveller through the partner's app, so it is exactly
+            # Same event, same fields minus the prose. A webhook wording is written from a client's
+            # own subscription and reaches its traveller through the client's app, so it is exactly
             # the "prose in routine logs" R16 keeps out; provider, model, result and the hashed
             # subject are what an operator actually diagnoses with, and they stay.
             logger.info(
@@ -1323,7 +1323,7 @@ def write_message_detailed(
         # VARSEL_LLM_LOG_PROMPTS says. The flag is a debugging affordance sized for the poller's
         # handful of calls per cycle; a public request path replaying a day of stored inputs would
         # turn it into bulk publication of origin, destination and departure time, and nobody
-        # setting it would have that in mind. A partner surface is the same shape of problem with a
+        # setting it would have that in mind. A client surface is the same shape of problem with a
         # second party's data in it (R16), and the suppression is in code for the reason that
         # requirement names: dev, where this rollout starts, sets the variable true and `/varsel`
         # needs it.

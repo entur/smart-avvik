@@ -1,17 +1,17 @@
 {
-  "$comment": "One synthetic event, dumped from disruptions/api/partner_api.py's `_synthetic_event` -- the body `POST /notification-api/v1/test-events` actually signs and sends. It is a GENERATED file, not an authored one: regenerate it rather than editing it, with the recipe under `how_to_regenerate`. It exists because a hand-written transcription of that function drifted from it in eight fields (the vendored receiver's end-to-end fixture, corrected 2026-09-09), and nothing caught the drift -- `payload.call` and `payload.probabilities` are deliberately OPEN objects in event.schema.json, so a wrongly named key inside them is schema-VALID. Stop places and ids here are test values and name no real partner.",
+  "$comment": "One synthetic event, dumped from disruptions/api/notification_api.py's `_synthetic_event` -- the body `POST /notification-api/v1/test-events` actually signs and sends. It is a GENERATED file, not an authored one: regenerate it rather than editing it, with the recipe under `how_to_regenerate`. It exists because a hand-written transcription of that function drifted from it in eight fields (the vendored receiver's end-to-end fixture, corrected 2026-09-09), and nothing caught the drift -- `payload.call` and `payload.probabilities` are deliberately OPEN objects in event.schema.json, so a wrongly named key inside them is schema-VALID. Stop places and ids here are test values and name no real client.",
   "version": 1,
   "how_to_regenerate": {
-    "why": "A partner's first sight of a real payload is a test event, so a fixture that teaches `probabilities.cancel` or `call.aimed_departure` -- neither of which any producer emits -- breaks their receiver on the first genuine cancelled train, in production, at go-live.",
-    "producer": "disruptions/api/partner_api.py::_synthetic_event",
-    "the_other_producer": "disruptions/api/varsel.py::_partner_payload builds the payload of a REAL event, and test_partner_api.py::test_the_synthetic_payload_has_the_same_shape_as_a_real_one compares the two in both directions. So pinning against this file pins against both.",
+    "why": "A client's first sight of a real payload is a test event, so a fixture that teaches `probabilities.cancel` or `call.aimed_departure` -- neither of which any producer emits -- breaks their receiver on the first genuine cancelled train, in production, at go-live.",
+    "producer": "disruptions/api/notification_api.py::_synthetic_event",
+    "the_other_producer": "disruptions/api/varsel.py::_webhook_payload builds the payload of a REAL event, and test_notification_api.py::test_the_synthetic_payload_has_the_same_shape_as_a_real_one compares the two in both directions. So pinning against this file pins against both.",
     "inputs": {
       "now": "2026-09-09T05:00:00+00:00",
       "nonce": "0123456789ab",
       "subscription": {
-        "subscription_id": "partner-a~morgentur",
-        "partner_id": "partner-a",
-        "destination_id": "dst_partner_a_test",
+        "subscription_id": "client-a~morgentur",
+        "client_id": "client-a",
+        "destination_id": "dst_client_a_test",
         "from_stop": "NSR:StopPlace:337",
         "to_stop": "NSR:StopPlace:59872",
         "begin": "06:30",
@@ -23,13 +23,13 @@
           3,
           4
         ],
-        "partner_ref": "commuter-4711",
+        "external_ref": "commuter-4711",
         "test": true,
         "version": 1,
         "status": "active"
       }
     },
-    "owed": "A Python re-derivation check -- rebuild this event from `_synthetic_event` under the inputs above and compare, the way test_webhook_signing.py re-derives signing-vectors.json -- belongs in disruptions/api/test_partner_api.py and is NOT written yet. Until it is, this file can rot the way the fixture it replaced did."
+    "owed": "A Python re-derivation check -- rebuild this event from `_synthetic_event` under the inputs above and compare, the way test_webhook_signing.py re-derives signing-vectors.json -- belongs in disruptions/api/test_notification_api.py and is NOT written yet. Until it is, this file can rot the way the fixture it replaced did."
   },
   "how_to_consume": {
     "timestamps": "`occurred_at`, `valid_until`, `call_date` and `payload.call.aimed_departure_time` are fixed instants from the generating run. A receiver test asserting on its own clock must re-stamp them and PRESERVE THE OFFSETS: `valid_until` is the earlier of occurred_at + 60 minutes and the departure, which here is the departure at occurred_at + 45 minutes.",
@@ -45,9 +45,9 @@
     "revision": 361740,
     "occurred_at": "2026-09-09T05:00:00+00:00",
     "valid_until": "2026-09-09T05:45:00+00:00",
-    "subscription_id": "partner-a~morgentur",
+    "subscription_id": "client-a~morgentur",
     "subscription_version": 1,
-    "partner_ref": "commuter-4711",
+    "external_ref": "commuter-4711",
     "test": true,
     "operator": "VYG",
     "line": "VYG:Line:L1",

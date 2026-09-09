@@ -11,7 +11,7 @@ tzdata>=2026.3
 # subscription/journey state in a GCS blob so it survives redeploys.
 pywebpush>=2.3.0
 google-cloud-storage>=3.13.0
-# Partner notification webhooks (partner_store.py): subscriptions, events and delivery state in
+# Notification webhooks (notification_store.py): subscriptions, events and delivery state in
 # Firestore Native, one named database per environment (KTD5). gRPC only -- there is no REST
 # fallback -- and the import is LAZY (inside _client()), so a deployment that has not enabled the
 # channel neither imports it nor needs credentials for it.

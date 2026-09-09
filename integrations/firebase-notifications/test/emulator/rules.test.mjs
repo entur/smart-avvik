@@ -1,8 +1,8 @@
 // `firestore.rules`, asserted in the emulator against a real client SDK.
 //
-// The rules are not defence in depth here; they are the only thing between a partner's own app users
+// The rules are not defence in depth here; they are the only thing between a client's own app users
 // and this data. A Firestore database in a project with a Firebase app registered -- which a
-// partner's mobile BFF certainly has -- is reachable by a client SDK holding a public API key, and
+// client's mobile BFF certainly has -- is reachable by a client SDK holding a public API key, and
 // the console's default template opens the whole database to the world until a date passes.
 //
 // The three things an open ruleset would allow, and the second and third are why this is not merely
@@ -15,7 +15,7 @@
 //   * FORGE a `notification_inbox` document, which fires the trigger and INJECTS a notification.
 //
 // The suite asserts denial for an unauthenticated context AND for a signed-in one, because "signed
-// in" is the state a partner's own users are in, and a rule of `if request.auth != null` is the
+// in" is the state a client's own users are in, and a rule of `if request.auth != null` is the
 // commonest way this data ends up readable. It also asserts an ADMIN write succeeding in the same
 // run: without that, every deny assertion would pass equally well against a broken emulator.
 //
@@ -85,7 +85,7 @@ before(async () => {
     projectId: PROJECT_ID,
     firestore: {
       // The SHIPPED file, read from disk. Loading anything else here would test a string in this
-      // suite rather than the artifact a partner installs.
+      // suite rather than the artifact a client installs.
       rules: fs.readFileSync(path.join(PACKAGE_ROOT, "firestore.rules"), "utf8"),
       host,
       port: Number(port),
@@ -101,7 +101,7 @@ after(async () => {
 
 test("the rules file names every collection this package writes", () => {
   // A collection added in code and forgotten in the rules is readable by any signed-in user of the
-  // partner's app, and nothing in a TypeScript build would notice. So the code's own list is checked
+  // client's app, and nothing in a TypeScript build would notice. So the code's own list is checked
   // against the file.
   const rules = fs.readFileSync(path.join(PACKAGE_ROOT, "firestore.rules"), "utf8");
   for (const collection of ALL_COLLECTIONS) {
@@ -126,9 +126,9 @@ test("an UNAUTHENTICATED client SDK can neither read nor write any of the collec
 });
 
 test("a SIGNED-IN client SDK can neither read nor write any of the collections", async () => {
-  // The state a partner's own app users are in. `allow read: if request.auth != null` is the
+  // The state a client's own app users are in. `allow read: if request.auth != null` is the
   // commonest ruleset in the world and it would pass the unauthenticated test above.
-  const firestore = environment.authenticatedContext("a-partner-app-user").firestore();
+  const firestore = environment.authenticatedContext("a-client-app-user").firestore();
   for (const collection of ALL_COLLECTIONS) {
     const reference = doc(firestore, collection, "any-document");
     await assertFails(getDoc(reference));
@@ -141,7 +141,7 @@ test("a client SDK cannot forge the two documents that change what a traveller i
   // Named individually because these two are not disclosure, they are a write path into the
   // notification stream: a forged decision marker suppresses a real cancellation, and a forged inbox
   // document fires the trigger and injects one.
-  const firestore = environment.authenticatedContext("a-partner-app-user").firestore();
+  const firestore = environment.authenticatedContext("a-client-app-user").firestore();
   await assertFails(
     setDoc(doc(firestore, COLLECTIONS.decisions, "evt_real"), {
       settled: true,
@@ -168,10 +168,10 @@ test("the SERVER SDK is unaffected -- which is also what proves the emulator is 
 });
 
 test("a path the package does not use is denied too, by the catch-all", async () => {
-  // The catch-all is right for a project dedicated to this receiver and is the line a partner drops
+  // The catch-all is right for a project dedicated to this receiver and is the line a client drops
   // when merging into a project that also serves their app. Asserting it here documents which
   // behaviour is lost by that edit.
-  const firestore = environment.authenticatedContext("a-partner-app-user").firestore();
+  const firestore = environment.authenticatedContext("a-client-app-user").firestore();
   await assertFails(getDoc(doc(firestore, "some_other_collection", "x")));
 });
 
@@ -179,7 +179,7 @@ test("a permissive rule elsewhere in the ruleset DEFEATS these denials", async (
   // Firestore evaluates rules as a UNION: access is granted if ANY matching rule allows it, and a
   // deny cannot override an allow elsewhere in the ruleset. So the four matches in the shipped file
   // are NECESSARY and not SUFFICIENT; what makes them sufficient is that no broader rule in the
-  // partner's ruleset allows these paths. This is asserted as a property of a ruleset built here,
+  // client's ruleset allows these paths. This is asserted as a property of a ruleset built here,
   // so the README's merge instruction is demonstrated rather than merely claimed.
   const permissive = await initializeTestEnvironment({
     projectId: PERMISSIVE_PROJECT_ID,
@@ -198,7 +198,7 @@ test("a permissive rule elsewhere in the ruleset DEFEATS these denials", async (
     },
   });
   try {
-    const firestore = permissive.authenticatedContext("a-partner-app-user").firestore();
+    const firestore = permissive.authenticatedContext("a-client-app-user").firestore();
     await assertSucceeds(setDoc(doc(firestore, COLLECTIONS.inbox, "evt_leaked"), { forged: true }));
   } finally {
     await permissive.cleanup();

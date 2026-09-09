@@ -1,10 +1,10 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Entur journey notification partner API",
+    "title": "Entur journey notification notification API",
     "version": "1.0.0",
     "summary": "Register a commuter's recurring journey; receive a signed webhook when a disruption is predicted to hit it.",
-    "description": "The authenticated surface a partner BFF manages its own commuter registrations through, plus the outbound event contract under `webhooks` below.\n\n**This document renders the two authored schemas rather than restating them.** `subscription.schema.json` and `event.schema.json` sit beside this file and every property here is a `$ref` into one of them: two definitions of one payload is how they drift, and the partner's TypeScript types are generated from this document. OpenAPI 3.1 is JSON Schema 2020-12, so the references resolve without translation.\n\n**One property is inline rather than a `$ref`, on purpose:** `TestEventRequest.subscription_id`. A create body must carry your own reference and nothing else, while `POST /test-events` additionally accepts the opaque `subscription_id` an event carries -- so the two are genuinely different constraints, and referencing the stricter create-side one would publish a schema that refuses a value this API had itself just served. Widening the shared definition to match would be the same mistake pointing the other way.\n\n**Authentication** is a bearer credential this app issued: `Authorization: Bearer <key-id>.<secret>`. The `key-id` is prefixed `kixn_`; the secret is 256 random bits, shown once at issue and stored here only as an HMAC-SHA256 hash under a pepper. Never a cookie: the app serves one global CORS policy allowing every origin, so a cookie would be sent from all of them. Several credentials are live at once, which is how rotation works -- a new `key-id` is issued, the partner cuts over, and the old one is revoked afterwards, so nothing is taken down for a rotation.\n\n**Ownership comes from the credential.** Every route acts on the authenticated partner's own records only, and `partner_id` in a request body is ignored. A record belonging to another partner is indistinguishable from one that does not exist: both are 404, and no response body names anything about another partner.\n\n**Statuses worth knowing before you write a client.** `401` is a credential problem and carries no detail about which; `403` means the partner is suspended, which is a conversation with an operator rather than a credential to rotate; `429` is a limiter tier or a quota ceiling and always carries a bounded `Retry-After`; `503` means this deployment has no partner channel configured, or its store is briefly unavailable -- both retryable, neither a statement about your credential.\n\n**`422` has two body shapes, and the one you will meet first is the array.** A refusal this application made carries a string `detail` (`Error`); a refusal the framework made before any handler ran carries an array of objects (`ValidationError`) -- an out-of-range `limit`, an unknown body property, a `pattern` violation, a missing required property, an over-long path segment. Those are the errors you hit while writing the client, so branch on `detail`'s type rather than assuming a string. Every documented `422` here says which shapes it can be.\n\n**Retention.** A subscription expires at the earlier of 180 days from creation and 60 days from your last interaction with it, and both horizons are enforced when it is read as well as by the store's own expiry -- so a subscription never keeps alerting past its published expiry. Events and delivery records are kept 7 days. A `DELETE` tombstones the subscription in one write that stops routing and then deletes its events, deliveries and alert subjects; where that has not completed the response says so and names the maximum residual window, after which expiry removes the remainder.",
+    "description": "The authenticated surface a client BFF manages its own commuter registrations through, plus the outbound event contract under `webhooks` below.\n\n**This document renders the two authored schemas rather than restating them.** `subscription.schema.json` and `event.schema.json` sit beside this file and every property here is a `$ref` into one of them: two definitions of one payload is how they drift, and the client's TypeScript types are generated from this document. OpenAPI 3.1 is JSON Schema 2020-12, so the references resolve without translation.\n\n**One property is inline rather than a `$ref`, on purpose:** `TestEventRequest.subscription_id`. A create body must carry your own reference and nothing else, while `POST /test-events` additionally accepts the opaque `subscription_id` an event carries -- so the two are genuinely different constraints, and referencing the stricter create-side one would publish a schema that refuses a value this API had itself just served. Widening the shared definition to match would be the same mistake pointing the other way.\n\n**Authentication** is a bearer credential this app issued: `Authorization: Bearer <key-id>.<secret>`. The `key-id` is prefixed `kixn_`; the secret is 256 random bits, shown once at issue and stored here only as an HMAC-SHA256 hash under a pepper. Never a cookie: the app serves one global CORS policy allowing every origin, so a cookie would be sent from all of them. Several credentials are live at once, which is how rotation works -- a new `key-id` is issued, the client cuts over, and the old one is revoked afterwards, so nothing is taken down for a rotation.\n\n**Ownership comes from the credential.** Every route acts on the authenticated client's own records only, and `client_id` in a request body is ignored. A record belonging to another client is indistinguishable from one that does not exist: both are 404, and no response body names anything about another client.\n\n**Statuses worth knowing before you write a client.** `401` is a credential problem and carries no detail about which; `403` means the client is suspended, which is a conversation with an operator rather than a credential to rotate; `429` is a limiter tier or a quota ceiling and always carries a bounded `Retry-After`; `503` means this deployment has no webhook channel configured, or its store is briefly unavailable -- both retryable, neither a statement about your credential.\n\n**`422` has two body shapes, and the one you will meet first is the array.** A refusal this application made carries a string `detail` (`Error`); a refusal the framework made before any handler ran carries an array of objects (`ValidationError`) -- an out-of-range `limit`, an unknown body property, a `pattern` violation, a missing required property, an over-long path segment. Those are the errors you hit while writing the client, so branch on `detail`'s type rather than assuming a string. Every documented `422` here says which shapes it can be.\n\n**Retention.** A subscription expires at the earlier of 180 days from creation and 60 days from your last interaction with it, and both horizons are enforced when it is read as well as by the store's own expiry -- so a subscription never keeps alerting past its published expiry. Events and delivery records are kept 7 days. A `DELETE` tombstones the subscription in one write that stops routing and then deletes its events, deliveries and alert subjects; where that has not completed the response says so and names the maximum residual window, after which expiry removes the remainder.",
     "contact": {
       "name": "Entur - Team KI-eksperimentering"
     }
@@ -25,7 +25,7 @@
   ],
   "security": [
     {
-      "partnerKey": []
+      "clientKey": []
     }
   ],
   "tags": [
@@ -129,7 +129,7 @@
           "notification-subscriptions"
         ],
         "summary": "Your own watches",
-        "description": "Oldest first. The set is bounded by the per-partner ceiling on active subscriptions, so paging is a slice of one bounded read: pass a page's `next_cursor` back as `after`. A cursor the current set no longer contains is a 400 rather than an empty page, because \"that watch is gone\" and \"nothing matched\" are different answers.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\". A list page reads every row's state in ONE query, so a bounded read marks *every* row truncated -- including rows whose own subjects fitted, because a watch crowded out of the page would otherwise read exactly like a calm one. Ask about that watch individually and the read is scoped to it alone.",
+        "description": "Oldest first. The set is bounded by the per-client ceiling on active subscriptions, so paging is a slice of one bounded read: pass a page's `next_cursor` back as `after`. A cursor the current set no longer contains is a 400 rather than an empty page, because \"that watch is gone\" and \"nothing matched\" are different answers.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\". A list page reads every row's state in ONE query, so a bounded read marks *every* row truncated -- including rows whose own subjects fitted, because a watch crowded out of the page would otherwise read exactly like a calm one. Ask about that watch individually and the read is scoped to it alone.",
         "parameters": [
           {
             "name": "limit",
@@ -204,7 +204,7 @@
           "notification-subscriptions"
         ],
         "summary": "One watch, with servability and freshness",
-        "description": "Missing, deleted, expired and belonging to another partner are all 404: one answer for four states, so the difference cannot be used to enumerate anything.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\".",
+        "description": "Missing, deleted, expired and belonging to another client are all 404: one answer for four states, so the difference cannot be used to enumerate anything.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\".",
         "responses": {
           "200": {
             "description": "The watch.",
@@ -298,7 +298,7 @@
             "$ref": "#/components/responses/Suspended"
           },
           "404": {
-            "description": "No destination is provisioned for this partner. An operator provisions one out of band.",
+            "description": "No destination is provisioned for this client. An operator provisions one out of band.",
             "content": {
               "application/json": {
                 "schema": {
@@ -442,7 +442,7 @@
   },
   "components": {
     "securitySchemes": {
-      "partnerKey": {
+      "clientKey": {
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "<key-id>.<secret>",
@@ -455,7 +455,7 @@
       },
       "SubscriptionCreate": {
         "title": "Subscription (request)",
-        "description": "The writable half of a subscription. Every property references the authored schema, so a constraint is stated once. The read-only properties -- `partner_id`, `version`, `status`, `servable`, `servable_checked_at`, `expires_at`, `created_at`, `updated_at` -- are set by Entur and rejected in a request body.",
+        "description": "The writable half of a subscription. Every property references the authored schema, so a constraint is stated once. The read-only properties -- `client_id`, `version`, `status`, `servable`, `servable_checked_at`, `expires_at`, `created_at`, `updated_at` -- are set by Entur and rejected in a request body.",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -489,8 +489,8 @@
           "days": {
             "$ref": "./subscription.schema.json#/properties/days"
           },
-          "partner_ref": {
-            "$ref": "./subscription.schema.json#/properties/partner_ref"
+          "external_ref": {
+            "$ref": "./subscription.schema.json#/properties/external_ref"
           },
           "test": {
             "$ref": "./subscription.schema.json#/properties/test"
@@ -695,7 +695,7 @@
       },
       "TestEventRequest": {
         "title": "Test event request",
-        "description": "The one place in this document whose property is stated inline instead of referenced. `subscription.schema.json`'s `subscription_id` is the CREATE-side constraint -- your own reference, 128 characters, no `~` -- and it is correctly strict there: a create body must never name the namespaced form. This route accepts that form as well, exactly as the two path routes do, so referencing the create-side definition published a schema that refuses the id an event carries in its own `subscription_id` field. A partner validating outbound requests against it would reproduce, in their own client, the 422 this API was fixed to stop returning.",
+        "description": "The one place in this document whose property is stated inline instead of referenced. `subscription.schema.json`'s `subscription_id` is the CREATE-side constraint -- your own reference, 128 characters, no `~` -- and it is correctly strict there: a create body must never name the namespaced form. This route accepts that form as well, exactly as the two path routes do, so referencing the create-side definition published a schema that refuses the id an event carries in its own `subscription_id` field. A client validating outbound requests against it would reproduce, in their own client, the 422 this API was fixed to stop returning.",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -763,7 +763,7 @@
       },
       "Error": {
         "title": "Error",
-        "description": "The shape of every failure THIS APPLICATION refuses: `detail` is a short stable code, not prose to show a traveller, and it deliberately says nothing about another partner's records.\n\n**It is not the only failure shape, and a client that assumes it is will throw on the first malformed request it sends.** A request refused before any handler runs -- an unknown body field under `additionalProperties: false`, a value failing its `pattern` or its length or numeric bound, a missing required property, a path segment over its bound, a body that is not an object -- is refused by the framework, whose `detail` is an ARRAY: see `ValidationError`. That is why every 422 documented here is a `oneOf` of the two, and why `GET`/`DELETE` routes that constrain a parameter document a 422 at all.",
+        "description": "The shape of every failure THIS APPLICATION refuses: `detail` is a short stable code, not prose to show a traveller, and it deliberately says nothing about another client's records.\n\n**It is not the only failure shape, and a client that assumes it is will throw on the first malformed request it sends.** A request refused before any handler runs -- an unknown body field under `additionalProperties: false`, a value failing its `pattern` or its length or numeric bound, a missing required property, a path segment over its bound, a body that is not an object -- is refused by the framework, whose `detail` is an ARRAY: see `ValidationError`. That is why every 422 documented here is a `oneOf` of the two, and why `GET`/`DELETE` routes that constrain a parameter document a 422 at all.",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -854,7 +854,7 @@
         }
       },
       "Suspended": {
-        "description": "The credential is valid and the partner is suspended. Not a credential to rotate.",
+        "description": "The credential is valid and the client is suspended. Not a credential to rotate.",
         "content": {
           "application/json": {
             "schema": {
@@ -864,7 +864,7 @@
         }
       },
       "NotFound": {
-        "description": "No such record for this credential. Missing, deleted, expired and another partner's are one answer.",
+        "description": "No such record for this credential. Missing, deleted, expired and another client's are one answer.",
         "content": {
           "application/json": {
             "schema": {
@@ -918,7 +918,7 @@
         }
       },
       "Unavailable": {
-        "description": "The partner channel is not configured in this deployment, or its store is briefly unavailable. Retryable, and not a statement about your credential.",
+        "description": "The webhook channel is not configured in this deployment, or its store is briefly unavailable. Retryable, and not a statement about your credential.",
         "headers": {
           "Retry-After": {
             "schema": {

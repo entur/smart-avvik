@@ -1,7 +1,7 @@
 # Entur journey notification webhooks — Firebase receiver
 
 A Firestore-backed inbox, alert ledger, Cloud Functions receiver, security rules and recovery sweep
-for Entur's partner journey-notification channel. It builds on
+for Entur's client journey-notification channel. It builds on
 [`@entur/kix-notifications-client`](../notifications-client/README.md), which holds the typed
 envelope, the signature verifier and the suppression policy and has no Firebase dependency.
 
@@ -88,7 +88,7 @@ const adapters = {
   // Rechecked immediately before dispatch. Entur rechecks the subscription on its side too, but a
   // request already in flight may complete, so the last word is yours.
   async eligibility(event) {
-    const doc = await db.collection("commuters").doc(event.partner_ref).get();
+    const doc = await db.collection("commuters").doc(event.external_ref).get();
     if (!doc.exists || doc.data().unsubscribed) {
       return { ok: false, reason: "commuter has unsubscribed" };
     }
@@ -236,7 +236,7 @@ destination until an operator resumes it.
 ```sh
 npm test              # node --test over the .ts sources, no build step
 npm run test:emulator # the Firestore emulator suite, including the rules deny assertions
-npm run verify:dist   # build the declared shape and load it as a partner would
+npm run verify:dist   # build the declared shape and load it as a client would
 npm run typecheck
 ```
 
@@ -256,7 +256,7 @@ kix-avvik repository's root config:
 | `hub.port` | 4400 | **4401** | the root file does not name it at all; 4400 is the CLI default |
 | `firestore.websocketPort` | 9150 | **9151** | named in neither. The CLI allocates it separately from `firestore.port`, defaults it to 9150 for every project, and shifts it only by probing for a free port at start-up — a race |
 
-The emulator also runs under its **own demo project id** (`demo-kixpartner`). The CLI keys its hub
+The emulator also runs under its **own demo project id** (`demo-kixclient`). The CLI keys its hub
 locator file on the project id and warns that two instances of one project "may result in unexpected
 behavior"; a distinct id answers that warning rather than tolerating it.
 
@@ -287,6 +287,6 @@ Two related properties this suite relies on, both learned the hard way:
   is unavailable, with `connect ECONNREFUSED` out of `before()` and every rules assertion marked
   failed for a reason having nothing to do with rules.
 
-The emulator suite runs against the project id `demo-kixpartner`. A `demo-` prefix is what makes it
+The emulator suite runs against the project id `demo-kixclient`. A `demo-` prefix is what makes it
 credential-free: the SDKs skip Application Default Credentials entirely and the project can reach no
 real GCP service. Never point it at a real project id.

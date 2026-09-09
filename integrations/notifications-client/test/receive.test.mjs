@@ -131,7 +131,7 @@ test("a stale timestamp is 401 for the WINDOW, distinguishably from a wrong key"
   assert.equal(stores.state.inbox.size, 0);
 });
 
-test("an unknown partner -- no secret for this destination -- is 401 and writes nothing", async () => {
+test("an unknown client -- no secret for this destination -- is 401 and writes nothing", async () => {
   const stores = createMemoryStores();
   const request = signedRequest();
   const unknown = await receive(
@@ -142,7 +142,7 @@ test("an unknown partner -- no secret for this destination -- is 401 and writes 
   assert.equal(unknown.detail, "no_secrets");
 
   // And another destination's secret does not verify it either: per-destination derivation means
-  // one partner's leaked receiver secret forges nothing for another.
+  // one client's leaked receiver secret forges nothing for another.
   const wrongDestination = await receive(
     { secrets: [OTHER_DESTINATION_SECRET], inbox: stores.inbox, now: () => NOW },
     request,

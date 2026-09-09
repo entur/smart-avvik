@@ -1,8 +1,8 @@
-"""R6's freshness half: partner subscriptions whose servability answer has gone stale.
+"""R6's freshness half: webhook subscriptions whose servability answer has gone stale.
 
-:mod:`partner_api` answers the question ONCE, at create and at replace
-(``partner_api._record_servability``): does any single direct trip serve this stop pair today? This
-module is the other half of AE13 -- "it is re-checked as service appears" -- and it is the partner
+:mod:`notification_api` answers the question ONCE, at create and at replace
+(``notification_api._record_servability``): does any single direct trip serve this stop pair today? This
+module is the other half of AE13 -- "it is re-checked as service appears" -- and it is the client
 channel's copy of ``varsel.recheck_service``, whose whole reason for existing applies here
 unchanged. A weekend-only ferry registered on a Friday evening, a seasonal route registered out of
 season and a pair whose timetable simply had not been published yet all answer "no direct service"
@@ -13,9 +13,9 @@ R5 forbids, with extra steps.
 **Four rules, and each is ``varsel.recheck_service``'s.**
 
 1. **A ``None`` verdict is never written.** The seam returns ``None`` for "could not be established"
-   -- a BigQuery outage, the 20 s timeout, the partner channel's own per-minute ceiling on distinct
+   -- a BigQuery outage, the 20 s timeout, the webhook channel's own per-minute ceiling on distinct
    pairs. ``varsel`` ``continue``s on it; so does this. The edge is sharper
-   here because ``partner_store.set_servability`` accepts ``None`` and would then move
+   here because ``notification_store.set_servability`` accepts ``None`` and would then move
    ``servable_checked_at``: calling it would convert "we do not know" into a freshly-stamped
    non-answer, and one blip into a caveat U4's docstring says must never be rendered as one. So a
    failed check leaves the stored value AND its stamp exactly as they were.
@@ -41,8 +41,8 @@ volume is the difference between nothing and the ceiling below binding every cyc
 **Bounded, in numbers, because each bound protects a different resource.**
 
 * :data:`_MAX_CHECKS_PER_CYCLE` (4) bounds the BigQuery spend and this pass's share of the seam's
-  per-minute limit -- since 2026-09-09 the PARTNER channel's own
-  (`main._PARTNER_CONNECTIVITY_MAX_PER_MIN`, 15), not the public unauthenticated endpoint's, so a
+  per-minute limit -- since 2026-09-09 the Webhook channel's own
+  (`main._NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`, 15), not the public unauthenticated endpoint's, so a
   sweep cannot cost a real traveller their registration's no-direct-service caveat. It is the bound
   that binds in ordinary operation.
 * :data:`_DEADLINE_S` (30 s) bounds the poller. It RESERVES the worst case
@@ -52,7 +52,7 @@ volume is the difference between nothing and the ceiling below binding every cyc
   not the store write that follows it, so the step ends within ``_DEADLINE_S`` **plus one
   ``set_servability``**; that constant's own comment carries the arithmetic and the reason the
   residual is left rather than reserved.
-* The store read is one page of at most ``partner_store.MAX_SUBSCRIPTIONS_PER_CYCLE`` documents,
+* The store read is one page of at most ``notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE`` documents,
   R21's existing ceiling and the same query the notification pass already runs once per cycle. It
   needs no new composite index, which is the second reason to reuse it: a query ordering on
   ``servable_checked_at`` would have to reason about Firestore excluding documents that lack the
@@ -60,7 +60,7 @@ volume is the difference between nothing and the ceiling below binding every cyc
   neither the emulator suite nor a dry run could catch getting that wrong.
 
 When a bound binds it is LOGGED, once per cycle, under ``result`` values of the existing
-``partner_servability`` event -- a ceiling nobody can see binding is not a ceiling anybody can
+``notification_servability`` event -- a ceiling nobody can see binding is not a ceiling anybody can
 size. And when it binds the order is defensible rather than arbitrary: subscriptions carrying a
 user-visible ``false`` caveat before ones that were never established, each group oldest answer
 first, a missing stamp counting as oldest.
@@ -80,7 +80,7 @@ from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 
-import partner_store
+import notification_store
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 #: How long an answer stands before it is re-asked. `varsel._SERVICE_RECHECK`'s six hours, restated
 #: rather than imported: this module holds no import of `varsel` (147 KB of poller state, and the
-#: seam below is injected for exactly that reason), and `test_partner_servability` pins the two
+#: seam below is injected for exactly that reason), and `test_notification_servability` pins the two
 #: values equal so the two channels cannot come to disagree about what "stale" means.
 _RECHECK_INTERVAL = timedelta(hours=6)
 
@@ -101,7 +101,7 @@ _WORST_CASE_CHECK_S = 20.0
 #: At most this many questions per cycle. Four is sized off the cadence rather than picked: at the
 #: measured ~296 s cycle period a subscription needs four checks a day to hold rule 2's six-hour
 #: interval, so four per cycle carries ~290 permanently-unservable subscriptions at full cadence --
-#: two orders of magnitude above a pilot, and still only four BigQuery questions of the partner
+#: two orders of magnitude above a pilot, and still only four BigQuery questions of the client
 #: channel's own 15/min share of a limit this module does not own.
 _MAX_CHECKS_PER_CYCLE = 4
 
@@ -114,9 +114,9 @@ _MAX_CHECKS_PER_CYCLE = 4
 #:
 #: **What it does NOT reserve, stated rather than implied: the store write that follows an admitted
 #: question.** So the true ceiling is this number plus one `set_servability`, whose own worst case is
-#: five contended transaction attempts at `partner_store._CALL_DEADLINE_S` each with commits that
+#: five contended transaction attempts at `notification_store._CALL_DEADLINE_S` each with commits that
 #: carry no deadline at all -- unbounded in principle, and only an outer bounded wait on a worker
-#: thread could fix that (`partner_events._EMIT_WAIT_S`'s shape, and its residual is a leaked
+#: thread could fix that (`notification_events._EMIT_WAIT_S`'s shape, and its residual is a leaked
 #: thread). Reserving a guessed write cost instead would push this to ~50 s to keep the same start
 #: window, and would still not be a ceiling. This step is a maintenance chore on a ~296 s cycle with
 #: ~230 s of headroom, so the proportionate answer is the honest number rather than a bigger one
@@ -125,7 +125,7 @@ _DEADLINE_S = 30.0
 
 # ---- The connectivity seam ---------------------------------------------------------------------
 #
-# `varsel._service_verdict`, injected exactly as it is into `partner_api`: it expands both stop refs
+# `varsel._service_verdict`, injected exactly as it is into `notification_api`: it expands both stop refs
 # to every ref of their place (`varsel.place_refs`) and already fails open to None, which is what
 # keeps "we could not establish it" from ever reading as "no trips run". Injected rather than
 # imported so this module can be exercised without varsel's module state, and so an unwired
@@ -149,7 +149,7 @@ def reset_for_tests() -> None:
 # ---- Which subscriptions are due ---------------------------------------------------------------
 
 
-def check_due(subscription: partner_store.Subscription, now: datetime) -> bool:
+def check_due(subscription: notification_store.Subscription, now: datetime) -> bool:
     """Is this subscription's servability answer stale enough to re-ask?
 
     ``True`` is never due (module docstring). Everything else is, once the stamp is old enough --
@@ -167,10 +167,10 @@ def check_due(subscription: partner_store.Subscription, now: datetime) -> bool:
         return True
 
 
-def _priority(subscription: partner_store.Subscription) -> tuple[int, float]:
+def _priority(subscription: notification_store.Subscription) -> tuple[int, float]:
     """The order the ceiling spends itself in: caveat-carrying first, oldest answer first.
 
-    A ``False`` is a caveat a partner is being shown right now and the only one AE13's second clause
+    A ``False`` is a caveat a client is being shown right now and the only one AE13's second clause
     is about; a ``None`` was never established and is worth re-asking, but not ahead of one. Within
     a group the oldest answer goes first, and a record with no stamp at all is the oldest there is
     -- otherwise a systematic failure to establish an answer would keep re-sorting the queue and
@@ -185,8 +185,8 @@ def _priority(subscription: partner_store.Subscription) -> tuple[int, float]:
 
 
 def due_subscriptions(
-    subscriptions: Iterable[partner_store.Subscription], now: datetime
-) -> list[partner_store.Subscription]:
+    subscriptions: Iterable[notification_store.Subscription], now: datetime
+) -> list[notification_store.Subscription]:
     """The due set, in the order the ceiling should be spent."""
     return sorted((s for s in subscriptions if check_due(s, now)), key=_priority)
 
@@ -194,7 +194,7 @@ def due_subscriptions(
 # ---- The pass ----------------------------------------------------------------------------------
 
 
-def _ask(subscription: partner_store.Subscription) -> tuple[bool, bool] | None:
+def _ask(subscription: notification_store.Subscription) -> tuple[bool, bool] | None:
     """One question through the seam. Never raises: an unanswerable question is not an answer."""
     provider = _connectivity
     if provider is None:  # narrowed for the type checker; recheck() already returned
@@ -203,13 +203,13 @@ def _ask(subscription: partner_store.Subscription) -> tuple[bool, bool] | None:
         return provider(subscription.from_stop, subscription.to_stop)
     except Exception:
         logger.warning(
-            "Partner servability re-check raised; the stored answer and its stamp stand",
+            "Client servability re-check raised; the stored answer and its stamp stand",
             exc_info=True,
             extra={
                 "fields": {
-                    "event": "partner_servability",
+                    "event": "notification_servability",
                     "result": "error",
-                    "partner_id": subscription.partner_id,
+                    "client_id": subscription.client_id,
                     "subscription_id": subscription.subscription_id,
                 }
             },
@@ -217,7 +217,7 @@ def _ask(subscription: partner_store.Subscription) -> tuple[bool, bool] | None:
         return None
 
 
-def _record(subscription: partner_store.Subscription, servable: bool) -> bool:
+def _record(subscription: notification_store.Subscription, servable: bool) -> bool:
     """Write an ESTABLISHED answer. ``True`` when it landed.
 
     Guarded per record rather than per pass (R20): a subscription deleted between the read and the
@@ -226,41 +226,41 @@ def _record(subscription: partner_store.Subscription, servable: bool) -> bool:
 
     The version is the one the QUESTION was asked about -- the answer is about a ROUTE, and a
     replace during a 20 s check would otherwise stamp the new route with the old route's verdict,
-    freshly timestamped. Same guard `partner_api._record_servability` uses, for the same race.
+    freshly timestamped. Same guard `notification_api._record_servability` uses, for the same race.
     """
     try:
-        partner_store.set_servability(
+        notification_store.set_servability(
             subscription.subscription_id,
             servable=servable,
             expected_version=subscription.version,
         )
         return True
-    except partner_store.NotFound:
+    except notification_store.NotFound:
         # Deleted or tombstoned while we were asking. `set_servability` reads before it writes, so
         # nothing was resurrected; there is simply nothing left to stamp.
         logger.debug(
-            "Partner subscription vanished during its servability re-check; skipping it",
+            "Webhook subscription vanished during its servability re-check; skipping it",
             extra={
                 "fields": {
-                    "event": "partner_servability",
+                    "event": "notification_servability",
                     "result": "vanished",
-                    "partner_id": subscription.partner_id,
+                    "client_id": subscription.client_id,
                     "subscription_id": subscription.subscription_id,
                 }
             },
         )
         return False
-    except partner_store.Conflict:
+    except notification_store.Conflict:
         # Replaced while we were asking. The newer definition retired the answer and its stamp on
         # purpose; a due record with nothing established is picked up on the next cadence, so this
         # needs no repair -- only a name, so the counter does not read it as a write failure.
         logger.debug(
-            "A partner subscription was replaced during its servability re-check; verdict dropped",
+            "A webhook subscription was replaced during its servability re-check; verdict dropped",
             extra={
                 "fields": {
-                    "event": "partner_servability",
+                    "event": "notification_servability",
                     "result": "superseded",
-                    "partner_id": subscription.partner_id,
+                    "client_id": subscription.client_id,
                     "subscription_id": subscription.subscription_id,
                 }
             },
@@ -268,13 +268,13 @@ def _record(subscription: partner_store.Subscription, servable: bool) -> bool:
         return False
     except Exception:
         logger.warning(
-            "Partner servability write failed; the record keeps its previous caveat",
+            "Client servability write failed; the record keeps its previous caveat",
             exc_info=True,
             extra={
                 "fields": {
-                    "event": "partner_servability",
+                    "event": "notification_servability",
                     "result": "write_failed",
-                    "partner_id": subscription.partner_id,
+                    "client_id": subscription.client_id,
                     "subscription_id": subscription.subscription_id,
                 }
             },
@@ -282,31 +282,31 @@ def _record(subscription: partner_store.Subscription, servable: bool) -> bool:
         return False
 
 
-def _load(now: datetime) -> partner_store.LoadedSubscriptions | None:
+def _load(now: datetime) -> notification_store.LoadedSubscriptions | None:
     """This environment's live subscriptions, or ``None`` when the store could not be read."""
     try:
-        return partner_store.active_subscriptions(now=now)
+        return notification_store.active_subscriptions(now=now)
     except Exception:
         logger.warning(
-            "Partner subscriptions could not be read for the servability re-check; caveats stand",
+            "Webhook subscriptions could not be read for the servability re-check; caveats stand",
             exc_info=True,
-            extra={"fields": {"event": "partner_servability", "result": "load_failed"}},
+            extra={"fields": {"event": "notification_servability", "result": "load_failed"}},
         )
         return None
 
 
 def recheck(*, now: datetime | None = None) -> None:
-    """Re-ask about partner subscriptions whose servability answer is stale, and clear the ones
+    """Re-ask about webhook subscriptions whose servability answer is stale, and clear the ones
     that now have service.
 
-    Called from the poller's refresh cycle, in its own phase after ``partner_webhooks``. Costs one
+    Called from the poller's refresh cycle, in its own phase after ``notification_webhooks``. Costs one
     bounded store read on every cycle and nothing else on a healthy list. ``now`` is injectable for
-    the same reason every ``partner_store`` entry point's is: staleness is the whole rule here, and
+    the same reason every ``notification_store`` entry point's is: staleness is the whole rule here, and
     a suite that could not pin the clock could only assert it by sleeping.
     """
     if _connectivity is None:
         # No seam wired: nothing could be established anyway, so this must not spend a store read
-        # to discover that. Same shape as `partner_api._record_servability`'s own first line.
+        # to discover that. Same shape as `notification_api._record_servability`'s own first line.
         return
     # The clock starts BEFORE the load, not at the first question. The load is a Firestore stream
     # and part of what the phase spends, so a deadline measured from after it would bound the loop
@@ -327,7 +327,7 @@ def recheck(*, now: datetime | None = None) -> None:
 
 
 def _sweep(
-    due: Sequence[partner_store.Subscription], *, truncated: bool, started: float
+    due: Sequence[notification_store.Subscription], *, truncated: bool, started: float
 ) -> None:
     deadline = started + _DEADLINE_S
     checked = cleared = still_unservable = 0
@@ -348,7 +348,7 @@ def _sweep(
         if verdict is None:
             continue  # rule 1: the stored value and its stamp are left exactly as they were
         # Only the forward direction decides the caveat. `verdict[1]` is the reverse-service
-        # reading /varsel words a likely from/to swap from, and the partner record has nowhere to
+        # reading /varsel words a likely from/to swap from, and the client record has nowhere to
         # carry it: `set_servability` takes one tri-state, and inventing a second field here would
         # publish a hint U4 never contracted.
         servable = bool(verdict[0])
@@ -360,21 +360,21 @@ def _sweep(
             still_unservable += 1
     ms = int((monotonic() - started) * 1000)
     fields = {
-        "event": "partner_servability",
+        "event": "notification_servability",
         "result": bound or "swept",
         "due": len(due),
         "checked": checked,
         "cleared": cleared,
         "unservable": still_unservable,
         # R21's ceiling bound the page this pass read, so the due set may be incomplete. The
-        # notification pass warns about it once a cycle already (`partner_store.recipient_documents`),
+        # notification pass warns about it once a cycle already (`notification_store.recipient_documents`),
         # so this only carries the flag rather than repeating the warning.
         "truncated": truncated,
         "ms": ms,
     }
     if bound is not None:
         logger.warning(
-            "Partner servability re-check hit its %s bound: %d of %d due checked in %d ms",
+            "Client servability re-check hit its %s bound: %d of %d due checked in %d ms",
             bound,
             checked,
             len(due),
@@ -383,13 +383,13 @@ def _sweep(
         )
     elif cleared:
         logger.info(
-            "Planned service appeared for %d partner subscription(s); caveat cleared",
+            "Planned service appeared for %d webhook subscription(s); caveat cleared",
             cleared,
             extra={"fields": fields},
         )
     else:
         logger.debug(
-            "Partner servability re-check: %d of %d due checked in %d ms",
+            "Client servability re-check: %d of %d due checked in %d ms",
             checked,
             len(due),
             ms,

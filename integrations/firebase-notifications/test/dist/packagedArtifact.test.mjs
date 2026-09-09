@@ -1,4 +1,4 @@
-// The declared consumption shape, loaded the way a partner's Cloud Functions runtime loads it.
+// The declared consumption shape, loaded the way a client's Cloud Functions runtime loads it.
 //
 // A Firebase Functions deployment `require()`s the entry point at cold start. That is CommonJS on
 // the Node major the runtime pins, which is a different program from the .ts sources `node --test`
@@ -47,7 +47,7 @@ test("the compiled worker still declares retry -- the option survives the build"
 });
 
 test("the sibling client package is consumed as its BUILT artifact, not as sources", () => {
-  // The `file:` link resolves to the sibling's package.json `main`, which is its dist. So a partner
+  // The `file:` link resolves to the sibling's package.json `main`, which is its dist. So a client
   // vendoring both gets two compiled packages, and this package never depends on Node's type
   // stripping at runtime.
   const link = path.join(PACKAGE_ROOT, "node_modules", "@entur", "kix-notifications-client");
@@ -74,7 +74,7 @@ test("the packaged manifest points at files that exist and ships the rules", () 
   const manifest = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8"));
   assert.ok(fs.existsSync(path.join(PACKAGE_ROOT, manifest.main)));
   assert.ok(fs.existsSync(path.join(PACKAGE_ROOT, manifest.types)));
-  // The rules are part of the deliverable, not documentation: a partner who installs the code and
+  // The rules are part of the deliverable, not documentation: a client who installs the code and
   // not the rules has an open database.
   assert.ok(manifest.files.includes("firestore.rules"));
   assert.ok(manifest.files.includes("firestore.indexes.json"));

@@ -9,7 +9,7 @@ between checks.
 The suite is in two halves. The first is a MOVE check: the wording came out of `varsel` unchanged,
 so every golden string here was read off the pre-extraction module and a diff in one of them is a
 different notification on a real traveller's lock screen, never a test to update. The second is the
-new surface: a partner wording is produced with no VAPID keypair and no model at all, its model
+new surface: a webhook wording is produced with no VAPID keypair and no model at all, its model
 calls are charged to their own allowance and latched on their own holder, and neither can be
 reached from — or reach into — the browser push path.
 
@@ -36,14 +36,14 @@ DEP = datetime(2026, 7, 6, 6, 0, tzinfo=UTC)  # 08:00 Europe/Oslo
 ROUTE = nw.Route(from_stop="NSR:StopPlace:A", to_stop="NSR:StopPlace:B")
 
 
-def _reset(*, provider="claude", partner_delivery=True):
+def _reset(*, provider="claude", webhook_delivery=True):
     llm_message._stop_name_provider = None
     llm_message._PROVIDER = provider
     llm_message._ENABLED = True
     llm_message._PROJECT = "ent-kixavvik-test"
     llm_message._STATE = llm_message._LatchState()
     nw.reset_state()
-    nw._PARTNER_DELIVERY_ENABLED = partner_delivery
+    nw._WEBHOOK_DELIVERY_ENABLED = webhook_delivery
 
 
 def _facts(**kw):
@@ -252,12 +252,12 @@ def test_a_no_sx_departure_never_quotes_our_own_placeholder_as_an_operator():
     assert nw.deterministic_body(payload).startswith("Mulig avvik")
 
 
-# ---- half two: the partner surface ---------------------------------------------------------------
-def test_a_partner_wording_needs_no_vapid_keypair_and_no_model():
-    """KTD4's flat requirement: a partner wording does not depend on a VAPID keypair.
+# ---- half two: the client surface ---------------------------------------------------------------
+def test_a_webhook_wording_needs_no_vapid_keypair_and_no_model():
+    """KTD4's flat requirement: a webhook wording does not depend on a VAPID keypair.
 
     A deployment can hold no VAPID keypair at all — `varsel.push_enabled()` False, no browser
-    delivery attempted — and a partner event still has to carry a ready-to-display Norwegian title
+    delivery attempted — and a notification event still has to carry a ready-to-display Norwegian title
     and body (R7). So does a deployment whose model backend is unreachable. The template is free
     and always available, which is what makes both true rather than aspirational.
 
@@ -280,7 +280,7 @@ def test_a_partner_wording_needs_no_vapid_keypair_and_no_model():
     assert wording.source == "deterministic"
 
 
-def test_the_egress_kill_switch_reaches_the_partner_path():
+def test_the_egress_kill_switch_reaches_the_notification_api_path():
     """`VARSEL_LLM_PROVIDER=off` is the switch an operator reaches for when traveller data must
     stop leaving for Vertex. It is process-wide by design, and a surface that could opt out of it
     would make it a lie — so it is checked here rather than assumed from the shared module."""
@@ -293,22 +293,22 @@ def test_the_egress_kill_switch_reaches_the_partner_path():
         llm_message._BACKENDS["claude"] = llm_message._claude_write
     assert called == [], "no backend may be asked"
     assert wording.source == "deterministic" and wording.status == "disabled"
-    assert nw.spent(nw._PARTNER_PATH) == (0, 0), (
+    assert nw.spent(nw._WEBHOOK_PATH) == (0, 0), (
         "the kill switch must not burn the allowance -- otherwise it reports `rate_limited` after "
         "500 calls it never made, which is a misleading diagnosis of the control an operator "
         "reached for in an incident"
     )
 
 
-def test_the_partner_delivery_switch_is_its_own_and_defaults_off():
+def test_the_webhook_delivery_switch_is_its_own_and_defaults_off():
     """The rollout note is explicit: deterministic wording first, model wording enabled separately
     after matching and delivery qualify. Sharing `VARSEL_LLM_ENABLED` would turn model prose on for
-    partners in the same deploy that turns it on for the PWA."""
+    clients in the same deploy that turns it on for the PWA."""
     source = inspect.getsource(nw)
-    assert 'os.environ.get("NOTIFICATION_PARTNER_LLM_ENABLED", "false")' in source
-    assert nw.PARTNER.deliver is nw.partner_delivery_enabled
-    assert nw.BROWSER.deliver is not nw.partner_delivery_enabled
-    _reset(partner_delivery=False)
+    assert 'os.environ.get("NOTIFICATION_WEBHOOK_LLM_ENABLED", "false")' in source
+    assert nw.WEBHOOK.deliver is nw.webhook_delivery_enabled
+    assert nw.BROWSER.deliver is not nw.webhook_delivery_enabled
+    _reset(webhook_delivery=False)
     called = []
     llm_message._BACKENDS["claude"] = lambda body: called.append(body) or '{"melding":"x"}'
     try:
@@ -358,8 +358,8 @@ def test_every_model_failure_falls_back_to_the_template():
         assert wording.body == nw.deterministic_body(wording.message_input)
 
 
-# ---- scenarios 3 and 4: the partner allowance and latch are its own ----------------------------
-def test_a_partner_pass_is_bounded_and_the_bound_is_reported_not_hidden():
+# ---- scenarios 3 and 4: the client allowance and latch are its own ----------------------------
+def test_a_webhook_pass_is_bounded_and_the_bound_is_reported_not_hidden():
     """A busy morning must not spend the surface's whole hourly allowance in one sweep, and a
     bounded subject must say so — a template wording with no explanation is indistinguishable from
     a deployment that does not deliver model prose at all."""
@@ -374,28 +374,28 @@ def test_a_partner_pass_is_bounded_and_the_bound_is_reported_not_hidden():
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
     assert statuses == ["ok", "ok", "capped", "capped"]
-    assert nw.spent(nw._PARTNER_PATH) == (2, 2), "a capped subject spends no allowance"
+    assert nw.spent(nw._WEBHOOK_PATH) == (2, 2), "a capped subject spends no allowance"
 
 
-def test_partner_exhaustion_cannot_consume_the_browser_allowance():
+def test_webhook_exhaustion_cannot_consume_the_browser_allowance():
     """Scenario 3, the arithmetic half.
 
     The ledger is keyed by caller in the shape `alternatives._fetch_calls` and
     `meldinger._replay_calls` already use. The browser push path does not call this module at all,
     so its slot stays empty BY CONSTRUCTION — which is the point of the keying: it makes that a
     structural property rather than a fact somebody has to keep true, and it stops a later caller
-    silently drawing the partner allowance down or being drawn down by it.
+    silently drawing the client allowance down or being drawn down by it.
     """
     _reset()
     llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
     try:
         for i in range(5):
             nw.write_wording(ROUTE, _facts(cancelled=True), subject_id=f"dep_{i}")
-        assert nw.spent(nw._PARTNER_PATH) == (5, 5)
+        assert nw.spent(nw._WEBHOOK_PATH) == (5, 5)
         assert nw.spent(nw._BROWSER_PATH) == (0, 0)
-        # ...and once the hour is full the partner surface degrades to the template rather than
+        # ...and once the hour is full the client surface degrades to the template rather than
         # borrowing from anywhere.
-        nw._calls[nw._PARTNER_PATH][0].extend([nw.monotonic()] * nw._MAX_CALLS_PER_HOUR)
+        nw._calls[nw._WEBHOOK_PATH][0].extend([nw.monotonic()] * nw._MAX_CALLS_PER_HOUR)
         wording = nw.write_wording(ROUTE, _facts(cancelled=True), subject_id="dep_last")
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
@@ -403,10 +403,10 @@ def test_partner_exhaustion_cannot_consume_the_browser_allowance():
     assert nw.spent(nw._BROWSER_PATH) == (0, 0)
 
 
-def test_partner_exhaustion_cannot_disable_the_pollers_own_backend():
+def test_webhook_exhaustion_cannot_disable_the_pollers_own_backend():
     """Scenarios 3 and 4, the latch half — and the one whose failure is silent on both sides.
 
-    A partner burst that drives every backend into a configuration error must not make
+    A client burst that drives every backend into a configuration error must not make
     `generation_enabled()` read False on the push path for the next thirty minutes: every real
     traveller's push would fall back to the template and the poller would spend a message attempt
     per subject on each `None`, with nothing traveller-facing reporting it.
@@ -420,11 +420,11 @@ def test_partner_exhaustion_cannot_disable_the_pollers_own_backend():
     try:
         for i in range(3):
             assert nw.write_wording(ROUTE, _facts(), subject_id=f"dep_{i}").source == "deterministic"
-        assert llm_message.generation_enabled(nw.PARTNER.state()) is False
+        assert llm_message.generation_enabled(nw.WEBHOOK.state()) is False
         assert llm_message.generation_enabled() is True, "the push path is untouched"
     finally:
         llm_message._BACKENDS["claude"] = llm_message._claude_write
-    assert nw.PARTNER.state() is not llm_message._STATE
+    assert nw.WEBHOOK.state() is not llm_message._STATE
     assert nw.BROWSER.state() is None, "the browser surface works against the module-global holder"
 
 
@@ -451,11 +451,11 @@ def _code_names(source: str) -> set[str]:
     return names
 
 
-def test_a_partner_call_writes_no_public_audit_data():
+def test_a_webhook_call_writes_no_public_audit_data():
     """R16, structurally: this module cannot reach the writers that publish.
 
     `varsel_decisions` feeds `/historikk` and `/meldinger`, feedback contexts feed the review
-    exporter, and all three are public or semi-public surfaces. A partner's input and prose must
+    exporter, and all three are public or semi-public surfaces. A client's input and prose must
     not reach any of them, and the way to guarantee that is for the module to be unable to name the
     writers — checked over the module's identifiers, so the paragraphs explaining the rule do not
     trip it.
@@ -478,7 +478,7 @@ def test_a_partner_call_writes_no_public_audit_data():
 def test_the_subject_id_is_what_is_handed_to_the_writer_as_its_correlation_key():
     """`varsel` passes `journey_key`, which is literally `from|to|begin|end|days` — a home-to-work
     pattern with times and weekdays — and hashes it before logging for exactly that reason. A
-    partner subject id is opaque and service-issued, so it is safe to pass and useless to anyone
+    webhook subject id is opaque and service-issued, so it is safe to pass and useless to anyone
     who reads it."""
     _reset()
     seen = {}
@@ -495,7 +495,7 @@ def test_the_subject_id_is_what_is_handed_to_the_writer_as_its_correlation_key()
     finally:
         llm_message.write_message_detailed = original
     assert seen["journey_key"] == "dep_9f2c"
-    assert seen["caller"] == "partner", "the audit record is marked as this surface's"
+    assert seen["caller"] == "webhook", "the audit record is marked as this surface's"
 
 
 def test_only_a_non_browser_surface_carries_the_llm_caller_marker():
@@ -507,17 +507,17 @@ def test_only_a_non_browser_surface_carries_the_llm_caller_marker():
     which made `BROWSER` pass `caller="browser"` -- truthy, and read by the gate as "suppress"."""
     assert nw.BROWSER.name == "browser"
     assert nw.BROWSER.caller is None, "the browser must not mark itself as a non-browser surface"
-    assert nw.PARTNER.caller == "partner"
+    assert nw.WEBHOOK.caller == "webhook"
 
     # The gate itself, so the two halves cannot drift: a browser record keeps `message`/`reply`, a
-    # partner record drops them, and neither carries `replay` (that word means /meldinger).
+    # client record drops them, and neither carries `replay` (that word means /meldinger).
     assert "caller" not in llm_message._log_fields(False, nw.BROWSER.caller, event="llm_message")
-    assert llm_message._log_fields(False, nw.PARTNER.caller, event="llm_message")["caller"] == (
-        "partner"
+    assert llm_message._log_fields(False, nw.WEBHOOK.caller, event="llm_message")["caller"] == (
+        "webhook"
     )
 
 
-# ---- scenario 6: a partner generation writes no prompt record ------------------------------------
+# ---- scenario 6: a client generation writes no prompt record ------------------------------------
 class _Collect(logging.Handler):
     def __init__(self):
         super().__init__()
@@ -547,7 +547,7 @@ def _llm_log_fields(call):
     return [r.fields for r in handler.records if isinstance(getattr(r, "fields", None), dict)]
 
 
-def test_a_partner_wording_writes_no_prompt_record_even_with_prompt_logging_on():
+def test_a_webhook_wording_writes_no_prompt_record_even_with_prompt_logging_on():
     """Scenario 6, end to end through `write_wording` rather than through `llm_message` directly.
 
     `VARSEL_LLM_LOG_PROMPTS` is "true" in dev (`helm/kix-avvik/env/values-kub-ent-dev.yaml`), which
@@ -558,7 +558,7 @@ def test_a_partner_wording_writes_no_prompt_record_even_with_prompt_logging_on()
     the prose, because provider/model/result/hashed-subject are what an operator diagnoses with.
 
     Checked HERE as well as in `test_llm_message` because the coupling is what breaks: the
-    suppression is `llm_message`'s, and whether it applies depends on `PARTNER.caller` being passed
+    suppression is `llm_message`'s, and whether it applies depends on `WEBHOOK.caller` being passed
     through `write_wording`. A test of either half alone passes with the two disconnected.
     """
     _reset()
@@ -567,7 +567,7 @@ def test_a_partner_wording_writes_no_prompt_record_even_with_prompt_logging_on()
     previous = llm_message._LOG_PROMPTS
     llm_message._LOG_PROMPTS = True
     try:
-        partner = _llm_log_fields(
+        client = _llm_log_fields(
             lambda: nw.write_wording(ROUTE, _facts(), subject_id="dep_abc")
         )
         # The browser policy, on the same input, is the control: it is the traffic the flag exists
@@ -580,10 +580,10 @@ def test_a_partner_wording_writes_no_prompt_record_even_with_prompt_logging_on()
     finally:
         llm_message._LOG_PROMPTS = previous
         llm_message._BACKENDS["claude"] = llm_message._claude_write
-    assert not [f for f in partner if f["event"] == "llm_message_prompt"]
-    assert not any("message_input" in f for f in partner)
-    assert not any("message" in f for f in partner), "the prose must not reach the log either"
-    assert [f["caller"] for f in partner if f["event"] == "llm_message"] == ["partner"]
+    assert not [f for f in client if f["event"] == "llm_message_prompt"]
+    assert not any("message_input" in f for f in client)
+    assert not any("message" in f for f in client), "the prose must not reach the log either"
+    assert [f["caller"] for f in client if f["event"] == "llm_message"] == ["webhook"]
     assert [f for f in browser if f["event"] == "llm_message_prompt"], (
         "the poller's own debugging record must be untouched"
     )
@@ -593,11 +593,11 @@ def test_a_partner_wording_writes_no_prompt_record_even_with_prompt_logging_on()
 
 # ---- scenario 5: the gate is not widened -------------------------------------------------------
 def test_no_module_in_the_api_directory_widens_the_alert_gate():
-    """KTD2: the partner gate is `alertworthy`, full stop — one gate, read by both surfaces.
+    """KTD2: the client gate is `alertworthy`, full stop — one gate, read by both surfaces.
 
     The branch this unit was extracted from carried a second function beside the gate that widened
     it by a declared cancellation anywhere on the ridden segment. KTD2 refuses it by name: it makes
-    a partner recipient see alerts a `/varsel` user does not, which R3 forbids, and nothing in the
+    a webhook recipient see alerts a `/varsel` user does not, which R3 forbids, and nothing in the
     decision log can score the difference. Reintroducing it would be SILENT — every existing check
     here and in `test_varsel` would keep passing, because a widening only ever adds subjects.
 

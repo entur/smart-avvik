@@ -3,7 +3,7 @@
 // The file is produced by the sender's own `webhook_signing.py` and re-derived by its test suite, so
 // it cannot drift from the code that signs. What these checks establish is that THIS package agrees
 // with it byte for byte -- which is the only thing standing between "our verifier is fine" and a
-// partner whose receiver rejects every event we send.
+// client whose receiver rejects every event we send.
 //
 // Two things the file insists on, and both are here because the obvious version is wrong:
 //

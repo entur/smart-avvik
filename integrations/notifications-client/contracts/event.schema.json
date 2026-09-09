@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://kix-avvik.entur.io/contracts/notifications/v1/event.schema.json",
-  "title": "Partner notification event",
+  "title": "Webhook notification event",
   "description": "One revision of one alert about one train for one subscription. Delivery is at-least-once with no ordering guarantee, so a receiver MUST apply three suppression rules before it dispatches anything natively: drop a duplicate event_id; drop a revision not strictly newer than the highest applied for that alert_id; and never dispatch a `predicted` revision for a train already `confirmed`, whatever its revision. Duplicate suppression and revision ordering within our stream are supplied as a client policy, not left as homework.",
   "type": "object",
   "additionalProperties": false,
@@ -29,7 +29,7 @@
     "schema_version": {
       "type": "string",
       "const": "1",
-      "description": "Refuse a shape your receiver does not know rather than mis-parse it. Every partner step on our side fails closed the same way."
+      "description": "Refuse a shape your receiver does not know rather than mis-parse it. Every client step on our side fails closed the same way."
     },
     "event_id": {
       "type": "string",
@@ -47,7 +47,7 @@
     },
     "alert_id": {
       "type": "string",
-      "description": "The canonical per-train subject key, and the only key the supplied policy deduplicates and orders on. The grain is (subscription, train): a partner serves many commuters through one receiver, and a per-train-only key would make the receiver's own revision rule suppress the SECOND commuter's notification about the same disrupted train. The train's own fields below ride along for display and for your joins; they are not the identity."
+      "description": "The canonical per-train subject key, and the only key the supplied policy deduplicates and orders on. The grain is (subscription, train): a client serves many commuters through one receiver, and a per-train-only key would make the receiver's own revision rule suppress the SECOND commuter's notification about the same disrupted train. The train's own fields below ride along for display and for your joins; they are not the identity."
     },
     "revision": {
       "type": "integer",
@@ -70,7 +70,7 @@
       "minimum": 1,
       "description": "The subscription version this event was authorised by. Deletion or expiry stops later claims, and we recheck eligibility immediately before dispatch -- but a request already in flight may complete, so your receiver rechecks the recipient mapping too."
     },
-    "partner_ref": {
+    "external_ref": {
       "type": "string",
       "description": "Your own opaque reference from the subscription, echoed unchanged."
     },
@@ -111,7 +111,7 @@
             },
             "action": {
               "type": ["object", "null"],
-              "description": "An optional deep link or label the partner may render."
+              "description": "An optional deep link or label the client may render."
             }
           }
         },

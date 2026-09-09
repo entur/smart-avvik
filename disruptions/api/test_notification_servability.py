@@ -1,13 +1,13 @@
-"""Checks for partner_servability.py: AE13's second clause, and the four rules it borrows.
+"""Checks for notification_servability.py: AE13's second clause, and the four rules it borrows.
 
-Hermetic and store-free. Every other partner suite runs `partner_store`'s real transaction bodies
+Hermetic and store-free. Every other client suite runs `notification_store`'s real transaction bodies
 against a Firestore fake, because what they assert is a committed document; nothing here is about a
 document. What is under test is the SELECTION (which subscriptions are due, and in which order),
 the WRITE RULE (an unestablished answer is never written, an established one always moves the
 stamp) and the two BOUNDS -- so the store is two recorded callables and the assertions are about
 what was asked and what was written.
 
-The suite runs as its own process (`python test_partner_servability.py`, never pytest), like every
+The suite runs as its own process (`python test_notification_servability.py`, never pytest), like every
 suite in this directory, and its runner is at the END of the file: a runner placed mid-file
 silently skips every test below it while still printing a passing count.
 """
@@ -20,13 +20,13 @@ import pathlib
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import partner_api
-import partner_servability
-import partner_store
+import notification_api
+import notification_servability
+import notification_store
 import varsel
 
 NOW = datetime(2026, 9, 9, 6, 30, tzinfo=UTC)
-MODULE_SOURCE = pathlib.Path(partner_servability.__file__).read_text()
+MODULE_SOURCE = pathlib.Path(notification_servability.__file__).read_text()
 
 
 # ---- A recording store ------------------------------------------------------------------------
@@ -37,7 +37,7 @@ class _Store:
 
     def __init__(
         self,
-        subscriptions: list[partner_store.Subscription],
+        subscriptions: list[notification_store.Subscription],
         *,
         truncated: bool = False,
         load_error: BaseException | None = None,
@@ -51,11 +51,11 @@ class _Store:
         self.writes: list[tuple[str, bool | None]] = []
         self.versions: list[tuple[str, int]] = []
 
-    def active_subscriptions(self, **_: Any) -> partner_store.LoadedSubscriptions:
+    def active_subscriptions(self, **_: Any) -> notification_store.LoadedSubscriptions:
         self.loads += 1
         if self.load_error is not None:
             raise self.load_error
-        return partner_store.LoadedSubscriptions(
+        return notification_store.LoadedSubscriptions(
             subscriptions=tuple(self.subscriptions),
             truncated=self.truncated,
             skipped=0,
@@ -87,17 +87,17 @@ def _sub(
     checked_at: datetime | None = None,
     from_stop: str = "NSR:StopPlace:337",
     to_stop: str = "NSR:StopPlace:418",
-) -> partner_store.Subscription:
-    return partner_store.Subscription(
+) -> notification_store.Subscription:
+    return notification_store.Subscription(
         subscription_id=subscription_id,
-        partner_id="partner-a",
+        client_id="client-a",
         destination_id="dest-a",
         from_stop=from_stop,
         to_stop=to_stop,
         begin="07:00",
         end="09:00",
         days=(0, 1, 2, 3, 4),
-        partner_ref="ref-1",
+        external_ref="ref-1",
         test=False,
         version=1,
         status="active",
@@ -121,12 +121,12 @@ class _Records(logging.Handler):
         self.records.append(record)
 
 
-# A collecting sink rather than a `NullHandler`, for `test_partner_delivery`'s reason: the faults
+# A collecting sink rather than a `NullHandler`, for `test_webhook_delivery`'s reason: the faults
 # this suite injects are logged with `exc_info=True`, and with no handler in the hierarchy
 # `logging.lastResort` prints every one of them -- so a green run would end in stack traces, which
 # is how a real one stops being read.
 _SINK = _Records()
-for _name in ("partner_servability", "partner_store"):
+for _name in ("notification_servability", "notification_store"):
     _sink_logger = logging.getLogger(_name)
     _sink_logger.setLevel(logging.DEBUG)
     _sink_logger.addHandler(_SINK)
@@ -142,7 +142,7 @@ def _run(
     """Run one pass with `store` installed and a seam that answers `verdicts`.
 
     `verdicts` is either one answer for every question or a callable taking (from_stop, to_stop).
-    Returns the structured `partner_servability` log fields the pass emitted.
+    Returns the structured `notification_servability` log fields the pass emitted.
     """
     asked: list[tuple[str, str]] = []
 
@@ -152,30 +152,30 @@ def _run(
 
     mark = len(_SINK.records)
     before = (
-        partner_store.active_subscriptions,
-        partner_store.set_servability,
-        partner_servability.monotonic,
+        notification_store.active_subscriptions,
+        notification_store.set_servability,
+        notification_servability.monotonic,
     )
-    partner_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
-    partner_store.set_servability = store.set_servability  # type: ignore[assignment]
+    notification_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
+    notification_store.set_servability = store.set_servability  # type: ignore[assignment]
     if monotonic is not None:
-        partner_servability.monotonic = monotonic
-    partner_servability.configure(connectivity=seam)
+        notification_servability.monotonic = monotonic
+    notification_servability.configure(connectivity=seam)
     try:
-        partner_servability.recheck(now=now)
+        notification_servability.recheck(now=now)
     finally:
         (
-            partner_store.active_subscriptions,
-            partner_store.set_servability,
-            partner_servability.monotonic,
+            notification_store.active_subscriptions,
+            notification_store.set_servability,
+            notification_servability.monotonic,
         ) = before
-        partner_servability.reset_for_tests()
+        notification_servability.reset_for_tests()
     store.asked = asked  # type: ignore[attr-defined]
     kept = [
         record
         for record in _SINK.records[mark:]
         if isinstance(getattr(record, "fields", None), dict)
-        and record.fields.get("event") == "partner_servability"
+        and record.fields.get("event") == "notification_servability"
     ]
     # Levels beside the fields, because two of the assertions below are about the LEVEL a record
     # went out at rather than its content: an ordinary outcome logged as a warning is how a real
@@ -212,15 +212,15 @@ def test_none_is_never_passed_to_the_store():
     """Belt to the braces above: the module must not contain a call that could stamp a non-answer,
     however the control flow is later rearranged."""
     assert "servable=None" not in MODULE_SOURCE
-    body = inspect.getsource(partner_servability._sweep)
+    body = inspect.getsource(notification_servability._sweep)
     assert "if verdict is None:" in body and "continue" in body
 
 
 def test_the_create_path_states_the_same_rule():
-    """`partner_api._record_servability` is the other half of R6 and holds rule 1 independently.
+    """`notification_api._record_servability` is the other half of R6 and holds rule 1 independently.
     Pinned here because the two are only one rule if both say it: a create that stamped a None
     would leave a record this pass reads as freshly answered and skips for six hours."""
-    create = inspect.getsource(partner_api._record_servability)
+    create = inspect.getsource(notification_api._record_servability)
     assert "if verdict is None:" in create and "return None" in create
 
 
@@ -237,11 +237,11 @@ def test_a_fresh_answer_is_not_re_asked():
 
 def test_the_interval_boundary_is_inclusive():
     """`now - stamp >= interval`, `varsel._service_check_due`'s own comparison."""
-    just_inside = _sub("s1", checked_at=NOW - partner_servability._RECHECK_INTERVAL)
-    just_outside = _sub("s2", checked_at=NOW - partner_servability._RECHECK_INTERVAL)
-    assert partner_servability.check_due(just_inside, NOW) is True
+    just_inside = _sub("s1", checked_at=NOW - notification_servability._RECHECK_INTERVAL)
+    just_outside = _sub("s2", checked_at=NOW - notification_servability._RECHECK_INTERVAL)
+    assert notification_servability.check_due(just_inside, NOW) is True
     assert (
-        partner_servability.check_due(
+        notification_servability.check_due(
             just_outside, NOW - timedelta(seconds=1)
         )
         is False
@@ -249,25 +249,25 @@ def test_the_interval_boundary_is_inclusive():
 
 
 def test_the_interval_is_varsels_own():
-    """Two channels, one meaning of "stale". Restated rather than imported (a poller-side partner
+    """Two channels, one meaning of "stale". Restated rather than imported (a poller-side client
     module holds no import of varsel), so the equality is pinned instead."""
-    assert partner_servability._RECHECK_INTERVAL == varsel._SERVICE_RECHECK
+    assert notification_servability._RECHECK_INTERVAL == varsel._SERVICE_RECHECK
 
 
 def test_a_missing_or_unusable_stamp_is_due_now():
-    assert partner_servability.check_due(_sub("s1", checked_at=None), NOW) is True
+    assert notification_servability.check_due(_sub("s1", checked_at=None), NOW) is True
     # A naive datetime -- a document written by something that is not this binary. Subtracting it
     # from an aware `now` raises TypeError, and a record whose freshness cannot be read must not
     # read as fresh.
     naive = _sub("s2", checked_at=NOW.replace(tzinfo=None))
-    assert partner_servability.check_due(naive, NOW) is True
+    assert notification_servability.check_due(naive, NOW) is True
 
 
 def test_a_servable_subscription_is_never_re_asked():
     """The one asymmetry, and it is deliberate: a stale `true` renders no caveat and publishes its
     own age, while re-asking every servable pair is O(all subscriptions) BigQuery questions."""
     ancient = _sub("s1", servable=True, checked_at=NOW - timedelta(days=90))
-    assert partner_servability.check_due(ancient, NOW) is False
+    assert notification_servability.check_due(ancient, NOW) is False
     store = _Store([ancient])
     _run(store)
     assert store.asked == [] and store.writes == []
@@ -276,9 +276,9 @@ def test_a_servable_subscription_is_never_re_asked():
 def test_a_never_established_answer_is_due():
     """A `null` is R6's other unresolved state: leaving it unresolved forever has the same shape as
     the never-clearing caveat this pass exists to fix."""
-    assert partner_servability.check_due(_sub("s1", servable=None, checked_at=None), NOW) is True
+    assert notification_servability.check_due(_sub("s1", servable=None, checked_at=None), NOW) is True
     stale_null = _sub("s2", servable=None, checked_at=NOW - timedelta(hours=7))
-    assert partner_servability.check_due(stale_null, NOW) is True
+    assert notification_servability.check_due(stale_null, NOW) is True
 
 
 # ---- Rule 3: the stamp moves on every established answer ----------------------------------------
@@ -303,7 +303,7 @@ def test_an_unchanged_answer_still_moves_the_stamp():
 
 
 def test_only_the_forward_direction_decides_the_caveat():
-    """The reverse reading is what /varsel words a likely from/to swap from; the partner record has
+    """The reverse reading is what /varsel words a likely from/to swap from; the client record has
     one tri-state and nowhere to carry it, and inventing a field would publish an uncontracted hint."""
     store = _Store([_sub("s1", checked_at=NOW - timedelta(hours=7))])
     _run(store, verdicts=(False, True))
@@ -318,7 +318,7 @@ def test_a_subscription_deleted_while_we_were_asking_is_skipped_not_resurrected(
     # vanished record first: what is under test is that the pass carries on past it.
     store = _Store(
         [_sub("s1", checked_at=None), _sub("s2", checked_at=NOW - timedelta(hours=7))],
-        write_errors={"s1": partner_store.NotFound("no such subscription")},
+        write_errors={"s1": notification_store.NotFound("no such subscription")},
     )
     fields = _run(store, verdicts=(True, True))
     assert [w[0] for w in store.writes] == ["s1", "s2"], "the second record is still processed"
@@ -335,7 +335,7 @@ def test_a_subscription_deleted_while_we_were_asking_is_skipped_not_resurrected(
 def test_a_route_replaced_mid_check_is_superseded_rather_than_stamped():
     """The verdict is about a ROUTE, and the question outlives the definition it was asked about.
 
-    A check is a ~20 s BigQuery question and a replace is one partner request, so they interleave.
+    A check is a ~20 s BigQuery question and a replace is one client request, so they interleave.
     Without the version guard this pass would stamp the CURRENT record with a verdict about the
     route it has just stopped watching, and date it now -- `servable` reading as an answer beside a
     fresh `servable_checked_at` is the exact pair R6 publishes so a caveat's age can be judged.
@@ -346,7 +346,7 @@ def test_a_route_replaced_mid_check_is_superseded_rather_than_stamped():
     """
     store = _Store(
         [_sub("s1", checked_at=None), _sub("s2", checked_at=NOW - timedelta(hours=7))],
-        write_errors={"s1": partner_store.Conflict("version is 2, not 1")},
+        write_errors={"s1": notification_store.Conflict("version is 2, not 1")},
     )
     fields = _run(store, verdicts=(True, True))
     assert [w[0] for w in store.writes] == ["s1", "s2"], "the second record is still processed"
@@ -378,13 +378,13 @@ def test_an_unreadable_store_leaves_every_caveat_standing():
 def test_no_seam_means_no_store_read():
     """An unwired deployment must not spend a store read to discover it has no seam."""
     store = _Store([_sub("s1")])
-    before = partner_store.active_subscriptions
-    partner_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
-    partner_servability.reset_for_tests()
+    before = notification_store.active_subscriptions
+    notification_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
+    notification_servability.reset_for_tests()
     try:
-        partner_servability.recheck(now=NOW)
+        notification_servability.recheck(now=NOW)
     finally:
-        partner_store.active_subscriptions = before  # type: ignore[assignment]
+        notification_store.active_subscriptions = before  # type: ignore[assignment]
     assert store.loads == 0
 
 
@@ -393,17 +393,17 @@ def test_no_seam_means_no_store_read():
 
 def test_the_ceiling_binds_and_says_so():
     """A ceiling nobody can see binding is not a ceiling anybody can size."""
-    n = partner_servability._MAX_CHECKS_PER_CYCLE + 6
+    n = notification_servability._MAX_CHECKS_PER_CYCLE + 6
     store = _Store([_sub(f"s{i}", checked_at=None) for i in range(n)])
     fields = _run(store, verdicts=(False, False))
-    assert len(store.asked) == partner_servability._MAX_CHECKS_PER_CYCLE
+    assert len(store.asked) == notification_servability._MAX_CHECKS_PER_CYCLE
     capped = [f for f in fields if f["result"] == "capped"]
     assert capped and capped[0]["due"] == n
-    assert capped[0]["checked"] == partner_servability._MAX_CHECKS_PER_CYCLE
+    assert capped[0]["checked"] == notification_servability._MAX_CHECKS_PER_CYCLE
 
 
 def test_the_ceiling_is_spent_on_the_caveat_carrying_ones_oldest_first():
-    """The order when it binds. A `false` is a caveat a partner is being shown right now; a `null`
+    """The order when it binds. A `false` is a caveat a client is being shown right now; a `null`
     was never established and is worth asking, but not ahead of one -- and within a group the
     oldest answer goes first, with a missing stamp counting as the oldest there is."""
     subs = [
@@ -412,7 +412,7 @@ def test_the_ceiling_is_spent_on_the_caveat_carrying_ones_oldest_first():
         _sub("null-never", servable=None, checked_at=None),
         _sub("false-old", servable=False, checked_at=NOW - timedelta(days=3)),
     ]
-    order = [s.subscription_id for s in partner_servability.due_subscriptions(subs, NOW)]
+    order = [s.subscription_id for s in notification_servability.due_subscriptions(subs, NOW)]
     assert order == ["false-old", "false-recent", "null-never", "null-recent"]
 
 
@@ -424,7 +424,7 @@ def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time
     would end one whole worst case beyond it.
     """
     clock = {"t": 0.0}
-    step = partner_servability._WORST_CASE_CHECK_S / 2
+    step = notification_servability._WORST_CASE_CHECK_S / 2
 
     def fake_monotonic() -> float:
         return clock["t"]
@@ -435,7 +435,7 @@ def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time
 
     store = _Store([_sub(f"s{i}", checked_at=None) for i in range(20)])
     fields = _run(store, verdicts=slow, monotonic=fake_monotonic)
-    assert clock["t"] <= partner_servability._DEADLINE_S, (
+    assert clock["t"] <= notification_servability._DEADLINE_S, (
         "the pass must END inside the deadline, not merely stop starting questions at it"
     )
     bound = [f for f in fields if f["result"] in {"capped", "deadline"}]
@@ -452,19 +452,19 @@ def test_the_clock_starts_before_the_store_read():
     something longer -- and a slow store read would spend none of the budget it is actually
     spending. Pinned by source order because the alternative is timing a real Firestore call.
     """
-    body = inspect.getsource(partner_servability.recheck)
+    body = inspect.getsource(notification_servability.recheck)
     assert body.index("started = monotonic()") < body.index("_load(")
 
 
 def test_the_deadline_does_not_claim_to_reserve_the_write():
     """The ceiling is `_DEADLINE_S` plus one `set_servability`, and the module says so.
 
-    `partner_store._run_transaction` retries a contended body five times at
-    `partner_store._CALL_DEADLINE_S` per read, and the commit carries no deadline at all -- so the
+    `notification_store._run_transaction` retries a contended body five times at
+    `notification_store._CALL_DEADLINE_S` per read, and the commit carries no deadline at all -- so the
     write tail cannot be reserved into a true ceiling from here, only bounded by an outer wait this
     step does not run. What the comment must not do is state a ceiling the code does not hold.
     """
-    reservation = inspect.getsource(partner_servability._sweep)
+    reservation = inspect.getsource(notification_servability._sweep)
     assert "monotonic() + _WORST_CASE_CHECK_S > deadline" in reservation
     assert "_WORST_CASE_WRITE" not in MODULE_SOURCE, (
         "if a write allowance is ever reserved, the docstring's residual has to go with it"
@@ -472,13 +472,13 @@ def test_the_deadline_does_not_claim_to_reserve_the_write():
 
 
 def test_the_bounds_are_sized_against_each_other_and_against_the_cadence():
-    assert partner_servability._DEADLINE_S > partner_servability._WORST_CASE_CHECK_S, (
+    assert notification_servability._DEADLINE_S > notification_servability._WORST_CASE_CHECK_S, (
         "a deadline at the worst case admits exactly one question, making the count a decoration"
     )
     # Four questions a day hold the six-hour interval for one subscription, so the per-cycle
     # ceiling times a day of ~296 s cycles is the population this pass can carry at full cadence.
-    per_day = partner_servability._MAX_CHECKS_PER_CYCLE * (24 * 3600 / 296)
-    carried = per_day / (timedelta(days=1) / partner_servability._RECHECK_INTERVAL)
+    per_day = notification_servability._MAX_CHECKS_PER_CYCLE * (24 * 3600 / 296)
+    carried = per_day / (timedelta(days=1) / notification_servability._RECHECK_INTERVAL)
     assert carried > 100, carried
 
 
@@ -497,12 +497,12 @@ def test_truncation_is_carried_on_the_summary_rather_than_warned_about_twice():
     fields = _run(store, verdicts=(True, True))
     summary = [f for f in fields if f["result"] == "swept"]
     assert summary and summary[0]["truncated"] is True
-    assert all("Partner subscription load bounded" not in str(f) for f in fields)
+    assert all("Webhook subscription load bounded" not in str(f) for f in fields)
 
 
 def test_no_log_record_carries_a_route_a_window_or_prose():
-    """R16. The ids are the two `partner_store` already logs (`partner_subscription`); a stop ref,
-    a boarding window or the partner's own opaque reference are not published anywhere here."""
+    """R16. The ids are the two `notification_store` already logs (`notification_subscription`); a stop ref,
+    a boarding window or the client's own opaque reference are not published anywhere here."""
     store = _Store(
         [_sub("s1", checked_at=None), _sub("s2", checked_at=None)],
         write_errors={"s2": RuntimeError("nope")},
@@ -516,7 +516,7 @@ def test_no_log_record_carries_a_route_a_window_or_prose():
         assert set(record) <= {
             "event",
             "result",
-            "partner_id",
+            "client_id",
             "subscription_id",
             "due",
             "checked",
@@ -530,9 +530,9 @@ def test_no_log_record_carries_a_route_a_window_or_prose():
 def test_every_record_rides_the_event_name_the_create_path_already_uses():
     """One event name for both halves of R6, so a query written for either finds both -- the
     meldinger-rename lesson. A new name would silently drop these out of every existing query."""
-    assert '"event": "partner_servability"' in MODULE_SOURCE
-    assert MODULE_SOURCE.count('"event": "') == MODULE_SOURCE.count('"event": "partner_servability"')
-    assert '"event": "partner_servability"' in pathlib.Path(partner_api.__file__).read_text()
+    assert '"event": "notification_servability"' in MODULE_SOURCE
+    assert MODULE_SOURCE.count('"event": "') == MODULE_SOURCE.count('"event": "notification_servability"')
+    assert '"event": "notification_servability"' in pathlib.Path(notification_api.__file__).read_text()
 
 
 if __name__ == "__main__":
@@ -544,4 +544,4 @@ if __name__ == "__main__":
             print(f"ok  {_name}")
     # The COUNT, in every other suite's shape: a runner that silently collects nothing still exits
     # 0, so "it passed" is not the check -- "the number moved" is.
-    print(f"\n{_ran} partner servability checks passed.")
+    print(f"\n{_ran} client servability checks passed.")

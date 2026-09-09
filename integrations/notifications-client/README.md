@@ -1,7 +1,7 @@
 # Entur journey notification webhooks — TypeScript client
 
 The typed envelope, the signature verifier, the idempotent inbox contract and the three suppression
-rules for Entur's partner journey-notification channel. **No Firebase dependency**: it runs in a
+rules for Entur's client journey-notification channel. **No Firebase dependency**: it runs in a
 Cloud Function, a container, or a `node:http` server, and the generic Node receiver in
 `src/nodeReceiver.ts` is a shipped reference rather than an example.
 
@@ -61,7 +61,7 @@ inside a later request. Persist, acknowledge, then let something retryable do th
 
 ## The three suppression rules
 
-Keyed on `alert_id`, whose grain is **(subscription, train)** and not the train alone. One partner
+Keyed on `alert_id`, whose grain is **(subscription, train)** and not the train alone. One client
 serves many commuters through one receiver, and a per-train key would make rule 2 suppress the
 *second* commuter's notification about the same disrupted train.
 
@@ -117,7 +117,7 @@ files in the kix-avvik repository, so the package is self-contained when vendore
 copies have not drifted when the repository is present.
 
 The unknown-field refusal matters in both directions. Entur's store legitimately holds three fields
-it must never put on the wire — `partner_id` and `destination_id` (its own routing) and `expires_at`
+it must never put on the wire — `client_id` and `destination_id` (its own routing) and `expires_at`
 (a retention decision that is *not* validity) — and its sender projects onto an allow-list for that
 reason. Refusing them here is what turns a regression there into a test failure rather than a
 production incident on every event.
@@ -166,7 +166,7 @@ event reaches neither map: the staleness cut runs at entry, ahead of the `test` 
 
 ```sh
 npm test              # node --test over the .ts sources, no build step
-npm run verify:dist   # build the declared shape and load it as a partner would
+npm run verify:dist   # build the declared shape and load it as a client would
 npm run typecheck
 npm run generate      # regenerate src/contracts.generated.ts from contracts/
 ```

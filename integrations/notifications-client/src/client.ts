@@ -95,7 +95,7 @@ export interface ReceiveConfig {
    * Every secret that may sign for the destination this request arrived on, active generation first.
    *
    * An empty array means the receiver holds no credential for this destination -- an unknown
-   * partner, or a destination whose secrets were revoked. That is answered 401 with the same status
+   * client, or a destination whose secrets were revoked. That is answered 401 with the same status
    * and body as a bad signature, deliberately: distinguishing them would turn the endpoint into an
    * oracle for which destinations exist.
    */
@@ -186,7 +186,7 @@ export async function receive(
   };
 }
 
-/** Whether the traveller is presented with this event, and to whom. Supplied by the partner. */
+/** Whether the traveller is presented with this event, and to whom. Supplied by the client. */
 export interface DispatchRequest {
   event: NotificationEvent;
   display: Display;
@@ -216,7 +216,7 @@ export interface ProcessAdapters {
   testRecipients?(event: NotificationEvent): Promise<readonly unknown[]>;
   /**
    * R13's recheck, immediately before dispatch: is the subscription still active, is the departure
-   * still ahead, is anything else the partner knows still true?
+   * still ahead, is anything else the client knows still true?
    *
    * Called AFTER the ledger has applied the state, which is the flowchart's own order and is
    * deliberate: an ineligible event still carried the newest fact about that train, and forgetting
@@ -254,7 +254,7 @@ export class TransientReceiverError extends Error {
  * A failure the caller should NOT retry.
  *
  * For an adapter to say "this payload will never work" from inside `dispatch` -- an unregistered
- * device token, a recipient the partner has since deleted. Recorded as a suppression and settled.
+ * device token, a recipient the client has since deleted. Recorded as a suppression and settled.
  */
 export class TerminalReceiverError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -367,7 +367,7 @@ export async function process(
   }
   // Only now is the decision finished, and only now does a re-entry report it as a duplicate. The
   // gap between the dispatch and this line is the residual at-least-once window: a crash inside it
-  // re-dispatches, which is what the sender's contract already tells the partner to expect and what
+  // re-dispatches, which is what the sender's contract already tells the client to expect and what
   // a per-train notification tag absorbs on the device.
   await adapters.ledger.settle(working.eventId);
   await adapters.inbox.settle(working.eventId, "dispatched");

@@ -1,21 +1,21 @@
-"""Checks for partner_delivery.py: one bounded attempt per pending event, and what stops the pass.
+"""Checks for webhook_delivery.py: one bounded attempt per pending event, and what stops the pass.
 
 Hermetic, and hermetic in two distinct ways that both matter.
 
-The Firestore fake runs ``partner_store``'s REAL bodies and applies their writes, so every
+The Firestore fake runs ``notification_store``'s REAL bodies and applies their writes, so every
 assertion is about the committed delivery documents. It is the fourth copy of that fake in this
-directory (after ``test_partner_store``, ``test_partner_api`` and ``test_partner_events``), which
+directory (after ``test_notification_store``, ``test_notification_api`` and ``test_notification_events``), which
 is the convention rather than an oversight: CI runs every suite as its own process, so a shared
 helper module here would be a new import-time surface for all thirty of them.
 
-The SENDER is stubbed, and ``webhook_client.deliver`` raises ``NetworkBlocked`` from a test process
-that forgets to — so a missing stub is a loud failure rather than a request to a partner-supplied
+The SENDER is stubbed, and ``webhook_sender.deliver`` raises ``NetworkBlocked`` from a test process
+that forgets to — so a missing stub is a loud failure rather than a request to a client-supplied
 host from CI. Nothing here opens a socket.
 
 **The two timeout scenarios are deliberately two tests, and they catch different bugs.** A hanging
-DESTINATION is bounded by ``webhook_client``'s own per-attempt ceiling, so what has to hold is the
+DESTINATION is bounded by ``webhook_sender``'s own per-attempt ceiling, so what has to hold is the
 reservation budget plus the per-destination skip. A slow STORE has no ceiling of its own —
-``partner_store`` plumbs no ``timeout=`` into the Firestore client — so what has to hold is the
+``notification_store`` plumbs no ``timeout=`` into the Firestore client — so what has to hold is the
 outer bounded wait on a pool that is abandoned rather than joined. One test cannot cover both, and
 a suite with only the first would ship a pass a hung transaction can hold forever.
 """
@@ -32,28 +32,28 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import partner_auth
-import partner_delivery
-import partner_events
-import partner_store
-import webhook_client
+import notification_auth
+import notification_events
+import notification_store
+import webhook_delivery
+import webhook_sender
 import webhook_signing
 
 NOW = datetime(2026, 9, 8, 6, 30, tzinfo=UTC)
 SID = "sub-1"
-PARTNER = "partner-a"
+CLIENT = "client-a"
 DEST = "dest-a"
 URL = "https://receiver.example.com/hooks/kix"
 PEPPER = "p" * 48
 SIGNING_ROOT = "r" * 48
-MODULE_SOURCE = pathlib.Path(partner_delivery.__file__).read_text()
+MODULE_SOURCE = pathlib.Path(webhook_delivery.__file__).read_text()
 SCHEMA_PATH = pathlib.Path("contracts/notifications/v1/event.schema.json")
 
 
 def _code() -> str:
     """The module minus its own docstring and comment lines.
 
-    Every header in `partner_delivery.py` explains what it deliberately does NOT do -- it names
+    Every header in `webhook_delivery.py` explains what it deliberately does NOT do -- it names
     `varsel._state_lock`, `shutdown(wait=True)` and `decisions` in order to refuse them -- so a
     negative grep over the raw text matches the explanation and passes for the wrong reason.
     """
@@ -87,9 +87,9 @@ class _Ref:
         self.client, self.path = client, path
 
     def get(self, transaction: Any = None, timeout: float | None = None) -> _Snap:
-        # `timeout` is accepted and ignored: every read in `partner_store` now carries its own
+        # `timeout` is accepted and ignored: every read in `notification_store` now carries its own
         # Firestore deadline (KTD6 -- an abandoned worker thread with no call deadline delays
-        # pod termination via `concurrent.futures`' atexit join). `test_partner_store` is where
+        # pod termination via `concurrent.futures`' atexit join). `test_notification_store` is where
         # the deadline is asserted; this double only has to tolerate the kwarg.
         del timeout
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
@@ -155,7 +155,7 @@ class _Fake:
 
 
 class _MemoryDocs:
-    """``partner_auth._Docs`` over a dict."""
+    """``notification_auth._Docs`` over a dict."""
 
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], dict[str, Any]] = {}
@@ -246,22 +246,22 @@ def _install() -> _Fake:
     client = _Fake()
     _saved.update(
         {
-            "client": partner_store._client,
-            "run": partner_store._run_transaction,
-            "query": partner_store._query,
-            "pool": partner_delivery.ThreadPoolExecutor,
-            "emit_pool": partner_events.ThreadPoolExecutor,
+            "client": notification_store._client,
+            "run": notification_store._run_transaction,
+            "query": notification_store._query,
+            "pool": webhook_delivery.ThreadPoolExecutor,
+            "emit_pool": notification_events.ThreadPoolExecutor,
             "fake": client,
         }
     )
-    # BOTH pools, because `_pending()` reaches the real emit path and `partner_events.emit` makes
+    # BOTH pools, because `_pending()` reaches the real emit path and `notification_events.emit` makes
     # its own. No test here hangs the client before `_pending`, so an emit worker cannot straggle
     # today -- and closing it costs one line, where discovering it later costs another afternoon of
     # bisecting a suite that fails one run in nine.
-    partner_delivery.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
-    partner_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
+    webhook_delivery.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
+    notification_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
     _pools.clear()
-    partner_store._client = lambda: client  # type: ignore[assignment]
+    notification_store._client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
         if client.hang is not None:
@@ -293,7 +293,7 @@ def _install() -> _Fake:
         # Accepted and unused: only the listing route pages, and no test here reaches it.
         start_after: Any = None,
     ) -> _Page:
-        spec = partner_store._SPECS_BY_NAME[name]
+        spec = notification_store._SPECS_BY_NAME[name]
         rows: list[tuple[str, dict[str, Any]]] = []
         for path, data in list(client.docs.items()):
             if path.split("/", 1)[0] != spec.collection:
@@ -315,15 +315,15 @@ def _install() -> _Fake:
             )
         return _Page(client, rows[:limit])
 
-    partner_store._run_transaction = _run  # type: ignore[assignment]
-    partner_store._query = _query  # type: ignore[assignment]
-    partner_store.configure(client=client, clock=lambda: NOW)
+    notification_store._run_transaction = _run  # type: ignore[assignment]
+    notification_store._query = _query  # type: ignore[assignment]
+    notification_store.configure(client=client, clock=lambda: NOW)
 
-    os.environ[partner_auth.PEPPER_ENV] = PEPPER
+    os.environ[notification_auth.PEPPER_ENV] = PEPPER
     os.environ[webhook_signing.SIGNING_ROOT_ENV] = SIGNING_ROOT
-    partner_auth.configure(docs=_MemoryDocs(), clock=lambda: NOW)
-    partner_auth.create_partner(PARTNER, name="Partner A", actor="op@entur.org")
-    partner_auth.create_destination(DEST, partner_id=PARTNER, callback_url=URL, actor="op@entur.org")
+    notification_auth.configure(docs=_MemoryDocs(), clock=lambda: NOW)
+    notification_auth.create_client(CLIENT, name="Client A", actor="op@entur.org")
+    notification_auth.create_destination(DEST, client_id=CLIENT, callback_url=URL, actor="op@entur.org")
 
     _sent.clear()
     _result.clear()
@@ -336,64 +336,64 @@ def _uninstall() -> None:
 
     _drain_pools(_saved.get("fake"))
     if _saved:
-        partner_delivery.ThreadPoolExecutor = _saved["pool"]  # type: ignore[misc]
-        partner_events.ThreadPoolExecutor = _saved["emit_pool"]  # type: ignore[misc]
-        partner_store._client = _saved["client"]  # type: ignore[assignment]
-        partner_store._run_transaction = _saved["run"]  # type: ignore[assignment]
-        partner_store._query = _saved["query"]  # type: ignore[assignment]
+        webhook_delivery.ThreadPoolExecutor = _saved["pool"]  # type: ignore[misc]
+        notification_events.ThreadPoolExecutor = _saved["emit_pool"]  # type: ignore[misc]
+        notification_store._client = _saved["client"]  # type: ignore[assignment]
+        notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
+        notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
-    partner_store.reset_for_tests()
-    partner_auth.reset_for_tests()
-    os.environ.pop(partner_auth.PEPPER_ENV, None)
+    notification_store.reset_for_tests()
+    notification_auth.reset_for_tests()
+    os.environ.pop(notification_auth.PEPPER_ENV, None)
     os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
 
 
 def _sender(**over: Any):
-    """A stub in ``webhook_client.deliver``'s exact shape, recording what was sent."""
+    """A stub in ``webhook_sender.deliver``'s exact shape, recording what was sent."""
     hang: threading.Event | None = over.pop("hang", None)
 
     def send(url, *, body, headers, timeout_s, connect_timeout_s):
         if hang is not None:
             hang.wait(30)
         _sent.append({"url": url, "body": body, "headers": dict(headers)})
-        return webhook_client.DeliveryAttempt(**{**_result, **over})
+        return webhook_sender.DeliveryAttempt(**{**_result, **over})
 
     return send
 
 
-def _spec(**over: Any) -> partner_store.SubscriptionSpec:
+def _spec(**over: Any) -> notification_store.SubscriptionSpec:
     base: dict[str, Any] = {
         "subscription_id": SID,
-        "partner_id": PARTNER,
+        "client_id": CLIENT,
         "destination_id": DEST,
         "from_stop": "NSR:StopPlace:337",
         "to_stop": "NSR:StopPlace:418",
         "begin": "05:00",
         "end": "12:00",
         "days": (0, 1, 2, 3, 4, 5, 6),
-        "partner_ref": "commuter-42",
+        "external_ref": "commuter-42",
         "test": False,
     }
     base.update(over)
-    return partner_store.SubscriptionSpec(**base)
+    return notification_store.SubscriptionSpec(**base)
 
 
 def _live(client: _Fake, **over: Any) -> None:
     spec = _spec(**over)
     client.put(
-        partner_store.SUBSCRIPTIONS,
+        notification_store.SUBSCRIPTIONS,
         spec.subscription_id,
-        partner_store._new_subscription_doc(spec, NOW),
+        notification_store._new_subscription_doc(spec, NOW),
     )
 
 
-def _subject(**over: Any) -> partner_events.PartnerSubject:
+def _subject(**over: Any) -> notification_events.WebhookSubject:
     base: dict[str, Any] = {
         "subscription_id": SID,
-        "partner_id": PARTNER,
+        "client_id": CLIENT,
         "destination_id": DEST,
         "subscription_version": 1,
-        "partner_ref": "commuter-42",
+        "external_ref": "commuter-42",
         "alertworthy": True,
         "cancelled": True,
         "situations": ("ENT:SituationNumber:1",),
@@ -408,7 +408,7 @@ def _subject(**over: Any) -> partner_events.PartnerSubject:
         "payload": {"notification": {"title": "Tog L1 08:50 er innstilt", "body": "Oslo S → Ski"}},
     }
     base.update(over)
-    return partner_events.PartnerSubject(**base)
+    return notification_events.WebhookSubject(**base)
 
 
 def _pending(client: _Fake, n: int = 1, **over: Any) -> list[dict[str, Any]]:
@@ -423,9 +423,9 @@ def _pending(client: _Fake, n: int = 1, **over: Any) -> list[dict[str, Any]]:
         )
         for i in range(n)
     ]
-    partner_events.emit(subjects, now=NOW)
+    notification_events.emit(subjects, now=NOW)
     return sorted(
-        client.in_collection(partner_store.DELIVERIES), key=lambda d: d["valid_until"]
+        client.in_collection(notification_store.DELIVERIES), key=lambda d: d["valid_until"]
     )
 
 
@@ -447,9 +447,9 @@ class _Records(logging.Handler):
 # A collecting sink, not a `NullHandler`: it satisfies `callHandlers` so `lastResort` never fires,
 # AND it keeps the record, so the two tests that inject a fault assert it was logged rather than
 # merely stopping it being seen. Attached to the loggers this suite drives -- both the module under
-# test and the store it calls, since `partner_store` warns on its own paths too.
+# test and the store it calls, since `notification_store` warns on its own paths too.
 _SINK = _Records()
-for _name in ("partner_delivery", "partner_store"):
+for _name in ("webhook_delivery", "notification_store"):
     _sink_logger = logging.getLogger(_name)
     _sink_logger.setLevel(logging.INFO)
     _sink_logger.addHandler(_SINK)
@@ -467,7 +467,7 @@ def _sink_since(mark: int, name: str) -> list[dict]:
 
 def _capture() -> _Records:
     handler = _Records()
-    logger = logging.getLogger("partner_delivery")
+    logger = logging.getLogger("webhook_delivery")
     logger.setLevel(logging.INFO)
     logger.addHandler(handler)
     return handler
@@ -479,7 +479,7 @@ def _fields(handler: _Records, name: str) -> list[dict]:
         fields = getattr(record, "fields", None)
         if isinstance(fields, dict) and fields.get("event") == name:
             out.append(fields)
-    logging.getLogger("partner_delivery").removeHandler(handler)
+    logging.getLogger("webhook_delivery").removeHandler(handler)
     return out
 
 
@@ -500,12 +500,12 @@ def test_a_pending_delivery_is_signed_sent_once_and_recorded_sent():
     try:
         _live(client)
         [delivery] = _pending(client)
-        report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         assert report.sent == 1 and report.ready == 1
-        stored = client.doc(partner_store.DELIVERIES, delivery["delivery_id"])
+        stored = client.doc(notification_store.DELIVERIES, delivery["delivery_id"])
         assert stored["state"] == "sent" and stored["attempts"] == 1
-        subscription = client.doc(partner_store.SUBSCRIPTIONS, SID)
-        assert subscription["daily_deliveries"] == {partner_store.oslo_day(NOW): 1}
+        subscription = client.doc(notification_store.SUBSCRIPTIONS, SID)
+        assert subscription["daily_deliveries"] == {notification_store.oslo_day(NOW): 1}
         assert "ENT:SituationNumber:1" in subscription["delivered"]
 
         [attempt] = _sent
@@ -513,7 +513,7 @@ def test_a_pending_delivery_is_signed_sent_once_and_recorded_sent():
         assert attempt["headers"][webhook_signing.HEADER_ID] == delivery["delivery_id"]
         # Signed over what was SENT. Re-serializing between signing and sending is the canonical
         # webhook bug: the signature then covers a document the receiver did not get.
-        destination = partner_auth.destination_for_delivery(DEST)
+        destination = notification_auth.destination_for_delivery(DEST)
         secret = webhook_signing.derive_secret(DEST, destination.active_generation)
         assert webhook_signing.verify(
             secret=secret,
@@ -525,9 +525,9 @@ def test_a_pending_delivery_is_signed_sent_once_and_recorded_sent():
         ), "the bytes sent must verify under the destination's own derived secret"
         wire = json.loads(attempt["body"].decode())
         assert wire["event_id"] == delivery["event_id"] and wire["revision"] >= 1
-        assert partner_store.TTL_FIELD not in wire, (
+        assert notification_store.TTL_FIELD not in wire, (
             "the TTL field is a RETENTION decision of ours; on the wire it would read as a "
-            "deletion date the partner is entitled to rely on"
+            "deletion date the client is entitled to rely on"
         )
         assert wire["payload"]["notification"]["title"] == "Tog L1 08:50 er innstilt"
     finally:
@@ -540,10 +540,10 @@ def test_nothing_is_attempted_twice_in_one_cycle():
     try:
         _live(client)
         _pending(client)
-        partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         assert len(_sent) == 1
         # A second pass in the same cycle finds nothing: the record is `sent`, not `pending`.
-        assert partner_delivery.deliver_pending(now=NOW, sender=_sender()).ready == 0
+        assert webhook_delivery.deliver_pending(now=NOW, sender=_sender()).ready == 0
         assert len(_sent) == 1
     finally:
         _uninstall()
@@ -579,11 +579,11 @@ def test_thirteen_pending_events_yield_four_notifications_and_nine_recorded_supp
         _live(client)
         deliveries = _pending(client, n=13)
         assert len(deliveries) == 13
-        report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         # Every one of the thirteen accounted for, and the split exact — and BOTH are now
         # unconditional, which they were not when this comment last changed.
         assert report.sent + report.capped == 13, report
-        assert report.sent == partner_store.MAX_ALERT_DELIVERIES_PER_DAY == 4, report
+        assert report.sent == notification_store.MAX_ALERT_DELIVERIES_PER_DAY == 4, report
         assert report.capped == 9, report
         assert report.deadline == 0, report
         # WHY THEY ARE EXACT, since the answer moved twice and the previous one is worth not
@@ -600,7 +600,7 @@ def test_thirteen_pending_events_yield_four_notifications_and_nine_recorded_supp
         # coupling it was guarding. What remains worth knowing: if this ever moves, look at the
         # reservation's confirm/release paths or at the sharding, never at contamination.
 
-        stored = {d["delivery_id"]: client.doc(partner_store.DELIVERIES, d["delivery_id"]) for d in deliveries}
+        stored = {d["delivery_id"]: client.doc(notification_store.DELIVERIES, d["delivery_id"]) for d in deliveries}
         sent = [d for d in stored.values() if d["state"] == "sent"]
         capped = [d for d in stored.values() if d["state"] == "pending"]
         assert len(sent) == 4 and len(capped) == 9
@@ -613,10 +613,10 @@ def test_thirteen_pending_events_yield_four_notifications_and_nine_recorded_supp
         # reservation, or sharding per delivery again -- would still have passed.
         assert sorted(d["valid_until"] for d in sent) == [
             d["valid_until"]
-            for d in deliveries[: partner_store.MAX_ALERT_DELIVERIES_PER_DAY]
+            for d in deliveries[: notification_store.MAX_ALERT_DELIVERIES_PER_DAY]
         ], sorted(d["valid_until"] for d in sent)
-        assert client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_deliveries"] == {
-            partner_store.oslo_day(NOW): 4
+        assert client.doc(notification_store.SUBSCRIPTIONS, SID)["daily_deliveries"] == {
+            notification_store.oslo_day(NOW): 4
         }
     finally:
         _uninstall()
@@ -636,23 +636,23 @@ def test_a_cap_exempt_confirmation_still_reaches_a_subscription_whose_four_are_s
         # Emitted as cancelled they would already be `confirmed`, and the confirmation would mint
         # nothing at all -- which would pass a weaker assertion for the wrong reason.
         _pending(client, n=4, cancelled=False)
-        assert partner_delivery.deliver_pending(now=NOW, sender=_sender()).sent == 4
+        assert webhook_delivery.deliver_pending(now=NOW, sender=_sender()).sent == 4
 
         # A confirmation about a train already delivered: exempt at MINT.
         subjects = [_subject(journey_ref="DatedServiceJourney:1000", cancelled=True)]
-        partner_events.emit(subjects, now=NOW + timedelta(minutes=1))
+        notification_events.emit(subjects, now=NOW + timedelta(minutes=1))
         docs = dict(client.docs)
         _uninstall()
         client = _install()
         client.docs.clear()
         client.docs.update(docs)
 
-        report = partner_delivery.deliver_pending(now=NOW + timedelta(minutes=2), sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW + timedelta(minutes=2), sender=_sender())
         assert report.sent == 1 and report.capped == 0, (
             "a confirmation that replaces a delivered forecast is exempt from the cap (R11)"
         )
-        assert client.doc(partner_store.SUBSCRIPTIONS, SID)["daily_deliveries"] == {
-            partner_store.oslo_day(NOW): 4
+        assert client.doc(notification_store.SUBSCRIPTIONS, SID)["daily_deliveries"] == {
+            notification_store.oslo_day(NOW): 4
         }, "and spends no slot"
     finally:
         _uninstall()
@@ -677,7 +677,7 @@ def test_a_hanging_destination_is_skipped_and_the_pass_ends_inside_its_deadline(
         _live(client)
         _pending(client, n=30)
         started = time.monotonic()
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(ok=False, retryable=True, error="TimeoutError"),
             deadline_s=1.0,
@@ -693,14 +693,14 @@ def test_a_hanging_destination_is_skipped_and_the_pass_ends_inside_its_deadline(
         # above by the pool width and never by one: measured with the real 5 s per-attempt ceiling
         # this pass makes FOUR attempts and skips 26, so the `== 1` this used to assert was reading
         # the unloaded interleaving of a narrow timeout as a property of the mechanism.
-        assert 1 <= len(_sent) <= partner_delivery._WORKERS, (
+        assert 1 <= len(_sent) <= webhook_delivery._WORKERS, (
             f"at least one attempt, at most one per worker; got {len(_sent)}"
         )
         assert report.retryable == len(_sent), report
         assert report.retryable + report.skipped == 30, report
         assert report.skipped_destinations == 1, report
         # And nothing terminal was written for the skipped ones.
-        states = {d["state"] for d in client.in_collection(partner_store.DELIVERIES)}
+        states = {d["state"] for d in client.in_collection(notification_store.DELIVERIES)}
         assert states == {"pending"}, states
     finally:
         _uninstall()
@@ -709,7 +709,7 @@ def test_a_hanging_destination_is_skipped_and_the_pass_ends_inside_its_deadline(
 def test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait():
     """AE14's slow-store half, and the failure the reservation CANNOT see.
 
-    `partner_store` plumbs no `timeout=` into the Firestore client, so a hung transaction has no
+    `notification_store` plumbs no `timeout=` into the Firestore client, so a hung transaction has no
     ceiling of its own and the reservation reserves a worst case the call then exceeds without
     limit. What holds is the outer bounded wait on a pool that is ABANDONED — `shutdown(wait=True)`
     would block the poller until the hung call finally returned and defeat the bound completely.
@@ -724,7 +724,7 @@ def test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait():
         client.hang = threading.Event()
         handler = _capture()
         started = time.monotonic()
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(),
             wait_s=0.15,
@@ -739,7 +739,7 @@ def test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait():
         assert elapsed < 2.0, f"a hung store must not hold the poller thread; took {elapsed:.1f}s"
         assert report.timed_out is True and report.sent == 0
         assert not _sent, "nothing was dialled: the claim never returned"
-        assert {f["result"] for f in _fields(handler, "partner_delivery_round")} == {"timeout"}
+        assert {f["result"] for f in _fields(handler, "webhook_delivery_round")} == {"timeout"}
     finally:
         if client.hang is not None:
             client.hang.set()
@@ -772,13 +772,13 @@ def test_a_hung_store_cannot_hold_the_pass_inside_the_stale_sweep_either():
         # Written straight onto the documents: emitting an already-expired event is not a shape the
         # emit path produces, and `valid_until` is the only field this classification reads.
         for delivery in deliveries:
-            client.docs[f"{partner_store.DELIVERIES}/{delivery['delivery_id']}"]["valid_until"] = (
+            client.docs[f"{notification_store.DELIVERIES}/{delivery['delivery_id']}"]["valid_until"] = (
                 NOW - timedelta(seconds=1)
             )
         client.hang = threading.Event()
         handler = _capture()
         started = time.monotonic()
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(),
             wait_s=0.15,
@@ -790,7 +790,7 @@ def test_a_hung_store_cannot_hold_the_pass_inside_the_stale_sweep_either():
         assert elapsed < 2.0, f"a hung store must not hold the poller thread; took {elapsed:.1f}s"
         assert report.timed_out is True, report
         assert report.expired == 0, "the hung commit landed nothing, and says so"
-        assert {f["result"] for f in _fields(handler, "partner_delivery_round")} == {"timeout"}
+        assert {f["result"] for f in _fields(handler, "webhook_delivery_round")} == {"timeout"}
     finally:
         if client.hang is not None:
             client.hang.set()
@@ -810,7 +810,7 @@ def test_the_deadline_binds_before_the_backlog_does():
         _live(client, days=(0, 1, 2, 3, 4, 5, 6))
         _pending(client, n=20)
         started = time.monotonic()
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(),
             deadline_s=0.3,
@@ -847,20 +847,20 @@ def test_a_503_stays_pending_and_a_deletion_then_cancels_it():
     try:
         _live(client)
         [delivery] = _pending(client)
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=NOW, sender=_sender(ok=False, status=503, retryable=True, error="http_503")
         )
         assert report.retryable == 1
-        stored = client.doc(partner_store.DELIVERIES, delivery["delivery_id"])
+        stored = client.doc(notification_store.DELIVERIES, delivery["delivery_id"])
         assert stored["state"] == "pending" and stored["attempts"] == 1
-        assert client.doc(partner_store.SUBSCRIPTIONS, SID).get("daily_deliveries") in (None, {})
+        assert client.doc(notification_store.SUBSCRIPTIONS, SID).get("daily_deliveries") in (None, {})
 
         # The subscription is deleted (tombstoned) before the next cycle.
-        client.docs[f"{partner_store.SUBSCRIPTIONS}/{SID}"]["status"] = "deleted"
+        client.docs[f"{notification_store.SUBSCRIPTIONS}/{SID}"]["status"] = "deleted"
         _sent.clear()
-        report = partner_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender())
         assert report.cancelled == 1 and not _sent, "no further attempt for it"
-        stored = client.doc(partner_store.DELIVERIES, delivery["delivery_id"])
+        stored = client.doc(notification_store.DELIVERIES, delivery["delivery_id"])
         assert stored["state"] == "cancelled" and stored["cancelled_reason"] == "deleted"
     finally:
         _uninstall()
@@ -879,18 +879,18 @@ def test_a_departed_train_becomes_expired_rather_than_failed_and_is_not_retried(
         _live(client)
         [delivery] = _pending(client)
         after_departure = delivery["valid_until"] + timedelta(minutes=1)
-        report = partner_delivery.deliver_pending(now=after_departure, sender=_sender())
+        report = webhook_delivery.deliver_pending(now=after_departure, sender=_sender())
         assert report.expired == 1 and not _sent, "not retried"
-        assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["state"] == "expired"
+        assert client.doc(notification_store.DELIVERIES, delivery["delivery_id"])["state"] == "expired"
 
         # The horizon, for a departure far enough out that it is the binding term.
         client.docs.clear()
         _live(client)
         [far] = _pending(client, departure_time=NOW + timedelta(hours=6))
-        horizon = NOW + timedelta(minutes=partner_store.EVENT_VALIDITY_MINUTES)
+        horizon = NOW + timedelta(minutes=notification_store.EVENT_VALIDITY_MINUTES)
         assert far["valid_until"] == horizon, "60 minutes, not the departure"
         _sent.clear()
-        report = partner_delivery.deliver_pending(now=horizon + timedelta(seconds=1), sender=_sender())
+        report = webhook_delivery.deliver_pending(now=horizon + timedelta(seconds=1), sender=_sender())
         assert report.expired == 1 and not _sent
     finally:
         _uninstall()
@@ -908,7 +908,7 @@ def test_a_410_pauses_the_destination_until_an_operator_resumes_it():
     try:
         _live(client)
         deliveries = _pending(client, n=2)
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(
                 ok=False, status=410, retryable=False, terminal_state="cancelled",
@@ -935,41 +935,41 @@ def test_a_410_pauses_the_destination_until_an_operator_resumes_it():
         # code, and `paused` itself used to be counted that way and flaked one run in six.
         assert report.cancelled + report.skipped == 2, report
         assert (report.cancelled, report.skipped) == (1, 1), report
-        assert client.doc(partner_store.DELIVERIES, deliveries[0]["delivery_id"])["state"] == "cancelled"
-        destination = partner_auth.destination_for_delivery(DEST)
+        assert client.doc(notification_store.DELIVERIES, deliveries[0]["delivery_id"])["state"] == "cancelled"
+        destination = notification_auth.destination_for_delivery(DEST)
         assert destination.paused is True and destination.deliverable is False
 
         _sent.clear()
-        report = partner_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender())
         assert not _sent and report.not_deliverable >= 1, (
             "a paused destination is read BEFORE the attempt, not rediscovered by it"
         )
         # And the event is left pending rather than thrown away on an operator's behalf.
-        assert client.doc(partner_store.DELIVERIES, deliveries[1]["delivery_id"])["state"] == "pending"
+        assert client.doc(notification_store.DELIVERIES, deliveries[1]["delivery_id"])["state"] == "pending"
 
-        partner_auth.resume_destination(DEST, actor="op@entur.org")
-        assert partner_delivery.deliver_pending(now=NOW + timedelta(minutes=2), sender=_sender()).sent == 1
+        notification_auth.resume_destination(DEST, actor="op@entur.org")
+        assert webhook_delivery.deliver_pending(now=NOW + timedelta(minutes=2), sender=_sender()).sent == 1
     finally:
         _uninstall()
 
 
 def test_a_4xx_other_than_410_is_terminal_for_that_event_only():
-    """The classification `webhook_client` owns, passed straight through to the store.
+    """The classification `webhook_sender` owns, passed straight through to the store.
 
-    Both `terminal_state` values are pinned as members of `partner_store.DELIVERY_STATES` by U5's
+    Both `terminal_state` values are pinned as members of `notification_store.DELIVERY_STATES` by U5's
     suite, which is what makes passing them through safe rather than a coincidence.
     """
     client = _install()
     try:
         _live(client)
         [delivery] = _pending(client)
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(ok=False, status=400, retryable=False, terminal_state="failed", error="http_400"),
         )
         assert report.failed == 1
-        assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["state"] == "failed"
-        assert partner_auth.destination_for_delivery(DEST).paused is False, (
+        assert client.doc(notification_store.DELIVERIES, delivery["delivery_id"])["state"] == "failed"
+        assert notification_auth.destination_for_delivery(DEST).paused is False, (
             "only a 410 pauses the destination; a 400 is this event's problem"
         )
     finally:
@@ -993,7 +993,7 @@ def test_a_restart_between_commit_and_delivery_resends_the_original_id_and_revis
     try:
         _live(client)
         [delivery] = _pending(client)
-        partner_delivery.deliver_pending(
+        webhook_delivery.deliver_pending(
             now=NOW, sender=_sender(ok=False, retryable=True, error="TimeoutError")
         )
         first = dict(_sent[-1])
@@ -1008,7 +1008,7 @@ def test_a_restart_between_commit_and_delivery_resends_the_original_id_and_revis
         real_time = time.time
         try:
             time.time = lambda: real_time() + 600  # type: ignore[assignment]
-            partner_delivery.deliver_pending(now=later, sender=_sender())
+            webhook_delivery.deliver_pending(now=later, sender=_sender())
         finally:
             time.time = real_time  # type: ignore[assignment]
 
@@ -1021,7 +1021,7 @@ def test_a_restart_between_commit_and_delivery_resends_the_original_id_and_revis
         assert second["headers"][webhook_signing.HEADER_SIGNATURE] != first["headers"][
             webhook_signing.HEADER_SIGNATURE
         ]
-        assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["attempts"] == 2
+        assert client.doc(notification_store.DELIVERIES, delivery["delivery_id"])["attempts"] == 2
     finally:
         _uninstall()
 
@@ -1035,7 +1035,7 @@ def test_an_event_past_its_expiry_is_never_sent_even_on_a_first_attempt():
         # Past the event's own `valid_until` but still inside its seven-day retention, which is the
         # window where a naive implementation would happily send it: `_not_expired` says the document
         # is alive, and only `event_is_valid` says the EVENT is not.
-        report = partner_delivery.deliver_pending(
+        report = webhook_delivery.deliver_pending(
             now=delivery["valid_until"] + timedelta(seconds=1), sender=_sender()
         )
         assert not _sent and report.expired == 1
@@ -1057,7 +1057,7 @@ def test_a_destination_that_failed_in_one_cycle_is_attempted_again_in_the_next()
     try:
         _live(client)
         _pending(client, n=2)
-        first = partner_delivery.deliver_pending(
+        first = webhook_delivery.deliver_pending(
             now=NOW, sender=_sender(ok=False, retryable=True, error="TimeoutError")
         )
         # The sum, not the split: two events against one failing destination, and whether the
@@ -1067,7 +1067,7 @@ def test_a_destination_that_failed_in_one_cycle_is_attempted_again_in_the_next()
         assert first.skipped_destinations == 1, first
         assert first.retryable + first.skipped == 2, first
         _sent.clear()
-        second = partner_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender())
+        second = webhook_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender())
         assert second.sent == 2, f"both are attempted on the next cycle; got {second}"
     finally:
         _uninstall()
@@ -1078,18 +1078,18 @@ def test_a_429_retry_after_is_persisted_and_still_deferred_after_a_restart():
 
     `retry_not_before` is on the delivery record and the delivery QUERY filters on it, so the
     backoff survives a cycle boundary and a restart. Capped at the lesser of the header, the time to
-    departure and five minutes — a partner can legally answer `Retry-After: 999999` and RFC 9110
+    departure and five minutes — a client can legally answer `Retry-After: 999999` and RFC 9110
     puts no ceiling on it.
     """
     client = _install()
     try:
         _live(client)
         [delivery] = _pending(client, departure_time=NOW + timedelta(hours=3))
-        partner_delivery.deliver_pending(
+        webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(ok=False, status=429, retryable=True, retry_after_s=120.0, error="http_429"),
         )
-        stored = client.doc(partner_store.DELIVERIES, delivery["delivery_id"])
+        stored = client.doc(notification_store.DELIVERIES, delivery["delivery_id"])
         assert stored["state"] == "pending"
         assert stored["retry_not_before"] == NOW + timedelta(seconds=120)
 
@@ -1099,9 +1099,9 @@ def test_a_429_retry_after_is_persisted_and_still_deferred_after_a_restart():
         client.docs.clear()
         client.docs.update(docs)
         _sent.clear()
-        report = partner_delivery.deliver_pending(now=NOW + timedelta(seconds=60), sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW + timedelta(seconds=60), sender=_sender())
         assert report.ready == 0 and not _sent, "still deferred after a restart"
-        report = partner_delivery.deliver_pending(now=NOW + timedelta(seconds=121), sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW + timedelta(seconds=121), sender=_sender())
         assert report.sent == 1, "and attempted once the backoff has passed"
     finally:
         _uninstall()
@@ -1113,11 +1113,11 @@ def test_the_retry_after_cap_never_outlives_the_departure():
     try:
         _live(client)
         [delivery] = _pending(client, departure_time=NOW + timedelta(minutes=11))
-        partner_delivery.deliver_pending(
+        webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(ok=False, status=429, retryable=True, retry_after_s=299.0, error="http_429"),
         )
-        stored = client.doc(partner_store.DELIVERIES, delivery["delivery_id"])
+        stored = client.doc(notification_store.DELIVERIES, delivery["delivery_id"])
         assert stored["retry_not_before"] <= delivery["valid_until"]
     finally:
         _uninstall()
@@ -1132,62 +1132,62 @@ def test_a_store_failure_writes_nothing_and_re_offers_the_delivery():
     Including the case a natural implementation misses: an exhausted transaction surfaces as a plain
     `ValueError` after five attempts, not a Google API error, so a handler keyed on
     `google.api_core` exceptions would call it terminal, mark the subject failed, and never deliver
-    it. `partner_store.is_retryable` is what this path asks.
+    it. `notification_store.is_retryable` is what this path asks.
     """
     client = _install()
     try:
         _live(client)
         [delivery] = _pending(client)
-        real = partner_store.claim_delivery
-        prefix = partner_store._exhausted_transaction_prefix()
+        real = notification_store.claim_delivery
+        prefix = notification_store._exhausted_transaction_prefix()
 
         def exhausted(*_a: Any, **_k: Any):
             raise ValueError(f"{prefix} 5 attempts.")
 
-        partner_store.claim_delivery = exhausted  # type: ignore[assignment]
+        notification_store.claim_delivery = exhausted  # type: ignore[assignment]
         mark = len(_SINK.records)
         try:
             handler = _capture()
-            report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+            report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         finally:
-            partner_store.claim_delivery = real  # type: ignore[assignment]
+            notification_store.claim_delivery = real  # type: ignore[assignment]
         # `not _sent` is the assertion a straggler from the previous test used to break: the
         # slow-store test abandons four workers, its `finally` releases the hang, and they dialled
         # the stub in here. `_drain_pools` is what makes this deterministic.
         assert report.store_errors == 1 and not _sent
         [record] = [r for r in _SINK.records[mark:] if r.exc_info]
         assert isinstance(record.exc_info[1], ValueError), "an exhausted transaction, not an API error"
-        assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["state"] == "pending"
-        assert [f["step"] for f in _fields(handler, "partner_delivery")] == ["claim"]
+        assert client.doc(notification_store.DELIVERIES, delivery["delivery_id"])["state"] == "pending"
+        assert [f["step"] for f in _fields(handler, "webhook_delivery")] == ["claim"]
 
-        assert partner_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender()).sent == 1
+        assert webhook_delivery.deliver_pending(now=NOW + timedelta(minutes=1), sender=_sender()).sent == 1
     finally:
         _uninstall()
 
 
 def test_an_unreadable_pending_set_attempts_nothing_and_raises_nothing():
-    """R20: reading partner state is guarded, and a failure suppresses that step only."""
+    """R20: reading notification state is guarded, and a failure suppresses that step only."""
     client = _install()
     try:
         _live(client)
-        real = partner_store.pending_deliveries
+        real = notification_store.pending_deliveries
 
         def failing(*_a: Any, **_k: Any):
             raise RuntimeError("Firestore is unreachable")
 
-        partner_store.pending_deliveries = failing  # type: ignore[assignment]
+        notification_store.pending_deliveries = failing  # type: ignore[assignment]
         mark = len(_SINK.records)
         try:
-            report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+            report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         finally:
-            partner_store.pending_deliveries = real  # type: ignore[assignment]
+            notification_store.pending_deliveries = real  # type: ignore[assignment]
         assert report.store_errors == 1 and report.ready == 0 and not _sent
         # The fault is ASSERTED, not printed. It is logged with `exc_info=True` on purpose, so
         # without a handler it reached `lastResort` and put a traceback on stderr on every run of
         # a passing suite.
         [record] = [r for r in _SINK.records[mark:] if r.exc_info]
         assert isinstance(record.exc_info[1], RuntimeError)
-        assert [f["result"] for f in _sink_since(mark, "partner_delivery")] == ["pending_error"]
+        assert [f["result"] for f in _sink_since(mark, "webhook_delivery")] == ["pending_error"]
     finally:
         _uninstall()
 
@@ -1205,11 +1205,11 @@ def test_an_unconfigured_signing_root_leaves_the_event_pending():
         _live(client)
         [delivery] = _pending(client)
         os.environ.pop(webhook_signing.SIGNING_ROOT_ENV, None)
-        report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         assert not _sent and report.store_errors == 1
-        assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["state"] == "pending"
-        assert partner_auth.destination_for_delivery(DEST).paused is False, (
-            "an unsigned attempt is our fault; pausing is the partner telling us to stop"
+        assert client.doc(notification_store.DELIVERIES, delivery["delivery_id"])["state"] == "pending"
+        assert notification_auth.destination_for_delivery(DEST).paused is False, (
+            "an unsigned attempt is our fault; pausing is the client telling us to stop"
         )
     finally:
         _uninstall()
@@ -1218,18 +1218,18 @@ def test_an_unconfigured_signing_root_leaves_the_event_pending():
 # ---- R16 and the module's own shape -----------------------------------------------------------
 
 
-def test_no_callback_url_partner_reference_or_prose_reaches_a_log_line():
-    """R16 on this module's records. A callback URL is a partner's infrastructure, not ours to log."""
+def test_no_callback_url_external_reference_or_prose_reaches_a_log_line():
+    """R16 on this module's records. A callback URL is a client's infrastructure, not ours to log."""
     client = _install()
     try:
         _live(client)
         _pending(client)
         handler = _capture()
-        partner_delivery.deliver_pending(
+        webhook_delivery.deliver_pending(
             now=NOW, sender=_sender(ok=False, status=500, retryable=True, error="http_500")
         )
         records = handler.records
-        logging.getLogger("partner_delivery").removeHandler(handler)
+        logging.getLogger("webhook_delivery").removeHandler(handler)
         rendered = " ".join(
             [r.getMessage() for r in records] + [str(getattr(r, "fields", "")) for r in records]
         )
@@ -1250,10 +1250,10 @@ def test_the_pool_is_four_wide_and_the_claim_happens_inside_the_worker():
     submitting is what queues the work, so a claim there would admit every task before the deadline
     was consulted and the bound would guarantee nothing. That is `/meldinger`'s recorded lesson.
     """
-    assert partner_delivery._WORKERS == 4
-    body = inspect.getsource(partner_delivery._attempt)
+    assert webhook_delivery._WORKERS == 4
+    body = inspect.getsource(webhook_delivery._attempt)
     assert "budget.claim()" in body, "the claim is in the worker's own body"
-    submit = inspect.getsource(partner_delivery.deliver_pending)
+    submit = inspect.getsource(webhook_delivery.deliver_pending)
     assert "budget.claim" not in submit, "and never at submit time"
     assert "shutdown(wait=False)" in submit, (
         "the pool is abandoned, not joined: `wait=True` would block the poller until whatever is "
@@ -1261,7 +1261,7 @@ def test_the_pool_is_four_wide_and_the_claim_happens_inside_the_worker():
     )
     # Over the CODE, not the raw text: the module docstring names `varsel._state_lock` in order to
     # say it never takes it, so a grep over the whole file matches the explanation and passes (or
-    # fails) for the wrong reason. Same rule `test_partner_store` applies to its Terraform greps.
+    # fails) for the wrong reason. Same rule `test_notification_store` applies to its Terraform greps.
     assert "_state_lock" not in _code(), (
         "no Firestore call under varsel's state lock -- this module never takes it at all"
     )
@@ -1275,18 +1275,18 @@ def test_the_pending_set_is_taken_from_the_store_and_never_re_sorted():
     pending document nothing ever resolves is a document the query keeps returning for its whole
     seven-day retention.
     """
-    body = inspect.getsource(partner_delivery.deliver_pending)
+    body = inspect.getsource(webhook_delivery.deliver_pending)
     assert "pending.ready" in body and ".sort(" not in body and "sorted(" not in body
-    assert "mark_delivery_expired" in inspect.getsource(partner_delivery._expire_stale)
+    assert "mark_delivery_expired" in inspect.getsource(webhook_delivery._expire_stale)
 
 
 def test_the_module_writes_nothing_to_the_decision_log():
-    """KTD10, at the import boundary: partner state is Firestore's, never `varsel_decisions`.
+    """KTD10, at the import boundary: notification state is Firestore's, never `varsel_decisions`.
 
     /historikk and /meldinger publish that table on public hosts — with resolved origin and
-    destination names since 2026-08-22 — and partner-app travellers are members of the public. Its
+    destination names since 2026-08-22 — and client-app travellers are members of the public. Its
     `pushed` column is also journey-DEFINITION grain and cannot tell a webhook from a Web Push, so a
-    partner delivery recorded there would corrupt both pages' meaning as well as their privacy
+    webhook delivery recorded there would corrupt both pages' meaning as well as their privacy
     claim. A module that imports neither `decisions` nor `varsel` cannot do it however it drifts.
     """
     for forbidden in ("decisions", "varsel", "main", "historikk", "meldinger"):
@@ -1295,9 +1295,9 @@ def test_the_module_writes_nothing_to_the_decision_log():
 
 
 def test_the_wire_envelope_is_exactly_the_published_schemas_properties():
-    """`additionalProperties: false`, so one stray field costs every event to every partner.
+    """`additionalProperties: false`, so one stray field costs every event to every client.
 
-    The stored event carries three names the envelope does not: `partner_id` and `destination_id`
+    The stored event carries three names the envelope does not: `client_id` and `destination_id`
     are our own routing, recorded so a delivery can be traced back to the destination that
     authorised it, and the TTL field is a retention decision of ours. A receiver running the
     verifier U7 ships REFUSES a body carrying any of them, and it would refuse EVERY event rather
@@ -1310,14 +1310,14 @@ def test_the_wire_envelope_is_exactly_the_published_schemas_properties():
     eighteen REQUIRED names that is the same refusal reached by the opposite route.
     """
     schema = json.loads(
-        (pathlib.Path(partner_delivery.__file__).parents[2] / SCHEMA_PATH).read_text()
+        (pathlib.Path(webhook_delivery.__file__).parents[2] / SCHEMA_PATH).read_text()
     )
     assert schema["additionalProperties"] is False, (
         "the allow-list projection exists BECAUSE the envelope is closed; if this is ever relaxed, "
         "re-read `_WIRE_FIELDS`' first reason before trusting it"
     )
     properties = set(schema["properties"])
-    fields = partner_delivery._WIRE_FIELDS
+    fields = webhook_delivery._WIRE_FIELDS
     assert len(set(fields)) == len(fields), "a duplicate would hide a missing name"
     assert set(fields) == properties, (
         "the wire envelope and the published schema must name the same fields: "
@@ -1329,18 +1329,18 @@ def test_the_wire_envelope_is_exactly_the_published_schemas_properties():
     try:
         _live(client)
         [delivery] = _pending(client)
-        stored = client.doc(partner_store.EVENTS, delivery["event_id"])
-        for ours in ("partner_id", "destination_id", partner_store.TTL_FIELD):
+        stored = client.doc(notification_store.EVENTS, delivery["event_id"])
+        for ours in ("client_id", "destination_id", notification_store.TTL_FIELD):
             assert ours in stored, (
                 f"{ours} is expected to be STORED — the test is worthless if the store stops "
                 "writing the very fields the projection exists to withhold"
             )
-        wire = partner_delivery.wire_event(stored)
+        wire = webhook_delivery.wire_event(stored)
         assert set(wire) <= properties, sorted(set(wire) - properties)
         assert set(schema["required"]) <= set(wire), sorted(set(schema["required"]) - set(wire))
 
         # And through the real path, on the bytes that are actually signed and sent.
-        partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         [attempt] = _sent
         sent = json.loads(attempt["body"].decode())
         assert set(sent) <= properties, sorted(set(sent) - properties)
@@ -1352,12 +1352,12 @@ def test_the_wire_envelope_is_exactly_the_published_schemas_properties():
 def test_a_late_arrival_is_not_counted_as_a_fresh_delivery():
     """The abandoned-thread race, from this side: the write is refused and the COUNT must follow.
 
-    `partner_store.mark_delivery_sent` now refuses a write to a delivery that is no longer
+    `notification_store.mark_delivery_sent` now refuses a write to a delivery that is no longer
     `pending` and answers `already_resolved` with the state it actually holds, so R11's cap is no
     longer double-spent. That leaves the report as the thing that is wrong: `_attempt` returned
     "sent" whenever the write did not raise, so an attempt thread the previous cycle abandoned would
-    report a second delivery of one notification. `partner_delivery_round` is published as
-    operational telemetry, so `sent` has to mean a notification the partner did not already have.
+    report a second delivery of one notification. `webhook_delivery_round` is published as
+    operational telemetry, so `sent` has to mean a notification the client did not already have.
 
     The state is flipped INSIDE the sender, which is where the race actually sits: a delivery that
     is already resolved when the pass starts is never offered by `pending_deliveries` at all, so
@@ -1373,7 +1373,7 @@ def test_a_late_arrival_is_not_counted_as_a_fresh_delivery():
     try:
         _live(client)
         [delivery] = _pending(client)
-        path = f"{partner_store.DELIVERIES}/{delivery['delivery_id']}"
+        path = f"{notification_store.DELIVERIES}/{delivery['delivery_id']}"
 
         def resolving(state: str):
             """A sender that succeeds, and while it is on the wire another pass resolves the row."""
@@ -1386,13 +1386,13 @@ def test_a_late_arrival_is_not_counted_as_a_fresh_delivery():
 
             return send
 
-        report = partner_delivery.deliver_pending(now=NOW, sender=resolving("sent"))
+        report = webhook_delivery.deliver_pending(now=NOW, sender=resolving("sent"))
         assert report.sent == 0, "a late arrival is not a fresh delivery"
         assert report.already_resolved == 1 and report.superseded == 0, report
         assert len(_sent) == 1, "the HTTP call did happen; it is the ACCOUNTING that changed"
-        subscription = client.doc(partner_store.SUBSCRIPTIONS, SID)
+        subscription = client.doc(notification_store.SUBSCRIPTIONS, SID)
         assert subscription.get("daily_deliveries", {}) == {}, "and no slot was spent"
-        assert client.doc(partner_store.DELIVERIES, delivery["delivery_id"])["attempts"] == 0, (
+        assert client.doc(notification_store.DELIVERIES, delivery["delivery_id"])["attempts"] == 0, (
             "and NOTHING was written: the refused write leaves `attempts` alone too, which is the "
             "cosmetic half of the same double-count"
         )
@@ -1401,13 +1401,13 @@ def test_a_late_arrival_is_not_counted_as_a_fresh_delivery():
         # replacement spends R11's slot itself.
         client.docs[path]["state"] = "pending"
         client.docs[path]["retry_not_before"] = NOW
-        third = partner_delivery.deliver_pending(now=NOW, sender=resolving("superseded"))
+        third = webhook_delivery.deliver_pending(now=NOW, sender=resolving("superseded"))
         assert third.superseded == 1 and third.sent == 0 and third.already_resolved == 0, third
 
         # And the guard must not turn an ordinary send into a late arrival.
         client.docs[path]["state"] = "pending"
         client.docs[path]["retry_not_before"] = NOW
-        ordinary = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+        ordinary = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         assert ordinary.sent == 1 and ordinary.already_resolved == 0 and ordinary.superseded == 0
     finally:
         _uninstall()
@@ -1435,13 +1435,13 @@ def test_one_subscriptions_claims_never_run_concurrently():
     try:
         _live(client)
         _pending(client, n=8)
-        real = partner_store.claim_delivery
+        real = notification_store.claim_delivery
         lock = threading.Lock()
         live: dict[str, int] = {}
         peak: dict[str, int] = {}
 
         def watched(delivery_id: str, **kwargs: Any):
-            stored = client.doc(partner_store.DELIVERIES, delivery_id) or {}
+            stored = client.doc(notification_store.DELIVERIES, delivery_id) or {}
             sid = str(stored.get("subscription_id") or "")
             with lock:
                 live[sid] = live.get(sid, 0) + 1
@@ -1453,11 +1453,11 @@ def test_one_subscriptions_claims_never_run_concurrently():
                 with lock:
                     live[sid] -= 1
 
-        partner_store.claim_delivery = watched  # type: ignore[assignment]
+        notification_store.claim_delivery = watched  # type: ignore[assignment]
         try:
-            report = partner_delivery.deliver_pending(now=NOW, sender=_sender())
+            report = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         finally:
-            partner_store.claim_delivery = real  # type: ignore[assignment]
+            notification_store.claim_delivery = real  # type: ignore[assignment]
         assert peak.get(SID) == 1, (
             f"one subscription's claims must be sequential; peak concurrency was {peak}"
         )
@@ -1483,7 +1483,7 @@ def test_two_subscriptions_are_still_delivered_in_parallel():
         other = "sub-2"
         _live(client, subscription_id=other)
         _pending(client, n=1)
-        partner_events.emit(
+        notification_events.emit(
             [_subject(subscription_id=other, journey_ref="DatedServiceJourney:2000")], now=NOW
         )
         barrier = threading.Barrier(2, timeout=10)
@@ -1498,7 +1498,7 @@ def test_two_subscriptions_are_still_delivered_in_parallel():
                 pass
             return inner(url, **kwargs)
 
-        report = partner_delivery.deliver_pending(now=NOW, sender=meeting, wait_s=30.0)
+        report = webhook_delivery.deliver_pending(now=NOW, sender=meeting, wait_s=30.0)
         assert overlapped.is_set(), (
             "two subscriptions must be attempted concurrently; the barrier timed out, so the "
             "shards were run one after another"
@@ -1517,4 +1517,4 @@ if __name__ == "__main__":
             print(f"ok  {name}")
     # The COUNT, in every other suite's shape: a runner that silently collects nothing still exits
     # 0, so "it passed" is not the check -- "the number moved" is.
-    print(f"\n{_ran} partner delivery checks passed.")
+    print(f"\n{_ran} webhook delivery checks passed.")
