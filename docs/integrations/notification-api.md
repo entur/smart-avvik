@@ -15,7 +15,7 @@ disagree:
 
 | file | what it is |
 |---|---|
-| `contracts/notifications/v1/openapi.json` | the six routes, hand-authored |
+| `contracts/notifications/v1/openapi.json` | the six routes, hand-authored. Its tags — `notification-subscriptions`, `notification-destinations`, `notification-test` — are the router's own, pinned as one vocabulary by a test; a bare `subscriptions` would say nothing among this app's other paths |
 | `contracts/notifications/v1/subscription.schema.json` | the subscription request and response |
 | `contracts/notifications/v1/event.schema.json` | the event envelope (`additionalProperties: false`) |
 | `contracts/notifications/v1/signing-vectors.json` | seven cross-language signing vectors, self-describing |
@@ -51,13 +51,15 @@ follow (KTD12) and the enablement condition they impose.
    account, one callback destination per environment, and one API credential; every action lands in
    an append-only audit record. See `scripts/manage_notification_partner.py` and the operations doc.
    You get back a `key-id` and a secret **shown once** (from `issue-key`), and a `destination_id`.
-   **You also need the verification secret your receiver checks signatures with, and no shipped
-   command prints it.** It is `HMAC-SHA256` of the environment's signing root over the destination
-   and generation, so an operator holding the root can derive it with
-   `webhook_signing.derive_secret(destination_id, generation)`; there is no subcommand and no route
-   that does — `GET /destinations/current` serves generation *numbers* only, deliberately, so the API
-   has nothing to leak. Ask the operator for it explicitly, once per live generation. Environments are
-   separate GCP projects: a dev credential is worthless in prd.
+   **You also need the verification secret your receiver checks signatures with**, and the operator
+   prints it for you with `show-signing-secret` — once per live generation, and again after each
+   `rotate-signing`. **No route serves it and none ever will**, which is the interesting half: a
+   secret fetchable over your own API credential is a secret that credential can be traded for, so
+   `GET /destinations/current` gives you the generation *numbers* and never calls the derivation at
+   all. The value is derived from the environment's signing root over the destination and
+   generation, so nothing stores it and one partner's leaked receiver secret forges nothing for
+   another. It is a live credential: take it the way you would take a password, not in a ticket or a
+   chat message. Environments are separate GCP projects: a dev credential is worthless in prd.
 2. **Stand up a receiver.** `firebase-bff.md`. The vendored packages do the signature verification,
    the idempotent inbox, revision ordering and duplicate suppression; you supply recipient lookup,
    an eligibility recheck and native dispatch.
@@ -225,8 +227,12 @@ to leak, and it never calls the derivation either.
 
 ### `POST /test-events` — one signed synthetic event
 
-`{"subscription_id": "<your reference>"}`. Refused with **409 `not_a_test_subscription`** unless the
-watch was created `test: true`.
+`{"subscription_id": "<your reference>"}` — and, like the two path routes, the namespaced
+`<partner_id>~<reference>` form works too. That matters more than it sounds: the id you have to hand
+is usually the one a `GET` response or an event your receiver just handled gave you, and that is the
+namespaced form, so accepting only the bare reference meant a 422 from a value this API had itself
+just served. Refused with **409 `not_a_test_subscription`** unless the watch was created
+`test: true`.
 
 Sent synchronously and **nothing is stored** — no event, no delivery, no alert subject, no cap slot.
 That is not convenience: the pending-event ceiling is exact rather than best-effort *because the emit
@@ -238,15 +244,30 @@ Answers **200 with the outcome** even when your endpoint rejected it —
 this is a diagnostic endpoint and the classification is the diagnosis. A refusal on *our* side (not a
 test watch, paused destination, signing not configured) is a 4xx/503 as usual.
 
-**The synthetic event's `payload` is a simplified stand-in, and it is not shaped like a real one.**
-The *envelope* is identical, and that is what the receiver's protocol work runs on. But
-`payload.probabilities` is `{"impact", "cancel"}` here against a real event's
-`{"impact", "cancellation", "delay_ge10", "alert_threshold"}`; `payload.call` is
-`{"operator", "line", "stop_place", "aimed_departure"}` against
-`{"stop_place", "stop_order", "aimed_departure_time", "departs_tomorrow"}`; and `delay`, `effect` and
-`situations` are always null or empty. **Do not type a client against a test event's payload** — read
-the real shapes below, and treat `payload` as open (the schema declares
-`additionalProperties: false` on the envelope only).
+**A test event is a faithful sample, and it is meant to be the thing you write your receiver
+against** — it is the only body you can see before a real disruption. Its `payload` carries the same
+keys a real event's does, pinned in both directions by
+`test_the_synthetic_payload_has_the_same_shape_as_a_real_one`, and the body is projected through the
+delivery pass's own `wire_event` allow-list and serialized by its own `event_body` — the same
+allow-list and the same serializer a real delivery goes through, so key order, UTF-8 and timestamp
+rendering are identical too.
+
+It is a coherent **confirmed cancellation** rather than an arbitrary sample, because the schema's own
+rule is that a `confirmed` event carries probabilities of 1.0 and null delay figures; a synthetic
+event stating 1.0 under `predicted` would teach a combination no real event produces. Its
+`has_situation` is `false` and truthfully so — no SIRI-SX message named this train, and its
+`alert_threshold` is therefore the **no-SX cut** rather than the published one (see
+[the payload](#payload)).
+
+Two things still differ, both deliberately: `alert_id` and `event_id` are **random** here, where a
+real event derives them from the subject and revision — otherwise the supplied receiver's duplicate
+rule would give you exactly one notification however many test events you asked for — and
+`journey_ref` is a `KIX:Test:` reference that can never collide with a real subject.
+
+What does *not* change is that `payload` is an **open** object: the schema declares
+`additionalProperties: false` on the envelope only, and its sub-objects carry no property list. So a
+differently named key inside `payload` would be schema-valid and wrong, which is exactly why that
+shape is pinned by a test rather than by the schema.
 
 ### Errors
 
@@ -395,17 +416,26 @@ this carries. The prose is the same text `/varsel` would have pushed for the sam
 the same assembly, and it is deliberately brand-independent.
 
 Beside it: `call` (`stop_place`, `stop_order`, `aimed_departure_time`, `departs_tomorrow`),
-`probabilities` (`impact`, `cancellation`, `delay_ge10`, and `alert_threshold` — the operator's own
-alerting bar, so the reason this cleared it is visible rather than inferred), `delay`
+`probabilities` (`impact`, `cancellation`, `delay_ge10`, and `alert_threshold` — the bar this alert
+actually cleared, carried so the reason is visible rather than inferred). **`alert_threshold` varies
+along two axes, not one.** It is per operator *and* per population: a train **no SIRI-SX message
+named** is scored from real-time data alone and is cut at a higher bar than a published disruption —
+0.85 against 0.65 for VYG, a difference of 0.20 — because without a message the only signal is the
+last hour of observation and the probability decays with the ask horizon far faster. Read the value
+off the event; do not assume the published per-operator cut. A `situations` entry whose
+`has_situation` is `false` is how you can tell which population an alert came from. Then `delay`
 (`{typical_min, worst_case_min}` or `null`), `effect`, `situations` (objects: `situation_number`,
 `summary`, `description`, `has_situation`) and `alternative_journey` (`object|null`).
 
-**`payload.call`'s schema description over-promises and is being left as the description rather than
-quietly implemented.** It says the call carries "aimed and expected times, and whether boarding and
-alighting are permitted there". Only `aimed_departure_time` is emitted; there is no expected time and
-there are no boarding/alighting flags on the wire. The matcher itself does honour the two SIRI
-activities — a train that calls at the destination with alighting closed is never offered — so the
-*selection* is right and only the reported field set is short. Do not write a client that reads them.
+**`payload.call` carries an aimed time and never an expected one, and no boarding or alighting
+flags — both by design, and the schema now says so.** The real-time estimate for this call is what
+the probabilities and the delay figures beside it are *derived from*; restating it here as a second
+time would invite a receiver to display a figure the forecast has already superseded. And the two
+SIRI boarding/alighting activities gate the **match** upstream — calling at a stop is not the same as
+being usable from it, since long-distance runs are routinely sold boarding-only over their local
+stretch — so a call you receive is already one the traveller may board and alight at, and repeating
+the flags would publish a rule instead of its result. Putting either on the wire would be a schema
+**addition**, not a description change.
 
 **`effect`'s vocabulary is `"cancelled"`, `"delayed"` or `null`** — the schema declares the field and
 enumerates no values, so this list is the code's and is stated here rather than left to be discovered.
