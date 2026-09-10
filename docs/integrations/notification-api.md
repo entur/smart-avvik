@@ -645,6 +645,10 @@ definition is registered**.
 
 ## The event
 
+**Samples**: `samples/notification-webhooks/` holds a real `journey.alert.created` event as the exact
+bytes that were signed and sent, and a `POST /test-events` request captured verbatim at a receiver
+with its three signing headers — both from dev on 2026-09-10.
+
 `contracts/notifications/v1/event.schema.json` is the authority. `additionalProperties: false` **on
 the envelope**; the nested objects under `payload` are deliberately open.
 

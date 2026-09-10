@@ -1,0 +1,26 @@
+{
+  "method": "POST",
+  "url": "/webhook",
+  "headers": {
+    "host": "cork-psp-trades-sam.trycloudflare.com",
+    "user-agent": "kix-avvik-notifications/1",
+    "content-length": "1342",
+    "accept": "*/*",
+    "accept-encoding": "gzip",
+    "cdn-loop": "cloudflare; loops=1; subreqs=1",
+    "cf-connecting-ip": "34.140.252.46",
+    "cf-ew-via": "15",
+    "cf-ipcountry": "BE",
+    "cf-ray": "a390cc0558358e67-OSL",
+    "cf-visitor": "{\"scheme\":\"https\"}",
+    "cf-warp-tag-id": "16720541-a93d-4a3f-b477-06f399642c6c",
+    "cf-worker": "trycloudflare.com",
+    "connection": "keep-alive",
+    "content-type": "application/json",
+    "webhook-id": "test-3ed29acb46205904ea1b95ca",
+    "webhook-signature": "v1,fj04pQT5kb7eVcvX3yjA2iV/zap0jdLCvTeoKr+22w8=",
+    "webhook-timestamp": "1789068099",
+    "x-forwarded-for": "34.140.252.46",
+    "x-forwarded-proto": "https"
+  }
+}
