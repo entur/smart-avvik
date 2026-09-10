@@ -107,7 +107,7 @@ impact.configure(snapshot_provider=lambda: (_active_snapshot["value"], None))
 
 
 def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                     with_alternative=False, min_impact=0.0):
+                     with_alternative=False, min_impact=0.0, path="poller"):
     return impact.for_trip(
         from_stop=from_stop,
         to_stop=to_stop,
@@ -120,6 +120,9 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
         # that care, so nothing here reaches the network either way.
         with_alternative=with_alternative,
         min_impact=min_impact,
+        # Likewise: a provider that accepts `path` and drops it satisfies the Protocol, and the only
+        # thing that can tell is the ledger (test_the_suites_provider_forwards_the_fetch_path).
+        path=path,
     )
 
 
@@ -4437,6 +4440,27 @@ def test_the_client_read_is_bounded_by_a_document_ceiling():
     assert len(fetched) == varsel._MAX_WEBHOOK_RECIPIENTS, (
         "the cursor must stop at the ceiling, not be drained and then trimmed"
     )
+
+
+def test_the_suites_provider_forwards_the_fetch_path(monkeypatch):
+    """This suite's provider stands in for `main._varsel_impact` in every e2e check here, so it must
+    forward `path` to the real engine exactly as the real provider does (2026-09-10) — a double that
+    swallowed it would keep every check green while the pull read spent the poller's budget.
+
+    Pinned at `fetch_candidates`, the seam this suite stubs structurally (see the module-level stub:
+    the ledger below it is unreachable from here by design). The pin that asks the ledger itself,
+    through the real provider, is `test_varsel.test_the_real_provider_charges_the_pull_ledger`.
+    """
+    paths = []
+    monkeypatch.setattr(
+        alternatives, "fetch_candidates", lambda *a, **k: paths.append(k.get("path")) or []
+    )
+    alerts = varsel.match_journey(_JOURNEY, with_alternative=True, path="pull")
+    assert alerts and alerts[0].alertworthy, "control: the train must be worth a lookup"
+    assert paths and set(paths) == {"pull"}, paths
+    paths.clear()
+    varsel.match_journey(_JOURNEY, with_alternative=True)
+    assert paths and set(paths) == {alternatives._POLLER_PATH}, paths
 
 
 if __name__ == "__main__":

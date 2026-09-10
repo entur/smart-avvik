@@ -58,8 +58,9 @@ Design notes
   the quantum comes first, the TTL second.
 * **Bounded, per path.** ``/impact`` is unauthenticated on a public host and turns one inbound
   request into one outbound JP call, so :data:`_FETCH_MAX_PER_MIN` caps how many *distinct keys*
-  may be fetched per minute — counted separately for the request path and the poller path, so
-  request traffic can never eat the poller's share. Past the ceiling this module yields no
+  may be fetched per minute — counted separately for the request path, the poller path and the
+  journey-alert pull read's path, so request traffic can never eat the poller's share and the read
+  can eat neither. Past the ceiling this module yields no
   candidates (``alternative_journey: null``) rather than the pod degrading. There is deliberately
   **no global circuit breaker**: one module-global cache serves both paths, so a global breaker
   would let request-path failures — or a caller tripping it on purpose — suppress the alternatives
@@ -145,6 +146,14 @@ _FETCH_MAX_PER_MIN = 30
 # Raise the two together or not at all — widening this alone just makes the poller thread block
 # longer.
 _POLLER_FETCH_MAX_PER_MIN = 90
+# ...and the journey-alert pull read (2026-09-10) gets a THIRD, separate allowance. It fetches the
+# alternative on request, like the public endpoint, but it is neither of the two callers above: it
+# is not the browser's cycle, so charging it to the poller would let a burst of reads starve the
+# push cycle's reserved share; and it is not the anonymous endpoint, so charging it to `request`
+# would let an /impact flood empty the read's allowance — and a read that is throttled serves
+# `unanswered`, which is exactly the outcome the split exists to keep rare. The public number, on
+# the public reasoning: the read is reachable without credentials and a caller can invent keys.
+_PULL_FETCH_MAX_PER_MIN = 30
 _RATE_WINDOW = timedelta(minutes=1)
 # How long past `_HTTP_TIMEOUT_S` a caller waiting on somebody else's in-flight fetch keeps waiting.
 # Covers the gap between claiming the key and actually issuing the request; past it the waiter gives
@@ -637,7 +646,8 @@ class _KeyedTTLCache:
 
         `wait_for_refresh` decides what a caller who finds this key already in flight does: give up
         with whatever it had (the default, and what the request path wants), or **block until the
-        thread that claimed it answers, then read the fresh value** (what the poller wants).
+        thread that claimed it answers, then read the fresh value** (what the poller wants, and since
+        2026-09-10 the journey-alert pull read too — see `_WAITING_PATHS`).
 
         That distinction did not exist while the poller's lookups were sequential, because they
         could not collide: journey A's fetch had completed and populated the cache before journey B
@@ -764,17 +774,31 @@ class _KeyedTTLCache:
 _cache = _KeyedTTLCache(_TTL, _FAILURE_COOLDOWN)
 
 # ---- Fetch budget ----------------------------------------------------------------------------
-# Two tallies, never one. The poller's share is RESERVED: request traffic spends only the request
-# path's budget, so an anonymous caller inventing `at` values cannot starve the alternatives out of
-# every push notification. That starvation is also why there is no global circuit breaker here —
-# `_cache` is one module global shared by the public endpoint and the poller, so a breaker tripped
-# by request-path failures (or tripped deliberately) would suppress the poller's lookups too. The
-# per-key cooldown inside `_KeyedTTLCache` is the only back-off.
+# One tally per caller, never one shared. The poller's share is RESERVED: request traffic spends
+# only the request path's budget, so an anonymous caller inventing `at` values cannot starve the
+# alternatives out of every push notification, and the pull read (2026-09-10) spends only its own.
+# That starvation is also why there is no global circuit breaker here — `_cache` is one module
+# global shared by every path, so a breaker tripped by request-path failures (or tripped
+# deliberately) would suppress the poller's lookups too. The per-key cooldown inside
+# `_KeyedTTLCache` is the only back-off.
+#
+# The ceiling is a LOOKUP, not a conditional: a fourth path added to the Literal without a row here
+# raises `KeyError` on its first fetch rather than silently sharing somebody else's number — which
+# is how the request and poller paths came to share one constant until 2026-08-21.
 _REQUEST_PATH = "request"
 _POLLER_PATH = "poller"
-FetchPath = Literal["request", "poller"]
+_PULL_PATH = "pull"
+FetchPath = Literal["request", "poller", "pull"]
+_FETCH_CEILINGS: dict[str, int] = {
+    _REQUEST_PATH: _FETCH_MAX_PER_MIN,
+    _POLLER_PATH: _POLLER_FETCH_MAX_PER_MIN,
+    _PULL_PATH: _PULL_FETCH_MAX_PER_MIN,
+}
+# The paths whose caller blocks on somebody else's in-flight fetch for the same key — see
+# `wait_for_refresh` in `_KeyedTTLCache.get`. Not the request path, and the reason is stated there.
+_WAITING_PATHS = frozenset({_POLLER_PATH, _PULL_PATH})
 _budget_lock = threading.Lock()
-_fetch_calls: dict[str, list[datetime]] = {_REQUEST_PATH: [], _POLLER_PATH: []}
+_fetch_calls: dict[str, list[datetime]] = {path: [] for path in _FETCH_CEILINGS}
 
 
 def _reserve_fetch(path: str, now: datetime) -> bool:
@@ -786,8 +810,10 @@ def _reserve_fetch(path: str, now: datetime) -> bool:
 
     Called from inside `_KeyedTTLCache.get`'s lock (see its `gate` parameter). Nothing takes these
     two locks in the other order.
+
+    An unknown `path` raises: see :data:`_FETCH_CEILINGS`.
     """
-    ceiling = _POLLER_FETCH_MAX_PER_MIN if path == _POLLER_PATH else _FETCH_MAX_PER_MIN
+    ceiling = _FETCH_CEILINGS[path]
     with _budget_lock:
         calls = _fetch_calls.setdefault(path, [])
         calls[:] = [t for t in calls if now - t < _RATE_WINDOW]
@@ -1190,9 +1216,10 @@ def fetch_candidates(
     straddle two instants, and this lookup must sit on that same instant.
 
     `path` says which side of the reserved budget this lookup spends: `"poller"` for the refresh
-    cycle behind push alerting, `"request"` for anything serving an inbound HTTP request. It
-    defaults to `"request"`, the conservative reading — an unwired caller is then throttled by the
-    public budget rather than silently spending the poller's. See :data:`_FETCH_MAX_PER_MIN`.
+    cycle behind push alerting, `"pull"` for the journey-alert pull read, `"request"` for anything
+    serving an inbound HTTP request. It defaults to `"request"`, the conservative reading — an
+    unwired caller is then throttled by the public budget rather than silently spending the
+    poller's. See :data:`_FETCH_MAX_PER_MIN`.
 
     `outcome`, when passed, is filled with `{"answered": bool}`: **was a reply obtained at all**, as
     distinct from "the reply was empty". Fail-open collapses timeout, GraphQL `errors`, cooldown,
@@ -1281,13 +1308,15 @@ def fetch_candidates(
         label=digest,
         gate=gate,
         outcome=cache_outcome,
-        # Only the poller waits on somebody else's in-flight fetch for this key. Its callers are
+        # The poller waits on somebody else's in-flight fetch for this key. Its callers are
         # concurrent with each other and share stop pairs heavily, so waiting is what keeps a
         # fan-out from turning "one fetch, N answers" into "one fetch, one answer and N-1 shrugs".
-        # The request path keeps giving up immediately: an inbound HTTP request holding an anyio
-        # threadpool slot to wait on an unrelated request's fetch is how a slow upstream turns into
-        # a queue, and `/impact` already degrades to `alternative_journey: null` gracefully.
-        wait_for_refresh=path == _POLLER_PATH,
+        # The pull read waits too (2026-09-10): it runs on its own executor, not in the anyio
+        # request pool, and the key it wants is often the one the poller's pass is fetching at that
+        # instant. The request path keeps giving up immediately: an inbound HTTP request holding an
+        # anyio threadpool slot to wait on an unrelated request's fetch is how a slow upstream turns
+        # into a queue, and `/impact` already degrades to `alternative_journey: null` gracefully.
+        wait_for_refresh=path in _WAITING_PATHS,
     )
     _log_lookup(
         pair_digest=digest,

@@ -98,6 +98,7 @@ from typing import Annotated, Any, Protocol
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import alternatives  # the Journey Planner fetch-path vocabulary the matcher forwards
 import feedback
 import feedback_contexts
 import notification_events  # the webhook channel's typed hand-off type and its emit step
@@ -377,6 +378,12 @@ class ImpactProvider(Protocol):
     swallowed it, and all push alerting stopped with a green test suite (both test doubles hand-write
     their own provider, so nothing checked the real one). `...` would have accepted that drift; this
     does not.
+
+    `path` (2026-09-10) names which Journey Planner budget the provider's alternative lookups spend
+    (`alternatives.FetchPath`); `_impact` sends it on EVERY call, defaulted to the poller's. CI runs
+    no type checker, so a provider that accepts the keyword and drops it still satisfies this — the
+    pin for that is a test asking the pull ledger whether it was charged
+    (`test_varsel.test_the_real_provider_charges_the_pull_ledger`).
     """
 
     def __call__(
@@ -389,6 +396,7 @@ class ImpactProvider(Protocol):
         catchable_after: datetime | None = ...,
         with_alternative: bool = ...,
         min_impact: float = ...,
+        path: alternatives.FetchPath = ...,
     ) -> ImpactResponse: ...
 
 
@@ -963,11 +971,17 @@ def _impact(
     with_alternative: bool = False,
     from_stop: str | None = None,
     to_stop: str | None = None,
+    *,
+    path: alternatives.FetchPath = alternatives._POLLER_PATH,
 ) -> ImpactResponse | None:
     """One /impact call for a journey's boarding window, or None when unconfigured.
 
     `from_stop`/`to_stop` override the journey's own refs so :func:`match_journey` can ask about the
     other refs of the same physical place (see :func:`place_refs`).
+
+    `path` is forwarded on every call and defaults to the poller's budget, which is what every
+    caller before 2026-09-10 spent (`main._varsel_impact` hard-coded it); the journey-alert pull
+    read passes its own so a burst of reads cannot starve the push cycle's reserved share.
 
     `min_impact` is :func:`alert_policy.min_threshold` rather than a per-operator cut: the operator
     is a property of the matched train, which is only known after the call. It is the floor of the
@@ -984,6 +998,7 @@ def _impact(
         catchable_after=catchable_after,
         with_alternative=with_alternative,
         min_impact=min_threshold() if with_alternative else 0.0,
+        path=path,
     )
 
 
@@ -1457,7 +1472,11 @@ class Alert(BaseModel):
 
 
 def match_journey(
-    journey: dict, now: datetime | None = None, *, with_alternative: bool = False
+    journey: dict,
+    now: datetime | None = None,
+    *,
+    with_alternative: bool = False,
+    path: alternatives.FetchPath = alternatives._POLLER_PATH,
 ) -> list[Alert]:
     """Situations currently hitting `journey`, worst-first — one :class:`Alert` per situation.
 
@@ -1479,6 +1498,8 @@ def match_journey(
     and a device with 20 registered journeys x 2 windows would fan out ~40 of them on a single
     request. The poller passes True (the push is where the advice matters); the request path leaves it
     off and the in-app list shows the cached written message, which already names the alternative.
+
+    `path` says whose Journey Planner budget those lookups spend (see :func:`_impact`).
     """
     if now is None:
         now = datetime.now(UTC)
@@ -1503,7 +1524,7 @@ def match_journey(
             impact = _impact(
                 journey, window_start, window_end, catchable_after=now,
                 with_alternative=with_alternative and pair_index == 0,
-                from_stop=from_ref, to_stop=to_ref,
+                from_stop=from_ref, to_stop=to_ref, path=path,
             )
             if impact is None:
                 continue
@@ -1518,6 +1539,7 @@ def match_journey(
                             getattr(sit, "alternative_journey", None),
                             bool(getattr(sit, "original_is_best", False)),
                             subject,
+                            bool(getattr(sit, "answered", True)),
                         ),
                     )
             _collect_alerts(impact, worst_by_situation, now=now)
@@ -1553,6 +1575,7 @@ def match_journey(
                     "alternative_journey": known.journey,
                     "original_is_best": known.original_is_best,
                     "alternative_subject": known.subject,
+                    "answered": known.answered,
                 }
             )
 
@@ -1603,7 +1626,7 @@ def _collect_alerts(
             alertworthy=alertworthy,
             latest_observation=observation_by_line.get(sit.line),
             alternative_journey=getattr(sit, "alternative_journey", None),
-            # This situation's own lookup, projected onto the response the alert carries: the three
+            # This situation's own lookup, projected onto the response the alert carries: the four
             # alternative fields are the only ones that differ per situation, and every reader
             # downstream (`decisions._alternative_status`, `_reconcile_caches`,
             # `llm_message.build_message_input`) reaches for them through `alert.impact`. Projecting
@@ -1614,6 +1637,9 @@ def _collect_alerts(
                     "alternative_journey": getattr(sit, "alternative_journey", None),
                     "original_is_best": bool(getattr(sit, "original_is_best", False)),
                     "alternative_subject": getattr(sit, "alternative_subject", None),
+                    # Defaulted True like the model field: a synthetic provider that predates the
+                    # flag is reporting terminal absences, not throttled lookups.
+                    "answered": bool(getattr(sit, "answered", True)),
                 }
             ),
         )

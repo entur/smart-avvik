@@ -1075,13 +1075,14 @@ class _JourneyPlanner:
     `answered` is the real function's out-parameter: False says no reply was obtained at all (an
     outage, the post-failure cooldown, a spent fetch budget), as distinct from a reply that came
     back empty. It defaults to True, because that is what the real lookup reports for every reply it
-    actually got — including an empty one.
+    actually got — including an empty one. A sequence answers per call (the last value repeats), so
+    a test can have the first query reply and the fallback go unanswered.
     """
 
     def __init__(self, *replies, raises=False, answered=True):
         self.replies = [list(r) for r in replies]
         self.raises = raises
-        self.answered = answered
+        self.answered = list(answered) if isinstance(answered, (list, tuple)) else [answered]
         self.calls: list[dict] = []
 
     def __call__(self, from_stop, to_stop, *, arrive_by, date_time, now, path="request",
@@ -1090,11 +1091,11 @@ class _JourneyPlanner:
             {"from_stop": from_stop, "to_stop": to_stop, "arrive_by": arrive_by,
              "date_time": date_time, "now": now, "path": path}
         )
+        index = len(self.calls) - 1
         if outcome is not None:
-            outcome["answered"] = self.answered
+            outcome["answered"] = self.answered[min(index, len(self.answered) - 1)]
         if self.raises:
             raise RuntimeError("JP down")
-        index = len(self.calls) - 1
         return self.replies[index] if index < len(self.replies) else []
 
 
@@ -1884,6 +1885,55 @@ def test_impact_endpoint_is_not_a_coroutine():
     import inspect
 
     assert not inspect.iscoroutinefunction(main.impact)
+
+
+def test_an_unanswered_lookup_is_distinguishable_from_an_empty_one_on_the_response():
+    """The journey-alert pull read (2026-09-10) serves `unanswered` for a lookup that obtained no
+    reply and `none_found` for one that did and had nothing. Until now the two collapsed into one
+    outcome the moment `_best_remaining_journey` returned, and every Alert downstream inherited the
+    collapse — so a throttled Journey Planner would have been cached as "no alternative exists".
+
+    Four readings, on one scope. Answered-and-empty: a lookup ran to completion (`subject` set) and
+    `answered` is true. A throttled first query, a throttled fallback and a raising lookup: each is
+    `answered` false. Capped by `_MAX_ALTERNATIVE_LOOKUPS`: terminal, so it stays true — "we did not
+    look" and "we could not get an answer" must not be worded alike either.
+    """
+    now = datetime.now(UTC)
+    scope = _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93))
+
+    resp = _for_trip(scope, _JourneyPlanner([], []), now=now)
+    sit = resp.situations[0]
+    assert sit.alternative_subject == ("VYG", "j1") and sit.alternative_journey is None
+    assert sit.answered is True, "an answered-but-empty search is a terminal answer"
+    assert resp.answered is True, "the headline echoes situations[0]"
+    assert "answered" not in sit.model_dump() and "answered" not in resp.model_dump(), (
+        "internal working state, kept off the wire like the other two"
+    )
+
+    resp = _for_trip(scope, _JourneyPlanner([], answered=False), now=now)
+    assert resp.situations[0].answered is False, "a throttled first query"
+    assert resp.answered is False
+
+    resp = _for_trip(scope, _JourneyPlanner([], [], answered=[True, False]), now=now)
+    assert resp.situations[0].answered is False, "an answered first query, a throttled fallback"
+
+    resp = _for_trip(scope, _JourneyPlanner(raises=True), now=now)
+    assert resp.situations[0].answered is False, "a raising lookup obtained no answer"
+    assert resp.situations[0].alternative_subject is None, (
+        "and the failure branch still leaves the decision-log status untouched"
+    )
+
+    capped = _scope(**{
+        f"S{i}": _live_train(now, f"j{i}", dep_min=10 + i, arr_min=50 + i, p_impact_dep=0.93,
+                             line=f"VYG:Line:R{i}", situation_number=f"S{i}")
+        for i in range(impact._MAX_ALTERNATIVE_LOOKUPS + 1)
+    })
+    resp = _for_trip(capped, _JourneyPlanner(answered=False), now=now)
+    by_sit = {s.situation_number: s for s in resp.situations}
+    last = f"S{impact._MAX_ALTERNATIVE_LOOKUPS}"
+    assert by_sit[last].alternative_subject is None, "control: the last train was capped"
+    assert by_sit[last].answered is True, "capped is terminal, not transient"
+    assert by_sit["S0"].answered is False, "while the looked-up trains were throttled"
 
 
 def _run():
