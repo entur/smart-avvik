@@ -1,0 +1,53 @@
+{
+  "alert_id": "test-3ed29acb46205904ea1b95ca",
+  "call_date": "2026-09-10",
+  "event_id": "test-3ed29acb46205904ea1b95ca",
+  "external_ref": "laptop-smoke",
+  "journey_ref": "KIX:Test:3ed29acb46205904ea1b95ca",
+  "line": "VYG:Line:L1",
+  "occurred_at": "2026-09-10T19:21:39.291100+00:00",
+  "operator": "VYG",
+  "payload": {
+    "alternative_journey": null,
+    "call": {
+      "aimed_departure_time": "2026-09-10T20:06:39.291100+00:00",
+      "departs_tomorrow": false,
+      "stop_order": 1,
+      "stop_place": "NSR:StopPlace:508"
+    },
+    "delay": null,
+    "effect": "cancelled",
+    "notification": {
+      "action": null,
+      "body": "NSR:StopPlace:508 → NSR:StopPlace:200\nDette er et testvarsel fra Entur. Ingen virkelige avganger er berørt.",
+      "title": "Testvarsel: Tog L1 er innstilt"
+    },
+    "probabilities": {
+      "alert_threshold": 0.85,
+      "cancellation": 1.0,
+      "delay_ge10": null,
+      "impact": 1.0
+    },
+    "situations": [
+      {
+        "description": "Syntetisk hendelse sendt fra /notification-api/v1/test-events. Ingen virkelige avganger er berørt.",
+        "has_situation": false,
+        "situation_number": "KIX:TestEvent:3ed29acb46205904ea1b95ca",
+        "summary": "Testvarsel fra Entur"
+      }
+    ]
+  },
+  "phase": "confirmed",
+  "revision": 364041,
+  "schema_version": "1",
+  "situations": [
+    "KIX:TestEvent:3ed29acb46205904ea1b95ca"
+  ],
+  "stop_order": 1,
+  "stop_place": "NSR:StopPlace:508",
+  "subscription_id": "kix-smoke~smoke-1",
+  "subscription_version": 1,
+  "test": true,
+  "type": "journey.alert.created",
+  "valid_until": "2026-09-10T20:06:39.291100+00:00"
+}
