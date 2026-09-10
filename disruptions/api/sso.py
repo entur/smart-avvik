@@ -1,13 +1,24 @@
-"""Entur-SSO gate for the internal surfaces: /historikk and /meldinger, pages and APIs both.
+"""Entur-SSO gate for the internal surfaces: /historikk, /meldinger, /rushhistorikk and /demo,
+pages and APIs both.
 
-Google OIDC against the entur.org Workspace — the same flow ki.entur.no and Kompass use — enforced
-in this process, because nothing upstream enforces anything: the platform ingress is a shared
-host router, and the kix gateway's SSO is a portal-UI property, not an HTTP one (its own host
-serves ``/kix/*`` to anyone). The choice of Google over Entra ID is practical, not doctrinal: an
-OAuth client in this app's own GCP project is self-service (consent screen "Internal" restricts it
-to the entur.org organisation), while an Entra app registration is a request to another team. The
-flow and this module are issuer-agnostic enough that swapping later is a config-plus-verifier
-change, not a redesign.
+OpenID Connect against **Auth0's partner tenant** (``partner.<dev|staging|>.entur.org``), which
+federates Entur staff and hired-in consultants from Entra ID through its ``entur-waad``
+connection — the official route (Team Sikkerhet's Golden Path, «How to implement
+authentication»), enforced in this process because nothing upstream enforces anything: the
+platform ingress is a shared host router, and the kix gateway's SSO is a portal-UI property, not an
+HTTP one. It replaced a Google-OIDC gate on 2026-09-10; that one needed an OAuth client in this
+app's own GCP project, and the ``roles/oauthconfig.editor`` it takes is not on the platform's
+assignable-roles list (tf-gcp-apps PR #724's answer was "use Auth0"). The flow is the same
+authorization-code exchange either way — what moved is the endpoints, the verifier and the
+access rule.
+
+**The access rule is the organisation claim, not the tenant.** The partner tenant hosts every
+partner operator's users too, so "authenticated by it" is not "works at Entur". A tenant action
+(``auth0-tf-partner/actions/add-organisationID-to-tokens``) puts ``https://entur.io/organisationID``
+on the id_token when ``profile`` is in scope — a JSON number, Entur's is 1 — and denies the login
+outright when a user has none; ``_claims_problem`` requires exactly that value. The application is
+also registered with only the ``entur-waad`` connection enabled, and ``/auth/login`` names it, so a
+partner user never gets as far as the claim check; neither of those two is the lock.
 
 What is gated is exactly :data:`PROTECTED_PREFIXES` — entries are absolute path prefixes, so a
 new one MUST start with "/" (every ASGI path does; an unslashed entry matches nothing and the
@@ -16,29 +27,34 @@ Everything else — /varsel, /togmelding, the read-only APIs — is deliberately
 the traveller-facing surfaces, and this gate exists so the internal ones (and the partner demo)
 can stop being public without moving anybody's URL.
 
-**Failure posture: closed.** ``SSO_REQUIRED=true`` with a missing client id/secret serves the
-protected paths as 503, never as public — a deployment that loses an env var must not quietly
-republish the decision log. ``SSO_REQUIRED`` unset or falsy is the documented off switch and the
-rollback: everything serves exactly as before this module existed.
+**Failure posture: closed.** ``SSO_REQUIRED=true`` with a missing domain, client id or client
+secret serves the protected paths as 503, never as public — a deployment that loses an env var
+must not quietly republish the decision log. ``SSO_REQUIRED`` unset or falsy is the documented off
+switch and the rollback: everything serves exactly as before this module existed.
 
 **Sessions** are a signed cookie (HMAC-SHA256 over ``{email, exp}``), 12 h, HttpOnly,
 SameSite=Lax. There is no server-side session store and no revocation — acceptable for a gate
 whose failure mode was "public". If ``SSO_SESSION_SECRET`` is unset (or under 32 chars) the key is
 per-process, so every redeploy logs everyone out; the re-login is a silent redirect bounce while
-the browser's Google session lives, but in-flight XHR on an open page gets 401s until reload, so
-deployed environments should set the secret. Expiry behaves the same way: the SPAs' fetches start
-returning 401 and a reload logs back in.
+the Auth0 session lives, but in-flight XHR on an open page gets 401s until reload, so deployed
+environments should set the secret. Expiry behaves the same way: the SPAs' fetches start
+returning 401 and a reload logs back in. ``/auth/logout`` ends the Auth0 session as well as ours,
+because Auth0's SSO cookie outlives our cookie and the next ``/auth/login`` would otherwise mint a
+new session without a prompt.
 
-Operational recipe, per environment (the OAuth client cannot be Terraformed — it is a console
-resource, like the VAPID keypair):
+Operational recipe, per environment (the application is a dashboard resource the tenant owners
+create by hand — a Slack request per the Golden Path, not a PR; ours was posted 2026-09-09):
 
-1. In ``ent-kixavvik-<env>``: APIs & Services → OAuth consent screen → User type **Internal**.
-2. Credentials → Create credentials → OAuth client ID → **Web application**, authorized redirect
-   URI ``https://<host>/auth/callback`` (kix-avvik.dev.entur.io / kix-avvik.staging.entur.io /
-   kix-avvik.entur.io; add ``http://localhost:8080/auth/callback`` for local runs if wanted).
-3. Wire the env: ``SSO_GOOGLE_CLIENT_ID`` (configmap — it is not a secret),
-   ``SSO_GOOGLE_CLIENT_SECRET`` and ``SSO_SESSION_SECRET`` (Secret Manager, like the VAPID keys),
-   then flip ``SSO_REQUIRED`` to ``"true"``.
+1. Ask for a **Regular Web Application** in the partner tenant of that environment, callback
+   ``https://<host>/auth/callback`` (kix-avvik.dev.entur.io / kix-avvik.staging.entur.io /
+   kix-avvik.entur.io; ``http://localhost:8000/auth/callback`` on dev for local runs — 8000 is the
+   local port, 8080 is the container's), logout URL ``https://<host>/``, only the ``entur-waad``
+   connection enabled, no API/audience.
+2. Wire the env: ``SSO_AUTH0_DOMAIN`` and ``SSO_AUTH0_CLIENT_ID`` (configmap — neither is a
+   secret; the client id is in every login redirect), ``SSO_AUTH0_CLIENT_SECRET`` and
+   ``SSO_SESSION_SECRET`` (Secret Manager, their own ExternalSecret group, and the values must
+   exist BEFORE the names land in Helm — see the env values files), then flip ``SSO_REQUIRED``
+   to ``"true"``. ``SSO_AUTH0_CONNECTION`` overrides the connection hint (empty disables it).
 
 All configuration is read at call time, not import (deployment.py's rule), so tests can set the
 variables around a request.
@@ -53,6 +69,7 @@ import json
 import logging
 import os
 import secrets
+import threading
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -77,12 +94,24 @@ PROTECTED_PREFIXES = (
 )
 
 _COOKIE_NAME = "kix_sso"
-_SESSION_TTL_S = 12 * 3600  # a working day; renewal is a silent bounce while the Google session lives
-_STATE_TTL_S = 600  # how long a login redirect may sit on the Google screen before the state expires
+_SESSION_TTL_S = 12 * 3600  # a working day; renewal is a silent bounce while the Auth0 session lives
+_STATE_TTL_S = 600  # how long a login redirect may sit on the Entra screen before the state expires
 
-_GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-_GOOGLE_ISSUERS = ("https://accounts.google.com", "accounts.google.com")
+# The claim the tenant's action sets and the value that means Entur (auth0-tf-partner,
+# add-organisationID-to-profile: `Number.parseInt` of the connection's metadata, so a JSON number).
+_ORGANISATION_CLAIM = "https://entur.io/organisationID"
+_ENTUR_ORGANISATION_ID = 1
+# The Entra federation for Entur staff. A hint on /authorize that skips Universal Login's
+# connection chooser; the application is registered with only this connection anyway.
+_DEFAULT_CONNECTION = "entur-waad"
+# `profile` is what puts the organisation claim on the id_token (the action tests the raw scope
+# string for the word); `email` is the session identity and the audit trail.
+_SCOPE = "openid email profile"
+# Asymmetric only. HS256 is on the tenant's supported list and would take the client secret as the
+# key — never accept it, and never pass the secret to a verifier.
+_ID_TOKEN_ALGORITHMS = ("RS256", "PS256")
+_CLOCK_LEEWAY_S = 30
+_JWKS_TTL_S = 3600  # how long a fetched key set is served before it is re-read; an unknown kid refetches at once
 
 _TRUTHY = ("true", "1", "yes", "on")  # the same allow-list as llm_message._TRUTHY
 
@@ -92,20 +121,50 @@ def required() -> bool:
     return os.environ.get("SSO_REQUIRED", "").strip().lower() in _TRUTHY
 
 
+def _domain() -> str:
+    """The tenant host, bare: `partner.dev.entur.org`. A pasted `https://…/` is tolerated."""
+    value = os.environ.get("SSO_AUTH0_DOMAIN", "").strip()
+    for prefix in ("https://", "http://"):
+        value = value.removeprefix(prefix)
+    return value.strip("/")
+
+
 def _client_id() -> str:
-    return os.environ.get("SSO_GOOGLE_CLIENT_ID", "").strip()
+    return os.environ.get("SSO_AUTH0_CLIENT_ID", "").strip()
 
 
 def _client_secret() -> str:
-    return os.environ.get("SSO_GOOGLE_CLIENT_SECRET", "").strip()
+    return os.environ.get("SSO_AUTH0_CLIENT_SECRET", "").strip()
+
+
+def _connection() -> str:
+    return os.environ.get("SSO_AUTH0_CONNECTION", _DEFAULT_CONNECTION).strip()
 
 
 def configured() -> bool:
-    return bool(_client_id() and _client_secret())
+    return bool(_domain() and _client_id() and _client_secret())
 
 
-def _allowed_domain() -> str:
-    return os.environ.get("SSO_ALLOWED_DOMAIN", "entur.org").strip().lower()
+# Auth0's endpoints are fixed relative to the tenant host (confirmed against all three tenants'
+# /.well-known/openid-configuration on 2026-09-10); the issuer carries a trailing slash.
+def _issuer() -> str:
+    return f"https://{_domain()}/"
+
+
+def _authorize_url() -> str:
+    return f"https://{_domain()}/authorize"
+
+
+def _token_url() -> str:
+    return f"https://{_domain()}/oauth/token"
+
+
+def _jwks_url() -> str:
+    return f"https://{_domain()}/.well-known/jwks.json"
+
+
+def _logout_url() -> str:
+    return f"https://{_domain()}/v2/logout"
 
 
 # Fallback signing key when SSO_SESSION_SECRET is absent: per-process, so sessions die with the
@@ -223,14 +282,18 @@ def _is_local(host: str) -> bool:
     return host.split(":")[0] in ("localhost", "127.0.0.1")
 
 
-def _redirect_uri(request: Request) -> str:
-    """The callback URL as Google must see it. Derived from the Host header, with the scheme
-    forced to https except locally: uvicorn runs without --proxy-headers (Dockerfile CMD), so
-    request.url.scheme is plain http in-cluster while the ingress terminates TLS. A forged Host
-    only produces a redirect_uri Google refuses as unregistered."""
+def _origin(request: Request) -> str:
+    """This deployment's own origin as Auth0 must see it. Derived from the Host header, with the
+    scheme forced to https except locally: uvicorn runs without --proxy-headers (Dockerfile CMD),
+    so request.url.scheme is plain http in-cluster while the ingress terminates TLS. A forged Host
+    only produces a URL Auth0 refuses as unregistered."""
     host = request.headers.get("host") or "localhost"
     scheme = "http" if _is_local(host) else "https"
-    return f"{scheme}://{host}/auth/callback"
+    return f"{scheme}://{host}"
+
+
+def _redirect_uri(request: Request) -> str:
+    return f"{_origin(request)}/auth/callback"
 
 
 def _safe_next(value: str) -> str:
@@ -254,14 +317,16 @@ def login(request: Request, next: str = "/") -> Response:
         "response_type": "code",
         "client_id": _client_id(),
         "redirect_uri": _redirect_uri(request),
-        "scope": "openid email",
+        "scope": _SCOPE,
         "state": state,
         "nonce": nonce,
-        # A UX hint that preselects the entur.org account on Google's chooser. It is NOT the
-        # enforcement — that is _claims_problem's hd check on the verified token.
-        "hd": _allowed_domain(),
     }
-    return RedirectResponse(f"{_GOOGLE_AUTH_URL}?{urlencode(params)}", status_code=302)
+    connection = _connection()
+    if connection:
+        # Straight to Entra instead of Universal Login's chooser. A UX hint, NOT the enforcement —
+        # that is _claims_problem's organisation check on the verified token.
+        params["connection"] = connection
+    return RedirectResponse(f"{_authorize_url()}?{urlencode(params)}", status_code=302)
 
 
 def _exchange_code(code: str, redirect_uri: str) -> str:
@@ -273,7 +338,7 @@ def _exchange_code(code: str, redirect_uri: str) -> str:
     import requests
 
     resp = requests.post(
-        _GOOGLE_TOKEN_URL,
+        _token_url(),
         data={
             "grant_type": "authorization_code",
             "code": code,
@@ -290,36 +355,71 @@ def _exchange_code(code: str, redirect_uri: str) -> str:
     return id_token_jwt
 
 
-def _verify_id_token(id_token_jwt: str) -> dict[str, Any]:
-    """Signature (against Google's published certs), issuer, audience and expiry — google-auth is
-    already in the image via the BigQuery client. Also a test seam."""
-    from google.auth.transport import requests as google_requests
-    from google.oauth2 import id_token as google_id_token
+# One key-set client per JWKS URL (one per deployment in practice), so the tenant's keys are
+# fetched once per _JWKS_TTL_S rather than once per login. PyJWT refetches on an unknown kid, which
+# is how a tenant key rotation is picked up without waiting out the TTL.
+_jwks_clients: dict[str, Any] = {}
+_jwks_lock = threading.Lock()
 
-    return google_id_token.verify_oauth2_token(
-        id_token_jwt, google_requests.Request(), audience=_client_id()
+
+def _jwks_client(url: str) -> Any:
+    import jwt
+
+    with _jwks_lock:
+        client = _jwks_clients.get(url)
+        if client is None:
+            client = jwt.PyJWKClient(url, cache_keys=True, lifespan=_JWKS_TTL_S, timeout=10)
+            _jwks_clients[url] = client
+        return client
+
+
+def _verify_id_token(id_token_jwt: str) -> dict[str, Any]:
+    """Signature (against the tenant's published JWKS), issuer, audience and expiry. Also a test
+    seam; the suite exercises the real thing once with a key of its own."""
+    import jwt
+
+    signing_key = _jwks_client(_jwks_url()).get_signing_key_from_jwt(id_token_jwt)
+    return jwt.decode(
+        id_token_jwt,
+        signing_key.key,
+        algorithms=list(_ID_TOKEN_ALGORITHMS),
+        audience=_client_id(),
+        issuer=_issuer(),
+        leeway=_CLOCK_LEEWAY_S,
+        options={"require": ["exp", "iat", "iss", "aud", "sub"]},
     )
+
+
+def _organisation_id(claims: dict[str, Any]) -> int | None:
+    """The organisation claim as an int, or None when absent or unreadable. The action writes a
+    number; a string copy of one is tolerated, a bool (which int() would read as 1) is not."""
+    value = claims.get(_ORGANISATION_CLAIM)
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _claims_problem(claims: dict[str, Any], expected_nonce: str) -> str | None:
     """Why these verified claims still must not become a session, or None when they may.
 
-    The hd check is the actual access rule — "an entur.org Workspace identity" — and the email
-    suffix check restates it from a second claim on purpose. verify_oauth2_token already refuses
-    a non-Google issuer; the check here is belt and braces, not the lock.
+    The organisation check is the actual access rule — "an Entur identity", whichever partner
+    tenant connection produced it. jwt.decode already refuses another issuer; the check here is
+    belt and braces, not the lock.
     """
-    if claims.get("iss") not in _GOOGLE_ISSUERS:
+    if claims.get("iss") != _issuer():
         return "wrong_issuer"
     if claims.get("nonce") != expected_nonce:
         return "nonce_mismatch"
-    if not claims.get("email_verified"):
-        return "email_not_verified"
-    domain = _allowed_domain()
-    if claims.get("hd") != domain:
-        return "wrong_hosted_domain"
-    email = (claims.get("email") or "").lower()
-    if not email.endswith("@" + domain):
-        return "wrong_email_domain"
+    organisation = _organisation_id(claims)
+    if organisation is None:
+        return "no_organisation"
+    if organisation != _ENTUR_ORGANISATION_ID:
+        return "wrong_organisation"
+    if not claims.get("email"):
+        return "no_email"
     return None
 
 
@@ -329,6 +429,7 @@ def callback(
     code: str | None = None,
     state: str | None = None,
     error: str | None = None,
+    error_description: str | None = None,
 ) -> Response:
     if not (required() and configured()):
         return JSONResponse({"detail": "not_found"}, status_code=404)
@@ -336,7 +437,21 @@ def callback(
     if state_payload is None:
         return JSONResponse({"detail": "invalid_state"}, status_code=400)
     if error or not code:
-        # The user (or Google) declined; nothing to verify. The error slug is Google's, not ours.
+        # The user, Entra or the tenant declined; nothing to verify. The slug is Auth0's, not ours
+        # (`access_denied` is what its organisation action answers with), and the description is
+        # logged rather than echoed.
+        logger.info(
+            "SSO login refused upstream: %s",
+            error or "no_code",
+            extra={
+                "fields": {
+                    "event": "sso_login",
+                    "result": "refused",
+                    "error": error or "no_code",
+                    "description": error_description,
+                }
+            },
+        )
         return JSONResponse({"detail": f"login_refused:{error or 'no_code'}"}, status_code=403)
     try:
         claims = _verify_id_token(_exchange_code(code, _redirect_uri(request)))
@@ -349,7 +464,8 @@ def callback(
         return JSONResponse({"detail": "token_exchange_failed"}, status_code=502)
     problem = _claims_problem(claims, state_payload.get("nonce", ""))
     if problem:
-        # The reason, never the token. hd/email of a refused login are logged for the audit trail.
+        # The reason, never the token. Organisation, subject and email of a refused login are
+        # logged for the audit trail.
         logger.warning(
             "SSO login rejected: %s",
             problem,
@@ -358,7 +474,8 @@ def callback(
                     "event": "sso_login",
                     "result": "rejected",
                     "reason": problem,
-                    "hd": claims.get("hd"),
+                    "organisation_id": claims.get(_ORGANISATION_CLAIM),
+                    "sub": claims.get("sub"),
                     "email": claims.get("email"),
                 }
             },
@@ -384,7 +501,16 @@ def callback(
 
 
 @router.get("/logout", include_in_schema=False)
-def logout() -> Response:
-    response: Response = RedirectResponse("/", status_code=302)
+def logout(request: Request) -> Response:
+    """Drop our cookie and end the Auth0 session, landing back on this host's root — which is
+    the application's registered logout URL, per environment. Not `federated`: that would sign
+    the person out of Entra and every Microsoft 365 tab with it. With the gate off there is no
+    Auth0 session to end, so the redirect is just home."""
+    if required() and configured():
+        params = {"client_id": _client_id(), "returnTo": f"{_origin(request)}/"}
+        target = f"{_logout_url()}?{urlencode(params)}"
+    else:
+        target = "/"
+    response: Response = RedirectResponse(target, status_code=302)
     response.delete_cookie(_COOKIE_NAME, path="/")
     return response
