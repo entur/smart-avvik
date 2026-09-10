@@ -63,6 +63,8 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
+import metrics  # sibling leaf module (no main import): the decision-write counter (KTD11)
+
 if TYPE_CHECKING:  # type-checker only: no runtime import, so the varsel <-> decisions cycle stays broken
     from varsel import Alert
 
@@ -497,11 +499,16 @@ def record(rows: list[dict]) -> int:
     BigQuery outage on the path between a live disruption and a traveller's phone.
     """
     if not rows or not ensure_table():
+        # No write was attempted, so no outcome to count — an `error` increment here would page
+        # on every deployment that simply has no client configured.
         return 0
     try:
         errors = _bq_client.insert_rows_json(TABLE, rows)
     except Exception:
         logger.warning("Could not record %d alert decisions", len(rows), exc_info=True)
+        # The write fails open by design, which is exactly why the failure needs a counter: the
+        # log going quiet is otherwise invisible (KTD11).
+        metrics.DECISION_WRITE_TOTAL.labels(result="error").inc()
         return 0
     if errors:
         # insert_rows_json reports per-row failures instead of raising, so a schema drift shows up
@@ -513,10 +520,12 @@ def record(rows: list[dict]) -> int:
             errors[:3],
             extra={"fields": {"event": "varsel_decision_write", "result": "partial"}},
         )
+        metrics.DECISION_WRITE_TOTAL.labels(result="partial").inc()
         return len(rows) - len(errors)
     logger.info(
         "Recorded %d alert decisions",
         len(rows),
         extra={"fields": {"event": "varsel_decision_write", "result": "ok", "n_rows": len(rows)}},
     )
+    metrics.DECISION_WRITE_TOTAL.labels(result="ok").inc()
     return len(rows)

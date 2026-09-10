@@ -101,6 +101,7 @@ from zoneinfo import ZoneInfo
 import alternatives  # the Journey Planner fetch-path vocabulary the matcher forwards
 import feedback
 import feedback_contexts
+import metrics  # sibling leaf module (no main import): the push-delivery counter (KTD11)
 import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
 import reserved_budget  # the one reserve-don't-check pass budget
@@ -1983,7 +1984,7 @@ def _send_push(subscription: dict, payload: dict) -> str:
             # thread and stop ingestion for every other feature (review 2026-07-29).
             timeout=_PUSH_TIMEOUT_S,
         )
-        return "sent"
+        result = "sent"
     except WebPushException as exc:
         status = getattr(exc.response, "status_code", None)
         body = (getattr(exc.response, "text", "") or "")[:400]
@@ -1992,12 +1993,16 @@ def _send_push(subscription: dict, payload: dict) -> str:
         logger.warning(
             "Web push failed: status=%s host=%s body=%r exc=%s", status, host, body, exc
         )
-        if status in (404, 410):
-            return "gone"
-        return "error"
+        result = "gone" if status in (404, 410) else "error"
     except Exception:
         logger.exception("Web push raised unexpectedly")
-        return "error"
+        result = "error"
+    # Exactly one increment per delivery attempt, on the single exit (KTD11) — a per-branch
+    # `return` here is how the unexpected-exception path quietly stops being counted. The push
+    # KIND stays in the structured `event="push"` log, never in a label, so the series set is
+    # fixed at three.
+    metrics.PUSH_TOTAL.labels(result=result).inc()
+    return result
 
 
 def _log_push(
