@@ -104,8 +104,8 @@ property of the poller, which is the sentence this document leans on everywhere 
 channel still emits and delivers, carrying the deterministic template wording; the model is not asked
 and nothing is charged.
 
-**It is set in ONE Helm values file — dev, since 2026-09-10 — and the reason is not the webhook
-channel.** The public journey-keyed read (`GET /notification-api/v1/journey-alerts`, plan
+**It is set in TWO Helm values files — dev and prd, both since 2026-09-10 — and the reason is not
+the webhook channel.** The public journey-keyed read (`GET /notification-api/v1/journey-alerts`, plan
 2026-09-10-001) follows this same switch: whether an entry's `payload.notification` carries the
 model's prose is `notification_wording.PULL`'s `deliver` gate, which is `webhook_delivery_enabled()`,
 the same function the event's wording reads. The flag is import-time and defaults off, so without
@@ -113,10 +113,12 @@ the chart line the read would have shipped template-only in dev and defeated the
 enrichment — hence `helm/kix-avvik/env/values-kub-ent-dev.yaml` sets it to `"true"`, with the comment
 naming the read as the reason and `NOTIFICATION_WEBHOOKS_ENABLED` (off in dev) as what keeps it
 inert for events: no subscription is loaded and nothing is minted or delivered, so the only surface
-the value reaches in dev is the read. tst and prd do not set it; there every entry the read serves
-reads `wording.status: disabled` with the template, which is correct and complete. Turning it on for
-the webhook channel's own prose in tst or prd is still the rollout order's second step below, and a
-restart applies it.
+the value reaches in dev is the read. prd set it later the same day, on the product owner's call,
+for the same reason and with the same thing keeping it inert for events (`NOTIFICATION_WEBHOOKS_ENABLED`
+is off in prd too), so a read on `kix-avvik.entur.io` carries the model's prose under the read's own
+allowances. tst does not set it; there every entry the read serves reads `wording.status: disabled`
+with the template, which is correct and complete. When the webhook channel itself is enabled in an
+environment, this flag's value is the rollout order's second step below and a restart applies it.
 
 **The bad-text revert is therefore TWO switches, and the one an operator already knows does not
 reach every surface.** `VARSEL_LLM_ENABLED=false` returns the *browser push* to the template and
@@ -885,8 +887,9 @@ beside each; the ones still open say who owns them.
 3. **`NOTIFICATION_WEBHOOK_LLM_ENABLED` was in no chart until 2026-09-10.** Whether client prose is the model's is a
    product decision, and the name lands in Helm when that decision is made. **Partly overtaken
    (2026-09-10)**: dev sets it for the public read, which follows the same switch — see section 4
-   — and the webhook channel there is off, so no event carries it yet. For tst and prd it is still
-   the rollout order's second step, and the decision is made when that step is. **Open for the
+   — and prd followed later that day on the product owner's call; the webhook channel is off in
+   both, so no event carries it yet. For tst it is still the rollout order's second step, and
+   for the channel's own prose the decision is made when that step is. **Open for the
    product owner**: whether the read should have a prose switch of its own rather than sharing
    this one.
 4. **Webhook-only routes are unscored** (the fourth KTD12 limitation above). **Decided 2026-09-09:
