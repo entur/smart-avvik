@@ -925,6 +925,45 @@ def test_every_environment_has_an_operator_group_that_can_exist():
         assert group.startswith("sg-dig-"), f"{env}: not an Entra-provisioned group: {group}"
 
 
+def test_the_actor_is_the_adc_users_email_and_never_the_os_user():
+    """A user ADC carries no email attribute, so `_actor_from` used to answer `$USER` for every human
+    and the membership query asked Cloud Identity about "thomas" -- a 403 that reads as an IAM
+    problem. The first real run refused its own author. Now the OpenID userinfo email is taken
+    before the marker, and a marker is refused before the API is asked, with a reason that names
+    the fix rather than the symptom."""
+    import types
+
+    class _UserAdc:  # google.oauth2.credentials.Credentials: token, valid, no email attribute
+        token = "ya29.x"
+        valid = True
+
+    original = tool._email_from_userinfo
+    try:
+        tool._email_from_userinfo = lambda credentials: "operator@entur.org"
+        assert tool._actor_from(_UserAdc()) == "operator@entur.org"
+        tool._email_from_userinfo = lambda credentials: None
+        marker = tool._actor_from(_UserAdc())
+        assert "@" not in marker
+        reason = tool._unresolved_actor_reason(marker)
+        assert reason is not None and reason.startswith("actor_unresolved")
+        assert "application-default login" in reason
+    finally:
+        tool._email_from_userinfo = original
+    sa = types.SimpleNamespace(service_account_email="ci@ent-kixavvik-dev.iam.gserviceaccount.com")
+    assert tool._actor_from(sa) == sa.service_account_email, "a service account needs no lookup"
+    assert tool._unresolved_actor_reason("operator@entur.org") is None
+    assert tool._email_from_userinfo(None) is None
+
+
+def test_the_membership_query_single_quotes_the_member_key():
+    """Cloud Identity's filter accepts `member_key_id == 'x'` and answers the double-quoted form
+    with a 403 that names insufficient permissions, not syntax -- measured 2026-09-10 on the same
+    group and credential. The refusal that produced reads exactly like the IAM gap the docstring
+    warns about, so the spelling is pinned here rather than left to the next first run."""
+    assert "member_key_id == '{actor}'" in TOOL_SOURCE
+    assert 'member_key_id == "{actor}"' not in TOOL_SOURCE
+
+
 def test_the_environment_is_never_inferred():
     """A tool that guessed prd from an exported GOOGLE_CLOUD_PROJECT would be one stale shell
     variable away from provisioning the wrong environment."""
