@@ -1459,6 +1459,9 @@ async def lifespan(app: FastAPI):
     finally:
         stop_event.set()
         thread.join(timeout=5)
+        # The pull read's enrichment pool: stop it without waiting, so a task parked on a Vertex or
+        # Journey Planner call cannot hold the process open past the poller's own five seconds.
+        notification_pull.shutdown()
 
 
 

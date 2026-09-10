@@ -400,7 +400,8 @@ silently.
 | `webhook_delivery_response_truncated` | a 2xx body over the response cap | `limit` |
 | `notification_auth_config` / `webhook_signing_config` | once per process: a secret arrived with whitespace and was stripped | `variable` — the **name only**, never the value |
 | `notification_wording` | a webhook wording fault | `result` (`error`, `rate_limited`), `surface` |
-| `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
+| `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`, and since U4 `enrich_failed` — the same WARNING shape, for the background enrichment task's matcher run or the task itself), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
+| `notification_pull_bounded` | a bound binding on the read's enrichment (U4) | `reason` (`queue_full` — the task was refused and every listed entry marked `capped`; `wordings_per_read`; `alternative_lookups`; `wording_allowance` — the PULL allowance answered `rate_limited`; `waiters` — no waiter slot, the read behaved as `wait=0`), `n` (entries the bound touched), `pair_digest`. Nothing identifying. The read's own record also carries `result="enrich_failed"` at WARNING when the task's matcher run raised — the exception's TYPE in the message, never its text |
 | `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"`, `ms`, `result` |
 
 **What no `notification_*` or `webhook_*` log line carries:** an origin, a destination, a departure time, a full callback
@@ -648,12 +649,37 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `notification_pull.DEFAULT_LIMIT` | 10 |
 | `notification_pull.MAX_LIMIT` | 20 |
 | `notification_pull.FIGURES_CACHE_MAX` | 512 |
+| `notification_pull.MAX_WORDINGS_PER_READ` | 4 |
+| `notification_pull.WORKERS` | 4 |
+| `notification_pull.QUEUE_MAX` | 16 |
+| `notification_pull.WORDING_WORKERS` | 4 |
+| `notification_pull.MAX_CONCURRENT_WAITERS` | 64 |
+| `notification_pull.WORDING_CACHE_MAX` | 10000 |
+| `notification_pull.WORDING_TTL_S` | 43200 |
+| `notification_pull.FAILURE_TTL_S` | 60 |
+| `notification_wording.WORDINGS_PER_MIN` | 30 |
+| `notification_wording.WORDINGS_PER_HOUR` | 500 |
+| `notification_wording.WORDINGS_PER_DAY` | 2000 |
+| `alternatives._PULL_FETCH_MAX_PER_MIN` | 30 |
 
-**The journey-keyed pull read** (plan 2026-09-10-001): the seven `notification_pull.*` rows are the
-public read's own numbers — its limiter (a global per-minute ceiling and a per-stop-pair one in a map
-bounded at `LIMITER_KEYS_MAX`, independent of the credentialed tiers above), its `wait` and `limit`
-bounds, and the per-cycle figures cache. They are the read WITHOUT enrichment (U3); the enrichment
-budget (U4) and the published contract (U5) add their own rows here when they land.
+**The journey-keyed pull read** (plan 2026-09-10-001): the `notification_pull.*` rows are the public
+read's own numbers. The first seven are the read without enrichment (U3) — its limiter (a global
+per-minute ceiling and a per-stop-pair one in a map bounded at `LIMITER_KEYS_MAX`, independent of the
+credentialed tiers above), its `wait` and `limit` bounds, and the per-cycle figures cache. The next
+eight are the enrichment (U4): the wordings one read may spend (`MAX_WORDINGS_PER_READ`, soonest
+departure first; the rest carry the template under `not_worded`), the background pool (`WORKERS`, a
+queue of `QUEUE_MAX` bounded by the module itself — past `WORKERS + QUEUE_MAX` unfinished tasks a new
+definition's read is answered `capped` at once, with its figures — and `WORDING_WORKERS` inside one
+task), the requests that may be parked on a task at once (`MAX_CONCURRENT_WAITERS`; without a slot a
+read behaves as `wait=0`, never a 503), and the two cache lifetimes: a wording lives `WORDING_TTL_S`
+(the situation's own 12 h outer bound, and shorter when the figures refresh no longer lists its
+train) in a map of `WORDING_CACHE_MAX`, an alternative outcome lives `alternatives._TTL`, and a
+transient outcome (`pending` aside: `error`, `rate_limited`, `unanswered`, a queue-full `capped`) is
+a `FAILURE_TTL_S` marker resubmitted on expiry. The four rows after them are the allowances the read
+spends and nothing else does (R4): its wording ceilings per minute, hour and day
+(`notification_wording.WORDINGS_PER_*`, charged to the `pull` path under the `PULL` policy, with its
+own latch holder) and its Journey Planner budget (`alternatives._PULL_FETCH_MAX_PER_MIN`). The
+published contract (U5) adds its own rows here when it lands.
 
 Two numbers on the receiver's side are TypeScript's and are pinned against
 `integrations/notifications-client/src/client.ts` by the same suite: the **64 KiB** inbound ceiling
@@ -681,6 +707,12 @@ the other's, so cleanup deliberately does not try.
 - **What they hold:** prose and its provenance. No client id, no callback URL, no `external_ref`.
 - `notification_wording` holds no journey-keyed cache at all — its module state is a call-count budget
   of timestamps plus per-surface latch holders — so this claim is about `varsel` alone.
+- `notification_pull` (U4) holds a SECOND in-process prose cache, keyed by canonical stop pair and
+  train rather than by journey definition: a wording for up to `WORDING_TTL_S` (12 h, or until the
+  figures refresh no longer lists its train) and an alternative outcome for `alternatives._TTL`.
+  Written for ad-hoc definitions nobody registered as much as for registered ones, it carries no
+  client id, no subscription id and no callback, and a subscription's deletion has nothing in it to
+  reach — the same residual window as `varsel`'s, in memory only, cleared by a redeploy.
 
 **2. Client and event identifiers in cluster logs.** They live in `ent-kub-{dev,prd}`, namespace
 `kix-avvik`, under that project's retention and access policy and not this repo's — nothing here
