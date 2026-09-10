@@ -39,8 +39,9 @@ class _FakeBQ:
     """Dispatches on SQL text. Records every MERGE's parameters, which is the only way a wrong
     write is visible — the module logs and swallows, so an unrecorded failure passes silently."""
 
-    def __init__(self, provisional=(), settled=(), work_set=(), fail_on=None):
+    def __init__(self, provisional=(), settled=(), work_set=(), fail_on=None, issued_today=True):
         self.provisional = list(provisional)
+        self.issued_today = issued_today  # the forecast-day probe's answer for `today'
         self.settled = list(settled)
         self.work_set = list(work_set)
         self.fail_on = fail_on  # a substring: any query containing it raises
@@ -67,6 +68,8 @@ class _FakeBQ:
             kind = "settled" if "settled = TRUE" in sql else "provisional"
             self.merges.append({"kind": kind, **params})
             return _FakeJob([])
+        if "togvarsel_issued" in sql and "LIMIT 1" in sql:
+            return _FakeJob([{"issued": 1}] if self.issued_today else [])
         if "togvarsel_issued" in sql:
             return _FakeJob([{"d": d} for d in self.work_set])
         if "rail_calls_planned_today" in sql:
@@ -259,6 +262,59 @@ def test_the_provisional_pass_runs_once_per_rush_per_day():
     togvarsel_outcomes.refresh(now=_oslo(9, 25))
     togvarsel_outcomes.refresh(now=_oslo(9, 25) + togvarsel_outcomes._FAIL_COOLDOWN + timedelta(minutes=1))
     assert len([q for q in fake.queries if "rail_calls_planned_today" in q]) == 1
+
+
+def _provisional_queries(fake) -> list[str]:
+    return [q for q in fake.queries if "rail_calls_planned_today" in q]
+
+
+def _probe_queries(fake) -> list[str]:
+    return [q for q in fake.queries if "togvarsel_issued" in q and "LIMIT 1" in q]
+
+
+def test_a_weekend_runs_no_provisional_pass_and_asks_nothing():
+    """No forecast is ever issued on a weekend, and the settled pass resolves issued days only — so a
+    provisional row written on a Saturday is a row nothing ever settles. prd carried six of them
+    (5 and 6 September 2026) before this gate existed. Answered without a query: the weekday is
+    known, and a tiny probe per poll tick is still a BigQuery job per poll tick."""
+    saturday = date(2026, 9, 5)
+    fake = _FakeBQ(provisional=[_row("am", 0.12, d=saturday), _row("amrest", 0.11, d=saturday)])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=_oslo(9, 25, d=saturday))
+    togvarsel_outcomes.refresh(now=_oslo(18, 25, d=saturday))
+    # The settled pass still runs its own work-set SELECT on this tick, as on any day; what must be
+    # absent is the provisional read, the probe, and every write.
+    assert _provisional_queries(fake) == [] and _probe_queries(fake) == []
+    assert fake.merges == []
+    assert togvarsel_outcomes._state["provisional_done"] == {"am", "amrest", "pm"}
+
+
+def test_a_weekday_with_no_forecast_is_skipped_and_re_asked_when_the_afternoon_comes_due():
+    """A holiday, or a morning whose issues all failed. The morning scopes are retired on one probe,
+    and the afternoon is probed AGAIN rather than inheriting the morning's no: the 12:00 and 14:00
+    issues can still land on a day the 06:30 and 07:00 did not, and their check is then owed."""
+    fake = _FakeBQ(provisional=[_row("am", 0.12), _row("amrest", 0.11)], issued_today=False)
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=_oslo(9, 25))
+    assert _provisional_queries(fake) == [] and fake.merges == []
+    assert togvarsel_outcomes._state["provisional_done"] == {"am", "amrest"}
+    assert "provisional:am+amrest" not in togvarsel_outcomes._state["backoff"]
+    fake.issued_today = True
+    fake.provisional = [_row("pm", 0.05)]
+    togvarsel_outcomes.refresh(now=_oslo(18, 25))
+    assert len(_probe_queries(fake)) == 2
+    assert {m["scope"] for m in fake.merges} == {"pm"}
+    assert togvarsel_outcomes._state["provisional_done"] == {"am", "amrest", "pm"}
+
+
+def test_the_forecast_day_probe_runs_once_per_weekday_after_a_yes():
+    fake = _FakeBQ(provisional=[_row("am", 0.12), _row("amrest", 0.11)])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=_oslo(9, 25))
+    fake.provisional = [_row("pm", 0.05)]
+    togvarsel_outcomes.refresh(now=_oslo(18, 25))
+    assert len(_probe_queries(fake)) == 1
+    assert len(_provisional_queries(fake)) == 2
 
 
 def test_a_successful_provisional_pass_marks_its_scopes_done_and_backs_off_nothing():
