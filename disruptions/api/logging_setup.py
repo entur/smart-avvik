@@ -47,6 +47,35 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(entry, ensure_ascii=False, default=str)
 
 
+#: Paths whose QUERY STRING is redacted from uvicorn's access log (2026-09-10). The journey-keyed
+#: public read takes a traveller's origin, destination and period as query parameters, and the
+#: access line — `'GET /path?query HTTP/1.1' 200` — would otherwise put exactly the trio
+#: `/historikk-api` refuses to serve into Cloud Logging on every request. A literal here rather
+#: than an import from `notification_pull`: this module is imported before every other one in
+#: `main`, and the suite pins the two against each other instead.
+REDACTED_QUERY_PATHS = ("/notification-api/v1/journey-alerts",)
+_REDACTED_QUERY = "?<redacted>"
+
+
+class _AccessLogRedaction(logging.Filter):
+    """Rewrites the full path of a uvicorn access record for :data:`REDACTED_QUERY_PATHS`.
+
+    uvicorn logs `'%s - "%s %s HTTP/%s" %d'` on the `uvicorn.access` logger with
+    `args = (client_addr, method, full_path, http_version, status_code)`, so the path with its
+    query string is `args[2]`. Only a record of exactly that shape — five args, a str third — is
+    touched, and always by building a NEW tuple; anything else passes through untouched. Always
+    returns True: this is a rewrite, never a drop.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            path, sep, _query = args[2].partition("?")
+            if sep and any(path == p or path.startswith(p + "/") for p in REDACTED_QUERY_PATHS):
+                record.args = (*args[:2], path + _REDACTED_QUERY, *args[3:])
+        return True
+
+
 def setup() -> None:
     """Route ALL logging — including uvicorn's — through one JSON handler on stdout."""
     handler = logging.StreamHandler(sys.stdout)
@@ -60,6 +89,11 @@ def setup() -> None:
         uv_logger = logging.getLogger(name)
         uv_logger.handlers[:] = []
         uv_logger.propagate = True
+    # On the access logger itself, not on root: a logger's filters see only records logged ON it,
+    # and uvicorn logs access lines on this one directly. Installed once, however often setup runs.
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _AccessLogRedaction) for f in access.filters):
+        access.addFilter(_AccessLogRedaction())
 
 
 setup()
