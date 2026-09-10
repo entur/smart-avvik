@@ -910,12 +910,19 @@ def test_the_tool_reports_a_refused_url_as_a_failure_rather_than_a_crash():
         _uninstall()
 
 
-def test_production_has_its_own_operator_group():
-    """R22: "separately for production". Two groups, and the prd one is not the other."""
+def test_every_environment_has_an_operator_group_that_can_exist():
+    """R22 asked for a prd-separate least-privilege group, and this test used to pin exactly that:
+    two groups, `@entur.org`, `prd` in the prd one. None of it could be true -- Entur's groups are
+    Entra `sg-dig-*` groups provisioned by Team Plattform and addressed `@entur.no`, so the pinned
+    names were groups nobody could create and the tool refused every operator. For the pilot
+    (2026-09-10) every environment is gated on the team's own group. Pin what keeps the tool
+    runnable: one group per environment, in the domain Entur's groups actually live in, and a
+    group that the transitive-membership check is known to answer for. When the dedicated groups
+    exist, restore the prd != dev assertion here."""
     assert set(tool.OPERATOR_GROUPS) == set(tool.ENVIRONMENTS)
-    assert tool.OPERATOR_GROUPS["prd"] != tool.OPERATOR_GROUPS["dev"]
-    assert tool.OPERATOR_GROUPS["prd"].endswith("@entur.org")
-    assert "prd" in tool.OPERATOR_GROUPS["prd"]
+    for env, group in tool.OPERATOR_GROUPS.items():
+        assert group.endswith("@entur.no"), f"{env}: Entur groups are @entur.no, not {group}"
+        assert group.startswith("sg-dig-"), f"{env}: not an Entra-provisioned group: {group}"
 
 
 def test_the_environment_is_never_inferred():

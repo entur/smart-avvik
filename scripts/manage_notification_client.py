@@ -6,19 +6,30 @@ the running app: provisioning a client, issuing or revoking a credential, moving
 callback destination and suspending a client are operator actions, and putting any of them behind
 a client credential would let a client grant itself what an operator is supposed to decide.
 
-**Authorization.** Every subcommand -- reads included -- is authorized against a NAMED
-least-privilege Google group, and production has its own:
+**Authorization.** Every subcommand -- reads included -- is authorized against a NAMED Google
+group, and for the pilot that group is the team's own in every environment:
 
 ============  =====================================================================
-``dev``       ``kix-avvik-notification-operators@entur.org``
-``tst``       ``kix-avvik-notification-operators@entur.org``
-``prd``       ``kix-avvik-notification-operators-prd@entur.org``
+``dev``       ``sg-dig-team-ki-eksperimentering@entur.no``
+``tst``       ``sg-dig-team-ki-eksperimentering@entur.no``
+``prd``       ``sg-dig-team-ki-eksperimentering@entur.no``
 ============  =====================================================================
 
-The group is what holds ``roles/datastore.user`` on that environment's GCP project, which is what
-makes the IAM environment-scoped rather than global: each environment is its own project with its
-own runtime identity (KTD5). Reads are gated too, deliberately: a destination's callback URL and a
-client's key ids are exactly what an attacker would want before trying to forge one.
+R22 asked for a least-privilege group with production as its own, and that is still the intended
+end state. It is not what ships (decided 2026-09-10) because a new group at Entur is not
+self-service: the ``sg-dig-*`` groups are Entra security groups created by Team Plattform through
+``tf-azure-ad`` and granted through ``tf-gcp-iam``, they come back as ``@entur.no``, and the two
+dedicated groups this docstring once named had been requested nowhere. The team group already
+reads both ``notifications`` databases through the roles it holds on the folder above the projects
+(``entur.devOps`` among them -- verified from a member's ADC in dev and prd), and the membership
+check below answers for it. What the shortcut gives up is exactly R22's separation: everyone on
+the team is a prd operator. Acceptable while the registrants in prd are the team; moving to the
+dedicated groups is this constant plus the operations document, nothing else.
+
+Reads are gated too, deliberately: a destination's callback URL and a client's key ids are exactly
+what an attacker would want before trying to forge one. Each environment is still its own project
+with its own runtime identity (KTD5), so what a member can reach is bounded by project IAM, not by
+this table.
 
 **``--environment`` picks the target as well as the gate**, and until 2026-09-09 it picked only the
 gate: ``--project`` chose which project was read and written with no comparison between the two, so
@@ -122,12 +133,13 @@ logger = logging.getLogger("manage_notification_client")
 
 ENVIRONMENTS = ("dev", "tst", "prd")
 
-#: R22's named groups. Production is its own, so membership for the environments where a mistake is
-#: cheap does not carry into the one where it is not.
+#: The team group in every environment for the pilot (2026-09-10) -- see the module docstring for
+#: why R22's dedicated, prd-separate groups are the end state and not what ships. Entur groups are
+#: `@entur.no`, never `@entur.org`.
 OPERATOR_GROUPS = {
-    "dev": "kix-avvik-notification-operators@entur.org",
-    "tst": "kix-avvik-notification-operators@entur.org",
-    "prd": "kix-avvik-notification-operators-prd@entur.org",
+    "dev": "sg-dig-team-ki-eksperimentering@entur.no",
+    "tst": "sg-dig-team-ki-eksperimentering@entur.no",
+    "prd": "sg-dig-team-ki-eksperimentering@entur.no",
 }
 
 #: WHICH PROJECT EACH ENVIRONMENT IS, so the gate and the target cannot be chosen separately.
