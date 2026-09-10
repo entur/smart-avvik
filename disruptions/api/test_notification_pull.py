@@ -1276,6 +1276,167 @@ def test_the_module_shuts_its_pool_down_without_waiting():
     assert notification_pull._executor._shutdown is False
 
 
+def _six_trains(now):
+    """Six alert-worthy trains at ten-minute intervals from 06:30 -- two past the wording cap."""
+    return {
+        f"S{i}": _train(now + timedelta(minutes=30 + 10 * i), jkey=f"t{i}", situation=f"S{i}", p_impact_dep=0.9)
+        for i in range(6)
+    }
+
+
+def test_not_worded_is_a_position_in_this_reads_order_not_a_marker_another_definition_can_read(monkeypatch):
+    """Finding #4 (2026-09-10): `not_worded` is POSITIONAL -- past the cap in the order of the
+    definition being read -- and never written to the cache. Persisted under KTD3's key, which
+    carries no definition term, a wide definition's fifth train poisoned every narrower definition
+    on the pair whose FIRST train it was: that read found a terminal record, submitted no task,
+    and served the template as a complete, publicly cacheable answer for twelve hours."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    _use_snapshot(_six_trains(now))
+    words = _fake_wording(monkeypatch)
+    cap = notification_pull.MAX_WORDINGS_PER_READ
+    wide = _get().json()
+    assert [a["wording"]["status"] for a in wide["alerts"]] == ["ok"] * cap + ["not_worded"] * 2
+    assert len(words) == cap
+
+    # A period covering only the fifth train (07:10): for THIS definition it is position 0.
+    narrow = {"begin": "07:05", "end": "07:15", "days": ALL_DAYS}
+    r = _get(wait=0, **narrow)
+    body = r.json()
+    assert [a["train"]["journey_ref"] for a in body["alerts"]] == ["t4"]
+    assert body["alerts"][0]["wording"] == {"source": "deterministic", "status": "pending"}, body["alerts"][0]
+    assert body["complete"] is False and r.headers["Cache-Control"] == "no-store"
+    _join(**narrow)
+    assert sorted(c[1] for c in words) == [f"S{i}" for i in range(cap + 1)], "worded once, for the narrow read"
+    body = _get(wait=0, **narrow).json()
+    assert body["alerts"][0]["wording"] == {"source": "llm", "status": "ok"} and body["complete"] is True
+
+    # Back on the wide definition: a live record wins over position, so its fifth train now reads
+    # the wording the narrow read paid for; the sixth is still past ITS cap, and no task is owed.
+    wide = _get(wait=0).json()
+    assert [a["wording"]["status"] for a in wide["alerts"]] == ["ok"] * (cap + 1) + ["not_worded"]
+    assert wide["complete"] is True and len(words) == cap + 1
+
+
+def test_a_train_past_the_cap_is_worded_once_the_trains_ahead_of_it_have_departed(monkeypatch):
+    """The same finding on one definition over time: the fifth train of a whole-day read is
+    `not_worded` at 06:00 and, once the four ahead of it have left, position 0 -- so the next read
+    finds it `pending` and resubmits the task, which words it. Same Oslo day, so the figures cache
+    hits and the departure cut is the assembly's (`_alive`), never a matcher re-run."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    _use_snapshot({k: v for k, v in _six_trains(now).items() if k != "S5"})
+    words = _fake_wording(monkeypatch)
+    cap = notification_pull.MAX_WORDINGS_PER_READ
+    body = _get().json()
+    assert [a["wording"]["status"] for a in body["alerts"]] == ["ok"] * cap + ["not_worded"]
+    assert len(words) == cap
+    calls = _count_matcher_calls()
+    # 07:05: the 07:00 train's expected departure (aimed + 3 min typical) has passed; the 07:10 has not.
+    notification_pull._now = lambda: now + timedelta(minutes=65)
+    r = _get(wait=0)
+    body = r.json()
+    assert [a["train"]["journey_ref"] for a in body["alerts"]] == ["t4"]
+    assert body["alerts"][0]["wording"] == {"source": "deterministic", "status": "pending"}, body["alerts"][0]
+    assert body["complete"] is False
+    _join()
+    assert sorted(c[1] for c in words) == [f"S{i}" for i in range(cap + 1)], "the resubmitted task worded it"
+    body = _get(wait=0).json()
+    assert body["alerts"][0]["wording"] == {"source": "llm", "status": "ok"} and body["complete"] is True
+    assert calls() == 1, "the figures were a hit; only the resubmitted task ran the matcher"
+
+
+def _failing_enrichment_matcher(monkeypatch):
+    """`varsel.match_journey` as the figures phase sees it, and a `RuntimeError` on the enrichment
+    task's own run (`with_alternative=True`) -- the branch `_hold_matcher` can park but never fail.
+    Returns the count of enrichment runs attempted."""
+    calls = []
+    original = _ORIGINAL_MATCH
+
+    def failing(journey, now=None, *, with_alternative=False, path="poller"):
+        if with_alternative:
+            calls.append(path)
+            raise RuntimeError("boom")
+        return original(journey, now, with_alternative=with_alternative, path=path)
+
+    monkeypatch.setattr(varsel, "match_journey", failing)
+    return calls
+
+
+def test_a_matcher_failure_inside_the_task_marks_every_entry_transient_and_the_read_resubmits_on_expiry(monkeypatch):
+    """Finding #3 (2026-09-10), the enrichment half of `test_a_matcher_failure_is_a_503_...`: the
+    figures phase succeeds and the task's own matcher run raises. Every listed entry then carries
+    `wording error` / `alternative unanswered` -- both transient -- `complete` is false and the
+    answer is `no-store`; the WARNING names the exception's TYPE and nothing of the definition;
+    and once the markers expire the next read resubmits the task."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    _use_snapshot(_two_trains(now))
+    runs = _failing_enrichment_matcher(monkeypatch)
+    words = _fake_wording(monkeypatch)
+    with _captured() as records:
+        assert _get(wait=0).json()["alerts"][0]["wording"]["status"] == "pending"
+        _join()
+        r = _get(wait=0)
+    body = r.json()
+    assert runs == ["pull"] and words == []
+    assert body["complete"] is False and r.headers["Cache-Control"] == "no-store"
+    for entry in body["alerts"]:
+        assert entry["wording"] == {"source": "deterministic", "status": "error"}, entry["wording"]
+        assert entry["alternative"] == {"status": "unanswered"}
+    warnings = [x for x in records if x.levelno >= logging.WARNING]
+    assert len(warnings) == 1, [(x.getMessage(), getattr(x, "fields", {})) for x in warnings]
+    (record,) = warnings
+    assert record.fields["event"] == "notification_pull" and record.fields["result"] == "enrich_failed"
+    assert record.fields["pair_digest"] == alternatives.pair_digest(NSR_A, NSR_B)
+    assert "RuntimeError" in record.getMessage() and record.exc_info is None
+    text = record.getMessage() + " " + str(record.fields)
+    assert not any(token in text for token in ("NSR:", "Asker", "Oslo S", "boom")), text
+    # Within the markers' life nothing is submitted again; past it the read resubmits.
+    assert _get(wait=0).json()["alerts"][0]["wording"]["status"] == "error" and runs == ["pull"]
+    _expire_markers()
+    assert _get(wait=0).json()["alerts"][0]["wording"]["status"] == "pending"
+    _join()
+    assert runs == ["pull", "pull"], "the expired markers were resubmitted"
+
+
+def test_a_raising_wording_writer_is_one_entrys_transient_error_and_is_retried_after_the_failure_ttl(monkeypatch):
+    """Finding #3 (2026-09-10), the wording half: `notification_wording.write_wording` RAISES
+    rather than returning an `error` wording (which `test_a_backend_error_is_transient_...` covers).
+    `_word_one`'s own fallback records `error` for that entry alone, logs it under
+    `notification_wording` with no ref, and the marker expires like any transient one."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    _use_snapshot(_two_trains(now))
+    raised = []
+
+    def raising(route, facts, *, policy, subject_id="", now=None, budget=None, message_input=None):
+        raised.append(facts.situation_number)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(notification_wording, "write_wording", raising)
+    with _captured() as records:
+        r = _get()
+        _join()
+    body = r.json()
+    assert sorted(raised) == ["S1", "S2"]
+    assert [a["wording"] for a in body["alerts"]] == [{"source": "deterministic", "status": "error"}] * 2
+    assert body["complete"] is False and r.headers["Cache-Control"] == "no-store"
+    warnings = [x for x in records if x.levelno >= logging.WARNING]
+    assert len(warnings) == 2, [(x.getMessage(), getattr(x, "fields", {})) for x in warnings]
+    for record in warnings:
+        assert record.fields == {"event": "notification_wording", "result": "error", "surface": "pull"}
+        text = record.getMessage() + " " + str(record.fields)
+        assert not any(token in text for token in ("NSR:", "Asker", "Oslo S", "boom")), text
+    assert _get().json()["alerts"][0]["wording"]["status"] == "error" and len(raised) == 2, "the marker stands"
+    _expire_markers()
+    words = _fake_wording(monkeypatch)
+    r = _get()
+    assert [a["wording"] for a in r.json()["alerts"]] == [{"source": "llm", "status": "ok"}] * 2
+    assert sorted(c[1] for c in words) == ["S1", "S2"] and len(raised) == 2, "retried once each after the TTL"
+    assert r.headers["Cache-Control"] == "public, max-age=60"
+
+
 def _run():
     """Mirrors `test_varsel_api`'s runner: a test naming `monkeypatch` gets the shim, undone after."""
     import inspect
