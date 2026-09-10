@@ -1970,6 +1970,19 @@ def poll_for_changes(
             togvarsel_outcomes.refresh()
         except Exception:
             logger.exception("Togvarsel outcome refresh failed this tick; retrying on next tick")
+        # The labelling-freshness detector rides the same wall-clock tick, fourth and last (R8):
+        # the nightly varsel-label-daily job runs OUTSIDE this process, so nothing else in here
+        # would ever notice it dying — and past its 10-day retry window the unlabelled decisions
+        # are lost for good. decisions rate-limits itself to one BigQuery check per 6 h, so this
+        # is a cheap in-memory no-op on all but ~4 ticks a day. Deliberately NOT a _rebuild_all
+        # phase (KTD7): a quiet night with no SX movement — hence no rebuild — is exactly when a
+        # dead labelling job must still be noticed. Isolated like the three blocks above: the
+        # function never raises by design, so this except is belt-and-braces against a defect in
+        # the detector itself, which must cost the check and never the feed, the pushes or the tick.
+        try:
+            decisions.check_labelling_freshness()
+        except Exception:
+            logger.exception("Labelling freshness check failed this tick; retrying on next tick")
         if stop_event is not None:
             if stop_event.wait(interval):
                 return

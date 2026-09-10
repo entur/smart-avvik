@@ -57,7 +57,7 @@ Design notes
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Any
@@ -529,3 +529,133 @@ def record(rows: list[dict]) -> int:
     )
     metrics.DECISION_WRITE_TOTAL.labels(result="ok").inc()
     return len(rows)
+
+
+# --- Labelling-freshness detector (R8, KTD7) ------------------------------------------------------
+#
+# The nightly outcome labelling (`varsel-label-daily`, a BigQuery scheduled query) runs OUTSIDE
+# this process, and nothing in the app consumes its output on any hot path — so when it dies (a
+# schema drift breaking the registered copy of the SQL is the documented way) the only symptom is
+# /historikk quietly filling with `venter`, and past the job's 10-day retry window every
+# still-unlabelled decision is lost forever. This check turns that silence into a structured ERROR
+# within hours. It rides the poller's wall-clock tick (see main.poll_for_changes) rather than the
+# SX rebuild, because a quiet night with no SX movement is exactly when a dead labelling job must
+# still be noticed — and deliberately not as a `_rebuild_all` phase, whose list is pinned by
+# test_poller_refresh.py.
+
+# At most one BigQuery check per 6 hours: hours of latency are irrelevant against a 10-day loss
+# window, and the check must cost jobs on the scale of the scheduled query it watches, not on the
+# scale of the 60 s tick that hosts it.
+_FRESHNESS_CHECK_INTERVAL_S = 6 * 3600
+# The labelling job runs daily at 04:00 UTC, so a healthy MAX(labelled_at) is under ~24 h old plus
+# jitter; 48 h means at least one whole run has failed to land.
+_LABELLING_STALE_AFTER_H = 48.0
+# Bounded like _ENSURE_TIMEOUT_S and for the same reason: this query runs on the sole poller
+# thread, which must never inherit "wait forever" from a new call site.
+_FRESHNESS_TIMEOUT_S = 60.0
+
+# Both aggregates are partition-bounded, and neither bound is cosmetic. `call_date` is
+# varsel_decision_outcomes' partition key while `labelled_at` is NOT, so an unbounded
+# MAX(labelled_at) is a full-table scan repeated every 6 h forever — and 10 days is the labelling
+# job's own retry window, past which a fresher row cannot appear. varsel_decisions is
+# PARTITION BY DATE(decided_at), so the 48 h work-to-label cut carries a DATE() predicate beside
+# it (3 days: the timestamp cut can straddle at most two UTC date partitions, plus margin) or it
+# prunes nothing. Nothing in this repo executes SQL, so test_decisions_freshness.py pins the
+# bounds as source text.
+_FRESHNESS_SQL = """\
+SELECT
+  (SELECT MAX(labelled_at)
+     FROM disruptions.varsel_decision_outcomes
+    WHERE call_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY)) AS latest_labelled,
+  (SELECT COUNT(*)
+     FROM disruptions.varsel_decisions
+    WHERE DATE(decided_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
+      AND decided_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)) AS recent_decisions
+"""
+
+_freshness_last_checked: float | None = None  # monotonic stamp of the last attempted check
+_freshness_quiet_logged = False  # the no-work-to-label notice fires at most once per process
+
+
+def check_labelling_freshness() -> None:
+    """Alert when the nightly labelling job has stopped landing verdicts. Never raises.
+
+    The decision is R8's work-to-label gate, one query with two aggregates:
+
+    * labelling stale (MAX(labelled_at) older than 48 h) **or absent** (NULL) while decisions were
+      recorded in the last 48 h → ``logger.error`` with ``event="labelling_stale"``, carrying
+      ``hours_stale`` when a timestamp exists and ``reason="no_labelled_rows"`` when none does.
+      The absent case is the one a naive age check gets backwards: a prd outage that outlasts the
+      10-day window empties the bounded MAX to NULL precisely when loss becomes permanent, and
+      NULL must alert there, not read as "nothing to report". The ERROR re-fires once per 6 h
+      window for as long as the condition holds — it is an alert condition, not an event.
+    * no recent decisions (tst, or a genuinely quiet period): stale labelling is the system
+      working — nothing was decided, so nothing could be labelled — and the answer is at most ONE
+      INFO per process, never an ERROR that trains readers to ignore the event name.
+    * fresh: set :data:`metrics.LABELLING_LAST_SUCCESS` to the labelled_at epoch (the PromQL age
+      rule is ``time() - value``, so the gauge must be the observation, never "now") and log
+      nothing.
+
+    Fail-open like everything else in this module: a query failure is a WARNING with
+    ``result="check_failed"`` — the detector must never take the poller down. The 6 h window is
+    stamped before the query, so a failing BigQuery backs off for the whole window instead of
+    being re-asked on every 60 s tick.
+    """
+    global _freshness_last_checked, _freshness_quiet_logged
+    if _bq_client is None:
+        # No client, no check — and no window spent: configure() may land a moment later, and the
+        # first configured check should then run immediately.
+        return
+    now = monotonic()
+    if (
+        _freshness_last_checked is not None
+        and now - _freshness_last_checked < _FRESHNESS_CHECK_INTERVAL_S
+    ):
+        return
+    _freshness_last_checked = now
+    try:
+        row = next(iter(_bq_client.query(_FRESHNESS_SQL).result(timeout=_FRESHNESS_TIMEOUT_S)))
+        latest = row.latest_labelled
+        recent = int(row.recent_decisions or 0)
+    except Exception:
+        logger.warning(
+            "Labelling freshness check failed; retrying in %d h",
+            _FRESHNESS_CHECK_INTERVAL_S // 3600,
+            exc_info=True,
+            extra={"fields": {"event": "labelling_stale", "result": "check_failed"}},
+        )
+        return
+    hours_stale: float | None = None
+    if latest is not None:
+        if latest.tzinfo is None:
+            # BigQuery TIMESTAMPs come back tz-aware UTC; normalize a naive one rather than let
+            # the subtraction below throw on the poller thread.
+            latest = latest.replace(tzinfo=UTC)
+        hours_stale = (datetime.now(tz=UTC) - latest).total_seconds() / 3600.0
+        if hours_stale <= _LABELLING_STALE_AFTER_H:
+            metrics.LABELLING_LAST_SUCCESS.set(latest.timestamp())
+            return
+    if recent > 0:
+        fields: dict[str, Any] = {"event": "labelling_stale", "recent_decisions": recent}
+        if hours_stale is not None:
+            fields["hours_stale"] = round(hours_stale, 1)
+            detail = f"latest outcome was labelled {hours_stale:.0f} h ago"
+        else:
+            fields["reason"] = "no_labelled_rows"
+            detail = "no outcome labelled in the last 10 days"
+        logger.error(
+            "varsel-label-daily appears to have stopped: %s while %d decisions from the last "
+            "48 h await labelling. Decisions still unlabelled after the job's 10-day retry "
+            "window are lost for good.",
+            detail,
+            recent,
+            extra={"fields": fields},
+        )
+        return
+    if not _freshness_quiet_logged:
+        _freshness_quiet_logged = True
+        logger.info(
+            "No decisions recorded in the last 48 h, so stale labelling is expected here; the "
+            "freshness check stays quiet until there is work to label",
+            extra={"fields": {"event": "labelling_stale", "result": "no_recent_decisions"}},
+        )
