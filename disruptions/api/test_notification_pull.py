@@ -915,7 +915,14 @@ def test_neither_a_registered_nor_an_ad_hoc_read_writes_the_pollers_state_the_lo
     notification store are untouched by a read of a registered definition and by one of an ad-hoc
     definition on the same pair."""
     _reset()
+    # The pass runs on the real wall clock and drops departed trains, so the departure has to be
+    # ahead of REAL now -- which puts it on tomorrow's Oslo day late in the evening. The ad hoc
+    # definition therefore differs from REGISTERED in `days` (the train's own weekday) and not in
+    # the time of day: a narrower period fell outside a departure past its `end` every evening
+    # after 21:00 Oslo, and a window of 00:00-23:59 on one weekday contains the train at any hour.
     dep = datetime.now(tz=_OSLO) + timedelta(hours=2)
+    ad_hoc_definition = {"begin": "00:00", "end": "23:59", "days": [dep.weekday()]}
+    assert ad_hoc_definition != REGISTERED
     snapshot = {"S1": _train(dep, p_cancel=0.82, p_impact_dep=0.9)}
     _use_snapshot(snapshot)
     monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
@@ -930,9 +937,9 @@ def test_neither_a_registered_nor_an_ad_hoc_read_writes_the_pollers_state_the_lo
     )
     before = (_poller_caches(), len(store_calls), len(decisions_written))
     assert _get(**REGISTERED).json()["alerts"][0]["wording"]["status"] == "ok"
-    ad_hoc = _get(begin="05:00", end="23:00", days=ALL_DAYS).json()
+    ad_hoc = _get(**ad_hoc_definition).json()
     assert ad_hoc["n_alerts"] == 1
-    _join(begin="05:00", end="23:00", days=ALL_DAYS)
+    _join(**ad_hoc_definition)
     assert (_poller_caches(), len(store_calls), len(decisions_written)) == before
 
 
