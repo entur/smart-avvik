@@ -1,4 +1,5 @@
-"""The alert gate: how bad a prediction has to be before the traveller is told.
+"""The alert gate: how bad a prediction has to be before the traveller is told — the table, and
+the comparison against it.
 
 One operating point, several readers. :func:`varsel.check_and_notify` applies it to decide whether a
 matched train earns a push; ``/demo`` scores its retrospective verdicts against it so the demo
@@ -12,11 +13,25 @@ circular import. Injection (``impact.configure``) is the wrong tool here: that p
 state the poller owns and hands down, and this is a constant table with no lifecycle at all — it is
 imported, like :mod:`deployment`.
 
+:func:`gate` joined the table on 2026-09-08 and does not weaken that argument: it reads
+:func:`threshold_for` and nothing else — no clock, no environment, no other module — so the
+dependency graph is exactly what it was, and the module is still importable from either side of the
+``varsel``/``impact`` pair in either order. What it adds is that the **comparison** now has one
+statement too, rather than one per surface. That matters because a second notification surface is
+being built beside `/varsel` (KTD1/KTD2 of the client-notification plan): two surfaces each
+restating ``impact_p >= threshold`` is how one of them quietly acquires a cancellation-probability
+fallback, or starts reading a missing probability as a low one, and a widened gate on one surface
+would show a webhook recipient alerts a `/varsel` user never sees. Note the alert-worthiness of a
+train is the one thing here a caller must not re-derive; the raw numbers stay public because /demo
+and the pre-screen legitimately need the bar without a probability to compare to it.
+
 Nothing here reads the environment or the clock: the numbers are tuned offline
 (``eval/tune_alert_thresholds.py``) and change only by editing this file.
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 # Push a match only when the worst matching train's impact probability crosses this — the same
 # operating threshold as /demo and eval/impact_eval.py (>=91 % precision at every ask horizon).
@@ -94,10 +109,46 @@ def threshold_for(operator: str | None, *, has_situation: bool = True) -> float:
     ``has_situation=False`` selects the no-SX cut instead. It is keyword-only and defaults to True
     so every existing caller keeps its exact meaning: a caller that has not been taught about the
     second population is, by construction, asking about the first.
+
+    Since 2026-09-08 the *comparison* against this number also lives in one place — :func:`gate`,
+    which is what every notification surface applies. This function stays the table; that one
+    states what clearing it means.
     """
     if not has_situation:
         return _NOSX_ALERT_THRESHOLD
     return _OPERATOR_ALERT_THRESHOLD.get(operator or "", _ALERT_THRESHOLD)
+
+
+class Gate(NamedTuple):
+    """The operating point applied to one departure, and whether it cleared it."""
+
+    threshold: float
+    alertworthy: bool
+
+
+def gate(
+    impact_probability: float | None, operator: str | None, *, has_situation: bool = True
+) -> Gate:
+    """Whether this departure is worth telling anybody about, and at what bar.
+
+    The bar is :func:`threshold_for` and nothing else — the per-operator table plus the no-SX cut,
+    which is HIGHER than the published one (0.85 against 0.65) because a probability with no
+    operator message behind it decays with the ask horizon far faster and reaches the traveller
+    with no explanation attached.
+
+    The comparison is stated once, here, rather than at each surface. ``None`` is not alert-worthy
+    at any bar: there is no calibrated score, and reading its absence as "not bad" would be the
+    manufactured all-clear this codebase refuses everywhere else. Note there is deliberately no
+    cancellation-probability fallback — measured 2026-07-27, ``p_impact_dep`` is NULL only where
+    ``aimed_dep`` is, i.e. at terminals no matcher offers as a boarding.
+
+    Returned as a pair rather than a bare bool because both halves are recorded: ``alert_threshold``
+    and ``alertworthy`` are columns on every ``varsel_decisions`` row, and `/historikk` computes
+    precision over them. Asking twice — once for the number to record, once for the verdict — is
+    how the recorded bar and the applied bar come to be two different things.
+    """
+    threshold = threshold_for(operator, has_situation=has_situation)
+    return Gate(threshold, impact_probability is not None and impact_probability >= threshold)
 
 
 def min_threshold() -> float:

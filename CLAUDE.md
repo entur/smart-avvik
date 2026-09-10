@@ -50,6 +50,27 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   ~120 s of headroom, and BigQuery owns ~97 % of what is spent. The corollary matters when sizing
   anything user-facing: **the expensive part of a cycle does not scale with registrations**, and
   what does — `varsel_notify` — is 3 % of it.
+  **Two notification phases exist since 2026-09-08**, `notification_webhooks` and — since 2026-09-09 —
+  `notification_servability` after it, and both are present only when the webhook channel's flag is on:
+  with it off the keys are *absent* from `poller_cycle.phases`, not zero. `notification_webhooks` runs
+  after `varsel_notify`, i.e. after `check_and_notify` has returned, so a raise inside it cannot
+  unwind the decision-log write or the state save at all. Two of its worst cases are **ceilings**
+  rather than timings and the distinction is worth keeping: a destination hanging forever costs
+  `_DELIVERY_WAIT_S` (20.0 s) and a hung store costs `_EMIT_WAIT_S` + `_DELIVERY_WAIT_S` = **28.0 s**,
+  2 s under KTD6's 30 s reversal trigger and pinned as such by
+  `test_notification_events.test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger`. The
+  timings beside them: a hanging destination ~5.0 s (one attempt at the 5 s per-attempt ceiling —
+  since claims are sharded per subscription, 30 pending on one subscription are one shard and the
+  first failure skips the rest), a healthy backlog of 200 pending in 7 ms, emit of 200 subjects in
+  14 ms. `notification_servability` is the six-hourly re-ask of a stale or never-established servability
+  answer (`varsel.recheck_service`'s webhook copy, which cannot reach these because it walks
+  `_journeys`). Its own number is likewise a **ceiling**: `_DEADLINE_S` (30 s) **plus one
+  `set_servability`**, because the budget reserves the BigQuery question and not the store write that
+  follows it — typical is ~0, since nothing is due on a healthy list and a due one costs ~2 s. It is
+  its own phase rather than folded into `notification_webhooks` precisely because that phase's measured
+  `ms` is the unit KTD6's reversal trigger is stated in, and adding this reservation to its 28 s
+  would fire the trigger on a healthy cycle. Note the period quoted above is **stale**: measured
+  again on 2026-09-08 it is ~296 s, against which the 28 s ceiling is ~9.5 % of one cycle.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket
@@ -116,6 +137,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Work is shared per journey *definition* (`varsel.journey_key`): two
   devices watching the same trip drive one `/impact` call and one written message and see identical
   text, while push dedup stays keyed on `journey_id` so each device is still notified once.
+  **Since 2026-09-09 that group can also contain a webhook subscription** (KTD3, see the client
+  channel's own section below): a webhook recipient is another registration in the same group, so one
+  match and one wording fan out to both channels. It is a **view merged at match time, never a
+  materialization** — `by_journey_key` stays browser-only because that is what `_record_decisions`
+  iterates, and `_journeys`, `_notified` and the GCS state blob never carry a client id.
   **`to_stop` narrows `/impact`**: only trains that actually reach it are returned, so a caller
   passing it sees fewer situations than one that does not.
   **One picker row per physical place** (2026-08-03): `/varsel-api/stops` collapses stop refs that
@@ -148,9 +174,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   line, with a sharper text naming both stops when the pair is served *the other way* (a likely
   swap). Weekend-only and seasonal routes are why a refusal would be wrong, and why the poller
   re-asks every 6 h (`varsel.recheck_service`) and clears the caveat when service appears; a match
-  also suppresses it. `None` from the provider means "could not establish" — an outage, a timeout, the
-  30/min rate limit that exists because the endpoint is unauthenticated — and never becomes a
-  warning. Answers are cached 10 min.
+  also suppresses it. `None` from the provider means "could not establish" — an outage, a timeout, a
+  rate limit — and never becomes a warning. Answers are cached 10 min.
+  **That rate limit is TWO numbers since 2026-09-09**, keyed per caller in
+  `alternatives._fetch_calls`' shape: `main._CONNECTIVITY_MAX_PER_MIN` (30) for this public
+  unauthenticated path, and `_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN` (15) for the notification API's
+  create/replace. One shared list was `alternatives`' own 2026-08-21 lesson repeated a module over —
+  a client may issue 120 create/replace requests a minute, and every one it spent came out of a
+  budget that exists as abuse control for a traveller's registration. What a traveller loses when it
+  binds is not an error: the caveat is simply not established, so the journey registers without it.
+  The *cache* stays shared, because an answer about a stop pair is an answer whoever asked.
   **Calling at a stop is not the same as being usable from it** (2026-09-01): a traveller wrote in
   after an Oslo S → Drammen registration was pushed «Tog F4 16:23 er innstilt» — the 16:23 is the
   Bergen train, which calls Drammen with **alighting closed**. Vy sells the local stretch of every
@@ -367,6 +400,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
     `push_enabled=false`); the journey list still works. Regenerate with
     `uv run --with pywebpush python disruptions/api/gen_vapid.py`.
+    **The keypair no longer gates the writing pass** (KTD4, 2026-09-08). `check_and_notify` used to
+    skip loop 1c entirely when no keypair was loaded, on the reasoning that writing prose nobody can
+    receive is spend with no reader — the reasoning is right and the test was wrong, because it read
+    "no keypair" as "no reader" and so a webhook-only deployment, and tst which has no keypair, wrote
+    nothing at all. The condition is now **at least one deliverable recipient on any channel**:
+    browser push enabled, or a webhook subscription with a pending delivery for that train. The other
+    half of the same move is the expensive one — a browser recipient is **not** pending when
+    `push_enabled()` is false, because `_pending_pushes` derives pending-ness from `_notified` and
+    `_notified` only grows on a successful browser send, so without that clause a keypair-less
+    deployment reports every alert-worthy train as pending for every browser registration on every
+    cycle and spends the whole write budget re-wording trains it can never deliver. A journey with no
+    deliverable channel still writes nothing and still records `message_status='push_disabled'`, so
+    that value keeps its meaning for browser subjects.
   - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
@@ -499,7 +545,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **The poller's two blocking passes run CONCURRENTLY** (2026-08-21), which is what makes a pilot
   ten times the size affordable. `check_and_notify`'s loop 1 is now three passes: **1a** matches
   every journey across `varsel._MATCH_WORKERS` (16) — carrying the Journey Planner lookups with it,
-  since those live inside `match_journey`; **1b** reconciles caches and picks what to write for,
+  since those live inside `match_journey`, and, since 2026-09-09, matching webhook subscriptions in
+  the same pass as browser registrations grouped on `journey_key`; **1b** reconciles caches and picks what to write for,
   sequentially, because it only mutates module state and blocks on nothing; **1c** writes the
   wordings across `varsel._LLM_WORKERS` (16). Both ceilings moved with the widths and only make
   sense together — `_MAX_LLM_CALLS_PER_CYCLE` 8 → 64 and `alternatives._POLLER_FETCH_MAX_PER_MIN`
@@ -525,6 +572,244 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   nobody noticed while ~44 registrations rarely reached a cap of 8, but at ten times that the cap
   binds on every busy morning and would hand the whole budget to whichever travellers registered
   earliest, every cycle, forever.
+
+- The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
+  `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
+  `/varsel` already sends its own browsers, as signed HTTPS webhooks. **Renamed on 2026-09-09 from the
+  `partner_*` vocabulary**, before anything was applied or integrated: the credentialed caller is a
+  **client** (the Entur app is one, an external operator another — "partner" is Entur's word for the
+  latter only), the channel is **webhook**, the shared machinery is **notification**, and the Firestore
+  database is `notifications` with unprefixed collections. `/varsel` stays as the test-bed for
+  experimental features ahead of this API, and the decision log will cover both once `/historikk`
+  is behind authentication. The three documents are
+  `docs/integrations/notification-api.md` (the client contract), `docs/integrations/firebase-bff.md`
+  (the two vendored TypeScript packages under `integrations/`) and
+  `docs/operations/notification-webhooks.md` (the operating contract, which carries the
+  clause-by-clause retention check and the enablement conditions). **It is off in every environment**
+  and needs four values and two Secret Manager secrets that do not exist yet; the operations document
+  is the sequence.
+  **It is `/varsel`'s logic reused by extraction, not a second alerting stack.** Which trains alert,
+  which alerts clear the bar, the per-train collapse, the Norwegian wording and the daily cap are
+  `/varsel`'s, unchanged: a webhook subscription is another registration whose channel is a webhook,
+  grouped under `journey_key`, so a client and a browser holding the same definition see the same
+  trains and cost **one match and one wording between them** — asserted by call count, because that
+  parity is the whole premise and the thing most likely to drift silently. `alert_policy.gate` is the
+  one statement of the threshold and the comparison, so the two surfaces cannot come to disagree
+  about what a threshold means; `is_material` — the origin branch's widening of that gate by a
+  declared cancellation anywhere on the ridden segment — is **refused by name** and its absence is
+  pinned by a grep, because a widening only ever adds subjects and would therefore be silent.
+  **Notification state is Firestore's and never `varsel_decisions`'** (KTD10). That table is written for
+  every match including sub-threshold ones and `/historikk` and `/meldinger` publish it on public
+  hosts — including resolved origin and destination names since 2026-08-22, accepted then because
+  prd's registrations are the team's test users. Client-app travellers are not, and `/meldinger`
+  measured 21 of 31 stop pairs isolating exactly one journey. Its `pushed` column is also
+  journey-definition grain and cannot tell a webhook from a Web Push, so writing webhook deliveries
+  there would corrupt both pages' meaning as well as their privacy claim. **The consequence is the
+  fourth of KTD12's limitations and it is created by this feature rather than inherited: a
+  webhook-only route produces no decision row at all, so its alerts are not thinly evidenced — they
+  are unscored, deliberately.** Hence the Definition-of-Done term: no client is enabled for an
+  operator `/historikk`'s verdicts do not cover without that gap recorded and signed off, and nothing
+  anywhere is a claim about any operator but **Vy rail** (21 308 of 21 331 replayed subjects were
+  VYG). **Decided 2026-09-09: webhook-only routes stay out until `/historikk` and `/meldinger` are
+  behind authentication, then go in** — and that is not a simplification of this channel: `pushed`
+  cannot tell a webhook from a Web Push, so the row needs a channel discriminator, and that column
+  reaches the groups view, the labelling INSERT and the scheduled-query re-registration in one
+  operation.
+  **The R16 prompt-record claim has two halves and only one is closed**, published rather than
+  asserted away. A **webhook-only** definition — one absent from `by_journey_key`, which stays
+  browser-only for exactly this — is written for through `notification_wording.WEBHOOK`, which
+  suppresses the prompt/reply DEBUG record **in code** regardless of `VARSEL_LLM_LOG_PROMPTS` (dev has
+  it on) and drops `message` from the INFO record. A **shared** definition stays on the browser policy
+  unavoidably: one wording between the channels means one call and it is the browser's, and that
+  record would exist with no webhook channel at all. So R16 is about webhook-only routes plus every
+  other client field; it is **not** "no client route ever appears in the prompt log". Accepted as
+  it stands on 2026-09-09: dashboard authentication, offered as a reason to drop R16 altogether, does
+  not reach this half — the record is in Cloud Logging, which project IAM gates — and the code behind
+  it is one field (`caller`) on the webhook wording policy.
+  **Decide in the pass, deliver in the pass, after the browser cycle is already durable** (KTD6).
+  Emit and deliver are their own `main._rebuild_all` phase (`notification_webhooks`) placed after the
+  `varsel_notify` phase and fed by a `PassOutcome` that `check_and_notify` returns — deliberately
+  stronger than "after `_record_decisions` and `_save_state`", since running after the function has
+  *returned* means a raise cannot unwind either write at all. A return value rather than a
+  module-level snapshot, because a leaked half-cycle snapshot reads exactly like the give-up bug the
+  stale sweep exists to prevent. The read-only load step necessarily precedes pass 1a and reports
+  `event="varsel_webhook_load"`. Every bound is a number: one attempt per pending event per cycle
+  with the next cycle as the retry; a **4-wide** pool (`/meldinger`'s width, the repo's narrowest, not
+  `varsel`'s 16/16/32); 5 s per attempt and 2 s connect; 4 s per Firestore call, under `varsel`'s 5 s
+  wait so a hung call surfaces as the store's own retryable `DeadlineExceeded` rather than as the
+  caller's timeout with a thread still running; and deadlines that **reserve** the worst case rather
+  than check a clock. The per-destination skip is **pass-local**, the documented exception to the
+  stale-sweep rule: swept, one failure would pause a destination permanently, which is
+  indistinguishable from the intended 410 pause.
+  **The store's own rules, each with the failure that motivated it.** Four collections, all **top
+  level** carrying a subscription id — a document delete does not remove subcollections and a TTL
+  field does not cascade into them, so subcollections would be orphaned by the deletion path and the
+  delivery query would keep returning them. **TTL is a retention floor and never an access rule**:
+  Firestore deletes within roughly 24 h and expired documents stay queryable until it does, so every
+  read path tests `expires_at` itself and a *missing* one reads as expired. **A transaction body may
+  run more than once**, so every `_*_body` takes its clock and its revision seed as arguments, reads
+  before it writes, returns rather than appending to an outer list, and logs nothing — the suite runs
+  each body twice against one fake transaction with a clock that raises and a logger that raises on
+  attribute access. `alert_id`'s grain is **(subscription, train)**, not per train: a per-train id
+  would make the supplied receiver's "drop a revision not strictly newer" rule suppress the *second*
+  commuter's notification about the same train. **A revision is minted only on a lifecycle
+  transition** — a changed probability, delay figure or wording mints nothing at any size, because
+  minting on a changed figure would turn every cycle into a fresh revision and a second notification
+  about one train. Monotonicity is structural: a UTC instant captured once outside the transaction,
+  clamped inside to `max(stored + 1, derived)` — an Oslo-formatted revision goes backwards for an hour
+  at every autumn DST fall-back and the receiver then silently discards every event for those
+  subjects, a confirmed cancellation included.
+  **The daily cap is `/varsel`'s, at `/varsel`'s grain**, four per subscription per Oslo day, spent
+  soonest-departure-first and spent **on success** — a dead destination must not burn a subscription's
+  four. Two things about it are published because they are not what the requirement's wording implies.
+  `cap_exempt` is decided **at mint, not at send**, so a `confirmed` minted before its `predicted` was
+  ever delivered is *not* exempt: it is the first notification about that train. And the exemption is
+  **generalised beyond "a confirmation"** to any replacement of a *delivered* revision, which includes
+  a **withdrawal** — a retraction the cap suppressed leaves the traveller holding a warning we have
+  withdrawn, the friskmelding argument. That widening is **an open product-owner question**, flagged
+  in the operations document rather than presented as settled.
+  **The cap, the active-subscription ceiling and the per-minute rate are per-client DEFAULTS since
+  2026-09-09** (`notification_auth.Quotas`, three fields on the `clients` document seeded from the
+  constants, bounded by `QUOTA_BOUNDS` at 1 000 / 10 000 / 10 000, set with the operator tool's
+  `set-quotas` and read on every request through the cached account lookup, so they ride on the
+  `Principal` for free). The cap is copied onto each subscription document (`daily_cap`) at create,
+  replace and touch — the idempotent re-PUT included — which is where `cap_remaining` reads it, so a
+  changed cap reaches a subscription at the client's next write and a document without the field
+  reads as four. The bound on the subscription ceiling is not arbitrary: `_create_body` counts a
+  client's live subscriptions by READING them inside the create transaction, so a ceiling above
+  10 000 needs the `count()` aggregation named in the operations document's "Scaling beyond the
+  pilot" section, which lists what has to move before 100 000 commuters (matcher per place pair,
+  mirror instead of full read, emit and delivery as their own Deployment, batched servability, the
+  aggregation) and states that none of it touches the wire contract. Every subscription document
+  also carries `channel` (`webhook`; `web_push` is reserved for `/varsel`'s move).
+  **Four semantics moved on 2026-09-10, on the full review's findings, and each is the kind a later
+  reader would otherwise assume the other way.** (1) The delivered marks on a subscription document
+  are keyed on the **`alert_id`** — one per delivered (subscription, train) — not on situation
+  numbers: the store mints per train, so `varsel._pending_pushes` asks per train for a webhook
+  recipient (`_webhook_pending`, through `notification_events.alert_id_for`, the same derivation the
+  emit step's `train_ref` uses), while the browser ledger `_notified` stays per situation because a
+  browser is pushed once per situation. Per-situation marks refused the wording pass to a second
+  departure under a delivered situation whose event still went out. No migration: the channel is off
+  everywhere. (2) `valid_until`'s departure term is the **expected** departure (aimed plus predicted
+  typical delay, `WebhookSubject.expected_departure_time`), never earlier than `DEPARTURE_GRACE_S`
+  (120 s) past the emit instant (a term less than that far ahead, already past included, is floored
+  to it) — the matcher keeps a late train on exactly that figure, and the aimed-time clamp minted
+  events that were stale before their first attempt. (3) The create-time
+  ceiling counts through its own `subscription_count` query ordered `expires_at DESC` (a seventh
+  composite index): through the listing's `created_at ASC` the page filled with expired rows first
+  and under-counted. (4) The webhook event's route line always carries the stop **registry's** names,
+  never a browser registration's typed `from_name`/`to_name` — unauthenticated free text that reached
+  a client's notification through a shared definition; `test_varsel_api` now wires the registry
+  provider exactly as `main` does. Beside those: `pending_deliveries` pages past a throttled
+  destination up to `MAX_DELIVERY_SCAN_PER_CYCLE`, the served-subjects bound and the list ceiling
+  follow the client's quota (`subjects.maxItems` is `QUOTA_BOUNDS["daily_cap"]`'s 1 000), the
+  servability re-check reuses the pass's read of `subscriptions` when under `_LOAD_REUSE_S` (600 s)
+  old, and the delivery attempt's destination lookup goes through `_store_step` like every other read.
+  **Signing is Standard Webhooks, fresh per attempt, per destination** (KTD7). HMAC-SHA256 over
+  `webhook-id.webhook-timestamp.<raw body>` with stdlib `hmac` and no new dependency; the body bytes
+  are stored once and signed unmodified, because re-serializing signs a document the receiver did not
+  get. **The `webhook-id` is the delivery id and is what gets persisted; never persist the timestamp
+  or the signature** — a retry reusing the first attempt's timestamp lands outside the receiver's
+  five-minute replay window, where a *correct* receiver drops our own retry as an attack. Each
+  destination's secret is HMAC of a root over length-framed `destination_id || generation`, so the
+  store holds no signing material and one client's leaked receiver secret forges nothing for another;
+  both live generations ride in one header, each revocable alone.
+  **The outbound client uses a POSITIVE address test, not a deny-list** (KTD9), and that is not
+  belt-and-braces: implemented first as the bare `is_global and not is_multicast`, the NAT64 form
+  `64:ff9b::a9fe:a9fe` was **accepted** — global, non-private, non-multicast, `ipv4_mapped` None, and
+  in none of the named ranges — while the address it carries is the metadata service. So the same test
+  is re-run on whatever a prefix embeds (`::ffff:0:0/96`, `2002::/16`, `64:ff9b::/96`), judging the
+  reachable host rather than the notation. The host is resolved **once**, every returned address in
+  both families is validated, and the connection dials a validated literal while still sending the
+  original SNI and Host — validate-then-request-by-hostname is a time-of-check race, which is how
+  CVE-2026-27129 and SVIXSEC-2026-0001 both happened this year. An IPv4-mapped address is judged by
+  what it *carries* rather than refused outright; do not "fix" that into a blanket refusal.
+  **The API mounts unconditionally**, independent of `NOTIFICATION_WEBHOOKS_ENABLED`, because gating
+  onboarding on the flag that needs onboarding is circular — availability is store plus pepper, read
+  per call, so tst answers 503 today. The consequence was put to the product owner and decided on
+  2026-09-09 — this is a public API:
+  **`/notification-api/v1` appears in the public `/docs`**, since `docs_url` is FastAPI's default, and
+  unlike Rushvarsel nothing here asks for the product to be unmentioned. The prefix is deliberately
+  **not** in `sso.PROTECTED_PREFIXES`: that gate answers an unconfigured deployment with 503 and an
+  unauthenticated browser with a 302, and a machine caller following a redirect into a Google login
+  screen gets HTML where it expected JSON. `/test-events` writes **nothing at all**, because the
+  store's pending-event ceiling is exact rather than best-effort *only because the emit path has one
+  writer* — one poller thread, no route invoking the pass, one replica under Recreate — and a route
+  calling `commit_event` would falsify every quota check in that module.
+  **What a reader sees in the logs**: `varsel_webhook_load`, `notification_store_load`, `notification_emit`,
+  `notification_event`, `webhook_delivery_round`, `webhook_delivery`, `notification_quota`,
+  `notification_subscription`, `notification_cleanup`, `notification_auth`, `notification_admin`, `notification_test_event`,
+  `notification_servability`, `notification_alert_state`, `webhook_delivery_refused`,
+  `webhook_delivery_response_truncated`, `notification_auth_config` / `webhook_signing_config`,
+  `notification_wording`, and `poller_phase` with `phase="notification_webhooks"` **or
+  `"notification_servability"`** — two phases, not one. `docs/operations/notification-webhooks.md` carries
+  the table of what each field means and is grep-pinned against the code by
+  `test_notification_contract.py::test_the_operations_document_names_every_notification_log_event`; **nothing
+  pins this copy of the list**, so treat that table as the authority and this sentence as a summary
+  that can lag it.
+  No **`notification_*` or `webhook_*`** log line carries an origin, a destination, a departure time, a full callback
+  URL, a credential secret or any prose — read the qualifier, because the fourth carrier below is why
+  it needs one. Four things are carried and named rather than glossed, the first three inside that
+  namespace and the fourth deliberately outside it: `subscription_id` embeds the client's own
+  reference, `webhook_delivery_refused.reason` can carry a refused destination's hostname and its
+  resolved addresses, `notification_admin.actor` is a named human, and **a webhook subscription's origin
+  and destination DO reach Cloud Logging, under `/varsel`'s event name rather than a client one.**
+  `main._varsel_connectivity` writes both stop refs into the *message* of an INFO record
+  (`event="varsel_service_check"`, `result="ok"`) on every established verdict, while its structured
+  `fields` carry only `event`, `result`, `forward` and `reverse` — which is exactly why the claim
+  above is true as stated and would mislead anybody who stopped there. The webhook channel reaches
+  that line at **create time** (it always did) and, since 2026-09-09, again **every six hours per
+  unservable subscription** through `notification_servability`. It is **pre-existing and shared with
+  `/varsel`'s own registrations**, so the honest framing is an accepted exposure this feature
+  *extends* rather than a new leak; if it is ever to be closed, the fix is `/varsel`'s log line, not
+  this channel's. App logs live in the **cluster** project
+  (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
+  **`NOTIFICATION_WEBHOOK_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
+  other three flags; it is named in **no Helm values file** and defaults off, so the channel emits and
+  delivers the deterministic template until somebody adds it. Expect one divergence during the
+  rollout window: with `VARSEL_LLM_ENABLED=true` beside it false, the push carries the model's prose
+  while the event carries the template, so the two channels are byte-identical only where both
+  switches agree.
+  **Infrastructure is this repo's own Terraform** (`terraform/firestore.tf`, the directory's first
+  non-IAM resource): the API, one named Firestore database per environment in `europe-west1`
+  (immutable), seven composite indexes materialised with `for_each` keyed on each index's **content**
+  rather than its array position, the four TTL field configs, and a prd-only backup schedule (five
+  weeks, a chosen value: Firestore allows 14 weeks on both recurrences — checked 2026-09-09 — and
+  five is what PITR's seven days does not already cover) — and, since 2026-09-09, the deny-all
+  `firestore.rules` **released** as the named database's live rules (`google_firebaserules_ruleset` +
+  `_release`, named `cloud.firestore/<database>` per firebase-tools' own release code, not the bare
+  `cloud.firestore` the provider's documentation quotes). Until then the file was committed and
+  emulated but deployed by nothing, safe only because no Firebase app exists in these projects. None
+  of the three projects is a Firebase project (checked 2026-09-09) and the release is expected to work
+  regardless — Google's own docs deploy rules to a *named* database from the Google Cloud console and
+  reserve the Firebase console for `(default)` — so what the first apply confirms is only that the API
+  takes `cloud.firestore/<database>` from Terraform's client; the two resources are removable alone if
+  it refuses. The
+  runtime `roles/datastore.user` grant is the one part that **cannot** go there — a
+  `google_project_iam_member` runs under a `projectIamAdmin` conditioned by `only_assignable_roles`,
+  which carries no `roles/datastore.*` (note `terraform/oauth_iam.tf`'s own PARKED header diagnoses
+  the identical 403 as an org-level deny policy instead, and the two readings are not reconciled —
+  a conditioned grant and a deny policy refuse with the same wording); it goes in `.entur/application.yaml`, whose filter drops a
+  non-matching role **silently**, so the binding is verified after `entur apply` rather than assumed.
+  Plan-time index drift rests on one config line that is present: `firestore.indexes.json` and
+  `firestore.rules` are in **both** of `terraform.yml`'s `paths:` lists, without which a PR adding a query and its index would
+  pass the static test, merge, apply nothing and land a runtime `FailedPrecondition`.
+  **The two TypeScript packages ship from here and are vendored, not published** (KTD11). Declared
+  consumption shape: compiled CommonJS plus `.d.ts` on Node 24, and `package.json` deliberately
+  declares **no `type` field** — with none, Node's syntax detection loads a `.ts` source as ESM (what
+  `node --test` needs) while treating `dist/*.js` as CommonJS (what the artifact needs); an explicit
+  `"commonjs"`, which `npm install` adds if allowed, kills the `.ts` path and `"module"` kills the CJS
+  emit. Both were observed and a test pins the omission. Two answers only the TypeScript side knows:
+  `firebase-functions@7.3.2`'s `retry` is reachable **only** through the options-object overload of
+  `onDocumentCreated`, and the `document: string` overload every quickstart shows produces
+  `retry === false` — not an absent field — so it deploys, runs, and silently drops events on the
+  first store blip; and the shipped `firestore.rules` is **necessary and not sufficient**, because
+  Firestore evaluates rules as a **union** and a deny cannot override an allow, so a client merging
+  the four blocks into a ruleset carrying a permissive catch-all still has an open database.
+  **The two emulator suites cannot be started at the same instant**: this repo's root `firebase.json`
+  binds Firestore on 8571 with the hub on its default 4400, and the client package pins 8572 / 9151 /
+  4401 and its own demo project id, which makes the *sequential* case safe (CI's shape) but not two
+  simultaneous starts — the contention is inside `firebase-tools`' own hub startup.
 
 - The **Varselhistorikk** page at `/historikk` (`demo/varselhistorikk/`, React + Vite + Entur
   Linje) is the feedback loop for alerting: every decision Avviksvarsel took about a registered

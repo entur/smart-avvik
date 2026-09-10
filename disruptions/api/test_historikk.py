@@ -871,6 +871,52 @@ def test_the_no_filter_array_test_is_null_safe():
         assert "IFNULL(ARRAY_LENGTH(" in sql, f"{name}: no array emptiness test found at all"
 
 
+# ---- KTD10: the webhook channel is invisible on this page ------------------------------------
+
+
+def test_no_notification_store_field_or_collection_name_appears_in_this_pages_sql():
+    """KTD10, as a grep over the UNCOMMENTED SQL, because a query that cannot name a column
+    cannot leak it however the code above it drifts.
+
+    `varsel_decisions` is written for every match and this page publishes it on a public host --
+    with resolved origin and destination names since 2026-08-22, accepted then because prd's
+    registrations are test users. Client-app travellers are members of the public, so client
+    decisions and deliveries are recorded in Firestore and NEVER in that table. Its `pushed` column
+    is also journey-DEFINITION grain and cannot tell a webhook from a Web Push, so a client
+    delivery recorded there would corrupt this page's meaning as well as its privacy claim.
+
+    The rule is enforced three ways and this is the cheapest of them: nothing writes a client row
+    (`varsel.check_and_notify` hands `_record_decisions` the browser grouping only), no client
+    module imports `decisions`, and no query here names a client column or collection. Over the
+    uncommented text on purpose -- `meldinger_decisions.sql`'s own headers discuss what they refuse
+    to select, so a grep over the raw file would match an explanation.
+    """
+    import pathlib
+    import re
+
+    forbidden = (
+        "client_id",
+        "external_ref",
+        "destination_id",
+        "subscription_id",
+        "callback_url",
+        "alert_id",
+        "subscriptions",
+        "events",
+        "deliveries",
+        "alert_subjects",
+    )
+    here = pathlib.Path(__file__).parent
+    files = sorted(here.glob("historikk_*.sql"))
+    assert files, "the page's queries must be found for this guard to mean anything"
+    for path in files:
+        code = "\n".join(
+            re.sub(r"--.*$", "", line) for line in path.read_text().splitlines()
+        )
+        for name in forbidden:
+            assert name not in code, f"{path.name} names {name!r}: KTD10 keeps notification state out"
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

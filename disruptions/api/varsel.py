@@ -57,15 +57,15 @@ Design notes
   The in-app list shows every match an operator PUBLISHED regardless, flagged with
   ``alertworthy``; a match no SX message named is shown only once it crosses that gate
   (:func:`_card_alerts`), since a sub-threshold one carries no operator text to read.
-* **What the push says** — which train (``_train_label``: "Tog L1 09:24", the line included
-  because a journey matches several of them and a time alone does not say which), then the
-  *alerting* quantity in ``/demo``'s wording: P(innstilling eller ≥ 10 min forsinkelse), then
-  whichever driver dominates (likely cancellation, or the exceedance-stack delay interval). Never
-  the raw ``dep_delay_typ_min`` regression: for today's alert-worthy boardings its median is 2 min
-  against the stack p50's 15 min (rail), so quoting it made a 93 %-impact alert read as "1 % sjanse
-  for innstilling, typisk 2 min forsinket". An alternative, when there is one, closes the body with
-  the same label over its FIRST transit leg ("Alternativ tog R11 08:24") — the departure the
-  traveller has to catch, as opposed to a connection further along it.
+* **What the push says** — which train (``notification_wording.train_label``: "Tog L1 09:24", the
+  line included because a journey matches several of them and a time alone does not say which),
+  then the *alerting* quantity in ``/demo``'s wording: P(innstilling eller ≥ 10 min forsinkelse),
+  then whichever driver dominates (likely cancellation, or the exceedance-stack delay interval).
+  Never the raw ``dep_delay_typ_min`` regression: for today's alert-worthy boardings its median is
+  2 min against the stack p50's 15 min (rail), so quoting it made a 93 %-impact alert read as
+  "1 % sjanse for innstilling, typisk 2 min forsinket". An alternative, when there is one, closes
+  the body with the same label over its FIRST transit leg ("Alternativ tog R11 08:24") — the
+  departure the traveller has to catch, as opposed to a connection further along it.
 * **State** (devices / journeys / notified) is tiny JSON, guarded by a re-entrant lock and written
   through to a local file and — when ``VARSEL_STATE_BUCKET`` is set — a GCS blob, so it survives a
   redeploy (the container fs is ephemeral). Single always-on instance ⇒ last-write-wins is
@@ -87,9 +87,11 @@ import os
 import re
 import threading
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
+from itertools import islice
 from pathlib import Path
 from time import monotonic
 from typing import Annotated, Any, Protocol
@@ -98,13 +100,27 @@ from zoneinfo import ZoneInfo
 
 import feedback
 import feedback_contexts
+import notification_events  # the webhook channel's typed hand-off type and its emit step
+import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
+import reserved_budget  # the one reserve-don't-check pass budget
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
 # it back from here would be a cycle — see alert_policy's docstring). Bound at module level rather
 # than reached through `alert_policy.`, so `varsel.threshold_for` / `varsel.TROUBLE_DELAY_MIN` keep
 # resolving for the callers that already read them off this module. TROUBLE_DELAY_MIN is such a
 # re-export and nothing else: it is /demo's realized-outcome bar, not something varsel reads.
-from alert_policy import TROUBLE_DELAY_MIN, min_threshold, threshold_for  # noqa: F401
+#
+# `gate` arrived on 2026-09-08 (U1) and is the one that matters for this module: it is
+# `threshold_for` plus the comparison, stated once, so this module's browser adapter and the
+# client adapter being built beside it cannot come to disagree about what a threshold means. The
+# per-operator table and the no-SX cut are unchanged, which is why `alert_threshold` still reads
+# exactly what it always did on every existing decision row.
+from alert_policy import (  # noqa: F401
+    TROUBLE_DELAY_MIN,
+    gate,
+    min_threshold,
+    threshold_for,
+)
 from alternatives import AlternativeJourney
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -112,6 +128,20 @@ from fastapi import (
     Path as PathParam,  # aliased: `Path` here is pathlib's (see _STATE_PATH)
 )
 from impact import AlternativeOutcome, ImpactResponse, LatestObservation, severity_key
+
+# The WORDING moved out on 2026-09-08 (U1) so a second notification surface can produce the same
+# Norwegian text without importing this module -- 147 KB of poller state, the device registry, the
+# VAPID keypair and the decision-log writer, none of which a notification event may reach (R16). Bound
+# at module level under their old names, not reached through `notification_wording.`, so every
+# caller that already reads `varsel._deterministic_body` off this module keeps resolving -- `main`
+# injects it into `/meldinger`, and two suites assert push bodies against it. A monkeypatch of one
+# of these still reaches `_notification_payload`, which resolves the module global at call time.
+from notification_wording import delay_phrase as _delay_phrase
+from notification_wording import deterministic_body as _deterministic_body
+from notification_wording import mode_label
+from notification_wording import notification_title as _notification_title
+from notification_wording import train_label as _train_label
+from notification_wording import train_label_from_input as _train_label_from_input
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
@@ -129,14 +159,9 @@ _OSLO = ZoneInfo("Europe/Oslo")
 # job is to produce a usable input when llm_message is the thing that failed.
 _CANCEL_LIKELY = 0.5
 
-# Rail codespaces (operator == ref codespace). vehicleMode is NULL for most bus producers, so the
-# vehicle noun is derived from the codespace, not the feed; everything not rail is labelled "Buss".
-_RAIL_CODESPACES = frozenset({"VYG", "NSB", "GOA", "SJN", "FLT"})
-
-
-def mode_label(operator: str | None) -> str:
-    """User-facing vehicle noun for an operator: 'Tog' (rail) or 'Buss' (everything else)."""
-    return "Tog" if operator in _RAIL_CODESPACES else "Buss"
+# `mode_label` and its rail-codespace table moved to `notification_wording` with the wording that
+# reads them (2026-09-08): a notification event needs the vehicle noun and must not import this module
+# for it. Re-exported above, so `varsel.mode_label` -- which `main` calls twice -- still resolves.
 
 
 # FOLLOW-UP (needs its own eval before enabling): MOR/ATB/OST/GCO publish the SX *after* departure,
@@ -376,17 +401,108 @@ class ConnectivityProvider(Protocol):
 
     Returns (from→to runs, to→from runs), or None when the question could not be answered — an
     outage, a timeout, the rate limit. None is not "no service".
+
+    ``path`` names whose per-minute budget the question spends. The provider owns the vocabulary and
+    the ceilings (`main._CONNECTIVITY_NOTIFICATION_API_PATH` and its neighbours); this module only forwards
+    the tag it was handed, so an unrecognised one is charged the public budget rather than minting a
+    new one. It is keyword-only and defaulted so a caller that does not care — and every existing
+    one — is unchanged.
     """
 
     def __call__(
-        self, from_refs: Sequence[str], to_refs: Sequence[str]
+        self, from_refs: Sequence[str], to_refs: Sequence[str], *, path: str = ...
     ) -> tuple[bool, bool] | None: ...
+
+
+@dataclass(frozen=True)
+class WebhookRecipient:
+    """One webhook subscription as this pass sees it: a registration whose channel is a webhook.
+
+    KTD3's whole shape in three fields. It is a **view merged at match time, never a
+    materialization** — nothing here is ever written into :data:`_journeys`, :data:`_notified` or
+    the GCS state blob, which is what makes a rollback to pre-feature code safe (`_save_state`
+    writes known keys, so `_state_extra`'s round-trip could not have protected notification state that
+    had leaked into the blob).
+
+    ``journey`` carries exactly the five fields the shared work reads off a registration —
+    ``from_stop``, ``to_stop``, ``begin``, ``end``, ``days`` — because those are what
+    :func:`journey_key`, :func:`journey_windows` and :func:`_impact` consult, and
+    ``llm_message.build_message_input`` resolves the two place NAMES from the stop registry rather
+    than from the record.
+
+    ``delivered`` is this channel's counterpart of :data:`_notified` at the channel's OWN grain: the
+    ``alert_id`` of every (subscription, train) already delivered to THIS subscription, which is the
+    grain the store mints events at and therefore the grain :func:`_pending_pushes` asks its
+    question at through :func:`_webhook_pending`. Not the browser ledger's per-situation grain
+    (2026-09-10): a second train under a delivered situation is a new event here. Firestore is the
+    only dedup ledger for this channel; this is a read-only snapshot of it.
+
+    **The four routing fields ride along, and until 2026-09-08 they deliberately did not** — the
+    docstring here said a client document's destination and quotas "deliberately do not enter this
+    pass", which was right while nothing in the process emitted an event. What changed the answer is
+    ``subscription_version``, and specifically WHY the emit transaction reads it: it exists so a
+    slow pass cannot commit obsolete work (``notification_store._subscription_obsolete``), which only
+    means anything if the version compared is **the one the match was computed against**. Re-reading
+    it at emit time would compare the stored value with itself — always equal, never refusing — and
+    an alert about a train matched for a route the client has since amended would go out stamped
+    with the new version. So the version comes from the load snapshot, and the three ids beside it
+    come with it rather than earning a second store read each.
+
+    What has NOT changed is the invariant KTD3 rests on: none of these ever reaches
+    :data:`_journeys`, :data:`_notified`, the GCS state blob or a log line. They live in this
+    cycle's locals, are handed to the emit step as a return value, and are gone with the pass.
+    ``external_ref`` — the client's own opaque handle on a traveller — is carried for the event
+    envelope and is the one field R16 keeps out of even a structured log field.
+    """
+
+    recipient_id: str
+    journey: dict
+    delivered: frozenset[str] = frozenset()
+    # Appended after `delivered` on purpose: three suites construct this positionally, and every
+    # existing caller must keep working.
+    client_id: str = ""
+    destination_id: str = ""
+    subscription_version: int = 0
+    external_ref: str = ""
+    test: bool = False
+
+
+class WebhookRecipientProvider(Protocol):
+    """The webhook subscriptions this cycle should match, as RAW documents.
+
+    A Protocol for the same reason as :class:`ImpactProvider`: it is a cross-module contract whose
+    drift is quiet. A webhook recipient that silently stops being matched looks exactly like a
+    healthy deployment with nothing disrupted, which is the failure mode this whole surface exists
+    to avoid.
+
+    Raw documents rather than parsed records, deliberately. R20 wants an unreadable document
+    skipped rather than failing its collection, and only the reader can decide what "unreadable"
+    means for the schema the *running binary* knows: a store adapter written against a newer
+    document shape must be able to hand this pass something it refuses, one document at a time. So
+    the provider's job is to read the store and this module's job is to validate
+    (:func:`_parse_webhook_recipient`).
+
+    Returning a lazy iterable is fine and expected — a Firestore cursor is one — because
+    :func:`_load_webhook_recipients` materializes it INSIDE the bounded step, so both the wall-clock
+    ceiling and the :data:`_MAX_WEBHOOK_RECIPIENTS` count ceiling apply to the paging as well as to
+    the first call. The provider must still carry its own per-call deadline (KTD6): the bound here
+    is on how long the poller WAITS, not on when the store gives up.
+    """
+
+    def __call__(self) -> Iterable[Mapping[str, Any]]: ...
 
 
 _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 _connectivity_provider: ConnectivityProvider | None = None
 _togvarsel_notify_provider: Callable[[], bool] | None = None
+# The webhook channel's two seams, both defaulting to "no webhook recipients" so an un-wired
+# deployment -- which is every deployment until the store lands -- behaves byte for byte as it did
+# before this existed. `_webhook_enabled` is main's flag read, injected rather than read here for
+# `_togvarsel_notify_enabled`'s reason: one function is the seam, and it is consulted at CALL time
+# so an environment change needs no import-time dance.
+_webhook_enabled: Callable[[], bool] | None = None
+_webhook_provider: WebhookRecipientProvider | None = None
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -399,6 +515,8 @@ def configure(
     stops_provider: Callable[[], list[dict]],
     connectivity_provider: ConnectivityProvider | None = None,
     togvarsel_notify_provider: Callable[[], bool] | None = None,
+    webhook_enabled: Callable[[], bool] | None = None,
+    webhook_recipients_provider: WebhookRecipientProvider | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -406,12 +524,22 @@ def configure(
     what every deploy did before the check existed. `togvarsel_notify_provider` is main's
     TOGVARSEL_NOTIFY_ENABLED read, surfaced through /config so the PWA can announce the rush
     forecasts only where they are actually delivered; absent reads as off.
+
+    `webhook_enabled` and `webhook_recipients_provider` are the webhook channel (KTD3). Both are
+    optional and both default to off, which is not laziness about defaults: an un-wired deployment
+    must be indistinguishable from the code before the channel existed, and it is the pair being
+    absent — not a flag value — that guarantees it. The flag is injected separately from the store
+    so the pass can decline to touch the store at all, which is what makes "the flag is unset, so
+    nothing was read" a property of this module rather than of whoever wrote the provider.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
+    global _webhook_enabled, _webhook_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
+    _webhook_enabled = webhook_enabled
+    _webhook_provider = webhook_recipients_provider
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -481,6 +609,219 @@ def _canonicalize_journeys() -> None:
         )
 
 
+# ---- Webhook channel: subscriptions as registrations with a webhook ---------------------------
+#
+# R21's read ceiling. A webhook subscription costs this pass one journey_key group at most (they
+# collapse onto the browser groups they duplicate), and pass 1a is already 16-wide, so the number
+# that matters is not "how many can we match" but "how much can one bad store answer make the
+# poller carry". Deliberately the same order as `_MAX_JOURNEYS` (20 000) divided down: a pilot is
+# one client and a few hundred subscriptions, so anything approaching this is a store bug or a
+# quota breach rather than growth, and truncating it is the right failure. Truncation is logged.
+_MAX_WEBHOOK_RECIPIENTS = 2000
+# How long the poller waits for the whole load -- the first call AND every page of a lazy cursor.
+# It is a bound on the WAIT and not on the store: the provider carries its own per-call deadline
+# (KTD6), and a thread parked past this one is abandoned rather than killed, because Python has no
+# way to kill it. Sized against the cycle it sits in: `check_and_notify` is the last phase of a
+# cycle measured at 50-63 s on a period measured at ~296 s (2026-08-21 / 2026-09-08), and this runs
+# BEFORE `_WriteBudget`'s 30 s clock starts, so a slow store costs the cycle its own tail and
+# never the wordings.
+_WEBHOOK_LOAD_TIMEOUT_S = 5.0
+
+
+def webhook_channel_enabled() -> bool:
+    """Is the webhook channel live in this deployment? Read at CALL time, never latched.
+
+    Two things have to be true, and they are deliberately separate: main's flag (unset = off, the
+    `_togvarsel_notify_enabled` convention) and a store to read. Either missing means the channel
+    contributes nothing, and a cycle then reduces to exactly the pass that ran before the channel
+    existed — which is the property the whole feature's rollback story rests on.
+    """
+    if _webhook_provider is None or _webhook_enabled is None:
+        return False
+    try:
+        return bool(_webhook_enabled())
+    except Exception:
+        # A flag reader that raises must read as OFF, like every other gate in this repo: the
+        # failure direction of a delivery switch is closed (llm_message.py argues it at length).
+        logger.warning(
+            "Webhook channel flag could not be read; treating the channel as off this cycle",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_webhook_load", "result": "flag_error"}},
+        )
+        return False
+
+
+def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
+    """One raw client document → a :class:`WebhookRecipient`, raising on anything unreadable.
+
+    Restates :class:`JourneyIn`'s three window rules (HH:MM, a non-empty subset of 0..6, and
+    ``begin < end`` so overnight windows are refused) rather than importing that model, for two
+    reasons that both matter. `JourneyIn` requires a ``device_id``, which a webhook subscription by
+    definition does not have; and this runs on the ingestion thread against documents written by a
+    possibly NEWER binary, so it must validate the fields the pass actually reads and be
+    indifferent to fields it does not — a model whose required set grows would start refusing every
+    document in the collection on the deploy that adds a field.
+    ``test_the_webhook_loader_refuses_exactly_what_the_registration_api_refuses`` pins the two
+    against each other so the restatement cannot drift into being looser.
+
+    **The stop refs are canonicalized here** (:func:`canonical_stop`), and that is not a tidy-up.
+    `_canonicalize_journeys` only ever walks `_journeys`, so a client document naming a ref the
+    stop registry has since collapsed onto a primary would produce a DIFFERENT `journey_key` than
+    the browser registration for the identical physical trip — two groups, two /impact calls, two
+    wordings, and AE1's whole claim quietly false. Same defect as the 2026-08-03 picker bug, one
+    layer out.
+
+    Raises rather than returning None: the caller's per-document guard is what turns a bad document
+    into a skipped document, and a sentinel return would let a future edit forget to check it.
+    """
+    recipient_id = str(doc["recipient_id"])
+    if not recipient_id:
+        raise ValueError("recipient_id must be a non-empty string")
+    from_stop = canonical_stop(str(doc["from_stop"]))
+    to_stop = canonical_stop(str(doc["to_stop"]))
+    if not from_stop or not to_stop:
+        raise ValueError("from_stop and to_stop must be non-empty")
+    if from_stop == to_stop:
+        raise ValueError("from_stop and to_stop must differ")
+    begin, end = str(doc["begin"]), str(doc["end"])
+    if not _HHMM_RE.match(begin) or not _HHMM_RE.match(end):
+        raise ValueError("begin/end must be HH:MM (24h)")
+    if _parse_hhmm(begin) >= _parse_hhmm(end):
+        raise ValueError("begin must be before end (overnight windows are not supported)")
+    days = sorted({int(d) for d in doc["days"]})
+    if not days or any(d < 0 or d > 6 for d in days):
+        raise ValueError("days must be a non-empty subset of 0..6 (0=Monday)")
+    return WebhookRecipient(
+        recipient_id=recipient_id,
+        journey={
+            "from_stop": from_stop,
+            "to_stop": to_stop,
+            "begin": begin,
+            "end": end,
+            "days": days,
+        },
+        delivered=frozenset(str(s) for s in doc.get("delivered") or ()),
+        # Read PERMISSIVELY, unlike everything above it, and the asymmetry is the point. The fields
+        # above are what the pass MATCHES on: a document that cannot supply them cannot be matched
+        # at all, so it is refused and skipped. These four are what the pass ROUTES with, and a
+        # document missing one can still be matched — it still collapses onto its journey key, still
+        # shares the one /impact call and the one wording AE1 asserts. Refusing it would take a
+        # browser registration's own wording away over a client field, so it is matched and simply
+        # not emitted for: `notification_events.train_ref` and `_webhook_subjects` drop a subject that
+        # names no destination, and the count is logged.
+        client_id=str(doc.get("client_id") or ""),
+        destination_id=str(doc.get("destination_id") or ""),
+        subscription_version=int(doc.get("version") or 0),
+        external_ref=str(doc.get("external_ref") or ""),
+        test=bool(doc.get("test")),
+    )
+
+
+def _load_webhook_recipients() -> list[WebhookRecipient]:
+    """This cycle's webhook subscriptions, or an empty list — the single guarded, bounded read.
+
+    The ONE place this pass reads notification state (KTD6): passes 1a and 1b work off the snapshot it
+    returns and never go back to the store, which is what keeps 1b free to stay sequential (it
+    mutates module state and blocks on nothing).
+
+    Three failure shapes, three treatments, and the middle one is what a naive version gets wrong:
+
+    * **the store raises** — this cycle has no webhook recipients, logged once, and the browser
+      half of the pass is untouched. Guarded in the shape of the `_reconcile_caches` guard below,
+      and for a strictly bigger blast radius: called bare, a raise here unwinds out of
+      `check_and_notify` entirely, so loop 2 never runs (no pushes at all) and `_record_decisions`
+      never runs (no rows either).
+    * **the store is slow** — bounded by :data:`_WEBHOOK_LOAD_TIMEOUT_S` on a worker thread. The
+      executor is deliberately NOT used as a context manager: `__exit__` calls
+      `shutdown(wait=True)`, which would block the poller until the slow call finally returned and
+      defeat the timeout completely. `shutdown(wait=False)` abandons the thread instead, which is
+      the honest trade — Python cannot cancel a thread parked in a socket read, and one leaked
+      thread per bad cycle is far cheaper than a stalled ingestion thread. What abandoning it still
+      costs is interpreter shutdown: `concurrent.futures.thread` registers an atexit hook that
+      joins its workers, so a provider with NO deadline of its own would delay a pod termination by
+      however long it hangs. That is the second reason KTD6 puts a per-call deadline on the
+      provider rather than treating this ceiling as the only bound.
+    * **one document is unreadable** — skipped, per document, never allowed to fail its collection
+      (R20). The count and the exception CLASS are logged and the document body never is (R16): a
+      webhook subscription is a route with times, and this log line is not the place for it.
+
+    Materializing the iterable happens inside the worker (`list(islice(...))`), so a lazy Firestore
+    cursor's paging is under the same clock as the first call and :data:`_MAX_WEBHOOK_RECIPIENTS`
+    bounds the read rather than merely the result.
+    """
+    if not webhook_channel_enabled():
+        return []
+    provider = _webhook_provider
+    if provider is None:  # narrowed for the type checker; webhook_channel_enabled already said so
+        return []
+    started = monotonic()
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="client-load")
+    try:
+        future = pool.submit(lambda: list(islice(provider(), _MAX_WEBHOOK_RECIPIENTS)))
+        docs = future.result(timeout=_WEBHOOK_LOAD_TIMEOUT_S)
+    except Exception:
+        logger.warning(
+            "Webhook subscriptions could not be read this cycle; matching browser registrations "
+            "only",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_webhook_load", "result": "error"}},
+        )
+        return []
+    finally:
+        # Never wait: see the docstring. A thread still inside a slow provider call outlives this
+        # cycle and is collected when the call returns.
+        pool.shutdown(wait=False)
+
+    recipients: list[WebhookRecipient] = []
+    skipped: dict[str, int] = {}
+    for doc in docs:
+        try:
+            recipients.append(_parse_webhook_recipient(doc))
+        except Exception as exc:
+            # The traceback at DEBUG, the COUNT at WARNING below. Never the document: a client
+            # subscription is a route with times and weekdays, and R16 keeps that out of routine
+            # logs -- which a per-document warning quoting the record would defeat. Bounded by
+            # `_MAX_WEBHOOK_RECIPIENTS`, and the exception messages reachable here are either a
+            # missing key name or one of this function's own sentences, so the traceback is safe.
+            logger.debug("Unreadable webhook subscription document; skipping it", exc_info=True)
+            skipped[type(exc).__name__] = skipped.get(type(exc).__name__, 0) + 1
+    if skipped:
+        logger.warning(
+            "Skipped %d unreadable webhook subscription document(s) this cycle (%s); the rest of "
+            "the collection was matched",
+            sum(skipped.values()),
+            ", ".join(f"{name} x{n}" for name, n in sorted(skipped.items())),
+            extra={
+                "fields": {
+                    "event": "varsel_webhook_load",
+                    "result": "skipped",
+                    "skipped": sum(skipped.values()),
+                }
+            },
+        )
+    logger.info(
+        "Loaded %d webhook subscription(s) in %.0f ms (%d skipped)",
+        len(recipients),
+        (monotonic() - started) * 1000,
+        sum(skipped.values()),
+        extra={
+            "fields": {
+                "event": "varsel_webhook_load",
+                "result": "ok",
+                "n": len(recipients),
+                "skipped": sum(skipped.values()),
+                "ms": int((monotonic() - started) * 1000),
+                # `>=`, so a collection of exactly the ceiling reports truncated. That is not a
+                # rounding error to fix: the read stops AT the ceiling (R21 -- it may not exceed
+                # it), so this cycle genuinely cannot tell a full collection from a clipped one,
+                # and claiming otherwise would need one more document than the ceiling allows.
+                "truncated": len(docs) >= _MAX_WEBHOOK_RECIPIENTS,
+            }
+        },
+    )
+    return recipients
+
+
 # Shown on the card of a journey no planned trip connects today. Deliberately a warning and never a
 # rejection, in both shapes below: a route that runs only at weekends, or seasonally, is legitimately
 # absent from today's timetable, and even "served only the other way" can be a pair whose return leg
@@ -525,12 +866,24 @@ def _service_check_due(rec: dict, now: datetime) -> bool:
         return True
 
 
-def _service_verdict(from_stop: str, to_stop: str) -> tuple[bool, bool] | None:
-    """Ask the injected provider about every ref of both places. None when unavailable."""
+def _service_verdict(
+    from_stop: str, to_stop: str, *, path: str | None = None
+) -> tuple[bool, bool] | None:
+    """Ask the injected provider about every ref of both places. None when unavailable.
+
+    ``path`` is forwarded to the provider only when a caller names one, and that is not a style
+    choice: a provider is an INJECTED seam, several suites supply two-positional fakes, and this
+    function swallows every exception into ``None``. Passing ``path=`` unconditionally would turn
+    each of those fakes into a silent "could not establish" — which is the exact failure this seam
+    exists to avoid, arriving with a green test suite. `notification_api` and `notification_servability` are
+    wired with a partial that names the client budget (see `main.lifespan`).
+    """
     if _connectivity_provider is None:
         return None
     try:
-        return _connectivity_provider(place_refs(from_stop), place_refs(to_stop))
+        if path is None:
+            return _connectivity_provider(place_refs(from_stop), place_refs(to_stop))
+        return _connectivity_provider(place_refs(from_stop), place_refs(to_stop), path=path)
     except Exception:
         # Same rule as the provider's own failure path: an unanswerable question never blocks a
         # registration, and never becomes a warning either.
@@ -548,7 +901,7 @@ def recheck_service() -> None:
     """Re-ask about journeys flagged as having no direct service, and clear the ones that now do.
 
     Called from the poller's refresh cycle. Bounded by design: only flagged journeys are re-asked, and
-    each at most once per :data:`_SERVICE_RECHECK_S`, so this costs nothing on a healthy list.
+    each at most once per :data:`_SERVICE_RECHECK`, so this costs nothing on a healthy list.
     """
     now = datetime.now(UTC)
     with _state_lock:
@@ -1219,8 +1572,14 @@ def _collect_alerts(
     observation_by_line = {line.line: line.latest_observation for line in (impact.lines or [])}
     for sit in impact.situations or []:
         dep = sit.departure_prediction
-        threshold = threshold_for(sit.operator, has_situation=sit.has_situation)
         impact_p = dep.impact_probability
+        # THE one gate, since 2026-09-08: `alert_policy.gate` states the comparison (and the
+        # "None is never alert-worthy" rule) in a single place, so this browser adapter and the
+        # client adapter being built beside it cannot come to disagree about what a threshold
+        # means. It is `threshold_for` underneath and nothing else -- the per-operator table and
+        # the no-SX cut are unchanged, which is why `alert_threshold` still reads exactly what it
+        # always did on every existing decision row.
+        threshold, alertworthy = gate(impact_p, sit.operator, has_situation=sit.has_situation)
         alert = Alert(
             situation_number=sit.situation_number,
             summary=sit.summary,
@@ -1241,7 +1600,7 @@ def _collect_alerts(
             ge10_probability=dep.ge10_probability,
             impact_probability=impact_p,
             alert_threshold=threshold,
-            alertworthy=impact_p is not None and impact_p >= threshold,
+            alertworthy=alertworthy,
             latest_observation=observation_by_line.get(sit.line),
             alternative_journey=getattr(sit, "alternative_journey", None),
             # This situation's own lookup, projected onto the response the alert carries: the three
@@ -1303,8 +1662,10 @@ def _train_key(alert: Alert) -> tuple | None:
     return None
 
 
-def _pending_pushes(jids, alerts: list[Alert]) -> list[Alert]:
-    """The alert-worthy trains a push is still coming for, worst-first.
+def _pending_pushes(
+    jids, alerts: list[Alert], webhook_recipients: Sequence[WebhookRecipient] = ()
+) -> list[Alert]:
+    """The alert-worthy trains a notification is still coming for, worst-first — on ANY channel.
 
     This is what the writing budget is spent on.
 
@@ -1314,7 +1675,22 @@ def _pending_pushes(jids, alerts: list[Alert]) -> list[Alert]:
     "Still coming" is per REGISTRATION, because `_notified` is: two devices on one trip are notified
     separately, so a train the first device already heard about is still pending for the second
     and its wording can still change what somebody sees. A journey definition nobody is registered
-    on any more yields nothing, which is correct — there is no push to write for.
+    on any more yields nothing, which is correct — there is no notification to write for.
+
+    **A webhook subscription is another registration** (KTD3), so it is asked the same question
+    against its own ledger: `WebhookRecipient.delivered`, Firestore's counterpart of `_notified`,
+    read once per cycle in `_load_webhook_recipients`. Never the store itself — this is called
+    from pass 1b, which is sequential precisely because it blocks on nothing. Its GRAIN is the
+    channel's own, not the browser's: per TRAIN (`_webhook_pending`), because that channel mints one
+    event per (subscription, train), where `_notified` is per situation because a browser is pushed
+    once per situation.
+
+    **The caller passes NO browser jids when `push_enabled()` is false**, and that half is easy to
+    miss and expensive to get wrong (KTD4). `_notified` only grows on a successful browser send, so
+    without it a keypair-less deployment (tst has no keypair) would report every alert-worthy train
+    as pending for every browser registration on every cycle, and spend the whole write budget
+    re-wording trains it can never deliver — competing with exactly the webhook subjects the gate
+    change exists to serve.
 
     Deliberately approximate in one direction only. It does not check that each registration
     still has a live subscription (loop 2 does, and drops the device if the endpoint is gone), so
@@ -1329,8 +1705,34 @@ def _pending_pushes(jids, alerts: list[Alert]) -> list[Alert]:
         alert
         for alert in one_alert_per_train(alerts)
         if alert.alertworthy
-        and any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
+        and (
+            any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
+            or any(_webhook_pending(recipient, alert) for recipient in webhook_recipients)
+        )
     ]
+
+
+def _webhook_pending(recipient: WebhookRecipient, alert: Alert) -> bool:
+    """Is a webhook notification about this TRAIN still coming for this subscription?
+
+    Per train, because the store mints one event per (subscription, train) -- the `alert_id` -- and
+    keys its delivered marks on it. Admitting on the situation number, as this did until
+    2026-09-10, refused a second departure under an already-delivered situation: its event still
+    went out (a new train is a new subject) but carried the template, while the first train's
+    carried the model's prose. The id is derived through `notification_events.alert_id_for`, the
+    same derivation the emit step's `train_ref` uses, so a mark the store wrote is a mark this
+    reads. A train that cannot be a stable subject is never minted and is therefore never pending.
+    """
+    train_id = notification_events.alert_id_for(
+        recipient.recipient_id,
+        operator=alert.operator,
+        line=alert.line,
+        journey_ref=alert.jkey,
+        stop_place=alert.stop_place,
+        stop_order=alert.stop_order,
+        departure_time=alert.departure_time,
+    )
+    return train_id is not None and train_id not in recipient.delivered
 
 
 def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
@@ -1375,191 +1777,13 @@ def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
 
 
 # ---- Notify ----------------------------------------------------------------------------------
-def _delay_phrase(message_input: dict) -> str | None:
-    """"typisk 15–27 min forsinket" from the exceedance-stack interval (p50–p90, /demo's delay
-    column); collapsed to one number when they coincide, None when neither is known."""
-    delay = message_input.get("forsinkelse_min") or {}
-    p50, p90 = delay.get("typisk"), delay.get("verstefall")
-    if not p50 and not p90:
-        return None
-    if p50 and p90 and p90 > p50:
-        return f"Typisk {p50}–{p90} min forsinket"
-    return f"Typisk {p90 or p50} min forsinket"
-
-
-def _train_label(mode: str | None, line: str | None, hhmm: str) -> str:
-    """Which departure this is, as a departure board names it: "Tog L1 09:24".
-
-    The line is what makes the label identify *their* train rather than *a* train: a registered
-    journey routinely matches several lines at once, so "Tog kl 09:24" leaves the reader to work out
-    which of them left at 09:24 — on a lock screen, in the minutes before they walk to the platform.
-
-    One label for both departures a body can name — the traveller's own train and the alternative
-    offered instead of it — so the two read alike and a reader comparing them is comparing like with
-    like. That is why it takes its parts rather than reading them off the message input: they come
-    from the top level for the first and from `alternativ_reise.reisevei[0]` for the second.
-
-    `mode` is passed in RATHER THAN LOOKED UP, and its case comes with it: the first label heads its
-    own line ("Tog R10 08:00: …") while the second sits mid-clause after "Alternativ", where bokmål
-    wants a lower-case common noun. This function cannot know which, so `_LEG_MODE_NOUN` — used only
-    for the second — carries the lower-case form and the alert's own `mode` stays as it is.
-
-    Every part is optional, and each missing one costs only itself: `linje` is absent when the ref
-    was unknown, and a leg can carry a mode this codebase has no noun for. Inventing either would be
-    the one failure worse than saying too little. Note the line-less form keeps "kl" and the line
-    form drops it — "Tog 09:24" alone reads as a quantity, "Tog L1 09:24" as a line and a time.
-    """
-    if line:
-        return f"{mode} {line} {hhmm}" if mode else f"{line} {hhmm}"
-    return f"{mode} kl {hhmm}" if mode else f"kl {hhmm}"
-
-
-# The Journey Planner's transport modes in Norwegian. A closed set: `alternatives._TRIP_QUERY`
-# asks for exactly these six (foot legs never reach a wording -- build_message_input drops them),
-# so this is a complete translation rather than a best effort. Anything outside it yields no noun
-# at all: "Alternativ R11 08:24" says less than it could, while a guessed noun would put the wrong
-# vehicle on a lock screen, and the line and time still identify the departure without one.
-#
-# LOWER CASE, unlike the `mode` on the alert (2026-08-20). These are ordinary bokmål nouns, and this
-# label is the only one that lands mid-clause -- always after "Alternativ", never at the start of a
-# line -- so "Alternativ tog R11 08:24" is what Norwegian orthography asks for and "Alternativ Tog
-# R11 08:24" reads as a proper noun. The alert's own label keeps its capital because it heads its
-# line. Case therefore belongs HERE, at the one call site whose position is fixed, and not in
-# `_train_label`, which cannot know where its caller will put the result. "T-bane" keeps its capital
-# T in every position: it is an abbreviation, not a common noun.
-_LEG_MODE_NOUN = {
-    "rail": "tog",
-    "bus": "buss",
-    "coach": "buss",
-    "tram": "trikk",
-    "metro": "T-bane",
-    "water": "båt",
-}
-
-
-def _first_leg_label(alternative: dict, hhmm: str) -> str:
-    """The alternative's first transit leg, labelled like any other departure: "tog R11 08:24".
-
-    "Alternativ kl 08:24" tells a traveller when to be on a platform but not what to board, which on
-    a station with several departures in the same minute is the half of the advice they cannot
-    supply themselves. The FIRST leg, because that is the one they have to catch; a later leg's line
-    is a connection they will read off a board once they are moving, and naming it here would put
-    two line numbers in one clause with nothing saying which to board.
-
-    `reisevei` holds the transit legs in order, foot already excluded
-    (llm_message.build_message_input), so leg zero is that first one. An empty or absent list falls
-    through to the time alone — the wording this had before it named any line.
-    """
-    leg = next(iter(alternative.get("reisevei") or []), {})
-    return _train_label(_LEG_MODE_NOUN.get(leg.get("transportmiddel")), leg.get("linje"), hhmm)
-
-
-def _alternative_phrase(message_input: dict) -> str | None:
-    """"Alternativ tog R11 08:24, framme kl 09:05" — the escape route, with its caveats.
-
-    This is the wording prd actually ships (`VARSEL_LLM_ENABLED=false` there), so a caveat that
-    reaches only the prompt reaches nobody. Two of them are stated rather than implied:
-
-    * `ankommer_i_tide: false` — the alternative is framme AFTER the traveller's planned arrival.
-      Routine, not exotic: since the selection rule gained its fallback tier the offer for a
-      cancelled train is regularly the next possibility rather than a faster one, and a clause that
-      named a departure time without saying so would tell that traveller they still make their
-      appointment. Read as `is False`, not falsily: an input built before this key existed (a
-      replayed decision row, `_message_input_from_alert` from an older process) says *nothing* about
-      which side of the deadline this lands on, and asserting lateness from silence is a fabrication.
-    * `egen_risiko` — the replacement is itself predicted to be in trouble. It is offered because
-      nothing safer reached the destination in time, so it must not read as a clean escape.
-
-    `minutter_spart` is deliberately not quoted. It is in the input only when positive (see
-    `llm_message.build_message_input`), the two times already say it, and one figure per line is the
-    register this template keeps.
-
-    Same "assemble from the parts that exist" discipline as the rest of the body: the Journey Planner
-    can answer without a readable departure or arrival time, and an alternative naming neither is not
-    advice — it is dropped rather than rendered as "Alternativ kl None". The line and vehicle come
-    from :func:`_first_leg_label` and are each optional in the same way.
-    """
-    alt = message_input.get("alternativ_reise") or {}
-    departure, arrival = alt.get("avgang_kl"), alt.get("ankomst_kl")
-    if not departure and not arrival:
-        return None
-    phrase = f"Alternativ {_first_leg_label(alt, departure)}" if departure else "Alternativ"
-    if arrival:
-        phrase += f", framme kl {arrival}" if departure else f" framme kl {arrival}"
-    if alt.get("ankommer_i_tide") is False:
-        # With the figure when the input carries one: «34 min senere enn planlagt ankomst» spares
-        # the reader subtracting two clock times on a lock screen (design review 2026-09-01,
-        # finding 16). `minutter_senere` is present only when positive -- see build_message_input.
-        later = alt.get("minutter_senere")
-        phrase += (
-            f" – {later} min senere enn planlagt ankomst"
-            if later
-            else " – senere enn planlagt ankomst"
-        )
-    if alt.get("egen_risiko"):
-        phrase += " (kan også bli rammet)"
-    return phrase
-
-
-def _deterministic_body(message_input: dict) -> str:
-    """The template wording: what the push says when no written message is available.
-
-    Written from the same message input the model is prompted with (llm_message.build_message_input)
-    rather than from the Alert directly, so the two wordings are always built from one set of facts.
-    Adding a figure to the input is what makes it sayable by both; before this, enriching the
-    template meant reaching past the document the model had already been handed.
-
-    Every part is optional, so the body is assembled from the ones that exist rather than
-    interpolated blind. A pushed alert is gated on `impact_probability`, which comes off the
-    exceedance head and not off these columns: `p_cancel` can sit under the cancellation bar (so the
-    input carries no `innstilling_prosent`) while both delay percentiles are NULL, and `sammendrag`
-    is nullable too. Interpolating either unguarded put the literal string "None" in a notification
-    body. Dropping the part is the honest fallback -- with a departure time present (the matcher
-    needs one, so in practice there always is) the reader still gets which train, and the payload
-    title still names the journey.
-    """
-    situations = message_input.get("situasjoner") or []
-    summary = situations[0].get("sammendrag") if situations else None
-    if message_input.get("ingen_melding"):
-        # No operator has published anything about this train, so there is no text to quote and
-        # `situasjoner` is empty -- without a headline of our own the body would open on whatever
-        # detail line follows and read as though it were quoting somebody. It says only what the
-        # warning is, not that no message stands behind it (2026-08-20): the caveat ran longer than
-        # the warning, and the same shortening is why the prompt no longer asks for it either, so
-        # the two writers stay comparable on this axis.
-        summary = "Mulig avvik"
-
-    # `innstilling_prosent` is in the input only when cancellation is the most likely outcome, which
-    # is exactly when the wording should lead with it -- see llm_message.build_message_input.
-    cancel_pct = message_input.get("innstilling_prosent")
-    if message_input.get("innstilt"):
-        # ET has already declared this departure cancelled. State it. A probability here would be
-        # both wrong and unhelpful: the train is not in the journey planner any more, so "91 %
-        # sjanse for innstilling" sends the traveller looking for a departure that does not exist
-        # (2026-08-05). The input carries no delay figures in this case either -- they meant
-        # "if it runs".
-        detail = "Innstilt"
-    elif cancel_pct is not None:
-        detail = f"{cancel_pct} % sjanse for innstilling"
-    else:
-        detail = _delay_phrase(message_input)
-    hhmm = message_input.get("avgang_kl")
-    if hhmm:
-        train = _train_label(
-            message_input.get("transportmiddel"), message_input.get("linje"), hhmm
-        )
-        if message_input.get("i_morgen"):
-            # The departure is TOMORROW. The poller scores ~12 h ahead, so a push about a 07:18
-            # train routinely goes out the evening before -- by design, not by accident -- and read
-            # at 21:36 "Tog L1 07:18 er innstilt" sounds like tonight's train (design review
-            # 2026-09-01, finding 48). Same key the prompt is told about, so both writers say it.
-            train = f"{train} i morgen"
-        detail = f"{train}: {detail}" if detail else train
-    # The alternative comes LAST, after the cancellation or the delay: what has happened to the
-    # traveller's own train is the news, and the replacement is the advice that follows from it.
-    return "\n".join(
-        part for part in (summary, detail, _alternative_phrase(message_input)) if part
-    )
+# `_delay_phrase`, `_train_label`, `_LEG_MODE_NOUN`, `_first_leg_label`,
+# `_alternative_phrase` and `_deterministic_body` moved to `notification_wording` on
+# 2026-09-08 and are imported above under their old names. Not a rewrite: every one of them
+# was already a pure function of the message input `llm_message.build_message_input`
+# produces, which is what made the move a move. The bytes a traveller receives are unchanged,
+# and `test_varsel`/`test_varsel_api` assert them against the imported names, so a drift is a
+# failing assertion rather than a quietly different notification.
 
 
 def _tag_environment(title: str) -> str:
@@ -1595,39 +1819,9 @@ def normalize_brand(brand: str | None) -> str:
     return brand if brand in _BRAND_ASSETS else DEFAULT_BRAND
 
 
-def _notification_title(
-    message_input: dict, from_name: str, to_name: str, *, confirmed: bool = False
-) -> str:
-    """The lock-screen title: the FACT about the train, never the registration's name.
-
-    It was «Asker stasjon → Lillestrøm stasjon» until 2026-09-02 -- the route the traveller already
-    knows, and one every phone truncated to «Asker stasjon → Lillestrøm s…» (design review
-    2026-09-01, finding 13). The title is the surface a lock screen is scanned by, so it now says
-    what happened, «Tog L1 07:18 er innstilt», and the route moved to the body's first line. Built
-    from the same message input as the body, so the two name the train identically; the route is
-    the fallback when the input names no departure.
-
-    `confirmed` prefixes a declared cancellation with «Bekreftet:» when an earlier push about the
-    same train already reached this registration (finding 14): the two arrive under one
-    notification tag, so the second REPLACES the first, and the prefix says that is what it is.
-    Only a cancellation earns it -- a second forecast about the same train is an update, not a
-    confirmation of anything.
-    """
-    hhmm = message_input.get("avgang_kl")
-    if not hhmm:
-        return f"{from_name} → {to_name}"
-    train = _train_label(message_input.get("transportmiddel"), message_input.get("linje"), hhmm)
-    if message_input.get("i_morgen"):
-        train = f"{train} i morgen"
-    if message_input.get("innstilt"):
-        title = f"{train} er innstilt"
-        return f"Bekreftet: {title}" if confirmed else title
-    if message_input.get("innstilling_prosent") is not None:
-        return f"{train} kan bli innstilt"
-    delay = message_input.get("forsinkelse_min") or {}
-    if delay.get("typisk") or delay.get("verstefall"):
-        return f"{train} kan bli forsinket"
-    return f"{train}: mulig avvik"
+# `_notification_title` moved to `notification_wording` with the body it heads, and is
+# imported above under its old name -- the two must name the train identically, so they
+# belong together.
 
 
 def _notification_tag(journey_id: str | None, alert: Alert) -> str | None:
@@ -1644,6 +1838,36 @@ def _notification_tag(journey_id: str | None, alert: Alert) -> str | None:
     if journey_id is None or key is None:
         return None
     return f"{journey_id}|" + "|".join(str(part) for part in key)
+
+
+def notification_wording_for(
+    message_input: dict,
+    from_name: str,
+    to_name: str,
+    message: str | None,
+    *,
+    confirmed: bool = False,
+) -> tuple[str, str]:
+    """The title and body ONE notification carries, whatever channel carries it.
+
+    Extracted from :func:`_notification_payload` on 2026-09-08 so the webhook channel's event
+    envelope is byte-identical to the Web Push by CONSTRUCTION rather than by a parallel builder
+    that agrees today. R7 states the claim ("the Norwegian title and body /varsel would have
+    pushed"), and a second copy of two f-strings is exactly the shape that drifts silently: nothing
+    crashes and no assertion fails when one of them stops prefixing the route.
+
+    The BODY is the route on its own line followed by the wording (2026-09-02). The wording is what
+    `/historikk` records and what the two writers are compared on, so the route was added AROUND it
+    when the title stopped carrying it rather than written into it. The TITLE carries the
+    environment tag — `[dev] `, leading because phones truncate on the right — and the body never
+    does, so the recorded wording is the same text in every environment.
+    """
+    return (
+        _tag_environment(
+            _notification_title(message_input, from_name, to_name, confirmed=confirmed)
+        ),
+        f"{from_name} → {to_name}\n{message or _deterministic_body(message_input)}",
+    )
 
 
 def _notification_payload(
@@ -1685,12 +1909,12 @@ def _notification_payload(
         separator = "&" if "?" in url else "?"
         url = f"{url}{separator}{urlencode({'journey': journey_id, 'situation': alert.situation_number})}"
     message_input = message_input or _message_input_from_alert(alert)
-    wording = message or _deterministic_body(message_input)
+    title, body = notification_wording_for(
+        message_input, from_name, to_name, message, confirmed=confirmed
+    )
     payload = {
-        "title": _tag_environment(
-            _notification_title(message_input, from_name, to_name, confirmed=confirmed)
-        ),
-        "body": f"{from_name} → {to_name}\n{wording}",
+        "title": title,
+        "body": body,
         "url": url,
         "icon": assets["icon"],
         "situation_number": alert.situation_number,
@@ -2093,7 +2317,8 @@ def _message_input_from_alert(alert: Alert) -> dict:
             "ankomst_kl": _local_hhmm(alt.arrival_time),
             "ankommer_i_tide": alt.arrives_before_original,
             "egen_risiko": alt.at_risk,
-            # Same shape and same foot filter as build_message_input's, because _alternative_phrase
+            # Same shape and same foot filter as build_message_input's, because
+            # notification_wording.alternative_phrase
             # reads ONE document and takes the vehicle and line it names from leg zero. Omitting the
             # legs here would leave this path's wording saying "Alternativ kl 08:24" while the very
             # same offer, worded from a buildable input, named the train to board.
@@ -2106,7 +2331,8 @@ def _message_input_from_alert(alert: Alert) -> dict:
         if alt.minutes_saved > 0:
             alternative["minutter_spart"] = alt.minutes_saved
         # Same rule as build_message_input: the figure rides only when the alternative is late
-        # against the plan, so `_alternative_phrase` never says "0 min senere".
+        # against the plan, so `notification_wording.alternative_phrase` never says
+        # "0 min senere".
         later = getattr(alt, "minutes_after_original", None)
         if alt.arrives_before_original is False and later:
             alternative["minutter_senere"] = later
@@ -2202,8 +2428,8 @@ def _record_decisions(
                     written = _messages.get(message_key)
                     meta = dict(_message_meta.get(message_key) or {})
                 # No meta means the writer was never reached for this alert, and why is knowable
-                # from the state that decided it: below the threshold, push (and with it the writer)
-                # switched off, no backend available to ask — or alert-worthy but not among the
+                # from the state that decided it: below the threshold, no deliverable recipient on
+                # any channel, no backend available to ask — or alert-worthy but not among the
                 # trains this journey wrote for this cycle (`not_selected`). Since 2026-08-21 that
                 # last value is much narrower: a second situation about a train another situation
                 # already covers (`one_alert_per_train` collapsed it), a train with no push pending
@@ -2215,6 +2441,13 @@ def _record_decisions(
                     if not alert.alertworthy:
                         status = "not_alertworthy"
                     elif not push_on:
+                        # Unchanged on purpose (KTD4): every row `_record_decisions` writes is a
+                        # BROWSER subject (it iterates the browser grouping -- KTD10 keeps client
+                        # subjects out of this table), so "no keypair" is still exactly why this
+                        # subject got no wording, and the value keeps the meaning every existing row
+                        # in `varsel_decisions` carries. What changed above is only that a client
+                        # subscription can now earn a wording the browser channel could not deliver
+                        # -- and where one did, `meta` is set and this branch is never reached.
                         status = "push_disabled"
                     elif not generation_on:
                         # Kept as "llm_disabled" -- the value is an established column in
@@ -2461,7 +2694,417 @@ def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
                 _forget_message(message_key)
 
 
-class _WriteBudget:
+# ---- The webhook channel's outgoing side: this cycle's subjects -------------------------------
+#
+# Everything below turns the SAME match, the SAME collapse and the SAME wording the browser channel
+# used into the shape `notification_events` commits. It is the last thing `check_and_notify` does and it
+# leaves nothing behind: the result is a return value (KTD3 -- a view merged at match time, never a
+# materialization), so `_journeys`, `_notified` and the state blob still carry no client id and a
+# rollback to pre-feature code has nothing of this to lose.
+
+#: What a retraction says. Withdrawal means THE FORECAST CHANGED, not that normal service is
+#: guaranteed — the store's own `record_below_threshold` docstring makes that the wording's job, and
+#: it is the one sentence a traveller could most easily read as an all-clear. Norwegian, like every
+#: other traveller-facing string in this module, and deliberately brand-independent for the reason
+#: every push wording is: it is the text a comparison would be split by.
+_WEBHOOK_WITHDRAWAL_DETAIL = (
+    "Vi varsler ikke lenger om denne avgangen. Det betyr ikke at den er garantert i rute."
+)
+_WEBHOOK_WITHDRAWAL_TITLE = "varselet er trukket tilbake"
+
+
+def _webhook_delivery_enabled() -> bool:
+    """Whether a Notification event carries the model's prose rather than the template.
+
+    :func:`notification_wording.webhook_delivery_enabled` (``NOTIFICATION_WEBHOOK_LLM_ENABLED``,
+    unset = off), deliberately NOT :func:`_deliverable_message`, which is the BROWSER delivery gate
+    (``VARSEL_LLM_ENABLED``). The two are separate on purpose: the rollout turns the webhook channel
+    on with the template wording first and model prose only once matching and delivery qualify, and
+    sharing one variable would flip client prose on the moment it goes on for the PWA, in the same
+    deploy — precisely the coupling the 2026-08-07 generation/delivery split removed one layer down.
+
+    Read ONCE per cycle by the caller, like ``_record_decisions``' own two gate reads: a flag
+    re-read per subject could write for one train and not the next inside one pass.
+
+    A failure answers False — the template — for :func:`_deliverable_message`'s reason: an
+    unreadable switch is not evidence that a model's prose should go out.
+    """
+    try:
+        return bool(notification_wording.webhook_delivery_enabled())
+    except Exception:
+        logger.warning(
+            "Could not read the webhook wording-delivery switch; using the deterministic wording",
+            exc_info=True,
+            extra={"fields": {"event": "notification_wording", "result": "error"}},
+        )
+        return False
+
+
+def _webhook_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str | None:
+    """The written wording a Notification event may carry, or None for the template.
+
+    Reads :data:`_messages` RAW, which is the whole reason this is not
+    :func:`_deliverable_message`: for a definition both channels share, that cache holds the ONE
+    wording AE1 asserts, and reading it through the browser's delivery gate would withhold it from a
+    client in prd for a reason about ``VARSEL_LLM_ENABLED``.
+    """
+    if not enabled:
+        return None
+    with _state_lock:
+        return _messages.get(message_key)
+
+
+def _webhook_withdrawal_wording(
+    message_input: dict, from_name: str, to_name: str
+) -> tuple[str, str]:
+    """Title and body for a retraction, in :func:`notification_wording_for`'s two shapes.
+
+    Not routed through that function, because there is no wording to retract *with*: the template
+    body describes the disruption, and a retraction that led with "91 % sjanse for innstilling"
+    would be the opposite of what it means. What it does keep is the two structural rules — the
+    train named exactly as every other notification names it (:func:`_train_label`, falling back to
+    the route when the input names no departure, which is :func:`notification_title`'s own
+    fallback), and the route on the body's first line.
+    """
+    train = _train_label_from_input(message_input)
+    if train:
+        title = f"{train}: {_WEBHOOK_WITHDRAWAL_TITLE}"
+    else:
+        title = f"{from_name} → {to_name}: {_WEBHOOK_WITHDRAWAL_TITLE}"
+    return _tag_environment(title), f"{from_name} → {to_name}\n{_WEBHOOK_WITHDRAWAL_DETAIL}"
+
+
+def _webhook_situations(alerts: list[Alert]) -> list[dict]:
+    """The contributing situations for one train, operator text included.
+
+    Built from the UNCOLLAPSED alerts about that train rather than from the one
+    :func:`one_alert_per_train` kept, because R8 asks for "the contributing situations" and because
+    operators routinely publish several messages about one disruption — Vy sent both "Ta neste tog"
+    and "Innstilt Drammen–Skøyen" for the same cancelled 15:03. The wording still comes from the
+    single most severe one; this is what a client joins on and displays.
+    """
+    seen: set[str] = set()
+    out: list[dict] = []
+    for alert in alerts:
+        number = alert.situation_number
+        if number in seen:
+            continue
+        seen.add(number)
+        out.append(
+            {
+                "situation_number": number,
+                "summary": alert.summary,
+                "description": alert.description,
+                # False means no SX message named this train at all, so `summary` is text this
+                # codebase wrote rather than an operator's. A receiver presenting it as an
+                # operator's statement would be making the 2026-08-20 mistake one layer out.
+                "has_situation": bool(alert.has_situation),
+            }
+        )
+    return out
+
+
+def _webhook_payload(
+    alert: Alert,
+    contributing: list[Alert],
+    *,
+    message_input: dict,
+    title: str,
+    body: str,
+) -> dict:
+    """The event payload: the facts plus the Norwegian prose (R7).
+
+    "Normal receipt needs no second request to us" is a property of what this carries, which is why
+    the figures ride along beside the wording rather than behind a lookup.
+
+    Two shapes, split on a declared cancellation exactly as every other writer in this module splits
+    on it. When ET has already declared the call cancelled the probabilities are 1.0 by construction
+    (``impact._cancelled_prediction``) and the delay figures are **null**, because every one of them
+    meant "if it runs" — the same rule ``_deterministic_body`` and the message input follow, and the
+    same rule ``event.schema.json`` states for ``phase: confirmed``.
+    """
+    delay = (
+        None
+        if alert.cancelled
+        else {"typical_min": alert.delay_p50_min, "worst_case_min": alert.delay_p90_min}
+    )
+    alternative = getattr(alert, "alternative_journey", None)
+    dumped: Any = None
+    if alternative is not None:
+        try:
+            # `mode="json"` so the stored document holds JSON primitives: the event is serialized to
+            # the wire bytes the signature covers, and a datetime that survived into it would need a
+            # custom encoder on a path where a raise costs the delivery.
+            dumped = alternative.model_dump(mode="json")
+        except Exception:
+            logger.debug("Could not serialize an alternative journey for a notification event", exc_info=True)
+    return {
+        "notification": {"title": title, "body": body, "action": None},
+        "call": {
+            "stop_place": alert.stop_place,
+            "stop_order": alert.stop_order,
+            "aimed_departure_time": (
+                alert.departure_time.isoformat() if alert.departure_time else None
+            ),
+            "departs_tomorrow": bool(message_input.get("i_morgen")),
+        },
+        "probabilities": {
+            "impact": alert.impact_probability,
+            "cancellation": alert.cancel_probability,
+            "delay_ge10": alert.ge10_probability,
+            # The operator's own alerting bar, so a client can see WHY this cleared it rather than
+            # inferring a threshold from the numbers. One gate serves both surfaces (KTD2).
+            "alert_threshold": alert.alert_threshold,
+        },
+        "delay": delay,
+        # A two-value vocabulary derived from what we actually know, `null` when neither is
+        # established. New wire vocabulary, so U7's typed client and U8's published contract have to
+        # match these two literals rather than invent their own.
+        "effect": (
+            "cancelled"
+            if alert.cancelled
+            else "delayed"
+            if (alert.delay_p50_min or alert.delay_p90_min)
+            else None
+        ),
+        "situations": _webhook_situations(contributing),
+        "alternative_journey": dumped,
+    }
+
+
+def _webhook_subjects(
+    webhook_by_key: dict[str, list[WebhookRecipient]],
+    alerts_by_key: dict[str, list[Alert]],
+    match_targets: dict[str, dict],
+    message_inputs: dict[tuple[str, str, str], dict | None],
+    *,
+    webhook_llm: bool,
+) -> list[notification_events.WebhookSubject]:
+    """This cycle's webhook subjects — one per (subscription, train), alert-worthy or not.
+
+    Below-threshold trains are included on purpose: a withdrawal is a lifecycle transition and the
+    consecutive-below-threshold count that drives it lives on the alert subject, so the observation
+    has to reach the store to be counted. ``notification_events`` is what keeps that affordable — it
+    reads which subjects stand and spends a transaction only where one can be written.
+
+    The wording, the collapse and the payload are computed once per (definition, train) and shared
+    across the recipients on that definition, which is the same economy AE1 asserts for the match
+    and the wording: two recipients watching one trip see identical text.
+    """
+    subjects: list[notification_events.WebhookSubject] = []
+    unroutable = 0
+    failed = 0
+    for key, recipients in webhook_by_key.items():
+        try:
+            unroutable += _subjects_for_key(
+                subjects,
+                key,
+                recipients,
+                alerts_by_key=alerts_by_key,
+                match_targets=match_targets,
+                message_inputs=message_inputs,
+                webhook_llm=webhook_llm,
+            )
+        except Exception:
+            # Per DEFINITION, the same rule `_reconcile_caches` and `_match` are guarded by: one
+            # journey's awkward payload must cost that journey's subjects, not the cycle's. What
+            # this touches is duck-typed -- an alternative journey from an injected provider, a
+            # pydantic dump -- so "it cannot raise" would be an assumption about somebody else's
+            # object, and the caller's outer guard would drop every OTHER client's events with it.
+            failed += 1
+            logger.warning(
+                "Could not build webhook subjects for a journey definition; the rest of the "
+                "cycle's client work is unaffected",
+                exc_info=True,
+                extra={"fields": {"event": "notification_emit", "result": "subject_error"}},
+            )
+    if unroutable:
+        # The COUNT and never the document (R16). A subscription with no destination was still
+        # matched and still contributed to the shared wording; it simply cannot be routed.
+        logger.warning(
+            "%d webhook subject(s) name no destination and were not emitted for",
+            unroutable,
+            extra={"fields": {"event": "notification_emit", "result": "unroutable", "n": unroutable}},
+        )
+    if failed:
+        logger.warning(
+            "%d journey definition(s) produced no webhook subjects this cycle",
+            failed,
+            extra={"fields": {"event": "notification_emit", "result": "subjects_skipped", "n": failed}},
+        )
+    return subjects
+
+
+def _subjects_for_key(
+    out: list[notification_events.WebhookSubject],
+    key: str,
+    recipients: list[WebhookRecipient],
+    *,
+    alerts_by_key: dict[str, list[Alert]],
+    match_targets: dict[str, dict],
+    message_inputs: dict[tuple[str, str, str], dict | None],
+    webhook_llm: bool,
+) -> int:
+    """One journey definition's subjects, appended to `out`. Returns the unroutable count.
+
+    Split out so the per-definition guard in :func:`_webhook_subjects` has something to wrap.
+    """
+    unroutable = 0
+    alerts = alerts_by_key.get(key) or []
+    if not alerts:
+        return 0
+    journey = match_targets.get(key) or {}
+    contributing: dict[tuple, list[Alert]] = {}
+    for alert in alerts:
+        train = _train_key(alert)
+        if train is not None:
+            contributing.setdefault(train, []).append(alert)
+    for winner in one_alert_per_train(alerts):
+        train = _train_key(winner)
+        if train is None:
+            # No train identity, so no stable `alert_id`: two different trains would share one
+            # and the receiver's own revision rule would suppress the second recipient's
+            # notification. `notification_events.train_ref` refuses the same set and counts it.
+            continue
+        message_key = _message_key(key, winner)
+        message_input = message_inputs.get(message_key) or _message_input_from_alert(winner)
+        resolved = message_input.get("reise") or {}
+        # SERVER-SIDE names only, never a browser registration's `from_name`/`to_name`. Those are
+        # up to 120 characters of unauthenticated free text, and on a definition both channels
+        # share the browser record is what `match_targets` holds -- so until 2026-09-10 whoever
+        # registered a journey on `/varsel-api/journeys` first wrote the route line of a CLIENT's
+        # notification about the same trains. `llm_message.build_message_input` already refuses
+        # exactly this for the prompt (see the note above its `_canonical_stop_name`), and `reise`
+        # is its registry-resolved pair; the bare ref is the bounded fallback when the input had to
+        # be rebuilt off the alert (`_message_input_from_alert` carries no `reise`). The cost is
+        # stated rather than hidden: a push and an event about one train agree byte for byte only
+        # when the traveller's typed name equals the registry's, which is the ordinary case and
+        # `test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push` pins it.
+        from_name = resolved.get("fra") or journey.get("from_stop") or ""
+        to_name = resolved.get("til") or journey.get("to_stop") or ""
+        if winner.alertworthy:
+            title, body = notification_wording_for(
+                message_input,
+                from_name,
+                to_name,
+                # NO CACHED WORDING FOR A DECLARED CANCELLATION. `_message_key` is
+                # (journey_key, situation_number, departure) and carries no `cancelled` flag, so a
+                # wording written while the train was merely at risk shares one entry with the
+                # reading taken after ET declared it gone -- and nothing forgets it in between:
+                # `_reconcile_caches`' only unconditional forget is the below-threshold one, a
+                # declared cancellation stays alert-worthy at (1.0, 1.0), and the write pass
+                # short-circuits on `message_key in _messages`. The title is rebuilt from THIS
+                # cycle's input, so the event read «Tog L1 07:18 er innstilt» over «91 % sjanse for
+                # innstilling, typisk 15-27 min forsinket» beside `delay: null` and
+                # `effect: "cancelled"` in the same payload. The template is the documented correct
+                # wording here -- `_deterministic_body` renders «Innstilt» and carries no delay
+                # figures, which is `impact._cancelled_prediction`'s own rule -- so refusing the
+                # cache costs nothing and states the certainty.
+                #
+                # The BROWSER card reads the same entry through `_deliverable_message` and still
+                # shows the stale text; that half is pre-existing and needs its own pass over
+                # `_messages`, `_message_meta`, `_alternatives` and `_message_attempts`. What this
+                # narrows is the one consumer that turns a stale cache entry into a DELIVERED
+                # notification a client's traveller then acts on.
+                None if winner.cancelled else _webhook_wording(message_key, enabled=webhook_llm),
+                # Always False, and structurally so. The browser's «Bekreftet:» prefix comes off
+                # `_pushed_trains`, which is per REGISTRATION and per device — a client has no
+                # such record here, and the envelope carries the same fact better:
+                # `type=journey.alert.updated` with `phase=confirmed` says a revision replaces
+                # an earlier one about this train, which is what the prefix was standing in for.
+                confirmed=False,
+            )
+        else:
+            title, body = _webhook_withdrawal_wording(message_input, from_name, to_name)
+        payload = _webhook_payload(
+            winner,
+            contributing.get(train, [winner]),
+            message_input=message_input,
+            title=title,
+            body=body,
+        )
+        situations = tuple(s["situation_number"] for s in payload["situations"])
+        for recipient in recipients:
+            if not recipient.client_id or not recipient.destination_id:
+                unroutable += 1
+                continue
+            out.append(
+                notification_events.WebhookSubject(
+                    subscription_id=recipient.recipient_id,
+                    client_id=recipient.client_id,
+                    destination_id=recipient.destination_id,
+                    subscription_version=recipient.subscription_version,
+                    external_ref=recipient.external_ref,
+                    test=recipient.test,
+                    alertworthy=bool(winner.alertworthy),
+                    cancelled=bool(winner.cancelled),
+                    situations=situations,
+                    operator=winner.operator,
+                    line=winner.line,
+                    journey_ref=winner.jkey,
+                    stop_place=winner.stop_place,
+                    stop_order=winner.stop_order,
+                    departure_time=winner.departure_time,
+                    title=title,
+                    body=body,
+                    payload=payload,
+                    expected_departure_time=_expected_departure_of(winner),
+                )
+            )
+    return unroutable
+
+
+def _expected_departure_of(alert: Alert) -> datetime | None:
+    """When the train is expected to actually leave: aimed time plus the typical delay predicted
+    for it -- `impact._expected_departure`'s rule, restated on the Alert because the matcher's
+    `CallPred` is gone by now. This is what R12's "the departure" has to mean for the webhook
+    event's validity: the matcher keeps a late train past its aimed time on exactly this figure
+    (`catchable_after`), and an event that expired at the aimed time was never attempted for it.
+    A declared cancellation carries no delay figure, so its expected departure is its aimed one."""
+    if alert.departure_time is None:
+        return None
+    return alert.departure_time + timedelta(minutes=max(alert.delay_p50_min or 0, 0))
+
+
+@dataclass(frozen=True)
+class PassOutcome:
+    """What one notification pass produced for the steps that run AFTER it.
+
+    A RETURN VALUE, not a module-level snapshot, and that is a decision rather than a style: a
+    module-level ledger would need registering in `check_and_notify`'s per-cycle stale sweep and in
+    `test_varsel_api._reset_state`, and a leaked half-cycle snapshot reads exactly like the give-up
+    bug those sweeps exist to prevent. Additive, so every existing caller — `main`'s poller before
+    this change, and every suite — keeps working by ignoring it.
+
+    Handing it to `main` rather than acting on it here is what makes KTD6's ordering claim
+    structural: the client emit and delivery steps run in their own `main._phase`, *after this
+    function has returned*, so a raise in either cannot unwind `_record_decisions` or `_save_state`
+    at all rather than merely being sequenced after them.
+    """
+
+    webhook_subjects: tuple[notification_events.WebhookSubject, ...] = ()
+
+
+class _LockedPassBudget(notification_wording.PassBudget):
+    """`notification_wording.PassBudget` with a lock, because pass 1c is `_LLM_WORKERS`-wide.
+
+    That class documents itself as "not thread-shared: one pass, one counter", which is true of
+    `/meldinger`'s own sequential use and false here — `self.left -= 1` is a read-modify-write and
+    the GIL does not make it atomic. Unlocked, the ceiling could be overspent by up to one call per
+    worker. Small, and worth eight lines to remove: the shape is `_WriteBudget.claim`'s, which every
+    reader of this file already knows.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        super().__init__() if limit is None else super().__init__(limit)
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        with self._lock:
+            return super().take()
+
+
+class _WriteBudget(reserved_budget.ReservedBudget):
     """This cycle's ceiling on written messages, claimable from several threads at once.
 
     Two limits behind one `claim()`, because a caller must not be able to satisfy one and ignore the
@@ -2487,23 +3130,32 @@ class _WriteBudget:
     """
 
     def __init__(self, max_calls: int, deadline: float) -> None:
-        self._lock = threading.Lock()
-        self._max_calls = max_calls
-        self._deadline = deadline
-        self.claimed = 0
-        self.refused = 0
+        super().__init__(max_calls, deadline, _WORST_CASE_CALL_S)
 
-    def claim(self) -> bool:
-        """Reserve one call, or refuse. Never blocks for longer than the dict operations here."""
+    def claim_clock(self) -> bool:
+        """Reserve the wall clock WITHOUT spending the call allowance. What a webhook subject claims.
+
+        `notification_wording.PassBudget`'s docstring states the split and the reason, and it is not
+        a nicety: the CLOCK is a property of the pass — two surfaces writing inside one pass cannot
+        each have their own, and the whole point of the reservation is that the deadline bounds when
+        the pass ENDS — while the COUNT is a property of the surface. Merged, a client with a few
+        hundred subscriptions would spend :data:`_MAX_LLM_CALLS_PER_CYCLE` on client wordings and
+        silently retire the browser ones, which is that constant's own lesson read the other way
+        round (raising the count without the width just moves the binding constraint to the clock).
+        A client call is charged to `notification_wording`'s per-pass budget and its caller-keyed
+        trailing hour/day instead.
+
+        `refused` is still incremented, so the one summary line per cycle reports what the clock
+        cost whichever surface paid it.
+        """
         with self._lock:
-            if self.claimed >= self._max_calls or monotonic() + _WORST_CASE_CALL_S >= self._deadline:
+            if monotonic() + self._worst_case >= self._deadline:
                 self.refused += 1
                 return False
-            self.claimed += 1
             return True
 
 
-def check_and_notify(by_situation: dict[str, list]) -> None:
+def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     """Send a push for every registered journey × newly alert-worthy situation.
 
     Called at the end of main's ingestion-change rebuild with the freshly-refreshed per-call
@@ -2526,19 +3178,48 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     **Scoring and recording run even when push is disabled**; only delivery is gated. The decision
     log's guarantee is "every decision, not every push", and an early return here quietly broke it:
     an environment without VAPID keys recorded nothing at all, so /historikk looked like a broken
-    deployment rather than an un-provisioned one. The LLM stays gated on push, though — writing
-    traveller-facing prose nobody can receive at all is spend with no reader, and the deterministic
-    body already captures what the decision was.
+    deployment rather than an un-provisioned one.
+
+    **Wording depends on a deliverable RECIPIENT, not on a VAPID keypair** (KTD4, 2026-09-08). This
+    used to skip the whole writing pass on ``push_enabled()``, and the reason it gave was right —
+    writing traveller-facing prose nobody can receive is spend with no reader — while the condition
+    was wrong: it read "no keypair" as "no reader". A webhook-only deployment, and tst which holds no
+    keypair at all, therefore wrote nothing and recorded ``message_status='push_disabled'`` on every
+    row. The gate is now the condition it was reaching for: at least one deliverable recipient on
+    any channel — browser push enabled, or a webhook subscription with a delivery still pending for
+    that train. A journey with no deliverable channel still writes nothing, so
+    ``message_status='push_disabled'`` keeps its meaning for browser subjects.
+
+    **Webhook subscriptions are registrations with a webhook channel** (KTD3), merged into pass 1a
+    under :func:`journey_key` so one match and one wording serve both channels. It is a view, not a
+    materialization: `_journeys`, `_notified` and the state blob never carry a client id. Note
+    `_record_decisions` is handed the BROWSER grouping only (KTD10) — the decision log is published
+    on public hosts, and a webhook-only route therefore produces no row at all, which is KTD12's
+    recorded limitation rather than an oversight.
+
+    **The webhook channel's writes and sends happen AFTER this returns** (KTD6). What this function
+    produces for them is a :class:`PassOutcome` — one subject per (subscription, train) with the
+    wording already resolved — which `main` hands to its own poller phase. Returning the work rather
+    than doing it is strictly stronger than KTD6's literal placement on KTD6's own stated reason: a
+    raise in a step that runs after this function has returned cannot unwind `_record_decisions` or
+    `_save_state` at all, rather than merely being sequenced after them, and it puts the step under
+    `main`'s existing per-step `try/except` and `_phase` isolation. Same thread, same cycle, same
+    process either way, so nothing KTD6 settled with the user is touched. The return value is
+    additive: every caller that ignores it behaves exactly as before.
 
     **Writing a wording and sending it are separate switches** (2026-08-07). A message is written
     whenever a backend can be tried (``llm_message.generation_enabled``); ``VARSEL_LLM_ENABLED``
     decides only which of the two wordings the traveller receives, on both surfaces, through
     :func:`_deliverable_message`. So prd — delivery off — writes the model's version, pushes the
     deterministic one, and records both, which is the only way the two can be compared on prd's own
-    traffic instead of on dev's. Note "gated on push" above is still true and is the wider gate:
-    push off means no write at all, delivery off means write but send the template.
+    traffic instead of on dev's. Note the recipient gate above is the wider one: no deliverable
+    recipient means no write at all, delivery off means write but send the template.
     """
     push_on = push_enabled()
+    # Read once for the whole cycle: whether a Notification event carries the model's prose. It decides
+    # both whether a webhook-only definition is written for at all and which wording its event
+    # carries, and one pass must not answer that two ways.
+    webhook_llm = _webhook_delivery_enabled()
     with _state_lock:
         journeys = list(_journeys.items())
         # Prune notified entries and cached messages whose situation is no longer live. In-place
@@ -2565,7 +3246,24 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         oslo_today = datetime.now(_OSLO).date().isoformat()
         for jid in [j for j, (day, _count) in _daily_pushes.items() if day != oslo_today]:
             _daily_pushes.pop(jid, None)
+        # NOTHING FOR THE WEBHOOK CHANNEL SWEEPS HERE, and that is a property worth stating rather
+        # than an omission. The client snapshot loaded below is a pass-local list, and Firestore is
+        # the only dedup ledger for that channel (KTD3), so this pass holds no notification state to go
+        # stale. Anything a later unit adds at module level -- a per-cycle counter, a budget -- goes
+        # here AND in `test_varsel_api._reset_state`: a leaked half-spent budget is indistinguishable
+        # from a give-up bug. The per-destination delivery skip is the deliberate exception and must
+        # stay pass-local, or one failure pauses a destination permanently (KTD6).
         changed = bool(stale)
+
+    # ---- The one client read: BEFORE pass 1a, and before the write budget's clock starts -----
+    #
+    # KTD6: the load necessarily precedes 1a, because that is what webhook subscriptions are matched
+    # from, and it is the ONLY client read passes 1a and 1b depend on. Placed outside the
+    # `_state_lock` block above (no store I/O under that lock, `_prepare_alert`'s rule) and before
+    # `_WriteBudget` is constructed below, so a slow store spends the cycle's own tail rather than
+    # silently eating the 30 s wording ceiling. Empty list when the channel is off, unreachable or
+    # slow -- every failure shape is inside the helper.
+    webhook_recipients = _load_webhook_recipients()
 
     # ---- Loop 1: one impact call per journey definition, one written message per train ---------
     by_journey_key: dict[str, dict] = {}
@@ -2579,6 +3277,23 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         by_journey_key.setdefault(_key, journey)
         jids_by_key.setdefault(_key, []).append(_jid)
 
+    # The same grouping for the webhook channel, and the merged set pass 1a actually matches.
+    # `by_journey_key` stays BROWSER-ONLY on purpose: it is what `_record_decisions` iterates, and
+    # KTD10 keeps webhook subjects out of `varsel_decisions` entirely (that table is published, with
+    # resolved place names, on public hosts). So a definition both channels share is matched once and
+    # recorded once, exactly as today, while a webhook-only definition is matched and never recorded.
+    #
+    # `setdefault` order matters: the browser record wins for a shared key. A browser registration
+    # carries `from_name`/`to_name`, the service caveat and the consent version, none of which the
+    # shared work reads -- but `_record_decisions` and `_notification_payload` do, and they must keep
+    # seeing the record the traveller actually registered rather than a client's projection of it.
+    webhook_by_key: dict[str, list[WebhookRecipient]] = {}
+    for recipient in webhook_recipients:
+        webhook_by_key.setdefault(journey_key(recipient.journey), []).append(recipient)
+    match_targets: dict[str, dict] = dict(by_journey_key)
+    for _key, _recipients in webhook_by_key.items():
+        match_targets.setdefault(_key, _recipients[0].journey)
+
     alerts_by_key: dict[str, list[Alert]] = {}
     # What every message about this cycle's decisions is written from, one per journey definition x
     # situation. Built here, before any wording exists, so the prompt, the deterministic fallback and
@@ -2589,6 +3304,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # rather than checked. This is the ingestion thread: every second here is a second /disruptions,
     # /journey, /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1.
     budget = _WriteBudget(_MAX_LLM_CALLS_PER_CYCLE, monotonic() + _MAX_LLM_SECONDS_PER_CYCLE)
+    # The WEBHOOK surface's own call allowance, spent inside this same pass and therefore under the
+    # same wall clock -- `notification_wording.PassBudget`'s docstring states that contract and this
+    # is the caller it was written for. The COUNT is deliberately separate from
+    # `_MAX_LLM_CALLS_PER_CYCLE`: the clock is a property of the pass and two surfaces writing inside
+    # one pass cannot each have their own, while the count is a property of the surface, and merging
+    # them would let a busy client morning silently retire the browser wordings.
+    webhook_budget = _LockedPassBudget()
     # One instant for the whole cycle, so "has this alternative departed?" cannot be answered
     # differently for two journeys scored a few seconds apart.
     cycle_now = datetime.now(UTC)
@@ -2629,9 +3351,9 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             return key, []
 
     matched: list[tuple[str, list[Alert]]] = []
-    if by_journey_key:
-        with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(by_journey_key))) as pool:
-            matched = list(pool.map(_match, list(by_journey_key.items())))
+    if match_targets:
+        with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(match_targets))) as pool:
+            matched = list(pool.map(_match, list(match_targets.items())))
 
     # ---- Pass 1b: reconcile, and decide what to write for -- SEQUENTIALLY ----------------------
     #
@@ -2641,10 +3363,28 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # of it blocks on anything. The split is behaviour-preserving -- `_reconcile_caches` for one
     # journey never reads another journey's alerts, and `_pending_pushes` reads `_notified`, which
     # only loop 2 writes.
-    write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int]] = []
+    write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int, bool]] = []
     for key, alerts in matched:
-        journey = by_journey_key[key]
+        journey = match_targets[key]
         alerts_by_key[key] = alerts
+        # WHICH WORDING POLICY writes for this definition, and the discriminator is `by_journey_key`
+        # itself -- browser-only by construction (KTD10), so "absent from it" is exactly "no browser
+        # registration holds this route". A webhook-only subject must go through
+        # `notification_wording.WEBHOOK`, because the browser policy's prompt audit record carries
+        # the traveller's origin, destination and departure time at DEBUG wherever
+        # VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and R16 forbids that for client data.
+        # WEBHOOK suppresses that record in CODE rather than by an environment variable, drops
+        # `message` from the INFO record, and latches against its own holder. Its FIRST bound is the
+        # webhook delivery switch, so with client prose undelivered — every deployment today — the
+        # writer is still invoked (AE10: a client registration with no VAPID keypair matches and is
+        # written for) and answers with the template, asking no backend and charging nothing.
+        #
+        # A SHARED definition stays on the browser policy, unavoidably and by design: AE1 pins one
+        # match and one wording between the two channels, so there is one call and it is the
+        # browser's. The prompt record for that route would exist with no webhook channel at all,
+        # because a browser registration holds the same route -- so R16's claim is about
+        # webhook-only routes plus every other client field, and U8 publishes exactly that.
+        webhook_only = key not in by_journey_key
         for alert in alerts:
             message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
         # ABOVE the early return, and over every alert: a superseded alternative most often goes
@@ -2669,11 +3409,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 exc_info=True,
                 extra={"fields": {"event": "varsel_reconcile_error"}},
             )
-        if not push_on:
-            # No message writing without push: the text exists to be delivered, and the decision is
-            # recorded with the deterministic wording either way.
-            continue
-        # ONE WORDING PER TRAIN THIS CYCLE WILL PUSH ABOUT, not one per journey (2026-08-21).
+        # ONE WORDING PER TRAIN THIS CYCLE WILL NOTIFY ABOUT, not one per journey (2026-08-21).
         #
         # Loop 2 delivers per train -- `one_alert_per_train`, the same collapse applied here --
         # while this loop wrote for `next(a for a in alerts if a.alertworthy)` alone. So a journey
@@ -2693,10 +3429,28 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         # train is still written for, because the in-app journey card reads these same wordings
         # through `_deliverable_message` and would otherwise decay to the template as soon as
         # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
-        pending = _pending_pushes(jids_by_key.get(key, ()), alerts)
-        subjects = (pending or [a for a in one_alert_per_train(alerts) if a.alertworthy][:1])[
-            :_MAX_MESSAGES_PER_JOURNEY
-        ]
+        # It is gated on `push_on` because the CARD is the reader it exists for, and the card is
+        # the browser channel; a webhook subject with nothing pending has already been told.
+        #
+        # KTD4's gate, expressed as three lines rather than a boolean somewhere else. `jids` are
+        # withheld when push is off -- see `_pending_pushes` for why that half is load-bearing --
+        # so `pending` is exactly "a recipient on some channel still needs telling about this
+        # train", and `push_on or pending` is exactly "some channel can deliver". With no client
+        # recipients (every deployment until the store lands, and every existing test) both
+        # predicates reduce to what they were: `pending` is the browser list, and the guard below
+        # is the old `if not push_on: continue`.
+        pending = _pending_pushes(
+            jids_by_key.get(key, ()) if push_on else (), alerts, webhook_by_key.get(key, ())
+        )
+        if not push_on and not pending:
+            # No deliverable recipient on ANY channel: a keypair-less deployment with no client
+            # subscription pending for this journey. The decision is still recorded below, with the
+            # deterministic wording, and `message_status` still reads `push_disabled` for it.
+            continue
+        subjects = (
+            pending
+            or ([a for a in one_alert_per_train(alerts) if a.alertworthy][:1] if push_on else [])
+        )[:_MAX_MESSAGES_PER_JOURNEY]
         for subject in subjects:
             message_key = _message_key(key, subject)
             with _state_lock:
@@ -2716,7 +3470,13 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
             # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h
             # life. That thins exactly the written-but-withheld population prd's rollout is judged
             # on.
-            if not _generation_enabled():
+            #
+            # Asked for a BROWSER subject only. `_generation_enabled` reads `llm_message`'s
+            # module-global latch, which is the poller's own; the WEBHOOK policy latches against its
+            # own holder precisely so the two callers cannot disable each other, and consulting the
+            # browser latch for a webhook-only subject would hand that isolation straight back.
+            # `write_wording` asks the same question against the right holder as its second bound.
+            if not webhook_only and not _generation_enabled():
                 _remember_message_meta(message_key, status="llm_disabled")
                 continue
             if already_written:
@@ -2742,7 +3502,7 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 # and a rate computed across both measures neither.
                 _remember_message_meta(message_key, status="transient_exhausted")
                 continue
-            write_queue.append((key, subject, message_key, attempts, errors))
+            write_queue.append((key, subject, message_key, attempts, errors, webhook_only))
 
     # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
     # until the budget could actually bind across journeys there was nothing to order. The queue
@@ -2770,12 +3530,69 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
     # `_MAX_LLM_CALLS_PER_CYCLE` of them run per cycle; sequentially that is the difference between
     # a budget of 8 (~18 s, all of the ceiling) and one of 64 (~140 s, absurd). Across
     # `_LLM_WORKERS` it is ~9 s.
-    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int, int]) -> None:
-        key, subject, message_key, attempts, errors = item
+    def _write_webhook_only(
+        key: str, subject: Alert, message_key: tuple[str, str, str]
+    ) -> tuple[str | None, str | None]:
+        """One webhook-only definition's wording, through `notification_wording.WEBHOOK`.
+
+        Returns `(message, status)` in `_write_message`'s own vocabulary, so pass 1c's budget
+        bookkeeping below is one branch rather than two.
+
+        **Only an `llm`-sourced wording is a message.** `write_wording` never returns without a
+        wording -- every failure falls through to the template -- so returning its body unconditional
+        would cache the TEMPLATE in `_messages`, and the next cycle's `already_written` check would
+        then report `ok_cached` and never ask again. That is the give-up bug in a new place: with the
+        webhook delivery switch off (every deployment today) it would freeze the first template
+        forever, and with it on it would freeze whatever a transient Vertex failure produced.
+
+        `subject_id` is the journey key, which is what `_write_message` passes on the browser path
+        and is protected the same way: `llm_message` hashes it (`key_digest`) before it reaches a
+        log field, so the pattern itself never leaves the process. `write_wording`'s docstring asks
+        for an opaque service-issued id and names that hashing as the reason varsel's own value is
+        acceptable; there is no departure id at this grain, and two conventions for one parameter
+        would be worse than one. What actually keeps a webhook-only route out of the prompt audit
+        record is the POLICY -- `WEBHOOK.caller` suppresses the prompt/reply DEBUG record in code
+        and drops `message` from the INFO record -- not the shape of this argument.
+        """
+        message_input = message_inputs.get(message_key)
+        if message_input is None:
+            # Nothing to prompt with. Charges no retry budget, for `_write_message`'s reason: the
+            # absence of an input is not evidence about the model.
+            return None, "no_input"
+        try:
+            wording = notification_wording.write_wording(
+                notification_wording.Route(
+                    match_targets[key].get("from_stop"), match_targets[key].get("to_stop")
+                ),
+                notification_wording.DepartureWordingFacts(
+                    situation_number=subject.situation_number
+                ),
+                policy=notification_wording.WEBHOOK,
+                subject_id=key,
+                budget=webhook_budget,
+                message_input=message_input,
+            )
+        except Exception:
+            logger.warning(
+                "Webhook wording step raised; using the deterministic wording",
+                exc_info=True,
+                extra={"fields": {"event": "notification_wording", "result": "error",
+                                  "surface": "webhook"}},
+            )
+            return None, "error"
+        _remember_message_meta(message_key, status=wording.status, message_input=message_input)
+        return (wording.body if wording.source == "llm" else None), wording.status
+
+    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int, int, bool]) -> None:
+        key, subject, message_key, attempts, errors, webhook_only = item
         # Claimed here rather than filtered above, so the ceiling is spent on calls that actually
         # START. A pre-filter would hand the budget to the first N in the queue whether or not the
         # clock still allowed them.
-        if not budget.claim():
+        #
+        # A webhook subject claims the CLOCK only -- see `_WriteBudget.claim_clock`. Its call
+        # allowance is `notification_wording`'s own, which is what keeps a client with a few
+        # hundred subscriptions from spending the browser wordings' budget.
+        if not (budget.claim_clock() if webhook_only else budget.claim()):
             _remember_message_meta(message_key, status="capped")
             return
         # _write_message catches Exception itself, so this is belt and braces for a future edit
@@ -2784,12 +3601,15 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
         # loop 2 pushes independently and falls back to the deterministic wording.
         outcome: dict[str, Any] = {}
         try:
-            message = _write_message(
-                subject,
-                journey_key=key,
-                message_input=message_inputs.get(message_key),
-                outcome=outcome,
-            )
+            if webhook_only:
+                message, outcome["status"] = _write_webhook_only(key, subject, message_key)
+            else:
+                message = _write_message(
+                    subject,
+                    journey_key=key,
+                    message_input=message_inputs.get(message_key),
+                    outcome=outcome,
+                )
         except Exception:
             logger.warning(
                 "Written-message step raised for %s; using the deterministic wording",
@@ -2989,12 +3809,39 @@ def check_and_notify(by_situation: dict[str, list]) -> None:
                 if handle_gone_device(journey["device_id"]):
                     changed = True
 
+    # BROWSER subjects only, and structurally so: this iterates `by_journey_key`, which is built
+    # from `_journeys` alone. KTD10 keeps webhook subjects out of `varsel_decisions` entirely --
+    # /historikk and /meldinger publish that table on public hosts, with resolved place names since
+    # 2026-08-22, and client-app travellers are members of the public. `pushed_keys` is likewise
+    # only ever written by loop 2 above: it is journey-DEFINITION grain, so a webhook delivery
+    # recorded there would mark a browser registration's row `pushed` with no browser push behind
+    # it -- and `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed
+    # row. That is why the webhook deliveries happen in a later phase entirely and not here.
     _record_decisions(
         by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
     )
 
     if changed:
         _save_state()
+
+    # LAST, after the cycle's two durable writes, and handed back rather than acted on: KTD6 orders
+    # every client step that writes or sends after `_record_decisions` and `_save_state`, and
+    # returning the work means a raise in it runs after this function has returned and cannot unwind
+    # either of them at all. Guarded, because building a subject reads duck-typed objects (an
+    # alternative journey from an injected provider, a pydantic dump) and a raise here would cost the
+    # browser cycle its own tail for a client field.
+    try:
+        subjects = _webhook_subjects(
+            webhook_by_key, alerts_by_key, match_targets, message_inputs, webhook_llm=webhook_llm
+        )
+    except Exception:
+        logger.warning(
+            "Could not build this cycle's webhook subjects; no notification event is emitted for it",
+            exc_info=True,
+            extra={"fields": {"event": "notification_emit", "result": "build_error"}},
+        )
+        subjects = []
+    return PassOutcome(webhook_subjects=tuple(subjects))
 
 
 # ---- API models ------------------------------------------------------------------------------

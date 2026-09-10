@@ -1,0 +1,38 @@
+{
+  "$comment": [
+    "The DECLARED consumption shape (KTD11): compiled CommonJS plus type declarations, on the Node",
+    "major the client's Cloud Functions runtime pins. `node --test` over the .ts sources is a test",
+    "convenience and is not what a client consumes.",
+    "",
+    "Three settings are load-bearing and each was arrived at by watching the alternative fail:",
+    "  * package.json declares NO `type` field. Node's syntax detection then loads a .ts source with",
+    "    `import` as ESM (which `node --test` needs) while treating dist/*.js as CommonJS (which the",
+    "    published artifact needs). An explicit `\"type\": \"commonjs\"` -- which `npm install` adds if",
+    "    you let it -- DISABLES that detection, and every .ts import fails with `Cannot use import",
+    "    statement outside a module`. An explicit `\"type\": \"module\"` breaks the CommonJS emit instead.",
+    "  * `rewriteRelativeImportExtensions` with `allowImportingTsExtensions`: sources carry explicit",
+    "    `.ts` extensions because Node resolves none, and tsc rewrites them to `.js` on emit.",
+    "  * `erasableSyntaxOnly`: enums, namespaces and parameter properties are not type syntax and",
+    "    Node's stripper cannot remove them, so they would compile and then fail to run."
+  ],
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "node18",
+    "types": ["node"],
+    "rootDir": "src",
+    "outDir": "dist",
+    "declaration": true,
+    "declarationMap": false,
+    "sourceMap": false,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "erasableSyntaxOnly": true,
+    "rewriteRelativeImportExtensions": true,
+    "allowImportingTsExtensions": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts"]
+}

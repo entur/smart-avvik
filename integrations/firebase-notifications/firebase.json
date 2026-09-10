@@ -1,0 +1,50 @@
+{
+  "$comment": [
+    "This package's OWN emulator configuration, for the client's project. It is not the repo-root",
+    "firebase.json, which configures the emulator kix-avvik's own notification store is tested against.",
+    "",
+    "WHAT THE SEPARATION IS FOR, at the strength it was measured at. CI runs the two emulator steps",
+    "SEQUENTIALLY, and there the separation is what keeps a step clean when the previous one has not",
+    "finished tearing down -- observed on this machine, a Firestore emulator left holding 8572 for",
+    "minutes after its runner exited, and the next run then failed with `Port 8572 is not open`. It",
+    "is also what lets a developer run this suite while a repo-root emulator is already up: measured",
+    "6 of 6 runs clean, exit 0, 23/23, with the root suite live throughout.",
+    "",
+    "WHAT IT IS NOT FOR, stated because the earlier version of this comment claimed it and was wrong.",
+    "It does NOT make two emulator suites safe to START AT THE SAME INSTANT. Measured 3 of 3 rounds:",
+    "the Firebase CLI prints its generic `Error: An unexpected error has occurred.` before running the",
+    "wrapped script, `emulators:exec` exits 2, and its error-path teardown can kill the script",
+    "mid-run. A probe found the hub listening on 4401 for 6 samples out of 40. The contention is",
+    "inside firebase-tools' own emulator hub startup, not in any port this file can name -- all three",
+    "nameable ports are separated below and the project id differs. Start one, wait for it to listen,",
+    "then start the other.",
+    "",
+    "THE THREE PORTS, and two of them are invisible in the root config:",
+    "  * firestore.port          8571 -> 8572",
+    "  * hub.port                4400 (the CLI default; the root file does not name it) -> 4401",
+    "  * firestore.websocketPort 9150 -> 9151. NOT covered by `firestore.port`: the CLI allocates it",
+    "    separately, defaults it to 9150 for every project, and shifts it only by probing for a free",
+    "    port at start-up -- a race two simultaneous starts both win. Pinning it makes the separation",
+    "    deterministic instead of probabilistic.",
+    "",
+    "And the emulator runs under its OWN demo project id (`demo-kixclient`, in package.json's",
+    "test:emulator script). The CLI keys its hub locator file on the project id and warns that two",
+    "instances of one project `may result in unexpected behavior`; a distinct id answers that warning",
+    "rather than tolerating it. The suites read the id from GCLOUD_PROJECT, which `emulators:exec",
+    "--project` exports, so the two cannot disagree. Note a distinct id does NOT give a distinct",
+    "database: the emulator runs in --single_project_mode, which is why the two test files must run",
+    "serially (`--test-concurrency=1`).",
+    "",
+    "`firestore.rules` must be named here or `emulators:exec` loads no rules and every deny assertion",
+    "in test/emulator/rules.test.mjs would pass against an open database."
+  ],
+  "emulators": {
+    "firestore": { "port": 8572, "websocketPort": 9151, "host": "127.0.0.1" },
+    "hub": { "port": 4401, "host": "127.0.0.1" },
+    "ui": { "enabled": false }
+  },
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  }
+}

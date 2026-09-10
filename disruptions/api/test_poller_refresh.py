@@ -25,6 +25,7 @@ from google.cloud import bigquery as _bq
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
 import main
+import notification_servability
 
 
 class _RecordingClient:
@@ -446,6 +447,253 @@ def test_neither_the_page_nor_the_api_answers_while_the_master_gate_is_off():
     assert "/varsel-api/config" in schema
     # The page's directory constant is untouched, so flipping the flag needs no other change.
     assert main._TOGMELDING_STATIC_DIR.name == "togmelding_static"
+
+
+# --- The webhook channel's gate and its (non-)effect on the cycle -------------------
+
+
+def test_the_notification_webhooks_flag_is_an_allow_list_with_unset_off():
+    """U2 scenario 5, the flag half: only true/1/yes/on enable, and UNSET is OFF.
+
+    ONE flag, unlike `_togvarsel_notify_enabled`'s two — rushvarsel has a master product gate over
+    three surfaces and the webhook channel has one. What is copied is the parse and the failure
+    direction, which is what actually matters: a typo reads as off, and the code default matches
+    the closed gate rather than relying on a helm value being present. Read at CALL time, so this
+    can set the environment per case without an import dance.
+    """
+    import os
+
+    with _env(NOTIFICATION_WEBHOOKS_ENABLED=None):
+        assert main._notification_webhooks_enabled() is False, "unset must be off"
+        for value, want in (
+            ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
+            (" true ", True), ("false", False), ("", False), ("off", False), ("disabled", False),
+            ("0", False),
+        ):
+            os.environ["NOTIFICATION_WEBHOOKS_ENABLED"] = value
+            assert main._notification_webhooks_enabled() is want, value
+
+
+def test_the_webhook_channel_adds_exactly_two_rebuild_phases_after_the_alerting_step():
+    """U6: the cycle gains `notification_webhooks`, and AE13's second clause adds `notification_servability`.
+
+    Two halves of this were settled by U2 and by U6 respectively, and the difference matters.
+
+    The client **load** rides inside the existing `varsel_notify` phase, because KTD6 puts it
+    immediately before pass 1a — that is what the subscriptions are matched from — and the seam has
+    `varsel` calling the store rather than `main` loading it and passing it down; a `main._phase`
+    would have to time a call it does not make. Its cost is one `event="varsel_webhook_load"`
+    record per cycle.
+
+    The client **emit and deliver** steps are their own phase, after `varsel_notify`. That is
+    strictly stronger than KTD6's literal "after `_record_decisions` and `_save_state`": running
+    after `check_and_notify` has RETURNED means a raise cannot unwind either of them at all. It
+    also gives the Verification Contract's cycle-budget row a real `poller_phase` reading, which is
+    the same number KTD6's reversal trigger is stated in.
+
+    The **servability re-check** (R6, AE13's second clause) is a THIRD phase and not a fold into
+    either neighbour. Not into `varsel_recheck_service`, whose analogue it is, because a Firestore
+    read inside the browser phase blurs both the timing attribution and KTD6's ordering guarantee.
+    And not into `notification_webhooks`, because that phase's `ms` is what KTD6's reversal trigger
+    reads: its two steps reserve 28 s against a 30 s trigger, so a third reservation inside it would
+    fire the trigger on a healthy cycle.
+
+    Pinned as an exact tuple rather than a containment check, in both directions: a phase silently
+    added here is a cycle-timing change nobody asked for, and a phase silently REMOVED is how a
+    step stops being timed while `poller_cycle`'s `phases` breakdown still looks complete.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(main._rebuild_all)
+    phases = tuple(re.findall(r'_phase\(\s*"([a-z_]+)"', source))
+    assert phases == (
+        "rail_calls",
+        "disruptions_sql",
+        "categories",
+        "predict_sql",
+        "disruptions_cache",
+        "impact_lookup",
+        "svv_baselines",
+        "rail_planned_calls",
+        "predict_calls_rail",
+        "disruptions_bus_sql",
+        "bus_planned_calls",
+        "predict_calls_bus",
+        "call_predictions_cache",
+        "varsel_stops",
+        "varsel_recheck_service",
+        "varsel_notify",
+        "notification_webhooks",
+        "notification_servability",
+    ), phases
+    # And the alerting step is still isolated exactly as it was: its own try/except, so a client
+    # store outage inside it degrades alerting alone and the feed rebuild above it is untouched.
+    # `_phase` re-raises by design (test_phase_does_not_swallow_the_exception), so the try/except
+    # around the `with` is the only thing that contains it.
+    notify = source[source.index('_phase("varsel_notify"') :]
+    assert "except Exception:" in notify and "Avviksvarsel notify failed" in notify
+    assert "No-op when VAPID is unconfigured" not in source, (
+        "the comment was false before this change and is more so now: scoring, recording and -- "
+        "where any channel can deliver -- wording all run without a keypair"
+    )
+
+
+def test_the_webhook_phase_is_gated_guarded_twice_and_fed_by_a_return_value():
+    """U6 scenario 8, at the wiring: what contains a client failure, and what feeds the phase.
+
+    Four assertions, and each is about a failure that is silent if it is missing.
+
+    * The phase is gated on `varsel.webhook_channel_enabled()`. Without it every environment with
+      no named Firestore database — tst today, and every deployment before the flag is set — logs a
+      `NotConfigured` traceback on every cycle from `pending_deliveries`, which is noise that trains
+      an operator to ignore this phase.
+    * Emit and deliver are guarded SEPARATELY (R20): an emit failure must not cost the deliveries
+      already committed on an earlier cycle.
+    * Delivery does not depend on `outcome`, so a cycle in which `check_and_notify` raised still
+      drains the pending set — which is Firestore's, not this cycle's.
+    * The subjects arrive as a RETURN VALUE. A module-level snapshot in `varsel` would need
+      registering in `check_and_notify`'s stale sweep and in `test_varsel_api._reset_state`, and a
+      leaked half-cycle snapshot reads exactly like the give-up bug those sweeps exist to prevent.
+    """
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    # Bounded at the NEXT phase, not run to the end of the function. `notification_servability` follows
+    # this one and carries a guard of its own, so an unbounded slice would count three
+    # `except Exception:` and pass only if the count assertion below were weakened -- which would
+    # retire the thing it checks, that emit and deliver are guarded separately.
+    phase = source[
+        source.index('_phase("notification_webhooks"') : source.index('_phase("notification_servability"')
+    ]
+    # The flag is read ONCE for the cycle and both phases gate on that local. Read twice, a broken
+    # injected reader wrote the same warning and the same traceback twice per cycle.
+    assert source.count("varsel.webhook_channel_enabled()") == 1, source
+    assert source.count("if webhook_channel:") == 2, (
+        "both notification phases gate on the one read, and neither may run ungated"
+    )
+    assert source.index("varsel.webhook_channel_enabled()") < source.index(
+        '_phase("notification_webhooks"'
+    ), "the gate must be outside the phase, or an ungated cycle still times a step it skipped"
+    assert source.index("if webhook_channel:") < source.index('_phase("notification_webhooks"'), (
+        "same, for the first phase's own gate"
+    )
+    assert source.rindex("if webhook_channel:") < source.index('_phase("notification_servability"'), (
+        "same, for the second phase's own gate"
+    )
+    assert "outcome = varsel.check_and_notify(" in source, (
+        "the notification phase is fed by check_and_notify's return value, not by module state"
+    )
+    assert phase.count("except Exception:") == 2, phase
+    assert "Notification event emission failed" in phase
+    assert "Webhook delivery failed" in phase
+    deliver = phase[phase.index("webhook_delivery.deliver_pending(") :]
+    assert "outcome" not in deliver, (
+        "delivery must run on a cycle whose notification pass raised: the pending set is the "
+        "store's committed delivery records, not this cycle's decisions"
+    )
+
+
+def test_the_notification_store_is_now_injected_into_varsel_as_the_recipient_provider():
+    """U6's seam, asserted at the wiring rather than in prose.
+
+    The mirror of U2's marker test, which asserted the provider was deliberately ABSENT while the
+    store was a later unit. Both halves are wired now, and `webhook_channel_enabled()` still
+    requires both — so a deployment missing either is the pass that ran before the channel existed.
+
+    Checked over `lifespan`'s source because entering the lifespan starts the poller thread, which
+    this suite must never do (it spends real BigQuery money per cycle).
+    """
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    configure = source[source.index("varsel.configure(") :]
+    configure = configure[: configure.index("llm_message.configure(")]
+    assert "webhook_enabled=_notification_webhooks_enabled" in configure
+    assert "webhook_recipients_provider=notification_store.recipient_documents" in configure
+
+
+def test_the_servability_phase_is_gated_guarded_and_last():
+    """AE13's second clause at the wiring: what gates it, what contains it, and where it sits.
+
+    Four assertions, each about a failure that is silent without it.
+
+    * It is GATED on `varsel.webhook_channel_enabled()`. Ungated, every deployment that has
+      onboarded nobody -- and tst, which has no named Firestore database -- would read the store on
+      every cycle and log a `NotConfigured` traceback for an empty population, which is the same
+      noise the phase above is gated to avoid. The cost of gating is stated rather than hidden: a
+      client onboarded before the flag is set reads the create-time answer with
+      `servable_checked_at` publishing its age.
+    * It is GUARDED, so a store outage inside it cannot reach the cycle. `_phase` re-raises by
+      design, so the try/except around the `with` is the only thing that contains it.
+    * It is LAST, after `notification_webhooks`. Ahead of it, a servability re-check that ran long would
+      eat the delivery phase's reserved clock; behind it, nothing client-side can unwind the
+      browser cycle's durable writes.
+    * It names no `outcome`. This phase is fed by the store, not by the notification pass, and
+      taking a dependency on the pass's return value would make a cycle whose alerting raised skip
+      a re-check that has nothing to do with it.
+    """
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    phase = source[source.index('_phase("notification_servability"') :]
+    assert source.index('_phase("notification_webhooks"') < source.index('_phase("notification_servability"')
+    # Two gates over ONE read: the flag is read once for the cycle (a broken injected reader logged
+    # its warning and its traceback twice when it was read per phase), and each phase still carries
+    # its own `if`, so neither can end up running inside the other's guard.
+    gates = [i for i in range(len(source)) if source.startswith("if webhook_channel:", i)]
+    assert len(gates) == 2, "each notification phase carries its own gate"
+    assert source.count("varsel.webhook_channel_enabled()") == 1, "read once per cycle, not per phase"
+    assert gates[1] < source.index('_phase("notification_servability"'), (
+        "the gate must be outside the phase, or an ungated cycle still times a step it skipped"
+    )
+    assert phase.count("except Exception:") == 1, phase
+    assert "notification_servability.recheck()" in phase
+    assert "Client servability re-check failed" in phase
+    assert "outcome" not in phase, (
+        "the re-check is fed by the store, not by this cycle's notification pass"
+    )
+
+
+def test_the_servability_seam_is_the_same_one_the_notification_api_answers_from():
+    """One seam object for both halves of R6, and one number for the worst case.
+
+    `notification_api._record_servability` answers at create/replace and `notification_servability.recheck`
+    re-answers on the cadence; wiring them to two different callables would let the caveat a
+    client is shown and the re-check that clears it disagree about the same pair.
+
+    The second half is a parity pin `notification_servability` cannot make itself: its reservation budget
+    reserves the seam's own worst case, and the seam's timeout lives in `main`, which a poller-side
+    module cannot import. Under-state it and the reservation stops being a ceiling on when the phase
+    ends -- which is the whole reason it reserves rather than measures.
+
+    Since 2026-09-09 the seam is `_service_verdict` bound to the NOTIFICATION API connectivity budget rather
+    than the bare function. Both halves take the same bound object, which is what still makes them
+    one answer -- and it is also what keeps a client's bulk onboarding out of the traveller-facing
+    30/min tally the seam used to spend (`main._NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`). One partial, not
+    two: two would be two tallies, and the sweep exists to backfill what the create path could not
+    establish.
+
+    Checked over `lifespan`'s source because entering the lifespan starts the poller thread, which
+    this suite must never do (it spends real BigQuery money per cycle).
+    """
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    bound = (
+        "notification_api_connectivity = functools.partial(\n"
+        "        varsel._service_verdict, path=_CONNECTIVITY_NOTIFICATION_API_PATH\n"
+        "    )"
+    )
+    assert bound in source, "the client seam must name the client budget, not the default one"
+    assert "notification_servability.configure(connectivity=notification_api_connectivity)" in source
+    api = source[source.index("notification_api.configure(") :]
+    assert "connectivity=notification_api_connectivity," in api[: api.index(")")]
+    assert notification_servability._WORST_CASE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
+    assert notification_servability._DEADLINE_S > notification_servability._WORST_CASE_CHECK_S, (
+        "a deadline equal to the worst case admits exactly one check, making the count ceiling "
+        "decoration"
+    )
 
 
 if __name__ == "__main__":

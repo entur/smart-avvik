@@ -1,0 +1,939 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Entur journey notification notification API",
+    "version": "1.0.0",
+    "summary": "Register a commuter's recurring journey; receive a signed webhook when a disruption is predicted to hit it.",
+    "description": "The authenticated surface a client BFF manages its own commuter registrations through, plus the outbound event contract under `webhooks` below.\n\n**This document renders the two authored schemas rather than restating them.** `subscription.schema.json` and `event.schema.json` sit beside this file and every property here is a `$ref` into one of them: two definitions of one payload is how they drift, and the client's TypeScript types are generated from this document. OpenAPI 3.1 is JSON Schema 2020-12, so the references resolve without translation.\n\n**One property is inline rather than a `$ref`, on purpose:** `TestEventRequest.subscription_id`. A create body must carry your own reference and nothing else, while `POST /test-events` additionally accepts the opaque `subscription_id` an event carries -- so the two are genuinely different constraints, and referencing the stricter create-side one would publish a schema that refuses a value this API had itself just served. Widening the shared definition to match would be the same mistake pointing the other way.\n\n**Authentication** is a bearer credential this app issued: `Authorization: Bearer <key-id>.<secret>`. The `key-id` is prefixed `kixn_`; the secret is 256 random bits, shown once at issue and stored here only as an HMAC-SHA256 hash under a pepper. Never a cookie: the app serves one global CORS policy allowing every origin, so a cookie would be sent from all of them. Several credentials are live at once, which is how rotation works -- a new `key-id` is issued, the client cuts over, and the old one is revoked afterwards, so nothing is taken down for a rotation.\n\n**Ownership comes from the credential.** Every route acts on the authenticated client's own records only, and `client_id` in a request body is ignored. A record belonging to another client is indistinguishable from one that does not exist: both are 404, and no response body names anything about another client.\n\n**Statuses worth knowing before you write a client.** `401` is a credential problem and carries no detail about which; `403` means the client is suspended, which is a conversation with an operator rather than a credential to rotate; `429` is a limiter tier or a quota ceiling and always carries a bounded `Retry-After`; `503` means this deployment has no webhook channel configured, or its store is briefly unavailable -- both retryable, neither a statement about your credential.\n\n**`422` has two body shapes, and the one you will meet first is the array.** A refusal this application made carries a string `detail` (`Error`); a refusal the framework made before any handler ran carries an array of objects (`ValidationError`) -- an out-of-range `limit`, an unknown body property, a `pattern` violation, a missing required property, an over-long path segment. Those are the errors you hit while writing the client, so branch on `detail`'s type rather than assuming a string. Every documented `422` here says which shapes it can be.\n\n**Retention.** A subscription expires at the earlier of 180 days from creation and 60 days from your last interaction with it, and both horizons are enforced when it is read as well as by the store's own expiry -- so a subscription never keeps alerting past its published expiry. Events and delivery records are kept 7 days. A `DELETE` tombstones the subscription in one write that stops routing and then deletes its events, deliveries and alert subjects; where that has not completed the response says so and names the maximum residual window, after which expiry removes the remainder.",
+    "contact": {
+      "name": "Entur - Team KI-eksperimentering"
+    }
+  },
+  "servers": [
+    {
+      "url": "https://kix-avvik.entur.io/notification-api/v1",
+      "description": "Production."
+    },
+    {
+      "url": "https://kix-avvik.staging.entur.io/notification-api/v1",
+      "description": "Test (tst). Records and credentials are per environment; a production credential is not valid here."
+    },
+    {
+      "url": "https://kix-avvik.dev.entur.io/notification-api/v1",
+      "description": "Development."
+    }
+  ],
+  "security": [
+    {
+      "clientKey": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "notification-subscriptions",
+      "description": "One commuter's recurring journey."
+    },
+    {
+      "name": "notification-destinations",
+      "description": "Your callback endpoint and its signing generations."
+    },
+    {
+      "name": "notification-test",
+      "description": "Signed synthetic events, restricted to test-only subscriptions."
+    }
+  ],
+  "paths": {
+    "/subscriptions": {
+      "post": {
+        "operationId": "createOrReplaceSubscription",
+        "tags": [
+          "notification-subscriptions"
+        ],
+        "summary": "Create or replace a watch by your own reference",
+        "description": "Idempotent on (reference, definition): an identical retry returns the stored record and changes nothing but the inactivity horizon, so an unacknowledged POST is safe to repeat. A different definition under the same reference amends it and bumps `version`. A reference that has been deleted is **not** resurrected -- the id is spent and its record is the audit trail -- which is a 409.\n\nThe window, the weekday set and the stop pair are validated exactly as Entur's own Avviksvarsel validates them, including the refusal of overnight windows: `begin` must be strictly before `end`, so a watch spanning midnight is registered as two.\n\nA stop pair that no direct trip serves is **stored, never refused** -- weekend-only and seasonal routes are why a refusal would be wrong -- and carries the caveat on `servable` with `servable_checked_at` beside it. `servable: null` means the answer could not be established and must never be rendered to a traveller as an all-clear.\n\n`alerts` is **null** on this response: a create or replace does not read the alert state. Null therefore means \"not included here\", never \"no standing alerts\" -- that is `n_active: 0` with `truncated: false`, from either GET route.",
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": false,
+            "description": "The `version` you last read. A mismatch is 409 rather than a silent overwrite. Omit it to replace unconditionally.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubscriptionCreate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The watch already existed: unchanged (an identical retry) or amended.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Suspended"
+          },
+          "409": {
+            "description": "The reference is tombstoned, or `version` moved under you.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "get": {
+        "operationId": "listSubscriptions",
+        "tags": [
+          "notification-subscriptions"
+        ],
+        "summary": "Your own watches",
+        "description": "Oldest first. The set is bounded by the per-client ceiling on active subscriptions, so paging is a slice of one bounded read: pass a page's `next_cursor` back as `after`. A cursor the current set no longer contains is a 400 rather than an empty page, because \"that watch is gone\" and \"nothing matched\" are different answers.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\". A list page reads every row's state in ONE query, so a bounded read marks *every* row truncated -- including rows whose own subjects fitted, because a watch crowded out of the page would otherwise read exactly like a calm one. Ask about that watch individually and the read is scoped to it alone.",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "description": "A previous page's `next_cursor`.",
+            "schema": {
+              "type": "string",
+              "maxLength": 128
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of watches.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionList"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Suspended"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/subscriptions/{subscription_id}": {
+      "parameters": [
+        {
+          "name": "subscription_id",
+          "in": "path",
+          "required": true,
+          "description": "Your own reference. The opaque `subscription_id` an event carries is also accepted, so a receiver holding an event can look the watch up without knowing how records are keyed.",
+          "schema": {
+            "type": "string",
+            "maxLength": 257
+          }
+        }
+      ],
+      "get": {
+        "operationId": "getSubscription",
+        "tags": [
+          "notification-subscriptions"
+        ],
+        "summary": "One watch, with servability and freshness",
+        "description": "Missing, deleted, expired and belonging to another client are all 404: one answer for four states, so the difference cannot be used to enumerate anything.\n\nEach watch carries `alerts`: its **current alert state**, read from the notification service's own committed alert subjects rather than re-evaluated, so it is what stands right now about this watch. `n_active` counts standing alerts (withdrawn ones are not standing and are not listed), `n_confirmed` how many are confirmed cancellations, and `subjects` carries the worst few -- capped at the number of notifications one watch can receive in an Oslo day, because a longer list would enumerate what that cap has already suppressed. **Read `truncated`.** When it is true the counts are lower bounds and `n_active: 0` means \"we could not establish this\", never \"all clear\".",
+        "responses": {
+          "200": {
+            "description": "The watch.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Subscription"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Suspended"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteSubscription",
+        "tags": [
+          "notification-subscriptions"
+        ],
+        "summary": "Stop a watch: tombstone, then durable cleanup",
+        "description": "Ordered and durable. The tombstone lands first, in one write that stops routing, and only then are the watch's events, deliveries and alert subjects removed -- reversed, a partial failure would leave a routable watch whose events were already gone.\n\nRepeated deletion succeeds, and so does deleting a reference that never existed (`existed: false`). Where cleanup has not finished, `cleanup.state` is `pending` and a repeated `DELETE` resumes it; `cleanup.residual_hours` is the maximum window after which expiry removes whatever is left.\n\nDeletion deliberately does not reach the notification wording caches: those key on the journey definition, which is exactly what this watch shares with any other registration on the same route, and they expire with the disruption they describe.",
+        "responses": {
+          "200": {
+            "description": "Deleted, with the cleanup's state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Suspended"
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/destinations/current": {
+      "get": {
+        "operationId": "getCurrentDestination",
+        "tags": [
+          "notification-destinations"
+        ],
+        "summary": "Destination readiness and signing key ids",
+        "description": "Your provisioned callback, whether it is currently deliverable, and which signing generations are live. **Generation numbers only, never a secret**: a signing secret is derived from a root over `destination_id || generation` and is stored nowhere, and this endpoint never derives one.\n\n`paused` is set automatically when your endpoint answers `410 Gone` -- the documented meaning of which is \"stop sending\" -- and is lifted only by an Entur operator. While it is paused, new watches can still be registered and events still queue; nothing is dialled.",
+        "responses": {
+          "200": {
+            "description": "The destination.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Destination"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Suspended"
+          },
+          "404": {
+            "description": "No destination is provisioned for this client. An operator provisions one out of band.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "$ref": "#/components/responses/Unavailable"
+          }
+        }
+      }
+    },
+    "/test-events": {
+      "post": {
+        "operationId": "sendTestEvent",
+        "tags": [
+          "notification-test"
+        ],
+        "summary": "Send one signed synthetic event to your callback",
+        "description": "Signs and dials one synthetic event, so a receiver can be verified end to end before a real disruption. **Restricted to a subscription created with `test: true`**, and that marker is immutable -- changing it needs delete and re-create -- because it rides inside the signed body and a receiver is expected to refuse a test event before dispatching a native notification. Anything else is 409.\n\nThe event's `test` field, `event_id` and `alert_id` are unique per call, so asking twice gives two notifications rather than one the receiver's duplicate rule discards. Nothing is stored: no event, no delivery record, and your daily notification allowance is untouched.\n\nAnswers 200 with the outcome even when your endpoint rejected the attempt -- the classification is the diagnosis. A refusal on Entur's side is a 4xx or 503 as usual.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestEventRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The attempt was made; the body says how it went.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestEventResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Suspended"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "The watch is not test-only, or the destination is missing or paused.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "422": {
+            "$ref": "#/components/responses/ValidationFailed"
+          },
+          "429": {
+            "$ref": "#/components/responses/RateLimited"
+          },
+          "503": {
+            "description": "Signing is not configured in this deployment, or the store is unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "webhooks": {
+    "journeyAlert": {
+      "post": {
+        "operationId": "receiveJourneyAlert",
+        "summary": "An alert about one train on one of your watches",
+        "description": "Entur POSTs this to your callback destination. The body is `event.schema.json`, referenced here rather than restated.\n\n**Verification.** Each attempt is signed over the exact bytes sent, in the Standard Webhooks shape: HMAC-SHA256 over `webhook-id.webhook-timestamp.<raw body>`, base64, presented as `v1,<signature>`. Verify against the raw body before parsing it. `webhook-id` is stable across attempts of the same delivery, and `webhook-timestamp` and the signature are fresh per attempt -- so a retry that crosses a cycle boundary still lands inside your replay window. Two signature entries are present while a signing generation is being rotated; accept the request if **either** verifies.\n\n**Delivery is at-least-once with no ordering guarantee.** One attempt per notification pass while the event is valid -- validity being the earlier of 60 minutes from `occurred_at`, the train's departure, and the subscription's own lifetime -- after which the event expires and is not retried. The pass period is driven by upstream real-time ingestion rather than a fixed timer, so treat the interval as measured, not promised.\n\n**Suppress before dispatching natively**, in this order: drop a duplicate `event_id`; drop a revision not strictly newer than the highest you have applied for that `alert_id`; and never dispatch a `predicted` revision for a train you have already shown as `confirmed`, whatever its revision. The supplied client package implements all three.\n\n**Answer quickly.** `2xx` is success. `410 Gone` pauses the destination until an operator resumes it, so use it only when you mean \"stop for good\". `408` and `429` are retried, and a `Retry-After` is honoured up to a cap; other `4xx` are terminal for that event; `5xx` is retried. A redirect is not followed.",
+        "parameters": [
+          {
+            "name": "webhook-id",
+            "in": "header",
+            "required": true,
+            "description": "The delivery id, stable across attempts. Deduplicate on it as well as on `event_id`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "webhook-timestamp",
+            "in": "header",
+            "required": true,
+            "description": "Unix seconds, fresh per attempt. Reject a timestamp outside your replay window (5 minutes is the reference tolerance).",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "webhook-signature",
+            "in": "header",
+            "required": true,
+            "description": "Space-delimited `v1,<base64>` entries -- one per live signing generation. Accept if any verifies.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "./event.schema.json"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted."
+          },
+          "410": {
+            "description": "Gone: pauses this destination until an Entur operator resumes it."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "clientKey": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "<key-id>.<secret>",
+        "description": "The credential an Entur operator issued. `Authorization: Bearer kixn_....<secret>`. Never sent as a cookie."
+      }
+    },
+    "schemas": {
+      "Subscription": {
+        "$ref": "./subscription.schema.json"
+      },
+      "SubscriptionCreate": {
+        "title": "Subscription (request)",
+        "description": "The writable half of a subscription. Every property references the authored schema, so a constraint is stated once. The read-only properties -- `client_id`, `version`, `status`, `servable`, `servable_checked_at`, `expires_at`, `created_at`, `updated_at` -- are set by Entur and rejected in a request body.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "subscription_id",
+          "destination_id",
+          "from_stop",
+          "to_stop",
+          "begin",
+          "end",
+          "days"
+        ],
+        "properties": {
+          "subscription_id": {
+            "$ref": "./subscription.schema.json#/properties/subscription_id"
+          },
+          "destination_id": {
+            "$ref": "./subscription.schema.json#/properties/destination_id"
+          },
+          "from_stop": {
+            "$ref": "./subscription.schema.json#/properties/from_stop"
+          },
+          "to_stop": {
+            "$ref": "./subscription.schema.json#/properties/to_stop"
+          },
+          "begin": {
+            "$ref": "./subscription.schema.json#/properties/begin"
+          },
+          "end": {
+            "$ref": "./subscription.schema.json#/properties/end"
+          },
+          "days": {
+            "$ref": "./subscription.schema.json#/properties/days"
+          },
+          "external_ref": {
+            "$ref": "./subscription.schema.json#/properties/external_ref"
+          },
+          "test": {
+            "$ref": "./subscription.schema.json#/properties/test"
+          }
+        }
+      },
+      "SubscriptionList": {
+        "title": "Subscription page",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "count",
+          "limit",
+          "next_cursor",
+          "subscriptions"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many watches this page holds."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "The page size that was applied."
+          },
+          "next_cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Pass as `after` to continue. `null` when this is the last page."
+          },
+          "subscriptions": {
+            "type": "array",
+            "items": {
+              "$ref": "./subscription.schema.json"
+            }
+          }
+        }
+      },
+      "CleanupState": {
+        "title": "Cleanup state",
+        "description": "The auditable completion state of a deletion's second half. `pending` means a repeated `DELETE` will resume it and that expiry is the fallback until it does.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "state",
+          "passes",
+          "deleted_events",
+          "deleted_deliveries",
+          "deleted_subjects",
+          "residual_hours"
+        ],
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "done",
+              "pending"
+            ]
+          },
+          "passes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many batched passes this request ran."
+          },
+          "deleted_events": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "deleted_deliveries": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "deleted_subjects": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "residual_hours": {
+            "type": "integer",
+            "description": "The maximum window in which anything cleanup did not remove is still stored, after which expiry removes it. Published rather than implied."
+          }
+        }
+      },
+      "DeleteResult": {
+        "title": "Delete result",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "subscription_id",
+          "status",
+          "existed",
+          "cleanup"
+        ],
+        "properties": {
+          "subscription_id": {
+            "$ref": "./subscription.schema.json#/properties/subscription_id"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "deleted"
+            ],
+            "description": "Always `deleted`: a repeated deletion succeeds."
+          },
+          "existed": {
+            "type": "boolean",
+            "description": "Whether there was a live watch to tombstone. `false` is not an error."
+          },
+          "cleanup": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CleanupState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "`null` when there was nothing to clean up."
+          }
+        }
+      },
+      "SigningGenerations": {
+        "title": "Signing generations",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "active",
+          "retiring"
+        ],
+        "properties": {
+          "active": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "retiring": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Both are valid at once while a rotation is in flight, so accept a request whose signature verifies under either. `null` when nothing is retiring."
+          }
+        }
+      },
+      "Destination": {
+        "title": "Destination",
+        "description": "Your callback destination. Carries no signing material: a secret is derived from a root and stored nowhere.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "destination_id",
+          "callback_url",
+          "status",
+          "paused",
+          "paused_at",
+          "paused_reason",
+          "ready",
+          "signing_generations"
+        ],
+        "properties": {
+          "destination_id": {
+            "type": "string"
+          },
+          "callback_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "HTTPS only, default port, no userinfo and no fragment. Provisioned by an operator out of band."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "retired"
+            ]
+          },
+          "paused": {
+            "type": "boolean",
+            "description": "Set automatically when your endpoint answers 410; lifted only by an operator."
+          },
+          "paused_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "paused_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ready": {
+            "type": "boolean",
+            "description": "Active, not paused, and signing is configured in this deployment."
+          },
+          "signing_generations": {
+            "$ref": "#/components/schemas/SigningGenerations"
+          }
+        }
+      },
+      "TestEventRequest": {
+        "title": "Test event request",
+        "description": "The one place in this document whose property is stated inline instead of referenced. `subscription.schema.json`'s `subscription_id` is the CREATE-side constraint -- your own reference, 128 characters, no `~` -- and it is correctly strict there: a create body must never name the namespaced form. This route accepts that form as well, exactly as the two path routes do, so referencing the create-side definition published a schema that refuses the id an event carries in its own `subscription_id` field. A client validating outbound requests against it would reproduce, in their own client, the 422 this API was fixed to stop returning.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "subscription_id"
+        ],
+        "properties": {
+          "subscription_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 257,
+            "pattern": "^[A-Za-z0-9._:~-]+$",
+            "description": "A subscription created with `test: true`. Your own reference, or the opaque `subscription_id` an event carries -- the same two forms the path routes accept, and the bound is theirs: `~` plus 128 characters either side. Anything else is refused."
+          }
+        }
+      },
+      "TestEventResult": {
+        "title": "Test event result",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "subscription_id",
+          "destination_id",
+          "delivered",
+          "status",
+          "error",
+          "signed_generations"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "description": "The synthetic event's id, also its `webhook-id`."
+          },
+          "subscription_id": {
+            "$ref": "./subscription.schema.json#/properties/subscription_id"
+          },
+          "destination_id": {
+            "type": "string"
+          },
+          "delivered": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Your endpoint's HTTP status, when it answered at all."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A short classification of what went wrong, for diagnosis."
+          },
+          "signed_generations": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "Which signing generations the attempt was signed under."
+          }
+        }
+      },
+      "Error": {
+        "title": "Error",
+        "description": "The shape of every failure THIS APPLICATION refuses: `detail` is a short stable code, not prose to show a traveller, and it deliberately says nothing about another client's records.\n\n**It is not the only failure shape, and a client that assumes it is will throw on the first malformed request it sends.** A request refused before any handler runs -- an unknown body field under `additionalProperties: false`, a value failing its `pattern` or its length or numeric bound, a missing required property, a path segment over its bound, a body that is not an object -- is refused by the framework, whose `detail` is an ARRAY: see `ValidationError`. That is why every 422 documented here is a `oneOf` of the two, and why `GET`/`DELETE` routes that constrain a parameter document a 422 at all.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "ValidationError": {
+        "title": "Validation error",
+        "description": "FastAPI's own refusal, for a request no handler here ever saw. `detail` is an **array of objects** (`type`/`loc`/`msg`/`input`, plus `ctx` where the violated constraint has a value to quote), never a string -- so test `detail`'s type before reading it as one.\n\n**Published rather than flattened, deliberately.** Reshaping these into `Error` needs a `RequestValidationError` handler, and FastAPI registers those per APPLICATION, not per router: this API is mounted in a process that also serves `/varsel-api`, `/historikk-api`, `/meldinger-api` and more, so one handler would silently restate every one of their validation bodies too. Two honest shapes beat one uniform shape bought at that price. `docs/integrations/notification-api.md` says the same thing in prose.\n\nThe item's key set is Pydantic's rather than ours, so it is deliberately left open here. Measured against this app (FastAPI 0.140, Pydantic 2.13) over a query bound, a query type, a path length, a body pattern, a missing field, a forbidden extra field and a non-object body: every item carried `type`, `loc`, `msg` and `input`, and `ctx` appeared on the four that had a constraint to name.",
+        "type": "object",
+        "required": [
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "type",
+                "loc",
+                "msg",
+                "input"
+              ],
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "description": "Pydantic's error kind: `missing`, `extra_forbidden`, `string_pattern_mismatch`, `string_too_long`, `less_than_equal`, `int_parsing`, `model_attributes_type`, and others. Match on this rather than on `msg`."
+                },
+                "loc": {
+                  "type": "array",
+                  "description": "Where the offending value sits: `[\"query\", \"limit\"]`, `[\"path\", \"subscription_id\"]`, `[\"body\", \"from_stop\"]`, or `[\"body\"]` for a body that is not an object. An INTEGER element is an index into an array property -- `[\"body\", \"days\", 1]` -- which is why the items are string or integer and not string.",
+                  "items": {
+                    "type": [
+                      "string",
+                      "integer"
+                    ]
+                  }
+                },
+                "msg": {
+                  "type": "string",
+                  "description": "English prose from Pydantic. For your log, not for a traveller: it is neither Norwegian nor a stable code."
+                },
+                "input": {
+                  "description": "The value that was refused, as received -- any JSON type, and for `missing` it is the enclosing object. Required, and on the same footing as the three beside it: Pydantic declares `type`, `loc`, `msg` and `input` always present and `ctx` optional, and all seven refusals measured against this app agreed."
+                },
+                "ctx": {
+                  "type": "object",
+                  "description": "The constraint that was violated, when the error kind has one to quote: `{\"le\": 500}`, `{\"max_length\": 257}`, `{\"pattern\": \"^[A-Za-z0-9._:~-]+$\"}`. Absent for kinds with no constraint, such as `missing`."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "A malformed parameter.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing, unknown, revoked, expired or wrong credential. The body says which it is not.",
+        "headers": {
+          "WWW-Authenticate": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Suspended": {
+        "description": "The credential is valid and the client is suspended. Not a credential to rotate.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "No such record for this credential. Missing, deleted, expired and another client's are one answer.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "The request body is malformed. **Two shapes, and you must handle both.** A refusal this application made -- a bad window, weekday set or stop pair, an unknown `destination_id` -- is `Error`, with `detail` a string. A refusal the framework made before the handler ran -- an unknown property, a value failing its pattern or bound, a missing required property -- is `ValidationError`, with `detail` an array. `detail`'s type is what tells them apart.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/Error"
+                },
+                {
+                  "$ref": "#/components/schemas/ValidationError"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "ValidationFailed": {
+        "description": "A parameter or body property failed its published schema, and no handler here ran. Only the framework's array shape reaches you on this route: it has no refusal of its own at this status.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ValidationError"
+            }
+          }
+        }
+      },
+      "RateLimited": {
+        "description": "A limiter tier or a quota ceiling. `Retry-After` is always present and bounded.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      },
+      "Unavailable": {
+        "description": "The webhook channel is not configured in this deployment, or its store is briefly unavailable. Retryable, and not a statement about your credential.",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    }
+  }
+}

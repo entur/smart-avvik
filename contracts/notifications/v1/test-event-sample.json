@@ -1,0 +1,92 @@
+{
+  "$comment": "One synthetic event, dumped from disruptions/api/notification_api.py's `_synthetic_event` -- the body `POST /notification-api/v1/test-events` actually signs and sends. It is a GENERATED file, not an authored one: regenerate it rather than editing it, with the recipe under `how_to_regenerate`. It exists because a hand-written transcription of that function drifted from it in eight fields (the vendored receiver's end-to-end fixture, corrected 2026-09-09), and nothing caught the drift -- `payload.call` and `payload.probabilities` are deliberately OPEN objects in event.schema.json, so a wrongly named key inside them is schema-VALID. Stop places and ids here are test values and name no real client.",
+  "version": 1,
+  "how_to_regenerate": {
+    "why": "A client's first sight of a real payload is a test event, so a fixture that teaches `probabilities.cancel` or `call.aimed_departure` -- neither of which any producer emits -- breaks their receiver on the first genuine cancelled train, in production, at go-live.",
+    "producer": "disruptions/api/notification_api.py::_synthetic_event",
+    "the_other_producer": "disruptions/api/varsel.py::_webhook_payload builds the payload of a REAL event, and test_notification_api.py::test_the_synthetic_payload_has_the_same_shape_as_a_real_one compares the two in both directions. So pinning against this file pins against both.",
+    "inputs": {
+      "now": "2026-09-09T05:00:00+00:00",
+      "nonce": "0123456789ab",
+      "subscription": {
+        "subscription_id": "client-a~morgentur",
+        "client_id": "client-a",
+        "destination_id": "dst_client_a_test",
+        "from_stop": "NSR:StopPlace:337",
+        "to_stop": "NSR:StopPlace:59872",
+        "begin": "06:30",
+        "end": "09:00",
+        "days": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "external_ref": "commuter-4711",
+        "test": true,
+        "version": 1,
+        "status": "active"
+      }
+    },
+    "checked_by": "disruptions/api/test_notification_api.py::test_the_committed_test_event_sample_still_matches_the_producer rebuilds this event from `_synthetic_event` under the inputs above and compares structure, leaf types, every non-derived top-level value and the three payload parts -- the way test_webhook_signing.py re-derives signing-vectors.json. A regenerated sample that drifts from the producer fails there before it can rot the way the fixture it replaced did."
+  },
+  "how_to_consume": {
+    "timestamps": "`occurred_at`, `valid_until`, `call_date` and `payload.call.aimed_departure_time` are fixed instants from the generating run. A receiver test asserting on its own clock must re-stamp them and PRESERVE THE OFFSETS: `valid_until` is the earlier of occurred_at + 60 minutes and the departure, which here is the departure at occurred_at + 45 minutes.",
+    "identity": "`event_id`, `alert_id` and `journey_ref` are minted per call on that route (`test-<nonce>` / `KIX:Test:<nonce>`), deliberately, so two test events are never read as two revisions of one train. Substitute a nonce rather than reusing this one if a test sends more than once.",
+    "phase": "`confirmed`, and the whole event is coherent with it: both probabilities 1.0, every delay figure null, `effect: cancelled`. The supplied client's `defaultDisplay` maps `predicted` to `alert` and everything else to `silent`, so a receiver test built on this event asserts `silent`."
+  },
+  "event": {
+    "schema_version": "1",
+    "event_id": "test-0123456789ab",
+    "type": "journey.alert.created",
+    "phase": "confirmed",
+    "alert_id": "test-0123456789ab",
+    "revision": 361740,
+    "occurred_at": "2026-09-09T05:00:00+00:00",
+    "valid_until": "2026-09-09T05:45:00+00:00",
+    "subscription_id": "client-a~morgentur",
+    "subscription_version": 1,
+    "external_ref": "commuter-4711",
+    "test": true,
+    "operator": "VYG",
+    "line": "VYG:Line:L1",
+    "journey_ref": "KIX:Test:0123456789ab",
+    "call_date": "2026-09-09",
+    "stop_place": "NSR:StopPlace:337",
+    "stop_order": 1,
+    "situations": [
+      "KIX:TestEvent:0123456789ab"
+    ],
+    "payload": {
+      "notification": {
+        "title": "Testvarsel: Tog L1 er innstilt",
+        "body": "NSR:StopPlace:337 → NSR:StopPlace:59872\nDette er et testvarsel fra Entur. Ingen virkelige avganger er berørt.",
+        "action": null
+      },
+      "call": {
+        "stop_place": "NSR:StopPlace:337",
+        "stop_order": 1,
+        "aimed_departure_time": "2026-09-09T05:45:00+00:00",
+        "departs_tomorrow": false
+      },
+      "probabilities": {
+        "impact": 1.0,
+        "cancellation": 1.0,
+        "delay_ge10": null,
+        "alert_threshold": 0.85
+      },
+      "delay": null,
+      "effect": "cancelled",
+      "situations": [
+        {
+          "situation_number": "KIX:TestEvent:0123456789ab",
+          "summary": "Testvarsel fra Entur",
+          "description": "Syntetisk hendelse sendt fra /notification-api/v1/test-events. Ingen virkelige avganger er berørt.",
+          "has_situation": false
+        }
+      ],
+      "alternative_journey": null
+    }
+  }
+}
