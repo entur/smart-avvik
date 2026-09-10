@@ -795,9 +795,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   this channel's. App logs live in the **cluster** project
   (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
   **`NOTIFICATION_WEBHOOK_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
-  other three flags; it defaults off and is set in **dev only** (since 2026-09-10, for the public
-  read below, not for the channel — `NOTIFICATION_WEBHOOKS_ENABLED` stays off there, so no event
-  carries it), so in tst and prd the channel emits and delivers the deterministic template until
+  other three flags; it defaults off and is set in **dev and prd** (both since 2026-09-10, for the
+  public read below, not for the channel — `NOTIFICATION_WEBHOOKS_ENABLED` stays off in both, so no
+  event carries it), so in tst the channel would emit and deliver the deterministic template until
   somebody adds it. Expect one divergence during the rollout window: with `VARSEL_LLM_ENABLED=true`
   beside it false, the push carries the model's prose while the event carries the template, so the
   two channels are byte-identical only where both switches agree.
