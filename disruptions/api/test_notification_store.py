@@ -3200,27 +3200,31 @@ def test_the_deny_all_rules_file_exists_and_denies():
     assert firebase["firestore"]["indexes"] == "firestore.indexes.json"
 
 
-def test_the_deny_all_rules_are_released_by_terraform_not_only_committed():
-    """Until 2026-09-09 the file above was asserted and emulated but deployed by nothing, so the
-    real database ran on whatever rules it was created with. The release is what turns a console
-    edit towards the open template into drift the next apply reverts. Pinned in three places, each
-    the one that would otherwise rot silently: the ruleset reads THIS file (a second copy under
-    terraform/ would drift from the one the emulator enforces), the release names the NAMED
-    database (a bare `cloud.firestore` would rule `(default)`, which does not exist here), and the
-    workflow triggers on the file (or an edit merges and applies nothing -- the indexes' own
-    lesson, one file over)."""
-    assert 'resource "google_firebaserules_ruleset"' in FIRESTORE_TF_CODE
-    assert 'resource "google_firebaserules_release"' in FIRESTORE_TF_CODE
-    assert 'content = file("${path.module}/../firestore.rules")' in FIRESTORE_TF_CODE
-    assert (
-        'name         = "cloud.firestore/${google_firestore_database.notifications.name}"'
-        in FIRESTORE_TF_CODE
-    ), "a named database's release is cloud.firestore/<database>, never bare cloud.firestore"
-    assert 'service            = "firebaserules.googleapis.com"' in FIRESTORE_TF_CODE
-    # A ruleset a release points at cannot be deleted, so the replacement must exist first.
-    assert "create_before_destroy = true" in FIRESTORE_TF_CODE
-    assert TERRAFORM_YML.count("- 'firestore.rules'") == 2, (
-        "both of terraform.yml's paths: lists must carry firestore.rules, like firestore.indexes.json"
+def test_the_deny_all_rules_are_deliberately_not_released_by_terraform():
+    """The rules file is the emulator's and the tests' statement, NOT a Terraform-managed release --
+    and that is a decision with a date, not an omission. For one day (2026-09-09/10) it was
+    released as the named database's live ruleset; the refresh of that ruleset needs
+    `firebaserules.rulesets.get`, which the PULL-REQUEST plan identity lacks while the push APPLY
+    identity has it, so every Terraform PR after the apply failed its plan. Rules govern client-SDK
+    access only, no Firebase app exists in these projects, and a database with no release denies
+    every client anyway -- so the guard guarded nothing and cost every plan.
+
+    Pinned in the shape that would otherwise rot: no `resource` of either kind (the `removed`
+    blocks that forget them are fine, and go once every environment that held them has applied),
+    the emulator still reads the file, and terraform.yml no longer triggers on it -- a workflow that
+    plans on a rules edit while nothing consumes the edit is the same silent gap as the reverse.
+    Re-adding the release is the right move THE DAY a Firebase app is registered here, together
+    with the Team Plattform ask for the plan-reader permission -- see terraform/firestore.tf."""
+    assert 'resource "google_firebaserules_ruleset"' not in FIRESTORE_TF_CODE
+    assert 'resource "google_firebaserules_release"' not in FIRESTORE_TF_CODE
+    assert 'resource "google_project_service" "firebaserules"' not in FIRESTORE_TF_CODE
+    firebase = json.loads((REPO / "firebase.json").read_text())
+    assert firebase["firestore"]["rules"] == "firestore.rules"
+    assert "- 'firestore.rules'" not in TERRAFORM_YML, (
+        "terraform.yml must not trigger on firestore.rules while nothing in terraform/ consumes it"
+    )
+    assert TERRAFORM_YML.count("- 'firestore.indexes.json'") == 2, (
+        "both of terraform.yml's paths: lists must still carry firestore.indexes.json"
     )
 
 
