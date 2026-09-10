@@ -1,0 +1,59 @@
+rules_version = '2';
+
+// Deny every client SDK on the four collections this package writes.
+//
+// WHY THIS FILE EXISTS AT ALL. Cloud Functions here use the ADMIN SDK, which is authorized by IAM
+// and which Security Rules do not apply to -- so nothing in this file grants the receiver anything.
+// What it closes is the other door. A Firestore database in a project that has a Firebase app
+// registered (which a client's mobile BFF certainly does) is reachable by an untrusted client SDK
+// holding a public API key, and the console's default template opens the whole database to the world
+// until a date passes. Without these rules any signed-in user of the client's own app can:
+//
+//   * READ every event -- the Norwegian prose of every commuter's disruption alert, with their
+//     origin, destination and departure time;
+//   * FORGE a `notification_decisions` document marking a real event as already settled, which
+//     suppresses a genuine cancellation notification before it is ever dispatched;
+//   * FORGE a `notification_inbox` document, which fires the trigger and INJECTS a notification.
+//
+// The second and third are the ones worth stating out loud: this is not only a disclosure risk, it
+// is a write path into what a traveller is told about their train.
+//
+// HOW TO MERGE THIS INTO YOUR OWN RULES. Firestore evaluates rules as a UNION: access is granted if
+// ANY matching rule allows it, and a deny CANNOT override an allow elsewhere in the ruleset. So
+// copying the four matches below into a ruleset that also carries `match /{document=**} { allow
+// read, write: if request.auth != null; }` leaves these collections wide open. The four matches are
+// necessary and not sufficient; what makes them sufficient is that no broader rule in your ruleset
+// allows these paths. Check for one.
+//
+// The final catch-all is right for a project dedicated to this receiver and wrong for a project that
+// also serves your app. Drop it when merging -- but do not drop the four above it.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // The inbox: one document per accepted delivery, written by the receiver before it answers 2xx.
+    match /notification_inbox/{eventId} {
+      allow read, write: if false;
+    }
+
+    // The ledger's standing state: the highest applied revision and phase per alert_id.
+    match /notification_alerts/{alertId} {
+      allow read, write: if false;
+    }
+
+    // The per-event decision marker. Forging one suppresses a real notification.
+    match /notification_decisions/{eventId} {
+      allow read, write: if false;
+    }
+
+    // Every suppression, with its rule and reason.
+    match /notification_suppressions/{suppressionId} {
+      allow read, write: if false;
+    }
+
+    // Everything else, for a project dedicated to this receiver. See the note above before keeping
+    // this in a project that also serves your app.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

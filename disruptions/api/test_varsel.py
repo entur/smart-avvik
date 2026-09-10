@@ -20,6 +20,7 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import alert_policy
 import alternatives
 import impact
 import main
@@ -820,6 +821,134 @@ def test_the_survivor_of_a_tie_does_not_depend_on_input_order():
     assert varsel.one_alert_per_train([b, a])[0].situation_number == "S2"
 
 
+# ---- U2: pending-ness is per RECIPIENT, on either channel (KTD3/KTD4) ------------------------
+
+
+def test_pending_pushes_is_channel_neutral():
+    """One question, two ledgers, and the unit-level statement of KTD3.
+
+    `_notified` answers it for a browser registration (`"<journey_id>|<situation>"`, grown only on a
+    successful send) and `WebhookRecipient.delivered` answers it for a webhook subscription
+    (Firestore's copy, read once per cycle). A train is pending while ANY recipient on either
+    channel still needs telling, which is what makes one wording serve both.
+
+    The two ledgers are NOT at one grain, and that is the channel's own shape rather than an
+    accident: the browser is pushed once per situation, so `_notified` is per situation; the store
+    mints one event per (subscription, train), so `delivered` holds `alert_id`s and the question is
+    asked per train (`_webhook_pending`). The marks here are derived through the same
+    `notification_events.alert_id_for` the store's `_sent_body` keys on.
+    """
+    import notification_events
+
+    varsel._notified.clear()
+    alerts = [_alert("S1"), _alert("S2", jkey="t2", dep=MON_0800 + timedelta(minutes=30))]
+
+    def mark(alert):
+        train_id = notification_events.alert_id_for(
+            "sub-1",
+            operator=alert.operator,
+            line=alert.line,
+            journey_ref=alert.jkey,
+            stop_place=alert.stop_place,
+            stop_order=alert.stop_order,
+            departure_time=alert.departure_time,
+        )
+        assert train_id is not None
+        return train_id
+
+    client = varsel.WebhookRecipient("sub-1", {"from_stop": "A"}, frozenset({mark(alerts[0])}))
+
+    # Browser only, nothing notified yet: both trains pending.
+    assert [a.situation_number for a in varsel._pending_pushes(["j1"], alerts)] == ["S1", "S2"]
+    # Browser told about S1: only S2 remains -- for that registration.
+    varsel._notified.add("j1|S1")
+    assert [a.situation_number for a in varsel._pending_pushes(["j1"], alerts)] == ["S2"]
+    # A SECOND registration on the same definition has heard nothing, so S1 is pending again.
+    assert [a.situation_number for a in varsel._pending_pushes(["j1", "j2"], alerts)] == [
+        "S1", "S2",
+    ]
+    # No browser recipient at all (which is what the caller passes when push is disabled) and a
+    # client that has had S1: S2 alone, and it is the client's ledger saying so.
+    assert [
+        a.situation_number for a in varsel._pending_pushes((), alerts, [client])
+    ] == ["S2"]
+    # And a client that has had both leaves nothing pending on any channel.
+    done = varsel.WebhookRecipient(
+        "sub-1", {"from_stop": "A"}, frozenset({mark(alerts[0]), mark(alerts[1])})
+    )
+    assert varsel._pending_pushes((), alerts, [done]) == []
+    # A situation NUMBER in the ledger marks nothing: the client's grain is the train.
+    by_situation = varsel.WebhookRecipient("sub-1", {"from_stop": "A"}, frozenset({"S1", "S2"}))
+    assert [a.situation_number for a in varsel._pending_pushes((), alerts, [by_situation])] == [
+        "S1", "S2",
+    ]
+    varsel._notified.clear()
+
+
+def test_a_sub_threshold_train_is_never_pending_on_either_channel():
+    """The gate comes first, on both channels alike (KTD2/R3): a webhook recipient must not earn a
+    wording for a train `/varsel` would not have alerted on. `alertworthy` is the whole test, and
+    it is applied before either ledger is consulted."""
+    varsel._notified.clear()
+    mild = _alert("S1", p_impact=0.2)
+    mild.alertworthy = False
+    client = varsel.WebhookRecipient("sub-1", {"from_stop": "A"}, frozenset())
+    assert varsel._pending_pushes(["j1"], [mild], [client]) == []
+
+
+def test_a_webhook_recipient_carries_only_the_five_shared_registration_fields():
+    """R16 and KTD3: what enters the pass is a journey DEFINITION and a delivered set, nothing else.
+
+    The five fields are exactly what `journey_key`, `journey_windows` and `_impact` read off a
+    registration — `llm_message.build_message_input` resolves the two place NAMES from the stop
+    registry rather than from the record, which is why none is needed here. A client's callback
+    URL, quota or opaque reference has no way into this pass, and a wider record is how one would
+    arrive.
+    """
+    recipient = varsel._parse_webhook_recipient(
+        {
+            "recipient_id": "sub-1",
+            "from_stop": "A",
+            "to_stop": "B",
+            "begin": "07:00",
+            "end": "09:00",
+            "days": [4, 0, 0],
+            "delivered": ["S1", "S1"],
+            "callback_url": "https://client.example.com/hook",
+        }
+    )
+    assert set(recipient.journey) == {"from_stop", "to_stop", "begin", "end", "days"}
+    assert recipient.journey["days"] == [0, 4], "de-duplicated and sorted, as JourneyIn does"
+    assert recipient.delivered == frozenset({"S1"})
+    assert "client.example.com" not in str(recipient.journey)
+    # And the definition keys exactly as a browser registration with the same shape would.
+    assert varsel.journey_key(recipient.journey) == varsel.journey_key(
+        {"from_stop": "A", "to_stop": "B", "begin": "07:00", "end": "09:00", "days": [0, 4]}
+    )
+
+
+def test_the_webhook_channel_is_off_without_both_seams():
+    """Un-wired means off, and it takes BOTH halves to be on.
+
+    The default is what makes an un-wired deployment byte-for-byte the code before the channel
+    existed, and it is asserted rather than assumed because it is the entire rollback story: a
+    provider with no flag, or a flag with no provider, must contribute nothing.
+    """
+    before = (varsel._webhook_enabled, varsel._webhook_provider)
+    try:
+        varsel._webhook_enabled = varsel._webhook_provider = None
+        assert varsel.webhook_channel_enabled() is False
+        assert varsel._load_webhook_recipients() == []
+        varsel._webhook_enabled = lambda: True
+        assert varsel.webhook_channel_enabled() is False, "a flag with no store is off"
+        varsel._webhook_enabled, varsel._webhook_provider = None, list
+        assert varsel.webhook_channel_enabled() is False, "a store with no flag is off"
+        varsel._webhook_enabled = lambda: True
+        assert varsel.webhook_channel_enabled() is True
+    finally:
+        varsel._webhook_enabled, varsel._webhook_provider = before
+
+
 def test_push_body_states_a_declared_cancellation_instead_of_scoring_it():
     """The 2026-08-05 report. ET had already cancelled the 15:03 from Asker, and the push (and the
     card wording it) still said "91 % sjanse for innstilling" for a train the journey planner had
@@ -938,10 +1067,10 @@ def test_push_body_names_an_in_time_alternative():
 def test_the_vehicle_noun_is_capitalized_only_where_it_heads_a_line():
     """"Alternativ tog R11 08:24", not "Alternativ Tog R11 08:24" (2026-08-20).
 
-    Both labels come from `_train_label`, but they land in different places: the traveller's own
-    train heads its own line, where the capital is the sentence's, and the alternative sits
-    mid-clause after "Alternativ", where bokmål wants an ordinary common noun. `_LEG_MODE_NOUN`
-    carries the lower-case form for exactly that reason — the alert's `mode` ("Tog") is a label in
+    Both labels come from `notification_wording.train_label`, but they land in different places:
+    the traveller's own train heads its own line, where the capital is the sentence's, and the
+    alternative sits mid-clause after "Alternativ", where bokmål wants an ordinary common noun.
+    `notification_wording._LEG_MODE_NOUN` carries the lower-case form for exactly that reason — the alert's `mode` ("Tog") is a label in
     the payload, not a spelling. The system prompt asks the model for the same thing, so the two
     writers stay comparable on this axis rather than differing by orthography.
     """
@@ -973,9 +1102,10 @@ def test_the_alternative_names_the_leg_the_traveller_has_to_catch():
 
 
 def test_an_alternative_this_codebase_has_no_noun_for_still_names_its_line():
-    """Each missing part costs only itself. A mode outside `_LEG_MODE_NOUN` yields no vehicle noun
-    -- a guessed one would put the wrong vehicle on a lock screen -- while the line and the time
-    still identify the departure, and a leg with neither falls back to the time alone."""
+    """Each missing part costs only itself. A mode outside `notification_wording._LEG_MODE_NOUN`
+    yields no vehicle noun -- a guessed one would put the wrong vehicle on a lock screen -- while
+    the line and the time still identify the departure, and a leg with neither falls back to the
+    time alone."""
     unknown_mode = _alternative(legs=[
         alternatives.AlternativeLeg(mode="funicular", line="X:Line:F1", public_code="F1"),
     ])
@@ -1231,7 +1361,8 @@ def test_an_alternative_that_became_risky_drops_the_written_message():
     assert dropped is None, "a clean escape that stopped being one is different advice"
 
     # The same for the other flag a wording states: arriving after the planned time is the caveat
-    # `_alternative_phrase` adds, and it must not survive on a journey that now arrives in time.
+    # `notification_wording.alternative_phrase` adds, and it must not survive on a journey that
+    # now arrives in time.
     _, dropped, _ = _reconcile_cycle(
         cached=_alternative(**_LATE_ALTERNATIVE),
         fresh=_alternative(**{**_LATE_ALTERNATIVE, "arrives_before_original": True}),
@@ -1442,6 +1573,90 @@ def _cancelled_alert(alternative):
         delay_p50_min=None, delay_p90_min=None, alert_threshold=0.65, alertworthy=True,
         alternative_journey=alternative,
     )
+
+
+# ---- the extraction is a no-op for /varsel (U1 characterization) -------------------------------
+def test_every_field_of_a_matched_alert_is_what_it_was_before_the_wording_moved():
+    """The full row, not a spot check.
+
+    U1 moved the wording out of this module and routed the alert gate through `alert_policy.gate`.
+    Both are meant to be no-ops for `/varsel`, and a no-op is only demonstrable against the whole
+    object: `alert_threshold` and `alertworthy` are recorded on every `varsel_decisions` row and
+    are what `/historikk`'s precision is computed over, `jkey` / `stop_place` / `stop_order` are
+    the ET join key the nightly labelling job uses, and `mode` is read straight into two wordings.
+    A silent change in any of them is a changed decision log.
+    """
+    install({"S1": _train(MON_0800, jkey="j1")})
+    alerts = varsel.match_journey(_journey(), NOW)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.model_dump(
+        include={
+            "situation_number", "summary", "operator", "mode", "has_situation", "line",
+            "departure_time", "jkey", "stop_place", "stop_order", "cancelled",
+            "cancel_probability", "delay_p50_min", "delay_p90_min", "ge10_probability",
+            "impact_probability", "alert_threshold", "alertworthy",
+        }
+    ) == {
+        "situation_number": "S1",
+        "summary": "Signalfeil",
+        "operator": "VYG",
+        "mode": "Tog",
+        "has_situation": True,
+        "line": "VYG:Line:R10",
+        "departure_time": MON_0800,
+        "jkey": "j1",
+        "stop_place": "A",
+        "stop_order": 1,
+        "cancelled": False,
+        "cancel_probability": 0.5,
+        "delay_p50_min": 3,
+        "delay_p90_min": 12,
+        "ge10_probability": 0.8,
+        "impact_probability": 0.9,
+        "alert_threshold": 0.65,
+        "alertworthy": True,
+    }
+    assert alert.decided_at == NOW
+
+
+def test_the_gate_is_reached_rather_than_restated_at_this_surface():
+    """One threshold contract, two adapters (KTD1/KTD2).
+
+    `alert_policy.gate` is `threshold_for` plus the comparison — including the rule that a missing
+    probability is never alert-worthy. Restating `>= threshold` here is how a second surface
+    quietly acquires a cancellation-probability fallback, or starts reading a NULL as a low score;
+    the two severity orders drifted exactly that way before `impact` was extracted.
+
+    Both halves matter, so both are asserted: the threshold this surface RECORDS and the verdict it
+    APPLIES come out of one call. Asking twice is how the recorded bar and the applied bar come to
+    be two different numbers on one decision row.
+    """
+    import inspect
+
+    source = inspect.getsource(varsel._collect_alerts)
+    assert "gate(impact_p, sit.operator" in source
+    assert ">= threshold" not in source
+    assert varsel.gate is alert_policy.gate, "reached, not copied"
+
+    install({"S1": _train(MON_0800, jkey="j1", p_impact_dep=0.9)})
+    alert = varsel.match_journey(_journey(), NOW)[0]
+    assert (alert.alert_threshold, alert.alertworthy) == alert_policy.gate(
+        alert.impact_probability, alert.operator, has_situation=alert.has_situation
+    )
+
+
+def test_the_wording_varsel_sends_is_the_shared_one_and_not_a_copy():
+    """`main` injects `varsel._deterministic_body` into `/meldinger`, and two suites assert push
+    bodies against it. The alias must BE the shared function: two implementations that agree today
+    would split every wording comparison in the decision log the first time one of them changed."""
+    import notification_wording
+
+    assert varsel._deterministic_body is notification_wording.deterministic_body
+    assert varsel._notification_title is notification_wording.notification_title
+    assert varsel._train_label is notification_wording.train_label
+    assert varsel._delay_phrase is notification_wording.delay_phrase
+    assert varsel.mode_label is notification_wording.mode_label
 
 
 if __name__ == "__main__":

@@ -124,6 +124,13 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
 
 
 varsel.configure(impact_provider=_impact_provider, stops_provider=lambda: STOPS)
+# The stop REGISTRY the message input resolves its place names from, wired exactly as `main` wires
+# it (`llm_message.configure(stop_name_provider=_varsel_stops)`). Unwired, every `reise.fra` here
+# read as the bare ref -- which the browser push hid behind the registration's own typed names and
+# the webhook event, which must never use those, does not.
+import llm_message
+
+llm_message.configure(stop_name_provider=lambda: STOPS)
 
 # Suite-wide: this provider calls the REAL impact.for_trip, which calls
 # alternatives.fetch_candidates whenever with_alternative=True. Individual tests stubbing it are not
@@ -190,8 +197,53 @@ def _reset_state():
     import llm_message
 
     llm_message._STATE = llm_message._LatchState()
+    # `notification_wording`'s per-surface allowance and latch holders, for exactly the same reason
+    # one line up and with the same failure (U1, 2026-09-08). The module is not on the browser push
+    # path -- its browser slot is empty by construction -- so nothing this suite drives spends it
+    # today; it is registered here because the house rule is that every module-level budget a
+    # notification surface owns is reset from this one function, and because a suite that leaves a
+    # partly-spent allowance or a latched-off client holder behind reads exactly like the give-up
+    # bug the tests downstream of it exist to pin.
+    import notification_wording
+
+    notification_wording.reset_state()
+    # The webhook channel's two INJECTED SEAMS (U2, 2026-09-08). Not a ledger -- the pass holds no
+    # notification state at module level, deliberately (KTD3: Firestore is the only dedup ledger for that
+    # channel, and the snapshot `check_and_notify` matches from is pass-local) -- but a leaked stub
+    # store is the same class of pollution as a leaked budget and worse to read: every later test
+    # would quietly match one extra journey_key group, so a wording count or an /impact call count
+    # would be off by one with nothing in that test mentioning clients. Reset to the off default,
+    # which is what an un-wired deployment holds.
+    varsel._webhook_enabled = None
+    varsel._webhook_provider = None
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
+
+
+def test_the_shared_reset_clears_the_notification_wording_allowance_and_holders():
+    """U1 scenario 7: one seam, called from this suite's own `_reset_state`.
+
+    Both halves leak, and only one of them is obvious. A partly-spent trailing hour makes a later
+    webhook wording fall back to the template for a reason having nothing to do with what is being
+    checked; a latch holder driven off by a `_ConfigurationError` stays off for
+    `llm_message._LATCH_TTL` -- thirty minutes, i.e. the rest of the run -- and reports `disabled`
+    with nothing saying why. Asserted through the holder the surface actually hands out rather than
+    through the private field, so widening the seam cannot pass this while leaving a caller stale.
+    """
+    import notification_wording as nw
+
+    _reset_state()
+    nw._spend(nw._WEBHOOK_PATH)
+    nw._spend(nw._WEBHOOK_PATH)
+    before = nw.WEBHOOK.state()
+    assert nw.spent(nw._WEBHOOK_PATH) == (2, 2)
+    assert before is not None
+
+    _reset_state()
+
+    assert nw.spent(nw._WEBHOOK_PATH) == (0, 0)
+    assert nw.spent(nw._BROWSER_PATH) == (0, 0)
+    assert nw.WEBHOOK.state() is not before, "the latch holder must be rebuilt, not reused"
 
 
 def test_config_reports_push_enabled():
@@ -2156,7 +2208,14 @@ def test_the_write_budgets_are_unchanged_by_the_delivery_switch(monkeypatch):
     _register(DEVICE)
     monkeypatch.setattr(varsel, "push_enabled", lambda: False)
     varsel.check_and_notify(SNAPSHOT)
-    assert writes == [], "no message writing without push -- text exists to be delivered"
+    # Still true after KTD4 (2026-09-08), and the reason is now stated rather than implied: the
+    # rule was never "no keypair, no writing" but "no reader, no writing", and with no client
+    # channel wired -- this suite's default, and every deployment's until the store lands -- a
+    # missing keypair means there is no reader on any channel. The companion case, where a client
+    # subscription IS the reader, is
+    # `test_a_webhook_subscription_matches_and_is_written_for_without_a_keypair`.
+    assert writes == [], "no deliverable recipient on any channel -- text exists to be delivered"
+    assert varsel.webhook_channel_enabled() is False
 
 
 def test_two_devices_share_one_write_with_delivery_off(monkeypatch):
@@ -3201,6 +3260,1183 @@ def test_alert_pushes_per_registration_are_capped_per_day_soonest_first(monkeypa
     varsel.check_and_notify(trains)
     assert len(sent) == 6
     _use_snapshot(SNAPSHOT)
+
+
+# ---- U2: a webhook subscription is a registration with a webhook channel (KTD3/KTD4) ----------
+#
+# The notification store itself is a later unit, so everything here drives the SEAM with stubs: a list
+# of raw documents, a provider that raises, a provider that hangs, and a document this binary
+# cannot read. That is deliberate and not a shortcut -- R20's claim is about what the PASS does
+# when the store misbehaves, and a stub is the only way to produce those four states on demand.
+
+WEBHOOK_DOC = {
+    "recipient_id": "sub-0001",
+    "from_stop": "A",
+    "to_stop": "B",
+    "begin": "00:00",
+    "end": "23:59",
+    "days": [0, 1, 2, 3, 4, 5, 6],
+}
+# The same document as the store's `as_recipient_document` actually writes it: the four ROUTING
+# fields as well as the five the pass matches on. `WEBHOOK_DOC` above keeps only the matching ones
+# on purpose -- it is what a document written by a binary that predates the routing fields looks
+# like, and `test_a_subscription_with_no_destination_is_matched_but_never_emitted_for` is the
+# assertion that such a document is still matched.
+WEBHOOK_DOC_ROUTED = {
+    **WEBHOOK_DOC,
+    "subscription_id": "sub-0001",
+    "client_id": "client-a",
+    "destination_id": "dest-a",
+    "version": 1,
+    "external_ref": "commuter-42",
+    "test": False,
+}
+
+
+def _delivered_mark(recipient_id: str, call: FakeCall) -> str:
+    """The delivered mark the store writes for this recipient x train: the `alert_id`, derived
+    through the one derivation the emit step and the admission test share
+    (`notification_events.alert_id_for`). A test that hand-wrote a situation number here would be
+    testing the browser ledger's grain against the webhook channel's."""
+    import notification_events
+
+    mark = notification_events.alert_id_for(
+        recipient_id,
+        operator=call.operator,
+        line=call.line,
+        journey_ref=call.jkey,
+        stop_place=call.stop_place,
+        stop_order=call.stop_order,
+        departure_time=call.aimed_dep,
+    )
+    assert mark is not None
+    return mark
+
+
+def _use_notification_store(monkeypatch, docs, *, enabled=True):
+    """Wire the webhook channel's two seams and return the list its provider appends a call to.
+
+    `docs` may be a list or a zero-argument callable, so a test can make the store raise, hang or
+    page. Returns the call log rather than a count, so "the store was never consulted" is an
+    assertion about a list and not about a number that could also be zero by accident.
+    """
+    calls = []
+
+    def provider():
+        calls.append(1)
+        return docs() if callable(docs) else list(docs)
+
+    monkeypatch.setattr(varsel, "_webhook_enabled", lambda: enabled)
+    monkeypatch.setattr(varsel, "_webhook_provider", provider)
+    return calls
+
+
+def _capture_writes(monkeypatch, text="Toget er innstilt. Ta neste tog."):
+    """Record every subject EITHER writer is asked about, as (journey_key, situation_number).
+
+    Both, since U6 (2026-09-08): a definition a browser registration holds goes through
+    `varsel._write_message` (the browser wording policy) and a **webhook-only** definition goes
+    through `notification_wording.write_wording` under `notification_wording.WEBHOOK`, whose prompt
+    audit record is suppressed in code — R16 forbids the browser policy's record for client data,
+    and dev runs `VARSEL_LLM_LOG_PROMPTS=true`.
+
+    Stubbing only one of the two would make every webhook-only assertion here read "nothing was
+    written for it", which is exactly the shape of the failure these tests exist to catch. Both
+    stubs return prose, so the caller caches it as the model's — `write_wording`'s `source` is what
+    decides that, so `"llm"` is the value a returned text has to carry.
+    """
+    import notification_wording
+
+    written = []
+
+    def fake_write(alert, *, journey_key, message_input, **_):
+        written.append((journey_key, alert.situation_number))
+        return text
+
+    def fake_webhook_write(route, facts, *, subject_id="", message_input=None, **_):
+        written.append((subject_id, facts.situation_number))
+        return notification_wording.Wording(
+            title="Tog L1 07:18 er innstilt",
+            body=text,
+            source="llm",
+            status="ok",
+            message_input=message_input or {},
+        )
+
+    monkeypatch.setattr(varsel, "_write_message", fake_write)
+    monkeypatch.setattr(notification_wording, "write_wording", fake_webhook_write)
+    return written
+
+
+def test_a_registration_with_no_device_record_is_matched_and_written_for(monkeypatch):
+    """CHARACTERIZATION, taken before U2 changed anything: this shape already exists at scale.
+
+    79 of prd's 186 registrations sit on a device id with no push subscription behind it — an
+    iPhone that opened the link in Safari and never turned notifications on. `_journeys` keys the
+    per-recipient ledgers, not `_devices`, so the matcher already runs for such a journey, it is
+    already reported pending by `_pending_pushes` (which deliberately does not read device state),
+    a wording is already written for it, and only the delivery loop skips it.
+
+    That is exactly the shape a webhook subscription has, which is why KTD3 calls one a
+    registration with a channel rather than a device. U2 leaves this behaviour untouched, and this
+    test is what says so: if the gate change had been written as "a live browser subscription
+    exists" rather than "push is enabled", every one of those 79 registrations would silently stop
+    attracting a wording and the in-app card would decay to the template for all of them.
+
+    Verified BOTH ways on 2026-09-08, which is the only thing that makes it characterization rather
+    than a description of the new code: it passes against the pre-U2 `varsel`/`main` as well as
+    against this one. A characterization test only run forwards proves the new behaviour and says
+    nothing about whether it changed.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+    provider_calls = _count_provider_calls(monkeypatch)
+    jid = _register(DEVICE)
+    with varsel._state_lock:
+        varsel._devices.pop(DEVICE)  # the journey stays; the device record is gone
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert provider_calls, "the matcher still runs for a journey with no device record"
+    assert [s for _k, s in written] == ["S1"], "and a wording is still written for it"
+    assert sent == [], "but nothing is delivered -- there is no subscription to deliver to"
+    assert not varsel._notified, "so no dedup key is written either; the next cycle re-offers it"
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["pushed"] is False
+    assert row["message_llm"] == "Toget er innstilt. Ta neste tog.", (
+        "the wording reached the decision log, so it demonstrably exists for the card to read"
+    )
+    assert jid in varsel._journeys and DEVICE not in varsel._devices
+
+
+def test_a_webhook_subscription_matches_and_is_written_for_without_a_keypair(monkeypatch):
+    """U2 scenario 1 / AE10: no VAPID keypair, and the webhook channel still works.
+
+    `push_enabled()` False is tst's real posture (it holds no keypair) and a webhook-only
+    deployment's by construction. Before KTD4 this cycle wrote nothing at all and recorded
+    `message_status='push_disabled'` on every row, because the writing pass was gated on the
+    keypair rather than on there being a reader.
+
+    Driven with TWO SX messages about one departure, so the collapse is exercised rather than
+    assumed: `one_alert_per_train` is what makes the count-of-one meaningful.
+
+    The EVENT half of the scenario ("produces an event") lands in U6, which owns event emission —
+    U2 has no event type and deliberately does not invent one. What this asserts is everything the
+    unit reaches: the match, the per-train collapse, the written wording, and that no browser
+    delivery was attempted.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+    calls = _use_notification_store(monkeypatch, [WEBHOOK_DOC])
+    _use_snapshot(SNAPSHOT_TWO_NOTICES)
+
+    varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
+
+    assert calls == [1], "the store is read exactly once per cycle, before pass 1a"
+    assert len(written) == 1, f"one wording per TRAIN, not per SX message; got {written}"
+    assert written[0][0] == "A|B|00:00|23:59|0,1,2,3,4,5,6", "keyed on the journey DEFINITION"
+    assert varsel._messages, "and cached, which is what U6's event will carry"
+    assert sent == [], "no keypair means no browser delivery was even attempted"
+
+
+def test_a_browser_and_a_webhook_registration_share_one_match_and_one_wording(monkeypatch):
+    """U2 scenario 2 / AE1: one definition, two channels, ONE match and ONE wording.
+
+    Asserted BY CALL COUNT, which is the only way to assert it: comparing the two channels' outputs
+    would pass just as happily if the pass had matched twice and produced two identical answers, and
+    the cost R3 buys is precisely that it does not. A webhook subscription costs this pass no
+    /impact call and no Vertex call of its own when a browser registration already covers its
+    definition; what it costs is one more entry in a list.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC])
+    _register(DEVICE)
+    # The counters go on AFTER registration, deliberately: `POST /journeys` annotates the created
+    # journey by running the matcher on the request path, so counting from before it would charge
+    # this cycle a call the cycle never made.
+    matches = []
+    real_match = varsel.match_journey
+
+    def counting_match(journey, *a, **kw):
+        matches.append(varsel.journey_key(journey))
+        return real_match(journey, *a, **kw)
+
+    monkeypatch.setattr(varsel, "match_journey", counting_match)
+    provider_calls = _count_provider_calls(monkeypatch)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    key = "A|B|00:00|23:59|0,1,2,3,4,5,6"
+    assert matches == [key], f"exactly one matcher call between the two channels; got {matches}"
+    assert written == [(key, "S1")], f"and exactly one written wording; got {written}"
+    # The verdicts are identical because there is only one set of them: both channels read the same
+    # `alerts_by_key` entry, which is what makes "identical verdicts" structural rather than checked.
+    assert len(varsel._messages) == 1
+    assert len(provider_calls) == len(
+        varsel.journey_windows(next(iter(varsel._journeys.values())), datetime.now(UTC))
+    ), "one /impact call per boarding window of the ONE group, not two groups' worth"
+
+
+def test_only_the_train_a_client_still_needs_is_written_for_without_a_keypair(monkeypatch):
+    """U2 scenario 3, and the half of KTD4 that is easy to miss and expensive to get wrong.
+
+    Two disrupted departures on one definition, no keypair, and a webhook subscription that has
+    already been delivered S1. The wording budget must go to S3 and to nothing else.
+
+    Both halves of the move are under test here. If the gate had been changed WITHOUT withholding
+    the browser jids from `_pending_pushes`, the browser registration would report BOTH trains
+    pending on every cycle — `_notified` only grows on a successful browser send, and there can
+    never be one here — so this cycle would write for two trains it can never deliver, on every
+    tick, competing with the one subject the client is actually waiting for. And if the pending
+    set had not been extended to webhook recipients at all, S3 would fall through to the
+    worst-train fallback, which picks S1 (the more severe) and hands the traveller the template for
+    the train they still need to hear about.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch,
+        [{**WEBHOOK_DOC, "delivered": [_delivered_mark("sub-0001", SNAPSHOT_TWO_DISRUPTED["S1"][0])]}],
+    )
+    _register(DEVICE)  # a browser registration on the same definition, undeliverable here
+    _use_snapshot(SNAPSHOT_TWO_DISRUPTED)
+
+    varsel.check_and_notify(SNAPSHOT_TWO_DISRUPTED)
+
+    assert [s for _k, s in written] == ["S3"], (
+        f"only the train the client is still owed; got {written}"
+    )
+
+
+def test_a_second_train_under_a_delivered_situation_is_still_written_for_a_client(monkeypatch):
+    """Admission is per TRAIN for a webhook recipient, because that channel mints one event per
+    (subscription, train). `match_journey` yields one alert per situation -- the worst train in the
+    window -- so the case is two cycles of one situation: the 07:xx was delivered (its mark is on
+    the recipient), it has since left, and the same situation now names the next departure. That is
+    a NEW event for the client, and it is still owed a wording. Admitting on the situation number
+    (as until 2026-09-10) wrote nothing here, so the second train's event went out with the template
+    while the first's had carried the model's prose. With the second train's mark present as well,
+    nothing is written, which is the other half of the same rule."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    first = SNAPSHOT["S1"][0]
+    second = FakeCall("t2", "A", 1, DEP + timedelta(minutes=30), p_cancel=0.82, p_impact_dep=0.9)
+    later = {
+        "S1": [second, FakeCall("t2", "B", 5, None, aimed_arr=DEP + timedelta(minutes=70))]
+    }
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch, [{**WEBHOOK_DOC, "delivered": [_delivered_mark("sub-0001", first)]}]
+    )
+    _use_snapshot(later)
+    try:
+        varsel.check_and_notify(later)
+        assert [s for _k, s in written] == ["S1"], f"the second train is owed; got {written}"
+        assert any(key[2] == second.aimed_dep.isoformat() for key in varsel._messages), (
+            "the wording written is the SECOND train's",
+            list(varsel._messages),
+        )
+
+        _reset_state()
+        written = _capture_writes(monkeypatch)
+        _use_notification_store(
+            monkeypatch,
+            [
+                {
+                    **WEBHOOK_DOC,
+                    "delivered": [
+                        _delivered_mark("sub-0001", first),
+                        _delivered_mark("sub-0001", second),
+                    ],
+                }
+            ],
+        )
+        varsel.check_and_notify(later)
+        assert written == [], f"both trains delivered: nothing owed; got {written}"
+    finally:
+        _use_snapshot(SNAPSHOT)
+
+
+def test_a_keypair_less_cycle_writes_nothing_once_the_client_has_been_told(monkeypatch):
+    """The other side of the same rule: nothing pending on any channel means no write.
+
+    A browser registration is present and disrupted, and it would report pending forever on this
+    deployment. It contributes nothing, because the browser channel cannot deliver at all here —
+    which is what stops a keypair-less deployment spending its whole budget re-wording trains that
+    reach nobody.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch, [{**WEBHOOK_DOC, "delivered": [_delivered_mark("sub-0001", SNAPSHOT["S1"][0])]}]
+    )
+    _register(DEVICE)
+
+    for _ in range(3):  # three poller ticks on one live situation
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert written == [], f"no deliverable recipient on any channel; got {written}"
+
+
+def test_no_deliverable_recipient_on_any_channel_spends_no_vertex_call(monkeypatch):
+    """U2 scenario 4: a keypair-less deployment with the client flag unset writes nothing.
+
+    This is the case every deployment is in today, and the one the old `if not push_on: continue`
+    got right. The gate had to keep it right while widening: the condition is now "a recipient on
+    some channel can receive this", and with no keypair and no notification store there is none.
+
+    `_generation_enabled` is asserted never to be consulted either, because that is where the spend
+    would begin — a cycle that reaches the writer's gate has already decided to write.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    log = _use_decision_log(monkeypatch)
+    written = _capture_writes(monkeypatch)
+    asked = []
+    monkeypatch.setattr(
+        varsel, "_generation_enabled", lambda: asked.append(1) or True
+    )
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert written == [] and asked == [], "no reader, no spend"
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["message_status"] == "push_disabled", (
+        "and `push_disabled` keeps its meaning for a browser subject -- every row this table gets "
+        "is one (KTD10 keeps webhook subjects out), so the value still says exactly why"
+    )
+
+
+def test_the_webhook_flag_unset_never_touches_the_store(monkeypatch):
+    """U2 scenario 5: with the flag unset the pass makes no store call at all.
+
+    Enforced in `varsel`, not in whoever wrote the provider: the flag is injected as its own seam
+    precisely so "the flag is off, so nothing was read" is a property of the pass. Both shapes of
+    off are checked — the flag reading False, and a flag reader that raises, which must also read
+    as off (the failure direction of a delivery switch is closed).
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    # The WRITER too, and not because this test cares what it says: push is enabled here, so the
+    # cycle reaches pass 1c, and nothing in this suite structurally fences `_write_message` the way
+    # `alternatives._post_json` fences the Journey Planner. Left unstubbed it makes a real Vertex
+    # call from CI -- two, one per backend, before the latch closes.
+    _capture_writes(monkeypatch)
+    _register(DEVICE)
+
+    calls = _use_notification_store(monkeypatch, [WEBHOOK_DOC], enabled=False)
+    varsel.check_and_notify(SNAPSHOT)
+    assert calls == [], "the flag is off, so the store must not be consulted"
+    assert varsel.webhook_channel_enabled() is False
+
+    def boom():
+        raise RuntimeError("the flag could not be read")
+
+    monkeypatch.setattr(varsel, "_webhook_enabled", boom)
+    assert varsel.webhook_channel_enabled() is False, "a raising gate reads as OFF"
+    varsel.check_and_notify(SNAPSHOT)
+    assert calls == []
+    # And with no provider wired at all -- every deployment until the store lands.
+    monkeypatch.setattr(varsel, "_webhook_enabled", lambda: True)
+    monkeypatch.setattr(varsel, "_webhook_provider", None)
+    assert varsel.webhook_channel_enabled() is False
+
+
+def test_a_broken_notification_store_costs_the_webhook_channel_and_nothing_else(monkeypatch):
+    """U2 scenario 7 / AE14: the store raises, hangs, or hands over one unreadable document.
+
+    Three shapes in one test because they share the whole assertion: browser matching, wording,
+    delivery, decision recording and state persistence all complete, and only the webhook channel's
+    own contribution is lost. Called bare instead of guarded, a raise here unwinds out of
+    `check_and_notify` entirely — loop 2 never runs, so no push at all goes out, and
+    `_record_decisions` never runs, so the decision log gains a hole no later cycle backfills.
+    """
+    import threading
+    from time import monotonic
+
+    # --- 1. the store raises -------------------------------------------------------------------
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+
+    def raising():
+        raise RuntimeError("Firestore is unreachable")
+
+    calls = _use_notification_store(monkeypatch, raising)
+    _register(DEVICE)
+    with _capture_varsel_logs() as records:
+        varsel.check_and_notify(SNAPSHOT)
+    assert calls == [1], "it was tried"
+    assert len(sent) == 1 and written and log.rows, "and the browser cycle completed regardless"
+    assert varsel._notified, "including the state the save persists"
+    assert [e["result"] for e in _events(records, "varsel_webhook_load")] == ["error"]
+
+    # --- 2. the store hangs --------------------------------------------------------------------
+    # A real bound, not a mocked clock: the provider parks for `held` and the load is allowed 50 ms.
+    # The cycle must come back long before the provider does, which is the property KTD6 asks for --
+    # the poller thread is what ingestion for every other feature runs on.
+    _reset_state()
+    release = threading.Event()
+    monkeypatch.setattr(varsel, "_WEBHOOK_LOAD_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    sent.clear()
+    written = _capture_writes(monkeypatch)
+
+    def hanging():
+        release.wait(30)  # bounded so a failing assertion cannot wedge the suite
+        return [WEBHOOK_DOC]
+
+    _use_notification_store(monkeypatch, hanging)
+    _register(DEVICE)
+    started = monotonic()
+    try:
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        release.set()  # let the abandoned worker finish rather than leaking it into the next test
+    elapsed = monotonic() - started
+    assert elapsed < 5.0, f"a hanging store must not hold the poller thread; took {elapsed:.1f}s"
+    assert len(sent) == 1 and written, "and the browser cycle still completed"
+
+    # --- 3. one unreadable document among readable ones ----------------------------------------
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch,
+        [
+            {"recipient_id": "sub-broken"},  # no window, no stops: this binary cannot read it
+            {**WEBHOOK_DOC, "recipient_id": "sub-good"},
+        ],
+    )
+    with _capture_varsel_logs() as records:
+        varsel.check_and_notify(SNAPSHOT)
+    assert [s for _k, s in written] == ["S1"], (
+        "the readable subscription was matched and written for: one bad document must never fail "
+        "its collection (R20)"
+    )
+    loads = _events(records, "varsel_webhook_load")
+    assert next(e for e in loads if e["result"] == "skipped")["skipped"] == 1
+    assert next(e for e in loads if e["result"] == "ok")["n"] == 1
+    # R16: the count and the exception class are logged, the document never is.
+    assert not any("sub-broken" in str(getattr(r, "msg", "")) for r in records)
+
+
+def test_a_cycle_with_webhook_recipients_writes_a_byte_identical_state_blob(monkeypatch):
+    """U2 scenario 8, and KTD3's central invariant made testable rather than claimed.
+
+    `_journeys`, `_notified` and the GCS state blob never carry a client id: the client view is
+    merged at match time and thrown away with the cycle. That is what makes a rollback to
+    pre-feature code safe — `_save_state` writes known keys, so `_state_extra`'s round-trip could
+    not have protected notification state that had leaked into the blob, and a rolled-back binary would
+    silently erase it on its first save.
+
+    Both cycles start from the SAME serialized state (restored through `_apply_state`), because a
+    fresh registration mints a new `journey_id` and the two blobs would then differ for a reason
+    having nothing to do with clients.
+
+    U2's scenario says "matched **and delivered**". Webhook deliverY is U6's — this unit has no
+    sender and deliberately invents none — so what is asserted here is a cycle in which the
+    subscriptions matched, earned a wording and had the browser channel deliver and save beside
+    them. U6 re-asserts the same equality across a cycle that also delivered a webhook, which is
+    where a client id would most plausibly be written into the blob (its dedup ledger is
+    Firestore, and the temptation is to mirror it into `_notified`).
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _capture_writes(monkeypatch)
+    _register(DEVICE)
+    baseline = varsel._serialize_state()
+
+    def one_cycle() -> str:
+        varsel._apply_state(baseline)
+        with varsel._state_lock:
+            varsel._pushed_trains.clear()  # not in the blob, but it gates the daily cap
+            varsel._daily_pushes.clear()
+            varsel._messages.clear()
+        varsel.check_and_notify(SNAPSHOT)
+        return varsel._serialize_state()
+
+    _use_notification_store(
+        monkeypatch,
+        [
+            WEBHOOK_DOC,
+            {
+                **WEBHOOK_DOC,
+                "recipient_id": "sub-0002",
+                "delivered": [_delivered_mark("sub-0002", SNAPSHOT["S1"][0])],
+            },
+        ],
+    )
+    with_webhooks = one_cycle()
+    assert "S1" in with_webhooks, "the cycle must really have delivered, or this proves nothing"
+
+    monkeypatch.setattr(varsel, "_webhook_provider", None)
+    without_webhooks = one_cycle()
+
+    assert with_webhooks == without_webhooks
+    assert "sub-000" not in with_webhooks, "no client id may reach the blob"
+    assert varsel._STATE_KEYS == frozenset(
+        {"devices", "journeys", "notified", "togvarsel_rounds", "device_tombstones"}
+    ), "the blob's key set is unchanged: the webhook channel persists nothing here"
+    assert not any("sub-000" in json.dumps(rec) for rec in varsel._journeys.values())
+
+
+def test_a_webhook_only_route_records_no_decision_row(monkeypatch):
+    """KTD10, and the limitation KTD12 records rather than hides.
+
+    `varsel_decisions` is published on public hosts, with resolved origin and destination names
+    since 2026-08-22 — accepted then because prd's registrations are the team's own test users.
+    Client-app travellers are members of the public, so webhook subjects stay out of that table
+    entirely, which `_record_decisions` gets for free by iterating the BROWSER grouping.
+
+    The cost is real and is the reason this is a test rather than a comment: a webhook-only route
+    produces no row at all, so `/historikk` scores the definitions both channels share and nothing
+    else. Scoring webhook-only routes is deferred work; the enablement gate is conditional on
+    `/historikk`'s per-operator verdicts with that gap written down.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC])  # and NO browser registration
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert [s for _k, s in written] == ["S1"], "the subscription was matched and written for"
+    assert log.rows == [], "and recorded nowhere in varsel_decisions"
+
+
+# ---- U6: the pass outcome -- what the notification phase is handed --------------------------------
+
+
+def test_two_situations_about_one_train_yield_one_webhook_subject_carrying_both(monkeypatch):
+    """U6 scenario 1 / AE2, on the varsel side: one TRAIN is one subject, not one per SX message.
+
+    Operators routinely publish several situations about one disruption — Vy sent both "Ta neste
+    tog" and "Innstilt Drammen–Skøyen" for the same cancelled 15:03, which is what put "91 %" and
+    "87 %" for one train two boxes apart on a card in 2026-08. `one_alert_per_train` collapses them
+    for every traveller-facing surface, and the webhook channel is one.
+
+    **Both situation numbers ride on the subject**, and that half is easy to miss and expensive:
+    `notification_store._sent_body` writes a delivered mark per situation number, and
+    `_pending_pushes` tests the collapsed WINNER's number against those marks. Carrying only the
+    winner's would let a winner flip between cycles re-pend a train already delivered and re-spend
+    the wording budget on it. R8 calls them "the contributing situations" for the same reason.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _use_snapshot(SNAPSHOT_TWO_NOTICES)
+
+    outcome = varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
+
+    assert len(outcome.webhook_subjects) == 1, (
+        f"one subject per TRAIN, not per SX message; got {outcome.webhook_subjects}"
+    )
+    subject = outcome.webhook_subjects[0]
+    assert set(subject.situations) == {"S1", "S2"}, subject.situations
+    assert [s["situation_number"] for s in subject.payload["situations"]] == list(subject.situations)
+    # The subject carries the routing the emit step needs, from the LOAD snapshot's version.
+    assert subject.subscription_id == "sub-0001" and subject.subscription_version == 1
+    assert subject.alertworthy is True
+
+
+def test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push(monkeypatch):
+    """R7: "the Norwegian title and body /varsel would have pushed", asserted byte for byte.
+
+    Both go through `varsel.notification_wording_for`, which is what makes this true by
+    construction rather than by two f-strings that agree today: the route on the body's own first
+    line, the environment tag on the title only, and the wording itself untouched.
+
+    **Two documented divergences, and both are deliberate.** The ROUTE's names: the event always
+    carries the stop REGISTRY's names, never a browser registration's typed `from_name`/`to_name`
+    (those are unauthenticated free text and would otherwise reach a client's notification through
+    a shared definition -- `test_a_browser_registrations_typed_stop_name_never_reaches_a_client_event`),
+    so the two agree byte for byte exactly when the traveller typed the registry's name, as this
+    registration does. And the WORDING, while the two delivery switches disagree — the rollout turns
+    the webhook channel on with the template first (`NOTIFICATION_WEBHOOK_LLM_ENABLED` unset) while
+    the PWA is already receiving the model's prose, so during that window the event carries the
+    template and the push does not. Both switches are on below, which is the state R7's claim is
+    about, and the second half of this test asserts the divergence rather than pretending it does
+    not exist.
+    """
+    import notification_wording
+
+    _reset_state()
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert len(sent) == 1 and len(outcome.webhook_subjects) == 1
+    subject = outcome.webhook_subjects[0]
+    assert subject.title == sent[0]["title"], (subject.title, sent[0]["title"])
+    assert subject.body == sent[0]["body"], (subject.body, sent[0]["body"])
+    assert subject.body.startswith("Oslo S → Lillehammer\n"), subject.body
+    assert subject.payload["notification"] == {
+        "title": subject.title,
+        "body": subject.body,
+        "action": None,
+    }
+    # The mark the store writes on delivery (`alert_subject_id` over the emit step's `train_ref`)
+    # is the mark the pass admits on (`_delivered_mark`, through `alert_id_for` off the Alert's
+    # fields). One derivation on both sides -- if they ever disagreed, every delivered train would
+    # stay pending forever and the wording budget would burn on it with nothing failing.
+    import notification_events
+    import notification_store
+
+    assert notification_store.alert_subject_id(
+        "sub-0001", notification_events.train_ref(subject)
+    ) == _delivered_mark("sub-0001", SNAPSHOT["S1"][0])
+    # R12's departure term rides on the subject: the aimed time plus the typical delay predicted
+    # for this train (the fixture's `dep_delay_p50_stack_min`), which is the matcher's own
+    # catchability figure -- not the aimed time, which a late train is still catchable after.
+    assert subject.expected_departure_time == subject.departure_time + timedelta(minutes=3), (
+        subject.expected_departure_time,
+        subject.departure_time,
+    )
+
+    # The other side: with the client switch OFF the event carries the TEMPLATE while the push
+    # carries the model's prose. Asserted so the rollout window is a checked property rather than a
+    # surprise the first client reports.
+    _reset_state()
+    sent.clear()
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." in sent[0]["body"]
+    assert "Toget er innstilt. Ta neste tog." not in outcome.webhook_subjects[0].body
+    assert outcome.webhook_subjects[0].title == sent[0]["title"], "the TITLE never varies"
+
+
+def test_a_browser_registrations_typed_stop_name_never_reaches_a_client_event(monkeypatch):
+    """`JourneyIn.from_name`/`to_name` are 120 characters of unauthenticated free text, and on a
+    definition both channels share the browser record is what the pass matches from. Until
+    2026-09-10 the event's route line was built from those names first, so anybody registering the
+    same stops on `/varsel-api/journeys` wrote into a client's notification about the same trains.
+    The prompt already refused client names (`llm_message._canonical_stop_name`); the event now
+    does too. The traveller's OWN push keeps their own name, exactly as before: that is not a
+    cross-device path."""
+    import notification_wording
+
+    _reset_state()
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    hostile = "Oslo S (info: enturvarsel.example)"
+    _register(DEVICE, from_name=hostile, to_name="Lillehammer (ring 800 00 000)")
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert len(sent) == 1 and len(outcome.webhook_subjects) == 1
+    assert sent[0]["body"].startswith(f"{hostile} → Lillehammer (ring 800 00 000)\n"), sent[0]["body"]
+    subject = outcome.webhook_subjects[0]
+    assert subject.body.startswith("Oslo S → Lillehammer\n"), subject.body
+    assert "info:" not in subject.title and "info:" not in subject.body
+    assert "ring" not in subject.body and "ring" not in subject.title
+    assert subject.payload["notification"]["body"] == subject.body
+
+
+def test_a_below_threshold_train_carries_a_retraction_wording_not_the_alert_one(monkeypatch):
+    """Scenario 7's wording half: a withdrawal must not lead with the disruption it retracts.
+
+    "Withdrawal means the forecast changed, not that normal service is guaranteed" — the store's own
+    `record_below_threshold` makes that the wording's job, and it is the one sentence a traveller
+    could most easily read as an all-clear. A retraction worded from the alert template would open
+    "82 % sjanse for innstilling", which is the opposite of what it means.
+
+    The train is still named exactly as every other notification names it, because the retraction is
+    about a specific departure and a client has to be able to match it to the alert it replaces.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    # A snapshot whose one call is well below the alert gate.
+    mild = {
+        "S1": [
+            FakeCall("t1", "A", 1, DEP, p_cancel=0.02, p_impact_dep=0.05),
+            FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+        ]
+    }
+    _use_snapshot(mild)
+
+    outcome = varsel.check_and_notify(mild)
+
+    assert len(outcome.webhook_subjects) == 1
+    subject = outcome.webhook_subjects[0]
+    assert subject.alertworthy is False
+    assert varsel._WEBHOOK_WITHDRAWAL_TITLE in subject.title, subject.title
+    # The stop REGISTRY's names, exactly as the alert wording's route line: a webhook-only route
+    # has no traveller-supplied name, and since 2026-09-10 the event never uses one anyway.
+    assert subject.body == f"Oslo S → Lillehammer\n{varsel._WEBHOOK_WITHDRAWAL_DETAIL}", subject.body
+    assert "innstilling" not in subject.body and "%" not in subject.body
+
+
+def test_a_declared_cancellation_carries_no_delay_figures_in_its_payload(monkeypatch):
+    """The three-way split every writer in this module makes, applied to the event payload.
+
+    When ET has already declared the call cancelled the probabilities are 1.0 by construction
+    (`impact._cancelled_prediction`) and every delay figure meant "if it runs" — so `delay` is
+    null, exactly as `event.schema.json` states for `phase: confirmed` and exactly as
+    `_deterministic_body` and the message input already do it.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    cancelled = {"S1": _cancelled_notice("S1")}
+    _use_snapshot(cancelled)
+
+    outcome = varsel.check_and_notify(cancelled)
+
+    [subject] = outcome.webhook_subjects
+    assert subject.cancelled is True
+    assert subject.payload["delay"] is None
+    assert subject.payload["probabilities"]["cancellation"] == 1.0
+    assert subject.payload["effect"] == "cancelled"
+
+
+def test_a_webhook_delivery_can_never_enter_pushed_keys(monkeypatch):
+    """U6 scenario 5 / KTD10's second leak, closed structurally rather than by care.
+
+    `pushed_keys` is journey-DEFINITION grain, so a webhook delivery recorded there would mark a
+    browser registration's row `pushed` with no browser push behind it — and
+    `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed row, so the
+    page would quote a wording nobody received. That is the 2026-08-21 defect, re-created from the
+    other side.
+
+    What makes it impossible is WHERE the delivery happens: `check_and_notify` returns before any
+    notification event is sent, so there is no moment at which a client outcome could reach that set.
+    Asserted both ways — a shared definition with push off records `pushed=False` while the client
+    subject exists, and the source of the delivery module names neither symbol.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)  # a browser registration on the SAME definition
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert outcome.webhook_subjects, "the webhook subject exists"
+    row = next(r for r in log.rows if r["situation_number"] == "S1")
+    assert row["pushed"] is False, (
+        "the browser row must not read `pushed` on the strength of a webhook delivery"
+    )
+    import pathlib
+
+    text = (pathlib.Path(varsel.__file__).parent / "webhook_delivery.py").read_text()
+    assert "pushed_keys" not in text and "import varsel" not in text
+
+
+def test_the_decision_log_and_the_state_blob_are_written_before_the_outcome_is_built(monkeypatch):
+    """U6 scenario 8: a failure in the client work cannot cost the browser cycle's durable writes.
+
+    KTD6 orders every client step that writes or sends after `_record_decisions` and `_save_state`.
+    Building the outcome LAST and handing it back is strictly stronger on KTD6's own stated reason:
+    the emit and delivery steps run after this function has returned, so a raise in them cannot
+    unwind either write at all. This asserts the weaker half that is still checkable here — a raise
+    while BUILDING the subjects leaves both writes intact and the cycle reports no subjects.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    saves: list[int] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_save_state", lambda: saves.append(1) or True)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+
+    import pathlib
+
+    def raising(*_a, **_k):
+        raise RuntimeError("a duck-typed payload bit back")
+
+    monkeypatch.setattr(varsel, "_webhook_payload", raising)
+    with _capture_varsel_logs() as records:
+        outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert outcome.webhook_subjects == (), "no client work this cycle"
+    assert log.rows, "and the decision log was still written"
+    assert saves, "and the state blob was still saved"
+    # Caught PER DEFINITION, not by the outer backstop: one journey's awkward payload must cost
+    # that journey's subjects rather than every other client's events in the same cycle.
+    results = [e["result"] for e in _events(records, "notification_emit")]
+    assert results == ["subject_error", "subjects_skipped"], results
+    assert _events(records, "notification_emit")[1]["n"] == 1
+    # And the outer guard is still there as the backstop for a raise the loop itself cannot reach.
+    assert '"result": "build_error"' in pathlib.Path(varsel.__file__).read_text()
+
+
+def test_a_subscription_with_no_destination_is_matched_but_never_emitted_for(monkeypatch):
+    """R20's per-document rule applied to the four ROUTING fields, one layer past the loader.
+
+    The loader reads them permissively on purpose: the fields it REFUSES on are the ones the pass
+    matches with, and a document missing a destination can still be matched — it still collapses
+    onto its journey key and still shares the one /impact call and the one wording AE1 asserts.
+    Refusing it would take a browser registration's own wording away over a client field. So it is
+    matched and simply not emitted for, and the COUNT is logged (never the document — R16).
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC])  # no client_id, no destination_id
+
+    with _capture_varsel_logs() as records:
+        outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert [s for _k, s in written] == ["S1"], "matched and written for"
+    assert outcome.webhook_subjects == (), "and not emitted for"
+    assert _events(records, "notification_emit")[0]["result"] == "unroutable"
+
+
+def test_a_webhook_only_definition_is_written_for_through_the_webhook_policy(monkeypatch):
+    """The R16 exposure U2 left open, and the half of it U6 closes.
+
+    A `journey_key` reaching `varsel._write_message` reaches `llm_message.write_message_detailed`,
+    which emits `event="llm_message"` — and under `VARSEL_LLM_LOG_PROMPTS=true`, which dev runs, the
+    full prompt at DEBUG, carrying the traveller's origin, destination and departure time. R16
+    forbids that for client data, so a definition NO browser registration holds is routed through
+    `notification_wording.WEBHOOK`, which suppresses that record in code rather than by an
+    environment variable.
+
+    The discriminator is `by_journey_key`, which U2 kept browser-only precisely so this question has
+    a cheap answer. The shared case is unavoidable and by design — AE1 pins one match and one
+    wording between the channels, so there is one call and it is the browser's — and this asserts
+    both halves, because asserting only the webhook-only one would pass just as happily if every
+    subject went through WEBHOOK and AE1 were quietly false.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    browser_calls: list[str] = []
+    client_calls: list[str] = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, *, journey_key, message_input, **_: browser_calls.append(journey_key)
+        or "Skrevet av modellen.",
+    )
+
+    def webhook_write(route, facts, *, subject_id="", message_input=None, **_):
+        client_calls.append(subject_id)
+        return notification_wording.Wording(
+            title="t", body="b", source="llm", status="ok", message_input=message_input or {}
+        )
+
+    monkeypatch.setattr(notification_wording, "write_wording", webhook_write)
+
+    # 1. webhook-only: the WEBHOOK policy, and the browser writer is never reached.
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    varsel.check_and_notify(SNAPSHOT)
+    assert client_calls and not browser_calls, (client_calls, browser_calls)
+
+    # 2. SHARED: the browser writer, once, and the client writer not at all.
+    _reset_state()
+    client_calls.clear()
+    browser_calls.clear()
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(browser_calls) == 1 and not client_calls, (browser_calls, client_calls)
+
+
+def test_the_webhook_wording_gate_is_the_webhook_switch_not_varsel_llm_enabled(monkeypatch):
+    """The two delivery switches stay separate, which is the rollout order's whole point.
+
+    "Enable the client flag in dev first, with deterministic wording, then model wording once
+    matching and delivery qualify." Sharing `VARSEL_LLM_ENABLED` would flip client prose on the
+    moment it goes on for the PWA, in the same deploy — precisely the coupling the 2026-08-07
+    generation/delivery split removed one layer down.
+
+    Read ONCE per cycle, like `_record_decisions`' own two gate reads: a flag re-read per subject
+    could write for one train and not the next inside one pass.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+
+    # Client prose OFF (the default everywhere today): the event carries the template.
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: False)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    template_body = outcome.webhook_subjects[0].body
+    assert "Toget er innstilt. Ta neste tog." not in template_body
+
+    # Client prose ON: the same cached wording the browser card would show.
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." in outcome.webhook_subjects[0].body
+
+    # And a switch that raises reads as OFF -- the failure direction of a delivery gate is closed.
+    def boom() -> bool:
+        raise RuntimeError("unreadable")
+
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", boom)
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." not in outcome.webhook_subjects[0].body
+
+
+def test_a_confirmed_cancellation_never_carries_the_wording_written_before_it(monkeypatch):
+    """The cancellation title over the pre-cancellation body, and why the cache cannot notice.
+
+    `_message_key` is (journey_key, situation_number, departure) and carries no `cancelled` flag, so
+    a wording written while the train was merely at risk shares one cache entry with the reading
+    taken after ET declared it gone. The TITLE is rebuilt from this cycle's `message_input`
+    (`innstilt: True`), the BODY is the cached string — so the notification event read «Tog L1 07:18 er
+    innstilt» over «91 % sjanse for innstilling, typisk 15-27 min forsinket», beside
+    `delay: null`, `effect: "cancelled"` and `probabilities.cancellation: 1.0` in the same payload.
+
+    Reachable under ONE situation number, which is what makes it the common case rather than a
+    corner: measured in dev on 2026-08-19, 70 of 90 declared-cancelled rail calls were named by an
+    SX situation that already existed — so the flip happens with the message key unchanged, and
+    `notification_store._transition('predicted', 'confirmed')` mints a real revision and a real delivery
+    for it. It is also the highest-value notification the channel sends: a `confirmed` revision is
+    cap-exempt and replaces a delivered one.
+
+    Nothing forgets the entry in between. `_reconcile_caches`' only unconditional `_forget_message`
+    is the below-threshold one, and a declared cancellation scores (1.0, 1.0) and stays alert-worthy
+    — and the write pass short-circuits on `message_key in _messages`, so it is never refreshed
+    either. The narrow fix is to refuse the cache for a declared cancellation: the template renders
+    «Innstilt» and carries no delay figures, which is the documented correct wording for a confirmed
+    call (`impact._cancelled_prediction`'s own rule). The browser card reads the same stale entry
+    through `_deliverable_message` and still does; that half is pre-existing and needs its own pass
+    over `_messages`/`_message_meta`/`_alternatives`/`_message_attempts`.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+
+    # Cycle 1: at risk, not yet cancelled. The model's prose is written and cached.
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    assert "Toget er innstilt. Ta neste tog." in outcome.webhook_subjects[0].body
+    assert varsel._messages, "the wording is cached, which is what the next cycle reuses"
+
+    # Cycle 2: the SAME situation now declares the train cancelled.
+    _use_snapshot({"S1": _cancelled_notice("S1")})
+    outcome = varsel.check_and_notify(_active_snapshot["value"])
+    [subject] = outcome.webhook_subjects
+    assert subject.cancelled is True, "the reading this cycle is a declared cancellation"
+    assert "innstilt" in subject.title.lower(), subject.title
+    assert "Toget er innstilt. Ta neste tog." not in subject.body, (
+        "the body is this cycle's template, not the wording written before the cancellation"
+    )
+    assert "Innstilt" in subject.body, subject.body
+    # And the payload it rides in says the same thing, so the two cannot be read as disagreeing.
+    assert subject.payload["effect"] == "cancelled"
+    assert subject.payload["probabilities"]["delay_ge10"] is None
+    assert subject.payload["notification"]["body"] == subject.body
+
+
+def test_the_write_budgets_clock_is_shared_and_its_call_allowance_is_not(monkeypatch):
+    """`notification_wording.PassBudget`'s stated split, at the one call site that has to honour it.
+
+    The CLOCK is a property of the pass — two surfaces writing inside one pass cannot each have
+    their own, and the reservation is what makes the deadline a ceiling on when the pass ENDS. The
+    COUNT is a property of the surface: merged, a client with a few hundred subscriptions would
+    spend `_MAX_LLM_CALLS_PER_CYCLE` on client wordings and silently retire the browser ones, which
+    is that constant's own lesson read the other way round.
+    """
+    budget = varsel._WriteBudget(1, varsel.monotonic() + 3600)
+    assert budget.claim_clock() is True and budget.claimed == 0, "the clock only"
+    assert budget.claim() is True and budget.claimed == 1
+    assert budget.claim() is False, "the count binds for the browser surface"
+    assert budget.claim_clock() is True, "and not for the client one"
+
+    spent = varsel._WriteBudget(9, varsel.monotonic() - 1)
+    assert spent.claim_clock() is False, "an expired clock binds for BOTH"
+    assert spent.claim() is False
+
+
+def test_the_locked_pass_budget_is_safe_across_the_write_pool(monkeypatch):
+    """`PassBudget` documents itself as not thread-shared, and pass 1c is `_LLM_WORKERS`-wide.
+
+    `self.left -= 1` is a read-modify-write and the GIL does not make it atomic, so unlocked the
+    ceiling could be overspent by up to one call per worker. Driven from more threads than the limit
+    allows, the number of successful takes must be exactly the limit.
+    """
+    import threading
+
+    budget = varsel._LockedPassBudget(5)
+    taken: list[bool] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        got = budget.take()
+        with lock:
+            taken.append(got)
+
+    threads = [threading.Thread(target=worker) for _ in range(40)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(taken) == 5, f"exactly the limit, got {sum(taken)}"
+
+
+def test_a_webhook_subscription_is_invisible_on_every_varsel_surface(monkeypatch):
+    """U2 scenario 6 for the /varsel side, and R16: nothing about a client reaches the PWA.
+
+    A webhook subscription is a view merged inside `check_and_notify` and thrown away with the
+    cycle (KTD3), so the journey list, the state file and the device registry must all read exactly
+    as they would with no webhook channel at all. Asserted after a cycle in which the subscription
+    genuinely matched and earned a wording, since that is the only interesting moment: a view that
+    contributed nothing could not leak anything either.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC])
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert written, "the subscription really was matched and written for"
+    assert varsel._journeys == {} and varsel._devices == {}
+    assert varsel._notified == set()
+    listing = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    assert listing.status_code == 200 and listing.json()["journeys"] == []
+    # /config is the PWA's only other read of module state, and it says nothing about channels.
+    # What this is about, and not the exact key set: an unrelated future field would otherwise
+    # fail this test with a message about clients, which is the worst kind of failing assertion.
+    assert not any(
+        "webhook" in key for key in client.get("/varsel-api/config").json()
+    ), "the PWA's config gains no client field: the channel is not its business"
+
+
+def test_a_webhook_document_naming_a_collapsed_stop_ref_groups_with_the_browser_journey(
+    monkeypatch,
+):
+    """The 2026-08-03 picker bug, one layer out — and it would have been silent.
+
+    `_canonicalize_journeys` only ever walks `_journeys`, so nothing would have rewritten a client
+    document naming a ref the stop registry has since collapsed onto a primary. Left alone it
+    produces a DIFFERENT `journey_key` for the identical physical trip: two groups, two /impact
+    calls, two wordings, and AE1's claim quietly false with every assertion about a single channel
+    still passing.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _capture_writes(monkeypatch)
+    varsel.set_stop_aliases({"A2": "A"})  # A2 is the same physical place as A, collapsed onto A
+    try:
+        _use_notification_store(monkeypatch, [{**WEBHOOK_DOC, "from_stop": "A2"}])
+        _register(DEVICE)
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.set_stop_aliases({})
+
+    assert written == [("A|B|00:00|23:59|0,1,2,3,4,5,6", "S1")], (
+        f"one group, one wording, keyed on the canonical refs; got {written}"
+    )
+
+
+def test_the_webhook_loader_refuses_exactly_what_the_registration_api_refuses():
+    """R2: a webhook subscription is `/varsel`'s registration shape, including the refusals.
+
+    The loader restates `JourneyIn`'s three window rules rather than importing the model — a
+    webhook subscription has no `device_id`, and a load step on the ingestion thread must be
+    indifferent to fields a NEWER binary added, which a model with a growing required set is not.
+    That restatement is exactly the kind of duplicate that drifts into being looser, so the two are
+    pinned against each other here: the same shapes, the same verdicts.
+    """
+    import pydantic
+
+    cases = [
+        ({}, True),                                   # the valid baseline
+        ({"begin": "24:00"}, False),
+        ({"end": "7:5"}, False),
+        ({"begin": "10:00", "end": "09:00"}, False),  # overnight windows are refused, not wrapped
+        ({"begin": "10:00", "end": "10:00"}, False),
+        ({"days": []}, False),
+        ({"days": [7]}, False),
+        ({"days": [-1]}, False),
+        ({"to_stop": "A"}, False),                    # from == to
+    ]
+    for overrides, want_ok in cases:
+        doc = {**WEBHOOK_DOC, **overrides}
+        loader_ok = True
+        try:
+            varsel._parse_webhook_recipient(doc)
+        except (KeyError, TypeError, ValueError) as exc:
+            # The three classes a malformed document can reach here; anything else is a defect in
+            # the loader rather than a bad document, and this test must not paper over it.
+            loader_ok = False
+            assert str(exc), overrides
+        api_ok = True
+        try:
+            varsel.JourneyIn(device_id="dev-abc12345", **{k: v for k, v in doc.items()
+                                                          if k != "recipient_id"})
+        except pydantic.ValidationError:
+            api_ok = False
+        assert loader_ok is want_ok, f"loader disagreed on {overrides}"
+        assert api_ok is want_ok, f"JourneyIn disagreed on {overrides}"
+
+    # A field the running binary does not know is IGNORED, not refused: the store will grow columns
+    # (a destination, a quota, a test marker) and a load step that rejected unknown keys would stop
+    # matching the whole collection on the deploy that adds one.
+    kept = varsel._parse_webhook_recipient({**WEBHOOK_DOC, "some_future_field": {"a": 1}})
+    assert set(kept.journey) == {"from_stop", "to_stop", "begin", "end", "days"}
+    assert kept.recipient_id == "sub-0001" and kept.delivered == frozenset()
+
+
+def test_the_client_read_is_bounded_by_a_document_ceiling():
+    """R21: the per-cycle read cannot exceed the ceiling, and the ceiling binds on the PAGING.
+
+    `islice` is applied inside the worker thread, so a lazy cursor stops fetching at the ceiling
+    rather than being fetched whole and then trimmed — which is what makes this a bound on the read
+    and not merely on the result. Anything approaching it in a pilot is a store bug or a quota
+    breach, so truncating is the right failure and it is reported.
+    """
+    fetched = []
+
+    def endless():
+        for i in range(varsel._MAX_WEBHOOK_RECIPIENTS + 500):
+            fetched.append(i)
+            yield {**WEBHOOK_DOC, "recipient_id": f"sub-{i}"}
+
+    before = (varsel._webhook_enabled, varsel._webhook_provider)
+    varsel._webhook_enabled, varsel._webhook_provider = (lambda: True), endless
+    try:
+        loaded = varsel._load_webhook_recipients()
+    finally:
+        varsel._webhook_enabled, varsel._webhook_provider = before
+    assert len(loaded) == varsel._MAX_WEBHOOK_RECIPIENTS
+    assert len(fetched) == varsel._MAX_WEBHOOK_RECIPIENTS, (
+        "the cursor must stop at the ceiling, not be drained and then trimmed"
+    )
 
 
 if __name__ == "__main__":

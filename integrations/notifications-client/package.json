@@ -1,0 +1,33 @@
+{
+  "name": "@entur/kix-notifications-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Typed client, signature verifier, idempotent inbox contract and suppression policy for Entur's journey notification webhooks. No Firebase dependency.",
+  "license": "EUPL-1.2",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "contracts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "generate": "node scripts/generate-contracts.mjs",
+    "generate:check": "node scripts/generate-contracts.mjs --check",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "pretest": "node -e \"const fs = require('node:fs'); const files = fs.existsSync('test') ? fs.readdirSync('test').filter(file => file.endsWith('.test.mjs')) : []; if (files.length === 0) { console.error('No test/*.test.mjs files found'); process.exit(1); }\"",
+    "test": "node --test --disable-warning=MODULE_TYPELESS_PACKAGE_JSON test/*.test.mjs",
+    "verify:dist": "npm run build && node --test test/dist/*.test.mjs"
+  },
+  "dependencies": {
+    "standardwebhooks": "1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^7.0.2"
+  }
+}

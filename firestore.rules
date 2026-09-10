@@ -1,0 +1,32 @@
+rules_version = '2';
+
+// Deny everything, and that is the correct rule rather than a placeholder.
+//
+// Security Rules do not apply to server client libraries AT ALL: the Python client in
+// disruptions/api/notification_store.py authenticates with the runtime service account and is
+// authorized by project IAM (roles/datastore.user, granted in .entur/application.yaml), which
+// Rules cannot narrow. So there is nothing here for the API to be granted.
+//
+// What this file DOES do is close the other door. A Firestore database in a project that has ever
+// had a Firebase web/mobile app registered is reachable by an untrusted client SDK with an API key,
+// and the default template ("allow read, write: if request.time < <a date>") opens it to the world
+// until that date passes. These four collections hold webhook subscriptions, callback destinations
+// and the Norwegian prose of a traveller's disruption alert; none of it may be read by a browser.
+//
+// THIS FILE IS DEPLOYED, not only committed (2026-09-09). terraform/firestore.tf reads it into a
+// google_firebaserules_ruleset and releases that as `cloud.firestore/<database>` for the named
+// database, so a console edit towards the template above is drift the next apply reverts. The
+// emulator reads the same file through firebase.json, and .github/workflows/terraform.yml lists it
+// in both `paths:` lists so an edit here plans and applies like one to the indexes. Before that
+// date the file asserted a protection nothing deployed -- true only because no Firebase app has
+// ever been registered in these projects, which is exactly the state the release exists to survive.
+//
+// Note the client receiver's OWN rules are a separate file in integrations/firebase-notifications/
+// and live in the CLIENT's project, not this one.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

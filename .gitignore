@@ -43,6 +43,20 @@ disruptions/api/rushhistorikk_static/
 demo/rushhistorikk/node_modules/
 demo/rushhistorikk/tsconfig.tsbuildinfo
 
+# The TypeScript packages a CLIENT vendors (integrations/). Neither goes into the image --
+# .dockerignore excludes the whole directory -- and neither is published: KTD11 vendors them for
+# the pilot. `dist/` is the DECLARED consumption shape (compiled CommonJS plus .d.ts) and is built
+# by `npm run build`, so committing it would ship a copy that goes stale against src/ the first time
+# anyone edits a source and forgets. The lockfiles ARE committed: the CI steps run `npm ci`, which
+# fails without one. `contracts/` inside the client package is committed too -- it is a vendored,
+# byte-parity-guarded copy of contracts/notifications/v1/, and the package must be self-contained
+# when a client takes it.
+integrations/notifications-client/node_modules/
+integrations/notifications-client/dist/
+integrations/firebase-notifications/node_modules/
+integrations/firebase-notifications/dist/
+**/tsconfig.tsbuildinfo
+
 # Local avviksvarsel state file (durable state lives in the GCS bucket in prod).
 disruptions/api/varsel_state.json
 
@@ -66,3 +80,15 @@ terraform/crash.log
 
 # Local linked worktrees.
 .worktrees/
+
+# Firebase emulator working files. The emulator is only ever started by
+# `firebase emulators:exec` around disruptions/api/test_notification_store.py -- from ci.yml's own
+# step, or by hand -- and it drops its debug logs in whatever directory it was started from,
+# which for that suite is disruptions/api/. firebase.json, firestore.rules and
+# firestore.indexes.json ARE committed: the last of those is also what terraform/firestore.tf
+# materialises every composite index from.
+**/firebase-debug.log
+**/firestore-debug.log
+**/ui-debug.log
+**/pubsub-debug.log
+.firebase/
