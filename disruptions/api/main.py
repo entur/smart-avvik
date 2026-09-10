@@ -1055,6 +1055,10 @@ def _phase(name: str, timings: dict[str, int]):
             result,
             extra={"fields": {"event": "poller_phase", "phase": name, "ms": ms, "result": result}},
         )
+        # Beside the log line, never instead of it (the event is an operator contract). `phase` is
+        # the small fixed vocabulary of step names above, so the label stays bounded.
+        metrics.POLLER_PHASE_DURATION.labels(phase=name).observe(ms / 1000)
+        metrics.POLLER_PHASE_TOTAL.labels(phase=name, result=result).inc()
 
 
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
@@ -1082,6 +1086,12 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
                 }
             },
         )
+        # EPOCH seconds, never `monotonic()` (KTD1's two-clock rule): the runbook's freshness
+        # alerts compute `time() - value`, which a monotonic export silently breaks. This gauge
+        # measures cache freshness — it moves only when SIRI-SX moves — not liveness; the tick
+        # gauge in poll_for_changes is the liveness one.
+        metrics.POLLER_LAST_CYCLE.set(time.time())
+        metrics.POLLER_CYCLE_DURATION.observe(total_ms / 1000)
 
 
 def _rebuild_all(timings: dict[str, int]) -> None:
@@ -1920,6 +1930,10 @@ def poll_for_changes(
         # before anything that can fail — so a broken upstream reads as the logged per-tick
         # error below while the pod stays up, and only a loop that stopped ITERATING goes stale.
         _poller_heartbeat_monotonic = time.monotonic()
+        # Two clocks on purpose, never conflated (KTD1): the heartbeat above stays MONOTONIC —
+        # /health does age arithmetic on it, and a wall-clock step must not fake a wedge — while
+        # the exported gauge is EPOCH, because PromQL age alerts compute `time() - value`.
+        metrics.POLLER_LAST_TICK.set(time.time())
         try:
             current = get_last_ingestion_time()
             if not seen_any or current != last_seen:
