@@ -182,14 +182,17 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
   // of every alert — without anything that identifies you or your device. Whether that is
   // sufficiently anonymous on a thin route is an open question for the data protection officer
   // (see docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md §5); the text
-  // states what is shown rather than promising anonymity.
+  // states what is shown rather than promising anonymity. Since 2026-09-10 the two pages are
+  // behind Entur SSO (disruptions/api/sso.py) and the text says so — §5 of that document requires
+  // the published audience and the gate's state to move in the same change, in both directions.
   {
-    title: 'Åpne evalueringssider',
+    title: 'Evalueringssider for Entur-ansatte',
     body:
-      'For å vise hvordan tjenesten treffer, publiserer vi vurderingene av varslene på to åpne ' +
-      'sider: hvilken strekning og avgang varselet gjaldt, hva som ble sendt, og om det slo til. ' +
-      'Sidene viser ikke noe som identifiserer deg eller enheten din, men på strekninger med få ' +
-      'reisende kan en strekning og et tidsrom i seg selv si noe om hvem som reiser der.',
+      'For å vurdere hvordan tjenesten treffer, viser vi vurderingene av varslene på to sider som ' +
+      'krever innlogging med Entur-konto: hvilken strekning og avgang varselet gjaldt, hva som ble ' +
+      'sendt, og om det slo til. Sidene viser ikke noe som identifiserer deg eller enheten din, men ' +
+      'på strekninger med få reisende kan en strekning og et tidsrom i seg selv si noe om hvem som ' +
+      'reiser der.',
     links: [
       { text: 'Varselhistorikk', href: HISTORIKK_HREF },
       { text: 'Meldinger', href: MELDINGER_HREF },

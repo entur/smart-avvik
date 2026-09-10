@@ -26,7 +26,7 @@ Seven things here are decisions rather than mechanics.
    endpoint is reachable from every origin and a cookie would be sent from all of them. The client
    prefix is deliberately **not** in ``sso.PROTECTED_PREFIXES`` -- that gate answers an
    unconfigured deployment with 503 *and an unauthenticated browser with a 302*, and a machine
-   caller following a redirect into a Google login screen gets an HTML page where it expected JSON.
+   caller following a redirect into an Entra login screen gets an HTML page where it expected JSON.
 3. **Ownership comes from the credential and never from the body.** ``client_id`` is read off
    :class:`notification_auth.Principal`, and the stored document id is
    ``f"{client_id}~{subscription_id}"`` -- so one client physically cannot address another's

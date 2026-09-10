@@ -83,6 +83,38 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   would silently drop `application@ent-kixavvik-prd`, which `copy_runtime_to_prd.sh` reads through),
   and the dataset itself is **not** a Terraform resource — the app creates it at startup and CTASes
   into it, so `dataset_id` stays a literal string.
+- **The internal surfaces are behind Entur SSO** (`disruptions/api/sso.py`; `/historikk`,
+  `/meldinger`, `/rushhistorikk` and `/demo`, pages and APIs both — `sso.PROTECTED_PREFIXES` is the
+  list, pinned exactly by `test_sso.py`; everything traveller-facing stays public). OIDC
+  authorization-code flow against **Auth0's partner tenant** (`partner.<dev|staging|>.entur.org`,
+  Entra-federated through the `entur-waad` connection), which is the official route per Team
+  Sikkerhet's Golden Path — it replaced a Google-OIDC gate on 2026-09-10, whose OAuth client needed
+  `roles/oauthconfig.editor` in our own project, a role the platform's assignable-roles list does
+  not carry (tf-gcp-apps PR #724's answer). **The access rule is the organisation claim, never the
+  tenant**: that tenant logs in every partner operator's staff too, so `_claims_problem` requires
+  `https://entur.io/organisationID == 1` (a JSON number set by the tenant's own action, on the
+  id_token only when `profile` is in scope — drop `profile` from `_SCOPE` and every login is refused
+  as `no_organisation`). The verifier is PyJWT against the tenant's JWKS, RS256/PS256 only. Per
+  environment: `SSO_REQUIRED`, `SSO_AUTH0_DOMAIN`, `SSO_AUTH0_CLIENT_ID` in the configmap and
+  `SSO_AUTH0_CLIENT_SECRET` + `SSO_SESSION_SECRET` in Secret Manager as the `sso` ExternalSecret
+  group — its own group, because one unresolvable name fails a whole group and `varsel`'s carries
+  the VAPID keys. **The Auth0 application is a dashboard resource the tenant owners create by
+  hand** on a Slack request (`#talk-sikkerhet` / `#work-tilgangsstyring`, one Regular Web
+  Application per tenant environment, callback `https://<host>/auth/callback`, logout
+  `https://<host>/`, only `entur-waad` enabled) — a new protected PATH costs nothing, a new HOST
+  is another request. Fail-closed: required but missing any of the four serves the gated paths as
+  503; rollback is the environment's flag back to `"false"`. **Two follow-ups are owed** (2026-09-10):
+  `terraform/oauth_iam.tf` + `var.oauth_config_editors` are dead and should go; and they could not
+  go in the SSO PR because **every PR `terraform plan` now 403s** — #139's apply created
+  `google_firebaserules_ruleset.notification_deny_all`, and refreshing it needs
+  `firebaserules.rulesets.get`, which the PR-plan identity (`gh-kix-avvik-f849-ci@ent-github-shr`,
+  `roles/viewer` + the org's `githubCiTerraformPlanReader`) lacks while the apply identity
+  (`…-dev@`, `roles/firebase.admin`) has it. Earlier plans passed only because a resource not yet
+  in state needs no `get`. The permission is Team Plattform's to add; the alternative is to drop the
+  two ruleset resources and deploy `firestore.rules` another way. Sessions are a 12 h signed cookie
+  with no server-side store; `/auth/logout` also ends the Auth0 session (`/v2/logout`, never
+  `federated`, which would sign the person out of Microsoft 365). Local runs use
+  `http://localhost:8000/auth/callback`, registered on the dev application only.
 - **Front-ends are built into the image**, not committed: the Dockerfile's node stage runs each
   app's `npm ci && npm run build`, and Vite writes into
   `disruptions/api/{demo,varsel,historikk,meldinger,togmelding,rushhistorikk}_static/` (all gitignored). `demo/*/build.sh` do the same locally for dev. **`/eval` is the exception**:
@@ -731,7 +763,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **`/notification-api/v1` appears in the public `/docs`**, since `docs_url` is FastAPI's default, and
   unlike Rushvarsel nothing here asks for the product to be unmentioned. The prefix is deliberately
   **not** in `sso.PROTECTED_PREFIXES`: that gate answers an unconfigured deployment with 503 and an
-  unauthenticated browser with a 302, and a machine caller following a redirect into a Google login
+  unauthenticated browser with a 302, and a machine caller following a redirect into an Entra login
   screen gets HTML where it expected JSON. `/test-events` writes **nothing at all**, because the
   store's pending-event ceiling is exact rather than best-effort *only because the emit path has one
   writer* — one poller thread, no route invoking the pass, one replica under Recreate — and a route
@@ -789,7 +821,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `google_project_iam_member` runs under a `projectIamAdmin` conditioned by `only_assignable_roles`,
   which carries no `roles/datastore.*` (note `terraform/oauth_iam.tf`'s own PARKED header diagnoses
   the identical 403 as an org-level deny policy instead, and the two readings are not reconciled —
-  a conditioned grant and a deny policy refuse with the same wording); it goes in `.entur/application.yaml`, whose filter drops a
+  a conditioned grant and a deny policy refuse with the same wording; the grant itself is dead since
+  the SSO gate moved to Auth0 on 2026-09-10 and its retirement is a pending follow-up, see below); it goes in `.entur/application.yaml`, whose filter drops a
   non-matching role **silently**, so the binding is verified after `entur apply` rather than assumed.
   Plan-time index drift rests on one config line that is present: `firestore.indexes.json` and
   `firestore.rules` are in **both** of `terraform.yml`'s `paths:` lists, without which a PR adding a query and its index would
@@ -1787,14 +1820,15 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     rush forecast is one product-wide prognosis over a fixed 39-station geography, with no journey,
     route, device or departure behind a row — the one way this surface is simpler than its two
     siblings.
-  - **Its SSO prefixes gate nothing today**, like its siblings'. `sso.PROTECTED_PREFIXES` carries
-    both `/rushhistorikk` and `/rushhistorikk-api` (matching is per path segment, so one does not
-    claim the other), but `SSO_REQUIRED` is `"false"` in `helm/kix-avvik/values.yaml`, overridden in
-    no environment file, and no environment wires the OAuth client — so `sso.required()` returns
-    False and the middleware short-circuits. With `trafficType: public` set once and inherited, the
-    page ships publicly readable on all three hosts. The prefixes land in the same commit as the
-    router, so no deploy ever serves the API with no entry. `test_sso.py` pins the tuple EXACTLY
-    (eight entries now) — extend it, never weaken it to a containment check.
+  - **Its SSO prefixes gate it since 2026-09-10**, like its siblings'. `sso.PROTECTED_PREFIXES`
+    carries both `/rushhistorikk` and `/rushhistorikk-api` (matching is per path segment, so one
+    does not claim the other), and every environment file sets `SSO_REQUIRED: "true"` with its
+    Auth0 partner-tenant client (see the SSO section under Deployment). Until then the base
+    `"false"` held everywhere and the page shipped publicly readable on all three hosts —
+    `trafficType: public` is set once and inherited, so the gate in-process is the only one there
+    is. The prefixes land in the same commit as the router, so no deploy ever serves the API with
+    no entry. `test_sso.py` pins the tuple EXACTLY (eight entries now) — extend it, never weaken
+    it to a containment check.
   - The window is a four-value allow-list (7 / 14 / 30 / 365, "all time" being a bounded year), not
     a range check: the value lands in the response-cache key on a public endpoint, so arbitrary
     integers would mint one cache entry and one BigQuery query apiece. Four values, four reachable
