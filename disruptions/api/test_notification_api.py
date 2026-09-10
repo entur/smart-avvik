@@ -1391,7 +1391,7 @@ def test_a_limiter_rejection_carries_a_bounded_retry_after():
 
 def test_the_notification_api_prefix_is_deliberately_not_behind_the_browser_sso_gate():
     """Scenario 9. That gate answers an unconfigured deployment with 503 and an unauthenticated
-    BROWSER with a 302 -- and a machine caller following a redirect into a Google login screen gets
+    BROWSER with a 302 -- and a machine caller following a redirect into an Entra login screen gets
     an HTML page where it expected JSON. The credential dependency is the gate here."""
     assert len(sso.PROTECTED_PREFIXES) == 8
     assert not any(p.startswith("/notification") for p in sso.PROTECTED_PREFIXES)

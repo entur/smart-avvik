@@ -87,7 +87,7 @@ test('required phrases: sender line, experiment disclaimer, and all ten T5 secti
       'Hva vi lagrer',
       'Hvorfor',
       'Hvem som kan se opplysningene',
-      'Åpne evalueringssider',
+      'Evalueringssider for Entur-ansatte',
       'Hvor lenge',
       'Rettighetene dine',
       'Rettslig grunnlag',
@@ -107,7 +107,13 @@ test('the privacy page answers where to go: complaint, controller, evaluation pa
   );
   assert.match(links['Klage'], /^https:\/\/www\.datatilsynet\.no\//);
   assert.match(links['Behandlingsansvarlig'], /^https:\/\/entur\.no\/personvern\//);
-  const evaluation = T5_SECTIONS.find((section) => section.title === 'Åpne evalueringssider');
+  const evaluation = T5_SECTIONS.find(
+    (section) => section.title === 'Evalueringssider for Entur-ansatte',
+  );
+  // The pages sit behind Entur SSO since 2026-09-10 and the section says so; the decisions
+  // document's §5 ties the published audience to the gate's state.
+  assert.ok(evaluation.body.includes('innlogging med Entur-konto'));
+  assert.ok(!evaluation.body.includes('åpne'));
   assert.deepEqual(
     evaluation.links.map((link) => link.href),
     ['/historikk', '/meldinger'],

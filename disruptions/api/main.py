@@ -1489,9 +1489,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Entur-SSO gate (sso.py): Google OIDC against the entur.org Workspace, in front of the internal
-# surfaces — /historikk, /meldinger and /demo, pages and APIs both (sso.PROTECTED_PREFIXES is
-# the source of truth). Everything else stays public. Off unless SSO_REQUIRED is set; when
+# Entur-SSO gate (sso.py): OIDC against Auth0's partner tenant, Entra-federated, gated on the
+# organisation claim — in front of the internal surfaces, /historikk, /meldinger, /rushhistorikk
+# and /demo, pages and APIs both (sso.PROTECTED_PREFIXES is the source of truth). Everything else
+# stays public. Off unless SSO_REQUIRED is set (every environment sets it since 2026-09-10); when
 # required but unconfigured the gated paths fail CLOSED (503), never open. Added after
 # CORSMiddleware, so it runs OUTSIDE it; it exempts OPTIONS itself so a preflight still gets its
 # CORS answer.

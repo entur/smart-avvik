@@ -188,3 +188,10 @@ endene av en reise.
 Å utelate dette ville gjort mottakerlisten usann fra dag én. **Skrus SSO-porten på**, bør denne
 setningen snevres inn til Entur-ansatte i samme endring — ingen annen mekanisme holder den
 publiserte mottakerlisten i takt med portens tilstand.
+
+**Oppdatering 2026-09-10:** porten ble skrudd på i alle tre miljøer (Auth0s partner-tenant med
+Entra-innlogging, bare organisasjon Entur — `disruptions/api/sso.py`), og T5-avsnittet ble snevret
+inn i samme endring: overskriften er «Evalueringssider for Entur-ansatte» og teksten sier at sidene
+krever innlogging med Entur-konto. Setningen om tynne strekninger står, fordi spørsmålet til
+personvernombudet (funn 46) er snevret inn av porten, ikke besvart av den. Skrus porten AV igjen,
+gjelder regelen over motsatt vei.
