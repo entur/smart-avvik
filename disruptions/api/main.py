@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 # Aliased: the route function below is also called `impact`, and inside its body a bare
 # `impact.` would resolve to that function rather than to this module.
 import alert_policy  # sibling module: the shared alert gate (thresholds, the "trouble" bar)
+import alternatives  # sibling module: the Journey Planner lookup and its per-caller fetch budgets
 import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
 import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
 import feedback_contexts  # exact display snapshots for isolated /varsel feedback
@@ -934,6 +935,7 @@ def _varsel_impact(
     catchable_after: datetime | None = None,
     with_alternative: bool = False,
     min_impact: float = 0.0,
+    path: alternatives.FetchPath = alternatives._POLLER_PATH,
 ) -> impact_engine.ImpactResponse:
     """/impact for a registered journey's boarding window, injected into varsel via configure().
 
@@ -959,12 +961,14 @@ def _varsel_impact(
         catchable_after=catchable_after,
         with_alternative=with_alternative,
         min_impact=min_impact,
-        # Charge this provider's Journey Planner fetches to the poller's reserved budget, not the
-        # public one. Only `check_and_notify` ever passes `with_alternative=True` — the
-        # /varsel-api request path leaves it False and issues no fetch at all — so a flat "poller"
-        # is exact here, and it is what stops an unauthenticated caller flooding /impact from
-        # starving the push cycle it shares this module-global cache with.
-        path="poller",
+        # Charge this provider's Journey Planner fetches to the CALLER's budget, defaulting to the
+        # poller's reserved one and never the public one. Until 2026-09-10 this was a flat
+        # "poller", exact while `check_and_notify` was the only caller passing
+        # `with_alternative=True`; the journey-alert pull read now names its own path, and a
+        # provider that swallowed it would spend the push cycle's share on every read. What the
+        # default still protects: an unauthenticated caller flooding /impact cannot starve the
+        # push cycle it shares this module-global cache with.
+        path=path,
     )
 
 
