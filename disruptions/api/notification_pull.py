@@ -1331,6 +1331,11 @@ TAG = "notification-journey-alerts"
 router = APIRouter(prefix=notification_api.PREFIX, tags=[TAG])
 
 
+# `async def`, like `meldinger.messages` and for the same reason (KTD9): the wait on enrichment must
+# not hold one of the anyio pool's slots, which every plain-`def` route in this process -- `/impact`,
+# the `/varsel-api` writes -- shares. The one blocking step here, the matcher on a figures miss, runs
+# through `run_in_threadpool`; the enrichment runs on this module's own pool and is only ever AWAITED
+# here.
 @router.get(
     _ROUTE,
     summary="The alert-worthy trains ahead on a journey definition, right now",
@@ -1361,18 +1366,16 @@ async def journey_alerts(
     ),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT, description="Entries to return."),
 ) -> JourneyAlertsResponse:
-    """What `/varsel` would be warning about on this definition, with no registration.
+    """The alert-worthy trains ahead on this journey definition, with no registration.
+
+    Each entry carries the predicted delay and the chance of cancellation for one train (for a
+    train ET has declared cancelled the chance is 1.0 and the delay figures are null), plus
+    `payload`, which has the same shape as a webhook event's payload. The wording in
+    `payload.notification` is what the event would have contained if it were generated now.
 
     `days` is a repeated query parameter only -- `days=0&days=1` -- and strictly integers 0..6: a
     comma-separated list is a 422, as is any other shape. No period means the whole day
-    (`00:00`-`23:59`); no days means today's and tomorrow's Oslo weekday, which is every window the
-    prediction cache can carry.
-
-    `async def`, like `meldinger.messages` and for the same reason (KTD9): the wait on enrichment
-    must not hold one of the anyio pool's slots, which every plain-`def` route in this process --
-    `/impact`, the `/varsel-api` writes -- shares. The one blocking step here, the matcher on a
-    figures miss, runs through `run_in_threadpool`; the enrichment runs on this module's own pool
-    and is only ever AWAITED here.
+    (`00:00`-`23:59`); no days means today's and tomorrow's Oslo weekday.
     """
     started = monotonic()
     now = _now()
