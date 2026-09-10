@@ -104,9 +104,42 @@ property of the poller, which is the sentence this document leans on everywhere 
 channel still emits and delivers, carrying the deterministic template wording; the model is not asked
 and nothing is charged.
 
-**It is named in no Helm values file.** That is deliberate — it defaults off, and this document is
-where the code's own comment says the name should be revisited. Adding it is a chart change; do it in
-the step that turns client prose on, not before.
+**It is set in ONE Helm values file — dev, since 2026-09-10 — and the reason is not the webhook
+channel.** The public journey-keyed read (`GET /notification-api/v1/journey-alerts`, plan
+2026-09-10-001) follows this same switch: whether an entry's `payload.notification` carries the
+model's prose is `notification_wording.PULL`'s `deliver` gate, which is `webhook_delivery_enabled()`,
+the same function the event's wording reads. The flag is import-time and defaults off, so without
+the chart line the read would have shipped template-only in dev and defeated the decision behind its
+enrichment — hence `helm/kix-avvik/env/values-kub-ent-dev.yaml` sets it to `"true"`, with the comment
+naming the read as the reason and `NOTIFICATION_WEBHOOKS_ENABLED` (off in dev) as what keeps it
+inert for events: no subscription is loaded and nothing is minted or delivered, so the only surface
+the value reaches in dev is the read. tst and prd do not set it; there every entry the read serves
+reads `wording.status: disabled` with the template, which is correct and complete. Turning it on for
+the webhook channel's own prose in tst or prd is still the rollout order's second step below, and a
+restart applies it.
+
+**The bad-text revert is therefore TWO switches, and the one an operator already knows does not
+reach every surface.** `VARSEL_LLM_ENABLED=false` returns the *browser push* to the template and
+nothing else: the read and the webhook event serve the poller's cached model text under this gate,
+not the browser's. So:
+
+- bad text on the **push** → `VARSEL_LLM_ENABLED=false`, no restart;
+- bad text on the **read or the event** → `NOTIFICATION_WEBHOOK_LLM_ENABLED=false` **plus a
+  restart**, which returns both to the template and leaves the push alone;
+- egress must stop everywhere → `VARSEL_LLM_PROVIDER=off`, the one switch that stops every surface
+  asking.
+
+Whether the read should have a switch of its own rather than following this one is an open question
+for the product owner; the default this plan shipped is one switch.
+
+**The read's Gemini egress is read as covered by the two existing decisions, and the owner if that
+reading is contested is the DPO.** The 2026-08-07 egress decision and prd's classification of the
+origin, destination and departure-time trio as «Intern» were taken for registered travellers. The
+read's prompts carry only an anonymous definition — a stop pair, a period, weekdays — and no
+identity, no device and no registration; a wording is written through `notification_wording.PULL`,
+whose truthy `caller` suppresses the prompt/reply record in code, and the model-call record carries
+the salted per-process pair digest rather than a definition digest. That is strictly less than what
+the covered decisions already send.
 
 A consequence worth knowing before anyone compares two wordings: with `VARSEL_LLM_ENABLED=true`
 (prd's setting since 2026-08-23) beside `NOTIFICATION_WEBHOOK_LLM_ENABLED=false`, **the Web Push
@@ -129,8 +162,9 @@ deployment silently blocks every delivery.
 
 **No client is enabled for an operator `/historikk`'s own verdicts do not cover without that gap
 being recorded and signed off.** That is a Definition-of-Done term, not advice, and it is the whole
-of what replaced the origin plan's dated-leg replay gate. It survives as four limitations, of which
-**only the first three are inherited — the fourth is created by this plan.**
+of what replaced the origin plan's dated-leg replay gate. It survives as five limitations, of which
+**only the first three are inherited — the fourth is created by this plan, and the fifth by the
+public read that followed it.**
 
 1. **`/historikk`'s rows are one per subject per cycle**, the repeats being the lead-time series,
    while a notification fires on the first threshold crossing. A rate over rows is not a rate over
@@ -151,6 +185,15 @@ of what replaced the origin plan's dated-leg replay gate. It survives as four li
    done then — see [Open questions](#open-questions-and-product-decisions), item 4. **They are, since
    2026-09-10** (Entur SSO via Auth0's partner tenant, `disruptions/api/sso.py`, every environment),
    so the deferral has ended and the work is owed.
+5. **A definition nobody registered produces no `varsel_decisions` row at all, and the public read
+   serves exactly those** (plan 2026-09-10-001, origin KTD10). `GET /journey-alerts` runs the
+   matcher for whatever five fields a caller names, records nothing — no decision row, no Firestore
+   document — and so what it answers for an ad-hoc favourite is **unscored**: not thinly evidenced,
+   unscored, and by the same decision as the fourth. The read's own contract says so, and says an
+   empty list is never all-clear. Where the caller's five fields are verbatim a registration's the
+   entry is the registration's own wording and that registration's row exists — but the read cannot
+   tell the client which case it is in, deliberately, and no claim about the panel's alert quality
+   follows from `/historikk` for any route a browser registration does not also hold.
 
 Therefore: **no generalized alert-quality claim, no per-route claim, and no claim about any operator
 but Vy rail.**
@@ -169,11 +212,16 @@ but Vy rail.**
 
 ## Rollout order
 
-1. **dev, deterministic wording.** `NOTIFICATION_WEBHOOKS_ENABLED=true`,
-   `NOTIFICATION_WEBHOOK_LLM_ENABLED` unset. Register a test-only subscription against a receiver you
-   control, send a `/test-events` event, and watch a real disruption produce a real event end to end.
-2. **dev, model wording.** Add `NOTIFICATION_WEBHOOK_LLM_ENABLED=true` and restart. Compare a client
-   event's `payload.notification` against the Web Push body for the same journey; they must agree.
+1. **dev, deterministic wording.** `NOTIFICATION_WEBHOOKS_ENABLED=true` and, for this step only,
+   `NOTIFICATION_WEBHOOK_LLM_ENABLED` set back to `"false"` — dev has carried `"true"` since
+   2026-09-10 for the public read (section 4 above), so the template-only step is a deliberate
+   flip down rather than the starting state. Register a test-only subscription against a receiver
+   you control, send a `/test-events` event, and watch a real disruption produce a real event end
+   to end.
+2. **dev, model wording.** Return `NOTIFICATION_WEBHOOK_LLM_ENABLED` to `"true"` and restart.
+   Compare a client event's `payload.notification` against the Web Push body for the same journey;
+   they must agree — and against the public read's entry for the same five fields, which must be
+   byte-identical to the event's.
 3. **A test client in prd**, with the KTD12 checklist above completed and every subscription
    `test: true`.
 4. **The pilot**, with real subscriptions.
@@ -195,9 +243,11 @@ gcloud projects get-iam-policy ent-kixavvik-dev \
 
 Credential rotation needs both an ExternalSecret re-sync (hourly) and a pod restart.
 
-**Reverting.** Bad client *text* → `NOTIFICATION_WEBHOOK_LLM_ENABLED=false` plus a restart; the
-template goes back out and nothing else changes. Egress must stop → `VARSEL_LLM_PROVIDER=off`, which
-also stops the browser channel asking. The whole channel must stop →
+**Reverting.** Bad client *text* — on the webhook event **or on the public read**, which follow one
+switch — → `NOTIFICATION_WEBHOOK_LLM_ENABLED=false` plus a restart; the template goes back out on both
+and nothing else changes. Note the other direction: `VARSEL_LLM_ENABLED=false` reverts the *browser
+push* only and reaches neither of these. Egress must stop → `VARSEL_LLM_PROVIDER=off`, which stops
+every surface asking, the read included. The whole channel must stop →
 `NOTIFICATION_WEBHOOKS_ENABLED=false`, which takes effect on the next cycle with no restart and
 **preserves every subscription**: nothing is deleted, no obsolete event is replayed on resume (the
 pending set is read from Firestore and every event carries its own validity horizon), and the first
@@ -428,13 +478,42 @@ and the fourth entry below is why it needs one.
   again **every six hours per unservable subscription**, through `notification_servability`. It is
   **pre-existing and shared with `/varsel`'s own registrations**, so the honest framing is an
   accepted exposure this feature extends rather than a new leak; and if it is ever to be closed, the
-  fix is `/varsel`'s log line, not this channel's.
+  fix is `/varsel`'s log line, not this channel's. **The public read deliberately never reaches it**:
+  no servability question is asked for an anonymous pair, which is one reason the read has a
+  `coverage` block instead of a caveat.
+- **The public read's own three accepted exposures, published beside this one rather than closed**
+  (plan 2026-09-10-001). (1) **The completeness and latency of a FIRST read reveal whether a
+  registration with exactly those five fields exists and is alert-worthy now**: a registered
+  definition the pass has worded answers complete at once, a cold one waits or answers `pending`.
+  The mitigation is that no status ever says so, and that a definition is a stop pair with a
+  period, not a person. (2) **The global ceiling and the wording and Journey Planner allowances are
+  shared by every anonymous caller**, the app's BFF included, with no reserved slice — one source
+  at `MAX_PER_MIN` holds every caller at 429, one at `WORDINGS_PER_DAY` holds every caller
+  template-only for the trailing day; the client contract tells the BFF to treat both as ordinary
+  states. (3) **The definition rides in the query string.** The process redacts it from its own
+  access log (`logging_setup._AccessLogRedaction`) and no `notification_pull*` record carries a
+  ref, a name, a departure time or prose — only `pair_digest`, the salted per-process digest
+  `alternatives` already logs — but any log outside the process (the ingress, a proxy, the caller's
+  own client) may keep the request line, and nothing in this repository governs those.
 
 Log retention and access are the cluster project's, not this repo's: nothing here configures a log
 bucket or a sink, so what applies is whatever `ent-kub-{dev,prd}` sets. **Verify it against the
 project rather than assuming the 30-day `_Default`** before quoting a number to anybody.
 
 **There are no metrics on this path.** Everything an operator reads is a structured log record.
+
+**What to watch on the public read** (`GET /journey-alerts`), since its bounds are shared by every
+anonymous caller and bind silently as per-entry statuses rather than as errors: the **rate of
+`notification_pull_bounded`** by `reason` — a steady `wording_allowance` means the pull wording
+allowance is spent and every caller is getting the template, a steady `queue_full` means the
+enrichment pool is saturated, `waiters` that a burst is parking more readers than
+`MAX_CONCURRENT_WAITERS` — and **`notification_wording.spent("pull")` against the hour**, the
+`(hour, day)` pair of wording calls charged to the pull path, read against `WORDINGS_PER_HOUR` (500)
+and `WORDINGS_PER_DAY` (2 000). Both are the read's own ledgers: the poller's and the webhook
+channel's are `spent("browser")` and `spent("webhook")`, and a read burst that moves either of those
+is a bug. `notification_pull` with `result="rate_limited"` is the limiter itself binding; with
+`cache="miss"` at a high rate it is the figures cost, which is the peak measurement the plan's
+verification contract asks for before the panel goes live.
 
 ---
 
@@ -679,7 +758,8 @@ a `FAILURE_TTL_S` marker resubmitted on expiry. The four rows after them are the
 spends and nothing else does (R4): its wording ceilings per minute, hour and day
 (`notification_wording.WORDINGS_PER_*`, charged to the `pull` path under the `PULL` policy, with its
 own latch holder) and its Journey Planner budget (`alternatives._PULL_FETCH_MAX_PER_MIN`). The
-published contract (U5) adds its own rows here when it lands.
+published contract (U5, 2026-09-10) added no row: every number the read publishes was already here,
+and the client contract's rate-limit table quotes these.
 
 Two numbers on the receiver's side are TypeScript's and are pinned against
 `integrations/notifications-client/src/client.ts` by the same suite: the **64 KiB** inbound ceiling
@@ -800,9 +880,13 @@ beside each; the ones still open say who owns them.
    revision already delivered about that train**, which includes a **withdrawal**. The reasoning is
    that a retraction the cap suppressed leaves the traveller holding a warning we have withdrawn —
    Rushvarsel's friskmelding argument. **Decided 2026-09-09: the wider rule stands.**
-3. **`NOTIFICATION_WEBHOOK_LLM_ENABLED` is in no chart.** Whether client prose is the model's is a
-   product decision, and the name lands in Helm when that decision is made. **Open**: it is the
-   rollout order's second step, and the decision is made when that step is.
+3. **`NOTIFICATION_WEBHOOK_LLM_ENABLED` was in no chart until 2026-09-10.** Whether client prose is the model's is a
+   product decision, and the name lands in Helm when that decision is made. **Partly overtaken
+   (2026-09-10)**: dev sets it for the public read, which follows the same switch — see section 4
+   — and the webhook channel there is off, so no event carries it yet. For tst and prd it is still
+   the rollout order's second step, and the decision is made when that step is. **Open for the
+   product owner**: whether the read should have a prose switch of its own rather than sharing
+   this one.
 4. **Webhook-only routes are unscored** (the fourth KTD12 limitation above). **Decided 2026-09-09:
    they stay out of `varsel_decisions` until `/historikk` and `/meldinger` are behind
    authentication — planned, and expected before any real client data — and go in once they are.**

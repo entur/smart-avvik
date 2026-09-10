@@ -683,8 +683,12 @@ def test_the_filter_leaves_any_other_record_shape_alone():
 
 
 def test_the_pull_router_has_no_dependency_and_exactly_one_route_which_is_a_coroutine():
-    """Pinned here rather than beside `notification_api`'s router pins; U5 widens the published
-    contract and will look for exactly these two claims."""
+    """Pinned here rather than beside `notification_api`'s router pins. U5 (2026-09-10) widened
+    `test_notification_api.test_the_openapi_paths_are_exactly_the_routers_routes` and
+    `..._the_openapi_tags_are_the_routers_own` to the UNION of both routers (seven routes, four
+    tags) and added `..._the_public_read_overrides_the_global_security_per_operation`; those three
+    read the published document, this one reads the router, and the two claims below -- no
+    dependency, exactly one path -- are deliberately not repeated there."""
     import inspect
 
     import notification_api
