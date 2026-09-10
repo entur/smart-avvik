@@ -26,3 +26,8 @@ pyjwt>=2.10.0
 # import happens until a message is actually written, so an un-provisioned deploy still serves.
 anthropic[vertex]>=0.69.0
 google-genai>=1.0.0
+# Observability (metrics.py): Prometheus text exposition on the dedicated internal METRICS_PORT
+# (9464, annotation-scraped; never the public 8080) -- HTTP request counts, poller freshness
+# gauges, log-level counters. start_http_server runs its own daemon thread, so /metrics answers
+# during the slow BigQuery lifespan load, which is when the scraper first arrives.
+prometheus-client>=0.26.0

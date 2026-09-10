@@ -1892,6 +1892,7 @@ api = [
     { name = "google-cloud-firestore" },
     { name = "google-cloud-storage" },
     { name = "google-genai" },
+    { name = "prometheus-client" },
     { name = "pyjwt" },
     { name = "pywebpush" },
 ]
@@ -1926,6 +1927,7 @@ api = [
     { name = "google-cloud-firestore", specifier = ">=2.30.0" },
     { name = "google-cloud-storage", specifier = ">=3.13.0" },
     { name = "google-genai", specifier = ">=1.0.0" },
+    { name = "prometheus-client", specifier = ">=0.26.0" },
     { name = "pyjwt", specifier = ">=2.10.0" },
     { name = "pywebpush", specifier = ">=2.3.0" },
 ]

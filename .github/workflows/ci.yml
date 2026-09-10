@@ -88,7 +88,8 @@ jobs:
             echo "::group::$suite"
             uv run --with fastapi --with httpx --with pydantic \
                    --with google-cloud-bigquery --with google-cloud-storage \
-                   --with pywebpush --with google-cloud-firestore python "$suite"
+                   --with pywebpush --with google-cloud-firestore \
+                   --with prometheus-client python "$suite"
             echo "::endgroup::"
           done
       # The notification store's EMULATOR-backed checks, which the loop above cannot run: it has no

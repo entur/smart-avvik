@@ -24,6 +24,7 @@ import impact as impact_engine  # sibling module: the /impact matcher, shared wi
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
+import metrics  # sibling module: Prometheus registry, HTTP-metrics middleware, log-level counting
 import notification_api  # sibling module: the authenticated notification API (/notification-api/v1)
 import notification_auth  # sibling module: client accounts, API keys, callback destinations, audit
 import notification_events  # sibling module: this cycle's observations turned into committed events
@@ -1310,6 +1311,17 @@ def _notification_webhooks_enabled() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Metrics exporter FIRST, before any BigQuery load (KTD2 in the observability plan): the
+    # platform's annotation scraper targets the pod IP before the pod is Ready, so METRICS_PORT is
+    # the only window into the up-to-300 s startup below. A dedicated internal port, never the
+    # public 8080. configure() is idempotent and must be re-run if logging_setup.setup() ever
+    # re-runs (setup() wipes root handlers, the level-counting handler with them). A bind failure
+    # is logged and tolerated: losing the exporter must never take the serving app down with it.
+    metrics.configure()
+    try:
+        metrics.start(int(os.environ.get("METRICS_PORT", "9464")))
+    except Exception:
+        logger.exception("Prometheus exporter failed to start; metrics unavailable this process")
     # Eager initial load so /alert_profile works before the first ingestion change fires
     # the poller's rebuild. Tolerate failure — the poller retries on every tick.
     try:
@@ -1539,6 +1551,12 @@ app.add_middleware(
 # CORSMiddleware, so it runs OUTSIDE it; it exempts OPTIONS itself so a preflight still gets its
 # CORS answer.
 app.add_middleware(sso.RequireSSO)
+
+# HTTP request metrics (metrics.py): counts and times every request by method, first path segment
+# and status class. Added after RequireSSO — Starlette runs the last-added middleware outermost —
+# so a request the SSO gate rejects (302/401/503) is still counted. The tracing middleware (a
+# later unit) is added directly after this line, outside both.
+app.add_middleware(metrics.HTTPMetrics)
 
 # Avviksvarsel API (registered-journey push alerts). Registered before the /varsel static mount
 # so /varsel-api/* resolves to these routes.
