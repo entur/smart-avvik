@@ -65,7 +65,9 @@ om reiser noen har registrert mellom de to stedene. Det er en bevisst innsnevrin
 løftet over (2026-08-21): paret kan velges og avgangene leses av. Det som *ikke* er endret, er at
 ingen enkeltrad bærer `from_stop`/`to_stop`/`journey_digest` — et kort navngir fortsatt et tog, ikke
 en reise. Vil vi ha sterkere garanti enn det, er svaret tilgangsstyring på `/historikk`, ikke en
-kortere SELECT.
+kortere SELECT — og den finnes siden 2026-09-10: siden og `/historikk-api` ligger bak Entur-SSO
+(`sso.py`, Auth0s partner-tenant med Entra-innlogging, bare organisasjon Entur) i alle miljøer.
+Redaksjonen over står likevel som før; porten er én miljøvariabel fra å være av.
 
 Utfall/«bare med fasit»/«bare der vi varslet» avgrenser derimot på *resultat* og treffer med vilje
 bare lista, aldri `/summary`: filtrerer man til treff, blir presisjonen 100 %. De fire første

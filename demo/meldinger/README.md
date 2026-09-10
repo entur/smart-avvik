@@ -139,7 +139,10 @@ besluttet i lag med at Fra/Til-filtrene gjorde paret valgbart uansett, og hviler
 registreringene i prd er testbrukere og ikke publikum. **Tar `/varsel` noen gang imot registreringer
 fra publikum, publiserer dette ekte reisevaner** — og svaret er da tilgangsstyring foran
 `/meldinger`, ikke en kortere SELECT, siden den samme eksponeringen ligger i den genererte teksten
-som ingen projeksjon styrer.
+som ingen projeksjon styrer. Den tilgangsstyringen finnes siden 2026-09-10: `/meldinger` og
+`/meldinger-api` ligger bak Entur-SSO (`sso.py`) i alle miljøer, så forbeholdet er innfridd på
+forhånd — men målingen over er fortsatt verdt å gjenta den dagen registreringene ikke er testbrukere,
+fordi porten er én miljøvariabel fra å være av.
 
 ## To endepunkter, med vilje
 

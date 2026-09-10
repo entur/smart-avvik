@@ -22,7 +22,10 @@ withheld entirely before then. They are served as a *vocabulary* by :func:`filte
 predicates; no decision row carries them, so a card still names a train rather than a trip. What
 the change concedes is that a from/to pair can be chosen and the matching departures read off. See
 :class:`FilterOptions` and the header of ``historikk_decisions.sql``; stronger ground than that
-means access control on ``/historikk``, not a smaller SELECT list.
+means access control on ``/historikk``, not a smaller SELECT list -- and since 2026-09-10 that
+access control exists: ``sso.RequireSSO`` fronts this API and the page with Entur SSO in every
+environment (see ``sso.py``). The redaction rules below are kept as they are, deliberately: the gate
+is one env var from off, and none of them costs the page anything.
 
 Reads only. No import of main (the package rule): main injects the BigQuery client via
 :func:`configure`, the same pattern reisevalg/varsel/llm_message/decisions already use. The stop

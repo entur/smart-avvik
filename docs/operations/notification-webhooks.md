@@ -148,7 +148,9 @@ of what replaced the origin plan's dated-leg replay gate. It survives as four li
    evidenced; they are unscored, deliberately.** Scoring them is deferred work, and the seven-day
    event retention below is the constraint that work would first have to lift. **Deferred by
    decision on 2026-09-09** until `/historikk` and `/meldinger` are behind authentication, and to be
-   done then — see [Open questions](#open-questions-and-product-decisions), item 4.
+   done then — see [Open questions](#open-questions-and-product-decisions), item 4. **They are, since
+   2026-09-10** (Entur SSO via Auth0's partner tenant, `disruptions/api/sso.py`, every environment),
+   so the deferral has ended and the work is owed.
 
 Therefore: **no generalized alert-quality claim, no per-route claim, and no claim about any operator
 but Vy rail.**
@@ -758,6 +760,9 @@ beside each; the ones still open say who owns them.
 4. **Webhook-only routes are unscored** (the fourth KTD12 limitation above). **Decided 2026-09-09:
    they stay out of `varsel_decisions` until `/historikk` and `/meldinger` are behind
    authentication — planned, and expected before any real client data — and go in once they are.**
+   **Unblocked 2026-09-10**: both pages and both APIs are behind Entur SSO in every environment
+   (#142), so this is now owed work, not a deferral: the channel discriminator on `varsel_decisions`,
+   the groups view, the labelling INSERT and the scheduled-query re-registration, in one operation.
    Including them now was offered if it simplified the channel; it does not, it adds: `pushed` is
    journey-definition grain and cannot tell a webhook from a Web Push (KTD10), so the row needs a
    channel discriminator, and that column reaches `varsel_decision_groups`, the nightly labelling
