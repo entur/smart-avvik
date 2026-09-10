@@ -27,6 +27,7 @@ import meldinger  # sibling module: past alert decisions replayed through today'
 import notification_api  # sibling module: the authenticated notification API (/notification-api/v1)
 import notification_auth  # sibling module: client accounts, API keys, callback destinations, audit
 import notification_events  # sibling module: this cycle's observations turned into committed events
+import notification_pull  # sibling module: the journey-keyed public read (/notification-api/v1/journey-alerts)
 import notification_servability  # sibling module: R6's freshness half, re-asked on the poller's cadence
 import notification_store  # sibling module: durable webhook subscriptions, events and deliveries
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
@@ -1330,6 +1331,10 @@ async def lifespan(app: FastAPI):
         webhook_enabled=_notification_webhooks_enabled,
         webhook_recipients_provider=notification_store.recipient_documents,
     )
+    # The journey-keyed public read's one seam (2026-09-10): when the per-call prediction cache
+    # was loaded, so it can answer 503 rather than "no disruptions" before the poller's first load.
+    # Its stop cache and matcher come through `varsel`'s own providers, wired just above.
+    notification_pull.configure(refreshed_at=_varsel_refreshed_at)
     llm_message.configure(stop_name_provider=_varsel_stops)
     # The webhook channel's two Firestore-backed planes and the authenticated API over
     # them. All three are wired UNCONDITIONALLY, and the flag above is deliberately not consulted
@@ -1578,6 +1583,10 @@ app.include_router(rushhistorikk.router)
 # And it is registered before the static mounts, like every other API router: nothing serves
 # /notification-api as a page, but the ordering rule is the one this file follows throughout.
 app.include_router(notification_api.router)
+# The journey-keyed PUBLIC read on the same prefix (2026-09-10). Its own router, because the one
+# above carries the credential and throttle dependencies at router level and a read with no
+# credential cannot live on it; same prefix, so the published contract stays one API.
+app.include_router(notification_pull.router)
 
 # Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.

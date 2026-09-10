@@ -39,10 +39,13 @@ import ast
 import re
 from pathlib import Path
 
+import alternatives
 import notification_api
 import notification_auth
 import notification_events
+import notification_pull
 import notification_store
+import notification_wording
 import webhook_delivery
 import webhook_sender
 import webhook_signing
@@ -66,6 +69,9 @@ NOTIFICATION_MODULES = (
     "webhook_signing.py",
     "webhook_sender.py",
     "notification_wording.py",
+    # The journey-keyed public read (2026-09-10). Public and unauthenticated, so R11's log claim
+    # binds it harder than the rest: every field it logs is walked here.
+    "notification_pull.py",
 )
 
 MODULES_BY_NAME = {
@@ -76,6 +82,11 @@ MODULES_BY_NAME = {
     "webhook_delivery": webhook_delivery,
     "webhook_signing": webhook_signing,
     "webhook_sender": webhook_sender,
+    "notification_pull": notification_pull,
+    # Two modules the read's published numbers cite (the pull wording ceilings and the Journey
+    # Planner budget) without being channel modules themselves.
+    "notification_wording": notification_wording,
+    "alternatives": alternatives,
 }
 
 
@@ -349,6 +360,10 @@ def test_the_store_and_delivery_modules_import_no_poller_state():
     — "events are still delivered" in a deployment with no keypair — which nothing else asserts.
     """
     forbidden = {"varsel", "main", "impact", "llm_message", "decisions", "historikk", "meldinger"}
+    # `notification_pull.py` is deliberately NOT in this tuple (KTD1, 2026-09-10): it imports
+    # `varsel` at module level by design, because the read IS `varsel`'s selection and assembly
+    # reused. What this tuple guards is an EVENT reaching the VAPID keypair and the device registry,
+    # and a read delivers nothing.
     for module in (
         "notification_store.py",
         "notification_auth.py",

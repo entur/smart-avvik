@@ -400,6 +400,7 @@ silently.
 | `webhook_delivery_response_truncated` | a 2xx body over the response cap | `limit` |
 | `notification_auth_config` / `webhook_signing_config` | once per process: a secret arrived with whitespace and was stripped | `variable` — the **name only**, never the value |
 | `notification_wording` | a webhook wording fault | `result` (`error`, `rate_limited`), `surface` |
+| `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
 | `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"`, `ms`, `result` |
 
 **What no `notification_*` or `webhook_*` log line carries:** an origin, a destination, a departure time, a full callback
@@ -640,6 +641,19 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `webhook_delivery._DELIVERY_DEADLINE_S` | 20.0 |
 | `webhook_delivery._DELIVERY_WAIT_S` | 20.0 |
 | `webhook_delivery._WORKERS` | 4 |
+| `notification_pull.MAX_PER_MIN` | 300 |
+| `notification_pull.PER_PAIR_PER_MIN` | 30 |
+| `notification_pull.LIMITER_KEYS_MAX` | 10000 |
+| `notification_pull.MAX_WAIT_S` | 20 |
+| `notification_pull.DEFAULT_LIMIT` | 10 |
+| `notification_pull.MAX_LIMIT` | 20 |
+| `notification_pull.FIGURES_CACHE_MAX` | 512 |
+
+**The journey-keyed pull read** (plan 2026-09-10-001): the seven `notification_pull.*` rows are the
+public read's own numbers — its limiter (a global per-minute ceiling and a per-stop-pair one in a map
+bounded at `LIMITER_KEYS_MAX`, independent of the credentialed tiers above), its `wait` and `limit`
+bounds, and the per-cycle figures cache. They are the read WITHOUT enrichment (U3); the enrichment
+budget (U4) and the published contract (U5) add their own rows here when they land.
 
 Two numbers on the receiver's side are TypeScript's and are pinned against
 `integrations/notifications-client/src/client.ts` by the same suite: the **64 KiB** inbound ceiling
