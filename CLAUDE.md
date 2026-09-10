@@ -608,7 +608,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   latter only), the channel is **webhook**, the shared machinery is **notification**, and the Firestore
   database is `notifications` with unprefixed collections. `/varsel` stays as the test-bed for
   experimental features ahead of this API, and the decision log will cover both once `/historikk`
-  is behind authentication. The three documents are
+  is behind authentication — **which it is since 2026-09-10, so that work is unblocked and not yet
+  done** (see the next paragraph). The three documents are
   `docs/integrations/notification-api.md` (the client contract), `docs/integrations/firebase-bff.md`
   (the two vendored TypeScript packages under `integrations/`) and
   `docs/operations/notification-webhooks.md` (the operating contract, which carries the
@@ -641,7 +642,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   behind authentication, then go in** — and that is not a simplification of this channel: `pushed`
   cannot tell a webhook from a Web Push, so the row needs a channel discriminator, and that column
   reaches the groups view, the labelling INSERT and the scheduled-query re-registration in one
-  operation.
+  operation. **The precondition was met on 2026-09-10** (Entur SSO, #142) and the work itself is
+  still owed: until it lands, a webhook-only route is unscored exactly as the DoD term says.
   **The R16 prompt-record claim has two halves and only one is closed**, published rather than
   asserted away. A **webhook-only** definition — one absent from `by_journey_key`, which stays
   browser-only for exactly this — is written for through `notification_wording.WEBHOOK`, which
@@ -1046,7 +1048,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     behind a k=1 pair. Team decision. The condition to re-check is therefore not a threshold but a
     fact — **if `/varsel` ever takes registrations from the public, this publishes real commutes** —
     and the fix then is access control on `/historikk`, not a shorter SELECT list, because the same
-    exposure sits in `/meldinger`'s generated prose, which no projection controls. What still
+    exposure sits in `/meldinger`'s generated prose, which no projection controls. **That access
+    control exists since 2026-09-10** (Entur SSO on both pages and both APIs, every environment —
+    see the SSO bullet under Deployment), so the condition is answered ahead of time; the redaction
+    below stays as it is because the gate is one env var from off. What still
     holds: `journey_digest` is absent from both surfaces (it is the join key to the LLM audit log,
     and no page needs it), the raw stop **refs** never leave the process, and `Decision` is still
     `extra="forbid"` — which is what fails loudly if a SELECT re-adds the digest or a future change
@@ -1060,7 +1065,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     The *API* redacts further — though much less than it did, see the 2026-08-22 note above.
     `journey_digest` and the raw `from_stop`/`to_stop` refs are **not** served; the route itself is,
     by resolved NSR name. Until 2026-08-22 the route was withheld too, on the grounds that
-    `/historikk-api` is unauthenticated on a public host and origin plus destination next to
+    `/historikk-api` was (until 2026-09-10) unauthenticated on a public host and origin plus destination next to
     `departure_time` and `n_devices` publishes "somebody commutes A→B at 07:15" — which it does, and
     which is now accepted because the registrations behind it are test users. `Decision` is
     `extra="forbid"` so a SELECT that re-adds the digest, or a change that forgets to pop the refs,
@@ -1346,7 +1351,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     carry tens of thousands of people a day, so naming one as disrupted discloses nothing about
     anybody. **Re-run that measurement if prd ever takes registrations from the public** — at k=1 on
     two thirds of pairs it becomes a genuine disclosure, and the fix is then access control in front
-    of `/meldinger` (a chart change, since `trafficType` is set once), not a shorter SELECT list, and
+    of `/meldinger` — **in place since 2026-09-10** as the in-process Entur-SSO gate (`sso.py`), not
+    the `trafficType` chart change once imagined here, which would have locked the team out too —
+    not a shorter SELECT list, and
     not the deleted flag either: withholding the whole surface from prd would answer the prompt
     question on dev's thin data. A page built on *hypothetical* journeys rather than registrations
     would retire the question outright. Note the volume argument for prd is weaker than it looks:
