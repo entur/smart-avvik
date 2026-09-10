@@ -1770,6 +1770,94 @@ def test_an_unanswered_lookup_reaches_the_alert():
         install({})
 
 
+# ---- U2 of the pull read: the read selects trains as the pass does, and knows a cold cache -------
+def _sub_gate_no_sx(situation, *, jkey="t1", p_impact=0.80, dep=MON_0800):
+    """A no-SX reading UNDER its own gate (0.85) that still outranks a published one over ITS gate
+    (0.65) on severity -- the collapse keeps it, and the train is then not alert-worthy."""
+    return Alert(
+        situation_number=situation, summary="Mulig avvik", line="VYG:Line:R10", operator="VYG",
+        jkey=jkey, stop_place="A", stop_order=1, departure_time=dep, has_situation=False,
+        cancel_probability=0.3, delay_p50_min=None, delay_p90_min=None,
+        impact_probability=p_impact, alert_threshold=alert_policy._NOSX_ALERT_THRESHOLD,
+        alertworthy=False,
+    )
+
+
+def _train_of(subject_or_alert):
+    return (
+        subject_or_alert.operator,
+        getattr(subject_or_alert, "journey_ref", None) or getattr(subject_or_alert, "jkey", None),
+        subject_or_alert.stop_place,
+        subject_or_alert.stop_order,
+        subject_or_alert.departure_time,
+    )
+
+
+def test_alert_worthy_trains_is_the_collapse_then_the_gate_exactly_as_the_pass_iterates():
+    """KTD7 / R2. The read must select trains in the notification pass's own order: collapse to
+    one alert per train FIRST, then the push gate. The fixture is the case where the order shows:
+    train t1 carries a published situation over its gate (0.70 > 0.65) and a no-SX reading under
+    its own (0.80 < 0.85) that outranks it on severity, so the collapse keeps the sub-gate winner
+    and t1 is NOT alert-worthy -- `_subjects_for_key` iterates it as a withdrawal subject. A
+    gate-first filter would list t1 through its published situation. Pinned against the pass's
+    own loop rather than restated, and the order is the collapse's, which the read sorts after."""
+    key = "A|B|07:00|09:00|0,1,2,3,4"
+    alerts = [
+        _alert("S_t2", jkey="t2", p_impact=0.95, dep=MON_0800 + timedelta(minutes=30)),
+        _sub_gate_no_sx("KIX:NoSituation:VYG:t1"),
+        _alert("S_t1_published", p_impact=0.70),
+        _alert("S_t3", jkey="t3", p_impact=0.66, dep=MON_0800 + timedelta(minutes=60)),
+    ]
+    assert varsel.one_alert_per_train(alerts)[1].situation_number == "KIX:NoSituation:VYG:t1", (
+        "control: the sub-gate no-SX reading wins the collapse for t1"
+    )
+
+    chosen = varsel.alert_worthy_trains(alerts)
+
+    assert [a.situation_number for a in chosen] == ["S_t2", "S_t3"]
+    assert "S_t1_published" not in {a.situation_number for a in chosen}, (
+        "a gate-first filter would list t1 through its over-gate published situation"
+    )
+    assert [_train_of(a) for a in chosen] == [
+        _train_of(a) for a in varsel.one_alert_per_train(alerts) if a.alertworthy
+    ], "the collapse's own order is kept; the read sorts afterwards"
+
+    # The pass's own loop on the same fixture: its alert-worthy subjects are the helper's trains, and
+    # t1 is there as a withdrawal subject -- present, and not alert-worthy.
+    out: list = []
+    recipient = varsel.WebhookRecipient("sub_1", _journey(), client_id="c1", destination_id="d1")
+    unroutable = varsel._subjects_for_key(
+        out, key, [recipient], alerts_by_key={key: alerts}, match_targets={key: _journey()},
+        message_inputs={}, webhook_llm=False,
+    )
+    assert unroutable == 0
+    assert [_train_of(s) for s in out if s.alertworthy] == [_train_of(a) for a in chosen]
+    t1 = [s for s in out if s.journey_ref == "t1"]
+    assert len(t1) == 1 and t1[0].alertworthy is False, "t1 is the pass's withdrawal subject"
+
+
+def test_the_freshness_provider_reads_none_before_the_first_load_and_the_timestamp_after():
+    """R6: the read answers 503 on a prediction cache the poller has not loaded, and what tells a
+    cold cache from a loaded one is `_call_pred_refreshed_at` -- None until the first rebuild --
+    read under the same lock `_impact_snapshot` takes."""
+    with main._call_pred_lock:
+        previous = main._call_pred_refreshed_at
+    loaded_at = datetime(2026, 7, 6, 5, 55, tzinfo=UTC)
+    try:
+        with main._call_pred_lock:
+            main._call_pred_refreshed_at = None
+        assert main._varsel_refreshed_at() is None
+        with main._call_pred_lock:
+            main._call_pred_refreshed_at = loaded_at
+        assert main._varsel_refreshed_at() == loaded_at
+        assert main._varsel_refreshed_at() == main._impact_snapshot()[1], (
+            "one timestamp, read off the same snapshot /impact answers from"
+        )
+    finally:
+        with main._call_pred_lock:
+            main._call_pred_refreshed_at = previous
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

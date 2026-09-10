@@ -1802,6 +1802,22 @@ def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
     return out
 
 
+def alert_worthy_trains(alerts: list[Alert]) -> list[Alert]:
+    """The trains a notification would go out for: the collapse FIRST, then the push gate.
+
+    For the journey-keyed public read (2026-09-10), which must select trains exactly as the pass
+    does. The order is the whole point and it is easy to get backwards: `_subjects_for_key` walks
+    :func:`one_alert_per_train` and tests `alertworthy` on each WINNER, so a train whose most
+    severe reading is a sub-gate no-SX one (0.80 under its own 0.85) that outranks an over-gate
+    published one (0.70 over 0.65) is NOT alert-worthy — the collapse kept the sub-gate winner.
+    Filtering on the gate first would list that train through its published situation and tell
+    a reader about a train the pass would be withdrawing. That loop is left untouched because its
+    non-alert-worthy winners are its withdrawal subjects; this is the alert-worthy subset of what
+    it iterates, in the collapse's own order, which the read sorts afterwards.
+    """
+    return [alert for alert in one_alert_per_train(alerts) if alert.alertworthy]
+
+
 # ---- Notify ----------------------------------------------------------------------------------
 # `_delay_phrase`, `_train_label`, `_LEG_MODE_NOUN`, `_first_leg_label`,
 # `_alternative_phrase` and `_deterministic_body` moved to `notification_wording` on
@@ -2778,6 +2794,32 @@ def _webhook_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str
         return None
     with _state_lock:
         return _messages.get(message_key)
+
+
+def cached_wording_and_alternative(
+    journey_key: str, alert: Alert, *, enabled: bool
+) -> tuple[str | None, AlternativeJourney | None]:
+    """The poller's cached wording and cached alternative for one (definition, train), READ ONLY.
+
+    For the journey-keyed public read (2026-09-10), which serves a registered definition what the
+    pass already wrote rather than writing again. One `_state_lock` read for both, and
+    :func:`_webhook_wording`'s rules for the wording: the RAW entry, not through the browser's
+    delivery gate (`enabled` is the webhook channel's gate, as there); none for a declared
+    cancellation, because `_message_key` carries no `cancelled` flag and the entry may predate the
+    declaration; None where absent. The alternative is returned whatever `enabled` says — it is
+    the Journey Planner's answer and has nothing to do with whether a model's prose is delivered —
+    and it is the raw entry too: whether it is still catchable is `_journey_model`'s policy, applied
+    by the caller.
+
+    **Never writes**, and that is a stop condition rather than a nicety: pass 1c records
+    `ok_cached` for a key already in :data:`_messages`, so an entry a read had written would land
+    on `/historikk` under the browser's attribution, and the poller's caches are its own.
+    """
+    message_key = _message_key(journey_key, alert)
+    with _state_lock:
+        alternative = _alternatives.get(message_key)
+        wording = None if (not enabled or alert.cancelled) else _messages.get(message_key)
+    return wording, alternative
 
 
 def _webhook_withdrawal_wording(
