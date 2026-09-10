@@ -79,12 +79,14 @@ common:
       # co-managing that database collides with google_app_engine_application, which auto-provisions
       # it as a side effect (see terraform/firestore.tf).
       NOTIFICATION_FIRESTORE_DATABASE: notifications
-      # Entur-SSO gate (sso.py) for the internal surfaces /historikk, /meldinger and /demo —
-      # pages and APIs both. Same flag convention as the two above: only true/1/yes/on enables,
-      # unset is
-      # also off, and this line states the posture where an operator looks. Flipping an
-      # environment on additionally needs SSO_GOOGLE_CLIENT_ID (configmap) plus
-      # SSO_GOOGLE_CLIENT_SECRET and SSO_SESSION_SECRET (Secret Manager, wired like the VAPID
-      # keys) — the OAuth client recipe is in sso.py's docstring. "true" WITHOUT those serves the
-      # gated surfaces as 503 (fail closed), never publicly; rollback is this flag back to "false".
+      # Entur-SSO gate (sso.py) for the internal surfaces /historikk, /meldinger, /rushhistorikk
+      # and /demo — pages and APIs both — against Auth0's partner tenant (Entra-federated). Same
+      # flag convention as the two above: only true/1/yes/on enables, unset is also off, and this
+      # line states the posture where an operator looks. Every environment overrides it to "true"
+      # since 2026-09-10 and wires, per environment: SSO_AUTH0_DOMAIN and SSO_AUTH0_CLIENT_ID
+      # (configmap — neither is a secret) plus SSO_AUTH0_CLIENT_SECRET and SSO_SESSION_SECRET
+      # (Secret Manager, their own `sso` ExternalSecret group, never appended to `varsel`). The
+      # application itself is a dashboard resource the tenant owners create on request — the recipe
+      # is in sso.py's docstring. "true" WITHOUT all four serves the gated surfaces as 503 (fail
+      # closed), never publicly; rollback is the environment's flag back to "false".
       SSO_REQUIRED: "false"
