@@ -589,9 +589,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   finished before B asked) and becomes the common case once journeys sharing a stop pair are matched
   at the same instant. Without `wait_for_refresh` every journey but the first is told there is no
   alternative, having spent no fetch and learned nothing; nothing errors, the cards just quietly
-  stop offering a replacement train. The wait is **poller-only** (an inbound request holding an
-  anyio slot to wait on another request's fetch is how a slow upstream becomes a queue) and bounded
-  by the fetch's own timeout, and `_release` fires on the fetch's **failure** path too — during a JP
+  stop offering a replacement train. The wait is **poller and pull only** — never the request path
+  (an inbound request holding an anyio slot to wait on another request's fetch is how a slow
+  upstream becomes a queue; the pull path runs on its own executor, which is why it may wait) —
+  and bounded by the fetch's own timeout, and `_release` fires on the fetch's **failure** path too — during a JP
   outage the success path never runs. The write budget (`varsel._WriteBudget`) **reserves** its
   worst case under a lock rather than checking a clock, so the deadline stays a ceiling on when the
   pass *ends*, exactly as it was single-threaded. And the write queue is now sorted **soonest
@@ -794,11 +795,57 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   this channel's. App logs live in the **cluster** project
   (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
   **`NOTIFICATION_WEBHOOK_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
-  other three flags; it is named in **no Helm values file** and defaults off, so the channel emits and
-  delivers the deterministic template until somebody adds it. Expect one divergence during the
-  rollout window: with `VARSEL_LLM_ENABLED=true` beside it false, the push carries the model's prose
-  while the event carries the template, so the two channels are byte-identical only where both
-  switches agree.
+  other three flags; it defaults off and is set in **dev only** (since 2026-09-10, for the public
+  read below, not for the channel — `NOTIFICATION_WEBHOOKS_ENABLED` stays off there, so no event
+  carries it), so in tst and prd the channel emits and delivers the deterministic template until
+  somebody adds it. Expect one divergence during the rollout window: with `VARSEL_LLM_ENABLED=true`
+  beside it false, the push carries the model's prose while the event carries the template, so the
+  two channels are byte-identical only where both switches agree.
+  **The journey-keyed public read** (`GET /notification-api/v1/journey-alerts`,
+  `disruptions/api/notification_pull.py`, plan 2026-09-10-001) is the same selection and the same
+  payload assembly with **no registration and no credential**: the Entur app's favourites panel
+  asks for a saved route — five fields, `from_stop`/`to_stop` canonicalized, optional Oslo
+  `begin`/`end`, optional repeated `days` — and gets one entry per alert-worthy train ahead,
+  soonest expected departure first with a worst-first `severity` rank, each carrying the webhook
+  event's own `payload`. Its own `APIRouter` on the shared prefix with **no router-level
+  dependency** (`notification_api.router` carries `_authenticated` and `_throttled` at router
+  level, which is exactly why a public route cannot live on it), `async def` like `/meldinger`,
+  deliberately **not** in `sso.PROTECTED_PREFIXES`, and published in the same `openapi.json` with
+  operation-level `security: []` and a fourth tag. **Two phases, three caches, one assembly per
+  request**: the figures (`match_journey` → `alert_worthy_trains`) are cached per
+  `(journey_key, refreshed_at, Oslo day)` with single-flight and evicted when the poller's load
+  moves, and the enrichment — one background task per definition per day on the module's own
+  `WORKERS`-wide pool that re-runs the matcher with Journey Planner lookups and words the soonest
+  `MAX_WORDINGS_PER_READ` trains — fills a per-train wording cache (`WORDING_TTL_S`, keyed on pair,
+  situation, departure, `cancelled`, `i_morgen`, alternative identity and `PROMPT_VERSION`) and a
+  per-train alternative cache (`alternatives._TTL`), while the request waits at most `wait`
+  (≤ `MAX_WAIT_S`) seconds and assembles whatever is ready, with `complete` deciding
+  `Cache-Control` (`public, max-age=60` / `no-store`). **Its own limiter and allowances, never the
+  poller's**: `MAX_PER_MIN` global and `PER_PAIR_PER_MIN` per canonical pair, wordings through
+  `notification_wording.PULL` (its own `WORDINGS_PER_MIN/HOUR/DAY` ledger and its own latch holder)
+  and Journey Planner fetches on `alternatives._PULL_PATH` (`_PULL_FETCH_MAX_PER_MIN`) — a read
+  burst that moves `spent("browser")` or `spent("webhook")` is a bug. **It never writes poller
+  state** (`_messages`, `_alternatives`, `_notified`, `varsel_decisions`, Firestore): the one
+  accessor it reads through is `varsel.cached_wording_and_alternative`, read-only by contract. A
+  cold prediction cache is **503 `predictions_not_loaded`, never an empty list**. **Byte-identity
+  has one boundary**: where the five fields are verbatim a registration's and the pass has worded
+  the train, the entry serves the poller's wording and `payload.notification` equals the event's
+  byte for byte; the figures are live where the event's were its mint snapshot, the alternative can
+  differ in the one case the operations document publishes, and everywhere else the wording is the
+  read's own draw or the template — and the entry never says whether the definition is
+  registered. **Log redaction is R11**: `notification_pull` / `notification_pull_bounded` carry no
+  ref, name, departure time or prose, only `pair_digest`, the prompt record is suppressed in code,
+  and `logging_setup._AccessLogRedaction` strips the query string from the access log for this
+  path. **A definition nobody registered is unscored** — no decision row (KTD10), the fifth KTD12
+  limitation — and an empty list means no alert-worthy train among the trains the service scores,
+  never all-clear. **The bad-text revert is now two switches** beside `/varsel`'s: `VARSEL_LLM_ENABLED=false`
+  returns the *push* to the template and reaches neither the read nor the event; those follow
+  `NOTIFICATION_WEBHOOK_LLM_ENABLED`, so `false` **plus a restart** is their revert (`disabled` on
+  every entry, template served, correct and complete); `VARSEL_LLM_PROVIDER=off` stops every
+  surface. Three accepted exposures are published in both documents rather than closed: a first
+  read's completeness reveals that a matching registration exists, the ceiling and allowances are
+  shared with every anonymous caller, and the definition rides in the query string outside the
+  process's own redaction.
   **Infrastructure is this repo's own Terraform** (`terraform/firestore.tf`, the directory's first
   non-IAM resource): the API, one named Firestore database per environment in `europe-west1`
   (immutable), seven composite indexes materialised with `for_each` keyed on each index's **content**

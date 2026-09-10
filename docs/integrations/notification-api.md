@@ -15,7 +15,7 @@ disagree:
 
 | file | what it is |
 |---|---|
-| `contracts/notifications/v1/openapi.json` | the six routes, hand-authored. Its tags — `notification-subscriptions`, `notification-destinations`, `notification-test` — are the router's own, pinned as one vocabulary by a test; a bare `subscriptions` would say nothing among this app's other paths |
+| `contracts/notifications/v1/openapi.json` | the seven routes, hand-authored — six credentialed, and the public journey-keyed read `GET /journey-alerts` (`security: []` on that one operation). Its tags — `notification-subscriptions`, `notification-destinations`, `notification-test`, `notification-journey-alerts` — are the two routers' own, pinned as one vocabulary by a test; a bare `subscriptions` would say nothing among this app's other paths |
 | `contracts/notifications/v1/subscription.schema.json` | the subscription request and response |
 | `contracts/notifications/v1/event.schema.json` | the event envelope (`additionalProperties: false`) |
 | `contracts/notifications/v1/signing-vectors.json` | seven cross-language signing vectors, self-describing |
@@ -41,7 +41,8 @@ exactly-once, and deliberately so. See [What the packages guarantee](#what-the-p
 **Nothing here is a claim about alert quality**, and nothing anywhere is a claim about any operator
 but **Vy rail**. `/historikk` scores `/varsel`'s decision logic on the journey definitions a browser
 registration also holds; a webhook-only route produces no decision row at all and is therefore
-**unscored, deliberately**. `../operations/notification-webhooks.md` states the four limitations that
+**unscored, deliberately** — and so is any definition read through [`GET /journey-alerts`](#the-journey-keyed-read)
+that nobody registered. `../operations/notification-webhooks.md` states the five limitations that
 follow (KTD12) and the enablement condition they impose.
 
 ---
@@ -111,6 +112,12 @@ secret" must not be distinguishable over the wire. A suspended client gets **403
 **Reads are authenticated and throttled exactly like writes.** A GET is a Firestore query like any
 other.
 
+**One route is public.** [`GET /journey-alerts`](#the-journey-keyed-read) takes no credential at all:
+it is keyed on a stop pair and a period, holds nothing personal, and reads the service's in-process
+caches rather than Firestore. It has its own limiter instead, shared by every anonymous caller, and
+its contract is its own section below. Everything else on the prefix is authenticated as described
+here.
+
 ---
 
 ## Rate limits and quotas
@@ -134,11 +141,23 @@ subscription on your next `POST` of it — the idempotent re-registration is eno
 | active credentials per client | 8 | operator-side `Conflict` |
 | active destinations per client | 4 | operator-side `Conflict` |
 | list page size | default 100, max 500 | `422` outside 1–500 |
+| `GET /journey-alerts`, process-wide, every anonymous caller, 60 s sliding | 300 req/min | `429 rate_limited`, `Retry-After: 60` |
+| `GET /journey-alerts`, per canonical stop pair, 60 s sliding | 30 req/min | `429 rate_limited`, `Retry-After: 60` |
+| `GET /journey-alerts` wordings, every anonymous caller together | 30 / min, 500 / h, 2 000 / day | the entry carries the template with `wording.status: rate_limited`; never a 429 |
+| `GET /journey-alerts` Journey Planner lookups, every anonymous caller together | 30 / min | the entry carries no alternative with `alternative.status: unanswered`; never a 429 |
+| `GET /journey-alerts` wordings per read | 4, soonest departure first | the rest carry the template with `wording.status: not_worded` |
+| `GET /journey-alerts` `wait` / `limit` | 0–20 s (default 20) / 1–20 (default 10) | `422` outside those |
 
 The two limiter tiers exist because *verifying a credential is itself store work*: a repeated bad
 credential is refused by the global tier and a short-TTL negative cache before any Firestore read, so
 it cannot spend a real client's budget. An anonymous flood can still exhaust the global tier — the
 same accepted trade `/impact`'s limiter makes.
+
+**The public read's limiter and allowances are a separate ledger, and a SHARED one.** They are not
+the credentialed tiers above and never touch a client's own budget — but they are also not per
+caller: the app's BFF has no reserved slice, so one anonymous source at the ceiling holds every
+caller at 429, and one at the daily wording allowance holds every caller template-only for the
+trailing day. Treat both as ordinary states and serve your cached answer.
 
 `Retry-After` on a quota breach is deliberately 300 s and not 60: a subscription-count ceiling does
 not clear when a limiter window rolls over, so telling you to retry in a minute would invite exactly
@@ -155,10 +174,18 @@ gating onboarding on the flag that needs onboarding is circular. Two consequence
   rather than overlooked: this surface is publicly reachable by design, with the credential, the
   two-tier limiter and the quotas in front of it.
 - A deployment whose store or key pepper is not configured answers **503
-  `{"detail": "channel_not_configured"}`** with `Retry-After: 60` on every route — never 401.
+  `{"detail": "channel_not_configured"}`** with `Retry-After: 60` on every **credentialed** route —
+  never 401. The public read is the exception: it never touches the store or the pepper, so it is
+  never `channel_not_configured` — it serves in every environment, tst included, with the one 503
+  of its own below.
   **Every environment answers this today**: the database name ships in the base chart and is
   inherited everywhere, so the pepper is the only discriminator and it exists in none of the three
   projects. Any other store fault answers **503 `store_unavailable`**.
+- **The public read has a 503 of its own, and you will meet it after every deploy**: **503
+  `{"detail": "predictions_not_loaded"}`** with `Retry-After: 60` for about a minute after the
+  process starts, until the poller's first load. It is deliberately never an empty list — an empty
+  list off an empty cache would report an empty process as a calm day. Your own cache carries the
+  panel across it. A failed match answers **503 `matcher_failed`**, likewise retryable.
 
 `NOTIFICATION_WEBHOOKS_ENABLED` gates the *notification pass* — whether the poller matches
 subscriptions and delivers events — not the API. With it off you can register watches and read them
@@ -168,8 +195,9 @@ back; no event is minted and nothing is delivered.
 
 ## Routes
 
-All six sit under `/notification-api/v1`. Both the authentication and the throttle dependency run on
-every one of them, before the handler.
+All seven sit under `/notification-api/v1`. On the six credentialed ones both the authentication and
+the throttle dependency run before the handler; the seventh, `GET /journey-alerts`, is public and has
+[its own section](#the-journey-keyed-read).
 
 ### `POST /subscriptions` — create or replace a watch
 
@@ -288,6 +316,12 @@ What does *not* change is that `payload` is an **open** object: the schema decla
 differently named key inside `payload` would be schema-valid and wrong, which is exactly why that
 shape is pinned by a test rather than by the schema.
 
+### `GET /journey-alerts` — the public read
+
+No credential. The alert-worthy trains ahead on a journey definition nobody registered, each carrying
+the event's own `payload`. Its parameters, statuses, wait budget, caching rule and the BFF guidance
+are [The journey-keyed read](#the-journey-keyed-read) below.
+
 ### Errors
 
 Every error this module raises itself is `{"detail": "<short stable string>"}`:
@@ -300,14 +334,16 @@ Every error this module raises itself is `{"detail": "<short stable string>"}`:
 | 404 | `not_found`, `no_destination` |
 | 409 | `version_conflict`, `not_a_test_subscription`, `destination_missing`, `destination_paused` |
 | 422 | `unknown_destination` |
-| 429 | `rate_limited`, `quota_exceeded`, `test_events_rate_limited` |
-| 503 | `channel_not_configured`, `store_unavailable`, `signing_not_configured` |
+| 429 | `rate_limited`, `quota_exceeded`, `test_events_rate_limited` — and `rate_limited` from the public read's own limiter |
+| 503 | `channel_not_configured`, `store_unavailable`, `signing_not_configured` — and, on the public read only, `predictions_not_loaded`, `matcher_failed` |
 
 Validation refusals carry prose rather than a code, and it is the prose `/varsel`'s own rules produce:
 `"begin must be before end (overnight windows are not supported)"`,
 `"days must be a non-empty subset of 0..6 (0=Monday)"`, `"begin/end must be HH:MM (24h)"`,
 `"from_stop and to_stop must differ"`, `"the test marker is immutable; delete and re-create instead"`,
 `"subscription id already exists with a different definition"`, `f"version is {n}, not {m}"`.
+The public read adds two of its own, and neither echoes your value:
+`"from_stop and to_stop must be NSR:StopPlace:<digits>"`, `"begin and end must be given together"`.
 
 **One shape this page cannot flatten:** a schema-level 422 — an unknown body field under
 `extra="forbid"`, a `subscription_id` failing its pattern, `limit` out of range, a path segment over
@@ -317,9 +353,10 @@ its 257-character bound — is FastAPI's default, where `detail` is an **array o
 
 The OpenAPI document publishes both shapes rather than promising only the string one, which it did
 until 2026-09-09: `ValidationError` is the array shape, `Error` the string, and every documented 422
-is one or the other — `oneOf` on `POST /subscriptions`, which is the only route with a refusal of its
-own at that status, and `ValidationError` alone on the four routes where the framework is the only
-thing that can return it (both `GET`s, the `DELETE`, and `POST /test-events`). `GET /destinations/current`
+is one or the other — `oneOf` on `POST /subscriptions` and on `GET /journey-alerts`, the two routes
+with a refusal of their own at that status, and `ValidationError` alone on the four routes where the
+framework is the only thing that can return it (both subscription `GET`s, the `DELETE`, and
+`POST /test-events`). `GET /destinations/current`
 documents no 422 because it constrains nothing: no body, no query, no path parameter. Flattening the
 array into `Error` would need a `RequestValidationError` handler, and FastAPI registers those per
 application rather than per router — this API shares a process with `/varsel-api`, `/historikk-api`
@@ -396,6 +433,214 @@ this* — never all-clear.
 Ordering is `confirmed` before `predicted`, then most recently changed, then `alert_id`: a declared
 cancellation is never displaced by a freshly-changed forecast, and the order cannot flip between two
 requests about unchanged data.
+
+---
+
+## The journey-keyed read
+
+`GET /notification-api/v1/journey-alerts` answers "what would Avviksvarsel be warning about on this
+trip right now?" for a definition **nobody registered**, with **no credential**. It exists for the
+Entur app's favourites panel: one read per saved route when a user opens the app. The selection is
+the notification pass's own — the same trains, the same per-operator bar, the same collapse of
+several situations about one train into one entry — and every entry's `payload` is built by the same
+assembly the webhook event goes through, so a receiver that renders an event renders this.
+
+### Parameters
+
+| parameter | required | rule | default |
+|---|---|---|---|
+| `from_stop` | yes | `^NSR:StopPlace:[0-9]+$`, canonicalised as `/varsel` canonicalises a submitted ref | — |
+| `to_stop` | yes | same, and a different physical place after canonicalisation | — |
+| `begin` | with `end` | `HH:MM`, Europe/Oslo | `00:00` |
+| `end` | with `begin` | `HH:MM`, strictly after `begin` — an overnight period is refused, ask as two | `23:59` |
+| `days` | no | **repeated** parameter, `days=0&days=1`, integers 0–6, 0 = Monday. A comma-separated list is a 422 | today's and tomorrow's Oslo weekday |
+| `wait` | no | 0–20 seconds to wait for the wording and the alternative | 20 |
+| `limit` | no | 1–20 entries | 10 |
+
+`begin`/`end` come together or not at all; no period is the whole day. No `days` is today and
+tomorrow, which is every window the prediction cache can carry — a read at 22:00 with no period
+lists a 00:30 departure with `departs_tomorrow: true`.
+
+### The answer
+
+```json
+{
+  "as_of": "2026-09-10T05:12:04+00:00",
+  "refreshed_at": "2026-09-10T05:09:31+00:00",
+  "complete": true,
+  "n_alerts": 1,
+  "truncated": false,
+  "journey": {"from_stop": "NSR:StopPlace:337", "to_stop": "NSR:StopPlace:59872",
+              "begin": "06:30", "end": "09:00", "days": [2, 3]},
+  "windows": [{"start": "2026-09-10T04:30:00+00:00", "end": "2026-09-10T07:00:00+00:00"},
+              {"start": "2026-09-11T04:30:00+00:00", "end": "2026-09-11T07:00:00+00:00"}],
+  "coverage": {"operators": ["ATB", "FIN", "GOA", "KOL", "MOR", "NOR", "RUT", "TRO", "VYG"],
+               "from_stop_in_timetable_today": true, "to_stop_in_timetable_today": true},
+  "alerts": [
+    {
+      "severity": 1,
+      "phase": "confirmed",
+      "train": {"operator": "VYG", "line": "VYG:Line:L1", "journey_ref": "VYG:ServiceJourney:L1-2143-20260910",
+                "call_date": "2026-09-10", "stop_place": "NSR:StopPlace:337", "stop_order": 4},
+      "aimed_departure_time": "2026-09-10T05:45:00+00:00",
+      "expected_departure_time": "2026-09-10T05:45:00+00:00",
+      "situations": ["KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910"],
+      "payload": {
+        "notification": {"title": "Tog L1 07:45 er innstilt",
+                         "body": "Oslo S → Lillestrøm\nToget er innstilt. Neste tog L1 går 07:55 og er fremme 08:16.",
+                         "action": null},
+        "call": {"stop_place": "NSR:StopPlace:337", "stop_order": 4,
+                 "aimed_departure_time": "2026-09-10T05:45:00+00:00", "departs_tomorrow": false},
+        "probabilities": {"impact": 1.0, "cancellation": 1.0, "delay_ge10": null, "alert_threshold": 0.85},
+        "delay": null,
+        "effect": "cancelled",
+        "situations": [{"situation_number": "KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910",
+                        "summary": "Innstilt", "description": null, "has_situation": false}],
+        "alternative_journey": {"...": "the best remaining way there, see the event's payload"}
+      },
+      "wording": {"source": "llm", "status": "ok"},
+      "alternative": {"status": "offered"}
+    }
+  ]
+}
+```
+
+The values above are illustrative; `payload` is documented under [the event](#payload) and is the
+same object, so it is not restated here. What the envelope around it means:
+
+- **`alerts` is soonest expected departure first**, at most `limit` entries; `n_alerts` is the
+  total before the cut and `truncated` says whether one was made — the soonest trains are kept.
+  **`severity` is a 1-based rank in worst-first order** (the pass's own order: severity, then
+  situation number) over every train that survived, assigned before the cut, so a client can re-sort
+  worst first and a truncated answer may lack some ranks. Soonest-first is the list order because a
+  panel opened on the platform needs the next train first, and on a line suspension where every
+  cancellation ties, worst-first would cut a commuter's next train.
+- **`phase` is `predicted` or `confirmed`** and there is no `withdrawn` entry: a train no longer over
+  the gate, or whose expected departure has passed, is simply absent.
+- **`train`** is the event's own six identity fields; an entry and an event about one train join on
+  them without translation. `expected_departure_time` is the aimed time plus the typical delay
+  predicted for it — the figure that decides whether the train can still be caught, and the one the
+  list is ordered on; equal to the aimed time for a declared cancellation.
+- **`journey` and `windows` are what the answer is about** — the canonical refs, the defaults filled
+  in, and the boarding windows as UTC instants (today's remaining one and tomorrow's, on the
+  definition's weekdays). **Key your cache on `journey` plus `refreshed_at`**, never on the query
+  string you sent: two spellings of one place are one answer.
+- **`refreshed_at`** is when the prediction cache the figures come from was loaded. It rebuilds only
+  when upstream real-time ingestion moves, so a quiet feed leaves a *correct* cache old; the age is
+  served rather than refused, and you judge.
+
+### `coverage`, and what an empty list means
+
+`coverage.operators` is the set of operator codespaces the service scores at all — Vy rail and the
+trained bus operators. The two `*_in_timetable_today` flags say whether each canonical stop appears in
+today's planned timetable, checked over every ref of the physical place; they **fail open** (an
+unloaded timetable reads `true`), because "we do not know" must never render as "not served".
+
+There is deliberately **no servability caveat** on this read: the question costs a BigQuery query per
+anonymous pair and writes both refs into a log line, neither of which belongs on a public
+unauthenticated path. The `coverage` block is what you render an unknown favourite from — **render a
+favourite whose stop reads `false` as unverified, not as calm.**
+
+And read an empty `alerts` for what it is: **no alert-worthy train among the trains the service
+scores** — direct trips by the operators in `coverage.operators` — and never all-clear. A trip with a
+transfer never alerts; nothing here says anything about any other operator; and nothing here is
+evidence about alert quality, because a definition nobody registered produces no decision row and is
+**unscored, deliberately** (the fifth KTD12 limitation in the operations document).
+
+### The statuses, and which are final
+
+Each entry carries `wording {source, status}` and `alternative {status}`:
+
+| | terminal (a wording is held for the situation's life, up to 12 h; an alternative outcome for the Journey Planner cache's 10 min) | transient (expire after ~60 s and are retried on a later read) |
+|---|---|---|
+| `wording.status` | `ok` (source `llm`), `rejected`, `ungrounded` (the model answered and the answer was unusable for this input — re-asking would learn nothing), `disabled` (this deployment does not deliver the model's prose on this channel, or no backend may be asked), `not_worded` (past the four-per-read cap) | `pending`, `capped` (the enrichment queue was full), `rate_limited` (the read's wording allowance), `error` |
+| `alternative.status` | `offered`, `suppressed` (the selection kept the traveller on their own train), `none_found`, `not_worth_lookup` (none was issued), `not_looked_up` (past the per-read lookup cap) | `pending`, `capped`, `unanswered` (the Journey Planner did not reply: throttled, an outage, its cooldown) |
+
+`wording.source` is `llm` or `deterministic` and nothing else. **The template is the floor: render
+it.** A `deterministic` entry is a complete, correct notification in Norwegian — it is what `/varsel`
+sends whenever the model cannot be asked — and every non-`ok` status above is the reason the model's
+text is not there instead.
+
+### The wait budget and `complete`
+
+The read is two halves. The **figures** — which trains, which numbers — are served at once from the
+service's in-process cache. The **wording and the alternative journey** are fetched on request, in
+the background, under the read's own allowances; the request waits up to `wait` seconds for them and
+answers with whatever is ready. What is not ready is served as the template and no alternative, with
+the statuses above saying why. **The work continues after the request returns**, so the next read of
+the same definition finds it.
+
+`complete` is `true` only when every *listed* entry's two statuses are terminal, and it decides the
+caching header:
+
+| `complete` | `Cache-Control` |
+|---|---|
+| `true` | `public, max-age=60` — safe for an intermediary and for your BFF to hold for a minute |
+| `false` | `no-store` — the incomplete entries change on the next read |
+
+A warm read within one prediction cycle runs no matcher, no model call and no Journey Planner call.
+A cold definition with one alert-worthy train typically completes within one `wait` (a few seconds:
+one match with lookups, then the wording), and about three seconds more per further train up to the
+four-per-read wording cap.
+
+### Byte-identity with the event, and its exact boundary
+
+When the five fields you pass are **verbatim a registration's** — a browser's or a webhook
+subscription's — and the notification pass has already worded that train, the entry serves the
+pass's own wording and `payload.notification` is **byte-identical to the event's**, with no pull
+wording spent. The boundary is worth stating precisely, because it is narrower than "the same as the
+event":
+
+- it is **exact-key**: `begin`, `end` and `days` are part of the key, so a favourite that differs
+  from the registration by a minute is a fresh draw;
+- it is **the notification only**: the figures are live where the event's were its mint-time
+  snapshot (a revision is minted only on a lifecycle transition, so the event's numbers may be a
+  cycle old), and the alternative can differ in one case the operating contract publishes;
+- it is **one channel's**: identity is with the webhook event, and the browser push can differ while
+  the two prose switches disagree (see the operations document);
+- everywhere else the wording is **the read's own draw from a non-deterministic model**, or the
+  template — so two definitions on one pair, or two reads across a re-wording, can carry different
+  prose about one train, and that is sampling, not a change in the forecast.
+
+The entry says whether its text is the model's (`wording.source`); it **never says whether the
+definition is registered**.
+
+### Three accepted exposures, published rather than closed
+
+1. **The completeness and latency of a first read reveal whether a registration with exactly those
+   five fields exists and is alert-worthy right now** — a registered definition answers complete at
+   once where a cold one waits. The mitigation is that no status ever says so, and that a definition
+   is a stop pair with a period, not a person.
+2. **The global ceiling and the allowances are shared by every anonymous caller**, the app's BFF
+   included, with no reserved slice — one source at the ceiling holds every caller at 429; one at
+   the daily wording allowance holds every caller template-only for the trailing day. Treat both as
+   ordinary states.
+3. **The definition rides in a query string.** The service redacts it from its own access log and no
+   record it writes carries a ref, a name, a departure time or any prose — but any log outside the
+   process (an ingress, a proxy, your own client) may keep the request line, and that is yours to
+   govern.
+
+### BFF guidance
+
+- **Serve favourite routes only.** A favourite departure and a favourite stop place carry no
+  destination and have nothing to be keyed on here.
+- **Collapse identical canonical definitions before calling.** Two users with the same route and
+  period are one read; the per-pair ceiling is 30 a minute and period churn on one pair does not buy
+  a fresh bucket.
+- **Key your cache on the echoed `journey` plus `refreshed_at`**, not on what you sent.
+- **From the panel, send `wait=0`** and read again about five seconds later if `complete` was false;
+  render the template meanwhile. A patient tool sends the default `wait` and takes the complete
+  answer in one request.
+- **Render the template on `complete: false`** — it is a real notification, not a placeholder — and
+  never a spinner in its place.
+- **Render an uncovered or unknown favourite as unverified**, from `coverage`, never as calm; and
+  never render an empty list as all-clear.
+- **Treat 429, 503 `predictions_not_loaded` and a `rate_limited` status as ordinary states** and
+  serve your cached answer. They are the read's bounds binding, not a fault to alarm on.
+- **Whether an entry's wording is the model's follows a deployment switch**
+  (`NOTIFICATION_WEBHOOK_LLM_ENABLED`, the webhook event's own; on in dev, off elsewhere today), so
+  in an environment where it is off every entry reads `disabled` with the template — correct, and
+  complete.
 
 ---
 
@@ -704,5 +949,13 @@ Ukur cancellation feed; the companion BFF integration and native enrollment work
 surface a commuter registers a journey on**, and the subscription shape assumes it captures origin,
 destination, weekdays and hours as `/varsel`'s does; notifications tied to a specific ticket rather
 than a registered journey; publishing the helper packages to a registry; a delivery-status API or
-dashboard for clients; scored outcomes for webhook-only route definitions; destination-ownership
-verification; additional languages; self-service onboarding; new model or operator coverage.
+dashboard for clients; scored outcomes for webhook-only route definitions **and for definitions read
+through `GET /journey-alerts`**; destination-ownership verification; additional languages;
+self-service onboarding; new model or operator coverage.
+
+And for the public read specifically: a favourite **departure** (a line at a stop) and a favourite
+**stop place** carry no destination and are not served — the read is keyed on a pair and serves
+favourite **routes** only; a trip with a **transfer** never alerts, so a definition across one reads
+as calm however bad the day is; the per-subscription pull with an unguessable token, for a client
+that wants the full event envelope rather than the payload; and a pull helper in the vendored
+package.
