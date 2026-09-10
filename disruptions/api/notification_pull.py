@@ -469,6 +469,16 @@ def _remember_figures(key: tuple, refreshed_at: datetime, figures: _Figures) -> 
             _figures.popitem(last=False)
 
 
+def _release(lock: threading.Lock, inflight: dict[tuple, threading.Event], key: tuple, event: threading.Event) -> None:
+    """Give up ownership of a single-flight key: drop it from the in-flight map and wake the waiters.
+    One helper for the figures and the wordings, because the shape is the same and the order is
+    the part that matters -- the map entry goes before the event fires, or a waiter could re-find
+    the owner's own event and park on it again."""
+    with lock:
+        inflight.pop(key, None)
+    event.set()
+
+
 def _figures_for(definition: dict, key: tuple, refreshed_at: datetime, now: datetime) -> _Figures:
     """A miss: run the matcher once per key, with every other caller for the key waiting on it.
 
@@ -497,9 +507,7 @@ def _figures_for(definition: dict, key: tuple, refreshed_at: datetime, now: date
         _remember_figures(key, refreshed_at, figures)
         return figures
     finally:
-        with _figures_lock:
-            _figures_inflight.pop(key, None)
-        event.set()
+        _release(_figures_lock, _figures_inflight, key, event)
 
 
 def _compute_figures(definition: dict, now: datetime, *, journey_key: str) -> _Figures:
@@ -925,12 +933,10 @@ def _enrich_body(
             type(exc).__name__,
             extra={"fields": {"event": "notification_pull", "result": "enrich_failed", "pair_digest": digest}},
         )
-        for entry in ordered:
-            if _cached_alternative(pair, entry.train_key, now) is None:
-                _remember_alternative(_alternative_key(pair, entry.train_key), _AlternativeRecord("unanswered", None), epoch)
-            state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled)
-            if state.wording_status == _PENDING and state.wording_key is not None:
-                _remember_wording(state.wording_key, _WordingRecord(None, "error", entry.train_key), epoch)
+        _mark_unresolved(
+            definition, journey_key, pair, ordered, now,
+            alternative_status="unanswered", wording_status="error", enabled=enabled, epoch=epoch,
+        )
         return
     by_train = {}
     for alert in varsel.alert_worthy_trains(alerts):
@@ -1034,9 +1040,7 @@ def _word_one(
         _remember_wording(key, _WordingRecord(text, status, entry.train_key), epoch)
         return status
     finally:
-        with _enrichment_lock:
-            _wording_inflight.pop(key, None)
-        event.set()
+        _release(_enrichment_lock, _wording_inflight, key, event)
 
 
 def _submit(
@@ -1064,17 +1068,42 @@ def _submit(
         return future
 
 
-def _mark_capped(definition: dict, journey_key: str, pair: tuple[str, str], entries: list[_Entry], now: datetime) -> None:
-    """A refused submission: every entry still owed something is marked `capped`, transient, so
-    the reads that follow within `FAILURE_TTL_S` report it without each trying to submit again."""
-    enabled = _webhook_delivery_enabled()
-    epoch = _epoch
+def _mark_unresolved(
+    definition: dict,
+    journey_key: str,
+    pair: tuple[str, str],
+    entries: list[_Entry],
+    now: datetime,
+    *,
+    alternative_status: str,
+    wording_status: str,
+    enabled: bool,
+    epoch: int,
+) -> None:
+    """Write a transient marker on every entry still owed something, and on nothing else.
+
+    "Owed" is `_entry_state`'s own verdict, for both halves: an entry the poller owns (its wording
+    is cached in `varsel`) reads terminal there and gets no marker, even though the read's own
+    alternative cache has never heard of its train -- a marker written on that absence would sit
+    in the cache and be served as this read's outcome the moment the poller forgot the train.
+    """
     for entry in entries:
         state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled)
         if state.alternative_status == _PENDING:
-            _remember_alternative(_alternative_key(pair, entry.train_key), _AlternativeRecord(_CAPPED, None), epoch)
+            _remember_alternative(
+                _alternative_key(pair, entry.train_key), _AlternativeRecord(alternative_status, None), epoch
+            )
         if state.wording_status == _PENDING and state.wording_key is not None:
-            _remember_wording(state.wording_key, _WordingRecord(None, _CAPPED, entry.train_key), epoch)
+            _remember_wording(state.wording_key, _WordingRecord(None, wording_status, entry.train_key), epoch)
+
+
+def _mark_capped(definition: dict, journey_key: str, pair: tuple[str, str], entries: list[_Entry], now: datetime) -> None:
+    """A refused submission: every entry still owed something is marked `capped`, transient, so
+    the reads that follow within `FAILURE_TTL_S` report it without each trying to submit again."""
+    _mark_unresolved(
+        definition, journey_key, pair, entries, now,
+        alternative_status=_CAPPED, wording_status=_CAPPED, enabled=_webhook_delivery_enabled(), epoch=_epoch,
+    )
 
 
 def _claim_waiter() -> bool:
@@ -1090,6 +1119,24 @@ def _release_waiter() -> None:
     global _waiters
     with _tasks_lock:
         _waiters = max(0, _waiters - 1)
+
+
+async def _wait_for_enrichment(future: Future, wait: int, digest: str) -> bool:
+    """Park on the task from a waiter slot, or not at all. Returns whether a wait happened.
+
+    No slot means the read behaves as `wait=0` (KTD9): the answer is the figures and the statuses,
+    the task still runs, and a bounded record says the slots bound rather than a 503.
+    """
+    if wait <= 0:
+        return False
+    if not _claim_waiter():
+        _log_bounded("waiters", 1, digest)
+        return False
+    try:
+        await _await_task(future, wait)
+    finally:
+        _release_waiter()
+    return True
 
 
 async def _await_task(future: Future, wait: int) -> None:
@@ -1152,35 +1199,32 @@ def _assembled_entry(definition: dict, entry: _Entry, state: _EntryState, rank: 
     )
 
 
-def _assemble(
-    definition: dict,
-    journey_key: str,
-    pair: tuple[str, str],
-    entries: tuple[_Entry, ...],
-    now: datetime,
-    limit: int,
-    *,
-    enabled: bool,
-) -> tuple[list[JourneyAlertOut], int, bool]:
-    """The answer's list from the cached figures and the two enrichment caches: the departure cut,
-    the order, the rank, the cut, and `complete`.
+def _listed_states(
+    definition: dict, journey_key: str, pair: tuple[str, str], listed: list[_Entry], now: datetime, *, enabled: bool
+) -> list[_EntryState]:
+    """What the caches say about each listed entry, resolved once per request -- and again only
+    after a wait, which is the one thing between the two reads that can move them."""
+    return [_entry_state(definition, journey_key, pair, entry, now, enabled=enabled) for entry in listed]
 
-    The expected-departure cut is the matcher's own comparison (`impact.for_trip` drops a boarding
-    whose expected departure is `< catchable_after`), re-applied against THIS request's clock.
+
+def _assemble(
+    definition: dict, alive: list[_Entry], states: list[_EntryState], limit: int
+) -> tuple[list[JourneyAlertOut], int, bool]:
+    """The answer's list from the figures and their resolved states: the rank, the cut, `complete`.
+
+    `alive` is the departure cut already applied against THIS request's clock (`_alive`), because
+    `catchable_after` is match time and a cached figure can outlive a departure by a cycle.
     `severity` is the 1-based position in the worst-first order over every train that survived the
     cut, assigned before `limit` so a truncated answer's ranks still mean the same thing.
     `complete` is over the LISTED entries: it describes the answer a cache would hold.
     """
-    alive = _alive(entries, now)
     by_rank = sorted(alive, key=lambda e: varsel._alert_rank(e.winner), reverse=True)
     rank = {id(e): position for position, e in enumerate(by_rank, start=1)}
-    out: list[JourneyAlertOut] = []
-    complete = True
-    for entry in alive[:limit]:
-        state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled)
-        complete = complete and state.terminal
-        out.append(_assembled_entry(definition, entry, state, rank[id(entry)]))
-    return out, len(alive), complete
+    out = [
+        _assembled_entry(definition, entry, state, rank[id(entry)])
+        for entry, state in zip(alive[:limit], states, strict=True)
+    ]
+    return out, len(alive), all(state.terminal for state in states)
 
 
 def _log(
@@ -1347,22 +1391,17 @@ async def journey_alerts(
     enabled = _webhook_delivery_enabled()
     alive = _alive(figures.entries, now)
     listed = alive[:limit]
-    owed = any(_entry_state(definition, key, pair, e, now, enabled=enabled).pending for e in listed)
-    if owed:
+    states = _listed_states(definition, key, pair, listed, now, enabled=enabled)
+    if any(state.pending for state in states):
         future = _submit(definition, key, pair, now, figures.entries, digest)
         if future is None:
             _log_bounded("queue_full", len(listed), digest)
             _mark_capped(definition, key, pair, listed, now)
-        elif wait > 0:
-            if _claim_waiter():
-                try:
-                    await _await_task(future, wait)
-                finally:
-                    _release_waiter()
-            else:
-                _log_bounded("waiters", 1, digest)
+            states = _listed_states(definition, key, pair, listed, now, enabled=enabled)
+        elif await _wait_for_enrichment(future, wait, digest):
+            states = _listed_states(definition, key, pair, listed, now, enabled=enabled)
 
-    alerts, n_alerts, complete = _assemble(definition, key, pair, figures.entries, now, limit, enabled=enabled)
+    alerts, n_alerts, complete = _assemble(definition, alive, states, limit)
     response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE if complete else _CACHE_CONTROL_INCOMPLETE
     _log("ok", cache=cache, n_alerts=n_alerts, wait_s=wait, started=started, pair_digest=digest)
     return JourneyAlertsResponse(
