@@ -2678,7 +2678,7 @@ def test_deliver_to_devices_stops_a_device_at_gone_but_not_the_others(monkeypatc
         per_device, lambda item: ({"endpoint": f"https://p.example/{item[0]}"}, item[1])
     )
     # a3 was never attempted: its device died at a2. dev-b is untouched by dev-a's fate.
-    assert [(d, i[0], r) for d, i, r, _p in results] == [
+    assert [(d, i[0], r) for d, i, r, _p, _e in results] == [
         ("dev-a", "a1", "sent"), ("dev-a", "a2", "gone"), ("dev-b", "b1", "sent"),
     ]
     assert sorted(c[1] for c in calls) == ["a1", "a2", "b1"]

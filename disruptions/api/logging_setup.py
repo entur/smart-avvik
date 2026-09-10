@@ -19,12 +19,45 @@ Logging), e.g.::
 
 import json
 import logging
+import os
 import sys
 import threading
 from datetime import UTC, datetime
 
 # Keys a `fields` dict may not override (the entry's own schema).
 _RESERVED = {"timestamp", "severity", "message", "logger"}
+
+# The names LOG_LEVEL accepts (case-insensitive). NOTSET is deliberately absent: on the root
+# logger it means "fall back to WARNING", which nobody setting a level intends — it resolves to
+# INFO like any other unrecognised value.
+_LEVEL_NAMES = {
+    "CRITICAL": logging.CRITICAL,
+    "FATAL": logging.FATAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "WARN": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+}
+
+
+def _resolve_level() -> tuple[int, bool]:
+    """The root level LOG_LEVEL asks for, and whether the privacy interlock refused DEBUG.
+
+    LOG_LEVEL is a standard level name, case-insensitive; unset or unrecognised means INFO.
+    ONE interlock (KTD12): DEBUG is refused while VARSEL_LLM_LOG_PROMPTS is truthy — at DEBUG
+    that flag writes the full LLM prompt, which carries the traveller's origin, destination and
+    departure time, to Cloud Logging (llm_message._LOG_PROMPTS). Turning on traveller-prompt
+    logging must require deliberately touching the privacy flag in the same change as the
+    verbosity, never arrive as a side effect of "let's see the debug logs". The truthy set is
+    llm_message's own parse of that flag, kept identical so the two reads cannot disagree.
+    """
+    raw = os.environ.get("LOG_LEVEL", "").strip().upper()
+    level = _LEVEL_NAMES.get(raw, logging.INFO)
+    prompts = os.environ.get("VARSEL_LLM_LOG_PROMPTS", "").lower() in ("1", "true", "yes")
+    if level <= logging.DEBUG and prompts:
+        return logging.INFO, True
+    return level, False
 
 
 class JsonFormatter(logging.Formatter):
@@ -77,6 +110,23 @@ class _AccessLogRedaction(logging.Filter):
         return True
 
 
+class _HealthAccessMute(logging.Filter):
+    """Drops uvicorn access records for the /health probe (R9).
+
+    GKE's liveness and readiness probes hit /health every few seconds, so every real request in
+    the access log sits between probe lines — noise that costs ingestion and buries the lines
+    worth reading. Same record contract as :class:`_AccessLogRedaction`: only a record shaped
+    like uvicorn's access line (five args, a str full path third) is examined; anything else
+    passes. The path must be EXACTLY ``/health`` (query string ignored) — never a prefix match,
+    which would silently hide a future ``/healthz`` from the log.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        is_access_shape = isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str)
+        return not (is_access_shape and args[2].partition("?")[0] == "/health")
+
+
 def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
     """``threading.excepthook`` replacement: one structured ERROR per dying thread.
 
@@ -100,11 +150,15 @@ def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
 
 def setup() -> None:
     """Route ALL logging — including uvicorn's — through one JSON handler on stdout."""
+    # LOG_LEVEL (R12): standard names, case-insensitive, default INFO. DEBUG is refused while
+    # VARSEL_LLM_LOG_PROMPTS is truthy — the privacy interlock _resolve_level documents — and
+    # the refusal is logged as a structured ERROR below, once the JSON handler is in place.
+    level, conflict = _resolve_level()
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(JsonFormatter())
     root = logging.getLogger()
     root.handlers[:] = [handler]
-    root.setLevel(logging.INFO)
+    root.setLevel(level)
     # uvicorn installs its own non-propagating text handlers (error log on stderr!) before it
     # imports the app; strip them so its records — access log included — propagate to root.
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
@@ -116,9 +170,25 @@ def setup() -> None:
     access = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, _AccessLogRedaction) for f in access.filters):
         access.addFilter(_AccessLogRedaction())
+    if not any(isinstance(f, _HealthAccessMute) for f in access.filters):
+        access.addFilter(_HealthAccessMute())
     # A dying thread leaves one structured ERROR (event="thread_died") instead of a raw stderr
     # traceback. Assigning the module-level function is idempotent across setup() re-runs.
     threading.excepthook = _log_thread_exception
+    if conflict:
+        logging.getLogger(__name__).error(
+            "LOG_LEVEL=DEBUG refused: VARSEL_LLM_LOG_PROMPTS is enabled, and DEBUG would put "
+            "travellers' prompts (origin, destination, departure time) into Cloud Logging; "
+            "running at INFO. Unset VARSEL_LLM_LOG_PROMPTS in the same change that lowers "
+            "LOG_LEVEL.",
+            extra={
+                "fields": {
+                    "event": "log_level_conflict",
+                    "log_level": os.environ.get("LOG_LEVEL"),
+                    "varsel_llm_log_prompts": os.environ.get("VARSEL_LLM_LOG_PROMPTS"),
+                }
+            },
+        )
 
 
 setup()

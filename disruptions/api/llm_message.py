@@ -147,6 +147,7 @@ _MAX_TOKENS = 1200
 _TIMEOUT_S = 8.0
 # Log the full prompt and reply (at DEBUG). Off by default: the prompt embeds the traveller's
 # origin, destination and departure time. Turn on temporarily when debugging message quality.
+# While truthy, logging_setup._resolve_level refuses LOG_LEVEL=DEBUG (KTD12) and mirrors this parse.
 _LOG_PROMPTS = os.environ.get("VARSEL_LLM_LOG_PROMPTS", "").lower() in ("1", "true", "yes")
 
 

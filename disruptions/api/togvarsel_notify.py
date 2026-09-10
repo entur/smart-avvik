@@ -855,7 +855,7 @@ def push_round(
     resolve_device: Callable[[str], tuple[dict, str] | None],
     deliver: Callable[
         [Mapping[str, list[Any]], Callable[[Any], tuple[dict, dict]]],
-        list[tuple[str, Any, str, dict]],
+        list[tuple[str, Any, str, dict, dict | None]],
     ],
     handle_gone: Callable[[str], bool],
     brand_assets: Mapping[str, Mapping[str, str]],
@@ -891,7 +891,9 @@ def push_round(
         per_device[device_id] = [(subscription, payload)]  # one item per device per round
     counts = {"sent": 0, "error": 0, "gone": 0}
     dropped = 0
-    for device_id, _item, result, _payload in deliver(per_device, lambda item: item):
+    # The per-push error detail is deliberately unused here: forecast rounds log COUNTS in the
+    # one round event below, never a per-push record (per-push logging is a deferred follow-up).
+    for device_id, _item, result, _payload, _error_detail in deliver(per_device, lambda item: item):
         counts[result] = counts.get(result, 0) + 1
         if result == "gone" and handle_gone(device_id):
             dropped += 1
