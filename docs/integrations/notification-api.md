@@ -638,7 +638,7 @@ definition is registered**.
 - **Treat 429, 503 `predictions_not_loaded` and a `rate_limited` status as ordinary states** and
   serve your cached answer. They are the read's bounds binding, not a fault to alarm on.
 - **Whether an entry's wording is the model's follows a deployment switch**
-  (`NOTIFICATION_WEBHOOK_LLM_ENABLED`, the webhook event's own; on in dev, off elsewhere today), so
+  (`NOTIFICATION_WEBHOOK_LLM_ENABLED`, the webhook event's own; on in dev and prd, off in tst today), so
   in an environment where it is off every entry reads `disabled` with the template — correct, and
   complete.
 
