@@ -264,7 +264,46 @@ def settled_due(now: datetime, last_run_utc: date | None) -> bool:
 def _blank_state(d: date) -> dict[str, Any]:
     """The Oslo-day-scoped state. Note what is NOT here: the authoritative pass's last-run date,
     which is UTC-scoped and must survive the Oslo rollover (see settled_due)."""
-    return {"date": d, "provisional_done": set(), "backoff": {}}
+    return {"date": d, "provisional_done": set(), "backoff": {}, "forecast_day": False}
+
+
+# Has a forecast been issued for today? One tiny lookup, and the provisional pass's population test:
+# the settled pass resolves ISSUED days only (see _WORK_SET_SQL), so a provisional row for a day no
+# forecast was issued on — a weekend, a holiday, a morning the issue failed — is a row nothing ever
+# settles. Measured in prd on 2026-09-10: Saturday 5 and Sunday 6 September each carried three
+# `settled = FALSE` rows the page could never join to, and every weekend would have added two more.
+_ISSUED_TODAY_SQL = """
+SELECT 1 AS issued FROM `disruptions.togvarsel_issued` WHERE d = @today LIMIT 1
+"""
+
+
+def _forecast_day(today: date, now: datetime, scopes: tuple[str, ...]) -> bool:
+    """Whether the provisional pass has anything to measure today.
+
+    A weekend is answered without a query — no forecast is ever issued on one. A weekday asks
+    `togvarsel_issued` once and remembers a yes for the rest of the Oslo day; a no is re-asked when
+    the next window comes due, because a morning whose issues all failed can still issue at 12:00
+    and 14:00, and the afternoon check is then owed. Two probes on a holiday, one on a weekday.
+    """
+    if now.weekday() >= 5:
+        return False
+    if _state.get("forecast_day"):
+        return True
+    rows = list(
+        _bq_client.query(_ISSUED_TODAY_SQL, job_config=_job_config([_scalar("today", "DATE", today)]))
+        .result(timeout=60)
+    )
+    if rows:
+        _state["forecast_day"] = True
+        return True
+    logger.info(
+        "togvarsel_outcomes: no forecast issued for %s by %s; skipping provisional %s",
+        today,
+        now.strftime("%H:%M"),
+        ",".join(scopes),
+        extra={"fields": {"event": "togvarsel_outcomes_skip", "day": str(today), "scopes": list(scopes)}},
+    )
+    return False
 
 
 def _retryable(key: str, now: datetime) -> bool:
@@ -347,8 +386,15 @@ def _outcome_scalars(row_d, scope, trouble10, n_resolved, n_unresolved, n_calls,
     ]
 
 
-def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
-    """One same-day pass over `scopes`, writing the provisional trio and the served value."""
+def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> set[str]:
+    """One same-day pass over `scopes`, writing the provisional trio and the served value.
+
+    Returns the scopes the query actually answered for, which is what `refresh` marks done. It
+    returned nothing from 2026-09-02 to 2026-09-10 while the caller iterated the result: every pass
+    wrote its rows and then raised, so the retry loop re-ran the same SELECT and MERGEs every 15
+    minutes to the give-up, and the 18:20 window — with nothing marked done — re-wrote the morning's
+    rows on top, so `provisional_at` read ~20:10 on every weekday instead of 09:20.
+    """
     from google.cloud import bigquery
 
     _ensure_table_ready()
@@ -371,6 +417,7 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
                 )
             ),
         ).result(timeout=60)
+    answered = {row["scope"] for row in rows}
     logger.info(
         "togvarsel_outcomes: provisional %s for %s — %d rows",
         ",".join(scopes),
@@ -386,6 +433,7 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
             }
         },
     )
+    return answered
 
 
 def _run_settled(days: Sequence[date], now: datetime) -> None:
@@ -546,11 +594,18 @@ def refresh(now: datetime | None = None) -> None:
     due_key = f"provisional:{'+'.join(due)}"
     if due and _retryable(due_key, now):
         try:
-            answered = _run_provisional(today, due, now)
-            # Only a scope the query actually answered for is done. Marking an unanswered scope
-            # done would retire it for the rest of the Oslo day on the strength of one empty read —
-            # and the page would show `venter` until the overnight pass, with nothing retrying.
-            _state["provisional_done"].update(answered)
+            if _forecast_day(today, now, due):
+                answered = _run_provisional(today, due, now)
+                # Only a scope the query actually answered for is done. Marking an unanswered scope
+                # done would retire it for the rest of the Oslo day on the strength of one empty
+                # read — and the page would show `venter` until the overnight pass, with nothing
+                # retrying.
+                _state["provisional_done"].update(answered)
+            else:
+                # A day with no forecast has nothing to measure, and the settled pass will never
+                # visit it either: marking the due scopes done is what keeps a weekend from
+                # writing rows nothing settles. The next window re-asks (see _forecast_day).
+                _state["provisional_done"].update(due)
             _state["backoff"].pop(due_key, None)
         except Exception:
             logger.exception("togvarsel_outcomes: provisional pass failed; retrying after backoff")
