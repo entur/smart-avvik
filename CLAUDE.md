@@ -614,9 +614,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `docs/integrations/notification-api.md` (the client contract), `docs/integrations/firebase-bff.md`
   (the two vendored TypeScript packages under `integrations/`) and
   `docs/operations/notification-webhooks.md` (the operating contract, which carries the
-  clause-by-clause retention check and the enablement conditions). **It is off in every environment**
-  and needs four values and two Secret Manager secrets that do not exist yet; the operations document
-  is the sequence.
+  clause-by-clause retention check and the enablement conditions). **It is on in dev since 2026-09-10 with
+  no client onboarded, and off in tst and prd**, where it still needs the two Secret Manager secrets
+  and, in prd, the Terraform apply; the operations document is the sequence.
   **It is `/varsel`'s logic reused by extraction, not a second alerting stack.** Which trains alert,
   which alerts clear the bar, the per-train collapse, the Norwegian wording and the daily cap are
   `/varsel`'s, unchanged: a webhook subscription is another registration whose channel is a webhook,
@@ -796,8 +796,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
   **`NOTIFICATION_WEBHOOK_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
   other three flags; it defaults off and is set in **dev and prd** (both since 2026-09-10, for the
-  public read below, not for the channel — `NOTIFICATION_WEBHOOKS_ENABLED` stays off in both, so no
-  event carries it), so in tst the channel would emit and deliver the deterministic template until
+  public read below, not for the channel — `NOTIFICATION_WEBHOOKS_ENABLED` is on in dev since later that day
+  and off in prd, so only a dev event can carry it), so in tst the channel would emit and deliver the deterministic template until
   somebody adds it. Expect one divergence during the rollout window: with `VARSEL_LLM_ENABLED=true`
   beside it false, the push carries the model's prose while the event carries the template, so the
   two channels are byte-identical only where both switches agree.
