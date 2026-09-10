@@ -617,6 +617,132 @@ def test_no_module_in_the_api_directory_widens_the_alert_gate():
     assert offenders == [], f"the widened gate is back in {offenders}"
 
 
+# ---- U2 of the pull read: the third policy, PULL --------------------------------------------------
+def test_a_pull_wording_is_charged_to_its_own_allowance_and_to_nobody_elses():
+    """R4, the arithmetic half, for the third surface: a public read that words on demand must not
+    be able to draw the webhook channel's or the browser's allowance down, nor be drawn down by
+    them. Same keying, one more slot -- and the slot must be SEEDED, since an unseeded path is a
+    `KeyError` on the first call rather than a refusal."""
+    _reset()
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
+    try:
+        for i in range(3):
+            wording = nw.write_wording(
+                ROUTE, _facts(cancelled=True), policy=nw.PULL, subject_id=f"pair_{i}"
+            )
+            assert wording.source == "llm", wording.status
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert nw.spent(nw._PULL_PATH) == (3, 3)
+    assert nw.spent(nw._WEBHOOK_PATH) == (0, 0)
+    assert nw.spent(nw._BROWSER_PATH) == (0, 0)
+
+
+def test_the_pull_allowance_drains_over_minutes_rather_than_in_one_burst():
+    """The pull path is the only one with a per-minute ceiling: `WORDINGS_PER_MIN` (30) under an
+    hour of `WORDINGS_PER_HOUR` (500), so a burst from a public endpoint cannot spend the whole
+    hour in its first seconds. The browser and webhook policies keep the module's two numbers and
+    no per-minute ceiling at all -- a 31st call inside a minute is refused on pull and nowhere
+    else."""
+    _reset()
+    assert (nw.WORDINGS_PER_MIN, nw.WORDINGS_PER_HOUR, nw.WORDINGS_PER_DAY) == (30, 500, 2000)
+    t = nw.monotonic()
+    for _ in range(nw.WORDINGS_PER_MIN):
+        assert nw._spend(nw._PULL_PATH, now=t)
+    assert not nw._spend(nw._PULL_PATH, now=t), "the thirty-first call inside a minute"
+    assert nw.spent(nw._PULL_PATH)[0] == nw.WORDINGS_PER_MIN < nw.WORDINGS_PER_HOUR, (
+        "the hour still has room; it is the minute that bound"
+    )
+    assert nw._spend(nw._PULL_PATH, now=t + 61.0), "a minute later the window has moved on"
+    for path in (nw._WEBHOOK_PATH, nw._BROWSER_PATH):
+        for _ in range(nw.WORDINGS_PER_MIN + 1):
+            assert nw._spend(path, now=t), f"no per-minute ceiling binds {path}"
+    # ...and end to end: the refusal is reported as `rate_limited`, the status the operations
+    # document already names, rather than as a new word.
+    _reset()
+    llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
+    try:
+        now = nw.monotonic()
+        nw._calls[nw._PULL_PATH].minute.extend([now] * nw.WORDINGS_PER_MIN)
+        wording = nw.write_wording(ROUTE, _facts(cancelled=True), policy=nw.PULL, subject_id="p")
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert wording.status == "rate_limited" and wording.source == "deterministic"
+
+
+def test_pull_exhaustion_cannot_disable_any_other_surfaces_backend():
+    """R4, the latch half. A configuration error discovered through the pull holder latches only
+    it: the module-global holder (the poller's) and the webhook channel's still read True."""
+    _reset()
+
+    def unserved(_body):
+        raise _ConfigurationError("model not enabled in this project")
+
+    llm_message._BACKENDS["claude"] = unserved
+    try:
+        for i in range(3):
+            wording = nw.write_wording(ROUTE, _facts(), policy=nw.PULL, subject_id=f"pair_{i}")
+            assert wording.source == "deterministic"
+        assert llm_message.generation_enabled(nw.PULL.state()) is False
+        assert llm_message.generation_enabled() is True, "the push path is untouched"
+        assert llm_message.generation_enabled(nw.WEBHOOK.state()) is True, (
+            "the webhook channel's holder is untouched"
+        )
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert nw.PULL.state() is not llm_message._STATE
+    assert nw.PULL.state() is not nw.WEBHOOK.state()
+
+
+def test_reset_state_clears_the_pull_holder_and_the_pull_ledger():
+    """`reset_state` iterates `_POLICIES`, so the pull holder is cleared by being ON the tuple; a
+    test that drove it off would otherwise leave every later pull wording a template for thirty
+    minutes with nothing saying why."""
+    _reset()
+    before = nw.PULL.state()
+    assert before is not None
+    nw._spend(nw._PULL_PATH)
+    nw._spend(nw._PULL_PATH)
+    assert nw.spent(nw._PULL_PATH) == (2, 2)
+    nw.reset_state()
+    assert nw.spent(nw._PULL_PATH) == (0, 0)
+    assert nw.PULL.state() is not before, "the latch holder must be rebuilt, not reused"
+    assert nw.PULL in nw._POLICIES
+
+
+def test_a_pull_wording_writes_no_prompt_record_and_no_definition_digest():
+    """R11, both halves through `write_wording`. The pull policy carries a truthy `caller`, so the
+    prompt/reply DEBUG record is suppressed in code with `VARSEL_LLM_LOG_PROMPTS` on and the INFO
+    record drops the prose; and the read hands the SALTED pair digest as the subject id, so the
+    `journey_digest` the model-call record carries is not `key_digest` of the definition's
+    `journey_key` -- the unsalted digest `/historikk`'s rows and the browser's records join on."""
+    import alternatives
+
+    _reset()
+    assert nw.PULL.caller, "a falsy marker would switch the suppression off"
+    assert llm_message._log_fields(False, nw.PULL.caller, event="llm_message")["caller"] == "pull"
+    prose = "Toget er innstilt."
+    llm_message._BACKENDS["claude"] = lambda body: json.dumps({"melding": prose})
+    previous = llm_message._LOG_PROMPTS
+    llm_message._LOG_PROMPTS = True
+    subject = alternatives.pair_digest("NSR:StopPlace:A", "NSR:StopPlace:B")
+    try:
+        pull = _llm_log_fields(
+            lambda: nw.write_wording(ROUTE, _facts(), policy=nw.PULL, subject_id=subject)
+        )
+    finally:
+        llm_message._LOG_PROMPTS = previous
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert not [f for f in pull if f["event"] == "llm_message_prompt"]
+    assert not any("message_input" in f for f in pull)
+    assert not any("message" in f for f in pull), "the prose must not reach the log either"
+    records = [f for f in pull if f["event"] == "llm_message"]
+    assert [f["caller"] for f in records] == ["pull"]
+    definition = "NSR:StopPlace:A|NSR:StopPlace:B|07:00|09:00|0,1,2,3,4"
+    assert records[0]["journey_digest"] == llm_message.key_digest(subject)
+    assert records[0]["journey_digest"] != llm_message.key_digest(definition)
+
+
 def _run():
     logging.getLogger("notification_wording").setLevel(logging.CRITICAL)
     tests = sorted(

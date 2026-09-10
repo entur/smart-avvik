@@ -310,8 +310,12 @@ test("every documented 422 admits the framework's array `detail`, and constraine
 
   // Every operation that constrains a parameter or a body can be refused this way, so every one of
   // them documents a 422. `/destinations/current` constrains nothing -- no body, no query, no path
-  // parameter -- and documenting one there would be the opposite error.
+  // parameter -- and documenting one there would be the opposite error. The public
+  // `GET /journey-alerts` (2026-09-10) constrains every one of its query parameters -- the two stop
+  // refs, the optional period, the repeated `days`, `wait` and `limit` -- so it belongs here: a
+  // client that reads its `detail` as a string throws on the first mistyped favourite.
   const constrained = new Set([
+    "/journey-alerts|get",
     "/subscriptions|post",
     "/subscriptions|get",
     "/subscriptions/{subscription_id}|get",

@@ -98,6 +98,7 @@ from typing import Annotated, Any, Protocol
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import alternatives  # the Journey Planner fetch-path vocabulary the matcher forwards
 import feedback
 import feedback_contexts
 import notification_events  # the webhook channel's typed hand-off type and its emit step
@@ -377,6 +378,12 @@ class ImpactProvider(Protocol):
     swallowed it, and all push alerting stopped with a green test suite (both test doubles hand-write
     their own provider, so nothing checked the real one). `...` would have accepted that drift; this
     does not.
+
+    `path` (2026-09-10) names which Journey Planner budget the provider's alternative lookups spend
+    (`alternatives.FetchPath`); `_impact` sends it on EVERY call, defaulted to the poller's. CI runs
+    no type checker, so a provider that accepts the keyword and drops it still satisfies this — the
+    pin for that is a test asking the pull ledger whether it was charged
+    (`test_varsel.test_the_real_provider_charges_the_pull_ledger`).
     """
 
     def __call__(
@@ -389,6 +396,7 @@ class ImpactProvider(Protocol):
         catchable_after: datetime | None = ...,
         with_alternative: bool = ...,
         min_impact: float = ...,
+        path: alternatives.FetchPath = ...,
     ) -> ImpactResponse: ...
 
 
@@ -963,11 +971,17 @@ def _impact(
     with_alternative: bool = False,
     from_stop: str | None = None,
     to_stop: str | None = None,
+    *,
+    path: alternatives.FetchPath = alternatives._POLLER_PATH,
 ) -> ImpactResponse | None:
     """One /impact call for a journey's boarding window, or None when unconfigured.
 
     `from_stop`/`to_stop` override the journey's own refs so :func:`match_journey` can ask about the
     other refs of the same physical place (see :func:`place_refs`).
+
+    `path` is forwarded on every call and defaults to the poller's budget, which is what every
+    caller before 2026-09-10 spent (`main._varsel_impact` hard-coded it); the journey-alert pull
+    read passes its own so a burst of reads cannot starve the push cycle's reserved share.
 
     `min_impact` is :func:`alert_policy.min_threshold` rather than a per-operator cut: the operator
     is a property of the matched train, which is only known after the call. It is the floor of the
@@ -984,6 +998,7 @@ def _impact(
         catchable_after=catchable_after,
         with_alternative=with_alternative,
         min_impact=min_threshold() if with_alternative else 0.0,
+        path=path,
     )
 
 
@@ -1457,7 +1472,11 @@ class Alert(BaseModel):
 
 
 def match_journey(
-    journey: dict, now: datetime | None = None, *, with_alternative: bool = False
+    journey: dict,
+    now: datetime | None = None,
+    *,
+    with_alternative: bool = False,
+    path: alternatives.FetchPath = alternatives._POLLER_PATH,
 ) -> list[Alert]:
     """Situations currently hitting `journey`, worst-first — one :class:`Alert` per situation.
 
@@ -1479,6 +1498,8 @@ def match_journey(
     and a device with 20 registered journeys x 2 windows would fan out ~40 of them on a single
     request. The poller passes True (the push is where the advice matters); the request path leaves it
     off and the in-app list shows the cached written message, which already names the alternative.
+
+    `path` says whose Journey Planner budget those lookups spend (see :func:`_impact`).
     """
     if now is None:
         now = datetime.now(UTC)
@@ -1503,7 +1524,7 @@ def match_journey(
             impact = _impact(
                 journey, window_start, window_end, catchable_after=now,
                 with_alternative=with_alternative and pair_index == 0,
-                from_stop=from_ref, to_stop=to_ref,
+                from_stop=from_ref, to_stop=to_ref, path=path,
             )
             if impact is None:
                 continue
@@ -1518,6 +1539,7 @@ def match_journey(
                             getattr(sit, "alternative_journey", None),
                             bool(getattr(sit, "original_is_best", False)),
                             subject,
+                            bool(getattr(sit, "answered", True)),
                         ),
                     )
             _collect_alerts(impact, worst_by_situation, now=now)
@@ -1553,6 +1575,7 @@ def match_journey(
                     "alternative_journey": known.journey,
                     "original_is_best": known.original_is_best,
                     "alternative_subject": known.subject,
+                    "answered": known.answered,
                 }
             )
 
@@ -1603,7 +1626,7 @@ def _collect_alerts(
             alertworthy=alertworthy,
             latest_observation=observation_by_line.get(sit.line),
             alternative_journey=getattr(sit, "alternative_journey", None),
-            # This situation's own lookup, projected onto the response the alert carries: the three
+            # This situation's own lookup, projected onto the response the alert carries: the four
             # alternative fields are the only ones that differ per situation, and every reader
             # downstream (`decisions._alternative_status`, `_reconcile_caches`,
             # `llm_message.build_message_input`) reaches for them through `alert.impact`. Projecting
@@ -1614,6 +1637,9 @@ def _collect_alerts(
                     "alternative_journey": getattr(sit, "alternative_journey", None),
                     "original_is_best": bool(getattr(sit, "original_is_best", False)),
                     "alternative_subject": getattr(sit, "alternative_subject", None),
+                    # Defaulted True like the model field: a synthetic provider that predates the
+                    # flag is reporting terminal absences, not throttled lookups.
+                    "answered": bool(getattr(sit, "answered", True)),
                 }
             ),
         )
@@ -1774,6 +1800,22 @@ def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
             # in place preserves that ordering while the tie-break decides which situation shows.
             out[pos] = alert
     return out
+
+
+def alert_worthy_trains(alerts: list[Alert]) -> list[Alert]:
+    """The trains a notification would go out for: the collapse FIRST, then the push gate.
+
+    For the journey-keyed public read (2026-09-10), which must select trains exactly as the pass
+    does. The order is the whole point and it is easy to get backwards: `_subjects_for_key` walks
+    :func:`one_alert_per_train` and tests `alertworthy` on each WINNER, so a train whose most
+    severe reading is a sub-gate no-SX one (0.80 under its own 0.85) that outranks an over-gate
+    published one (0.70 over 0.65) is NOT alert-worthy — the collapse kept the sub-gate winner.
+    Filtering on the gate first would list that train through its published situation and tell
+    a reader about a train the pass would be withdrawing. That loop is left untouched because its
+    non-alert-worthy winners are its withdrawal subjects; this is the alert-worthy subset of what
+    it iterates, in the collapse's own order, which the read sorts afterwards.
+    """
+    return [alert for alert in one_alert_per_train(alerts) if alert.alertworthy]
 
 
 # ---- Notify ----------------------------------------------------------------------------------
@@ -2752,6 +2794,32 @@ def _webhook_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str
         return None
     with _state_lock:
         return _messages.get(message_key)
+
+
+def cached_wording_and_alternative(
+    journey_key: str, alert: Alert, *, enabled: bool
+) -> tuple[str | None, AlternativeJourney | None]:
+    """The poller's cached wording and cached alternative for one (definition, train), READ ONLY.
+
+    For the journey-keyed public read (2026-09-10), which serves a registered definition what the
+    pass already wrote rather than writing again. One `_state_lock` read for both, and
+    :func:`_webhook_wording`'s rules for the wording: the RAW entry, not through the browser's
+    delivery gate (`enabled` is the webhook channel's gate, as there); none for a declared
+    cancellation, because `_message_key` carries no `cancelled` flag and the entry may predate the
+    declaration; None where absent. The alternative is returned whatever `enabled` says — it is
+    the Journey Planner's answer and has nothing to do with whether a model's prose is delivered —
+    and it is the raw entry too: whether it is still catchable is `_journey_model`'s policy, applied
+    by the caller.
+
+    **Never writes**, and that is a stop condition rather than a nicety: pass 1c records
+    `ok_cached` for a key already in :data:`_messages`, so an entry a read had written would land
+    on `/historikk` under the browser's attribution, and the poller's caches are its own.
+    """
+    message_key = _message_key(journey_key, alert)
+    with _state_lock:
+        alternative = _alternatives.get(message_key)
+        wording = None if (not enabled or alert.cancelled) else _messages.get(message_key)
+    return wording, alternative
 
 
 def _webhook_withdrawal_wording(

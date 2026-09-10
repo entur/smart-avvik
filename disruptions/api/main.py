@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 # Aliased: the route function below is also called `impact`, and inside its body a bare
 # `impact.` would resolve to that function rather than to this module.
 import alert_policy  # sibling module: the shared alert gate (thresholds, the "trouble" bar)
+import alternatives  # sibling module: the Journey Planner lookup and its per-caller fetch budgets
 import decisions  # sibling module: the append-only Avviksvarsel alert-decision log
 import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
 import feedback_contexts  # exact display snapshots for isolated /varsel feedback
@@ -26,6 +27,7 @@ import meldinger  # sibling module: past alert decisions replayed through today'
 import notification_api  # sibling module: the authenticated notification API (/notification-api/v1)
 import notification_auth  # sibling module: client accounts, API keys, callback destinations, audit
 import notification_events  # sibling module: this cycle's observations turned into committed events
+import notification_pull  # sibling module: the journey-keyed public read (/notification-api/v1/journey-alerts)
 import notification_servability  # sibling module: R6's freshness half, re-asked on the poller's cadence
 import notification_store  # sibling module: durable webhook subscriptions, events and deliveries
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
@@ -899,6 +901,18 @@ def _impact_snapshot() -> tuple[dict[str, list[impact_engine.CallPred]], datetim
         return _call_pred_by_situation, _call_pred_refreshed_at
 
 
+def _varsel_refreshed_at() -> datetime | None:
+    """When the per-call prediction cache was last loaded, or None before the poller's first load.
+
+    The freshness provider for the journey-keyed public read on `/notification-api/v1`
+    (2026-09-10): a cache nobody has loaded yet has no situations in it, and a read that answered
+    "no disruptions" off it would be reporting an empty process as a calm day. The read answers 503
+    while this is None. The second half of `_impact_snapshot`, under the same lock, so the answer
+    can never describe a different load than the situations /impact matched from.
+    """
+    return _impact_snapshot()[1]
+
+
 def _impact_journey_calls(operator: str | None, jkey: str) -> list[impact_engine.CallPred] | None:
     """The scored calls of ONE journey, or None when no live situation touches it.
 
@@ -934,6 +948,7 @@ def _varsel_impact(
     catchable_after: datetime | None = None,
     with_alternative: bool = False,
     min_impact: float = 0.0,
+    path: alternatives.FetchPath = alternatives._POLLER_PATH,
 ) -> impact_engine.ImpactResponse:
     """/impact for a registered journey's boarding window, injected into varsel via configure().
 
@@ -959,12 +974,14 @@ def _varsel_impact(
         catchable_after=catchable_after,
         with_alternative=with_alternative,
         min_impact=min_impact,
-        # Charge this provider's Journey Planner fetches to the poller's reserved budget, not the
-        # public one. Only `check_and_notify` ever passes `with_alternative=True` — the
-        # /varsel-api request path leaves it False and issues no fetch at all — so a flat "poller"
-        # is exact here, and it is what stops an unauthenticated caller flooding /impact from
-        # starving the push cycle it shares this module-global cache with.
-        path="poller",
+        # Charge this provider's Journey Planner fetches to the CALLER's budget, defaulting to the
+        # poller's reserved one and never the public one. Until 2026-09-10 this was a flat
+        # "poller", exact while `check_and_notify` was the only caller passing
+        # `with_alternative=True`; the journey-alert pull read now names its own path, and a
+        # provider that swallowed it would spend the push cycle's share on every read. What the
+        # default still protects: an unauthenticated caller flooding /impact cannot starve the
+        # push cycle it shares this module-global cache with.
+        path=path,
     )
 
 
@@ -1314,6 +1331,10 @@ async def lifespan(app: FastAPI):
         webhook_enabled=_notification_webhooks_enabled,
         webhook_recipients_provider=notification_store.recipient_documents,
     )
+    # The journey-keyed public read's one seam (2026-09-10): when the per-call prediction cache
+    # was loaded, so it can answer 503 rather than "no disruptions" before the poller's first load.
+    # Its stop cache and matcher come through `varsel`'s own providers, wired just above.
+    notification_pull.configure(refreshed_at=_varsel_refreshed_at)
     llm_message.configure(stop_name_provider=_varsel_stops)
     # The webhook channel's two Firestore-backed planes and the authenticated API over
     # them. All three are wired UNCONDITIONALLY, and the flag above is deliberately not consulted
@@ -1438,6 +1459,9 @@ async def lifespan(app: FastAPI):
     finally:
         stop_event.set()
         thread.join(timeout=5)
+        # The pull read's enrichment pool: stop it without waiting, so a task parked on a Vertex or
+        # Journey Planner call cannot hold the process open past the poller's own five seconds.
+        notification_pull.shutdown()
 
 
 
@@ -1562,6 +1586,10 @@ app.include_router(rushhistorikk.router)
 # And it is registered before the static mounts, like every other API router: nothing serves
 # /notification-api as a page, but the ordering rule is the one this file follows throughout.
 app.include_router(notification_api.router)
+# The journey-keyed PUBLIC read on the same prefix (2026-09-10). Its own router, because the one
+# above carries the credential and throttle dependencies at router level and a read with no
+# credential cannot live on it; same prefix, so the published contract stays one API.
+app.include_router(notification_pull.router)
 
 # Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.

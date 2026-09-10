@@ -769,7 +769,7 @@ def _install_fetch(fake):
     original = alternatives._fetch_trip_patterns
     alternatives._fetch_trip_patterns = fake
     alternatives._cache = _KeyedTTLCache(alternatives._TTL, alternatives._FAILURE_COOLDOWN)
-    alternatives._fetch_calls = {"request": [], "poller": []}
+    alternatives._fetch_calls = {path: [] for path in alternatives._FETCH_CEILINGS}
     return original
 
 
@@ -1598,6 +1598,94 @@ def test_the_poller_gets_a_bigger_fetch_ceiling_than_the_public_path():
             alternatives._reserve_fetch("request", CAND_NOW)
         assert not alternatives._reserve_fetch("request", CAND_NOW)
     finally:
+        alternatives._fetch_trip_patterns = original
+
+
+def test_a_pull_path_fetch_charges_the_pull_ledger_only():
+    """The journey-alert pull read (2026-09-10) fetches the alternative on request, on its own
+    executor. It is neither the browser's cycle nor the public endpoint, so it gets a THIRD ledger:
+    charging it to `request` would let an anonymous /impact flood empty the read's allowance, and
+    charging it to `poller` would let the read empty the push cycle's."""
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    try:
+        got = fetch_candidates(
+            CAND_FROM, CAND_TO, arrive_by=True, date_time=CAND_NOW + timedelta(minutes=45),
+            now=CAND_NOW, path="pull",
+        )
+        assert got and len(calls) == 1
+        assert len(alternatives._fetch_calls["pull"]) == 1, "the pull ledger was not charged"
+        assert alternatives._fetch_calls["request"] == [], "the public ledger must be untouched"
+        assert alternatives._fetch_calls["poller"] == [], "the poller's ledger must be untouched"
+    finally:
+        alternatives._fetch_trip_patterns = original
+
+
+def test_the_pull_ceiling_binds_and_refuses_as_an_unanswered_outcome():
+    """Past `_PULL_FETCH_MAX_PER_MIN` the read is told "no reply was obtained", never "nothing
+    available": the read serves `unanswered` (transient) for the first and `none_found` (terminal)
+    for the second, and a throttle that read as terminal would be cached as such. And an unknown
+    path must NOT quietly inherit a ceiling — a fourth caller has to be given its own number."""
+    calls = []
+    original = _install_fetch(lambda *a, **k: calls.append(1) or _recorded_patterns())
+    handler = _capture_logs()
+    try:
+        assert alternatives._PULL_FETCH_MAX_PER_MIN == 30
+        for i in range(alternatives._PULL_FETCH_MAX_PER_MIN):
+            assert alternatives._reserve_fetch("pull", CAND_NOW), f"refused at {i}"
+        outcome: dict = {}
+        blocked = fetch_candidates(
+            CAND_FROM, "NSR:StopPlace:9999", arrive_by=False, date_time=CAND_NOW, now=CAND_NOW,
+            path="pull", outcome=outcome,
+        )
+        assert blocked == [] and calls == [], "past the ceiling no request is issued"
+        assert outcome == {"answered": False}, outcome
+        # The other two ledgers were never at risk.
+        assert alternatives._reserve_fetch("request", CAND_NOW)
+        assert alternatives._reserve_fetch("poller", CAND_NOW)
+        try:
+            alternatives._reserve_fetch("dashboard", CAND_NOW)
+        except KeyError:
+            pass
+        else:
+            raise AssertionError("an unknown path silently got a ceiling")
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_trip_patterns = original
+
+
+def test_a_pull_path_caller_waits_for_an_in_flight_fetch():
+    """The read runs on its own executor, not in the anyio request pool, so the argument that keeps
+    the request path from waiting does not apply — and the poller's pass may be fetching the very
+    key the read wants. Waiting is what turns that collision into one fetch and two answers."""
+    gate = threading.Event()
+    calls: list = []
+    original = _install_fetch(_blocking_fetch(gate, calls))
+    try:
+        deadline = CAND_NOW + timedelta(minutes=45)
+        results: dict[str, list] = {}
+
+        def ask(tag: str, path: str) -> None:
+            results[tag] = fetch_candidates(
+                CAND_FROM, CAND_TO, arrive_by=True, date_time=deadline, now=CAND_NOW, path=path,
+            )
+
+        first = threading.Thread(target=ask, args=("poller", "poller"))
+        first.start()
+        while not calls:
+            time.sleep(0.01)
+        second = threading.Thread(target=ask, args=("pull", "pull"))
+        second.start()
+        time.sleep(0.05)
+        gate.set()
+        first.join(5)
+        second.join(5)
+        assert len(calls) == 1, "the waiter must not duplicate the fetch"
+        assert results["pull"] == results["poller"] and results["pull"], (
+            "the pull caller was served a non-answer instead of the value it waited for"
+        )
+    finally:
+        gate.set()
         alternatives._fetch_trip_patterns = original
 
 
