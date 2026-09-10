@@ -16,7 +16,7 @@ any operator but Vy rail.** See [Enablement conditions](#enablement-conditions-k
 
 ## The four flags, and the order they go on in
 
-The channel is off everywhere today. Turning it on is four values and they are **not
+The channel is on in dev since 2026-09-10 and off in tst and prd. Turning it on is four values and they are **not
 interchangeable**; the first is a prerequisite for the third, and the third is the only one that
 takes effect **without a restart** — every value here is configmap- or secret-sourced, so a pod
 restart is needed anyway to change what the process sees, and what flag 3 buys is that it is re-read
@@ -37,7 +37,7 @@ both files, because a mismatch between the chart and Terraform fails the same si
 
 ### 2. `NOTIFICATION_KEY_PEPPER` and `WEBHOOK_SIGNING_ROOT` — Secret Manager, per environment
 
-**Neither exists in any of the three projects today.** Both are read per call, both refuse a value
+**Both exist in dev since 2026-09-10 and in neither tst nor prd.** Both are read per call, both refuse a value
 under 32 bytes, and both fail **closed**:
 
 - no pepper → `notification_auth.available()` is false → every `/notification-api/v1` route answers
@@ -45,8 +45,8 @@ under 32 bytes, and both fail **closed**:
 - no signing root → `webhook_delivery` logs `webhook_delivery` / `result="unsigned"` and leaves the
   event **pending**. Nothing is burned; the events expire on their own horizon.
 
-Their Helm names ship **commented**, in their own `# notifications:` ExternalSecret group in all three
-environment files. Two rules, both written into those files:
+Their Helm names ship **commented** in tst's and prd's environment files, in their own
+`# notifications:` ExternalSecret group, and uncommented in dev's since 2026-09-10. Two rules, both written into those files:
 
 - **Never append them to the `varsel` group.** An ExternalSecret is all-or-nothing under
   `secretVersionSelectionPolicy=LatestOrFail`, and the chart's `envFrom.secretRef` carries no
@@ -72,7 +72,9 @@ hashes cannot be re-derived. The signing root can, generation by generation.
 
 ### 3. `NOTIFICATION_WEBHOOKS_ENABLED` — the channel gate
 
-`helm/kix-avvik/values.yaml`, `"false"`, no environment overrides it. Allow-list parse
+`helm/kix-avvik/values.yaml`, `"false"`; dev overrides it to `"true"` since 2026-09-10 (with no client
+onboarded — the population is empty until the operator tool creates one, and the KTD12 checklist
+below still gates every client). Allow-list parse
 (`true/1/yes/on`), **unset = off**, **read at call time** — so it takes effect without a restart,
 *given* flag 1.
 
