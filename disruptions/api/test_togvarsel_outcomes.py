@@ -249,11 +249,42 @@ def test_the_provisional_pass_asks_only_for_the_scopes_whose_rush_has_ended():
 
 
 def test_the_provisional_pass_runs_once_per_rush_per_day():
-    fake = _FakeBQ(provisional=[_row("am", 0.12)])
+    """The second tick is PAST the failure cooldown, deliberately. At 09:30 it sat inside the 15 min
+    `_FAIL_COOLDOWN`, so this test could not tell "done" from "backing off after a raise" — and from
+    2026-09-02 to 2026-09-10 it was the latter: `_run_provisional` returned None, `refresh` iterated
+    it, and every pass wrote its rows, raised, and re-ran a quarter of an hour later. Both morning
+    scopes are answered here because an unanswered one is legitimately still due."""
+    fake = _FakeBQ(provisional=[_row("am", 0.12), _row("amrest", 0.11)])
     _reset(fake)
     togvarsel_outcomes.refresh(now=_oslo(9, 25))
-    togvarsel_outcomes.refresh(now=_oslo(9, 30))
+    togvarsel_outcomes.refresh(now=_oslo(9, 25) + togvarsel_outcomes._FAIL_COOLDOWN + timedelta(minutes=1))
     assert len([q for q in fake.queries if "rail_calls_planned_today" in q]) == 1
+
+
+def test_a_successful_provisional_pass_marks_its_scopes_done_and_backs_off_nothing():
+    """The discriminator the suite lacked: a pass that writes and then raises leaves the done-set
+    empty and a backoff entry behind, and `refresh` swallows the raise — so a test that reads only
+    the merges passes either way. The backoff key is what makes the swallowed exception visible."""
+    fake = _FakeBQ(provisional=[_row("am", 0.12), _row("amrest", 0.11)])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=_oslo(9, 25))
+    assert togvarsel_outcomes._state["provisional_done"] == {"am", "amrest"}
+    assert "provisional:am+amrest" not in togvarsel_outcomes._state["backoff"]
+
+
+def test_the_afternoon_pass_asks_only_for_pm_once_the_morning_is_done():
+    """With the morning never marked done, the 18:20 window asked for all three scopes under a fresh
+    key with a fresh budget, and its MERGEs re-wrote the morning's provisional rows with an evening
+    reading — `provisional_at` read ~20:10 on every prd weekday, and the morning skew measurement
+    the pass exists for was overwritten before anybody could read it."""
+    fake = _FakeBQ(provisional=[_row("am", 0.12), _row("amrest", 0.11)])
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=_oslo(9, 25))
+    fake.provisional = [_row("pm", 0.05)]
+    togvarsel_outcomes.refresh(now=_oslo(18, 25))
+    afternoon = [m for m in fake.merges if m["now"] == _oslo(18, 25)]
+    assert {m["scope"] for m in afternoon} == {"pm"}
+    assert togvarsel_outcomes._state["provisional_done"] == {"am", "amrest", "pm"}
 
 
 # ---- The authoritative pass ------------------------------------------------------------------
@@ -547,6 +578,7 @@ def test_an_unanswered_provisional_scope_stays_due():
     fake.provisional = [_row("am", 0.12), _row("amrest", 0.11)]
     togvarsel_outcomes.refresh(now=_oslo(9, 45))
     assert {m["scope"] for m in fake.merges} == {"am", "amrest"}
+    assert togvarsel_outcomes._state["provisional_done"] == {"am", "amrest"}
 
 
 def test_the_backoff_constants_stay_in_step_with_togvarsels():
