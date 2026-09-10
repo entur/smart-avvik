@@ -900,6 +900,18 @@ def _impact_snapshot() -> tuple[dict[str, list[impact_engine.CallPred]], datetim
         return _call_pred_by_situation, _call_pred_refreshed_at
 
 
+def _varsel_refreshed_at() -> datetime | None:
+    """When the per-call prediction cache was last loaded, or None before the poller's first load.
+
+    The freshness provider for the journey-keyed public read on `/notification-api/v1`
+    (2026-09-10): a cache nobody has loaded yet has no situations in it, and a read that answered
+    "no disruptions" off it would be reporting an empty process as a calm day. The read answers 503
+    while this is None. The second half of `_impact_snapshot`, under the same lock, so the answer
+    can never describe a different load than the situations /impact matched from.
+    """
+    return _impact_snapshot()[1]
+
+
 def _impact_journey_calls(operator: str | None, jkey: str) -> list[impact_engine.CallPred] | None:
     """The scored calls of ONE journey, or None when no live situation touches it.
 
