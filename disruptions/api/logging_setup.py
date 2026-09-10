@@ -20,6 +20,7 @@ Logging), e.g.::
 import json
 import logging
 import sys
+import threading
 from datetime import UTC, datetime
 
 # Keys a `fields` dict may not override (the entry's own schema).
@@ -76,6 +77,27 @@ class _AccessLogRedaction(logging.Filter):
         return True
 
 
+def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
+    """``threading.excepthook`` replacement: one structured ERROR per dying thread.
+
+    The interpreter's default prints the traceback raw to stderr, which GKE ingests split into
+    one entry per line — for the poller thread that is the only record of why every push and
+    cache refresh stopped, and it is unfindable. SystemExit is ignored exactly as threading's own
+    default ignores it (a thread asking to stop is not a death). Never re-raises: the thread is
+    already gone, and an exception from a hook would land on the stderr path this module exists
+    to avoid.
+    """
+    if args.exc_type is SystemExit:
+        return
+    thread_name = args.thread.name if args.thread is not None else "<unknown>"
+    logging.getLogger(__name__).error(
+        "Thread %r died from an uncaught exception",
+        thread_name,
+        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        extra={"fields": {"event": "thread_died", "thread": thread_name}},
+    )
+
+
 def setup() -> None:
     """Route ALL logging — including uvicorn's — through one JSON handler on stdout."""
     handler = logging.StreamHandler(sys.stdout)
@@ -94,6 +116,9 @@ def setup() -> None:
     access = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, _AccessLogRedaction) for f in access.filters):
         access.addFilter(_AccessLogRedaction())
+    # A dying thread leaves one structured ERROR (event="thread_died") instead of a raw stderr
+    # traceback. Assigning the module-level function is idempotent across setup() re-runs.
+    threading.excepthook = _log_thread_exception
 
 
 setup()

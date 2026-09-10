@@ -38,7 +38,7 @@ import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel W
 import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 import webhook_delivery  # sibling module: one bounded webhook attempt per pending notification event
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from google.cloud import bigquery
@@ -212,6 +212,14 @@ _disruptions_lock = threading.Lock()
 _disruptions_cache: list[_CachedDisruption] = []
 _disruptions_refreshed_at: datetime | None = None
 
+# Ceiling on every BigQuery wait the POLLER makes (get_last_ingestion_time + the query jobs the
+# rebuild issues from this module), via `result(timeout=...)`. It exists for /health's staleness
+# check: kept below HEALTH_STALE_AFTER_S (600 s) so a SLOW upstream surfaces as the existing
+# per-tick logged error — the heartbeat keeps beating, the next tick retries — instead of wedging
+# the loop past the threshold and restart-looping the pod against an outage a restart cannot fix.
+# Request-path queries (disruptions_as_of, /demo-api) deliberately keep unbounded waits.
+_POLLER_QUERY_TIMEOUT_S = 240
+
 
 def _row_to_cached(r) -> _CachedDisruption:
     """Map one BigQuery row (active_disruptions.sql / disruptions_as_of.sql share the same
@@ -241,7 +249,7 @@ def _row_to_cached(r) -> _CachedDisruption:
 
 def refresh_disruptions_cache() -> None:
     """Reload the active-disruptions cache from predictions_today (reopen_ts IS NULL)."""
-    rows = bq_client.query(_ACTIVE_DISRUPTIONS_QUERY).result()
+    rows = bq_client.query(_ACTIVE_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     disruptions = [_row_to_cached(r) for r in rows]
     with _disruptions_lock:
         global _disruptions_cache, _disruptions_refreshed_at
@@ -314,7 +322,7 @@ _MIN_SITUATIONS = 30
 
 def refresh_impact_lookup() -> None:
     """Reload the (category, line, hour) -> impact-profile lookup from BigQuery."""
-    rows = bq_client.query(_ALERT_PROFILES_QUERY).result()
+    rows = bq_client.query(_ALERT_PROFILES_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     table = {(r["category"], r["line"], r["hour"]): dict(r.items()) for r in rows}
     with _impact_lock:
         global _impact_lookup
@@ -427,7 +435,7 @@ def maybe_refresh_rail_calls() -> None:
         )
     if fresh:
         return
-    bq_client.query(_RAIL_CALLS_QUERY).result()
+    bq_client.query(_RAIL_CALLS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     with _rail_calls_lock:
         _rail_calls_refreshed_at = now
     logger.info("Rebuilt actuals call source (rail_calls_today)")
@@ -456,7 +464,7 @@ def maybe_refresh_planned_calls() -> None:
         )
     if fresh:
         return
-    bq_client.query(_RAIL_CALLS_PLANNED_QUERY).result()
+    bq_client.query(_RAIL_CALLS_PLANNED_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     with _planned_lock:
         _planned_refreshed_at = now
     logger.info("Rebuilt planned call source (rail_calls_planned_today)")
@@ -484,7 +492,7 @@ def maybe_refresh_bus_planned_calls() -> None:
         )
     if fresh:
         return
-    bq_client.query(_BUS_CALLS_PLANNED_QUERY).result()
+    bq_client.query(_BUS_CALLS_PLANNED_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     with _bus_planned_lock:
         _bus_planned_refreshed_at = now
     logger.info("Rebuilt bus planned call source (bus_calls_planned_today)")
@@ -558,12 +566,15 @@ def refresh_call_predictions_cache() -> None:
 
     # NSB/prod family: operator is the rail codespace of the lineRef (VYG:Line:... -> 'VYG').
     _ingest(
-        bq_client.query(_CALL_PREDICTIONS_QUERY).result(),
+        bq_client.query(_CALL_PREDICTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S),
         lambda r: (r.lineRef or "VYG").split(":")[0],
     )
     # Bus/GOA/pooled family: the table carries an explicit operator column.
     try:
-        _ingest(bq_client.query(_CALL_PREDICTIONS_BUS_QUERY).result(), lambda r: r.operator)
+        _ingest(
+            bq_client.query(_CALL_PREDICTIONS_BUS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S),
+            lambda r: r.operator,
+        )
     except Exception:
         logger.exception(
             "Bus per-call predictions load failed; serving NSB-only this refresh "
@@ -605,7 +616,9 @@ def _varsel_stop_places() -> dict[str, tuple[str, str | None]]:
     """
     places: dict[str, tuple[str, str | None]] = {}
     try:
-        for r in bq_client.query(_VARSEL_STOP_PLACES_QUERY).result():
+        for r in bq_client.query(_VARSEL_STOP_PLACES_QUERY).result(
+            timeout=_POLLER_QUERY_TIMEOUT_S
+        ):
             county_no = getattr(r, "county_no", None)
             region = (
                 getattr(r, "municipality", None)
@@ -641,7 +654,7 @@ def refresh_varsel_stops() -> None:
     merged: dict[str, dict] = {}
     for q in (_VARSEL_STOPS_QUERY, _VARSEL_STOPS_BUS_QUERY):
         try:
-            for r in bq_client.query(q).result():
+            for r in bq_client.query(q).result(timeout=_POLLER_QUERY_TIMEOUT_S):
                 e = merged.setdefault(
                     r.stop_place,
                     {"stop_place": r.stop_place, "stop_name": None, "n_calls": 0,
@@ -1083,7 +1096,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     with _phase("rail_calls", timings):
         maybe_refresh_rail_calls()
     with _phase("disruptions_sql", timings):
-        bq_client.query(_DISRUPTIONS_QUERY).result()
+        bq_client.query(_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     # AI.CLASSIFY (Gemini) categorisation of any *new* free text. Isolated so a failure here
     # never kills the rebuild: predict.sql LEFT JOINs disruptions.categories and falls back to
     # 'UNKNOWN' (with the global '__ALL__' quantile offsets) for unclassified text, so the feed
@@ -1093,14 +1106,14 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # empty feed.
     try:
         with _phase("categories", timings):
-            bq_client.query(_UPDATE_CATEGORIES_QUERY).result()
+            bq_client.query(_UPDATE_CATEGORIES_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     except Exception:
         logger.exception(
             "Category classification (AI.CLASSIFY) failed; serving with existing categories "
             "(new text -> UNKNOWN). Check the SA has roles/aiplatform.user."
         )
     with _phase("predict_sql", timings):
-        bq_client.query(_PREDICT_QUERY).result()
+        bq_client.query(_PREDICT_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     with _phase("disruptions_cache", timings):
         refresh_disruptions_cache()
     # The impact lookup is a static, offline-built table — reloading it here just keeps it
@@ -1125,17 +1138,17 @@ def _rebuild_all(timings: dict[str, int]) -> None:
         with _phase("rail_planned_calls", timings):
             maybe_refresh_planned_calls()
         with _phase("predict_calls_rail", timings):
-            bq_client.query(_PREDICT_CALLS_QUERY).result()
+            bq_client.query(_PREDICT_CALLS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
         # Bus/GOA (pooled_all) per-call predictions. Nested + isolated so any bus failure degrades
         # bus only — NSB /journey keeps serving from call_predictions_today. Builds today's bus SX
         # snapshot, refreshes the bus planned source on its own TTL, then scores.
         try:
             with _phase("disruptions_bus_sql", timings):
-                bq_client.query(_DISRUPTIONS_BUS_QUERY).result()
+                bq_client.query(_DISRUPTIONS_BUS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
             with _phase("bus_planned_calls", timings):
                 maybe_refresh_bus_planned_calls()
             with _phase("predict_calls_bus", timings):
-                bq_client.query(_PREDICT_CALLS_BUS_QUERY).result()
+                bq_client.query(_PREDICT_CALLS_BUS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
         except Exception:
             logger.exception(
                 "Bus per-call predictions failed; /journey + /varsel serve NSB-only this tick"
@@ -1454,6 +1467,11 @@ async def lifespan(app: FastAPI):
         daemon=True,
     )
     thread.start()
+    # The handle /health reads to tell a dead poller from one never started. Stored after
+    # start() (a stored-but-unstarted handle would read as dead), and no request can race the
+    # store anyway: the app serves nothing until this lifespan yields.
+    global _poller_thread
+    _poller_thread = thread
     try:
         yield
     finally:
@@ -1809,8 +1827,57 @@ else:
 
 def get_last_ingestion_time() -> datetime | None:
     """Return the most recent ingestionTime for today's SIRI-SX partitions."""
-    row = next(iter(bq_client.query(_LAST_INGESTION_TIME_QUERY).result()))
+    row = next(
+        iter(bq_client.query(_LAST_INGESTION_TIME_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S))
+    )
     return row.last_ingestion_time
+
+
+# Poller liveness, read by GET /health (KTD1). The heartbeat is MONOTONIC on purpose: the age
+# check must not jump on wall-clock corrections, and the epoch gauge a later unit exports is a
+# different clock that must never leak in here. No lock, unlike the caches above: one writer (the
+# poller thread), scalar assignment is atomic under the GIL, and a read racing one tick behind is
+# indistinguishable from probing a moment earlier. The thread handle is what tells "poller died"
+# from "poller never started" — hermetic tests and local runs without the lifespan leave it None,
+# and /health must stay 200 for them.
+_poller_heartbeat_monotonic: float | None = None
+_poller_thread: threading.Thread | None = None
+_health_degraded_logged = False  # one health_degraded record per 200→503 transition
+
+
+def _health_stale_after_s() -> float:
+    """Staleness threshold for /health, from HEALTH_STALE_AFTER_S (seconds; default 600).
+
+    Read at call time so tests (and a redeploy-free env tweak) take effect per request. `0`
+    disables the staleness branch; thread-death detection stays active regardless. An unparsable
+    value falls back to the default rather than taking the probe down with a ValueError.
+    """
+    raw = os.environ.get("HEALTH_STALE_AFTER_S", "").strip()
+    try:
+        return float(raw) if raw else 600.0
+    except ValueError:
+        return 600.0
+
+
+def _poller_health() -> tuple[bool, str | None]:
+    """The ordered liveness decision behind GET /health: (healthy, reason when not).
+
+    Order matters and is KTD1's: no thread handle → healthy (the poller was never started — see
+    the globals above); a handle that is not alive → dead, regardless of the staleness setting; a
+    heartbeat older than the threshold → wedged (the thread is alive but stopped iterating, e.g.
+    blocked in an unbounded upstream wait — is_alive() cannot see that state); else healthy. A
+    None heartbeat beside a live thread is the sub-second window before the first iteration.
+    """
+    if _poller_thread is None:
+        return True, None
+    if not _poller_thread.is_alive():
+        return False, "poller thread has died"
+    stale_after = _health_stale_after_s()
+    if stale_after > 0 and _poller_heartbeat_monotonic is not None:
+        age = time.monotonic() - _poller_heartbeat_monotonic
+        if age > stale_after:
+            return False, f"poller heartbeat is {age:.0f} s old (limit {stale_after:.0f} s)"
+    return True, None
 
 
 def poll_for_changes(
@@ -1827,9 +1894,14 @@ def poll_for_changes(
     logged and retried on the next tick rather than killing this daemon thread for good.
     That lets the service self-recover once access lands, without a restart.
     """
+    global _poller_heartbeat_monotonic
     last_seen = None
     seen_any = False
     while True:
+        # Liveness heartbeat for /health (R1): unconditional, at the TOP of the iteration —
+        # before anything that can fail — so a broken upstream reads as the logged per-tick
+        # error below while the pod stays up, and only a loop that stopped ITERATING goes stale.
+        _poller_heartbeat_monotonic = time.monotonic()
         try:
             current = get_last_ingestion_time()
             if not seen_any or current != last_seen:
@@ -2964,13 +3036,36 @@ async def demo_journeys(
 @app.get(
     "/health",
     summary="Liveness check",
-    response_description='Always `{"status": "ok"}` when the service is up.',
+    response_description=(
+        '`{"status": "ok"}` while the poller is healthy (or never started); 503 with '
+        '`{"status": "unhealthy", "reason": ...}` when it has died or its heartbeat is stale.'
+    ),
     tags=["diagnostics"],
 )
-async def health() -> dict[str, str]:
-    """Lightweight liveness probe — returns 200 with `{"status": "ok"}` and does not touch
-    BigQuery."""
-    return {"status": "ok"}
+async def health(response: Response) -> dict[str, str]:
+    """Liveness probe with the poller's pulse behind it — still touches no BigQuery.
+
+    Both kube probes point here, so the 503 trips liveness and the pod restarts: that is the
+    intended self-healing for a dead or wedged poller (KTD1), whose old failure mode was a
+    healthy-looking pod serving stale caches and pushing nothing. The decision is
+    :func:`_poller_health`; a process without the lifespan (tests, local dev) stays 200. The one
+    `event="health_degraded"` record per 200→503 transition — not per probe, recovery re-arms —
+    is the surviving forensic line, since the access log will not carry /health.
+    """
+    global _health_degraded_logged
+    healthy, reason = _poller_health()
+    if healthy:
+        _health_degraded_logged = False
+        return {"status": "ok"}
+    if not _health_degraded_logged:
+        _health_degraded_logged = True
+        logger.error(
+            "Health degraded: %s",
+            reason,
+            extra={"fields": {"event": "health_degraded", "reason": reason}},
+        )
+    response.status_code = 503
+    return {"status": "unhealthy", "reason": reason}
 
 
 @app.get(
