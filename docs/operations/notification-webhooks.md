@@ -216,9 +216,7 @@ The first non-IAM resource this directory creates.
 | `google_firestore_index.notification` | `for_each` over `firestore.indexes.json`, **keyed on the index's own content**, never its array position — reordering the file would otherwise destroy and recreate every index |
 | `google_firestore_field.notification_ttl` | `expires_at` on all four notification collections. **No `index_config {}` block** — an empty one disables all indexes on the field, which is not what it looks like |
 | `google_firestore_backup_schedule.webhook_daily` | prd only, `daily_recurrence` with `retention = "3024000s"` — five weeks, a chosen value rather than a ceiling. Firestore allows up to 14 weeks for both daily and weekly recurrences (checked against Google's documentation, 2026-09-09). Five is what PITR does not already cover: PITR gives the last seven days at minute granularity, so the backup buys the month beyond it |
-| `google_project_service.firebaserules` | `firebaserules.googleapis.com`, `disable_on_destroy = false` — the Rules API the two resources below need |
-| `google_firebaserules_ruleset.notification_deny_all` | reads the repo-root `firestore.rules` — the same file the emulator enforces — with `create_before_destroy`, because a ruleset a release still points at cannot be deleted |
-| `google_firebaserules_release.notification_firestore` | `cloud.firestore/notifications`: makes the deny-all ruleset the named database's live rules. Added 2026-09-09 — until then the file was committed and emulated but deployed by nothing, and a console edit towards the open template would have been invisible from this repository; now it is drift the next apply reverts |
+| *(no Rules resources)* | `firestore.rules` is **deliberately not released by Terraform** since 2026-09-10. It was, for one day (`google_firebaserules_ruleset` + `_release`, `cloud.firestore/notifications`, added 2026-09-09), and the apply worked — but refreshing the ruleset on every later plan needs `firebaserules.rulesets.get`, which the pull-request plan identity (`gh-kix-avvik-f849-ci@`, `roles/viewer` + the org's `githubCiTerraformPlanReader`) lacks while the push-apply identity (`…-dev@`, `roles/firebase.admin`) holds it, so every Terraform PR after that apply failed its plan. Rules govern client-SDK access only, no Firebase app exists here, and a database with no release denies every client anyway. Two `removed { destroy = false }` blocks forget the pair (dev's live release stays deny-all, unmanaged); re-add them, with the Team Plattform ask for the plan-reader permission, the day a Firebase app is registered |
 
 **Do not add an IAM grant to this file.** `roles/datastore.user` lives in `.entur/application.yaml`
 because the two paths meet two different guards: a `google_project_iam_member` here runs under a
@@ -226,16 +224,16 @@ because the two paths meet two different guards: a `google_project_iam_member` h
 `roles/datastore.*`. It governs IAM grants only, which is exactly why it does not reach a database, an
 API enablement or an index.
 
-**The repository disagrees with itself about the diagnosis of the same 403, and that is worth knowing
-before anyone re-tries the parked file.** `terraform/firestore.tf` and `.entur/application.yaml` read
-it as this `only_assignable_roles` condition; `terraform/oauth_iam.tf`'s own `STATUS: PARKED` header
-reads it as an org-level deny policy or principal access boundary and does not mention the condition
-at all. A conditioned grant and a deny policy refuse with the same wording, which is why both readings
-survive. Settling it is one line outside this plan; until then, do not quote either as established.
+**That diagnosis is settled** (2026-09-01, by reading `entur/tf-gcp-apps`' `github_iam.tf`, which
+attaches the condition; `terraform/firestore.tf` and `.entur/application.yaml` both carry it). The
+parked `terraform/oauth_iam.tf` that read the same 403 as an org-level deny policy was retired on
+2026-09-10 together with the Google-OAuth SSO route it served — the gate now uses Auth0's partner
+tenant, which needs no project IAM at all (`disruptions/api/sso.py`).
 
 **Plan-time index drift rests on one config line, and it is present:**
-`.github/workflows/terraform.yml` lists `firestore.indexes.json` **and `firestore.rules`** beside
-`terraform/**` in **both** of its `paths:` lists. Without it, a PR adding a query and its index entry would touch neither
+`.github/workflows/terraform.yml` lists `firestore.indexes.json` beside `terraform/**` in **both**
+of its `paths:` lists (and, since 2026-09-10, deliberately not `firestore.rules` — nothing in
+`terraform/` consumes it any more). Without it, a PR adding a query and its index entry would touch neither
 `terraform/` nor the workflow, pass the static coverage test, merge, apply nothing, and land a runtime
 `FailedPrecondition` in production. A missing composite index is never a deploy-time error and the
 emulator tracks no indexes at all, so this is the earliest anything can catch it.
@@ -244,18 +242,16 @@ Expect the **first apply in each project to need a re-run** if `firestore.google
 finished propagating by the time the database resource is created; the platform's own project module
 sleeps 60 s after enabling APIs for that reason.
 
-**The Rules release is created in projects Firebase has never touched, and that was checked rather
-than assumed** (2026-09-09): none of the three projects has any `firebase*`/`firestore*` API enabled,
-and the Firebase Management API answers `SERVICE_DISABLED` for all three. It is expected to work all
-the same — Google's Firestore documentation deploys rules to a **named** database from the Google
-Cloud console (Databases → the database → Security → Firestore Rules → Publish) and needs the Firebase
-console for `(default)` only, and that console path uses the same Rules API Terraform does — and the
-CD account holds `roles/firebase.admin`, which carries all eleven `firebaserules.*` permissions. What
-only the first apply confirms is that the API accepts `cloud.firestore/<database>` as a release name
-from Terraform's client. If it refuses, `google_firebaserules_ruleset.notification_deny_all` and
-`google_firebaserules_release.notification_firestore` are removable on their own — neither the database
-nor anything reading it depends on them — and `firestore.rules` goes back to being what it was, a
-committed statement the emulator enforces.
+**The Rules release WAS accepted in a project Firebase has never touched** — the 2026-09-09 apply
+created `cloud.firestore/notifications` from Terraform's client exactly as predicted, so that question
+is answered. What nobody had checked was the *plan* side: the pull-request plan runs as a different,
+read-only identity than the push apply, and that identity cannot `get` a ruleset. The pair was
+therefore forgotten again on 2026-09-10 (see the table above); the confirmed release name and the
+apply identity's `roles/firebase.admin` are what make re-adding it a small change when a Firebase app
+ever exists here. Worth knowing for the next resource a plan cannot read: a `removed { destroy = false }`
+block is **not refreshed** during plan (verified on that PR's own plan — no `Refreshing state…` line,
+just "will no longer be managed by Terraform, but will not be destroyed"), so the pair left state on a
+green plan; deleting the resource blocks outright would have planned a destroy, which refreshes first.
 
 ### Collections
 
@@ -772,7 +768,10 @@ beside each; the ones still open say who owns them.
 6. **`/notification-api/v1` is discoverable in the public `/docs`.** **Decided 2026-09-09: by
    design — this is a public API.**
 7. **`firestore.rules` asserted a protection nothing deployed.** **Decided 2026-09-09: wired** — see
-   [Terraform](#terraform-terraformfirestoretf).
+   [Terraform](#terraform-terraformfirestoretf). **Un-wired 2026-09-10**: the release cost every
+   Terraform PR its plan (the plan identity cannot read a ruleset) and guarded a Firebase app that
+   does not exist; the file is back to being the emulator's and the tests' statement, and the
+   release returns the day an app is registered.
 
 ---
 

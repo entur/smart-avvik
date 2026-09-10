@@ -103,15 +103,10 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   Application per tenant environment, callback `https://<host>/auth/callback`, logout
   `https://<host>/`, only `entur-waad` enabled) — a new protected PATH costs nothing, a new HOST
   is another request. Fail-closed: required but missing any of the four serves the gated paths as
-  503; rollback is the environment's flag back to `"false"`. **Two follow-ups are owed** (2026-09-10):
-  `terraform/oauth_iam.tf` + `var.oauth_config_editors` are dead and should go; and they could not
-  go in the SSO PR because **every PR `terraform plan` now 403s** — #139's apply created
-  `google_firebaserules_ruleset.notification_deny_all`, and refreshing it needs
-  `firebaserules.rulesets.get`, which the PR-plan identity (`gh-kix-avvik-f849-ci@ent-github-shr`,
-  `roles/viewer` + the org's `githubCiTerraformPlanReader`) lacks while the apply identity
-  (`…-dev@`, `roles/firebase.admin`) has it. Earlier plans passed only because a resource not yet
-  in state needs no `get`. The permission is Team Plattform's to add; the alternative is to drop the
-  two ruleset resources and deploy `firestore.rules` another way. Sessions are a 12 h signed cookie
+  503; rollback is the environment's flag back to `"false"`. The Google route's parked Terraform
+  (`oauth_iam.tf`, `var.oauth_config_editors`) was retired the same day, in the PR that also
+  un-released the Firestore rules (#143; see the Firestore paragraph in the webhook section for
+  the plan-identity gap behind it). Sessions are a 12 h signed cookie
   with no server-side store; `/auth/logout` also ends the Auth0 session (`/v2/logout`, never
   `federated`, which would sign the person out of Microsoft 365). Local runs use
   `http://localhost:8000/auth/callback`, registered on the dev application only.
@@ -807,25 +802,33 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   (immutable), seven composite indexes materialised with `for_each` keyed on each index's **content**
   rather than its array position, the four TTL field configs, and a prd-only backup schedule (five
   weeks, a chosen value: Firestore allows 14 weeks on both recurrences — checked 2026-09-09 — and
-  five is what PITR's seven days does not already cover) — and, since 2026-09-09, the deny-all
-  `firestore.rules` **released** as the named database's live rules (`google_firebaserules_ruleset` +
-  `_release`, named `cloud.firestore/<database>` per firebase-tools' own release code, not the bare
-  `cloud.firestore` the provider's documentation quotes). Until then the file was committed and
-  emulated but deployed by nothing, safe only because no Firebase app exists in these projects. None
-  of the three projects is a Firebase project (checked 2026-09-09) and the release is expected to work
-  regardless — Google's own docs deploy rules to a *named* database from the Google Cloud console and
-  reserve the Firebase console for `(default)` — so what the first apply confirms is only that the API
-  takes `cloud.firestore/<database>` from Terraform's client; the two resources are removable alone if
-  it refuses. The
+  five is what PITR's seven days does not already cover). **The deny-all `firestore.rules` is
+  deliberately NOT released by Terraform** (2026-09-10). It was, for one day — `google_firebaserules_ruleset`
+  + `_release`, named `cloud.firestore/<database>` per firebase-tools' own release code, and the
+  2026-09-09 apply accepted that name from a project Firebase has never touched, so that question is
+  answered — but refreshing the ruleset on every later plan needs `firebaserules.rulesets.get`, and
+  **the pull-request plan runs as a different identity than the push apply**:
+  `gh-kix-avvik-f849-ci@ent-github-shr` (`roles/viewer` + the org's `githubCiTerraformPlanReader`)
+  lacks it, `…-dev@` (`roles/firebase.admin`) has it. So #139's plans and apply passed (a resource not
+  yet in state needs no get) and every Terraform PR after it failed its plan — #142 had to drop its
+  Terraform change to merge. Rules govern client-SDK access only, no Firebase app exists in these
+  projects, and a database with no release denies every client anyway, so the guard guarded nothing.
+  Two `removed { destroy = false }` blocks forget the pair (dev's live release stays deny-all,
+  unmanaged; tst/prd never held it) — and a `removed` block is what made that plannable: Terraform
+  does not refresh a resource it is forgetting (verified on #143's plan), whereas deleting the
+  blocks outright plans a destroy, which refreshes first. Keep that in mind for the next resource a
+  plan cannot read. Re-add them, with the Team Plattform ask for the plan-reader permission, the
+  day a Firebase app is registered here. `test_notification_store` pins the absence. The
   runtime `roles/datastore.user` grant is the one part that **cannot** go there — a
   `google_project_iam_member` runs under a `projectIamAdmin` conditioned by `only_assignable_roles`,
-  which carries no `roles/datastore.*` (note `terraform/oauth_iam.tf`'s own PARKED header diagnoses
-  the identical 403 as an org-level deny policy instead, and the two readings are not reconciled —
-  a conditioned grant and a deny policy refuse with the same wording; the grant itself is dead since
-  the SSO gate moved to Auth0 on 2026-09-10 and its retirement is a pending follow-up, see below); it goes in `.entur/application.yaml`, whose filter drops a
+  which carries no `roles/datastore.*` (the same condition refused the Google-OAuth
+  `roles/oauthconfig.editor` grant `terraform/oauth_iam.tf` carried — parked 2026-08-31, retired
+  2026-09-10 with the move to Auth0; its header had read the 403 as an org-level deny policy, which
+  refuses with the same wording); it goes in `.entur/application.yaml`, whose filter drops a
   non-matching role **silently**, so the binding is verified after `entur apply` rather than assumed.
-  Plan-time index drift rests on one config line that is present: `firestore.indexes.json` and
-  `firestore.rules` are in **both** of `terraform.yml`'s `paths:` lists, without which a PR adding a query and its index would
+  Plan-time index drift rests on one config line that is present: `firestore.indexes.json` is in
+  **both** of `terraform.yml`'s `paths:` lists (and `firestore.rules` deliberately is not, since
+  nothing in `terraform/` consumes it), without which a PR adding a query and its index would
   pass the static test, merge, apply nothing and land a runtime `FailedPrecondition`.
   **The two TypeScript packages ship from here and are vendored, not published** (KTD11). Declared
   consumption shape: compiled CommonJS plus `.d.ts` on Node 24, and `package.json` deliberately
