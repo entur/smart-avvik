@@ -178,9 +178,8 @@ gating onboarding on the flag that needs onboarding is circular. Two consequence
   never 401. The public read is the exception: it never touches the store or the pepper, so it is
   never `channel_not_configured` — it serves in every environment, tst included, with the one 503
   of its own below.
-  **Every environment answers this today**: the database name ships in the base chart and is
-  inherited everywhere, so the pepper is the only discriminator and it exists in none of the three
-  projects. Any other store fault answers **503 `store_unavailable`**.
+  **tst answers this today; dev and prd have had the pepper since 2026-09-10**: the database name ships in the base chart and is
+  inherited everywhere, so the pepper is the only discriminator and it exists in dev and prd. Any other store fault answers **503 `store_unavailable`**.
 - **The public read has a 503 of its own, and you will meet it after every deploy**: **503
   `{"detail": "predictions_not_loaded"}`** with `Retry-After: 60` for about a minute after the
   process starts, until the poller's first load. It is deliberately never an empty list — an empty

@@ -3128,8 +3128,11 @@ def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
     off for real travellers over a feature that is switched off.
 
     The names are checked whether they are live or commented, because they land commented until
-    their values exist in Secret Manager (which this unit cannot create).
+    their values exist in Secret Manager (which this unit cannot create). `live_secret_envs` is the
+    admission rule: an environment goes in only after `gcloud secrets versions list` has shown a
+    version of BOTH secrets in that project -- dev and prd on 2026-09-10 (version 1 of each).
     """
+    live_secret_envs = {"dev", "prd"}
     for env in ("dev", "tst", "prd"):
         values = (REPO / "helm" / "kix-avvik" / "env" / f"values-kub-ent-{env}.yaml").read_text()
         live = _uncommented(values)
@@ -3137,10 +3140,13 @@ def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
             assert name in values, f"{env} does not name {name} at all"
             # The prose above the block names both secrets in order to explain them, so the
             # "not in the varsel group" half has to read the LIVE yaml.
-            assert name not in live, (
-                f"{env} names {name} in a live secrets group -- the value does not exist in Secret "
-                "Manager yet, and an unresolvable name fails the whole ExternalSecret"
-            )
+            if env in live_secret_envs:
+                assert name in live, f"{env} has the secret in Secret Manager but does not mount it"
+            else:
+                assert name not in live, (
+                    f"{env} names {name} in a live secrets group -- the value does not exist in "
+                    "Secret Manager yet, and an unresolvable name fails the whole ExternalSecret"
+                )
             assert "-" not in name  # the common chart fails the template on a dashed secret name
         # Its own group under `secrets:`, as one contiguous block, live or commented: appended to
         # varsel's list instead it would take the VAPID keys down with it.
