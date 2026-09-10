@@ -6,19 +6,30 @@ the running app: provisioning a client, issuing or revoking a credential, moving
 callback destination and suspending a client are operator actions, and putting any of them behind
 a client credential would let a client grant itself what an operator is supposed to decide.
 
-**Authorization.** Every subcommand -- reads included -- is authorized against a NAMED
-least-privilege Google group, and production has its own:
+**Authorization.** Every subcommand -- reads included -- is authorized against a NAMED Google
+group, and for the pilot that group is the team's own in every environment:
 
 ============  =====================================================================
-``dev``       ``kix-avvik-notification-operators@entur.org``
-``tst``       ``kix-avvik-notification-operators@entur.org``
-``prd``       ``kix-avvik-notification-operators-prd@entur.org``
+``dev``       ``sg-dig-team-ki-eksperimentering@entur.no``
+``tst``       ``sg-dig-team-ki-eksperimentering@entur.no``
+``prd``       ``sg-dig-team-ki-eksperimentering@entur.no``
 ============  =====================================================================
 
-The group is what holds ``roles/datastore.user`` on that environment's GCP project, which is what
-makes the IAM environment-scoped rather than global: each environment is its own project with its
-own runtime identity (KTD5). Reads are gated too, deliberately: a destination's callback URL and a
-client's key ids are exactly what an attacker would want before trying to forge one.
+R22 asked for a least-privilege group with production as its own, and that is still the intended
+end state. It is not what ships (decided 2026-09-10) because a new group at Entur is not
+self-service: the ``sg-dig-*`` groups are Entra security groups created by Team Plattform through
+``tf-azure-ad`` and granted through ``tf-gcp-iam``, they come back as ``@entur.no``, and the two
+dedicated groups this docstring once named had been requested nowhere. The team group already
+reads both ``notifications`` databases through the roles it holds on the folder above the projects
+(``entur.devOps`` among them -- verified from a member's ADC in dev and prd), and the membership
+check below answers for it. What the shortcut gives up is exactly R22's separation: everyone on
+the team is a prd operator. Acceptable while the registrants in prd are the team; moving to the
+dedicated groups is this constant plus the operations document, nothing else.
+
+Reads are gated too, deliberately: a destination's callback URL and a client's key ids are exactly
+what an attacker would want before trying to forge one. Each environment is still its own project
+with its own runtime identity (KTD5), so what a member can reach is bounded by project IAM, not by
+this table.
 
 **``--environment`` picks the target as well as the gate**, and until 2026-09-09 it picked only the
 gate: ``--project`` chose which project was read and written with no comparison between the two, so
@@ -122,12 +133,13 @@ logger = logging.getLogger("manage_notification_client")
 
 ENVIRONMENTS = ("dev", "tst", "prd")
 
-#: R22's named groups. Production is its own, so membership for the environments where a mistake is
-#: cheap does not carry into the one where it is not.
+#: The team group in every environment for the pilot (2026-09-10) -- see the module docstring for
+#: why R22's dedicated, prd-separate groups are the end state and not what ships. Entur groups are
+#: `@entur.no`, never `@entur.org`.
 OPERATOR_GROUPS = {
-    "dev": "kix-avvik-notification-operators@entur.org",
-    "tst": "kix-avvik-notification-operators@entur.org",
-    "prd": "kix-avvik-notification-operators-prd@entur.org",
+    "dev": "sg-dig-team-ki-eksperimentering@entur.no",
+    "tst": "sg-dig-team-ki-eksperimentering@entur.no",
+    "prd": "sg-dig-team-ki-eksperimentering@entur.no",
 }
 
 #: WHICH PROJECT EACH ENVIRONMENT IS, so the gate and the target cannot be chosen separately.
@@ -188,6 +200,11 @@ def google_group_authorizer(environment: str) -> Authorization:
             scopes=["https://www.googleapis.com/auth/cloud-identity.groups.readonly"]
         )
         actor = _actor_from(credentials)
+        if (unresolved := _unresolved_actor_reason(actor)) is not None:
+            # Asked with a member key that is not an email, Cloud Identity answers 403
+            # "Insufficient permissions to retrieve memberships" -- which reads as an IAM problem
+            # and is not one. Refuse before asking, with the reason that is actually true.
+            return Authorization(actor=actor, group=group, allowed=False, reason=unresolved)
         service = build("cloudidentity", "v1", credentials=credentials, cache_discovery=False)
         # `groupKey_id`, with an UNDERSCORE. The discovery client renames a dotted query parameter
         # (`groupKey.id`) by replacing the dot, because a dot is not valid in a Python keyword
@@ -199,7 +216,12 @@ def google_group_authorizer(environment: str) -> Authorization:
         result = (
             service.groups()
             .memberships()
-            .checkTransitiveMembership(parent=lookup["name"], query=f'member_key_id == "{actor}"')
+            # SINGLE quotes around the member key, and nothing else: with double quotes Cloud
+            # Identity answers 403 "Error(4013): Insufficient permissions to retrieve
+            # memberships" for a member it would confirm one keystroke later (measured
+            # 2026-09-10 on the team group, same credential, both spellings). Read as an IAM gap
+            # that costs a day; it is a query-syntax error the API does not name.
+            .checkTransitiveMembership(parent=lookup["name"], query=f"member_key_id == '{actor}'")
             .execute()
         )
         allowed = bool(result.get("hasMembership"))
@@ -224,6 +246,14 @@ def _actor_from(credentials: Any) -> str:
     Preference order is the same one `gcloud` itself reports: the credential's service-account
     email, then its id-token subject, then the ADC user's email. Falls back to a marker rather than
     to a blank, so an audit row always says *something* about provenance.
+
+    The third step is a network call, and it is the one every human operator takes: a user ADC
+    (`gcloud auth application-default login`) is a ``google.oauth2.credentials.Credentials`` that
+    carries NO email attribute at all, so until 2026-09-10 this function fell straight through to
+    ``$USER`` for every person and the membership query asked Cloud Identity about ``"thomas"``,
+    which it answers with a 403 that reads as a permissions problem. The first real run of the
+    tool refused its own author that way. The OpenID ``userinfo`` endpoint returns the ADC user's
+    email under the scopes that login grants by default, which is what `gcloud auth list` shows.
     """
     for attribute in ("service_account_email", "signer_email", "quota_project_id"):
         value = getattr(credentials, attribute, None)
@@ -233,7 +263,55 @@ def _actor_from(credentials: Any) -> str:
         value = getattr(credentials, attribute, None)
         if isinstance(value, str) and value:
             return value
+    email = _email_from_userinfo(credentials)
+    if email is not None:
+        return email
     return os.environ.get("USER") or "unknown"
+
+
+def _email_from_userinfo(credentials: Any) -> str | None:
+    """The ADC user's email from Google's OpenID ``userinfo`` endpoint, or None on any failure.
+
+    Best-effort by design: a failure here only means the caller falls through to the ``$USER``
+    marker, which :func:`_unresolved_actor_reason` then refuses with a reason naming this step.
+    """
+    if credentials is None or not hasattr(credentials, "token"):
+        return None
+    try:
+        # google-auth's own session attaches and refreshes the ADC token itself; no header is
+        # built here, and nothing in this file ever presents a credential of its own. The quota
+        # project is dropped for this one call: a user ADC carries one (`gcloud auth
+        # application-default set-quota-project`), google-auth sends it as `x-goog-user-project`,
+        # and the OpenID endpoint -- not a GCP API -- answers 403 "Caller does not have required
+        # permission to use project" to a caller who cannot bill that project. Measured
+        # 2026-09-10; the membership call keeps the quota project, Cloud Identity accepts it.
+        from google.auth.transport.requests import AuthorizedSession
+
+        plain = credentials.with_quota_project(None)
+        response = AuthorizedSession(plain).get(_USERINFO_URL, timeout=10)
+        response.raise_for_status()
+        email = response.json().get("email")
+    except Exception:  # noqa: BLE001 - best-effort, see the docstring
+        return None
+    return email if isinstance(email, str) and "@" in email else None
+
+
+_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+
+def _unresolved_actor_reason(actor: str) -> str | None:
+    """Why `actor` cannot be put to Cloud Identity as a member key, or None when it can.
+
+    A member key is an email. Anything else -- the ``$USER`` marker, ``unknown`` -- is refused
+    HERE rather than sent, because Cloud Identity's answer to a non-email key is a 403
+    ``Insufficient permissions to retrieve memberships``, indistinguishable from an IAM gap.
+    """
+    if "@" in actor:
+        return None
+    return (
+        f"actor_unresolved: ADC identifies nobody by email (got {actor!r}); run "
+        "`gcloud auth application-default login` as your entur.org user"
+    )
 
 
 def _authorize(

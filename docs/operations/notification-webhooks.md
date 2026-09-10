@@ -16,7 +16,7 @@ any operator but Vy rail.** See [Enablement conditions](#enablement-conditions-k
 
 ## The four flags, and the order they go on in
 
-The channel is off everywhere today. Turning it on is four values and they are **not
+The channel is on in dev and prd since 2026-09-10 and off in tst. Turning it on is four values and they are **not
 interchangeable**; the first is a prerequisite for the third, and the third is the only one that
 takes effect **without a restart** — every value here is configmap- or secret-sourced, so a pod
 restart is needed anyway to change what the process sees, and what flag 3 buys is that it is re-read
@@ -37,7 +37,7 @@ both files, because a mismatch between the chart and Terraform fails the same si
 
 ### 2. `NOTIFICATION_KEY_PEPPER` and `WEBHOOK_SIGNING_ROOT` — Secret Manager, per environment
 
-**Neither exists in any of the three projects today.** Both are read per call, both refuse a value
+**Both exist in dev and prd since 2026-09-10 and not in tst.** Both are read per call, both refuse a value
 under 32 bytes, and both fail **closed**:
 
 - no pepper → `notification_auth.available()` is false → every `/notification-api/v1` route answers
@@ -45,8 +45,8 @@ under 32 bytes, and both fail **closed**:
 - no signing root → `webhook_delivery` logs `webhook_delivery` / `result="unsigned"` and leaves the
   event **pending**. Nothing is burned; the events expire on their own horizon.
 
-Their Helm names ship **commented**, in their own `# notifications:` ExternalSecret group in all three
-environment files. Two rules, both written into those files:
+Their Helm names ship **commented** in tst's environment file, in its own `# notifications:`
+ExternalSecret group, and uncommented in dev's and prd's since 2026-09-10. Two rules, both written into those files:
 
 - **Never append them to the `varsel` group.** An ExternalSecret is all-or-nothing under
   `secretVersionSelectionPolicy=LatestOrFail`, and the chart's `envFrom.secretRef` carries no
@@ -72,7 +72,9 @@ hashes cannot be re-derived. The signing root can, generation by generation.
 
 ### 3. `NOTIFICATION_WEBHOOKS_ENABLED` — the channel gate
 
-`helm/kix-avvik/values.yaml`, `"false"`, no environment overrides it. Allow-list parse
+`helm/kix-avvik/values.yaml`, `"false"`; dev and prd override it to `"true"` since 2026-09-10 (with no client
+onboarded — the population is empty until the operator tool creates one, and the KTD12 checklist
+below still gates every client). Allow-list parse
 (`true/1/yes/on`), **unset = off**, **read at call time** — so it takes effect without a restart,
 *given* flag 1.
 
@@ -400,12 +402,22 @@ from ADC and never from an argument:
 
 | environment | group |
 |---|---|
-| dev, tst | `kix-avvik-notification-operators@entur.org` |
-| prd | `kix-avvik-notification-operators-prd@entur.org` |
+| dev, tst, prd | `sg-dig-team-ki-eksperimentering@entur.no` |
 
-Neither group exists yet, and **the groups' own `roles/datastore.user` binding is created nowhere in
-this repo** — `terraform/` cannot grant it and `.entur/application.yaml` grants only the runtime
-service account. Provisioning both is a manual prerequisite.
+**That is the team group, in every environment, and it is a pilot shortcut decided on 2026-09-10.**
+R22 asked for a dedicated least-privilege group with production as its own
+(`kix-avvik-notification-operators[-prd]`), and that remains the end state. It is not what ships
+because a new group at Entur is not self-service: the `sg-dig-*` groups are Entra security groups
+that Team Plattform creates through `tf-azure-ad` and grants through `tf-gcp-iam` (ask in
+`#talk-utviklerplattform`), they are addressed `@entur.no` — never `@entur.org`, which the first
+version of this table named — and nobody had requested them. The team group needs no
+`roles/datastore.user` grant of its own: it already reads both `notifications` databases through the
+roles it holds on the folder above the projects (`entur.devOps` among them; verified from a member's
+ADC in dev and prd on 2026-09-10), and `checkTransitiveMembership` answers for it. What the shortcut
+gives up is R22's separation — everyone on the team is a prd operator — which is acceptable while
+prd's registrants are the team. Moving to the dedicated groups is `OPERATOR_GROUPS` in the tool
+plus this table, once Team Plattform has created them and granted `roles/datastore.user` in each
+project; nothing else changes, because project IAM, not this table, bounds what a member reaches.
 
 **Refusals fail closed on every error**, including a permission error on the membership check itself
 (reason `membership_check_failed: ...`). A refusal writes a JSON line to **stderr** and then
@@ -932,10 +944,16 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
    account can plan the new file at all: its read side is `roles/viewer` plus the custom org role
    `entur.githubCiTerraformPlanReader`, whose contents an ordinary developer cannot describe, and it
    is the one permission in KTD5's chain that was never measured.
-4. **Create the two operator groups** — `kix-avvik-notification-operators@entur.org` (dev, tst) and
-   `kix-avvik-notification-operators-prd@entur.org` (prd) — **and grant each `roles/datastore.user`
-   in the projects it operates**. That grant exists nowhere in this repository: `terraform/` cannot
-   make it and `.entur/application.yaml` grants only the runtime service account.
+4. **The operator groups — DONE for the pilot by shortcut, 2026-09-10**, and still owed in the
+   intended form. The tool gates every environment on the team group
+   `sg-dig-team-ki-eksperimentering@entur.no` (see "The operator tool" above for why and what it
+   gives up). The end state is still two dedicated groups, `kix-avvik-notification-operators` for
+   dev and tst and `kix-avvik-notification-operators-prd` for prd, each holding
+   `roles/datastore.user` in the projects it operates — a Team Plattform request
+   (`tf-azure-ad` for the groups, `tf-gcp-iam` for the grants; `#talk-utviklerplattform`), since
+   that grant exists nowhere in this repository: `terraform/` cannot make it and
+   `.entur/application.yaml` grants only the runtime service account. When they exist, point
+   `OPERATOR_GROUPS` at them and restore the prd-is-its-own assertion in `test_notification_auth`.
 5. **Close the superseded PR unmerged.** KTD1 keeps `feat/journey-notification-webhooks` out of this
    branch — its dated-leg half is ~2 500 lines and +99.2 MB per bus prediction run that the next
    change would delete — and the wording seam was extracted by file rather than merged. The open PR
