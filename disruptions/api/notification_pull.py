@@ -121,7 +121,13 @@ MAX_LIMIT = 20
 #: minute and a ~5 min cycle the working set is well under this, and an entry is a few KB.
 FIGURES_CACHE_MAX = 512
 #: Trains worded per read, spent soonest-first (KTD7). Four is a panel's worth and one Vertex call
-#: each; the rest carry the template under `not_worded`, terminal for the wording's life.
+#: each; the rest carry the template under `not_worded`. That verdict is POSITIONAL -- derived at
+#: read time from the entry's place in the definition's own soonest-first order, never written to
+#: the wording cache (2026-09-10): persisted under KTD3's key, which carries no definition term, a
+#: wide definition's fifth train made every narrower definition on the pair whose FIRST train it
+#: was read a terminal record, submit no task and serve the template as a complete, publicly
+#: cacheable answer for `WORDING_TTL_S`. So it is re-evaluated on every read, and the same train
+#: is worded once the trains ahead of it have departed or a narrower read puts it under the cap.
 MAX_WORDINGS_PER_READ = 4
 #: The enrichment pool's width (KTD5). `/meldinger`'s number, the repo's narrowest, because this is
 #: reachable from a public unauthenticated endpoint on the process that also runs the poller.
@@ -167,9 +173,11 @@ _CACHE_CONTROL_INCOMPLETE = "no-store"
 # `wording.status`: `ok` (source `llm`), `rejected`/`ungrounded` (the model answered and the answer
 # was unusable for THIS input -- payload-determined, so terminal for the wording's life, source
 # `deterministic`), `disabled` (no backend may be asked, or the channel does not deliver prose --
-# terminal), `not_worded` (past the per-read cap -- terminal); `pending` (a task is running),
-# `capped` (the queue refused the task), `rate_limited` (the PULL allowance) and `error` (a
-# transient backend failure) expire after `FAILURE_TTL_S` and are retried.
+# terminal), `not_worded` (past the per-read cap in THIS read's soonest-first order -- terminal for
+# this read, so `complete` may be true, but never cached: it is derived from the entry's position by
+# `_entry_state` on every read and re-evaluated as the list moves, see `MAX_WORDINGS_PER_READ`);
+# `pending` (a task is running), `capped` (the queue refused the task), `rate_limited` (the PULL
+# allowance) and `error` (a transient backend failure) expire after `FAILURE_TTL_S` and are retried.
 _TERMINAL_WORDING = frozenset({"ok", "rejected", "ungrounded", "disabled", "not_worded"})
 # `alternative.status`: `decisions._alternative_status`'s four (`offered`, `suppressed`,
 # `none_found`, `not_worth_lookup`) plus `not_looked_up` (past the matcher's lookup cap) are
@@ -178,6 +186,7 @@ _TERMINAL_WORDING = frozenset({"ok", "rejected", "ungrounded", "disabled", "not_
 _TERMINAL_ALTERNATIVE = frozenset({"offered", "suppressed", "none_found", "not_worth_lookup", "not_looked_up"})
 _PENDING = "pending"
 _CAPPED = "capped"
+_NOT_WORDED = "not_worded"
 
 _refreshed_at_provider: Callable[[], datetime | None] | None = None
 
@@ -768,7 +777,14 @@ def _enriched(winner: varsel.Alert, alt) -> varsel.Alert:
 
 
 def _entry_state(
-    definition: dict, journey_key: str, pair: tuple[str, str], entry: _Entry, now: datetime, *, enabled: bool
+    definition: dict,
+    journey_key: str,
+    pair: tuple[str, str],
+    entry: _Entry,
+    now: datetime,
+    *,
+    enabled: bool,
+    position: int,
 ) -> _EntryState:
     """Resolve one entry against the poller's caches and then the read's own.
 
@@ -783,8 +799,12 @@ def _entry_state(
     different moments.
 
     Otherwise the read's own caches: the alternative outcome by train, then -- with the alternative
-    on the alert and the message input built from it -- the wording by KTD3's key. Absent means
-    `pending`, which is what tells the route a task is owed.
+    on the alert and the message input built from it -- the wording by KTD3's key. A live record
+    wins whatever the position. Absent, the verdict is `position` -- the entry's index in the
+    definition's alive, soonest-first order (`_alive`), which every caller passes for the same
+    list the task spends its cap in: at or past `MAX_WORDINGS_PER_READ` the entry is `not_worded`
+    for this read, with its key still set so a later task words it once it moves under the cap;
+    under it, `pending`, which is what tells the route a task is owed.
     """
     text, poller_alt = varsel.cached_wording_and_alternative(journey_key, entry.winner, enabled=enabled)
     if text:
@@ -806,7 +826,8 @@ def _entry_state(
     key = _wording_key(pair, winner, alt, message_input)
     wording = _cached(_wordings, key, monotonic())
     if wording is None:
-        text, source, status = None, "deterministic", _PENDING
+        text, source = None, "deterministic"
+        status = _NOT_WORDED if position >= MAX_WORDINGS_PER_READ else _PENDING
     else:
         text, source, status = wording.text, ("llm" if wording.text else "deterministic"), wording.status
     return _EntryState(
@@ -953,17 +974,19 @@ def _enrich_body(
     if not_looked_up:
         _log_bounded("alternative_lookups", not_looked_up, digest)
 
-    to_word: list[_Entry] = []
+    to_word: list[tuple[int, _Entry]] = []
     beyond = 0
     for position, entry in enumerate(ordered):
-        state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled)
+        state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled, position=position)
+        if state.wording_status == _NOT_WORDED:
+            # Past the cap in this task's order and nothing cached for it: counted for the bounded
+            # record and written NOWHERE (2026-09-10) -- the verdict is the position, and the next
+            # read derives it again from wherever the train sits then.
+            beyond += 1
+            continue
         if state.wording_status != _PENDING or state.wording_key is None:
             continue  # the poller's, already worded, or a marker that still stands
-        if position >= MAX_WORDINGS_PER_READ:
-            beyond += 1
-            _remember_wording(state.wording_key, _WordingRecord(None, "not_worded", entry.train_key), epoch)
-            continue
-        to_word.append(entry)
+        to_word.append((position, entry))
     if beyond:
         _log_bounded("wordings_per_read", beyond, digest)
     if not to_word:
@@ -971,7 +994,8 @@ def _enrich_body(
     rate_limited = 0
     with ThreadPoolExecutor(max_workers=WORDING_WORKERS, thread_name_prefix="pull-word") as pool:
         for status in pool.map(
-            lambda entry: _word_one(definition, journey_key, pair, entry, now, enabled, epoch, digest), to_word
+            lambda item: _word_one(definition, journey_key, pair, item[1], now, enabled, epoch, digest, position=item[0]),
+            to_word,
         ):
             rate_limited += status == "rate_limited"
     if rate_limited:
@@ -987,17 +1011,20 @@ def _word_one(
     enabled: bool,
     epoch: int,
     digest: str,
+    *,
+    position: int,
 ) -> str | None:
     """One train's wording through `notification_wording.PULL`, single-flight per wording key.
 
     The state is re-read here rather than carried in, because the alternative record was written
-    moments ago on this task and the key depends on it. `subject_id` is the pair digest (KTD4) --
+    moments ago on this task and the key depends on it (`position` rides along for the same
+    re-read; it is under the cap by construction). `subject_id` is the pair digest (KTD4) --
     an opaque per-process label, never the pattern -- and the message input is the one built after
     the alternative, so the model and the template word the same document (2026-08-05). No
     `budget`: the per-read cap was spent by the caller before this was reached, and `write_wording`'s
     own `PassBudget` is the poller pass's shape, not this one's.
     """
-    state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled)
+    state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled, position=position)
     key = state.wording_key
     if state.wording_status != _PENDING or key is None:
         return state.wording_status
@@ -1086,9 +1113,13 @@ def _mark_unresolved(
     is cached in `varsel`) reads terminal there and gets no marker, even though the read's own
     alternative cache has never heard of its train -- a marker written on that absence would sit
     in the cache and be served as this read's outcome the moment the poller forgot the train.
+    An entry past the wording cap in this order reads `not_worded` rather than `pending` and gets
+    no wording marker either: it was owed no wording by this task, and the next read re-derives
+    its position. `entries` is an alive prefix -- `_alive` itself, or the listed cut of it -- so
+    the index is the position.
     """
-    for entry in entries:
-        state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled)
+    for position, entry in enumerate(entries):
+        state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled, position=position)
         if state.alternative_status == _PENDING:
             _remember_alternative(
                 _alternative_key(pair, entry.train_key), _AlternativeRecord(alternative_status, None), epoch
@@ -1203,8 +1234,12 @@ def _listed_states(
     definition: dict, journey_key: str, pair: tuple[str, str], listed: list[_Entry], now: datetime, *, enabled: bool
 ) -> list[_EntryState]:
     """What the caches say about each listed entry, resolved once per request -- and again only
-    after a wait, which is the one thing between the two reads that can move them."""
-    return [_entry_state(definition, journey_key, pair, entry, now, enabled=enabled) for entry in listed]
+    after a wait, which is the one thing between the two reads that can move them. `listed` is a
+    prefix of the alive order, so its index is the position the wording cap is spent by."""
+    return [
+        _entry_state(definition, journey_key, pair, entry, now, enabled=enabled, position=position)
+        for position, entry in enumerate(listed)
+    ]
 
 
 def _assemble(

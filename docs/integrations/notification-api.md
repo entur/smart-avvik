@@ -145,7 +145,7 @@ subscription on your next `POST` of it — the idempotent re-registration is eno
 | `GET /journey-alerts`, per canonical stop pair, 60 s sliding | 30 req/min | `429 rate_limited`, `Retry-After: 60` |
 | `GET /journey-alerts` wordings, every anonymous caller together | 30 / min, 500 / h, 2 000 / day | the entry carries the template with `wording.status: rate_limited`; never a 429 |
 | `GET /journey-alerts` Journey Planner lookups, every anonymous caller together | 30 / min | the entry carries no alternative with `alternative.status: unanswered`; never a 429 |
-| `GET /journey-alerts` wordings per read | 4, soonest departure first | the rest carry the template with `wording.status: not_worded` |
+| `GET /journey-alerts` wordings per read | 4, soonest departure first | the rest carry the template with `wording.status: not_worded`, re-evaluated on every read as the trains ahead depart |
 | `GET /journey-alerts` `wait` / `limit` | 0–20 s (default 20) / 1–20 (default 10) | `422` outside those |
 
 The two limiter tiers exist because *verifying a credential is itself store work*: a repeated bad
@@ -553,7 +553,7 @@ Each entry carries `wording {source, status}` and `alternative {status}`:
 
 | | terminal (a wording is held for the situation's life, up to 12 h; an alternative outcome for the Journey Planner cache's 10 min) | transient (expire after ~60 s and are retried on a later read) |
 |---|---|---|
-| `wording.status` | `ok` (source `llm`), `rejected`, `ungrounded` (the model answered and the answer was unusable for this input — re-asking would learn nothing), `disabled` (this deployment does not deliver the model's prose on this channel, or no backend may be asked), `not_worded` (past the four-per-read cap) | `pending`, `capped` (the enrichment queue was full), `rate_limited` (the read's wording allowance), `error` |
+| `wording.status` | `ok` (source `llm`), `rejected`, `ungrounded` (the model answered and the answer was unusable for this input — re-asking would learn nothing), `disabled` (this deployment does not deliver the model's prose on this channel, or no backend may be asked), `not_worded` (past the four-per-read wording cap in this read's soonest-first order; re-evaluated on every read as the trains ahead depart, never cached — terminal for this read only) | `pending`, `capped` (the enrichment queue was full), `rate_limited` (the read's wording allowance), `error` |
 | `alternative.status` | `offered`, `suppressed` (the selection kept the traveller on their own train), `none_found`, `not_worth_lookup` (none was issued), `not_looked_up` (past the per-read lookup cap) | `pending`, `capped`, `unanswered` (the Journey Planner did not reply: throttled, an outage, its cooldown) |
 
 `wording.source` is `llm` or `deterministic` and nothing else. **The template is the floor: render
