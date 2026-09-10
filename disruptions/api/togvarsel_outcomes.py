@@ -347,8 +347,15 @@ def _outcome_scalars(row_d, scope, trouble10, n_resolved, n_unresolved, n_calls,
     ]
 
 
-def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
-    """One same-day pass over `scopes`, writing the provisional trio and the served value."""
+def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> set[str]:
+    """One same-day pass over `scopes`, writing the provisional trio and the served value.
+
+    Returns the scopes the query actually answered for, which is what `refresh` marks done. It
+    returned nothing from 2026-09-02 to 2026-09-10 while the caller iterated the result: every pass
+    wrote its rows and then raised, so the retry loop re-ran the same SELECT and MERGEs every 15
+    minutes to the give-up, and the 18:20 window — with nothing marked done — re-wrote the morning's
+    rows on top, so `provisional_at` read ~20:10 on every weekday instead of 09:20.
+    """
     from google.cloud import bigquery
 
     _ensure_table_ready()
@@ -371,6 +378,7 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
                 )
             ),
         ).result(timeout=60)
+    answered = {row["scope"] for row in rows}
     logger.info(
         "togvarsel_outcomes: provisional %s for %s — %d rows",
         ",".join(scopes),
@@ -386,6 +394,7 @@ def _run_provisional(day: date, scopes: tuple[str, ...], now: datetime) -> None:
             }
         },
     )
+    return answered
 
 
 def _run_settled(days: Sequence[date], now: datetime) -> None:
