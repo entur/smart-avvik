@@ -268,6 +268,15 @@ class SituationImpact(BaseModel):
         "own worst train. Set iff a lookup ran to completion for it, which is what separates "
         "`none_found` from `not_worth_lookup` in the decision log.",
     )
+    answered: bool = Field(
+        default=True,
+        exclude=True,
+        repr=False,
+        description="Whether the Journey Planner REPLIED to this train's lookup — see "
+        "`AlternativeOutcome.answered`. False is a transient absence (throttled, outage, a raising "
+        "lookup), never to be cached as 'no alternative exists'; a lookup that was not issued at "
+        "all stays True, because that absence is terminal.",
+    )
 
 
 class LineImpact(BaseModel):
@@ -357,6 +366,13 @@ class ImpactResponse(BaseModel):
         "worst affected train across this whole response. A caller that back-fills one trip's "
         "lookup onto several alerts (varsel.match_journey) needs it: 'stay put' about a train two "
         "minutes late says nothing about a cancelled one on another ref of the same place.",
+    )
+    answered: bool = Field(
+        default=True,
+        exclude=True,
+        repr=False,
+        description="`situations[0]`'s `answered`, echoed like the two fields above; True when "
+        "there are no situations, since nothing was asked.",
     )
 
 
@@ -749,11 +765,21 @@ class AlternativeOutcome(NamedTuple):
     Kept as one value because the three travel together everywhere they go — response, situation,
     alert, decision row — and three parallel fields threaded through four modules is how one of them
     ends up back-filled without the other two.
+
+    `answered` (2026-09-10) is the fourth, and it is a different kind of claim from the other
+    three: not what the lookup concluded but whether the Journey Planner REPLIED. False means the
+    reply was never obtained — a throttled path, an outage, the post-failure cooldown, a raising
+    lookup — so the absence of an offer is transient and must not be cached as terminal; the
+    journey-alert pull read serves it as `unanswered` where an answered-but-empty lookup is
+    `none_found`. Every terminal absence (no lookup issued, capped, beyond the horizon) stays True.
+    It rides beside `subject` rather than replacing it, so `decisions._alternative_status`, which
+    reads only the other three, does not move.
     """
 
     journey: AlternativeJourney | None = None
     original_is_best: bool = False
     subject: tuple[str | None, str] | None = None
+    answered: bool = True
 
 
 # "No lookup ran for this train." Not the same as an empty answer — see AlternativeOutcome.
@@ -812,6 +838,7 @@ def _impact_response(
                 alternative_journey=outcome.journey,
                 original_is_best=outcome.original_is_best,
                 alternative_subject=outcome.subject,
+                answered=outcome.answered,
             )
         )
     situations.sort(key=lambda s: severity_key(s.departure_prediction), reverse=True)
@@ -847,6 +874,7 @@ def _impact_response(
         alternative_journey=headline.alternative_journey if headline else None,
         original_is_best=bool(headline and headline.original_is_best),
         alternative_subject=headline.alternative_subject if headline else None,
+        answered=headline.answered if headline else True,
     )
 
 
@@ -1385,10 +1413,17 @@ def _best_remaining_journey(
     # told there was no alternative while a catchable later journey existed. `original_is_best` is
     # the one result that must NOT trigger it: a genuine stay-put verdict means something WAS in
     # time (the original itself), so the fallback tier has nothing to add.
+    # Whichever query the selection actually used is the one whose reply status the outcome
+    # carries: the first when no fallback ran, the fallback's when it did. An unanswered fallback
+    # leaves the traveller with exactly the non-answer an unanswered first query would have.
+    used_query = first_query
     if best is None and not selection.get("original_is_best") and first_query.get("answered", True):
+        fallback_query: dict[str, Any] = {}
         fallback = alternatives.fetch_candidates(
-            from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path
+            from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path,
+            outcome=fallback_query,
         )
+        used_query = fallback_query
         # Reconciled against this reply too. The fallback runs precisely when nothing arrives in
         # time, which is when the disrupted train is worst off — so leaving its arrival at our
         # optimistic p50 here would rank it ahead of the rivals it is being compared against, in
@@ -1397,7 +1432,9 @@ def _best_remaining_journey(
         selection = {}
         best = select(scored_pool(fallback), selection)
 
-    return AlternativeOutcome(best, bool(selection.get("original_is_best")), subject)
+    return AlternativeOutcome(
+        best, bool(selection.get("original_is_best")), subject, used_query.get("answered", True)
+    )
 
 
 # How many Journey Planner lookups one /impact call may issue. The unit is a train, and the reason
@@ -1542,7 +1579,10 @@ def _alternatives_by_situation(
                     }
                 },
             )
-            outcome = NO_ALTERNATIVE
+            # `answered=False` and nothing else: the decision log's status reads what an
+            # un-attempted lookup leaves behind (no subject), while the pull read can still tell
+            # this transient failure from a terminal "did not look".
+            outcome = AlternativeOutcome(answered=False)
         outcomes[sit_num] = outcome
         if train is not None:
             by_train[train] = outcome

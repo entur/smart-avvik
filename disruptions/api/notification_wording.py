@@ -49,7 +49,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from time import monotonic
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -465,50 +465,105 @@ _DAY_WINDOW_S = 24.0 * 60 * 60
 # cannot silently draw the client allowance down (or be drawn down BY it — U1 scenario 3).
 _WEBHOOK_PATH = "webhook"
 _BROWSER_PATH = "browser"
-_budget_lock = threading.Lock()
-_calls: dict[str, tuple[deque[float], deque[float]]] = {
-    _WEBHOOK_PATH: (deque(), deque()),
-    _BROWSER_PATH: (deque(), deque()),
+# The journey-keyed PUBLIC read on `/notification-api/v1` (2026-09-10), which words on demand for
+# an unauthenticated caller. Its own slot for the same structural reason, and its own CEILINGS,
+# below: a public endpoint's allowance has to drain over minutes rather than in one burst.
+_PULL_PATH = "pull"
+
+# The pull read's three ceilings, public so the operations document can quote them by name. The
+# per-minute one is what the other two surfaces do not have: an hour's allowance spent in its first
+# seconds by a burst of reads would leave the next fifty-nine minutes on the template, and a burst
+# is exactly what a public read path gets. 30 a minute is a sixteenth of the hour.
+WORDINGS_PER_MIN = 30
+WORDINGS_PER_HOUR = 500
+WORDINGS_PER_DAY = 2000
+_MINUTE_WINDOW_S = 60.0
+
+
+class _Ceilings(NamedTuple):
+    """One path's three ceilings; `per_min` None means no per-minute window binds it."""
+
+    per_min: int | None
+    per_hour: int
+    per_day: int
+
+
+# Per PATH, keyed like `alternatives._FETCH_CEILINGS`, and the ONE source `_spend` reads: putting
+# the numbers on the policy instead would let a bare `_spend("pull")` -- which the suites call --
+# silently lose the minute cap. `WordingPolicy.ceilings` reads this table by path. The ledger is
+# derived from it, so a path cannot exist here without a slot, and an unknown path is a `KeyError`
+# on its first call rather than a silent zero.
+_CEILINGS: dict[str, _Ceilings] = {
+    _WEBHOOK_PATH: _Ceilings(None, _MAX_CALLS_PER_HOUR, _MAX_CALLS_PER_DAY),
+    _BROWSER_PATH: _Ceilings(None, _MAX_CALLS_PER_HOUR, _MAX_CALLS_PER_DAY),
+    _PULL_PATH: _Ceilings(WORDINGS_PER_MIN, WORDINGS_PER_HOUR, WORDINGS_PER_DAY),
 }
 
 
+class _Ledger(NamedTuple):
+    """One path's trailing windows. `minute` is LAST so `[0]` stays the hour deque, which is how
+    the suites reached into a slot before the minute window existed."""
+
+    hour: deque[float]
+    day: deque[float]
+    minute: deque[float]
+
+
+_budget_lock = threading.Lock()
+_calls: dict[str, _Ledger] = {path: _Ledger(deque(), deque(), deque()) for path in _CEILINGS}
+
+
 def _spend(path: str, *, now: float | None = None) -> bool:
-    """Charge one backend call to `path`, or refuse when either trailing window is full."""
+    """Charge one backend call to `path`, or refuse when any of its trailing windows is full.
+
+    The ceilings are the path's own (:data:`_CEILINGS`); the minute window is pruned and checked
+    only for a path that has one, so the two older surfaces cost exactly what they did.
+    """
     now = monotonic() if now is None else now
+    ceilings = _CEILINGS[path]
     with _budget_lock:
-        hour, day = _calls[path]
+        hour, day, minute = _calls[path]
         while hour and now - hour[0] > _HOUR_WINDOW_S:
             hour.popleft()
         while day and now - day[0] > _DAY_WINDOW_S:
             day.popleft()
-        if len(hour) >= _MAX_CALLS_PER_HOUR or len(day) >= _MAX_CALLS_PER_DAY:
+        while minute and now - minute[0] > _MINUTE_WINDOW_S:
+            minute.popleft()
+        if len(hour) >= ceilings.per_hour or len(day) >= ceilings.per_day:
+            return False
+        if ceilings.per_min is not None and len(minute) >= ceilings.per_min:
             return False
         hour.append(now)
         day.append(now)
+        minute.append(now)
         return True
 
 
 def spent(path: str = _WEBHOOK_PATH) -> tuple[int, int]:
-    """(hour, day) calls currently charged to `path` — for tests and for a diagnostics route."""
+    """(hour, day) calls currently charged to `path` — for tests and for a diagnostics route.
+
+    Two figures, not three, so every existing reader and the operations document are unchanged;
+    a minute count is asserted through a refusal, or read off `_calls[path].minute`.
+    """
     with _budget_lock:
-        hour, day = _calls[path]
+        hour, day, _minute = _calls[path]
         return (len(hour), len(day))
 
 
 def _reset_budget() -> None:
     with _budget_lock:
-        for hour, day in _calls.values():
-            hour.clear()
-            day.clear()
+        for ledger in _calls.values():
+            for window in ledger:
+                window.clear()
 
 
 @dataclass
 class WordingPolicy:
     """One surface's answer to "may a model be asked, and does its prose reach the traveller?".
 
-    Both fields are read by :func:`write_wording`, not documentation. The two instances below are
-    the explicit per-surface adapters KTD1's extraction asks for; a third surface adds a third
-    instance rather than a branch.
+    Both fields are read by :func:`write_wording`, not documentation. The instances below are the
+    explicit per-surface adapters KTD1's extraction asks for; a further surface adds a further
+    instance rather than a branch — which is how `PULL` arrived on 2026-09-10.
 
     `deliver` is the delivery gate — `llm_message.delivery_enabled()` for the browser
     (VARSEL_LLM_ENABLED), :func:`webhook_delivery_enabled` for a client. `path` names the
@@ -554,6 +609,11 @@ class WordingPolicy:
         with self._lock:
             self._state = None
 
+    @property
+    def ceilings(self) -> _Ceilings:
+        """This surface's per-minute / hour / day ceilings, read off :data:`_CEILINGS` by path."""
+        return _CEILINGS[self.path]
+
 
 def _browser_delivery_enabled() -> bool:
     import llm_message
@@ -567,6 +627,12 @@ def _new_webhook_state() -> Any:
     return llm_message.new_webhook_state()
 
 
+def _new_pull_state() -> Any:
+    import llm_message
+
+    return llm_message.new_pull_state()
+
+
 BROWSER = WordingPolicy(name="browser", deliver=_browser_delivery_enabled, path=_BROWSER_PATH)
 WEBHOOK = WordingPolicy(
     name="webhook",
@@ -576,7 +642,21 @@ WEBHOOK = WordingPolicy(
     state_factory=_new_webhook_state,
 )
 
-_POLICIES = (BROWSER, WEBHOOK)
+# The journey-keyed public read (2026-09-10). `deliver` is the webhook channel's gate rather than
+# the browser's: what the read serves is the client channel's wording, and the browser gate is
+# about what a /varsel traveller receives. A truthy `caller` is what suppresses the prompt/reply
+# record in `llm_message` (R11); its own holder is what keeps a burst of reads that drives a
+# backend into a configuration error from reading `generation_enabled()` False on the poller or
+# on the webhook channel (R4).
+PULL = WordingPolicy(
+    name="pull",
+    deliver=webhook_delivery_enabled,
+    path=_PULL_PATH,
+    caller="pull",
+    state_factory=_new_pull_state,
+)
+
+_POLICIES = (BROWSER, WEBHOOK, PULL)
 
 
 def reset_state() -> None:
@@ -720,7 +800,8 @@ def write_wording(
         return template("capped")
     if not _spend(policy.path):
         logger.info(
-            "Webhook wording allowance exhausted; using the deterministic wording",
+            "%s wording allowance exhausted; using the deterministic wording",
+            policy.name,
             extra={"fields": {"event": "notification_wording", "result": "rate_limited",
                               "surface": policy.name}},
         )

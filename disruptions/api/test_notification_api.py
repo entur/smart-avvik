@@ -32,6 +32,7 @@ from typing import Any
 import alert_policy
 import notification_api
 import notification_auth
+import notification_pull
 import notification_store
 import sso
 import webhook_sender
@@ -1931,10 +1932,15 @@ def test_the_openapi_document_renders_the_authored_schemas_rather_than_restating
 
 def test_the_openapi_paths_are_exactly_the_routers_routes():
     """A published contract that has drifted from the router is worse than none: a client writes a
-    client against it. Checked in both directions, and the six are the plan's own API table."""
+    client against it. Checked in both directions, over the UNION of the two routers that share the
+    prefix (KTD12, 2026-09-10): the six credentialed routes are the origin plan's own API table, the
+    seventh is the public journey-keyed read on `notification_pull.router`. The pull router's own
+    pins -- no dependency, exactly that one path, a coroutine -- live in `test_notification_pull`
+    and are deliberately not repeated here."""
     routes = {
         (route.path[len(notification_api.PREFIX) :] or "/", method.lower())
-        for route in notification_api.router.routes
+        for router in (notification_api.router, notification_pull.router)
+        for route in router.routes
         for method in route.methods
         if method not in ("HEAD", "OPTIONS")
     }
@@ -1945,7 +1951,7 @@ def test_the_openapi_paths_are_exactly_the_routers_routes():
         if method in ("get", "post", "put", "delete", "patch")
     }
     assert routes == published, (routes - published, published - routes)
-    assert len(published) == 6
+    assert len(published) == 7
     for server in OPENAPI["servers"]:
         assert server["url"].endswith(notification_api.PREFIX)
 
@@ -2464,15 +2470,44 @@ def test_the_openapi_tags_are_the_routers_own():
         if method != "parameters"
         for tag in op["tags"]
     }
-    router_tags = {tag for route in notification_api.router.routes for tag in (route.tags or [])}
+    router_tags = {
+        tag
+        for router in (notification_api.router, notification_pull.router)
+        for route in router.routes
+        for tag in (route.tags or [])
+    }
     assert published == used == router_tags
     assert router_tags == {
         notification_api.TAG_SUBSCRIPTIONS,
         notification_api.TAG_DESTINATIONS,
         notification_api.TAG_TEST,
+        # The public read's own tag (KTD12, 2026-09-10): a fourth grouping, because the tag is
+        # what a generated client and this app's /docs both group on, and "public, no credential"
+        # is worth a heading of its own beside three credentialed ones.
+        notification_pull.TAG,
     }
-    # Prefixed, because these six routes sit among three dozen paths in this app.
+    # Prefixed, because these seven routes sit among three dozen paths in this app.
     assert all(tag.startswith("notification-") for tag in router_tags)
+
+
+def test_the_public_read_overrides_the_global_security_per_operation():
+    """KTD12's third scenario: the document keeps its global `clientKey` requirement, and the ONE
+    public operation says `security: []` on itself rather than the file dropping the global.
+
+    Both directions matter. A global that went away would publish six credentialed routes as open;
+    a pull operation without its own override would tell a generated client to send a bearer it
+    does not have -- and the read would still answer 200, so nothing at runtime would notice.
+    """
+    assert OPENAPI["security"] == [{"clientKey": []}]
+    operation = OPENAPI["paths"]["/journey-alerts"]["get"]
+    assert operation["security"] == []
+    assert operation["tags"] == [notification_pull.TAG]
+    # Every credentialed operation inherits the global and declares nothing of its own.
+    for path, operations in OPENAPI["paths"].items():
+        for method, op in operations.items():
+            if method == "parameters" or path == "/journey-alerts":
+                continue
+            assert "security" not in op, (path, method)
 
 
 def test_the_call_payload_promises_only_what_both_producers_emit():

@@ -107,7 +107,7 @@ impact.configure(snapshot_provider=lambda: (_active_snapshot["value"], None))
 
 
 def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                     with_alternative=False, min_impact=0.0):
+                     with_alternative=False, min_impact=0.0, path="poller"):
     return impact.for_trip(
         from_stop=from_stop,
         to_stop=to_stop,
@@ -120,6 +120,9 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
         # that care, so nothing here reaches the network either way.
         with_alternative=with_alternative,
         min_impact=min_impact,
+        # Likewise: a provider that accepts `path` and drops it satisfies the Protocol, and the only
+        # thing that can tell is the ledger (test_the_suites_provider_forwards_the_fetch_path).
+        path=path,
     )
 
 
@@ -4437,6 +4440,76 @@ def test_the_client_read_is_bounded_by_a_document_ceiling():
     assert len(fetched) == varsel._MAX_WEBHOOK_RECIPIENTS, (
         "the cursor must stop at the ceiling, not be drained and then trimmed"
     )
+
+
+def test_the_suites_provider_forwards_the_fetch_path(monkeypatch):
+    """This suite's provider stands in for `main._varsel_impact` in every e2e check here, so it must
+    forward `path` to the real engine exactly as the real provider does (2026-09-10) — a double that
+    swallowed it would keep every check green while the pull read spent the poller's budget.
+
+    Pinned at `fetch_candidates`, the seam this suite stubs structurally (see the module-level stub:
+    the ledger below it is unreachable from here by design). The pin that asks the ledger itself,
+    through the real provider, is `test_varsel.test_the_real_provider_charges_the_pull_ledger`.
+    """
+    paths = []
+    monkeypatch.setattr(
+        alternatives, "fetch_candidates", lambda *a, **k: paths.append(k.get("path")) or []
+    )
+    alerts = varsel.match_journey(_JOURNEY, with_alternative=True, path="pull")
+    assert alerts and alerts[0].alertworthy, "control: the train must be worth a lookup"
+    assert paths and set(paths) == {"pull"}, paths
+    paths.clear()
+    varsel.match_journey(_JOURNEY, with_alternative=True)
+    assert paths and set(paths) == {alternatives._POLLER_PATH}, paths
+
+
+# ---- U2 of the pull read: the poller's caches are READ for a registered definition, never written
+def test_the_cached_wording_and_alternative_are_read_for_a_registered_definition_and_never_written(
+    monkeypatch,
+):
+    """KTD6 / R10. The read hands a registered definition the wording and the alternative the
+    poller already cached, under one lock read and `_webhook_wording`'s rules: raw entries (not
+    through the browser delivery gate), no wording for a declared cancellation, None where absent.
+    And it must never WRITE either cache: pass 1c records `ok_cached` for a key already in
+    `_messages`, so an entry the read had written would land on `/historikk` under the browser's
+    attribution. Asserted by comparing dict copies around every call."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: "Toget er innstilt.")
+    _register(DEVICE)
+    varsel.check_and_notify(SNAPSHOT)
+    journey = next(iter(varsel._journeys.values()))
+    key = varsel.journey_key(journey)
+    alert = varsel.match_journey(journey)[0]
+    message_key = varsel._message_key(key, alert)
+    assert varsel._messages.get(message_key) == "Toget er innstilt.", "control: the pass cached it"
+    alternative = alternatives.AlternativeJourney(
+        departure_time=DEP + timedelta(minutes=20),
+        arrival_time=DEP + timedelta(minutes=50),
+        duration_min=30, minutes_saved=10, legs=[],
+    )
+    varsel._alternatives[message_key] = alternative
+
+    def unchanged(call):
+        messages, alts = dict(varsel._messages), dict(varsel._alternatives)
+        result = call()
+        assert varsel._messages == messages and varsel._alternatives == alts, "the read wrote"
+        return result
+
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, alert, enabled=True))
+    assert got == ("Toget er innstilt.", alternative)
+
+    cancelled = alert.model_copy(update={"cancelled": True})
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, cancelled, enabled=True))
+    assert got == (None, alternative), "no wording for a declared cancellation, still the alternative"
+
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, alert, enabled=False))
+    assert got == (None, alternative), "the delivery gate withholds the wording only"
+
+    got = unchanged(
+        lambda: varsel.cached_wording_and_alternative("X|Y|07:00|09:00|0", alert, enabled=True)
+    )
+    assert got == (None, None)
 
 
 if __name__ == "__main__":

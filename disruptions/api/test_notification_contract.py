@@ -39,10 +39,13 @@ import ast
 import re
 from pathlib import Path
 
+import alternatives
 import notification_api
 import notification_auth
 import notification_events
+import notification_pull
 import notification_store
+import notification_wording
 import webhook_delivery
 import webhook_sender
 import webhook_signing
@@ -53,6 +56,7 @@ DOCS = REPO_ROOT / "docs"
 OPERATIONS_DOC = DOCS / "operations" / "notification-webhooks.md"
 API_DOC = DOCS / "integrations" / "notification-api.md"
 BFF_DOC = DOCS / "integrations" / "firebase-bff.md"
+DEV_VALUES = REPO_ROOT / "helm" / "kix-avvik" / "env" / "values-kub-ent-dev.yaml"
 
 #: The modules the channel is made of. `notification_wording` is included even though it also serves
 #: the browser: it is the one module both surfaces write through, so a leak added there would reach
@@ -66,6 +70,9 @@ NOTIFICATION_MODULES = (
     "webhook_signing.py",
     "webhook_sender.py",
     "notification_wording.py",
+    # The journey-keyed public read (2026-09-10). Public and unauthenticated, so R11's log claim
+    # binds it harder than the rest: every field it logs is walked here.
+    "notification_pull.py",
 )
 
 MODULES_BY_NAME = {
@@ -76,6 +83,11 @@ MODULES_BY_NAME = {
     "webhook_delivery": webhook_delivery,
     "webhook_signing": webhook_signing,
     "webhook_sender": webhook_sender,
+    "notification_pull": notification_pull,
+    # Two modules the read's published numbers cite (the pull wording ceilings and the Journey
+    # Planner budget) without being channel modules themselves.
+    "notification_wording": notification_wording,
+    "alternatives": alternatives,
 }
 
 
@@ -349,6 +361,10 @@ def test_the_store_and_delivery_modules_import_no_poller_state():
     — "events are still delivered" in a deployment with no keypair — which nothing else asserts.
     """
     forbidden = {"varsel", "main", "impact", "llm_message", "decisions", "historikk", "meldinger"}
+    # `notification_pull.py` is deliberately NOT in this tuple (KTD1, 2026-09-10): it imports
+    # `varsel` at module level by design, because the read IS `varsel`'s selection and assembly
+    # reused. What this tuple guards is an EVENT reaching the VAPID keypair and the device registry,
+    # and a read delivers nothing.
     for module in (
         "notification_store.py",
         "notification_auth.py",
@@ -634,6 +650,48 @@ def test_the_two_halves_of_the_prompt_record_claim_are_both_published():
         "the closed half alone is the failure this check exists for: a shared route's prompt "
         "record exists, and a reader told only about `notification_wording.WEBHOOK` would conclude "
         "otherwise."
+    )
+
+
+def test_the_journey_keyed_read_is_published_with_its_two_switch_revert_and_its_dev_flag():
+    """The pull read's three published facts, grep-pinned in the shape of the cross-reference test
+    above (plan 2026-09-10-001, U5 / R13, KTD14).
+
+    Three claims, three files, and each fails silently without a pin. The client contract has to
+    NAME the read, or a client integrates the six credentialed routes and never learns there is a
+    public one. The operations document has to state the revert as TWO switches: since the read
+    and the webhook event follow `NOTIFICATION_WEBHOOK_LLM_ENABLED`, `VARSEL_LLM_ENABLED=false` --
+    the documented bad-text revert for the browser push -- no longer reaches every surface that
+    carries the model's prose, and an operator who reverts the one they know would leave a
+    client-facing panel serving the text they meant to withdraw. And the dev values file has to
+    set the flag, because it is read at import and defaults off: without the chart line the read
+    ships template-only in dev and the decision behind the read's enrichment is defeated with
+    nothing red anywhere.
+    """
+    api = API_DOC.read_text(encoding="utf-8")
+    assert "journey-alerts" in api, (
+        "the client contract no longer names the journey-keyed read (`GET /journey-alerts`)"
+    )
+    assert "Cache-Control" in api and "max-age=60" in api, (
+        "the client contract no longer states the read's caching rule, which is the BFF's own "
+        "caching rule too"
+    )
+    operations = OPERATIONS_DOC.read_text(encoding="utf-8")
+    for switch in ("NOTIFICATION_WEBHOOK_LLM_ENABLED=false", "VARSEL_LLM_ENABLED=false", "VARSEL_LLM_PROVIDER=off"):
+        assert switch in operations, (
+            f"the operations document no longer names `{switch}` in the revert; the bad-text revert "
+            "is two switches and the kill switch a third, and each has to be stated"
+        )
+    assert "journey-alerts" in operations, "the operations document no longer names the read"
+    values = DEV_VALUES.read_text(encoding="utf-8")
+    assert 'NOTIFICATION_WEBHOOK_LLM_ENABLED: "true"' in values, (
+        "the dev values file no longer sets NOTIFICATION_WEBHOOK_LLM_ENABLED. It is read at import "
+        "and defaults off, so the pull read in dev would serve the template on every entry and the "
+        "operations document's rollout text would be describing a deployment that does not exist."
+    )
+    assert "journey-alerts" in values or "pull read" in values, (
+        "the dev values file sets the flag without naming the read as the reason; the next reader "
+        "will take it for the webhook channel's rollout step and turn it off with the channel"
     )
 
 

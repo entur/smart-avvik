@@ -15,6 +15,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 
 import alert_policy
+import alternatives
 import varsel
 from alert_policy import min_threshold, threshold_for
 
@@ -174,6 +175,27 @@ def test_varsel_gates_the_alternative_lookup_at_the_policy_floor():
         varsel._impact_provider = None
 
     assert [kw["min_impact"] for kw in seen] == [min_threshold(), 0.0]
+
+
+def test_varsel_forwards_the_fetch_path_and_defaults_to_the_pollers():
+    """`varsel._impact` is the one call site between the matcher and the provider, and it sends
+    `path` on EVERY call (2026-09-10): defaulted to the poller's value so nothing that exists today
+    moves, forwarded verbatim so the pull read spends its own Journey Planner budget."""
+    seen = []
+
+    def provider(**kwargs):
+        seen.append(kwargs)
+
+    varsel.configure(impact_provider=provider, stops_provider=list)
+    try:
+        journey = {"from_stop": "NSR:StopPlace:337", "to_stop": "NSR:StopPlace:418"}
+        start = datetime(2026, 8, 6, 7, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=30)
+        varsel._impact(journey, start, end, with_alternative=True)
+        varsel._impact(journey, start, end, with_alternative=True, path="pull")
+    finally:
+        varsel._impact_provider = None
+    assert [kw["path"] for kw in seen] == [alternatives._POLLER_PATH, "pull"]
 
 
 def _import_in_subprocess(statement: str) -> subprocess.CompletedProcess:

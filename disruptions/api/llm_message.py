@@ -404,6 +404,22 @@ def new_webhook_state() -> _LatchState:
     return _LatchState(seed_from=_STATE, cache_clients=True)
 
 
+def new_pull_state() -> _LatchState:
+    """A holder for the journey-keyed public read on `/notification-api/v1` — the fourth caller.
+
+    Browser/poller, replay, webhook, and now a read that words on demand for an unauthenticated
+    caller. Same construction as :func:`new_webhook_state`, and its own name for that function's
+    stated reason: the two document the surfaces that own a holder. The isolation matters most
+    here of the four, because the burst that drives a backend into a ``_ConfigurationError`` is
+    reachable from a public endpoint — and the holders it must not reach are BOTH of the others
+    that deliver to a traveller, the poller's module-global one and the webhook channel's.
+
+    Seeded one-way from the module-global holder, so a read does not re-discover a 404 the poller
+    already paid for and can never write a failure back onto any delivering path.
+    """
+    return _LatchState(seed_from=_STATE, cache_clients=True)
+
+
 @dataclass(frozen=True)
 class _CallContext:
     """Which holder the call running on this thread belongs to, and whether it is a replay.
@@ -453,7 +469,7 @@ def _log_fields(replay: bool, caller: str | None = None, **fields: Any) -> dict[
     empty on a live push wording, so an existing query keeps matching exactly the records it always
     did.
 
-    `caller` names a non-browser surface (``"webhook"``). Deliberately not spelled ``replay=True``
+    `caller` names a non-browser surface (``"webhook"``, ``"pull"``). Deliberately not spelled ``replay=True``
     by such a surface: that flag means `/meldinger` in every saved query and dashboard, and
     borrowing it would silently file client traffic as replay.
     """
@@ -1162,7 +1178,7 @@ def write_message_detailed(
     origin, destination and departure time to Cloud Logging at page-load volume rather than at the
     poller's few-per-cycle rate. Neither changes anything for a caller that passes neither.
 
-    ``caller`` names a non-browser surface (``"webhook"``) and does three things, all of them
+    ``caller`` names a non-browser surface (``"webhook"``, ``"pull"``) and does three things, all of them
     required by R16 and none of them left to an environment variable —
     ``helm/kix-avvik/env/values-kub-ent-dev.yaml`` sets ``VARSEL_LLM_LOG_PROMPTS="true"`` in exactly
     the environment this rollout starts in, and `/varsel` message debugging needs it left on:

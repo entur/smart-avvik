@@ -123,9 +123,9 @@ def install(by_situation):
     _snapshot.clear(); _snapshot.update(by_situation)
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                 with_alternative=False, min_impact=0.0):
+                 with_alternative=False, min_impact=0.0, path="poller"):
         # Pass the flag THROUGH rather than hard-coding False: hard-coding it made the suite blind to
-        # a Journey Planner call reappearing on the request path (review 2026-07-29).
+        # a Journey Planner call reappearing on the request path (review 2026-07-29). `path` likewise.
         return impact.for_trip(
             from_stop=from_stop,
             to_stop=to_stop,
@@ -135,6 +135,7 @@ def install(by_situation):
             catchable_after=catchable_after,
             with_alternative=with_alternative,
             min_impact=min_impact,
+            path=path,
         )
 
     varsel.configure(impact_provider=provider, stops_provider=list)
@@ -258,7 +259,7 @@ def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
     asked = []
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                 with_alternative=False, min_impact=0.0):
+                 with_alternative=False, min_impact=0.0, path="poller"):
         asked.append((from_stop, with_alternative))
         return impact.for_trip(
             from_stop=from_stop, to_stop=to_stop, window_start=window_start,
@@ -1657,6 +1658,204 @@ def test_the_wording_varsel_sends_is_the_shared_one_and_not_a_copy():
     assert varsel._train_label is notification_wording.train_label
     assert varsel._delay_phrase is notification_wording.delay_phrase
     assert varsel.mode_label is notification_wording.mode_label
+
+
+# ---- The fetch path and the answered flag (the journey-alert pull read, 2026-09-10) ----------
+NSR_A = "NSR:StopPlace:337"
+NSR_B = "NSR:StopPlace:418"
+
+
+def _nsr_journey():
+    """An all-day, every-day registration between two NSR-shaped refs: `fetch_candidates` refuses
+    a non-NSR ref before it reaches the budget, so a ledger test on `"A"`/`"B"` proves nothing."""
+    return {**_journey(begin="00:00", end="23:59", days=range(7)),
+            "from_stop": NSR_A, "to_stop": NSR_B}
+
+
+def _nsr_train(dep, **board_kw):
+    return [
+        FakeCall(jkey="t1", stop_place=NSR_A, stop_order=1, aimed_dep=dep, **board_kw),
+        FakeCall(jkey="t1", stop_place=NSR_B, stop_order=5, aimed_dep=None,
+                 aimed_arr=dep + timedelta(minutes=40)),
+    ]
+
+
+def _install_budgeted_fetch(fake):
+    """Stub the network one level BELOW `fetch_candidates` (test_alternatives' `_install_fetch`),
+    so a lookup reaches `_reserve_fetch`; returns what to restore."""
+    saved = (alternatives._fetch_trip_patterns, alternatives._cache, alternatives._fetch_calls)
+    alternatives._fetch_trip_patterns = fake
+    alternatives._cache = alternatives._KeyedTTLCache(alternatives._TTL, alternatives._FAILURE_COOLDOWN)
+    alternatives._fetch_calls = {path: [] for path in alternatives._FETCH_CEILINGS}
+    return saved
+
+
+def _restore_budgeted_fetch(saved):
+    alternatives._fetch_trip_patterns, alternatives._cache, alternatives._fetch_calls = saved
+
+
+def test_match_journey_names_the_budget_its_lookups_spend():
+    """`path` reaches the provider on EVERY call, keyword-only, and defaults to the poller's value
+    so every existing caller is unchanged. Without it the pull read would spend the poller's
+    Journey Planner budget — silently, since both refill every minute."""
+    _snapshot.clear(); _snapshot.update({"S1": _train(MON_0800)})
+    seen = []
+
+    def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
+                 with_alternative=False, min_impact=0.0, path="poller"):
+        seen.append(path)  # falls off the end: _impact hands None back; the argument is the point
+
+    varsel.configure(impact_provider=provider, stops_provider=list)
+    try:
+        varsel.match_journey(_journey(), NOW, with_alternative=True, path="pull")
+        assert seen and set(seen) == {"pull"}, seen
+        seen.clear()
+        varsel.match_journey(_journey(), NOW, with_alternative=True)
+        assert seen and set(seen) == {alternatives._POLLER_PATH}, seen
+    finally:
+        install({})
+
+
+def test_the_real_provider_charges_the_pull_ledger():
+    """`main._varsel_impact` hard-coded `"poller"` until 2026-09-10. A provider that ACCEPTS the
+    keyword and ignores it satisfies the Protocol (CI runs no type checker) and every recording
+    double alike; only the ledger can tell, so this asks the ledger through the real provider."""
+    dep = datetime.now(tz=_OSLO) + timedelta(hours=2)
+    _snapshot.clear(); _snapshot.update({"S1": _nsr_train(dep, p_cancel=0.8, p_impact_dep=0.9)})
+    varsel.configure(impact_provider=main._varsel_impact, stops_provider=list)
+    saved = _install_budgeted_fetch(lambda *a, **k: [])
+    try:
+        alerts = varsel.match_journey(_nsr_journey(), with_alternative=True, path="pull")
+        assert alerts and alerts[0].alertworthy, "control: the train must be worth a lookup"
+        assert alternatives._fetch_calls["pull"], "the real provider did not charge the pull ledger"
+        assert alternatives._fetch_calls["poller"] == [], "and spent none of the poller's"
+        assert alternatives._fetch_calls["request"] == [], "nor the public endpoint's"
+    finally:
+        _restore_budgeted_fetch(saved)
+        install({})
+
+
+def test_an_unanswered_lookup_reaches_the_alert():
+    """`answered` travels from the outcome onto `alert.impact` through `_collect_alerts`' projection,
+    and through the back-fill onto a collapsed-ref alert about the same train — the two places the
+    other alternative fields are carried, and where a forgotten field silently reads as answered."""
+    _snapshot.clear(); _snapshot.update({"S1": _train(MON_0800, p_cancel=0.8, p_impact_dep=0.9)})
+    install(_snapshot.copy())
+    original = impact._best_remaining_journey
+    impact._best_remaining_journey = lambda cells, **kw: impact.AlternativeOutcome(
+        None, False, ("VYG", "t1"), False
+    )
+    try:
+        alerts = varsel.match_journey(_journey(), NOW, with_alternative=True)
+        assert alerts and alerts[0].impact.alternative_subject == ("VYG", "t1")
+        assert alerts[0].impact.answered is False, "the projection dropped the flag"
+
+        # The back-fill: the worst reading comes from a collapsed ref (asked without a lookup), and
+        # the canonical pass's whole outcome — the flag included — transfers onto it.
+        _snapshot.clear()
+        _snapshot.update({"S1": [
+            *_train(MON_0800, jkey="t1", p_cancel=0.30, p_impact_dep=0.55),
+            *_twin(MON_0800, "A2", jkey="t1", p_cancel=0.80, p_impact_dep=0.95),
+        ]})
+        varsel.set_stop_aliases({"A2": "A"})
+        try:
+            alerts = varsel.match_journey(_journey(), NOW, with_alternative=True)
+        finally:
+            varsel.set_stop_aliases({})
+        assert alerts[0].impact_probability == 0.95, "control: the collapsed reading won"
+        assert alerts[0].impact.alternative_subject == ("VYG", "t1"), "control: back-filled"
+        assert alerts[0].impact.answered is False, "the back-fill dropped the flag"
+    finally:
+        impact._best_remaining_journey = original
+        install({})
+
+
+# ---- U2 of the pull read: the read selects trains as the pass does, and knows a cold cache -------
+def _sub_gate_no_sx(situation, *, jkey="t1", p_impact=0.80, dep=MON_0800):
+    """A no-SX reading UNDER its own gate (0.85) that still outranks a published one over ITS gate
+    (0.65) on severity -- the collapse keeps it, and the train is then not alert-worthy."""
+    return Alert(
+        situation_number=situation, summary="Mulig avvik", line="VYG:Line:R10", operator="VYG",
+        jkey=jkey, stop_place="A", stop_order=1, departure_time=dep, has_situation=False,
+        cancel_probability=0.3, delay_p50_min=None, delay_p90_min=None,
+        impact_probability=p_impact, alert_threshold=alert_policy._NOSX_ALERT_THRESHOLD,
+        alertworthy=False,
+    )
+
+
+def _train_of(subject_or_alert):
+    return (
+        subject_or_alert.operator,
+        getattr(subject_or_alert, "journey_ref", None) or getattr(subject_or_alert, "jkey", None),
+        subject_or_alert.stop_place,
+        subject_or_alert.stop_order,
+        subject_or_alert.departure_time,
+    )
+
+
+def test_alert_worthy_trains_is_the_collapse_then_the_gate_exactly_as_the_pass_iterates():
+    """KTD7 / R2. The read must select trains in the notification pass's own order: collapse to
+    one alert per train FIRST, then the push gate. The fixture is the case where the order shows:
+    train t1 carries a published situation over its gate (0.70 > 0.65) and a no-SX reading under
+    its own (0.80 < 0.85) that outranks it on severity, so the collapse keeps the sub-gate winner
+    and t1 is NOT alert-worthy -- `_subjects_for_key` iterates it as a withdrawal subject. A
+    gate-first filter would list t1 through its published situation. Pinned against the pass's
+    own loop rather than restated, and the order is the collapse's, which the read sorts after."""
+    key = "A|B|07:00|09:00|0,1,2,3,4"
+    alerts = [
+        _alert("S_t2", jkey="t2", p_impact=0.95, dep=MON_0800 + timedelta(minutes=30)),
+        _sub_gate_no_sx("KIX:NoSituation:VYG:t1"),
+        _alert("S_t1_published", p_impact=0.70),
+        _alert("S_t3", jkey="t3", p_impact=0.66, dep=MON_0800 + timedelta(minutes=60)),
+    ]
+    assert varsel.one_alert_per_train(alerts)[1].situation_number == "KIX:NoSituation:VYG:t1", (
+        "control: the sub-gate no-SX reading wins the collapse for t1"
+    )
+
+    chosen = varsel.alert_worthy_trains(alerts)
+
+    assert [a.situation_number for a in chosen] == ["S_t2", "S_t3"]
+    assert "S_t1_published" not in {a.situation_number for a in chosen}, (
+        "a gate-first filter would list t1 through its over-gate published situation"
+    )
+    assert [_train_of(a) for a in chosen] == [
+        _train_of(a) for a in varsel.one_alert_per_train(alerts) if a.alertworthy
+    ], "the collapse's own order is kept; the read sorts afterwards"
+
+    # The pass's own loop on the same fixture: its alert-worthy subjects are the helper's trains, and
+    # t1 is there as a withdrawal subject -- present, and not alert-worthy.
+    out: list = []
+    recipient = varsel.WebhookRecipient("sub_1", _journey(), client_id="c1", destination_id="d1")
+    unroutable = varsel._subjects_for_key(
+        out, key, [recipient], alerts_by_key={key: alerts}, match_targets={key: _journey()},
+        message_inputs={}, webhook_llm=False,
+    )
+    assert unroutable == 0
+    assert [_train_of(s) for s in out if s.alertworthy] == [_train_of(a) for a in chosen]
+    t1 = [s for s in out if s.journey_ref == "t1"]
+    assert len(t1) == 1 and t1[0].alertworthy is False, "t1 is the pass's withdrawal subject"
+
+
+def test_the_freshness_provider_reads_none_before_the_first_load_and_the_timestamp_after():
+    """R6: the read answers 503 on a prediction cache the poller has not loaded, and what tells a
+    cold cache from a loaded one is `_call_pred_refreshed_at` -- None until the first rebuild --
+    read under the same lock `_impact_snapshot` takes."""
+    with main._call_pred_lock:
+        previous = main._call_pred_refreshed_at
+    loaded_at = datetime(2026, 7, 6, 5, 55, tzinfo=UTC)
+    try:
+        with main._call_pred_lock:
+            main._call_pred_refreshed_at = None
+        assert main._varsel_refreshed_at() is None
+        with main._call_pred_lock:
+            main._call_pred_refreshed_at = loaded_at
+        assert main._varsel_refreshed_at() == loaded_at
+        assert main._varsel_refreshed_at() == main._impact_snapshot()[1], (
+            "one timestamp, read off the same snapshot /impact answers from"
+        )
+    finally:
+        with main._call_pred_lock:
+            main._call_pred_refreshed_at = previous
 
 
 if __name__ == "__main__":
