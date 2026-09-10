@@ -46,6 +46,9 @@ api = [
     "google-genai>=1.0.0",
     "google-cloud-firestore>=2.30.0",
     "pyjwt>=2.10.0",
+    # Imported at module level by metrics.py, which main imports — so unlike the lazy entries
+    # above, `import main` (every API test suite) fails without it.
+    "prometheus-client>=0.26.0",
 ]
 
 [tool.uv]

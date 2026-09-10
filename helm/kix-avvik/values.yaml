@@ -17,6 +17,17 @@ common:
         path: /health
       readiness:
         path: /health
+    # Prometheus scrape wiring (2026-09-11): rendered as the pod's prometheus.io/{scrape,path,port}
+    # annotations, pointing the platform's annotation-driven scraper at the app's dedicated
+    # internal exporter port -- served from the lifespan hook before readiness, so the slow
+    # BigQuery startup is observable. Never the public app port (8080), and never drop the
+    # explicit port: the chart's template applies `default .Values.service.internalPort` BEFORE
+    # its `required` guard can fire, so an omitted port silently points the scrape at 8080
+    # (which serves no /metrics) instead of failing the render. Rollback: enabled: false.
+    prometheus:
+      enabled: true
+      path: /metrics
+      port: 9464
 
   deployment:
     # Single instance by design: the app keeps an in-process cache and runs one
