@@ -3130,9 +3130,9 @@ def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
     The names are checked whether they are live or commented, because they land commented until
     their values exist in Secret Manager (which this unit cannot create). `live_secret_envs` is the
     admission rule: an environment goes in only after `gcloud secrets versions list` has shown a
-    version of BOTH secrets in that project -- dev on 2026-09-10 (version 1 of each).
+    version of BOTH secrets in that project -- dev and prd on 2026-09-10 (version 1 of each).
     """
-    live_secret_envs = {"dev"}
+    live_secret_envs = {"dev", "prd"}
     for env in ("dev", "tst", "prd"):
         values = (REPO / "helm" / "kix-avvik" / "env" / f"values-kub-ent-{env}.yaml").read_text()
         live = _uncommented(values)
