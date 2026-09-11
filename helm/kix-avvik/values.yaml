@@ -2,12 +2,14 @@
 # Environment-specific overrides live in env/values-kub-ent-{dev,tst,prd}.yaml.
 common:
   app: kix-avvik
-  shortname: kixavvik        # must match .entur/application.yaml metadata.id
+  appId: kixavvik            # must match .entur/application.yaml metadata.id
   team: ki-eksperimentering  # team label without the "team-" prefix
 
   container:
     image: kix-avvik  # replaced with image:tag by gha-helm deploy.yml
     cpu: 0.5
+    # Request AND limit since common 2.x, which has no separate limit knob (1.22.0 set the limit
+    # to 6/5 of this, 1228Mi). 29-day peak on 2026-09-11: 446 MiB dev, 496 MiB prd (which sets 2048).
     memory: 1024
     # The chart's default tcpSocket startup probe (300 x 1s) covers the app's
     # slow start: uvicorn only binds the port after the lifespan hook has
