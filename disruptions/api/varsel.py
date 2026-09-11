@@ -2012,6 +2012,17 @@ def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
     return result, error_detail
 
 
+def _send_push_result(sent: tuple[str, dict | None] | str) -> tuple[str, dict | None]:
+    """Normalize a ``_send_push`` return to ``(result, error_detail)``.
+
+    Suites across this repo stub ``_send_push`` with a bare result string; tolerating that shape
+    here (detail ``None``) is what lets the stubbed contract survive — the ``fetch_candidates``
+    precedent. The real function always returns the 2-tuple, so production never takes the
+    fallback arm.
+    """
+    return sent if isinstance(sent, tuple) else (sent, None)
+
+
 def _log_push(
     kind: str,
     result: str,
@@ -2100,11 +2111,7 @@ def deliver_to_devices(
             if prepared is None:
                 continue  # withdrawn between collection and dispatch; not a delivery attempt
             subscription, payload = prepared
-            sent = _send_push(subscription, payload)
-            # Suites across this repo stub `_send_push` with a bare result string; tolerate that
-            # shape (detail None) so the stubbed contract survives — the fetch_candidates
-            # precedent. The real function always returns the 2-tuple.
-            result, error_detail = sent if isinstance(sent, tuple) else (sent, None)
+            result, error_detail = _send_push_result(_send_push(subscription, payload))
             out.append((device_id, item, result, payload, error_detail))
             if result == "gone":
                 break  # stop this device's remaining pushes this batch
@@ -4727,9 +4734,7 @@ def test_push(body: TestIn) -> dict:
         "url": assets["url"],
         "icon": assets["icon"],
     }
-    sent = _send_push(subscription, payload)
-    # Same stub tolerance as deliver_to_devices: suites replace _send_push with a bare string.
-    result, error_detail = sent if isinstance(sent, tuple) else (sent, None)
+    result, error_detail = _send_push_result(_send_push(subscription, payload))
     _log_push("test", result, body.device_id, payload, error_detail=error_detail)
     if result == "gone":
         if _device_is_fresh(body.device_id):
