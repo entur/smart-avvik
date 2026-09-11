@@ -27,6 +27,49 @@ from datetime import UTC, datetime
 # Keys a `fields` dict may not override (the entry's own schema).
 _RESERVED = {"timestamp", "severity", "message", "logger"}
 
+#: The opentelemetry.trace module once imported, or False after a failed import (R17). Lazy and
+#: cached: this module must import before everything else in main and must not require the OTel
+#: API to be installed, but re-raising ImportError on every record would be paid per log line.
+_OTEL_TRACE = None
+
+
+def _span_correlation() -> dict:
+    """Cloud Logging's trace-correlation keys for the current span; {} outside any valid span.
+
+    Inside a valid span context — sampled or not, Cloud Logging's `trace_sampled` says which —
+    the entry gains `logging.googleapis.com/spanId` and `.../trace_sampled`, plus `.../trace` in
+    the `projects/<project>/traces/<32-hex>` form ONLY when GOOGLE_CLOUD_PROJECT is set: a
+    `projects/None/...` key correlates with nothing and must never be emitted. Wrapped so it can
+    NEVER raise — the formatter runs on every record, and a tracing problem taking logging down
+    with it would be the observability stack eating itself.
+    """
+    global _OTEL_TRACE
+    if _OTEL_TRACE is False:
+        return {}
+    try:
+        if _OTEL_TRACE is None:
+            try:
+                from opentelemetry import trace
+            except ImportError:
+                _OTEL_TRACE = False
+                return {}
+            _OTEL_TRACE = trace
+        ctx = _OTEL_TRACE.get_current_span().get_span_context()
+        if not ctx.is_valid:
+            return {}
+        keys = {
+            "logging.googleapis.com/spanId": _OTEL_TRACE.format_span_id(ctx.span_id),
+            "logging.googleapis.com/trace_sampled": bool(ctx.trace_flags.sampled),
+        }
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        if project:
+            keys["logging.googleapis.com/trace"] = (
+                f"projects/{project}/traces/{_OTEL_TRACE.format_trace_id(ctx.trace_id)}"
+            )
+        return keys
+    except Exception:  # noqa: BLE001 - see docstring: the formatter must never raise
+        return {}
+
 # The names LOG_LEVEL accepts (case-insensitive). NOTSET is deliberately absent: on the root
 # logger it means "fall back to WARNING", which nobody setting a level intends — it resolves to
 # INFO like any other unrecognised value.
@@ -78,6 +121,9 @@ class JsonFormatter(logging.Formatter):
         fields = getattr(record, "fields", None)
         if isinstance(fields, dict):
             entry.update({k: v for k, v in fields.items() if k not in _RESERVED})
+        # Applied AFTER the fields merge, so the true span identity wins over anything a fields
+        # dict happens to spell with these keys.
+        entry.update(_span_correlation())
         return json.dumps(entry, ensure_ascii=False, default=str)
 
 

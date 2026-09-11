@@ -37,6 +37,7 @@ import sso  # sibling module: the Entur-SSO gate in front of /historikk and /mel
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
 import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
+import tracing_setup  # import side effect: OTel tracing when TRACING_ENABLED (fail-open, KTD3)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 import webhook_delivery  # sibling module: one bounded webhook attempt per pending notification event
 from fastapi import FastAPI, HTTPException, Query, Response
@@ -1041,7 +1042,11 @@ def _phase(name: str, timings: dict[str, int]):
     started = monotonic()
     result = "ok"
     try:
-        yield
+        # A child span of the cycle root span via context (KTD4) — non-recording, and costless,
+        # when tracing is off. Inside the try on purpose: the span records the exception, and the
+        # except/finally below keep exactly the semantics documented above.
+        with tracing_setup.span(name):
+            yield
     except Exception:
         result = "error"
         raise
@@ -1066,32 +1071,38 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     logger.info("Last ingestion time changed: %s", last_ingestion_time)
     timings: dict[str, int] = {}
     cycle_started = monotonic()
-    try:
-        _rebuild_all(timings)
-    finally:
-        # In `finally` for the same reason each phase is: a rebuild that dies partway through is
-        # when the breakdown is worth having, and `poll_for_changes` catches whatever comes out of
-        # here and retries on the next tick, so this line is the only record that the cycle ran at
-        # all. `phases` carries only the steps that were reached, which is itself the diagnosis.
-        total_ms = round((monotonic() - cycle_started) * 1000)
-        logger.info(
-            "Poller cycle finished in %.1f s: %s",
-            total_ms / 1000,
-            ", ".join(f"{name} {ms} ms" for name, ms in timings.items()),
-            extra={
-                "fields": {
-                    "event": "poller_cycle",
-                    "ms": total_ms,
-                    "phases": dict(timings),
-                }
-            },
-        )
-        # EPOCH seconds, never `monotonic()` (KTD1's two-clock rule): the runbook's freshness
-        # alerts compute `time() - value`, which a monotonic export silently breaks. This gauge
-        # measures cache freshness — it moves only when SIRI-SX moves — not liveness; the tick
-        # gauge in poll_for_changes is the liveness one.
-        metrics.POLLER_LAST_CYCLE.set(time.time())
-        metrics.POLLER_CYCLE_DURATION.observe(total_ms / 1000)
+    # The cycle is ONE root span with per-phase children (KTD4): each `_phase` opens a child via
+    # context, and parent-based sampling then also governs the BigQuery client's automatic spans
+    # inside the cycle. The `finally` sits INSIDE the span so the cycle-summary log line carries
+    # the trace-correlation keys (R17). Non-recording, and costless, when tracing is off.
+    with tracing_setup.span("poller_cycle"):
+        try:
+            _rebuild_all(timings)
+        finally:
+            # In `finally` for the same reason each phase is: a rebuild that dies partway through
+            # is when the breakdown is worth having, and `poll_for_changes` catches whatever comes
+            # out of here and retries on the next tick, so this line is the only record that the
+            # cycle ran at all. `phases` carries only the steps that were reached, which is itself
+            # the diagnosis.
+            total_ms = round((monotonic() - cycle_started) * 1000)
+            logger.info(
+                "Poller cycle finished in %.1f s: %s",
+                total_ms / 1000,
+                ", ".join(f"{name} {ms} ms" for name, ms in timings.items()),
+                extra={
+                    "fields": {
+                        "event": "poller_cycle",
+                        "ms": total_ms,
+                        "phases": dict(timings),
+                    }
+                },
+            )
+            # EPOCH seconds, never `monotonic()` (KTD1's two-clock rule): the runbook's freshness
+            # alerts compute `time() - value`, which a monotonic export silently breaks. This
+            # gauge measures cache freshness — it moves only when SIRI-SX moves — not liveness;
+            # the tick gauge in poll_for_changes is the liveness one.
+            metrics.POLLER_LAST_CYCLE.set(time.time())
+            metrics.POLLER_CYCLE_DURATION.observe(total_ms / 1000)
 
 
 def _rebuild_all(timings: dict[str, int]) -> None:
@@ -1564,9 +1575,15 @@ app.add_middleware(sso.RequireSSO)
 
 # HTTP request metrics (metrics.py): counts and times every request by method, first path segment
 # and status class. Added after RequireSSO — Starlette runs the last-added middleware outermost —
-# so a request the SSO gate rejects (302/401/503) is still counted. The tracing middleware (a
-# later unit) is added directly after this line, outside both.
+# so a request the SSO gate rejects (302/401/503) is still counted. The tracing middleware is
+# added directly after this line, outside both.
 app.add_middleware(metrics.HTTPMetrics)
+
+# OpenTelemetry request tracing (tracing_setup.py) — a no-op unless TRACING_ENABLED. Instrumented
+# AFTER the metrics middleware so tracing is outermost (KTD10's stack: OTel → metrics →
+# RequireSSO → CORS → routes): an SSO-rejected request is traced and counted alike. /health is
+# excluded; every URL span attribute leaves with its query string stripped (R15b).
+tracing_setup.instrument_app(app)
 
 # Avviksvarsel API (registered-journey push alerts). Registered before the /varsel static mount
 # so /varsel-api/* resolves to these routes.
