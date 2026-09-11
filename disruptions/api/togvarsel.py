@@ -157,6 +157,16 @@ _GRACE_H = 10 / 60
 # failure (a missing model in prd, a broken feed) costs a bounded number of billable scans.
 _FAIL_COOLDOWN = timedelta(minutes=15)
 _MAX_FAILS_PER_DAY = 8
+# Every BigQuery wait in this module runs on the poller thread, so none may be unbounded: a hang
+# holds the tick, the tick stops moving the heartbeat, and past HEALTH_STALE_AFTER_S /health 503s
+# and liveness restarts the single replica — into the same hang on the next tick, a crash loop
+# against an outage no restart can fix. The client's default is no timeout at all, so the bound
+# has to be passed; both numbers are ceilings on a wedge, not budgets anything healthy approaches
+# (the rebuild is a handful of jobs, the reads are single rows and short lists). _REBUILD is
+# main._POLLER_QUERY_TIMEOUT_S, the ceiling the poller's own heavy scans carry. Charging a slow
+# rebuild as a failure is the deliberate cost: _note_failure backs the issue off and retries it.
+_READ_TIMEOUT_S = 60
+_REBUILD_TIMEOUT_S = 240
 
 
 @dataclass(frozen=True)
@@ -461,7 +471,8 @@ def known_deviations_for(sx: list[dict]) -> list[KnownDeviation]:
 
 
 def _rows(query: str) -> list[dict]:
-    return [dict(r) for r in _bq_client.query(query).result()]
+    """Every read in this module goes through here, which is where the timeout is stated once."""
+    return [dict(r) for r in _bq_client.query(query).result(timeout=_READ_TIMEOUT_S)]
 
 
 def _record_issue(d: date, issue: Issue, model: str) -> None:
@@ -570,7 +581,7 @@ def refresh(now: datetime | None = None) -> None:
     # Rebuild the live feature row + today's SX list (one multi-statement job), then read both.
     # A failure here charges every issue the rebuild was serving, capping the daily spend.
     try:
-        _bq_client.query(_FEATURES_TODAY_SQL).result()
+        _bq_client.query(_FEATURES_TODAY_SQL).result(timeout=_REBUILD_TIMEOUT_S)
         rows = _rows(_FEATURES_ROW_SQL)
         if not rows:
             raise RuntimeError("togvarsel_features_today came back empty")
