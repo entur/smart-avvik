@@ -39,9 +39,12 @@ POLLER_LAST_TICK = Gauge(
 )
 POLLER_LAST_CYCLE = Gauge(
     "kix_poller_last_cycle_timestamp_seconds",
-    "Epoch seconds when a full rebuild cycle (main._rebuild_all) last completed. Moves only when "
-    "the upstream SIRI-SX ingestion timestamp moves (~3 min p50), so it measures cache freshness, "
-    "never liveness — an age alert on it would page on every quiet night.",
+    "Epoch seconds when a full rebuild cycle (main._rebuild_all) last RAN TO THE END. Moves only "
+    "when the upstream SIRI-SX ingestion timestamp moves (~3 min p50), so it measures cache "
+    "freshness, never liveness — an age alert on it would page on every quiet night. A cycle that "
+    "died in one of the steps that propagate does not move it; a step with its own try/except "
+    "failing every cycle DOES leave it moving, so pair it with "
+    "kix_poller_phase_total{result=\"error\"} rather than reading it as 'every cache is fresh'.",
 )
 POLLER_CYCLE_DURATION = Histogram(
     "kix_poller_cycle_duration_seconds",

@@ -142,6 +142,12 @@ _COVERAGE_MIN_PCT = 50.0
 _VOLUME_WINDOW_H = 6
 
 _HTTP_TIMEOUT_S = 3.0
+# refresh_baselines runs on the POLLER thread (main._rebuild_all's `svv_baselines` phase), where
+# the BigQuery client's default of waiting forever is a wedge: the tick stops making progress,
+# /health goes stale and liveness restarts the replica into the same hang. A ceiling on that, not
+# a budget -- the read is a small lookup table. A timeout is caught by the tolerant `except`
+# below like any other failure, which keeps the previous lookup and re-reads on the next tick.
+_BASELINES_TIMEOUT_S = 60
 _JP_URL = "https://api.entur.io/journey-planner/v3/graphql"
 _TRAFIKKDATA_URL = "https://trafikkdata-api.atlas.vegvesen.no/"
 # The contact address is required, not decorative: Trafikkdata is open and keyless (NLOD), so the
@@ -391,7 +397,7 @@ def refresh_baselines() -> None:
         logger.info("No BigQuery client configured; svv baselines not loaded")
         return
     try:
-        rows = _bq_client.query(_BASELINES_QUERY).result()
+        rows = _bq_client.query(_BASELINES_QUERY).result(timeout=_BASELINES_TIMEOUT_S)
         table: dict[tuple[str, int, int], dict[str, Any]] = {}
         built_at: datetime | None = None
         for r in rows:

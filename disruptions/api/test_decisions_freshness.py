@@ -41,9 +41,9 @@ NOW = datetime.now(tz=UTC)
 class _Row:
     """The one row the two-aggregate freshness query returns, attribute-access like bigquery.Row."""
 
-    def __init__(self, latest_labelled, recent_decisions):
+    def __init__(self, latest_labelled, labellable_decisions):
         self.latest_labelled = latest_labelled
-        self.recent_decisions = recent_decisions
+        self.labellable_decisions = labellable_decisions
 
 
 class _Job:
@@ -57,10 +57,10 @@ class _Job:
 class _FreshnessClient:
     """Serves the freshness row; counts calls so the 6 h rate window is assertable."""
 
-    def __init__(self, latest_labelled, recent_decisions):
+    def __init__(self, latest_labelled, labellable_decisions):
         self.calls = 0
         self.sqls: list[str] = []
-        self._row = _Row(latest_labelled, recent_decisions)
+        self._row = _Row(latest_labelled, labellable_decisions)
 
     def query(self, sql):
         self.calls += 1
@@ -152,7 +152,7 @@ def test_a_stale_labelling_with_work_waiting_is_one_error_and_the_window_holds()
     must run NO query — the detector rides a 60 s poller tick and cannot cost a BigQuery job per
     tick."""
     assert decisions._FRESHNESS_CHECK_INTERVAL_S == 6 * 3600
-    client = _FreshnessClient(NOW - timedelta(hours=72), recent_decisions=15)
+    client = _FreshnessClient(NOW - timedelta(hours=72), labellable_decisions=15)
     with _freshness(client) as recorder:
         decisions.check_labelling_freshness()
         errors = recorder.by_level("ERROR")
@@ -170,7 +170,7 @@ def test_absent_labelling_with_work_waiting_alerts_with_a_named_reason():
     """The prd-outage-past-the-window case. An outage that outlasts the 10-day retry window
     empties the partition-bounded MAX to NULL — precisely when loss becomes permanent — so NULL
     beside recent decisions must alert, never read as "nothing to report"."""
-    client = _FreshnessClient(None, recent_decisions=8)
+    client = _FreshnessClient(None, labellable_decisions=8)
     with _freshness(client) as recorder:
         decisions.check_labelling_freshness()
         errors = recorder.by_level("ERROR")
@@ -184,7 +184,7 @@ def test_no_work_to_label_is_one_latched_info_never_error():
     """tst decides nothing, so tst labels nothing — stale-or-NULL labelling there is the system
     working, not failing. One INFO per process says the detector looked; repeating it per check
     (or raising it to ERROR) would train whoever reads the channel to ignore labelling_stale."""
-    client = _FreshnessClient(None, recent_decisions=0)
+    client = _FreshnessClient(None, labellable_decisions=0)
     with _freshness(client) as recorder:
         decisions.check_labelling_freshness()
         assert recorder.by_level("ERROR") == []
@@ -197,7 +197,7 @@ def test_no_work_to_label_is_one_latched_info_never_error():
         assert recorder.by_level("ERROR") == []
         # A stale timestamp with no recent decisions is the same quiet verdict.
         decisions._freshness_last_checked = None
-        decisions._bq_client = _FreshnessClient(NOW - timedelta(days=9), recent_decisions=0)
+        decisions._bq_client = _FreshnessClient(NOW - timedelta(days=9), labellable_decisions=0)
         decisions.check_labelling_freshness()
         assert recorder.by_level("ERROR") == []
         assert len(recorder.by_level("INFO")) == 1
@@ -207,12 +207,52 @@ def test_fresh_labelling_sets_the_gauge_and_logs_nothing():
     """The healthy path is a gauge move and silence: `time() - value` is the PromQL age rule the
     runbook alerts on, so the gauge must be the labelled_at EPOCH, not "now"."""
     latest = NOW - timedelta(hours=2)
-    client = _FreshnessClient(latest, recent_decisions=40)
+    client = _FreshnessClient(latest, labellable_decisions=40)
     with _freshness(client) as recorder:
         decisions.check_labelling_freshness()
         assert recorder.records == [], recorder.records
     value = REGISTRY.get_sample_value("kix_labelling_last_success_timestamp_seconds")
     assert value == latest.timestamp(), "the gauge is the labelled_at epoch, never time.time()"
+
+
+def test_a_fresh_environment_with_only_unlabellable_decisions_stays_quiet():
+    """The regression that made every new deployment cry wolf on day one.
+
+    A brand-new environment (a rebuilt dev table, tst the moment a journey registers, prd's first
+    day) has decisions but nothing labelled yet — and nothing the nightly job COULD have labelled,
+    because it joins last_recorded and that stops at yesterday. Gated on "decisions in the last
+    48 h" this fired `reason="no_labelled_rows"` — "varsel-label-daily appears to have stopped" —
+    from the first decision written, every 6 h for over a day, tripping the runbook's ERROR rule
+    each time. The gate counts only decisions old enough to have been labelled, so this state is
+    the quiet one it always should have been.
+    """
+    client = _FreshnessClient(None, labellable_decisions=0)  # decisions exist, none yet labellable
+    with _freshness(client) as recorder:
+        decisions.check_labelling_freshness()
+        assert recorder.by_level("ERROR") == [], (
+            "a deployment whose decisions are all younger than the labelling job's reach must "
+            "not be reported as a dead labelling job"
+        )
+
+
+def test_the_gauge_is_set_even_when_labelling_is_stale():
+    """R8: the gauge must exist whenever a labelled row does, or the age rule cannot age it.
+
+    Set only on the healthy path, `kix_labelling_last_success_timestamp_seconds` disappeared
+    exactly when labelling stopped — so the runbook's `time() - value` rule saw no-data precisely
+    in the failure it exists to catch, and had to alert on no-data to compensate, which then
+    paged on every quiet environment instead.
+    """
+    stale = NOW - timedelta(hours=72)
+    client = _FreshnessClient(stale, labellable_decisions=15)
+    with _freshness(client) as recorder:
+        decisions.check_labelling_freshness()
+        assert len(recorder.by_level("ERROR")) == 1, "stale with work waiting is still the alert"
+    value = REGISTRY.get_sample_value("kix_labelling_last_success_timestamp_seconds")
+    assert value == stale.timestamp(), (
+        "the gauge reports the last labelling that DID happen, however long ago — its age is the "
+        "alert, and an absent series has no age"
+    )
 
 
 # ---- failure posture ----------------------------------------------------------------------------
@@ -324,8 +364,19 @@ def test_the_query_is_partition_bounded_on_both_tables():
     beside it to prune partitions at all."""
     sql = decisions._FRESHNESS_SQL
     assert "call_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY)" in sql
-    assert "DATE(decided_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)" in sql
-    assert "decided_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)" in sql
+    # The work gate: decisions the nightly job HAS had the chance to label. The upper bound
+    # (today-2) is the whole point — the job joins last_recorded, which stops at yesterday, so a
+    # decision about today's departure is not late, it is not yet labellable. Counting it made
+    # every fresh environment fire a false labelling_stale ERROR from its first decision.
+    assert "call_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY)" in sql
+    assert "AND DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)" in sql
+    # varsel_decisions is PARTITION BY DATE(decided_at), and call_date is not that key, so the
+    # gate above prunes nothing on its own: a decision precedes its call by at most ~1 day
+    # (measured), which is what makes today-11 a safe cover for a call_date floor of today-10.
+    assert "DATE(decided_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 11 DAY)" in sql
+    assert "TIMESTAMP_SUB" not in sql, (
+        "the 48 h decision window was the false-positive source; it must not come back"
+    )
 
 
 def test_the_check_rides_the_wall_clock_tick_never_the_sx_rebuild():

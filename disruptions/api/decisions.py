@@ -102,10 +102,15 @@ _ensure_failed_at: float | None = None
 _descriptions_done = False
 _descriptions_failed_at: float | None = None
 
-# The DDL runs on the startup path of a single always-on pod. Every other bq call in this app is
-# unbounded, but this one is new and sits in front of the poller thread, so it gets an explicit
-# ceiling rather than inheriting "wait forever".
+# The DDL runs on the startup path of a single always-on pod, in front of the poller thread, so
+# it gets an explicit ceiling rather than inheriting the client's "wait forever".
 _ENSURE_TIMEOUT_S = 60.0
+# `record` runs inside check_and_notify on the poller thread, so its streaming insert needs the
+# same ceiling for the same reason (a hung insertAll wedges the tick, /health goes stale, liveness
+# restarts into the hang). Generous against a small batch: a write that needs longer than this has
+# something wrong with it, and the write fails open anyway — the row is logged as lost and the
+# traveller's push is unaffected.
+_WRITE_TIMEOUT_S = 60.0
 
 
 def configure(*, bq_client: Any) -> None:
@@ -498,12 +503,22 @@ def record(rows: list[dict]) -> int:
     A failure here is logged and dropped. The alternative — letting it propagate — would put a
     BigQuery outage on the path between a live disruption and a traveller's phone.
     """
-    if not rows or not ensure_table():
-        # No write was attempted, so no outcome to count — an `error` increment here would page
-        # on every deployment that simply has no client configured.
+    if not rows:
+        return 0
+    if not ensure_table():
+        # Two different states wear this one False, and only one of them is nothing to report.
+        # No client configured is a deployment that never intended to record — counting an
+        # `error` there would page on every such environment forever. A configured client whose
+        # structural CREATE failed is the 2026-08-07 mode: a BigQuery table-update rate limit (5
+        # per 10 s) turns a cosmetic description edit into a decision log that records NOTHING,
+        # and `ensure_table` only logs one WARNING per retry window — below the runbook's ERROR
+        # rule. Uncounted, the counter simply flatlines, which on a dashboard is indistinguishable
+        # from "no alerts happened" — exactly the silent loss KTD11 added this counter to catch.
+        if _bq_client is not None:
+            metrics.DECISION_WRITE_TOTAL.labels(result="error").inc()
         return 0
     try:
-        errors = _bq_client.insert_rows_json(TABLE, rows)
+        errors = _bq_client.insert_rows_json(TABLE, rows, timeout=_WRITE_TIMEOUT_S)
     except Exception:
         logger.warning("Could not record %d alert decisions", len(rows), exc_info=True)
         # The write fails open by design, which is exactly why the failure needs a counter: the
@@ -569,8 +584,9 @@ SELECT
     WHERE call_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY)) AS latest_labelled,
   (SELECT COUNT(*)
      FROM disruptions.varsel_decisions
-    WHERE DATE(decided_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 3 DAY)
-      AND decided_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)) AS recent_decisions
+    WHERE DATE(decided_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 11 DAY)
+      AND call_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 10 DAY)
+                        AND DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)) AS labellable_decisions
 """
 
 _freshness_last_checked: float | None = None  # monotonic stamp of the last attempted check
@@ -582,19 +598,34 @@ def check_labelling_freshness() -> None:
 
     The decision is R8's work-to-label gate, one query with two aggregates:
 
-    * labelling stale (MAX(labelled_at) older than 48 h) **or absent** (NULL) while decisions were
-      recorded in the last 48 h → ``logger.error`` with ``event="labelling_stale"``, carrying
-      ``hours_stale`` when a timestamp exists and ``reason="no_labelled_rows"`` when none does.
-      The absent case is the one a naive age check gets backwards: a prd outage that outlasts the
-      10-day window empties the bounded MAX to NULL precisely when loss becomes permanent, and
-      NULL must alert there, not read as "nothing to report". The ERROR re-fires once per 6 h
-      window for as long as the condition holds — it is an alert condition, not an event.
-    * no recent decisions (tst, or a genuinely quiet period): stale labelling is the system
-      working — nothing was decided, so nothing could be labelled — and the answer is at most ONE
-      INFO per process, never an ERROR that trains readers to ignore the event name.
-    * fresh: set :data:`metrics.LABELLING_LAST_SUCCESS` to the labelled_at epoch (the PromQL age
-      rule is ``time() - value``, so the gauge must be the observation, never "now") and log
-      nothing.
+    * labelling stale (MAX(labelled_at) older than 48 h) **or absent** (NULL) while decisions the
+      job has HAD THE CHANCE to label are waiting → ``logger.error`` with
+      ``event="labelling_stale"``, carrying ``hours_stale`` when a timestamp exists and
+      ``reason="no_labelled_rows"`` when none does. The absent case is the one a naive age check
+      gets backwards: a prd outage that outlasts the 10-day window empties the bounded MAX to NULL
+      precisely when loss becomes permanent, and NULL must alert there, not read as "nothing to
+      report". The ERROR re-fires once per 6 h window for as long as the condition holds — it is
+      an alert condition, not an event.
+    * nothing labellable yet: at most ONE INFO per process, never an ERROR.
+
+      **The work gate counts `call_date` in [today-10, today-2], not decisions from the last
+      48 h.** The nightly job can only label a call that has run, and it joins `last_recorded`,
+      which stops at yesterday — so a decision about today's or tomorrow's departure is not late,
+      it is not yet labellable. Counting the last 48 h of decisions made every fresh environment
+      (a rebuilt dev table, tst the moment a journey registers, prd's first day) fire
+      ``reason="no_labelled_rows"`` — "the job appears to have stopped" — from the very first
+      decision, every 6 h for over a day, when nothing had yet been labellable at all. An ERROR
+      that cries wolf on day one of every deployment is worse than no detector: it teaches the
+      reader to filter the event name out. The lower bound is the same 10 days as the MAX above,
+      so the two aggregates describe one window; `DATE(decided_at) >= today-11` is the partition
+      prune (a decision precedes its call by at most ~1 day, measured), not part of the gate.
+    * fresh: log nothing.
+
+    :data:`metrics.LABELLING_LAST_SUCCESS` is set whenever a labelled row exists at all, stale or
+    fresh (the PromQL age rule is ``time() - value``, so the gauge must be the observation, never
+    "now"). Deliberately not only on the healthy path: an age alert cannot age an absent series,
+    so a gauge that disappeared exactly when labelling stopped would be useless to the rule
+    watching it.
 
     Fail-open like everything else in this module: a query failure is a WARNING with
     ``result="check_failed"`` — the detector must never take the poller down. The 6 h window is
@@ -616,7 +647,7 @@ def check_labelling_freshness() -> None:
     try:
         row = next(iter(_bq_client.query(_FRESHNESS_SQL).result(timeout=_FRESHNESS_TIMEOUT_S)))
         latest = row.latest_labelled
-        recent = int(row.recent_decisions or 0)
+        labellable = int(row.labellable_decisions or 0)
     except Exception:
         logger.warning(
             "Labelling freshness check failed; retrying in %d h",
@@ -632,11 +663,16 @@ def check_labelling_freshness() -> None:
             # the subtraction below throw on the poller thread.
             latest = latest.replace(tzinfo=UTC)
         hours_stale = (datetime.now(tz=UTC) - latest).total_seconds() / 3600.0
+        # Set whenever a labelled row EXISTS, fresh or stale — not only on the healthy path, which
+        # is where it was and which made the series mean "last labelling, but reported only while
+        # it is going well". A gauge named last_success that vanishes exactly when labelling stops
+        # is the opposite of what an age alert needs: the runbook computes `time() - value`, and a
+        # value that is simply absent cannot be aged at all.
+        metrics.LABELLING_LAST_SUCCESS.set(latest.timestamp())
         if hours_stale <= _LABELLING_STALE_AFTER_H:
-            metrics.LABELLING_LAST_SUCCESS.set(latest.timestamp())
             return
-    if recent > 0:
-        fields: dict[str, Any] = {"event": "labelling_stale", "recent_decisions": recent}
+    if labellable > 0:
+        fields: dict[str, Any] = {"event": "labelling_stale", "labellable_decisions": labellable}
         if hours_stale is not None:
             fields["hours_stale"] = round(hours_stale, 1)
             detail = f"latest outcome was labelled {hours_stale:.0f} h ago"
@@ -644,18 +680,18 @@ def check_labelling_freshness() -> None:
             fields["reason"] = "no_labelled_rows"
             detail = "no outcome labelled in the last 10 days"
         logger.error(
-            "varsel-label-daily appears to have stopped: %s while %d decisions from the last "
-            "48 h await labelling. Decisions still unlabelled after the job's 10-day retry "
-            "window are lost for good.",
+            "varsel-label-daily appears to have stopped: %s while %d decisions old enough to "
+            "have been labelled are still waiting. Decisions still unlabelled after the job's "
+            "10-day retry window are lost for good.",
             detail,
-            recent,
+            labellable,
             extra={"fields": fields},
         )
         return
     if not _freshness_quiet_logged:
         _freshness_quiet_logged = True
         logger.info(
-            "No decisions recorded in the last 48 h, so stale labelling is expected here; the "
-            "freshness check stays quiet until there is work to label",
-            extra={"fields": {"event": "labelling_stale", "result": "no_recent_decisions"}},
+            "No decisions old enough to have been labelled yet, so stale labelling is expected "
+            "here; the freshness check stays quiet until there is work to label",
+            extra={"fields": {"event": "labelling_stale", "result": "no_labellable_decisions"}},
         )

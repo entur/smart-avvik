@@ -53,7 +53,34 @@ _EXCLUDED_URLS = r"^https?://[^/]+/health$"
 #: token that lets anyone push to that device.
 _PUSH_HOSTS_ON_GOOGLE = frozenset({"fcm.googleapis.com"})
 
+#: Path segments whose NEXT segment is an identifier minted for one subscriber, never a method
+#: name. `/varsel-api/devices/<device_id>` is the sharp one: that id is the capability token
+#: `/varsel-api/devices` accepts as proof of ownership — the same secret this module already
+#: refuses to export for `fcm.googleapis.com` — so exporting it in an INBOUND span's path would
+#: hand anyone with Cloud Trace read in the project everything they need to replay the call.
+#: `journeys` and `subscriptions` are the other two identifier-bearing routes in the app.
+#: Redacting the segment after these keeps the span's shape (the route is what makes it
+#: diagnosable) while dropping the only part of it that identifies a person (R15b).
+_ID_BEARING_SEGMENTS = frozenset({"devices", "journeys", "subscriptions"})
+_REDACTED_SEGMENT = "<redacted>"
+
 _enabled = False
+
+
+def _safe_path(path: str) -> str:
+    """``path`` with every subscriber identifier replaced by a placeholder.
+
+    A whitelist of preceding segments rather than a guess at what an id looks like: an
+    "is this a uuid?" heuristic silently stops matching the day an id format changes, and the
+    failure is invisible — a leaked token looks exactly like a working span. Every path-parameter
+    route in the app sits behind one of :data:`_ID_BEARING_SEGMENTS`, and a test walks the app's
+    own routes to keep that true.
+    """
+    segments = path.split("/")
+    for i in range(1, len(segments)):
+        if segments[i - 1].lower() in _ID_BEARING_SEGMENTS and segments[i]:
+            segments[i] = _REDACTED_SEGMENT
+    return "/".join(segments)
 
 
 def _path_safe_host(host: str) -> bool:
@@ -93,9 +120,14 @@ def _overwrite_url_attributes(span, safe_url: str, safe_target: str) -> None:
 
 
 def _server_request_hook(span, scope) -> None:
-    """Strip the query string from every URL attribute on an inbound server span (R15b).
+    """Strip the query string AND every subscriber id from an inbound server span's URL (R15b).
 
-    Fires after the ASGI instrumentation has set the span's attributes, so overwriting is enough.
+    The query string was the only thing stripped here at first, which left the sharper leak wide
+    open: the id in `/varsel-api/devices/<device_id>` is a path segment, not a parameter, and it
+    is a capability token. :func:`_safe_path` handles it. The route template would be the tidier
+    source, but `http.route` is not set yet when this hook fires — the ASGI instrumentation opens
+    the span before Starlette has matched a route — so the redaction works on the concrete path.
+
     Never raises: a hook failure inside the middleware would fail the request it observes.
     """
     try:
@@ -104,8 +136,8 @@ def _server_request_hook(span, scope) -> None:
             return
         full = attributes.get("http.url") or attributes.get("url.full") or ""
         parts = urlsplit(str(full))
-        path = parts.path or (scope or {}).get("path", "")
-        safe_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        path = _safe_path(parts.path or (scope or {}).get("path", ""))
+        safe_url = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
         _overwrite_url_attributes(span, safe_url or path, path)
     except Exception:  # noqa: BLE001, S110 - sanitizing must never fail the request it rides on
         pass
@@ -159,6 +191,14 @@ def setup(exporter_factory=None) -> None:
     WARNING (``event="tracing_disabled"``) and leaves tracing off while the app serves normally.
     The global provider is set LAST, so a failure part-way through configures nothing at all.
 
+    "Fails open" is about SETUP, and it is worth being precise because the env files used to
+    overclaim it: once setup succeeds, a failing EXPORT is not quiet. The OTLP exporter logs
+    "Failed to export" at ERROR for every batch it cannot deliver — roughly one every 5 s under
+    the default BatchSpanProcessor schedule — and a non-retryable code (PERMISSION_DENIED from a
+    missing trace-write role, UNAVAILABLE from a disabled service) never stops recurring. The app
+    is unaffected; the ERROR channel is not. That is why the flag ships off in an environment
+    whose IAM has not been verified, rather than relying on the failure being harmless.
+
     ``exporter_factory`` is the test seam: injecting an in-memory exporter is what lets the suite
     exercise the whole enabled path without ever building channel credentials.
     """
@@ -186,10 +226,16 @@ def setup(exporter_factory=None) -> None:
         # shutdown hang against an unreachable endpoint, and the default 30 s cap bounds it
         # (KTD9) — the pod's termination grace period covers that.
         provider.add_span_processor(BatchSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
         from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
         RequestsInstrumentor().instrument(request_hook=_requests_request_hook)
+        # LAST, after the final fallible step, which is what makes the docstring's promise true.
+        # Set before the instrumentor — as it was — a contrib/SDK mismatch that made `instrument`
+        # raise left the provider installed and its BatchSpanProcessor exporting poller and
+        # BigQuery spans, while `_enabled` was False, `instrument_app` no-opped, and the operator
+        # read a warning saying tracing was off. Instrumenting first is safe: the API hands out a
+        # ProxyTracer that resolves to whatever provider is installed when a span is first created.
+        trace.set_tracer_provider(provider)
         _enabled = True
         logger.info(
             "Tracing enabled: OTLP export to %s",
@@ -198,6 +244,13 @@ def setup(exporter_factory=None) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - R13: tracing must never take the app down
         _enabled = False
+        # BatchSpanProcessor starts its worker thread in __init__, so a failure after the
+        # provider was built leaves one running with nothing to flush. Shutting it down is
+        # belt-and-braces beside the ordering above — and must not itself raise here.
+        try:
+            provider.shutdown()
+        except Exception:  # noqa: BLE001, S110 - the provider may not exist yet; nothing to do
+            pass
         logger.warning(
             "Tracing disabled: setup failed (%s); the app serves normally with no-op spans",
             exc,

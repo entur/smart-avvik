@@ -392,6 +392,68 @@ def test_a_raising_exporter_factory_fails_open_with_one_structured_warning():
         _reset_tracing()
 
 
+def test_a_device_id_never_reaches_a_span_in_the_request_path():
+    """R15b: the capability token in /varsel-api/devices/<id> is redacted, not just the query.
+
+    The first version of the inbound hook stripped the query string only, which missed the sharper
+    leak entirely: the device id is a PATH segment, and it is the same secret `/varsel-api/devices`
+    accepts as proof of ownership — the one this module already refuses to export for
+    fcm.googleapis.com. Exported, anyone with Cloud Trace read in the project could replay it.
+    """
+    cases = [
+        ("/varsel-api/devices/abc123", "/varsel-api/devices/<redacted>"),
+        ("/varsel-api/devices/abc123/data", "/varsel-api/devices/<redacted>/data"),
+        ("/varsel-api/journeys/j-77", "/varsel-api/journeys/<redacted>"),
+        ("/notification-api/v1/subscriptions/s-9", "/notification-api/v1/subscriptions/<redacted>"),
+        # Untouched: no identifier, and a bare collection route has nothing to redact.
+        ("/varsel-api/devices", "/varsel-api/devices"),
+        ("/varsel-api/stops", "/varsel-api/stops"),
+        ("/health", "/health"),
+    ]
+    for raw, expected in cases:
+        assert tracing_setup._safe_path(raw) == expected, raw
+
+    class _Span:
+        def __init__(self):
+            self.attributes = {"http.url": "https://x.entur.io/varsel-api/devices/abc123?y=1"}
+
+        def set_attribute(self, key, value):
+            self.attributes[key] = value
+
+    span = _Span()
+    tracing_setup._server_request_hook(span, {"path": "/varsel-api/devices/abc123"})
+    exported = span.attributes["http.url"]
+    assert "abc123" not in exported, exported
+    assert "y=1" not in exported, exported
+    assert exported == "https://x.entur.io/varsel-api/devices/<redacted>"
+
+
+def test_every_path_parameter_route_sits_behind_a_redacted_segment():
+    """The redaction is a whitelist of PRECEDING segments, so a new id-bearing route must join it.
+
+    Walks the app's own routes rather than restating a list: an "is this a uuid?" heuristic would
+    stop matching the day an id format changes, and the failure is invisible — a leaked token
+    looks exactly like a working span. A new `/…/widgets/{widget_id}` fails here until `widgets`
+    is added to _ID_BEARING_SEGMENTS or deliberately judged non-identifying.
+    """
+    import re
+
+    import main
+
+    unguarded = []
+    for route in main.app.routes:
+        path = getattr(route, "path", "")
+        for match in re.finditer(r"\{[^}]+\}", path):
+            prefix = path[: match.start()].rstrip("/")
+            preceding = prefix.rsplit("/", 1)[-1].lower()
+            if preceding not in tracing_setup._ID_BEARING_SEGMENTS:
+                unguarded.append(f"{path} (segment before the parameter: {preceding!r})")
+    assert not unguarded, (
+        "path-parameter routes whose id would be exported to Cloud Trace verbatim:\n"
+        + "\n".join(unguarded)
+    )
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

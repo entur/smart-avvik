@@ -9,8 +9,12 @@ What the rest pins is the ordered liveness decision (KTD1): a dead thread handle
 of configuration, a heartbeat older than HEALTH_STALE_AFTER_S 503s while the thread still looks
 alive (the wedged-poller case a plain is_alive() can never see), the 200→503 transition leaves
 exactly ONE `event="health_degraded"` record (the access log will not carry /health, so this is
-the surviving forensic line), and the heartbeat beats at the TOP of the loop — before anything
-that can fail — so a broken upstream keeps the pod alive while a wedged loop does not. The last
+the surviving forensic line), and the heartbeat beats at the top of the loop — before anything
+that can fail — AND at every progress point inside it, so a broken upstream keeps the pod alive
+while a wedged loop does not. That last part is the contract `_beat` states: the threshold means
+"no STEP has finished in HEALTH_STALE_AFTER_S", not "the iteration took longer than that" — an
+iteration legitimately runs minutes (a cold start rebuilds both ET partition scans), and reading
+one as a wedge would restart the pod into the same cold start. The last
 section covers `threading.excepthook`: a dying thread leaves one structured ERROR
 (`event="thread_died"`) instead of the interpreter's raw stderr traceback.
 
@@ -35,6 +39,7 @@ _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
 import logging_setup
 import main
+import metrics
 from fastapi.testclient import TestClient
 
 # Not entered as a context manager on purpose: that would run the lifespan hook, which starts the
@@ -285,6 +290,44 @@ def test_a_dying_thread_leaves_one_structured_error_record():
     assert "boom-in-thread" in entry["message"], entry
 
 
+def test_a_finished_phase_beats_the_heartbeat_so_a_slow_cycle_is_not_a_wedge():
+    """A long iteration made of finishing STEPS must stay healthy; only a stuck step goes stale.
+
+    The heartbeat used to be written once per iteration, which made HEALTH_STALE_AFTER_S bound the
+    whole cycle: ~12-16 bounded BigQuery calls plus togvarsel plus the notify ceilings plus the
+    sleep. A cold start (both ET partition scans rebuilt after a restart zeroed their TTL stamps)
+    could cross 600 s while every single step was healthy, and the 503 would restart the pod into
+    another cold start. Both clocks move, not just the monotonic one — leaving the epoch gauge on
+    the per-iteration beat would just move the false alarm to the runbook's rule 1 at 900 s.
+    """
+    before = (main._poller_heartbeat_monotonic, main.logger)
+    main.logger = _Recorder()
+    try:
+        main._poller_heartbeat_monotonic = time.monotonic() - 10_000  # far past any threshold
+        tick_before = metrics.POLLER_LAST_TICK._value.get()
+        with main._phase("a_step_that_took_a_while", {}):
+            pass
+        age = time.monotonic() - main._poller_heartbeat_monotonic
+        assert age < 60, f"a finished phase must beat the heartbeat; age was {age:.0f} s"
+        assert metrics.POLLER_LAST_TICK._value.get() > tick_before, (
+            "the EPOCH gauge must move with the monotonic one, or rule 1 fires on the same cycle "
+            "/health has just learned to tolerate"
+        )
+        # A step that FAILED is still progress — the thread is moving — so the beat is in the
+        # `finally` and the exception still propagates untouched.
+        main._poller_heartbeat_monotonic = time.monotonic() - 10_000
+        try:
+            with main._phase("a_step_that_died", {}):
+                raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+        assert time.monotonic() - main._poller_heartbeat_monotonic < 60, (
+            "a failed phase is progress too: it proves the thread is still moving"
+        )
+    finally:
+        main._poller_heartbeat_monotonic, main.logger = before
+
+
 def test_no_poller_path_bigquery_wait_is_unbounded():
     """Every `.result()` in the togvarsel modules passes a timeout (KTD1's other half).
 
@@ -295,20 +338,28 @@ def test_no_poller_path_bigquery_wait_is_unbounded():
     in (togvarsel `_rows` and the feature rebuild, togvarsel_notify's station fetch), all found by
     review rather than by a test, which is what this is.
 
-    Source-level and scoped to these three modules on purpose. They are wholly poller-path, so the
+    Source-level and scoped to these four modules on purpose. They are wholly poller-path, so the
     rule is unconditional here and needs no judgment about the caller. `main.py` is deliberately
     NOT covered: it mixes the poller path with the request path, where an unbounded wait holds an
     anyio slot instead of the tick and the five that remain there are legitimate — a grep cannot
     tell the two apart, and one asserting over both would have to be either wrong or disabled.
+
+    Two shapes, because a BigQuery wait has two spellings: `.result()` on a query job, and
+    `insert_rows_json` — the streaming write `decisions.record` makes on the same thread, which
+    the first pattern cannot see (it takes its timeout as a keyword, not through a job).
     """
     import pathlib
     import re
 
+    modules = ("togvarsel.py", "togvarsel_notify.py", "togvarsel_outcomes.py", "reisevalg.py")
     offenders = []
-    for name in ("togvarsel.py", "togvarsel_notify.py", "togvarsel_outcomes.py"):
+    for name in (*modules, "decisions.py"):
         text = (pathlib.Path(__file__).parent / name).read_text()
         for lineno, line in enumerate(text.splitlines(), 1):
-            if re.search(r"\.result\(\s*\)", line):
+            if name in modules and re.search(r"\.result\(\s*\)", line):
+                offenders.append(f"{name}:{lineno}: {line.strip()}")
+            # An insert_rows_json CALL (not the stub definitions in the suites) with no timeout.
+            if re.search(r"insert_rows_json\((?![^)]*timeout=)[^)]*\)", line):
                 offenders.append(f"{name}:{lineno}: {line.strip()}")
     assert not offenders, "unbounded BigQuery wait on the poller thread:\n" + "\n".join(offenders)
 

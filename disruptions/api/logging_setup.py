@@ -75,6 +75,24 @@ def _span_correlation() -> dict:
 # intends, so it resolves to INFO like any other unrecognised value.
 _LEVEL_NAMES = {k: v for k, v in logging.getLevelNamesMapping().items() if k != "NOTSET"}
 
+#: Third-party loggers pinned at INFO whenever LOG_LEVEL asks for DEBUG. LOG_LEVEL lowers the
+#: ROOT logger, so it lowers these too — and at DEBUG they publish exactly what the rest of this
+#: codebase goes out of its way not to:
+#:
+#: * ``urllib3.connectionpool`` logs one line per request including the PATH, so every Web Push
+#:   becomes ``fcm.googleapis.com "POST /wp/<capability-token>"`` in Cloud Logging — the same
+#:   token ``tracing_setup`` refuses to put in a span, and enough to push to that device.
+#: * ``anthropic`` / ``httpx`` log request options and bodies, which on the LLM path is the
+#:   traveller's origin, destination and departure time — the trio VARSEL_LLM_LOG_PROMPTS exists
+#:   to gate, arriving here without anyone setting it.
+#: * ``google`` / ``grpc`` add credential-adjacent auth noise at DEBUG.
+#:
+#: So the privacy interlock in :func:`_resolve_level` guards our OWN prompt record, and this
+#: guards the libraries' — without it the interlock closes one door and leaves two open. Debugging
+#: an HTTP-level problem in one of these is a deliberate act: raise it by name in a debugger or a
+#: throwaway branch, never as a side effect of "let's see the debug logs".
+_THIRD_PARTY_DEBUG_MUTED = ("urllib3", "httpx", "httpcore", "anthropic", "google", "grpc")
+
 
 def _resolve_level() -> tuple[int, bool]:
     """The root level LOG_LEVEL asks for, and whether the privacy interlock refused DEBUG.
@@ -207,6 +225,12 @@ def setup() -> None:
     root = logging.getLogger()
     root.handlers[:] = [handler]
     root.setLevel(level)
+    # Lowering the root lowers every library with it — see _THIRD_PARTY_DEBUG_MUTED for what they
+    # publish at DEBUG. Pinned only when DEBUG was actually asked for, so the ordinary INFO
+    # deployment keeps whatever these loggers would do by default.
+    if level <= logging.DEBUG:
+        for name in _THIRD_PARTY_DEBUG_MUTED:
+            logging.getLogger(name).setLevel(logging.INFO)
     # uvicorn installs its own non-propagating text handlers (error log on stderr!) before it
     # imports the app; strip them so its records — access log included — propagate to root.
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
