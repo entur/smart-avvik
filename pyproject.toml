@@ -46,6 +46,18 @@ api = [
     "google-genai>=1.0.0",
     "google-cloud-firestore>=2.30.0",
     "pyjwt>=2.10.0",
+    # Imported at module level by metrics.py, which main imports — so unlike the lazy entries
+    # above, `import main` (every API test suite) fails without it.
+    "prometheus-client>=0.26.0",
+    # tracing_setup.py: the API package is imported at module level by main (so `import main`
+    # fails without it, like prometheus-client above); the SDK, the OTLP exporter and both
+    # instrumentors load lazily inside the TRACING_ENABLED-gated setup() (KTD3) and are listed so
+    # a plain `uv sync` environment can exercise the enabled path and run test_tracing_setup.py.
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.44.0",
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    "opentelemetry-instrumentation-requests>=0.65b0",
 ]
 
 [tool.uv]

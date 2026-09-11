@@ -142,6 +142,12 @@ _COVERAGE_MIN_PCT = 50.0
 _VOLUME_WINDOW_H = 6
 
 _HTTP_TIMEOUT_S = 3.0
+# refresh_baselines runs on the POLLER thread (main._rebuild_all's `svv_baselines` phase), where
+# the BigQuery client's default of waiting forever is a wedge: the tick stops making progress,
+# /health goes stale and liveness restarts the replica into the same hang. A ceiling on that, not
+# a budget -- the read is a small lookup table. A timeout is caught by the tolerant `except`
+# below like any other failure, which keeps the previous lookup and re-reads on the next tick.
+_BASELINES_TIMEOUT_S = 60
 _JP_URL = "https://api.entur.io/journey-planner/v3/graphql"
 _TRAFIKKDATA_URL = "https://trafikkdata-api.atlas.vegvesen.no/"
 # The contact address is required, not decorative: Trafikkdata is open and keyless (NLOD), so the
@@ -369,6 +375,11 @@ _baselines_lock = threading.Lock()
 _baselines: dict[tuple[str, int, int], dict[str, Any]] = {}
 _baselines_built_at: datetime | None = None
 _baselines_refreshed_at: datetime | None = None
+# Once-per-process latch for the unavailable warning (R10): prd deliberately has no svv_baselines
+# (see the deployment notes), so without it the poller re-warns every ~5-7 min forever and trains
+# readers to ignore the WARNING channel. First failure warns; repeats log INFO under the SAME
+# event name (saved queries keep matching); a successful refresh re-arms it so a NEW outage warns.
+_baselines_unavailable_warned = False
 
 _bq_client: Any | None = None  # injected via configure() from main.py
 
@@ -381,12 +392,12 @@ def refresh_baselines() -> None:
     any failure logs and keeps the previous lookup (initially empty), which makes the volume
     provider report the road side as unavailable rather than erroring.
     """
-    global _baselines_built_at, _baselines_refreshed_at
+    global _baselines_built_at, _baselines_refreshed_at, _baselines_unavailable_warned
     if _bq_client is None:
         logger.info("No BigQuery client configured; svv baselines not loaded")
         return
     try:
-        rows = _bq_client.query(_BASELINES_QUERY).result()
+        rows = _bq_client.query(_BASELINES_QUERY).result(timeout=_BASELINES_TIMEOUT_S)
         table: dict[tuple[str, int, int], dict[str, Any]] = {}
         built_at: datetime | None = None
         for r in rows:
@@ -398,7 +409,13 @@ def refresh_baselines() -> None:
             if r.built_at is not None and (built_at is None or r.built_at > built_at):
                 built_at = r.built_at
     except Exception as exc:  # noqa: BLE001  (deliberate: any load failure degrades the road side to unavailable)
-        logger.warning(
+        # WARNING only for the FIRST failure since the last success (the latch above): the
+        # chronic case is a deployment where the table deliberately does not exist.
+        with _baselines_lock:
+            first_since_success = not _baselines_unavailable_warned
+            _baselines_unavailable_warned = True
+        log = logger.warning if first_since_success else logger.info
+        log(
             "svv_baselines unavailable (%s: %s); reisevalg road volume side reports unavailable "
             "(expected until data/queries/reisevalg_road_baseline.sql has run)",
             type(exc).__name__,
@@ -411,6 +428,7 @@ def refresh_baselines() -> None:
         _baselines = table
         _baselines_built_at = built_at
         _baselines_refreshed_at = datetime.now(UTC)
+        _baselines_unavailable_warned = False  # re-arm: the next outage is news again
     logger.info(
         "Refreshed svv baselines: %d cells (built_at=%s)",
         len(table),

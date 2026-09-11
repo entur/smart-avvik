@@ -26,3 +26,20 @@ pyjwt>=2.10.0
 # import happens until a message is actually written, so an un-provisioned deploy still serves.
 anthropic[vertex]>=0.69.0
 google-genai>=1.0.0
+# Observability (metrics.py): Prometheus text exposition on the dedicated internal METRICS_PORT
+# (9464, annotation-scraped; never the public 8080) -- HTTP request counts, poller freshness
+# gauges, log-level counters. start_http_server runs its own daemon thread, so /metrics answers
+# during the slow BigQuery lifespan load, which is when the scraper first arrives.
+prometheus-client>=0.26.0
+# Observability (tracing_setup.py): OpenTelemetry tracing to Cloud Trace over OTLP/gRPC, gated on
+# TRACING_ENABLED and failing open. Only the API package is imported at module level (main hard-
+# imports tracing_setup); the SDK, the exporter and both instrumentors load lazily inside the
+# gated setup(), so an exporter problem can never crash `import main` (KTD3). The exporter is the
+# plain OTLP one -- opentelemetry-exporter-gcp-trace is deprecated in its favor (KTD9) -- with
+# ADC channel credentials built by hand from google-auth + grpcio, both of which already arrive
+# with google-cloud-bigquery. Contrib 0.65b0 is lockstep with SDK 1.44.
+opentelemetry-api>=1.44.0
+opentelemetry-sdk>=1.44.0
+opentelemetry-exporter-otlp-proto-grpc>=1.44.0
+opentelemetry-instrumentation-fastapi>=0.65b0
+opentelemetry-instrumentation-requests>=0.65b0

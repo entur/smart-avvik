@@ -688,7 +688,7 @@ def test_refresh_baselines_loads_rows(monkeypatch):
 
     class _BQ:
         def query(self, q):
-            return SimpleNamespace(result=lambda: [row])
+            return SimpleNamespace(result=lambda timeout=None: [row])
 
     monkeypatch.setattr(reisevalg, "_bq_client", _BQ())
     monkeypatch.setattr(reisevalg, "_baselines", {})
