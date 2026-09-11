@@ -897,10 +897,15 @@ def push_round(
         per_device[device_id] = [(subscription, payload)]  # one item per device per round
     counts = {"sent": 0, "error": 0, "gone": 0}
     dropped = 0
-    # The per-push error detail is deliberately unused here: forecast rounds log COUNTS in the
-    # one round event below, never a per-push record (per-push logging is a deferred follow-up).
-    for device_id, _item, result, _payload, _error_detail in deliver(per_device, lambda item: item):
+    # Forecast rounds log COUNTS in the one round event below, never a per-push record (per-push
+    # logging is a deferred follow-up) — but a count of errors with no reason anywhere is not a
+    # diagnosis. The FIRST failure's detail rides the round event, which is enough to tell a dead
+    # push service from a bad keypair without minting a record per device.
+    first_error: dict | None = None
+    for device_id, _item, result, _payload, error_detail in deliver(per_device, lambda item: item):
         counts[result] = counts.get(result, 0) + 1
+        if result == "error" and first_error is None and error_detail:
+            first_error = error_detail
         if result == "gone" and handle_gone(device_id):
             dropped += 1
     summary: dict[str, Any] = {
@@ -913,6 +918,15 @@ def push_round(
         "dropped": dropped,
         **counts,
     }
+    # Deliberately NOT added to `summary`: that dict is the togvarsel_rounds row, and an
+    # unrecognised key there is a silently rejected streamed insert.
+    round_fields: dict[str, Any] = {"event": "togvarsel_notify_round", **summary}
+    if first_error is not None:
+        round_fields.update(
+            push_error_status=first_error.get("status"),
+            push_error_host=first_error.get("host"),
+            push_error_body=first_error.get("body"),
+        )
     logger.info(
         "togvarsel_notify: round %s %s (%s) — %d journeys on %d devices matched; "
         "%d sent, %d error (not retried), %d gone (%d dropped)",
@@ -925,7 +939,7 @@ def push_round(
         counts["error"],
         counts["gone"],
         dropped,
-        extra={"fields": {"event": "togvarsel_notify_round", **summary}},
+        extra={"fields": round_fields},
     )
     return summary
 

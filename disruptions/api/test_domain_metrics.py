@@ -37,6 +37,7 @@ _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 import decisions
 import llm_message
 import main
+import metrics
 import varsel
 from prometheus_client import REGISTRY
 
@@ -141,7 +142,7 @@ class _InsertClient:
         self._errors = errors or []
         self._raise = raise_exc
 
-    def insert_rows_json(self, table, rows):
+    def insert_rows_json(self, table, rows, timeout=None):
         if self._raise is not None:
             raise self._raise
         return self._errors
@@ -196,6 +197,35 @@ def test_decision_write_counter_is_silent_when_no_write_was_attempted():
     assert _decision_totals() == before
 
 
+def test_a_failed_table_ensure_counts_an_error_rather_than_flatlining():
+    """A configured client whose DDL failed is silent data loss, and must not look like silence.
+
+    `ensure_table()` returns False for two very different states. No client is a deployment that
+    never meant to record — counted, it would page forever on every hermetic environment. But a
+    CONFIGURED client whose structural CREATE failed is the 2026-08-07 mode: BigQuery's 5-per-10 s
+    table-update limit turns a cosmetic description edit into a decision log that records nothing,
+    behind one WARNING per retry window — below the runbook's ERROR rule. Uncounted, the counter
+    simply flatlines, which on a dashboard is indistinguishable from "no alerts happened" — the
+    exact silent loss this counter was added to catch.
+    """
+
+    class _EnsureFailsClient:
+        """Configured, and its structural DDL raises — `ensure_table` returns False."""
+
+        def query(self, sql, **kwargs):
+            raise RuntimeError("Exceeded rate limits: too many table update operations")
+
+    before = _decision_totals()
+    with _decisions_client(_EnsureFailsClient()):
+        decisions._table_ready = False
+        decisions._ensure_failed_at = None
+        assert decisions.record([{"situation_number": "s1"}]) == 0
+    after = _decision_totals()
+    assert after["error"] == before["error"] + 1, (
+        "a configured client that cannot ensure its table is a failed write, not a no-op"
+    )
+
+
 # ---- The poller cycle: epoch gauge + duration histogram, both from `finally` -------------------
 
 
@@ -216,15 +246,25 @@ def test_a_rebuild_cycle_sets_the_epoch_gauge_and_observes_the_duration():
     assert abs(time.time() - gauge) < 60
 
 
-def test_a_dying_rebuild_still_moves_the_cycle_metrics():
-    """Same `finally` contract as the poller_cycle log line: a rebuild that dies partway through
-    is when the reading matters most, and poll_for_changes retries on the next tick."""
+def test_a_dying_rebuild_observes_its_duration_but_does_not_advance_the_freshness_gauge():
+    """The two cycle metrics answer different questions, so they sit on different sides of the try.
+
+    The DURATION stays in `finally`, same contract as the poller_cycle log line: a rebuild that
+    died partway through is when that reading matters most. The freshness GAUGE must not move —
+    it was in the `finally` too, which made the runbook's staleness rule unfirable by
+    construction: with `predict_sql` raising every cycle (one of the four steps deliberately not
+    wrapped in its own try/except, so it propagates), every cache goes hours stale while the
+    gauge keeps advancing and the rule stays green forever.
+    """
 
     def exploding_rebuild(timings):
         raise RuntimeError("rebuild died")
 
     before_count = _sample("kix_poller_cycle_duration_seconds_count")
     before_main = (main._rebuild_all, main.logger)
+    # A known, distinctly old value, so "did not move" is assertable rather than inferred from a
+    # gauge some earlier test happened to set.
+    metrics.POLLER_LAST_CYCLE.set(1_700_000_000.0)
     main._rebuild_all = exploding_rebuild
     main.logger = _SilentLogger()
     try:
@@ -236,8 +276,12 @@ def test_a_dying_rebuild_still_moves_the_cycle_metrics():
             raise AssertionError("the rebuild failure must still propagate")
     finally:
         main._rebuild_all, main.logger = before_main
-    assert _sample("kix_poller_cycle_duration_seconds_count") == before_count + 1
-    assert _sample("kix_poller_last_cycle_timestamp_seconds") > 1.7e9
+    assert _sample("kix_poller_cycle_duration_seconds_count") == before_count + 1, (
+        "a failed cycle's duration is the reading worth having"
+    )
+    assert _sample("kix_poller_last_cycle_timestamp_seconds") == 1_700_000_000.0, (
+        "a cycle that died must not report the caches as freshly rebuilt"
+    )
 
 
 # ---- The per-phase histogram and outcome counter ------------------------------------------------

@@ -1064,6 +1064,11 @@ def _phase(name: str, timings: dict[str, int]):
         # the small fixed vocabulary of step names above, so the label stays bounded.
         metrics.POLLER_PHASE_DURATION.labels(phase=name).observe(ms / 1000)
         metrics.POLLER_PHASE_TOTAL.labels(phase=name, result=result).inc()
+        # A finished step — successful or failed — is progress: the thread is moving, which is the
+        # only thing /health's staleness branch asks about. In `finally` beside the rest, so a
+        # step that fails after a long wait still proves liveness rather than counting toward a
+        # wedge. See `_beat`.
+        _beat()
 
 
 def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
@@ -1078,6 +1083,20 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     with tracing_setup.span("poller_cycle"):
         try:
             _rebuild_all(timings)
+            # EPOCH seconds, never `monotonic()` (KTD1's two-clock rule): the runbook's freshness
+            # alerts compute `time() - value`, which a monotonic export silently breaks. This
+            # gauge measures cache freshness — it moves only when SIRI-SX moves — not liveness;
+            # `_beat` in poll_for_changes owns the liveness one.
+            #
+            # On the SUCCESS path only. In the `finally` beside the duration below, a rebuild that
+            # died partway still advanced it: with `predict_sql` raising every cycle — it is one
+            # of the four steps deliberately NOT wrapped in its own try/except, so it propagates —
+            # every cache goes hours stale while the runbook's staleness rule stays green forever.
+            # What the gauge can still not see is a step that IS isolated (varsel_notify,
+            # predict_calls_*, …) failing on every cycle: the rebuild returns normally and this
+            # runs. That is what `kix_poller_phase_total{result="error"}` is for, and the help
+            # text says so rather than overclaiming.
+            metrics.POLLER_LAST_CYCLE.set(time.time())
         finally:
             # In `finally` for the same reason each phase is: a rebuild that dies partway through
             # is when the breakdown is worth having, and `poll_for_changes` catches whatever comes
@@ -1097,11 +1116,8 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
                     }
                 },
             )
-            # EPOCH seconds, never `monotonic()` (KTD1's two-clock rule): the runbook's freshness
-            # alerts compute `time() - value`, which a monotonic export silently breaks. This
-            # gauge measures cache freshness — it moves only when SIRI-SX moves — not liveness;
-            # the tick gauge in poll_for_changes is the liveness one.
-            metrics.POLLER_LAST_CYCLE.set(time.time())
+            # In `finally` deliberately, unlike the freshness gauge above: a failed cycle's
+            # duration is exactly the reading worth having (a step that died slowly).
             metrics.POLLER_CYCLE_DURATION.observe(total_ms / 1000)
 
 
@@ -1890,6 +1906,33 @@ _poller_thread: threading.Thread | None = None
 _health_degraded_logged = False  # one health_degraded record per 200→503 transition
 
 
+def _beat() -> None:
+    """Record that the poller thread is still making progress — BOTH clocks, always together.
+
+    Called at the top of every iteration and again at each progress point inside it: the end of
+    every `_phase`, and after each of the wall-clock tick blocks. One beat per ITERATION was the
+    original shape and it made the threshold mean the wrong thing: an iteration is ~12-16
+    sequential BigQuery calls (each bounded at `_POLLER_QUERY_TIMEOUT_S`), plus togvarsel's rebuild
+    and reads, plus the notify and servability ceilings, plus the sleep — so its worst case is tens
+    of minutes and its COLD case is already minutes. A restart zeroes `_planned_refreshed_at` and
+    `_bus_planned_refreshed_at`, so the first iteration after one rebuilds both ET partition scans
+    (~8 GB rail, ~12 GB bus) on top of everything else; at `HEALTH_STALE_AFTER_S` = 600 a healthy
+    but cold start could cross the line, 503, get restarted by liveness, and come up cold again —
+    a self-sustaining crash loop costing ~20 GB of scans per turn, with no single query anywhere
+    near its own ceiling. Beating on progress makes the threshold mean what KTD1 says it means:
+    not "an iteration took longer than 600 s" but "no STEP has finished in 600 s", which is the
+    wedged-poller state a per-query timeout cannot see and `is_alive()` cannot see either.
+
+    Both clocks move together or the fix just relocates the false alarm: the monotonic one is
+    /health's (age arithmetic, immune to a wall-clock step) and the epoch gauge is the runbook's
+    rule 1 at 900 s. Beating only the first would leave rule 1 paging on exactly the cold iteration
+    /health had just learned to tolerate.
+    """
+    global _poller_heartbeat_monotonic
+    _poller_heartbeat_monotonic = time.monotonic()
+    metrics.POLLER_LAST_TICK.set(time.time())
+
+
 def _health_stale_after_s() -> float:
     """Staleness threshold for /health, from HEALTH_STALE_AFTER_S (seconds; default 600).
 
@@ -1939,18 +1982,15 @@ def poll_for_changes(
     logged and retried on the next tick rather than killing this daemon thread for good.
     That lets the service self-recover once access lands, without a restart.
     """
-    global _poller_heartbeat_monotonic
     last_seen = None
     seen_any = False
     while True:
         # Liveness heartbeat for /health (R1): unconditional, at the TOP of the iteration —
         # before anything that can fail — so a broken upstream reads as the logged per-tick
-        # error below while the pod stays up, and only a loop that stopped ITERATING goes stale.
-        _poller_heartbeat_monotonic = time.monotonic()
-        # Two clocks on purpose, never conflated (KTD1): the heartbeat above stays MONOTONIC —
-        # /health does age arithmetic on it, and a wall-clock step must not fake a wedge — while
-        # the exported gauge is EPOCH, because PromQL age alerts compute `time() - value`.
-        metrics.POLLER_LAST_TICK.set(time.time())
+        # error below while the pod stays up. `_beat` also runs at every progress point INSIDE
+        # the iteration (see its docstring), so a slow-but-moving cycle stays healthy and only a
+        # step that has stopped finishing reads as a wedge.
+        _beat()
         try:
             current = get_last_ingestion_time()
             if not seen_any or current != last_seen:
@@ -1959,6 +1999,7 @@ def poll_for_changes(
                 on_change(current)
         except Exception:
             logger.exception("Ingestion poll failed; retrying on next tick")
+        _beat()
         # Togmeldingen (/togmelding-api) runs on EVERY tick, not just ingestion changes: an issue
         # is due at its clock cutoff (06:30/07:00/12:00/14:00) whether or not new SX arrived, so
         # it must not hang off the SX cadence. Cheap in-memory no-op on the vast majority of
@@ -1971,6 +2012,7 @@ def poll_for_changes(
             logger.exception(
                 "Togvarsel refresh failed; /togmelding-api serves the day's existing issues"
             )
+        _beat()
         # Togvarsel pushes ride the same wall-clock tick, AFTER refresh so the tick that issues a
         # round is the tick that can notify it — and never the SX-ingestion rebuild above.
         # Isolated the same way: a notify failure costs notifications, never the feed or the tick.
@@ -1978,6 +2020,7 @@ def poll_for_changes(
             togvarsel_notify.evaluate()
         except Exception:
             logger.exception("Togvarsel notify failed this tick; retrying on next tick")
+        _beat()
         # The rush outcome resolves on the same wall-clock tick, and for the same reason: a rush
         # ends at its hour whether or not SX moved. Both of its passes are due-gated internally
         # (provisional 09:20/18:20 Oslo, authoritative after 04:00 UTC), so this is a cheap no-op on
@@ -1987,6 +2030,7 @@ def poll_for_changes(
             togvarsel_outcomes.refresh()
         except Exception:
             logger.exception("Togvarsel outcome refresh failed this tick; retrying on next tick")
+        _beat()
         # The labelling-freshness detector rides the same wall-clock tick, fourth and last (R8):
         # the nightly varsel-label-daily job runs OUTSIDE this process, so nothing else in here
         # would ever notice it dying — and past its 10-day retry window the unlabelled decisions
@@ -2000,6 +2044,7 @@ def poll_for_changes(
             decisions.check_labelling_freshness()
         except Exception:
             logger.exception("Labelling freshness check failed this tick; retrying on next tick")
+        _beat()
         if stop_event is not None:
             if stop_event.wait(interval):
                 return

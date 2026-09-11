@@ -283,7 +283,9 @@ class _FailingClient:
 
 class _EmptyClient:
     def query(self, sql):
-        return SimpleNamespace(result=list)
+        # `timeout=` is passed by refresh_baselines (the poller-path bound), so a bare `list`
+        # here raises TypeError and the refresh reads as a failed one.
+        return SimpleNamespace(result=lambda timeout=None: [])
 
 
 @contextmanager
@@ -376,11 +378,13 @@ def test_an_unexpected_exception_still_yields_a_detail_and_no_log_line():
         result, detail = _push(_raiser(RuntimeError("socket melted")))
     assert records == []
     assert result == "error"
-    assert detail == {
-        "status": None,
-        "host": "push.example.com",
-        "body": "RuntimeError: socket melted",
-    }
+    assert detail["status"] is None
+    assert detail["host"] == "push.example.com"
+    assert detail["body"] == "RuntimeError: socket melted"
+    # The TRACEBACK rides the detail too. `type: str` alone left the raising frame unrecoverable,
+    # and an unexpected raise here is by definition a defect whose location is the whole question
+    # — the audit record being the only trace is exactly why it has to carry one.
+    assert "Traceback" in detail["traceback"] and "socket melted" in detail["traceback"]
 
 
 def test_a_failed_push_yields_exactly_one_push_record_carrying_the_error_fields():

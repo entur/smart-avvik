@@ -86,6 +86,7 @@ import logging
 import os
 import re
 import threading
+import traceback
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -1997,12 +1998,24 @@ def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
         result = "sent"
     except WebPushException as exc:
         status = getattr(exc.response, "status_code", None)
-        body = (getattr(exc.response, "text", "") or "")[:400]
+        # `str(exc)` and not only the response body: pywebpush raises this for failures that carry
+        # NO response at all (a malformed VAPID key, an encryption error), where `text` is empty
+        # and the exception's own message is the entire diagnosis. Dropping it left a detail dict
+        # of three Nones — a record that says a push failed and nothing about why.
+        body = (getattr(exc.response, "text", "") or "")[:400] or str(exc)[:400]
         error_detail = {"status": status, "host": host, "body": body}
         result = "gone" if status in (404, 410) else "error"
     except Exception as exc:  # noqa: BLE001  (deliberate: any raise must become one counted, audited "error")
-        # The audit record is the only trace of an unexpected raise now, so name the exception.
-        error_detail = {"status": None, "host": host, "body": f"{type(exc).__name__}: {exc}"[:400]}
+        # The audit record is the only trace of an unexpected raise now, so it carries the
+        # TRACEBACK, not just the exception's name: `type: str` leaves the raising frame
+        # unrecoverable, and an unexpected raise here is by definition a defect whose location is
+        # the whole question. Truncated, because it rides a log field.
+        error_detail = {
+            "status": None,
+            "host": host,
+            "body": f"{type(exc).__name__}: {exc}"[:400],
+            "traceback": traceback.format_exc()[-2000:],
+        }
         result = "error"
     # Exactly one increment per delivery attempt, on the single exit (KTD11) — a per-branch
     # `return` here is how the unexpected-exception path quietly stops being counted. The push
@@ -2052,6 +2065,8 @@ def _log_push(
             push_error_host=error_detail.get("host"),
             push_error_body=error_detail.get("body"),
         )
+        if error_detail.get("traceback"):
+            fields["push_error_traceback"] = error_detail["traceback"]
     if alert is not None:
         fields.update(
             situation_number=alert.situation_number,
@@ -2065,7 +2080,17 @@ def _log_push(
             impact_probability=alert.impact_probability,
             alert_threshold=alert.alert_threshold,
         )
-    logger.info(
+    # ONE record per attempt (R11), but not one SEVERITY: consolidating the old prose lines into
+    # this record moved every failure to INFO, and the runbook's "any ERROR is worth a look" rule
+    # watches ERROR only. A defect that makes EVERY push raise — a pywebpush upgrade, a malformed
+    # VAPID key — would then produce no ERROR and no WARNING anywhere, leaving only the push
+    # failure-RATIO rule, which needs >5 attempts in 30 min and so cannot see a quiet night.
+    # `gone` stays INFO: a device that unsubscribed is the system working, and it is routine.
+    level = logging.ERROR if error_detail and error_detail.get("traceback") else (
+        logging.WARNING if result == "error" else logging.INFO
+    )
+    logger.log(
+        level,
         "Push %s (%s) to device %s: %s | %s",
         result,
         kind,
