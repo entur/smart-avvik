@@ -70,18 +70,10 @@ def _span_correlation() -> dict:
     except Exception:  # noqa: BLE001 - see docstring: the formatter must never raise
         return {}
 
-# The names LOG_LEVEL accepts (case-insensitive). NOTSET is deliberately absent: on the root
-# logger it means "fall back to WARNING", which nobody setting a level intends — it resolves to
-# INFO like any other unrecognised value.
-_LEVEL_NAMES = {
-    "CRITICAL": logging.CRITICAL,
-    "FATAL": logging.FATAL,
-    "ERROR": logging.ERROR,
-    "WARNING": logging.WARNING,
-    "WARN": logging.WARNING,
-    "INFO": logging.INFO,
-    "DEBUG": logging.DEBUG,
-}
+# The names LOG_LEVEL accepts (case-insensitive): the stdlib's own name→level mapping, minus
+# NOTSET — on the root logger that means "fall back to WARNING", which nobody setting a level
+# intends, so it resolves to INFO like any other unrecognised value.
+_LEVEL_NAMES = {k: v for k, v in logging.getLevelNamesMapping().items() if k != "NOTSET"}
 
 
 def _resolve_level() -> tuple[int, bool]:
@@ -137,22 +129,34 @@ REDACTED_QUERY_PATHS = ("/notification-api/v1/journey-alerts",)
 _REDACTED_QUERY = "?<redacted>"
 
 
-class _AccessLogRedaction(logging.Filter):
-    """Rewrites the full path of a uvicorn access record for :data:`REDACTED_QUERY_PATHS`.
+def _access_request_path(record: logging.LogRecord) -> str | None:
+    """The full request path of a uvicorn access record, or None for any other record shape.
 
     uvicorn logs `'%s - "%s %s HTTP/%s" %d'` on the `uvicorn.access` logger with
     `args = (client_addr, method, full_path, http_version, status_code)`, so the path with its
-    query string is `args[2]`. Only a record of exactly that shape — five args, a str third — is
-    touched, and always by building a NEW tuple; anything else passes through untouched. Always
-    returns True: this is a rewrite, never a drop.
+    query string is `args[2]`. Only a record of exactly that shape — five args, a str third —
+    qualifies; both access-log filters below share this one statement of the contract.
+    """
+    args = record.args
+    if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+        return args[2]
+    return None
+
+
+class _AccessLogRedaction(logging.Filter):
+    """Rewrites the full path of a uvicorn access record for :data:`REDACTED_QUERY_PATHS`.
+
+    Only a record matching :func:`_access_request_path`'s contract is touched, and always by
+    building a NEW tuple; anything else passes through untouched. Always returns True: this is
+    a rewrite, never a drop.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        args = record.args
-        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
-            path, sep, _query = args[2].partition("?")
+        full_path = _access_request_path(record)
+        if full_path is not None:
+            path, sep, _query = full_path.partition("?")
             if sep and any(path == p or path.startswith(p + "/") for p in REDACTED_QUERY_PATHS):
-                record.args = (*args[:2], path + _REDACTED_QUERY, *args[3:])
+                record.args = (*record.args[:2], path + _REDACTED_QUERY, *record.args[3:])
         return True
 
 
@@ -161,16 +165,14 @@ class _HealthAccessMute(logging.Filter):
 
     GKE's liveness and readiness probes hit /health every few seconds, so every real request in
     the access log sits between probe lines — noise that costs ingestion and buries the lines
-    worth reading. Same record contract as :class:`_AccessLogRedaction`: only a record shaped
-    like uvicorn's access line (five args, a str full path third) is examined; anything else
-    passes. The path must be EXACTLY ``/health`` (query string ignored) — never a prefix match,
-    which would silently hide a future ``/healthz`` from the log.
+    worth reading. Only a record matching :func:`_access_request_path`'s contract is examined;
+    anything else passes. The path must be EXACTLY ``/health`` (query string ignored) — never a
+    prefix match, which would silently hide a future ``/healthz`` from the log.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
-        args = record.args
-        is_access_shape = isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str)
-        return not (is_access_shape and args[2].partition("?")[0] == "/health")
+        full_path = _access_request_path(record)
+        return not (full_path is not None and full_path.partition("?")[0] == "/health")
 
 
 def _log_thread_exception(args: threading.ExceptHookArgs) -> None:
