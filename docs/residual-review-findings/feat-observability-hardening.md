@@ -24,13 +24,28 @@ which makes BigQuery itself cancel the job, and would also have covered the two 
 
 ## 2. Inbound `traceparent` decides prd's sampling on a public unauthenticated host
 
-**Severity:** medium · `helm/kix-avvik/env/values-kub-ent-prd.yaml` · **Not applied: no mechanical fix exists; must be settled before tracing is flipped on in prd.**
+**Severity:** medium · `helm/kix-avvik/env/values-kub-ent-prd.yaml` · **SETTLED 2026-09-11: risk accepted by the product owner; referred to Team Plattform as a shared-ingress concern. No longer blocks flipping tracing on in prd.**
 
 `OTEL_TRACES_SAMPLER: parentbased_traceidratio` honours a remote parent's sampled flag before the ratio applies, and the ASGI instrumentation extracts trace context from request headers. So any caller can send `traceparent: 00-<id>-<id>-01` on every request to `kix-avvik.entur.io` and force 100 % sampling with trace ids they chose — span volume, ingestion cost, and poisoned trace search. An ingress that always stamps `-00` would silently reduce sampling to zero while the values file claims 10 %.
 
 **The obvious fix does not work.** Swapping to a plain `traceidratio` — or to a `ParentBased` whose remote arms are the ratio, which is what the review suggested — closes the always-`-00` case and leaves the attacker case fully open: `TraceIdRatioBased` is deterministic on the trace id, and the trace id is the attacker's. They pick ids that hash into the sampled range.
 
-The real fix is to not accept inbound trace context at the public edge — strip the header in a middleware outside the OTel one, or settle it at the ingress — which is a design decision about whether kix-avvik is ever a child of an upstream Entur trace. Mitigated for now by shipping `TRACING_ENABLED: "false"` in tst and prd (commit `9399f3b`); the prd values file and the rollout checklist both name this as a precondition for flipping it on.
+The real fix is to not accept inbound trace context at the public edge — strip the header in a middleware outside the OTel one, or settle it at the ingress — which is a design decision about whether kix-avvik is ever a child of an upstream Entur trace.
+
+### The decision (2026-09-11)
+
+**Accepted, and referred outward.** The product owner's call: take the risk in this app, and leave it to Team Plattform to fix at the shared ingress if they judge it worth fixing. Stripping `traceparent` there closes it for every Entur service at once, which is the right layer for a header the public can set — and doing it in this app alone would fix one host while the same exposure sits on every other public one.
+
+Both directions were on the table when it was accepted, and the record should be explicit that the *mundane* one is the likelier:
+
+- **`-01` (adversarial):** a caller forces 100 % sampling with trace ids of their choosing — unbounded billed span volume, and trace search populated with ids they picked. Measured against the real SDK: 100.0 % vs the configured 9.6 %.
+- **`-00` (accidental, and more likely):** any middlebox, CDN or client library that stamps an unsampled parent takes prd's tracing to **zero** while this file says 10 % and the alert rules assume traces exist. Nothing errors. You would believe you had tracing and have none.
+
+Also recorded, because it was measured while settling this and is easy to assume otherwise: **dev has the same `-00` exposure.** `parentbased_always_on` defaults `remote_parent_not_sampled` to `ALWAYS_OFF`, so a caller can suppress dev's *request* spans too. Poller-cycle traces are immune in every environment — they have no inbound parent — which is why they are the sound basis for a coverage claim and request spans are not.
+
+**Detection, since there is no prevention here:** if prd request traces thin out or vanish while poller-cycle traces keep arriving, suspect an upstream stamping `-00` before suspecting the exporter or the IAM. That asymmetry — poller traces present, request traces absent — is the signature, and it is the one reading that distinguishes this from every other tracing failure.
+
+Consequently `TRACING_ENABLED` in prd is now gated only on the rollout checklist's IAM step, which passed for all three projects on 2026-09-11.
 
 ## 3. The three `cd.yml` smoke jobs are byte-identical copies
 
