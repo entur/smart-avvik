@@ -73,6 +73,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import metrics  # sibling leaf module (no main import): the wording-attempt counter (KTD11)
+
 logger = logging.getLogger(__name__)
 
 _OSLO = ZoneInfo("Europe/Oslo")
@@ -145,6 +147,7 @@ _MAX_TOKENS = 1200
 _TIMEOUT_S = 8.0
 # Log the full prompt and reply (at DEBUG). Off by default: the prompt embeds the traveller's
 # origin, destination and departure time. Turn on temporarily when debugging message quality.
+# While truthy, logging_setup._resolve_level refuses LOG_LEVEL=DEBUG (KTD12) and mirrors this parse.
 _LOG_PROMPTS = os.environ.get("VARSEL_LLM_LOG_PROMPTS", "").lower() in ("1", "true", "yes")
 
 
@@ -1148,7 +1151,58 @@ def _call_backend(
         _current_call.reset(token)
 
 
+# The calling surfaces the metric's `surface` label may name (KTD11). `caller` is a string other
+# modules pass, so anything unlisted collapses to "other" rather than minting a time series per
+# novel value — metrics.py's one rule is that label vocabularies stay closed.
+_KNOWN_CALLERS = frozenset({"webhook", "pull"})
+
+
+def _surface_label(replay: bool, caller: str | None) -> str:
+    """The bounded `surface` label for one write_message_detailed call: replay/webhook/pull/live,
+    and "other" for any caller string the frozenset above does not name."""
+    if replay:
+        return "replay"
+    if caller is None:
+        return "live"
+    return caller if caller in _KNOWN_CALLERS else "other"
+
+
 def write_message_detailed(
+    message_input: dict,
+    *,
+    journey_key: str = "",
+    situation_number: str = "",
+    state: _LatchState | None = None,
+    replay: bool = False,
+    caller: str | None = None,
+) -> MessageResult:
+    """:func:`_write_message_detailed_inner`'s full contract, counted — this wrapper adds nothing
+    to the behaviour, and the docstring below it is the one that documents it.
+
+    The `kix_llm_message_total` increment lives HERE, at the return boundary, and never at the
+    inner function's log branches: those miss `truncated` and `unavailable` entirely (both fall
+    out of the backend loop without a final log line) and fire once per retried backend, so
+    counting there would both undercount statuses and double-count attempts. One call, one
+    increment, whatever the outcome — and `provider` falls back to the bounded "none" for the
+    statuses that name no backend (`disabled`, `unavailable`).
+    """
+    result = _write_message_detailed_inner(
+        message_input,
+        journey_key=journey_key,
+        situation_number=situation_number,
+        state=state,
+        replay=replay,
+        caller=caller,
+    )
+    metrics.LLM_MESSAGE_TOTAL.labels(
+        provider=result.provider or "none",
+        result=result.status,
+        surface=_surface_label(replay, caller),
+    ).inc()
+    return result
+
+
+def _write_message_detailed_inner(
     message_input: dict,
     *,
     journey_key: str = "",

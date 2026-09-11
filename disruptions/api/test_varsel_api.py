@@ -1639,7 +1639,7 @@ class _FakeBQ:
 
         return _Job()
 
-    def insert_rows_json(self, table, rows):
+    def insert_rows_json(self, table, rows, timeout=None):
         if self.insert_error is not None:
             raise self.insert_error
         self.rows.extend(rows)
@@ -2678,7 +2678,7 @@ def test_deliver_to_devices_stops_a_device_at_gone_but_not_the_others(monkeypatc
         per_device, lambda item: ({"endpoint": f"https://p.example/{item[0]}"}, item[1])
     )
     # a3 was never attempted: its device died at a2. dev-b is untouched by dev-a's fate.
-    assert [(d, i[0], r) for d, i, r, _p in results] == [
+    assert [(d, i[0], r) for d, i, r, _p, _e in results] == [
         ("dev-a", "a1", "sent"), ("dev-a", "a2", "gone"), ("dev-b", "b1", "sent"),
     ]
     assert sorted(c[1] for c in calls) == ["a1", "a2", "b1"]
@@ -4510,6 +4510,73 @@ def test_the_cached_wording_and_alternative_are_read_for_a_registered_definition
         lambda: varsel.cached_wording_and_alternative("X|Y|07:00|09:00|0", alert, enabled=True)
     )
     assert got == (None, None)
+
+
+def test_a_failed_push_keeps_its_severity_and_an_unexpected_raise_keeps_its_traceback():
+    """One record per attempt (R11) must not mean one LEVEL per attempt.
+
+    Consolidating the old prose lines into the `event="push"` audit record moved every failure to
+    INFO, and the runbook's "any ERROR is worth a look" rule watches ERROR only. A defect that
+    makes EVERY push raise — a pywebpush upgrade, a malformed VAPID key — would then leave no
+    ERROR and no WARNING anywhere, visible only through the push failure-RATIO rule, which needs
+    >5 attempts in 30 min and so cannot see a quiet night. `gone` stays INFO: a device that
+    unsubscribed is routine, and the system working.
+    """
+    from types import SimpleNamespace
+
+    import pywebpush
+
+    def _attempt(webpush_stub):
+        before = pywebpush.webpush
+        pywebpush.webpush = webpush_stub
+        try:
+            with _capture_varsel_logs() as records:
+                result, detail = varsel._send_push(
+                    {"endpoint": "https://push.example.com/sub/1"}, {"title": "t", "body": "b"}
+                )
+                pushes = [r for r in records if getattr(r, "fields", {}).get("event") == "push"]
+                varsel._log_push("alert", result, "dev-1", {"title": "t"}, error_detail=detail)
+                pushes = [r for r in records if getattr(r, "fields", {}).get("event") == "push"]
+            return result, detail, pushes[-1]
+        finally:
+            pywebpush.webpush = before
+
+    def _raiser(exc):
+        def _raise(**_kwargs):
+            raise exc
+
+        return _raise
+
+    result, _detail, record = _attempt(lambda **kwargs: None)
+    assert result == "sent" and record.levelno == logging.INFO
+
+    gone = pywebpush.WebPushException("gone", response=SimpleNamespace(status_code=410, text="G"))
+    result, _detail, record = _attempt(_raiser(gone))
+    assert result == "gone" and record.levelno == logging.INFO, "an unsubscribed device is routine"
+
+    five = pywebpush.WebPushException("err", response=SimpleNamespace(status_code=500, text="boom"))
+    result, _detail, record = _attempt(_raiser(five))
+    assert result == "error"
+    assert record.levelno == logging.WARNING, "a failed delivery is at least a warning"
+    assert record.fields["push_error_status"] == 500
+
+    # A WebPushException carrying NO response — pywebpush's "Missing keys", encryption errors —
+    # where the exception's own message is the entire diagnosis.
+    bare = pywebpush.WebPushException("Missing keys")
+    result, detail, record = _attempt(_raiser(bare))
+    assert result == "error"
+    assert "Missing keys" in (detail or {}).get("body", ""), (
+        "a failure with no response body must still say what went wrong"
+    )
+
+    # An unexpected raise is a defect: ERROR, and the raising frame must be recoverable.
+    result, detail, record = _attempt(_raiser(RuntimeError("socket melted")))
+    assert result == "error"
+    assert record.levelno == logging.ERROR, "an unexpected raise is a defect, not a bad delivery"
+    assert "socket melted" in record.fields["push_error_traceback"]
+    assert "Traceback" in record.fields["push_error_traceback"], (
+        "the exception NAME is not the frame; a traceback is what makes the defect findable"
+    )
 
 
 if __name__ == "__main__":

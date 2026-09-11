@@ -86,6 +86,7 @@ import logging
 import os
 import re
 import threading
+import traceback
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -101,6 +102,7 @@ from zoneinfo import ZoneInfo
 import alternatives  # the Journey Planner fetch-path vocabulary the matcher forwards
 import feedback
 import feedback_contexts
+import metrics  # sibling leaf module (no main import): the push-delivery counter (KTD11)
 import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
 import reserved_budget  # the one reserve-don't-check pass budget
@@ -1967,10 +1969,20 @@ def _notification_payload(
     return payload
 
 
-def _send_push(subscription: dict, payload: dict) -> str:
-    """Send one Web Push. Returns 'sent', 'gone' (404/410 — drop the device) or 'error' (retry)."""
+def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
+    """Send one Web Push. Returns ``(result, error_detail)``: result is 'sent', 'gone' (404/410 —
+    drop the device) or 'error' (retry); error_detail is None on success, else the failure's
+    status/host/body (body capped at 400 chars) for the caller's audit record.
+
+    This function emits no log line of its own (R11): the failure detail rides the single
+    ``event="push"`` record ``_log_push`` writes per delivery attempt, so a failed push is exactly
+    one record — never a prose line plus an audit line saying the same thing.
+    """
     from pywebpush import WebPushException, webpush
 
+    endpoint = str(subscription.get("endpoint", ""))
+    host = endpoint.split("/", 3)[2] if "://" in endpoint else endpoint[:40]
+    error_detail: dict | None = None
     try:
         webpush(
             subscription_info=subscription,
@@ -1983,21 +1995,45 @@ def _send_push(subscription: dict, payload: dict) -> str:
             # thread and stop ingestion for every other feature (review 2026-07-29).
             timeout=_PUSH_TIMEOUT_S,
         )
-        return "sent"
+        result = "sent"
     except WebPushException as exc:
         status = getattr(exc.response, "status_code", None)
-        body = (getattr(exc.response, "text", "") or "")[:400]
-        endpoint = str(subscription.get("endpoint", ""))
-        host = endpoint.split("/", 3)[2] if "://" in endpoint else endpoint[:40]
-        logger.warning(
-            "Web push failed: status=%s host=%s body=%r exc=%s", status, host, body, exc
-        )
-        if status in (404, 410):
-            return "gone"
-        return "error"
-    except Exception:
-        logger.exception("Web push raised unexpectedly")
-        return "error"
+        # `str(exc)` and not only the response body: pywebpush raises this for failures that carry
+        # NO response at all (a malformed VAPID key, an encryption error), where `text` is empty
+        # and the exception's own message is the entire diagnosis. Dropping it left a detail dict
+        # of three Nones — a record that says a push failed and nothing about why.
+        body = (getattr(exc.response, "text", "") or "")[:400] or str(exc)[:400]
+        error_detail = {"status": status, "host": host, "body": body}
+        result = "gone" if status in (404, 410) else "error"
+    except Exception as exc:  # noqa: BLE001  (deliberate: any raise must become one counted, audited "error")
+        # The audit record is the only trace of an unexpected raise now, so it carries the
+        # TRACEBACK, not just the exception's name: `type: str` leaves the raising frame
+        # unrecoverable, and an unexpected raise here is by definition a defect whose location is
+        # the whole question. Truncated, because it rides a log field.
+        error_detail = {
+            "status": None,
+            "host": host,
+            "body": f"{type(exc).__name__}: {exc}"[:400],
+            "traceback": traceback.format_exc()[-2000:],
+        }
+        result = "error"
+    # Exactly one increment per delivery attempt, on the single exit (KTD11) — a per-branch
+    # `return` here is how the unexpected-exception path quietly stops being counted. The push
+    # KIND stays in the structured `event="push"` log, never in a label, so the series set is
+    # fixed at three.
+    metrics.PUSH_TOTAL.labels(result=result).inc()
+    return result, error_detail
+
+
+def _send_push_result(sent: tuple[str, dict | None] | str) -> tuple[str, dict | None]:
+    """Normalize a ``_send_push`` return to ``(result, error_detail)``.
+
+    Suites across this repo stub ``_send_push`` with a bare result string; tolerating that shape
+    here (detail ``None``) is what lets the stubbed contract survive — the ``fetch_candidates``
+    precedent. The real function always returns the 2-tuple, so production never takes the
+    fallback arm.
+    """
+    return sent if isinstance(sent, tuple) else (sent, None)
 
 
 def _log_push(
@@ -2008,9 +2044,12 @@ def _log_push(
     *,
     journey_id: str | None = None,
     alert: Alert | None = None,
+    error_detail: dict | None = None,
 ) -> None:
     """One structured log line per push attempt, message text included — the audit trail of what
-    was actually sent to whom (``jsonPayload.event = "push"`` in Cloud Logging)."""
+    was actually sent to whom (``jsonPayload.event = "push"`` in Cloud Logging). A failed
+    attempt's detail (``_send_push``'s status/host/body) rides this same record as the three
+    ``push_error_*`` fields — the audit is symmetric (R11), and this record is the ONLY line."""
     fields = {
         "event": "push",
         "push_kind": kind,  # "alert" (journey×situation match) or "test"
@@ -2020,6 +2059,14 @@ def _log_push(
         "title": payload.get("title"),
         "body": payload.get("body"),
     }
+    if error_detail is not None:
+        fields.update(
+            push_error_status=error_detail.get("status"),
+            push_error_host=error_detail.get("host"),
+            push_error_body=error_detail.get("body"),
+        )
+        if error_detail.get("traceback"):
+            fields["push_error_traceback"] = error_detail["traceback"]
     if alert is not None:
         fields.update(
             situation_number=alert.situation_number,
@@ -2033,7 +2080,17 @@ def _log_push(
             impact_probability=alert.impact_probability,
             alert_threshold=alert.alert_threshold,
         )
-    logger.info(
+    # ONE record per attempt (R11), but not one SEVERITY: consolidating the old prose lines into
+    # this record moved every failure to INFO, and the runbook's "any ERROR is worth a look" rule
+    # watches ERROR only. A defect that makes EVERY push raise — a pywebpush upgrade, a malformed
+    # VAPID key — would then produce no ERROR and no WARNING anywhere, leaving only the push
+    # failure-RATIO rule, which needs >5 attempts in 30 min and so cannot see a quiet night.
+    # `gone` stays INFO: a device that unsubscribed is the system working, and it is routine.
+    level = logging.ERROR if error_detail and error_detail.get("traceback") else (
+        logging.WARNING if result == "error" else logging.INFO
+    )
+    logger.log(
+        level,
         "Push %s (%s) to device %s: %s | %s",
         result,
         kind,
@@ -2047,7 +2104,7 @@ def _log_push(
 def deliver_to_devices(
     per_device: Mapping[str, list[Any]],
     prepare: Callable[[Any], tuple[dict, dict] | None],
-) -> list[tuple[str, Any, str, dict]]:
+) -> list[tuple[str, Any, str, dict, dict | None]]:
     """Fan one batch of pending pushes out across devices, bounded by the module's worker pool.
 
     ``per_device`` maps device_id → that device's pending items, in send order; ``prepare`` turns
@@ -2062,13 +2119,15 @@ def deliver_to_devices(
     poller for devices × 10 s in the bad case — while a "gone" result must still stop that
     device's REMAINING items this batch, which only holds if its own sends stay ordered.
 
-    Returns ``(device_id, item, result, payload)`` flattened in ``per_device`` order; the caller
+    Returns ``(device_id, item, result, payload, error_detail)`` flattened in ``per_device``
+    order — error_detail is ``_send_push``'s failure detail (None on success), so the caller's
+    single ``event="push"`` record can carry it (R11); the caller
     owns what a result means — logging, dedup bookkeeping, and the gone → grace → drop rule
     (:func:`handle_gone_device`). Shared by check_and_notify's SX delivery loop and (injected by
     main, so that module imports no varsel) togvarsel_notify's forecast rounds.
     """
 
-    def _deliver_device(entry: tuple[str, list[Any]]) -> list[tuple[str, Any, str, dict]]:
+    def _deliver_device(entry: tuple[str, list[Any]]) -> list[tuple[str, Any, str, dict, dict | None]]:
         """One device's pending items, in order, stopping at a dead subscription."""
         device_id, items = entry
         out = []
@@ -2077,8 +2136,8 @@ def deliver_to_devices(
             if prepared is None:
                 continue  # withdrawn between collection and dispatch; not a delivery attempt
             subscription, payload = prepared
-            result = _send_push(subscription, payload)
-            out.append((device_id, item, result, payload))
+            result, error_detail = _send_push_result(_send_push(subscription, payload))
+            out.append((device_id, item, result, payload, error_detail))
             if result == "gone":
                 break  # stop this device's remaining pushes this batch
         return out
@@ -3852,9 +3911,19 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
 
     pushed_keys: set[tuple[str, str]] = set()
     if per_device:
-        for _device_id, item, result, payload in deliver_to_devices(per_device, _prepare_alert):
+        for _device_id, item, result, payload, error_detail in deliver_to_devices(
+            per_device, _prepare_alert
+        ):
             jid, _device, journey, alert, _key, _brand, replaces = item
-            _log_push("alert", result, journey["device_id"], payload, journey_id=jid, alert=alert)
+            _log_push(
+                "alert",
+                result,
+                journey["device_id"],
+                payload,
+                journey_id=jid,
+                alert=alert,
+                error_detail=error_detail,
+            )
             if result == "sent":
                 with _state_lock:
                     # Same liveness rule as `_prepare_alert`, re-asked because the delete can also
@@ -4690,8 +4759,8 @@ def test_push(body: TestIn) -> dict:
         "url": assets["url"],
         "icon": assets["icon"],
     }
-    result = _send_push(subscription, payload)
-    _log_push("test", result, body.device_id, payload)
+    result, error_detail = _send_push_result(_send_push(subscription, payload))
+    _log_push("test", result, body.device_id, payload, error_detail=error_detail)
     if result == "gone":
         if _device_is_fresh(body.device_id):
             # A brand-new subscription can briefly 404/410 before it propagates — don't drop it.

@@ -38,7 +38,7 @@ class _RecordingClient:
         self.queries.append(sql)
 
         class _Job:
-            def result(self_inner):
+            def result(self_inner, timeout=None):  # poller-path calls pass a timeout (U1)
                 return []
 
         return _Job()

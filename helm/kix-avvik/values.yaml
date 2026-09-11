@@ -17,6 +17,17 @@ common:
         path: /health
       readiness:
         path: /health
+    # Prometheus scrape wiring (2026-09-11): rendered as the pod's prometheus.io/{scrape,path,port}
+    # annotations, pointing the platform's annotation-driven scraper at the app's dedicated
+    # internal exporter port -- served from the lifespan hook before readiness, so the slow
+    # BigQuery startup is observable. Never the public app port (8080), and never drop the
+    # explicit port: the chart's template applies `default .Values.service.internalPort` BEFORE
+    # its `required` guard can fire, so an omitted port silently points the scrape at 8080
+    # (which serves no /metrics) instead of failing the render. Rollback: enabled: false.
+    prometheus:
+      enabled: true
+      path: /metrics
+      port: 9464
 
   deployment:
     # Single instance by design: the app keeps an in-process cache and runs one
@@ -90,3 +101,16 @@ common:
       # is in sso.py's docstring. "true" WITHOUT all four serves the gated surfaces as 503 (fail
       # closed), never publicly; rollback is the environment's flag back to "false".
       SSO_REQUIRED: "false"
+      # OpenTelemetry tracing to Cloud Trace (tracing_setup.py, 2026-09-11). Same flag convention
+      # as the gates above: only true/1/yes/on enable, the code default for an UNSET value is also
+      # off, and this line states the closed posture where an operator looks. It is the kill
+      # switch — rollback from any tracing problem is this value back to "false" in the
+      # environment file and a deploy. Fails OPEN in every failure mode (R13): an init error logs
+      # one event="tracing_disabled" WARNING and the app serves with no-op spans, and an export
+      # failure only logs exporter warnings — pushes and the poller are never gated on a span.
+      # Turning it on in an environment needs IAM beyond the flag (R19): the runtime SA needs the
+      # Cloud Trace write role, without which the OTLP export logs warnings and no trace arrives.
+      # Sampling rides on the standard OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG env vars,
+      # which the SDK reads natively (no code in this repo reads them) — set per environment
+      # beside the environment's own "true".
+      TRACING_ENABLED: "false"

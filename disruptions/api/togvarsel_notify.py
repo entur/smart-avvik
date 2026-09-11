@@ -400,6 +400,12 @@ def _record_round(
 # ---- Station set ------------------------------------------------------------------------
 
 _STATIONS_SQL = "SELECT stop_place FROM `disruptions.togvarsel_oslo_stations`"
+# Bounded for the reason every wait in the round path is (togvarsel._READ_TIMEOUT_S carries the
+# full statement): this runs on the poller thread, the client defaults to waiting forever, and a
+# hang here wedges the tick into the /health staleness restart loop. A ceiling on a wedge, not a
+# budget — the scan is 39 rows. A timeout is caught below like any other failure, which is the
+# cheapest possible outcome here: no cooldown, so the next tick simply asks again.
+_STATIONS_TIMEOUT_S = 60
 
 _bq_client: Any = None
 # {"date": Oslo date, "refs": frozenset} once fetched; "error_date" throttles the failure log to
@@ -484,7 +490,7 @@ def station_set(now: datetime) -> frozenset[str] | None:
     if _station_state.get("date") == today:
         return _station_state["refs"]
     try:
-        rows = _bq_client.query(_STATIONS_SQL).result()
+        rows = _bq_client.query(_STATIONS_SQL).result(timeout=_STATIONS_TIMEOUT_S)
         refs = frozenset(str(r["stop_place"]) for r in rows)
         if not refs:
             raise RuntimeError("disruptions.togvarsel_oslo_stations came back empty")
@@ -855,7 +861,7 @@ def push_round(
     resolve_device: Callable[[str], tuple[dict, str] | None],
     deliver: Callable[
         [Mapping[str, list[Any]], Callable[[Any], tuple[dict, dict]]],
-        list[tuple[str, Any, str, dict]],
+        list[tuple[str, Any, str, dict, dict | None]],
     ],
     handle_gone: Callable[[str], bool],
     brand_assets: Mapping[str, Mapping[str, str]],
@@ -891,8 +897,15 @@ def push_round(
         per_device[device_id] = [(subscription, payload)]  # one item per device per round
     counts = {"sent": 0, "error": 0, "gone": 0}
     dropped = 0
-    for device_id, _item, result, _payload in deliver(per_device, lambda item: item):
+    # Forecast rounds log COUNTS in the one round event below, never a per-push record (per-push
+    # logging is a deferred follow-up) — but a count of errors with no reason anywhere is not a
+    # diagnosis. The FIRST failure's detail rides the round event, which is enough to tell a dead
+    # push service from a bad keypair without minting a record per device.
+    first_error: dict | None = None
+    for device_id, _item, result, _payload, error_detail in deliver(per_device, lambda item: item):
         counts[result] = counts.get(result, 0) + 1
+        if result == "error" and first_error is None and error_detail:
+            first_error = error_detail
         if result == "gone" and handle_gone(device_id):
             dropped += 1
     summary: dict[str, Any] = {
@@ -905,6 +918,15 @@ def push_round(
         "dropped": dropped,
         **counts,
     }
+    # Deliberately NOT added to `summary`: that dict is the togvarsel_rounds row, and an
+    # unrecognised key there is a silently rejected streamed insert.
+    round_fields: dict[str, Any] = {"event": "togvarsel_notify_round", **summary}
+    if first_error is not None:
+        round_fields.update(
+            push_error_status=first_error.get("status"),
+            push_error_host=first_error.get("host"),
+            push_error_body=first_error.get("body"),
+        )
     logger.info(
         "togvarsel_notify: round %s %s (%s) — %d journeys on %d devices matched; "
         "%d sent, %d error (not retried), %d gone (%d dropped)",
@@ -917,7 +939,7 @@ def push_round(
         counts["error"],
         counts["gone"],
         dropped,
-        extra={"fields": {"event": "togvarsel_notify_round", **summary}},
+        extra={"fields": round_fields},
     )
     return summary
 

@@ -84,11 +84,19 @@ jobs:
           shopt -s nullglob
           # Globbed, not a hardcoded list: a literal list means adding a suite and forgetting this
           # line gives a green build that never ran it -- the same silent gap this job exists to fix.
+          # opentelemetry-api is a hard import of main (via tracing_setup); the SDK and the two
+          # instrumentors are what test_tracing_setup.py's enabled-path checks drive. The OTLP
+          # exporter is deliberately NOT here: no test may build it (the in-memory seam exists
+          # for exactly that), and its absence is what proves the lazy-import claim (KTD3).
           for suite in test_*.py; do
             echo "::group::$suite"
             uv run --with fastapi --with httpx --with pydantic \
                    --with google-cloud-bigquery --with google-cloud-storage \
-                   --with pywebpush --with google-cloud-firestore python "$suite"
+                   --with pywebpush --with google-cloud-firestore \
+                   --with prometheus-client --with opentelemetry-api \
+                   --with opentelemetry-sdk \
+                   --with opentelemetry-instrumentation-fastapi \
+                   --with opentelemetry-instrumentation-requests python "$suite"
             echo "::endgroup::"
           done
       # The notification store's EMULATOR-backed checks, which the loop above cannot run: it has no
