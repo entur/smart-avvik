@@ -285,6 +285,34 @@ def test_a_dying_thread_leaves_one_structured_error_record():
     assert "boom-in-thread" in entry["message"], entry
 
 
+def test_no_poller_path_bigquery_wait_is_unbounded():
+    """Every `.result()` in the togvarsel modules passes a timeout (KTD1's other half).
+
+    The wedge guard is only as good as its coverage: the client's default is to wait FOREVER, so
+    one unbounded call on the poller thread is enough to hold a tick past HEALTH_STALE_AFTER_S,
+    503 /health and have liveness restart the replica into the same hang next tick — a crash loop
+    against an outage no restart can fix. Three such calls were left behind when the timeouts went
+    in (togvarsel `_rows` and the feature rebuild, togvarsel_notify's station fetch), all found by
+    review rather than by a test, which is what this is.
+
+    Source-level and scoped to these three modules on purpose. They are wholly poller-path, so the
+    rule is unconditional here and needs no judgment about the caller. `main.py` is deliberately
+    NOT covered: it mixes the poller path with the request path, where an unbounded wait holds an
+    anyio slot instead of the tick and the five that remain there are legitimate — a grep cannot
+    tell the two apart, and one asserting over both would have to be either wrong or disabled.
+    """
+    import pathlib
+    import re
+
+    offenders = []
+    for name in ("togvarsel.py", "togvarsel_notify.py", "togvarsel_outcomes.py"):
+        text = (pathlib.Path(__file__).parent / name).read_text()
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if re.search(r"\.result\(\s*\)", line):
+                offenders.append(f"{name}:{lineno}: {line.strip()}")
+    assert not offenders, "unbounded BigQuery wait on the poller thread:\n" + "\n".join(offenders)
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

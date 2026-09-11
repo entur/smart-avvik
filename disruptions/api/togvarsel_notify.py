@@ -400,6 +400,12 @@ def _record_round(
 # ---- Station set ------------------------------------------------------------------------
 
 _STATIONS_SQL = "SELECT stop_place FROM `disruptions.togvarsel_oslo_stations`"
+# Bounded for the reason every wait in the round path is (togvarsel._READ_TIMEOUT_S carries the
+# full statement): this runs on the poller thread, the client defaults to waiting forever, and a
+# hang here wedges the tick into the /health staleness restart loop. A ceiling on a wedge, not a
+# budget — the scan is 39 rows. A timeout is caught below like any other failure, which is the
+# cheapest possible outcome here: no cooldown, so the next tick simply asks again.
+_STATIONS_TIMEOUT_S = 60
 
 _bq_client: Any = None
 # {"date": Oslo date, "refs": frozenset} once fetched; "error_date" throttles the failure log to
@@ -484,7 +490,7 @@ def station_set(now: datetime) -> frozenset[str] | None:
     if _station_state.get("date") == today:
         return _station_state["refs"]
     try:
-        rows = _bq_client.query(_STATIONS_SQL).result()
+        rows = _bq_client.query(_STATIONS_SQL).result(timeout=_STATIONS_TIMEOUT_S)
         refs = frozenset(str(r["stop_place"]) for r in rows)
         if not refs:
             raise RuntimeError("disruptions.togvarsel_oslo_stations came back empty")
