@@ -438,6 +438,13 @@ def test_every_path_parameter_route_sits_behind_a_redacted_segment():
     """
     import re
 
+    # This suite is otherwise main-free, so it carries no module-top BigQuery stub — and main
+    # builds a client at import scope. CI has no ADC, so an unstubbed import raises
+    # DefaultCredentialsError there while passing on any laptop that has run `gcloud auth login`.
+    # Same stub every main-importing suite applies at its module top, just applied here.
+    from google.cloud import bigquery as _bq_for_main
+
+    _bq_for_main.Client = lambda *a, **k: None  # type: ignore[assignment]
     import main
 
     unguarded = []
