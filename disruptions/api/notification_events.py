@@ -177,6 +177,92 @@ class WebhookSubject:
 
 
 @dataclass(frozen=True)
+class Recipient:
+    """One subscription a shared observation is owed to. Everything routing needs and nothing else.
+
+    Split out of :class:`WebhookSubject` in U9 so the wording, the payload and the train identity
+    are held ONCE per (definition, train) instead of once per recipient -- see
+    :class:`WebhookObservation` for the arithmetic that forces it.
+    """
+
+    subscription_id: str
+    client_id: str
+    destination_id: str
+    subscription_version: int
+    external_ref: str = ""
+    test: bool = False
+
+
+@dataclass(frozen=True)
+class WebhookObservation:
+    """One (definition, train) this cycle observed, and every subscription watching it.
+
+    **What the pass hands over since U9, and the change is about memory rather than tidiness.** It
+    used to be one :class:`WebhookSubject` per (recipient, train), built in `varsel` before this
+    module saw any of them -- so a corridor with 100 000 subscriptions and AE3's thirteen cancelled
+    departures materialised 1.3 million dataclasses in one burst on the ingestion thread, every one
+    of them carrying the routing of a subscription whose subject may not even stand. The payload
+    was already shared by reference; the objects around it were not, and the pod's memory limit
+    equals its request.
+
+    Held this way, the wording and the train are one object per train and the per-recipient cost is
+    six strings. :meth:`subject` materialises the rest, and :func:`_run` calls it only where the
+    standing set says a store call can actually happen -- which for ~83 % of matched alerts (the
+    sub-threshold ones, `varsel_decisions`' own split) is never.
+
+    Every field below means exactly what the same-named field on :class:`WebhookSubject` means; the
+    docstring there is the one to read.
+    """
+
+    recipients: tuple[Recipient, ...] = ()
+
+    alertworthy: bool = False
+    cancelled: bool = False
+    situations: tuple[str, ...] = ()
+
+    operator: str | None = None
+    line: str | None = None
+    journey_ref: str | None = None
+    stop_place: str | None = None
+    stop_order: int | None = None
+    departure_time: datetime | None = None
+
+    title: str = ""
+    body: str = ""
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    expected_departure_time: datetime | None = None
+
+    def subject(self, recipient: Recipient) -> WebhookSubject:
+        """This observation as one recipient's subject. The payload is SHARED, not copied.
+
+        `_emit_one` copies it into the request it builds, which is the one place a mutation could
+        matter; copying here instead would put a dict copy per recipient back into the hot loop
+        this class exists to empty.
+        """
+        return WebhookSubject(
+            subscription_id=recipient.subscription_id,
+            client_id=recipient.client_id,
+            destination_id=recipient.destination_id,
+            subscription_version=recipient.subscription_version,
+            external_ref=recipient.external_ref,
+            test=recipient.test,
+            alertworthy=self.alertworthy,
+            cancelled=self.cancelled,
+            situations=self.situations,
+            operator=self.operator,
+            line=self.line,
+            journey_ref=self.journey_ref,
+            stop_place=self.stop_place,
+            stop_order=self.stop_order,
+            departure_time=self.departure_time,
+            title=self.title,
+            body=self.body,
+            payload=self.payload,
+            expected_departure_time=self.expected_departure_time,
+        )
+
+
+@dataclass(frozen=True)
 class EmitReport:
     """What one emit step did, as counts an operator can read off one log line.
 
@@ -331,8 +417,22 @@ def skip_reason(stored_phase: str | None, subject: WebhookSubject) -> str | None
     ``_transition`` over the whole phase cross-product, so a client-side skip can never be looser
     than the store's own decision.
     """
-    if subject.alertworthy:
-        if notification_store._transition(stored_phase, requested_phase(subject)) is None:
+    return _skip_reason_for(
+        stored_phase, alertworthy=subject.alertworthy, phase=requested_phase(subject)
+    )
+
+
+def _skip_reason_for(
+    stored_phase: str | None, *, alertworthy: bool, phase: str
+) -> str | None:
+    """:func:`skip_reason` without a subject, so the hot loop needs none.
+
+    The rule is stated once, here; :func:`skip_reason` is the wrapper the source-inspection test
+    and every other caller use, and it is what keeps "a subject decides this" true as a statement
+    about the module even though the pass no longer builds one to ask.
+    """
+    if alertworthy:
+        if notification_store._transition(stored_phase, phase) is None:
             return "unchanged"
         return None
     if stored_phase in (None, notification_store.PHASE_WITHDRAWN):
@@ -423,7 +523,7 @@ class _Standing:
 _INCOMPLETE = _Standing(phases={}, complete=False)
 
 
-def _standing(subjects: Sequence[WebhookSubject], now: datetime) -> dict[str, _Standing]:
+def _standing(recipients: Sequence[Recipient], now: datetime) -> dict[str, _Standing]:
     """Which subjects stand, in which phase -- off the mirror, one lookup per subscription.
 
     No store read at all since U9, and therefore no per-client failure mode: the whole
@@ -437,38 +537,46 @@ def _standing(subjects: Sequence[WebhookSubject], now: datetime) -> dict[str, _S
     """
     mirror = notification_store.subject_mirror()
     if not mirror.ready:
-        return {s.subscription_id: _INCOMPLETE for s in subjects}
+        return {r.subscription_id: _INCOMPLETE for r in recipients}
     runs = mirror.open_runs(now)
     return {
-        s.subscription_id: _Standing(
-            phases=mirror.phases_for(s.subscription_id, now),
+        r.subscription_id: _Standing(
+            phases=mirror.phases_for(r.subscription_id, now),
             complete=True,
             open_runs=runs,
         )
-        for s in subjects
+        for r in recipients
     }
 
 
-def _sort_key(subject: WebhookSubject) -> tuple:
+def _sort_key(observation: WebhookObservation) -> tuple:
     """Alert-worthy first, then soonest departure, then a stable tie-break.
 
-    Soonest-departure-first across subscriptions is ``/varsel``'s own rule for spending a bounded
-    budget (`_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`, and the write queue since 2026-08-21), and the
-    reason is the same here: when the budget binds it must be spent on the trains a traveller can
-    still act on. Alert-worthy ahead of below-threshold so a squeezed cycle never spends its last
+    Soonest-departure-first is ``/varsel``'s own rule for spending a bounded budget
+    (`_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`, and the write queue since 2026-08-21), and the reason
+    is the same here: when the budget binds it must be spent on the trains a traveller can still
+    act on. Alert-worthy ahead of below-threshold so a squeezed cycle never spends its last
     transaction retracting a warning instead of raising one.
 
+    **It orders TRAINS since U9, where it used to order (recipient, train) pairs**, and the
+    subscription id has left the key with them. That is a sharper statement of the same rule rather
+    than a weakening of it: urgency is a property of the departure, so within one train every
+    recipient is equally urgent and the order among them is whatever the standing set hands over --
+    deterministic, and carrying no meaning it would be wrong to read into it. What the old key did
+    with `subscription_id` in third place was group one subscription's trains together inside an
+    identical departure instant, which nothing depended on.
+
     ``.timestamp()`` rather than the datetime, because the key must be total and comparing an aware
-    datetime with a naive one raises; a subject with no departure sorts last and keeps its relative
-    order, which :func:`train_ref` will refuse anyway.
+    datetime with a naive one raises; an observation with no departure sorts last and keeps its
+    relative order, which :func:`train_ref_of` will refuse anyway.
     """
     return (
-        not subject.alertworthy,
-        subject.departure_time is None,
-        subject.departure_time.timestamp() if subject.departure_time else 0.0,
-        subject.subscription_id,
-        subject.journey_ref or "",
-        subject.stop_order if subject.stop_order is not None else -1,
+        not observation.alertworthy,
+        observation.departure_time is None,
+        observation.departure_time.timestamp() if observation.departure_time else 0.0,
+        observation.journey_ref or "",
+        observation.stop_order if observation.stop_order is not None else -1,
+        observation.operator or "",
     )
 
 
@@ -525,7 +633,7 @@ def _emit_one(
 
 
 def _run(
-    subjects: Sequence[WebhookSubject],
+    observations: Sequence[WebhookObservation],
     *,
     now: datetime,
     deadline_s: float,
@@ -536,7 +644,9 @@ def _run(
     """The emit loop itself, on a worker thread so the caller's wait can bound a hung store call."""
     counts: dict[str, int] = {}
     budget = _EmitBudget(max_calls, monotonic() + deadline_s, worst_case_s)
-    standing = _standing(subjects, now)
+    standing = _standing(
+        [r for observation in observations for r in observation.recipients], now
+    )
     # One lookup per CLIENT per pass, not one per subject. The resolver behind it is a cached
     # account read, but a pass touches tens of thousands of subjects across a handful of clients and
     # a cache hit is still a lock acquisition and a dict walk apiece.
@@ -556,70 +666,99 @@ def _run(
     # indistinguishable from the intended 410 pause.
     over_quota: set[str] = set()
 
-    for subject in sorted(subjects, key=_sort_key):
-        train = train_ref(subject)
+    for observation in sorted(observations, key=_sort_key):
+        # ONCE PER TRAIN, not once per recipient: the train identity, its `TrainRef` and the phase
+        # it asks for are properties of the observation, and at 100 000 subscriptions on one
+        # corridor the difference is four function calls against four hundred thousand.
+        train = train_ref_of(
+            operator=observation.operator,
+            line=observation.line,
+            journey_ref=observation.journey_ref,
+            stop_place=observation.stop_place,
+            stop_order=observation.stop_order,
+            departure_time=observation.departure_time,
+        )
         if train is None:
-            counts["unidentified"] = counts.get("unidentified", 0) + 1
+            counts["unidentified"] = counts.get("unidentified", 0) + len(observation.recipients)
             continue
-        if subject.destination_id in over_quota:
-            counts["quota"] = counts.get("quota", 0) + 1
-            continue
-        known = standing.get(subject.subscription_id, _INCOMPLETE)
-        # Hoisted out of the `complete` branch: the withdrawal-run reset below needs it on both
-        # paths, and it is a pure hash of two strings.
-        alert_id = notification_store.alert_subject_id(subject.subscription_id, train)
-        if known.complete:
-            reason = skip_reason(known.phases.get(alert_id), subject)
-            if reason is not None:
-                if reason == "unchanged":
-                    # THE recovery case: alert-worthy, standing in the same phase, minting nothing
-                    # -- so the store is about to hear nothing about a cycle that proves any open
-                    # withdrawal run is broken. This is the one place that can tell it.
-                    _close_run(alert_id, known, now=now, budget=budget, counts=counts)
-                counts[reason] = counts.get(reason, 0) + 1
+        phase = (
+            notification_store.PHASE_CONFIRMED
+            if observation.cancelled
+            else notification_store.PHASE_PREDICTED
+        )
+        for recipient in observation.recipients:
+            if recipient.destination_id in over_quota:
+                counts["quota"] = counts.get("quota", 0) + 1
                 continue
-        if not budget.claim():
-            counts["capped"] = counts.get("capped", 0) + 1
-            continue
-        try:
-            commit = _emit_one(
-                subject,
-                train=train,
-                phase=requested_phase(subject),
-                now=now,
-                max_pending=_pending_ceiling(subject.client_id),
-            )
-        except notification_store.QuotaExceeded:
-            # R21, and visible rather than silent: the store has already logged the breach with its
-            # own count. Skipping the rest of this destination's subjects is a cost decision, not a
-            # policy one -- they are re-offered on the next cycle.
-            over_quota.add(subject.destination_id)
-            counts["quota"] = counts.get("quota", 0) + 1
-            continue
-        except Exception as exc:
-            # `notification_store.is_retryable` and NOT a handler keyed on `google.api_core` exceptions:
-            # an exhausted transaction surfaces as a plain `ValueError` after five attempts, and
-            # treating that as terminal would mark a contended subject failed and never deliver it.
-            bucket = "retryable" if notification_store.is_retryable(exc) else "failed"
-            counts[bucket] = counts.get(bucket, 0) + 1
-            logger.warning(
-                "Notification event could not be committed (%s); it is re-offered next cycle",
-                bucket,
-                exc_info=True,
-                extra={"fields": {"event": "notification_emit", "result": bucket,
-                                  "client_id": subject.client_id}},
-            )
-            continue
-        if commit.status == "created" and commit.event_type == notification_store.EVENT_WITHDRAWN:
-            counts["withdrawn"] = counts.get("withdrawn", 0) + 1
-        else:
-            if commit.status == "unchanged":
-                # Same recovery, reached the long way: the pre-read was truncated or missing, so
-                # the store was asked and said "no transition". A mint would have closed the run
-                # itself (`_mint` writes both counter fields), which is why only `unchanged` needs
-                # this -- on either path.
-                _close_run(alert_id, known, now=now, budget=budget, counts=counts)
-            counts[commit.status] = counts.get(commit.status, 0) + 1
+            known = standing.get(recipient.subscription_id, _INCOMPLETE)
+            # Hoisted out of the `complete` branch: the withdrawal-run reset below needs it on both
+            # paths, and it is a pure hash of two strings.
+            alert_id = notification_store.alert_subject_id(recipient.subscription_id, train)
+            if known.complete:
+                reason = _skip_reason_for(
+                    known.phases.get(alert_id),
+                    alertworthy=observation.alertworthy,
+                    phase=phase,
+                )
+                if reason is not None:
+                    if reason == "unchanged":
+                        # THE recovery case: alert-worthy, standing in the same phase, minting
+                        # nothing -- so the store is about to hear nothing about a cycle that
+                        # proves any open withdrawal run is broken. This is the one place that can
+                        # tell it.
+                        _close_run(alert_id, known, now=now, budget=budget, counts=counts)
+                    counts[reason] = counts.get(reason, 0) + 1
+                    continue
+            if not budget.claim():
+                counts["capped"] = counts.get("capped", 0) + 1
+                continue
+            # MATERIALISED HERE AND NOWHERE EARLIER. Everything above is decided from the
+            # observation and six strings; this is the first line that builds a per-recipient
+            # object, and it is reached only where a store call is actually going to happen.
+            subject = observation.subject(recipient)
+            try:
+                commit = _emit_one(
+                    subject,
+                    train=train,
+                    phase=phase,
+                    now=now,
+                    max_pending=_pending_ceiling(recipient.client_id),
+                )
+            except notification_store.QuotaExceeded:
+                # R21, and visible rather than silent: the store has already logged the breach with
+                # its own count. Skipping the rest of this destination's subjects is a cost
+                # decision, not a policy one -- they are re-offered on the next cycle.
+                over_quota.add(recipient.destination_id)
+                counts["quota"] = counts.get("quota", 0) + 1
+                continue
+            except Exception as exc:
+                # `notification_store.is_retryable` and NOT a handler keyed on `google.api_core`
+                # exceptions: an exhausted transaction surfaces as a plain `ValueError` after five
+                # attempts, and treating that as terminal would mark a contended subject failed and
+                # never deliver it.
+                bucket = "retryable" if notification_store.is_retryable(exc) else "failed"
+                counts[bucket] = counts.get(bucket, 0) + 1
+                logger.warning(
+                    "Notification event could not be committed (%s); it is re-offered next cycle",
+                    bucket,
+                    exc_info=True,
+                    extra={"fields": {"event": "notification_emit", "result": bucket,
+                                      "client_id": recipient.client_id}},
+                )
+                continue
+            if (
+                commit.status == "created"
+                and commit.event_type == notification_store.EVENT_WITHDRAWN
+            ):
+                counts["withdrawn"] = counts.get("withdrawn", 0) + 1
+            else:
+                if commit.status == "unchanged":
+                    # Same recovery, reached the long way: the standing set was not ready, so the
+                    # store was asked and said "no transition". A mint would have closed the run
+                    # itself (`_mint` writes both counter fields), which is why only `unchanged`
+                    # needs this -- on either path.
+                    _close_run(alert_id, known, now=now, budget=budget, counts=counts)
+                counts[commit.status] = counts.get(commit.status, 0) + 1
     return EmitReport(
         created=counts.get("created", 0),
         unchanged=counts.get("unchanged", 0),
@@ -640,7 +779,7 @@ def _run(
 
 
 def emit(
-    subjects: Sequence[WebhookSubject],
+    observations: Sequence[WebhookObservation],
     *,
     now: datetime | None = None,
     deadline_s: float = _EMIT_DEADLINE_S,
@@ -677,7 +816,7 @@ def emit(
     also carry the credential machinery. ``None`` keeps the module constant for every client, which
     is what every test that does not care about quotas gets.
     """
-    if not subjects:
+    if not observations:
         return EmitReport()
     instant = (now or datetime.now(UTC)).astimezone(UTC)
     started = monotonic()
@@ -685,7 +824,7 @@ def emit(
     try:
         future = pool.submit(
             _run,
-            subjects,
+            observations,
             now=instant,
             deadline_s=deadline_s,
             worst_case_s=worst_case_s,
@@ -735,7 +874,11 @@ def emit(
                 "run_clear_error": report.run_clear_error,
                 "retryable": report.retryable,
                 "failed": report.failed,
-                "n": len(subjects),
+                # `n` keeps its meaning -- the (recipient, train) observations this cycle offered
+                # -- so a rate computed across U9 still measures one thing. `trains` is what the
+                # fan-out is over, and the ratio between them is the corridor's sharing factor.
+                "n": sum(len(o.recipients) for o in observations),
+                "trains": len(observations),
                 "ms": ms,
             }
         },

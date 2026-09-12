@@ -245,6 +245,20 @@ def _reset_state():
     _use_snapshot(SNAPSHOT)
 
 
+
+def _subjects(outcome: object) -> list:
+    """Every (recipient, train) the pass observed, materialised as `notification_events` does.
+
+    The pass hands over one observation per (definition, train) with its recipients since U9 --
+    1.3 million dataclasses on a 100 000-subscription corridor is why -- so a test that wants to
+    read one recipient's subject asks for it the same way the emit loop does.
+    """
+    return [
+        observation.subject(recipient)
+        for observation in outcome.webhook_observations
+        for recipient in observation.recipients
+    ]
+
 def test_the_shared_reset_clears_the_notification_wording_allowance_and_holders():
     """U1 scenario 7: one seam, called from this suite's own `_reset_state`.
 
@@ -4645,10 +4659,10 @@ def test_two_situations_about_one_train_yield_one_webhook_subject_carrying_both(
 
     outcome = varsel.check_and_notify(SNAPSHOT_TWO_NOTICES)
 
-    assert len(outcome.webhook_subjects) == 1, (
-        f"one subject per TRAIN, not per SX message; got {outcome.webhook_subjects}"
+    assert len(_subjects(outcome)) == 1, (
+        f"one subject per TRAIN, not per SX message; got {_subjects(outcome)}"
     )
-    subject = outcome.webhook_subjects[0]
+    subject = _subjects(outcome)[0]
     assert set(subject.situations) == {"S1", "S2"}, subject.situations
     assert [s["situation_number"] for s in subject.payload["situations"]] == list(subject.situations)
     # The subject carries the routing the emit step needs, from the LOAD snapshot's version.
@@ -4687,8 +4701,8 @@ def test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push(monkey
 
     outcome = varsel.check_and_notify(SNAPSHOT)
 
-    assert len(sent) == 1 and len(outcome.webhook_subjects) == 1
-    subject = outcome.webhook_subjects[0]
+    assert len(sent) == 1 and len(_subjects(outcome)) == 1
+    subject = _subjects(outcome)[0]
     assert subject.title == sent[0]["title"], (subject.title, sent[0]["title"])
     assert subject.body == sent[0]["body"], (subject.body, sent[0]["body"])
     assert subject.body.startswith("Oslo S → Lillehammer\n"), subject.body
@@ -4726,8 +4740,8 @@ def test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push(monkey
     _register(DEVICE)
     outcome = varsel.check_and_notify(SNAPSHOT)
     assert "Toget er innstilt. Ta neste tog." in sent[0]["body"]
-    assert "Toget er innstilt. Ta neste tog." not in outcome.webhook_subjects[0].body
-    assert outcome.webhook_subjects[0].title == sent[0]["title"], "the TITLE never varies"
+    assert "Toget er innstilt. Ta neste tog." not in _subjects(outcome)[0].body
+    assert _subjects(outcome)[0].title == sent[0]["title"], "the TITLE never varies"
 
 
 def test_a_browser_registrations_typed_stop_name_never_reaches_a_client_event(monkeypatch):
@@ -4751,9 +4765,9 @@ def test_a_browser_registrations_typed_stop_name_never_reaches_a_client_event(mo
 
     outcome = varsel.check_and_notify(SNAPSHOT)
 
-    assert len(sent) == 1 and len(outcome.webhook_subjects) == 1
+    assert len(sent) == 1 and len(_subjects(outcome)) == 1
     assert sent[0]["body"].startswith(f"{hostile} → Lillehammer (ring 800 00 000)\n"), sent[0]["body"]
-    subject = outcome.webhook_subjects[0]
+    subject = _subjects(outcome)[0]
     assert subject.body.startswith("Oslo S → Lillehammer\n"), subject.body
     assert "info:" not in subject.title and "info:" not in subject.body
     assert "ring" not in subject.body and "ring" not in subject.title
@@ -4786,8 +4800,8 @@ def test_a_below_threshold_train_carries_a_retraction_wording_not_the_alert_one(
 
     outcome = varsel.check_and_notify(mild)
 
-    assert len(outcome.webhook_subjects) == 1
-    subject = outcome.webhook_subjects[0]
+    assert len(_subjects(outcome)) == 1
+    subject = _subjects(outcome)[0]
     assert subject.alertworthy is False
     assert varsel._WEBHOOK_WITHDRAWAL_TITLE in subject.title, subject.title
     # The stop REGISTRY's names, exactly as the alert wording's route line: a webhook-only route
@@ -4813,7 +4827,7 @@ def test_a_declared_cancellation_carries_no_delay_figures_in_its_payload(monkeyp
 
     outcome = varsel.check_and_notify(cancelled)
 
-    [subject] = outcome.webhook_subjects
+    [subject] = _subjects(outcome)
     assert subject.cancelled is True
     assert subject.payload["delay"] is None
     assert subject.payload["probabilities"]["cancellation"] == 1.0
@@ -4843,7 +4857,7 @@ def test_a_webhook_delivery_can_never_enter_pushed_keys(monkeypatch):
 
     outcome = varsel.check_and_notify(SNAPSHOT)
 
-    assert outcome.webhook_subjects, "the webhook subject exists"
+    assert _subjects(outcome), "the webhook subject exists"
     row = next(r for r in log.rows if r["situation_number"] == "S1")
     assert row["pushed"] is False, (
         "the browser row must not read `pushed` on the strength of a webhook delivery"
@@ -4881,7 +4895,7 @@ def test_the_decision_log_and_the_state_blob_are_written_before_the_outcome_is_b
     with _capture_varsel_logs() as records:
         outcome = varsel.check_and_notify(SNAPSHOT)
 
-    assert outcome.webhook_subjects == (), "no client work this cycle"
+    assert _subjects(outcome) == [], "no client work this cycle"
     assert log.rows, "and the decision log was still written"
     assert saves, "and the state blob was still saved"
     # Caught PER DEFINITION, not by the outer backstop: one journey's awkward payload must cost
@@ -4911,7 +4925,7 @@ def test_a_subscription_with_no_destination_is_matched_but_never_emitted_for(mon
         outcome = varsel.check_and_notify(SNAPSHOT)
 
     assert [s for _k, s in written] == ["S1"], "matched and written for"
-    assert outcome.webhook_subjects == (), "and not emitted for"
+    assert _subjects(outcome) == [], "and not emitted for"
     assert _events(records, "notification_emit")[0]["result"] == "unroutable"
 
 
@@ -4989,13 +5003,13 @@ def test_the_webhook_wording_gate_is_the_webhook_switch_not_varsel_llm_enabled(m
     # Client prose OFF (the default everywhere today): the event carries the template.
     monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: False)
     outcome = varsel.check_and_notify(SNAPSHOT)
-    template_body = outcome.webhook_subjects[0].body
+    template_body = _subjects(outcome)[0].body
     assert "Toget er innstilt. Ta neste tog." not in template_body
 
     # Client prose ON: the same cached wording the browser card would show.
     monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
     outcome = varsel.check_and_notify(SNAPSHOT)
-    assert "Toget er innstilt. Ta neste tog." in outcome.webhook_subjects[0].body
+    assert "Toget er innstilt. Ta neste tog." in _subjects(outcome)[0].body
 
     # And a switch that raises reads as OFF -- the failure direction of a delivery gate is closed.
     def boom() -> bool:
@@ -5003,7 +5017,7 @@ def test_the_webhook_wording_gate_is_the_webhook_switch_not_varsel_llm_enabled(m
 
     monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", boom)
     outcome = varsel.check_and_notify(SNAPSHOT)
-    assert "Toget er innstilt. Ta neste tog." not in outcome.webhook_subjects[0].body
+    assert "Toget er innstilt. Ta neste tog." not in _subjects(outcome)[0].body
 
 
 def test_a_confirmed_cancellation_never_carries_the_wording_written_before_it(monkeypatch):
@@ -5012,7 +5026,7 @@ def test_a_confirmed_cancellation_never_carries_the_wording_written_before_it(mo
 `_message_key` carried no `cancelled` flag until KTD9 (2026-09-12), so
     a wording written while the train was merely at risk shared one cache entry with the reading
     taken after ET declared it gone. Both halves of that are closed now — the flag is in the key,
-    AND `_subjects_for_key` still refuses the cache outright — and this is what says so. The TITLE
+    AND `_observations_for_key` still refuses the cache outright — and this is what says so. The TITLE
     is rebuilt from this cycle's `message_input`
     (`innstilt: True`), the BODY is the cached string — so the notification event read «Tog L1 07:18 er
     innstilt» over «91 % sjanse for innstilling, typisk 15-27 min forsinket», beside
@@ -5045,13 +5059,13 @@ def test_a_confirmed_cancellation_never_carries_the_wording_written_before_it(mo
 
     # Cycle 1: at risk, not yet cancelled. The model's prose is written and cached.
     outcome = varsel.check_and_notify(SNAPSHOT)
-    assert "Toget er innstilt. Ta neste tog." in outcome.webhook_subjects[0].body
+    assert "Toget er innstilt. Ta neste tog." in _subjects(outcome)[0].body
     assert varsel._messages, "the wording is cached, which is what the next cycle reuses"
 
     # Cycle 2: the SAME situation now declares the train cancelled.
     _use_snapshot({"S1": _cancelled_notice("S1")})
     outcome = varsel.check_and_notify(_active_snapshot["value"])
-    [subject] = outcome.webhook_subjects
+    [subject] = _subjects(outcome)
     assert subject.cancelled is True, "the reading this cycle is a declared cancellation"
     assert "innstilt" in subject.title.lower(), subject.title
     assert "Toget er innstilt. Ta neste tog." not in subject.body, (

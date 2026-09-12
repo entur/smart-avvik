@@ -1399,7 +1399,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                     # `notification_events` pins its own import set exactly, and the answer lives in
                     # `notification_auth`. This module already imports both.
                     notification_events.emit(
-                        outcome.webhook_subjects,
+                        outcome.webhook_observations,
                         pending_quota=lambda client_id: notification_auth.quotas_for(
                             client_id
                         ).max_pending_events,

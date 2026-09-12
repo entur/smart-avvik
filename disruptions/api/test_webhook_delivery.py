@@ -416,6 +416,47 @@ def _subject(**over: Any) -> notification_events.WebhookSubject:
     return notification_events.WebhookSubject(**base)
 
 
+def _emit(subjects: list[notification_events.WebhookSubject], *, now: datetime) -> Any:
+    """Emit through the REAL path, handing over the observation shape `varsel` now builds.
+
+    One observation per subject here rather than a grouping: every fixture in this suite is a
+    distinct train on one subscription, so the fan-out is one deep and the grouping `varsel` does
+    across recipients has nothing to collapse. `test_notification_events._observed` is where the
+    grouping itself is exercised.
+    """
+    return notification_events.emit(
+        [
+            notification_events.WebhookObservation(
+                recipients=(
+                    notification_events.Recipient(
+                        subscription_id=s.subscription_id,
+                        client_id=s.client_id,
+                        destination_id=s.destination_id,
+                        subscription_version=s.subscription_version,
+                        external_ref=s.external_ref,
+                        test=s.test,
+                    ),
+                ),
+                alertworthy=s.alertworthy,
+                cancelled=s.cancelled,
+                situations=s.situations,
+                operator=s.operator,
+                line=s.line,
+                journey_ref=s.journey_ref,
+                stop_place=s.stop_place,
+                stop_order=s.stop_order,
+                departure_time=s.departure_time,
+                title=s.title,
+                body=s.body,
+                payload=s.payload,
+                expected_departure_time=s.expected_departure_time,
+            )
+            for s in subjects
+        ],
+        now=now,
+    )
+
+
 def _pending(client: _Fake, n: int = 1, **over: Any) -> list[dict[str, Any]]:
     """Emit `n` events through the REAL emit path, so the pending records are the real shape."""
     subjects = [
@@ -428,7 +469,7 @@ def _pending(client: _Fake, n: int = 1, **over: Any) -> list[dict[str, Any]]:
         )
         for i in range(n)
     ]
-    notification_events.emit(subjects, now=NOW)
+    _emit(subjects, now=NOW)
     return sorted(
         client.in_collection(notification_store.DELIVERIES), key=lambda d: d["valid_until"]
     )
@@ -645,7 +686,7 @@ def test_a_cap_exempt_confirmation_still_reaches_a_subscription_whose_four_are_s
 
         # A confirmation about a train already delivered: exempt at MINT.
         subjects = [_subject(journey_ref="DatedServiceJourney:1000", cancelled=True)]
-        notification_events.emit(subjects, now=NOW + timedelta(minutes=1))
+        _emit(subjects, now=NOW + timedelta(minutes=1))
         docs = dict(client.docs)
         _uninstall()
         client = _install()
@@ -1524,9 +1565,7 @@ def test_two_subscriptions_are_still_delivered_in_parallel():
         other = "sub-2"
         _live(client, subscription_id=other)
         _pending(client, n=1)
-        notification_events.emit(
-            [_subject(subscription_id=other, journey_ref="DatedServiceJourney:2000")], now=NOW
-        )
+        _emit([_subject(subscription_id=other, journey_ref="DatedServiceJourney:2000")], now=NOW)
         barrier = threading.Barrier(2, timeout=10)
         inner = _sender()
         overlapped = threading.Event()

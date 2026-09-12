@@ -824,7 +824,7 @@ def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
         # document missing one can still be matched — it still collapses onto its journey key, still
         # shares the one /impact call and the one wording AE1 asserts. Refusing it would take a
         # browser registration's own wording away over a client field, so it is matched and simply
-        # not emitted for: `notification_events.train_ref` and `_webhook_subjects` drop a subject that
+        # not emitted for: `notification_events.train_ref` and `_webhook_observations` drop a subject that
         # names no destination, and the count is logged.
         client_id=str(doc.get("client_id") or ""),
         destination_id=str(doc.get("destination_id") or ""),
@@ -2044,7 +2044,7 @@ def alert_worthy_trains(alerts: list[Alert]) -> list[Alert]:
     """The trains a notification would go out for: the collapse FIRST, then the push gate.
 
     For the journey-keyed public read (2026-09-10), which must select trains exactly as the pass
-    does. The order is the whole point and it is easy to get backwards: `_subjects_for_key` walks
+    does. The order is the whole point and it is easy to get backwards: `_observations_for_key` walks
     :func:`one_alert_per_train` and tests `alertworthy` on each WINNER, so a train whose most
     severe reading is a sub-gate no-SX one (0.80 under its own 0.85) that outranks an over-gate
     published one (0.70 over 0.65) is NOT alert-worthy — the collapse kept the sub-gate winner.
@@ -3539,15 +3539,15 @@ def _webhook_payload(
     }
 
 
-def _webhook_subjects(
+def _webhook_observations(
     webhook_by_key: dict[str, list[WebhookRecipient]],
     alerts_by_key: dict[str, list[Alert]],
     match_targets: dict[str, dict],
     message_inputs: dict[tuple[str, str, str], dict | None],
     *,
     webhook_llm: bool,
-) -> list[notification_events.WebhookSubject]:
-    """This cycle's webhook subjects — one per (subscription, train), alert-worthy or not.
+) -> list[notification_events.WebhookObservation]:
+    """This cycle's webhook observations — one per (definition, train), alert-worthy or not.
 
     Below-threshold trains are included on purpose: a withdrawal is a lifecycle transition and the
     consecutive-below-threshold count that drives it lives on the alert subject, so the observation
@@ -3557,14 +3557,21 @@ def _webhook_subjects(
     The wording, the collapse and the payload are computed once per (definition, train) and shared
     across the recipients on that definition, which is the same economy AE1 asserts for the match
     and the wording: two recipients watching one trip see identical text.
+
+    **One observation per train rather than one subject per recipient since U9.** The wording and
+    the payload were always shared by reference; the dataclasses around them were not, so a
+    corridor with 100 000 subscriptions and AE3's thirteen departures built 1.3 million of them
+    here before `notification_events` saw one — on the ingestion thread, in a pod whose memory
+    limit equals its request. The fan-out now happens inside the emit loop, after the standing set
+    has said whether a store call can happen at all.
     """
-    subjects: list[notification_events.WebhookSubject] = []
+    observations: list[notification_events.WebhookObservation] = []
     unroutable = 0
     failed = 0
     for key, recipients in webhook_by_key.items():
         try:
-            unroutable += _subjects_for_key(
-                subjects,
+            unroutable += _observations_for_key(
+                observations,
                 key,
                 recipients,
                 alerts_by_key=alerts_by_key,
@@ -3574,7 +3581,7 @@ def _webhook_subjects(
             )
         except Exception:
             # Per DEFINITION, the same rule `_reconcile_caches` and `_match` are guarded by: one
-            # journey's awkward payload must cost that journey's subjects, not the cycle's. What
+            # journey's awkward payload must cost that journey's observations, not the cycle's. What
             # this touches is duck-typed -- an alternative journey from an injected provider, a
             # pydantic dump -- so "it cannot raise" would be an assumption about somebody else's
             # object, and the caller's outer guard would drop every OTHER client's events with it.
@@ -3599,11 +3606,11 @@ def _webhook_subjects(
             failed,
             extra={"fields": {"event": "notification_emit", "result": "subjects_skipped", "n": failed}},
         )
-    return subjects
+    return observations
 
 
-def _subjects_for_key(
-    out: list[notification_events.WebhookSubject],
+def _observations_for_key(
+    out: list[notification_events.WebhookObservation],
     key: str,
     recipients: list[WebhookRecipient],
     *,
@@ -3612,9 +3619,9 @@ def _subjects_for_key(
     message_inputs: dict[tuple[str, str, str], dict | None],
     webhook_llm: bool,
 ) -> int:
-    """One journey definition's subjects, appended to `out`. Returns the unroutable count.
+    """One journey definition's observations, appended to `out`. Returns the unroutable count.
 
-    Split out so the per-definition guard in :func:`_webhook_subjects` has something to wrap.
+    Split out so the per-definition guard in :func:`_webhook_observations` has something to wrap.
     """
     unroutable = 0
     alerts = alerts_by_key.get(key) or []
@@ -3702,33 +3709,44 @@ def _subjects_for_key(
             body=body,
         )
         situations = tuple(s["situation_number"] for s in payload["situations"])
+        routable: list[notification_events.Recipient] = []
         for recipient in recipients:
             if not recipient.client_id or not recipient.destination_id:
                 unroutable += 1
                 continue
-            out.append(
-                notification_events.WebhookSubject(
+            routable.append(
+                notification_events.Recipient(
                     subscription_id=recipient.recipient_id,
                     client_id=recipient.client_id,
                     destination_id=recipient.destination_id,
                     subscription_version=recipient.subscription_version,
                     external_ref=recipient.external_ref,
                     test=recipient.test,
-                    alertworthy=bool(winner.alertworthy),
-                    cancelled=bool(winner.cancelled),
-                    situations=situations,
-                    operator=winner.operator,
-                    line=winner.line,
-                    journey_ref=winner.jkey,
-                    stop_place=winner.stop_place,
-                    stop_order=winner.stop_order,
-                    departure_time=winner.departure_time,
-                    title=title,
-                    body=body,
-                    payload=payload,
-                    expected_departure_time=_expected_departure_of(winner),
                 )
             )
+        if not routable:
+            # An observation nobody can be routed to is not an observation: the count above has
+            # already recorded it, and an empty fan-out would cost the emit loop a train's sort key
+            # and a `TrainRef` for nothing.
+            continue
+        out.append(
+            notification_events.WebhookObservation(
+                recipients=tuple(routable),
+                alertworthy=bool(winner.alertworthy),
+                cancelled=bool(winner.cancelled),
+                situations=situations,
+                operator=winner.operator,
+                line=winner.line,
+                journey_ref=winner.jkey,
+                stop_place=winner.stop_place,
+                stop_order=winner.stop_order,
+                departure_time=winner.departure_time,
+                title=title,
+                body=body,
+                payload=payload,
+                expected_departure_time=_expected_departure_of(winner),
+            )
+        )
     return unroutable
 
 
@@ -3760,7 +3778,7 @@ class PassOutcome:
     at all rather than merely being sequenced after them.
     """
 
-    webhook_subjects: tuple[notification_events.WebhookSubject, ...] = ()
+    webhook_observations: tuple[notification_events.WebhookObservation, ...] = ()
 
 
 @dataclass
@@ -4713,7 +4731,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # alternative journey from an injected provider, a pydantic dump) and a raise here would cost the
     # browser cycle its own tail for a client field.
     try:
-        subjects = _webhook_subjects(
+        observations = _webhook_observations(
             webhook_by_key, alerts_by_key, match_targets, message_inputs, webhook_llm=webhook_llm
         )
     except Exception:
@@ -4722,8 +4740,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             exc_info=True,
             extra={"fields": {"event": "notification_emit", "result": "build_error"}},
         )
-        subjects = []
-    return PassOutcome(webhook_subjects=tuple(subjects))
+        observations = []
+    return PassOutcome(webhook_observations=tuple(observations))
 
 
 # ---- API models ------------------------------------------------------------------------------
