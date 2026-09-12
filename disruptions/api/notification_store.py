@@ -746,7 +746,19 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
     QuerySpec(
         name="load_active_subscriptions",
         collection=SUBSCRIPTIONS,
-        equality=("status",),
+        # `channel` since U5, and it is a PRECONDITION rather than an optimisation: U12-U14 move
+        # /varsel's own registrations into this collection as `web_push` documents, and without the
+        # equality the poller's webhook load would pick every one of them up and hand it to
+        # `varsel._parse_webhook_recipient` as a client subscription. Filtered in the QUERY and not
+        # after the fact because this page is bounded by a ceiling -- a Python-side test would let
+        # the browser majority fill the page and truncate the webhook recipients out of it.
+        #
+        # The equality is safe on today's data because every document `_new_subscription_doc` has
+        # ever written carries the field; checked rather than assumed on 2026-09-12, 18 of 18 in dev
+        # and 0 in prd. That check matters more than it looks: Firestore's equality filter does not
+        # match a document that LACKS the field, so a collection with pre-field documents would see
+        # them silently vanish from the load rather than fail.
+        equality=("status", "channel"),
         # `expires_at` DESCENDING, and the direction is load-bearing. Expiry is tested in PYTHON
         # (see `subscription_is_live`), so an expired-but-not-yet-deleted document is still returned
         # by this query and discarded after the fact. Ordered ascending, a page truncated at the
@@ -766,7 +778,11 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
     QuerySpec(
         name="subscription_count",
         collection=SUBSCRIPTIONS,
-        equality=("client_id", "status"),
+        # `channel` since U5: the ceiling this counts for is the client's WEBHOOK ceiling, and a
+        # traveller's `web_push` document is not a client's subscription at all. Counted together,
+        # /varsel's own registrations moving into this collection (U12-U14) would exhaust every
+        # client's ceiling on a collection they do not own.
+        equality=("client_id", "status", "channel"),
         # `expires_at` DESCENDING, for `load_active_subscriptions`' reason one client down. The
         # create-time ceiling is counted from a page bounded AT the ceiling, and liveness is tested in
         # Python, so the page must shed dead rows before live ones. Counted through the listing's
@@ -1017,6 +1033,10 @@ class SubscriptionSpec:
     days: tuple[int, ...]
     external_ref: str = ""
     test: bool = False
+    #: Defaulted rather than required, because every caller today is the webhook API and a required
+    #: field would make this a breaking change to a shape three modules build. U12 gives /varsel's
+    #: own registrations `web_push` through the same builder.
+    channel: str = CHANNEL_WEBHOOK
 
     def validate(self) -> None:
         """/varsel's own three window rules, restated rather than imported.
@@ -1030,6 +1050,11 @@ class SubscriptionSpec:
         """
         if not self.subscription_id or not self.client_id or not self.destination_id:
             raise Conflict("subscription_id, client_id and destination_id are required")
+        # Validated against the vocabulary rather than left free, because it is now a QUERY key:
+        # a typo'd channel writes a document that no read path's equality filter matches, which is
+        # a subscription that exists, is billed for, and is never loaded or counted by anything.
+        if self.channel not in CHANNELS:
+            raise Conflict(f"channel must be one of {', '.join(CHANNELS)}")
         if not self.from_stop or not self.to_stop:
             raise Conflict("from_stop and to_stop must be non-empty")
         if self.from_stop == self.to_stop:
@@ -1098,6 +1123,12 @@ class Subscription:
             "recipient_id": self.subscription_id,
             "subscription_id": self.subscription_id,
             "client_id": self.client_id,
+            # Carried so the READER can refuse what it cannot route (R20's rule: this module hands
+            # over the shape, `varsel._parse_webhook_recipient` decides what it can read). The query
+            # already filters on it, so this is the second of two independent statements -- which is
+            # deliberate, because U6 replaces that query with a mirror that filters in Python and
+            # this field is what the mirror's filter will read.
+            "channel": self.channel,
             "destination_id": self.destination_id,
             "external_ref": self.external_ref,
             "version": self.version,
@@ -1166,7 +1197,7 @@ def _new_subscription_doc(
         "subscription_id": spec.subscription_id,
         "client_id": spec.client_id,
         "destination_id": spec.destination_id,
-        "channel": CHANNEL_WEBHOOK,
+        "channel": spec.channel,
         "from_stop": spec.from_stop,
         "to_stop": spec.to_stop,
         "begin": spec.begin,
@@ -1275,7 +1306,9 @@ def create_subscription(
     refs = _Refs(_firestore_client())
     count_query = _query(
         "subscription_count",
-        equality={"client_id": spec.client_id, "status": "active"},
+        # The client's own ceiling, on the channel it is creating for. A client's webhook ceiling is
+        # not spent by a traveller's `web_push` document in the same collection (U12-U14).
+        equality={"client_id": spec.client_id, "status": "active", "channel": spec.channel},
         limit=ceiling,
     )
     outcome, doc = _run_transaction(
@@ -1714,7 +1747,10 @@ def forget_recent_load() -> None:
 
 
 def active_subscriptions(
-    *, limit: int = MAX_SUBSCRIPTIONS_PER_CYCLE, now: datetime | None = None
+    *,
+    limit: int = MAX_SUBSCRIPTIONS_PER_CYCLE,
+    now: datetime | None = None,
+    channel: str = CHANNEL_WEBHOOK,
 ) -> LoadedSubscriptions:
     """Every live subscription in this environment, bounded by R21's per-cycle ceiling.
 
@@ -1727,7 +1763,11 @@ def active_subscriptions(
     """
     instant = now or _now()
     ceiling = min(limit, MAX_SUBSCRIPTIONS_PER_CYCLE)
-    query = _query("load_active_subscriptions", equality={"status": "active"}, limit=ceiling)
+    query = _query(
+        "load_active_subscriptions",
+        equality={"status": "active", "channel": channel},
+        limit=ceiling,
+    )
     page = _stream(query)
     out: list[Subscription] = []
     skipped = expired = 0

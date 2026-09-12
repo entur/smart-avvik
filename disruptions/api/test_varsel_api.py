@@ -4486,6 +4486,61 @@ def test_a_broken_notification_store_costs_the_webhook_channel_and_nothing_else(
     assert not any("sub-broken" in str(getattr(r, "msg", "")) for r in records)
 
 
+def test_a_web_push_document_is_declined_by_the_webhook_pass_and_not_counted_as_unreadable(
+    monkeypatch,
+):
+    """U5. The collection stops being webhook-only at U12, and this pass must not deliver a
+    traveller's own registration to a client's destination.
+
+    The store's query already filters on `channel`, so this is the SECOND of two statements and is
+    meant to be: U6 replaces that query with a mirror that filters in Python, and "the load path
+    forgot the filter" is then a defect whose symptom is a private commute arriving at a client's
+    webhook. Two independent refusals is the right number for that failure.
+
+    Counted apart from `skipped`, and that is not bookkeeping. A `web_push` document is not
+    unreadable -- it is another channel's, correctly declined -- and from U12 there are tens of
+    thousands of them. Folded into the skip counter, every healthy cycle would log a warning naming
+    them, which is exactly how a warning that matters stops being read.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch,
+        [
+            {**WEBHOOK_DOC, "recipient_id": "sub-browser", "channel": "web_push"},
+            {**WEBHOOK_DOC, "recipient_id": "sub-client", "channel": "webhook"},
+        ],
+    )
+    with _capture_varsel_logs() as records:
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert [s for _k, s in written] == ["S1"], "the webhook subscription was still matched"
+    loads = _events(records, "varsel_webhook_load")
+    ok = next(e for e in loads if e["result"] == "ok")
+    assert ok["n"] == 1, ok
+    assert ok["unroutable"] == 1, ok
+    assert ok["skipped"] == 0, ok
+    assert not any(e["result"] == "skipped" for e in loads), "a declined channel is not a warning"
+
+    # And the parser itself. A MISSING or empty channel reads as `webhook` -- what every document
+    # written before the field meant -- so this cannot retire the 18 documents already in dev.
+    assert varsel._parse_webhook_recipient(WEBHOOK_DOC).recipient_id == "sub-0001"
+    assert varsel._parse_webhook_recipient({**WEBHOOK_DOC, "channel": ""}).recipient_id == "sub-0001"
+    # Anything else is declined, case included: the value is a query key in the store, so `WEBHOOK`
+    # is a document no equality filter there matches either.
+    for declined in ("web_push", "WEBHOOK", "sms"):
+        try:
+            varsel._parse_webhook_recipient({**WEBHOOK_DOC, "channel": declined})
+        except varsel.UnroutableChannel:
+            continue
+        except Exception as exc:  # the exception CLASS is the assertion
+            raise AssertionError(
+                f"{declined!r} raised {type(exc).__name__}, not UnroutableChannel"
+            ) from exc
+        raise AssertionError(f"channel {declined!r} was routed as a webhook")
+
+
 def test_a_cycle_with_webhook_recipients_writes_a_byte_identical_state_blob(monkeypatch):
     """U2 scenario 8, and KTD3's central invariant made testable rather than claimed.
 

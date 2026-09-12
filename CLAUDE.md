@@ -822,6 +822,32 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   mirror instead of full read, emit and delivery as their own Deployment, batched servability, the
   aggregation) and states that none of it touches the wire contract. Every subscription document
   also carries `channel` (`webhook`; `web_push` is reserved for `/varsel`'s move).
+  **Since 2026-09-12 that field is a QUERY key, not just a label** (U5 of the 100k plan, the
+  precondition for U12-U14 moving `/varsel`'s own registrations into the same collection). Two of
+  the three subscription queries gained a `channel` equality — `load_active_subscriptions` (the
+  poller's per-cycle read) and `subscription_count` (the client's create-time ceiling) — and the
+  listing deliberately did not, because a client lists what it created and until U13 everything it
+  can create is a webhook. Both are per-channel *questions*: a page bounded by a ceiling would
+  otherwise let a `web_push` majority truncate the webhook recipients out of the load, and a
+  traveller's own registration would spend a client's webhook ceiling on a collection they do not
+  own. The equality is **in the query and not after the fact** for the first of those reasons, and
+  `varsel._parse_webhook_recipient` restates it as a second, independent refusal (`UnroutableChannel`,
+  counted as `unroutable` on `varsel_webhook_load` and deliberately NOT as `skipped` — a declined
+  channel is not an unreadable document, and from U12 a warning naming tens of thousands of healthy
+  ones is how a real warning stops being read). Two statements is the right number because U6
+  replaces that query with a mirror filtering in Python: "the load path forgot the filter" then has a
+  private commute arriving at a client's webhook as its symptom. Three traps. A Firestore equality
+  **does not match a document that LACKS the field**, so the filter silently retires pre-field
+  documents — checked rather than assumed before shipping, 18 of 18 in dev carry it and prd holds
+  none — and both the store's reader and the parser read a missing or empty value as `webhook`, which
+  is what every document written before the field meant. Adding an equality **replaces** the index
+  rather than adding one beside it (Firestore serves a query from an index whose equality fields
+  match and whose first ordering is the range field), so the terraform plan shows a destroy and a
+  create per changed query, and between that apply and the pod rollout the running binary's own load
+  query has no index — guarded, logged, and at a pilot with one dev smoke client and no prd client
+  it costs nothing, but it is not nothing at scale. And `SubscriptionSpec.channel` is validated
+  against `CHANNELS` at create: unvalidated, a typo writes a document that no read path's equality
+  matches — a subscription that exists, is billed for, and is never loaded or counted by anything.
   **Four semantics moved on 2026-09-10, on the full review's findings, and each is the kind a later
   reader would otherwise assume the other way.** (1) The delivered marks on a subscription document
   are keyed on the **`alert_id`** — one per delivered (subscription, train) — not on situation
