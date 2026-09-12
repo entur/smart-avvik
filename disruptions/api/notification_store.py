@@ -54,6 +54,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import secrets
 import threading
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
@@ -209,6 +210,20 @@ WITHDRAWAL_CYCLES = 2
 WITHDRAWAL_GAP_S = 900
 # `Retry-After` is honoured but capped, at the lesser of the header, the time to departure and this.
 RETRY_AFTER_CAP_S = 300
+# HOW LONG A CLAIM HOLDS A DELIVERY AGAINST OTHER WORKERS (U8, KTD14), and the arithmetic is the
+# whole of it. After `_claim_body` commits, one attempt still has to: read the event (one Firestore
+# call at `_CALL_DEADLINE_S`, 4 s), POST it (`webhook_sender.DEFAULT_TIMEOUT_S`, 5 s, of which 2 s
+# is the connect), and write the terminal state (4 s again). 13 s worst case, so the plan's "~15 s"
+# leaves two seconds of margin for signing, scheduling and a slow GC pause -- 20 s is the same
+# number with room, and what it costs is the only thing the lease delays: a delivery whose holder
+# DIED is re-offered 20 s later instead of 13. Against an event validity of 60 minutes and a pass
+# period of ~296 s that is free.
+#
+# Distinct from `RESERVATION_TTL_S` below and not to be conflated with it: that one is a slot on the
+# SUBSCRIPTION protecting R11's daily cap, this one is a hold on the DELIVERY protecting against two
+# workers POSTing the same event. They have different owners, different documents and different
+# failure modes.
+DELIVERY_LEASE_S = 20.0
 # HOW LONG A RESERVED CAP SLOT SURVIVES UNCONFIRMED, and this number is the whole of the scheme's
 # crash safety. `claim_delivery` reserves a slot, the terminal writes confirm or release it, and a
 # process that dies in between leaves a reservation nobody will ever report on. A reservation that
@@ -222,6 +237,18 @@ RETRY_AFTER_CAP_S = 300
 # can stretch that), and comfortably SHORTER than the pass period measured at ~296 s. That is the
 # property worth stating: a leaked reservation costs at most ONE cycle's worth of allowance, never
 # the day, and the next cycle reclaims it with no sweep and no repair job.
+#
+# **REWRITTEN FOR A WORKER WITH NO PASS PERIOD (U8, step 5), and the number did not move.** The
+# upper half of that argument was "shorter than the pass period", which is a property of the poller
+# and stops holding the moment delivery moves to its own Deployment (U11): a worker draining a queue
+# has no period at all, so there is no cycle for a leaked reservation to cost. What replaces it is
+# the lower half plus `DELIVERY_LEASE_S` above. A reservation is taken by a claim, and a claim now
+# holds a 20 s lease; a holder that dies is re-claimed as soon as that lapses, and the re-claim
+# either confirms the slot (`_sent_body`) or releases it (`_failed_body`). So the interval a leaked
+# reservation can survive is bounded by the LEASE and the retry behind it, not by the pass -- 120 s
+# is six leases, which is the margin, and the ceiling that actually matters is still that it must be
+# far below an Oslo day. Do not read this number as "one cycle" once U11 lands; read it as "long
+# enough that no live attempt loses its own slot, short enough that a dead one cannot keep it".
 RESERVATION_TTL_S = 120.0
 # THE DEADLINE ON EVERY INDIVIDUAL FIRESTORE CALL, and KTD6 requires it of the load step and the
 # emit transactions alike. It is NOT the same bound as the poller's wait: `varsel`'s own
@@ -3565,6 +3592,9 @@ class Delivery:
     revision: int
     valid_until: datetime | None
     retry_not_before: datetime | None
+    #: U8's lease. ``None`` on every delivery written before it existed, which reads as unheld --
+    #: the direction that keeps a backlog deliverable across the deploy that introduces the field.
+    claimed_until: datetime | None
     expires_at: datetime | None
     situations: tuple[str, ...]
     cap_exempt: bool
@@ -3585,6 +3615,7 @@ def _delivery_from_doc(doc: Mapping[str, Any]) -> Delivery:
         revision=int(doc.get("revision") or 0),
         valid_until=_as_dt(doc.get("valid_until")),
         retry_not_before=_as_dt(doc.get("retry_not_before")),
+        claimed_until=_as_dt(doc.get("claimed_until")),
         expires_at=_as_dt(doc.get(TTL_FIELD)),
         situations=tuple(str(s) for s in (doc.get("situations") or ())),
         cap_exempt=bool(doc.get("cap_exempt")),
@@ -3700,6 +3731,13 @@ def pending_deliveries(
                 continue
             if delivery.retry_not_before is not None and delivery.retry_not_before > instant:
                 continue
+            # LEASED rows are filtered in PYTHON, not in the query (U8). A second inequality would
+            # need its own composite index and would exclude every document that lacks the field --
+            # which, on the deploy that introduces it, is all of them. The cost of filtering here is
+            # that a leased row still occupies a slot in the scan; the cost of filtering there is
+            # that no delivery written before this release is ever offered again.
+            if delivery.claimed_until is not None and delivery.claimed_until > instant:
+                continue
             candidates.append(delivery)
         candidates.sort(key=lambda d: (d.valid_until, d.delivery_id))
         for delivery in candidates:
@@ -3749,13 +3787,19 @@ class DeliveryClaim:
 
     ``status``: ``ready`` (dispatch it), ``cancelled`` (the subscription is gone or obsolete -- R13,
     written durably so nothing re-offers it), ``expired`` (validity passed), ``capped`` (R11's
-    allowance is spent; recorded and left pending so it is re-offered next cycle) or ``gone`` (no
-    such delivery, or it is no longer pending).
+    allowance is spent; recorded and left pending so it is re-offered next cycle), ``leased``
+    (another worker holds it mid-attempt -- nothing is written, and it is re-offered when the lease
+    lapses) or ``gone`` (no such delivery, or it is no longer pending).
     """
 
     status: str
     delivery: Delivery | None = None
     subscription: Subscription | None = None
+    #: The lease this claim took, present only on ``ready``. Carried back to the terminal write so a
+    #: holder whose lease has lapsed and been re-claimed cannot resolve a delivery it no longer
+    #: holds. Never persisted anywhere but the delivery document, and never logged: it is the only
+    #: thing that distinguishes two workers, so it is a capability for exactly one write.
+    token: str | None = None
     #: The allowance left AFTER this claim's own reservation, not before it. A `ready` claim has
     #: already taken a slot -- that is the whole point of reserving inside the claim transaction --
     #: so reporting the pre-claim figure would tell a caller a slot is available that it has itself
@@ -3795,11 +3839,35 @@ def _release_slot(
 
 
 def _claim_body(
-    transaction: Any, refs: _Refs, *, delivery_id: str, now: datetime
+    transaction: Any,
+    refs: _Refs,
+    *,
+    delivery_id: str,
+    token: str,
+    lease_s: float,
+    now: datetime,
 ) -> tuple[str, dict[str, Any], dict[str, Any], int, str | None]:
+    """Recheck eligibility and take the lease, or refuse because somebody else holds it.
+
+    ``token`` is minted by the CALLER, outside the transaction, for the reason every clock here is
+    read outside one: a body may run more than once, and a token minted inside would differ between
+    attempts, so the retry would write a lease its own caller cannot later prove it holds.
+
+    **The lease is what makes a second worker safe** (KTD14). Until U11 there is exactly one --
+    ``claimed_at`` was written and read by nothing -- so this is unreachable in production today and
+    is pinned against the fake anyway: a check that arrives with the second replica arrives after the
+    duplicate notifications it exists to prevent.
+    """
     delivery = _doc(_read(transaction, refs.delivery(delivery_id)))
     if not delivery or delivery.get("state") != "pending" or not _not_expired(delivery, now):
         return "gone", delivery, {}, 0, None
+    held_until = _as_dt(delivery.get("claimed_until"))
+    if held_until is not None and held_until > now:
+        # Somebody else is mid-attempt. NOT an error and NOT a terminal state: the delivery is
+        # still `pending` and the holder is about to resolve it, or its lease lapses and the next
+        # pass takes it. Writing anything here would be this reader's opinion about another
+        # worker's in-flight attempt.
+        return "leased", delivery, {}, 0, "lease"
     subscription = _doc(_read(transaction, refs.subscription(str(delivery["subscription_id"]))))
     valid_until = _as_dt(delivery.get("valid_until"))
     if valid_until is None or valid_until <= now:
@@ -3856,7 +3924,18 @@ def _claim_body(
             },
         )
         return "capped", delivery, subscription, remaining, "daily_cap"
-    transaction.update(refs.delivery(delivery_id), {"claimed_at": now, "updated_at": now})
+    transaction.update(
+        refs.delivery(delivery_id),
+        # `claimed_until` and `claim_token` REPLACE the write-only `claimed_at`, which nothing read.
+        # The token is what the terminal writes compare against, so a holder whose lease lapsed
+        # cannot resolve a delivery another worker has since re-claimed.
+        {
+            "claimed_at": now,
+            "claimed_until": now + timedelta(seconds=lease_s),
+            "claim_token": token,
+            "updated_at": now,
+        },
+    )
     if not exempt:
         # RESERVE, in the same transaction that returns `ready`. That is the fix and the placement
         # is the whole of it: two claims for one subscription both write this document, so Standard
@@ -3870,7 +3949,9 @@ def _claim_body(
     return "ready", delivery, subscription, remaining - (0 if exempt else 1), None
 
 
-def claim_delivery(delivery_id: str, *, now: datetime | None = None) -> DeliveryClaim:
+def claim_delivery(
+    delivery_id: str, *, lease_s: float = DELIVERY_LEASE_S, now: datetime | None = None
+) -> DeliveryClaim:
     """Recheck eligibility immediately before dispatch, durably (R13).
 
     Called right before the outbound attempt, never at the top of the pass: the pending set was read
@@ -3879,8 +3960,15 @@ def claim_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery
     """
     instant = now or _now()
     refs = _Refs(_firestore_client())
+    # Minted HERE, outside the body, exactly as `now` is: a body may run more than once and a token
+    # minted inside would differ between attempts. `token_hex` and not a counter or a hash of the
+    # id -- two workers must not be able to derive each other's token, or the compare proves
+    # nothing.
+    token = secrets.token_hex(8)
     status, delivery, subscription, remaining, reason = _run_transaction(
-        lambda txn: _claim_body(txn, refs, delivery_id=delivery_id, now=instant)
+        lambda txn: _claim_body(
+            txn, refs, delivery_id=delivery_id, token=token, lease_s=lease_s, now=instant
+        )
     )
     return DeliveryClaim(
         status=status,
@@ -3888,6 +3976,7 @@ def claim_delivery(delivery_id: str, *, now: datetime | None = None) -> Delivery
         subscription=_subscription_from_doc(subscription) if subscription else None,
         cap_remaining=remaining,
         reason=reason,
+        token=token if status == "ready" else None,
     )
 
 
@@ -3907,11 +3996,17 @@ class DeliveryOutcome:
     slot_spent: bool = False
     retry_not_before: datetime | None = None
     already_resolved: bool = False
+    #: The delivery is still ``pending`` but is held by a DIFFERENT claim than the one this write
+    #: belongs to, so nothing was written (U8). A third outcome rather than a flavour of
+    #: ``already_resolved``: the delivery is not resolved, it is somebody else's, and the caller
+    #: must not count it as a send or a failure. Unreachable while there is one writer; it is what
+    #: makes a second replica safe rather than what reports on one.
+    lease_lost: bool = False
 
 
 def _sent_body(
-    transaction: Any, refs: _Refs, *, delivery_id: str, now: datetime
-) -> tuple[dict[str, Any], bool, bool]:
+    transaction: Any, refs: _Refs, *, delivery_id: str, token: str | None, now: datetime
+) -> tuple[dict[str, Any], bool, bool, bool]:
     """Record a successful attempt, and spend R11's slot in the SAME transaction.
 
     Three states change together and must not be splittable: the delivery becomes ``sent``, the
@@ -3940,12 +4035,22 @@ def _sent_body(
     outage -- but it must not read as a fresh success either, which is why the flag exists rather
     than returning a plain `sent`. Note the guard is what `_terminal_body` has had all along; its
     absence here and in `_failed_body` was the oversight, not the presence of it there.
+
+    **And conditional on the LEASE since U8** (KTD14). A delivery can be `pending` and still not be
+    this caller's to resolve: its lease lapsed, another worker re-claimed it, and this write would
+    otherwise mark sent an attempt whose outcome nobody knows -- spending R11's slot for a
+    notification that may never have arrived, and clearing a pending delivery the live holder is
+    still working on. ``token`` is the one the claim returned; ``None`` means the caller is not
+    using leases and the compare is skipped, which is what keeps every existing suite's direct call
+    meaningful. The lease is cleared here on success, so a resolved delivery holds no stale hold.
     """
     delivery = _doc(_read(transaction, refs.delivery(delivery_id)))
     if not delivery:
         raise NotFound("no such delivery")
     if delivery.get("state") != "pending":
-        return delivery, False, True
+        return delivery, False, True, False
+    if token is not None and str(delivery.get("claim_token") or "") != token:
+        return delivery, False, False, True
     subscription_id = str(delivery["subscription_id"])
     subscription = _doc(_read(transaction, refs.subscription(subscription_id)))
     alert_id = str(delivery.get("alert_id") or "")
@@ -3957,6 +4062,10 @@ def _sent_body(
         "sent_at": now,
         "attempts": attempts,
         "last_error": None,
+        # The hold goes with the resolution. Left behind, a `sent` record would carry a lease that
+        # means nothing and an operator reading the document could not tell it from a live one.
+        "claimed_until": None,
+        "claim_token": None,
         "updated_at": now,
     }
     transaction.update(refs.delivery(delivery_id), delivery_patch)
@@ -4020,10 +4129,12 @@ def _sent_body(
         if subject.get("pending_delivery_id") == delivery_id:
             subject_patch["pending_delivery_id"] = None
         transaction.update(refs.subject(alert_id), subject_patch)
-    return {**delivery, **delivery_patch}, spent, False
+    return {**delivery, **delivery_patch}, spent, False, False
 
 
-def mark_delivery_sent(delivery_id: str, *, now: datetime | None = None) -> DeliveryOutcome:
+def mark_delivery_sent(
+    delivery_id: str, *, token: str | None = None, now: datetime | None = None
+) -> DeliveryOutcome:
     """Record that the client received this event. Idempotent, and it spends R11's slot once.
 
     ``state`` is read back from the document rather than asserted to be ``"sent"``: a delivery some
@@ -4032,8 +4143,8 @@ def mark_delivery_sent(delivery_id: str, *, now: datetime | None = None) -> Deli
     """
     instant = now or _now()
     refs = _Refs(_firestore_client())
-    doc, spent, already_resolved = _run_transaction(
-        lambda txn: _sent_body(txn, refs, delivery_id=delivery_id, now=instant)
+    doc, spent, already_resolved, lease_lost = _run_transaction(
+        lambda txn: _sent_body(txn, refs, delivery_id=delivery_id, token=token, now=instant)
     )
     return DeliveryOutcome(
         delivery_id=delivery_id,
@@ -4041,6 +4152,7 @@ def mark_delivery_sent(delivery_id: str, *, now: datetime | None = None) -> Deli
         attempts=int(doc.get("attempts") or 0),
         slot_spent=spent,
         already_resolved=already_resolved,
+        lease_lost=lease_lost,
     )
 
 
@@ -4053,8 +4165,9 @@ def _failed_body(
     retryable: bool,
     retry_after_s: float | None,
     terminal_state: str,
+    token: str | None,
     now: datetime,
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool, bool]:
     # Conditional on `pending` for the same reason as `_sent_body`, and here the unguarded version
     # is the WORSE of the two: an abandoned attempt thread from the previous cycle, returning after
     # this cycle has already marked the delivery `sent`, would set the state back to `pending` with
@@ -4065,7 +4178,12 @@ def _failed_body(
     if not delivery:
         raise NotFound("no such delivery")
     if delivery.get("state") != "pending":
-        return delivery, True
+        return delivery, True, False
+    # And conditional on the LEASE, for `_sent_body`'s reason mirrored: a lapsed holder writing a
+    # failure here would set `retry_not_before` on a delivery the live holder is mid-POST with, and
+    # release a cap slot that claim is still using.
+    if token is not None and str(delivery.get("claim_token") or "") != token:
+        return delivery, False, True
     # RELEASE, on the retryable branch as much as the terminal one. A retryable failure leaves the
     # delivery `pending` for the next cycle, and holding its slot until the reservation lapses would
     # withhold the allowance from a delivery that could use it NOW -- the cap is spent on success,
@@ -4080,6 +4198,11 @@ def _failed_body(
         # the record itself is what an operator needs to tell a TLS failure from a 500.
         "last_error": str(error)[:500],
         "last_attempt_at": now,
+        # Released with the outcome, on both branches: a retryable failure leaves the delivery
+        # `pending` for the next cycle, and a lease outliving the attempt that took it would make
+        # the next cycle refuse its own retry.
+        "claimed_until": None,
+        "claim_token": None,
         "updated_at": now,
     }
     if retryable:
@@ -4099,7 +4222,7 @@ def _failed_body(
     transaction.update(refs.delivery(delivery_id), patch)
     if release is not None:
         transaction.update(refs.subscription(str(delivery["subscription_id"])), release)
-    return {**delivery, **patch}, False
+    return {**delivery, **patch}, False, False
 
 
 def mark_delivery_failed(
@@ -4109,6 +4232,7 @@ def mark_delivery_failed(
     retryable: bool,
     retry_after_s: float | None = None,
     terminal_state: str = "failed",
+    token: str | None = None,
     now: datetime | None = None,
 ) -> DeliveryOutcome:
     """Record a failed attempt. Retryable keeps it ``pending``; terminal parks it.
@@ -4122,7 +4246,7 @@ def mark_delivery_failed(
         raise Conflict(f"terminal_state must be one of {DELIVERY_STATES}")
     instant = now or _now()
     refs = _Refs(_firestore_client())
-    doc, already_resolved = _run_transaction(
+    doc, already_resolved, lease_lost = _run_transaction(
         lambda txn: _failed_body(
             txn,
             refs,
@@ -4131,6 +4255,7 @@ def mark_delivery_failed(
             retryable=retryable,
             retry_after_s=retry_after_s,
             terminal_state=terminal_state,
+            token=token,
             now=instant,
         )
     )
@@ -4140,6 +4265,7 @@ def mark_delivery_failed(
         attempts=int(doc.get("attempts") or 0),
         retry_not_before=_as_dt(doc.get("retry_not_before")),
         already_resolved=already_resolved,
+        lease_lost=lease_lost,
     )
 
 

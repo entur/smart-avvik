@@ -457,7 +457,7 @@ silently.
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated` |
 | `notification_emit` | the emit step | `result` (`ok`, `timeout`, `retryable`, `failed`, `standing_error`, `run_clear_error`), `created`, `withdrawn`, `unchanged`, `obsolete`, `quota`, `capped`, `retryable`, `ms` |
 | `notification_event` | one committed revision | `result` = the event type, `client_id`, `destination_id`, `alert_id`, `revision`, `superseded` |
-| `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
+| `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
 | `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
@@ -558,6 +558,25 @@ Every bound is a number:
 | emit step deadline / bounded wait | 6 s / 8 s |
 | per Firestore call | 4 s, under `varsel`'s 5 s wait |
 | attempts per cycle, total / per destination | 200 / **the client's `deliveries_per_minute`**, default 50 |
+
+**A claim takes a 20 s lease on the delivery** (U8, KTD14), and the arithmetic is the whole of the
+number: after `_claim_body` commits, one attempt still reads the event (one Firestore call at 4 s),
+POSTs it (5 s, of which 2 s is the connect) and writes the terminal state (4 s again) — 13 s worst
+case, so the lease outlasts a healthy attempt with room and a delivery whose holder *died* is
+re-offered 20 s later rather than 13. `claimed_at` was written and read by nothing before this: two
+workers reading the same pending page both claimed, both POSTed, and the traveller was notified
+twice — which the receiver's own `event_id` inbox drops, which is exactly why it would never have
+been noticed from our side. The claim mints a token; the two terminal writes compare it, so a holder
+whose lease lapsed and was re-claimed cannot mark a delivery sent (spending one of the traveller's
+four for an outcome nobody knows) or set a re-claimed one back to `pending` (releasing the live
+claim's slot). Both outcomes are counted: `leased` is a claim refused because somebody else holds
+it, `lease_lost` a terminal write refused because the holder changed. **Both are unreachable while
+there is one writer** — one poller thread, one replica under Recreate — so they report on U11's
+worker rather than on today, and they are pinned against the fake anyway: a check that arrives with
+the second replica arrives after the duplicates it exists to prevent. A leased row is filtered out
+of `pending_deliveries` in Python rather than in the query, because a second inequality would need
+its own composite index *and* would exclude every document that lacks the field, which on the deploy
+that introduces it is the whole backlog.
 
 A destination is **skipped for the rest of the cycle after its first failure**, in pass-local state.
 That is the documented exception to this repo's "every module-level ledger is swept" rule: made
@@ -878,6 +897,7 @@ reads it — the other five are read from the account on each pass.
 | `notification_store.WITHDRAWAL_GAP_S` | 900 |
 | `notification_store.RETRY_AFTER_CAP_S` | 300 |
 | `notification_store.RESERVATION_TTL_S` | 120.0 |
+| `notification_store.DELIVERY_LEASE_S` | 20.0 |
 | `notification_auth.MAX_CREDENTIALS_PER_CLIENT` | 8 |
 | `notification_auth.MAX_DESTINATIONS_PER_CLIENT` | 4 |
 | `notification_auth.MIN_PEPPER_BYTES` | 32 |

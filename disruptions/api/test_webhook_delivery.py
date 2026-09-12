@@ -1436,14 +1436,18 @@ def test_a_late_arrival_is_not_counted_as_a_fresh_delivery():
 
         # A newer revision replaced it instead: still not a send, and counted apart because that
         # replacement spends R11's slot itself.
-        client.docs[path]["state"] = "pending"
-        client.docs[path]["retry_not_before"] = NOW
+        # The lease goes back with the state (U8): a row put back to `pending` by hand is standing
+        # in for one no worker holds, and the previous pass's `claimed_until` would otherwise keep
+        # `pending_deliveries` from offering it for another twenty seconds -- correctly, which is
+        # why the fixture resets it rather than the code losing the check.
+        client.docs[path].update({"state": "pending", "retry_not_before": NOW,
+                                  "claimed_until": None, "claim_token": None})
         third = webhook_delivery.deliver_pending(now=NOW, sender=resolving("superseded"))
         assert third.superseded == 1 and third.sent == 0 and third.already_resolved == 0, third
 
         # And the guard must not turn an ordinary send into a late arrival.
-        client.docs[path]["state"] = "pending"
-        client.docs[path]["retry_not_before"] = NOW
+        client.docs[path].update({"state": "pending", "retry_not_before": NOW,
+                                  "claimed_until": None, "claim_token": None})
         ordinary = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
         assert ordinary.sent == 1 and ordinary.already_resolved == 0 and ordinary.superseded == 0
     finally:
@@ -1738,6 +1742,96 @@ def test_a_backoff_is_not_a_pause_to_anything_that_reads_deliverable():
         assert record.deliverable is True, "a backoff is not a pause"
         assert record.ready_to_dial(NOW) is False
         assert record.ready_to_dial(NOW + timedelta(seconds=46)) is True
+    finally:
+        _uninstall()
+
+
+def test_two_delivery_loops_against_one_store_send_each_row_exactly_once():
+    """U8's integration check, and the whole reason the lease exists (KTD14).
+
+    Two `deliver_pending` calls overlapping is what U11 makes ordinary and what is structurally
+    impossible today -- one poller thread, one replica under Recreate. Without the lease both read
+    the same pending page, both claim, both POST, and every traveller on that page is notified
+    twice; the receiver's `event_id` inbox drops the duplicate, which is exactly why it would never
+    have been noticed from here.
+
+    The two loops are started together and the sender parks on a barrier, so both are inside their
+    claims at the same instant rather than politely one after the other.
+    """
+    client = _install()
+    try:
+        _live(client)
+        deliveries = _pending(client, 4)
+        gate = threading.Barrier(2, timeout=10)
+        inner = _sender()
+
+        def meeting(url, **kwargs):
+            try:
+                gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return inner(url, **kwargs)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reports = list(
+                pool.map(
+                    lambda _: webhook_delivery.deliver_pending(
+                        now=NOW, sender=meeting, wait_s=30.0
+                    ),
+                    range(2),
+                )
+            )
+        assert len(_sent) == len(deliveries), (
+            f"each pending row must be POSTed once; {len(_sent)} sends for "
+            f"{len(deliveries)} deliveries"
+        )
+        assert sum(r.sent for r in reports) == len(deliveries), reports
+        # And R11's allowance was charged once per delivery, which is the cost of getting this
+        # wrong: a duplicate spends one of the traveller's four for a notification they already had.
+        counters = client.doc(notification_store.SUBSCRIPTIONS, SID)["daily_deliveries"]
+        assert sum(counters.values()) == len(deliveries), counters
+    finally:
+        _uninstall()
+
+
+def test_a_worker_that_dies_after_the_2xx_re_sends_once_and_spends_one_slot():
+    """The at-least-once residual, stated rather than hidden (R12).
+
+    An attempt that POSTs successfully and dies before its terminal write leaves the delivery
+    `pending` with a lease. The lease is what bounds how long nothing may retry it; when it lapses
+    the next pass re-claims and re-POSTs, so the client receives the event twice and its `event_id`
+    inbox drops the second. What must NOT happen is the cap being charged twice -- and it is not,
+    because the slot is spent in the same transaction as the `sent` state, which the dead worker
+    never reached.
+    """
+    client = _install()
+    try:
+        _live(client)
+        [delivery] = _pending(client)
+
+        class _Died(Exception):
+            pass
+
+        def dies_after_the_post(url, **kwargs):
+            _sender()(url, **kwargs)
+            raise _Died("the worker died between the 2xx and the sent write")
+
+        report = webhook_delivery.deliver_pending(now=NOW, sender=dies_after_the_post)
+        assert len(_sent) == 1 and report.sent == 0, report
+        stored = client.doc(notification_store.DELIVERIES, delivery["delivery_id"])
+        assert stored["state"] == "pending", "nothing terminal was written"
+        assert client.doc(notification_store.SUBSCRIPTIONS, SID).get("daily_deliveries", {}) == {}
+
+        # Inside the lease, nothing retries it -- which is the bound the lease exists to give.
+        inside = webhook_delivery.deliver_pending(now=NOW + timedelta(seconds=5), sender=_sender())
+        assert inside.ready == 0 and len(_sent) == 1, inside
+
+        # Past it, exactly one more POST and exactly one slot.
+        past = NOW + timedelta(seconds=notification_store.DELIVERY_LEASE_S + 1)
+        after = webhook_delivery.deliver_pending(now=past, sender=_sender())
+        assert after.sent == 1 and len(_sent) == 2, after
+        counters = client.doc(notification_store.SUBSCRIPTIONS, SID)["daily_deliveries"]
+        assert sum(counters.values()) == 1, counters
     finally:
         _uninstall()
 
