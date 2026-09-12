@@ -438,8 +438,8 @@ requests about unchanged data.
 ## The journey-keyed read
 
 `GET /notification-api/v1/journey-alerts` answers "what would Avviksvarsel be warning about on this
-trip right now?" for a definition **nobody registered**, with **no credential**. It exists for the
-Entur app's favourites panel: one read per saved route when a user opens the app. The selection is
+trip right now?" for a definition **nobody registered**, with **no credential**. An example is showing
+information about a user's favourite routes: one read per saved route when a user opens the app. The selection is
 the notification pass's own — the same trains, the same per-operator bar, the same collapse of
 several situations about one train into one entry — and every entry's `payload` is built by the same
 assembly the webhook event goes through, so a receiver that renders an event renders this.
