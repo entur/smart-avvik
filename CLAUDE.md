@@ -650,6 +650,58 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   nobody noticed while ~44 registrations rarely reached a cap of 8, but at ten times that the cap
   binds on every busy morning and would hand the whole budget to whichever travellers registered
   earliest, every cycle, forever.
+  **One wording and one alternative per (PLACE PAIR, TRAIN), not per definition** (KTD9, 2026-09-12).
+  What a notification says is a function of the trip's two ends and of the disrupted train — never of
+  the window or weekday set one commuter registered (`llm_message.build_message_input` reads only
+  `from_stop`/`to_stop` off the record) — so keying the wording caches on `journey_key` made a
+  corridor with five hundred registrations cost five hundred Vertex calls per disrupted train and let
+  five hundred travellers be shown five hundred different sentences about one departure. The key is
+  `notification_wording.wording_key` — `(pair, situation, departure, cancelled, tomorrow, alternative
+  identity, prompt version)`, the shape `notification_pull` already used — and it and
+  `alternative_identity` live in that **leaf module** so `varsel` never imports `notification_pull`
+  (a plan stop condition, pinned by a source-inspection test both ways).
+  **It is TWO key shapes, and collapsing them to one breaks something specific each way.**
+  `varsel._message_key` (the wording) carries all seven elements; `varsel._subject_key` — `(pair,
+  situation, departure)` — carries `_alternatives`, `_message_attempts` and `_message_errors`. The
+  alternative cannot be keyed on its own identity, because a lookup is skipped on most cycles (the
+  impact gate, the 6 h horizon, `impact._MAX_ALTERNATIVE_LOOKUPS`, a Journey Planner outage) and
+  `_reconcile_caches` deliberately keeps the cached answer through that silence — a read that must
+  therefore not name the answer it is looking for. And the two retry budgets must not reset when a
+  replacement train shifts by a minute: `_forget_message` says so in as many words, and that is the
+  ~720-calls-per-situation hole `_MAX_MESSAGE_ATTEMPTS` closed. `_message_key` therefore reads the
+  EFFECTIVE alternative out of `_alternatives` itself rather than off the alert; keying on the raw
+  field would make every silent cycle a miss and re-word every alerting train.
+  `varsel._decision_key` is the third and is the OLD shape, kept for everything genuinely about one
+  registration: `pushed_keys` (two definitions on one corridor differ — different windows, and
+  `_notified` is per registration), `_decision_ledger` (KTD15) and the pass-local `message_inputs`
+  each row records. **`_MAX_MESSAGES_PER_JOURNEY` (3) is a PAIR's cap now**, spent soonest-departure
+  first within the pair, and the queue is still sorted soonest-first across pairs — spending it in
+  descending subscription count was considered and refused (a busy train three hours out must not
+  beat a quiet one leaving in five minutes), and the comment at the sort records that as an open
+  product question rather than a settled one.
+  **Which wording POLICY runs is now a question about the pair** (R16): browser as soon as ANY
+  browser registration on the corridor contributed the train, `notification_wording.WEBHOOK`
+  otherwise. One flag on the queue entry decides three things together — the policy, whether the
+  poller's own `llm_message` latch is consulted, and whether the call claims the browser allowance or
+  only the clock — because the new key names no definition, and answered per definition a
+  client-only route's origin, destination and departure time would reach the prompt/reply DEBUG
+  record dev writes. Two tests drive the REAL `write_wording` with only the model call stubbed and
+  assert the absence and the presence of that record; the wholesale stub every other webhook test
+  uses cannot see it. Two consequences to expect rather than discover: a train written for because a
+  SIBLING definition needed it records `ok`/`ok_cached` where it recorded `not_selected`, and the LLM
+  audit record is one per (pair, train) carrying the digest of the definition that caused the call,
+  so the `journey_digest` join resolves for that one and correctly for none of the others.
+  **The Journey Planner fetch was ALREADY shared per pair** and this unit pins it rather than adding
+  a memo: `alternatives._cache` keys on (from, to, arrive-by, anchor) with a 10-minute TTL and
+  cross-thread single-flight, and the in-time anchor is the train's own aimed arrival, so five
+  definitions on one pair spend one lookup (`test_five_definitions_on_one_pair_issue_one_journey_
+  planner_lookup`, which drives the real `fetch_candidates` — a stub sits above the cache and would
+  count five). What pair-keying ADDS is that a lookup any definition paid for now answers the whole
+  corridor through `_alternatives`. What is **not** done: `impact._MAX_ALTERNATIVE_LOOKUPS` is still
+  a per-`/impact`-call budget, so with different windows the three trains it covers still differ per
+  definition. Making it per (pair, train) per cycle needs a cycle-stable instant in `impact`, which
+  does not exist — `for_trip` samples its own `now` per call — so the seam is `main._rebuild_all`
+  calling something like `impact.begin_lookup_cycle()`, and `main.py` was outside this unit.
 
 - The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
   `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
