@@ -2524,30 +2524,42 @@ def sync_mirrors(
     return report
 
 
-def _mirror_subject(commit: EventCommit) -> EventCommit:
-    """Record a committed subject in the standing set, and hand the commit back.
+#: The transaction bodies that write a subject document AND must be seen by the standing-subject
+#: mirror, declared as a SET for the reason `MIRROR_STAMPING_BODIES` is: what has to hold is a
+#: property of the set, and a body added next year is the case no behavioural test over today's
+#: four can see. `test_notification_store` pins it against the source both ways.
+#:
+#: Each of these moves something the emit pass READS BACK -- the phase, or the open withdrawal run
+#: -- so an unmirrored one leaves the next cycle answering from a stale standing set: a subject
+#: minted in cycle N reads as absent in cycle N+1, `skip_reason` answers `nothing_standing` for the
+#: below-threshold observation that follows, and the withdrawal is never counted.
+SUBJECT_MIRRORING_BODIES = frozenset({"_mint", "_withdraw_body", "_clear_below_threshold_body"})
 
-    **The one place a subject reaches the mirror**, called by every public function that can move
-    one and by nothing else, so "which writes the mirror sees" is a property of this module rather
-    than of whoever remembered. Which writes those are, and the one that is deliberately absent:
+#: The one body that writes a subject document and deliberately does NOT mirror it.
+#: `_sent_body` writes `delivered_revision`, `delivered_at` and the pending pointer. None of the
+#: three is in the standing set, the emit pass never asks about them, and mirroring them would put
+#: the busiest documents in the hottest loop for no reader -- the same economy that keeps this body
+#: out of `MIRROR_STAMPING_BODIES`. **Re-check this sentence when U11 moves delivery to its own
+#: Deployment**: what a worker there writes is exactly those three fields, and the moment one of
+#: them enters the standing set this process stops being their only writer.
+SUBJECT_WRITERS_OUTSIDE_THE_MIRROR = frozenset({"_sent_body"})
 
-    * :func:`commit_event`, :func:`record_below_threshold` and :func:`clear_below_threshold` all
-      move something the emit pass READS BACK -- the phase, or the open withdrawal run -- so each
-      must be seen or the next cycle answers from a stale standing set;
-    * :func:`mark_delivery_sent` writes ``delivered_revision``, ``delivered_at`` and the pending
-      pointer onto the subject and is deliberately NOT here. None of the three is in the standing
-      set, the emit pass never asks about them, and mirroring them would put the busiest documents
-      in the hottest loop for no reader -- the same economy that keeps `_sent_body` out of
-      `MIRROR_STAMPING_BODIES`. Re-check that sentence, not this call list, when U11 moves delivery
-      to its own Deployment: what a worker there writes is exactly those three fields, and the
-      moment one of them enters the standing set this process stops being their only writer.
 
-    Returns its argument so a caller can write ``return _mirror_subject(_run_transaction(...))``
-    and there is no path that commits without passing through here.
+def _mirror_subject(state: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """Record a committed subject in the standing set, and hand its document back.
+
+    **The one place a subject reaches the mirror**, so "which writes the mirror sees" is a property
+    of this module rather than of whoever remembered; :data:`SUBJECT_MIRRORING_BODIES` names the
+    bodies whose writes get here and the suite pins that set against the source.
+
+    Called on the RESULT of a transaction and never from inside a body: a body may run more than
+    once, so an apply from inside would record a state a later attempt then overwrote and the
+    mirror would answer the next cycle with a phase Firestore never held. Returns its argument so a
+    call site reads as one expression.
     """
-    if commit.subject_state is not None:
-        _subject_mirror.apply(commit.subject_state)
-    return commit
+    if state is not None:
+        _subject_mirror.apply(state)
+    return state
 
 
 def recipient_documents() -> list[dict[str, Any]]:
@@ -3130,9 +3142,10 @@ def commit_event(
         raise QuotaExceeded(
             f"destination holds {pending} pending events (ceiling {ceiling})"
         )
-    commit = _mirror_subject(
-        _run_transaction(lambda txn: _emit_body(txn, refs, request=request, now=instant, seed=seed))
+    commit = _run_transaction(
+        lambda txn: _emit_body(txn, refs, request=request, now=instant, seed=seed)
     )
+    _mirror_subject(commit.subject_state)
     if commit.status == "created":
         logger.info(
             "Notification event %s revision %d (%s)",
@@ -3253,11 +3266,11 @@ def record_below_threshold(request: EmitRequest, *, now: datetime | None = None)
     instant = now or _now()
     seed = revision_seed(instant)
     refs = _Refs(_firestore_client())
-    return _mirror_subject(
-        _run_transaction(
-            lambda txn: _withdraw_body(txn, refs, request=request, now=instant, seed=seed)
-        )
+    commit = _run_transaction(
+        lambda txn: _withdraw_body(txn, refs, request=request, now=instant, seed=seed)
     )
+    _mirror_subject(commit.subject_state)
+    return commit
 
 
 def _clear_below_threshold_body(
@@ -3304,13 +3317,12 @@ def clear_below_threshold(alert_id: str, *, now: datetime) -> bool:
     if not alert_id:
         return False
     refs = _Refs(_firestore_client())
-    cleared = _run_transaction(
-        lambda txn: _clear_below_threshold_body(txn, refs, alert_id=alert_id, now=now)
+    cleared = _mirror_subject(
+        _run_transaction(
+            lambda txn: _clear_below_threshold_body(txn, refs, alert_id=alert_id, now=now)
+        )
     )
-    if cleared is None:
-        return False
-    _subject_mirror.apply(cleared)
-    return True
+    return cleared is not None
 
 
 def get_subject(alert_id: str, *, now: datetime | None = None) -> AlertSubject | None:

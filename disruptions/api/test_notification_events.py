@@ -878,6 +878,41 @@ def test_the_train_identity_is_resolved_once_per_train_not_once_per_recipient():
         _uninstall()
 
 
+def test_the_standing_set_is_asked_once_per_subscription_not_once_per_observation():
+    """AE3's line suspension is thirteen departures on ONE subscription.
+
+    `phases_for` is a lock, a list copy and a dict build; asked per recipient rather than per
+    subscription, twelve of those thirteen answers would be spent on a dict comprehension that
+    overwrites them. At 100 000 subscriptions on one corridor it is 100 000 lookups against 1.3
+    million, every cycle — the same quadratic-in-a-linear-structure mistake `open_runs` is asked
+    once to avoid.
+    """
+    client = _install()
+    try:
+        _live(client)
+        subjects = [
+            _subject(journey_ref=f"DatedServiceJourney:{4000 + i}", alertworthy=False)
+            for i in range(13)
+        ]
+        mirror = notification_store.subject_mirror()
+        asked: list[str] = []
+        original = mirror.phases_for
+
+        def counting(subscription_id: str, now: datetime) -> Any:
+            asked.append(subscription_id)
+            return original(subscription_id, now)
+
+        mirror.phases_for = counting  # type: ignore[method-assign]
+        try:
+            report = _emit(subjects, now=NOW)
+        finally:
+            del mirror.phases_for
+        assert report.nothing_standing == 13, report
+        assert asked == [SID], f"the standing set was asked {len(asked)} times for one subscription"
+    finally:
+        _uninstall()
+
+
 def test_the_pre_reads_own_ceiling_is_gone_and_a_line_suspension_costs_nothing():
     """U9 step 2, and this test is the whole reason the standing set moved into memory.
 
