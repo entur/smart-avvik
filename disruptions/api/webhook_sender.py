@@ -76,6 +76,7 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 from notification_store import RETRY_AFTER_CAP_S
 
@@ -364,6 +365,20 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self._pinned_ip = pinned_ip
         self._deadline = deadline
 
+    def arm(self, deadline: float) -> None:
+        """Give this connection THIS request's deadline, before the request is issued.
+
+        **Per request, not per connect, and that distinction is the whole of U8's pooling bug.**
+        The socket timeout used to be set once inside :meth:`connect`, which was correct while every
+        attempt opened its own connection. A pooled connection carries the FIRST request's deadline
+        into the second, third and two-hundredth -- and that deadline is already in the past, so
+        `read_timeout` floors it at 50 ms and every reused connection times out. Nothing about the
+        symptom points at the pool: it reads as a receiver that suddenly went slow.
+        """
+        self._deadline = deadline
+        if self.sock is not None:
+            self.sock.settimeout(read_timeout(deadline))
+
     def connect(self) -> None:
         original = self._create_connection
 
@@ -377,8 +392,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
             self._create_connection = original  # type: ignore[method-assign]
         # The connection was opened under the CONNECT timeout; the rest of the attempt shares what
         # is left of the total. See the module docstring on why this is a per-recv bound.
-        if self.sock is not None:
-            self.sock.settimeout(read_timeout(self._deadline))
+        self.arm(self._deadline)
 
 
 #: ONE trust store for the process, not one per delivery attempt.
@@ -404,27 +418,235 @@ def _shared_context() -> ssl.SSLContext:
         return _default_context
 
 
-class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
-    """``HTTPSHandler`` that builds :class:`_PinnedHTTPSConnection` instead of the default."""
+# ---- The per-host connection pool (U8) ---------------------------------------------------------
+#
+# 20 000 POSTs to one receiver used to be 20 000 TLS handshakes. A handshake is one to two round
+# trips plus an asymmetric operation on both sides, inside a 5 s per-attempt ceiling that
+# `webhook_delivery` treats as scarce -- so the connection, not the request, was the cost of a bad
+# morning. The pool keeps HTTP/1.1 keep-alive connections per host and hands them back out.
+#
+# What it bounds, and why each bound exists:
+#
+#   _RESOLVE_TTL_S       How long one validated resolution is reused. KTD9's whole argument is that
+#                        the address is validated and then DIALLED, never re-looked-up -- so the
+#                        pool must re-resolve and RE-VALIDATE on a window rather than trusting the
+#                        first answer for the life of the process. A rebind that starts answering
+#                        with a metadata address is refused at the next resolve, and the idle
+#                        connections are dropped with it. A connection already open stays open: it
+#                        is connected to an address that WAS validated, and closing it mid-request
+#                        would fail a delivery for something that cannot affect it.
+#   _IDLE_TIMEOUT_S      How long an unused connection is kept. Receivers close idle keep-alives on
+#                        their own schedule and a socket the peer has already closed fails the next
+#                        request; short enough that the common case is a live one, long enough to
+#                        span a pass.
+#   max_in_flight        Concurrent requests to one host, from the client's `concurrent_deliveries`
+#                        quota. It is what stops a wide worker opening a connection per thread
+#                        against one receiver, which is the shape a receiver experiences as an
+#                        attack rather than as traffic.
+_RESOLVE_TTL_S = 60.0
+_IDLE_TIMEOUT_S = 60.0
+#: In-flight requests per host when a caller names no limit. `notification_auth`'s
+#: `DEFAULT_CONCURRENT_DELIVERIES` is the same number by assertion, not by import -- that module
+#: imports this one for `validate_url`, so the edge only runs one way.
+DEFAULT_MAX_IN_FLIGHT = 4
 
-    def __init__(self, *, pinned_ip: str, deadline: float, context: ssl.SSLContext | None = None):
-        super().__init__(context=context or _shared_context())
-        self._pinned_ip = pinned_ip
-        self._deadline = deadline
 
-    def https_open(self, req):
-        def factory(host, **kwargs):
-            return _PinnedHTTPSConnection(
-                host, pinned_ip=self._pinned_ip, deadline=self._deadline, **kwargs
-            )
+class _HostPool:
+    """Connections, the current validated resolution, and the in-flight count for one host.
 
-        return self.do_open(factory, req, context=self._context)
+    One lock over all three, because they are decided together: a resolve that refuses must drop the
+    idle connections, and a request must not take a connection the resolve is about to invalidate.
+    The lock is never held across a network call -- resolving and connecting both happen outside it.
+    """
+
+    def __init__(self) -> None:
+        self._cv = threading.Condition()
+        self._idle: list[tuple[float, _PinnedHTTPSConnection]] = []
+        self._resolved: ResolvedDestination | None = None
+        self._resolved_at = 0.0
+        self._in_flight = 0
+
+    # -- concurrency
+
+    def acquire(self, limit: int, timeout_s: float) -> bool:
+        """Take one in-flight slot, or answer False within ``timeout_s``.
+
+        Bounded rather than blocking: a caller that waits forever for a slot has turned a
+        per-attempt ceiling into an unbounded one, and the pass's own deadline would be the only
+        thing left holding. A refusal is reported as a retryable failure, so the delivery is
+        attempted again next cycle.
+        """
+        deadline = time.monotonic() + timeout_s
+        with self._cv:
+            while self._in_flight >= max(1, limit):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(remaining)
+            self._in_flight += 1
+            return True
+
+    def release_slot(self) -> None:
+        with self._cv:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._cv.notify()
+
+    # -- resolution
+
+    def resolution(
+        self, destination: Destination, *, resolver: Resolver | None, now: float
+    ) -> ResolvedDestination:
+        with self._cv:
+            cached = self._resolved
+            fresh = cached is not None and now - self._resolved_at < _RESOLVE_TTL_S
+        if fresh and cached is not None:
+            return cached
+        try:
+            resolved = resolve_and_validate(destination, resolver=resolver)
+        except UnsafeDestination:
+            # The host is refused NOW. Whatever this pool is holding was dialled under an answer
+            # that is no longer trusted, so it goes -- and the refusal propagates to the caller,
+            # which records it as a terminal delivery failure exactly as a first resolve would.
+            self.discard_idle()
+            with self._cv:
+                self._resolved = None
+            raise
+        with self._cv:
+            moved = cached is not None and cached.connect_address != resolved.connect_address
+            self._resolved = resolved
+            self._resolved_at = now
+        if moved:
+            # DNS moved the host. The old connections are safe (their address was validated) but
+            # they are pointed at the endpoint the client has just moved away from, so keeping them
+            # would defeat the failover the client just performed.
+            self.discard_idle()
+        return resolved
+
+    # -- connections
+
+    def take(self) -> _PinnedHTTPSConnection | None:
+        """An idle connection worth trying, or ``None`` to open a fresh one.
+
+        It takes neither the destination nor the resolution, and both omissions are deliberate. The
+        pool is keyed on (host, port), so every connection in it is already for the right receiver.
+        And each was pinned to an address this module VALIDATED at the instant it was opened
+        (KTD9), so reuse cannot reach an address the positive test would refuse -- re-checking it
+        against a newer resolution would only make a receiver that has since moved fail *sooner*,
+        which the caller's one retry on a fresh connection already handles, against the current
+        resolution, within the same attempt.
+        """
+        cutoff = time.monotonic() - _IDLE_TIMEOUT_S
+        stale: list[_PinnedHTTPSConnection] = []
+        found: _PinnedHTTPSConnection | None = None
+        with self._cv:
+            while self._idle:
+                stamp, connection = self._idle.pop()
+                if stamp < cutoff:
+                    stale.append(connection)
+                    continue
+                found = connection
+                break
+        for connection in stale:
+            _close_quietly(connection)
+        return found
+
+    def give_back(self, connection: _PinnedHTTPSConnection, *, reusable: bool) -> None:
+        if not reusable:
+            _close_quietly(connection)
+            return
+        with self._cv:
+            self._idle.append((time.monotonic(), connection))
+
+    def discard_idle(self) -> None:
+        with self._cv:
+            idle, self._idle = self._idle, []
+        for _stamp, connection in idle:
+            _close_quietly(connection)
+
+    def idle_count(self) -> int:
+        with self._cv:
+            return len(self._idle)
 
 
-#: The seam a suite replaces. Called as ``transport(resolved, request, connect_timeout_s, deadline)``
-#: and returns something with ``status``, ``headers`` and ``read(n)`` -- i.e. an
-#: ``http.client.HTTPResponse``, or a fake.
-Transport = Callable[[ResolvedDestination, urllib.request.Request, float, float], object]
+_pools: dict[tuple[str, int], _HostPool] = {}
+_pools_lock = threading.Lock()
+
+
+def _pool_for(destination: Destination) -> _HostPool:
+    key = (destination.host, destination.port)
+    with _pools_lock:
+        pool = _pools.get(key)
+        if pool is None:
+            pool = _HostPool()
+            _pools[key] = pool
+        return pool
+
+
+def _close_quietly(connection: object) -> None:
+    close = getattr(connection, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # closing a dead socket must never reach the caller
+            logger.debug("Ignoring an error while closing a pooled connection", exc_info=True)
+
+
+def reset_pools_for_tests() -> None:
+    """Close and forget every pooled connection. A module ledger, swept like every other."""
+    with _pools_lock:
+        pools = list(_pools.values())
+        _pools.clear()
+    for pool in pools:
+        pool.discard_idle()
+
+
+class _PooledResponse:
+    """An ``HTTPResponse`` that returns its connection to the pool when the caller closes it.
+
+    The caller's contract is unchanged -- ``status``, ``headers``, ``read(n)``, ``close()`` -- which
+    is what keeps :data:`Transport` a seam a suite can replace with a plain object. What it adds is
+    that ``close()`` decides whether the connection may be used again, and that decision has to be
+    made from the response's own state BEFORE it is closed: a body that was not read to the end
+    leaves bytes on the socket, and the next request on that connection would read them as its
+    reply.
+    """
+
+    def __init__(
+        self, response: Any, *, pool: _HostPool, connection: _PinnedHTTPSConnection
+    ) -> None:
+        self._response = response
+        self._pool = pool
+        self._connection = connection
+        self._done = False
+
+    @property
+    def status(self) -> int:
+        return int(getattr(self._response, "status", 0) or 0)
+
+    @property
+    def headers(self) -> Any:
+        return getattr(self._response, "headers", None)
+
+    def read(self, amount: int | None = None) -> bytes:
+        return self._response.read(amount)
+
+    def close(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        # Both read BEFORE the close, which sets `isclosed()` unconditionally.
+        drained = bool(self._response.isclosed())
+        keep_alive = not bool(getattr(self._response, "will_close", True))
+        _close_quietly(self._response)
+        self._pool.give_back(self._connection, reusable=drained and keep_alive)
+        self._pool.release_slot()
+
+
+#: The seam a suite replaces. Called as
+#: ``transport(resolved, request, connect_timeout_s, deadline, max_in_flight)`` and returns
+#: something with ``status``, ``headers``, ``read(n)`` and ``close()`` -- i.e. a
+#: :class:`_PooledResponse`, or a fake.
+Transport = Callable[..., object]
 
 
 def _send(
@@ -432,21 +654,98 @@ def _send(
     request: urllib.request.Request,
     connect_timeout_s: float,
     deadline: float,
+    max_in_flight: int | None = None,
 ) -> object:
-    """The real transport: one request, pinned, no redirects, no proxy, no cookies.
+    """The real transport: one request on a pooled, pinned connection.
 
-    The opener is built by hand rather than with ``build_opener`` because what it must NOT contain
-    is the point. ``HTTPRedirectHandler`` absent means a 3xx is returned as a response instead of
-    followed; ``HTTPErrorProcessor`` absent means every status arrives the same way and this module
-    does the classifying; ``ProxyHandler`` absent means ``https_proxy`` cannot redirect the request
-    to an address nothing validated; ``HTTPCookieProcessor`` was never there and stays away.
+    **``http.client`` directly rather than ``urllib``'s opener since U8**, and the reason is the
+    pool: ``AbstractHTTPHandler.do_open`` opens a connection per call and closes it, which is
+    exactly the cost this unit exists to remove. Everything the opener was chosen for is kept by
+    construction rather than by absence -- a 3xx is returned as a response instead of followed,
+    every status arrives the same way and this module classifies it, ``https_proxy`` cannot
+    redirect the request anywhere, and no cookie jar exists.
     """
     _require_network()
-    opener = urllib.request.OpenerDirector()
-    opener.add_handler(
-        _PinnedHTTPSHandler(pinned_ip=resolved.connect_address, deadline=deadline)
-    )
-    return opener.open(request, timeout=connect_timeout_s)
+    destination = resolved.destination
+    pool = _pool_for(destination)
+    limit = DEFAULT_MAX_IN_FLIGHT if max_in_flight is None else int(max_in_flight)
+    if not pool.acquire(limit, connect_timeout_s):
+        # A slot within the connect budget or nothing. Reported as a retryable OSError, which is
+        # what the caller already classifies a connect failure as: the receiver is busy with our own
+        # traffic, and the next cycle is the retry.
+        raise TimeoutError(
+            f"no free connection slot for {destination.host!r} within {connect_timeout_s}s "
+            f"(limit {limit})"
+        )
+    try:
+        connection = pool.take()
+        reused = connection is not None
+        if connection is None:
+            connection = _PinnedHTTPSConnection(
+                destination.host,
+                port=destination.port,
+                pinned_ip=resolved.connect_address,
+                deadline=deadline,
+                timeout=connect_timeout_s,
+                context=_shared_context(),
+            )
+        # PER REQUEST. See `arm` -- a pooled connection otherwise carries the first request's
+        # deadline, which is in the past, into every later one.
+        connection.arm(deadline)
+        try:
+            connection.request(
+                "POST",
+                _request_target(destination),
+                body=request.data,
+                headers=dict(request.header_items()),
+            )
+            response = connection.getresponse()
+        except Exception:
+            _close_quietly(connection)
+            if reused:
+                # A pooled connection the peer had already closed. One retry on a FRESH connection,
+                # because this failure is about the pool rather than about the receiver -- and one
+                # only, so a genuinely broken host still costs one attempt.
+                fresh = _PinnedHTTPSConnection(
+                    destination.host,
+                    port=destination.port,
+                    pinned_ip=resolved.connect_address,
+                    deadline=deadline,
+                    timeout=connect_timeout_s,
+                    context=_shared_context(),
+                )
+                fresh.arm(deadline)
+                try:
+                    fresh.request(
+                        "POST",
+                        _request_target(destination),
+                        body=request.data,
+                        headers=dict(request.header_items()),
+                    )
+                    response = fresh.getresponse()
+                except Exception:
+                    _close_quietly(fresh)
+                    raise
+                return _PooledResponse(response, pool=pool, connection=fresh)
+            raise
+    except BaseException:
+        pool.release_slot()
+        raise
+    return _PooledResponse(response, pool=pool, connection=connection)
+
+
+def _request_target(destination: Destination) -> str:
+    """Origin-form path plus query, which is what an absolute URL would break.
+
+    ``http.client`` writes the request line verbatim, so handing it the whole URL would send
+    ``POST https://host/path HTTP/1.1`` -- legal only to a proxy, and refused or misrouted by an
+    ordinary receiver.
+    """
+    parsed = urllib.parse.urlsplit(destination.url)
+    target = parsed.path or "/"
+    if parsed.query:
+        target = f"{target}?{parsed.query}"
+    return target
 
 
 # ---- Classification ----------------------------------------------------------------------------
@@ -552,6 +851,7 @@ def deliver(
     headers: Mapping[str, str],
     timeout_s: float = DEFAULT_TIMEOUT_S,
     connect_timeout_s: float = CONNECT_TIMEOUT_S,
+    max_in_flight: int | None = None,
     resolver: Resolver | None = None,
     transport: Transport | None = None,
 ) -> DeliveryAttempt:
@@ -566,6 +866,10 @@ def deliver(
     ``body`` is sent byte for byte as given; it is the object :func:`webhook_signing.sign` signed.
     ``resolver`` and ``transport`` are the test seams -- see the module docstring on where the fence
     sits relative to each.
+
+    ``max_in_flight`` is the client's ``concurrent_deliveries`` quota, bounding concurrent requests
+    to this host across the process. It is the caller's to look up: this module knows a URL and
+    nothing about accounts.
     """
     started = time.monotonic()
     deadline = started + timeout_s
@@ -575,7 +879,13 @@ def deliver(
 
     try:
         destination = validate_url(url)
-        resolved = resolve_and_validate(destination, resolver=resolver)
+        # Through the POOL, so one validated resolution serves every request to this host for a
+        # window instead of one per attempt -- and so a rebind is refused at the next resolve rather
+        # than at the next process restart. A caller that injects its own `transport` still resolves
+        # here, which is what keeps the address test on the path a suite exercises.
+        resolved = _pool_for(destination).resolution(
+            destination, resolver=resolver, now=time.monotonic()
+        )
     except UnsafeDestination as exc:
         # Terminal, and NOT a reason to pause the destination: pausing is the 410 signal and means
         # "the client told us to stop". A destination record with a bad URL is an operator's to
@@ -609,7 +919,7 @@ def deliver(
     )
     send = transport or _send
     try:
-        response = send(resolved, request, connect_timeout_s, deadline)
+        response = send(resolved, request, connect_timeout_s, deadline, max_in_flight)
     except NetworkBlocked:
         raise
     except (urllib.error.URLError, http.client.HTTPException, ssl.SSLError, OSError) as exc:
@@ -678,6 +988,7 @@ __all__ = [
     "ALLOWED_SCHEME",
     "ALLOW_NETWORK_ENV",
     "CONNECT_TIMEOUT_S",
+    "DEFAULT_MAX_IN_FLIGHT",
     "DEFAULT_TIMEOUT_S",
     "MAX_RESPONSE_BYTES",
     "USER_AGENT",
@@ -695,6 +1006,7 @@ __all__ = [
     "network_allowed",
     "parse_retry_after",
     "read_timeout",
+    "reset_pools_for_tests",
     "resolve_and_validate",
     "validate_url",
 ]

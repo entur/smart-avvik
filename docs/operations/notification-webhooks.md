@@ -457,7 +457,7 @@ silently.
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated` |
 | `notification_emit` | the emit step | `result` (`ok`, `timeout`, `retryable`, `failed`, `standing_error`, `run_clear_error`), `created`, `withdrawn`, `unchanged`, `obsolete`, `quota`, `capped`, `retryable`, `ms` |
 | `notification_event` | one committed revision | `result` = the event type, `client_id`, `destination_id`, `alert_id`, `revision`, `superseded` |
-| `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
+| `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
 | `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
@@ -558,6 +558,60 @@ Every bound is a number:
 | emit step deadline / bounded wait | 6 s / 8 s |
 | per Firestore call | 4 s, under `varsel`'s 5 s wait |
 | attempts per cycle, total / per destination | 200 / **the client's `deliveries_per_minute`**, default 50 |
+
+**A claim takes a 20 s lease on the delivery** (U8, KTD14), and the arithmetic is the whole of the
+number: after `_claim_body` commits, one attempt still reads the event (one Firestore call at 4 s),
+POSTs it (5 s, of which 2 s is the connect) and writes the terminal state (4 s again) — 13 s worst
+case, so the lease outlasts a healthy attempt with room and a delivery whose holder *died* is
+re-offered 20 s later rather than 13. `claimed_at` was written and read by nothing before this: two
+workers reading the same pending page both claimed, both POSTed, and the traveller was notified
+twice — which the receiver's own `event_id` inbox drops, which is exactly why it would never have
+been noticed from our side. The claim mints a token; the two terminal writes compare it, so a holder
+whose lease lapsed and was re-claimed cannot mark a delivery sent (spending one of the traveller's
+four for an outcome nobody knows) or set a re-claimed one back to `pending` (releasing the live
+claim's slot). Both outcomes are counted: `leased` is a claim refused because somebody else holds
+it, `lease_lost` a terminal write refused because the holder changed. **Both are unreachable while
+there is one writer** — one poller thread, one replica under Recreate — so they report on U11's
+worker rather than on today, and they are pinned against the fake anyway: a check that arrives with
+the second replica arrives after the duplicates it exists to prevent. A leased row is filtered out
+of `pending_deliveries` in Python rather than in the query, because a second inequality would need
+its own composite index *and* would exclude every document that lacks the field, which on the deploy
+that introduces it is the whole backlog.
+
+**The outbound client pools connections per host since U8.** Twenty thousand POSTs to one receiver
+used to be twenty thousand TLS handshakes — one to two round trips plus an asymmetric operation on
+both sides, inside the 5 s per-attempt ceiling this section treats as scarce, so the *connection*
+rather than the request was the cost of a bad morning. Four things bound it, and each exists for a
+reason worth knowing before changing the number.
+
+- **One validated resolution per host per 60 s.** KTD9's whole argument is that an address is
+  validated and then *dialled*, never re-looked-up — so a pool that trusted its first answer for the
+  life of the process would be safe against a rebind and useless against a client moving their
+  endpoint, while one that re-resolved per request would pay a DNS round trip inside the per-attempt
+  ceiling. On a refusal at the next resolve the idle connections go with it; a connection already
+  open stays open, because it is connected to an address that *was* validated and closing it
+  mid-request would fail a delivery for something that cannot affect it. A resolution that merely
+  *moves* also drops the idle set, so a client's own DNS failover takes effect.
+- **Idle connections are kept 60 s.** Receivers close idle keep-alives on their own schedule, and a
+  socket the peer has already closed fails the next request — which is a fact about the pool rather
+  than about the receiver, so it costs one fresh connection and exactly one retry, never a delivery.
+- **In-flight requests per host come from the client's `concurrent_deliveries`.** What it stops is a
+  wide worker opening a connection per thread against one receiver, which is the shape a receiver
+  experiences as an attack rather than as traffic — and the one thing about delivery that gets worse
+  rather than better as the worker gets wider. A request that cannot get a slot within the connect
+  budget is a retryable failure, never an unbounded wait.
+- **A response that was not drained is never put back.** An over-long body is read to
+  `MAX_RESPONSE_BYTES` and no further, so the rest is still on the wire; reusing that connection
+  would hand the leftovers to whatever asks next, as a wrong status on an unrelated delivery.
+
+The transport drives `http.client` directly rather than a `urllib` opener, because
+`AbstractHTTPHandler.do_open` opens a connection per call and closes it — which is exactly the cost
+this removes. Everything the opener was chosen for is kept by construction rather than by absence: a
+3xx is returned as a response and classified here, nothing reads `https_proxy`, and no cookie jar
+exists. **The socket deadline is armed per REQUEST, not per connect**, and that is the bug pooling
+introduces: a reused connection would otherwise carry the first request's deadline — already in the
+past — into every later one, `read_timeout` would floor it at 50 ms, and the symptom would read as a
+receiver that suddenly went slow.
 
 A destination is **skipped for the rest of the cycle after its first failure**, in pass-local state.
 That is the documented exception to this repo's "every module-level ledger is swept" rule: made
@@ -685,6 +739,10 @@ touches the wire contract, which is why the pilot could ship without them.
    the client's ceiling too, so the new bound would have turned an ordinary listing over a
    collection full of undeleted rows into a 200 000-document read. That scan is capped separately at
    `MAX_SUBSCRIPTION_LIST_SCAN` (10 000 — the old bound), so the listing's worst case did not move.
+   **Verified against dev Firestore on 2026-09-13, read-only**: the aggregation with all four
+   predicates returns 18, which is what the mirror holds, so the checked-in index really does serve
+   it. Worth doing rather than reasoning about — the emulator tracks no composite indexes, so it
+   cannot answer this, and a missing one is a `FailedPrecondition` on *every* create.
 
 ### What a bad morning is worded by, and what carries the template
 
@@ -878,6 +936,7 @@ reads it — the other five are read from the account on each pass.
 | `notification_store.WITHDRAWAL_GAP_S` | 900 |
 | `notification_store.RETRY_AFTER_CAP_S` | 300 |
 | `notification_store.RESERVATION_TTL_S` | 120.0 |
+| `notification_store.DELIVERY_LEASE_S` | 20.0 |
 | `notification_auth.MAX_CREDENTIALS_PER_CLIENT` | 8 |
 | `notification_auth.MAX_DESTINATIONS_PER_CLIENT` | 4 |
 | `notification_auth.MIN_PEPPER_BYTES` | 32 |
@@ -891,6 +950,7 @@ reads it — the other five are read from the account on each pass.
 | `webhook_sender.DEFAULT_TIMEOUT_S` | 5.0 |
 | `webhook_sender.CONNECT_TIMEOUT_S` | 2.0 |
 | `webhook_sender.MAX_RESPONSE_BYTES` | 65536 |
+| `webhook_sender.DEFAULT_MAX_IN_FLIGHT` | 4 |
 | `notification_api._LIST_DEFAULT` | 100 |
 | `notification_api._LIST_MAX` | 500 |
 | `notification_api._TEST_EVENTS_PER_MIN` | 6 |

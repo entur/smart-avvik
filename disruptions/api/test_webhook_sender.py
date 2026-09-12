@@ -23,9 +23,12 @@ import pathlib
 import re
 import socket
 import ssl
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from typing import ClassVar
 
 # --- Fence the network before importing the module under test -----------------------------------
 
@@ -113,14 +116,32 @@ class _Recorder:
         self.error = error
         self.calls: list[tuple] = []
 
-    def __call__(self, resolved, request, connect_timeout_s, deadline):
+    def __call__(self, resolved, request, connect_timeout_s, deadline, max_in_flight=None):
         self.calls.append((resolved, request, connect_timeout_s, deadline))
         if self.error is not None:
             raise self.error
         return self.response if self.response is not None else _Response()
 
 
+def _code() -> str:
+    """The module minus its docstring and comment lines.
+
+    The headers here name what the transport deliberately does NOT use -- `build_opener`,
+    `ProxyHandler`, redirects -- so a negative grep over the raw text matches the explanation and
+    passes for the wrong reason. `test_webhook_delivery` has the same helper for the same reason.
+    """
+    body = MODULE_SOURCE.split('"""', 2)[-1]
+    return "\n".join(line for line in body.splitlines() if not line.strip().startswith("#"))
+
+
 def _deliver(**kwargs):
+    # A FRESH pool per call. The pool caches one validated resolution per host for
+    # `_RESOLVE_TTL_S`, which is the point of it in production and is exactly wrong in a suite where
+    # every test injects a different resolver for the same host -- the second `deliver` would get
+    # the first test's answer and pass or fail for a reason having nothing to do with its own
+    # fixture. `test_the_pool_reuses_one_resolution_for_a_window` is where the caching itself is
+    # asserted, deliberately, rather than being relied on everywhere by accident.
+    wc.reset_pools_for_tests()
     kwargs.setdefault("url", DEST_URL)
     kwargs.setdefault("body", b'{"event_id":"e1"}')
     kwargs.setdefault("headers", {"webhook-id": "d1"})
@@ -419,19 +440,369 @@ def test_the_read_timeout_floors_at_a_blocking_value():
     assert wc.read_timeout(0.0, now=0.0) == wc._MIN_READ_TIMEOUT_S
 
 
-def test_the_opener_carries_no_redirect_proxy_error_or_cookie_handler():
-    """Refusing redirects is structural here: there is no handler that could follow one."""
-    opener = urllib.request.OpenerDirector()
-    opener.add_handler(wc._PinnedHTTPSHandler(pinned_ip=GOOD_V4, deadline=time.monotonic() + 1))
-    names = {type(h).__name__ for h in opener.handlers}
-    assert names == {"_PinnedHTTPSHandler"}, names
-    for forbidden in ("HTTPRedirectHandler", "ProxyHandler", "HTTPErrorProcessor"):
-        assert forbidden not in names
-    # And `_send` builds it exactly that way -- one handler, and never `build_opener`, whose
-    # default handler set includes both ProxyHandler and HTTPRedirectHandler. Matched as a CALL, so
-    # the docstring naming it as the thing not used does not satisfy the check.
-    assert not re.search(r"build_opener\s*\(", MODULE_SOURCE)
-    assert "OpenerDirector()" in MODULE_SOURCE
+def test_nothing_can_follow_a_redirect_use_a_proxy_or_keep_a_cookie():
+    """Refusing all three is structural: since U8 there is no urllib machinery here at all.
+
+    It used to be an `OpenerDirector` carrying exactly one handler, so the guarantee was the ABSENCE
+    of `HTTPRedirectHandler`, `ProxyHandler` and `HTTPErrorProcessor` from a list -- true, and one
+    `build_opener` away from being false. The pooled transport drives `http.client` directly: a 3xx
+    is a response this module classifies, there is no code that reads `https_proxy`, and no cookie
+    jar exists to keep anything in. Asserted as the absence of the machinery rather than of the
+    handlers, and matched as CALLS so a comment naming what is not used cannot satisfy it.
+    """
+    for forbidden in (
+        r"build_opener\s*\(",
+        r"OpenerDirector\s*\(",
+        r"HTTPRedirectHandler",
+        r"ProxyHandler",
+        r"HTTPErrorProcessor",
+        r"HTTPCookieProcessor",
+    ):
+        assert not re.search(forbidden, _code()), forbidden
+    # `urllib.request.Request` survives as a value carrier for url, data and headers -- it opens
+    # nothing. What must not survive is anything that can OPEN a connection through urllib.
+    assert not re.search(r"opener\.open\s*\(", _code())
+    assert "connection.request(" in MODULE_SOURCE, "the transport drives http.client directly"
+
+
+# --- The per-host connection pool (U8) ----------------------------------------------------------
+#
+# These are the only tests that drive the REAL transport, so they fake the connection class instead
+# of the transport. `_require_network` is stubbed with them: the fence exists so a suite that forgot
+# to stub the network fails loudly, and a test that has replaced the connection class by definition
+# has not forgotten.
+
+
+class _FakeSocket:
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
+
+
+class _FakeResponse:
+    def __init__(self, status: int = 200, body: bytes = b"{}", *, will_close: bool = False) -> None:
+        self.status = status
+        self.headers = {}
+        self.will_close = will_close
+        self._body = body
+        self._read = False
+
+    def read(self, amount: int | None = None) -> bytes:
+        self._read = True
+        return self._body if amount is None else self._body[:amount]
+
+    def isclosed(self) -> bool:
+        return self._read
+
+    def close(self) -> None:
+        pass
+
+
+class _FakeConnection:
+    """Stands in for `_PinnedHTTPSConnection`, recording what the transport did with it."""
+
+    opened: ClassVar[list[_FakeConnection]] = []
+
+    def __init__(self, host, *, port, pinned_ip, deadline, timeout, context) -> None:
+        self.host = host
+        self.port = port
+        self.pinned_ip = pinned_ip
+        self.timeout = timeout
+        self.sock = _FakeSocket()
+        self.requests: list[tuple[str, str, dict]] = []
+        self.armed: list[float] = []
+        self.closed = False
+        self.next_response: object = _FakeResponse()
+        self.raise_on_request: BaseException | None = None
+        _FakeConnection.opened.append(self)
+
+    def arm(self, deadline: float) -> None:
+        self.armed.append(deadline)
+        self.sock.settimeout(wc.read_timeout(deadline))
+
+    def request(self, method, target, body=None, headers=None) -> None:
+        if self.raise_on_request is not None:
+            raise self.raise_on_request
+        self.requests.append((method, target, dict(headers or {})))
+
+    def getresponse(self) -> object:
+        return self.next_response
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _pooled(**kwargs):
+    """Drive the REAL transport with a faked connection class, and clean up after."""
+    saved_connection = wc._PinnedHTTPSConnection
+    saved_fence = wc._require_network
+    _FakeConnection.opened = []
+    wc._PinnedHTTPSConnection = _FakeConnection  # type: ignore[misc]
+    wc._require_network = lambda: None  # type: ignore[assignment]
+    try:
+        kwargs.setdefault("url", DEST_URL)
+        kwargs.setdefault("body", b'{"event_id":"e1"}')
+        kwargs.setdefault("headers", {"webhook-id": "d1"})
+        kwargs.setdefault("resolver", _resolver(GOOD_V4))
+        url = kwargs.pop("url")
+        return wc.deliver(url, **kwargs)
+    finally:
+        wc._PinnedHTTPSConnection = saved_connection  # type: ignore[misc]
+        wc._require_network = saved_fence  # type: ignore[assignment]
+
+
+def test_a_second_request_to_one_host_reuses_the_connection():
+    """20 000 POSTs used to be 20 000 TLS handshakes.
+
+    A handshake is one to two round trips plus an asymmetric operation on both sides, inside the 5 s
+    per-attempt ceiling `webhook_delivery` treats as scarce -- so the CONNECTION, not the request,
+    was the cost of a bad morning.
+    """
+    wc.reset_pools_for_tests()
+    saved_connection, saved_fence = wc._PinnedHTTPSConnection, wc._require_network
+    _FakeConnection.opened = []
+    wc._PinnedHTTPSConnection = _FakeConnection  # type: ignore[misc]
+    wc._require_network = lambda: None  # type: ignore[assignment]
+    try:
+        for _ in range(3):
+            attempt = wc.deliver(
+                DEST_URL, body=b"{}", headers={"webhook-id": "d1"}, resolver=_resolver(GOOD_V4)
+            )
+            assert attempt.ok, attempt
+        assert len(_FakeConnection.opened) == 1, (
+            f"three requests opened {len(_FakeConnection.opened)} connections"
+        )
+        connection = _FakeConnection.opened[0]
+        assert len(connection.requests) == 3
+        # Every request carries the HOSTNAME, never the pinned literal: the Host header and the
+        # certificate both key on it, and neither may see the address.
+        assert connection.host == "hooks.client.example"
+        assert connection.pinned_ip == GOOD_V4
+        # And the origin-form target, never the absolute URL -- `http.client` writes the request
+        # line verbatim and an absolute URL is legal only to a proxy.
+        assert {target for _m, target, _h in connection.requests} == {"/kix/notifications"}
+    finally:
+        wc._PinnedHTTPSConnection = saved_connection  # type: ignore[misc]
+        wc._require_network = saved_fence  # type: ignore[assignment]
+
+
+def test_the_socket_deadline_is_re_armed_for_every_request_on_a_pooled_connection():
+    """The bug pooling introduces, and it does not look like a pooling bug.
+
+    The socket timeout used to be set once inside `connect()`, which was right while every attempt
+    opened its own connection. Reused, a connection carries the FIRST request's deadline into the
+    second -- and that deadline is already in the past, so `read_timeout` floors it at 50 ms and
+    every later request times out. The symptom reads as a receiver that suddenly went slow.
+    """
+    wc.reset_pools_for_tests()
+    saved_connection, saved_fence = wc._PinnedHTTPSConnection, wc._require_network
+    _FakeConnection.opened = []
+    wc._PinnedHTTPSConnection = _FakeConnection  # type: ignore[misc]
+    wc._require_network = lambda: None  # type: ignore[assignment]
+    try:
+        for _ in range(2):
+            wc.deliver(DEST_URL, body=b"{}", headers={}, resolver=_resolver(GOOD_V4), timeout_s=5.0)
+        connection = _FakeConnection.opened[0]
+        assert len(connection.armed) == 2, "armed once per REQUEST, not once per connect"
+        assert connection.armed[1] > connection.armed[0], "the second deadline is its own"
+        # And what actually reached the socket is a real read budget, not the 50 ms floor.
+        assert all(t > wc._MIN_READ_TIMEOUT_S for t in connection.sock.timeouts), (
+            f"a reused connection got the floored timeout: {connection.sock.timeouts}"
+        )
+    finally:
+        wc._PinnedHTTPSConnection = saved_connection  # type: ignore[misc]
+        wc._require_network = saved_fence  # type: ignore[assignment]
+
+
+def test_a_body_that_was_not_drained_is_never_put_back():
+    """Unread bytes on a socket become the NEXT request's reply.
+
+    An over-long response is read to the cap and no further (`MAX_RESPONSE_BYTES`), so the rest is
+    still on the wire. Reusing that connection would hand the leftovers to whatever asks next, which
+    is a wrong status on a delivery that has nothing to do with it.
+    """
+    wc.reset_pools_for_tests()
+    saved_connection, saved_fence = wc._PinnedHTTPSConnection, wc._require_network
+    _FakeConnection.opened = []
+    wc._PinnedHTTPSConnection = _FakeConnection  # type: ignore[misc]
+    wc._require_network = lambda: None  # type: ignore[assignment]
+    try:
+        class _Undrained(_FakeResponse):
+            def isclosed(self) -> bool:
+                return False
+
+        original_init = _FakeConnection.__init__
+
+        def _init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self.next_response = _Undrained()
+
+        _FakeConnection.__init__ = _init  # type: ignore[method-assign]
+        try:
+            wc.deliver(DEST_URL, body=b"{}", headers={}, resolver=_resolver(GOOD_V4))
+            wc.deliver(DEST_URL, body=b"{}", headers={}, resolver=_resolver(GOOD_V4))
+        finally:
+            _FakeConnection.__init__ = original_init  # type: ignore[method-assign]
+        assert len(_FakeConnection.opened) == 2, "an undrained connection must not be reused"
+        assert _FakeConnection.opened[0].closed is True
+    finally:
+        wc._PinnedHTTPSConnection = saved_connection  # type: ignore[misc]
+        wc._require_network = saved_fence  # type: ignore[assignment]
+
+
+def test_a_pooled_connection_the_peer_closed_is_retried_once_on_a_fresh_one():
+    """Receivers close idle keep-alives on their own schedule.
+
+    A socket the peer has already closed fails the next request, and that failure is about the POOL
+    rather than about the receiver -- so it costs one fresh connection rather than one failed
+    delivery. Exactly one retry: a genuinely broken host must still cost one attempt per cycle, not
+    two.
+    """
+    wc.reset_pools_for_tests()
+    saved_connection, saved_fence = wc._PinnedHTTPSConnection, wc._require_network
+    _FakeConnection.opened = []
+    wc._PinnedHTTPSConnection = _FakeConnection  # type: ignore[misc]
+    wc._require_network = lambda: None  # type: ignore[assignment]
+    try:
+        first = wc.deliver(DEST_URL, body=b"{}", headers={}, resolver=_resolver(GOOD_V4))
+        assert first.ok and len(_FakeConnection.opened) == 1
+        _FakeConnection.opened[0].raise_on_request = ConnectionResetError("peer closed")
+        second = wc.deliver(DEST_URL, body=b"{}", headers={}, resolver=_resolver(GOOD_V4))
+        assert second.ok, "a dead pooled connection must not cost a delivery"
+        assert len(_FakeConnection.opened) == 2
+        assert _FakeConnection.opened[0].closed is True, "and the dead one is discarded"
+
+        # A host that really is broken fails, once, with a retryable classification. The pool is
+        # emptied first so the attempt starts on a FRESH connection -- otherwise it would take the
+        # healthy one the retry above put back and prove nothing.
+        wc.reset_pools_for_tests()
+        original_init = _FakeConnection.__init__
+
+        def _init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            self.raise_on_request = ConnectionResetError("still broken")
+
+        _FakeConnection.__init__ = _init  # type: ignore[method-assign]
+        try:
+            broken = wc.deliver(DEST_URL, body=b"{}", headers={}, resolver=_resolver(GOOD_V4))
+        finally:
+            _FakeConnection.__init__ = original_init  # type: ignore[method-assign]
+        assert broken.ok is False and broken.retryable is True, broken
+    finally:
+        wc._PinnedHTTPSConnection = saved_connection  # type: ignore[misc]
+        wc._require_network = saved_fence  # type: ignore[assignment]
+
+
+def test_one_validated_resolution_serves_a_window_and_a_rebind_is_refused_at_the_next_one():
+    """KTD9 one layer along: the pool must RE-validate, not trust the first answer forever.
+
+    A process that resolved once at startup and dialled that literal for a week would be safe
+    against a rebind and useless against a client moving their endpoint. A pool that re-resolved per
+    request would pay a DNS round trip inside the per-attempt ceiling. One validated answer per
+    window is the trade, and the window is what bounds how long a rebind is still being dialled.
+    """
+    wc.reset_pools_for_tests()
+    saved_connection, saved_fence = wc._PinnedHTTPSConnection, wc._require_network
+    _FakeConnection.opened = []
+    wc._PinnedHTTPSConnection = _FakeConnection  # type: ignore[misc]
+    wc._require_network = lambda: None  # type: ignore[assignment]
+    resolves: list[int] = []
+    try:
+        def counting(host, port):
+            resolves.append(1)
+            return _answers(GOOD_V4)
+
+        for _ in range(3):
+            wc.deliver(DEST_URL, body=b"{}", headers={}, resolver=counting)
+        assert resolves == [1], f"one resolution per window, not {len(resolves)}"
+
+        # Past the window, with DNS now answering the metadata service: refused, terminally, and
+        # the idle connection goes with it -- it was dialled under an answer nothing trusts now.
+        pool = wc._pool_for(wc.validate_url(DEST_URL))
+        assert pool.idle_count() == 1
+        pool._resolved_at -= wc._RESOLVE_TTL_S + 1
+        attempt = wc.deliver(
+            DEST_URL, body=b"{}", headers={}, resolver=_resolver("169.254.169.254")
+        )
+        assert attempt.ok is False and attempt.retryable is False, attempt
+        assert "unsafe_destination" in (attempt.error or "")
+        assert pool.idle_count() == 0, "the idle connections go with the refused resolution"
+        assert len(_FakeConnection.opened) == 1, "and nothing was dialled"
+    finally:
+        wc._PinnedHTTPSConnection = saved_connection  # type: ignore[misc]
+        wc._require_network = saved_fence  # type: ignore[assignment]
+
+
+def test_concurrency_to_one_host_is_bounded_by_the_clients_quota():
+    """What stops a wide worker opening a connection per thread against one receiver.
+
+    That shape is what a receiver experiences as an attack rather than as traffic, and it is the one
+    thing about delivery that gets worse rather than better as the worker gets wider. Forced with a
+    barrier: `max_in_flight` requests arrive together and the next one waits.
+    """
+    wc.reset_pools_for_tests()
+    saved_connection, saved_fence = wc._PinnedHTTPSConnection, wc._require_network
+    _FakeConnection.opened = []
+    wc._PinnedHTTPSConnection = _FakeConnection  # type: ignore[misc]
+    wc._require_network = lambda: None  # type: ignore[assignment]
+    inside = threading.Semaphore(0)
+    release = threading.Event()
+    peak = [0]
+    live = [0]
+    lock = threading.Lock()
+    try:
+        original_request = _FakeConnection.request
+
+        def blocking(self, method, target, body=None, headers=None):
+            with lock:
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+            inside.release()
+            release.wait(10)
+            with lock:
+                live[0] -= 1
+            return original_request(self, method, target, body=body, headers=headers)
+
+        _FakeConnection.request = blocking  # type: ignore[method-assign]
+        try:
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = [
+                    pool.submit(
+                        wc.deliver,
+                        DEST_URL,
+                        body=b"{}",
+                        headers={},
+                        resolver=_resolver(GOOD_V4),
+                        max_in_flight=2,
+                        connect_timeout_s=10.0,
+                    )
+                    for _ in range(5)
+                ]
+                # Wait for the limit to be reached, then let everybody through.
+                for _ in range(2):
+                    assert inside.acquire(timeout=10), "the first two requests never arrived"
+                release.set()
+                assert all(f.result(timeout=15).ok for f in futures)
+        finally:
+            _FakeConnection.request = original_request  # type: ignore[method-assign]
+            release.set()
+        assert peak[0] <= 2, f"{peak[0]} requests were in flight against a limit of 2"
+    finally:
+        wc._PinnedHTTPSConnection = saved_connection  # type: ignore[misc]
+        wc._require_network = saved_fence  # type: ignore[assignment]
+
+
+def test_the_default_in_flight_limit_is_the_delivery_quotas_default():
+    """Two constants, one number, and neither module may import the other for it.
+
+    `notification_auth` imports THIS module for `validate_url`, so the edge runs one way and the
+    default is written out on both sides. Pinned here rather than left to agree by habit.
+    """
+    import notification_auth
+
+    assert wc.DEFAULT_MAX_IN_FLIGHT == notification_auth.DEFAULT_CONCURRENT_DELIVERIES
 
 
 # --- Classification (the Event contract's vocabulary) -------------------------------------------
