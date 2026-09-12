@@ -4398,6 +4398,131 @@ def test_one_unreadable_document_never_fails_the_mirror():
     assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s1"]
 
 
+def _subject_seed_page(client: _FakeClient, docs: list[dict[str, Any]]) -> None:
+    client.pages["mirror_seed_subjects"] = [
+        (f"{notification_store.SUBJECTS}/{d['alert_id']}", d) for d in docs
+    ]
+
+
+def test_the_subject_mirror_seeds_the_standing_set_and_skips_expired_subjects():
+    """U6 step 3. The complete standing set the emit pass cannot get from a bounded query.
+
+    `client_alerts` enumerates at most `MAX_SUBJECTS_PER_READ`, and past that the answer is
+    INCOMPLETE -- which is not a slightly worse answer: the pass falls back to a store transaction
+    per subject, because treating a truncated read as complete skips a withdrawal that was owed and
+    a `confirmed` mint for a train ET has cancelled. At one client with 100 000 subscriptions that
+    fallback IS the steady state.
+    """
+    client = _FakeClient()
+    _install(client)
+    dead = _state("a-dead", notification_store.PHASE_PREDICTED)
+    dead[notification_store.TTL_FIELD] = NOW - timedelta(minutes=1)
+    _subject_seed_page(
+        client,
+        [
+            _state("a1", notification_store.PHASE_PREDICTED),
+            _state("a2", notification_store.PHASE_CONFIRMED),
+            dead,
+        ],
+    )
+    mirror = notification_store.SubjectMirror()
+    assert mirror.ready is False
+    result = mirror.seed(now=NOW)
+
+    assert mirror.ready is True and mirror.size() == 2, result
+    assert mirror.phases_for(SID, NOW) == {
+        "a1": notification_store.PHASE_PREDICTED,
+        "a2": notification_store.PHASE_CONFIRMED,
+    }
+    # TTL runs up to ~24 h late, so an expired subject is still returned by the query -- and nothing
+    # writes a document when its own TTL passes, so the read is the only place it can be refused.
+    assert "a-dead" not in mirror.phases_for(SID, NOW)
+
+
+def test_the_subject_mirror_is_indexed_by_subscription_not_scanned():
+    """The emit pass asks per subscription; a flat map would make each of 100 000 questions a scan.
+
+    Asserted as a property rather than by timing: a subject belonging to another subscription is
+    invisible to this one's lookup, which is only true of a real index.
+    """
+    client = _FakeClient()
+    _install(client)
+    other = _state("b1", notification_store.PHASE_PREDICTED)
+    other["subscription_id"] = "sub-other"
+    _subject_seed_page(client, [_state("a1", notification_store.PHASE_PREDICTED), other])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+
+    assert mirror.phases_for(SID, NOW) == {"a1": notification_store.PHASE_PREDICTED}
+    assert mirror.phases_for("sub-other", NOW) == {"b1": notification_store.PHASE_PREDICTED}
+    assert mirror.phases_for("sub-nobody", NOW) == {}
+
+
+def test_a_committed_subject_reaches_the_standing_set_without_a_re_read():
+    """Kept current by the poller's own commits, not by a watermark.
+
+    Subject documents have exactly ONE writer (KTD6: one poller thread, no route invokes the pass,
+    one replica under Recreate), so every change passes through this process and applying it in
+    memory is both cheaper and stronger than re-reading it.
+    """
+    client = _FakeClient()
+    _install(client)
+    _subject_seed_page(client, [_state("a1", notification_store.PHASE_PREDICTED)])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+    assert mirror.phases_for(SID, NOW) == {"a1": notification_store.PHASE_PREDICTED}
+
+    mirror.apply(_state("a1", notification_store.PHASE_CONFIRMED))
+    assert mirror.phases_for(SID, NOW) == {"a1": notification_store.PHASE_CONFIRMED}
+    mirror.apply(_state("a2", notification_store.PHASE_PREDICTED))
+    assert set(mirror.phases_for(SID, NOW)) == {"a1", "a2"}
+
+    # An unreadable document is ignored rather than raised on: the commit has already happened, and
+    # raising here would unwind a pass over a mirror that is only ever an optimisation.
+    mirror.apply({"alert_id": "broken"})
+    assert set(mirror.phases_for(SID, NOW)) == {"a1", "a2"}
+
+
+def test_dropping_a_subject_and_dropping_a_whole_subscription():
+    """A revoked subscription takes its standing subjects with it, or the pass keeps answering for
+    a recipient that no longer exists."""
+    client = _FakeClient()
+    _install(client)
+    _subject_seed_page(
+        client,
+        [_state("a1", notification_store.PHASE_PREDICTED), _state("a2", notification_store.PHASE_PREDICTED)],
+    )
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+
+    mirror.drop(SID, "a1")
+    assert set(mirror.phases_for(SID, NOW)) == {"a2"}
+    mirror.drop(SID, "a-never-existed")
+    assert set(mirror.phases_for(SID, NOW)) == {"a2"}
+
+    mirror.drop_subscription(SID)
+    assert mirror.phases_for(SID, NOW) == {} and mirror.size() == 0
+
+
+def test_the_open_withdrawal_runs_are_served_whole_environment():
+    """`ClientAlerts.open_below_threshold`'s shape: the run is a property of the SUBJECT, and the
+    caller looks up the one alert id it is about."""
+    client = _FakeClient()
+    _install(client)
+    counting = _state("a1", notification_store.PHASE_PREDICTED)
+    counting["below_threshold_at"] = NOW - timedelta(minutes=5)
+    _subject_seed_page(client, [counting, _state("a2", notification_store.PHASE_PREDICTED)])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+
+    runs = mirror.open_runs(NOW)
+    assert set(runs) == {"a1"}, runs
+    assert runs["a1"] == NOW - timedelta(minutes=5)
+    # A mint closes the run -- both fields, which is what the emit body writes.
+    mirror.apply(_state("a1", notification_store.PHASE_CONFIRMED, below_threshold_at=None))
+    assert mirror.open_runs(NOW) == {}
+
+
 def _run() -> None:
     plain = sorted(
         (name, fn)
