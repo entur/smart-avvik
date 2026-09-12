@@ -1545,6 +1545,243 @@ def test_two_subscriptions_are_still_delivered_in_parallel():
         _uninstall()
 
 
+def _destination_doc() -> dict[str, Any]:
+    record = notification_auth.get_destination(DEST)
+    assert record is not None
+    return {
+        "retry_not_before": record.retry_not_before,
+        "consecutive_failures": record.consecutive_failures,
+    }
+
+
+def test_a_429_backs_the_destination_off_for_exactly_what_the_receiver_asked():
+    """U7: `Retry-After` is honoured DURABLY, which the pass-local skip cannot do.
+
+    The skip takes a destination out for the rest of the pass, so "not attempted twice in this
+    cycle" was already true and asserting it would prove nothing. What is new is that the next PASS
+    -- a fresh `_Skips`, as a later cycle has -- still waits, and waits exactly as long as the
+    receiver said. So the discriminating arrangement is three passes at three instants: the failure,
+    one inside the window, one past it.
+    """
+    client = _install()
+    try:
+        _live(client)
+        _pending(client, 2)
+        webhook_delivery.deliver_pending(
+            now=NOW,
+            sender=_sender(ok=False, status=429, retryable=True, retry_after_s=45.0, error="429"),
+        )
+        stored = _destination_doc()
+        assert stored["consecutive_failures"] == 1
+        assert stored["retry_not_before"] == NOW + timedelta(seconds=45), stored
+
+        # A LATER pass, inside the window: nothing is dialled, and it says which kind of nothing.
+        _sent.clear()
+        inside = webhook_delivery.deliver_pending(now=NOW + timedelta(seconds=30), sender=_sender())
+        assert _sent == [], "the destination must not be dialled inside its own backoff"
+        assert inside.backed_off >= 1 and inside.sent == 0, inside
+        # `skipped` is a DIFFERENT answer and must not absorb this one.
+        assert inside.skipped == 0, inside
+
+        # And past it, on a receiver that has recovered.
+        after = webhook_delivery.deliver_pending(now=NOW + timedelta(seconds=46), sender=_sender())
+        assert after.sent >= 1, after
+        assert _destination_doc() == {"retry_not_before": None, "consecutive_failures": 0}
+    finally:
+        _uninstall()
+
+
+def test_the_default_backoff_doubles_per_consecutive_failure_and_stops_at_the_cap():
+    """No `Retry-After`, so the delay is earned rather than asked for.
+
+    Driven through `notification_auth` directly rather than through five passes: what is under test
+    is the curve and its ceiling, and five delivery passes would spend their assertions on the
+    plumbing between them. The pass's own contribution -- that it writes ONCE per destination per
+    pass whatever a hung endpoint does to eight workers -- is the test below.
+    """
+    _install()
+    try:
+        base = notification_auth.BACKOFF_BASE_S
+        cap = notification_store.RETRY_AFTER_CAP_S
+        # And the two statuses the curve is FOR really are retryable, per the real classifier.
+        for status in (429, 503):
+            assert webhook_sender.classify_status(status)[1] is True, status
+        seen: list[float] = []
+        for i in range(8):
+            record = notification_auth.back_off_destination(DEST, now=NOW)
+            assert record.retry_not_before is not None
+            seen.append((record.retry_not_before - NOW).total_seconds())
+            assert record.consecutive_failures == i + 1
+        assert seen[0] == base, "the first failure waits the base delay, not twice it"
+        assert seen[1] == base * 2 and seen[2] == base * 4
+        assert seen[-1] == cap, "and it stops at the same ceiling a per-delivery retry uses"
+        assert max(seen) <= cap
+
+        # A 2xx clears both fields, and clearing again writes nothing to clear.
+        assert notification_auth.clear_destination_backoff(DEST, now=NOW) is not None
+        assert _destination_doc() == {"retry_not_before": None, "consecutive_failures": 0}
+        assert notification_auth.clear_destination_backoff(DEST, now=NOW) is None, (
+            "nothing to clear must cost no write -- a healthy pass is twenty thousand successes"
+        )
+    finally:
+        _uninstall()
+
+
+def test_one_backoff_write_per_destination_per_pass_however_many_workers_fail_at_once():
+    """Four workers failing against one endpoint are ONE round of failure, not four.
+
+    The pass-local skip alone does not give this. `_Skips.drop` is called AFTER the failure write,
+    so within one pass every worker already in flight fails before any of them has taken the
+    destination out -- and unclaimed, each of those doublings lands. A four-wide pool against a
+    receiver that is merely slow would therefore arrive at the cap on its first bad cycle and leave
+    a destination that recovers in a minute waiting five.
+
+    Concurrency is FORCED rather than hoped for. One shard is one subscription
+    (`_shard_by_subscription`), so four subscriptions are four shards, and the sender parks on a
+    barrier until all four have arrived -- without which the workers interleave and the test passes
+    on whichever ordering the scheduler happened to pick. Counted off `consecutive_failures`, which
+    is what the doubling curve reads.
+    """
+    client = _install()
+    try:
+        for i in range(4):
+            _live(client, subscription_id=f"sub-{i}")
+            _pending(client, 1, subscription_id=f"sub-{i}",
+                     journey_ref=f"DatedServiceJourney:{7000 + i}")
+        gate = threading.Barrier(4, timeout=10)
+        inner = _sender(ok=False, status=503, retryable=True, error="503")
+
+        def meeting(url, **kwargs):
+            try:
+                gate.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return inner(url, **kwargs)
+
+        report = webhook_delivery.deliver_pending(now=NOW, sender=meeting, wait_s=30.0)
+        assert not gate.broken, (
+            "the four attempts must be in flight together; the barrier timed out, so they were "
+            "serialized and this test cannot see the race it exists for"
+        )
+        assert report.retryable == 4, report
+        assert _destination_doc()["consecutive_failures"] == 1, (
+            "one pass, one round of failure -- see `_Skips.claim_backoff`"
+        )
+    finally:
+        _uninstall()
+
+
+def test_a_non_retryable_failure_earns_no_backoff():
+    """A 400 is about the event we sent, not about the host.
+
+    Backing off on it would punish a destination for our own malformed payload, and the payload is
+    the same on the next cycle -- so the delay would grow while the thing that would fix it is a
+    code change. The 410 pause is excluded by the same test and keeps its own path, which is
+    terminal rather than timed.
+    """
+    client = _install()
+    try:
+        _live(client)
+        _pending(client, 1)
+        _ok, retryable, _terminal, _pause = webhook_sender.classify_status(400)
+        assert retryable is False, "a 400 is about the event, so the real classifier must agree"
+        webhook_delivery.deliver_pending(
+            now=NOW,
+            sender=_sender(ok=False, status=400, retryable=False, terminal_state="failed",
+                           error="400"),
+        )
+        assert _destination_doc() == {"retry_not_before": None, "consecutive_failures": 0}
+    finally:
+        _uninstall()
+
+
+def test_the_410_pause_is_unchanged_and_is_not_a_backoff():
+    """R12's pause is terminal and an operator lifts it; U7's backoff lifts itself.
+
+    Pinned together so a later change cannot quietly make one into the other: a paused destination
+    that came back on a timer would resume delivering to an endpoint that told us it is gone.
+    """
+    client = _install()
+    try:
+        _live(client)
+        _pending(client, 1)
+        # The stub's `retryable=False` is what keeps the backoff out of this path, so assert the
+        # REAL classifier agrees -- otherwise this test is a property of its own fixture.
+        _ok, retryable, _terminal, pause = webhook_sender.classify_status(410)
+        assert retryable is False and pause is True, "410 is a pause, never a retry"
+        report = webhook_delivery.deliver_pending(
+            now=NOW,
+            sender=_sender(ok=False, status=410, retryable=False, terminal_state="cancelled",
+                           pause_destination=True, error="410"),
+        )
+        assert report.paused == 1, report
+        record = notification_auth.get_destination(DEST)
+        assert record is not None and record.paused is True
+        assert record.retry_not_before is None and record.consecutive_failures == 0
+        assert record.deliverable is False
+        assert record.ready_to_dial(NOW + timedelta(days=7)) is False, (
+            "a pause must not expire on a clock"
+        )
+    finally:
+        _uninstall()
+
+
+def test_a_backoff_is_not_a_pause_to_anything_that_reads_deliverable():
+    """`deliverable` keeps meaning "in service"; the backoff is a question about a moment.
+
+    Several readers use `deliverable` -- the notification API reports it to a client -- so folding a
+    30 s backoff into it would show a healthy destination as out of service after one 503.
+    """
+    _install()
+    try:
+        record = notification_auth.back_off_destination(DEST, retry_after_s=45.0, now=NOW)
+        assert record.deliverable is True, "a backoff is not a pause"
+        assert record.ready_to_dial(NOW) is False
+        assert record.ready_to_dial(NOW + timedelta(seconds=46)) is True
+    finally:
+        _uninstall()
+
+
+def test_the_concurrency_default_is_the_pools_own_width():
+    """`notification_auth.DEFAULT_CONCURRENT_DELIVERIES` is a literal, and this is why it may be.
+
+    The quota is per worker REPLICA, so its default has to be this pool's width -- but
+    `webhook_delivery` imports `notification_auth` and the reverse edge would be a cycle, so the
+    number is written out there rather than imported. Pinned from this side, which is the side that
+    owns the width: move `_WORKERS` without the default and a client's stated concurrency stops
+    describing what the pool actually does.
+    """
+    assert notification_auth.DEFAULT_CONCURRENT_DELIVERIES == webhook_delivery._WORKERS
+
+
+def test_the_per_destination_attempt_ceiling_reaches_the_store_as_the_clients_quota():
+    """U7: the read asks the client's account, not the module constant.
+
+    Asserted on the ARGUMENT the store is called with rather than on an outcome, because the
+    ceiling's effect lives inside `pending_deliveries` and this module's job is only to answer
+    "whose quota". A resolver that answered the wrong client, or none at all, is what this catches.
+    """
+    seen: list[int] = []
+    real = notification_store.pending_deliveries
+
+    def _pending(*, limit: int, per_destination_limit=None, now=None):
+        assert per_destination_limit is not None, "the resolver must be passed"
+        seen.append(per_destination_limit("client-x"))
+        return real(limit=limit, now=now)
+
+    saved_quotas = notification_auth.quotas_for
+    notification_store.pending_deliveries = _pending  # type: ignore[assignment]
+    notification_auth.quotas_for = lambda client_id: notification_auth.Quotas(  # type: ignore[assignment]
+        deliveries_per_minute=777
+    )
+    try:
+        webhook_delivery.deliver_pending(now=NOW)
+    finally:
+        notification_store.pending_deliveries = real  # type: ignore[assignment]
+        notification_auth.quotas_for = saved_quotas  # type: ignore[assignment]
+    assert seen == [777], seen
+
+
 if __name__ == "__main__":
     _ran = 0
     for name, fn in sorted(globals().items()):

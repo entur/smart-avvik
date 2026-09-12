@@ -51,7 +51,7 @@ reads included, but a transactional COMMIT carries no timeout at all. Both numbe
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -486,6 +486,7 @@ def _emit_one(
     train: notification_store.TrainRef,
     phase: str,
     now: datetime,
+    max_pending: int | None = None,
 ) -> notification_store.EventCommit:
     """One observation, committed. The valid_until note is the only judgement here.
 
@@ -527,7 +528,7 @@ def _emit_one(
         test=bool(subject.test),
     )
     if subject.alertworthy:
-        return notification_store.commit_event(request, now=now)
+        return notification_store.commit_event(request, max_pending=max_pending, now=now)
     return notification_store.record_below_threshold(request, now=now)
 
 
@@ -538,11 +539,24 @@ def _run(
     deadline_s: float,
     worst_case_s: float,
     max_calls: int,
+    pending_quota: Callable[[str], int] | None = None,
 ) -> EmitReport:
     """The emit loop itself, on a worker thread so the caller's wait can bound a hung store call."""
     counts: dict[str, int] = {}
     budget = _EmitBudget(max_calls, monotonic() + deadline_s, worst_case_s)
     standing = _standing(subjects, now)
+    # One lookup per CLIENT per pass, not one per subject. The resolver behind it is a cached
+    # account read, but a pass touches tens of thousands of subjects across a handful of clients and
+    # a cache hit is still a lock acquisition and a dict walk apiece.
+    quotas: dict[str, int | None] = {}
+
+    def _pending_ceiling(client_id: str) -> int | None:
+        if pending_quota is None:
+            return None
+        if client_id not in quotas:
+            quotas[client_id] = pending_quota(client_id)
+        return quotas[client_id]
+
     # Pass-local, and pass-local for the reason KTD6 gives about the delivery skip: a destination at
     # its pending-event ceiling refuses every further emit with the same answer, so asking again for
     # each of a hundred subjects is a hundred wasted aggregation queries -- but a ceiling remembered
@@ -576,7 +590,13 @@ def _run(
             counts["capped"] = counts.get("capped", 0) + 1
             continue
         try:
-            commit = _emit_one(subject, train=train, phase=requested_phase(subject), now=now)
+            commit = _emit_one(
+                subject,
+                train=train,
+                phase=requested_phase(subject),
+                now=now,
+                max_pending=_pending_ceiling(subject.client_id),
+            )
         except notification_store.QuotaExceeded:
             # R21, and visible rather than silent: the store has already logged the breach with its
             # own count. Skipping the rest of this destination's subjects is a cost decision, not a
@@ -635,6 +655,7 @@ def emit(
     wait_s: float = _EMIT_WAIT_S,
     worst_case_s: float = _WORST_CASE_EMIT_S,
     max_calls: int = _MAX_EMITS_PER_CYCLE,
+    pending_quota: Callable[[str], int] | None = None,
 ) -> EmitReport:
     """Commit this cycle's notification events. Never raises for a store problem.
 
@@ -656,6 +677,13 @@ def emit(
     stalled ingestion thread. An abandoned transaction that later commits is a committed event
     nothing delivered this cycle; the next cycle's ``pending_deliveries`` finds it, because the
     pending set is the store's rather than this cycle's.
+
+    ``pending_quota`` answers "how many pending events may this client's destination hold" from a
+    ``client_id``. A CALLABLE handed in rather than a lookup made here, and the reason is the import
+    set this suite pins exactly: the answer lives in ``notification_auth``, which imports
+    ``notification_store`` as this module does, and the edge would make every process that emits
+    also carry the credential machinery. ``None`` keeps the module constant for every client, which
+    is what every test that does not care about quotas gets.
     """
     if not subjects:
         return EmitReport()
@@ -670,6 +698,7 @@ def emit(
             deadline_s=deadline_s,
             worst_case_s=worst_case_s,
             max_calls=max_calls,
+            pending_quota=pending_quota,
         )
         report = future.result(timeout=wait_s)
         timed_out = False

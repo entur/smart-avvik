@@ -62,7 +62,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 import notification_store
@@ -158,6 +158,18 @@ _ACCOUNT_MAX = 1_000
 #: `Retry-After` on a limiter rejection. Bounded, and bounded small: the window is 60 s, so telling
 #: a caller to come back later than that would be a longer outage than the limiter causes.
 RETRY_AFTER_S = 60
+#: Concurrent in-flight POSTs to one destination, per worker replica. The default is
+#: `webhook_delivery._WORKERS` -- stated here as a literal rather than imported, because that module
+#: imports this one and the reverse edge would be a cycle. Pinned to it by
+#: `test_webhook_delivery.test_the_concurrency_default_is_the_pools_own_width`, so the two cannot
+#: drift apart silently.
+DEFAULT_CONCURRENT_DELIVERIES = 4
+#: The first backoff a retryably-failing destination earns when its receiver named no `Retry-After`.
+#: Doubling from here, capped at `notification_store.RETRY_AFTER_CAP_S` (300 s). 30 s is a fraction
+#: of a poller cycle (~296 s), so the FIRST failure costs a destination nothing it was not already
+#: going to lose to the pass-local skip -- what the curve buys is the third and fourth consecutive
+#: cycle against an endpoint that is genuinely down.
+BACKOFF_BASE_S = 30.0
 
 # ---- Per-client quotas ------------------------------------------------------------------------
 #
@@ -168,14 +180,20 @@ RETRY_AFTER_S = 60
 # both, and a constant published in the contract becomes the number a client builds around. The
 # bounds are why the fields are not simply "any positive integer":
 #
-#   max_active_subscriptions  bounded at 10 000 because `notification_store._create_body` COUNTS
-#                             the client's live subscriptions by READING them inside the create
-#                             transaction, up to the ceiling -- a bounded read at 500, and a
-#                             10 000-document read under pessimistic locks on every create at the
-#                             bound. Past it the count has to become a `count()` aggregation over
-#                             an `expires_at` inequality index (the operations document's
-#                             scale-out list), so raising this bound without that work only moves
-#                             the cost onto every create the client makes.
+#   max_active_subscriptions  bounded at 200 000 since U7, which is the number that work was
+#                             waiting on rather than a new judgement. It was 10 000 because
+#                             `notification_store._create_body` COUNTED the client's live
+#                             subscriptions by READING them inside the create transaction, up to
+#                             the ceiling -- a bounded read at 500 and a 10 000-document read under
+#                             pessimistic locks on every create at the bound, which is why the
+#                             comment here said raising it without the aggregation "only moves the
+#                             cost onto every create the client makes". The count is now a
+#                             `count()` over the `expires_at` inequality the `subscription_count`
+#                             spec declares, billed at roughly one read per thousand index entries
+#                             and taking no per-document lock, so the reason for the old bound is
+#                             gone. 200 000 is R1's population with room above it, not a capacity
+#                             measurement: what one client may actually hold is still decided by
+#                             the pass measurements this plan's harness takes.
 #   requests_per_minute       bounded at 10 000. Tier two of KTD8's limiter, spent after
 #                             authentication; tier one (`GLOBAL_PRELOOKUP_PER_MIN`) is unchanged and
 #                             is what bounds the credential lookup an anonymous flood can reach.
@@ -186,10 +204,31 @@ RETRY_AFTER_S = 60
 #                             it there, so the delivery pass needs no second lookup), which means a
 #                             change reaches a subscription the next time the client writes it --
 #                             the idempotent re-PUT included.
+#   max_pending_events        bounded at 10 000. What one DESTINATION may hold undelivered before
+#                             emit refuses it, and the number that stops a backlogged client from
+#                             filling the collection. It was the constant
+#                             `notification_store.MAX_PENDING_EVENTS_PER_DESTINATION` (500), sized
+#                             for a pilot at a few hundred subscriptions; a client at a hundred
+#                             thousand reaches 500 pending events on an ordinary bad morning and
+#                             would be refused for the rest of it.
+#   deliveries_per_minute     bounded at 10 000. Delivery ATTEMPTS one destination may be given in
+#                             one pass. Per minute rather than per pass because a pass is what U11
+#                             takes away: while delivery runs on the poller thread there is at most
+#                             one pass a cycle and a cycle is minutes, so this is a stated upper
+#                             bound the pass cannot exceed rather than a rate anything meters. U11's
+#                             worker makes it literal.
+#   concurrent_deliveries     bounded at 64, and per WORKER REPLICA -- the only quota here that is
+#                             not a property of the client alone, which is why it says so. DECLARED
+#                             AND UNREAD until U8 gives `webhook_sender` a per-host connection pool;
+#                             it is here now so that one `set-quotas` shape serves the whole unit
+#                             rather than changing under a client mid-plan.
 QUOTA_BOUNDS: dict[str, tuple[int, int]] = {
-    "max_active_subscriptions": (1, 10_000),
+    "max_active_subscriptions": (1, 200_000),
     "requests_per_minute": (1, 10_000),
     "daily_cap": (1, 1_000),
+    "max_pending_events": (1, 10_000),
+    "deliveries_per_minute": (1, 10_000),
+    "concurrent_deliveries": (1, 64),
 }
 
 
@@ -200,6 +239,9 @@ class Quotas:
     max_active_subscriptions: int = notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
     requests_per_minute: int = PER_CLIENT_PER_MIN
     daily_cap: int = notification_store.MAX_ALERT_DELIVERIES_PER_DAY
+    max_pending_events: int = notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
+    deliveries_per_minute: int = notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE
+    concurrent_deliveries: int = DEFAULT_CONCURRENT_DELIVERIES
 
     def validate(self) -> None:
         for name, (low, high) in QUOTA_BOUNDS.items():
@@ -760,6 +802,26 @@ def _account_state(client_id: str, now: float) -> tuple[str | None, Quotas]:
     return status, quotas
 
 
+def quotas_for(client_id: str) -> Quotas:
+    """One client's ceilings, off the same cached account lookup a request pays for.
+
+    For the two callers that hold a ``client_id`` and no :class:`Principal`: the emit pass and the
+    delivery pass, neither of which runs on a request. It shares :data:`_accounts` with
+    :func:`authenticate`, so a busy client's quotas are read once per :data:`_ACCOUNT_TTL_S` across
+    both paths rather than once per event -- which is what makes a per-client ceiling affordable
+    inside a pass that touches tens of thousands of them.
+
+    A client with no account reads the DEFAULTS rather than raising. That is the same direction
+    :func:`_quotas_from_doc` fails in and for the same reason: these are ceilings on work we are
+    already doing for a subscription that exists, so an unreadable account must not decide that the
+    work is unbounded, and it must not decide that it is forbidden either -- authentication is what
+    answers "may this client be here at all", and it answered that before the subscription was
+    written.
+    """
+    _status, quotas = _account_state(client_id, _monotonic())
+    return quotas
+
+
 # The store's own coercion, not a copy of it: both modules read documents the same three writers
 # produce (the client's ``DatetimeWithNanoseconds``, a plain possibly-naive ``datetime``, an ISO-8601
 # string from a hand-repaired document), and a second implementation was a second place for those
@@ -996,6 +1058,9 @@ def set_client_quotas(
     max_active_subscriptions: int | None = None,
     requests_per_minute: int | None = None,
     daily_cap: int | None = None,
+    max_pending_events: int | None = None,
+    deliveries_per_minute: int | None = None,
+    concurrent_deliveries: int | None = None,
     now: datetime | None = None,
 ) -> Account:
     """Raise or lower one client's ceilings; unnamed ones keep their value.
@@ -1024,6 +1089,9 @@ def set_client_quotas(
             ("max_active_subscriptions", max_active_subscriptions),
             ("requests_per_minute", requests_per_minute),
             ("daily_cap", daily_cap),
+            ("max_pending_events", max_pending_events),
+            ("deliveries_per_minute", deliveries_per_minute),
+            ("concurrent_deliveries", concurrent_deliveries),
         )
         if value is not None
     }
@@ -1207,6 +1275,13 @@ class Destination:
     updated_at: datetime | None
     paused_at: datetime | None = None
     paused_reason: str | None = None
+    #: U7's backoff. NOT a pause: a pause is R12's terminal state and an operator lifts it, while
+    #: this is a stretch of seconds a failing endpoint asked for (`Retry-After`) or earned (a
+    #: doubling default), and it lifts itself. Deliberately outside :attr:`deliverable`, which
+    #: several readers use to mean "is this destination in service"; the delivery pass asks
+    #: :meth:`ready_to_dial` instead, which is a question about a moment.
+    retry_not_before: datetime | None = None
+    consecutive_failures: int = 0
 
     @property
     def signing_generations(self) -> tuple[int, ...]:
@@ -1219,6 +1294,18 @@ class Destination:
     def deliverable(self) -> bool:
         """Whether U6 may attempt this destination at all: active, and not paused."""
         return self.status == _DESTINATION_ACTIVE and not self.paused
+
+    def ready_to_dial(self, now: datetime) -> bool:
+        """Deliverable, and not inside a backoff window this instant.
+
+        Two questions rather than one, because they have different answers for an operator:
+        `deliverable == False` is "somebody must resume this", and this is "it will come back by
+        itself". Folding the backoff into `deliverable` would make the notification API report a
+        healthy destination as out of service for a minute after one 503.
+        """
+        if not self.deliverable:
+            return False
+        return self.retry_not_before is None or self.retry_not_before <= now
 
 
 def _destination_from_doc(doc: Mapping[str, Any]) -> Destination:
@@ -1242,6 +1329,10 @@ def _destination_from_doc(doc: Mapping[str, Any]) -> Destination:
         updated_at=_as_dt(doc.get("updated_at")),
         paused_at=_as_dt(doc.get("paused_at")),
         paused_reason=doc.get("paused_reason") or None,
+        retry_not_before=_as_dt(doc.get("retry_not_before")),
+        # Absent reads as ZERO, so a destination written before the field existed starts its first
+        # backoff at the base delay rather than somewhere up the doubling curve.
+        consecutive_failures=int(doc.get("consecutive_failures") or 0),
     )
 
 
@@ -1498,6 +1589,83 @@ def pause_destination(
     return _destination_from_doc({**stored, **patch})
 
 
+def back_off_destination(
+    destination_id: str,
+    *,
+    retry_after_s: float | None = None,
+    now: datetime | None = None,
+) -> Destination:
+    """A destination that just failed retryably is not dialled again until this instant.
+
+    **Durable, where the pass-local skip is not.** ``webhook_delivery._Skips`` takes a destination
+    out for the rest of a pass on its first failure, which is what stops N pending events against
+    one hung endpoint costing N read timeouts on the poller's thread. It cannot survive the pass,
+    deliberately -- KTD6 names that as the reason it is not a swept module-level ledger, since one
+    failure would otherwise pause a destination permanently and be indistinguishable from R12's 410.
+    What it therefore cannot do is honour a receiver that says *how long* to wait: a 429 with
+    ``Retry-After: 45`` is answered by attempting again on the next cycle, which may be sooner.
+
+    So the two sit side by side and answer different questions. The delay is the receiver's when it
+    named one and a doubling default otherwise -- :data:`BACKOFF_BASE_S` shifted by the consecutive
+    failure count -- and both are capped at ``notification_store.RETRY_AFTER_CAP_S``, the same
+    ceiling the per-delivery ``retry_not_before`` already uses. Capped for the reason that one is:
+    an event's own validity is an hour, so a backoff longer than the cap would expire the backlog it
+    is protecting rather than delaying it.
+
+    Not audited, unlike :func:`pause_destination`. A pause is a state an operator has to lift and a
+    silent destination they need explaining; this clears itself within minutes, and a busy morning
+    against a flaky receiver would write an audit row per cycle per destination into a collection
+    that never expires.
+
+    **A named ``Retry-After`` still advances the count**, and the consequence is worth stating
+    rather than discovering: a receiver that asks for 45 s three times and then fails with a bare
+    503 is backed off at the fourth step of the curve, not the first. That is the intended reading
+    -- the count means consecutive failures, and a 429 is a failure -- but it means the curve
+    describes the destination's recent history rather than only its unasked-for failures.
+    """
+    instant = now or _now()
+    stored = _store().get(DESTINATIONS, destination_id)
+    if not stored:
+        raise NotFound("no such destination")
+    consecutive = int(stored.get("consecutive_failures") or 0) + 1
+    if retry_after_s is not None and retry_after_s > 0:
+        delay = float(retry_after_s)
+    else:
+        # Doubling, from the count AFTER this failure: the first failure waits the base delay.
+        # Shift-bounded before the float multiply so a destination that somehow accumulated a large
+        # count cannot build an overflowing number on the way to being capped.
+        delay = float(BACKOFF_BASE_S) * float(2 ** min(consecutive - 1, 16))
+    delay = min(delay, float(notification_store.RETRY_AFTER_CAP_S))
+    patch = {
+        "retry_not_before": instant + timedelta(seconds=delay),
+        "consecutive_failures": consecutive,
+        "updated_at": instant,
+    }
+    _store().update(DESTINATIONS, destination_id, patch)
+    return _destination_from_doc({**stored, **patch})
+
+
+def clear_destination_backoff(
+    destination_id: str, *, now: datetime | None = None
+) -> Destination | None:
+    """A destination answered 2xx: drop its backoff and its failure count.
+
+    ``None`` when there was nothing to clear, so the caller can make this cost a write only on
+    RECOVERY rather than on every successful delivery -- twenty thousand POSTs to a healthy endpoint
+    must not be twenty thousand writes to one document, which is also a hot-document contention
+    problem and not only a bill.
+    """
+    instant = now or _now()
+    stored = _store().get(DESTINATIONS, destination_id)
+    if not stored:
+        return None
+    if not stored.get("consecutive_failures") and not stored.get("retry_not_before"):
+        return None
+    patch = {"retry_not_before": None, "consecutive_failures": 0, "updated_at": instant}
+    _store().update(DESTINATIONS, destination_id, patch)
+    return _destination_from_doc({**stored, **patch})
+
+
 def resume_destination(
     destination_id: str, *, actor: str, now: datetime | None = None
 ) -> Destination:
@@ -1584,7 +1752,9 @@ def retire_signing_generation(
 __all__ = [
     "ACCOUNTS",
     "ADMIN_AUDIT",
+    "BACKOFF_BASE_S",
     "CREDENTIALS",
+    "DEFAULT_CONCURRENT_DELIVERIES",
     "DEFAULT_QUOTAS",
     "DESTINATIONS",
     "GLOBAL_PRELOOKUP_PER_MIN",
@@ -1611,9 +1781,11 @@ __all__ = [
     "amend_destination",
     "authenticate",
     "available",
+    "back_off_destination",
     "bearer_credential",
     "claim_client_slot",
     "claim_window",
+    "clear_destination_backoff",
     "configure",
     "create_client",
     "create_destination",
@@ -1626,6 +1798,7 @@ __all__ = [
     "mint_credential",
     "pause_destination",
     "pepper_ready",
+    "quotas_for",
     "record_admin_action",
     "reset_for_tests",
     "reset_limiters",

@@ -178,6 +178,11 @@ class DeliveryReport:
     gone: int = 0
     not_deliverable: int = 0
     paused: int = 0
+    #: Attempts not made because the destination is inside U7's durable backoff. Its own counter and
+    #: not folded into `skipped`, because the two are different operator answers: `skipped` is "a
+    #: sibling attempt in this pass took it out", this is "we are waiting exactly as long as the
+    #: receiver asked". A cycle that is all `backed_off` is the system behaving.
+    backed_off: int = 0
     skipped: int = 0
     skipped_destinations: int = 0
     store_errors: int = 0
@@ -216,6 +221,8 @@ class _Skips:
         self._lock = threading.Lock()
         self._out: set[str] = set()
         self._paused: set[str] = set()
+        self._backed_off: set[str] = set()
+        self._recovered: set[str] = set()
         self._records: dict[str, notification_auth.Destination | None] = {}
 
     def is_out(self, destination_id: str) -> bool:
@@ -244,6 +251,36 @@ class _Skips:
     def paused_count(self) -> int:
         with self._lock:
             return len(self._paused)
+
+    def claim_backoff(self, destination_id: str) -> bool:
+        """First failure for this destination in this pass? Then it writes the backoff.
+
+        A SET for `pause_recorded`'s reason one layer along: the durable backoff is per destination
+        and per failure, not per attempt, and several workers can be inside one destination's
+        failures at the same instant. Without the claim a hung endpoint holding eight workers writes
+        eight times to one document and doubles the delay eight times for what is one round of
+        failure -- turning a 30 s first backoff into an immediate cap.
+        """
+        with self._lock:
+            if destination_id in self._backed_off:
+                return False
+            self._backed_off.add(destination_id)
+            return True
+
+    def claim_recovery(self, destination_id: str) -> bool:
+        """First success for a destination whose CACHED record carried a backoff.
+
+        The read is pass-local and the write is therefore at most one per destination per pass,
+        which is the whole point: twenty thousand POSTs to a healthy endpoint must not be twenty
+        thousand writes to its document. A destination with nothing to clear never reaches here --
+        the caller tests the cached record first -- so the ordinary healthy pass writes nothing at
+        all.
+        """
+        with self._lock:
+            if destination_id in self._recovered:
+                return False
+            self._recovered.add(destination_id)
+            return True
 
     def destination(self, destination_id: str) -> notification_auth.Destination | None:
         """The destination record, read at most once per pass.
@@ -389,6 +426,14 @@ def _attempt(
         # resume, and writing a terminal state here would throw the event away on their behalf.
         skips.drop(delivery.destination_id)
         return "not_deliverable"
+    if not destination.ready_to_dial(now):
+        # U7's durable backoff: this destination failed retryably on an earlier pass and asked for,
+        # or earned, a stretch of seconds. Its own outcome rather than `skipped`, because `skipped`
+        # means "a sibling attempt in THIS pass took it out" and an operator reading a cycle where
+        # nothing was attempted needs to tell "we are waiting as asked" from "it broke just now".
+        # The delivery stays `pending` and is re-offered next cycle exactly as a skip is.
+        skips.drop(delivery.destination_id)
+        return "backed_off"
     claim = _store_step(
         "claim", delivery, lambda: notification_store.claim_delivery(delivery.delivery_id, now=now)
     )
@@ -470,6 +515,24 @@ def _attempt(
         )
         if outcome is None:
             return "store_errors"
+        # RECOVERY, and it costs a write only when there is something to clear. The test is on the
+        # pass-local CACHED record, so a healthy destination -- the ordinary case, and the one that
+        # carries twenty thousand POSTs -- never reaches the store at all here.
+        if (
+            destination.consecutive_failures or destination.retry_not_before is not None
+        ) and skips.claim_recovery(delivery.destination_id):
+            try:
+                notification_auth.clear_destination_backoff(delivery.destination_id, now=now)
+            except Exception:
+                # Never a delivery outcome: the event went out. A backoff that outlives its cause
+                # costs at most one cycle's attempts against a destination that is demonstrably
+                # healthy, and the next success clears it.
+                logger.warning(
+                    "Could not clear a recovered destination's backoff; it lapses on its own",
+                    exc_info=True,
+                    extra={"fields": {"event": "webhook_delivery", "result": "backoff_clear_failed",
+                                      "destination_id": delivery.destination_id}},
+                )
         # The write is idempotent and says so. A late arrival from a thread the previous cycle
         # abandoned found the delivery already resolved, wrote nothing, and spent no slot -- so it
         # is not a send, however successful the HTTP call it just made was. See `DeliveryReport`.
@@ -513,6 +576,26 @@ def _attempt(
     # tidiness: `http.client`'s read timeout is per-recv, so N pending events against one hung
     # endpoint is N multiples of it on the poller's own thread.
     skips.drop(delivery.destination_id)
+    # And, since U7, out for a stretch that OUTLIVES the pass. Only a retryable failure -- a 400 is
+    # about the event we sent and says nothing about the host, and a 410 is R12's pause, which is
+    # terminal and not a delay. `claim_backoff` makes this one write per destination per pass, or a
+    # hung endpoint holding eight workers would double the delay eight times for one round of
+    # failure and reach the cap immediately.
+    if attempt.retryable and skips.claim_backoff(delivery.destination_id):
+        try:
+            notification_auth.back_off_destination(
+                delivery.destination_id, retry_after_s=attempt.retry_after_s, now=now
+            )
+        except Exception:
+            # Not a delivery outcome either: the per-delivery `retry_not_before` the store just
+            # wrote still holds, and the pass-local skip still holds. What is lost is only the part
+            # that survives the pass.
+            logger.warning(
+                "Could not record a destination's backoff; only this pass's skip applies",
+                exc_info=True,
+                extra={"fields": {"event": "webhook_delivery", "result": "backoff_write_failed",
+                                  "destination_id": delivery.destination_id}},
+            )
     # The endpoint really did misbehave, so the destination is out for the rest of the cycle either
     # way -- but `retryable` would be a false promise for a record another pass has already
     # resolved: nothing was written and nothing will be retried. This is the failure half of the
@@ -754,7 +837,17 @@ def deliver_pending(
         max_attempts, started + deadline_s, _worst_case_s(timeout_s, store_call_s)
     )
     try:
-        pending = notification_store.pending_deliveries(limit=max_attempts, now=instant)
+        pending = notification_store.pending_deliveries(
+            limit=max_attempts,
+            # The per-destination attempt ceiling is the CLIENT's quota since U7, so a client at a
+            # hundred thousand subscriptions is not bounded by the number a pilot at a few hundred
+            # was sized with. Resolved here because the store must not import `notification_auth`;
+            # this module already does, for the destination record and R12's pause.
+            per_destination_limit=lambda client_id: notification_auth.quotas_for(
+                client_id
+            ).deliveries_per_minute,
+            now=instant,
+        )
     except Exception:
         logger.warning(
             "Could not read the pending webhook deliveries this cycle; nothing was attempted",
@@ -847,6 +940,7 @@ def deliver_pending(
         gone=counts.get("gone"),
         not_deliverable=counts.get("not_deliverable"),
         paused=skips.paused_count(),
+        backed_off=counts.get("backed_off"),
         skipped=counts.get("skipped"),
         skipped_destinations=skips.count(),
         store_errors=counts.get("store_errors"),
@@ -883,6 +977,7 @@ def deliver_pending(
                 "deadline": report.deadline,
                 "not_deliverable": report.not_deliverable,
                 "paused": report.paused,
+                "backed_off": report.backed_off,
                 "skipped": report.skipped,
                 "skipped_destinations": report.skipped_destinations,
                 "store_errors": report.store_errors,

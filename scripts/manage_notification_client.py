@@ -386,6 +386,9 @@ def _quotas_from_args(args: argparse.Namespace) -> dict[str, int]:
             ("max_active_subscriptions", args.max_active_subscriptions),
             ("requests_per_minute", args.requests_per_minute),
             ("daily_cap", args.daily_cap),
+            ("max_pending_events", args.max_pending_events),
+            ("deliveries_per_minute", args.deliveries_per_minute),
+            ("concurrent_deliveries", args.concurrent_deliveries),
         )
         if value is not None
     }
@@ -587,8 +590,8 @@ def _parser() -> argparse.ArgumentParser:
             default=None,
             help=f"Active subscriptions this client may hold (default "
             f"{defaults.max_active_subscriptions}, at most "
-            f"{bounds['max_active_subscriptions'][1]} -- above that the create transaction's "
-            "count read needs the aggregation the operations document describes).",
+            f"{bounds['max_active_subscriptions'][1]}). The create transaction counts through an "
+            "aggregation, so the bound is a population judgement rather than a read-cost one.",
         )
         p.add_argument(
             "--requests-per-minute",
@@ -604,6 +607,31 @@ def _parser() -> argparse.ArgumentParser:
             help=f"Alert deliveries per subscription per Oslo day (default {defaults.daily_cap}, "
             f"at most {bounds['daily_cap'][1]}). Copied onto each subscription when the client "
             "writes it, so a change reaches existing subscriptions on their next PUT.",
+        )
+        p.add_argument(
+            "--max-pending-events",
+            type=int,
+            default=None,
+            help=f"Undelivered events one destination may hold before emit refuses it (default "
+            f"{defaults.max_pending_events}, at most {bounds['max_pending_events'][1]}).",
+        )
+        p.add_argument(
+            "--deliveries-per-minute",
+            type=int,
+            default=None,
+            help=f"Delivery attempts one destination may be given in a pass (default "
+            f"{defaults.deliveries_per_minute}, at most {bounds['deliveries_per_minute'][1]}). "
+            "Per minute rather than per pass because a pass is what the delivery worker takes "
+            "away; while delivery runs on the poller thread this is an upper bound it cannot "
+            "exceed.",
+        )
+        p.add_argument(
+            "--concurrent-deliveries",
+            type=int,
+            default=None,
+            help=f"In-flight POSTs to one destination per worker replica (default "
+            f"{defaults.concurrent_deliveries}, at most {bounds['concurrent_deliveries'][1]}). "
+            "Declared and not yet read: the pooled sender that spends it is U8.",
         )
 
     p = add(

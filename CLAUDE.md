@@ -816,6 +816,64 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   earlier and U6 removes it: the destroy is free (nothing queries it), but it is worth knowing the
   plan's own sequencing produced it.
 
+  **Every per-client ceiling is the CLIENT's, and the create count is an aggregation** (U7,
+  2026-09-13). `_create_body` counted a client's live subscriptions by READING them inside the
+  create transaction, up to the ceiling — bounded, paid on a create, which a commuter does once, and
+  the stated reason `QUOTA_BOUNDS` capped `max_active_subscriptions` at 10 000. At 200 000 "bounded"
+  stops meaning "affordable". It is now a `count()` over the `expires_at > now` inequality the
+  `subscription_count` spec declares, and that inequality needed **no new index**: the query already
+  ordered by `expires_at DESCENDING`, and Firestore's rule is that a range filter's field must lead
+  the ordering, so `index_fields` is unchanged and the unit's terraform plan is empty — the
+  operations document predicted an index and was wrong. Two properties to know. The count is a
+  **superset of live, never a subset**: `expires_at` is the minimum of R5's two horizons, so every
+  live row is inside it, while a row whose stored value drifted ahead of a horizon is counted
+  although `subscription_is_live` would reject it — so it reads high, never low, and high REFUSES a
+  create, which is the direction a ceiling must fail in. And there is deliberately **no stream
+  fallback**, unlike `_count_destination_deliveries`, which keeps one because it is the same answer
+  at a worse price: at this ceiling a silent fallback is a 200 000-document read under pessimistic
+  locks on every create, so a `FailedPrecondition` nobody can miss is the better failure. One thing
+  moved with the bound that is not the ceiling — `list_subscriptions` bounded its liveness-skipping
+  scan by the client's ceiling too, so the raise would have turned a `?limit=1` request over a
+  collection full of undeleted rows into a 200 000-document read; that scan is capped separately at
+  `MAX_SUBSCRIPTION_LIST_SCAN` (10 000, the old bound), so the listing's worst case did not move.
+  Three more quotas joined `Quotas`: `max_pending_events` and `deliveries_per_minute` (the two
+  per-destination constants, which stay in the published-numbers table as DEFAULTS — the plan said
+  to remove the rows, and keeping them keeps the only guard that notices a constant moving) and
+  `concurrent_deliveries`, **declared and deliberately unread until U8**, with a test asserting it
+  is still unread so it cannot become decoration. All three are resolved by the CALLER and never by
+  the store: `notification_store` must not import `notification_auth`, and `notification_events`
+  pins its import set exactly, so `commit_event` takes `max_pending`, `pending_deliveries` takes a
+  `per_destination_limit` resolver, `emit` takes a `pending_quota` resolver, and `main` and
+  `webhook_delivery` — which already import both — do the lookups through the new
+  `notification_auth.quotas_for`, off the same cached account read `authenticate` pays for and
+  memoised once per client per pass. The delivery counter stays per DESTINATION while the ceiling
+  comes from the client, so one bad endpoint cannot eat its sibling's allowance.
+  **A retryable failure now backs the destination off DURABLY**, beside the pass-local skip rather
+  than instead of it. The skip is what stops N pending events against one hung endpoint costing N
+  read timeouts on the poller's thread and it cannot outlive the pass — so it could not honour a
+  receiver that says *how long*: a 429 with `Retry-After: 45` was answered by attempting again on
+  the next cycle, which may be sooner. `back_off_destination` writes `retry_not_before` and a
+  `consecutive_failures` count: the receiver's delay when it named one, otherwise `BACKOFF_BASE_S`
+  (30 s) doubled per consecutive failure, both capped at `RETRY_AFTER_CAP_S` (300 s) — an event's
+  validity is an hour, so a longer backoff would expire the backlog it protects. Four things about
+  it, each silent if taken the other way. It is **not a pause**: `deliverable` keeps meaning "in
+  service" because the notification API reports it to a client, and the delivery path asks
+  `ready_to_dial(now)` instead. Only a **retryable** failure earns one — a 400 is about the event we
+  sent, and a 410 keeps R12's terminal pause, which no clock lifts (the two are pinned together, or
+  a pause that expired on a timer would resume delivering to an endpoint that said it is gone; the
+  tests assert `webhook_sender.classify_status` itself rather than the stub that stands in for it).
+  A named `Retry-After` still advances the failure count, so a receiver that asks for 45 s three
+  times and then fails bare is backed off at the fourth step of the curve — intended, since the
+  count means consecutive failures, but it makes the curve describe recent history rather than only
+  unasked-for failures. It is
+  written **once per destination per pass**, because `_Skips.drop` runs AFTER the failure write and
+  every worker already in flight fails before it lands — unclaimed, a four-wide pool against a merely
+  slow receiver doubles four times and hits the cap on its first bad cycle. And it is **cleared on
+  the first success that has something to clear**, tested against the pass's cached record, so a
+  healthy endpoint carrying twenty thousand POSTs writes to its destination document zero times.
+  `backed_off` is its own counter on `webhook_delivery_round`, never folded into `skipped`: "a
+  sibling attempt took it out" and "we are waiting exactly as asked" are different operator answers.
+
   **The R16 prompt-record claim has two halves and only one is closed**, published rather than
   asserted away. A **webhook-only** definition — one absent from `by_journey_key`, which stays
   browser-only for exactly this — is written for through `notification_wording.WEBHOOK`, which
