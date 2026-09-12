@@ -1326,8 +1326,12 @@ def _run_all() -> None:
 
 
 def test_quotas_default_to_the_pilot_constants_and_ride_on_the_principal():
-    """A new account carries the three quota fields at the module defaults, and `authenticate`
-    hands them to the router on the Principal for the price of the account read it already pays."""
+    """A new account carries every quota field at the module defaults, and `authenticate` hands
+    them to the router on the Principal for the price of the account read it already pays.
+
+    Iterated over `QUOTA_BOUNDS` rather than written out, so a field added to the dataclass without
+    a default reaching the stored document fails here -- the shape U7 added three fields through.
+    """
     store = _install()
     bearer = _provision(store)
     try:
@@ -1340,6 +1344,11 @@ def test_quotas_default_to_the_pilot_constants_and_ride_on_the_principal():
         )
         assert stored["requests_per_minute"] == notification_auth.PER_CLIENT_PER_MIN
         assert stored["daily_cap"] == notification_store.MAX_ALERT_DELIVERIES_PER_DAY
+        for name in notification_auth.QUOTA_BOUNDS:
+            assert stored.get(name) == getattr(notification_auth.DEFAULT_QUOTAS, name), (
+                f"{name} must be seeded onto a new account, or a client reads a default the "
+                "operator tool cannot see and `show-client` under-reports what is in force"
+            )
         reads = store.reads
         principal = notification_auth.authenticate(f"Bearer {bearer}")
         assert principal.quotas == notification_auth.DEFAULT_QUOTAS
@@ -1448,6 +1457,59 @@ def test_quota_values_outside_their_bounds_are_refused_and_bad_stored_values_rea
             raise AssertionError("the third call against a limit of two must be refused")
     finally:
         _uninstall()
+
+
+def test_quotas_for_answers_off_the_same_cached_account_read():
+    """The emit and delivery passes hold a `client_id` and no Principal (U7).
+
+    Two properties. It shares the account cache with `authenticate`, so a pass that asks about a
+    busy client costs nothing beyond the read a request already paid for -- which is what makes a
+    per-client ceiling affordable inside a loop over tens of thousands of subjects. And an unknown
+    client reads the DEFAULTS rather than raising: these are ceilings on work already owed to a
+    subscription that exists, so an unreadable account must decide neither that the work is
+    unbounded nor that it is forbidden.
+    """
+    store = _install()
+    bearer = _provision(store)
+    try:
+        notification_auth.set_client_quotas(
+            CLIENT, actor="op@entur.org", max_pending_events=4_321
+        )
+        assert notification_auth.quotas_for(CLIENT).max_pending_events == 4_321
+        reads = store.reads
+        assert notification_auth.quotas_for(CLIENT).max_pending_events == 4_321
+        assert store.reads == reads, "the second answer must come from the cache"
+        # And the request path shares it: authenticating now costs the credential read only.
+        principal = notification_auth.authenticate(f"Bearer {bearer}")
+        assert principal.quotas.max_pending_events == 4_321
+        assert store.reads - reads == 1, "the account read was already paid for"
+        assert notification_auth.quotas_for("nobody") == notification_auth.DEFAULT_QUOTAS
+        assert notification_auth.quotas_for("") == notification_auth.DEFAULT_QUOTAS
+    finally:
+        _uninstall()
+
+
+def test_the_three_delivery_quotas_are_bounded_and_seeded_from_the_constants():
+    """U7's new fields, each with the constant it defaults to.
+
+    `concurrent_deliveries` is the one that is DECLARED AND UNREAD until U8 gives `webhook_sender`
+    its per-host pool. It is here now so one `set-quotas` shape serves the whole unit rather than
+    changing under a client mid-plan -- and asserting it exists is what stops it being quietly
+    dropped before the code that spends it arrives.
+    """
+    defaults = notification_auth.DEFAULT_QUOTAS
+    assert defaults.max_pending_events == notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
+    assert defaults.deliveries_per_minute == (
+        notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE
+    )
+    assert defaults.concurrent_deliveries == notification_auth.DEFAULT_CONCURRENT_DELIVERIES
+    for name in ("max_pending_events", "deliveries_per_minute", "concurrent_deliveries"):
+        low, high = notification_auth.QUOTA_BOUNDS[name]
+        assert low == 1 and high >= getattr(defaults, name), name
+    delivery_source = (HERE / "webhook_delivery.py").read_text()
+    assert "concurrent_deliveries" not in delivery_source, (
+        "still unread -- the pooled sender that spends it is U8"
+    )
 
 
 def test_the_tool_sets_quotas_and_create_client_takes_them_for_a_new_account():

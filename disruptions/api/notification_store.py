@@ -2971,7 +2971,9 @@ def _emit_body(
     )
 
 
-def commit_event(request: EmitRequest, *, now: datetime | None = None) -> EventCommit:
+def commit_event(
+    request: EmitRequest, *, max_pending: int | None = None, now: datetime | None = None
+) -> EventCommit:
     """Record one observation about one train, minting a revision only on a lifecycle transition.
 
     The pending set is read from Firestore, never re-derived from a cycle's decisions: a
@@ -2983,19 +2985,27 @@ def commit_event(request: EmitRequest, *, now: datetime | None = None) -> EventC
     than best effort, and the reason is nameable instead of hoped for: the emit path has exactly one
     writer (one poller thread, no route invokes the pass, one replica under the Recreate strategy),
     so nothing can create a pending event between the count and the commit.
+
+    ``max_pending`` is the CLIENT's (``notification_auth.Quotas.max_pending_events``); ``None``
+    means the module constant, resolved here at call time exactly as ``max_active`` is on the create
+    path. It is the caller's to look up rather than this module's, because the store must not import
+    ``notification_auth`` -- that edge already runs the other way.
     """
     if request.phase not in PHASES:
         raise Conflict(f"phase must be one of {PHASES}, not {request.phase!r}")
     instant = now or _now()
     seed = revision_seed(instant)
     refs = _Refs(_firestore_client())
-    pending = _count_destination_deliveries(request.destination_id, state="pending")
-    if pending >= MAX_PENDING_EVENTS_PER_DESTINATION:
+    ceiling = MAX_PENDING_EVENTS_PER_DESTINATION if max_pending is None else max_pending
+    pending = _count_destination_deliveries(
+        request.destination_id, state="pending", ceiling=ceiling
+    )
+    if pending >= ceiling:
         logger.warning(
             "Destination %s holds %d pending events; refusing to emit (ceiling %d)",
             request.destination_id,
             pending,
-            MAX_PENDING_EVENTS_PER_DESTINATION,
+            ceiling,
             extra={
                 "fields": {
                     "event": "notification_quota",
@@ -3006,8 +3016,7 @@ def commit_event(request: EmitRequest, *, now: datetime | None = None) -> EventC
             },
         )
         raise QuotaExceeded(
-            f"destination holds {pending} pending events "
-            f"(ceiling {MAX_PENDING_EVENTS_PER_DESTINATION})"
+            f"destination holds {pending} pending events (ceiling {ceiling})"
         )
     commit = _run_transaction(
         lambda txn: _emit_body(txn, refs, request=request, now=instant, seed=seed)
@@ -3507,7 +3516,7 @@ def empty_alert_snapshot(subscription_id: str, *, now: datetime | None = None) -
     )
 
 
-def _count_destination_deliveries(destination_id: str, *, state: str) -> int:
+def _count_destination_deliveries(destination_id: str, *, state: str, ceiling: int) -> int:
     """How many deliveries this destination holds in ``state``, bounded by the ceiling + 1.
 
     Bounded because the question is only ever "are we at the ceiling", so one document past it
@@ -3526,7 +3535,7 @@ def _count_destination_deliveries(destination_id: str, *, state: str) -> int:
     query = _query(
         "destination_deliveries_in_state",
         equality={"destination_id": destination_id, "state": state},
-        limit=MAX_PENDING_EVENTS_PER_DESTINATION + 1,
+        limit=ceiling + 1,
     )
     try:
         result = query.count(alias="n").get(timeout=_CALL_DEADLINE_S)
@@ -3606,7 +3615,10 @@ class PendingDeliveries:
 
 
 def pending_deliveries(
-    *, limit: int = MAX_DELIVERY_ATTEMPTS_PER_CYCLE, now: datetime | None = None
+    *,
+    limit: int = MAX_DELIVERY_ATTEMPTS_PER_CYCLE,
+    per_destination_limit: Callable[[str], int] | None = None,
+    now: datetime | None = None,
 ) -> PendingDeliveries:
     """What to attempt this cycle, soonest-departure-first.
 
@@ -3626,9 +3638,27 @@ def pending_deliveries(
     So when the page is full and the attempt set is not, the next page is read from a cursor,
     bounded by ``MAX_DELIVERY_SCAN_PER_CYCLE``. The per-destination ceiling is spent within each
     page soonest-departure-first, which is what the single-page version did.
+
+    ``per_destination_limit`` answers that ceiling from the delivery's own CLIENT_ID
+    (``notification_auth.Quotas.deliveries_per_minute``); ``None`` means the module constant for
+    every destination. Resolved by the caller rather than here for `commit_event`'s reason -- the
+    store must not import ``notification_auth`` -- and keyed on the client rather than the
+    destination because a quota is a property of an account and a client may hold several
+    destinations, each of which still spends its own ceiling.
     """
     instant = now or _now()
     ceiling = min(limit, MAX_DELIVERY_ATTEMPTS_PER_CYCLE)
+    per_client: dict[str, int] = {}
+
+    def _destination_ceiling(client_id: str) -> int:
+        if per_destination_limit is None:
+            return MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE
+        # Memoised for the pass: a page can hold hundreds of deliveries for one client, and the
+        # lookup behind this is a cached account read rather than a free one.
+        if client_id not in per_client:
+            per_client[client_id] = per_destination_limit(client_id)
+        return per_client[client_id]
+
     ready: list[Delivery] = []
     stale: list[str] = []
     per_destination: dict[str, int] = {}
@@ -3676,7 +3706,7 @@ def pending_deliveries(
             if len(ready) >= ceiling:
                 break
             spent = per_destination.get(delivery.destination_id, 0)
-            if spent >= MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE:
+            if spent >= _destination_ceiling(delivery.client_id):
                 throttled.add(delivery.destination_id)
                 continue
             per_destination[delivery.destination_id] = spent + 1

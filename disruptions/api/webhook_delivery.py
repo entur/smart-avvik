@@ -754,7 +754,17 @@ def deliver_pending(
         max_attempts, started + deadline_s, _worst_case_s(timeout_s, store_call_s)
     )
     try:
-        pending = notification_store.pending_deliveries(limit=max_attempts, now=instant)
+        pending = notification_store.pending_deliveries(
+            limit=max_attempts,
+            # The per-destination attempt ceiling is the CLIENT's quota since U7, so a client at a
+            # hundred thousand subscriptions is not bounded by the number a pilot at a few hundred
+            # was sized with. Resolved here because the store must not import `notification_auth`;
+            # this module already does, for the destination record and R12's pause.
+            per_destination_limit=lambda client_id: notification_auth.quotas_for(
+                client_id
+            ).deliveries_per_minute,
+            now=instant,
+        )
     except Exception:
         logger.warning(
             "Could not read the pending webhook deliveries this cycle; nothing was attempted",

@@ -811,14 +811,26 @@ Every number this feature publishes, beside the constant that defines it.
 module, so a constant that moves without this document moving fails the build — which is what turns
 R19's clause-by-clause check from a one-off reading into something that keeps holding.
 
-Three of these are **defaults** rather than ceilings since 2026-09-09: `MAX_ALERT_DELIVERIES_PER_DAY`,
-`MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` and `PER_CLIENT_PER_MIN` seed a new client's own values
-(`notification_auth.Quotas`, stored on the `clients` document, changed with `set-quotas`, bounded by
-`notification_auth.QUOTA_BOUNDS` at 1 000 / 200 000 / 10 000 — the middle one was 10 000 until U7
-moved the create-time ceiling onto an aggregation, which is what it was waiting for; see item 5 of
-"Scaling beyond the pilot"). The table states the default; a client's
-effective values are on its account. The daily cap is also copied onto each subscription document
-(`daily_cap`) at create, replace and touch, which is where `cap_remaining` reads it.
+**Five of these are defaults rather than ceilings**, and a sixth quota has no constant at all.
+`MAX_ALERT_DELIVERIES_PER_DAY`, `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` and `PER_CLIENT_PER_MIN` have
+seeded a new client's own values since 2026-09-09; `MAX_PENDING_EVENTS_PER_DESTINATION` and
+`MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE` joined them in U7, and
+`concurrent_deliveries` was added beside them with no constant behind it because nothing reads it
+yet (the pooled sender that spends it is U8; its default is `DEFAULT_CONCURRENT_DELIVERIES`, which
+is `webhook_delivery._WORKERS` written out, since that module imports this one). All six live on
+the `clients` document as `notification_auth.Quotas`, are changed with `set-quotas`, and are bounded
+by `notification_auth.QUOTA_BOUNDS` at 1 000 / 200 000 / 10 000 / 10 000 / 10 000 / 64 — the second
+was 10 000 until U7 moved the create-time ceiling onto an aggregation, which is what it was waiting
+for; see item 5 of "Scaling beyond the pilot".
+
+**The two per-destination rows stay in the table although they are now defaults**, which is a
+deliberate departure from the plan's wording ("removed from the table"). They are still numbers this
+feature publishes and still constants a change could move silently, and removing the rows would
+remove the only guard that notices. What changes is what they MEAN: a ceiling for every client
+became the value a client gets until an operator sets another. The table states the default; a
+client's effective values are on its account. The daily cap is additionally copied onto each
+subscription document (`daily_cap`) at create, replace and touch, which is where `cap_remaining`
+reads it — the other five are read from the account on each pass.
 
 | constant | value |
 |---|---|
@@ -848,6 +860,7 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `notification_auth.GLOBAL_PRELOOKUP_PER_MIN` | 300 |
 | `notification_auth.PER_CLIENT_PER_MIN` | 120 |
 | `notification_auth.RETRY_AFTER_S` | 60 |
+| `notification_auth.DEFAULT_CONCURRENT_DELIVERIES` | 4 |
 | `webhook_signing.MIN_ROOT_BYTES` | 32 |
 | `webhook_signing.TOLERANCE_S` | 300 |
 | `webhook_sender.DEFAULT_TIMEOUT_S` | 5.0 |

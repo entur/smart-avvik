@@ -1545,6 +1545,46 @@ def test_two_subscriptions_are_still_delivered_in_parallel():
         _uninstall()
 
 
+def test_the_concurrency_default_is_the_pools_own_width():
+    """`notification_auth.DEFAULT_CONCURRENT_DELIVERIES` is a literal, and this is why it may be.
+
+    The quota is per worker REPLICA, so its default has to be this pool's width -- but
+    `webhook_delivery` imports `notification_auth` and the reverse edge would be a cycle, so the
+    number is written out there rather than imported. Pinned from this side, which is the side that
+    owns the width: move `_WORKERS` without the default and a client's stated concurrency stops
+    describing what the pool actually does.
+    """
+    assert notification_auth.DEFAULT_CONCURRENT_DELIVERIES == webhook_delivery._WORKERS
+
+
+def test_the_per_destination_attempt_ceiling_reaches_the_store_as_the_clients_quota():
+    """U7: the read asks the client's account, not the module constant.
+
+    Asserted on the ARGUMENT the store is called with rather than on an outcome, because the
+    ceiling's effect lives inside `pending_deliveries` and this module's job is only to answer
+    "whose quota". A resolver that answered the wrong client, or none at all, is what this catches.
+    """
+    seen: list[int] = []
+    real = notification_store.pending_deliveries
+
+    def _pending(*, limit: int, per_destination_limit=None, now=None):
+        assert per_destination_limit is not None, "the resolver must be passed"
+        seen.append(per_destination_limit("client-x"))
+        return real(limit=limit, now=now)
+
+    saved_quotas = notification_auth.quotas_for
+    notification_store.pending_deliveries = _pending  # type: ignore[assignment]
+    notification_auth.quotas_for = lambda client_id: notification_auth.Quotas(  # type: ignore[assignment]
+        deliveries_per_minute=777
+    )
+    try:
+        webhook_delivery.deliver_pending(now=NOW)
+    finally:
+        notification_store.pending_deliveries = real  # type: ignore[assignment]
+        notification_auth.quotas_for = saved_quotas  # type: ignore[assignment]
+    assert seen == [777], seen
+
+
 if __name__ == "__main__":
     _ran = 0
     for name, fn in sorted(globals().items()):
