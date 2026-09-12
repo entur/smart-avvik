@@ -324,6 +324,15 @@ class EmitReport:
     run_clear_capped: int = 0
     run_clear_error: int = 0
     timed_out: bool = False
+    #: Transactions still in flight when the collection's deadline passed, walked away from rather
+    #: than waited on -- a transactional commit carries no client-side deadline, so waiting would
+    #: hold the pass lock on a hung store and refuse every later cycle. An abandoned transaction
+    #: that later commits is a committed event nothing delivered this cycle; the next cycle's
+    #: `pending_deliveries` finds it, because the pending set is the store's rather than a cycle's.
+    #: This is the number behind "at most one pool's width in flight across a cycle boundary", and
+    #: it is the field to read beside `capped`: a big `capped` with no `abandoned` is a pass that
+    #: was simply larger than its budget, and one with `abandoned` is a slow store.
+    abandoned: int = 0
     #: The previous cycle's pass had not finished draining, so this one did not start. A refusal
     #: rather than a second pass, because the emit path's exactness rests on there being exactly
     #: one writer: two overlapping passes would each hold their own pending-event count and admit
@@ -794,7 +803,43 @@ def _run(
     at submit, every task is admitted before the deadline is consulted and the bound guarantees
     nothing -- `/meldinger`'s recorded lesson, and the one line here that is easy to move and fatal
     to move.
+
+    ``release`` is the pass lock's, released HERE and not in ``emit``'s own ``finally``: the caller
+    may have given up on this thread long ago, and releasing there would let the next cycle start a
+    second pass over the store while this one's abandoned workers are still committing.
     """
+    try:
+        return _run_pass(
+            observations,
+            now=now,
+            deadline_s=deadline_s,
+            worst_case_s=worst_case_s,
+            max_calls=max_calls,
+            workers=workers,
+            pending_quota=pending_quota,
+            beat=beat,
+        )
+    finally:
+        # OUTSIDE everything, because everything is inside: `_standing`, the ledger's construction
+        # and the pool's own are all above the loop's `try`, and a raise in any of them would
+        # otherwise leave the module lock held for the life of the pod -- every later cycle
+        # answering `overlap_refused` with nothing draining.
+        if release is not None:
+            release()
+
+
+def _run_pass(
+    observations: Sequence[WebhookObservation],
+    *,
+    now: datetime,
+    deadline_s: float,
+    worst_case_s: float,
+    max_calls: int,
+    workers: int,
+    pending_quota: Callable[[str], int] | None,
+    beat: Callable[[], None] | None,
+) -> EmitReport:
+    """:func:`_run` without the lock, so the lock's release cannot depend on any of this."""
     counts = _Counts()
     deadline = monotonic() + deadline_s
     budget = _EmitBudget(max_calls, deadline, worst_case_s)
@@ -822,6 +867,11 @@ def _run(
     )
     pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="client-emit")
     futures: list[Any] = []
+    #: Destinations whose pending-event ceiling could not be established this pass. Pass-local for
+    #: the reason KTD6 gives about the delivery skip: the answer is the same for every recipient on
+    #: the destination right now, and a ceiling remembered across cycles would keep refusing one
+    #: whose store has since recovered.
+    uncountable: set[str] = set()
 
     def _commit(
         observation: WebhookObservation,
@@ -847,9 +897,13 @@ def _run(
                 subject, train=train, phase=phase, now=now, max_pending=ceiling, pending=held
             )
         except notification_store.QuotaExceeded:
-            # R21, and visible rather than silent: the store counted for itself and disagreed with
-            # the ledger, which at one emitter should not happen -- so it is the belt, and the
-            # ledger is the braces. The store has already logged the breach with its own count.
+            # **UNREACHABLE FROM THIS PASS, and kept anyway.** `_emit_one` hands the store the
+            # ledger's pre-charge figure, and `charge` only returned it because it was under the
+            # ceiling -- so `commit_event`'s own comparison is a restatement of the one made two
+            # lines above and cannot fail. What makes it worth keeping is that `commit_event` is
+            # public: a caller passing `pending=None` gets the aggregation and the real refusal,
+            # and this is the branch that would carry it. Do not read it as a second, independent
+            # check on the ledger; the ledger IS the check here.
             ledger.refund(recipient.destination_id)
             counts.add("quota")
             return
@@ -938,8 +992,34 @@ def _run(
                             )
                         counts.add(reason)
                         continue
-                ceiling = _pending_ceiling(recipient.client_id)
-                held = ledger.charge(recipient.destination_id, ceiling)
+                if recipient.destination_id in uncountable:
+                    counts.add("retryable")
+                    continue
+                try:
+                    ceiling = _pending_ceiling(recipient.client_id)
+                    held = ledger.charge(recipient.destination_id, ceiling)
+                except Exception:
+                    # **GUARDED, because both of these moved onto the coordinator in U9 and were
+                    # inside the per-subject `try` before it.** The quota resolver is a cached
+                    # account read and the ledger's first sight of a destination is a Firestore
+                    # aggregation with a 4 s deadline -- and a 100 000-subscription morning is
+                    # exactly when that deadline gets hit. Unguarded, one blip raises out of this
+                    # loop, through `_run`, into `emit`'s handler, which reports the whole cycle as
+                    # a timeout and discards the counts of every transaction already committed.
+                    #
+                    # Once per DESTINATION, in the shape the pass-local skip set already had: the
+                    # answer is the same for every recipient on it, so the rest are counted as
+                    # retryable without asking again, and the next cycle is the retry.
+                    uncountable.add(recipient.destination_id)
+                    counts.add("retryable")
+                    logger.warning(
+                        "Could not establish a destination's pending-event ceiling; its "
+                        "observations are re-offered on the next cycle",
+                        exc_info=True,
+                        extra={"fields": {"event": "notification_emit", "result": "ceiling_error",
+                                          "client_id": recipient.client_id}},
+                    )
+                    continue
                 if held is None:
                     # R21's ceiling, refused before a transaction is spent discovering it. Charged
                     # on the coordinator, where there is one thread and so no contention for the
@@ -971,17 +1051,12 @@ def _run(
         # transaction that later commits is a committed event nothing delivered this cycle, and the
         # next cycle's `pending_deliveries` finds it. At most `workers` of them can be in flight
         # across a cycle boundary, which is what the refusal above bounds to one cycle's worth.
-        wait(futures, timeout=max(0.0, deadline - monotonic()))
+        _, unfinished = wait(futures, timeout=max(0.0, deadline - monotonic()))
+        counts.add("abandoned", len(unfinished))
     finally:
         pool.shutdown(wait=False)
         if beat is not None:
             _beat_quietly(beat)
-        if release is not None:
-            # HERE and not in `emit`'s own `finally`: the caller may have given up on this thread
-            # long ago, and releasing there would let the next cycle start a second pass over the
-            # store while this one's abandoned workers are still committing. Reached on every path
-            # because the collection above is bounded -- a hung commit cannot hold it.
-            release()
     return EmitReport(
         created=counts.get("created"),
         unchanged=counts.get("unchanged"),
@@ -998,6 +1073,7 @@ def _run(
         run_stale=counts.get("run_stale"),
         run_clear_capped=counts.get("run_clear_capped"),
         run_clear_error=counts.get("run_clear_error"),
+        abandoned=counts.get("abandoned"),
     )
 
 
@@ -1140,6 +1216,8 @@ def emit(
                 "run_clear_error": report.run_clear_error,
                 "retryable": report.retryable,
                 "failed": report.failed,
+                "abandoned": report.abandoned,
+                "overlap_refused": report.overlap_refused,
                 # `n` keeps its meaning -- the (recipient, train) observations this cycle offered
                 # -- so a rate computed across U9 still measures one thing. `trains` is what the
                 # fan-out is over, and the ratio between them is the corridor's sharing factor.
