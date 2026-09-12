@@ -622,11 +622,16 @@ touches the wire contract, which is why the pilot could ship without them.
    definitions is minutes per cycle, for both channels. Evaluate each (from, to) pair once against
    the situations, then apply the definitions' windows. Outside this channel's code and the first
    thing that binds — a single client at 500 subscriptions already costs ~20 s of matcher per cycle.
-2. **A mirror instead of a full read.** `varsel._load_webhook_recipients` reads every active
-   subscription every cycle through the provider callable, capped at `MAX_SUBSCRIPTIONS_PER_CYCLE`
-   (2 000) because a full read is what it is. Past that the provider becomes an in-memory mirror
-   synced on an `updated_at` watermark (or a listener), with a full read only at startup. The seam is
-   the callable; `varsel` does not change.
+2. **A mirror instead of a full read — done, 2026-09-12 (U6).** `varsel._load_webhook_recipients`
+   used to read every active subscription every cycle through the provider callable, capped at
+   `MAX_SUBSCRIPTIONS_PER_CYCLE` (2 000) because a full read is what it was. It now reads
+   `notification_store`'s in-memory mirror: one full paged read at startup, then a watermark query
+   per cycle for the documents whose server-stamped `mirror_updated_at` moved. As predicted, the
+   seam was the callable and `varsel` barely changed — what did change is that both 2 000 ceilings
+   are gone (there is no per-cycle read left to bound), the `truncated` flag with them, and the
+   store read moved out of the pass into its own `notification_mirror` phase, so a slow store costs
+   the mirror its freshness rather than costing the pass its cycle. What replaces the ceiling as the
+   thing to watch is `kix_mirror_age_seconds` and the mirror's readiness.
 3. **Emit and delivery as their own Deployment.** Both run on the poller thread today, bounded at
    `_MAX_EMITS_PER_CYCLE` (120) and `MAX_DELIVERY_ATTEMPTS_PER_CYCLE` (200) so a bad morning cannot
    stall the cycle. At scale a bad morning is tens of thousands of events an hour, which one thread
@@ -810,7 +815,6 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `notification_store.DELIVERED_MARK_TTL_H` | 48 |
 | `notification_store.MAX_ALERT_DELIVERIES_PER_DAY` | 4 |
 | `notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` | 500 |
-| `notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE` | 2000 |
 | `notification_store.MAX_PENDING_EVENTS_PER_DESTINATION` | 500 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_CYCLE` | 200 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE` | 50 |

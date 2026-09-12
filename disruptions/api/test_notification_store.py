@@ -242,6 +242,10 @@ class _FakeClient:
         self.transactions: list[_Txn] = []
         self.batch_deletes: list[str] = []
         self.fail_with: BaseException | None = None
+        # The STORE's clock, which a server stamp resolves against. Deliberately ahead of `NOW` by
+        # a visible margin: the bodies are handed `NOW` for `updated_at`, and a fake where the two
+        # agree could not tell a correct implementation from one that stamped `now` instead.
+        self.server_now: datetime = NOW + timedelta(seconds=37)
 
     def collection(self, name: str) -> _Collection:
         return _Collection(self, name)
@@ -261,6 +265,26 @@ class _FakeClient:
             (f"{collection}/{row.get('subscription_id') or row.get('delivery_id') or i}", row)
             for i, row in enumerate(rows)
         ]
+
+
+def _resolve_server_timestamps(
+    data: dict[str, Any] | None, server_now: datetime
+) -> dict[str, Any] | None:
+    """What Firestore does at commit: replace every ``SERVER_TIMESTAMP`` sentinel with a real time.
+
+    The fake applied writes verbatim, which left `MIRROR_FIELD` holding a sentinel object -- and a
+    watermark comparison against a sentinel is not a comparison at all, so every mirror check would
+    have passed or failed for a reason having nothing to do with the code. `server_now` is the
+    CLIENT's clock and deliberately separate from `NOW`, the clock the bodies are handed: the whole
+    point of a server stamp is that the two can differ, and a fake in which they cannot could not
+    show the drift the field exists to survive.
+    """
+    if not data:
+        return data
+    from google.cloud import firestore
+
+    sentinel = firestore.SERVER_TIMESTAMP
+    return {k: (server_now if v is sentinel else v) for k, v in data.items()}
 
 
 _fake: _FakeClient | None = None
@@ -300,10 +324,11 @@ def _install(client: _FakeClient) -> None:
         client.transactions.append(txn)
         result = body(txn)
         for kind, path, data in txn.writes:
+            resolved = _resolve_server_timestamps(data, client.server_now)
             if kind == "set":
-                client.docs[path] = dict(data or {})
+                client.docs[path] = dict(resolved or {})
             elif kind == "update":
-                client.docs.setdefault(path, {}).update(data or {})
+                client.docs.setdefault(path, {}).update(resolved or {})
             else:
                 client.docs.pop(path, None)
         return result
@@ -329,6 +354,9 @@ def _install(client: _FakeClient) -> None:
     notification_store._run_transaction = _run  # type: ignore[assignment]
     notification_store._query = _query  # type: ignore[assignment]
     notification_store.configure(client=client, clock=lambda: NOW)
+    # The mirrors are module state and leak between tests exactly as `_recent_load` does -- a
+    # half-seeded mirror from a previous test reads as a healthy one here.
+    notification_store.reset_mirrors_for_tests()
 
 
 def _uninstall() -> None:
@@ -339,6 +367,7 @@ def _uninstall() -> None:
         notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
     notification_store.reset_for_tests()
+    notification_store.reset_mirrors_for_tests()
     _fake = None
 
 
@@ -739,26 +768,23 @@ def test_the_create_count_sheds_dead_rows_before_live_ones():
         raise AssertionError("a page that is live rows up to the ceiling must refuse")
 
 
-def test_the_per_cycle_load_is_bounded_by_the_ceiling_and_reports_truncation():
-    client = _FakeClient()
-    _install(client)
-    rows = [_live_doc(subscription_id=f"s{i}") for i in range(5)]
-    client.page("load_active_subscriptions", notification_store.SUBSCRIPTIONS, rows)
-    loaded = notification_store.active_subscriptions(limit=3, now=NOW)
-    assert len(loaded.subscriptions) == 3
-    assert loaded.truncated is True
-    _name, _eq, _ineq, limit = client.query_calls[-1]
-    assert limit == 3
-    # A request for more than R21's ceiling is clamped to it, not honoured.
-    notification_store.active_subscriptions(limit=10**6, now=NOW)
-    assert client.query_calls[-1][3] == notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE
+def test_neither_two_thousand_ceiling_survives_u6():
+    """R21's per-cycle read ceiling and varsel's count ceiling both go with the full read.
 
+    They bounded the same read from two layers and had to be edited together, which is why a test
+    parsed one constant out of the other module's source. The mirror reads the collection once, at
+    startup, paged with a cursor -- so there is no per-cycle read to bound, and a ceiling left
+    behind would silently cap the mirror at 2 000 subscriptions instead.
 
-def test_the_cycle_ceiling_does_not_exceed_varsels_own():
-    """The same read is bounded one layer out, and the two must not drift apart."""
-    match = re.search(r"_MAX_WEBHOOK_RECIPIENTS\s*=\s*(\d+)", VARSEL_SOURCE)
-    assert match, "varsel._MAX_WEBHOOK_RECIPIENTS not found -- was it renamed?"
-    assert notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE <= int(match.group(1))
+    Asserted as ABSENCE from both modules, not as a changed value: a ceiling that survives as a
+    number nobody applies is the shape this repo has been bitten by before.
+    """
+    assert not hasattr(notification_store, "MAX_SUBSCRIPTIONS_PER_CYCLE")
+    assert not hasattr(notification_store, "active_subscriptions")
+    assert "_MAX_WEBHOOK_RECIPIENTS" not in VARSEL_SOURCE
+    # And the query they bounded is gone too, with its index: an index paid for on every write with
+    # no reader is what `test_every_checked_in_index_belongs_to_a_query...` exists to refuse.
+    assert not any(spec.name == "load_active_subscriptions" for spec in notification_store.QUERY_SPECS)
 
 
 def test_a_destination_past_the_pending_event_ceiling_cannot_emit():
@@ -909,9 +935,9 @@ def test_an_expired_subscription_is_neither_live_nor_loaded():
         notification_store.SUBSCRIPTIONS,
         [_live_doc(subscription_id="live"), dict(idle, subscription_id="idle")],
     )
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["live"]
-    assert loaded.expired == 1
+    _seed_mirror(client, [_live_doc(subscription_id="live"), dict(idle, subscription_id="idle")])
+    live = notification_store.subscription_mirror().recipients(NOW)
+    assert [e.subscription_id for e in live] == ["live"]
 
 
 def test_an_expired_subscription_cannot_be_replaced_touched_or_emitted_for():
@@ -1185,9 +1211,11 @@ def test_an_unreadable_document_is_skipped_rather_than_failing_its_collection():
             },
         ],
     )
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["good"]
-    assert loaded.skipped == 1
+    _seed_mirror(client, client.pages["load_active_subscriptions"] and [
+        row for _path, row in client.pages["load_active_subscriptions"]
+    ])
+    live = notification_store.subscription_mirror().recipients(NOW)
+    assert [e.subscription_id for e in live] == ["good"]
 
 
 # ---- Scenario 7: an exhausted transaction is retryable ----------------------------------------
@@ -1610,25 +1638,6 @@ def test_every_index_entry_has_the_fields_the_for_each_reads():
             assert spec_field["order"] in ("ASCENDING", "DESCENDING")
             # Known provider drift: an explicit __name__ field causes recreate loops.
             assert spec_field["fieldPath"] != "__name__"
-
-
-def test_the_load_query_sheds_dead_rows_before_live_ones():
-    """`expires_at` DESCENDING is load-bearing, not cosmetic.
-
-    Expiry is tested in Python, so an expired-but-not-deleted document is still returned by this
-    query. Ordered ascending, a page truncated at the per-cycle ceiling would keep exactly the rows
-    closest to expiry -- the dead ones -- and starve live subscriptions.
-    """
-    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "load_active_subscriptions")
-    assert spec.order_by == (("expires_at", "DESCENDING"),)
-    # The index the ordering needs, with U5's `channel` equality ahead of it. Firestore serves a
-    # query from an index whose equality fields match and whose first ordering is the range field,
-    # so adding the equality REPLACES this index rather than adding one beside it -- the reason the
-    # PR's terraform plan shows a destroy and a create per changed query, not two creates.
-    assert (
-        notification_store.SUBSCRIPTIONS,
-        (("status", "ASCENDING"), ("channel", "ASCENDING"), ("expires_at", "DESCENDING")),
-    ) in _declared_indexes()
 
 
 def test_every_collection_group_has_exactly_one_ttl_field():
@@ -2507,15 +2516,41 @@ def test_the_window_rules_are_varsels_own():
 def test_the_load_provider_is_the_shape_varsel_declares():
     client = _FakeClient()
     _install(client)
-    client.page(
-        "load_active_subscriptions",
-        notification_store.SUBSCRIPTIONS,
-        [_live_doc(subscription_id="s1"), _live_doc(subscription_id="s2")],
-    )
+    _seed_mirror(client, [_live_doc(subscription_id="s1"), _live_doc(subscription_id="s2")])
     documents = notification_store.recipient_documents()
     assert [d["recipient_id"] for d in documents] == ["s1", "s2"]
     assert all(isinstance(d, dict) for d in documents)
     assert "def __call__(self) -> Iterable[Mapping[str, Any]]: ..." in VARSEL_SOURCE
+
+
+def test_an_unseeded_mirror_yields_no_recipients_and_says_which_it_is():
+    """U6. A partial answer would be worse than none.
+
+    The pass cannot tell "this client has no live subscriptions" from "the mirror has not finished
+    loading", so a half-loaded mirror would silently retire whatever it had not reached. It is a
+    WARNING because it is the one state where the channel is deliberately serving nobody, and it
+    names itself so a restart window is not mistaken for an empty collection.
+    """
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_live_doc(subscription_id="s1")])
+    records: list[tuple[str, dict]] = []
+    saved = notification_store.logger
+    try:
+        notification_store.logger = _RecordingLogger(records)  # type: ignore[assignment]
+        assert notification_store.recipient_documents() == []
+        assert [level for level, _ in records] == ["warning"], records
+        assert records[0][1]["result"] == "mirror_not_ready"
+
+        records.clear()
+        notification_store.subscription_mirror().seed(now=NOW)
+        assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["s1"]
+        # An ordinary serve is DEBUG: a line on every cycle at WARNING is how a real warning stops
+        # being read, which is the argument `recipient_documents` already made about TTL lag.
+        assert [level for level, _ in records] == ["debug"], records
+        assert records[0][1]["result"] == "mirror"
+    finally:
+        notification_store.logger = saved  # type: ignore[assignment]
 
 
 # ---- Retry, expiry and the terminal states ----------------------------------------------------
@@ -2910,26 +2945,24 @@ def test_installing_the_fake_twice_still_restores_the_real_functions():
 
 
 def test_every_firestore_call_carries_its_own_deadline():
-    """KTD6 requires a per-CALL deadline, and the poller's wait is not one.
+    """KTD6 requires a per-CALL deadline, and it is now the ONLY bound on this module's reads.
 
-    ``varsel._WEBHOOK_LOAD_TIMEOUT_S`` bounds how long the ingestion thread WAITS on a worker; a
-    worker parked past it is abandoned, not killed, because Python cannot cancel a thread inside a
-    socket read. An abandoned thread is not free -- ``concurrent.futures.thread`` registers an atexit
-    hook that JOINS its workers, so a store call with no deadline of its own delays pod termination
-    by however long it hangs. That is what this deadline stops.
+    Until U6 there was a second one: `varsel._WEBHOOK_LOAD_TIMEOUT_S` bounded how long the ingestion
+    thread waited on a worker wrapping the per-cycle load, with the worker abandoned rather than
+    killed past it. That whole arrangement went with the per-cycle read -- the pass reads an
+    in-memory mirror now, so there is no socket in its path -- which makes the per-call deadline
+    load-bearing on its own rather than as the inner of two.
 
     Checked two ways, because either alone is weak. Statically: no read in the module reaches the
     client without ``timeout=``. Dynamically: the fake's ``get``/``stream``/``count`` all ASSERT the
     kwarg, so every path the suite exercises would fail rather than silently lose its deadline --
     which is why this is also the reason those fakes assert instead of accepting ``**kwargs``.
     """
-    assert 0 < notification_store._CALL_DEADLINE_S < 5.0, (
-        "it must sit under varsel._WEBHOOK_LOAD_TIMEOUT_S so a hung call surfaces as this "
-        "module's own retryable DeadlineExceeded rather than as the caller's timeout"
+    assert 0 < notification_store._CALL_DEADLINE_S < 5.0
+    assert "_WEBHOOK_LOAD_TIMEOUT_S" not in VARSEL_SOURCE, (
+        "the pass's wait outlived the read it bounded; a wait around an in-memory call is a "
+        "deadline that can never fire, which reads as a bound and is not one"
     )
-    varsel_wait = re.search(r"_WEBHOOK_LOAD_TIMEOUT_S\s*=\s*([0-9.]+)", VARSEL_SOURCE)
-    assert varsel_wait, "varsel._WEBHOOK_LOAD_TIMEOUT_S not found -- was it renamed?"
-    assert notification_store._CALL_DEADLINE_S < float(varsel_wait.group(1))
     # Every read site. `.get(` also matches the aggregation's and the dataclass helpers', so the
     # test is over the READ calls the module makes on a ref, a query or an aggregation.
     reads = re.findall(
@@ -2968,56 +3001,28 @@ def test_an_ordinary_ttl_lag_is_not_logged_as_a_warning():
     try:
         client = _FakeClient()
         _install(client)
-        # Expired rows only: the ordinary TTL lag.
-        client.page(
-            "load_active_subscriptions",
-            notification_store.SUBSCRIPTIONS,
-            [
-                _live_doc(subscription_id="live"),
-                _live_doc(subscription_id="idle", now=NOW - timedelta(days=120)),
-            ],
-        )
-        notification_store.recipient_documents()
-        # Only the records carrying structured fields are the load summary; a skipped document also
-        # emits a bare DEBUG traceback with no `extra`, which is not what this test is about.
+        # **The subscription half of this test moved to the mirror with U6.** The per-cycle load
+        # query is gone, and with it R21's ceiling and the `truncated` warning that announced it;
+        # an expired document is now dropped by the mirror's read-time liveness and an unreadable
+        # one by its seed, neither of which logs per cycle. What is left here is the alert-state
+        # read, which still queries and still owes the same distinction.
+        stale = _state("a-expired", notification_store.PHASE_PREDICTED)
+        stale[notification_store.TTL_FIELD] = NOW - timedelta(minutes=1)
+        _alert_page(client, [_state("a1", notification_store.PHASE_PREDICTED), stale])
+        notification_store.client_alerts(CLIENT, now=NOW)
         summaries = [(level, fields) for level, fields in records if fields]
         assert [level for level, _ in summaries] == ["debug"], records
-        assert summaries[0][1]["expired"] == 1
-        assert summaries[0][1]["event"] == "notification_store_load", "still queryable under one name"
+        assert summaries[0][1]["event"] == "notification_quota"
+        assert summaries[0][1]["expired"] == 1 and summaries[0][1]["truncated"] is False
 
-        # A document this binary cannot read still WARNS. It has to be LIVE but unparseable: the
-        # liveness test runs before the parse, so a doc missing its horizons is counted as expired
-        # and never reaches the parser at all -- which is how the first version of this fixture
-        # quietly tested the wrong branch.
+        # And the ceiling binding, which changes the CALLER's behaviour, still warns.
         records.clear()
-        unreadable = _live_doc(subscription_id="bad")
-        del unreadable["days"]
-        client.page(
-            "load_active_subscriptions",
-            notification_store.SUBSCRIPTIONS,
-            [_live_doc(subscription_id="good"), unreadable],
-        )
-        notification_store.recipient_documents()
-        summaries = [(level, fields) for level, fields in records if fields]
-        assert [level for level, _ in summaries] == ["warning"], records
-        assert summaries[0][1]["skipped"] == 1 and summaries[0][1]["expired"] == 0
-
-        # And so does R21's ceiling binding, on its own.
-        records.clear()
-        client.page(
-            "load_active_subscriptions",
-            notification_store.SUBSCRIPTIONS,
-            [_live_doc(subscription_id=f"s{i}") for i in range(3)],
-        )
-        notification_store.active_subscriptions(limit=2, now=NOW)
-        records.clear()
-        client.pages["load_active_subscriptions"] = client.pages["load_active_subscriptions"][:1]
-        saved_ceiling = notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE
+        saved_served = notification_store.MAX_SUBJECTS_PER_READ
         try:
-            notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE = 1
-            notification_store.recipient_documents()
+            notification_store.MAX_SUBJECTS_PER_READ = 1
+            notification_store.client_alerts(CLIENT, now=NOW)
         finally:
-            notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE = saved_ceiling
+            notification_store.MAX_SUBJECTS_PER_READ = saved_served
         summaries = [(level, fields) for level, fields in records if fields]
         assert [level for level, _ in summaries] == ["warning"], records
         assert summaries[0][1]["truncated"] is True
@@ -3317,7 +3322,14 @@ def emulator_test_the_subscription_round_trip_survives_the_real_client():
     assert client is not None
 
 
-def emulator_test_the_load_query_returns_only_live_subscriptions():
+def emulator_test_the_mirror_seed_holds_only_live_subscriptions():
+    """U6, against a real client. The seed reads EVERYTHING and liveness is applied on the read.
+
+    The three cases that have to come out differently, and none of which the fake can produce: a
+    live subscription, one past its inactivity horizon that TTL has not deleted yet, and a
+    tombstone. The seed's query filters none of them -- it cannot, because a tombstone written
+    during the seed has to be learned about -- so what separates them is entirely Python.
+    """
     _emulator_setup()
     notification_store.create_subscription(_spec(subscription_id="live"), now=NOW)
     notification_store.create_subscription(
@@ -3325,37 +3337,36 @@ def emulator_test_the_load_query_returns_only_live_subscriptions():
     )
     notification_store.create_subscription(_spec(subscription_id="gone"), now=NOW)
     notification_store.delete_subscription("gone", client_id=CLIENT, now=NOW)
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["live"]
-    # The idle one was returned by the query and dropped by the reader: TTL has not run.
-    assert loaded.expired == 1
-    documents = notification_store.recipient_documents()
-    assert [d["recipient_id"] for d in documents] == ["live"]
+
+    mirror = notification_store.subscription_mirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 3, "the seed reads every document, live or not"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["live"]
+    assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["live"]
 
 
 def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_ceiling():
-    """U5, against a real client rather than the fake.
+    """U5's claim, against a real client, on U6's path.
 
-    The emulator tracks no composite indexes, so this cannot prove the production index exists --
-    that is `test_every_query_in_the_module_has_a_checked_in_index`'s job, and the reason it exists.
-    What it DOES prove is the half a static check cannot: that the equality is really in the query
-    the client builds, that a `web_push` document is therefore not returned to the poller, and that
-    the client's webhook ceiling is not spent by one.
+    The channel filter moved from the load QUERY to the mirror's Python when the query went, and
+    the claim did not change: a `web_push` document is not handed to the poller as a webhook
+    recipient, and it does not spend the client's webhook ceiling. The ceiling half still goes
+    through a real query with a real equality, which is the half a static check cannot reach.
     """
     _emulator_setup()
     notification_store.create_subscription(_spec(subscription_id="client-sub"), now=NOW)
     notification_store.create_subscription(
         _spec(subscription_id="browser-sub", channel=notification_store.CHANNEL_WEB_PUSH), now=NOW
     )
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["client-sub"]
+    mirror = notification_store.subscription_mirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 2, "one mirror holds both channels -- which is what U12 needs"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["client-sub"]
     assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["client-sub"]
 
-    # The same collection, asked the other way: the browser document is there and readable.
-    on_browser = notification_store.active_subscriptions(
-        now=NOW, channel=notification_store.CHANNEL_WEB_PUSH
-    )
-    assert [s.subscription_id for s in on_browser.subscriptions] == ["browser-sub"]
+    # The same mirror, asked the other way: the browser document is there and readable.
+    on_browser = mirror.recipients(NOW, channel=notification_store.CHANNEL_WEB_PUSH)
+    assert [e.subscription_id for e in on_browser] == ["browser-sub"]
 
     # And the ceiling, with the one arrangement that DISCRIMINATES. The client holds two documents
     # and a ceiling of two, so an unfiltered count refuses the next create; counted per channel it
@@ -3893,22 +3904,105 @@ def test_a_subscription_document_names_its_channel_and_an_old_one_reads_as_webho
     assert legacy_recipient["channel"] == "webhook", legacy_recipient
 
 
-def test_the_two_bounded_subscription_queries_filter_on_the_channel():
-    """U5. Both are per-CHANNEL questions and neither said so before.
+def test_exactly_the_mirror_consuming_bodies_stamp_the_watermark_field():
+    """U6/KTD5. Which bodies stamp is the mechanism, so it is pinned both ways.
 
-    The load is bounded by a ceiling, so a Python-side test would let a `web_push` majority fill the
-    page and truncate the webhook recipients out of it; and a client's ceiling is its webhook
-    ceiling, which a traveller's own registration must not spend. Asserted on the specs rather than
-    on a fake query because `_query` builds every filter from them -- `test_every_filter_goes_
-    through_the_query_helper` is what makes that true.
+    The rule is "every body that changes a field the mirror CONSUMES", which is not the same as
+    "every body that touches a subscription", and both mistakes are silent:
+
+    * Leaving `_touch_body` OUT -- which the unit's own list did -- means the mirror keeps a stale
+      `expires_at` and drops a live subscription the client has just re-PUT. It is the write a
+      client makes most often.
+    * Leaving `_sent_body` IN defeats the watermark entirely: every delivery would make its
+      subscription due for re-read, so the busiest documents would sync on every cycle.
+
+    Read off the SOURCE rather than driven, because what has to hold is a property of the set of
+    bodies -- a body added next year is the case that matters, and no behavioural check over
+    today's five would see it.
+    """
+    source = pathlib.Path(notification_store.__file__).read_text()
+    bodies = {}
+    for chunk in source.split("\ndef ")[1:]:
+        name = "_" + chunk.split("(", 1)[0].lstrip("_")
+        if name.endswith("_body"):
+            bodies[name] = chunk
+    assert len(bodies) >= 13, f"only found {len(bodies)} bodies; did the naming change?"
+
+    # Matched on the CALL, not on one spelling of the assignment: `_replace_body` builds its patch
+    # and extends it, so a dict-literal-only pattern would read it as not stamping.
+    stamping = {name for name, body in bodies.items() if "_mirror_stamp()" in body}
+    # `_create_body` stamps through `_new_subscription_doc`, which is not a body itself.
+    builder = source.split("\ndef _new_subscription_doc", 1)[1].split("\ndef ", 1)[0]
+    if "_mirror_stamp()" in builder:
+        stamping.add("_create_body")
+    assert stamping == set(notification_store.MIRROR_STAMPING_BODIES), (
+        f"stamping bodies are {sorted(stamping)}, the declared set is "
+        f"{sorted(notification_store.MIRROR_STAMPING_BODIES)}. A new body that changes a field the "
+        "mirror reads must stamp AND be declared; one that does not must do neither."
+    )
+    for never in ("_sent_body", "_claim_body", "_failed_body", "_terminal_body"):
+        assert never in bodies, f"{never} is gone; this check has stopped checking anything"
+        assert never not in stamping, (
+            f"{never} stamps the watermark: every delivery would then make its subscription due "
+            "for re-read and the watermark would sync the busiest documents on every cycle"
+        )
+
+
+def test_the_watermark_field_is_the_stores_clock_and_advances_on_each_write():
+    """The stamp is the SERVER's, so a body must never write its own `now` into it.
+
+    The fake resolves the sentinel against a clock 37 s ahead of the one the bodies are handed, so
+    an implementation that wrote `now` reads as 37 s behind and fails here. Without that gap the
+    check would pass against either.
+    """
+    client = _FakeClient()
+    _install(client)
+    notification_store.create_subscription(_spec(), now=NOW)
+    stored = client.doc(notification_store.SUBSCRIPTIONS, SID)
+    assert stored is not None
+    created_stamp = stored[notification_store.MIRROR_FIELD]
+    assert created_stamp == client.server_now, "the stamp is not the store's clock"
+    assert created_stamp != stored["created_at"], "the stamp is the body's own `now`"
+
+    # Each mirror-consuming write moves it forward. The horizons a touch extends are exactly what
+    # the mirror tests liveness against, which is why the touch is in this list at all.
+    for step, call in (
+        ("touch", lambda: notification_store.touch_subscription(SID, client_id=CLIENT, now=NOW)),
+        (
+            "servability",
+            lambda: notification_store.set_servability(
+                SID, servable=True, expected_version=1, now=NOW
+            ),
+        ),
+        ("delete", lambda: notification_store.delete_subscription(SID, client_id=CLIENT, now=NOW)),
+    ):
+        client.server_now = client.server_now + timedelta(seconds=11)
+        call()
+        stored = client.doc(notification_store.SUBSCRIPTIONS, SID)
+        assert stored is not None
+        assert stored[notification_store.MIRROR_FIELD] == client.server_now, (
+            f"{step} did not restamp the watermark field"
+        )
+
+
+def test_the_create_ceiling_is_counted_per_channel():
+    """U5's surviving half. U6 took the other one with the query it filtered.
+
+    The load query is gone -- the mirror holds every channel and filters in Python -- so the only
+    place a `channel` equality is still load-bearing is the client's create-time ceiling, which is
+    its WEBHOOK ceiling and must not be spent by a traveller's own registration (U12-U14). Asserted
+    on the spec rather than on a fake query because `_query` builds every filter from the specs;
+    `test_every_filter_goes_through_the_query_helper` is what makes that true.
     """
     specs = {spec.name: spec for spec in notification_store.QUERY_SPECS}
-    assert "channel" in specs["load_active_subscriptions"].equality
     assert "channel" in specs["subscription_count"].equality
     # The listing is deliberately NOT in that set: a client lists what it created, and until U13
-    # everything it can create is a webhook. Adding the equality here would need a fourth index for
+    # everything it can create is a webhook. Adding the equality here would need another index for
     # no question anybody asks.
     assert "channel" not in specs["subscriptions"].equality
+    # And the mirror's own two queries filter nothing, which is what lets one mirror serve both
+    # channels when U12 puts /varsel's registrations in this collection.
+    assert specs["mirror_seed"].equality == () and specs["mirror_sync"].equality == ()
 
 
 def test_the_served_list_grows_with_the_clients_cap_and_never_shrinks_below_the_default():
@@ -4044,6 +4138,401 @@ def test_every_streamed_read_sits_under_a_span():
         "streamed reads with no firestore_stream span above them — route them through "
         "_stream():\n" + "\n".join(unguarded)
     )
+
+
+# ---- The subscription mirror (U6) ----------------------------------------------------------------
+
+
+class _RecordingLogger:
+    """Captures (level, structured fields) per log call. Promoted from a local class in the TTL-lag
+    test when the mirror gave a second test the same need."""
+
+    def __init__(self, records: list[tuple[str, dict[str, Any]]]) -> None:
+        self._records = records
+
+    def __getattr__(self, level: str):
+        def _log(_msg: str, *_args: Any, **kwargs: Any) -> None:
+            self._records.append((level, dict((kwargs.get("extra") or {}).get("fields") or {})))
+
+        return _log
+
+
+def _seed_mirror(client: _FakeClient, docs: list[dict[str, Any]], *, now: datetime = NOW) -> None:
+    """Put documents in the mirror the pass now reads through, as the seed would.
+
+    Since U6 `recipient_documents` serves the mirror rather than querying, so a test that stages a
+    `load_active_subscriptions` page is staging a page nothing reads.
+    """
+    _mirror_page(client, "mirror_seed", docs)
+    notification_store.subscription_mirror().seed(now=now)
+
+
+def _mirror_page(client: _FakeClient, spec: str, docs: list[dict[str, Any]]) -> None:
+    """Stage what one mirror query returns. The fake evaluates no inequality -- it serves what a
+    test puts there -- so the QUERY's own shape is asserted separately off `query_calls`."""
+    client.pages[spec] = [
+        (f"{notification_store.SUBSCRIPTIONS}/{d['subscription_id']}", d) for d in docs
+    ]
+
+
+def _mirrored(**over: Any) -> dict[str, Any]:
+    """A stored document as the real writer produces it, with the watermark already resolved.
+
+    `mirror_at` is popped BEFORE the document is built: it is this helper's own argument, not one
+    of `SubscriptionSpec`'s.
+    """
+    mirror_at = over.pop("mirror_at", NOW)
+    doc = _live_doc(**over)
+    doc[notification_store.MIRROR_FIELD] = mirror_at
+    return doc
+
+
+def test_the_mirror_seeds_from_the_whole_collection_and_pages_with_a_cursor():
+    """Scenario 1. The startup read is the only full read the mirror ever does."""
+    client = _FakeClient()
+    _install(client)
+    docs = [_mirrored(subscription_id=f"s{i}") for i in range(5)]
+    _mirror_page(client, "mirror_seed", docs)
+
+    beats: list[int] = []
+    mirror = notification_store.SubscriptionMirror()
+    page_size = notification_store.MIRROR_PAGE_SIZE
+    notification_store.MIRROR_PAGE_SIZE = 2
+    try:
+        result = mirror.seed(now=NOW, beat=lambda: beats.append(1))
+    finally:
+        notification_store.MIRROR_PAGE_SIZE = page_size
+
+    assert mirror.ready is True
+    assert mirror.size() == 5, result
+    assert result.pages == 3, "2 + 2 + 1: the short page is what ends the read"
+    assert len(beats) == 2, "the heartbeat moves BETWEEN pages, not after the last one"
+    assert {e.subscription_id for e in mirror.recipients(NOW)} == {f"s{i}" for i in range(5)}
+    # Ordered by `created_at`, never by the watermark field -- a document written before that field
+    # existed has to be in the read that seeds the mirror.
+    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "mirror_seed")
+    assert spec.order_by == (("created_at", "ASCENDING"),), spec
+    assert spec.equality == () and spec.inequality == (), "the seed filters nothing"
+
+
+def test_the_seed_needs_no_composite_index_and_neither_does_the_sync():
+    """Both mirror queries are single-field, which is why U6 adds no index and races no deploy."""
+    for name in ("mirror_seed", "mirror_sync"):
+        spec = next(s for s in notification_store.QUERY_SPECS if s.name == name)
+        assert spec.index_fields == (), f"{name} would need a composite index"
+
+
+def test_a_sync_applies_only_what_changed_and_asks_from_the_watermark_less_the_overlap():
+    """Scenarios 2 and 3. The overlap is what stops a late commit being stepped over forever."""
+    client = _FakeClient()
+    _install(client)
+    first = _mirrored(subscription_id="s1")
+    _mirror_page(client, "mirror_seed", [first])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 1
+
+    later = NOW + timedelta(minutes=5)
+    changed = _mirrored(subscription_id="s2", mirror_at=later)
+    _mirror_page(client, "mirror_sync", [changed])
+    client.query_calls.clear()
+    result = mirror.sync(now=later)
+
+    assert result.synced == 1 and result.removed == 0, result
+    assert mirror.size() == 2
+    name, _eq, inequality, _limit = client.query_calls[0]
+    assert name == "mirror_sync"
+    asked = inequality[notification_store.MIRROR_FIELD]
+    assert asked == NOW - timedelta(seconds=notification_store.MIRROR_SYNC_OVERLAP_S), asked
+
+    # Re-reading the same document is a no-op, which is what makes the overlap safe.
+    client.query_calls.clear()
+    again = mirror.sync(now=later)
+    assert mirror.size() == 2, "applying the overlap twice changed the mirror"
+    assert again.synced == 1, "the overlap deliberately re-reads; it must simply re-apply"
+
+
+def test_a_tombstone_removes_the_subscription_from_the_mirror():
+    """Scenario 4. The one path that carries a revocation the instant it is written."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    later = NOW + timedelta(minutes=1)
+    tombstoned = _mirrored(subscription_id="s1")
+    tombstoned["status"] = "deleted"
+    tombstoned[notification_store.MIRROR_FIELD] = later
+    _mirror_page(client, "mirror_sync", [tombstoned])
+    result = mirror.sync(now=later)
+
+    assert result.removed == 1 and result.synced == 0, result
+    assert mirror.size() == 0
+    assert mirror.recipients(later) == []
+
+
+def test_a_subscription_whose_horizon_passes_is_dropped_on_the_read_with_no_write():
+    """Scenario 5, and the reason liveness is applied on the READ.
+
+    Nothing writes a document when its inactivity horizon passes at 03:00, so no sync can carry the
+    news. Tested at read time, an expired subscription is never matched even by a mirror that has
+    not synced since.
+    """
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+    assert len(mirror.recipients(NOW)) == 1
+
+    past_horizon = NOW + timedelta(days=notification_store.SUBSCRIPTION_INACTIVITY_DAYS + 1)
+    assert mirror.recipients(past_horizon) == []
+    assert mirror.size() == 1, "the entry is still held; it is the READ that refuses it"
+
+
+def test_the_mirror_serves_one_channel_and_holds_them_all():
+    """U5's filter, now in Python: the mirror is the store for every channel (U12 needs it)."""
+    client = _FakeClient()
+    _install(client)
+    webhook_doc = _mirrored(subscription_id="client-sub")
+    _mirror_page(
+        client,
+        "mirror_seed",
+        [
+            webhook_doc,
+            _mirrored(subscription_id="browser-sub", channel=notification_store.CHANNEL_WEB_PUSH),
+        ],
+    )
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    assert mirror.size() == 2, "both channels are held"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["client-sub"]
+    on_browser = mirror.recipients(NOW, channel=notification_store.CHANNEL_WEB_PUSH)
+    assert [e.subscription_id for e in on_browser] == ["browser-sub"]
+    # **The document the pass receives is byte-identical to the one the store's own reader builds.**
+    # This is the assertion the whole unit rests on: U6 changes where the pass gets its documents,
+    # not what they say, and a mirror that served a subtly different shape would change matching
+    # behaviour with nothing in the diff that looks like a matching change.
+    from_store = notification_store._subscription_from_doc(webhook_doc).as_recipient_document(NOW)
+    assert mirror.documents(NOW) == [from_store]
+
+
+def test_a_sync_that_raises_keeps_the_previous_mirror():
+    """Scenario 7. An empty mirror on a transient error reads as "every client unsubscribed"."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    boom = RuntimeError("firestore is having a moment")
+    original = notification_store._stream
+
+    def _raises(query: Any) -> list[Any]:
+        raise boom
+
+    notification_store._stream = _raises  # type: ignore[assignment]
+    try:
+        try:
+            mirror.sync(now=NOW + timedelta(minutes=1))
+        except RuntimeError as exc:
+            assert exc is boom
+        else:
+            raise AssertionError("the sync swallowed the error; the CALLER decides, not the mirror")
+    finally:
+        notification_store._stream = original  # type: ignore[assignment]
+
+    assert mirror.size() == 1, "the previous mirror is still served"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s1"]
+
+
+def test_a_watermark_older_than_the_bound_forces_a_re_seed():
+    """The carried review's P1, and it is a CORRECTNESS bound rather than a freshness one.
+
+    A revocation reaches the mirror as a tombstone, and that tombstone has a TTL of its own. If
+    sync is broken for longer than the TTL, Firestore hard-deletes the tombstone before the mirror
+    ever reads it: the removal is lost for good and no later sync can repair it, because there is
+    nothing left to read. So the bound has to sit under the TTL, not merely under an alert
+    threshold.
+    """
+    assert notification_store.MIRROR_MAX_AGE_S < 24 * 60 * 60, (
+        "the bound must sit under the deletion marker's ~24 h TTL or it defends nothing"
+    )
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    # Just inside the bound: an ordinary incremental sync.
+    _mirror_page(client, "mirror_sync", [])
+    fresh = mirror.sync(now=NOW + timedelta(seconds=notification_store.MIRROR_MAX_AGE_S - 60))
+    assert fresh.reseeded is False, fresh
+
+    # Past it: the whole collection is read again, and the mirror follows the SEED's page.
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s2")])
+    stale = mirror.sync(now=NOW + timedelta(seconds=notification_store.MIRROR_MAX_AGE_S + 60))
+    assert stale.reseeded is True, stale
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s2"], (
+        "a re-seed replaces the mirror rather than merging into it -- which is the point: the "
+        "entries it can no longer account for are exactly the ones a lost tombstone would leave"
+    )
+
+
+def test_an_unseeded_mirror_answers_for_nobody_and_seeds_on_first_sync():
+    """`ready` is read, never inferred from emptiness: an empty collection is a steady state."""
+    client = _FakeClient()
+    _install(client)
+    mirror = notification_store.SubscriptionMirror()
+    assert mirror.ready is False
+    assert mirror.recipients(NOW) == []
+
+    _mirror_page(client, "mirror_seed", [])
+    result = mirror.sync(now=NOW)
+    assert result.reseeded is True and mirror.ready is True, result
+    assert mirror.size() == 0
+    assert mirror.ready is True, "an empty collection must not read as 'still loading'"
+
+
+def test_one_unreadable_document_never_fails_the_mirror():
+    """R20, the same per-document rule the load path applies."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(
+        client,
+        "mirror_seed",
+        [{"subscription_id": "broken"}, _mirrored(subscription_id="s1")],
+    )
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s1"]
+
+
+def _subject_seed_page(client: _FakeClient, docs: list[dict[str, Any]]) -> None:
+    client.pages["mirror_seed_subjects"] = [
+        (f"{notification_store.SUBJECTS}/{d['alert_id']}", d) for d in docs
+    ]
+
+
+def test_the_subject_mirror_seeds_the_standing_set_and_skips_expired_subjects():
+    """U6 step 3. The complete standing set the emit pass cannot get from a bounded query.
+
+    `client_alerts` enumerates at most `MAX_SUBJECTS_PER_READ`, and past that the answer is
+    INCOMPLETE -- which is not a slightly worse answer: the pass falls back to a store transaction
+    per subject, because treating a truncated read as complete skips a withdrawal that was owed and
+    a `confirmed` mint for a train ET has cancelled. At one client with 100 000 subscriptions that
+    fallback IS the steady state.
+    """
+    client = _FakeClient()
+    _install(client)
+    dead = _state("a-dead", notification_store.PHASE_PREDICTED)
+    dead[notification_store.TTL_FIELD] = NOW - timedelta(minutes=1)
+    _subject_seed_page(
+        client,
+        [
+            _state("a1", notification_store.PHASE_PREDICTED),
+            _state("a2", notification_store.PHASE_CONFIRMED),
+            dead,
+        ],
+    )
+    mirror = notification_store.SubjectMirror()
+    assert mirror.ready is False
+    result = mirror.seed(now=NOW)
+
+    assert mirror.ready is True and mirror.size() == 2, result
+    assert mirror.phases_for(SID, NOW) == {
+        "a1": notification_store.PHASE_PREDICTED,
+        "a2": notification_store.PHASE_CONFIRMED,
+    }
+    # TTL runs up to ~24 h late, so an expired subject is still returned by the query -- and nothing
+    # writes a document when its own TTL passes, so the read is the only place it can be refused.
+    assert "a-dead" not in mirror.phases_for(SID, NOW)
+
+
+def test_the_subject_mirror_is_indexed_by_subscription_not_scanned():
+    """The emit pass asks per subscription; a flat map would make each of 100 000 questions a scan.
+
+    Asserted as a property rather than by timing: a subject belonging to another subscription is
+    invisible to this one's lookup, which is only true of a real index.
+    """
+    client = _FakeClient()
+    _install(client)
+    other = _state("b1", notification_store.PHASE_PREDICTED)
+    other["subscription_id"] = "sub-other"
+    _subject_seed_page(client, [_state("a1", notification_store.PHASE_PREDICTED), other])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+
+    assert mirror.phases_for(SID, NOW) == {"a1": notification_store.PHASE_PREDICTED}
+    assert mirror.phases_for("sub-other", NOW) == {"b1": notification_store.PHASE_PREDICTED}
+    assert mirror.phases_for("sub-nobody", NOW) == {}
+
+
+def test_a_committed_subject_reaches_the_standing_set_without_a_re_read():
+    """Kept current by the poller's own commits, not by a watermark.
+
+    Subject documents have exactly ONE writer (KTD6: one poller thread, no route invokes the pass,
+    one replica under Recreate), so every change passes through this process and applying it in
+    memory is both cheaper and stronger than re-reading it.
+    """
+    client = _FakeClient()
+    _install(client)
+    _subject_seed_page(client, [_state("a1", notification_store.PHASE_PREDICTED)])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+    assert mirror.phases_for(SID, NOW) == {"a1": notification_store.PHASE_PREDICTED}
+
+    mirror.apply(_state("a1", notification_store.PHASE_CONFIRMED))
+    assert mirror.phases_for(SID, NOW) == {"a1": notification_store.PHASE_CONFIRMED}
+    mirror.apply(_state("a2", notification_store.PHASE_PREDICTED))
+    assert set(mirror.phases_for(SID, NOW)) == {"a1", "a2"}
+
+    # An unreadable document is ignored rather than raised on: the commit has already happened, and
+    # raising here would unwind a pass over a mirror that is only ever an optimisation.
+    mirror.apply({"alert_id": "broken"})
+    assert set(mirror.phases_for(SID, NOW)) == {"a1", "a2"}
+
+
+def test_dropping_a_subject_and_dropping_a_whole_subscription():
+    """A revoked subscription takes its standing subjects with it, or the pass keeps answering for
+    a recipient that no longer exists."""
+    client = _FakeClient()
+    _install(client)
+    _subject_seed_page(
+        client,
+        [_state("a1", notification_store.PHASE_PREDICTED), _state("a2", notification_store.PHASE_PREDICTED)],
+    )
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+
+    mirror.drop(SID, "a1")
+    assert set(mirror.phases_for(SID, NOW)) == {"a2"}
+    mirror.drop(SID, "a-never-existed")
+    assert set(mirror.phases_for(SID, NOW)) == {"a2"}
+
+    mirror.drop_subscription(SID)
+    assert mirror.phases_for(SID, NOW) == {} and mirror.size() == 0
+
+
+def test_the_open_withdrawal_runs_are_served_whole_environment():
+    """`ClientAlerts.open_below_threshold`'s shape: the run is a property of the SUBJECT, and the
+    caller looks up the one alert id it is about."""
+    client = _FakeClient()
+    _install(client)
+    counting = _state("a1", notification_store.PHASE_PREDICTED)
+    counting["below_threshold_at"] = NOW - timedelta(minutes=5)
+    _subject_seed_page(client, [counting, _state("a2", notification_store.PHASE_PREDICTED)])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+
+    runs = mirror.open_runs(NOW)
+    assert set(runs) == {"a1"}, runs
+    assert runs["a1"] == NOW - timedelta(minutes=5)
+    # A mint closes the run -- both fields, which is what the emit body writes.
+    mirror.apply(_state("a1", notification_store.PHASE_CONFIRMED, below_threshold_at=None))
+    assert mirror.open_runs(NOW) == {}
 
 
 def _run() -> None:
