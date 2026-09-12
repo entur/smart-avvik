@@ -845,7 +845,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   match and whose first ordering is the range field), so the terraform plan shows a destroy and a
   create per changed query, and between that apply and the pod rollout the running binary's own load
   query has no index — guarded, logged, and at a pilot with one dev smoke client and no prd client
-  it costs nothing, but it is not nothing at scale. And `SubscriptionSpec.channel` is validated
+  it costs nothing, but it is not nothing at scale. **Measured on the dev apply, 2026-09-12: the
+  window was 7 minutes**, not seconds — the destroys completed in 3-4 s and each create took
+  **7m01s**, because Firestore builds an index over the existing collection before it is usable. Two
+  poller cycles logged `varsel_webhook_load` `result="error"` inside it (18:51:17, 18:53:11), the
+  browser half of the pass was untouched (the cycle completed in 52.7 s), and the load recovered by
+  itself at 18:58:32 — `ok`, all 18 recipients, `unroutable: 0`. So the shape to expect from any
+  later query change here is **~7 minutes of a guarded, logged outage on that one read**, and the
+  order is fixed by the workflows rather than chosen: `terraform.yml` and `cd.yml` both fire on the
+  merge, so the index is destroyed while the OLD binary is still serving. If a future change cannot
+  afford that window, the way out is two merges — add the new index in one, switch the query in the
+  next — not a faster apply. And `SubscriptionSpec.channel` is validated
   against `CHANNELS` at create: unvalidated, a typo writes a document that no read path's equality
   matches — a subscription that exists, is billed for, and is never loaded or counted by anything.
   **Four semantics moved on 2026-09-10, on the full review's findings, and each is the kind a later
