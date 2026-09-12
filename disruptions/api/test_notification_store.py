@@ -197,8 +197,36 @@ class _Batch:
         self._deletes = []
 
 
+class _AggregationResult:
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+
+class _Aggregation:
+    """What `_Page.count()` returns: the page's own length, read under the same deadline.
+
+    Counting the REGISTERED ROWS and applying no predicate of its own is the honest fake here,
+    because the real aggregation applies its predicates in the INDEX -- `status`, `channel` and
+    `expires_at > now` are the query's, not the reader's. So a hermetic test that registers dead
+    rows and expects them not to be counted would be testing this class rather than the store; that
+    half of the ceiling lives in the emulator, where the filters are real.
+    """
+
+    def __init__(self, page: _Page) -> None:
+        self._page = page
+
+    def get(self, transaction: Any = None, timeout: float | None = None) -> list[list[Any]]:
+        assert timeout == notification_store._CALL_DEADLINE_S, "aggregation without a deadline"
+        if transaction is not None:
+            # Recorded as a READ, in order, so `test_every_transaction_body_reads_before_it_writes`
+            # sees the count for what it is. Filed as anything else -- or not recorded at all -- a
+            # body that counted after writing would pass that check.
+            transaction.ops.append(("read_count", "count"))
+        return [[_AggregationResult(len(self._page.rows))]]
+
+
 class _Page:
-    """What the fake `_query` returns: a page of snapshots, iterable and streamable."""
+    """What the fake `_query` returns: a page of snapshots, iterable, streamable and countable."""
 
     def __init__(self, client: Any, rows: list[tuple[str, dict[str, Any]]]) -> None:
         self.client = client
@@ -207,6 +235,10 @@ class _Page:
     def stream(self, timeout: float | None = None) -> list[_Snap]:
         assert timeout == notification_store._CALL_DEADLINE_S, "query stream without a deadline"
         return [_Snap(path, data, self.client) for path, data in self.rows]
+
+    def count(self, alias: str) -> _Aggregation:
+        assert alias == "n"
+        return _Aggregation(self)
 
 
 class _Txn:
@@ -701,71 +733,122 @@ def test_the_ceiling_counts_only_live_subscriptions():
     This is the whole reason the count is a query rather than a counter document: an expired or
     tombstoned subscription is still `status == "active"` (or still present) until TTL deletes it up
     to ~24 h later, and a counter would keep it in the total forever.
+
+    **Asserted on the QUERY since U7, not on the reader.** Liveness used to be tested in Python over
+    the rows the page returned, so a hermetic test could register dead rows and watch the count skip
+    them. The count is now a `count()` aggregation, which applies its predicates in the index and
+    returns a number -- there are no rows to inspect. The two halves of that move live in two
+    places: the predicates are pinned here, and that they really exclude a dead document is
+    `emulator_test_the_create_ceiling_counts_through_the_index`, where the filters are Firestore's.
     """
-    client = _FakeClient()
-    refs = notification_store._Refs(client)
-    dead = _live_doc(subscription_id="old", now=NOW - timedelta(days=400))
-    stale = [
-        (f"{notification_store.SUBSCRIPTIONS}/d{i}", dict(dead, subscription_id=f"d{i}"))
-        for i in range(notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT)
-    ]
-    txn = _Txn()
-    with _NoClockNoLog():
-        outcome, _doc = notification_store._create_body(
-            txn, refs, _Page(client, stale), spec=_spec(), now=NOW
-        )
-    assert outcome == "created"
+    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "subscription_count")
+    assert "status" in spec.equality, "a tombstone must not count against a live ceiling"
+    assert spec.inequality == (("expires_at", ">"),), "an expired row must not count either"
+
+
+def test_the_counted_ceiling_can_only_ever_read_HIGH():
+    """R21's property, argued rather than sampled: the count is a superset of live, never a subset.
+
+    `subscription_is_live` tests four things and the query tests three of them plus
+    `expires_at > now`. That field is written as the MINIMUM of the two horizons (`_horizons`), so a
+    document inside both is necessarily inside it -- every live row is counted. The converse fails
+    only for a document whose stored `expires_at` is somehow ahead of a horizon it should have been
+    derived from, and such a row is counted although the reader would reject it.
+
+    So the count can be too high and never too low, and too high REFUSES a create a stricter count
+    would have admitted. That is the direction a ceiling must fail in; R21 forbids the other one.
+    Pinned off `_horizons` rather than restated, so a change that stopped deriving the field from
+    the minimum fails here instead of quietly inverting the argument.
+    """
+    created = NOW
+    last_seen = NOW + timedelta(days=3)
+    horizons = notification_store._horizons(created, last_seen)
+    assert horizons[notification_store.TTL_FIELD] == min(
+        horizons["lifetime_expires_at"], horizons["inactivity_expires_at"]
+    )
 
 
 def test_the_create_ceiling_query_is_bounded_by_the_ceiling():
     client = _FakeClient()
     _install(client)
     notification_store.create_subscription(_spec(), now=NOW)
-    name, equality, _ineq, limit = client.query_calls[0]
+    name, equality, inequality, limit = client.query_calls[0]
     assert name == "subscription_count"
     # The channel is the spec's, not a constant: U12 creates `web_push` subscriptions through this
     # same path, and each channel's ceiling is counted on its own documents.
     assert equality == {"client_id": CLIENT, "status": "active", "channel": "webhook"}
+    # The instant is the CALLER's, taken once outside the transaction. A query built inside the body
+    # would take a different `now` on a retry, which is the same defect as a clock read in a body.
+    assert inequality == {"expires_at": NOW}
     assert limit == notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
 
 
-def test_the_create_count_sheds_dead_rows_before_live_ones():
-    """The count is bounded AT the ceiling, so which rows the page holds IS the count.
+def test_the_create_ceiling_is_counted_by_an_aggregation_inside_the_transaction():
+    """Not by reading the rows, which is what bounded `max_active_subscriptions` at 10 000.
 
-    Liveness is tested in Python, so an expired-but-not-yet-deleted row is returned by the query
-    and discarded after the fact. Counted through the listing's `created_at ASCENDING` ordering
-    (as it was until 2026-09-10), the page filled with the OLDEST rows first -- exactly where the
-    rows TTL has not caught up with sit -- so `ceiling` dead rows hid every live one, the count read
-    zero, and a client past its ceiling was admitted another subscription (R21). Ordered
-    `expires_at DESCENDING`, every live row precedes every dead one, so a page holding fewer than
-    `ceiling` live rows has counted them all. The fake cannot order, so the direction is pinned on
-    the spec the way `test_the_load_query_sheds_dead_rows_before_live_ones` pins its sibling.
+    The read cost up to `max_active` document read locks under Standard edition's pessimistic
+    concurrency, paid on every create the client makes -- fine at 500, and the stated reason the
+    bound could not be raised. A `count()` bills roughly one read per thousand index entries and
+    takes no per-document lock.
+
+    Two things are pinned rather than one. That the aggregation is the path taken: the page's
+    `stream` raises, so a reader that fell back to counting rows fails here rather than passing
+    slowly. And that it carries the TRANSACTION -- an aggregation read outside it would not see the
+    body's own consistent snapshot, so two concurrent creates could each count the other out and
+    both be admitted past the ceiling.
     """
-    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "subscription_count")
-    assert spec.order_by == (("expires_at", "DESCENDING"),)
-    assert spec.equality == ("client_id", "status", "channel")
-    listing = next(s for s in notification_store.QUERY_SPECS if s.name == "subscriptions")
-    assert listing.order_by == (("created_at", "ASCENDING"),), "the published list order is unchanged"
-    # And the page the body counts from really is the one the store asks for: a page of `ceiling`
-    # rows, live ones first, refuses; the same rows dead-first would have admitted.
+    seen: list[Any] = []
+
+    class _StreamlessPage(_Page):
+        def stream(self, timeout: float | None = None) -> list[_Snap]:
+            raise AssertionError("the aggregation path must be preferred over a stream")
+
+        def count(self, alias: str) -> Any:
+            aggregation = super().count(alias)
+            real_get = aggregation.get
+
+            def _get(transaction: Any = None, timeout: float | None = None) -> Any:
+                seen.append(transaction)
+                return real_get(transaction=transaction, timeout=timeout)
+
+            aggregation.get = _get  # type: ignore[method-assign]
+            return aggregation
+
     client = _FakeClient()
     refs = notification_store._Refs(client)
-    ceiling = notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
-    dead = _live_doc(subscription_id="old", now=NOW - timedelta(days=400))
-    live_first = [
-        (f"{notification_store.SUBSCRIPTIONS}/s{i}", _live_doc(subscription_id=f"s{i}"))
-        for i in range(ceiling)
-    ] + [(f"{notification_store.SUBSCRIPTIONS}/d0", dict(dead, subscription_id="d0"))]
     txn = _Txn()
-    try:
-        with _NoClockNoLog():
-            notification_store._create_body(
-                txn, refs, _Page(client, live_first[:ceiling]), spec=_spec(), now=NOW
-            )
-    except notification_store.QuotaExceeded:
-        pass
-    else:
-        raise AssertionError("a page that is live rows up to the ceiling must refuse")
+    with _NoClockNoLog():
+        outcome, _stored = notification_store._create_body(
+            txn, refs, _StreamlessPage(client, []), spec=_spec(), now=NOW
+        )
+    assert outcome == "created"
+    assert seen == [txn], "the count must be read inside the caller's own transaction"
+
+
+def test_the_ceiling_count_needs_no_new_index():
+    """The `expires_at` inequality is free: the range field was already the first ordering.
+
+    Firestore's classic rule is that a range filter's field must lead the ordering, and
+    `subscription_count` has ordered by `expires_at DESCENDING` since 2026-09-10 -- so the index the
+    aggregation needs is the one already checked in, and the terraform plan for this unit is empty.
+    Pinned as an equality between the spec's `index_fields` and the fields the checked-in index
+    declares, because "it needs no index" asserted as a comment is how a `FailedPrecondition` on
+    every create ships green.
+    """
+    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "subscription_count")
+    assert spec.index_fields == (
+        ("client_id", "ASCENDING"),
+        ("status", "ASCENDING"),
+        ("channel", "ASCENDING"),
+        ("expires_at", "DESCENDING"),
+    )
+    declared = INDEXES["indexes"]
+    wanted = [{"fieldPath": f, "order": o} for f, o in spec.index_fields]
+    assert any(
+        index["collectionGroup"] == notification_store.SUBSCRIPTIONS
+        and index["fields"] == wanted
+        for index in declared
+    ), "the aggregation's index must already be checked in"
 
 
 def test_neither_two_thousand_ceiling_survives_u6():
@@ -837,6 +920,48 @@ def test_the_delivery_set_is_bounded_per_cycle_and_per_destination():
     assert pending.throttled == (DEST,)
     # Soonest departure first, across the whole set.
     assert [d.valid_until for d in pending.ready] == sorted(d.valid_until for d in pending.ready)
+
+
+def test_the_per_destination_attempt_ceiling_is_the_clients_own():
+    """U7: a client at a hundred thousand subscriptions is not bounded by the pilot's 50.
+
+    The counter stays per DESTINATION -- two destinations of one client each spend their own
+    allowance, which is what stops one bad endpoint eating the other's -- while the CEILING is read
+    from the client's account, because a quota is a property of an account and not of a callback
+    URL. Asked once per client per pass: a page can hold hundreds of one client's deliveries and the
+    lookup behind it is a cached account read rather than a free one.
+    """
+    client = _FakeClient()
+    _install(client)
+    rows = [
+        {
+            "delivery_id": f"d{i:03d}",
+            "event_id": f"d{i:03d}",
+            "alert_id": "a",
+            "subscription_id": SID,
+            "subscription_version": 1,
+            "client_id": CLIENT,
+            "destination_id": DEST,
+            "state": "pending",
+            "attempts": 0,
+            "retry_not_before": NOW - timedelta(seconds=1),
+            "valid_until": NOW + timedelta(minutes=30 + i),
+            notification_store.TTL_FIELD: NOW + timedelta(days=7),
+            "situations": ["ENT:1"],
+        }
+        for i in range(notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE + 5)
+    ]
+    client.page("pending_deliveries", notification_store.DELIVERIES, rows)
+    asked: list[str] = []
+    raised = notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE + 3
+    pending = notification_store.pending_deliveries(
+        per_destination_limit=lambda client_id: (asked.append(client_id), raised)[1], now=NOW
+    )
+    assert len(pending.ready) == raised, (
+        "the ceiling must be the client's, not the module constant"
+    )
+    assert pending.throttled == (DEST,), "and it must still bind above it"
+    assert asked == [CLIENT], "asked once per client, not once per delivery"
 
 
 def test_a_stuck_destinations_backlog_cannot_starve_another_clients_deliveries():
@@ -1133,6 +1258,48 @@ def test_the_client_listing_is_filtered_by_the_authenticated_client():
     assert equality["client_id"] == CLIENT
     spec = next(s for s in notification_store.QUERY_SPECS if s.name == "subscriptions")
     assert "client_id" in spec.equality
+
+
+def test_the_listing_scan_is_capped_independently_of_the_clients_ceiling():
+    """A listing must not become a 200 000-document read when a client's ceiling is raised.
+
+    The listing tests liveness in Python -- a query cannot express both of R5's horizons -- so a
+    page of `limit` documents can come back with fewer live rows and it reads again. What bounded
+    those rounds was the client's own ceiling, which was the same number as the bound on
+    `max_active_subscriptions` and therefore at worst 10 000. U7 raises that bound to 200 000 for
+    the create count, and the scan deliberately does NOT follow it: a client whose collection is
+    dominated by rows TTL has not caught up with would otherwise turn an ordinary request on this
+    endpoint into the most expensive read in the module.
+
+    The arrangement is the one that makes the loop run to its bound -- a page source holding only
+    dead rows, more of them than the cap -- so what is measured is where it STOPS rather than that
+    it finished. Given a client ceiling of 200 000 the uncapped loop reads every registered row.
+    """
+    # Imported HERE rather than at module scope: this suite pins that the store has no reverse
+    # dependency on `notification_auth`, and a top-level import would read as one at a glance.
+    import notification_auth
+
+    assert (
+        notification_store.MAX_SUBSCRIPTION_LIST_SCAN
+        < notification_auth.QUOTA_BOUNDS["max_active_subscriptions"][1]
+    ), "the cap only means something while it is below the quota's own bound"
+    client = _FakeClient()
+    dead = _live_doc(subscription_id="old", now=NOW - timedelta(days=400))
+    page = notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
+    registered = notification_store.MAX_SUBSCRIPTION_LIST_SCAN + 2 * page
+    client.pages["subscriptions"] = [
+        (f"{notification_store.SUBSCRIPTIONS}/d{i}", dict(dead, subscription_id=f"d{i}"))
+        for i in range(registered)
+    ]
+    _install(client)
+    out = notification_store.list_subscriptions(
+        client_id=CLIENT, limit=page, max_active=200_000, now=NOW
+    )
+    assert out == [], "every registered row is dead, so the page is empty"
+    scanned = sum(call[3] for call in client.query_calls if call[0] == "subscriptions")
+    assert scanned == notification_store.MAX_SUBSCRIPTION_LIST_SCAN, (
+        f"the scan must stop at the cap, not at the client's raised ceiling: read {scanned}"
+    )
 
 
 def test_no_project_is_named_anywhere_in_the_module():
@@ -3384,6 +3551,47 @@ def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_c
         pass
     else:
         raise AssertionError("the webhook ceiling did not bind")
+
+
+def emulator_test_the_create_ceiling_counts_through_the_index():
+    """U7's half a hermetic test cannot reach: a `count()` against a real Firestore.
+
+    Three things are settled here and nowhere else. That the aggregation runs INSIDE a transaction
+    at all -- the Python client does not accept one through `Transaction.get`, so the call shape is
+    the aggregation's own `get(transaction=...)`, and a build that refused it would fail every
+    create. That a tombstoned document does not count: `status` is an equality, and the whole
+    reason the count is a query rather than a counter is that a dead row must not lock a client
+    out. And that an expired one does not either: `expires_at > now` is the inequality, applied by
+    the index over rows the reader never sees.
+
+    The arrangement DISCRIMINATES rather than merely passing. The client holds three documents, of
+    which one is live, against a ceiling of two: counted as written, three refuses; counted through
+    the filters, one is admitted. Strip either predicate from the spec and this fails.
+    """
+    _emulator_setup()
+    notification_store.create_subscription(_spec(subscription_id="live-sub"), now=NOW)
+    notification_store.create_subscription(_spec(subscription_id="gone-sub"), now=NOW)
+    notification_store.delete_subscription("gone-sub", client_id=CLIENT, now=NOW)
+    # An expired document, written directly: `create_subscription` derives its own horizons, so the
+    # only way to have one already past them is to put it there.
+    stale = dict(_live_doc(subscription_id="stale-sub", now=NOW - timedelta(days=400)))
+    _emulator_client().collection(notification_store.SUBSCRIPTIONS).document("stale-sub").set(stale)
+    assert stale["expires_at"] < NOW, "the fixture must really be expired"
+
+    created = notification_store.create_subscription(
+        _spec(subscription_id="next-sub"), max_active=2, now=NOW
+    )
+    assert created.version == 1, "a tombstone and an expired row must not spend the ceiling"
+
+    # And the ceiling still binds on what is actually live: two now, against a ceiling of two.
+    try:
+        notification_store.create_subscription(
+            _spec(subscription_id="one-too-many"), max_active=2, now=NOW
+        )
+    except notification_store.QuotaExceeded:
+        pass
+    else:
+        raise AssertionError("the counted ceiling did not bind")
 
 
 def emulator_test_concurrent_emissions_converge_on_one_event():

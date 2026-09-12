@@ -457,8 +457,8 @@ silently.
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated` |
 | `notification_emit` | the emit step | `result` (`ok`, `timeout`, `retryable`, `failed`, `standing_error`, `run_clear_error`), `created`, `withdrawn`, `unchanged`, `obsolete`, `quota`, `capped`, `retryable`, `ms` |
 | `notification_event` | one committed revision | `result` = the event type, `client_id`, `destination_id`, `alert_id`, `revision`, `superseded` |
-| `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms` |
-| `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`), `destination_id`. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
+| `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
+| `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
 | `notification_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
@@ -557,12 +557,36 @@ Every bound is a number:
 | delivery step deadline / bounded wait | 20 s / 20 s |
 | emit step deadline / bounded wait | 6 s / 8 s |
 | per Firestore call | 4 s, under `varsel`'s 5 s wait |
-| attempts per cycle, total / per destination | 200 / 50 |
+| attempts per cycle, total / per destination | 200 / **the client's `deliveries_per_minute`**, default 50 |
 
 A destination is **skipped for the rest of the cycle after its first failure**, in pass-local state.
 That is the documented exception to this repo's "every module-level ledger is swept" rule: made
 module-level and swept, one failure would pause a destination permanently, which is
 indistinguishable from the intended 410 pause.
+
+**Since U7 a retryable failure also writes a DURABLE backoff on the destination record**, and the
+two answer different questions. The pass-local skip is what stops N pending events against one hung
+endpoint costing N read timeouts on the poller's thread, and it cannot outlive the pass. So it
+cannot honour a receiver that says *how long* to wait: a 429 with `Retry-After: 45` was answered by
+attempting again on the next cycle, which may be sooner. The backoff is the receiver's delay when it
+named one and a doubling default otherwise — `notification_auth.BACKOFF_BASE_S` (30 s) shifted by
+the consecutive failure count — both capped at `RETRY_AFTER_CAP_S` (300 s), the same ceiling a
+per-delivery `retry_not_before` uses, because an event's own validity is an hour and a longer
+backoff would expire the backlog it is protecting rather than delaying it.
+
+Four things about it are worth knowing before reading a quiet cycle as an outage. It is **not a
+pause**: `Destination.deliverable` still reads true, because several readers use that to mean "in
+service" and the notification API reports it to a client — the delivery path asks
+`ready_to_dial(now)` instead, which is a question about a moment. Only a **retryable** failure earns
+one: a 400 is about the event we sent and would grow a delay while the fix is a code change, and a
+410 keeps R12's terminal pause, which no clock lifts. It is written **once per destination per
+pass** even when a four-wide pool has four workers failing at the same instant — unclaimed, one bad
+cycle would double the delay four times and reach the cap immediately. And it is **cleared on the
+first success that finds something to clear**, tested against the pass's cached record, so a healthy
+endpoint carrying twenty thousand POSTs writes to its destination document exactly zero times.
+Neither the write nor the clear is audited, unlike a pause: this lifts itself within minutes, and a
+busy morning against a flaky receiver would otherwise write an audit row per cycle per destination
+into a collection that never expires.
 
 **Worst cases under injected faults.** Two of these are *ceilings* — arithmetic over the constants
 above, and pinned as such by a test — and two are *timings* recorded when the step was built. The
@@ -643,11 +667,24 @@ touches the wire contract, which is why the pilot could ship without them.
    inline under a 15/min budget and `notification_servability` re-asks four subscriptions a cycle
    (~1 150 a day). Distinct stop pairs number in the thousands where subscriptions number in the
    hundreds of thousands, and the planned tables already answer all of them in one query at cents.
-5. **A `count()` aggregation for the active-subscription ceiling.** `_create_body` counts a client's
-   live subscriptions by reading them inside the create transaction, up to the ceiling, which is why
-   `QUOTA_BOUNDS` caps `max_active_subscriptions` at 10 000. Above that the count has to be an
-   aggregation over an `expires_at` inequality (a new composite index), so the quota a very large
-   client needs is unlocked by this item, not by `set-quotas` alone.
+5. **A `count()` aggregation for the active-subscription ceiling — done, 2026-09-13 (U7).**
+   `_create_body` counted a client's live subscriptions by READING them inside the create
+   transaction, up to the ceiling: bounded, and paid on a create, which is what made it affordable
+   at 500 and what capped `max_active_subscriptions` at 10 000. It is now a `count()` over the
+   `expires_at > now` inequality the `subscription_count` spec declares, billed at roughly one read
+   per thousand index entries and taking no per-document lock, so `QUOTA_BOUNDS` raises that ceiling
+   to **200 000**. The prediction in this entry was that the inequality would need a new composite
+   index; it did not. The query already ordered by `expires_at DESCENDING` — Firestore's rule is
+   that a range filter's field must lead the ordering, and it did — so the index was checked in
+   already and the terraform plan for the unit was empty. What the aggregation counts is a
+   **superset** of live: `expires_at` is the minimum of R5's two horizons, so every live row is
+   inside it, while a document whose stored value has drifted ahead of a horizon is counted although
+   the reader would reject it. The count can therefore read high and never low, and high **refuses**
+   a create a stricter count would have admitted — the direction a ceiling must fail in. One thing
+   moved with it that is not the ceiling: `list_subscriptions` bounded its liveness-skipping scan by
+   the client's ceiling too, so the new bound would have turned an ordinary listing over a
+   collection full of undeleted rows into a 200 000-document read. That scan is capped separately at
+   `MAX_SUBSCRIPTION_LIST_SCAN` (10 000 — the old bound), so the listing's worst case did not move.
 
 ### What a bad morning is worded by, and what carries the template
 
@@ -798,12 +835,26 @@ Every number this feature publishes, beside the constant that defines it.
 module, so a constant that moves without this document moving fails the build — which is what turns
 R19's clause-by-clause check from a one-off reading into something that keeps holding.
 
-Three of these are **defaults** rather than ceilings since 2026-09-09: `MAX_ALERT_DELIVERIES_PER_DAY`,
-`MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` and `PER_CLIENT_PER_MIN` seed a new client's own values
-(`notification_auth.Quotas`, stored on the `clients` document, changed with `set-quotas`, bounded by
-`notification_auth.QUOTA_BOUNDS` at 1 000 / 10 000 / 10 000). The table states the default; a client's
-effective values are on its account. The daily cap is also copied onto each subscription document
-(`daily_cap`) at create, replace and touch, which is where `cap_remaining` reads it.
+**Five of these are defaults rather than ceilings**, and a sixth quota has no constant at all.
+`MAX_ALERT_DELIVERIES_PER_DAY`, `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` and `PER_CLIENT_PER_MIN` have
+seeded a new client's own values since 2026-09-09; `MAX_PENDING_EVENTS_PER_DESTINATION` and
+`MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE` joined them in U7, and
+`concurrent_deliveries` was added beside them with no constant behind it because nothing reads it
+yet (the pooled sender that spends it is U8; its default is `DEFAULT_CONCURRENT_DELIVERIES`, which
+is `webhook_delivery._WORKERS` written out, since that module imports this one). All six live on
+the `clients` document as `notification_auth.Quotas`, are changed with `set-quotas`, and are bounded
+by `notification_auth.QUOTA_BOUNDS` at 1 000 / 200 000 / 10 000 / 10 000 / 10 000 / 64 — the second
+was 10 000 until U7 moved the create-time ceiling onto an aggregation, which is what it was waiting
+for; see item 5 of "Scaling beyond the pilot".
+
+**The two per-destination rows stay in the table although they are now defaults**, which is a
+deliberate departure from the plan's wording ("removed from the table"). They are still numbers this
+feature publishes and still constants a change could move silently, and removing the rows would
+remove the only guard that notices. What changes is what they MEAN: a ceiling for every client
+became the value a client gets until an operator sets another. The table states the default; a
+client's effective values are on its account. The daily cap is additionally copied onto each
+subscription document (`daily_cap`) at create, replace and touch, which is where `cap_remaining`
+reads it — the other five are read from the account on each pass.
 
 | constant | value |
 |---|---|
@@ -815,6 +866,7 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `notification_store.DELIVERED_MARK_TTL_H` | 48 |
 | `notification_store.MAX_ALERT_DELIVERIES_PER_DAY` | 4 |
 | `notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` | 500 |
+| `notification_store.MAX_SUBSCRIPTION_LIST_SCAN` | 10000 |
 | `notification_store.MAX_PENDING_EVENTS_PER_DESTINATION` | 500 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_CYCLE` | 200 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE` | 50 |
@@ -832,6 +884,8 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `notification_auth.GLOBAL_PRELOOKUP_PER_MIN` | 300 |
 | `notification_auth.PER_CLIENT_PER_MIN` | 120 |
 | `notification_auth.RETRY_AFTER_S` | 60 |
+| `notification_auth.DEFAULT_CONCURRENT_DELIVERIES` | 4 |
+| `notification_auth.BACKOFF_BASE_S` | 30.0 |
 | `webhook_signing.MIN_ROOT_BYTES` | 32 |
 | `webhook_signing.TOLERANCE_S` | 300 |
 | `webhook_sender.DEFAULT_TIMEOUT_S` | 5.0 |
