@@ -113,6 +113,7 @@ class Sender(Protocol):
         headers: dict[str, str],
         timeout_s: float,
         connect_timeout_s: float,
+        max_in_flight: int,
     ) -> webhook_sender.DeliveryAttempt: ...
 
 
@@ -509,6 +510,11 @@ def _attempt(
         headers=signed.headers,
         timeout_s=timeout_s,
         connect_timeout_s=connect_timeout_s,
+        # The client's own `concurrent_deliveries`, which bounds how many requests this process has
+        # in flight against that host at once (U8). Per worker REPLICA rather than per client, which
+        # is what the quota's own comment says and why it is the only one here that is not a
+        # property of the account alone.
+        max_in_flight=notification_auth.quotas_for(delivery.client_id).concurrent_deliveries,
     )
     if attempt.ok:
         # The client HAS the event; if this write fails, only our record of it is missing.

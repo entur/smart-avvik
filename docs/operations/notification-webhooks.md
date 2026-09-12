@@ -578,6 +578,41 @@ of `pending_deliveries` in Python rather than in the query, because a second ine
 its own composite index *and* would exclude every document that lacks the field, which on the deploy
 that introduces it is the whole backlog.
 
+**The outbound client pools connections per host since U8.** Twenty thousand POSTs to one receiver
+used to be twenty thousand TLS handshakes — one to two round trips plus an asymmetric operation on
+both sides, inside the 5 s per-attempt ceiling this section treats as scarce, so the *connection*
+rather than the request was the cost of a bad morning. Four things bound it, and each exists for a
+reason worth knowing before changing the number.
+
+- **One validated resolution per host per 60 s.** KTD9's whole argument is that an address is
+  validated and then *dialled*, never re-looked-up — so a pool that trusted its first answer for the
+  life of the process would be safe against a rebind and useless against a client moving their
+  endpoint, while one that re-resolved per request would pay a DNS round trip inside the per-attempt
+  ceiling. On a refusal at the next resolve the idle connections go with it; a connection already
+  open stays open, because it is connected to an address that *was* validated and closing it
+  mid-request would fail a delivery for something that cannot affect it. A resolution that merely
+  *moves* also drops the idle set, so a client's own DNS failover takes effect.
+- **Idle connections are kept 60 s.** Receivers close idle keep-alives on their own schedule, and a
+  socket the peer has already closed fails the next request — which is a fact about the pool rather
+  than about the receiver, so it costs one fresh connection and exactly one retry, never a delivery.
+- **In-flight requests per host come from the client's `concurrent_deliveries`.** What it stops is a
+  wide worker opening a connection per thread against one receiver, which is the shape a receiver
+  experiences as an attack rather than as traffic — and the one thing about delivery that gets worse
+  rather than better as the worker gets wider. A request that cannot get a slot within the connect
+  budget is a retryable failure, never an unbounded wait.
+- **A response that was not drained is never put back.** An over-long body is read to
+  `MAX_RESPONSE_BYTES` and no further, so the rest is still on the wire; reusing that connection
+  would hand the leftovers to whatever asks next, as a wrong status on an unrelated delivery.
+
+The transport drives `http.client` directly rather than a `urllib` opener, because
+`AbstractHTTPHandler.do_open` opens a connection per call and closes it — which is exactly the cost
+this removes. Everything the opener was chosen for is kept by construction rather than by absence: a
+3xx is returned as a response and classified here, nothing reads `https_proxy`, and no cookie jar
+exists. **The socket deadline is armed per REQUEST, not per connect**, and that is the bug pooling
+introduces: a reused connection would otherwise carry the first request's deadline — already in the
+past — into every later one, `read_timeout` would floor it at 50 ms, and the symptom would read as a
+receiver that suddenly went slow.
+
 A destination is **skipped for the rest of the cycle after its first failure**, in pass-local state.
 That is the documented exception to this repo's "every module-level ledger is swept" rule: made
 module-level and swept, one failure would pause a destination permanently, which is
@@ -911,6 +946,7 @@ reads it — the other five are read from the account on each pass.
 | `webhook_sender.DEFAULT_TIMEOUT_S` | 5.0 |
 | `webhook_sender.CONNECT_TIMEOUT_S` | 2.0 |
 | `webhook_sender.MAX_RESPONSE_BYTES` | 65536 |
+| `webhook_sender.DEFAULT_MAX_IN_FLIGHT` | 4 |
 | `notification_api._LIST_DEFAULT` | 100 |
 | `notification_api._LIST_MAX` | 500 |
 | `notification_api._TEST_EVENTS_PER_MIN` | 6 |
