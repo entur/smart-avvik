@@ -242,6 +242,10 @@ class _FakeClient:
         self.transactions: list[_Txn] = []
         self.batch_deletes: list[str] = []
         self.fail_with: BaseException | None = None
+        # The STORE's clock, which a server stamp resolves against. Deliberately ahead of `NOW` by
+        # a visible margin: the bodies are handed `NOW` for `updated_at`, and a fake where the two
+        # agree could not tell a correct implementation from one that stamped `now` instead.
+        self.server_now: datetime = NOW + timedelta(seconds=37)
 
     def collection(self, name: str) -> _Collection:
         return _Collection(self, name)
@@ -261,6 +265,26 @@ class _FakeClient:
             (f"{collection}/{row.get('subscription_id') or row.get('delivery_id') or i}", row)
             for i, row in enumerate(rows)
         ]
+
+
+def _resolve_server_timestamps(
+    data: dict[str, Any] | None, server_now: datetime
+) -> dict[str, Any] | None:
+    """What Firestore does at commit: replace every ``SERVER_TIMESTAMP`` sentinel with a real time.
+
+    The fake applied writes verbatim, which left `MIRROR_FIELD` holding a sentinel object -- and a
+    watermark comparison against a sentinel is not a comparison at all, so every mirror check would
+    have passed or failed for a reason having nothing to do with the code. `server_now` is the
+    CLIENT's clock and deliberately separate from `NOW`, the clock the bodies are handed: the whole
+    point of a server stamp is that the two can differ, and a fake in which they cannot could not
+    show the drift the field exists to survive.
+    """
+    if not data:
+        return data
+    from google.cloud import firestore
+
+    sentinel = firestore.SERVER_TIMESTAMP
+    return {k: (server_now if v is sentinel else v) for k, v in data.items()}
 
 
 _fake: _FakeClient | None = None
@@ -300,10 +324,11 @@ def _install(client: _FakeClient) -> None:
         client.transactions.append(txn)
         result = body(txn)
         for kind, path, data in txn.writes:
+            resolved = _resolve_server_timestamps(data, client.server_now)
             if kind == "set":
-                client.docs[path] = dict(data or {})
+                client.docs[path] = dict(resolved or {})
             elif kind == "update":
-                client.docs.setdefault(path, {}).update(data or {})
+                client.docs.setdefault(path, {}).update(resolved or {})
             else:
                 client.docs.pop(path, None)
         return result
@@ -3891,6 +3916,87 @@ def test_a_subscription_document_names_its_channel_and_an_old_one_reads_as_webho
     assert "daily_cap" not in recipient
     legacy_recipient = notification_store._subscription_from_doc(legacy).as_recipient_document(NOW)
     assert legacy_recipient["channel"] == "webhook", legacy_recipient
+
+
+def test_exactly_the_mirror_consuming_bodies_stamp_the_watermark_field():
+    """U6/KTD5. Which bodies stamp is the mechanism, so it is pinned both ways.
+
+    The rule is "every body that changes a field the mirror CONSUMES", which is not the same as
+    "every body that touches a subscription", and both mistakes are silent:
+
+    * Leaving `_touch_body` OUT -- which the unit's own list did -- means the mirror keeps a stale
+      `expires_at` and drops a live subscription the client has just re-PUT. It is the write a
+      client makes most often.
+    * Leaving `_sent_body` IN defeats the watermark entirely: every delivery would make its
+      subscription due for re-read, so the busiest documents would sync on every cycle.
+
+    Read off the SOURCE rather than driven, because what has to hold is a property of the set of
+    bodies -- a body added next year is the case that matters, and no behavioural check over
+    today's five would see it.
+    """
+    source = pathlib.Path(notification_store.__file__).read_text()
+    bodies = {}
+    for chunk in source.split("\ndef ")[1:]:
+        name = "_" + chunk.split("(", 1)[0].lstrip("_")
+        if name.endswith("_body"):
+            bodies[name] = chunk
+    assert len(bodies) >= 13, f"only found {len(bodies)} bodies; did the naming change?"
+
+    # Matched on the CALL, not on one spelling of the assignment: `_replace_body` builds its patch
+    # and extends it, so a dict-literal-only pattern would read it as not stamping.
+    stamping = {name for name, body in bodies.items() if "_mirror_stamp()" in body}
+    # `_create_body` stamps through `_new_subscription_doc`, which is not a body itself.
+    builder = source.split("\ndef _new_subscription_doc", 1)[1].split("\ndef ", 1)[0]
+    if "_mirror_stamp()" in builder:
+        stamping.add("_create_body")
+    assert stamping == set(notification_store.MIRROR_STAMPING_BODIES), (
+        f"stamping bodies are {sorted(stamping)}, the declared set is "
+        f"{sorted(notification_store.MIRROR_STAMPING_BODIES)}. A new body that changes a field the "
+        "mirror reads must stamp AND be declared; one that does not must do neither."
+    )
+    for never in ("_sent_body", "_claim_body", "_failed_body", "_terminal_body"):
+        assert never in bodies, f"{never} is gone; this check has stopped checking anything"
+        assert never not in stamping, (
+            f"{never} stamps the watermark: every delivery would then make its subscription due "
+            "for re-read and the watermark would sync the busiest documents on every cycle"
+        )
+
+
+def test_the_watermark_field_is_the_stores_clock_and_advances_on_each_write():
+    """The stamp is the SERVER's, so a body must never write its own `now` into it.
+
+    The fake resolves the sentinel against a clock 37 s ahead of the one the bodies are handed, so
+    an implementation that wrote `now` reads as 37 s behind and fails here. Without that gap the
+    check would pass against either.
+    """
+    client = _FakeClient()
+    _install(client)
+    notification_store.create_subscription(_spec(), now=NOW)
+    stored = client.doc(notification_store.SUBSCRIPTIONS, SID)
+    assert stored is not None
+    created_stamp = stored[notification_store.MIRROR_FIELD]
+    assert created_stamp == client.server_now, "the stamp is not the store's clock"
+    assert created_stamp != stored["created_at"], "the stamp is the body's own `now`"
+
+    # Each mirror-consuming write moves it forward. The horizons a touch extends are exactly what
+    # the mirror tests liveness against, which is why the touch is in this list at all.
+    for step, call in (
+        ("touch", lambda: notification_store.touch_subscription(SID, client_id=CLIENT, now=NOW)),
+        (
+            "servability",
+            lambda: notification_store.set_servability(
+                SID, servable=True, expected_version=1, now=NOW
+            ),
+        ),
+        ("delete", lambda: notification_store.delete_subscription(SID, client_id=CLIENT, now=NOW)),
+    ):
+        client.server_now = client.server_now + timedelta(seconds=11)
+        call()
+        stored = client.doc(notification_store.SUBSCRIPTIONS, SID)
+        assert stored is not None
+        assert stored[notification_store.MIRROR_FIELD] == client.server_now, (
+            f"{step} did not restamp the watermark field"
+        )
 
 
 def test_the_two_bounded_subscription_queries_filter_on_the_channel():

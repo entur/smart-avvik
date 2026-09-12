@@ -125,6 +125,22 @@ DELIVERED_MARK_TTL_H = 48
 # measured admission limits", so this is the lower one. Raising it needs a measurement of the pass
 # at the new population, not a judgement.
 MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT = 500
+#: The field the subscription mirror's watermark is read from (U6, KTD5).
+#:
+#: **Server-stamped, never `now`.** Every body here already takes `now` as an argument for
+#: `updated_at`, and reusing it would be the obvious thing to do and would break the mirror
+#: quietly: the watermark is compared against values Firestore wrote, so a value this process
+#: wrote is being compared against a different clock. A pod whose clock runs a few seconds fast
+#: would advance the watermark past documents the store stamped later, and they would never be
+#: synced -- no error, just a subscription that stops updating.
+#:
+#: Two properties the sync depends on, both consequences of it being a FIELD rather than a
+#: timestamp on the document itself. A Firestore `order_by` **excludes documents that lack the
+#: field**, exactly as an equality does (U5's lesson one layer along), so the startup read cannot
+#: order by this one -- every document written before it existed would be invisible to the read
+#: that is supposed to seed the mirror. And a document nothing writes is never re-read, which is
+#: the point: a `sent` mark must not cost a sync.
+MIRROR_FIELD = "mirror_updated_at"
 # What one poller cycle may READ. R21 says the per-cycle read cannot exceed the ceiling, and this is
 # literally the query's `limit`. It must stay at or below `varsel._MAX_WEBHOOK_RECIPIENTS`, which
 # bounds the same read one layer out; `test_the_cycle_ceiling_does_not_exceed_varsels_own` parses
@@ -326,6 +342,45 @@ def _span(name: str, **attributes: Any):
         return provider(name, attributes, record_exception=False, measure=True)
     except Exception:  # noqa: BLE001 - instrumentation must never fail the call it observes
         return nullcontext()
+
+
+def _mirror_stamp() -> Any:
+    """``SERVER_TIMESTAMP``, resolved by Firestore at commit -- see :data:`MIRROR_FIELD`.
+
+    A function rather than a module constant because the library is imported lazily throughout this
+    file: a deployment with the channel switched off imports no Firestore library at all.
+    """
+    from google.cloud import firestore
+
+    return firestore.SERVER_TIMESTAMP
+
+
+#: The transaction bodies that stamp :data:`MIRROR_FIELD`, and the ones that deliberately do not.
+#:
+#: The rule is "every body that changes a field the mirror CONSUMES", which is not the same as
+#: "every body that touches a subscription". `_touch_body` is in the list and is the one most
+#: easily left out: it moves `expires_at` through `_horizons`, the mirror tests liveness against
+#: its own stored copy, and the idempotent re-PUT is the write a client makes most often -- so an
+#: unstamped touch means the mirror keeps the stale horizon and DROPS a live subscription when it
+#: passes.
+#:
+#: `_sent_body` is the one most easily left in, and leaving it in would defeat the whole mechanism:
+#: it writes the `delivered` marks, so every delivery would make its subscription due for re-read
+#: and the watermark would sync the busiest documents on every cycle. The cost of leaving it out is
+#: real and bounded: the mirror's `delivered` set can lag, so the pass can word a train already
+#: delivered. It cannot DUPLICATE one -- `_emit_body` reads the real subject document inside its
+#: transaction and mints nothing for an unchanged subject -- and the standing-subject mirror is
+#: what closes the wasted wording. Same reasoning for the claim and reservation-release bodies.
+#:
+#: `_finish_cleanup_body` is out because it only ever runs on a subscription `_delete_body` has
+#: already tombstoned, which the mirror has already dropped on that stamp.
+MIRROR_STAMPING_BODIES = (
+    "_create_body",
+    "_replace_body",
+    "_delete_body",
+    "_touch_body",
+    "_servability_body",
+)
 
 
 def _stream(query: Any) -> list[Any]:
@@ -1211,6 +1266,7 @@ def _new_subscription_doc(
         "definition_digest": _definition_digest(spec),
         "created_at": now,
         "updated_at": now,
+        MIRROR_FIELD: _mirror_stamp(),
         "last_seen_at": now,
         "servable": None,
         "servable_checked_at": None,
@@ -1388,6 +1444,7 @@ def _replace_body(
     # own, while clearing them would re-notify every train already delivered today.
     if daily_cap is not None:
         patch["daily_cap"] = int(daily_cap)
+    patch[MIRROR_FIELD] = _mirror_stamp()
     transaction.update(refs.subscription(spec.subscription_id), patch)
     return {**stored, **patch}
 
@@ -1448,6 +1505,10 @@ def _delete_body(
         "lifetime_expires_at": now,
         "inactivity_expires_at": now,
         "cleanup": {"state": "pending", "attempts": 0, "requested_at": now},
+        # The mirror learns of a revocation HERE and nowhere else: the cleanup that follows only
+        # redacts a document the mirror has already dropped, and TTL's eventual hard delete writes
+        # nothing at all.
+        MIRROR_FIELD: _mirror_stamp(),
     }
     transaction.update(refs.subscription(subscription_id), patch)
     return {**stored, **patch}
@@ -1504,7 +1565,15 @@ def _touch_body(
     if not subscription_is_live(stored, now):
         raise NotFound("subscription is deleted or past one of its horizons")
     created = _as_dt(stored.get("created_at")) or now
-    patch: dict[str, Any] = {"last_seen_at": now, "updated_at": now, **_horizons(created, now)}
+    # `_horizons` moves `expires_at`, which the mirror tests liveness against from its OWN copy --
+    # so an unstamped touch leaves the mirror holding the stale horizon and dropping a subscription
+    # the client has just told us it still wants. This is the write a client makes most often.
+    patch: dict[str, Any] = {
+        "last_seen_at": now,
+        "updated_at": now,
+        MIRROR_FIELD: _mirror_stamp(),
+        **_horizons(created, now),
+    }
     if daily_cap is not None:
         patch["daily_cap"] = int(daily_cap)
     transaction.update(refs.subscription(subscription_id), patch)
@@ -1554,7 +1623,12 @@ def _servability_body(
             f"version is {stored.get('version')}, not {expected_version}; the route was replaced "
             "while this servability check was in flight"
         )
-    patch = {"servable": servable, "servable_checked_at": now, "updated_at": now}
+    patch = {
+        "servable": servable,
+        "servable_checked_at": now,
+        "updated_at": now,
+        MIRROR_FIELD: _mirror_stamp(),
+    }
     transaction.update(refs.subscription(subscription_id), patch)
     return {**stored, **patch}
 
