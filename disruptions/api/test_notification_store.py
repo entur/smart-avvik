@@ -4872,6 +4872,116 @@ def test_the_open_withdrawal_runs_are_served_whole_environment():
     assert mirror.open_runs(NOW) == {}
 
 
+def test_every_commit_that_moves_a_subject_reaches_the_standing_set():
+    """U9 step 2, and it is a CORRECTNESS step rather than an economy one.
+
+    U6 built this mirror and nothing outside its own tests ever wrote to it. Read from an
+    unmaintained standing set the emit pass is worse than useless: a subject minted in cycle N is
+    absent in cycle N+1, so `notification_events.skip_reason` answers `nothing_standing` for the
+    below-threshold observation that follows and the withdrawal is never counted at all -- a
+    traveller keeps a warning we have stopped believing, silently, forever.
+
+    Drives the three PUBLIC functions rather than `apply`, because what has to hold is that no
+    committing path can forget: `_mirror_subject` is the single statement and this is what pins it.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    mirror = notification_store.subject_mirror()
+
+    created = notification_store.commit_event(_emit(), now=NOW)
+    assert created.status == "created"
+    assert mirror.phases_for(SID, NOW) == {created.alert_id: notification_store.PHASE_PREDICTED}
+    # A mint closes any open run, and the mirror has to have heard that too.
+    assert mirror.open_runs(NOW) == {}
+
+    later = NOW + timedelta(minutes=5)
+    counting = notification_store.record_below_threshold(_emit(), now=later)
+    assert counting.status == "counting" and counting.below_threshold_cycles == 1
+    assert mirror.open_runs(later) == {created.alert_id: later}
+    # The phase does NOT move on a counting cycle: a below-threshold observation is not a
+    # withdrawal until the run is long enough, and a mirror that moved the phase here would make
+    # the next alert-worthy cycle mint a revision nobody is owed.
+    assert mirror.phases_for(SID, later) == {created.alert_id: notification_store.PHASE_PREDICTED}
+
+    assert notification_store.clear_below_threshold(created.alert_id, now=later) is True
+    assert mirror.open_runs(later) == {}
+    assert mirror.phases_for(SID, later) == {created.alert_id: notification_store.PHASE_PREDICTED}
+
+
+def test_a_delivery_writes_the_subject_and_deliberately_does_not_mirror_it():
+    """The omission `_mirror_subject` names, pinned so it stays a decision rather than an oversight.
+
+    `_sent_body` writes `delivered_revision`, `delivered_at` and the pending pointer onto the
+    subject. None of the three is in the standing set, so mirroring them would put the busiest
+    documents in the hottest loop for no reader -- the same economy that keeps that body out of
+    `MIRROR_STAMPING_BODIES`. The phase is untouched by construction, which is what makes the
+    omission safe and is asserted here rather than assumed.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    mirror = notification_store.subject_mirror()
+    created = notification_store.commit_event(_emit(), now=NOW)
+    before = dict(mirror.phases_for(SID, NOW))
+
+    claim = notification_store.claim_delivery(created.delivery_id, now=NOW)
+    assert claim.status == "ready", claim
+    notification_store.mark_delivery_sent(created.delivery_id, token=claim.token, now=NOW)
+
+    stored = client.doc(notification_store.SUBJECTS, created.alert_id) or {}
+    assert stored.get("delivered_revision") == created.revision, "the store did write the subject"
+    assert mirror.phases_for(SID, NOW) == before
+    assert stored.get("phase") == notification_store.PHASE_PREDICTED
+
+
+def test_a_tombstone_and_its_cleanup_both_take_the_standing_subjects_with_them():
+    """Nothing may stand for a subscription that can no longer be routed to (R13).
+
+    Two calls and not one: the tombstone is when the subscription stops being routable, cleanup is
+    the retryable path R19 requires -- and cleanup can run long after a restart that re-seeded the
+    mirror from the very documents it is deleting.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    mirror = notification_store.subject_mirror()
+    created = notification_store.commit_event(_emit(), now=NOW)
+    assert mirror.phases_for(SID, NOW) != {}
+
+    notification_store.delete_subscription(SID, client_id=CLIENT, now=NOW)
+    assert mirror.phases_for(SID, NOW) == {}
+
+    mirror.apply(_state(created.alert_id, notification_store.PHASE_PREDICTED))
+    assert mirror.phases_for(SID, NOW) != {}
+    notification_store.cleanup_subscription(SID, now=NOW)
+    assert mirror.phases_for(SID, NOW) == {}
+
+
+def test_the_standing_set_is_pruned_of_expired_subjects_rather_than_growing_for_a_week():
+    """Memory, not correctness -- both readers already test expiry.
+
+    A subject document lives `HISTORY_DAYS` (7), so an unpruned mirror holds every train every
+    subscription was ever warned about for a week. At 100 000 subscriptions that is the one number
+    this structure grows in, and the pod's memory limit equals its request.
+    """
+    client = _FakeClient()
+    _install(client)
+    dying = _state("a-old", notification_store.PHASE_PREDICTED)
+    dying[notification_store.TTL_FIELD] = NOW + timedelta(minutes=1)
+    _subject_seed_page(client, [_state("a1", notification_store.PHASE_PREDICTED), dying])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 2
+
+    assert mirror.prune(NOW) == 0, "nothing has expired yet"
+    assert mirror.prune(NOW + timedelta(minutes=2)) == 1
+    assert mirror.size() == 1 and set(mirror.phases_for(SID, NOW)) == {"a1"}
+    # An empty subscription leaves no bucket behind, or the index grows without holding anything.
+    assert mirror.prune(NOW + timedelta(days=notification_store.HISTORY_DAYS + 1)) == 1
+    assert mirror.size() == 0
+
+
 def _run() -> None:
     plain = sorted(
         (name, fn)
