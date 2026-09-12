@@ -3095,8 +3095,27 @@ def _emit_body(
     )
 
 
+def count_pending_events(destination_id: str, *, ceiling: int) -> int:
+    """How many pending deliveries this destination holds, bounded by ``ceiling``.
+
+    Public since U9 because the emit pass counts ONCE per destination per cycle and keeps its own
+    figure in step from there (`notification_events._PendingLedger`): a count per mint was most of
+    the transaction latency the widened pass had to remove, and at sixty-four workers it would be
+    sixty-four concurrent aggregations against one collection to re-derive a figure this process is
+    the only writer of.
+
+    Bounded by the ceiling and not by the collection: what the caller needs is "is it at or past
+    this number", so reading beyond it is a page nobody looks at.
+    """
+    return _count_destination_deliveries(destination_id, state="pending", ceiling=ceiling)
+
+
 def commit_event(
-    request: EmitRequest, *, max_pending: int | None = None, now: datetime | None = None
+    request: EmitRequest,
+    *,
+    max_pending: int | None = None,
+    pending: int | None = None,
+    now: datetime | None = None,
 ) -> EventCommit:
     """Record one observation about one train, minting a revision only on a lifecycle transition.
 
@@ -3106,14 +3125,22 @@ def commit_event(
     about the same train.
 
     The ceiling on pending events per destination is checked BEFORE the transaction. Exact rather
-    than best effort, and the reason is nameable instead of hoped for: the emit path has exactly one
-    writer (one poller thread, no route invokes the pass, one replica under the Recreate strategy),
-    so nothing can create a pending event between the count and the commit.
+    than best effort, and the reason was nameable instead of hoped for: the emit path has exactly
+    one writer -- **one sentence of which U9 changed.** The writer is now the sixty-four threads of
+    one emit pass rather than one thread, so what makes the ceiling exact is the caller's own
+    locked ledger (`notification_events._PendingLedger`) plus its refusal to run two passes at
+    once; the count here is the second, independent refusal, and it is the one a direct caller
+    still gets for free.
 
     ``max_pending`` is the CLIENT's (``notification_auth.Quotas.max_pending_events``); ``None``
     means the module constant, resolved here at call time exactly as ``max_active`` is on the create
     path. It is the caller's to look up rather than this module's, because the store must not import
     ``notification_auth`` -- that edge already runs the other way.
+
+    ``pending`` is how many pending events the destination already holds when the CALLER has
+    counted, which is what lets the pass spend one aggregation per destination per cycle instead of
+    one per mint. ``None`` means "count it here", which is what every other caller gets and what
+    keeps this function correct on its own.
     """
     if request.phase not in PHASES:
         raise Conflict(f"phase must be one of {PHASES}, not {request.phase!r}")
@@ -3121,9 +3148,10 @@ def commit_event(
     seed = revision_seed(instant)
     refs = _Refs(_firestore_client())
     ceiling = MAX_PENDING_EVENTS_PER_DESTINATION if max_pending is None else max_pending
-    pending = _count_destination_deliveries(
-        request.destination_id, state="pending", ceiling=ceiling
-    )
+    if pending is None:
+        pending = _count_destination_deliveries(
+            request.destination_id, state="pending", ceiling=ceiling
+        )
     if pending >= ceiling:
         logger.warning(
             "Destination %s holds %d pending events; refusing to emit (ceiling %d)",
@@ -4541,6 +4569,7 @@ __all__ = [
     "client_alerts",
     "commit_event",
     "configure",
+    "count_pending_events",
     "create_subscription",
     "daily_cap_of",
     "database_id",

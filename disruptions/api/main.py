@@ -1403,6 +1403,11 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                         pending_quota=lambda client_id: notification_auth.quotas_for(
                             client_id
                         ).max_pending_events,
+                        # The same seam `varsel.configure(beat=...)` takes, and for the same
+                        # reason one step further along: since U9 this pass may run for 80 s, and
+                        # `/health`'s staleness rule means "no STEP has finished in 600 s" — so a
+                        # phase that merely got slow must keep saying so while it works.
+                        beat=_beat,
                     )
             except Exception:
                 logger.exception("Notification event emission failed")
