@@ -739,6 +739,10 @@ touches the wire contract, which is why the pilot could ship without them.
    the client's ceiling too, so the new bound would have turned an ordinary listing over a
    collection full of undeleted rows into a 200 000-document read. That scan is capped separately at
    `MAX_SUBSCRIPTION_LIST_SCAN` (10 000 — the old bound), so the listing's worst case did not move.
+   **Verified against dev Firestore on 2026-09-13, read-only**: the aggregation with all four
+   predicates returns 18, which is what the mirror holds, so the checked-in index really does serve
+   it. Worth doing rather than reasoning about — the emulator tracks no composite indexes, so it
+   cannot answer this, and a missing one is a `FailedPrecondition` on *every* create.
 
 ### What a bad morning is worded by, and what carries the template
 
