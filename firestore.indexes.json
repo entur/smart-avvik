@@ -9,6 +9,10 @@
           "order": "ASCENDING"
         },
         {
+          "fieldPath": "channel",
+          "order": "ASCENDING"
+        },
+        {
           "fieldPath": "expires_at",
           "order": "DESCENDING"
         }
@@ -42,6 +46,10 @@
         },
         {
           "fieldPath": "status",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "channel",
           "order": "ASCENDING"
         },
         {
