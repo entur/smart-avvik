@@ -1603,6 +1603,9 @@ def test_the_default_backoff_doubles_per_consecutive_failure_and_stops_at_the_ca
     try:
         base = notification_auth.BACKOFF_BASE_S
         cap = notification_store.RETRY_AFTER_CAP_S
+        # And the two statuses the curve is FOR really are retryable, per the real classifier.
+        for status in (429, 503):
+            assert webhook_sender.classify_status(status)[1] is True, status
         seen: list[float] = []
         for i in range(8):
             record = notification_auth.back_off_destination(DEST, now=NOW)
@@ -1680,6 +1683,8 @@ def test_a_non_retryable_failure_earns_no_backoff():
     try:
         _live(client)
         _pending(client, 1)
+        _ok, retryable, _terminal, _pause = webhook_sender.classify_status(400)
+        assert retryable is False, "a 400 is about the event, so the real classifier must agree"
         webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(ok=False, status=400, retryable=False, terminal_state="failed",
@@ -1700,6 +1705,10 @@ def test_the_410_pause_is_unchanged_and_is_not_a_backoff():
     try:
         _live(client)
         _pending(client, 1)
+        # The stub's `retryable=False` is what keeps the backoff out of this path, so assert the
+        # REAL classifier agrees -- otherwise this test is a property of its own fixture.
+        _ok, retryable, _terminal, pause = webhook_sender.classify_status(410)
+        assert retryable is False and pause is True, "410 is a pause, never a retry"
         report = webhook_delivery.deliver_pending(
             now=NOW,
             sender=_sender(ok=False, status=410, retryable=False, terminal_state="cancelled",
