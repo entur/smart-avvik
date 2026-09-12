@@ -837,6 +837,14 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         why="the mirror's one full read, at startup",
     ),
     QuerySpec(
+        name="mirror_seed_subjects",
+        collection=SUBJECTS,
+        # `created_at` for `mirror_seed`'s reason: an `order_by` excludes documents that lack the
+        # field, and every subject document carries this one.
+        order_by=(("created_at", "ASCENDING"),),
+        why="the standing-subject mirror's one full read, at startup",
+    ),
+    QuerySpec(
         name="mirror_sync",
         collection=SUBSCRIPTIONS,
         inequality=((MIRROR_FIELD, ">"),),
@@ -2197,6 +2205,175 @@ class SubscriptionMirror:
             truncated=truncated,
             watermark_age_s=self.watermark_age_s(now),
         )
+
+
+# ---- The standing-subject mirror (U6 step 3, KTD2) ----------------------------------------------
+#
+# The emit pass asks one question per subject -- "does this already stand, and in which phase?" --
+# and today it answers with one `client_alerts` query per client, bounded at MAX_SUBJECTS_PER_READ.
+# Past that bound the answer is INCOMPLETE, and incomplete is not a slightly worse answer: the pass
+# falls back to a store transaction per subject, because treating a truncated read as complete would
+# skip a withdrawal that was owed and, worse, a `confirmed` mint for a train ET has cancelled. At one
+# client with 100 000 subscriptions the read is truncated on every cycle, so the fallback IS the
+# steady state and the emit pass costs a transaction per subject forever.
+#
+# This mirror answers the same question completely, from memory.
+#
+# **Kept current by the poller's own commits, not by a watermark.** The subscription mirror needs a
+# watermark because clients write subscriptions through the API at any time. Subject documents have
+# exactly one writer -- KTD6's single writer: one poller thread, no route invokes the pass, one
+# replica under Recreate -- so every change to a subject passes through this process, and applying
+# it in memory is both cheaper and stronger than re-reading it. That property is worth re-checking
+# rather than assuming when U11 moves delivery to its own Deployment: what the worker writes is
+# `delivered_revision` and `pending_delivery_id` on the subject, and neither is in the standing set,
+# which carries the phase and the below-threshold run only.
+
+
+@dataclass(frozen=True, slots=True)
+class StandingSubject:
+    """One standing subject, as the emit pass needs it -- the phase and the withdrawal run."""
+
+    alert_id: str
+    subscription_id: str
+    phase: str
+    below_threshold_at: datetime | None
+    expires_at: datetime | None
+
+
+def _standing_subject(doc: Mapping[str, Any]) -> StandingSubject:
+    return StandingSubject(
+        alert_id=str(doc["alert_id"]),
+        subscription_id=str(doc["subscription_id"]),
+        phase=str(doc["phase"]),
+        below_threshold_at=_as_dt(doc.get("below_threshold_at")),
+        expires_at=_as_dt(doc.get(TTL_FIELD)),
+    )
+
+
+class SubjectMirror:
+    """Which subjects stand, in which phase -- complete, in memory, for the whole environment.
+
+    Indexed BY SUBSCRIPTION as well as by alert id, and that is not a convenience: the emit pass
+    asks per subscription, and a flat map would make each of 100 000 questions a scan of 100 000
+    entries. The secondary index is what keeps the pass linear.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_subscription: dict[str, dict[str, StandingSubject]] = {}
+        self._seeded = False
+
+    @property
+    def ready(self) -> bool:
+        """Whether the standing set is COMPLETE. An incomplete one must not be trusted.
+
+        Same reasoning as `_Standing.complete` in `notification_events`, which this replaces: a
+        partial standing set that reads as complete skips a withdrawal that was owed and a
+        `confirmed` mint for a train ET has cancelled. Until the seed finishes, the pass falls back
+        to asking the store, exactly as it does today.
+        """
+        with self._lock:
+            return self._seeded
+
+    def size(self) -> int:
+        with self._lock:
+            return sum(len(v) for v in self._by_subscription.values())
+
+    def reset(self) -> None:
+        with self._lock:
+            self._by_subscription = {}
+            self._seeded = False
+
+    def seed(self, *, now: datetime, beat: Callable[[], None] | None = None) -> MirrorSync:
+        """Page `alert_subjects` into the standing set. The only full read it ever does."""
+        by_subscription: dict[str, dict[str, StandingSubject]] = {}
+        cursor: Any = None
+        pages = held = 0
+        while True:
+            query = _query("mirror_seed_subjects", limit=MIRROR_PAGE_SIZE, start_after=cursor)
+            page = _stream(query)
+            pages += 1
+            for snapshot in page:
+                stored = _doc(snapshot)
+                try:
+                    subject = _standing_subject(stored)
+                except Exception:
+                    logger.debug("Unreadable alert subject; not mirrored", exc_info=True)
+                    continue
+                # Expiry is applied at seed time AND on every read, for the subscription mirror's
+                # reason: TTL runs up to ~24 h late, so an expired subject is still returned by the
+                # query, and nothing writes a document when its own TTL passes.
+                if not _not_expired(stored, now):
+                    continue
+                by_subscription.setdefault(subject.subscription_id, {})[subject.alert_id] = subject
+                held += 1
+            if len(page) < MIRROR_PAGE_SIZE:
+                break
+            cursor = page[-1]
+            if beat is not None:
+                beat()
+        with self._lock:
+            self._by_subscription = by_subscription
+            self._seeded = True
+        return MirrorSync(synced=held, pages=pages, size=held, reseeded=True)
+
+    def apply(self, doc: Mapping[str, Any]) -> None:
+        """Record a subject document this process has just committed.
+
+        Silently ignores a document it cannot read, for the same reason every other per-document
+        path here does (R20): the commit has already happened, and raising here would unwind a pass
+        over a mirror that is only ever an optimisation.
+        """
+        try:
+            subject = _standing_subject(doc)
+        except Exception:
+            logger.debug("Committed subject could not be mirrored", exc_info=True)
+            return
+        with self._lock:
+            self._by_subscription.setdefault(subject.subscription_id, {})[subject.alert_id] = (
+                subject
+            )
+
+    def drop(self, subscription_id: str, alert_id: str) -> None:
+        with self._lock:
+            subjects = self._by_subscription.get(subscription_id)
+            if subjects is None:
+                return
+            subjects.pop(alert_id, None)
+            if not subjects:
+                self._by_subscription.pop(subscription_id, None)
+
+    def drop_subscription(self, subscription_id: str) -> None:
+        """Everything a revoked subscription was standing on. Called when the mirror drops it."""
+        with self._lock:
+            self._by_subscription.pop(subscription_id, None)
+
+    def phases_for(self, subscription_id: str, now: datetime) -> dict[str, str]:
+        """``alert_id -> phase`` for one subscription, expired subjects excluded."""
+        with self._lock:
+            subjects = list(self._by_subscription.get(subscription_id, {}).values())
+        return {
+            s.alert_id: s.phase
+            for s in subjects
+            if s.expires_at is not None and s.expires_at > now
+        }
+
+    def open_runs(self, now: datetime) -> dict[str, datetime]:
+        """``alert_id -> below_threshold_at`` for every subject with an open withdrawal run.
+
+        Whole-environment rather than per client, which is what `ClientAlerts.open_below_threshold`
+        is too: the run is a property of the subject, and the caller looks up the one alert id it
+        is about.
+        """
+        with self._lock:
+            everything = [s for subjects in self._by_subscription.values() for s in subjects.values()]
+        return {
+            s.alert_id: s.below_threshold_at
+            for s in everything
+            if s.below_threshold_at is not None
+            and s.expires_at is not None
+            and s.expires_at > now
+        }
 
 
 def active_subscriptions(
