@@ -62,7 +62,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 import notification_store
@@ -164,6 +164,12 @@ RETRY_AFTER_S = 60
 #: `test_webhook_delivery.test_the_concurrency_default_is_the_pools_own_width`, so the two cannot
 #: drift apart silently.
 DEFAULT_CONCURRENT_DELIVERIES = 4
+#: The first backoff a retryably-failing destination earns when its receiver named no `Retry-After`.
+#: Doubling from here, capped at `notification_store.RETRY_AFTER_CAP_S` (300 s). 30 s is a fraction
+#: of a poller cycle (~296 s), so the FIRST failure costs a destination nothing it was not already
+#: going to lose to the pass-local skip -- what the curve buys is the third and fourth consecutive
+#: cycle against an endpoint that is genuinely down.
+BACKOFF_BASE_S = 30.0
 
 # ---- Per-client quotas ------------------------------------------------------------------------
 #
@@ -1269,6 +1275,13 @@ class Destination:
     updated_at: datetime | None
     paused_at: datetime | None = None
     paused_reason: str | None = None
+    #: U7's backoff. NOT a pause: a pause is R12's terminal state and an operator lifts it, while
+    #: this is a stretch of seconds a failing endpoint asked for (`Retry-After`) or earned (a
+    #: doubling default), and it lifts itself. Deliberately outside :attr:`deliverable`, which
+    #: several readers use to mean "is this destination in service"; the delivery pass asks
+    #: :meth:`ready_to_dial` instead, which is a question about a moment.
+    retry_not_before: datetime | None = None
+    consecutive_failures: int = 0
 
     @property
     def signing_generations(self) -> tuple[int, ...]:
@@ -1281,6 +1294,18 @@ class Destination:
     def deliverable(self) -> bool:
         """Whether U6 may attempt this destination at all: active, and not paused."""
         return self.status == _DESTINATION_ACTIVE and not self.paused
+
+    def ready_to_dial(self, now: datetime) -> bool:
+        """Deliverable, and not inside a backoff window this instant.
+
+        Two questions rather than one, because they have different answers for an operator:
+        `deliverable == False` is "somebody must resume this", and this is "it will come back by
+        itself". Folding the backoff into `deliverable` would make the notification API report a
+        healthy destination as out of service for a minute after one 503.
+        """
+        if not self.deliverable:
+            return False
+        return self.retry_not_before is None or self.retry_not_before <= now
 
 
 def _destination_from_doc(doc: Mapping[str, Any]) -> Destination:
@@ -1304,6 +1329,10 @@ def _destination_from_doc(doc: Mapping[str, Any]) -> Destination:
         updated_at=_as_dt(doc.get("updated_at")),
         paused_at=_as_dt(doc.get("paused_at")),
         paused_reason=doc.get("paused_reason") or None,
+        retry_not_before=_as_dt(doc.get("retry_not_before")),
+        # Absent reads as ZERO, so a destination written before the field existed starts its first
+        # backoff at the base delay rather than somewhere up the doubling curve.
+        consecutive_failures=int(doc.get("consecutive_failures") or 0),
     )
 
 
@@ -1560,6 +1589,77 @@ def pause_destination(
     return _destination_from_doc({**stored, **patch})
 
 
+def back_off_destination(
+    destination_id: str,
+    *,
+    retry_after_s: float | None = None,
+    now: datetime | None = None,
+) -> Destination:
+    """A destination that just failed retryably is not dialled again until this instant.
+
+    **Durable, where the pass-local skip is not.** ``webhook_delivery._Skips`` takes a destination
+    out for the rest of a pass on its first failure, which is what stops N pending events against
+    one hung endpoint costing N read timeouts on the poller's thread. It cannot survive the pass,
+    deliberately -- KTD6 names that as the reason it is not a swept module-level ledger, since one
+    failure would otherwise pause a destination permanently and be indistinguishable from R12's 410.
+    What it therefore cannot do is honour a receiver that says *how long* to wait: a 429 with
+    ``Retry-After: 45`` is answered by attempting again on the next cycle, which may be sooner.
+
+    So the two sit side by side and answer different questions. The delay is the receiver's when it
+    named one and a doubling default otherwise -- :data:`BACKOFF_BASE_S` shifted by the consecutive
+    failure count -- and both are capped at ``notification_store.RETRY_AFTER_CAP_S``, the same
+    ceiling the per-delivery ``retry_not_before`` already uses. Capped for the reason that one is:
+    an event's own validity is an hour, so a backoff longer than the cap would expire the backlog it
+    is protecting rather than delaying it.
+
+    Not audited, unlike :func:`pause_destination`. A pause is a state an operator has to lift and a
+    silent destination they need explaining; this clears itself within minutes, and a busy morning
+    against a flaky receiver would write an audit row per cycle per destination into a collection
+    that never expires.
+    """
+    instant = now or _now()
+    stored = _store().get(DESTINATIONS, destination_id)
+    if not stored:
+        raise NotFound("no such destination")
+    consecutive = int(stored.get("consecutive_failures") or 0) + 1
+    if retry_after_s is not None and retry_after_s > 0:
+        delay = float(retry_after_s)
+    else:
+        # Doubling, from the count AFTER this failure: the first failure waits the base delay.
+        # Shift-bounded before the float multiply so a destination that somehow accumulated a large
+        # count cannot build an overflowing number on the way to being capped.
+        delay = float(BACKOFF_BASE_S) * float(2 ** min(consecutive - 1, 16))
+    delay = min(delay, float(notification_store.RETRY_AFTER_CAP_S))
+    patch = {
+        "retry_not_before": instant + timedelta(seconds=delay),
+        "consecutive_failures": consecutive,
+        "updated_at": instant,
+    }
+    _store().update(DESTINATIONS, destination_id, patch)
+    return _destination_from_doc({**stored, **patch})
+
+
+def clear_destination_backoff(
+    destination_id: str, *, now: datetime | None = None
+) -> Destination | None:
+    """A destination answered 2xx: drop its backoff and its failure count.
+
+    ``None`` when there was nothing to clear, so the caller can make this cost a write only on
+    RECOVERY rather than on every successful delivery -- twenty thousand POSTs to a healthy endpoint
+    must not be twenty thousand writes to one document, which is also a hot-document contention
+    problem and not only a bill.
+    """
+    instant = now or _now()
+    stored = _store().get(DESTINATIONS, destination_id)
+    if not stored:
+        return None
+    if not stored.get("consecutive_failures") and not stored.get("retry_not_before"):
+        return None
+    patch = {"retry_not_before": None, "consecutive_failures": 0, "updated_at": instant}
+    _store().update(DESTINATIONS, destination_id, patch)
+    return _destination_from_doc({**stored, **patch})
+
+
 def resume_destination(
     destination_id: str, *, actor: str, now: datetime | None = None
 ) -> Destination:
@@ -1646,6 +1746,7 @@ def retire_signing_generation(
 __all__ = [
     "ACCOUNTS",
     "ADMIN_AUDIT",
+    "BACKOFF_BASE_S",
     "CREDENTIALS",
     "DEFAULT_CONCURRENT_DELIVERIES",
     "DEFAULT_QUOTAS",
@@ -1674,9 +1775,11 @@ __all__ = [
     "amend_destination",
     "authenticate",
     "available",
+    "back_off_destination",
     "bearer_credential",
     "claim_client_slot",
     "claim_window",
+    "clear_destination_backoff",
     "configure",
     "create_client",
     "create_destination",
