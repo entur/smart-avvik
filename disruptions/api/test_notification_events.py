@@ -340,6 +340,70 @@ def _subject(**over: Any) -> notification_events.WebhookSubject:
     return notification_events.WebhookSubject(**base)
 
 
+def _observed(subjects: list[notification_events.WebhookSubject]) -> list[Any]:
+    """Group subjects into observations the way `varsel._observations_for_key` does.
+
+    The pass hands `emit` one observation per (definition, train) with its recipients since U9;
+    this suite's fixtures stay written in SUBJECTS because a subject is what the store sees and
+    what every assertion here is about. The grouping key is the train plus the observation —
+    exactly what `varsel` shares across the recipients on one definition — with `payload` left out
+    because a dict is unhashable and, in this suite, identical wherever the rest of the key is.
+    """
+    grouped: dict[tuple, list[notification_events.WebhookSubject]] = {}
+    for subject in subjects:
+        grouped.setdefault(
+            (
+                subject.alertworthy,
+                subject.cancelled,
+                subject.situations,
+                subject.operator,
+                subject.line,
+                subject.journey_ref,
+                subject.stop_place,
+                subject.stop_order,
+                subject.departure_time,
+                subject.title,
+                subject.body,
+                subject.expected_departure_time,
+            ),
+            [],
+        ).append(subject)
+    return [
+        notification_events.WebhookObservation(
+            recipients=tuple(
+                notification_events.Recipient(
+                    subscription_id=s.subscription_id,
+                    client_id=s.client_id,
+                    destination_id=s.destination_id,
+                    subscription_version=s.subscription_version,
+                    external_ref=s.external_ref,
+                    test=s.test,
+                )
+                for s in group
+            ),
+            alertworthy=group[0].alertworthy,
+            cancelled=group[0].cancelled,
+            situations=group[0].situations,
+            operator=group[0].operator,
+            line=group[0].line,
+            journey_ref=group[0].journey_ref,
+            stop_place=group[0].stop_place,
+            stop_order=group[0].stop_order,
+            departure_time=group[0].departure_time,
+            title=group[0].title,
+            body=group[0].body,
+            payload=group[0].payload,
+            expected_departure_time=group[0].expected_departure_time,
+        )
+        for group in grouped.values()
+    ]
+
+
+def _emit(subjects: list[notification_events.WebhookSubject], **kwargs: Any) -> Any:
+    """`notification_events.emit` over the observations those subjects belong to."""
+    return notification_events.emit(_observed(subjects), **kwargs)
+
+
 # See `test_webhook_delivery`'s copy for the full argument: every fault this suite injects is
 # logged by the code under test with `exc_info=True`, and with no handler in the hierarchy
 # `logging.lastResort` printed the record and its traceback to stderr -- so a passing run ended in
@@ -403,7 +467,7 @@ def test_an_alertworthy_train_mints_one_event_and_the_next_cycle_mints_nothing()
     client = _install()
     try:
         _live(client)
-        first = notification_events.emit([_subject()], now=NOW)
+        first = _emit([_subject()], now=NOW)
         events = client.in_collection(notification_store.EVENTS)
         assert first.created == 1 and len(events) == 1
         assert events[0]["type"] == notification_store.EVENT_CREATED
@@ -412,7 +476,7 @@ def test_an_alertworthy_train_mints_one_event_and_the_next_cycle_mints_nothing()
 
         # A LATER cycle, with a different probability in the payload: the facts moved, the lifecycle
         # did not. Nothing is minted, at any size of change -- there is no materiality threshold.
-        second = notification_events.emit(
+        second = _emit(
             [_subject(payload={"probabilities": {"impact": 0.99}})], now=NOW + timedelta(minutes=5)
         )
         assert second.created == 0 and second.unchanged == 1
@@ -439,11 +503,11 @@ def test_a_confirmed_cancellation_mints_an_updated_revision_and_supersedes_the_f
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         first = client.in_collection(notification_store.EVENTS)[0]
         notification_store.mark_delivery_sent(first["event_id"], now=NOW + timedelta(seconds=5))
 
-        notification_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
+        _emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
         events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
         assert len(events) == 2
         confirmed = events[-1]
@@ -474,9 +538,9 @@ def test_a_confirmation_whose_forecast_was_never_delivered_is_not_cap_exempt():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         first = client.in_collection(notification_store.EVENTS)[0]
-        notification_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
+        _emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
         events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
         assert client.doc(notification_store.DELIVERIES, events[-1]["event_id"])["cap_exempt"] is False
         assert client.doc(notification_store.DELIVERIES, first["event_id"])["state"] == "superseded"
@@ -507,13 +571,16 @@ def test_thirteen_departures_produce_thirteen_events_soonest_first():
             )
             for i in range(13)
         ]
-        report = notification_events.emit(subjects, now=NOW)
+        report = _emit(subjects, now=NOW)
         assert report.created == 13
         events = client.in_collection(notification_store.EVENTS)
         assert len({e["alert_id"] for e in events}) == 13
         # Minted in departure order, which the revision (clamped to `stored + 1` per subject, seeded
         # from one instant) cannot show -- so read the order off the queue itself.
-        order = [s.journey_ref for s in sorted(subjects, key=notification_events._sort_key)]
+        order = [
+            o.journey_ref
+            for o in sorted(_observed(subjects), key=notification_events._sort_key)
+        ]
         assert order == [f"DatedServiceJourney:{2000 + i}" for i in range(12, -1, -1)]
     finally:
         _uninstall()
@@ -533,8 +600,8 @@ def test_two_below_threshold_cycles_withdraw_and_one_does_not():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        one = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        _emit([_subject()], now=NOW)
+        one = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         assert one.counting == 1 and one.withdrawn == 0, "one dip is noise"
         assert len(client.in_collection(notification_store.EVENTS)) == 1
 
@@ -546,7 +613,7 @@ def test_two_below_threshold_cycles_withdraw_and_one_does_not():
         # Seeded AFTER the documents are back, because that is the order a pod comes up in: the
         # standing set is read out of Firestore by the poller's own step, before the pass.
         _sync_mirror()
-        two = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=2))
+        two = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=2))
         assert two.withdrawn == 1, "the counter survived the restart"
         events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
         assert events[-1]["type"] == notification_store.EVENT_WITHDRAWN
@@ -571,12 +638,12 @@ def test_a_recovered_cycle_breaks_the_run_so_a_later_dip_does_not_withdraw():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        dip = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        _emit([_subject()], now=NOW)
+        dip = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         assert dip.counting == 1, dip
 
         was = client.in_collection(notification_store.SUBJECTS)[0]
-        recovered = notification_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        recovered = _emit([_subject()], now=NOW + timedelta(minutes=2))
         assert recovered.unchanged == 1, "the same phase again: nothing is minted"
         assert recovered.run_cleared == 1, f"and the open run is closed; got {recovered}"
         subject = client.in_collection(notification_store.SUBJECTS)[0]
@@ -588,7 +655,7 @@ def test_a_recovered_cycle_breaks_the_run_so_a_later_dip_does_not_withdraw():
 
         # Well inside `WITHDRAWAL_GAP_S` of the first dip, so the time window alone would withdraw.
         assert timedelta(minutes=3).total_seconds() < notification_store.WITHDRAWAL_GAP_S
-        second = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=3))
+        second = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=3))
         assert second.withdrawn == 0 and second.counting == 1, (
             f"the recovery made this a FIRST dip, not the second of a run; got {second}"
         )
@@ -608,9 +675,9 @@ def test_an_ordinary_standing_cycle_still_writes_nothing():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         before = client.transactions
-        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=1))
+        report = _emit([_subject()], now=NOW + timedelta(minutes=1))
         assert report.unchanged == 1 and client.transactions == before, (
             f"an ordinary standing cycle writes nothing; "
             f"{client.transactions - before} transaction(s) happened"
@@ -629,11 +696,11 @@ def test_a_run_already_past_the_gap_is_left_for_the_store_to_reset():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        _emit([_subject()], now=NOW)
+        _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         later = NOW + timedelta(seconds=notification_store.WITHDRAWAL_GAP_S + 120)
         before = client.transactions
-        report = notification_events.emit([_subject()], now=later)
+        report = _emit([_subject()], now=later)
         assert report.run_stale == 1 and report.run_cleared == 0, report
         assert client.transactions == before, "and it costs no transaction"
     finally:
@@ -653,12 +720,12 @@ def test_an_unseeded_mirror_loses_the_reset_and_never_reads_per_subject():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        _emit([_subject()], now=NOW)
+        _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         notification_store.reset_mirrors_for_tests()
         assert notification_store.subject_mirror().ready is False
         mark = len(_SINK.records)
-        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        report = _emit([_subject()], now=NOW + timedelta(minutes=2))
         assert report.run_cleared == 0 and report.run_stale == 0, report
         assert report.unchanged == 1, "the store still answered the subject itself"
         assert not any("get_subject" in str(r.msg) for r in _SINK.records[mark:])
@@ -684,7 +751,7 @@ def test_a_below_threshold_train_with_nothing_standing_costs_no_transaction():
         _live(client)
         before = client.transactions
         queries = len(client.queries)
-        report = notification_events.emit([_subject(alertworthy=False)], now=NOW)
+        report = _emit([_subject(alertworthy=False)], now=NOW)
         assert report.nothing_standing == 1
         assert client.transactions == before, "no transaction was spent"
         assert client.queries[queries:] == [], "and no query either — the mirror answered it"
@@ -697,10 +764,116 @@ def test_an_unchanged_alertworthy_train_costs_no_transaction_either():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         before = client.transactions
-        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=1))
+        report = _emit([_subject()], now=NOW + timedelta(minutes=1))
         assert report.unchanged == 1 and client.transactions == before
+    finally:
+        _uninstall()
+
+
+def test_a_shared_observation_materialises_a_subject_only_where_a_store_call_happens():
+    """U9 step 1, and the number it prevents is the reason it exists.
+
+    The pass used to hand over one `WebhookSubject` per (recipient, train), built in `varsel`
+    before this module saw any of them — so a corridor with 100 000 subscriptions and AE3's
+    thirteen cancelled departures materialised 1.3 million dataclasses in one burst, on the
+    ingestion thread, in a pod whose memory limit equals its request. The payload was already
+    shared by reference; the objects around it were not.
+
+    What is asserted is the property rather than a byte count: the observation is one object, and a
+    subject is built only where the standing set says a store call is going to happen. For the ~83 %
+    of matched alerts that are sub-threshold with nothing standing, that is never.
+    """
+    client = _install()
+    try:
+        recipients = []
+        for i in range(5):
+            sid = f"sub-{i}"
+            _live(client, subscription_id=sid)
+            recipients.append(
+                notification_events.Recipient(
+                    subscription_id=sid,
+                    client_id=CLIENT,
+                    destination_id=DEST,
+                    subscription_version=1,
+                )
+            )
+        shared = _observed([_subject(alertworthy=False)])[0]
+        quiet = notification_events.WebhookObservation(
+            **{**shared.__dict__, "recipients": tuple(recipients)}
+        )
+
+        built: list[str] = []
+        original = notification_events.WebhookObservation.subject
+
+        def counting(self: Any, recipient: Any) -> Any:
+            built.append(recipient.subscription_id)
+            return original(self, recipient)
+
+        notification_events.WebhookObservation.subject = counting  # type: ignore[method-assign]
+        try:
+            quietly = notification_events.emit([quiet], now=NOW)
+            assert quietly.nothing_standing == 5, quietly
+            assert built == [], (
+                f"a below-threshold observation nobody stands on built {len(built)} subject(s); "
+                "the whole point of the shape is that it builds none"
+            )
+
+            # And where they DO stand, every recipient is materialised — once each.
+            alert = notification_events.WebhookObservation(
+                **{**quiet.__dict__, "alertworthy": True}
+            )
+            loud = notification_events.emit([alert], now=NOW)
+            assert loud.created == 5, loud
+            assert sorted(built) == [f"sub-{i}" for i in range(5)]
+        finally:
+            notification_events.WebhookObservation.subject = original  # type: ignore[method-assign]
+    finally:
+        _uninstall()
+
+
+def test_the_train_identity_is_resolved_once_per_train_not_once_per_recipient():
+    """The other half of step 1: `train_ref_of` and the requested phase are per OBSERVATION.
+
+    At 100 000 subscriptions on one corridor the difference between per-train and per-recipient is
+    four calls against four hundred thousand, every cycle — and the answer cannot differ between
+    two recipients, because it is derived from the train alone.
+    """
+    client = _install()
+    try:
+        recipients = []
+        for i in range(4):
+            sid = f"sub-{i}"
+            _live(client, subscription_id=sid)
+            recipients.append(
+                notification_events.Recipient(
+                    subscription_id=sid,
+                    client_id=CLIENT,
+                    destination_id=DEST,
+                    subscription_version=1,
+                )
+            )
+        shared = _observed([_subject()])[0]
+        observation = notification_events.WebhookObservation(
+            **{**shared.__dict__, "recipients": tuple(recipients)}
+        )
+
+        calls = 0
+        original = notification_events.train_ref_of
+
+        def counting(**kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return original(**kwargs)
+
+        notification_events.train_ref_of = counting  # type: ignore[assignment]
+        try:
+            report = notification_events.emit([observation], now=NOW)
+        finally:
+            notification_events.train_ref_of = original  # type: ignore[assignment]
+        assert report.created == 4, report
+        assert calls == 1, f"the train was identified {calls} times for one observation"
     finally:
         _uninstall()
 
@@ -726,11 +899,11 @@ def test_the_pre_reads_own_ceiling_is_gone_and_a_line_suspension_costs_nothing()
         subjects = [
             _subject(journey_ref=f"DatedServiceJourney:{3000 + i}") for i in range(served + 2)
         ]
-        notification_events.emit(subjects, now=NOW)
+        _emit(subjects, now=NOW)
         assert len(client.in_collection(notification_store.SUBJECTS)) == served + 2
 
         before = client.transactions
-        report = notification_events.emit(subjects, now=NOW + timedelta(minutes=1))
+        report = _emit(subjects, now=NOW + timedelta(minutes=1))
         assert report.unchanged == len(subjects), "every one still resolves to `no transition`"
         assert client.transactions == before, (
             f"a subscription past the old display ceiling ({served}) cost "
@@ -752,7 +925,7 @@ def test_an_unseeded_mirror_costs_transactions_and_never_events():
         _live(client)
         notification_store.reset_mirrors_for_tests()
         before = client.transactions
-        report = notification_events.emit([_subject()], now=NOW)
+        report = _emit([_subject()], now=NOW)
         assert report.created == 1, "the event was still committed"
         assert client.transactions > before, "and it was the store that answered, per subject"
     finally:
@@ -786,10 +959,10 @@ def test_the_revision_survives_the_oslo_dst_fall_back_and_a_clock_step_backwards
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject(departure_time=before + timedelta(minutes=20))], now=before)
+        _emit([_subject(departure_time=before + timedelta(minutes=20))], now=before)
         first = client.in_collection(notification_store.EVENTS)[0]["revision"]
         # A step BACKWARDS, further than the fall-back: the clamp is what holds now.
-        notification_events.emit(
+        _emit(
             [_subject(cancelled=True, departure_time=before + timedelta(minutes=20))],
             now=before - timedelta(days=2),
         )
@@ -832,7 +1005,7 @@ def test_validity_follows_the_expected_departure_and_is_floored_when_already_pas
         aimed_only = _subject(
             journey_ref="DatedServiceJourney:aimed", departure_time=NOW + timedelta(minutes=12)
         )
-        notification_events.emit([late, gone, imminent, aimed_only], now=NOW)
+        _emit([late, gone, imminent, aimed_only], now=NOW)
         events = {e["event_id"]: e for e in client.in_collection(notification_store.EVENTS)}
         by_ref = {
             events[d["event_id"]]["journey_ref"]: d
@@ -944,7 +1117,7 @@ def test_an_observation_that_cannot_name_a_train_is_never_a_subject():
     try:
         _live(client)
         before = client.transactions
-        report = notification_events.emit([_subject(stop_order=None)], now=NOW)
+        report = _emit([_subject(stop_order=None)], now=NOW)
         assert report.unidentified == 1 and client.transactions == before
     finally:
         _uninstall()
@@ -978,7 +1151,7 @@ def test_the_reservation_stops_new_transactions_before_the_deadline_rather_than_
             _subject(journey_ref=f"DatedServiceJourney:{4000 + i}") for i in range(6)
         ]
         started = time.monotonic()
-        report = notification_events.emit(
+        report = _emit(
             subjects, now=NOW, deadline_s=0.2, wait_s=2.0, worst_case_s=0.12
         )
         elapsed = time.monotonic() - started
@@ -1009,7 +1182,7 @@ def test_a_hung_store_cannot_extend_the_step_past_its_bounded_wait():
         notification_store._run_transaction = hanging  # type: ignore[assignment]
         handler = _capture()
         started = time.monotonic()
-        report = notification_events.emit([_subject()], now=NOW, wait_s=0.1)
+        report = _emit([_subject()], now=NOW, wait_s=0.1)
         elapsed = time.monotonic() - started
         assert elapsed < 2.0, f"a hung store must not hold the poller thread; took {elapsed:.1f}s"
         assert report.timed_out is True
@@ -1040,12 +1213,12 @@ def test_a_destination_at_its_pending_ceiling_is_skipped_for_the_rest_of_the_ste
         subjects = [
             _subject(journey_ref=f"DatedServiceJourney:{5000 + i}") for i in range(4)
         ]
-        report = notification_events.emit(subjects, now=NOW)
+        report = _emit(subjects, now=NOW)
         assert report.quota == 4 and report.created == 0
         assert client.transactions == 0, "and only ONE of them paid for the discovery"
 
         notification_store._count_destination_deliveries = real  # type: ignore[assignment]
-        assert notification_events.emit(subjects, now=NOW).created == 4, (
+        assert _emit(subjects, now=NOW).created == 4, (
             "the skip is pass-local: a drained destination is attempted again next cycle"
         )
     finally:
@@ -1066,13 +1239,13 @@ def test_an_exhausted_transaction_is_classified_retryable_not_terminal():
         prefix = notification_store._exhausted_transaction_prefix()
         client.fail_with = ValueError(f"{prefix} 5 attempts.")
         handler = _capture()
-        report = notification_events.emit([_subject()], now=NOW)
+        report = _emit([_subject()], now=NOW)
         assert report.retryable == 1 and report.failed == 0
         assert any(e["result"] == "retryable" for e in _events(handler, "notification_emit"))
 
         client.fail_with = ValueError("something else entirely")
         mark = len(_SINK.records)
-        report = notification_events.emit([_subject()], now=NOW)
+        report = _emit([_subject()], now=NOW)
         assert report.failed == 1 and report.retryable == 0
         # Asserted rather than printed: `_events` above removed the per-test handler, so this
         # second injection's record fell through to `lastResort` and put a traceback on stderr on
@@ -1094,11 +1267,11 @@ def test_an_obsolete_subscription_emits_nothing_and_says_which_kind():
     client = _install()
     try:
         _live(client)
-        assert notification_events.emit([_subject(subscription_version=2)], now=NOW).obsolete == 1
+        assert _emit([_subject(subscription_version=2)], now=NOW).obsolete == 1
         assert client.in_collection(notification_store.EVENTS) == []
 
         client.docs.clear()
-        assert notification_events.emit([_subject()], now=NOW).obsolete == 1, "deleted subscription"
+        assert _emit([_subject()], now=NOW).obsolete == 1, "deleted subscription"
     finally:
         _uninstall()
 
@@ -1118,7 +1291,7 @@ def test_no_external_reference_route_or_prose_reaches_a_log_line():
     try:
         _live(client)
         handler = _capture()
-        notification_events.emit(
+        _emit(
             [
                 _subject(
                     external_ref="commuter-42",
@@ -1189,7 +1362,7 @@ def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
 
         notification_store._count_destination_deliveries = _counted  # type: ignore[assignment]
         subjects = [_subject(journey_ref=f"DatedServiceJourney:{6000 + i}") for i in range(3)]
-        report = notification_events.emit(
+        report = _emit(
             subjects,
             now=NOW,
             pending_quota=lambda client_id: (asked.append(client_id), 9_999)[1],
@@ -1201,7 +1374,7 @@ def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
         # And with no resolver the module constant stands, which is what every caller that does not
         # care about quotas gets.
         seen.clear()
-        notification_events.emit(
+        _emit(
             [_subject(journey_ref="DatedServiceJourney:6100")], now=NOW
         )
         assert seen == [notification_store.MAX_PENDING_EVENTS_PER_DESTINATION], (

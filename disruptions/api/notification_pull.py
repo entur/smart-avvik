@@ -524,7 +524,7 @@ def _compute_figures(definition: dict, now: datetime, *, journey_key: str) -> _F
 
     Selection is `varsel.alert_worthy_trains` over `varsel.match_journey`'s alerts: the per-train
     collapse first, then the push gate, in the pass's own order (KTD7). A train `notification_events.
-    train_ref_of` cannot name stably is skipped exactly as `varsel._subjects_for_key` skips it, and
+    train_ref_of` cannot name stably is skipped exactly as `varsel._observations_for_key` skips it, and
     is not counted anywhere: `n_alerts` is what the answer lists. The per-train build -- message
     input, wording, payload -- moved to assembly (:func:`_assembled_entry`) with U4, because the
     wording and the alternative it is built from arrive after the figures do.
@@ -1206,7 +1206,7 @@ def _assembled_entry(definition: dict, entry: _Entry, state: _EntryState, rank: 
     """One answer entry from the figures plus what the caches hold: the message input built after
     the alternative, the wording through `varsel.notification_wording_for` (the route line around
     the text, the template when there is none), the payload through `varsel._webhook_payload` with
-    the uncollapsed alerts about the train -- `varsel._subjects_for_key`'s build, restated for a
+    the uncollapsed alerts about the train -- `varsel._observations_for_key`'s build, restated for a
     definition nobody registered, with registry-resolved names in `reise` and never a typed one."""
     resolved = state.message_input.get("reise") or {}
     from_name = resolved.get("fra") or definition["from_stop"]

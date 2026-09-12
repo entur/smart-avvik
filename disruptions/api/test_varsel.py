@@ -1820,7 +1820,7 @@ def test_alert_worthy_trains_is_the_collapse_then_the_gate_exactly_as_the_pass_i
     one alert per train FIRST, then the push gate. The fixture is the case where the order shows:
     train t1 carries a published situation over its gate (0.70 > 0.65) and a no-SX reading under
     its own (0.80 < 0.85) that outranks it on severity, so the collapse keeps the sub-gate winner
-    and t1 is NOT alert-worthy -- `_subjects_for_key` iterates it as a withdrawal subject. A
+    and t1 is NOT alert-worthy -- `_observations_for_key` iterates it as a withdrawal observation. A
     gate-first filter would list t1 through its published situation. Pinned against the pass's
     own loop rather than restated, and the order is the collapse's, which the read sorts after."""
     key = "A|B|07:00|09:00|0,1,2,3,4"
@@ -1844,18 +1844,18 @@ def test_alert_worthy_trains_is_the_collapse_then_the_gate_exactly_as_the_pass_i
         _train_of(a) for a in varsel.one_alert_per_train(alerts) if a.alertworthy
     ], "the collapse's own order is kept; the read sorts afterwards"
 
-    # The pass's own loop on the same fixture: its alert-worthy subjects are the helper's trains, and
-    # t1 is there as a withdrawal subject -- present, and not alert-worthy.
+    # The pass's own loop on the same fixture: its alert-worthy observations are the helper's
+    # trains, and t1 is there as a withdrawal observation -- present, and not alert-worthy.
     out: list = []
     recipient = varsel.WebhookRecipient("sub_1", _journey(), client_id="c1", destination_id="d1")
-    unroutable = varsel._subjects_for_key(
+    unroutable = varsel._observations_for_key(
         out, key, [recipient], alerts_by_key={key: alerts}, match_targets={key: _journey()},
         message_inputs={}, webhook_llm=False,
     )
     assert unroutable == 0
-    assert [_train_of(s) for s in out if s.alertworthy] == [_train_of(a) for a in chosen]
-    t1 = [s for s in out if s.journey_ref == "t1"]
-    assert len(t1) == 1 and t1[0].alertworthy is False, "t1 is the pass's withdrawal subject"
+    assert [_train_of(o) for o in out if o.alertworthy] == [_train_of(a) for a in chosen]
+    t1 = [o for o in out if o.journey_ref == "t1"]
+    assert len(t1) == 1 and t1[0].alertworthy is False, "t1 is the pass's withdrawal observation"
 
 
 def test_the_freshness_provider_reads_none_before_the_first_load_and_the_timestamp_after():
