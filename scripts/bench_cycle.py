@@ -71,6 +71,44 @@ NAMESPACE = "kix-avvik"
 EVENT_FIELD = "jsonPayload.event"
 
 
+class _NeverCalled:
+    """Stands in for `decisions._bq_client` so `decisions.enabled()` is true and the row build runs.
+
+    Both harnesses stub `decisions.record`, which is the only function that reaches the client, so
+    nothing should ever touch this object. Every attribute access therefore raises rather than
+    opening a session: a benchmark that promises to be hermetic and quietly talks to BigQuery is
+    worse than one that fails.
+    """
+
+    def __getattr__(self, name: str):  # pragma: no cover - the point is that it never runs
+        raise AssertionError(
+            f"a benchmark reached BigQuery: decisions._bq_client.{name}. "
+            "These runs are hermetic; stub whatever new call site this is."
+        )
+
+
+#: Shared by `run_profile` here and by `bench_matcher.run`, so the two cannot drift into two fences.
+NEVER_CALLED = _NeverCalled()
+
+
+def row_counting_record(sink: list[int]):
+    """A `decisions.record` stub written to the CALL's arity, appending each request's row count.
+
+    Shared by both harnesses and a function rather than a lambda so a test can bind it against the
+    real :func:`decisions.record` signature. That check is the point: the two harnesses carried
+    `lambda rows: 0`, the pre-U4 arity, and U4 added `beat=` to the call -- which at exact arity is
+    a `TypeError` at the call site. It never fired only because `_record_decisions` returns before
+    reaching it when no client is configured, so one silence hid the other. Widening this needs a
+    kwarg here and nothing else; leaving it narrow now fails a check instead of a benchmark.
+    """
+
+    def record(rows, *, beat=None):
+        sink.append(len(rows))
+        return len(rows)
+
+    return record
+
+
 #: The events a capacity row is read from. The first two are the cycle's own breakdown; the other
 #: three are the three steps whose cost `poller_phase` cannot resolve on its own.
 #:
@@ -326,9 +364,15 @@ def run_profile(definitions: int, *, top: int = 5) -> dict:
     suite._reset_state()
     # The two remaining writes. A push goes to a real push service and a decision row to BigQuery;
     # neither is interpreter time this profile is asking about, and both would be real side effects
-    # of a measurement.
+    # of a measurement. BUILDING the row is interpreter time and is measured: `_record_decisions`
+    # returns at its first line unless `decisions.enabled()` -- `_bq_client is not None` -- so a
+    # profile that configures no client silently skips the whole KTD15 ledger and row build, which
+    # R1 counts against the same budget as the match. `NEVER_CALLED` raises on any attribute access,
+    # so the fence stays a fence; the stub below is written to the CALL's arity,
+    # `record(rows, *, beat=...)`, not to the pre-U4 `record(rows)` this carried.
     varsel._send_push = lambda subscription, payload: "sent"
-    decisions.record = lambda rows: 0
+    decisions._bq_client = NEVER_CALLED
+    decisions.record = row_counting_record([])
     for i in range(definitions):
         device = f"profile-{i:06d}"
         varsel._devices[device] = {"subscription": None, "created_ts": "2026-01-01T00:00:00+00:00"}

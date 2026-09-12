@@ -215,18 +215,28 @@ RATIOS = ("plan", "prd")
 R1_TARGETS = {"35000": 3.4, "80000": 1.5}
 
 
-def population(ratio: str, definitions: int) -> dict[str, int]:
-    """How many pairs, windows and journeys `definitions` definitions are spread over."""
+def population(ratio: str, definitions: int, *, pairs: int | None = None) -> dict[str, int]:
+    """How many pairs, windows and journeys `definitions` definitions are spread over.
+
+    `pairs` overrides the ratio's own pair count and leaves everything else alone. Phase A's gate
+    names one shape the two ratios do not produce on their own -- 10 000 definitions over 2 000
+    pairs -- and deriving it by moving `--definitions` would change the denominator R1 is read
+    against at the same time.
+    """
     if ratio == "plan":
-        pairs = min(4000, definitions)
+        pairs = min(4000, definitions) if pairs is None else pairs
         windows = 50
     elif ratio == "prd":
-        pairs = max(1, round(definitions / PRD_DEFINITIONS_PER_PAIR))
+        pairs = max(1, round(definitions / PRD_DEFINITIONS_PER_PAIR)) if pairs is None else pairs
         # Definitions on one pair differ by WINDOW, so the window vocabulary must be at least the
         # per-pair count or the pairs cannot carry that many distinct definitions.
         windows = max(2, round(PRD_DEFINITIONS_PER_PAIR) + 1)
     else:  # pragma: no cover - argparse constrains this
         raise ValueError(f"unknown ratio: {ratio!r}")
+    pairs = max(1, min(pairs, definitions))
+    # Same rule as the `prd` branch's, applied after any override: fewer pairs than definitions
+    # means several definitions share one, and they can only differ by window.
+    windows = max(windows, -(-definitions // pairs) + 1)
     return {
         "definitions": definitions,
         "pairs": pairs,
@@ -293,6 +303,7 @@ def run(
     unpruned: bool = False,
     trips: int = PEAK_TRIPS,
     situations: int = PEAK_SITUATIONS,
+    pairs: int | None = None,
 ) -> dict:
     """Measure one `check_and_notify` over the synthetic peak cache. In-process, nothing written.
 
@@ -323,17 +334,36 @@ def run(
     import impact
     import test_varsel_api as suite  # type: ignore[import-not-found]
     import varsel
-    from bench_cycle import profile_report
+    from bench_cycle import NEVER_CALLED, profile_report, row_counting_record
 
     suite._reset_state()
     varsel._send_push = lambda subscription, payload: "sent"
-    decisions.record = lambda rows: 0
     alternatives.fetch_candidates = lambda *a, **k: []
+    # **The decision-row build is inside R1's budget, so it has to be inside the measurement.**
+    # R1 says in as many words that "matching and rows must fit the remainder", and
+    # `_record_decisions` returns at its FIRST line unless `decisions.enabled()` -- which is
+    # `_bq_client is not None`. A harness that configures no client therefore measured the match and
+    # the wording passes and skipped every row, silently, while reporting itself as the pass's
+    # end-to-end cost. The sentinel client is never called: `record` is the only entry point that
+    # touches it and it is stubbed, so this stays hermetic. What now runs for real is
+    # `decisions.build_row`, `decisions.rescored`, `varsel._thinning_reason` and the KTD15 ledger --
+    # the per-definition work U4 added, which is exactly what the gate has to see.
+    #
+    # The stub is written to the CALL's arity, `record(rows, *, beat=...)`, and not to the
+    # pre-U4 `record(rows)` the two harnesses carried: at exact arity an added kwarg raises
+    # `TypeError` at the call, which here would have surfaced as the whole benchmark failing -- and
+    # did not, only because the early return above meant the stub was never reached at all. Both
+    # halves of that are worth keeping shut, so the row count is REPORTED: a zero in
+    # `decision_rows` means the pass built no rows and the figure has quietly become a matcher
+    # figure again.
+    rows_written: list[int] = []
+    decisions._bq_client = NEVER_CALLED
+    decisions.record = row_counting_record(rows_written)
 
     snapshot = synthetic_snapshot(trips=trips, situations=situations)
     suite._use_snapshot(snapshot)
     impact.invalidate_generation()
-    shape = population(ratio, definitions)
+    shape = population(ratio, definitions, pairs=pairs)
     seeded = seed_registrations(varsel, shape)
 
     def reseed():
@@ -382,6 +412,9 @@ def run(
         profiled_interpreter_s=profiled_s,
         profiled_ms_per_definition=profiled_ms,
         r1_targets_ms_per_definition=R1_TARGETS,
+        # The unprofiled pass's rows -- the one the ms/definition above comes from. Zero means
+        # `_record_decisions` returned early and the figure covers matching and wording only.
+        decision_rows=rows_written[0] if rows_written else 0,
     )
     return report
 
@@ -399,6 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trips", type=int, default=PEAK_TRIPS)
     parser.add_argument("--situations", type=int, default=PEAK_SITUATIONS)
     parser.add_argument(
+        "--pairs",
+        type=int,
+        default=None,
+        help="Override the ratio's pair count (Phase A's gate names 10 000 definitions / 2 000 pairs).",
+    )
+    parser.add_argument(
         "--unpruned",
         action="store_true",
         help="Bypass the inverted index — the pass as it was before U2, for the comparison.",
@@ -409,12 +448,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def render(reports: Sequence[dict]) -> str:
     lines = ["", "bench_matcher — interpreter ms per definition", ""]
-    head = f"{'ratio':<6} {'index':<9} {'defs':>7} {'pairs':>7} {'total s':>9} {'ms/def':>9}"
+    head = (
+        f"{'ratio':<6} {'index':<9} {'defs':>7} {'pairs':>7} {'rows':>7} "
+        f"{'total s':>9} {'ms/def':>9}"
+    )
     lines += [head, "-" * len(head)]
     for r in reports:
         lines.append(
             f"{r['ratio']:<6} {'pruned' if r['pruned'] else 'unpruned':<9} "
-            f"{r['definitions']:>7} {r['population']['pairs']:>7} "
+            f"{r['definitions']:>7} {r['population']['pairs']:>7} {r['decision_rows']:>7} "
             f"{r['interpreter_s']:>9} {r['ms_per_definition']:>9}"
         )
     lines += [
@@ -440,6 +482,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             unpruned=args.unpruned,
             trips=args.trips,
             situations=args.situations,
+            pairs=args.pairs,
         )
         for ratio in ratios
     ]
