@@ -184,6 +184,7 @@ def test_the_rendered_table_names_both_ratios_and_the_cache_it_measured():
             "ratio": ratio, "pruned": True, "definitions": 20000,
             "population": {"pairs": 4000}, "interpreter_s": 9.0, "ms_per_definition": 0.45,
             "snapshot": {"situations": 1100, "trips": 930, "calls": 29000},
+            "decision_rows": 4321,
             "top_by_self_time": [{"self_ms": 1.0, "calls": 2, "function": "impact.py:1(f)"}],
         }
         for ratio in bm.RATIOS
@@ -193,6 +194,9 @@ def test_the_rendered_table_names_both_ratios_and_the_cache_it_measured():
         assert ratio in text, text
     assert "1100" in text and "930" in text, text
     assert "3.4 ms per definition at 35 000" in text, text
+    # The row count rides on the printed row, not only in --json: a figure copied into the
+    # operations document has to carry whether the row build was inside it.
+    assert "4321" in text, text
 
 
 def test_the_unpruned_mode_names_the_symbol_it_replaces():
@@ -209,6 +213,104 @@ def test_the_unpruned_mode_names_the_symbol_it_replaces():
     assert hasattr(impact, "_pruned_scope"), "bench_matcher patches a symbol that no longer exists"
     source = pathlib.Path(bm.__file__).read_text()
     assert "impact._pruned_scope = " in source, "the unpruned shim is gone"
+
+
+# ---- The decision-row build is inside the measurement --------------------------------------------
+
+
+def _api_on_path() -> None:
+    api = pathlib.Path(__file__).resolve().parents[1] / "disruptions" / "api"
+    if str(api) not in sys.path:
+        sys.path.insert(0, str(api))
+
+
+def test_the_record_stub_can_be_called_however_the_real_record_can():
+    """The stub's arity is bound against `decisions.record`'s own signature, not eyeballed.
+
+    This is the [[exact-arity-test-stubs]] trap as a check. Both harnesses carried
+    `lambda rows: 0`; U4 made the call `record(rows, beat=...)`, which at that arity is a
+    `TypeError` in the middle of a benchmark run. Binding the real signature's parameters against
+    the stub fails here instead, in the change that widens `record`.
+    """
+    import inspect
+
+    _api_on_path()
+    import bench_cycle
+    import decisions
+
+    real = inspect.signature(decisions.record)
+    args = [[] for name, p in real.parameters.items() if p.kind is not p.KEYWORD_ONLY]
+    kwargs = {name: None for name, p in real.parameters.items() if p.kind is p.KEYWORD_ONLY}
+    assert kwargs, "decisions.record has no keyword-only parameter; this check has gone vacuous"
+
+    sink: list[int] = []
+    inspect.signature(bench_cycle.row_counting_record(sink)).bind(*args, **kwargs)
+
+    # And it CAN fail: the narrow stub the harnesses used to carry does not bind. Without this the
+    # check above would keep passing against a signature that had quietly stopped being checked.
+    try:
+        inspect.signature(lambda rows: 0).bind(*args, **kwargs)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("the pre-U4 stub binds, so this check proves nothing")
+
+    assert bench_cycle.row_counting_record(sink)([{"a": 1}, {"b": 2}]) == 2
+    assert sink == [2], sink
+
+
+def test_both_harnesses_turn_the_decision_row_build_on():
+    """`_record_decisions` returns at its first line unless a client is configured.
+
+    R1 counts matching AND rows against one budget, so a harness measuring the pass with
+    `decisions.enabled()` false reports a matcher figure as an end-to-end one. The mechanism is
+    checked here, not just the string: `enabled()` really does flip on the sentinel.
+    """
+    _api_on_path()
+    import bench_cycle
+    import decisions
+
+    before = decisions._bq_client
+    assert decisions.enabled() is False, "a real client leaked into this suite"
+    try:
+        decisions._bq_client = bench_cycle.NEVER_CALLED
+        assert decisions.enabled() is True
+    finally:
+        decisions._bq_client = before
+
+    for module in (bm, bench_cycle):
+        source = pathlib.Path(module.__file__).read_text()
+        assert "decisions._bq_client = NEVER_CALLED" in source, module.__name__
+
+
+def test_the_sentinel_client_refuses_to_be_used():
+    """Hermetic has to stay hermetic: the fence raises rather than opening a BigQuery session."""
+    import bench_cycle
+
+    try:
+        _ = bench_cycle.NEVER_CALLED.insert_rows_json
+    except AssertionError as exc:
+        assert "hermetic" in str(exc), exc
+    else:
+        raise AssertionError("the sentinel answered an attribute access")
+
+
+def test_the_pair_count_can_be_overridden_for_the_phase_a_gate():
+    """The gate names 10 000 definitions over 2 000 pairs, which neither ratio produces alone.
+
+    Deriving it by moving `--definitions` would change the denominator R1 is read against at the
+    same time, so the override moves pairs and nothing else -- and the window vocabulary widens to
+    carry them, or the seeder cannot make that many distinct definitions.
+    """
+    shape = bm.population("plan", 10000, pairs=2000)
+    assert shape["pairs"] == 2000, shape
+    assert shape["definitions"] == 10000, shape
+    assert shape["windows"] >= 10000 / 2000, shape
+
+    fake = _FakeVarsel()
+    seeded = bm.seed_registrations(fake, bm.population("plan", 600, pairs=120))
+    assert seeded["distinct_definitions"] == 600, seeded
+    assert len({(j["from_stop"], j["to_stop"]) for j in fake._journeys.values()}) == 120
 
 
 def _run() -> None:
