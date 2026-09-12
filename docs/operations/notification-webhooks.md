@@ -643,11 +643,24 @@ touches the wire contract, which is why the pilot could ship without them.
    inline under a 15/min budget and `notification_servability` re-asks four subscriptions a cycle
    (~1 150 a day). Distinct stop pairs number in the thousands where subscriptions number in the
    hundreds of thousands, and the planned tables already answer all of them in one query at cents.
-5. **A `count()` aggregation for the active-subscription ceiling.** `_create_body` counts a client's
-   live subscriptions by reading them inside the create transaction, up to the ceiling, which is why
-   `QUOTA_BOUNDS` caps `max_active_subscriptions` at 10 000. Above that the count has to be an
-   aggregation over an `expires_at` inequality (a new composite index), so the quota a very large
-   client needs is unlocked by this item, not by `set-quotas` alone.
+5. **A `count()` aggregation for the active-subscription ceiling — done, 2026-09-13 (U7).**
+   `_create_body` counted a client's live subscriptions by READING them inside the create
+   transaction, up to the ceiling: bounded, and paid on a create, which is what made it affordable
+   at 500 and what capped `max_active_subscriptions` at 10 000. It is now a `count()` over the
+   `expires_at > now` inequality the `subscription_count` spec declares, billed at roughly one read
+   per thousand index entries and taking no per-document lock, so `QUOTA_BOUNDS` raises that ceiling
+   to **200 000**. The prediction in this entry was that the inequality would need a new composite
+   index; it did not. The query already ordered by `expires_at DESCENDING` — Firestore's rule is
+   that a range filter's field must lead the ordering, and it did — so the index was checked in
+   already and the terraform plan for the unit was empty. What the aggregation counts is a
+   **superset** of live: `expires_at` is the minimum of R5's two horizons, so every live row is
+   inside it, while a document whose stored value has drifted ahead of a horizon is counted although
+   the reader would reject it. The count can therefore read high and never low, and high **refuses**
+   a create a stricter count would have admitted — the direction a ceiling must fail in. One thing
+   moved with it that is not the ceiling: `list_subscriptions` bounded its liveness-skipping scan by
+   the client's ceiling too, so the new bound would have turned an ordinary listing over a
+   collection full of undeleted rows into a 200 000-document read. That scan is capped separately at
+   `MAX_SUBSCRIPTION_LIST_SCAN` (10 000 — the old bound), so the listing's worst case did not move.
 
 ### What a bad morning is worded by, and what carries the template
 
@@ -801,7 +814,9 @@ R19's clause-by-clause check from a one-off reading into something that keeps ho
 Three of these are **defaults** rather than ceilings since 2026-09-09: `MAX_ALERT_DELIVERIES_PER_DAY`,
 `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` and `PER_CLIENT_PER_MIN` seed a new client's own values
 (`notification_auth.Quotas`, stored on the `clients` document, changed with `set-quotas`, bounded by
-`notification_auth.QUOTA_BOUNDS` at 1 000 / 10 000 / 10 000). The table states the default; a client's
+`notification_auth.QUOTA_BOUNDS` at 1 000 / 200 000 / 10 000 — the middle one was 10 000 until U7
+moved the create-time ceiling onto an aggregation, which is what it was waiting for; see item 5 of
+"Scaling beyond the pilot"). The table states the default; a client's
 effective values are on its account. The daily cap is also copied onto each subscription document
 (`daily_cap`) at create, replace and touch, which is where `cap_remaining` reads it.
 
@@ -815,6 +830,7 @@ effective values are on its account. The daily cap is also copied onto each subs
 | `notification_store.DELIVERED_MARK_TTL_H` | 48 |
 | `notification_store.MAX_ALERT_DELIVERIES_PER_DAY` | 4 |
 | `notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` | 500 |
+| `notification_store.MAX_SUBSCRIPTION_LIST_SCAN` | 10000 |
 | `notification_store.MAX_PENDING_EVENTS_PER_DESTINATION` | 500 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_CYCLE` | 200 |
 | `notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE` | 50 |

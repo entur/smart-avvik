@@ -1392,7 +1392,11 @@ def test_quota_values_outside_their_bounds_are_refused_and_bad_stored_values_rea
             {"daily_cap": 0},
             {"daily_cap": 1_001},
             {"requests_per_minute": 0},
-            {"max_active_subscriptions": 10_001},
+            # Read off QUOTA_BOUNDS rather than written out, so raising a bound moves this check
+            # with it instead of leaving a literal that no longer names the edge.
+            {"max_active_subscriptions": notification_auth.QUOTA_BOUNDS[
+                "max_active_subscriptions"
+            ][1] + 1},
             {"max_active_subscriptions": True},
         ):
             try:
