@@ -1547,10 +1547,10 @@ def test_quotas_for_answers_off_the_same_cached_account_read():
 def test_the_three_delivery_quotas_are_bounded_and_seeded_from_the_constants():
     """U7's new fields, each with the constant it defaults to.
 
-    `concurrent_deliveries` is the one that is DECLARED AND UNREAD until U8 gives `webhook_sender`
-    its per-host pool. It is here now so one `set-quotas` shape serves the whole unit rather than
-    changing under a client mid-plan -- and asserting it exists is what stops it being quietly
-    dropped before the code that spends it arrives.
+    `concurrent_deliveries` was declared and unread in U7 and is spent by U8's pooled sender: the
+    delivery pass reads it per client and hands it to `webhook_sender.deliver`, which bounds
+    concurrent requests to one host by it. Declaring it a unit early was so that one `set-quotas`
+    shape served the whole plan rather than changing under a client mid-way.
     """
     defaults = notification_auth.DEFAULT_QUOTAS
     assert defaults.max_pending_events == notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
@@ -1561,9 +1561,12 @@ def test_the_three_delivery_quotas_are_bounded_and_seeded_from_the_constants():
     for name in ("max_pending_events", "deliveries_per_minute", "concurrent_deliveries"):
         low, high = notification_auth.QUOTA_BOUNDS[name]
         assert low == 1 and high >= getattr(defaults, name), name
+    # READ since U8, and asserted as such: the pooled sender bounds concurrent requests to one
+    # host by it. This assertion was the opposite until that landed, which is what made the wiring
+    # trip a test rather than slip in unnoticed.
     delivery_source = (HERE / "webhook_delivery.py").read_text()
-    assert "concurrent_deliveries" not in delivery_source, (
-        "still unread -- the pooled sender that spends it is U8"
+    assert "concurrent_deliveries" in delivery_source, (
+        "the delivery pass must spend this quota, or it is a number nobody applies"
     )
 
 

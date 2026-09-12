@@ -357,7 +357,7 @@ def _sender(**over: Any):
     """A stub in ``webhook_sender.deliver``'s exact shape, recording what was sent."""
     hang: threading.Event | None = over.pop("hang", None)
 
-    def send(url, *, body, headers, timeout_s, connect_timeout_s):
+    def send(url, *, body, headers, timeout_s, connect_timeout_s, max_in_flight=None):
         if hang is not None:
             hang.wait(30)
         _sent.append({"url": url, "body": body, "headers": dict(headers)})
