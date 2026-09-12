@@ -90,6 +90,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from itertools import islice
@@ -513,6 +514,12 @@ _togvarsel_notify_provider: Callable[[], bool] | None = None
 # so an environment change needs no import-time dance.
 _webhook_enabled: Callable[[], bool] | None = None
 _webhook_provider: WebhookRecipientProvider | None = None
+# The tracing seam (R16). `main` injects `tracing_setup.span`; absent, every sub-pass span is a
+# `nullcontext` and this module behaves exactly as it did before the seam existed. Injected rather
+# than imported for the reason every other seam here is: `varsel` must import neither `main` nor
+# the app's tracing wiring, and a module-level `import tracing_setup` would also run that module's
+# import-time `setup()` inside every suite that imports varsel.
+_span_provider: Callable[..., Any] | None = None
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -527,6 +534,7 @@ def configure(
     togvarsel_notify_provider: Callable[[], bool] | None = None,
     webhook_enabled: Callable[[], bool] | None = None,
     webhook_recipients_provider: WebhookRecipientProvider | None = None,
+    span: Callable[..., Any] | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -541,15 +549,44 @@ def configure(
     absent — not a flag value — that guarantees it. The flag is injected separately from the store
     so the pass can decline to touch the store at all, which is what makes "the flag is unset, so
     nothing was read" a property of this module rather than of whoever wrote the provider.
+
+    `span` is main's `tracing_setup.span` (R16), and it is a CALLABLE for the same reason as the
+    two above rather than an import: this module must depend on neither `main` nor the app's
+    tracing wiring. Absent, :func:`_span` yields a `nullcontext` and the pass is byte-for-byte what
+    it was. Whatever is injected must accept `(name, attributes)` and honour the closed-vocabulary
+    attribute rule — `tracing_setup.safe_attributes` is where that is enforced.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
-    global _webhook_enabled, _webhook_provider
+    global _webhook_enabled, _webhook_provider, _span_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
     _webhook_enabled = webhook_enabled
     _webhook_provider = webhook_recipients_provider
+    _span_provider = span
+
+
+def _span(name: str, **attributes: Any):
+    """One sub-pass span, or a no-op when nothing was injected.
+
+    **Counts and timings only, and only the names in `tracing_setup.SPAN_ATTRIBUTE_NAMES`.** A span
+    reaches Cloud Trace, where project IAM is the only gate, and these open exactly where the stop
+    refs, place names, departure times and wordings are — so no attribute may carry one. The filter
+    lives in `tracing_setup.safe_attributes`; what lives here is the discipline at the call site,
+    and `test_tracing_setup` reads this file's own source to keep it.
+
+    A broken provider degrades to no span rather than taking the cycle: this runs on the ingestion
+    thread, where an instrumentation exception would cost a cycle's alerting. Only construction is
+    guarded — `__enter__`/`__exit__` are the OTel API's, which does not raise from instrumentation.
+    """
+    provider = _span_provider
+    if provider is None:
+        return nullcontext()
+    try:
+        return provider(name, attributes)
+    except Exception:  # noqa: BLE001 - instrumentation must never fail the pass it observes
+        return nullcontext()
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -3478,9 +3515,19 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             return key, []
 
     matched: list[tuple[str, list[Alert]]] = []
-    if match_targets:
-        with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(match_targets))) as pool:
-            matched = list(pool.map(_match, list(match_targets.items())))
+    # The five sub-pass spans (R16) start here. `varsel_notify` showed as one opaque phase with the
+    # decision-log insert under it and nothing else, so "which of the five is the cycle in?" could
+    # only be answered by adding log lines. Opened unconditionally, including at zero definitions:
+    # a pass that did nothing is a reading, and a missing span reads as an uninstrumented one.
+    with _span(
+        "varsel_match",
+        definitions=len(match_targets),
+        recipients=len(webhook_recipients),
+        workers=min(_MATCH_WORKERS, len(match_targets)) if match_targets else 0,
+    ):
+        if match_targets:
+            with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(match_targets))) as pool:
+                matched = list(pool.map(_match, list(match_targets.items())))
 
     # ---- Pass 1b: reconcile, and decide what to write for -- SEQUENTIALLY ----------------------
     #
@@ -3490,166 +3537,167 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # of it blocks on anything. The split is behaviour-preserving -- `_reconcile_caches` for one
     # journey never reads another journey's alerts, and `_pending_pushes` reads `_notified`, which
     # only loop 2 writes.
-    write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int, bool]] = []
-    for key, alerts in matched:
-        journey = match_targets[key]
-        alerts_by_key[key] = alerts
-        # WHICH WORDING POLICY writes for this definition, and the discriminator is `by_journey_key`
-        # itself -- browser-only by construction (KTD10), so "absent from it" is exactly "no browser
-        # registration holds this route". A webhook-only subject must go through
-        # `notification_wording.WEBHOOK`, because the browser policy's prompt audit record carries
-        # the traveller's origin, destination and departure time at DEBUG wherever
-        # VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and R16 forbids that for client data.
-        # WEBHOOK suppresses that record in CODE rather than by an environment variable, drops
-        # `message` from the INFO record, and latches against its own holder. Its FIRST bound is the
-        # webhook delivery switch, so with client prose undelivered — every deployment today — the
-        # writer is still invoked (AE10: a client registration with no VAPID keypair matches and is
-        # written for) and answers with the template, asking no backend and charging nothing.
-        #
-        # A SHARED definition stays on the browser policy, unavoidably and by design: AE1 pins one
-        # match and one wording between the two channels, so there is one call and it is the
-        # browser's. The prompt record for that route would exist with no webhook channel at all,
-        # because a browser registration holds the same route -- so R16's claim is about
-        # webhook-only routes plus every other client field, and U8 publishes exactly that.
-        webhook_only = key not in by_journey_key
-        for alert in alerts:
-            message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
-        # ABOVE the early return, and over every alert: a superseded alternative most often goes
-        # stale precisely when nothing is alert-worthy any more, which is the case that returns.
-        # This is also what records a freshly found alternative, whether or not a message follows
-        # it (cap reached, LLM disabled, push off) -- the in-app list wants it either way.
-        #
-        # Guarded like the match above it, and for a strictly bigger blast radius than the
-        # 2026-07-29 incident that guard exists for: called bare, a raise here unwinds out of
-        # check_and_notify entirely, so loop 2 never runs (no pushes at all this cycle) and
-        # _record_decisions never runs (no rows either). What it touches is duck-typed -- an impact
-        # response from an injected provider, a cached AlternativeJourney, an aware/naive datetime
-        # comparison -- so "it cannot raise" is an assumption about somebody else's object. Keeping
-        # one cycle's stale cache is the smaller failure by a wide margin.
-        try:
-            _reconcile_caches(key, alerts, cycle_now)
-        except Exception:
-            logger.warning(
-                "Cache reconciliation failed for journey %s; keeping this cycle's cached "
-                "alternatives and messages",
-                key,
-                exc_info=True,
-                extra={"fields": {"event": "varsel_reconcile_error"}},
-            )
-        # ONE WORDING PER TRAIN THIS CYCLE WILL NOTIFY ABOUT, not one per journey (2026-08-21).
-        #
-        # Loop 2 delivers per train -- `one_alert_per_train`, the same collapse applied here --
-        # while this loop wrote for `next(a for a in alerts if a.alertworthy)` alone. So a journey
-        # with several disrupted departures pushed the model's prose for its worst train and the
-        # template for every other one, recorded as `message_status = 'not_selected'`: 604 of dev's
-        # 844 pushes over 14 days, 83 % of everything that reached a lock screen.
-        #
-        # `_pending_pushes` and not simply "every alert-worthy train", which the measurement says
-        # would be the expensive way to fix the cheap half of the problem. Per journey-cycle on dev:
-        # alert-worthy trains run p50 3 / p90 12 / max 22, while PUSHES run p90 1 / max 18 and 3 610
-        # of 4 099 cycles push nothing at all -- the trains are alert-worthy again every tick, but
-        # `_notified` means each one reaches a phone once. Writing for all of them would spend a
-        # bounded budget re-wording trains nobody will be told about again, and starve the one train
-        # that is about to be.
-        #
-        # The fallback keeps today's behaviour where it was right: with no push pending, the worst
-        # train is still written for, because the in-app journey card reads these same wordings
-        # through `_deliverable_message` and would otherwise decay to the template as soon as
-        # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
-        # It is gated on `push_on` because the CARD is the reader it exists for, and the card is
-        # the browser channel; a webhook subject with nothing pending has already been told.
-        #
-        # KTD4's gate, expressed as three lines rather than a boolean somewhere else. `jids` are
-        # withheld when push is off -- see `_pending_pushes` for why that half is load-bearing --
-        # so `pending` is exactly "a recipient on some channel still needs telling about this
-        # train", and `push_on or pending` is exactly "some channel can deliver". With no client
-        # recipients (every deployment until the store lands, and every existing test) both
-        # predicates reduce to what they were: `pending` is the browser list, and the guard below
-        # is the old `if not push_on: continue`.
-        pending = _pending_pushes(
-            jids_by_key.get(key, ()) if push_on else (), alerts, webhook_by_key.get(key, ())
-        )
-        if not push_on and not pending:
-            # No deliverable recipient on ANY channel: a keypair-less deployment with no client
-            # subscription pending for this journey. The decision is still recorded below, with the
-            # deterministic wording, and `message_status` still reads `push_disabled` for it.
-            continue
-        subjects = (
-            pending
-            or ([a for a in one_alert_per_train(alerts) if a.alertworthy][:1] if push_on else [])
-        )[:_MAX_MESSAGES_PER_JOURNEY]
-        for subject in subjects:
-            message_key = _message_key(key, subject)
-            with _state_lock:
-                # Read RAW, deliberately not through `_deliverable_message`: this asks whether a
-                # wording was already WRITTEN for this situation, which is a generation-side
-                # question. Gating it on delivery would make the writer re-run every cycle wherever
-                # delivery is off (prd today) — burning the cycle budget re-writing text that is
-                # already cached.
-                already_written = message_key in _messages
-                attempts = _message_attempts.get(message_key, 0)
-                errors = _message_errors.get(message_key, 0)
-            # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A
-            # `None` from `_write_message` costs an attempt (see pass 1c), but several of its paths
-            # never call a backend at all — this one, where no backend can be asked. So three cycles
-            # with generation off used to exhaust a situation permanently: when the 30-minute
-            # `llm_message._LATCH_TTL` expired and a backend came back, the situation was already at
-            # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h
-            # life. That thins exactly the written-but-withheld population prd's rollout is judged
-            # on.
+    with _span("varsel_reconcile", matched=len(matched)):
+        write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int, bool]] = []
+        for key, alerts in matched:
+            journey = match_targets[key]
+            alerts_by_key[key] = alerts
+            # WHICH WORDING POLICY writes for this definition, and the discriminator is `by_journey_key`
+            # itself -- browser-only by construction (KTD10), so "absent from it" is exactly "no browser
+            # registration holds this route". A webhook-only subject must go through
+            # `notification_wording.WEBHOOK`, because the browser policy's prompt audit record carries
+            # the traveller's origin, destination and departure time at DEBUG wherever
+            # VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and R16 forbids that for client data.
+            # WEBHOOK suppresses that record in CODE rather than by an environment variable, drops
+            # `message` from the INFO record, and latches against its own holder. Its FIRST bound is the
+            # webhook delivery switch, so with client prose undelivered — every deployment today — the
+            # writer is still invoked (AE10: a client registration with no VAPID keypair matches and is
+            # written for) and answers with the template, asking no backend and charging nothing.
             #
-            # Asked for a BROWSER subject only. `_generation_enabled` reads `llm_message`'s
-            # module-global latch, which is the poller's own; the WEBHOOK policy latches against its
-            # own holder precisely so the two callers cannot disable each other, and consulting the
-            # browser latch for a webhook-only subject would hand that isolation straight back.
-            # `write_wording` asks the same question against the right holder as its second bound.
-            if not webhook_only and not _generation_enabled():
-                _remember_message_meta(message_key, status="llm_disabled")
+            # A SHARED definition stays on the browser policy, unavoidably and by design: AE1 pins one
+            # match and one wording between the two channels, so there is one call and it is the
+            # browser's. The prompt record for that route would exist with no webhook channel at all,
+            # because a browser registration holds the same route -- so R16's claim is about
+            # webhook-only routes plus every other client field, and U8 publishes exactly that.
+            webhook_only = key not in by_journey_key
+            for alert in alerts:
+                message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
+            # ABOVE the early return, and over every alert: a superseded alternative most often goes
+            # stale precisely when nothing is alert-worthy any more, which is the case that returns.
+            # This is also what records a freshly found alternative, whether or not a message follows
+            # it (cap reached, LLM disabled, push off) -- the in-app list wants it either way.
+            #
+            # Guarded like the match above it, and for a strictly bigger blast radius than the
+            # 2026-07-29 incident that guard exists for: called bare, a raise here unwinds out of
+            # check_and_notify entirely, so loop 2 never runs (no pushes at all this cycle) and
+            # _record_decisions never runs (no rows either). What it touches is duck-typed -- an impact
+            # response from an injected provider, a cached AlternativeJourney, an aware/naive datetime
+            # comparison -- so "it cannot raise" is an assumption about somebody else's object. Keeping
+            # one cycle's stale cache is the smaller failure by a wide margin.
+            try:
+                _reconcile_caches(key, alerts, cycle_now)
+            except Exception:
+                logger.warning(
+                    "Cache reconciliation failed for journey %s; keeping this cycle's cached "
+                    "alternatives and messages",
+                    key,
+                    exc_info=True,
+                    extra={"fields": {"event": "varsel_reconcile_error"}},
+                )
+            # ONE WORDING PER TRAIN THIS CYCLE WILL NOTIFY ABOUT, not one per journey (2026-08-21).
+            #
+            # Loop 2 delivers per train -- `one_alert_per_train`, the same collapse applied here --
+            # while this loop wrote for `next(a for a in alerts if a.alertworthy)` alone. So a journey
+            # with several disrupted departures pushed the model's prose for its worst train and the
+            # template for every other one, recorded as `message_status = 'not_selected'`: 604 of dev's
+            # 844 pushes over 14 days, 83 % of everything that reached a lock screen.
+            #
+            # `_pending_pushes` and not simply "every alert-worthy train", which the measurement says
+            # would be the expensive way to fix the cheap half of the problem. Per journey-cycle on dev:
+            # alert-worthy trains run p50 3 / p90 12 / max 22, while PUSHES run p90 1 / max 18 and 3 610
+            # of 4 099 cycles push nothing at all -- the trains are alert-worthy again every tick, but
+            # `_notified` means each one reaches a phone once. Writing for all of them would spend a
+            # bounded budget re-wording trains nobody will be told about again, and starve the one train
+            # that is about to be.
+            #
+            # The fallback keeps today's behaviour where it was right: with no push pending, the worst
+            # train is still written for, because the in-app journey card reads these same wordings
+            # through `_deliverable_message` and would otherwise decay to the template as soon as
+            # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
+            # It is gated on `push_on` because the CARD is the reader it exists for, and the card is
+            # the browser channel; a webhook subject with nothing pending has already been told.
+            #
+            # KTD4's gate, expressed as three lines rather than a boolean somewhere else. `jids` are
+            # withheld when push is off -- see `_pending_pushes` for why that half is load-bearing --
+            # so `pending` is exactly "a recipient on some channel still needs telling about this
+            # train", and `push_on or pending` is exactly "some channel can deliver". With no client
+            # recipients (every deployment until the store lands, and every existing test) both
+            # predicates reduce to what they were: `pending` is the browser list, and the guard below
+            # is the old `if not push_on: continue`.
+            pending = _pending_pushes(
+                jids_by_key.get(key, ()) if push_on else (), alerts, webhook_by_key.get(key, ())
+            )
+            if not push_on and not pending:
+                # No deliverable recipient on ANY channel: a keypair-less deployment with no client
+                # subscription pending for this journey. The decision is still recorded below, with the
+                # deterministic wording, and `message_status` still reads `push_disabled` for it.
                 continue
-            if already_written:
-                # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row
-                # carries text written against an earlier cycle's payload, not the one recorded
-                # beside it.
-                _remember_message_meta(message_key, status="ok_cached")
-                continue
-            if attempts >= _MAX_MESSAGE_ATTEMPTS:
-                # Without this the retry never stops. A write that fails for a payload-dependent
-                # reason (a refusal, an over-long reply, an unparseable one) fails again on every 60
-                # s tick for the situation's whole life -- ~720 Vertex calls that can change
-                # nothing, because the push already went out with the deterministic wording, each
-                # one burning a slot from _MAX_LLM_CALLS_PER_CYCLE that a train which WOULD have
-                # succeeded now cannot use.
-                _remember_message_meta(message_key, status="attempts_exhausted")
-                continue
-            if errors >= _MAX_TRANSIENT_ATTEMPTS:
-                # The same stop, on the other budget and with a different meaning: the backend has
-                # been unreachable for this subject a dozen times running. Recorded under its own
-                # status so the two never have to be told apart by guesswork -- `attempts_exhausted`
-                # is a verdict on the payload, `transient_exhausted` is a verdict on the morning,
-                # and a rate computed across both measures neither.
-                _remember_message_meta(message_key, status="transient_exhausted")
-                continue
-            write_queue.append((key, subject, message_key, attempts, errors, webhook_only))
+            subjects = (
+                pending
+                or ([a for a in one_alert_per_train(alerts) if a.alertworthy][:1] if push_on else [])
+            )[:_MAX_MESSAGES_PER_JOURNEY]
+            for subject in subjects:
+                message_key = _message_key(key, subject)
+                with _state_lock:
+                    # Read RAW, deliberately not through `_deliverable_message`: this asks whether a
+                    # wording was already WRITTEN for this situation, which is a generation-side
+                    # question. Gating it on delivery would make the writer re-run every cycle wherever
+                    # delivery is off (prd today) — burning the cycle budget re-writing text that is
+                    # already cached.
+                    already_written = message_key in _messages
+                    attempts = _message_attempts.get(message_key, 0)
+                    errors = _message_errors.get(message_key, 0)
+                # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A
+                # `None` from `_write_message` costs an attempt (see pass 1c), but several of its paths
+                # never call a backend at all — this one, where no backend can be asked. So three cycles
+                # with generation off used to exhaust a situation permanently: when the 30-minute
+                # `llm_message._LATCH_TTL` expired and a backend came back, the situation was already at
+                # `_MAX_MESSAGE_ATTEMPTS` and was never offered to the writer again for its whole 12 h
+                # life. That thins exactly the written-but-withheld population prd's rollout is judged
+                # on.
+                #
+                # Asked for a BROWSER subject only. `_generation_enabled` reads `llm_message`'s
+                # module-global latch, which is the poller's own; the WEBHOOK policy latches against its
+                # own holder precisely so the two callers cannot disable each other, and consulting the
+                # browser latch for a webhook-only subject would hand that isolation straight back.
+                # `write_wording` asks the same question against the right holder as its second bound.
+                if not webhook_only and not _generation_enabled():
+                    _remember_message_meta(message_key, status="llm_disabled")
+                    continue
+                if already_written:
+                    # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row
+                    # carries text written against an earlier cycle's payload, not the one recorded
+                    # beside it.
+                    _remember_message_meta(message_key, status="ok_cached")
+                    continue
+                if attempts >= _MAX_MESSAGE_ATTEMPTS:
+                    # Without this the retry never stops. A write that fails for a payload-dependent
+                    # reason (a refusal, an over-long reply, an unparseable one) fails again on every 60
+                    # s tick for the situation's whole life -- ~720 Vertex calls that can change
+                    # nothing, because the push already went out with the deterministic wording, each
+                    # one burning a slot from _MAX_LLM_CALLS_PER_CYCLE that a train which WOULD have
+                    # succeeded now cannot use.
+                    _remember_message_meta(message_key, status="attempts_exhausted")
+                    continue
+                if errors >= _MAX_TRANSIENT_ATTEMPTS:
+                    # The same stop, on the other budget and with a different meaning: the backend has
+                    # been unreachable for this subject a dozen times running. Recorded under its own
+                    # status so the two never have to be told apart by guesswork -- `attempts_exhausted`
+                    # is a verdict on the payload, `transient_exhausted` is a verdict on the morning,
+                    # and a rate computed across both measures neither.
+                    _remember_message_meta(message_key, status="transient_exhausted")
+                    continue
+                write_queue.append((key, subject, message_key, attempts, errors, webhook_only))
 
-    # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
-    # until the budget could actually bind across journeys there was nothing to order. The queue
-    # used to be walked in `_journeys` insertion order, so when the cap was reached the trains that
-    # got prose were whichever journeys happened to be registered earliest, every cycle, forever.
-    # That is invisible while ~44 registrations rarely reach a cap of 8 and indefensible at ten
-    # times that: the same handful of travellers would take the whole budget on every busy morning.
-    # Soonest-first is the rule `impact._MAX_ALTERNATIVE_LOOKUPS` already spends its own budget by,
-    # and it is the one that matches what the wording is FOR -- a train leaving in six minutes can
-    # still be acted on, one leaving in three hours will be written for again on a later cycle.
-    #
-    # `.timestamp()` rather than the datetime itself: the key must be total, and comparing an aware
-    # datetime with a naive one raises. Trains with no departure time sort last and keep their
-    # relative order (Python's sort is stable), which is `_pending_pushes`' severity order.
-    write_queue.sort(
-        key=lambda item: (
-            item[1].departure_time is None,
-            item[1].departure_time.timestamp() if item[1].departure_time else 0.0,
+        # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
+        # until the budget could actually bind across journeys there was nothing to order. The queue
+        # used to be walked in `_journeys` insertion order, so when the cap was reached the trains that
+        # got prose were whichever journeys happened to be registered earliest, every cycle, forever.
+        # That is invisible while ~44 registrations rarely reach a cap of 8 and indefensible at ten
+        # times that: the same handful of travellers would take the whole budget on every busy morning.
+        # Soonest-first is the rule `impact._MAX_ALTERNATIVE_LOOKUPS` already spends its own budget by,
+        # and it is the one that matches what the wording is FOR -- a train leaving in six minutes can
+        # still be acted on, one leaving in three hours will be written for again on a later cycle.
+        #
+        # `.timestamp()` rather than the datetime itself: the key must be total, and comparing an aware
+        # datetime with a naive one raises. Trains with no departure time sort last and keep their
+        # relative order (Python's sort is stable), which is `_pending_pushes`' severity order.
+        write_queue.sort(
+            key=lambda item: (
+                item[1].departure_time is None,
+                item[1].departure_time.timestamp() if item[1].departure_time else 0.0,
+            )
         )
-    )
 
     # ---- Pass 1c: write the wordings, CONCURRENTLY --------------------------------------------
     #
@@ -3773,178 +3821,184 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             elif status in _TRANSIENT_FAILURES:
                 _message_errors[message_key] = errors + 1
 
-    if write_queue:
-        with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, len(write_queue))) as pool:
-            list(pool.map(_write_one, write_queue))
-    if budget.refused:
-        # ONCE per cycle, after the fact, and reporting what the ceiling actually cost rather than
-        # which journey happened to hit it first -- with the queue sorted and the calls concurrent,
-        # "from journey X onwards" would name an arbitrary thread's arbitrary moment.
-        logger.info(
-            "Written-message budget spent this cycle: %d written, %d trains capped (%d calls / "
-            "%.0fs ceiling); the capped trains take the deterministic wording",
-            budget.claimed,
-            budget.refused,
-            _MAX_LLM_CALLS_PER_CYCLE,
-            _MAX_LLM_SECONDS_PER_CYCLE,
-            extra={
-                "fields": {
-                    "event": "llm_message",
-                    "result": "capped",
-                    "written": budget.claimed,
-                    "capped": budget.refused,
-                }
-            },
-        )
+    with _span(
+        "varsel_write_wordings",
+        queued=len(write_queue),
+        workers=min(_LLM_WORKERS, len(write_queue)) if write_queue else 0,
+    ):
+        if write_queue:
+            with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, len(write_queue))) as pool:
+                list(pool.map(_write_one, write_queue))
+        if budget.refused:
+            # ONCE per cycle, after the fact, and reporting what the ceiling actually cost rather than
+            # which journey happened to hit it first -- with the queue sorted and the calls concurrent,
+            # "from journey X onwards" would name an arbitrary thread's arbitrary moment.
+            logger.info(
+                "Written-message budget spent this cycle: %d written, %d trains capped (%d calls / "
+                "%.0fs ceiling); the capped trains take the deterministic wording",
+                budget.claimed,
+                budget.refused,
+                _MAX_LLM_CALLS_PER_CYCLE,
+                _MAX_LLM_SECONDS_PER_CYCLE,
+                extra={
+                    "fields": {
+                        "event": "llm_message",
+                        "result": "capped",
+                        "written": budget.claimed,
+                        "capped": budget.refused,
+                    }
+                },
+            )
 
     # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
     # Collect first, then fan out through deliver_to_devices -- parallel ACROSS devices, sequential
     # WITHIN one; the worker/timeout rationale lives on that helper, which the togvarsel rounds
     # share. One broad situation produces one send per registration in a single cycle.
-    per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str, bool]]] = {}
-    oslo_today = cycle_now.astimezone(_OSLO).date().isoformat()
-    # Pushes this cycle will attempt per registration, so the daily cap is judged against what is
-    # about to go out as well as what has gone: without the reservation a cycle with five cancelled
-    # trains on one journey would pass all five through a ledger that still read zero.
-    reserved: dict[str, int] = {}
-    capped: dict[str, int] = {}
-    for jid, journey in journeys if push_on else []:
-        device = None
-        brand = DEFAULT_BRAND
-        with _state_lock:
-            if jid not in _journeys:  # deleted while iterating
-                continue
-            dev = _devices.get(journey["device_id"])
-            if dev is not None:
-                device = dev.get("subscription")
-                brand = normalize_brand(dev.get("brand"))
-        if device is None:
-            continue
-        key = journey_key(journey)
-        # One push per train, not per SX message. Two situations about one cancelled departure used
-        # to mean two notifications a minute apart, saying the same thing with different percentages
-        # (2026-08-05). `_notified` still keys on the surviving situation_number, so the suppressed
-        # one simply never notifies -- and `_record_decisions` below still sees both.
-        #
-        # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when the
-        # daily cap below binds, it must be spent on the trains the traveller can still act on.
-        trains = sorted(
-            (a for a in one_alert_per_train(alerts_by_key.get(key, [])) if a.alertworthy),
-            key=lambda a: (
-                a.departure_time is None,
-                a.departure_time.timestamp() if a.departure_time else 0.0,
-            ),
-        )
-        for alert in trains:
+    with _span("varsel_deliver", registrations=len(journeys) if push_on else 0):
+        per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str, bool]]] = {}
+        oslo_today = cycle_now.astimezone(_OSLO).date().isoformat()
+        # Pushes this cycle will attempt per registration, so the daily cap is judged against what is
+        # about to go out as well as what has gone: without the reservation a cycle with five cancelled
+        # trains on one journey would pass all five through a ledger that still read zero.
+        reserved: dict[str, int] = {}
+        capped: dict[str, int] = {}
+        for jid, journey in journeys if push_on else []:
+            device = None
+            brand = DEFAULT_BRAND
             with _state_lock:
-                if f"{jid}|{alert.situation_number}" in _notified:
+                if jid not in _journeys:  # deleted while iterating
                     continue
-                tag = _notification_tag(jid, alert)
-                # An earlier push about this TRAIN (another situation about it) already reached
-                # this registration: the new one replaces it on the lock screen under the same tag,
-                # so it is not counted against the cap and its title may say «Bekreftet:».
-                replaces = tag is not None and tag in _pushed_trains
-                day, count = _daily_pushes.get(jid, (oslo_today, 0))
-                sent_today = count if day == oslo_today else 0
-            if (
-                not replaces
-                and sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
-            ):
-                capped[jid] = capped.get(jid, 0) + 1
+                dev = _devices.get(journey["device_id"])
+                if dev is not None:
+                    device = dev.get("subscription")
+                    brand = normalize_brand(dev.get("brand"))
+            if device is None:
                 continue
-            if not replaces:
-                reserved[jid] = reserved.get(jid, 0) + 1
-            per_device.setdefault(journey["device_id"], []).append(
-                (jid, device, journey, alert, key, brand, replaces)
+            key = journey_key(journey)
+            # One push per train, not per SX message. Two situations about one cancelled departure used
+            # to mean two notifications a minute apart, saying the same thing with different percentages
+            # (2026-08-05). `_notified` still keys on the surviving situation_number, so the suppressed
+            # one simply never notifies -- and `_record_decisions` below still sees both.
+            #
+            # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when the
+            # daily cap below binds, it must be spent on the trains the traveller can still act on.
+            trains = sorted(
+                (a for a in one_alert_per_train(alerts_by_key.get(key, [])) if a.alertworthy),
+                key=lambda a: (
+                    a.departure_time is None,
+                    a.departure_time.timestamp() if a.departure_time else 0.0,
+                ),
             )
-    if capped:
-        # Once per cycle. The alerts themselves are still recorded below with pushed=False and are
-        # re-offered next cycle, so this line is the only place the suppression is visible.
-        logger.info(
-            "Daily push cap (%d per registration) withheld %d alert push(es) across %d "
-            "registration(s) this cycle",
-            _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
-            sum(capped.values()),
-            len(capped),
-            extra={
-                "fields": {
-                    "event": "push_capped",
-                    "withheld": sum(capped.values()),
-                    "registrations": len(capped),
-                    "cap": _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
-                }
-            },
-        )
-
-    def _prepare_alert(
-        item: tuple[str, dict, dict, Alert, str, str, bool],
-    ) -> tuple[dict, dict] | None:
-        """One pending alert → (subscription, payload), run on the fan-out's worker thread.
-
-        ``None`` means "the registration went away; skip the send". The collection loop above
-        already re-checks `_journeys` (a delete landing while it iterates), but everything it
-        collects -- the device's SUBSCRIPTION included -- is captured before the pool starts, so a
-        «Slett alt» arriving inside the fan-out window would otherwise still put a push on the
-        phone after the UI said everything was deleted, and the "sent" result below would write a
-        `_notified` key for a journey that no longer exists. This is the same re-check, moved to
-        the latest point that still precedes the network call. It takes `_state_lock` for two dict
-        lookups and never across `_send_push`.
-        """
-        jid, device, journey, alert, key, brand, replaces = item
-        with _state_lock:
-            if jid not in _journeys or journey["device_id"] not in _devices:
-                return None
-        message_key = _message_key(key, alert)
-        # The written wording only if this deployment delivers it; otherwise None, and
-        # _notification_payload words the push from the same message input the model was shown.
-        message = _deliverable_message(message_key)
-        payload = _notification_payload(
-            journey,
-            alert,
-            message,
-            journey_id=jid,
-            message_input=message_inputs.get(message_key),
-            brand=brand,
-            confirmed=replaces,
-        )
-        return device, payload
-
-    pushed_keys: set[tuple[str, str]] = set()
-    if per_device:
-        for _device_id, item, result, payload, error_detail in deliver_to_devices(
-            per_device, _prepare_alert
-        ):
-            jid, _device, journey, alert, _key, _brand, replaces = item
-            _log_push(
-                "alert",
-                result,
-                journey["device_id"],
-                payload,
-                journey_id=jid,
-                alert=alert,
-                error_detail=error_detail,
-            )
-            if result == "sent":
+            for alert in trains:
                 with _state_lock:
-                    # Same liveness rule as `_prepare_alert`, re-asked because the delete can also
-                    # land during the send itself: a dedup key for a journey that no longer exists
-                    # would be persisted by the save below and reloaded on the next restart.
-                    if jid in _journeys:
-                        _notified.add(f"{jid}|{alert.situation_number}")
+                    if f"{jid}|{alert.situation_number}" in _notified:
+                        continue
+                    tag = _notification_tag(jid, alert)
+                    # An earlier push about this TRAIN (another situation about it) already reached
+                    # this registration: the new one replaces it on the lock screen under the same tag,
+                    # so it is not counted against the cap and its title may say «Bekreftet:».
+                    replaces = tag is not None and tag in _pushed_trains
+                    day, count = _daily_pushes.get(jid, (oslo_today, 0))
+                    sent_today = count if day == oslo_today else 0
+                if (
+                    not replaces
+                    and sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
+                ):
+                    capped[jid] = capped.get(jid, 0) + 1
+                    continue
+                if not replaces:
+                    reserved[jid] = reserved.get(jid, 0) + 1
+                per_device.setdefault(journey["device_id"], []).append(
+                    (jid, device, journey, alert, key, brand, replaces)
+                )
+        if capped:
+            # Once per cycle. The alerts themselves are still recorded below with pushed=False and are
+            # re-offered next cycle, so this line is the only place the suppression is visible.
+            logger.info(
+                "Daily push cap (%d per registration) withheld %d alert push(es) across %d "
+                "registration(s) this cycle",
+                _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
+                sum(capped.values()),
+                len(capped),
+                extra={
+                    "fields": {
+                        "event": "push_capped",
+                        "withheld": sum(capped.values()),
+                        "registrations": len(capped),
+                        "cap": _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
+                    }
+                },
+            )
+
+        def _prepare_alert(
+            item: tuple[str, dict, dict, Alert, str, str, bool],
+        ) -> tuple[dict, dict] | None:
+            """One pending alert → (subscription, payload), run on the fan-out's worker thread.
+
+            ``None`` means "the registration went away; skip the send". The collection loop above
+            already re-checks `_journeys` (a delete landing while it iterates), but everything it
+            collects -- the device's SUBSCRIPTION included -- is captured before the pool starts, so a
+            «Slett alt» arriving inside the fan-out window would otherwise still put a push on the
+            phone after the UI said everything was deleted, and the "sent" result below would write a
+            `_notified` key for a journey that no longer exists. This is the same re-check, moved to
+            the latest point that still precedes the network call. It takes `_state_lock` for two dict
+            lookups and never across `_send_push`.
+            """
+            jid, device, journey, alert, key, brand, replaces = item
+            with _state_lock:
+                if jid not in _journeys or journey["device_id"] not in _devices:
+                    return None
+            message_key = _message_key(key, alert)
+            # The written wording only if this deployment delivers it; otherwise None, and
+            # _notification_payload words the push from the same message input the model was shown.
+            message = _deliverable_message(message_key)
+            payload = _notification_payload(
+                journey,
+                alert,
+                message,
+                journey_id=jid,
+                message_input=message_inputs.get(message_key),
+                brand=brand,
+                confirmed=replaces,
+            )
+            return device, payload
+
+        pushed_keys: set[tuple[str, str]] = set()
+        if per_device:
+            for _device_id, item, result, payload, error_detail in deliver_to_devices(
+                per_device, _prepare_alert
+            ):
+                jid, _device, journey, alert, _key, _brand, replaces = item
+                _log_push(
+                    "alert",
+                    result,
+                    journey["device_id"],
+                    payload,
+                    journey_id=jid,
+                    alert=alert,
+                    error_detail=error_detail,
+                )
+                if result == "sent":
+                    with _state_lock:
+                        # Same liveness rule as `_prepare_alert`, re-asked because the delete can also
+                        # land during the send itself: a dedup key for a journey that no longer exists
+                        # would be persisted by the save below and reloaded on the next restart.
+                        if jid in _journeys:
+                            _notified.add(f"{jid}|{alert.situation_number}")
+                            changed = True
+                            tag = _notification_tag(jid, alert)
+                            if tag is not None and alert.departure_time is not None:
+                                _pushed_trains[tag] = alert.departure_time
+                            if not replaces:
+                                day, count = _daily_pushes.get(jid, (oslo_today, 0))
+                                _daily_pushes[jid] = (
+                                    oslo_today,
+                                    (count if day == oslo_today else 0) + 1,
+                                )
+                    pushed_keys.add((journey_key(journey), alert.situation_number))
+                elif result == "gone":
+                    if handle_gone_device(journey["device_id"]):
                         changed = True
-                        tag = _notification_tag(jid, alert)
-                        if tag is not None and alert.departure_time is not None:
-                            _pushed_trains[tag] = alert.departure_time
-                        if not replaces:
-                            day, count = _daily_pushes.get(jid, (oslo_today, 0))
-                            _daily_pushes[jid] = (
-                                oslo_today,
-                                (count if day == oslo_today else 0) + 1,
-                            )
-                pushed_keys.add((journey_key(journey), alert.situation_number))
-            elif result == "gone":
-                if handle_gone_device(journey["device_id"]):
-                    changed = True
 
     # BROWSER subjects only, and structurally so: this iterates `by_journey_key`, which is built
     # from `_journeys` alone. KTD10 keeps webhook subjects out of `varsel_decisions` entirely --
@@ -3954,9 +4008,10 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # recorded there would mark a browser registration's row `pushed` with no browser push behind
     # it -- and `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed
     # row. That is why the webhook deliveries happen in a later phase entirely and not here.
-    _record_decisions(
-        by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
-    )
+    with _span("varsel_record_decisions", definitions=len(by_journey_key)):
+        _record_decisions(
+            by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
+        )
 
     if changed:
         _save_state()

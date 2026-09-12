@@ -191,6 +191,10 @@ def test_domain_metrics_are_declared_with_the_agreed_names_and_labels():
     metrics.POLLER_PHASE_DURATION.labels(**phase).observe(1.5)
     assert _sample("kix_poller_phase_duration_seconds_count", phase) == before + 1
 
+    before = _sample("kix_poller_phase_cpu_seconds_count", phase)
+    metrics.POLLER_PHASE_CPU.labels(**phase).observe(0.75)
+    assert _sample("kix_poller_phase_cpu_seconds_count", phase) == before + 1
+
     for counter, name, labels in (
         (metrics.POLLER_PHASE_TOTAL, "kix_poller_phase_total", {"phase": "test_phase", "result": "ok"}),
         (metrics.PUSH_TOTAL, "kix_push_total", {"result": "sent"}),

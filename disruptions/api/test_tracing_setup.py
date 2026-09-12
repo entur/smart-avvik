@@ -21,6 +21,7 @@ Run: uv run --with fastapi --with httpx --with pydantic --with opentelemetry-api
 import json
 import logging
 import os
+import re
 import sys
 
 # The flag must not leak in from a developer's shell: the import-time setup() call below must see
@@ -53,6 +54,17 @@ def _reset_tracing() -> None:
         from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
         instrumentor = RequestsInstrumentor()
+        if instrumentor.is_instrumented_by_opentelemetry:
+            instrumentor.uninstrument()
+    except ImportError:
+        pass
+    # The threading instrumentor is global in a sharper way than the requests one: it monkeypatches
+    # `threading.Thread.start` and `ThreadPoolExecutor.submit` for the whole process, so a test that
+    # left it installed changes how every LATER test's pools behave.
+    try:
+        from opentelemetry.instrumentation.threading import ThreadingInstrumentor
+
+        instrumentor = ThreadingInstrumentor()
         if instrumentor.is_instrumented_by_opentelemetry:
             instrumentor.uninstrument()
     except ImportError:
@@ -459,6 +471,236 @@ def test_every_path_parameter_route_sits_behind_a_redacted_segment():
         "path-parameter routes whose id would be exported to Cloud Trace verbatim:\n"
         + "\n".join(unguarded)
     )
+
+
+# ---- Span attributes: the closed-vocabulary rule (R16's span half) ------------------------------
+
+
+def test_span_attributes_are_a_closed_vocabulary_and_numbers_only():
+    """Spans had no data-redaction rule; the existing one covers LOG LINES only.
+
+    A span is exported to Cloud Trace, where project IAM is the only gate, and a sub-pass span is
+    opened right where the journey data is: a stop ref, a place name, a departure time, a callback
+    URL, a client id, a wording. So the same closed-set discipline `metrics.py` states for label
+    values applies here, and it is enforced rather than documented — a FILTER, never a raise,
+    because this runs on the poller thread where an instrumentation exception would take the cycle
+    with it (the `metrics.HTTPMetrics` collapse-to-`other` pattern).
+
+    Two clauses, and the second is the one a reviewer would not think to add: the key must be in
+    the vocabulary, AND the value must be a number or a bool. Names drift — a future
+    `definitions` could be handed a comma-joined list of refs — and a vocabulary alone would
+    export it.
+    """
+    _reset_tracing()
+    try:
+        exporter = _enable_with_memory_exporter()
+        with tracing_setup.span(
+            "varsel_match",
+            {
+                "definitions": 3,
+                "workers": 16,
+                "from_stop": "NSR:StopPlace:337",
+                "callback": "https://client.example/hook",
+                "definitions_named": "Oslo S -> Lillehammer",
+            },
+        ):
+            pass
+        _flush()
+        (span,) = exporter.get_finished_spans()
+        assert dict(span.attributes or {}) == {"definitions": 3, "workers": 16}
+    finally:
+        _reset_tracing()
+
+
+def test_a_vocabulary_name_carrying_a_string_is_dropped_not_exported():
+    """The value clause on its own, so the two cannot be satisfied by one assertion."""
+    _reset_tracing()
+    try:
+        exporter = _enable_with_memory_exporter()
+        with tracing_setup.span("varsel_match", {"definitions": "Oslo S -> Drammen"}):
+            pass
+        _flush()
+        (span,) = exporter.get_finished_spans()
+        assert dict(span.attributes or {}) == {}
+    finally:
+        _reset_tracing()
+
+
+def test_the_vocabulary_covers_every_attribute_the_poller_modules_pass():
+    """The filter drops silently — which is right on the poller thread and useless as feedback.
+
+    A span attribute that never arrives looks exactly like a span nobody instrumented, so a typo
+    in `varsel.py` would cost a capacity run its numbers and say nothing. This reads the two
+    instrumented modules' own source and requires every key they pass to be in the vocabulary;
+    it is the counterweight to the filter being silent.
+
+    Source text, not an import: this suite never imports main (see the module docstring), and
+    `varsel` imports it transitively.
+    """
+    import pathlib
+
+    unknown: list[str] = []
+    sites = 0
+    for name in ("varsel.py", "notification_store.py"):
+        source = (pathlib.Path(__file__).resolve().parent / name).read_text()
+        for call in _span_call_sites(source):
+            sites += 1
+            for key in _top_level_keywords(call):
+                if key not in tracing_setup.SPAN_ATTRIBUTE_NAMES:
+                    unknown.append(f"{name}: {key}")
+    assert not unknown, (
+        "span attributes not in tracing_setup.SPAN_ATTRIBUTE_NAMES — they would be dropped "
+        "silently:\n" + "\n".join(unknown)
+    )
+    # A matcher that matches nothing passes this check forever, which is how a source grep quietly
+    # retires. Five `_span("...")` call sites exist today: varsel's five sub-passes plus the
+    # store's two, minus the store's own helper definition — so the floor is well under it and
+    # still fails a matcher that has stopped working.
+    assert sites >= 5, f"the call-site scan found {sites} sites; it has stopped matching"
+
+
+def _span_call_sites(source: str) -> list[str]:
+    """The argument text of every ``_span("...", ...)`` call, by BALANCED-PAREN scanning.
+
+    Not a regex: the arguments contain their own parentheses
+    (``min(_MATCH_WORKERS, len(match_targets))``), and both obvious regex shapes get it wrong —
+    ``[^)]*`` stops at the first inner ``)`` and silently never sees the later keywords, while a
+    non-greedy ``.*?\\n\\s*\\):`` runs past a single-line call to the next one it can find and
+    reports every keyword in between. Both were tried here.
+    """
+    calls: list[str] = []
+    for match in re.finditer(r'_span\(\s*"[a-z_]+"', source):
+        start = source.index("(", match.start())
+        depth = 0
+        for i in range(start, len(source)):
+            if source[i] == "(":
+                depth += 1
+            elif source[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    calls.append(source[start + 1 : i])
+                    break
+    return calls
+
+
+def _top_level_keywords(arguments: str) -> list[str]:
+    """``key`` for every ``key=`` at the call's own nesting depth, ignoring nested calls."""
+    keys: list[str] = []
+    depth = 0
+    token = ""
+    for char in arguments:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        if depth == 0 and (char.isalnum() or char == "_"):
+            token += char
+        elif depth == 0 and char == "=":
+            if token:
+                keys.append(token)
+            token = ""
+        else:
+            token = ""
+    return keys
+
+
+def test_a_span_can_refuse_to_record_its_exception():
+    """The store's spans take this, and the two flags move together for one reason.
+
+    `record_exception` writes `str(exception)` into a span EVENT and `set_status_on_exception`
+    writes the same string into the span's STATUS, so suppressing one and not the other suppresses
+    nothing. A Firestore error message carries the document path, and a subscription id embeds the
+    client's own reference — which is exactly the identifier R16 keeps out of the record.
+    """
+    _reset_tracing()
+    try:
+        exporter = _enable_with_memory_exporter()
+        try:
+            with tracing_setup.span("firestore_transaction", record_exception=False):
+                raise RuntimeError("404 no such document: subscriptions/acme-commuter-91")
+        except RuntimeError:
+            pass
+        _flush()
+        (span,) = exporter.get_finished_spans()
+        assert span.events == (), "the exception event carries the message"
+        assert "acme-commuter-91" not in str(span.status.description or "")
+    finally:
+        _reset_tracing()
+
+
+# ---- Thread-pool context propagation ------------------------------------------------------------
+
+
+def test_worker_spans_join_the_cycles_trace_rather_than_becoming_roots():
+    """`check_and_notify`'s three passes are 16/16/32-wide, and a ThreadPoolExecutor carries no
+    context: without the threading instrumentation every Journey Planner, Vertex and push span
+    created in a worker is an independently sampled ROOT, so the trace that should show where a
+    pass spends its time shows the pass and nothing under it.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    _reset_tracing()
+    try:
+        exporter = _enable_with_memory_exporter()
+        if not tracing_setup._threading_instrumented():
+            raise AssertionError(
+                "opentelemetry-instrumentation-threading is not installed in this environment; "
+                "it is in requirements.txt and in ci.yml's --with list"
+            )
+        with tracing_setup.span("varsel_match") as parent:
+            expected = parent.get_span_context()
+
+            def _work(_i):
+                with tracing_setup.span("alternatives_fetch"):
+                    return trace.get_current_span().get_span_context().trace_id
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                trace_ids = set(pool.map(_work, range(4)))
+        _flush()
+        assert trace_ids == {expected.trace_id}, "a worker span became its own trace root"
+        workers = [s for s in exporter.get_finished_spans() if s.name == "alternatives_fetch"]
+        assert len(workers) == 4
+        for span in workers:
+            assert span.parent is not None and span.parent.span_id == expected.span_id
+    finally:
+        _reset_tracing()
+
+
+def test_a_missing_threading_instrumentation_leaves_tracing_ON():
+    """It is an optional extra, and the failure direction matters.
+
+    Folded into setup()'s one try/except, an ImportError here would flip `_enabled` False and cost
+    the deployment every span it already had — to lose an optimisation. Its own nested guard is
+    what keeps a missing distribution a degradation rather than an outage.
+    """
+    import builtins
+
+    _reset_tracing()
+    real_import = builtins.__import__
+
+    def _refuse(name, *args, **kwargs):
+        if name.startswith("opentelemetry.instrumentation.threading"):
+            raise ImportError("no threading instrumentation here")
+        return real_import(name, *args, **kwargs)
+
+    builtins.__import__ = _refuse
+    try:
+        exporter = _enable_with_memory_exporter()
+        assert tracing_setup._enabled, "a missing optional instrumentor must not disable tracing"
+        # Without this line the check is VACUOUS in the direction that matters: it would pass
+        # unchanged against a setup() that never attempts the import at all, which is exactly the
+        # state this test was written in.
+        assert not tracing_setup._threading_instrumented(), (
+            "the import was refused, so nothing may report as instrumented — a test that cannot "
+            "observe the absence cannot observe the guard either"
+        )
+        with tracing_setup.span("poller_cycle"):
+            pass
+        _flush()
+        assert [s.name for s in exporter.get_finished_spans()] == ["poller_cycle"]
+    finally:
+        builtins.__import__ = real_import
+        _reset_tracing()
 
 
 def _run():

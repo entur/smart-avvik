@@ -3852,6 +3852,128 @@ def test_the_served_list_grows_with_the_clients_cap_and_never_shrinks_below_the_
     grouped = notification_store.client_alerts(CLIENT, served=6, now=NOW)
     assert len(grouped.snapshots[SID].subjects) == 6
 
+# ---- Store spans: one per Firestore call, carrying its interpreter cost (R16, KTD2) ------------
+
+
+class _SpanRecorder:
+    """Stands in for `tracing_setup.span`, recording what the store asked for."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict, dict]] = []
+
+    def __call__(self, name: str, attributes=None, **kwargs):
+        self.calls.append((name, dict(attributes or {}), dict(kwargs)))
+        from contextlib import nullcontext
+
+        return nullcontext()
+
+
+def test_a_transaction_opens_one_measured_span_that_refuses_to_record_its_exception():
+    """KTD2 sizes the widened emit pass in INTERPRETER ms per transaction, and there is nowhere
+    else to read that: a Firestore transaction is not pure socket wait — the body, the protobuf
+    and the commit are all bytecode under KTD17, and at 3 ms each 20 000 transitions are 60 s of
+    the one interpreter. So the span measures itself (`measure=True`) rather than carrying a count.
+
+    ONE span covers all five of the client's internal retries, deliberately: what the pass is
+    charged is what the call cost it, and a per-attempt span would report the cheapest attempt.
+
+    `record_exception=False` is the redaction clause. A Firestore error message names the document
+    path and a `subscription_id` embeds the client's own reference, so neither the span event nor
+    the status description may carry it — and the two flags move together because both do.
+    """
+    from google.cloud import firestore
+
+    class _ClientWithTransaction(_FakeClient):
+        def transaction(self):
+            return _Txn()
+
+    recorder = _SpanRecorder()
+    notification_store.configure(
+        client=_ClientWithTransaction(), database=None, span=recorder
+    )
+    before = firestore.transactional
+    firestore.transactional = lambda fn: fn  # the retry wrapper needs a real Transaction
+    try:
+        assert notification_store._run_transaction(lambda txn: "committed") == "committed"
+    finally:
+        firestore.transactional = before
+        notification_store.reset_for_tests()
+    assert [name for name, _, _ in recorder.calls] == ["firestore_transaction"]
+    _, attributes, kwargs = recorder.calls[0]
+    assert attributes == {}, "the cost is measured at close, never guessed at open"
+    assert kwargs == {"measure": True, "record_exception": False}, kwargs
+
+
+def test_a_streamed_page_opens_its_own_span_and_returns_the_page_unchanged():
+    """The other half of "one span per Firestore call". The streams are the reads the mirror,
+    the delivery scan and the servability re-check are made of, and they were invisible: a dev
+    trace showed `notification_webhooks` with nothing under it at all.
+
+    The helper must be transparent — same list, same order, same timeout — because it replaced
+    eight bare `list(query.stream(timeout=_CALL_DEADLINE_S))` call sites.
+    """
+
+    class _Query:
+        def __init__(self) -> None:
+            self.timeouts: list[float] = []
+
+        def stream(self, timeout=None):
+            self.timeouts.append(timeout)
+            return iter(["a", "b", "c"])
+
+    recorder = _SpanRecorder()
+    query = _Query()
+    notification_store.configure(client=_FakeClient(), database=None, span=recorder)
+    try:
+        assert notification_store._stream(query) == ["a", "b", "c"]
+    finally:
+        notification_store.reset_for_tests()
+    assert query.timeouts == [notification_store._CALL_DEADLINE_S]
+    assert [name for name, _, _ in recorder.calls] == ["firestore_stream"]
+
+
+def test_without_an_injected_span_the_store_behaves_exactly_as_before():
+    """The seam defaults off, and the store must not know the difference — the same rule every
+    other injected capability in this repo follows, and the one that keeps `notification_store`
+    free of an import of `tracing_setup` (which would run that module's import-time setup())."""
+
+    class _Query:
+        def stream(self, timeout=None):
+            return iter([1, 2])
+
+    notification_store.reset_for_tests()
+    assert notification_store._span_provider is None
+    assert notification_store._stream(_Query()) == [1, 2]
+
+
+def test_every_streamed_read_sits_under_a_span():
+    """A new bare `query.stream(...)` would be an untraced Firestore call, and nothing about it
+    would look wrong — the store would simply stop accounting for one of its own reads, and the
+    capacity number it feeds would be quietly low.
+
+    The rule is checked where it can be checked cheaply: every line that streams under the call
+    deadline must sit within a few lines of a `firestore_stream` span. Two such lines exist by
+    design — `_stream`'s own body, and `_count`'s fallback, which counts without materialising the
+    page and so cannot go through the helper — and both open that span themselves. Comment lines
+    and the helper's docstring, which quotes the shape it replaced, are excluded.
+    """
+    lines = MODULE_SOURCE.split("\n")
+    unguarded = []
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if ".stream(timeout=_CALL_DEADLINE_S)" not in stripped:
+            continue
+        if stripped.startswith("#") or "``" in stripped:
+            continue  # a comment or the docstring quoting the replaced shape
+        window = lines[max(0, i - 4) : i]
+        if not any('_span("firestore_stream")' in w for w in window):
+            unguarded.append(f"line {i + 1}: {stripped}")
+    assert not unguarded, (
+        "streamed reads with no firestore_stream span above them — route them through "
+        "_stream():\n" + "\n".join(unguarded)
+    )
+
+
 def _run() -> None:
     plain = sorted(
         (name, fn)

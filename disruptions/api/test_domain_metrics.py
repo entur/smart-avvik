@@ -298,6 +298,87 @@ def test_a_phase_observes_its_histogram_and_counts_ok():
     assert _sample("kix_poller_phase_total", {**phase, "result": "ok"}) == before_ok + 1
 
 
+def test_a_phase_observes_interpreter_cpu_and_never_a_negative_value():
+    """KTD17's budget is INTERPRETER time, so wall clock alone cannot answer it.
+
+    The phase timings say a step took 9 s; they cannot say whether those 9 s were one CPython
+    thread executing bytecode (which a second core does not help and a wider pool does not help
+    either) or a socket wait (which both do). `kix_poller_phase_cpu_seconds{phase}` is the series
+    that separates them, and it is the one number every later unit's capacity claim is checked
+    against.
+
+    "Not negative" is the one arithmetic property worth pinning: `process_time()` is monotonic per
+    process, but a delta computed against the wrong baseline — a per-call start captured after the
+    body, a counter reset — reads as a negative observation, which prometheus_client accepts into
+    the sum and which no dashboard makes obvious.
+    """
+    phase = {"phase": "metrics_cpu_step"}
+    before = _sample("kix_poller_phase_cpu_seconds_count", phase)
+    before_sum = _sample("kix_poller_phase_cpu_seconds_sum", phase)
+    timings: dict[str, int] = {}
+    with _quiet(main), main._phase("metrics_cpu_step", timings):
+        sum(i * i for i in range(200_000))  # real bytecode, so the delta cannot be exactly zero
+    assert _sample("kix_poller_phase_cpu_seconds_count", phase) == before + 1
+    observed = _sample("kix_poller_phase_cpu_seconds_sum", phase) - before_sum
+    assert observed >= 0.0, f"a phase observed {observed} CPU seconds"
+
+
+def test_the_phase_record_carries_cpu_and_rss_beside_the_wall_clock():
+    """The harness reads phases out of Cloud Logging, not out of Prometheus.
+
+    `kix_*` lives in Thanos behind Grafana and is not in Google Managed Prometheus (checked
+    2026-09-11), so `bench_cycle.py` cannot scrape the histogram above — it reads the
+    `poller_phase` records. The three figures therefore have to be ON the record: `ms` was there,
+    `cpu_ms` and `rss_delta_bytes` are what R16 adds.
+
+    `rss_delta_bytes` is allowed to be absent (it is read from /proc, which exists in the
+    container and not on a developer's macOS), but never present-and-wrong: an absent reading must
+    omit the field rather than report 0, which would be indistinguishable from a phase that
+    allocated nothing.
+    """
+    records: list[dict] = []
+
+    class _Capture(_SilentLogger):
+        def info(self, *a, **kw):
+            records.append(dict((kw.get("extra") or {}).get("fields") or {}))
+
+    before = main.logger
+    main.logger = _Capture()
+    timings: dict[str, int] = {}
+    try:
+        with main._phase("metrics_fields_step", timings):
+            sum(i * i for i in range(200_000))
+    finally:
+        main.logger = before
+    record = next(r for r in records if r.get("event") == "poller_phase")
+    assert record["phase"] == "metrics_fields_step"
+    assert isinstance(record["ms"], int)
+    assert isinstance(record["cpu_ms"], int) and record["cpu_ms"] >= 0
+    if "rss_delta_bytes" in record:
+        assert isinstance(record["rss_delta_bytes"], int)
+    assert timings == {"metrics_fields_step": record["ms"]}, (
+        "the cycle's `phases` breakdown must stay a name -> int map: poller_cycle publishes it "
+        "verbatim and test_poller_refresh pins its shape"
+    )
+
+
+def test_the_cycle_histogram_reaches_past_the_medians_period():
+    """A harness cycle longer than the ~295 s period must land in a real bucket.
+
+    The buckets were tuned for a 10-180 s range against a ~177 s period. Under load the whole
+    question is how far past the period a cycle goes, and every answer beyond 300 s used to be the
+    same answer: `+Inf`. 600 and 900 give the overshoot two readings before the count stops
+    meaning anything.
+    """
+    upper = [
+        float(b) for b in metrics.POLLER_CYCLE_DURATION._upper_bounds if b != float("inf")
+    ]
+    assert 600 in upper and 900 in upper, upper
+    before = _sample("kix_poller_cycle_duration_seconds_bucket", {"le": "600.0"})
+    metrics.POLLER_CYCLE_DURATION.observe(500.0)
+    assert _sample("kix_poller_cycle_duration_seconds_bucket", {"le": "600.0"}) == before + 1
+
+
 def test_a_raising_phase_counts_error_and_still_observes_the_duration():
     phase = {"phase": "metrics_failing_step"}
     before_hist = _sample("kix_poller_phase_duration_seconds_count", phase)

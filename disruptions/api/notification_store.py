@@ -56,6 +56,7 @@ import logging
 import re
 import threading
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -299,6 +300,45 @@ class QuotaExceeded(NotificationStoreError):
 _firestore_client_obj: Any | None = None
 _database: str | None = None
 _clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+#: The tracing seam (R16). See :func:`configure`.
+_span_provider: Callable[..., Any] | None = None
+
+
+def _span(name: str, **attributes: Any):
+    """One span around one Firestore call, or a no-op when nothing was injected.
+
+    **Measured, and mute about its exception.** `measure=True` makes the span carry its own
+    `wall_ms` and `cpu_ms`: KTD2 sizes the widened emit pass in interpreter ms per transaction, and
+    a Firestore transaction is not pure socket wait — the body, the protobuf and the commit are all
+    bytecode under one GIL. `record_exception=False` is the redaction clause: a Firestore error
+    message names the document path, and a `subscription_id` embeds the client's own reference, so
+    neither the span event nor the status description may carry it (both do, which is why the
+    seam sets them together).
+
+    Attributes are counts only, from `tracing_setup.SPAN_ATTRIBUTE_NAMES`; the filter lives there.
+
+    A broken provider degrades to no span rather than failing the store call it observes.
+    """
+    provider = _span_provider
+    if provider is None:
+        return nullcontext()
+    try:
+        return provider(name, attributes, record_exception=False, measure=True)
+    except Exception:  # noqa: BLE001 - instrumentation must never fail the call it observes
+        return nullcontext()
+
+
+def _stream(query: Any) -> list[Any]:
+    """One page of a query, read under the module's call deadline and inside one span.
+
+    The single place a streamed read happens, so "one span per Firestore call" is a property of
+    this file rather than of whoever writes the next query: a bare
+    ``list(query.stream(timeout=_CALL_DEADLINE_S))`` would be an untraced read, and nothing about
+    it would look wrong — the store would simply stop accounting for one of its own calls.
+    Transparent by construction: same list, same order, same timeout.
+    """
+    with _span("firestore_stream"):
+        return list(query.stream(timeout=_CALL_DEADLINE_S))
 
 
 def configure(
@@ -306,6 +346,7 @@ def configure(
     client: Any | None = None,
     database: str | None = None,
     clock: Callable[[], datetime] | None = None,
+    span: Callable[..., Any] | None = None,
 ) -> None:
     """Wire the store: a named database (production) or a ready-made client (tests, the emulator).
 
@@ -317,11 +358,17 @@ def configure(
 
     ``clock`` is injectable because a transaction body may run more than once and must therefore
     read no clock: every public method takes its instant ONCE, here, and passes it down.
+
+    ``span`` is main's ``tracing_setup.span`` (R16). A CALLABLE and not an import, like every other
+    seam here: this module must stay importable with nothing configured, and importing
+    ``tracing_setup`` would run that module's import-time ``setup()`` in every suite that touches
+    the store. Absent, :func:`_span` is a no-op and the store is byte-for-byte what it was.
     """
-    global _firestore_client_obj, _database, _clock
+    global _firestore_client_obj, _database, _clock, _span_provider
     _firestore_client_obj = client
     _database = database
     _clock = clock or (lambda: datetime.now(UTC))
+    _span_provider = span
 
 
 def enabled() -> bool:
@@ -879,6 +926,10 @@ def _run_transaction(body: Callable[[Any], Any]) -> Any:
     raises a plain ``ValueError``. Nothing is caught here: the classification a caller needs is
     :func:`is_retryable`, and swallowing at this level would turn a contended subject into a
     silently dropped one.
+
+    ONE span covers all five of the client's internal retries, deliberately: what the pass is
+    charged is what the whole call cost it, and a per-attempt span would report the cheapest
+    attempt as the transaction's cost.
     """
     from google.cloud import firestore
 
@@ -889,7 +940,8 @@ def _run_transaction(body: Callable[[Any], Any]) -> Any:
     def _wrapped(txn: Any) -> Any:
         return body(txn)
 
-    return _wrapped(transaction)
+    with _span("firestore_transaction"):
+        return _wrapped(transaction)
 
 
 def is_retryable(exc: BaseException) -> bool:
@@ -1590,13 +1642,13 @@ def list_subscriptions(
     scanned = 0
     while len(out) < ceiling and scanned < bound:
         requested = min(ceiling - len(out), bound - scanned)
-        page = list(
+        page = _stream(
             _query(
                 "subscriptions",
                 equality={"client_id": client_id, "status": "active"},
                 limit=requested,
                 start_after=cursor,
-            ).stream(timeout=_CALL_DEADLINE_S)
+            )
         )
         scanned += len(page)
         for snapshot in page:
@@ -1676,7 +1728,7 @@ def active_subscriptions(
     instant = now or _now()
     ceiling = min(limit, MAX_SUBSCRIPTIONS_PER_CYCLE)
     query = _query("load_active_subscriptions", equality={"status": "active"}, limit=ceiling)
-    page = list(query.stream(timeout=_CALL_DEADLINE_S))
+    page = _stream(query)
     out: list[Subscription] = []
     skipped = expired = 0
     for snapshot in page:
@@ -1845,7 +1897,7 @@ def cleanup_subscription(
         ("subjects", "cleanup_subjects"),
     ):
         query = _query(spec_name, equality={"subscription_id": subscription_id}, limit=batch)
-        page = list(query.stream(timeout=_CALL_DEADLINE_S))
+        page = _stream(query)
         if page:
             writer = client.batch()
             for snapshot in page:
@@ -2597,7 +2649,7 @@ def subscription_alerts(
         equality={"subscription_id": subscription_id},
         limit=min(limit, MAX_SUBJECTS_PER_READ),
     )
-    page = list(query.stream(timeout=_CALL_DEADLINE_S))
+    page = _stream(query)
     rows, _expired = _live_subject_rows(page, instant)
     if client_id is not None:
         for row in rows:
@@ -2671,7 +2723,7 @@ def client_alerts(
     instant = now or _now()
     ceiling = min(limit, MAX_SUBJECTS_PER_READ)
     query = _query("client_alerts", equality={"client_id": client_id}, limit=ceiling)
-    page = list(query.stream(timeout=_CALL_DEADLINE_S))
+    page = _stream(query)
     rows, expired = _live_subject_rows(page, instant)
     truncated = len(page) >= ceiling
     grouped: dict[str, list[dict[str, Any]]] = {}
@@ -2768,7 +2820,10 @@ def _count_destination_deliveries(destination_id: str, *, state: str) -> int:
         return int(result[0][0].value)
     except Exception:
         logger.debug("count() aggregation unavailable; falling back to a stream", exc_info=True)
-        return sum(1 for _ in query.stream(timeout=_CALL_DEADLINE_S))
+        # Not `_stream`: this counts without materialising the page, which at the ceiling is the
+        # whole point of the fallback. It opens the same span so the call is still accounted for.
+        with _span("firestore_stream"):
+            return sum(1 for _ in query.stream(timeout=_CALL_DEADLINE_S))
 
 
 # ---- Deliveries --------------------------------------------------------------------------------
@@ -2878,7 +2933,7 @@ def pending_deliveries(
             limit=requested,
             start_after=cursor,
         )
-        page = list(query.stream(timeout=_CALL_DEADLINE_S))
+        page = _stream(query)
         scanned += len(page)
         candidates: list[Delivery] = []
         for snapshot in page:

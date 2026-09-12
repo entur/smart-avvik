@@ -219,6 +219,10 @@ def _reset_state():
     # which is what an un-wired deployment holds.
     varsel._webhook_enabled = None
     varsel._webhook_provider = None
+    # The tracing seam (U1, 2026-09-12), reset for the same reason and with a sharper failure: a
+    # recorder left behind by an earlier test keeps appending to a list that test still holds, so
+    # its assertions about span counts drift with the order the suite happens to run in.
+    varsel._span_provider = None
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
@@ -627,6 +631,105 @@ def test_journey_crud_and_live_match():
     assert client.delete(f"/varsel-api/journeys/{jid}?device_id=someone-else").status_code == 404
     assert client.delete(f"/varsel-api/journeys/{jid}?device_id={DEVICE}").status_code == 200
     assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
+
+
+def test_the_pass_opens_one_span_per_sub_pass_carrying_only_counts(monkeypatch):
+    """R16's trace half, and the span-attribute redaction rule at the call sites.
+
+    Until this existed a dev trace showed `varsel_notify` as one opaque phase with the decision
+    log's insert under it and nothing else, so "where does the pass spend its time" could only be
+    answered by adding log lines. The five children are the pass's own structure: match (16-wide),
+    reconcile (sequential), write wordings (16-wide), deliver (32-wide) and the decision rows.
+
+    Two things are asserted, and the second is the one that matters more. The spans exist and nest
+    under whatever the caller opened — and every attribute they carry is a COUNT from
+    `tracing_setup.SPAN_ATTRIBUTE_NAMES`. A span is exported to Cloud Trace, which project IAM is
+    the only gate on, and these five are opened exactly where the stop refs, the place names, the
+    departure times and the wordings are.
+
+    `varsel` must reach the tracer through an injected callable and never import `tracing_setup`
+    or `main` — the seam every other capability here uses — which is what this test drives.
+    """
+    import tracing_setup
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    opened: list[tuple[str, dict]] = []
+
+    @contextmanager
+    def _recorder(name, attributes=None, **kwargs):
+        opened.append((name, dict(attributes or {})))
+        yield None
+
+    varsel.configure(
+        impact_provider=varsel._impact_provider,
+        stops_provider=varsel._stops_provider,
+        span=_recorder,
+    )
+    try:
+        client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+        client.post(
+            "/varsel-api/journeys",
+            json={
+                "device_id": DEVICE,
+                "from_stop": "A",
+                "from_name": "Oslo S",
+                "to_stop": "B",
+                "to_name": "Lillehammer",
+                "begin": "00:00",
+                "end": "23:59",
+                "days": [0, 1, 2, 3, 4, 5, 6],
+            },
+        )
+        opened.clear()  # the registration's own connectivity work is not what this checks
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.configure(
+            impact_provider=varsel._impact_provider, stops_provider=varsel._stops_provider
+        )
+    names = [name for name, _ in opened]
+    assert names == [
+        "varsel_match",
+        "varsel_reconcile",
+        "varsel_write_wordings",
+        "varsel_deliver",
+        "varsel_record_decisions",
+    ], names
+    for name, attributes in opened:
+        assert attributes, f"{name} carries no counts, so the trace says nothing about it"
+        for key, value in attributes.items():
+            assert key in tracing_setup.SPAN_ATTRIBUTE_NAMES, f"{name}: {key}"
+            assert isinstance(value, (int, float)), f"{name}: {key}={value!r}"
+
+
+def test_an_unwired_span_seam_leaves_the_pass_exactly_as_it_was(monkeypatch):
+    """The default is off, and the pass must not know the difference.
+
+    Every seam in this module defaults to absent so an un-wired deployment is byte-for-byte the
+    code before the seam existed; a tracing seam is the one where a lazy default (import the tracer
+    here) would also break `varsel`'s import isolation. Driven rather than asserted in prose: the
+    same cycle with no provider still pushes.
+    """
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    assert varsel._span_provider is None, "_reset_state must return the seam to its off default"
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    client.post(
+        "/varsel-api/journeys",
+        json={
+            "device_id": DEVICE,
+            "from_stop": "A",
+            "from_name": "Oslo S",
+            "to_stop": "B",
+            "to_name": "Lillehammer",
+            "begin": "00:00",
+            "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+    )
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
 
 
 def test_notify_pushes_once_then_dedups(monkeypatch):
