@@ -1817,7 +1817,12 @@ def list_subscriptions(
 
 @dataclass(frozen=True)
 class LoadedSubscriptions:
-    subscriptions: tuple[Subscription, ...]
+    #: Either :class:`Subscription` records, from a direct read, or :class:`MirrorEntry` ones from
+    #: the mirror. The one reader of this beyond the pass -- `notification_servability` -- uses the
+    #: fields both carry (`subscription_id`, the pair, `servable`, `servable_checked_at`,
+    #: `version`), so it is indifferent to which, and typing it to the union rather than converting
+    #: keeps the mirror from paying a copy per subscription per cycle.
+    subscriptions: tuple[Subscription | MirrorEntry, ...]
     truncated: bool
     skipped: int
     expired: int
@@ -1930,6 +1935,13 @@ class MirrorEntry:
     delivered: Mapping[str, datetime]
     liveness: Mapping[str, Any]
     mirror_updated_at: datetime | None
+    # Not read by the matching pass at all -- these are `notification_servability`'s, which runs
+    # later in the SAME cycle over the same population and reuses this read through
+    # `recent_load` rather than walking the collection a second time. Carrying two more fields is
+    # what lets that arrangement survive the mirror; without them the re-check would go back to a
+    # full read per cycle, which is most of what U6 exists to remove.
+    servable: bool | None = None
+    servable_checked_at: datetime | None = None
 
     def is_live(self, now: datetime) -> bool:
         return subscription_is_live(self.liveness, now)
@@ -1968,6 +1980,8 @@ def _mirror_entry(doc: Mapping[str, Any]) -> MirrorEntry:
             "inactivity_expires_at": sub.inactivity_expires_at,
         },
         mirror_updated_at=_as_dt(doc.get(MIRROR_FIELD)),
+        servable=sub.servable,
+        servable_checked_at=sub.servable_checked_at,
     )
 
 
@@ -2376,6 +2390,45 @@ class SubjectMirror:
         }
 
 
+#: The process's two mirrors. Module-level for `_recent_load`'s reason -- the pass reads them from a
+#: worker thread and the poller syncs them from its own -- and both are internally locked.
+_subscription_mirror = SubscriptionMirror()
+_subject_mirror = SubjectMirror()
+
+
+def subscription_mirror() -> SubscriptionMirror:
+    return _subscription_mirror
+
+
+def subject_mirror() -> SubjectMirror:
+    return _subject_mirror
+
+
+def reset_mirrors_for_tests() -> None:
+    _subscription_mirror.reset()
+    _subject_mirror.reset()
+
+
+def sync_mirrors(
+    *, now: datetime | None = None, beat: Callable[[], None] | None = None
+) -> MirrorSync:
+    """Bring both mirrors up to date. One step of the poller's cycle, before the pass reads them.
+
+    Seeds whichever is not ready yet -- which on a fresh pod is both, and is why this runs on the
+    POLLER thread rather than in the lifespan: the app serves nothing until the lifespan yields, so
+    a 100 000-document read there would hold the port closed for the whole of it and fail the
+    readiness probe of a deployment doing exactly what it was told to.
+
+    Raises what the store raises. The caller decides, and the mirrors keep what they had -- an empty
+    mirror on a transient error is indistinguishable from "every client unsubscribed".
+    """
+    instant = now or _now()
+    report = _subscription_mirror.sync(now=instant, beat=beat)
+    if not _subject_mirror.ready:
+        _subject_mirror.seed(now=instant, beat=beat)
+    return report
+
+
 def active_subscriptions(
     *,
     limit: int = MAX_SUBSCRIPTIONS_PER_CYCLE,
@@ -2422,46 +2475,54 @@ def active_subscriptions(
 def recipient_documents() -> list[dict[str, Any]]:
     """``varsel.WebhookRecipientProvider``: the raw documents this cycle should match.
 
-    Raw documents rather than parsed records, because that Protocol is explicit about why: R20 wants
-    an unreadable document skipped rather than failing its collection, and only the READER can
-    decide what "unreadable" means for the schema the running binary knows. So this hands over the
-    shape and ``varsel._parse_webhook_recipient`` validates it.
+    Served from the mirror since U6, and the per-cycle full read is gone with it. What has NOT
+    changed is the shape: `_recipient_document` is the one statement of it, and the mirror and the
+    store's own reader both call it, so this returns byte-identical documents to the ones the query
+    produced.
+
+    Raw documents rather than parsed records, because `WebhookRecipientProvider` is explicit about
+    why: R20 wants an unreadable document skipped rather than failing its collection, and only the
+    READER can decide what "unreadable" means for the schema the running binary knows.
+
+    **An unseeded mirror yields nothing, and says so.** Returning a partial set would be worse than
+    returning none: the pass cannot tell "this client has no live subscriptions" from "the mirror
+    has not finished loading", and a half-loaded mirror would silently retire whatever it had not
+    reached yet. `sync_mirrors` runs as its own step before the pass, so a ready mirror is the
+    ordinary state and this is the restart window only.
     """
     instant = _now()
-    loaded = active_subscriptions(now=instant)
-    _remember_load(instant, loaded)
-    # `expired` IS NOT A WARNING, and this used to warn on it. TTL deletes an expired document
-    # "typically within 24 hours", so during that documented lag a perfectly healthy deployment logs
-    # a warning on EVERY cycle -- and `terraform/firestore.tf`'s own header makes the argument
-    # against that better than a comment here can: a standing warning is how a real one stops being
-    # read. The two conditions worth waking someone for stay warnings: `truncated` is R21's ceiling
-    # binding, which at a pilot's volume is a store bug or a quota breach rather than growth, and
-    # `skipped` is a document this binary cannot read, which is a schema or deploy problem. The
-    # ordinary counts still go out on one DEBUG record under the same event name, so "is TTL keeping
-    # up?" is still answerable -- just not by a warning.
-    fields = {
-        "event": "notification_store_load",
-        "n": len(loaded.subscriptions),
-        "skipped": loaded.skipped,
-        "expired": loaded.expired,
-        "truncated": loaded.truncated,
-    }
-    if loaded.truncated or loaded.skipped:
+    if not _subscription_mirror.ready:
         logger.warning(
-            "Webhook subscription load bounded: %d loaded, %d skipped, truncated=%s",
-            len(loaded.subscriptions),
-            loaded.skipped,
-            loaded.truncated,
-            extra={"fields": fields},
+            "The subscription mirror has not finished loading; no webhook recipient is matched on "
+            "this cycle",
+            extra={"fields": {"event": "notification_store_load", "result": "mirror_not_ready"}},
         )
-    else:
-        logger.debug(
-            "Webhook subscription load: %d loaded, %d expired but not yet TTL-deleted",
-            len(loaded.subscriptions),
-            loaded.expired,
-            extra={"fields": fields},
-        )
-    return [s.as_recipient_document(instant) for s in loaded.subscriptions]
+        return []
+    entries = _subscription_mirror.recipients(instant)
+    # The servability re-check runs later in the SAME cycle and walks every live subscription too.
+    # Stamping the mirror's own read here is what lets it reuse this one instead of reading for
+    # itself -- the arrangement that existed before the mirror, kept, because the re-check still
+    # wants a `LoadedSubscriptions` and does not care where it came from.
+    _remember_load(
+        instant,
+        LoadedSubscriptions(
+            subscriptions=tuple(entries), truncated=False, skipped=0, expired=0
+        ),
+    )
+    logger.debug(
+        "Webhook subscription load from the mirror: %d live of %d held",
+        len(entries),
+        _subscription_mirror.size(),
+        extra={
+            "fields": {
+                "event": "notification_store_load",
+                "result": "mirror",
+                "n": len(entries),
+                "mirror_size": _subscription_mirror.size(),
+            }
+        },
+    )
+    return [e.as_recipient_document(instant) for e in entries]
 
 
 # ---- Ordered, durable deletion ----------------------------------------------------------------

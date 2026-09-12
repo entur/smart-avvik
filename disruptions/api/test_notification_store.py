@@ -354,6 +354,9 @@ def _install(client: _FakeClient) -> None:
     notification_store._run_transaction = _run  # type: ignore[assignment]
     notification_store._query = _query  # type: ignore[assignment]
     notification_store.configure(client=client, clock=lambda: NOW)
+    # The mirrors are module state and leak between tests exactly as `_recent_load` does -- a
+    # half-seeded mirror from a previous test reads as a healthy one here.
+    notification_store.reset_mirrors_for_tests()
 
 
 def _uninstall() -> None:
@@ -364,6 +367,7 @@ def _uninstall() -> None:
         notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
     notification_store.reset_for_tests()
+    notification_store.reset_mirrors_for_tests()
     _fake = None
 
 
@@ -2532,15 +2536,41 @@ def test_the_window_rules_are_varsels_own():
 def test_the_load_provider_is_the_shape_varsel_declares():
     client = _FakeClient()
     _install(client)
-    client.page(
-        "load_active_subscriptions",
-        notification_store.SUBSCRIPTIONS,
-        [_live_doc(subscription_id="s1"), _live_doc(subscription_id="s2")],
-    )
+    _seed_mirror(client, [_live_doc(subscription_id="s1"), _live_doc(subscription_id="s2")])
     documents = notification_store.recipient_documents()
     assert [d["recipient_id"] for d in documents] == ["s1", "s2"]
     assert all(isinstance(d, dict) for d in documents)
     assert "def __call__(self) -> Iterable[Mapping[str, Any]]: ..." in VARSEL_SOURCE
+
+
+def test_an_unseeded_mirror_yields_no_recipients_and_says_which_it_is():
+    """U6. A partial answer would be worse than none.
+
+    The pass cannot tell "this client has no live subscriptions" from "the mirror has not finished
+    loading", so a half-loaded mirror would silently retire whatever it had not reached. It is a
+    WARNING because it is the one state where the channel is deliberately serving nobody, and it
+    names itself so a restart window is not mistaken for an empty collection.
+    """
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_live_doc(subscription_id="s1")])
+    records: list[tuple[str, dict]] = []
+    saved = notification_store.logger
+    try:
+        notification_store.logger = _RecordingLogger(records)  # type: ignore[assignment]
+        assert notification_store.recipient_documents() == []
+        assert [level for level, _ in records] == ["warning"], records
+        assert records[0][1]["result"] == "mirror_not_ready"
+
+        records.clear()
+        notification_store.subscription_mirror().seed(now=NOW)
+        assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["s1"]
+        # An ordinary serve is DEBUG: a line on every cycle at WARNING is how a real warning stops
+        # being read, which is the argument `recipient_documents` already made about TTL lag.
+        assert [level for level, _ in records] == ["debug"], records
+        assert records[0][1]["result"] == "mirror"
+    finally:
+        notification_store.logger = saved  # type: ignore[assignment]
 
 
 # ---- Retry, expiry and the terminal states ----------------------------------------------------
@@ -2993,56 +3023,28 @@ def test_an_ordinary_ttl_lag_is_not_logged_as_a_warning():
     try:
         client = _FakeClient()
         _install(client)
-        # Expired rows only: the ordinary TTL lag.
-        client.page(
-            "load_active_subscriptions",
-            notification_store.SUBSCRIPTIONS,
-            [
-                _live_doc(subscription_id="live"),
-                _live_doc(subscription_id="idle", now=NOW - timedelta(days=120)),
-            ],
-        )
-        notification_store.recipient_documents()
-        # Only the records carrying structured fields are the load summary; a skipped document also
-        # emits a bare DEBUG traceback with no `extra`, which is not what this test is about.
+        # **The subscription half of this test moved to the mirror with U6.** The per-cycle load
+        # query is gone, and with it R21's ceiling and the `truncated` warning that announced it;
+        # an expired document is now dropped by the mirror's read-time liveness and an unreadable
+        # one by its seed, neither of which logs per cycle. What is left here is the alert-state
+        # read, which still queries and still owes the same distinction.
+        stale = _state("a-expired", notification_store.PHASE_PREDICTED)
+        stale[notification_store.TTL_FIELD] = NOW - timedelta(minutes=1)
+        _alert_page(client, [_state("a1", notification_store.PHASE_PREDICTED), stale])
+        notification_store.client_alerts(CLIENT, now=NOW)
         summaries = [(level, fields) for level, fields in records if fields]
         assert [level for level, _ in summaries] == ["debug"], records
-        assert summaries[0][1]["expired"] == 1
-        assert summaries[0][1]["event"] == "notification_store_load", "still queryable under one name"
+        assert summaries[0][1]["event"] == "notification_quota"
+        assert summaries[0][1]["expired"] == 1 and summaries[0][1]["truncated"] is False
 
-        # A document this binary cannot read still WARNS. It has to be LIVE but unparseable: the
-        # liveness test runs before the parse, so a doc missing its horizons is counted as expired
-        # and never reaches the parser at all -- which is how the first version of this fixture
-        # quietly tested the wrong branch.
+        # And the ceiling binding, which changes the CALLER's behaviour, still warns.
         records.clear()
-        unreadable = _live_doc(subscription_id="bad")
-        del unreadable["days"]
-        client.page(
-            "load_active_subscriptions",
-            notification_store.SUBSCRIPTIONS,
-            [_live_doc(subscription_id="good"), unreadable],
-        )
-        notification_store.recipient_documents()
-        summaries = [(level, fields) for level, fields in records if fields]
-        assert [level for level, _ in summaries] == ["warning"], records
-        assert summaries[0][1]["skipped"] == 1 and summaries[0][1]["expired"] == 0
-
-        # And so does R21's ceiling binding, on its own.
-        records.clear()
-        client.page(
-            "load_active_subscriptions",
-            notification_store.SUBSCRIPTIONS,
-            [_live_doc(subscription_id=f"s{i}") for i in range(3)],
-        )
-        notification_store.active_subscriptions(limit=2, now=NOW)
-        records.clear()
-        client.pages["load_active_subscriptions"] = client.pages["load_active_subscriptions"][:1]
-        saved_ceiling = notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE
+        saved_served = notification_store.MAX_SUBJECTS_PER_READ
         try:
-            notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE = 1
-            notification_store.recipient_documents()
+            notification_store.MAX_SUBJECTS_PER_READ = 1
+            notification_store.client_alerts(CLIENT, now=NOW)
         finally:
-            notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE = saved_ceiling
+            notification_store.MAX_SUBJECTS_PER_READ = saved_served
         summaries = [(level, fields) for level, fields in records if fields]
         assert [level for level, _ in summaries] == ["warning"], records
         assert summaries[0][1]["truncated"] is True
@@ -4153,6 +4155,30 @@ def test_every_streamed_read_sits_under_a_span():
 
 
 # ---- The subscription mirror (U6) ----------------------------------------------------------------
+
+
+class _RecordingLogger:
+    """Captures (level, structured fields) per log call. Promoted from a local class in the TTL-lag
+    test when the mirror gave a second test the same need."""
+
+    def __init__(self, records: list[tuple[str, dict[str, Any]]]) -> None:
+        self._records = records
+
+    def __getattr__(self, level: str):
+        def _log(_msg: str, *_args: Any, **kwargs: Any) -> None:
+            self._records.append((level, dict((kwargs.get("extra") or {}).get("fields") or {})))
+
+        return _log
+
+
+def _seed_mirror(client: _FakeClient, docs: list[dict[str, Any]], *, now: datetime = NOW) -> None:
+    """Put documents in the mirror the pass now reads through, as the seed would.
+
+    Since U6 `recipient_documents` serves the mirror rather than querying, so a test that stages a
+    `load_active_subscriptions` page is staging a page nothing reads.
+    """
+    _mirror_page(client, "mirror_seed", docs)
+    notification_store.subscription_mirror().seed(now=now)
 
 
 def _mirror_page(client: _FakeClient, spec: str, docs: list[dict[str, Any]]) -> None:
