@@ -1616,6 +1616,12 @@ def back_off_destination(
     silent destination they need explaining; this clears itself within minutes, and a busy morning
     against a flaky receiver would write an audit row per cycle per destination into a collection
     that never expires.
+
+    **A named ``Retry-After`` still advances the count**, and the consequence is worth stating
+    rather than discovering: a receiver that asks for 45 s three times and then fails with a bare
+    503 is backed off at the fourth step of the curve, not the first. That is the intended reading
+    -- the count means consecutive failures, and a 429 is a failure -- but it means the curve
+    describes the destination's recent history rather than only its unasked-for failures.
     """
     instant = now or _now()
     stored = _store().get(DESTINATIONS, destination_id)
