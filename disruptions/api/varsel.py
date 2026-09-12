@@ -93,7 +93,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from itertools import islice
 from pathlib import Path
 from time import monotonic
 from typing import Annotated, Any, Protocol
@@ -499,11 +498,12 @@ class WebhookRecipientProvider(Protocol):
     the provider's job is to read the store and this module's job is to validate
     (:func:`_parse_webhook_recipient`).
 
-    Returning a lazy iterable is fine and expected — a Firestore cursor is one — because
-    :func:`_load_webhook_recipients` materializes it INSIDE the bounded step, so both the wall-clock
-    ceiling and the :data:`_MAX_WEBHOOK_RECIPIENTS` count ceiling apply to the paging as well as to
-    the first call. The provider must still carry its own per-call deadline (KTD6): the bound here
-    is on how long the poller WAITS, not on when the store gives up.
+    Returning a lazy iterable was fine and expected while this was a Firestore cursor, and the two
+    ceilings around it — a wall-clock wait and a document count — bounded the paging as well as the
+    first call. **Since U6 the provider serves the store's in-memory mirror**, so it returns
+    immediately, both ceilings are gone, and what bounds the STORE is one step earlier
+    (`notification_store.sync_mirrors`), in its own phase. A provider that still reaches a socket
+    must therefore carry its own deadline (KTD6): nothing in this pass bounds it any more.
     """
 
     def __call__(self) -> Iterable[Mapping[str, Any]]: ...
@@ -718,21 +718,12 @@ def _canonicalize_journeys() -> None:
 
 # ---- Webhook channel: subscriptions as registrations with a webhook ---------------------------
 #
-# R21's read ceiling. A webhook subscription costs this pass one journey_key group at most (they
-# collapse onto the browser groups they duplicate), and pass 1a is already 16-wide, so the number
-# that matters is not "how many can we match" but "how much can one bad store answer make the
-# poller carry". Deliberately the same order as `_MAX_JOURNEYS` (20 000) divided down: a pilot is
-# one client and a few hundred subscriptions, so anything approaching this is a store bug or a
-# quota breach rather than growth, and truncating it is the right failure. Truncation is logged.
-_MAX_WEBHOOK_RECIPIENTS = 2000
-# How long the poller waits for the whole load -- the first call AND every page of a lazy cursor.
-# It is a bound on the WAIT and not on the store: the provider carries its own per-call deadline
-# (KTD6), and a thread parked past this one is abandoned rather than killed, because Python has no
-# way to kill it. Sized against the cycle it sits in: `check_and_notify` is the last phase of a
-# cycle measured at 50-63 s on a period measured at ~296 s (2026-08-21 / 2026-09-08), and this runs
-# BEFORE `_WriteBudget`'s 30 s clock starts, so a slow store costs the cycle its own tail and
-# never the wordings.
-_WEBHOOK_LOAD_TIMEOUT_S = 5.0
+# **This pass no longer bounds the read, because there is no read to bound** (U6). It used to cap
+# the provider at 2 000 documents, on the reasoning that a pilot is one client and a few hundred
+# subscriptions, so anything approaching the cap is a store bug rather than growth. At 100 000 it is
+# growth, and a cap would silently match the first 2 000 -- so the cap is gone and the store holds
+# the collection in a mirror it seeds once. What replaced the ceiling as the thing to watch is the
+# mirror's readiness and watermark age, reported by the sync step that runs before this pass.
 
 
 def webhook_channel_enabled() -> bool:
@@ -844,7 +835,7 @@ def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
 
 
 def _load_webhook_recipients() -> list[WebhookRecipient]:
-    """This cycle's webhook subscriptions, or an empty list — the single guarded, bounded read.
+    """This cycle's webhook subscriptions, or an empty list — the pass's one guarded read.
 
     The ONE place this pass reads notification state (KTD6): passes 1a and 1b work off the snapshot it
     returns and never go back to the store, which is what keeps 1b free to stay sequential (it
@@ -857,23 +848,15 @@ def _load_webhook_recipients() -> list[WebhookRecipient]:
       and for a strictly bigger blast radius: called bare, a raise here unwinds out of
       `check_and_notify` entirely, so loop 2 never runs (no pushes at all) and `_record_decisions`
       never runs (no rows either).
-    * **the store is slow** — bounded by :data:`_WEBHOOK_LOAD_TIMEOUT_S` on a worker thread. The
-      executor is deliberately NOT used as a context manager: `__exit__` calls
-      `shutdown(wait=True)`, which would block the poller until the slow call finally returned and
-      defeat the timeout completely. `shutdown(wait=False)` abandons the thread instead, which is
-      the honest trade — Python cannot cancel a thread parked in a socket read, and one leaked
-      thread per bad cycle is far cheaper than a stalled ingestion thread. What abandoning it still
-      costs is interpreter shutdown: `concurrent.futures.thread` registers an atexit hook that
-      joins its workers, so a provider with NO deadline of its own would delay a pod termination by
-      however long it hangs. That is the second reason KTD6 puts a per-call deadline on the
-      provider rather than treating this ceiling as the only bound.
+    * **the provider is slow** — it is not, since U6. The provider reads the store's in-memory
+      mirror, so there is no socket in this path and nothing to time out: the bounded worker
+      thread that used to wrap it, and the abandoned-thread trade that came with it, are gone with
+      the per-cycle Firestore read they existed to bound. What bounds the STORE is now one step
+      earlier and its own phase (`notification_store.sync_mirrors`), where a slow call costs the
+      mirror its freshness rather than costing this pass its cycle.
     * **one document is unreadable** — skipped, per document, never allowed to fail its collection
       (R20). The count and the exception CLASS are logged and the document body never is (R16): a
       webhook subscription is a route with times, and this log line is not the place for it.
-
-    Materializing the iterable happens inside the worker (`list(islice(...))`), so a lazy Firestore
-    cursor's paging is under the same clock as the first call and :data:`_MAX_WEBHOOK_RECIPIENTS`
-    bounds the read rather than merely the result.
     """
     if not webhook_channel_enabled():
         return []
@@ -881,10 +864,8 @@ def _load_webhook_recipients() -> list[WebhookRecipient]:
     if provider is None:  # narrowed for the type checker; webhook_channel_enabled already said so
         return []
     started = monotonic()
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="client-load")
     try:
-        future = pool.submit(lambda: list(islice(provider(), _MAX_WEBHOOK_RECIPIENTS)))
-        docs = future.result(timeout=_WEBHOOK_LOAD_TIMEOUT_S)
+        docs = list(provider())
     except Exception:
         logger.warning(
             "Webhook subscriptions could not be read this cycle; matching browser registrations "
@@ -893,10 +874,6 @@ def _load_webhook_recipients() -> list[WebhookRecipient]:
             extra={"fields": {"event": "varsel_webhook_load", "result": "error"}},
         )
         return []
-    finally:
-        # Never wait: see the docstring. A thread still inside a slow provider call outlives this
-        # cycle and is collected when the call returns.
-        pool.shutdown(wait=False)
 
     recipients: list[WebhookRecipient] = []
     skipped: dict[str, int] = {}
@@ -911,9 +888,9 @@ def _load_webhook_recipients() -> list[WebhookRecipient]:
         except Exception as exc:
             # The traceback at DEBUG, the COUNT at WARNING below. Never the document: a client
             # subscription is a route with times and weekdays, and R16 keeps that out of routine
-            # logs -- which a per-document warning quoting the record would defeat. Bounded by
-            # `_MAX_WEBHOOK_RECIPIENTS`, and the exception messages reachable here are either a
-            # missing key name or one of this function's own sentences, so the traceback is safe.
+            # logs -- which a per-document warning quoting the record would defeat. The exception
+            # messages reachable here are either a missing key name or one of this function's own
+            # sentences, so the traceback is safe.
             logger.debug("Unreadable webhook subscription document; skipping it", exc_info=True)
             skipped[type(exc).__name__] = skipped.get(type(exc).__name__, 0) + 1
     if skipped:
@@ -944,11 +921,11 @@ def _load_webhook_recipients() -> list[WebhookRecipient]:
                 "skipped": sum(skipped.values()),
                 "unroutable": unroutable,
                 "ms": int((monotonic() - started) * 1000),
-                # `>=`, so a collection of exactly the ceiling reports truncated. That is not a
-                # rounding error to fix: the read stops AT the ceiling (R21 -- it may not exceed
-                # it), so this cycle genuinely cannot tell a full collection from a clipped one,
-                # and claiming otherwise would need one more document than the ceiling allows.
-                "truncated": len(docs) >= _MAX_WEBHOOK_RECIPIENTS,
+                # `truncated` is GONE with the ceiling it reported (U6). There is no per-cycle read
+                # to clip: the mirror holds the whole collection, so "did this cycle see all of it?"
+                # is answered by the mirror's own readiness and watermark age instead, which the
+                # sync step reports.
+                "mirror_size": len(docs),
             }
         },
     )

@@ -755,6 +755,67 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   reaches the groups view, the labelling INSERT and the scheduled-query re-registration in one
   operation. **The precondition was met on 2026-09-10** (Entur SSO, #142) and the work itself is
   still owed: until it lands, a webhook-only route is unscored exactly as the DoD term says.
+  **The poller matches against an in-memory MIRROR, not a per-cycle read** (U6, 2026-09-12, KTD5).
+  `varsel._load_webhook_recipients` used to pull every active subscription from Firestore on every
+  cycle, capped at 2 000 documents in two places that had to be edited together. At 100 000 that read
+  IS the cycle (~$9-18/day in document reads alone) and the cap truncates **silently** — the load
+  returns a page and the subscriptions past it are simply not matched. `notification_store` now holds
+  a `SubscriptionMirror`: one full paged read at startup, then per cycle a query for the documents
+  whose server-stamped `mirror_updated_at` moved. A subscription nothing writes to is read once, ever.
+  **Which bodies stamp is the mechanism**, and both mistakes are silent. `_touch_body` DOES (the plan's
+  own list omitted it): it moves `expires_at` through `_horizons`, the mirror tests liveness against
+  its own copy, and the idempotent re-PUT is the write a client makes most often — unstamped, the
+  mirror drops a live subscription the client has just said it still wants. `_sent_body` does NOT: it
+  writes the `delivered` marks, so stamping it would make every delivery re-read its own subscription
+  and the busiest documents would sync every cycle, which is the whole economy of the design. The cost
+  of that omission is stated rather than hidden — the mirror's `delivered` set can lag, so the pass can
+  WORD a train already delivered; it cannot duplicate one, because `_emit_body` reads the real subject
+  document inside its transaction — and the standing-subject mirror is what closes it. The set is
+  declared in `MIRROR_STAMPING_BODIES` and pinned off the source both ways, because what has to hold is
+  a property of the SET: a body added next year is the case no behavioural test over today's five sees.
+  **Server-stamped, never `now`.** Every body already takes `now` for `updated_at` and reusing it is the
+  obvious thing to do: it would break the mirror quietly, because the watermark is compared against
+  values Firestore wrote, so a pod whose clock runs a few seconds fast advances past documents the
+  store stamped later and never syncs them again. The suite's fake resolves the sentinel against a
+  clock deliberately 37 s ahead of the one the bodies get, so an implementation that wrote `now` fails.
+  **Three properties the pass depends on.** A failed sync RAISES and keeps the previous mirror (an
+  empty one reads to every downstream reader as "every client unsubscribed"). Liveness is applied on
+  the READ, because nothing writes a document when its inactivity horizon passes at 03:00, so no sync
+  can carry that news. And the 120 s overlap exists because Firestore commits are not ordered by the
+  instant a transaction started — a transaction that began before the last sync can commit with an
+  EARLIER stamp than a document that sync already saw, and a strict `> watermark` steps over it
+  forever; the overlap is safe only because entries are applied by document id, so re-applying is a
+  no-op. **`MIRROR_MAX_AGE_S` (6 h) is a CORRECTNESS bound, not a freshness one**: a revocation arrives
+  as a tombstone whose own TTL deletes it after roughly a day, so a sync broken for longer loses the
+  removal for good and the poller keeps alerting a revoked recipient — past the bound the mirror
+  re-seeds instead of syncing. `kix_mirror_age_seconds` is the series an alert selects on (rule 2a).
+  Two Firestore traps recorded here because both are silent: an `order_by` **excludes documents that
+  lack the field** exactly as an equality does, so the seed orders by `created_at` and never by the
+  watermark — ordering by it would skip every document written before it existed, which on the deploy
+  that introduces it is all of them; and the seed runs **on the poller thread**, not in the lifespan,
+  because the app serves nothing until the lifespan yields and a 100 000-document read there would
+  hold the port closed and fail the readiness probe. It beats the heartbeat between pages, or
+  `/health`'s 600 s staleness rule restarts the pod mid-read, forever. The sync is its own phase
+  (`notification_mirror`) placed BEFORE `varsel_notify`: its own because a slow store now costs the
+  mirror its freshness rather than the pass its cycle, and before because a mirror synced after the
+  pass would serve every cycle the population of the one before.
+  **The standing-subject mirror is the second half and is not optional.** The emit pass asks "does this
+  subject stand, and in which phase?" and answered it with one `client_alerts` query per client,
+  bounded at `MAX_SUBJECTS_PER_READ` — past which the answer is INCOMPLETE, and incomplete means a
+  store transaction per subject, because treating a truncated read as complete skips a withdrawal that
+  was owed and a `confirmed` mint for a train ET has cancelled. At one client with 100 000
+  subscriptions that fallback is the steady state. `SubjectMirror` answers it completely from memory,
+  **kept current by the poller's own commits rather than a watermark**: subject documents have exactly
+  one writer (KTD6), so every change passes through this process. Re-check that when U11 moves delivery
+  to its own Deployment — what a worker writes there is `delivered_revision` and `pending_delivery_id`,
+  neither of which is in the standing set. It is indexed BY SUBSCRIPTION as well as by alert id,
+  because the pass asks per subscription and a flat map would make each of 100 000 questions a scan.
+  **Both 2 000 ceilings are gone**, with `active_subscriptions`, the `load_active_subscriptions` spec,
+  its composite index and the `truncated` flag that reported it — an index paid for on every write with
+  no reader is what the bidirectional index test exists to refuse. Note U5 added that index one PR
+  earlier and U6 removes it: the destroy is free (nothing queries it), but it is worth knowing the
+  plan's own sequencing produced it.
+
   **The R16 prompt-record claim has two halves and only one is closed**, published rather than
   asserted away. A **webhook-only** definition — one absent from `by_journey_key`, which stays
   browser-only for exactly this — is written for through `notification_wording.WEBHOOK`, which
