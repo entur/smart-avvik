@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
@@ -80,6 +81,16 @@ from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo
 
 import metrics  # sibling leaf module (no main import): the decision-write counter (KTD11)
+
+try:
+    # BigQuery's OWN retry policy, imported only to narrow its deadline (see `_WRITE_RETRY`).
+    # Guarded because this module must stay importable without the BigQuery library: a deployment
+    # that has no client records nothing anyway (`record` returns early), and `test_decisions.py`
+    # runs on stdlib plus pydantic. Absent, `_WRITE_RETRY` is None, which the real client reads as
+    # "one attempt" — the same bound `timeout=` already puts on that attempt.
+    from google.cloud.bigquery.retry import DEFAULT_RETRY as _BQ_DEFAULT_RETRY
+except ImportError:  # pragma: no cover - exercised only where google-cloud-bigquery is absent
+    _BQ_DEFAULT_RETRY = None
 
 if TYPE_CHECKING:  # type-checker only: no runtime import, so the varsel <-> decisions cycle stays broken
     from varsel import Alert
@@ -121,12 +132,39 @@ _descriptions_failed_at: float | None = None
 # The DDL runs on the startup path of a single always-on pod, in front of the poller thread, so
 # it gets an explicit ceiling rather than inheriting the client's "wait forever".
 _ENSURE_TIMEOUT_S = 60.0
-# `record` runs inside check_and_notify on the poller thread, so its streaming insert needs the
-# same ceiling for the same reason (a hung insertAll wedges the tick, /health goes stale, liveness
+# `record` runs inside check_and_notify on the poller thread, so its streaming insert needs a
+# ceiling for the same reason (a hung insertAll wedges the tick, /health goes stale, liveness
 # restarts into the hang). Generous against a small batch: a write that needs longer than this has
 # something wrong with it, and the write fails open anyway — the row is logged as lost and the
 # traveller's push is unaffected.
+#
+# IT BOUNDS ONE HTTP ATTEMPT, NOT THE CALL, and until 2026-09-12 this comment claimed otherwise.
+# `insert_rows_json` runs under the client's `DEFAULT_RETRY`, whose deadline is
+# `_DEFAULT_RETRY_DEADLINE = 10.0 * 60.0` — so a single chunk could legitimately sit here for ten
+# minutes, and several sequential chunks for as many. `HEALTH_STALE_AFTER_S` is 600 s and a restart
+# comes up with both planned-call tables cold, so the library's default turns a BigQuery wobble into
+# a cold-start crash loop. See `_WRITE_RETRY` for the bound, and `record`'s `beat` for the other
+# half: the deadline below is only the exposure /health sees because a chunk boundary beats.
 _WRITE_TIMEOUT_S = 60.0
+
+# What ONE chunk may spend in total, retries included. BigQuery's own `DEFAULT_RETRY` with nothing
+# but its deadline narrowed: the predicate stays the library's, so exactly the same errors are
+# retried and only the time spent on them changes — the minimal edit, and the one that cannot
+# silently stop retrying something that used to recover.
+#
+# The arithmetic, stated because it is not the 60 s the name suggests. api_core checks the deadline
+# BEFORE each sleep, so an attempt that starts just under it still runs its own `timeout=`: the
+# worst case per chunk is `_WRITE_TIMEOUT_S` (the retry deadline) plus one attempt, i.e. ~120 s.
+# That is the whole exposure `/health` sees, because `record` beats the poller's liveness seam
+# between chunks — where before this it was (600 + 60) s per chunk, with no beat at all, however
+# many chunks a cycle had.
+#
+# None where google-cloud-bigquery is absent (see the guarded import above). The real client reads
+# that as "no retry wrapper", i.e. one attempt bounded by `timeout=` — strictly tighter than this,
+# never looser, which is the safe direction for a fallback nobody will notice taking effect.
+_WRITE_RETRY = (
+    _BQ_DEFAULT_RETRY.with_timeout(_WRITE_TIMEOUT_S) if _BQ_DEFAULT_RETRY is not None else None
+)
 
 # ---- One cycle is several insert REQUESTS (U4, 2026-09-12) ---------------------------------------
 #
@@ -631,7 +669,7 @@ def _insert_chunk(chunk: list[dict], index: int, total: int) -> int:
     four is not an `error` cycle and not an `ok` one.
     """
     try:
-        errors = _bq_client.insert_rows_json(TABLE, chunk, timeout=_WRITE_TIMEOUT_S)
+        errors = _bq_client.insert_rows_json(TABLE, chunk, timeout=_WRITE_TIMEOUT_S, retry=_WRITE_RETRY)
     except Exception:
         # `event` on this record, which it did not carry until 2026-09-12 — so the one branch that
         # loses a whole request was the one branch a query on event="varsel_decision_write" could
@@ -696,7 +734,7 @@ def _insert_chunk(chunk: list[dict], index: int, total: int) -> int:
     return len(chunk)
 
 
-def record(rows: list[dict]) -> int:
+def record(rows: list[dict], *, beat: Callable[[], None] | None = None) -> int:
     """Append decision rows. Returns how many were accepted; never raises.
 
     A failure here is logged and dropped. The alternative — letting it propagate — would put a
@@ -704,6 +742,20 @@ def record(rows: list[dict]) -> int:
 
     Sent as one insertAll request per `_chunks` bound, which at today's volumes is still exactly one
     request per cycle; a request that fails costs its own rows and no others.
+
+    `beat` is the poller's liveness seam, injected rather than imported for the reason every seam in
+    this package is (this module imports neither `main` nor `varsel`): `varsel._heartbeat`, which is
+    `main._beat` when one was wired and a no-op otherwise. **A chunk boundary is a progress point in
+    exactly `/health`'s sense** — the threshold means "no STEP has finished in
+    `HEALTH_STALE_AFTER_S`" — so without it several sequential chunks, each able to spend
+    `_WRITE_RETRY`'s deadline plus an attempt, are one unbroken silence inside the `varsel_notify`
+    phase, and the restart that follows comes up with both planned-call tables cold. Called AFTER
+    each chunk, including a failed one: a chunk that failed slowly is still proof the thread is
+    moving, which is the same rule `main._phase` follows by beating from its `finally`.
+
+    Guarded here as well as inside the seam. `record` promises never to raise and the caller's
+    rollback depends on it: a beat that threw would unwind `_record_decisions` before its ledger
+    rollback ran, which is the very loss this function's return value exists to report.
     """
     if not rows:
         return 0
@@ -720,7 +772,19 @@ def record(rows: list[dict]) -> int:
             metrics.DECISION_WRITE_TOTAL.labels(result="error").inc()
         return 0
     chunks = _chunks(rows)
-    return sum(_insert_chunk(chunk, i, len(chunks)) for i, chunk in enumerate(chunks))
+    accepted = 0
+    for index, chunk in enumerate(chunks):
+        accepted += _insert_chunk(chunk, index, len(chunks))
+        if beat is not None:
+            try:
+                beat()
+            except Exception:  # a liveness signal must never lose a cycle's rows
+                logger.warning(
+                    "Heartbeat seam failed during the decision write; continuing",
+                    exc_info=True,
+                    extra={"fields": {"event": "varsel_decision_write", "result": "beat_failed"}},
+                )
+    return accepted
 
 
 # --- Labelling-freshness detector (R8, KTD7) ------------------------------------------------------

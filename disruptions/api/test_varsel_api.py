@@ -1768,11 +1768,22 @@ def test_the_suppressed_notice_is_still_recorded(monkeypatch):
 class _FakeBQ:
     """Enough of google.cloud.bigquery.Client for the decision log; records what was inserted."""
 
-    def __init__(self, insert_error: Exception | None = None, query_error: Exception | None = None):
+    def __init__(
+        self,
+        insert_error: Exception | None = None,
+        query_error: Exception | None = None,
+        fail_requests: tuple[int, ...] = (),
+    ):
         self.rows: list[dict] = []
         self.insert_error = insert_error
         self.query_error = query_error
         self.queries = 0
+        # One insert REQUEST per chunk since 2026-09-12, so a cycle can now be PARTLY written —
+        # `fail_requests` names the request indices that fail, which is the shape the ledger
+        # rollback has to survive. Counted rather than derived from `rows`, since a failed request
+        # contributes none.
+        self.requests = 0
+        self.fail_requests = set(fail_requests)
 
     def query(self, sql, **kw):  # the CREATE TABLE IF NOT EXISTS
         self.queries += 1
@@ -1787,17 +1798,23 @@ class _FakeBQ:
 
         return _Job()
 
-    def insert_rows_json(self, table, rows, timeout=None):
+    def insert_rows_json(self, table, rows, timeout=None, retry=None):
+        index = self.requests
+        self.requests += 1
         if self.insert_error is not None:
             raise self.insert_error
+        if index in self.fail_requests:
+            raise RuntimeError(f"BigQuery refused request {index}")
         self.rows.extend(rows)
         return []
 
 
-def _use_decision_log(monkeypatch, insert_error=None, query_error=None) -> _FakeBQ:
+def _use_decision_log(
+    monkeypatch, insert_error=None, query_error=None, fail_requests=()
+) -> _FakeBQ:
     import decisions
 
-    fake = _FakeBQ(insert_error, query_error)
+    fake = _FakeBQ(insert_error, query_error, fail_requests)
     monkeypatch.setattr(decisions, "_bq_client", fake)
     monkeypatch.setattr(decisions, "_table_ready", False)
     # The retry backoff is module state that would otherwise leak between tests.
@@ -2088,8 +2105,11 @@ def test_a_situation_the_sweep_retires_gets_a_closing_row(monkeypatch):
         _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
                 now=now)
 
+    # `(key, entry)` pairs, not bare rows: the entry is what makes a closing row lost to a failed
+    # insert restorable, since retiring has already popped it from the ledger.
     closing = varsel._retire_decision_subjects(live={"S1"})
-    assert [r["impact_probability"] for r in closing] == [0.38]
+    assert [e["row"]["impact_probability"] for _k, e in closing] == [0.38]
+    assert [k for k, _e in closing] == [varsel._decision_key(key, _alert("S9", DEP, jkey="t1"))]
     assert not varsel._decision_ledger
     # The sweep hands its rows to the cycle's single write; it must not write on its own.
     assert [r["impact_probability"] for r in log.rows] == [0.40]
@@ -2154,6 +2174,156 @@ def test_a_lost_write_leaves_the_ledger_where_it_was(monkeypatch):
     assert len(healthy.rows) == 2, "the retired subject wrote no closing row for its lost look"
     assert healthy.rows[-1]["impact_probability"] == 0.97, (
         "the closing row carries the older successful write, so final_* understates the peak"
+    )
+
+
+def test_a_partly_written_cycle_advances_the_ledger_for_none_of_it(monkeypatch):
+    """A cycle is several insert REQUESTS since 2026-09-12, so "the write landed" is no longer a
+    boolean — and the rollback read it as one (`bool(rows) and not accepted`), which is true only
+    when NOTHING was accepted. A cycle whose second request was refused therefore returned a
+    non-zero count, and every subject of it was marked written: thinned for the next quarter hour
+    against rows nobody holds, with `max_impact` advanced past a peak no row in the log carries, so
+    the peak can never be written even after BigQuery recovers.
+
+    What the conservative test costs is the other side of the trade, and it is deliberate: on a
+    SHORT write the whole cycle is re-offered, so the subjects that did land are written twice.
+    That is harmless — every figure `varsel_decision_groups` computes is a MIN, a MAX, a
+    LOGICAL_OR or a first/last pick, and `n_decisions` already changed meaning in this same change
+    — while losing a peak is not.
+    """
+    import decisions
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    clock = _Clock()
+    # One row per request, so the two subjects below are two requests and the second can fail alone.
+    monkeypatch.setattr(decisions, "_MAX_ROWS_PER_INSERT", 1)
+
+    def _two(p, now):
+        return [
+            _alert("S1", DEP, jkey="t1", p_impact=p, decided_at=now),
+            _alert("S2", DEP + timedelta(minutes=7), jkey="t2", p_impact=p, decided_at=now),
+        ]
+
+    _decide(key, journey, jid, _two(0.40, clock.now), now=clock.now)
+    assert [r["impact_probability"] for r in log.rows] == [0.40, 0.40], "control: both landed"
+
+    # Both peak, both write a `new_max` row -- and the second request is refused.
+    partial = _use_decision_log(monkeypatch, fail_requests=(1,))
+    peak = clock.tick(1)
+    _decide(key, journey, jid, _two(0.60, peak), now=peak)
+    assert [r["situation_number"] for r in partial.rows] == ["S1"], (
+        "control: exactly one of the two requests landed, which is what makes this a SHORT write"
+    )
+
+    # Nothing about either subject has moved, so only the rollback can produce a row here.
+    healthy = _use_decision_log(monkeypatch)
+    again = clock.tick(1)
+    _decide(key, journey, jid, _two(0.60, again), now=again)
+    assert "S2" in {r["situation_number"] for r in healthy.rows}, (
+        "the lost subject's peak was thinned against a row BigQuery refused; "
+        "max_impact_probability -- the figure a threshold is tuned on -- can never reach 0.60 now"
+    )
+    assert [r["situation_number"] for r in healthy.rows] == ["S1", "S2"], (
+        "the accepted row is re-offered too, which is the stated cost of the conservative test"
+    )
+
+
+def test_a_closing_row_lost_to_a_failed_write_is_offered_again(monkeypatch):
+    """The sweep POPS a retiring subject, so a closing row lost to a failed insert used to be lost
+    for good: the entry was already gone, nothing would ever offer the row again, and `final_*`
+    then described an older cycle for the life of the table.
+
+    The rollback puts the entry back, so the next cycle's sweep retires it again and the closing row
+    lands as soon as BigQuery recovers. The rows travel opaquely here on purpose — this asserts the
+    behaviour, not the shape the sweep returns them in.
+    """
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=clock.now)],
+            now=clock.now)
+    later = clock.tick(5)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.38, decided_at=later)],
+            now=later)
+    assert [r["impact_probability"] for r in log.rows] == [0.40], "control: t+5 was thinned"
+
+    # The situation ends. The sweep hands its closing row to the cycle's write, which is lost.
+    broken = _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
+    retired = varsel._retire_decision_subjects(live=set())
+    assert retired, "control: the sweep had a closing row to hand over"
+    varsel._record_decisions({key: journey}, {key: []}, [(jid, journey)], set(), {},
+                             push_on=True, now=clock.tick(5), closing_rows=retired)
+    assert broken.rows == [], "control: the closing row was offered and refused"
+
+    healthy = _use_decision_log(monkeypatch)
+    again = varsel._retire_decision_subjects(live=set())
+    assert again, (
+        "the closing row was dropped for good: the subject is out of the ledger, nothing will ever "
+        "offer it again, and final_impact_probability keeps the older successful write (0.40)"
+    )
+    varsel._record_decisions({key: journey}, {key: []}, [(jid, journey)], set(), {},
+                             push_on=True, now=clock.tick(5), closing_rows=again)
+    assert [r["impact_probability"] for r in healthy.rows] == [0.38], (
+        "the retried closing row must carry the LAST look, not the last write"
+    )
+    assert not varsel._retire_decision_subjects(live=set()), (
+        "a subject retires exactly once: a landed closing row leaves nothing behind"
+    )
+
+
+def test_a_closing_row_for_a_train_that_left_the_match_survives_a_failed_write(monkeypatch):
+    """The other retirement path, with the same defect and the same fix: a subject this cycle did
+    not see is popped inside `_record_decisions` itself, so its closing row was lost with the write
+    that carried it. Both paths have to roll back, or half the closing rows are still dropped on a
+    BigQuery wobble."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=clock.now)],
+            now=clock.now)
+    later = clock.tick(5)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.38, decided_at=later)],
+            now=later)
+    assert [r["impact_probability"] for r in log.rows] == [0.40], "control: t+5 was thinned"
+
+    # The train can no longer be caught, so it leaves the match while its situation lives on.
+    broken = _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
+    _decide(key, journey, jid, [], now=clock.tick(5))
+    assert broken.rows == [], "control: the closing row was offered and refused"
+
+    healthy = _use_decision_log(monkeypatch)
+    _decide(key, journey, jid, [], now=clock.tick(5))
+    assert [r["impact_probability"] for r in healthy.rows] == [0.38], (
+        "the closing row went with the failed write, so final_* describes the cycle before it"
+    )
+    _decide(key, journey, jid, [], now=clock.tick(5))
+    assert len(healthy.rows) == 1, "a subject retires exactly once"
+
+
+def test_the_decision_write_beats_the_poller_heartbeat_between_chunks(monkeypatch):
+    """/health's staleness rule means "no STEP has finished in HEALTH_STALE_AFTER_S", and a cycle's
+    decision write is now several steps — each able to spend the retry deadline plus an attempt.
+    Unbeaten, they are one silence inside the single `varsel_notify` phase, and the restart it earns
+    comes up with both ET planned-call tables cold. `decisions.record` takes the beat; this is the
+    check that `varsel` actually hands it over, which is the half most likely to drift."""
+    import decisions
+
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    monkeypatch.setattr(decisions, "_MAX_ROWS_PER_INSERT", 1)
+    beats: list[int] = []
+    monkeypatch.setattr(varsel, "_beat_provider", lambda: beats.append(1))
+    now = datetime.now(UTC).replace(microsecond=0)
+    _decide(key, journey, jid, [
+        _alert("S1", DEP, jkey="t1", p_impact=0.40, decided_at=now),
+        _alert("S2", DEP + timedelta(minutes=7), jkey="t2", p_impact=0.40, decided_at=now),
+    ], now=now)
+
+    assert len(log.rows) == 2 and log.requests == 2, "control: two rows went as two requests"
+    assert len(beats) == 2, (
+        f"the write spanned {log.requests} requests and beat {len(beats)} times; a chunk boundary "
+        "is a progress point and /health cannot see one that is never reported"
     )
 
 

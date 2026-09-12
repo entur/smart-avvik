@@ -717,10 +717,11 @@ wanted versus spent (U2, U3), index write amplification (U9) and log lines per c
 Two costs that arrive with larger caps rather than with volume: `notification_events._standing`'s
 client-wide pre-read enumerates at most `MAX_SUBJECTS_PER_READ` (500) subjects and falls back to one
 transaction per subject when it is incomplete, which a client with many subscriptions and a high
-`daily_cap` will hit more often (correct, slower); and the model wording is written per journey
-definition under a per-cycle budget, so at scale most events carry the template unless the wording
-is re-keyed on (place pair, train). Neither changes what a client receives, only how much prose and
-how fast.
+`daily_cap` will hit more often (correct, slower); and the model wording is written under a per-cycle
+budget, so at scale most events carry the template. That second one was stated here as conditional on
+the wording being re-keyed on (place pair, train); that re-keying SHIPPED on 2026-09-12 (KTD9), so
+the budget is now spent per pair rather than per definition and the section above states what a bad
+morning is worded by. Neither changes what a client receives, only how much prose and how fast.
 
 Two things that do NOT need to change for a hundred thousand commuters: the one-subscription-per-
 commuter grain (a client that prefers one subscription per route can already use the API that way,

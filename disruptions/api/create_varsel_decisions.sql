@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   -- stated at the outcomes table below, and it applies to this one just as much): otherwise a fresh
   -- environment and an upgraded one hold the same columns in different orders, and anything
   -- positional writes each environment's data into a different column.
-  alt_status            STRING    OPTIONS(description="What became of the alternative-journey lookup, recorded on EVERY decision including the ~83 % that are sub-threshold: offered | none_found | suppressed (the selection ran and kept the traveller on their own train) | not_worth_lookup (no lookup was issued — the impact gate, or a reading taken from a non-canonical stop ref). Reserved but not yet written, because impact.for_trip does not record them and they are indistinguishable from 'no lookup' downstream: beyond_horizon | error. Without this an offer rate has no denominator across the 2026-08-06 selection change, which moves the numerator sharply — the same trap et_cancelled exists to avoid. NULL = written before the column."),
+  alt_status            STRING    OPTIONS(description="What became of the alternative-journey lookup: offered | none_found | suppressed (the selection ran and kept the traveller on their own train) | not_worth_lookup (no lookup was issued — the impact gate, or a reading taken from a non-canonical stop ref). Reserved but not yet written, because impact.for_trip does not record them and they are indistinguishable from 'no lookup' downstream: beyond_horizon | error. Recorded on every WRITTEN decision: until 2026-09-12 that was every decision, sub-threshold included; since the thinning rule (varsel._thinning_reason) it is every decision the log KEEPS. Thinning is blind to this column, so it drops the flat middle of standing sub-threshold subjects and the survivors over-represent transitions, peaks and pushes — NO offer rate over it is comparable across that date. It also gives the 2026-08-06 selection change a denominator, that change moving the numerator sharply. NULL = written before the column."),
   alt_arrives_before_original BOOL OPTIONS(description="The offered journey arrives strictly before the disrupted train's SCHEDULED arrival -- the traveller's own deadline, not the delayed train's expected arrival. FALSE is the fallback tier: nothing got there in time, and the traveller is better off late than stranded. Deliberately a different anchor from alt_minutes_saved, which measures against the PREDICTED arrival: one answers 'do I still make it', the other 'is this better than what I have'. Read them together, never either alone."),
   alt_at_risk           BOOL      OPTIONS(description="The offered journey is itself predicted to be in trouble (over its operator's alert gate, or on a line a live situation touches). Offered anyway because nothing safer reached the destination in time — these are the rows where a wording that promises a clean escape would be wrong."),
   alt_scored            BOOL      OPTIONS(description="The prediction cache held the offered journey's boarding call, so its probabilities are model output. FALSE means nothing scored it — the ordinary case, and NOT 'no risk'."),
@@ -506,7 +506,7 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- would drop exactly the statements that have not reached an environment yet while re-applying ones
 -- that already landed -- silent and perfectly counterproductive. Newest-first means a truncated run
 -- loses only re-applications. The block stood at 7 statements against that cap of 5, i.e. it could
--- not complete at all; after the 2026-09-12 prune it is 3 on varsel_decisions and 1 on the outcomes
+-- not complete at all; after the 2026-09-12 prune it is 4 on varsel_decisions and 1 on the outcomes
 -- table, which is inside the cap on both. Prune again before adding a fifth to either.
 --
 -- The real fix is to prune: a statement here exists solely to carry reworded text to a table that
@@ -525,9 +525,10 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 --
 -- That matters beyond tidiness: the block stood at 7 statements against a cap of 5 per 10 s per
 -- table, so it could not complete in one job at all and every startup spent three of them failing.
--- What follows is what is actually owed to an existing table today: THREE on varsel_decisions and
--- ONE on varsel_decision_outcomes, both inside the cap with room to grow. Prune again before
--- adding a fifth.
+-- What follows is what is actually owed to an existing table today: FOUR on varsel_decisions (the
+-- retention statement plus three descriptions; alt_status joined them in the U4 review) and ONE on
+-- varsel_decision_outcomes, both inside the cap -- varsel_decisions now with ONE slot left. Prune
+-- again before adding a fifth.
 
 -- Retention (U4, 2026-09-12). Carries the CREATE body's partition_expiration_days to the tables
 -- that already exist — the whole point of this block, and the one statement here that is not a
@@ -539,8 +540,14 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 ALTER TABLE `disruptions.varsel_decisions`
   SET OPTIONS(partition_expiration_days=365);
 
--- The three columns the thinning rule (KTD15, 2026-09-12) changed the READING of. None of them
--- changed type or value; what changed is what a row's presence, and a count of rows, now means.
+-- The columns the thinning rule (KTD15, 2026-09-12) changed the READING of. None of them changed
+-- type or value; what changed is what a row's presence, and a count of rows, now means. THREE of
+-- them are here plus the retention statement above, so this table stands at FOUR of BigQuery's five
+-- metadata updates per 10 s. That is inside the cap with one slot left: prune before adding a
+-- fifth, and prune rather than assume -- verify with `bq show --schema` in BOTH projects first.
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN alt_status SET OPTIONS(description="What became of the alternative-journey lookup: offered | none_found | suppressed (the selection ran and kept the traveller on their own train) | not_worth_lookup (no lookup was issued — the impact gate, or a reading taken from a non-canonical stop ref). Reserved but not yet written, because impact.for_trip does not record them and they are indistinguishable from 'no lookup' downstream: beyond_horizon | error. Recorded on every WRITTEN decision: until 2026-09-12 that was every decision, sub-threshold included; since the thinning rule (varsel._thinning_reason) it is every decision the log KEEPS. Thinning is blind to this column, so it drops the flat middle of standing sub-threshold subjects and the survivors over-represent transitions, peaks and pushes — NO offer rate over it is comparable across that date. It also gives the 2026-08-06 selection change a denominator, that change moving the numerator sharply. NULL = written before the column.");
+
 ALTER TABLE `disruptions.varsel_decisions`
   ALTER COLUMN decided_at SET OPTIONS(description="When this match was evaluated (UTC). NOT every cycle since 2026-09-12: a standing subject nothing has changed about is written at most once per quarter hour (varsel._thinning_reason), plus every cycle a figure is computed from -- first sighting, each alert-worthy/sub-threshold transition, each new maximum impact probability, each push, and a closing row carrying the subject's LAST observation, dated at the cycle it describes. So consecutive rows for one subject can be minutes or a quarter hour apart, and the gap is not a gap in the matching. Before that date every cycle wrote, which is why no per-cycle rate may be computed across it.");
 

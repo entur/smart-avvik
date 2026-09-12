@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import pathlib
 import re
 import sys
 import threading
+import types
 import urllib.request
 from datetime import UTC, datetime
 from typing import ClassVar
@@ -752,6 +754,66 @@ def test_the_scripts_step_is_wired_in_ci():
     step = CI_YML[CI_YML.index("working-directory: scripts") :]
     step = step[: step.index("- name:", 10)] if "- name:" in step[10:] else step
     assert "test_*.py" in step, step[:400]
+
+
+def test_the_store_is_bound_to_the_resolved_project_not_to_ambient_credentials():
+    """The four production refusals judge an ARGUMENT; none of them reaches the Firestore client.
+
+    `notification_store.firestore_client()` builds `firestore.Client(database=...)` with no project,
+    so without this binding the project comes from ambient ADC. A developer with
+    GOOGLE_CLOUD_PROJECT=ent-kixavvik-prd exported -- which this repo's own test suites show is a
+    normal thing to have exported -- would see "Seeding in dev" on stderr while synthetic
+    subscriptions landed in PRODUCTION, where the poller turns them into real push notifications and
+    real webhook deliveries. The refusals would all have passed.
+
+    Both halves are pinned: the environment variable (which also covers notification_auth, reading
+    through the same client) and the client actually handed to the store.
+    """
+    import loadgen_subscriptions as lg
+
+    target = lg.resolve_target("dev", env_project=None)
+    built: dict = {}
+    before = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-prd"  # the stale shell variable
+
+    class _FakeClient:
+        def __init__(self, project=None, database=None):
+            built["project"] = project
+            built["database"] = database
+
+    fake_firestore = types.SimpleNamespace(Client=_FakeClient)
+    google_cloud = sys.modules.setdefault("google.cloud", types.ModuleType("google.cloud"))
+    prior = getattr(google_cloud, "firestore", None)
+    google_cloud.firestore = fake_firestore
+    sys.modules["google.cloud.firestore"] = fake_firestore
+
+    configured: dict = {}
+    store = types.ModuleType("notification_store")
+    store.configure = lambda **kw: configured.update(kw)
+    prior_store = sys.modules.get("notification_store")
+    sys.modules["notification_store"] = store
+    try:
+        lg.bind_store(target)
+        assert os.environ["GOOGLE_CLOUD_PROJECT"] == target.project, (
+            "the stale production variable survived binding: "
+            f"{os.environ['GOOGLE_CLOUD_PROJECT']!r}"
+        )
+        assert built["project"] == target.project, (
+            f"the Firestore client was built on {built['project']!r}, not the resolved project"
+        )
+        assert configured["client"] is not None, "the store was left to build its own client"
+    finally:
+        if prior_store is not None:
+            sys.modules["notification_store"] = prior_store
+        else:
+            sys.modules.pop("notification_store", None)
+        sys.modules.pop("google.cloud.firestore", None)
+        if prior is not None:
+            google_cloud.firestore = prior
+        if before is None:
+            os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
+        else:
+            os.environ["GOOGLE_CLOUD_PROJECT"] = before
 
 
 def _run() -> None:

@@ -1655,6 +1655,11 @@ _index_generation: _Generation | None = None
 _index_stats: dict[str, int] = {"generation_builds": 0, "pair_builds": 0, "window_builds": 0}
 
 
+def _minute_aligned(t: datetime) -> bool:
+    """Whether `t` falls exactly on a minute — the test that decides if a window is worth filing."""
+    return t.second == 0 and t.microsecond == 0
+
+
 class _Generation:
     """Everything derived from one prediction-cache load, built lazily and dropped as a unit.
 
@@ -1741,6 +1746,25 @@ class _Generation:
         `aimed_dep`. Memoised per (pair, window) because a pilot's definitions cluster on both — but
         the memo is an optimisation, never load-bearing: `_pair` above already removes the term that
         scaled with the cache.
+
+        **Only a minute-ALIGNED window is filed.** The poller's windows come from
+        `varsel.journey_windows` and are minute-aligned by construction, so registrations sharing a
+        window share an entry — which is the clustering this memo exists for. The public `/impact`
+        endpoint's are `at ± main._IMPACT_AT_TOLERANCE` off `datetime.now(UTC)`, so they are never
+        aligned and no two requests ever agree: filed, each one would deposit an entry nothing can
+        hit again for the life of the generation — a leak proportional to public request volume, in
+        a structure whose whole point is being sized by the timetable. Declining to file it costs
+        that caller the two posting-list walks it was going to pay for anyway.
+
+        **`at` is deliberately NOT rounded to make them align.** `select="nearest"` scores on
+        `abs(aimed_dep - at)`, so moving `at` would change which train the matcher picks — the one
+        thing U2 must not do, and the reason this is a write guard rather than a key normalisation.
+
+        `_pairs` is left unbounded on purpose, and the difference is in kind rather than in degree:
+        its key is the caller's stop refs and not a clock, so a repeat HITS — that is a cache doing
+        its job, where an unaligned window mints a dead entry per request on the very same pair. A
+        ref the index has never seen yields the empty tuple for a few bytes, and the generation and
+        everything memoised on it are dropped whole on the next cache rebuild.
         """
         key = (from_ref, to_ref, window_start, window_end)
         found = self._windows.get(key)
@@ -1751,8 +1775,11 @@ class _Generation:
             for sit, candidates in self._pair(from_ref, to_ref)
             if any(window_start <= c.aimed_dep <= window_end for c in candidates)
         )
-        self._windows[key] = found
+        # Counted on every computation, not on every filing: "how often was this rebuilt" is what
+        # the tests read it for, and an unaligned window rebuilds it every single time.
         _index_stats["window_builds"] += 1
+        if _minute_aligned(window_start) and _minute_aligned(window_end):
+            self._windows[key] = found
         return found
 
 

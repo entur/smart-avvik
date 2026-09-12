@@ -2057,6 +2057,62 @@ def test_the_pair_and_window_memos_are_built_once_for_many_definitions():
     assert stats["window_builds"] == 1, stats
 
 
+def test_an_unaligned_window_is_answered_but_never_filed():
+    """The public endpoint must not be able to grow the window memo one dead entry per request.
+
+    `/impact` derives its window as `at ± main._IMPACT_AT_TOLERANCE` off `datetime.now(UTC)`, so no
+    two requests ever present the same one and a filed entry could never be hit again — for the life
+    of the generation, on a public unauthenticated endpoint. The poller's windows come from
+    `varsel.journey_windows` and ARE minute-aligned, which is the sharing the memo exists for, so
+    the guard is on the write and the answer is identical either way. `at` is deliberately not
+    rounded to make them align: `select="nearest"` scores on `abs(aimed_dep - at)`, so that would
+    move which train is picked.
+    """
+    scope = {"S1": _train("j1", 8)}
+    _generation(scope, refreshed_at=_at(7))
+    # The shape `/impact` presents: three requests a few hundred ms apart, so three `now()` instants
+    # carrying seconds and microseconds, no two of them equal. Deliberately three DIFFERENT windows
+    # rather than one repeated, because "one dead entry per request" is the leak being pinned.
+    ragged = [_at(7) + timedelta(seconds=37, microseconds=412 + i * 190) for i in range(3)]
+
+    def run():
+        answers = []
+        for start in ragged:
+            answers.append(impact.for_trip(
+                from_stop=A, to_stop=B, window_start=start,
+                window_end=start + timedelta(minutes=180),
+                select="nearest", at=_at(8), with_alternative=False,
+            ))
+        both_ragged = len(impact._index_generation._windows)
+        # One end aligned is still not a window anybody else will present.
+        impact.for_trip(
+            from_stop=A, to_stop=B, window_start=_at(7),
+            window_end=_at(9) + timedelta(microseconds=500),
+            select="nearest", at=_at(8), with_alternative=False,
+        )
+        half_ragged = len(impact._index_generation._windows)
+        for _ in range(3):
+            answers.append(impact.for_trip(
+                from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+                select="nearest", at=_at(8), with_alternative=False,
+            ))
+        return answers, both_ragged, half_ragged, len(
+            impact._index_generation._windows
+        ), impact.index_stats()
+
+    answers, both_ragged, half_ragged, aligned, stats = _with_generation(run)
+    for resp in answers:
+        assert [s.situation_number for s in resp.situations] == ["S1"], "the answer is unchanged"
+    assert both_ragged == 0, f"{both_ragged} dead entries filed for unaligned windows"
+    assert half_ragged == 0, "a half-aligned window was filed"
+    assert aligned == 1, "the poller's minute-aligned window was not filed"
+    # 3 unaligned + 1 half-aligned, each recomputed; then ONE build for the three aligned asks.
+    assert stats["window_builds"] == 5, stats
+    # And the pair memo is shared by all seven, which is what makes declining to file the window
+    # cheap: an unaligned caller re-walks nothing that scales with the cache.
+    assert stats["pair_builds"] == 1, stats
+
+
 def test_a_new_refreshed_at_drops_both_memos():
     """A rebuild stamps a new generation, and the next scan must not answer off the old one."""
     first = {"S1": _train("j1", 8)}
@@ -2135,6 +2191,10 @@ def test_three_threads_on_one_pair_build_the_memo_once():
 # elsewhere (the build counters, the dropped memo, the mid-pass beat).
 
 _IDENTITY_SEEDS = tuple(range(24))
+#: A slice of them re-run through an index shaped and ordered the way `main` builds one (Finding 2).
+#: A slice rather than all 24 because what this adds over the run above is the BUILDER, not more
+#: snapshots, and the seeds it does run already cover every awkwardness the generator draws.
+_INJECTED_SEEDS = _IDENTITY_SEEDS[:8]
 
 
 def _random_snapshot(rng):
@@ -2203,11 +2263,30 @@ def _random_snapshot(rng):
 
 
 def _identity_queries(rng, scope):
-    """The query shapes `for_trip` is reachable with, including the two narrowings."""
+    """The query shapes `for_trip` is reachable with, including the two narrowings.
+
+    Both memo DIMENSIONS vary across the list -- `to_stop` over {B, C, None} and the window over two
+    values -- because one generation now serves this whole list (see `_assert_prune_identity`), so
+    a memo that returned the WRONG entry is observable here and nowhere else.
+
+    The order is load-bearing for the window half. The two windows overlap without nesting, but a
+    memo that ignored the window serves whichever answer it built FIRST to every later query for
+    that pair, so the later query is the one that has to MISS a situation for the oracle to see it.
+    `_WINDOW_LATE` therefore comes first for each `to_stop` value: asked widest-first the mutation
+    would hand out a superset and stay green, for exactly the reason falsification 7 below stays
+    green.
+    """
     def q(**kw):
-        return {"to_stop": B, "select": "worst", "at": None, "catchable_after": None, **kw}
+        return {
+            "to_stop": B, "select": "worst", "at": None, "catchable_after": None,
+            "window": _WINDOW_MAIN, **kw,
+        }
 
     queries = [
+        # The second window first, once per `to_stop`, for the reason in the docstring above.
+        q(window=_WINDOW_LATE),
+        q(to_stop=None, window=_WINDOW_LATE),
+        q(to_stop=C, window=_WINDOW_LATE, select="nearest", at=_at(9)),
         q(),
         q(to_stop=None),
         q(select="nearest", at=_at(8)),
@@ -2218,6 +2297,106 @@ def _identity_queries(rng, scope):
     queries += [q(situation=sit) for sit in scope]
     queries.append(q(situation="nope"))
     return queries
+
+
+#: The window most queries ask about: its edges are the 07:00/09:00 the generator draws departures
+#: exactly on, one minute inside and one minute outside.
+_WINDOW_MAIN = (_at(7), _at(9))
+#: A second window, deliberately OVERLAPPING rather than nested: departures at 07:00-07:59 are in
+#: `_WINDOW_MAIN` alone and one at 09:01 is in this one alone, so neither window's situation set is
+#: a superset of the other's and a memo that confused them drops rows in either direction.
+_WINDOW_LATE = (_at(8), _at(10))
+
+
+def _assert_prune_identity(seeds, *, index_builder=None):
+    """Run the differential over `seeds`, returning the number of responses compared.
+
+    **One generation serves a seed's WHOLE query list**, which is what makes the memos observable.
+    Installed per QUERY -- as this was until 2026-09-12 -- every generation served exactly one
+    question, so neither memo ever held a second entry and a memo that returned the wrong one had
+    nothing to return it instead of. The adversarial reviewer demonstrated that by deleting `to_ref`
+    from the pair-memo key and watching all 41 suites stay green. Both halves of the hoist are
+    needed and only one of them is obvious: `_with_generation` calls `invalidate_generation()` in
+    its `finally`, so hoisting the `_generation(...)` install alone would still drop the memos after
+    every query.
+
+    What pins the hoist is the two COUNT assertions below, and it is worth being exact about which,
+    because the obvious candidate is the wrong one: `invalidate_generation()` resets the counters
+    as well as the generation, so under the old per-query shape `generation_builds` still reads 1 --
+    measured, while proving falsification 8 -- and it was `pair_builds` that fired. So
+    `pair_builds`/`window_builds` are what say one generation served the whole list;
+    `generation_builds == 1` says something else worth saying, that nothing REBUILT mid-seed behind
+    the test's back (a stamp mismatch, a flaking provider), which would silently empty the memos
+    again.
+
+    `index_builder` (Finding 2) swaps the engine's own fallback build for an index shaped and
+    ordered the way `main.refresh_call_predictions_cache` builds one, injected through the provider.
+    """
+    import random
+
+    compared = 0
+    for seed in seeds:
+        rng = random.Random(seed)
+        scope = _random_snapshot(rng)
+        stamp = _at(6) + timedelta(seconds=seed)
+        queries = _identity_queries(rng, scope)
+        _generation(scope, refreshed_at=stamp)
+        if index_builder is not None:
+            # Built over the dict the engine will actually serve, so the postings carry the same
+            # situation KEYS and the same `CallPred` objects the reference scan reads.
+            _generation_state["index"] = index_builder(_generation_state["snapshot"])
+
+        def run_seed(queries=queries, stamp=stamp, seed=seed):
+            n = 0
+            for query in queries:
+                situation = query.get("situation")
+                window_start, window_end = query["window"]
+                got = impact.for_trip(
+                    from_stop=A, to_stop=query["to_stop"],
+                    window_start=window_start, window_end=window_end,
+                    select=query["select"], at=query["at"],
+                    catchable_after=query["catchable_after"],
+                    situation=situation, with_alternative=False,
+                )
+                full = _generation_state["snapshot"]
+                if situation is not None:
+                    reference_scope = {situation: full[situation]} if situation in full else {}
+                else:
+                    reference_scope = full
+                cells = impact._trip_cells(
+                    reference_scope, A, query["to_stop"], window_start, window_end,
+                    select=query["select"], at=query["at"],
+                    catchable_after=query["catchable_after"],
+                )
+                want = impact._impact_response(
+                    cells, from_stop=A, to_stop=query["to_stop"], refreshed_at=stamp, now=got.as_of
+                )
+                assert got.model_dump() == want.model_dump(), (
+                    f"seed {seed}, query {query}: the prune changed the answer"
+                )
+                n += 1
+            return n, impact.index_stats()
+
+        n, stats = _with_generation(run_seed)
+        compared += n
+        # The memos are KEYED, not merely built: one entry per distinct `to_stop` and one per
+        # distinct (pair, window). Asserting the counts is what makes a key-shaped defect -- a memo
+        # that answers the right question with another question's entry -- reachable at all; the
+        # identity assertion above is what makes it FAIL.
+        pairs = {(A, q["to_stop"]) for q in queries}
+        windows = {(A, q["to_stop"], *q["window"]) for q in queries}
+        assert stats["generation_builds"] == 1, (
+            f"seed {seed}: {stats} — one generation must serve the whole query list, or the memos "
+            "never hold a second entry and this oracle cannot see a key-shaped defect"
+        )
+        assert stats["pair_builds"] == len(pairs), (
+            f"seed {seed}: {stats} — want one pair build per distinct to_stop ({len(pairs)})"
+        )
+        assert stats["window_builds"] == len(windows), (
+            f"seed {seed}: {stats} — want one window build per distinct (pair, window) "
+            f"({len(windows)})"
+        )
+    return compared
 
 
 def test_the_pruned_scan_answers_exactly_what_the_full_scan_answers():
@@ -2246,49 +2425,102 @@ def test_the_pruned_scan_answers_exactly_what_the_full_scan_answers():
        station legitimately has none. Reported as
        `seed 0, query {'to_stop': ..., 'select': 'worst'}: the prune changed the answer`.
 
-    And ONE that is deliberately GREEN: dropping the operator from the alighting group key. That
-    *loosens* the prune, so it stays a superset and the answer is unchanged — which is what shows
-    the superset property, rather than the exact predicate, is the thing doing the work.
+    Those six are all PREDICATE-shaped: each changes what the prune computes. Two more were added
+    on 2026-09-12, and they are KEY-shaped — the memo computes the right answer and then files or
+    fetches it under the wrong key — which this oracle could not see at all until one generation was
+    made to serve a seed's whole query list (see `_assert_prune_identity`):
+
+    7. Dropping `to_ref` from the pair memo's key, so an A→B answer is served to the next A→C and
+       A→(no destination) question. Reported as
+       `seed 0, query {'to_stop': None, ...}: the prune changed the answer`.
+    8. Dropping the window from the window memo's key, so the first window asked about a pair
+       answers every later one. Reported as
+       `seed 0, query {'to_stop': ..., 'window': (07:00, 09:00)}: the prune changed the answer`.
+
+    And TWO that are deliberately GREEN, both for one reason — a prune may only ever be too
+    generous: dropping the operator from the alighting group key, and (7)/(8) asked in the other
+    order, where the entry wrongly served is a SUPERSET of the right one and `_trip_cells` filters
+    the extras out itself. Which is what shows the superset property, rather than the exact
+    predicate, is the thing doing the work — and why `_identity_queries` is ordered as it is.
+    """
+    compared = _assert_prune_identity(_IDENTITY_SEEDS)
+    assert compared >= 200, f"only {compared} comparisons — the generator stopped covering"
+
+
+def _ingest_shaped_index(snapshot):
+    """`{stop_place: [(situationNumber, CallPred)]}`, built the way `main`'s ingest loop builds it.
+
+    `main.refresh_call_predictions_cache` appends in BigQuery ROW order — one stream of calls, with
+    situations interleaved — while `impact._build_stop_ref_index` walks `snapshot.items()` and so
+    emits each situation's calls contiguously. Same keys, same postings, different posting ORDER.
+    This round-robins over the situations to reproduce the interleaving on purpose: copying the
+    snapshot's order would just build the engine's own fallback a second time and prove nothing.
+
+    Also note main keys the posting on `r.situationNumber`, the same column `by_situation` is keyed
+    on — so the snapshot KEY is what belongs here, not `CallPred.situation_number`, which this
+    suite deliberately draws apart from it.
+    """
+    index: dict[str, list] = {}
+    remaining = {sit: list(calls) for sit, calls in snapshot.items()}
+    while remaining:
+        for sit in list(remaining):
+            call = remaining[sit].pop(0)
+            index.setdefault(call.stop_place, []).append((sit, call))
+            if not remaining[sit]:
+                del remaining[sit]
+    return index
+
+
+def test_the_pruned_scan_answers_the_same_through_the_pollers_own_index():
+    """The two ends of U2 meeting: the oracle, over the index `main` actually injects.
+
+    `main`'s builder is separately pinned for coverage, key set, per-stop ordering and stamp
+    agreement (`test_poller_refresh.test_the_ingest_loop_indexes_every_call_by_the_stop_it_calls_at`)
+    and `impact`'s fallback is what every other test here exercises — but nothing ran the matcher's
+    identity claim through the injected one, so a divergence in SHAPE or ORDER between the two
+    builders was uncaught by construction.
+
+    The divergence that exists is order: main appends in BigQuery row order (situations interleaved)
+    where the fallback walks situation by situation. It cannot reach the output, and the reason is
+    worth writing down rather than re-deriving — `_pruned_scope` hands `_trip_cells` the SNAPSHOT's
+    own `by_situation[sit]` lists, never the memo's candidate tuples, and posting order feeds only
+    `situations()`' order-independent `any(...)`. This makes that a checked property.
+
+    Two things make the test non-vacuous and both are asserted rather than reasoned about. The spy,
+    because a provider that silently failed the stamp comparison would fall back to
+    `_build_stop_ref_index` and the oracle would pass on the very build it was meant to stop
+    exercising. And the divergence itself, because a seed drawing a single situation makes the
+    round-robin index byte-identical to the fallback — if that held for every seed this would be the
+    engine's own builder run twice under a second name.
     """
     import random
 
-    compared = 0
-    for seed in _IDENTITY_SEEDS:
-        rng = random.Random(seed)
-        scope = _random_snapshot(rng)
-        stamp = _at(6) + timedelta(seconds=seed)
-        for query in _identity_queries(rng, scope):
-            situation = query.get("situation")
-            # A NEW dict per query, so the generation check sees each install on its own.
-            _generation(scope, refreshed_at=stamp)
+    diverged = 0
+    for seed in _INJECTED_SEEDS:
+        snapshot = _random_snapshot(random.Random(seed))  # deterministic; the same one below
+        if _ingest_shaped_index(snapshot) != impact._build_stop_ref_index(snapshot):
+            diverged += 1
+    assert diverged, (
+        "the two builders produced identical postings on every seed, so this runs the engine's own "
+        "fallback twice rather than the divergence it claims to cover"
+    )
 
-            def run(q=query, s=situation):
-                return impact.for_trip(
-                    from_stop=A, to_stop=q["to_stop"],
-                    window_start=_at(7), window_end=_at(9),
-                    select=q["select"], at=q["at"], catchable_after=q["catchable_after"],
-                    situation=s, with_alternative=False,
-                )
+    original = impact._build_stop_ref_index
+    fell_back: list = []
 
-            got = _with_generation(run)
-            full = _generation_state["snapshot"]
-            if situation is not None:
-                reference_scope = {situation: full[situation]} if situation in full else {}
-            else:
-                reference_scope = full
-            cells = impact._trip_cells(
-                reference_scope, A, query["to_stop"], _at(7), _at(9),
-                select=query["select"], at=query["at"],
-                catchable_after=query["catchable_after"],
-            )
-            want = impact._impact_response(
-                cells, from_stop=A, to_stop=query["to_stop"], refreshed_at=stamp, now=got.as_of
-            )
-            assert got.model_dump() == want.model_dump(), (
-                f"seed {seed}, query {query}: the prune changed the answer"
-            )
-            compared += 1
-    assert compared >= 200, f"only {compared} comparisons — the generator stopped covering"
+    def spy(snapshot):
+        fell_back.append(snapshot)
+        return original(snapshot)
+
+    impact._build_stop_ref_index = spy
+    try:
+        compared = _assert_prune_identity(_INJECTED_SEEDS, index_builder=_ingest_shaped_index)
+    finally:
+        impact._build_stop_ref_index = original
+    assert not fell_back, (
+        f"the engine rebuilt the index {len(fell_back)} time(s) instead of taking the injected one"
+    )
+    assert compared >= 50, f"only {compared} comparisons through the injected index"
 
 
 def test_the_catchable_cut_is_per_call_and_never_in_the_pair_memo():
