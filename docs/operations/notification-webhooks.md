@@ -710,13 +710,35 @@ touches the wire contract, which is why the pilot could ship without them.
    store read moved out of the pass into its own `notification_mirror` phase, so a slow store costs
    the mirror its freshness rather than costing the pass its cycle. What replaces the ceiling as the
    thing to watch is `kix_mirror_age_seconds` and the mirror's readiness.
-3. **Emit and delivery as their own Deployment.** Both run on the poller thread today, bounded at
-   `_MAX_EMITS_PER_CYCLE` (120) and `MAX_DELIVERY_ATTEMPTS_PER_CYCLE` (200) so a bad morning cannot
-   stall the cycle. At scale a bad morning is tens of thousands of events an hour, which one thread
-   cannot deliver at 5 s per attempt. `deliveries` is already a queue with transactional claims and a
-   `RESERVATION_TTL_S` lease, so a second Deployment can drain it safely; the one thing that changes
-   meaning is the pending-event ceiling, which is exact only because emit has one writer and becomes
-   best-effort with two.
+3. **Emit and delivery as their own Deployment — emit widened in place, 2026-09-13 (U9); delivery
+   still owed (U11).** Both ran on the poller thread one transaction at a time, bounded at
+   `_MAX_EMITS_PER_CYCLE` (120) and `MAX_DELIVERY_ATTEMPTS_PER_CYCLE` (200) so a bad morning could
+   not stall the cycle. One transaction at a time against a ~200 ms round trip is about **5 emits a
+   second** however many are waiting, so a bad morning's lifecycle transitions could not be emitted
+   inside one cycle at any population worth the name. **Emit is now one widened pass**: 64 workers
+   (`_EMIT_WORKERS`, derived as the target rate times the measured transaction latency), an 80 s
+   share of the cycle (`_EMIT_DEADLINE_S`) and 20 000 transactions (`_MAX_EMITS_PER_CYCLE`, which is
+   that deadline times R2's 250/s — the two are one derivation and a test refuses them drifting
+   apart). What is above the budget is re-offered on the next cycle and reported as `capped`.
+   Delivery is unchanged and still owed: `deliveries` is a queue with transactional claims and a
+   `DELIVERY_LEASE_S` lease (U8), so a second Deployment can drain it safely.
+
+   **Three sentences about the pending-event ceiling changed with the width, and none of them is
+   cosmetic.** It is exact because emit has one writer — and the writer is now the 64 threads of one
+   pass rather than one thread, so what enforces it is a pass-local locked ledger
+   (`notification_events._PendingLedger`) plus `emit`'s refusal to start a second pass while the
+   first is still draining (`overlap_refused` on the phase record). The ledger counts each
+   destination **once per pass** instead of once per mint, which is most of the per-emit latency
+   removed; it charges before the transaction and **refunds** whatever did not leave a new pending
+   delivery behind, because a mint that supersedes one is net zero and a counter that only counted
+   up would refuse at half the ceiling on exactly the morning that matters. And a **withdrawal** now
+   passes through the same ledger, so a destination at its ceiling has its retractions deferred to
+   the next cycle too — previously only a first `QuotaExceeded` stopped them. That is the intended
+   reading of R21 (a destination at its ceiling is not draining, and a withdrawal is another event
+   on the same queue), and it is stated here because it is a change rather than a restatement.
+   When delivery moves to its own Deployment the ledger's figure becomes stale HIGH inside a pass —
+   the worker drains events it does not hear about — so it refuses earlier than it needs to, which
+   is the conservative direction. What would need a change is a second EMITTER.
 4. **Servability for every pending pair in one query per cycle.** Today a create asks BigQuery
    inline under a 15/min budget and `notification_servability` re-asks four subscriptions a cycle
    (~1 150 a day). Distinct stop pairs number in the thousands where subscriptions number in the

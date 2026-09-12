@@ -114,8 +114,10 @@ class _Fake:
         self.fail_with: BaseException | None = None
         self.delay_s = 0.0
         # Keyed by spec NAME, because a blanket query failure would also break
-        # `_count_destination_deliveries` -- which runs inside `commit_event` -- and the point of
-        # the pre-read tests is that the emit still commits when only the pre-read failed.
+        # `_count_destination_deliveries` -- which the pass runs on the coordinator since U9, once
+        # per destination, and which failing takes that destination's observations with it
+        # (`test_a_destinations_uncountable_ceiling_...`). A test that wants one query to fail must
+        # be able to say which.
         self.query_fail_with: dict[str, BaseException] = {}
 
     def collection(self, name: str) -> _Collection:
@@ -1465,6 +1467,85 @@ def test_a_superseding_mint_gives_its_pending_slot_back():
             assert len(pending) == 2, f"one replacement and one new train; got {pending}"
         finally:
             notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+    finally:
+        _uninstall()
+
+
+def test_a_destinations_uncountable_ceiling_costs_that_destination_and_not_the_cycle():
+    """R20, applied to the two Firestore calls U9 moved onto the coordinator.
+
+    The quota resolver and the ledger's first sight of a destination were both INSIDE the
+    per-subject `try` before this unit — the resolver as an argument to `_emit_one`, the count
+    inside `commit_event` — so a blip cost one subject a `retryable` and the pass carried on.
+    Moved onto the coordinator and left unguarded, one raise leaves the loop, leaves `_run`, and
+    reaches `emit`'s handler, which reports the whole cycle as a timeout and DISCARDS the counts of
+    every transaction already committed. A 100 000-subscription morning is exactly when a 4 s
+    aggregation deadline gets hit.
+    """
+    client = _install()
+    try:
+        _live(client, subscription_id="sub-bad")
+        _live(client, subscription_id="sub-good")
+        real = notification_store._count_destination_deliveries
+
+        def flaky(destination_id: str, *, state: str, ceiling: int) -> int:
+            if destination_id == "dest-bad":
+                raise RuntimeError("Firestore is unreachable")
+            return 0
+
+        notification_store._count_destination_deliveries = flaky  # type: ignore[assignment]
+        try:
+            report = _emit(
+                [
+                    _subject(
+                        subscription_id="sub-bad",
+                        destination_id="dest-bad",
+                        journey_ref="DatedServiceJourney:9500",
+                    ),
+                    _subject(
+                        subscription_id="sub-good",
+                        destination_id="dest-good",
+                        journey_ref="DatedServiceJourney:9501",
+                    ),
+                ],
+                now=NOW,
+                workers=1,
+            )
+        finally:
+            notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+        assert report.timed_out is False, f"one destination's blip failed the whole cycle: {report}"
+        assert report.created == 1, report
+        assert report.retryable == 1, report
+    finally:
+        _uninstall()
+
+
+def test_a_raise_before_the_pool_exists_still_releases_the_pass_lock():
+    """The lock is held for the life of the pod otherwise, and nothing says so.
+
+    `_standing`, the ledger's construction and the pool's own all sit above the loop's `try`. A
+    raise in any of them would skip a `finally` that released there, and every later cycle would
+    answer `overlap_refused` with nothing actually draining — a pass that has stopped running and a
+    signal that says it is still running are the same reading.
+    """
+    client = _install()
+    try:
+        _live(client)
+        real = notification_events._standing
+        notification_events._standing = lambda ids, now: (_ for _ in ()).throw(  # type: ignore[assignment]
+            RuntimeError("the standing set exploded")
+        )
+        try:
+            broken = _emit([_subject()], now=NOW, workers=1)
+            assert broken.timed_out is True and broken.created == 0, broken
+        finally:
+            notification_events._standing = real  # type: ignore[assignment]
+
+        after = _emit([_subject()], now=NOW, workers=1)
+        assert after.overlap_refused is False, (
+            "the pass lock survived a raise above the pool; every later cycle is now refused"
+        )
+        assert after.created == 1, after
     finally:
         _uninstall()
 
