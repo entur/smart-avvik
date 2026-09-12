@@ -487,6 +487,10 @@ def reset_limiters() -> None:
         _client_calls.clear()
         _unknown.clear()
         _accounts.clear()
+        # The destination cache belongs in this list for the reason the docstring above gives: a
+        # record leaked from one test into the next reads as a healthy destination that is actually
+        # somebody else's fixture, and it carries the signing generations.
+        _destinations.clear()
 
 
 def reset_for_tests() -> None:
@@ -1351,15 +1355,64 @@ def get_destination(destination_id: str, *, client_id: str | None = None) -> Des
     return _destination_from_doc(stored)
 
 
+#: The delivery path's destination record, cached for one window beside the account cache (U8).
+#: Keyed on the destination id; the value is the stored document, or ``None`` for "no such record",
+#: which is cached too -- a destination that has gone missing must cost one read per window rather
+#: than one per pending event.
+_destinations: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_DESTINATION_TTL_S = 60.0
+_DESTINATION_MAX = 1_000
+
+
+def _write_destination(
+    destination_id: str, payload: Mapping[str, Any], *, replace: bool = False
+) -> None:
+    """Every write to a destination document, and the cache invalidation that must go with it.
+
+    ONE funnel rather than an invalidation beside each of the eight writers, because the one that
+    gets forgotten is the expensive one: a stale cached record carries the signing generations, so a
+    rotation whose invalidation was missed would keep signing with a retired key for a window, and
+    the receiver would refuse deliveries it should have accepted. A pause missed the same way keeps
+    delivering to an endpoint an operator has stopped.
+    """
+    if replace:
+        _store().set(DESTINATIONS, destination_id, dict(payload))
+    else:
+        _store().update(DESTINATIONS, destination_id, dict(payload))
+    with _lock:
+        _destinations.pop(destination_id, None)
+
+
 def destination_for_delivery(destination_id: str) -> Destination | None:
-    """What U6 reads before attempting a destination.
+    """What U6 reads before attempting a destination, cached for :data:`_DESTINATION_TTL_S`.
 
     Its own name rather than a bare :func:`get_destination` call, so the delivery path states which
     question it is asking: not "does this destination exist" but "may we dial it this cycle". A
     paused or retired destination comes back and reads ``deliverable == False``, so the caller can
     record *why* nothing was attempted instead of logging a missing record.
+
+    **Cached since U8, and `get_destination` deliberately is not.** The delivery pass reads this
+    once per destination per pass today, through `webhook_delivery._Skips` -- which is pass-local,
+    and a pass is what U11's worker takes away. A worker draining a queue has no pass boundary to
+    hang a cache on, so the window moves here, beside the account cache and for the same reason:
+    twenty thousand deliveries against four destinations must not be twenty thousand reads. The
+    operator-facing `get_destination` stays uncached because it is read-your-writes -- an operator
+    who pauses a destination and then looks at it must see the pause, not a window-old record.
+
+    Every writer in this module invalidates through :func:`_write_destination`, so the window bounds
+    how stale a record can be only when somebody ELSE wrote it (another replica, or a hand repair).
     """
-    return get_destination(destination_id)
+    now = _monotonic()
+    with _lock:
+        hit = _destinations.get(destination_id)
+        if hit is not None and now - hit[0] < _DESTINATION_TTL_S:
+            return _destination_from_doc(hit[1]) if hit[1] else None
+    stored = _store().get(DESTINATIONS, destination_id)
+    with _lock:
+        while len(_destinations) >= _DESTINATION_MAX:
+            _destinations.pop(next(iter(_destinations)))
+        _destinations[destination_id] = (now, dict(stored) if stored else None)
+    return _destination_from_doc(stored) if stored else None
 
 
 def current_destination(client_id: str) -> Destination | None:
@@ -1492,7 +1545,7 @@ def create_destination(
         "created_at": instant,
         "updated_at": instant,
     }
-    _store().set(DESTINATIONS, destination_id, doc)
+    _write_destination(destination_id, doc, replace=True)
     record_admin_action(
         actor=actor,
         action="create_destination",
@@ -1534,7 +1587,7 @@ def amend_destination(
         )
         raise
     patch = {"callback_url": url, "updated_at": instant}
-    _store().update(DESTINATIONS, destination_id, patch)
+    _write_destination(destination_id, patch)
     record_admin_action(
         actor=actor,
         action="amend_destination",
@@ -1576,7 +1629,7 @@ def pause_destination(
         "paused_reason": str(reason)[:200],
         "updated_at": instant,
     }
-    _store().update(DESTINATIONS, destination_id, patch)
+    _write_destination(destination_id, patch)
     record_admin_action(
         actor=actor,
         action="pause_destination",
@@ -1641,7 +1694,7 @@ def back_off_destination(
         "consecutive_failures": consecutive,
         "updated_at": instant,
     }
-    _store().update(DESTINATIONS, destination_id, patch)
+    _write_destination(destination_id, patch)
     return _destination_from_doc({**stored, **patch})
 
 
@@ -1662,7 +1715,7 @@ def clear_destination_backoff(
     if not stored.get("consecutive_failures") and not stored.get("retry_not_before"):
         return None
     patch = {"retry_not_before": None, "consecutive_failures": 0, "updated_at": instant}
-    _store().update(DESTINATIONS, destination_id, patch)
+    _write_destination(destination_id, patch)
     return _destination_from_doc({**stored, **patch})
 
 
@@ -1675,7 +1728,7 @@ def resume_destination(
     if not stored:
         raise NotFound("no such destination")
     patch = {"paused": False, "paused_at": None, "paused_reason": None, "updated_at": instant}
-    _store().update(DESTINATIONS, destination_id, patch)
+    _write_destination(destination_id, patch)
     record_admin_action(
         actor=actor,
         action="resume_destination",
@@ -1708,7 +1761,7 @@ def rotate_signing_generation(
         "retiring": current.active_generation,
     }
     patch = {"generations": generations, "updated_at": instant}
-    _store().update(DESTINATIONS, destination_id, patch)
+    _write_destination(destination_id, patch)
     record_admin_action(
         actor=actor,
         action="rotate_signing_generation",
@@ -1736,7 +1789,7 @@ def retire_signing_generation(
         "generations": {"active": current.active_generation, "retiring": None},
         "updated_at": instant,
     }
-    _store().update(DESTINATIONS, destination_id, patch)
+    _write_destination(destination_id, patch)
     record_admin_action(
         actor=actor,
         action="retire_signing_generation",
