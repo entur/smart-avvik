@@ -182,6 +182,11 @@ def _reset_state():
         # checking -- it reads as the give-up bug rather than as pollution.
         varsel._message_errors.clear()
         varsel._message_meta.clear()
+        # The decision log's thinning ledger (U4, 2026-09-12). Leaked, a subject from the previous
+        # test is already "seen", so the next test's first observation is thinned away and the log
+        # simply has one fewer row than the test asserts -- which reads as the rule misfiring rather
+        # than as pollution. It also leaves a closing row owed for a subject nothing will retire.
+        varsel._decision_ledger.clear()
         # The per-train push memory and the daily cap ledger (2026-09-02). A leaked count reads
         # exactly like the cap firing for no reason.
         varsel._pushed_trains.clear()
@@ -1300,6 +1305,7 @@ def test_a_cached_wording_is_recorded_beside_a_fresh_template(monkeypatch):
 
     _reset_state()
     log = _use_decision_log(monkeypatch)
+    _log_every_cycle(monkeypatch)  # two cycles one second apart: see the helper
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     monkeypatch.setattr(
         llm_message,
@@ -1790,6 +1796,20 @@ def _use_decision_log(monkeypatch, insert_error=None, query_error=None) -> _Fake
     return fake
 
 
+def _log_every_cycle(monkeypatch):
+    """Turn the thinning rule off, so every cycle writes a row (U4, 2026-09-12).
+
+    For the tests whose subject is what a row SAYS rather than how many there are. They drive two
+    or three `check_and_notify` calls back to back on the wall clock, i.e. inside one quarter hour
+    with nothing about the subject having moved -- which is precisely the case KTD15 thins, so the
+    later cycles would write nothing and the assertion would read as the feature under test having
+    broken. Zero is the interval the log ran at until this change, so what these tests pin is
+    unchanged; `test_a_thinned_subject_groups_to_the_same_figures_as_an_unthinned_one` is the one
+    that asserts the two arms agree.
+    """
+    monkeypatch.setattr(varsel, "_DECISION_THINNING_INTERVAL_S", 0)
+
+
 def test_decisions_record_non_alerting_matches_too(monkeypatch):
     """The recall half of the confusion matrix only exists if we write down what we did NOT alert on.
 
@@ -1840,6 +1860,423 @@ def test_decision_row_records_delivery_and_device_count(monkeypatch):
     assert by_situation["S1"]["pushed"] is True
     assert by_situation["S2"]["pushed"] is False
     assert by_situation["S1"]["n_devices"] == 2
+
+
+def _alert(
+    situation: str, departure, *, jkey: str, p_impact: float = 0.9, decided_at=None
+) -> varsel.Alert:
+    """A minimal Alert for the paths that take a list of them directly."""
+    return varsel.Alert(
+        situation_number=situation,
+        summary="Signalfeil",
+        operator="VYG",
+        line="VYG:Line:R10",
+        departure_time=departure,
+        jkey=jkey,
+        stop_place="A",
+        stop_order=1,
+        decided_at=decided_at or datetime.now(UTC),
+        cancel_probability=0.8,
+        ge10_probability=0.8,
+        delay_p50_min=3,
+        delay_p90_min=12,
+        impact_probability=p_impact,
+        alert_threshold=0.65,
+        alertworthy=p_impact >= 0.65,
+    )
+
+
+def test_the_pushed_mark_is_keyed_per_departure_not_per_situation(monkeypatch):
+    """`pushed` is per TRAIN, and `pushed_keys` was keyed per SITUATION until 2026-09-12.
+
+    The rows this decides are keyed (journey definition x situation x DEPARTURE); the set it was
+    read against was keyed (journey definition x situation). One situation reaches 12 h from its
+    onset and routinely names several trains, so one push marked EVERY departure under it as
+    delivered -- into `pushed_any`, into `varsel_decision_groups`'s quoted-wording pick (which takes
+    the FIRST pushed row), and through the nightly job into `varsel_decision_outcomes`, where the
+    copy is frozen. KTD4 reads `pushed` as ground truth per train on both channels, so the key has
+    to carry the departure before either channel is scored on it.
+
+    Driven through `_record_decisions` directly rather than through a cycle, and that is the honest
+    shape: `match_journey` keeps the WORST alert per situation across every window
+    (`worst_by_situation`), so one cycle never holds two departures under one situation for one
+    definition and the two key shapes agree today. What the fix buys is that they keep agreeing --
+    the grain the log is written at is the grain the mark is read at, stated rather than implied by
+    a collapse three call levels away.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    first = _alert("S1", DEP, jkey="t1")
+    second = _alert("S1", DEP + timedelta(minutes=30), jkey="t4")
+
+    varsel._record_decisions(
+        {key: journey},
+        {key: [first, second]},
+        [(jid, journey)],
+        {varsel._message_key(key, first)},
+        {},
+        push_on=True,
+    )
+
+    rows = sorted(log.rows, key=lambda r: r["departure_time"])
+    assert [r["situation_number"] for r in rows] == ["S1", "S1"], "two departures, one situation"
+    assert [r["pushed"] for r in rows] == [True, False], (
+        "the second departure inherited the first one's push"
+    )
+
+
+# ---- the thinning rule (KTD15, R11) -------------------------------------------------------------
+#
+# Until 2026-09-12 every matched subject wrote a row on every cycle, and the module said so in
+# prose: the repeats ARE the lead-time series. At 226 definitions that is 74 000-93 000 rows a day;
+# at 35 000-80 000 it is 14-32 M rows and 14-33 GB a day, which no bytes cap on /historikk can serve.
+# KTD15 overrides the intent with a rule that keeps every row the pages' figures are computed from.
+
+
+class _Clock:
+    """A cycle clock the tests advance by hand: the rule is about elapsed minutes."""
+
+    def __init__(self):
+        self.now = datetime.now(UTC).replace(microsecond=0)
+
+    def tick(self, minutes: int):
+        self.now += timedelta(minutes=minutes)
+        return self.now
+
+
+def _thinning_fixture(monkeypatch):
+    """A registered journey plus the decision log, ready for hand-driven cycles."""
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    return log, jid, journey, varsel.journey_key(journey)
+
+
+def _decide(key, journey, jid, alerts, *, now, pushed=()):
+    varsel._record_decisions(
+        {key: journey},
+        {key: list(alerts)},
+        [(jid, journey)],
+        {varsel._message_key(key, a) for a in pushed},
+        {},
+        push_on=True,
+        now=now,
+    )
+
+
+def test_an_unchanged_subject_writes_at_most_one_row_per_quarter_hour(monkeypatch):
+    """t, t+5, t+10, t+15, t+20 with the same class and the same figures: rows at t and t+15.
+
+    This is the case thinning exists for -- 88-95 % of today's rows are sub-threshold no-SX subjects
+    re-scored every ~5 minutes with nothing having moved, and every one of them is a row the pages
+    read only through aggregates that MIN, MAX or COUNT over it.
+    """
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute in (0, 5, 10, 15, 20):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=now)],
+                now=now)
+
+    written = [r["decided_at"] for r in log.rows]
+    assert len(written) == 2, f"expected two rows (t and t+15), got {len(written)}: {written}"
+    assert written == [
+        clock.now.isoformat(),
+        (clock.now + timedelta(minutes=15)).isoformat(),
+    ]
+
+
+def test_a_new_maximum_probability_always_writes_a_row(monkeypatch):
+    """`max_impact_probability` is a MAX over the rows, so a peak that is not written is a peak the
+    page cannot see -- and it is the figure a threshold is tuned on. The rise at t+10 does not cross
+    the gate, so no transition fires and only this trigger keeps it."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.35), (10, 0.55)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+
+    assert [r["impact_probability"] for r in log.rows] == [0.40, 0.55], (
+        "a new maximum under the gate was thinned away"
+    )
+    assert all(r["alertworthy"] is False for r in log.rows)
+
+
+def test_crossing_the_alert_gate_always_writes_a_row(monkeypatch):
+    """`first_alert_at` is MIN(decided_at) over the alerting rows and `alert_lead_min` is computed
+    from it, so the cycle a subject crosses the gate can never be thinned. Both directions: easing
+    back off is a transition too, and `final_*` describes the class the subject ended in."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.90), (10, 0.40)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+
+    assert [(r["decided_at"], r["alertworthy"]) for r in log.rows] == [
+        (clock.now.isoformat(), False),
+        ((clock.now + timedelta(minutes=5)).isoformat(), True),
+        ((clock.now + timedelta(minutes=10)).isoformat(), False),
+    ]
+
+
+def test_a_push_always_writes_its_own_row(monkeypatch):
+    """`pushed_any` is a LOGICAL_OR and the quoted wording is taken off the FIRST pushed row, so a
+    thinned push would lose both the fact and the text. The push lands at t+10, inside the quarter
+    hour and with no figure having moved -- nothing else would write it."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    alerts = {}
+    for minute in (0, 5, 10):
+        now = clock.now + timedelta(minutes=minute)
+        alerts[minute] = _alert("S9", DEP, jkey="t1", p_impact=0.90, decided_at=now)
+        _decide(key, journey, jid, [alerts[minute]], now=now,
+                pushed=[alerts[minute]] if minute == 10 else ())
+
+    pushed = [r for r in log.rows if r["pushed"]]
+    assert len(pushed) == 1 and pushed[0]["decided_at"] == (
+        clock.now + timedelta(minutes=10)
+    ).isoformat()
+
+
+def test_a_train_that_leaves_the_match_gets_a_closing_row(monkeypatch):
+    """A train stops being matched the moment it can no longer be CAUGHT, while its situation lives
+    on for hours. Without a closing row the subject's last written figures are up to a quarter hour
+    old, and `final_impact_probability` -- "the closest look we got before departure" -- would
+    describe a cycle we deliberately skipped."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.38), (10, 0.36)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+    # t+15: the definition still matches, the train does not.
+    gone = clock.now + timedelta(minutes=15)
+    _decide(key, journey, jid, [], now=gone)
+
+    assert [r["impact_probability"] for r in log.rows] == [0.40, 0.36], (
+        "the closing row must carry the LAST scored figures, not the last written ones"
+    )
+    assert log.rows[-1]["decided_at"] == (clock.now + timedelta(minutes=10)).isoformat(), (
+        "the closing row is dated at the cycle it describes, not at the cycle that noticed"
+    )
+    assert not varsel._decision_ledger, "a retired subject must leave the ledger"
+
+
+def test_a_situation_the_sweep_retires_gets_a_closing_row(monkeypatch):
+    """The other way a subject retires: its situation ends. The stale sweep runs at the TOP of a
+    cycle and drops everything keyed on a dead situation, so a closing row left to the end-of-cycle
+    absence check would find nothing there to close."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.38)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+
+    closing = varsel._retire_decision_subjects(live={"S1"})
+    assert [r["impact_probability"] for r in closing] == [0.38]
+    assert not varsel._decision_ledger
+    # The sweep hands its rows to the cycle's single write; it must not write on its own.
+    assert [r["impact_probability"] for r in log.rows] == [0.40]
+
+
+def test_a_subject_whose_last_cycle_was_written_gets_no_closing_duplicate(monkeypatch):
+    """The closing row exists to carry figures the log does not already hold. When the last cycle a
+    subject was seen on wrote its own row, a second copy of it would be a duplicate that moves
+    `n_decisions` and nothing else."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=clock.now)],
+            now=clock.now)
+    _decide(key, journey, jid, [], now=clock.now + timedelta(minutes=5))
+
+    assert len(log.rows) == 1, f"the first-seen row was closed over: {log.rows}"
+
+
+def test_a_lost_write_leaves_the_ledger_where_it_was(monkeypatch):
+    """The write fails open, so a row can be lost — and the ledger must not then believe it landed.
+
+    Two consequences if it did, and the second is the one that would go unnoticed: the subject is
+    thinned for the next quarter hour though the log holds nothing about it, and `max_impact` has
+    advanced past a peak no row carries, so the peak can never be written even after BigQuery
+    recovers. `max_impact_probability` is what a threshold is tuned on.
+    """
+    import decisions
+
+    _reset_state()
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    clock = _Clock()
+
+    broken = _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.90, decided_at=clock.now)],
+            now=clock.now)
+    assert broken.rows == [] and not varsel._decision_ledger, (
+        "a lost first-seen row must leave no entry behind"
+    )
+
+    healthy = _FakeBQ()
+    monkeypatch.setattr(decisions, "_bq_client", healthy)
+    later = clock.tick(1)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.90, decided_at=later)],
+            now=later)
+    assert len(healthy.rows) == 1, "the subject was thinned against a row that was never written"
+
+    # The same rollback for an ESTABLISHED subject, which is the half the thinned branch does not
+    # already cover: this cycle is a new maximum, so it WRITES, and the write is lost. The entry
+    # must not go on believing its last look landed -- otherwise the subject retires with no closing
+    # row and `final_impact_probability` reads 0.90 (the older successful write) instead of 0.97.
+    broken2 = _FakeBQ(insert_error=RuntimeError("BigQuery is down"))
+    monkeypatch.setattr(decisions, "_bq_client", broken2)
+    lost_at = clock.tick(1)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.97, decided_at=lost_at)],
+            now=lost_at)
+    assert broken2.rows == [] and len(healthy.rows) == 1, "the new maximum was offered and lost"
+
+    monkeypatch.setattr(decisions, "_bq_client", healthy)
+    _decide(key, journey, jid, [], now=clock.tick(1))
+    assert len(healthy.rows) == 2, "the retired subject wrote no closing row for its lost look"
+    assert healthy.rows[-1]["impact_probability"] == 0.97, (
+        "the closing row carries the older successful write, so final_* understates the peak"
+    )
+
+
+def _group(rows: list[dict]) -> dict:
+    """`varsel_decision_groups`' aggregates, transcribed from the view.
+
+    Nothing in this repo executes SQL, so the view is modelled here rather than run. Only the
+    figures R11 names are transcribed: the rows are all from one subject, so the GROUP BY is
+    implicit.
+    """
+    ordered = sorted(rows, key=lambda r: r["decided_at"])
+    alerting = [r for r in ordered if r["alertworthy"]]
+    pushed = [r for r in ordered if r["pushed"] and r["message"] is not None]
+    with_text = [r for r in ordered if r["message"] is not None]
+    last = ordered[-1]
+    return {
+        "first_decided_at": ordered[0]["decided_at"],
+        "ever_alerted": bool(alerting),
+        "first_alert_at": alerting[0]["decided_at"] if alerting else None,
+        "et_cancelled": alerting[0]["et_cancelled"] if alerting else any(r["et_cancelled"] for r in ordered),
+        "max_impact_probability": max(r["impact_probability"] for r in ordered),
+        "pushed_any": any(r["pushed"] for r in ordered),
+        "n_devices": max(r["n_devices"] for r in ordered),
+        "final_impact_probability": last["impact_probability"],
+        "final_cancel_probability": last["cancel_probability"],
+        "final_delay_p50_min": last["delay_p50_min"],
+        "final_delay_p90_min": last["delay_p90_min"],
+        "message": (pushed or with_text[::-1] or [{"message": None, "message_source": None}])[0]["message"],
+        "message_source": (pushed or with_text[::-1] or [{"message": None, "message_source": None}])[0]["message_source"],
+    }
+
+
+def test_a_thinned_subject_groups_to_the_same_figures_as_an_unthinned_one(monkeypatch):
+    """R11 in one test: the rule keeps every verdict, first-alert time, maximum probability,
+    lead-time figure and quoted wording the page computes today.
+
+    One synthetic history, replayed twice -- once with the rule and once with the rule disabled by
+    setting the interval to zero, which is exactly what "a row on every cycle" was. `n_decisions` is
+    deliberately not compared: it changes meaning, and its description says so.
+    """
+    history = [
+        (0, 0.30, False),
+        (5, 0.32, False),
+        (10, 0.55, False),
+        (15, 0.72, True),   # crosses the gate, and is pushed
+        (20, 0.70, False),
+        (25, 0.95, False),  # a new maximum
+        (30, 0.40, False),
+        (35, 0.38, False),
+        (40, 0.36, False),
+    ]
+
+    def replay(interval_s):
+        log, jid, journey, key = _thinning_fixture(monkeypatch)
+        monkeypatch.setattr(varsel, "_DECISION_THINNING_INTERVAL_S", interval_s)
+        clock = _Clock()
+        for minute, p, push in history:
+            now = clock.now + timedelta(minutes=minute)
+            alert = _alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)
+            _decide(key, journey, jid, [alert], now=now, pushed=[alert] if push else ())
+        _decide(key, journey, jid, [], now=clock.now + timedelta(minutes=45))
+        return list(log.rows)
+
+    thinned = replay(varsel._DECISION_THINNING_INTERVAL_S)
+    unthinned = replay(0)
+
+    assert len(thinned) < len(unthinned), "the rule wrote no fewer rows than writing every cycle"
+    assert _group(thinned) == _group(unthinned)
+
+
+def test_a_second_cycle_on_an_unchanged_situation_writes_nothing(monkeypatch):
+    """The rule through the REAL cycle, not through `_record_decisions` alone.
+
+    Two `check_and_notify` calls a moment apart on one snapshot: the first pushes and writes, the
+    second finds the same class, the same figures and `_notified` already holding the push. That is
+    the ordinary shape of every poller tick, and it is what 88-95 % of prd's rows are.
+    """
+    _reset_state()
+    _use_snapshot(SNAPSHOT)
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    after_first = len(log.rows)
+    assert after_first == 1 and log.rows[0]["pushed"] is True
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(log.rows) == after_first, (
+        f"the second cycle wrote {len(log.rows) - after_first} row(s) for an unchanged subject"
+    )
+
+
+def test_a_situation_that_ends_closes_its_subjects_through_the_real_cycle(monkeypatch):
+    """The sweep's half of the retirement, wired end to end: the situation leaves the snapshot, the
+    stale sweep at the top of the next cycle closes the subject, and its last look reaches the log
+    in that cycle's single write. The earlier unit test drives `_retire_decision_subjects` directly;
+    this one proves `live` and `closing_rows` are actually threaded through `check_and_notify`."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT)
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(log.rows) == 1
+    varsel.check_and_notify(SNAPSHOT)  # thinned: same class, same figures, push already sent
+    assert len(log.rows) == 1
+    # The situation is over. Nothing matches this cycle, so the ONLY row it can produce is the
+    # closing one -- carrying the second cycle's figures, which nothing else in the log holds.
+    _use_snapshot({})
+    varsel.check_and_notify({})
+    assert not varsel._decision_ledger, "the retired subject is still in the ledger"
+    assert len(log.rows) == 2, "the thinned last look never reached the log"
+    assert log.rows[1]["decided_at"] > log.rows[0]["decided_at"]
+    assert log.rows[1]["pushed"] is False, "a closing row is not a push"
+    _use_snapshot(SNAPSHOT)
+
+
+def test_the_thinning_ledger_is_swept_and_reset_like_every_other_module_budget():
+    """The house rule: a module-level ledger that outlives its subjects reads exactly like the
+    give-up bug the tests around it exist to pin. Its own structure, deliberately -- riding on
+    `_message_meta` would lose the prior class the instant `_forget_message` fires, which is the
+    tick a subject eases below the gate and precisely when the rule needs it."""
+    import pathlib
+
+    source = pathlib.Path(varsel.__file__).read_text()
+    assert "_decision_ledger" in source
+    assert "_decision_ledger.clear()" in pathlib.Path(__file__).read_text(), (
+        "_reset_state must clear the ledger"
+    )
+    # The sweep: the ledger is pruned on the same liveness test as `_messages` and `_notified`.
+    assert "_retire_decision_subjects" in source
 
 
 def test_decision_row_holds_no_device_or_journey_identifier(monkeypatch):

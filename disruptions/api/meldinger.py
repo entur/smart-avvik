@@ -144,8 +144,17 @@ _MAX_LIMIT = historikk._MAX_LIMIT
 # pruning regression on today's table. What it does catch is a query that starts reading something
 # big: the ET tables a mistyped join could reach are ~10 TiB for a two-year scan, three orders of
 # magnitude above this. It is a blast-radius bound on a public endpoint, not a pruning detector.
-# Revisit the number when the decision log approaches it — at that point it becomes both.
-_MAX_BYTES_BILLED = 2 * 1024**3
+# Revisit the number when the decision log approaches it — at that point it becomes both. It grew
+# fast: measured again on 2026-09-11 prd's log is 1.53 GB, so the same 2 GiB is now ~1.3x the whole
+# table rather than 11x.
+#
+# ONE CONSTANT for both pages since 2026-09-12 (R12, U4 step 4), imported rather than restated, the
+# way `_MAX_LIMIT` already is. The two ask the same question of the same table through the same
+# grouping, so a cap that differed between them would be an accident rather than a decision — and
+# the derivation that is owed (four times the measured pruned, thinned 14-day scan) has to land in
+# ONE place or the next reader has to guess which copy is authoritative. The derivation and the
+# three conditions it waits on are written out on `historikk._MAX_BYTES_BILLED`.
+_MAX_BYTES_BILLED = historikk._MAX_BYTES_BILLED
 
 # ---- The replay bounds -------------------------------------------------------------------------
 # Four of them, every one a number rather than an adjective, because /messages is the only path in

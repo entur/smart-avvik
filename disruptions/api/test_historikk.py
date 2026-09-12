@@ -939,6 +939,20 @@ def test_every_query_is_bounded_by_maximum_bytes_billed():
         assert job_config.maximum_bytes_billed == historikk._MAX_BYTES_BILLED
 
 
+def test_the_bytes_cap_is_one_constant_shared_with_meldinger():
+    """R12 asks for the cap to be DERIVED from the measured thinned 14-day scan, and a derivation
+    has to live in one place or the next reader guesses which copy is authoritative. The two pages
+    ask the same question of the same table through the same grouping, so a cap that differed
+    between them would be an accident. /rushhistorikk reads other tables and keeps its own.
+
+    The value itself has deliberately not moved yet: the derivation waits on a measurement of the
+    pruned, thinned log that only the load harness can take, and a cap derived from today's 1.5 GB
+    would turn the log's growth into refusals on the page with the longest window."""
+    import meldinger
+
+    assert meldinger._MAX_BYTES_BILLED is historikk._MAX_BYTES_BILLED
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

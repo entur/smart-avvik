@@ -2,8 +2,10 @@
 --
 -- UNION of two sources, because a decision becomes visible long before it can be judged:
 --   * varsel_decision_outcomes — labelled by the nightly job, carries a verdict.
---   * varsel_decision_groups   — every decision, including today's. Rows already labelled are
---                                excluded so nothing appears twice.
+--   * varsel_decision_groups_between(d_start, d_end) — every decision, including today's, read
+--                                through the table function so the two dates prune the partitioned
+--                                decision log (R12; the view over the same body takes no window).
+--                                Rows already labelled are excluded so nothing appears twice.
 -- Today's alerts therefore show up on the page within a poller cycle, with verdict NULL and
 -- outcome_state 'venter' rather than being invisible until tomorrow morning.
 --
@@ -36,11 +38,16 @@
 -- /meldinger's generated prose, which no projection controls. journey_digest stays absent from
 -- both surfaces regardless: it is the join key to the LLM audit log, and no page needs it.
 --
--- Cost: the outcomes side prunes on its call_date partition. The groups side does NOT:
--- varsel_decisions is partitioned on DATE(decided_at) and the view aggregates before any filter
--- can reach it, so `call_date BETWEEN` is a post-aggregation filter over a full scan. Acceptable
--- while the log is small (a handful of rows per poller cycle), and the reason the response is
--- cached. If it grows, give the view a decided_at bound rather than widening this comment.
+-- Cost: the outcomes side is partitioned on call_date. The groups side reads through a TABLE
+-- FUNCTION since 2026-09-12, carrying a DATE(decided_at) cover -- the advice this comment used to
+-- give ("give the view a decided_at bound"), in the only form a view allows, since a view takes no
+-- parameters. Be honest about what it bought HERE: measured for real against dev on 2026-09-12,
+-- this file's bytes are UNCHANGED by the move (26.8 MB for a one-day window, 382 MB for 28 days,
+-- identical either way), because BigQuery already prunes blocks on `call_date` from its columnar
+-- metadata and this log is written in `decided_at` order, so the two columns track each other. The
+-- sibling queries did gain (-34 % on the filters query, -11 % on the summary). The cover stays
+-- because that correlation is a property of the data rather than a guarantee: it weakens as the log
+-- grows and as the thinning rule changes the write pattern. The response is still cached.
 SELECT
   o.situation_number, o.summary, o.description,
   o.operator, o.line, o.mode, o.from_stop, o.to_stop, o.call_date, o.departure_time,
@@ -120,7 +127,17 @@ SELECT
   -- A decision with no journey key can never be joined to a realized call, so the labelling job
   -- skips it permanently. Reporting it as 'venter' would promise a verdict that is never coming.
   IF(g.jkey IS NULL, 'ukjent', 'venter') AS outcome_state
-FROM `disruptions.varsel_decision_groups` AS g
+-- THE TABLE FUNCTION, not the view, and the argument pair is what prunes this read (R12, U4).
+-- `varsel_decisions` is PARTITION BY DATE(decided_at) while every predicate here is on
+-- `call_date`, so through the windowless view this scanned the WHOLE log on every request. The
+-- cover is derived: a decision is made from 720 min before its departure to 54 min after and
+-- call_date is the Oslo date of that departure, so DATE(decided_at) lies in
+-- [call_date - 1, call_date] -- the derivation and its re-measure condition live on the function
+-- in create_varsel_decisions.sql. A too-narrow cover would fail SILENTLY and CHEAPLY: subjects
+-- would read as never alerted on, and a validator's byte count would report the loss as success.
+FROM `disruptions.varsel_decision_groups_between`(
+  DATE_SUB(@from_date, INTERVAL 1 DAY), DATE_ADD(@to_date, INTERVAL 1 DAY)
+) AS g
 WHERE g.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR g.operator = @operator)
   AND (@line     IS NULL OR g.line     = @line)

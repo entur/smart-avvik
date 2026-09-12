@@ -24,10 +24,11 @@
 -- model and the header of historikk_decisions.sql) — this is the one place they surface, as the
 -- vocabulary a filter needs, without being attached to any particular row.
 --
--- Cost: the outcomes side prunes on its call_date partition; the groups side does not, exactly as
--- in historikk_decisions.sql — the view aggregates before a filter can reach the partitioned table
--- underneath. So this is one more full scan of a small table per window per cache TTL. Same
--- acceptability argument, same escape hatch if the log grows: bound the view on decided_at.
+-- Cost: both sides prune now. The outcomes side is partitioned on call_date; the groups side goes
+-- through `varsel_decision_groups_between`, whose two arguments carry the window down to
+-- DATE(decided_at) before the aggregation happens. Until 2026-09-12 this read the whole decision
+-- log per window per cache TTL -- affordable at 1.5 GB, and the escape hatch this header used to
+-- name ("bound the view on decided_at") is exactly what was taken.
 WITH universe AS (
   SELECT operator, line, from_stop, to_stop
   FROM `disruptions.varsel_decision_outcomes`
@@ -36,7 +37,11 @@ WITH universe AS (
   UNION ALL
 
   SELECT operator, line, from_stop, to_stop
-  FROM `disruptions.varsel_decision_groups`
+  -- The table function, not the view; the cover is the same derived one, and it is what turns
+  -- the note above from an accepted cost into a bounded one.
+  FROM `disruptions.varsel_decision_groups_between`(
+    DATE_SUB(@from_date, INTERVAL 1 DAY), DATE_ADD(@to_date, INTERVAL 1 DAY)
+  )
   WHERE call_date BETWEEN @from_date AND @to_date
 )
 SELECT

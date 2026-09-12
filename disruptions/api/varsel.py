@@ -1220,6 +1220,63 @@ _pushed_trains: dict[str, datetime] = {}
 # the dict above -- a restart resets the count, which errs towards sending.
 _daily_pushes: dict[str, tuple[str, int]] = {}
 
+# ---- The decision log's thinning ledger (KTD15, R11) --------------------------------------------
+#
+# What `_record_decisions` remembers about a subject between cycles, keyed exactly like `_messages`:
+# (journey definition, situation, departure). One entry:
+#
+#   {"row": the last row BUILT for this subject, written or not,
+#    "written": whether that row was the one sent to BigQuery,
+#    "alertworthy": its class at the last observation,
+#    "max_impact": the highest impact probability ever seen for it,
+#    "written_at": when a row was last written (the quarter-hour clock)}
+#
+# ITS OWN STRUCTURE, not a field on `_message_meta`, and the reason is the one thing about this that
+# is easy to get wrong: `_forget_message` drops that entry the tick a subject eases below the gate
+# (`_reconcile_caches`), which is exactly the tick this rule needs the PRIOR class to notice a
+# transition. A ledger that forgets on the transition is a ledger that cannot see one.
+#
+# Swept with `_messages` and `_notified` on the same liveness test (the closing row is written from
+# the sweep -- see `_retire_decision_subjects`) and cleared by every suite's `_reset_state`, because
+# a leaked half-spent ledger reads exactly like the give-up bug.
+#
+# WHAT IT COSTS IN MEMORY, stated because it is the one thing about this that does not get cheaper
+# with scale: an entry holds a whole decision row, which prd measures at ~1 KB (`message_input` is
+# most of it), and the ledger holds one entry per LIVE subject. Today that is ~1 500 subjects in prd,
+# i.e. a megabyte and a half. At the 35 000-80 000 definitions R1 sizes for, extrapolating prd's
+# ~15-20 subjects per matched definition and its ~1/3 match rate, it is 200 000-500 000 entries --
+# 200-500 MB against a 2 048 MiB pod that already uses 350-435 MiB. That is the harness's
+# measurement to take before the pilot grows, and the lever if it binds is to store the closing
+# row's big text columns by reference to the last written row rather than by copy. It is NOT a
+# reason to drop the closing row: without it `final_*` describes a cycle the rule skipped.
+_decision_ledger: dict[tuple[str, str, str], dict[str, Any]] = {}
+#: How long a subject can go without a row when nothing about it has changed (KTD15).
+#:
+#: Measured 2026-09-11 in prd: 74 000-93 000 rows a day at 226 definitions, ~400 per definition per
+#: day, 88-95 % of them sub-threshold no-SX subjects re-scored on a ~295 s cycle with nothing having
+#: moved. At 35 000-80 000 definitions that is 14-32 M rows and 14-33 GB a day unthinned, which no
+#: bytes cap on a 14-day /historikk window can serve (R12).
+#:
+#: WHAT THE RULE ACTUALLY CUTS, replayed over prd's own rows (2026-09-12, the two days to 09-10:
+#: 168 436 rows over 6 462 subjects): **2.63x**, i.e. 38.1 % of the rows survive, and the same 38 %
+#: for the never-alerting subjects that are almost all of them. The kept rows are 6 462 first
+#: sightings, 44 pushes, 83 transitions, **13 502 new maxima** and 40 881 interval rows, plus 3 153
+#: closing rows. The new-maximum trigger being a fifth of the total is the surprise and it is
+#: correct rather than a leak: a no-SX probability drifts upward as the ask horizon shortens, and
+#: every one of those rows is the peak `max_impact_probability` would otherwise not hold.
+#:
+#: So 15 min is NOT enough on its own at 100 000 -- 33 GB a day becomes 12.5, and a 14-day window is
+#: still tens of GB. That is the decision-log volume question the plan carries, and its answer is a
+#: per-day summary table the pages read instead of the groups view, gated on exactly this
+#: measurement. A longer interval is not the answer: measured on the same rows, 30 min buys 3.76x
+#: and 60 min 4.96x, and past about an hour the interval stops being a thinning rule and starts
+#: deciding which cycle a reader is allowed to see. (A materiality band on the new maximum -- only
+#: writing a rise of 0.05 or more -- buys 2.93x and costs the exact peak; not taken.)
+#:
+#: Zero disables the rule: every observation writes. That is what the log did before 2026-09-12, and
+#: it is the arm the equivalence test replays against.
+_DECISION_THINNING_INTERVAL_S = 15 * 60
+
 # Togvarsel push round markers, {"<YYYY-MM-DD Oslo>": {"<issue>": {"level": str, "pushed": bool}}} —
 # togvarsel_notify's single state primitive (dedup + the follow-up baseline in one). Persisted in
 # the state blob so a completed round never re-fires across restarts. Exactly one date is kept:
@@ -2562,14 +2619,84 @@ def _message_input_json(message_input: dict | None) -> str | None:
         return None
 
 
+def _thinning_reason(
+    entry: dict[str, Any] | None, alert: Alert, *, pushed: bool, now: datetime
+) -> str | None:
+    """Why this observation has to be written down, or None to let the ledger carry it (KTD15).
+
+    Five triggers, and each one is the reason a figure `varsel_decision_groups` computes cannot be
+    recovered from any other row:
+
+    * ``first_seen`` — `first_decided_at` is MIN(decided_at) and nothing else can supply it.
+    * ``transition`` — `first_alert_at` is MIN over the ALERTING rows and `ever_alerted` a
+      LOGICAL_OR, so the cycle a subject crosses the gate in either direction is load-bearing; so is
+      the `et_cancelled` pick, which reads the first alerting row.
+    * ``new_max`` — `max_impact_probability` is a MAX, i.e. it is only ever as high as the highest
+      row written. This is the trigger that keeps a threshold tunable.
+    * ``pushed`` — `pushed_any` is a LOGICAL_OR and the quoted wording comes off the FIRST pushed
+      row. A thinned push loses the fact and the text together.
+    * ``interval`` — everything else, at most once per :data:`_DECISION_THINNING_INTERVAL_S`.
+
+    `final_*` and `last_decided_at` are not in that list because they are served by the CLOSING row
+    instead (see :func:`_retire_decision_subjects`): the subject's last observation is written when
+    it retires, so the last row in the log is the last look we got, exactly as it was unthinned.
+
+    ONE POPULATION DOES SHRINK, and it is not one R11 names: a cycle whose only news is that the
+    model wrote a wording (`message_status = 'ok'`) is thinned unless another trigger fires, so where
+    the push does not go out on that same cycle -- the daily cap, a push error -- the fresh
+    `message_llm` never reaches the log and a later cycle records `ok_cached` instead. That thins
+    `message_wording_comparison.sql`'s same-input population and any error-to-success recovery rate.
+    A sixth trigger on "a wording was written this cycle" would close it and would cost little (44
+    pushes in 168 436 measured rows), but KTD15 does not list one and this is not the unit to widen
+    the rule in.
+    """
+    if entry is None:
+        return "first_seen"
+    if pushed:
+        return "pushed"
+    if bool(alert.alertworthy) != bool(entry.get("alertworthy")):
+        return "transition"
+    impact_p = alert.impact_probability
+    if impact_p is not None and impact_p > entry.get("max_impact", float("-inf")):
+        return "new_max"
+    written_at = entry.get("written_at")
+    if written_at is None or (now - written_at).total_seconds() >= _DECISION_THINNING_INTERVAL_S:
+        return "interval"
+    return None
+
+
+def _retire_decision_subjects(*, live: set[str]) -> list[dict]:
+    """Close out every ledger subject whose SITUATION has ended, and return their closing rows.
+
+    Called from the stale sweep at the top of a cycle, where `_messages`, `_notified` and the rest
+    are pruned on this same liveness test — and it has to be called from there rather than left to
+    the end-of-cycle absence check, because by then the sweep has already dropped the entry and
+    there is nothing left to close.
+
+    It RETURNS the rows rather than writing them: the sweep holds `_state_lock` and does no I/O
+    under it, and a cycle makes exactly one decision-log write. A subject whose last observation was
+    itself written needs no closing row — that row is already in the log, and a second copy of it
+    would move `n_decisions` and nothing else.
+    """
+    closing: list[dict] = []
+    with _state_lock:
+        for key in [k for k in _decision_ledger if k[1] not in live]:
+            entry = _decision_ledger.pop(key)
+            if not entry.get("written") and entry.get("row") is not None:
+                closing.append(entry["row"])
+    return closing
+
+
 def _record_decisions(
     by_journey_key: dict[str, dict],
     alerts_by_key: dict[str, list[Alert]],
     journeys: list[tuple[str, dict]],
-    pushed_keys: set[tuple[str, str]],
+    pushed_keys: set[tuple[str, str, str]],
     message_inputs: dict[tuple[str, str, str], dict | None],
     *,
     push_on: bool,
+    now: datetime | None = None,
+    closing_rows: list[dict] | None = None,
 ) -> None:
     """Append this cycle's alert decisions to the decision log.
 
@@ -2585,6 +2712,17 @@ def _record_decisions(
     actually got. Those are different questions now that ``VARSEL_LLM_ENABLED`` only selects the
     wording — prd writes one and sends the other — and the pair on one row is the only way that
     deployment's own pushes can be compared against what the model would have said.
+
+    **Not every observation is a row, since 2026-09-12** (KTD15). The module used to write one per
+    subject per cycle and said so in prose — the repeats *are* the lead-time series — and at
+    35 000-80 000 definitions that is 14-33 GB a day, which no bytes cap on /historikk can serve.
+    :func:`_thinning_reason` states what is kept; what is dropped is a standing subject nothing
+    about which has moved, and the figures the pages compute are unchanged because the closing row
+    carries the last look. `n_decisions` is the one column whose MEANING changes, and its
+    description says so.
+
+    `now` is the cycle's single clock (the same instant the match was made at), injectable for
+    tests. `closing_rows` are the sweep's, written with this cycle's own.
     """
     try:
         import decisions
@@ -2601,24 +2739,60 @@ def _record_decisions(
         # the same tick's deliveries, and a flag re-read per alert could label two rows from one
         # cycle as having sent different wordings.
         delivery_on = llm_message.delivery_enabled()
+        cycle_now = now or datetime.now(UTC)
         device_counts: dict[str, set[str]] = {}
         for _jid, journey in journeys:
             device_counts.setdefault(journey_key(journey), set()).add(journey["device_id"])
 
-        rows = []
+        # ONE take of the lock for the whole pass, not one per alert (KTD15). Both dicts are keyed
+        # like the alerts being walked, so the copies are the same order of magnitude as the work;
+        # what this removes is tens of thousands of lock acquisitions on the poller thread, each of
+        # which the request path can be waiting behind. Shallow on purpose — the inner meta dict is
+        # copied per alert below, exactly as it was when the lock was held per alert.
+        with _state_lock:
+            messages_snapshot = dict(_messages)
+            meta_snapshot = dict(_message_meta)
+
+        rows = list(closing_rows or [])
+        seen: set[tuple[str, str, str]] = set()
+        # Ledger entries for the subjects this pass WRITES, held back until the insert has actually
+        # been accepted. The write fails open by design, and committing before it lands would mark a
+        # lost row as written: the subject would then be thinned for the next quarter hour, and — the
+        # one that matters — its `max_impact` would have advanced past a peak no row in the log
+        # holds, so the peak could never be written even after BigQuery recovered.
+        wrote: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
         for key, journey in by_journey_key.items():
             digest = key_digest(key)
             n_devices = len(device_counts.get(key, ()))
             for alert in alerts_by_key.get(key, []):
                 message_key = _message_key(key, alert)
+                seen.add(message_key)
+                pushed = message_key in pushed_keys
+                entry = _decision_ledger.get(message_key)
+                reason = _thinning_reason(entry, alert, pushed=pushed, now=cycle_now)
+                if reason is None and entry is not None:
+                    # Not written, but not forgotten: the stored row is re-stated with this cycle's
+                    # figures so the CLOSING row carries the last look rather than the last write.
+                    # Cheap by construction — no template rendering, no message-input JSON, which is
+                    # the work the rule exists to stop repeating.
+                    entry["row"] = {
+                        **decisions.rescored(entry["row"], alert),
+                        "n_devices": n_devices,
+                    }
+                    entry["written"] = False
+                    entry["alertworthy"] = bool(alert.alertworthy)
+                    if alert.impact_probability is not None:
+                        entry["max_impact"] = max(
+                            entry.get("max_impact", float("-inf")), alert.impact_probability
+                        )
+                    continue
                 # Read RAW, deliberately not through `_deliverable_message`: this is the half of the
                 # pair recorded as `message_llm`, which is what was WRITTEN whether or not it was
                 # sent. Since 2026-08-07 those differ by design — prd writes a wording and delivers
                 # the deterministic one — and gating this read would throw away exactly the column
                 # the comparison exists for. What was sent is decided below, on `delivery_on`.
-                with _state_lock:
-                    written = _messages.get(message_key)
-                    meta = dict(_message_meta.get(message_key) or {})
+                written = messages_snapshot.get(message_key)
+                meta = dict(meta_snapshot.get(message_key) or {})
                 # No meta means the writer was never reached for this alert, and why is knowable
                 # from the state that decided it: below the threshold, no deliverable recipient on
                 # any channel, no backend available to ask — or alert-worthy but not among the
@@ -2687,25 +2861,82 @@ def _record_decisions(
                     continue
                 delivered = written if delivery_on else None
                 message = delivered or deterministic
-                rows.append(
-                    decisions.build_row(
-                        journey,
-                        alert,
-                        journey_digest=digest,
-                        n_devices=n_devices,
-                        pushed=(key, alert.situation_number) in pushed_keys,
-                        message=message,
-                        message_source="llm" if delivered else "deterministic",
-                        message_llm=written,
-                        message_deterministic=deterministic,
-                        message_input=_message_input_json(message_input),
-                        llm_provider=meta.get("provider"),
-                        llm_model=meta.get("model"),
-                        message_status=status,
-                        prompt_version=llm_message.PROMPT_VERSION,
+                row = decisions.build_row(
+                    journey,
+                    alert,
+                    journey_digest=digest,
+                    n_devices=n_devices,
+                        # `_message_key`, not `(key, situation_number)`: the mark has to be read at
+                        # the grain the row is written at, which is (definition x situation x
+                        # DEPARTURE). One situation reaches 12 h from its onset and names several
+                        # trains, so a two-part key lets one push mark every departure under it --
+                        # into `pushed_any`, into the groups view's quoted-wording pick (the FIRST
+                        # pushed row) and, through the nightly job, permanently into
+                        # `varsel_decision_outcomes`. It agreed with this grain by accident until
+                        # 2026-09-12, because `match_journey` keeps only the WORST alert per
+                        # situation across every window, so one cycle held one departure per
+                        # situation; KTD4 reads `pushed` as ground truth per TRAIN on both channels
+                    # and must not rest on a collapse three call levels away.
+                    pushed=pushed,
+                    message=message,
+                    message_source="llm" if delivered else "deterministic",
+                    message_llm=written,
+                    message_deterministic=deterministic,
+                    message_input=_message_input_json(message_input),
+                    llm_provider=meta.get("provider"),
+                    llm_model=meta.get("model"),
+                    message_status=status,
+                    prompt_version=llm_message.PROMPT_VERSION,
+                )
+                rows.append(row)
+                wrote.append(
+                    (
+                        message_key,
+                        {
+                            "row": row,
+                            "written": True,
+                            "written_at": cycle_now,
+                            "alertworthy": bool(alert.alertworthy),
+                            "max_impact": max(
+                                (entry or {}).get("max_impact", float("-inf")),
+                                alert.impact_probability
+                                if alert.impact_probability is not None
+                                else float("-inf"),
+                            ),
+                        },
                     )
                 )
-        decisions.record(rows)
+
+        # Subjects the ledger holds that this cycle did not see. Two causes and one treatment: the
+        # train left the match because it can no longer be CAUGHT (its situation lives on for hours
+        # after the departures it describes), or the definition itself stopped matching. Either way
+        # the subject is over, and its closing row is the last look we got at it — which is what
+        # keeps `final_*` and `last_decided_at` equal to what an unthinned log would hold. The other
+        # retirement, a situation that has ENDED, is closed by the stale sweep at the top of the
+        # cycle and arrives here as `closing_rows`.
+        for message_key in [k for k in _decision_ledger if k not in seen]:
+            entry = _decision_ledger.pop(message_key)
+            if not entry.get("written") and entry.get("row") is not None:
+                rows.append(entry["row"])
+        accepted = decisions.record(rows)
+        # A write that landed nothing at all (no table, or the insert raised) leaves the ledger
+        # where it was, so the next cycle offers the same subjects again rather than thinning rows
+        # nobody has. The fresh figures still move onto the stored row: a closing row must describe
+        # the last look whether or not the intervening writes landed. A first-seen subject keeps no
+        # entry at all, which is what makes its next cycle a first-seen one again.
+        lost = bool(rows) and not accepted
+        for message_key, entry in wrote:
+            prior = _decision_ledger.get(message_key) if lost else None
+            if not lost:
+                _decision_ledger[message_key] = entry
+            elif prior is not None:
+                prior["row"] = entry["row"]
+                # And the row is NOT in the log, so the subject owes a closing row again. Without
+                # this the entry still claims its last look was written, and a subject that retires
+                # on the next cycle would close with nothing -- leaving `final_*` describing the
+                # older successful write rather than the last look, which is the exact hole the
+                # rollback exists to close.
+                prior["written"] = False
     except Exception:
         logger.warning("Could not record alert decisions this cycle", exc_info=True)
 
@@ -3473,6 +3704,13 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # stay pass-local, or one failure pauses a destination permanently (KTD6).
         changed = bool(stale)
 
+    # The decision log's own sweep, on the same liveness test one line of reasoning above -- but it
+    # RETURNS rows rather than dropping state, because a thinned subject's last look has not been
+    # written yet (KTD15). Outside the lock block so the rows travel as a pass-local list to the
+    # cycle's single decision-log write, which is the rule every other write here follows: no I/O
+    # under `_state_lock`, and one insert per cycle.
+    closing_rows = _retire_decision_subjects(live=live)
+
     # ---- The one client read: BEFORE pass 1a, and before the write budget's clock starts -----
     #
     # KTD6: the load necessarily precedes 1a, because that is what webhook subscriptions are matched
@@ -4029,7 +4267,9 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             )
             return device, payload
 
-        pushed_keys: set[tuple[str, str]] = set()
+        # KEYED PER DEPARTURE (`_message_key`'s shape), because that is the grain
+        # `_record_decisions` writes a row at. See the note on the `pushed=` argument there.
+        pushed_keys: set[tuple[str, str, str]] = set()
         if per_device:
             for _device_id, item, result, payload, error_detail in deliver_to_devices(
                 per_device, _prepare_alert
@@ -4061,7 +4301,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                                     oslo_today,
                                     (count if day == oslo_today else 0) + 1,
                                 )
-                    pushed_keys.add((journey_key(journey), alert.situation_number))
+                    pushed_keys.add(_message_key(journey_key(journey), alert))
                 elif result == "gone":
                     if handle_gone_device(journey["device_id"]):
                         changed = True
@@ -4076,7 +4316,17 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # row. That is why the webhook deliveries happen in a later phase entirely and not here.
     with _span("varsel_record_decisions", definitions=len(by_journey_key)):
         _record_decisions(
-            by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
+            by_journey_key,
+            alerts_by_key,
+            journeys,
+            pushed_keys,
+            message_inputs,
+            push_on=push_on,
+            # The cycle's own clock, the one the match was made at -- not a second `now()` taken
+            # here. The thinning rule is an elapsed-minutes test, and a pass that takes 60 s would
+            # otherwise measure it from an instant nothing else in the cycle shares.
+            now=cycle_now,
+            closing_rows=closing_rows,
         )
 
     if changed:
