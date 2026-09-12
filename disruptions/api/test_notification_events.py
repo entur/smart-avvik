@@ -1186,8 +1186,11 @@ def test_the_reservation_stops_new_transactions_before_the_deadline_rather_than_
             _subject(journey_ref=f"DatedServiceJourney:{4000 + i}") for i in range(6)
         ]
         started = time.monotonic()
+        # ONE worker, because what this checks is the reservation's arithmetic and not the pool's:
+        # at sixty-four the six slow transactions overlap and all six fit inside the deadline,
+        # which is the pool working rather than the budget failing.
         report = _emit(
-            subjects, now=NOW, deadline_s=0.2, wait_s=2.0, worst_case_s=0.12
+            subjects, now=NOW, deadline_s=0.2, wait_s=2.0, worst_case_s=0.12, workers=1
         )
         elapsed = time.monotonic() - started
         assert report.capped, f"the budget must bind; got {report}"
@@ -1353,19 +1356,252 @@ def test_no_external_reference_route_or_prose_reaches_a_log_line():
         _uninstall()
 
 
-def test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger():
-    """KTD6's trigger is a number, so the ceilings that feed it have to add up to less than it.
+def test_the_transactions_of_one_pass_overlap_rather_than_queueing():
+    """U9 step 3. One transaction at a time is ~5 emits a second however many are waiting.
 
-    "Move delivery out when the webhook phase exceeds 30 s of measured phase time on any cycle in a
-    week." Emit and deliver run in ONE `main._phase`, so their two outer bounds add: a pair that
-    summed to 30 s or more would make the trigger fire on a bad morning by construction rather than
-    because anything was wrong.
+    Asserted with a `Barrier`, not with a timing: four store calls must be in flight AT ONCE or the
+    barrier times out and the test fails on its own clock rather than on a threshold somebody has
+    to tune. Four different subscriptions, because that is what a corridor looks like — and because
+    two emits about one train on one subscription would be one subject, not two.
+    """
+    client = _install()
+    try:
+        subjects = []
+        for i in range(4):
+            sid = f"sub-{i}"
+            _live(client, subscription_id=sid)
+            subjects.append(_subject(subscription_id=sid))
+        barrier = threading.Barrier(4, timeout=10)
+        met = threading.Event()
+        real = notification_store.commit_event
+
+        def meeting(request: Any, **kwargs: Any) -> Any:
+            try:
+                barrier.wait()
+                met.set()
+            except threading.BrokenBarrierError:
+                pass
+            return real(request, **kwargs)
+
+        notification_store.commit_event = meeting  # type: ignore[assignment]
+        try:
+            report = _emit(subjects, now=NOW, workers=4)
+        finally:
+            notification_store.commit_event = real  # type: ignore[assignment]
+        assert met.is_set(), "the four transactions never overlapped; the pass is still serial"
+        assert report.created == 4, report
+    finally:
+        _uninstall()
+
+
+def test_a_superseding_mint_gives_its_pending_slot_back():
+    """The ledger is net-zero on a replacement, and a counter that only counts up is not.
+
+    `_mint` flips the superseded delivery to `superseded` in the same transaction that creates the
+    new one, so a `confirmed` replacing an undelivered `predicted` leaves the destination holding
+    exactly as many pending events as before. A ledger that charged without refunding would refuse
+    at HALF the ceiling on precisely the morning that matters — one where many mints are a
+    confirmation — and the symptom is a quota refusal an operator cannot reconcile with the count
+    Firestore holds.
+
+    Both mints are in ONE pass, because the ledger is pass-local: across two passes it is recounted
+    from the store and the refund has nothing to show. The counter reads the fake's own pending
+    deliveries rather than a fixed number, so the ledger's arithmetic is checked against what
+    Firestore would actually answer.
+    """
+    client = _install()
+    try:
+        _live(client)
+        real = notification_store._count_destination_deliveries
+
+        def live_count(destination_id: str, *, state: str, ceiling: int) -> int:
+            return len(
+                [
+                    d
+                    for d in client.in_collection(notification_store.DELIVERIES)
+                    if d.get("destination_id") == destination_id and d.get("state") == state
+                ]
+            )
+
+        notification_store._count_destination_deliveries = live_count  # type: ignore[assignment]
+        try:
+            ceiling = 2
+            soon = _subject(
+                journey_ref="DatedServiceJourney:7000",
+                departure_time=NOW + timedelta(minutes=10),
+            )
+            first = _emit([soon], now=NOW, workers=1, pending_quota=lambda c: ceiling)
+            assert first.created == 1, first
+
+            # One pass, two trains, a destination holding ONE pending event and a ceiling of two.
+            # The soonest is the same train declared cancelled — a `predicted` -> `confirmed`
+            # transition, which supersedes rather than adds — and the later one is genuinely new.
+            # Without the refund the replacement spends the second slot and the new train is
+            # refused, which is the defect this exists to catch.
+            report = _emit(
+                [
+                    _subject(
+                        journey_ref="DatedServiceJourney:7000",
+                        departure_time=NOW + timedelta(minutes=10),
+                        cancelled=True,
+                    ),
+                    _subject(
+                        journey_ref="DatedServiceJourney:7001",
+                        departure_time=NOW + timedelta(minutes=40),
+                    ),
+                ],
+                now=NOW + timedelta(minutes=1),
+                workers=1,
+                pending_quota=lambda c: ceiling,
+            )
+            assert report.created == 2 and report.quota == 0, (
+                f"the superseded slot was never given back: {report}"
+            )
+            pending = [
+                d
+                for d in client.in_collection(notification_store.DELIVERIES)
+                if d["state"] == "pending"
+            ]
+            assert len(pending) == 2, f"one replacement and one new train; got {pending}"
+        finally:
+            notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+    finally:
+        _uninstall()
+
+
+def test_a_second_pass_is_refused_while_the_first_is_still_draining():
+    """Two overlapping passes each hold their own pending count and admit past a ceiling together.
+
+    The emit path's exactness rests on there being one writer, and U9 makes that writer a pass
+    rather than a thread — so what enforces it is this refusal plus the ledger's lock. The
+    abandoned workers of a timed-out pass are exactly the ones still committing, which is why the
+    lock is released by `_run`'s own `finally` and not by the thread that gave up waiting.
+    """
+    client = _install()
+    try:
+        _live(client)
+        holding = threading.Event()
+        release = threading.Event()
+        real = notification_store.commit_event
+
+        def slow(request: Any, **kwargs: Any) -> Any:
+            holding.set()
+            release.wait(timeout=10)
+            return real(request, **kwargs)
+
+        notification_store.commit_event = slow  # type: ignore[assignment]
+        try:
+            first: list[Any] = []
+            runner = threading.Thread(
+                target=lambda: first.append(
+                    _emit([_subject()], now=NOW, workers=1, wait_s=0.2, deadline_s=5.0)
+                )
+            )
+            runner.start()
+            assert holding.wait(timeout=5), "the first pass never reached the store"
+            runner.join(timeout=5)
+            assert first and first[0].timed_out, first
+
+            # The first pass's worker is still parked in the store, so the second must refuse.
+            refused = _emit(
+                [_subject(journey_ref="DatedServiceJourney:8000")], now=NOW, workers=1
+            )
+            assert refused.overlap_refused is True, refused
+            assert refused.created == 0
+
+            release.set()
+            # Once it drains, the next cycle runs normally again — a refusal is one cycle, not a
+            # latch.
+            for _ in range(100):
+                time.sleep(0.02)
+                again = _emit(
+                    [_subject(journey_ref="DatedServiceJourney:8001")], now=NOW, workers=1
+                )
+                if not again.overlap_refused:
+                    break
+            assert again.overlap_refused is False and again.created == 1, again
+        finally:
+            release.set()
+            notification_store.commit_event = real  # type: ignore[assignment]
+    finally:
+        _uninstall()
+
+
+def test_the_pass_beats_the_heartbeat_while_it_submits():
+    """`/health`'s staleness rule means "no STEP has finished in 600 s", and this step may run 80 s.
+
+    A long way inside the threshold today, and a long way further inside it than the 6 s deadline
+    was — so the pass beats per chunk already rather than after the next widening. A seam that
+    raises must not cost the pass, which is `varsel._heartbeat`'s rule restated.
+    """
+    client = _install()
+    try:
+        _live(client)
+        beats = 0
+
+        def boom() -> None:
+            nonlocal beats
+            beats += 1
+            raise RuntimeError("heartbeat exploded")
+
+        subjects = [
+            _subject(journey_ref=f"DatedServiceJourney:{9000 + i}")
+            for i in range(notification_events._HEARTBEAT_EVERY + 1)
+        ]
+        report = _emit(subjects, now=NOW, workers=4, beat=boom)
+        assert report.created == len(subjects), report
+        assert beats >= 2, f"beat {beats} time(s) over {len(subjects)} submissions"
+    finally:
+        _uninstall()
+
+
+#: The poller cycle's measured period, 2026-09-08. A measurement, not a constant — it is set by how
+#: often the upstream SIRI-SX ingestion timestamp moves — so the bound below is a SHARE of it rather
+#: than a number, and re-measuring is what moves it.
+MEASURED_CYCLE_PERIOD_S = 296.0
+#: R2's target, which is what `_EMIT_DEADLINE_S` and `_MAX_EMITS_PER_CYCLE` are both derived from.
+TARGET_EMITS_PER_SECOND = 250
+
+
+def test_the_phase_ceiling_is_a_share_of_the_cycle_rather_than_ktd6s_thirty_seconds():
+    """U9 step 6. KTD6's trigger was a number and the widened pass exceeds it BY DESIGN.
+
+    It read "move delivery out when the webhook phase exceeds 30 s of measured phase time on any
+    cycle in a week", and until U9 the two outer bounds summed to 28 s, pinned here at 2 s under
+    it. That arithmetic was right for a one-wide loop at the pilot's few hundred events a day and
+    is the wrong shape for R2: a bad morning's transitions have to be emitted inside ONE cycle, and
+    one transaction at a time against a ~200 ms round trip is ~5 emits a second however many are
+    waiting. So the deadline moved with the width, and the trigger is restated in the operations
+    document as emit's share being exceeded — the pass ran to its deadline with work left over —
+    rather than as a wall-clock ceiling.
+
+    What still has to hold, and is checked here rather than argued:
+
+    * the phase's ceiling stays a MINORITY of the cycle it runs in, or a slow store turns every
+      cycle into the previous cycle's tail;
+    * the reservation binds before the backstop, or the backstop is the only bound there is;
+    * the two derived numbers stay derived: `_EMIT_DEADLINE_S` times R2's target rate IS
+      `_MAX_EMITS_PER_CYCLE`, so a change to one that forgets the other is caught here rather than
+      discovered as a pass that stops early with budget to spare.
     """
     import webhook_delivery
 
-    assert notification_events._EMIT_WAIT_S + webhook_delivery._DELIVERY_WAIT_S < 30.0
+    phase_ceiling = notification_events._EMIT_WAIT_S + webhook_delivery._DELIVERY_WAIT_S
+    assert phase_ceiling <= MEASURED_CYCLE_PERIOD_S / 2, (
+        f"the webhook phase's ceiling is {phase_ceiling:.0f} s against a ~{MEASURED_CYCLE_PERIOD_S:.0f} s "
+        "cycle period; past half of it a bad store makes every cycle the previous one's tail"
+    )
     assert notification_events._EMIT_DEADLINE_S < notification_events._EMIT_WAIT_S, (
         "the reservation must bind before the backstop, or the backstop is the only bound"
+    )
+    assert (
+        notification_events._MAX_EMITS_PER_CYCLE
+        == notification_events._EMIT_DEADLINE_S * TARGET_EMITS_PER_SECOND
+    ), (
+        f"{notification_events._MAX_EMITS_PER_CYCLE} emits over "
+        f"{notification_events._EMIT_DEADLINE_S:.0f} s is "
+        f"{notification_events._MAX_EMITS_PER_CYCLE / notification_events._EMIT_DEADLINE_S:.0f}/s, "
+        f"not R2's {TARGET_EMITS_PER_SECOND}/s. The count and the clock are one derivation."
     )
 
 
@@ -1382,6 +1618,12 @@ def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
     The resolver is a CALLABLE rather than an import for a reason this suite pins one test below:
     the answer lives in `notification_auth`, and the exact-import set is what keeps this module
     light enough for CI to run it in its own process.
+
+    **U9 moved the COUNT the ceiling is compared against.** It was an aggregation query per mint --
+    most of dev's first ~200-250 ms per emit, and at sixty-four workers sixty-four concurrent
+    aggregations against one collection to re-derive a figure this process is the only writer of.
+    It is now one count per destination per pass, kept in step by `_PendingLedger`, so the
+    assertion below is that the store was asked ONCE and that the ledger refused the rest.
     """
     client = _install()
     try:
@@ -1392,7 +1634,7 @@ def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
 
         def _counted(destination_id: str, *, state: str, ceiling: int) -> int:
             seen.append(ceiling)
-            # One under the ceiling, so the emit proceeds and the NEXT one would not.
+            # One under the ceiling, so the FIRST emit proceeds and the rest must not.
             return ceiling - 1
 
         notification_store._count_destination_deliveries = _counted  # type: ignore[assignment]
@@ -1400,20 +1642,22 @@ def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
         report = _emit(
             subjects,
             now=NOW,
+            workers=1,
             pending_quota=lambda client_id: (asked.append(client_id), 9_999)[1],
         )
-        assert report.created == 3, report
-        assert seen == [9_999, 9_999, 9_999], "the client's own ceiling reached the store"
+        assert seen == [9_999], (
+            f"the destination was counted {len(seen)} times for three mints; U9 counts once per "
+            "pass and keeps its own figure in step"
+        )
+        assert report.created == 1 and report.quota == 2, report
         assert asked == [subjects[0].client_id], "asked once per client, not once per subject"
 
         # And with no resolver the module constant stands, which is what every caller that does not
         # care about quotas gets.
         seen.clear()
-        _emit(
-            [_subject(journey_ref="DatedServiceJourney:6100")], now=NOW
-        )
+        _emit([_subject(journey_ref="DatedServiceJourney:6100")], now=NOW, workers=1)
         assert seen == [notification_store.MAX_PENDING_EVENTS_PER_DESTINATION], (
-            "with no resolver the store resolves its own constant, at call time"
+            "with no resolver the pass resolves the store's own constant"
         )
     finally:
         notification_store._count_destination_deliveries = real  # type: ignore[assignment]
@@ -1431,9 +1675,10 @@ def test_the_module_imports_neither_varsel_nor_main():
     assert "varsel" not in imports and "main" not in imports and "impact" not in imports
     # An EXACT set, never a containment check: the point is that nothing heavy can be added without
     # a reader of this line deciding it is light. `reserved_budget` is the shared reserve-don't-check
-    # pass budget, stdlib-only (`threading`, `time.monotonic`), and it is why `threading` is no
-    # longer imported here directly -- the lock moved with the class that owns it.
-    assert imports == {"logging", "notification_store", "reserved_budget"}, imports
+    # pass budget, stdlib-only (`threading`, `time.monotonic`). `threading` is back since U9: the
+    # pass has its own locks now -- the outcome tally and the pending ledger the sixty-four workers
+    # share, and the module lock that refuses a second pass over them.
+    assert imports == {"logging", "notification_store", "reserved_budget", "threading"}, imports
 
 
 if __name__ == "__main__":

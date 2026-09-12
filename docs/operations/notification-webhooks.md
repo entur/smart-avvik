@@ -956,9 +956,10 @@ reads it — the other five are read from the account on each pass.
 | `notification_api._TEST_EVENTS_PER_MIN` | 6 |
 | `notification_api._CLEANUP_PASSES` | 3 |
 | `notification_api._CLEANUP_BATCH` | 200 |
-| `notification_events._EMIT_DEADLINE_S` | 6.0 |
-| `notification_events._EMIT_WAIT_S` | 8.0 |
-| `notification_events._MAX_EMITS_PER_CYCLE` | 120 |
+| `notification_events._EMIT_DEADLINE_S` | 80.0 |
+| `notification_events._EMIT_WAIT_S` | 90.0 |
+| `notification_events._EMIT_WORKERS` | 64 |
+| `notification_events._MAX_EMITS_PER_CYCLE` | 20000 |
 | `webhook_delivery._DELIVERY_DEADLINE_S` | 20.0 |
 | `webhook_delivery._DELIVERY_WAIT_S` | 20.0 |
 | `webhook_delivery._WORKERS` | 4 |
