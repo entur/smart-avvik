@@ -713,7 +713,7 @@ script can scrape them; they are for rules and dashboards, and the log records a
 
 | Date | Unit | Subs | Defs | Pairs | Mode | Shape | Ratio | Cycle p50 / max | `varsel_notify` wall / CPU | `notification_webhooks` wall / CPU | `varsel_webhook_load` wall / CPU | Interpreter ms per definition | Emits/s, Firestore p50 | Delivery drain | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| — | U1 | — | — | — | — | — | — | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | The harness and the instrumentation landed with U1; the dev run that fills this row has not been made |
+| 2026-09-12 | U1–U4 | 18 | ~44 | ~40 | — | dev as it runs | — | 46.1 s / 63.8 s | 544 / 123 ms | 122 / 18 ms | 85 ms | — | 0 emits | nothing pending | **dev's own load, not a gate run.** The first reading off U1's instrumentation after the Phase A deploy, 6 cycles at 20:1x Oslo. Heaviest CPU phases: `varsel_stops` 1 550 ms and `call_predictions_cache` 1 351 ms (the U2 index build is inside it); `predict_calls_rail` is 13 271 ms wall against 167 ms CPU, i.e. BigQuery. Non-BigQuery CPU totals ~3.8 s against R1's 120 s |
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 2 000 | bench | evening (syn) | plan | — | — | — | — | **0.542** | — | — | 42 070 decision rows built. Laptop, one core, CPython 3.13 |
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 4 000 | bench | evening (syn) | plan | — | — | — | — | **0.604** | — | — | 41 687 rows. The pair term: +5 092 pairs over the row above costs +1.07 s, ~0.21 ms per pair |
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 7 092 | bench | evening (syn) | prd | — | — | — | — | **0.649** | — | — | 39 098 rows. prd's 1.41 definitions per pair — the honest floor on what the memo can buy |
@@ -723,8 +723,15 @@ ms per definition at the two ratios, against R1's 3.4 ms at 35 000 definitions a
 All three sit at 0.54–0.65 ms, inside the tighter of the two budgets by a factor of 2.3. What they do
 **not** answer is the rest of the gate — non-BigQuery cycle work under 60 s, and the per-phase CPU
 histogram — because those are properties of a live cycle in the cluster and this harness has no
-cluster. That run is the row above them, still owed, and it has to be taken between 22:00 and 01:00
-Oslo with the load seeded into dev.
+cluster.
+
+The dev row above them is that live cycle and **still does not close the gate**, for a reason worth
+stating rather than inferring from the tags: it is the right INSTRUMENT at the wrong SIZE. dev runs
+~44 registrations and 18 subscriptions, so its 3.8 s of non-BigQuery CPU says the instrumentation
+works and says nothing about 10 000 definitions. It is recorded because it is the baseline every
+later row is read against, and because "U1's phases are reporting `cpu_ms` and `rss_delta_bytes` in
+the cluster" was itself unverified until this deploy. The gate run is still owed: 10 000 definitions
+at both ratios, seeded into dev, taken between 22:00 and 01:00 Oslo.
 
 **These figures include the decision-row build and the figures before 2026-09-12 did not.** Both
 harnesses stubbed `decisions.record` and configured no client, and `varsel._record_decisions` returns
