@@ -576,7 +576,15 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   a cache sized by the *network* was re-walked for a question about two stops, and the cycle's cost
   grew with registrations although its input does not. Measured on a synthetic late-evening cache,
   pruning is **15.7x** cheaper per definition (0.52 ms against 8.2 ms), which is what brings 20 000
-  definitions inside R1's budget. `main.refresh_call_predictions_cache` now builds a fourth index in
+  definitions inside R1's budget. **Both of those figures are the MATCH and the wording passes
+  only**, and until 2026-09-12 the harness could produce no other: it stubbed `decisions.record` and
+  configured no client, so `_record_decisions` returned at its first line and the decision-row build
+  was outside every number either benchmark printed. It is inside them now, which moves the
+  end-to-end figure and not the speedup's meaning: at 10 000 definitions and the same cache, 0.604 ms
+  pruned against 8.164 ms unpruned is **13.5x** end to end, while the matcher alone — the two
+  arms less the ~0.083 ms the rows cost in each — is the 15.5x that 15.7x was. Quote 15.7x for what
+  the INDEX buys and 0.60-0.65 ms for what a definition COSTS, and read a `decision_rows` of zero on
+  a bench row as "this figure went back to being a matcher figure". `main.refresh_call_predictions_cache` now builds a fourth index in
   the same O(calls) ingest loop, `_call_pred_by_stop_ref = {stop_place: [(situationNumber,
   CallPred)]}`, and `impact` keeps a `_Generation` derived from it, identified by **(snapshot object,
   refreshed_at)** so the poller's swap-and-restamp under `_call_pred_lock` invalidates it on both
