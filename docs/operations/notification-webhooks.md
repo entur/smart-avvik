@@ -689,10 +689,15 @@ Three things about a row here, each of which a reader would otherwise have to gu
 created — `store` writes the documents through `notification_store`'s own builder (byte-identical to
 what the API writes, but without the create path's in-transaction count, its log line or its inline
 servability ask), `api` goes through `POST /subscriptions` and cannot exceed the create path's own
-ceilings. *Shape* is which peak the run measured: the late-evening cache maximum, or a bad morning.
-*Ratio* is how much the load clusters: `prd` is prd's measured 1.22 journeys per definition and 1.41
-definitions per pair, `plan` is the first draft's ~2.9 and ~4.4. R1 is sized on the range between
-them, so a run at one ratio has measured half the question.
+ceilings, and `bench` created none at all: `scripts/bench_matcher.py` seeds registrations straight
+into `varsel`'s in-process store and runs one `check_and_notify` over a synthetic cache, with no
+cluster, no Firestore and no BigQuery. *Shape* is which peak the run measured: the late-evening cache
+maximum, or a bad morning. A `bench` row's evening is **synthetic** — the generator's ~930 trips and
+~1 100 situations, built to the shape measured in prd on 2026-09-10 — and is tagged `evening (syn)`
+to keep it apart from a live dev run taken at that hour, which is the only thing that can carry the
+cluster columns. *Ratio* is how much the load clusters: `prd` is prd's measured 1.22 journeys per
+definition and 1.41 definitions per pair, `plan` is the first draft's ~2.9 and ~4.4. R1 is sized on
+the range between them, so a run at one ratio has measured half the question.
 
 **Wall and CPU answer different questions and only one of them is about capacity.** The poller and
 the request path share one CPython interpreter, so a phase bound by bytecode gets nothing from a
@@ -708,7 +713,33 @@ script can scrape them; they are for rules and dashboards, and the log records a
 
 | Date | Unit | Subs | Defs | Pairs | Mode | Shape | Ratio | Cycle p50 / max | `varsel_notify` wall / CPU | `notification_webhooks` wall / CPU | `varsel_webhook_load` wall / CPU | Interpreter ms per definition | Emits/s, Firestore p50 | Delivery drain | Notes |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| — | U1 | — | — | — | — | — | — | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | The harness and the instrumentation landed with U1; the dev run that fills this row has not been made |
+| 2026-09-12 | U1–U4 | 18 | ~44 | ~40 | — | dev as it runs | — | 46.1 s / 63.8 s | 544 / 123 ms | 122 / 18 ms | 85 ms | — | 0 emits | nothing pending | **dev's own load, not a gate run.** The first reading off U1's instrumentation after the Phase A deploy, 6 cycles at 20:1x Oslo. Heaviest CPU phases: `varsel_stops` 1 550 ms and `call_predictions_cache` 1 351 ms (the U2 index build is inside it); `predict_calls_rail` is 13 271 ms wall against 167 ms CPU, i.e. BigQuery. Non-BigQuery CPU totals ~3.8 s against R1's 120 s |
+| 2026-09-12 | U1–U4 | 0 | 10 000 | 2 000 | bench | evening (syn) | plan | — | — | — | — | **0.542** | — | — | 42 070 decision rows built. Laptop, one core, CPython 3.13 |
+| 2026-09-12 | U1–U4 | 0 | 10 000 | 4 000 | bench | evening (syn) | plan | — | — | — | — | **0.604** | — | — | 41 687 rows. The pair term: +5 092 pairs over the row above costs +1.07 s, ~0.21 ms per pair |
+| 2026-09-12 | U1–U4 | 0 | 10 000 | 7 092 | bench | evening (syn) | prd | — | — | — | — | **0.649** | — | — | 39 098 rows. prd's 1.41 definitions per pair — the honest floor on what the memo can buy |
+
+The three `bench` rows answer **half** of Phase A's gate and the half they answer is named: interpreter
+ms per definition at the two ratios, against R1's 3.4 ms at 35 000 definitions and 1.5 ms at 80 000.
+All three sit at 0.54–0.65 ms, inside the tighter of the two budgets by a factor of 2.3. What they do
+**not** answer is the rest of the gate — non-BigQuery cycle work under 60 s, and the per-phase CPU
+histogram — because those are properties of a live cycle in the cluster and this harness has no
+cluster.
+
+The dev row above them is that live cycle and **still does not close the gate**, for a reason worth
+stating rather than inferring from the tags: it is the right INSTRUMENT at the wrong SIZE. dev runs
+~44 registrations and 18 subscriptions, so its 3.8 s of non-BigQuery CPU says the instrumentation
+works and says nothing about 10 000 definitions. It is recorded because it is the baseline every
+later row is read against, and because "U1's phases are reporting `cpu_ms` and `rss_delta_bytes` in
+the cluster" was itself unverified until this deploy. The gate run is still owed: 10 000 definitions
+at both ratios, seeded into dev, taken between 22:00 and 01:00 Oslo.
+
+**These figures include the decision-row build and the figures before 2026-09-12 did not.** Both
+harnesses stubbed `decisions.record` and configured no client, and `varsel._record_decisions` returns
+at its first line unless `decisions.enabled()` — so every earlier number measured the match and the
+wording passes and skipped every row, while R1 counts "matching and rows" against one budget. The
+same shapes measured 0.521 and 0.548 ms before the fix, so the row build is 0.08–0.10 ms per
+definition, about a sixth of the figure. A row's `decision_rows` count is printed beside its
+ms/definition for exactly this reason: a zero there means the build was skipped again.
 
 Later units add their own columns rather than overwriting these: mirror documents and bytes per
 sync (U6), `/historikk` scanned bytes (U4), figures-cache hit rate and Journey Planner lookups
