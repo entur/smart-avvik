@@ -250,7 +250,25 @@ def _install() -> _Fake:
     notification_store._run_transaction = _run  # type: ignore[assignment]
     notification_store._query = _query  # type: ignore[assignment]
     notification_store.configure(client=client, clock=lambda: NOW)
+    # The standing set the pass reads, seeded over an empty store exactly as the poller's own
+    # `sync_mirrors` step does before every cycle. It has to be READY or `_standing` answers
+    # `_INCOMPLETE` for everything and the whole pre-read optimisation is switched off -- which is
+    # the restart window's correct behaviour and would make every assertion here about the fallback
+    # instead. From here it is kept current by the commits themselves (`_mirror_subject`), which is
+    # what these tests are checking.
+    _sync_mirror()
     return client
+
+
+def _sync_mirror(now: datetime = NOW) -> None:
+    """The poller's own `sync_mirrors` step: read the standing set out of whatever the store holds.
+
+    A fresh process does exactly this before its first pass, which is what makes a withdrawal
+    counter survive a restart — the count lives on the subject document, and the mirror is how this
+    module gets to see it without a read per subject.
+    """
+    notification_store.reset_mirrors_for_tests()
+    notification_store.subject_mirror().seed(now=now)
 
 
 def _uninstall() -> None:
@@ -261,6 +279,9 @@ def _uninstall() -> None:
         notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
         notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
+    # Module state, and it leaks between tests exactly as the configured client does: a mirror left
+    # holding the previous test's subjects reads here as a healthy one.
+    notification_store.reset_mirrors_for_tests()
     notification_store.reset_for_tests()
 
 
@@ -522,6 +543,9 @@ def test_two_below_threshold_cycles_withdraw_and_one_does_not():
         _uninstall()
         client = _install()
         client.docs.update(docs)
+        # Seeded AFTER the documents are back, because that is the order a pod comes up in: the
+        # standing set is read out of Firestore by the poller's own step, before the pass.
+        _sync_mirror()
         two = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=2))
         assert two.withdrawn == 1, "the counter survived the restart"
         events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
@@ -616,19 +640,23 @@ def test_a_run_already_past_the_gap_is_left_for_the_store_to_reset():
         _uninstall()
 
 
-def test_a_failed_pre_read_loses_the_reset_and_never_reads_per_subject():
-    """R20, applied to the reset: an outage costs the optimisation's exactness, never a read.
+def test_an_unseeded_mirror_loses_the_reset_and_never_reads_per_subject():
+    """R20, applied to the reset: the restart window costs the optimisation's exactness, never a read.
 
-    A failed `client_alerts` leaves `open_runs` empty, so no run is closed this cycle and the
-    store's time window is what protects the traveller. What must NOT happen is a per-subject read
-    to recover the information — that is the cost the whole pre-read exists to avoid.
+    The failure this guards used to be a failed `client_alerts` query; since U9 the standing set is
+    in memory and the only state that cannot answer is a mirror that has not finished seeding — a
+    pod coming up cold, which happens on every deploy. `open_runs` is then empty, so no run is
+    closed this cycle and the store's time window is what protects the traveller. What must NOT
+    happen is a per-subject read to recover the information, which is the cost the whole pre-read
+    exists to avoid.
     """
     client = _install()
     try:
         _live(client)
         notification_events.emit([_subject()], now=NOW)
         notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
-        client.query_fail_with["client_alerts"] = RuntimeError("Firestore is unreachable")
+        notification_store.reset_mirrors_for_tests()
+        assert notification_store.subject_mirror().ready is False
         mark = len(_SINK.records)
         report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=2))
         assert report.run_cleared == 0 and report.run_stale == 0, report
@@ -638,7 +666,6 @@ def test_a_failed_pre_read_loses_the_reset_and_never_reads_per_subject():
         subject = client.in_collection(notification_store.SUBJECTS)[0]
         assert subject["below_threshold_at"] is not None
     finally:
-        client.query_fail_with.pop("client_alerts", None)
         _uninstall()
 
 
@@ -647,17 +674,20 @@ def test_a_below_threshold_train_with_nothing_standing_costs_no_transaction():
 
     ~83 % of matched alerts are sub-threshold. A `record_below_threshold` for a train nobody was
     ever warned about writes nothing (`nothing_standing`), so paying a Firestore transaction to
-    discover that on every cycle for every such train is the cost the one client-scoped query
-    exists to avoid.
+    discover that on every cycle for every such train is the cost the standing set exists to avoid.
+
+    Since U9 it costs no QUERY either, which is the stronger claim and the one worth pinning: the
+    answer is in memory, so a cycle over a quiet population reaches Firestore not at all.
     """
     client = _install()
     try:
         _live(client)
         before = client.transactions
+        queries = len(client.queries)
         report = notification_events.emit([_subject(alertworthy=False)], now=NOW)
         assert report.nothing_standing == 1
         assert client.transactions == before, "no transaction was spent"
-        assert client.queries.count("client_alerts") == 1, "one query for the whole cycle"
+        assert client.queries[queries:] == [], "and no query either — the mirror answered it"
     finally:
         _uninstall()
 
@@ -675,14 +705,19 @@ def test_an_unchanged_alertworthy_train_costs_no_transaction_either():
         _uninstall()
 
 
-def test_a_truncated_or_over_full_pre_read_falls_back_to_asking_the_store():
-    """The pre-read's one honest limit, handled rather than assumed.
+def test_the_pre_reads_own_ceiling_is_gone_and_a_line_suspension_costs_nothing():
+    """U9 step 2, and this test is the whole reason the standing set moved into memory.
 
-    `client_alerts` COUNTS every live subject and enumerates at most `MAX_ALERTS_SERVED` of them,
-    so a subscription holding more than that reports a count this module cannot resolve to phases.
-    Treating the subset as complete would skip a withdrawal that was owed and — worse — skip a
-    `confirmed` mint for a train ET has cancelled, silently, for exactly the subscriptions a line
-    suspension has hit hardest.
+    The old pre-read was `client_alerts`, which COUNTS every live subject and enumerates at most
+    `MAX_ALERTS_SERVED` (4) of them — so a subscription holding more than that reported a count the
+    caller could not resolve to phases, and an incomplete answer means a store transaction PER
+    SUBJECT. AE3's line suspension is thirteen cancelled departures inside one window, so the
+    optimisation switched itself off in exactly the case it was written for, and at one client with
+    100 000 subscriptions that fallback was the steady state.
+
+    The mirror enumerates everything, so the same population now costs no transaction at all. The
+    ceiling it replaces is asserted by name rather than by a magic number, so this keeps meaning
+    what it says if `MAX_ALERTS_SERVED` ever moves.
     """
     client = _install()
     try:
@@ -697,24 +732,29 @@ def test_a_truncated_or_over_full_pre_read_falls_back_to_asking_the_store():
         before = client.transactions
         report = notification_events.emit(subjects, now=NOW + timedelta(minutes=1))
         assert report.unchanged == len(subjects), "every one still resolves to `no transition`"
-        assert client.transactions > before, (
-            "and it cost transactions, because the pre-read could not enumerate them: an "
-            "incomplete answer must ask the store rather than guess"
+        assert client.transactions == before, (
+            f"a subscription past the old display ceiling ({served}) cost "
+            f"{client.transactions - before} transaction(s); the mirror is complete by construction"
         )
     finally:
         _uninstall()
 
 
-def test_a_failed_pre_read_costs_transactions_and_never_events():
-    """R20: a store outage suppresses the OPTIMISATION, never the correctness."""
+def test_an_unseeded_mirror_costs_transactions_and_never_events():
+    """R20: the restart window suppresses the OPTIMISATION, never the correctness.
+
+    `sync_mirrors` runs as its own poller step before the pass, so an unseeded mirror is the window
+    between a pod starting and its first sync finishing. Every subject falls back to asking the
+    store, which is the slow path and the only correct one — and no event is lost to it.
+    """
     client = _install()
     try:
         _live(client)
-        client.query_fail_with["client_alerts"] = RuntimeError("Firestore is unreachable")
-        handler = _capture()
+        notification_store.reset_mirrors_for_tests()
+        before = client.transactions
         report = notification_events.emit([_subject()], now=NOW)
         assert report.created == 1, "the event was still committed"
-        assert any(e["result"] == "standing_error" for e in _events(handler, "notification_emit"))
+        assert client.transactions > before, "and it was the store that answered, per subject"
     finally:
         _uninstall()
 

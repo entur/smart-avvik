@@ -25,18 +25,24 @@ recognise as a duplicate and would turn into a second notification about the sam
 transactions, and the population this runs over is mostly *nothing to do*: about 83 % of matched
 alerts are sub-threshold (`varsel_decisions`' own split), and an alert-worthy train whose phase has
 not changed is a transaction that reads two documents and returns ``unchanged`` on every one of the
-~300 cycles in a day. So one client-scoped query (:func:`notification_store.client_alerts`) answers
-"which subjects stand, and in which phase" for the whole cycle, and the transactions are spent only
-where a write can actually happen. That is reading the store to decide what to write -- not
-re-deriving the pending set -- and it is exact rather than best-effort for the reason KTD6 names:
-the emit path has exactly one writer (one poller thread, no route invokes the pass, one replica
-under the Recreate strategy), so nothing can change a subject between the query and the commit.
+~300 cycles in a day. So "which subjects stand, and in which phase" is answered before the
+transactions are spent, and they are spent only where a write can actually happen. That is reading
+the store to decide what to write -- not re-deriving the pending set -- and it is exact rather than
+best-effort for the reason KTD6 names: the emit path has exactly one writer (one poller thread, no
+route invokes the pass, one replica under the Recreate strategy), so nothing can change a subject
+between the answer and the commit.
 
-The pre-read has one honest limit and it is handled rather than assumed. ``client_alerts`` serves
-at most :data:`notification_store.MAX_ALERTS_SERVED` subjects per subscription in its LIST while counting
-all of them, so a subscription holding more standing alerts than that -- AE3's line suspension,
-thirteen cancelled departures inside one window -- reports a count this module cannot enumerate.
-:class:`_Standing` calls that *incomplete* and falls back to asking the store per subject, which is
+**Where that answer comes from moved in U9, and the reason is a ceiling rather than a cost.** It
+was one client-scoped query per client (``notification_store.client_alerts``), which serves at most
+:data:`notification_store.MAX_ALERTS_SERVED` subjects per subscription in its LIST while counting
+all of them -- so a subscription holding more standing alerts than that (AE3's line suspension,
+thirteen cancelled departures inside one window) reported a count this module could not enumerate,
+and an incomplete answer means a store transaction PER SUBJECT. At one client with 100 000
+subscriptions that fallback is the steady state, which is to say the optimisation stops existing
+exactly where it is needed. :class:`notification_store.SubjectMirror` answers the same question
+completely, from memory, kept current by this process's own commits -- subject documents have
+exactly one writer, so every change passes through here. The fallback survives unchanged and is now
+the restart window only: an unseeded mirror is :data:`_INCOMPLETE` for every subscription, which is
 the slow path and the correct one.
 
 **Bounded twice, because the two failures are different.** A reservation budget
@@ -394,20 +400,23 @@ def _close_run(
 class _Standing:
     """What stands per subscription, and whether that is a claim or a guess.
 
-    ``complete`` is the load-bearing half. ``client_alerts`` counts every live subject and
-    enumerates at most :data:`notification_store.MAX_ALERTS_SERVED` of them, so past that ceiling the
-    phases below are a subset and "absent" no longer means "nothing stands". Treating a subset as
-    complete would skip a withdrawal that was owed and, worse, skip a ``confirmed`` mint for a train
-    ET has cancelled -- so an incomplete answer falls back to asking the store per subject, which is
-    the slow path and the only correct one.
+    ``complete`` is the load-bearing half: "absent" may only mean "nothing stands" when the answer
+    enumerates everything. Treating a subset as complete would skip a withdrawal that was owed and,
+    worse, skip a ``confirmed`` mint for a train ET has cancelled -- so an incomplete answer falls
+    back to asking the store per subject, which is the slow path and the only correct one.
+
+    Since U9 the answer comes from :class:`notification_store.SubjectMirror`, which is complete by
+    construction, so ``complete`` is False in exactly one state: the restart window before the
+    mirror has finished seeding. It is KEPT rather than dropped because that window is real -- a
+    pod comes up cold on every deploy -- and because a flag whose only value is True is a flag
+    nobody notices has stopped being checked.
     """
 
     phases: Mapping[str, str]
     complete: bool
-    #: alert_id -> `below_threshold_at` for this client's subjects with an OPEN withdrawal run,
-    #: straight off `ClientAlerts.open_below_threshold`. Carried even when `complete` is False,
-    #: because it is derived from the whole live page rather than from the four-row display list --
-    #: so a truncated snapshot still resets runs exactly, and only a FAILED read loses them.
+    #: alert_id -> `below_threshold_at` for every subject with an OPEN withdrawal run, from the
+    #: whole standing set rather than per client: the run is a property of the SUBJECT and the
+    #: caller looks up the one alert id it is about. Read once per pass, not once per subject.
     open_runs: Mapping[str, datetime] = field(default_factory=dict)
 
 
@@ -415,46 +424,29 @@ _INCOMPLETE = _Standing(phases={}, complete=False)
 
 
 def _standing(subjects: Sequence[WebhookSubject], now: datetime) -> dict[str, _Standing]:
-    """One client-scoped query per client: which subjects stand, in which phase.
+    """Which subjects stand, in which phase -- off the mirror, one lookup per subscription.
 
-    Fails to :data:`_INCOMPLETE` for every subscription of a client whose read raised (R20 -- a
-    store outage suppresses that client's *optimisation*, never its correctness), which costs
-    transactions rather than events.
+    No store read at all since U9, and therefore no per-client failure mode: the whole
+    client-scoped query it replaces is gone, along with the truncation that made its answer
+    incomplete for exactly the clients this has to scale for. What survives is the fallback, and
+    the one state that reaches it is an unseeded mirror -- ``sync_mirrors`` runs as its own poller
+    step before the pass, so that is the restart window and nothing else.
+
+    ``open_runs`` is asked ONCE and shared: it walks the whole standing set, so per subject it
+    would be quadratic in a structure built to keep the pass linear.
     """
-    out: dict[str, _Standing] = {}
-    for client_id in sorted({s.client_id for s in subjects if s.client_id}):
-        try:
-            alerts = notification_store.client_alerts(client_id, now=now)
-        except Exception:
-            logger.warning(
-                "Could not read standing client alerts; asking the store per subject this cycle",
-                exc_info=True,
-                extra={"fields": {"event": "notification_emit", "result": "standing_error",
-                                  "client_id": client_id}},
-            )
-            for subject in subjects:
-                if subject.client_id == client_id:
-                    out[subject.subscription_id] = _INCOMPLETE
-            continue
-        for subject in subjects:
-            if subject.client_id != client_id:
-                continue
-            snapshot = alerts.snapshots.get(subject.subscription_id)
-            if snapshot is None:
-                # Absent from a bounded read is "crowded out", not "calm" -- `client_alerts`
-                # documents exactly that, which is why the wrapper carries its own `truncated`.
-                out[subject.subscription_id] = _Standing(
-                    phases={},
-                    complete=not alerts.truncated,
-                    open_runs=alerts.open_below_threshold,
-                )
-                continue
-            out[subject.subscription_id] = _Standing(
-                phases={state.alert_id: state.phase for state in snapshot.subjects},
-                complete=not snapshot.truncated and snapshot.n_active <= len(snapshot.subjects),
-                open_runs=alerts.open_below_threshold,
-            )
-    return out
+    mirror = notification_store.subject_mirror()
+    if not mirror.ready:
+        return {s.subscription_id: _INCOMPLETE for s in subjects}
+    runs = mirror.open_runs(now)
+    return {
+        s.subscription_id: _Standing(
+            phases=mirror.phases_for(s.subscription_id, now),
+            complete=True,
+            open_runs=runs,
+        )
+        for s in subjects
+    }
 
 
 def _sort_key(subject: WebhookSubject) -> tuple:
