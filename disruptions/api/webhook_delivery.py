@@ -178,6 +178,13 @@ class DeliveryReport:
     gone: int = 0
     not_deliverable: int = 0
     paused: int = 0
+    #: Attempts whose lease had lapsed and been re-claimed by the time the terminal write arrived
+    #: (U8). Unreachable while there is one writer, and its own counter rather than folded into
+    #: `already_resolved` because it means the opposite: the delivery is not finished, it is in
+    #: somebody else's hands.
+    lease_lost: int = 0
+    #: Claims refused because another worker already held the delivery. Also unreachable today.
+    leased: int = 0
     #: Attempts not made because the destination is inside U7's durable backoff. Its own counter and
     #: not folded into `skipped`, because the two are different operator answers: `skipped` is "a
     #: sibling attempt in this pass took it out", this is "we are waiting exactly as long as the
@@ -511,10 +518,18 @@ def _attempt(
         outcome = _store_step(
             "sent",
             delivery,
-            lambda: notification_store.mark_delivery_sent(delivery.delivery_id, now=now),
+            lambda: notification_store.mark_delivery_sent(
+                delivery.delivery_id, token=claim.token, now=now
+            ),
         )
         if outcome is None:
             return "store_errors"
+        if outcome.lease_lost:
+            # Our lease lapsed and another worker re-claimed the delivery while this attempt was in
+            # flight. The client HAS the event -- but the record is now somebody else's to resolve,
+            # and writing over it would clear a hold that live holder is still using. Counted
+            # separately from `already_resolved`, which means the delivery is finished.
+            return "lease_lost"
         # RECOVERY, and it costs a write only when there is something to clear. The test is on the
         # pass-local CACHED record, so a healthy destination -- the ordinary case, and the one that
         # carries twenty thousand POSTs -- never reaches the store at all here.
@@ -564,6 +579,7 @@ def _attempt(
             error=attempt.error or "unknown",
             retryable=attempt.retryable,
             retry_after_s=attempt.retry_after_s,
+            token=claim.token,
             # `cancelled` for a gone destination, `failed` otherwise -- both are pinned as members
             # of `notification_store.DELIVERY_STATES` by U5's suite, so they pass straight through.
             terminal_state=attempt.terminal_state or "failed",
@@ -602,6 +618,8 @@ def _attempt(
     # same late-arrival race as the success branch, and `_failed_body` guards against it for a
     # sharper reason: unguarded it set an already-`sent` delivery back to `pending`, so the next
     # cycle sent the client a second copy.
+    if failure.lease_lost:
+        return "lease_lost"
     resolved = _resolved_kind(failure)
     if resolved is not None:
         return resolved
@@ -941,6 +959,8 @@ def deliver_pending(
         not_deliverable=counts.get("not_deliverable"),
         paused=skips.paused_count(),
         backed_off=counts.get("backed_off"),
+        lease_lost=counts.get("lease_lost"),
+        leased=counts.get("leased"),
         skipped=counts.get("skipped"),
         skipped_destinations=skips.count(),
         store_errors=counts.get("store_errors"),
@@ -978,6 +998,8 @@ def deliver_pending(
                 "not_deliverable": report.not_deliverable,
                 "paused": report.paused,
                 "backed_off": report.backed_off,
+                "lease_lost": report.lease_lost,
+                "leased": report.leased,
                 "skipped": report.skipped,
                 "skipped_destinations": report.skipped_destinations,
                 "store_errors": report.store_errors,
