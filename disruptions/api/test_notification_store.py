@@ -3641,6 +3641,40 @@ def emulator_test_the_mirror_seed_holds_only_live_subscriptions():
     assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["live"]
 
 
+def emulator_test_a_committed_subject_reaches_the_standing_set_through_the_real_client():
+    """U9 step 2, against a real client, because the hermetic fake cannot check the ORDERING.
+
+    `_mirror_subject` runs on what `_run_transaction` RETURNS, never from inside a body, and the
+    reason is the real client's retry: a body may run more than once, so an apply from inside would
+    record a state a later attempt overwrote. The suite's fake runs each body exactly once, which
+    is precisely the property that makes it unable to see the difference.
+    """
+    _emulator_setup()
+    notification_store.create_subscription(_spec(), now=NOW)
+    mirror = notification_store.subject_mirror()
+    mirror.reset()
+    mirror.seed(now=NOW)
+    assert mirror.phases_for(SID, NOW) == {}
+
+    created = notification_store.commit_event(_emit(), now=NOW)
+    assert created.status == "created"
+    assert mirror.phases_for(SID, NOW) == {created.alert_id: notification_store.PHASE_PREDICTED}
+
+    later = NOW + timedelta(minutes=5)
+    counting = notification_store.record_below_threshold(_emit(), now=later)
+    assert counting.status == "counting"
+    assert mirror.open_runs(later) == {created.alert_id: later}
+    assert notification_store.clear_below_threshold(created.alert_id, now=later) is True
+    assert mirror.open_runs(later) == {}
+
+    # And a re-seed off the real documents agrees with what the commits put there, which is what
+    # says the in-memory shortcut and the durable state have not drifted.
+    mirror.reset()
+    mirror.seed(now=later)
+    assert mirror.phases_for(SID, later) == {created.alert_id: notification_store.PHASE_PREDICTED}
+    assert mirror.open_runs(later) == {}
+
+
 def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_ceiling():
     """U5's claim, against a real client, on U6's path.
 
@@ -4870,6 +4904,55 @@ def test_the_open_withdrawal_runs_are_served_whole_environment():
     # A mint closes the run -- both fields, which is what the emit body writes.
     mirror.apply(_state("a1", notification_store.PHASE_CONFIRMED, below_threshold_at=None))
     assert mirror.open_runs(NOW) == {}
+
+
+def test_every_body_that_writes_a_subject_is_declared_mirroring_or_declared_exempt():
+    """U9 step 2, pinned the way `MIRROR_STAMPING_BODIES` is: as a property of the SET.
+
+    The rule is "every body that changes a field the standing set CONSUMES must reach the mirror",
+    and both mistakes are silent. A mirroring body left out means the next cycle reads a phase
+    Firestore no longer holds — a withdrawal never counted, or a `confirmed` mint skipped for a
+    train ET has cancelled. `_sent_body` left IN would put the busiest documents in the hottest
+    loop for no reader, which is exactly the economy that keeps it out of `MIRROR_STAMPING_BODIES`.
+
+    Read off the source, because the case that matters is a body added next year and no
+    behavioural check over today's four could see it. The test is what answers "does the mirror
+    need a periodic re-seed?" with no: the failure mode is not a timing race, it is a forgotten
+    writer, and this is what refuses one.
+    """
+    source = pathlib.Path(notification_store.__file__).read_text()
+    bodies = {}
+    for chunk in source.split("\ndef ")[1:]:
+        name = "_" + chunk.split("(", 1)[0].lstrip("_")
+        bodies[name] = chunk
+    # `_mint` is not named `*_body` and is the most important writer of the four, which is why this
+    # scans every function rather than only the bodies.
+    writers = {
+        name
+        for name, body in bodies.items()
+        if "refs.subject(" in body
+        and ("transaction.set(refs.subject(" in body or "transaction.update(refs.subject(" in body)
+    }
+    assert "_mint" in writers, "the scan stopped seeing the main writer; the spelling changed"
+    declared = set(notification_store.SUBJECT_MIRRORING_BODIES) | set(
+        notification_store.SUBJECT_WRITERS_OUTSIDE_THE_MIRROR
+    )
+    assert writers == declared, (
+        f"bodies writing a subject document are {sorted(writers)}, the declared sets cover "
+        f"{sorted(declared)}. A new one must either reach `_mirror_subject` and be declared in "
+        "SUBJECT_MIRRORING_BODIES, or be declared exempt with the reason."
+    )
+    assert notification_store.SUBJECT_MIRRORING_BODIES.isdisjoint(
+        notification_store.SUBJECT_WRITERS_OUTSIDE_THE_MIRROR
+    ), "a body cannot be both"
+    # And the exemption is not a loophole: the one exempt body must not touch the phase, which is
+    # what makes skipping the mirror safe rather than merely cheap.
+    for exempt in notification_store.SUBJECT_WRITERS_OUTSIDE_THE_MIRROR:
+        patch = bodies[exempt].split("transaction.update(refs.subject(", 1)[1]
+        assert '"phase"' not in patch.split("return", 1)[0], (
+            f"{exempt} writes the phase and is declared exempt from the mirror; the standing set "
+            "would then answer with a phase this process itself has moved"
+        )
 
 
 def test_every_commit_that_moves_a_subject_reaches_the_standing_set():

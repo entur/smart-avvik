@@ -57,7 +57,7 @@ reads included, but a transactional COMMIT carries no timeout at all. Both numbe
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -523,8 +523,8 @@ class _Standing:
 _INCOMPLETE = _Standing(phases={}, complete=False)
 
 
-def _standing(recipients: Sequence[Recipient], now: datetime) -> dict[str, _Standing]:
-    """Which subjects stand, in which phase -- off the mirror, one lookup per subscription.
+def _standing(subscription_ids: Iterable[str], now: datetime) -> dict[str, _Standing]:
+    """Which subjects stand, in which phase -- off the mirror, one lookup per SUBSCRIPTION.
 
     No store read at all since U9, and therefore no per-client failure mode: the whole
     client-scoped query it replaces is gone, along with the truncation that made its answer
@@ -532,20 +532,29 @@ def _standing(recipients: Sequence[Recipient], now: datetime) -> dict[str, _Stan
     the one state that reaches it is an unseeded mirror -- ``sync_mirrors`` runs as its own poller
     step before the pass, so that is the restart window and nothing else.
 
-    ``open_runs`` is asked ONCE and shared: it walks the whole standing set, so per subject it
-    would be quadratic in a structure built to keep the pass linear.
+    **Per subscription and not per recipient**, which is why it takes ids rather than recipients: a
+    subscription watching thirteen disrupted departures appears thirteen times in the fan-out, and
+    ``phases_for`` is a lock, a list copy and a dict build every time -- so asking per recipient
+    would spend twelve of those thirteen answers on a dict comprehension that overwrites them. At
+    100 000 subscriptions on one corridor that is the difference between 100 000 lookups and 1.3
+    million.
+
+    ``open_runs`` is asked ONCE and shared for the same reason, one step further: it walks the
+    whole standing set, so per subscription it would be quadratic in a structure built to keep the
+    pass linear.
     """
     mirror = notification_store.subject_mirror()
+    ids = sorted(set(subscription_ids))
     if not mirror.ready:
-        return {r.subscription_id: _INCOMPLETE for r in recipients}
+        return dict.fromkeys(ids, _INCOMPLETE)
     runs = mirror.open_runs(now)
     return {
-        r.subscription_id: _Standing(
-            phases=mirror.phases_for(r.subscription_id, now),
+        subscription_id: _Standing(
+            phases=mirror.phases_for(subscription_id, now),
             complete=True,
             open_runs=runs,
         )
-        for r in recipients
+        for subscription_id in ids
     }
 
 
@@ -645,7 +654,7 @@ def _run(
     counts: dict[str, int] = {}
     budget = _EmitBudget(max_calls, monotonic() + deadline_s, worst_case_s)
     standing = _standing(
-        [r for observation in observations for r in observation.recipients], now
+        (r.subscription_id for observation in observations for r in observation.recipients), now
     )
     # One lookup per CLIENT per pass, not one per subject. The resolver behind it is a cached
     # account read, but a pass touches tens of thousands of subjects across a handful of clients and
@@ -888,6 +897,8 @@ def emit(
 
 __all__ = [
     "EmitReport",
+    "Recipient",
+    "WebhookObservation",
     "WebhookSubject",
     "emit",
     "requested_phase",
