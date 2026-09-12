@@ -874,6 +874,60 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `backed_off` is its own counter on `webhook_delivery_round`, never folded into `skipped`: "a
   sibling attempt took it out" and "we are waiting exactly as asked" are different operator answers.
 
+  **A claim takes a LEASE, and the outbound client pools connections** (U8, 2026-09-13, KTD14).
+  `claimed_at` was written by `_claim_body` and read by nothing — harmless with one writer, and the
+  whole problem with U11's worker: two workers reading the same pending page both claim, both POST,
+  and the traveller is notified twice, which the receiver's own `event_id` inbox drops and which is
+  exactly why it would never have been noticed from our side. A claim now takes `DELIVERY_LEASE_S`
+  (20 s) and mints a token. **The number is arithmetic, not judgement**: after the claim commits an
+  attempt still reads the event (one Firestore call at 4 s), POSTs it (5 s, 2 s of that the connect)
+  and writes the terminal state (4 s) — 13 s worst case, so the plan's "~15 s" leaves two seconds
+  for signing and scheduling. The token is minted OUTSIDE the transaction for the reason every clock
+  here is read outside one: a body may run more than once, and one minted inside would differ
+  between attempts, so the retry would write a lease its own caller could not prove it holds.
+  `_sent_body` and `_failed_body` compare it, and a mismatch is a THIRD outcome (`lease_lost`) and
+  not a flavour of `already_resolved` — the delivery is not resolved, it is somebody else's. The
+  failure half is the worse one: unguarded, a lapsed holder returning would set a re-claimed
+  delivery back to `pending` and release the live claim's cap slot. Leased rows are filtered out of
+  `pending_deliveries` **in Python**, never in the query: a second inequality would need its own
+  index *and* would exclude every document lacking the field, which on the deploy that introduces it
+  is the whole backlog. `leased` and `lease_lost` are unreachable while there is one writer and say
+  so — they report on U11. `RESERVATION_TTL_S`'s rationale was rewritten and its number was not: its
+  upper half was "shorter than the pass period", which stops holding when delivery has no period, so
+  what bounds a leaked reservation is now the lease and the re-claim behind it.
+  **The pool is the other half.** Twenty thousand POSTs to one receiver were twenty thousand TLS
+  handshakes, inside a 5 s per-attempt ceiling — so the CONNECTION, not the request, was the cost of
+  a bad morning. `webhook_sender` keeps per-host connections with four bounds: one validated
+  resolution per 60 s (KTD9 one layer along — trusting the first answer forever is safe against a
+  rebind and useless against a client moving their endpoint, while re-resolving per request pays a
+  DNS round trip inside the ceiling; a refusal drops the idle set, an open connection finishes,
+  and a resolution that merely MOVES also drops idle so the client's own failover takes effect);
+  idle connections kept 60 s, with a peer-closed pooled connection costing exactly one fresh retry
+  rather than a delivery; in-flight requests per host from the client's `concurrent_deliveries`,
+  which is what stops a wide worker opening a connection per thread against one receiver; and a
+  response that was not drained is never put back, since the leftovers would become the next
+  request's reply. The transport drives `http.client` directly now — `urllib`'s
+  `AbstractHTTPHandler.do_open` opens and closes a connection per call, which is the cost being
+  removed — and everything the opener was chosen for holds by construction rather than by absence
+  (a 3xx is a response this module classifies, nothing reads `https_proxy`, no cookie jar exists).
+  **The socket deadline is armed per REQUEST, not per connect**, which is the bug pooling
+  introduces and does not look like one: a reused connection otherwise carries the first request's
+  deadline, already in the past, `read_timeout` floors it at 50 ms, and every later request times
+  out looking exactly like a receiver that went slow. One thing the plan asked for was deliberately
+  NOT done — see the paragraph below.
+  **`_emit_body` keeps its transactional subscription read**, against the plan's step 2 ("the
+  mirror holds the subscription"). The read feeds exactly one thing, `_subscription_obsolete`, and
+  four of its five checks are redundant with `_claim_body`'s own re-read at dispatch — but the
+  fifth, the VERSION compare, is not: `_claim_body` deliberately does not check version (a version
+  compare there would cancel a still-pending alert on every amendment, which its comment spells
+  out), so emit is the only place R13's version rule is enforced. The mirror is at best as fresh as
+  the sync at the start of this cycle, which is the same snapshot the pass matched against — so
+  reading it here would answer "has this subscription changed since the match?" with the match's own
+  data, and an amendment landing mid-cycle would emit a v1-shaped notification for a v2
+  subscription. The saving is one document read per minted transition; the cost is the only
+  enforcement point of a rule the plan does not otherwise replace. Revisit if the mirror ever syncs
+  inside the pass.
+
   **The R16 prompt-record claim has two halves and only one is closed**, published rather than
   asserted away. A **webhook-only** definition — one absent from `by_journey_key`, which stays
   browser-only for exactly this — is written for through `notification_wording.WEBHOOK`, which

@@ -545,11 +545,13 @@ def test_no_body_that_increments_a_counter_is_retry_sensitive():
         ),
         lambda c: (
             notification_store._Refs(c),
-            lambda t, r: notification_store._claim_body(t, r, delivery_id=_DELIVERY, now=NOW),
+            lambda t, r: notification_store._claim_body(
+                t, r, delivery_id=_DELIVERY, token="tok", lease_s=20.0, now=NOW
+            ),
         ),
         lambda c: (
             notification_store._Refs(c),
-            lambda t, r: notification_store._sent_body(t, r, delivery_id=_DELIVERY, now=NOW),
+            lambda t, r: notification_store._sent_body(t, r, delivery_id=_DELIVERY, token=None, now=NOW),
         ),
         lambda c: (
             notification_store._Refs(c),
@@ -561,6 +563,7 @@ def test_no_body_that_increments_a_counter_is_retry_sensitive():
                 retryable=True,
                 retry_after_s=30,
                 terminal_state="failed",
+                token=None,
                 now=NOW,
             ),
         ),
@@ -686,8 +689,10 @@ def test_the_send_and_claim_bodies_also_read_before_they_write():
     ]
     refs = notification_store._Refs(client)
     for body in (
-        lambda t: notification_store._claim_body(t, refs, delivery_id=delivery_id, now=NOW),
-        lambda t: notification_store._sent_body(t, refs, delivery_id=delivery_id, now=NOW),
+        lambda t: notification_store._claim_body(
+            t, refs, delivery_id=delivery_id, token="tok", lease_s=20.0, now=NOW
+        ),
+        lambda t: notification_store._sent_body(t, refs, delivery_id=delivery_id, token=None, now=NOW),
     ):
         txn = _Txn()
         with _NoClockNoLog():
@@ -2434,6 +2439,131 @@ def _many_pending(client: _FakeClient, n: int) -> list[str]:
     return ids
 
 
+def test_a_live_lease_refuses_a_second_claim_and_lapses_on_its_own():
+    """U8, KTD14: what makes a second delivery worker safe.
+
+    `claimed_at` was written and read by nothing, so two workers reading the same pending page both
+    claimed, both POSTed, and the client got the event twice -- which its own `event_id` inbox drops,
+    which is exactly why it would never have been noticed. The lease is the hold; the token is what
+    proves who has it.
+
+    Three instants, because a hold that never lapses is a delivery nobody can ever retry: inside the
+    lease it is refused, past it a second claim succeeds, and the token it gets is a DIFFERENT one.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    delivery_id = _many_pending(client, 1)[0]
+    first = notification_store.claim_delivery(delivery_id, now=NOW)
+    assert first.status == "ready" and first.token
+    stored = client.doc(notification_store.DELIVERIES, delivery_id)
+    assert stored["claimed_until"] == NOW + timedelta(seconds=notification_store.DELIVERY_LEASE_S)
+
+    inside = notification_store.claim_delivery(delivery_id, now=NOW + timedelta(seconds=5))
+    assert inside.status == "leased" and inside.reason == "lease"
+    assert inside.token is None, "a refused claim holds nothing"
+    # NOTHING was written: the live holder is mid-attempt and this reader has no opinion about it.
+    assert client.doc(notification_store.DELIVERIES, delivery_id) == stored
+
+    past = NOW + timedelta(seconds=notification_store.DELIVERY_LEASE_S + 1)
+    second = notification_store.claim_delivery(delivery_id, now=past)
+    assert second.status == "ready" and second.token and second.token != first.token
+    assert client.doc(notification_store.DELIVERIES, delivery_id)["claim_token"] == second.token
+
+
+def test_a_lapsed_holder_cannot_resolve_a_delivery_that_was_re_claimed():
+    """The other half of the lease, and the half that protects R11's cap.
+
+    A worker whose lease lapsed is not necessarily dead -- it may be slow. If it returns and writes
+    `sent`, it spends one of the traveller's four for an attempt whose outcome nobody knows, and it
+    clears a pending delivery the live holder is still POSTing. The token compare refuses it, and
+    the refusal is its OWN outcome: the delivery is not resolved (so it is not `already_resolved`)
+    and nothing failed (so it is not an error).
+
+    Both terminal writes, because the failure half is the worse one: unguarded it would set a
+    re-claimed delivery back to `pending` with a `retry_not_before` and release the live claim's cap
+    slot.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    delivery_id = _many_pending(client, 1)[0]
+    lapsed = notification_store.claim_delivery(delivery_id, now=NOW)
+    past = NOW + timedelta(seconds=notification_store.DELIVERY_LEASE_S + 1)
+    live = notification_store.claim_delivery(delivery_id, now=past)
+    assert live.status == "ready" and live.token != lapsed.token
+
+    refused = notification_store.mark_delivery_sent(delivery_id, token=lapsed.token, now=past)
+    assert refused.lease_lost is True and refused.already_resolved is False
+    assert refused.slot_spent is False, "and no slot was spent on an outcome nobody knows"
+    assert client.doc(notification_store.DELIVERIES, delivery_id)["state"] == "pending"
+    assert client.doc(notification_store.SUBSCRIPTIONS, SID).get("daily_deliveries", {}) == {}
+
+    failed = notification_store.mark_delivery_failed(
+        delivery_id, error="boom", retryable=True, token=lapsed.token, now=past
+    )
+    assert failed.lease_lost is True
+    assert client.doc(notification_store.DELIVERIES, delivery_id)["claim_token"] == live.token
+
+    # And the LIVE holder resolves it normally, clearing the hold with the state.
+    done = notification_store.mark_delivery_sent(delivery_id, token=live.token, now=past)
+    assert done.lease_lost is False and done.state == "sent" and done.slot_spent is True
+    resolved = client.doc(notification_store.DELIVERIES, delivery_id)
+    assert resolved["claimed_until"] is None and resolved["claim_token"] is None
+
+
+def test_a_leased_delivery_is_not_even_offered_by_the_pending_read():
+    """Filtered in PYTHON on the page, never in the query.
+
+    A second inequality would need its own composite index AND would exclude every document that
+    lacks the field -- which on the deploy that introduces it is all of them, so the whole backlog
+    would become invisible. Filtering here costs a leased row its slot in the scan; filtering there
+    costs the backlog.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    held, free = _many_pending(client, 2)
+    notification_store.claim_delivery(held, now=NOW)
+    client.page(
+        "pending_deliveries",
+        notification_store.DELIVERIES,
+        [client.doc(notification_store.DELIVERIES, d) for d in (held, free)],
+    )
+    offered = notification_store.pending_deliveries(now=NOW + timedelta(seconds=1))
+    assert [d.delivery_id for d in offered.ready] == [free]
+    # And it comes back once the lease lapses, which is what stops a dead holder parking it forever.
+    later = notification_store.pending_deliveries(
+        now=NOW + timedelta(seconds=notification_store.DELIVERY_LEASE_S + 1)
+    )
+    assert sorted(d.delivery_id for d in later.ready) == sorted([held, free])
+
+
+def test_the_lease_is_longer_than_one_attempts_worst_case():
+    """The arithmetic, pinned off the constants rather than restated as a number.
+
+    After the claim commits an attempt still reads the event (one Firestore call), POSTs it, and
+    writes the terminal state (another Firestore call). A lease shorter than that sum would lapse
+    mid-attempt on a healthy pass, and every slow delivery would be re-claimed and sent twice.
+    """
+    # Imported here rather than at module scope: this suite is the STORE's, and a top-level import
+    # of a delivery module would put its import-time surface in every run of it.
+    import webhook_sender
+
+    worst_case = (
+        notification_store._CALL_DEADLINE_S  # the event read
+        + webhook_sender.DEFAULT_TIMEOUT_S  # the POST, connect included
+        + notification_store._CALL_DEADLINE_S  # the terminal write
+    )
+    assert notification_store.DELIVERY_LEASE_S > worst_case, (
+        f"the lease ({notification_store.DELIVERY_LEASE_S}s) must outlast one attempt "
+        f"({worst_case}s), or a healthy pass re-claims its own in-flight deliveries"
+    )
+    # And it is not so long that a dead holder parks a delivery past its own usefulness: an event is
+    # valid for an hour and a pass runs every few minutes.
+    assert notification_store.DELIVERY_LEASE_S < notification_store.RESERVATION_TTL_S
+
+
 def test_a_claim_reserves_the_slot_so_a_concurrent_claim_cannot_read_it_free():
     """R11 could be OVERSPENT, masked by a coincidence.
 
@@ -2579,7 +2709,10 @@ def test_a_cap_exempt_delivery_reserves_nothing():
     assert claim.status == "ready"
     stored = client.doc(notification_store.SUBSCRIPTIONS, SID)
     assert stored["daily_reservations"] == {}, "an exempt claim takes no slot to reserve"
-    # And it is admitted even with the whole day's allowance already spent.
+    # And it is admitted even with the whole day's allowance already spent. PAST THE LEASE the
+    # claim above took (U8): re-claiming the same delivery at the same instant is now refused as
+    # `leased`, which is the lease doing exactly its job -- so the second claim is made after it
+    # lapses, which is also the only shape a real second worker could have.
     client.put(
         notification_store.SUBSCRIPTIONS,
         SID,
@@ -2590,12 +2723,8 @@ def test_a_cap_exempt_delivery_reserves_nothing():
             },
         ),
     )
-    assert (
-        notification_store.claim_delivery(
-            confirmed.delivery_id, now=NOW + timedelta(minutes=1)
-        ).status
-        == "ready"
-    )
+    past_lease = NOW + timedelta(minutes=1, seconds=notification_store.DELIVERY_LEASE_S + 1)
+    assert notification_store.claim_delivery(confirmed.delivery_id, now=past_lease).status == "ready"
 
 
 def test_an_unreadable_cap_counter_grants_no_allowance():

@@ -1459,6 +1459,61 @@ def test_quota_values_outside_their_bounds_are_refused_and_bad_stored_values_rea
         _uninstall()
 
 
+def test_the_delivery_destination_read_is_cached_and_every_writer_invalidates_it():
+    """U8: a worker draining a queue has no pass to hang a cache on.
+
+    `webhook_delivery._Skips` caches the record for one PASS, which is what makes twenty thousand
+    deliveries against four destinations four reads today. U11's worker has no pass boundary, so the
+    window moves here beside the account cache.
+
+    What the test is really about is the invalidation, because the stale value is not a stale
+    boolean: the record carries the SIGNING GENERATIONS, so a rotation whose invalidation was missed
+    keeps signing with a retired key and the receiver refuses deliveries it should accept. Every
+    writer therefore goes through one funnel, and this walks the three an operator actually uses.
+    """
+    store = _install()
+    _provision(store)
+    try:
+        notification_auth.create_destination(
+            "dest-a", client_id=CLIENT, callback_url="https://r.example.com/h", actor="op@entur.org"
+        )
+        first = notification_auth.destination_for_delivery("dest-a")
+        assert first is not None and first.deliverable is True
+        reads = store.reads
+        assert notification_auth.destination_for_delivery("dest-a") is not None
+        assert store.reads == reads, "the second read must come from the cache"
+
+        # A pause must be visible to the very next delivery, not a window later.
+        notification_auth.pause_destination("dest-a", reason="gone")
+        paused = notification_auth.destination_for_delivery("dest-a")
+        assert paused is not None and paused.deliverable is False
+        notification_auth.resume_destination("dest-a", actor="op@entur.org")
+        assert notification_auth.destination_for_delivery("dest-a").deliverable is True
+
+        # And a rotation: the generations the signer reads must be the new ones immediately.
+        before = notification_auth.destination_for_delivery("dest-a").signing_generations
+        notification_auth.rotate_signing_generation("dest-a", actor="op@entur.org")
+        after = notification_auth.destination_for_delivery("dest-a").signing_generations
+        assert after != before, "a rotation the cache hid would sign with a retired key"
+
+        # `get_destination` is deliberately NOT cached: an operator looking at what they just
+        # changed must see it, and this path is not the hot one.
+        assert "destination_for_delivery" in AUTH_SOURCE
+        reads = store.reads
+        notification_auth.get_destination("dest-a")
+        notification_auth.get_destination("dest-a")
+        assert store.reads - reads == 2, "the operator-facing read stays read-your-writes"
+
+        # A MISSING record is cached too, or a destination that has gone costs one read per
+        # pending event rather than one per window.
+        assert notification_auth.destination_for_delivery("nobody") is None
+        reads = store.reads
+        assert notification_auth.destination_for_delivery("nobody") is None
+        assert store.reads == reads
+    finally:
+        _uninstall()
+
+
 def test_quotas_for_answers_off_the_same_cached_account_read():
     """The emit and delivery passes hold a `client_id` and no Principal (U7).
 
@@ -1492,10 +1547,10 @@ def test_quotas_for_answers_off_the_same_cached_account_read():
 def test_the_three_delivery_quotas_are_bounded_and_seeded_from_the_constants():
     """U7's new fields, each with the constant it defaults to.
 
-    `concurrent_deliveries` is the one that is DECLARED AND UNREAD until U8 gives `webhook_sender`
-    its per-host pool. It is here now so one `set-quotas` shape serves the whole unit rather than
-    changing under a client mid-plan -- and asserting it exists is what stops it being quietly
-    dropped before the code that spends it arrives.
+    `concurrent_deliveries` was declared and unread in U7 and is spent by U8's pooled sender: the
+    delivery pass reads it per client and hands it to `webhook_sender.deliver`, which bounds
+    concurrent requests to one host by it. Declaring it a unit early was so that one `set-quotas`
+    shape served the whole plan rather than changing under a client mid-way.
     """
     defaults = notification_auth.DEFAULT_QUOTAS
     assert defaults.max_pending_events == notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
@@ -1506,9 +1561,12 @@ def test_the_three_delivery_quotas_are_bounded_and_seeded_from_the_constants():
     for name in ("max_pending_events", "deliveries_per_minute", "concurrent_deliveries"):
         low, high = notification_auth.QUOTA_BOUNDS[name]
         assert low == 1 and high >= getattr(defaults, name), name
+    # READ since U8, and asserted as such: the pooled sender bounds concurrent requests to one
+    # host by it. This assertion was the opposite until that landed, which is what made the wiring
+    # trip a test rather than slip in unnoticed.
     delivery_source = (HERE / "webhook_delivery.py").read_text()
-    assert "concurrent_deliveries" not in delivery_source, (
-        "still unread -- the pooled sender that spends it is U8"
+    assert "concurrent_deliveries" in delivery_source, (
+        "the delivery pass must spend this quota, or it is a number nobody applies"
     )
 
 
