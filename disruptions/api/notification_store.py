@@ -141,11 +141,6 @@ MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT = 500
 #: that is supposed to seed the mirror. And a document nothing writes is never re-read, which is
 #: the point: a `sent` mark must not cost a sync.
 MIRROR_FIELD = "mirror_updated_at"
-# What one poller cycle may READ. R21 says the per-cycle read cannot exceed the ceiling, and this is
-# literally the query's `limit`. It must stay at or below `varsel._MAX_WEBHOOK_RECIPIENTS`, which
-# bounds the same read one layer out; `test_the_cycle_ceiling_does_not_exceed_varsels_own` parses
-# that constant out of varsel.py rather than trusting the two to be edited together.
-MAX_SUBSCRIPTIONS_PER_CYCLE = 2000
 # Pending events per destination. Enforced with a bounded count BEFORE the emit transaction rather
 # than inside it, which is exact rather than best-effort for one reason that is nameable instead of
 # hoped for: the emit path has exactly one writer (KTD6 -- one poller thread, no route invokes the
@@ -798,31 +793,6 @@ class QuerySpec:
 
 
 QUERY_SPECS: tuple[QuerySpec, ...] = (
-    QuerySpec(
-        name="load_active_subscriptions",
-        collection=SUBSCRIPTIONS,
-        # `channel` since U5, and it is a PRECONDITION rather than an optimisation: U12-U14 move
-        # /varsel's own registrations into this collection as `web_push` documents, and without the
-        # equality the poller's webhook load would pick every one of them up and hand it to
-        # `varsel._parse_webhook_recipient` as a client subscription. Filtered in the QUERY and not
-        # after the fact because this page is bounded by a ceiling -- a Python-side test would let
-        # the browser majority fill the page and truncate the webhook recipients out of it.
-        #
-        # The equality is safe on today's data because every document `_new_subscription_doc` has
-        # ever written carries the field; checked rather than assumed on 2026-09-12, 18 of 18 in dev
-        # and 0 in prd. That check matters more than it looks: Firestore's equality filter does not
-        # match a document that LACKS the field, so a collection with pre-field documents would see
-        # them silently vanish from the load rather than fail.
-        equality=("status", "channel"),
-        # `expires_at` DESCENDING, and the direction is load-bearing. Expiry is tested in PYTHON
-        # (see `subscription_is_live`), so an expired-but-not-yet-deleted document is still returned
-        # by this query and discarded after the fact. Ordered ascending, a page truncated at the
-        # per-cycle ceiling would keep exactly the rows closest to expiry -- the dead ones -- and
-        # starve live subscriptions. Descending puts the furthest-from-expiry first, so truncation
-        # sheds dead rows before live ones.
-        order_by=(("expires_at", "DESCENDING"),),
-        why="the poller's one client read per cycle",
-    ),
     QuerySpec(
         name="mirror_seed",
         collection=SUBSCRIPTIONS,
@@ -2429,49 +2399,6 @@ def sync_mirrors(
     return report
 
 
-def active_subscriptions(
-    *,
-    limit: int = MAX_SUBSCRIPTIONS_PER_CYCLE,
-    now: datetime | None = None,
-    channel: str = CHANNEL_WEBHOOK,
-) -> LoadedSubscriptions:
-    """Every live subscription in this environment, bounded by R21's per-cycle ceiling.
-
-    The single read the notification pass depends on. Three things it reports rather than hides:
-    ``truncated`` (the ceiling bound the page, which at a pilot's volume is a store bug or a quota
-    breach rather than growth), ``expired`` (documents TTL has not caught up with -- the cost of
-    testing expiry in Python instead of in the query, and the reason the query orders by
-    ``expires_at`` DESCENDING) and ``skipped`` (documents this binary cannot read, skipped one at a
-    time so one bad document never fails its collection -- R20).
-    """
-    instant = now or _now()
-    ceiling = min(limit, MAX_SUBSCRIPTIONS_PER_CYCLE)
-    query = _query(
-        "load_active_subscriptions",
-        equality={"status": "active", "channel": channel},
-        limit=ceiling,
-    )
-    page = _stream(query)
-    out: list[Subscription] = []
-    skipped = expired = 0
-    for snapshot in page:
-        stored = _doc(snapshot)
-        if not subscription_is_live(stored, instant):
-            expired += 1
-            continue
-        try:
-            out.append(_subscription_from_doc(stored))
-        except Exception:
-            skipped += 1
-            logger.debug("Unreadable webhook subscription document; skipping it", exc_info=True)
-    return LoadedSubscriptions(
-        subscriptions=tuple(out),
-        truncated=len(page) >= ceiling,
-        skipped=skipped,
-        expired=expired,
-    )
-
-
 def recipient_documents() -> list[dict[str, Any]]:
     """``varsel.WebhookRecipientProvider``: the raw documents this cycle should match.
 
@@ -2491,14 +2418,15 @@ def recipient_documents() -> list[dict[str, Any]]:
     ordinary state and this is the restart window only.
     """
     instant = _now()
-    if not _subscription_mirror.ready:
+    mirror = subscription_mirror()
+    if not mirror.ready:
         logger.warning(
             "The subscription mirror has not finished loading; no webhook recipient is matched on "
             "this cycle",
             extra={"fields": {"event": "notification_store_load", "result": "mirror_not_ready"}},
         )
         return []
-    entries = _subscription_mirror.recipients(instant)
+    entries = mirror.recipients(instant)
     # The servability re-check runs later in the SAME cycle and walks every live subscription too.
     # Stamping the mirror's own read here is what lets it reuse this one instead of reading for
     # itself -- the arrangement that existed before the mirror, kept, because the re-check still
@@ -2512,13 +2440,13 @@ def recipient_documents() -> list[dict[str, Any]]:
     logger.debug(
         "Webhook subscription load from the mirror: %d live of %d held",
         len(entries),
-        _subscription_mirror.size(),
+        mirror.size(),
         extra={
             "fields": {
                 "event": "notification_store_load",
                 "result": "mirror",
                 "n": len(entries),
-                "mirror_size": _subscription_mirror.size(),
+                "mirror_size": mirror.size(),
             }
         },
     )
@@ -4271,16 +4199,20 @@ __all__ = [
     "EventCommit",
     "Forbidden",
     "LoadedSubscriptions",
+    "MirrorEntry",
+    "MirrorSync",
     "NotConfigured",
     "NotFound",
     "NotificationStoreError",
     "PendingDeliveries",
     "QuerySpec",
     "QuotaExceeded",
+    "StandingSubject",
+    "SubjectMirror",
     "Subscription",
+    "SubscriptionMirror",
     "SubscriptionSpec",
     "TrainRef",
-    "active_subscriptions",
     "alert_subject_id",
     "cap_remaining",
     "claim_delivery",

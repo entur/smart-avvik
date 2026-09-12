@@ -768,26 +768,23 @@ def test_the_create_count_sheds_dead_rows_before_live_ones():
         raise AssertionError("a page that is live rows up to the ceiling must refuse")
 
 
-def test_the_per_cycle_load_is_bounded_by_the_ceiling_and_reports_truncation():
-    client = _FakeClient()
-    _install(client)
-    rows = [_live_doc(subscription_id=f"s{i}") for i in range(5)]
-    client.page("load_active_subscriptions", notification_store.SUBSCRIPTIONS, rows)
-    loaded = notification_store.active_subscriptions(limit=3, now=NOW)
-    assert len(loaded.subscriptions) == 3
-    assert loaded.truncated is True
-    _name, _eq, _ineq, limit = client.query_calls[-1]
-    assert limit == 3
-    # A request for more than R21's ceiling is clamped to it, not honoured.
-    notification_store.active_subscriptions(limit=10**6, now=NOW)
-    assert client.query_calls[-1][3] == notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE
+def test_neither_two_thousand_ceiling_survives_u6():
+    """R21's per-cycle read ceiling and varsel's count ceiling both go with the full read.
 
+    They bounded the same read from two layers and had to be edited together, which is why a test
+    parsed one constant out of the other module's source. The mirror reads the collection once, at
+    startup, paged with a cursor -- so there is no per-cycle read to bound, and a ceiling left
+    behind would silently cap the mirror at 2 000 subscriptions instead.
 
-def test_the_cycle_ceiling_does_not_exceed_varsels_own():
-    """The same read is bounded one layer out, and the two must not drift apart."""
-    match = re.search(r"_MAX_WEBHOOK_RECIPIENTS\s*=\s*(\d+)", VARSEL_SOURCE)
-    assert match, "varsel._MAX_WEBHOOK_RECIPIENTS not found -- was it renamed?"
-    assert notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE <= int(match.group(1))
+    Asserted as ABSENCE from both modules, not as a changed value: a ceiling that survives as a
+    number nobody applies is the shape this repo has been bitten by before.
+    """
+    assert not hasattr(notification_store, "MAX_SUBSCRIPTIONS_PER_CYCLE")
+    assert not hasattr(notification_store, "active_subscriptions")
+    assert "_MAX_WEBHOOK_RECIPIENTS" not in VARSEL_SOURCE
+    # And the query they bounded is gone too, with its index: an index paid for on every write with
+    # no reader is what `test_every_checked_in_index_belongs_to_a_query...` exists to refuse.
+    assert not any(spec.name == "load_active_subscriptions" for spec in notification_store.QUERY_SPECS)
 
 
 def test_a_destination_past_the_pending_event_ceiling_cannot_emit():
@@ -938,9 +935,9 @@ def test_an_expired_subscription_is_neither_live_nor_loaded():
         notification_store.SUBSCRIPTIONS,
         [_live_doc(subscription_id="live"), dict(idle, subscription_id="idle")],
     )
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["live"]
-    assert loaded.expired == 1
+    _seed_mirror(client, [_live_doc(subscription_id="live"), dict(idle, subscription_id="idle")])
+    live = notification_store.subscription_mirror().recipients(NOW)
+    assert [e.subscription_id for e in live] == ["live"]
 
 
 def test_an_expired_subscription_cannot_be_replaced_touched_or_emitted_for():
@@ -1214,9 +1211,11 @@ def test_an_unreadable_document_is_skipped_rather_than_failing_its_collection():
             },
         ],
     )
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["good"]
-    assert loaded.skipped == 1
+    _seed_mirror(client, client.pages["load_active_subscriptions"] and [
+        row for _path, row in client.pages["load_active_subscriptions"]
+    ])
+    live = notification_store.subscription_mirror().recipients(NOW)
+    assert [e.subscription_id for e in live] == ["good"]
 
 
 # ---- Scenario 7: an exhausted transaction is retryable ----------------------------------------
@@ -1639,25 +1638,6 @@ def test_every_index_entry_has_the_fields_the_for_each_reads():
             assert spec_field["order"] in ("ASCENDING", "DESCENDING")
             # Known provider drift: an explicit __name__ field causes recreate loops.
             assert spec_field["fieldPath"] != "__name__"
-
-
-def test_the_load_query_sheds_dead_rows_before_live_ones():
-    """`expires_at` DESCENDING is load-bearing, not cosmetic.
-
-    Expiry is tested in Python, so an expired-but-not-deleted document is still returned by this
-    query. Ordered ascending, a page truncated at the per-cycle ceiling would keep exactly the rows
-    closest to expiry -- the dead ones -- and starve live subscriptions.
-    """
-    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "load_active_subscriptions")
-    assert spec.order_by == (("expires_at", "DESCENDING"),)
-    # The index the ordering needs, with U5's `channel` equality ahead of it. Firestore serves a
-    # query from an index whose equality fields match and whose first ordering is the range field,
-    # so adding the equality REPLACES this index rather than adding one beside it -- the reason the
-    # PR's terraform plan shows a destroy and a create per changed query, not two creates.
-    assert (
-        notification_store.SUBSCRIPTIONS,
-        (("status", "ASCENDING"), ("channel", "ASCENDING"), ("expires_at", "DESCENDING")),
-    ) in _declared_indexes()
 
 
 def test_every_collection_group_has_exactly_one_ttl_field():
@@ -2965,26 +2945,24 @@ def test_installing_the_fake_twice_still_restores_the_real_functions():
 
 
 def test_every_firestore_call_carries_its_own_deadline():
-    """KTD6 requires a per-CALL deadline, and the poller's wait is not one.
+    """KTD6 requires a per-CALL deadline, and it is now the ONLY bound on this module's reads.
 
-    ``varsel._WEBHOOK_LOAD_TIMEOUT_S`` bounds how long the ingestion thread WAITS on a worker; a
-    worker parked past it is abandoned, not killed, because Python cannot cancel a thread inside a
-    socket read. An abandoned thread is not free -- ``concurrent.futures.thread`` registers an atexit
-    hook that JOINS its workers, so a store call with no deadline of its own delays pod termination
-    by however long it hangs. That is what this deadline stops.
+    Until U6 there was a second one: `varsel._WEBHOOK_LOAD_TIMEOUT_S` bounded how long the ingestion
+    thread waited on a worker wrapping the per-cycle load, with the worker abandoned rather than
+    killed past it. That whole arrangement went with the per-cycle read -- the pass reads an
+    in-memory mirror now, so there is no socket in its path -- which makes the per-call deadline
+    load-bearing on its own rather than as the inner of two.
 
     Checked two ways, because either alone is weak. Statically: no read in the module reaches the
     client without ``timeout=``. Dynamically: the fake's ``get``/``stream``/``count`` all ASSERT the
     kwarg, so every path the suite exercises would fail rather than silently lose its deadline --
     which is why this is also the reason those fakes assert instead of accepting ``**kwargs``.
     """
-    assert 0 < notification_store._CALL_DEADLINE_S < 5.0, (
-        "it must sit under varsel._WEBHOOK_LOAD_TIMEOUT_S so a hung call surfaces as this "
-        "module's own retryable DeadlineExceeded rather than as the caller's timeout"
+    assert 0 < notification_store._CALL_DEADLINE_S < 5.0
+    assert "_WEBHOOK_LOAD_TIMEOUT_S" not in VARSEL_SOURCE, (
+        "the pass's wait outlived the read it bounded; a wait around an in-memory call is a "
+        "deadline that can never fire, which reads as a bound and is not one"
     )
-    varsel_wait = re.search(r"_WEBHOOK_LOAD_TIMEOUT_S\s*=\s*([0-9.]+)", VARSEL_SOURCE)
-    assert varsel_wait, "varsel._WEBHOOK_LOAD_TIMEOUT_S not found -- was it renamed?"
-    assert notification_store._CALL_DEADLINE_S < float(varsel_wait.group(1))
     # Every read site. `.get(` also matches the aggregation's and the dataclass helpers', so the
     # test is over the READ calls the module makes on a ref, a query or an aggregation.
     reads = re.findall(
@@ -3344,7 +3322,14 @@ def emulator_test_the_subscription_round_trip_survives_the_real_client():
     assert client is not None
 
 
-def emulator_test_the_load_query_returns_only_live_subscriptions():
+def emulator_test_the_mirror_seed_holds_only_live_subscriptions():
+    """U6, against a real client. The seed reads EVERYTHING and liveness is applied on the read.
+
+    The three cases that have to come out differently, and none of which the fake can produce: a
+    live subscription, one past its inactivity horizon that TTL has not deleted yet, and a
+    tombstone. The seed's query filters none of them -- it cannot, because a tombstone written
+    during the seed has to be learned about -- so what separates them is entirely Python.
+    """
     _emulator_setup()
     notification_store.create_subscription(_spec(subscription_id="live"), now=NOW)
     notification_store.create_subscription(
@@ -3352,37 +3337,36 @@ def emulator_test_the_load_query_returns_only_live_subscriptions():
     )
     notification_store.create_subscription(_spec(subscription_id="gone"), now=NOW)
     notification_store.delete_subscription("gone", client_id=CLIENT, now=NOW)
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["live"]
-    # The idle one was returned by the query and dropped by the reader: TTL has not run.
-    assert loaded.expired == 1
-    documents = notification_store.recipient_documents()
-    assert [d["recipient_id"] for d in documents] == ["live"]
+
+    mirror = notification_store.subscription_mirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 3, "the seed reads every document, live or not"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["live"]
+    assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["live"]
 
 
 def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_ceiling():
-    """U5, against a real client rather than the fake.
+    """U5's claim, against a real client, on U6's path.
 
-    The emulator tracks no composite indexes, so this cannot prove the production index exists --
-    that is `test_every_query_in_the_module_has_a_checked_in_index`'s job, and the reason it exists.
-    What it DOES prove is the half a static check cannot: that the equality is really in the query
-    the client builds, that a `web_push` document is therefore not returned to the poller, and that
-    the client's webhook ceiling is not spent by one.
+    The channel filter moved from the load QUERY to the mirror's Python when the query went, and
+    the claim did not change: a `web_push` document is not handed to the poller as a webhook
+    recipient, and it does not spend the client's webhook ceiling. The ceiling half still goes
+    through a real query with a real equality, which is the half a static check cannot reach.
     """
     _emulator_setup()
     notification_store.create_subscription(_spec(subscription_id="client-sub"), now=NOW)
     notification_store.create_subscription(
         _spec(subscription_id="browser-sub", channel=notification_store.CHANNEL_WEB_PUSH), now=NOW
     )
-    loaded = notification_store.active_subscriptions(now=NOW)
-    assert [s.subscription_id for s in loaded.subscriptions] == ["client-sub"]
+    mirror = notification_store.subscription_mirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 2, "one mirror holds both channels -- which is what U12 needs"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["client-sub"]
     assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["client-sub"]
 
-    # The same collection, asked the other way: the browser document is there and readable.
-    on_browser = notification_store.active_subscriptions(
-        now=NOW, channel=notification_store.CHANNEL_WEB_PUSH
-    )
-    assert [s.subscription_id for s in on_browser.subscriptions] == ["browser-sub"]
+    # The same mirror, asked the other way: the browser document is there and readable.
+    on_browser = mirror.recipients(NOW, channel=notification_store.CHANNEL_WEB_PUSH)
+    assert [e.subscription_id for e in on_browser] == ["browser-sub"]
 
     # And the ceiling, with the one arrangement that DISCRIMINATES. The client holds two documents
     # and a ceiling of two, so an unfiltered count refuses the next create; counted per channel it
@@ -4001,22 +3985,24 @@ def test_the_watermark_field_is_the_stores_clock_and_advances_on_each_write():
         )
 
 
-def test_the_two_bounded_subscription_queries_filter_on_the_channel():
-    """U5. Both are per-CHANNEL questions and neither said so before.
+def test_the_create_ceiling_is_counted_per_channel():
+    """U5's surviving half. U6 took the other one with the query it filtered.
 
-    The load is bounded by a ceiling, so a Python-side test would let a `web_push` majority fill the
-    page and truncate the webhook recipients out of it; and a client's ceiling is its webhook
-    ceiling, which a traveller's own registration must not spend. Asserted on the specs rather than
-    on a fake query because `_query` builds every filter from them -- `test_every_filter_goes_
-    through_the_query_helper` is what makes that true.
+    The load query is gone -- the mirror holds every channel and filters in Python -- so the only
+    place a `channel` equality is still load-bearing is the client's create-time ceiling, which is
+    its WEBHOOK ceiling and must not be spent by a traveller's own registration (U12-U14). Asserted
+    on the spec rather than on a fake query because `_query` builds every filter from the specs;
+    `test_every_filter_goes_through_the_query_helper` is what makes that true.
     """
     specs = {spec.name: spec for spec in notification_store.QUERY_SPECS}
-    assert "channel" in specs["load_active_subscriptions"].equality
     assert "channel" in specs["subscription_count"].equality
     # The listing is deliberately NOT in that set: a client lists what it created, and until U13
-    # everything it can create is a webhook. Adding the equality here would need a fourth index for
+    # everything it can create is a webhook. Adding the equality here would need another index for
     # no question anybody asks.
     assert "channel" not in specs["subscriptions"].equality
+    # And the mirror's own two queries filter nothing, which is what lets one mirror serve both
+    # channels when U12 puts /varsel's registrations in this collection.
+    assert specs["mirror_seed"].equality == () and specs["mirror_sync"].equality == ()
 
 
 def test_the_served_list_grows_with_the_clients_cap_and_never_shrinks_below_the_default():

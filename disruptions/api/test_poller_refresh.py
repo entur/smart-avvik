@@ -474,7 +474,7 @@ def test_the_notification_webhooks_flag_is_an_allow_list_with_unset_off():
             assert main._notification_webhooks_enabled() is want, value
 
 
-def test_the_webhook_channel_adds_exactly_two_rebuild_phases_after_the_alerting_step():
+def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerting_step():
     """U6: the cycle gains `notification_webhooks`, and AE13's second clause adds `notification_servability`.
 
     Two halves of this were settled by U2 and by U6 respectively, and the difference matters.
@@ -491,7 +491,13 @@ def test_the_webhook_channel_adds_exactly_two_rebuild_phases_after_the_alerting_
     also gives the Verification Contract's cycle-budget row a real `poller_phase` reading, which is
     the same number KTD6's reversal trigger is stated in.
 
-    The **servability re-check** (R6, AE13's second clause) is a THIRD phase and not a fold into
+    The **mirror sync** (U6) is its own phase AHEAD of `varsel_notify`, and both halves of that
+    matter. Its own, because the pass reads the mirror from memory: a slow store now costs the
+    mirror its freshness rather than costing the pass its cycle, and those are different failures
+    with different responses that one phase's `ms` could not tell apart. Ahead, because a mirror
+    synced after the pass would serve every cycle the population of the one before.
+
+    The **servability re-check** (R6, AE13's second clause) is a FOURTH phase and not a fold into
     either neighbour. Not into `varsel_recheck_service`, whose analogue it is, because a Firestore
     read inside the browser phase blurs both the timing attribution and KTD6's ordering guarantee.
     And not into `notification_webhooks`, because that phase's `ms` is what KTD6's reversal trigger
@@ -523,10 +529,16 @@ def test_the_webhook_channel_adds_exactly_two_rebuild_phases_after_the_alerting_
         "call_predictions_cache",
         "varsel_stops",
         "varsel_recheck_service",
+        "notification_mirror",
         "varsel_notify",
         "notification_webhooks",
         "notification_servability",
     ), phases
+    # `notification_mirror` is BEFORE `varsel_notify`, and the order is the assertion. The pass
+    # reads the store's mirror, so a mirror synced after it would serve every cycle the population
+    # of the one before -- a whole cycle's lag on every create, replace and revocation, with
+    # nothing anywhere that looks wrong.
+    assert phases.index("notification_mirror") < phases.index("varsel_notify"), phases
     # And the alerting step is still isolated exactly as it was: its own try/except, so a client
     # store outage inside it degrades alerting alone and the feed rebuild above it is untouched.
     # `_phase` re-raises by design (test_phase_does_not_swallow_the_exception), so the try/except
