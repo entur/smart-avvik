@@ -922,6 +922,48 @@ def test_the_delivery_set_is_bounded_per_cycle_and_per_destination():
     assert [d.valid_until for d in pending.ready] == sorted(d.valid_until for d in pending.ready)
 
 
+def test_the_per_destination_attempt_ceiling_is_the_clients_own():
+    """U7: a client at a hundred thousand subscriptions is not bounded by the pilot's 50.
+
+    The counter stays per DESTINATION -- two destinations of one client each spend their own
+    allowance, which is what stops one bad endpoint eating the other's -- while the CEILING is read
+    from the client's account, because a quota is a property of an account and not of a callback
+    URL. Asked once per client per pass: a page can hold hundreds of one client's deliveries and the
+    lookup behind it is a cached account read rather than a free one.
+    """
+    client = _FakeClient()
+    _install(client)
+    rows = [
+        {
+            "delivery_id": f"d{i:03d}",
+            "event_id": f"d{i:03d}",
+            "alert_id": "a",
+            "subscription_id": SID,
+            "subscription_version": 1,
+            "client_id": CLIENT,
+            "destination_id": DEST,
+            "state": "pending",
+            "attempts": 0,
+            "retry_not_before": NOW - timedelta(seconds=1),
+            "valid_until": NOW + timedelta(minutes=30 + i),
+            notification_store.TTL_FIELD: NOW + timedelta(days=7),
+            "situations": ["ENT:1"],
+        }
+        for i in range(notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE + 5)
+    ]
+    client.page("pending_deliveries", notification_store.DELIVERIES, rows)
+    asked: list[str] = []
+    raised = notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE + 3
+    pending = notification_store.pending_deliveries(
+        per_destination_limit=lambda client_id: (asked.append(client_id), raised)[1], now=NOW
+    )
+    assert len(pending.ready) == raised, (
+        "the ceiling must be the client's, not the module constant"
+    )
+    assert pending.throttled == (DEST,), "and it must still bind above it"
+    assert asked == [CLIENT], "asked once per client, not once per delivery"
+
+
 def test_a_stuck_destinations_backlog_cannot_starve_another_clients_deliveries():
     """Two destinations, one backlog. X holds more pending rows than a page, all sorting first by
     retry order because nothing ever advances them (paused after a 410, or skipped for the rest of

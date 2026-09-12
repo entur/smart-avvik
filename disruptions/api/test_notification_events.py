@@ -993,7 +993,9 @@ def test_a_destination_at_its_pending_ceiling_is_skipped_for_the_rest_of_the_ste
         _live(client)
         real = notification_store._count_destination_deliveries
         notification_store._count_destination_deliveries = (  # type: ignore[assignment]
-            lambda destination_id, *, state: notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
+            # Written to the store's EXACT arity, `ceiling` included: a stub narrower than the
+            # call site fails with a TypeError that reads like a bug in the code under test.
+            lambda destination_id, *, state, ceiling: ceiling
         )
         subjects = [
             _subject(journey_ref=f"DatedServiceJourney:{5000 + i}") for i in range(4)
@@ -1117,6 +1119,57 @@ def test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger():
     assert notification_events._EMIT_DEADLINE_S < notification_events._EMIT_WAIT_S, (
         "the reservation must bind before the backstop, or the backstop is the only bound"
     )
+
+
+def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
+    """U7: one client at a hundred thousand subscriptions is not bounded by the pilot's 500.
+
+    Two properties, and the second is what makes the first affordable. The ceiling the store
+    compares against is whatever the resolver answered for that subject's client -- so a raised
+    quota raises the ceiling, and a client's own backlog cannot be refused on another client's
+    behalf. And the resolver is consulted once per CLIENT per pass rather than once per subject: a
+    bad morning is tens of thousands of subjects across a handful of clients, and the answer behind
+    it is a cached account read, which is cheap but not free.
+
+    The resolver is a CALLABLE rather than an import for a reason this suite pins one test below:
+    the answer lives in `notification_auth`, and the exact-import set is what keeps this module
+    light enough for CI to run it in its own process.
+    """
+    client = _install()
+    try:
+        _live(client)
+        asked: list[str] = []
+        seen: list[int] = []
+        real = notification_store._count_destination_deliveries
+
+        def _counted(destination_id: str, *, state: str, ceiling: int) -> int:
+            seen.append(ceiling)
+            # One under the ceiling, so the emit proceeds and the NEXT one would not.
+            return ceiling - 1
+
+        notification_store._count_destination_deliveries = _counted  # type: ignore[assignment]
+        subjects = [_subject(journey_ref=f"DatedServiceJourney:{6000 + i}") for i in range(3)]
+        report = notification_events.emit(
+            subjects,
+            now=NOW,
+            pending_quota=lambda client_id: (asked.append(client_id), 9_999)[1],
+        )
+        assert report.created == 3, report
+        assert seen == [9_999, 9_999, 9_999], "the client's own ceiling reached the store"
+        assert asked == [subjects[0].client_id], "asked once per client, not once per subject"
+
+        # And with no resolver the module constant stands, which is what every caller that does not
+        # care about quotas gets.
+        seen.clear()
+        notification_events.emit(
+            [_subject(journey_ref="DatedServiceJourney:6100")], now=NOW
+        )
+        assert seen == [notification_store.MAX_PENDING_EVENTS_PER_DESTINATION], (
+            "with no resolver the store resolves its own constant, at call time"
+        )
+    finally:
+        notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+        _uninstall()
 
 
 def test_the_module_imports_neither_varsel_nor_main():

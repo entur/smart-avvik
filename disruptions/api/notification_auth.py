@@ -158,6 +158,12 @@ _ACCOUNT_MAX = 1_000
 #: `Retry-After` on a limiter rejection. Bounded, and bounded small: the window is 60 s, so telling
 #: a caller to come back later than that would be a longer outage than the limiter causes.
 RETRY_AFTER_S = 60
+#: Concurrent in-flight POSTs to one destination, per worker replica. The default is
+#: `webhook_delivery._WORKERS` -- stated here as a literal rather than imported, because that module
+#: imports this one and the reverse edge would be a cycle. Pinned to it by
+#: `test_webhook_delivery.test_the_concurrency_default_is_the_pools_own_width`, so the two cannot
+#: drift apart silently.
+DEFAULT_CONCURRENT_DELIVERIES = 4
 
 # ---- Per-client quotas ------------------------------------------------------------------------
 #
@@ -192,10 +198,31 @@ RETRY_AFTER_S = 60
 #                             it there, so the delivery pass needs no second lookup), which means a
 #                             change reaches a subscription the next time the client writes it --
 #                             the idempotent re-PUT included.
+#   max_pending_events        bounded at 10 000. What one DESTINATION may hold undelivered before
+#                             emit refuses it, and the number that stops a backlogged client from
+#                             filling the collection. It was the constant
+#                             `notification_store.MAX_PENDING_EVENTS_PER_DESTINATION` (500), sized
+#                             for a pilot at a few hundred subscriptions; a client at a hundred
+#                             thousand reaches 500 pending events on an ordinary bad morning and
+#                             would be refused for the rest of it.
+#   deliveries_per_minute     bounded at 10 000. Delivery ATTEMPTS one destination may be given in
+#                             one pass. Per minute rather than per pass because a pass is what U11
+#                             takes away: while delivery runs on the poller thread there is at most
+#                             one pass a cycle and a cycle is minutes, so this is a stated upper
+#                             bound the pass cannot exceed rather than a rate anything meters. U11's
+#                             worker makes it literal.
+#   concurrent_deliveries     bounded at 64, and per WORKER REPLICA -- the only quota here that is
+#                             not a property of the client alone, which is why it says so. DECLARED
+#                             AND UNREAD until U8 gives `webhook_sender` a per-host connection pool;
+#                             it is here now so that one `set-quotas` shape serves the whole unit
+#                             rather than changing under a client mid-plan.
 QUOTA_BOUNDS: dict[str, tuple[int, int]] = {
     "max_active_subscriptions": (1, 200_000),
     "requests_per_minute": (1, 10_000),
     "daily_cap": (1, 1_000),
+    "max_pending_events": (1, 10_000),
+    "deliveries_per_minute": (1, 10_000),
+    "concurrent_deliveries": (1, 64),
 }
 
 
@@ -206,6 +233,9 @@ class Quotas:
     max_active_subscriptions: int = notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
     requests_per_minute: int = PER_CLIENT_PER_MIN
     daily_cap: int = notification_store.MAX_ALERT_DELIVERIES_PER_DAY
+    max_pending_events: int = notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
+    deliveries_per_minute: int = notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE
+    concurrent_deliveries: int = DEFAULT_CONCURRENT_DELIVERIES
 
     def validate(self) -> None:
         for name, (low, high) in QUOTA_BOUNDS.items():
@@ -766,6 +796,26 @@ def _account_state(client_id: str, now: float) -> tuple[str | None, Quotas]:
     return status, quotas
 
 
+def quotas_for(client_id: str) -> Quotas:
+    """One client's ceilings, off the same cached account lookup a request pays for.
+
+    For the two callers that hold a ``client_id`` and no :class:`Principal`: the emit pass and the
+    delivery pass, neither of which runs on a request. It shares :data:`_accounts` with
+    :func:`authenticate`, so a busy client's quotas are read once per :data:`_ACCOUNT_TTL_S` across
+    both paths rather than once per event -- which is what makes a per-client ceiling affordable
+    inside a pass that touches tens of thousands of them.
+
+    A client with no account reads the DEFAULTS rather than raising. That is the same direction
+    :func:`_quotas_from_doc` fails in and for the same reason: these are ceilings on work we are
+    already doing for a subscription that exists, so an unreadable account must not decide that the
+    work is unbounded, and it must not decide that it is forbidden either -- authentication is what
+    answers "may this client be here at all", and it answered that before the subscription was
+    written.
+    """
+    _status, quotas = _account_state(client_id, _monotonic())
+    return quotas
+
+
 # The store's own coercion, not a copy of it: both modules read documents the same three writers
 # produce (the client's ``DatetimeWithNanoseconds``, a plain possibly-naive ``datetime``, an ISO-8601
 # string from a hand-repaired document), and a second implementation was a second place for those
@@ -1002,6 +1052,9 @@ def set_client_quotas(
     max_active_subscriptions: int | None = None,
     requests_per_minute: int | None = None,
     daily_cap: int | None = None,
+    max_pending_events: int | None = None,
+    deliveries_per_minute: int | None = None,
+    concurrent_deliveries: int | None = None,
     now: datetime | None = None,
 ) -> Account:
     """Raise or lower one client's ceilings; unnamed ones keep their value.
@@ -1030,6 +1083,9 @@ def set_client_quotas(
             ("max_active_subscriptions", max_active_subscriptions),
             ("requests_per_minute", requests_per_minute),
             ("daily_cap", daily_cap),
+            ("max_pending_events", max_pending_events),
+            ("deliveries_per_minute", deliveries_per_minute),
+            ("concurrent_deliveries", concurrent_deliveries),
         )
         if value is not None
     }
@@ -1591,6 +1647,7 @@ __all__ = [
     "ACCOUNTS",
     "ADMIN_AUDIT",
     "CREDENTIALS",
+    "DEFAULT_CONCURRENT_DELIVERIES",
     "DEFAULT_QUOTAS",
     "DESTINATIONS",
     "GLOBAL_PRELOOKUP_PER_MIN",
@@ -1632,6 +1689,7 @@ __all__ = [
     "mint_credential",
     "pause_destination",
     "pepper_ready",
+    "quotas_for",
     "record_admin_action",
     "reset_for_tests",
     "reset_limiters",
