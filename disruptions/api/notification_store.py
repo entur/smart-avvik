@@ -824,6 +824,26 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         why="the poller's one client read per cycle",
     ),
     QuerySpec(
+        name="mirror_seed",
+        collection=SUBSCRIPTIONS,
+        # NO filters, and ordered by `created_at` rather than by the watermark field. Both are
+        # deliberate. No filters because the mirror holds every channel and applies `status`,
+        # `channel` and liveness in Python -- a `status == "active"` equality here would mean a
+        # tombstone written during the seed is never learned about. And `created_at` because a
+        # Firestore `order_by` EXCLUDES documents that lack the field, so ordering by
+        # `mirror_updated_at` would skip every document written before it existed, which on the
+        # deploy that introduces it is all of them.
+        order_by=(("created_at", "ASCENDING"),),
+        why="the mirror's one full read, at startup",
+    ),
+    QuerySpec(
+        name="mirror_sync",
+        collection=SUBSCRIPTIONS,
+        inequality=((MIRROR_FIELD, ">"),),
+        order_by=((MIRROR_FIELD, "ASCENDING"),),
+        why="everything written since the mirror's watermark",
+    ),
+    QuerySpec(
         name="subscriptions",
         collection=SUBSCRIPTIONS,
         equality=("client_id", "status"),
@@ -1163,38 +1183,50 @@ class Subscription:
     def as_recipient_document(self, now: datetime) -> dict[str, Any]:
         """The raw document ``varsel.WebhookRecipientProvider`` is contracted to yield.
 
-        Exactly the keys ``varsel._parse_webhook_recipient`` reads, plus the ids U6 needs to route
-        a match back to a destination. The extra keys are safe by that function's own design: it
-        validates the fields the pass reads and is indifferent to the rest, so a store that adds a
-        field does not start failing every document in the collection.
-
-        ``delivered`` is Firestore's counterpart of ``varsel._notified`` for this channel, at the
-        grain events are minted at: the ``alert_id`` of every (subscription, train) already delivered
-        to THIS subscription. Not the browser ledger's per-situation grain -- a second train under a
-        delivered situation is a new event here and must read as pending. Marks whose window has
-        passed are dropped here rather than stored forever.
+        Built by :func:`_recipient_document`, which :class:`MirrorEntry` also calls: the mirror
+        serves this same shape from memory, and two builders would be two shapes the day one of
+        them gained a field.
         """
-        return {
-            "recipient_id": self.subscription_id,
-            "subscription_id": self.subscription_id,
-            "client_id": self.client_id,
-            # Carried so the READER can refuse what it cannot route (R20's rule: this module hands
-            # over the shape, `varsel._parse_webhook_recipient` decides what it can read). The query
-            # already filters on it, so this is the second of two independent statements -- which is
-            # deliberate, because U6 replaces that query with a mirror that filters in Python and
-            # this field is what the mirror's filter will read.
-            "channel": self.channel,
-            "destination_id": self.destination_id,
-            "external_ref": self.external_ref,
-            "version": self.version,
-            "test": self.test,
-            "from_stop": self.from_stop,
-            "to_stop": self.to_stop,
-            "begin": self.begin,
-            "end": self.end,
-            "days": list(self.days),
-            "delivered": sorted(_prune_marks(self.delivered, now)),
-        }
+        return _recipient_document(self, now)
+
+
+def _recipient_document(record: Any, now: datetime) -> dict[str, Any]:
+    """The ONE statement of the shape ``varsel.WebhookRecipientProvider`` yields.
+
+    Exactly the keys ``varsel._parse_webhook_recipient`` reads, plus the ids needed to route a match
+    back to a destination. The extra keys are safe by that function's own design: it validates the
+    fields the pass reads and is indifferent to the rest, so a store that adds a field does not
+    start failing every document in the collection.
+
+    ``delivered`` is Firestore's counterpart of ``varsel._notified`` for this channel, at the grain
+    events are minted at: the ``alert_id`` of every (subscription, train) already delivered to THIS
+    subscription. Not the browser ledger's per-situation grain -- a second train under a delivered
+    situation is a new event here and must read as pending. Marks whose window has passed are
+    dropped here rather than stored forever.
+
+    Takes any record carrying the attributes rather than a :class:`Subscription` specifically, so
+    the mirror's slimmer entry can serve the identical document without a second builder.
+    """
+    return {
+        "recipient_id": record.subscription_id,
+        "subscription_id": record.subscription_id,
+        "client_id": record.client_id,
+        # Carried so the READER can refuse what it cannot route (R20's rule: this module hands over
+        # the shape, `varsel._parse_webhook_recipient` decides what it can read). The store's query
+        # already filters on it, and the mirror filters in PYTHON -- so from U6 this field is not a
+        # second statement of the same thing, it is the only one the pass sees.
+        "channel": record.channel,
+        "destination_id": record.destination_id,
+        "external_ref": record.external_ref,
+        "version": record.version,
+        "test": record.test,
+        "from_stop": record.from_stop,
+        "to_stop": record.to_stop,
+        "begin": record.begin,
+        "end": record.end,
+        "days": list(record.days),
+        "delivered": sorted(_prune_marks(record.delivered, now)),
+    }
 
 
 def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
@@ -1818,6 +1850,353 @@ def forget_recent_load() -> None:
     global _recent_load
     with _recent_load_lock:
         _recent_load = None
+
+
+# ---- The subscription mirror (U6, KTD5) ---------------------------------------------------------
+#
+# Why a mirror at all. Until U6 the pass read every live subscription from Firestore on every cycle,
+# bounded at 2 000 documents. At 100 000 that read is the cycle: R3 sizes it at ~$9-18 a day in
+# document reads alone, and the 2 000 ceiling truncates SILENTLY -- the load simply returns a page
+# and the subscriptions past it are not matched, with nothing in the log that reads as data loss.
+#
+# What replaces it is not a cache with a TTL. A TTL cache answers "is this old?" and the question
+# that matters is "what has CHANGED?", which is what the watermark answers: one query per cycle for
+# the documents whose `mirror_updated_at` is newer than the last one seen. A subscription nothing
+# writes to is read once, at startup, and never again.
+
+#: How far BEHIND the watermark each sync re-reads. Firestore commits are not ordered by the
+#: instant a transaction started, so a transaction that began before the last sync can commit with
+#: a server stamp EARLIER than a document that sync already saw -- and a strict `> watermark` would
+#: step over it forever. The overlap costs re-reading whatever was written in the last two minutes
+#: and is applied on top of a dedupe by document id, so an entry re-read is simply re-applied.
+MIRROR_SYNC_OVERLAP_S = 120.0
+#: Documents per page, for both the startup read and each cycle's sync. Bounds one Firestore call
+#: rather than the whole read: the startup read pages with a cursor until the collection is
+#: exhausted, beating the poller's heartbeat between pages.
+MIRROR_PAGE_SIZE = 1000
+#: How many pages ONE cycle's sync may take before it stops and carries its cursor to the next.
+#: A sync that had to read 100 000 changed documents would otherwise hold `varsel_notify` for the
+#: whole read; bounded, it catches up over several cycles and the mirror is merely behind, which is
+#: the state `mirror_age` publishes.
+MIRROR_MAX_PAGES_PER_SYNC = 20
+#: When the watermark gets this old, the mirror stops trusting incremental sync and re-seeds.
+#:
+#: **This is a correctness bound, not a freshness one, and it is why the number is what it is.** A
+#: revocation reaches the mirror as a tombstone (`_delete_body`), and that tombstone is itself a
+#: document with a TTL: Firestore hard-deletes it roughly a day later. If sync is broken for longer
+#: than that, the tombstone is gone before the mirror ever sees it, the removal is lost for good,
+#: and the poller keeps alerting a recipient whose client revoked it -- which no later sync can
+#: repair, because there is nothing left to read. Six hours is well inside that window and well
+#: above three median cycle periods, so an ordinary slow patch never trips it.
+MIRROR_MAX_AGE_S = 6 * 60 * 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class MirrorEntry:
+    """One mirrored subscription: what the pass reads, and nothing else.
+
+    Slotted and deliberately slimmer than :class:`Subscription`, which carries `daily_deliveries`,
+    `daily_reservations`, `cleanup` and four more timestamps -- all of them spent inside store
+    transactions and none of them read by the matching pass. At 100 000 subscriptions that
+    difference is the difference between a mirror that fits the pod's memory limit and one that
+    does not.
+
+    ``liveness`` is the four fields :func:`subscription_is_live` reads, built ONCE here rather than
+    assembled per check: the liveness pass asks about every entry on every cycle, and there is
+    exactly one implementation of the question because the alternative is two that disagree about
+    an expired subscription.
+    """
+
+    subscription_id: str
+    client_id: str
+    destination_id: str
+    external_ref: str
+    version: int
+    test: bool
+    channel: str
+    from_stop: str
+    to_stop: str
+    begin: str
+    end: str
+    days: tuple[int, ...]
+    delivered: Mapping[str, datetime]
+    liveness: Mapping[str, Any]
+    mirror_updated_at: datetime | None
+
+    def is_live(self, now: datetime) -> bool:
+        return subscription_is_live(self.liveness, now)
+
+    def as_recipient_document(self, now: datetime) -> dict[str, Any]:
+        return _recipient_document(self, now)
+
+
+def _mirror_entry(doc: Mapping[str, Any]) -> MirrorEntry:
+    """One stored document to a mirror entry, raising on anything this binary cannot read.
+
+    Goes through :func:`_subscription_from_doc` rather than reading the document a second way: that
+    function is where a document's field-by-field meaning lives, including every permissive default
+    a newer binary's document depends on, and a second parser here would be a second set of
+    defaults to keep in step.
+    """
+    sub = _subscription_from_doc(doc)
+    return MirrorEntry(
+        subscription_id=sub.subscription_id,
+        client_id=sub.client_id,
+        destination_id=sub.destination_id,
+        external_ref=sub.external_ref,
+        version=sub.version,
+        test=sub.test,
+        channel=sub.channel,
+        from_stop=sub.from_stop,
+        to_stop=sub.to_stop,
+        begin=sub.begin,
+        end=sub.end,
+        days=tuple(sub.days),
+        delivered=dict(sub.delivered),
+        liveness={
+            "status": sub.status,
+            TTL_FIELD: sub.expires_at,
+            "lifetime_expires_at": sub.lifetime_expires_at,
+            "inactivity_expires_at": sub.inactivity_expires_at,
+        },
+        mirror_updated_at=_as_dt(doc.get(MIRROR_FIELD)),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MirrorSync:
+    """What one sync did, for the phase record. Every field is a number an operator can act on."""
+
+    synced: int = 0
+    removed: int = 0
+    pages: int = 0
+    size: int = 0
+    reseeded: bool = False
+    truncated: bool = False
+    watermark_age_s: float | None = None
+    error: str | None = None
+
+
+class SubscriptionMirror:
+    """Every live subscription, held in memory and kept current by a watermark query.
+
+    Three properties the pass depends on, none of which a TTL cache has:
+
+    * **A failed sync keeps the previous mirror.** The alternative -- an empty mirror on a transient
+      Firestore error -- is indistinguishable to every downstream reader from "every client
+      unsubscribed", and it would silently retire an entire channel for one bad minute.
+    * **A document nothing writes to is read once.** That is the whole economy of the design and is
+      why `_sent_body` must not stamp: the busiest documents would otherwise be the ones re-read
+      every cycle.
+    * **Removal is applied, not inferred.** A tombstone arrives as a document whose status is no
+      longer active, and the entry is dropped. Expiry is the one removal nothing writes, so it is
+      applied locally on every read, from the entry's own horizons.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entries: dict[str, MirrorEntry] = {}
+        self._watermark: datetime | None = None
+        self._seeded = False
+        self._seeded_at: datetime | None = None
+        self._cursor: Any = None
+
+    # -- state a reader can ask about ------------------------------------------------------------
+
+    @property
+    def ready(self) -> bool:
+        """Has the startup read completed? Until it has, this mirror answers for nobody.
+
+        Read rather than inferred from emptiness: an empty collection is a legitimate steady state
+        (no client onboarded) and must not read as "still loading", or a deployment with no clients
+        would hold its emit pass forever.
+        """
+        with self._lock:
+            return self._seeded
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def watermark_age_s(self, now: datetime) -> float | None:
+        with self._lock:
+            mark = self._watermark or self._seeded_at
+        if mark is None:
+            return None
+        return max(0.0, (now - mark).total_seconds())
+
+    def reset(self) -> None:
+        """Drop everything. For tests and for a forced re-seed."""
+        with self._lock:
+            self._entries = {}
+            self._watermark = None
+            self._seeded = False
+            self._seeded_at = None
+            self._cursor = None
+
+    # -- reads -----------------------------------------------------------------------------------
+
+    def recipients(self, now: datetime, *, channel: str = CHANNEL_WEBHOOK) -> list[MirrorEntry]:
+        """The live entries on one channel, liveness applied here rather than at sync time.
+
+        Applied on the READ because expiry is the one state change nothing writes a document for:
+        a subscription whose inactivity horizon passes at 03:00 is not touched by anybody, so no
+        sync can carry the news. Testing it here means the pass never matches an expired
+        subscription even if the mirror has not been synced since.
+        """
+        with self._lock:
+            entries = list(self._entries.values())
+        return [e for e in entries if e.channel == channel and e.is_live(now)]
+
+    def documents(self, now: datetime, *, channel: str = CHANNEL_WEBHOOK) -> list[dict[str, Any]]:
+        """:func:`recipient_documents`' shape, served from memory."""
+        return [e.as_recipient_document(now) for e in self.recipients(now, channel=channel)]
+
+    # -- writes ----------------------------------------------------------------------------------
+
+    def seed(self, *, now: datetime, beat: Callable[[], None] | None = None) -> MirrorSync:
+        """Page the whole collection into the mirror. Runs on the poller thread, after the port binds.
+
+        **Not in the lifespan.** The app serves nothing until the lifespan yields, so a 100 000
+        document read there would hold the port closed for the whole of it -- and the readiness
+        probe would fail a deployment that is doing exactly what it was told to.
+
+        **Paged with a cursor rather than streamed.** One `stream()` over 100 000 documents is one
+        call under one deadline; a cursor makes each page its own bounded call, which is what lets
+        `beat` move the poller's liveness clock between pages. Without that, `/health` reads "no
+        step has finished in 600 s" and restarts the pod mid-read, forever.
+
+        **Ordered by `created_at`, never by the watermark field.** A Firestore `order_by` excludes
+        documents that LACK the field, so ordering by `mirror_updated_at` here would silently skip
+        every document written before that field existed -- which, on the deploy that introduces
+        it, is all of them.
+        """
+        entries: dict[str, MirrorEntry] = {}
+        watermark: datetime | None = None
+        cursor: Any = None
+        pages = skipped = 0
+        while True:
+            query = _query("mirror_seed", limit=MIRROR_PAGE_SIZE, start_after=cursor)
+            page = _stream(query)
+            pages += 1
+            for snapshot in page:
+                stored = _doc(snapshot)
+                try:
+                    entry = _mirror_entry(stored)
+                except Exception:
+                    skipped += 1
+                    logger.debug("Unreadable subscription document; not mirrored", exc_info=True)
+                    continue
+                entries[entry.subscription_id] = entry
+                if entry.mirror_updated_at is not None and (
+                    watermark is None or entry.mirror_updated_at > watermark
+                ):
+                    watermark = entry.mirror_updated_at
+            if len(page) < MIRROR_PAGE_SIZE:
+                break
+            cursor = page[-1]
+            if beat is not None:
+                beat()
+        with self._lock:
+            self._entries = entries
+            self._watermark = watermark
+            self._seeded = True
+            self._seeded_at = now
+            self._cursor = None
+        return MirrorSync(synced=len(entries), pages=pages, size=len(entries), reseeded=True)
+
+    def sync(self, *, now: datetime, beat: Callable[[], None] | None = None) -> MirrorSync:
+        """Apply everything written since the watermark. One bounded read per cycle.
+
+        Re-seeds instead when the watermark is older than :data:`MIRROR_MAX_AGE_S` -- see that
+        constant for why the bound is a correctness one.
+        """
+        if not self.ready:
+            return self.seed(now=now, beat=beat)
+        age = self.watermark_age_s(now)
+        if age is not None and age > MIRROR_MAX_AGE_S:
+            logger.warning(
+                "Subscription mirror watermark is %.0f s old; re-seeding rather than syncing",
+                age,
+                extra={
+                    "fields": {
+                        "event": "notification_store_load",
+                        "result": "mirror_reseed",
+                        "watermark_age_s": int(age),
+                    }
+                },
+            )
+            return self.seed(now=now, beat=beat)
+
+        with self._lock:
+            watermark = self._watermark
+            cursor = self._cursor
+        # The overlap, and the reason a sync is applied by document id: the window deliberately
+        # re-reads documents this mirror already holds, so applying twice must be a no-op.
+        since = (
+            watermark - timedelta(seconds=MIRROR_SYNC_OVERLAP_S)
+            if watermark is not None
+            else _REVISION_EPOCH
+        )
+        synced = removed = pages = 0
+        newest = watermark
+        truncated = False
+        while pages < MIRROR_MAX_PAGES_PER_SYNC:
+            query = _query(
+                "mirror_sync",
+                inequality={MIRROR_FIELD: since},
+                limit=MIRROR_PAGE_SIZE,
+                start_after=cursor,
+            )
+            page = _stream(query)
+            pages += 1
+            for snapshot in page:
+                stored = _doc(snapshot)
+                try:
+                    entry = _mirror_entry(stored)
+                except Exception:
+                    logger.debug("Unreadable subscription document; not mirrored", exc_info=True)
+                    continue
+                # A tombstone is a document whose status is no longer active. It is REMOVED here
+                # rather than left to the liveness pass, because `_delete_body` also pulls both
+                # horizons back to `now` -- so the two agree, and this is the path that carries a
+                # revocation the instant it is written rather than at the next expiry check.
+                if entry.liveness.get("status") != "active":
+                    with self._lock:
+                        if self._entries.pop(entry.subscription_id, None) is not None:
+                            removed += 1
+                else:
+                    with self._lock:
+                        self._entries[entry.subscription_id] = entry
+                    synced += 1
+                if entry.mirror_updated_at is not None and (
+                    newest is None or entry.mirror_updated_at > newest
+                ):
+                    newest = entry.mirror_updated_at
+            if len(page) < MIRROR_PAGE_SIZE:
+                cursor = None
+                break
+            cursor = page[-1]
+            if beat is not None:
+                beat()
+        else:
+            # The page budget bound before the collection was drained. The cursor is CARRIED so the
+            # next cycle continues where this one stopped rather than re-reading from the overlap,
+            # and the watermark is not advanced past what was applied.
+            truncated = True
+
+        with self._lock:
+            self._watermark = newest
+            self._cursor = cursor
+            size = len(self._entries)
+        return MirrorSync(
+            synced=synced,
+            removed=removed,
+            pages=pages,
+            size=size,
+            truncated=truncated,
+            watermark_age_s=self.watermark_age_s(now),
+        )
 
 
 def active_subscriptions(

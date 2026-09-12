@@ -4152,6 +4152,252 @@ def test_every_streamed_read_sits_under_a_span():
     )
 
 
+# ---- The subscription mirror (U6) ----------------------------------------------------------------
+
+
+def _mirror_page(client: _FakeClient, spec: str, docs: list[dict[str, Any]]) -> None:
+    """Stage what one mirror query returns. The fake evaluates no inequality -- it serves what a
+    test puts there -- so the QUERY's own shape is asserted separately off `query_calls`."""
+    client.pages[spec] = [
+        (f"{notification_store.SUBSCRIPTIONS}/{d['subscription_id']}", d) for d in docs
+    ]
+
+
+def _mirrored(**over: Any) -> dict[str, Any]:
+    """A stored document as the real writer produces it, with the watermark already resolved.
+
+    `mirror_at` is popped BEFORE the document is built: it is this helper's own argument, not one
+    of `SubscriptionSpec`'s.
+    """
+    mirror_at = over.pop("mirror_at", NOW)
+    doc = _live_doc(**over)
+    doc[notification_store.MIRROR_FIELD] = mirror_at
+    return doc
+
+
+def test_the_mirror_seeds_from_the_whole_collection_and_pages_with_a_cursor():
+    """Scenario 1. The startup read is the only full read the mirror ever does."""
+    client = _FakeClient()
+    _install(client)
+    docs = [_mirrored(subscription_id=f"s{i}") for i in range(5)]
+    _mirror_page(client, "mirror_seed", docs)
+
+    beats: list[int] = []
+    mirror = notification_store.SubscriptionMirror()
+    page_size = notification_store.MIRROR_PAGE_SIZE
+    notification_store.MIRROR_PAGE_SIZE = 2
+    try:
+        result = mirror.seed(now=NOW, beat=lambda: beats.append(1))
+    finally:
+        notification_store.MIRROR_PAGE_SIZE = page_size
+
+    assert mirror.ready is True
+    assert mirror.size() == 5, result
+    assert result.pages == 3, "2 + 2 + 1: the short page is what ends the read"
+    assert len(beats) == 2, "the heartbeat moves BETWEEN pages, not after the last one"
+    assert {e.subscription_id for e in mirror.recipients(NOW)} == {f"s{i}" for i in range(5)}
+    # Ordered by `created_at`, never by the watermark field -- a document written before that field
+    # existed has to be in the read that seeds the mirror.
+    spec = next(s for s in notification_store.QUERY_SPECS if s.name == "mirror_seed")
+    assert spec.order_by == (("created_at", "ASCENDING"),), spec
+    assert spec.equality == () and spec.inequality == (), "the seed filters nothing"
+
+
+def test_the_seed_needs_no_composite_index_and_neither_does_the_sync():
+    """Both mirror queries are single-field, which is why U6 adds no index and races no deploy."""
+    for name in ("mirror_seed", "mirror_sync"):
+        spec = next(s for s in notification_store.QUERY_SPECS if s.name == name)
+        assert spec.index_fields == (), f"{name} would need a composite index"
+
+
+def test_a_sync_applies_only_what_changed_and_asks_from_the_watermark_less_the_overlap():
+    """Scenarios 2 and 3. The overlap is what stops a late commit being stepped over forever."""
+    client = _FakeClient()
+    _install(client)
+    first = _mirrored(subscription_id="s1")
+    _mirror_page(client, "mirror_seed", [first])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 1
+
+    later = NOW + timedelta(minutes=5)
+    changed = _mirrored(subscription_id="s2", mirror_at=later)
+    _mirror_page(client, "mirror_sync", [changed])
+    client.query_calls.clear()
+    result = mirror.sync(now=later)
+
+    assert result.synced == 1 and result.removed == 0, result
+    assert mirror.size() == 2
+    name, _eq, inequality, _limit = client.query_calls[0]
+    assert name == "mirror_sync"
+    asked = inequality[notification_store.MIRROR_FIELD]
+    assert asked == NOW - timedelta(seconds=notification_store.MIRROR_SYNC_OVERLAP_S), asked
+
+    # Re-reading the same document is a no-op, which is what makes the overlap safe.
+    client.query_calls.clear()
+    again = mirror.sync(now=later)
+    assert mirror.size() == 2, "applying the overlap twice changed the mirror"
+    assert again.synced == 1, "the overlap deliberately re-reads; it must simply re-apply"
+
+
+def test_a_tombstone_removes_the_subscription_from_the_mirror():
+    """Scenario 4. The one path that carries a revocation the instant it is written."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    later = NOW + timedelta(minutes=1)
+    tombstoned = _mirrored(subscription_id="s1")
+    tombstoned["status"] = "deleted"
+    tombstoned[notification_store.MIRROR_FIELD] = later
+    _mirror_page(client, "mirror_sync", [tombstoned])
+    result = mirror.sync(now=later)
+
+    assert result.removed == 1 and result.synced == 0, result
+    assert mirror.size() == 0
+    assert mirror.recipients(later) == []
+
+
+def test_a_subscription_whose_horizon_passes_is_dropped_on_the_read_with_no_write():
+    """Scenario 5, and the reason liveness is applied on the READ.
+
+    Nothing writes a document when its inactivity horizon passes at 03:00, so no sync can carry the
+    news. Tested at read time, an expired subscription is never matched even by a mirror that has
+    not synced since.
+    """
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+    assert len(mirror.recipients(NOW)) == 1
+
+    past_horizon = NOW + timedelta(days=notification_store.SUBSCRIPTION_INACTIVITY_DAYS + 1)
+    assert mirror.recipients(past_horizon) == []
+    assert mirror.size() == 1, "the entry is still held; it is the READ that refuses it"
+
+
+def test_the_mirror_serves_one_channel_and_holds_them_all():
+    """U5's filter, now in Python: the mirror is the store for every channel (U12 needs it)."""
+    client = _FakeClient()
+    _install(client)
+    webhook_doc = _mirrored(subscription_id="client-sub")
+    _mirror_page(
+        client,
+        "mirror_seed",
+        [
+            webhook_doc,
+            _mirrored(subscription_id="browser-sub", channel=notification_store.CHANNEL_WEB_PUSH),
+        ],
+    )
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    assert mirror.size() == 2, "both channels are held"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["client-sub"]
+    on_browser = mirror.recipients(NOW, channel=notification_store.CHANNEL_WEB_PUSH)
+    assert [e.subscription_id for e in on_browser] == ["browser-sub"]
+    # **The document the pass receives is byte-identical to the one the store's own reader builds.**
+    # This is the assertion the whole unit rests on: U6 changes where the pass gets its documents,
+    # not what they say, and a mirror that served a subtly different shape would change matching
+    # behaviour with nothing in the diff that looks like a matching change.
+    from_store = notification_store._subscription_from_doc(webhook_doc).as_recipient_document(NOW)
+    assert mirror.documents(NOW) == [from_store]
+
+
+def test_a_sync_that_raises_keeps_the_previous_mirror():
+    """Scenario 7. An empty mirror on a transient error reads as "every client unsubscribed"."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    boom = RuntimeError("firestore is having a moment")
+    original = notification_store._stream
+
+    def _raises(query: Any) -> list[Any]:
+        raise boom
+
+    notification_store._stream = _raises  # type: ignore[assignment]
+    try:
+        try:
+            mirror.sync(now=NOW + timedelta(minutes=1))
+        except RuntimeError as exc:
+            assert exc is boom
+        else:
+            raise AssertionError("the sync swallowed the error; the CALLER decides, not the mirror")
+    finally:
+        notification_store._stream = original  # type: ignore[assignment]
+
+    assert mirror.size() == 1, "the previous mirror is still served"
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s1"]
+
+
+def test_a_watermark_older_than_the_bound_forces_a_re_seed():
+    """The carried review's P1, and it is a CORRECTNESS bound rather than a freshness one.
+
+    A revocation reaches the mirror as a tombstone, and that tombstone has a TTL of its own. If
+    sync is broken for longer than the TTL, Firestore hard-deletes the tombstone before the mirror
+    ever reads it: the removal is lost for good and no later sync can repair it, because there is
+    nothing left to read. So the bound has to sit under the TTL, not merely under an alert
+    threshold.
+    """
+    assert notification_store.MIRROR_MAX_AGE_S < 24 * 60 * 60, (
+        "the bound must sit under the deletion marker's ~24 h TTL or it defends nothing"
+    )
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    # Just inside the bound: an ordinary incremental sync.
+    _mirror_page(client, "mirror_sync", [])
+    fresh = mirror.sync(now=NOW + timedelta(seconds=notification_store.MIRROR_MAX_AGE_S - 60))
+    assert fresh.reseeded is False, fresh
+
+    # Past it: the whole collection is read again, and the mirror follows the SEED's page.
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s2")])
+    stale = mirror.sync(now=NOW + timedelta(seconds=notification_store.MIRROR_MAX_AGE_S + 60))
+    assert stale.reseeded is True, stale
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s2"], (
+        "a re-seed replaces the mirror rather than merging into it -- which is the point: the "
+        "entries it can no longer account for are exactly the ones a lost tombstone would leave"
+    )
+
+
+def test_an_unseeded_mirror_answers_for_nobody_and_seeds_on_first_sync():
+    """`ready` is read, never inferred from emptiness: an empty collection is a steady state."""
+    client = _FakeClient()
+    _install(client)
+    mirror = notification_store.SubscriptionMirror()
+    assert mirror.ready is False
+    assert mirror.recipients(NOW) == []
+
+    _mirror_page(client, "mirror_seed", [])
+    result = mirror.sync(now=NOW)
+    assert result.reseeded is True and mirror.ready is True, result
+    assert mirror.size() == 0
+    assert mirror.ready is True, "an empty collection must not read as 'still loading'"
+
+
+def test_one_unreadable_document_never_fails_the_mirror():
+    """R20, the same per-document rule the load path applies."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(
+        client,
+        "mirror_seed",
+        [{"subscription_id": "broken"}, _mirrored(subscription_id="s1")],
+    )
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s1"]
+
+
 def _run() -> None:
     plain = sorted(
         (name, fn)
