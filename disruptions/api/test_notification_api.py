@@ -219,6 +219,33 @@ class _Page:
         self.client.documents_read += len(self.rows)
         return [_Snap(path, data, self.client) for path, data in self.rows]
 
+    def count(self, alias: str) -> _Aggregation:
+        assert alias == "n"
+        return _Aggregation(self)
+
+
+class _AggregationValue:
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+
+class _Aggregation:
+    """The create-time ceiling count (U7), which is an aggregation rather than a page of rows.
+
+    It bills ONE document read however many index entries it scans, which is why the count moved
+    off the rows -- so it adds one to `documents_read`, not `len(rows)`. An endpoint's cost is what
+    this suite judges, and charging the aggregation per row would report the old price for the new
+    query.
+    """
+
+    def __init__(self, page: _Page) -> None:
+        self._page = page
+
+    def get(self, transaction: Any = None, timeout: float | None = None) -> list[list[Any]]:
+        del transaction, timeout
+        self._page.client.documents_read += 1
+        return [[_AggregationValue(len(self._page.rows))]]
+
 
 class _Txn:
     def __init__(self, client: Any) -> None:

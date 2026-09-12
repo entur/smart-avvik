@@ -125,6 +125,14 @@ DELIVERED_MARK_TTL_H = 48
 # measured admission limits", so this is the lower one. Raising it needs a measurement of the pass
 # at the new population, not a judgement.
 MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT = 500
+# Subscription documents ONE listing page may read while filling itself. The listing tests liveness
+# in Python (a query cannot express both horizons), so a page of `limit` documents can come back
+# with fewer live rows and it reads again -- bounded, until U7, by the client's own ceiling. That
+# was the same number as the bound on `max_active_subscriptions`, which this plan raises to
+# 200 000: a client whose collection is dominated by rows TTL has not caught up with would then
+# turn one `?limit=1` request into a 200 000-document read. This is the old bound, kept as the scan
+# it always was, so the listing's worst case is exactly what it was before the quota moved.
+MAX_SUBSCRIPTION_LIST_SCAN = 10_000
 #: The field the subscription mirror's watermark is read from (U6, KTD5).
 #:
 #: **Server-stamped, never `now`.** Every body here already takes `now` as an argument for
@@ -836,14 +844,19 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         # /varsel's own registrations moving into this collection (U12-U14) would exhaust every
         # client's ceiling on a collection they do not own.
         equality=("client_id", "status", "channel"),
-        # `expires_at` DESCENDING, for `load_active_subscriptions`' reason one client down. The
-        # create-time ceiling is counted from a page bounded AT the ceiling, and liveness is tested in
-        # Python, so the page must shed dead rows before live ones. Counted through the listing's
-        # `created_at` ordering until 2026-09-10, the page filled with the OLDEST rows first -- which
-        # is exactly where the rows TTL has not caught up with sit -- so the count under-read and a
-        # create past the ceiling was admitted (R21). Descending on expiry puts every live row ahead
-        # of every dead one, so a page of `ceiling` rows that holds fewer than `ceiling` live rows
-        # has counted them all.
+        # `expires_at > now` since U7, which is what turns this from a bounded PAGE into a `count()`
+        # aggregation: expiry is now asked of the index instead of tested in Python over the rows it
+        # returned. The ordering is unchanged and so is `index_fields` -- the range field is already
+        # the first ordering, which is Firestore's classic rule -- so this query needs no new index
+        # and the terraform plan is empty (`test_the_ceiling_count_needs_no_new_index` pins that).
+        #
+        # Why the ordering was DESCENDING, kept because the fallback reasoning still has to hold if
+        # anyone ever pages this again: the count came from a page bounded AT the ceiling and
+        # liveness was tested in Python, so the page had to shed dead rows before live ones. Read
+        # through the listing's `created_at` ordering until 2026-09-10, the page filled with the
+        # OLDEST rows first -- exactly where rows TTL has not caught up with sit -- so the count
+        # under-read and a create past the ceiling was admitted (R21).
+        inequality=(("expires_at", ">"),),
         order_by=(("expires_at", "DESCENDING"),),
         why="the create-time ceiling count",
     ),
@@ -947,8 +960,12 @@ def _query(
 
 # ---- Reads and writes inside a transaction ----------------------------------------------------
 #
-# Two one-line helpers so a fake transaction has exactly two read shapes to implement, and so the
-# reads-before-writes rule is visible at every call site rather than inferred from the client's API.
+# Three one-line helpers so a fake transaction has exactly three read shapes to implement, and so
+# the reads-before-writes rule is visible at every call site rather than inferred from the client's
+# API. It was two until U7 moved the create-time ceiling onto a `count()` aggregation, which the
+# Python client does NOT reach through `Transaction.get` -- that method accepts a `DocumentReference`
+# or a `Query` and raises `ValueError` on anything else, so the aggregation carries the transaction
+# itself.
 
 
 def _read(transaction: Any, ref: Any) -> Any:
@@ -957,6 +974,20 @@ def _read(transaction: Any, ref: Any) -> Any:
 
 def _read_query(transaction: Any, query: Any) -> list[Any]:
     return list(transaction.get(query, timeout=_CALL_DEADLINE_S))
+
+
+def _read_count(transaction: Any, query: Any) -> int:
+    """How many documents the query matches, read INSIDE the transaction.
+
+    **No stream fallback here, unlike :func:`_count_destination_deliveries`.** That one keeps the
+    stream because the two are the same answer at a different price and a build without aggregation
+    support should degrade in cost rather than refuse to emit. This one bounds a client's create at
+    `notification_auth.QUOTA_BOUNDS["max_active_subscriptions"]`, which is 200 000 -- so a silent
+    fallback would put a 200 000-document read under pessimistic locks on every create the client
+    makes. A `FailedPrecondition` nobody can miss is the better failure.
+    """
+    result = query.count(alias="n").get(transaction=transaction, timeout=_CALL_DEADLINE_S)
+    return int(result[0][0].value)
 
 
 def _doc(snapshot: Any) -> dict[str, Any]:
@@ -1302,20 +1333,30 @@ def _create_body(
 
     ``max_active`` and ``daily_cap`` are the CLIENT's (``notification_auth.Quotas``); ``None``
     means the module constants, resolved here at call time so a test that moves the constant moves
-    the ceiling. The count read is bounded by the same ``max_active`` the caller passed as the
-    query's ``limit`` -- which is why ``notification_auth.QUOTA_BOUNDS`` caps it.
+    the ceiling.
 
     The ceiling is counted inside the transaction from the client's own subscriptions rather than
     from a counter document, deliberately. A counter over-counts and drifts: a subscription past one
     of R5's horizons is still ``status == "active"`` until TTL deletes it up to ~24 h later, so a
     client would be locked out by dead rows, and a crash between the tombstone and the decrement
-    would leave the counter permanently wrong with nothing to reconcile it against. Counting costs
-    up to ``MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT`` read locks under Standard edition's pessimistic
-    concurrency -- bounded, and paid on a create, which a commuter does once.
+    would leave the counter permanently wrong with nothing to reconcile it against.
 
-    R21's "the read cannot exceed the ceiling" is literally the query's ``limit`` -- and that is why
-    the query is ``subscription_count`` and not the listing's: bounded at the ceiling, WHICH rows the
-    page holds decides the count, and its ordering puts live rows first (see the spec).
+    **Counted by an aggregation since U7, not by reading the rows.** It read them until then --
+    up to ``max_active`` read locks under Standard edition's pessimistic concurrency, bounded and
+    paid on a create, which a commuter does once. That was the argument at a ceiling of 500 and it
+    is what put the 10 000 bound on ``QUOTA_BOUNDS``; at the 200 000 this plan sizes for, "bounded"
+    stops meaning "affordable" and every create the client makes pays it. A ``count()`` bills
+    roughly one read per thousand index entries and takes no per-document lock.
+
+    **What the aggregation counts is a SUPERSET of live, never a subset**, which is the property
+    R21 rests on. :func:`subscription_is_live` tests four things; the query tests three of them
+    (``status == "active"``, the client, the channel) plus ``expires_at > now``. That field is
+    written as the MINIMUM of the two horizons, so a document inside both of them is necessarily
+    inside it -- every live row is counted. The converse does not hold: a document whose stored
+    ``expires_at`` is somehow ahead of a horizon it should have been derived from is counted while
+    :func:`subscription_is_live` would reject it. So the count can only ever be too HIGH, and too
+    high refuses a create that a stricter count would have admitted. Refusing is the direction a
+    ceiling must fail in; admitting past it is the one R21 forbids.
     """
     existing = _read(transaction, refs.subscription(spec.subscription_id))
     stored = _doc(existing)
@@ -1340,11 +1381,11 @@ def _create_body(
             # a horizon or clear a spent cap slot.
             return "unchanged", stored
         raise Conflict("subscription id already exists with a different definition")
-    live = 0
-    for snapshot in _read_query(transaction, count_query):
-        if subscription_is_live(_doc(snapshot), now):
-            live += 1
     ceiling = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT if max_active is None else max_active
+    # The query is bounded at the ceiling by the helper that built it, so this is
+    # `min(actual, ceiling)` rather than the true count -- which is all the comparison below needs,
+    # and what keeps the aggregation's scan bounded by the same number R21 states.
+    live = _read_count(transaction, count_query)
     if live >= ceiling:
         raise QuotaExceeded(
             f"client already holds {live} active subscriptions (ceiling {ceiling})"
@@ -1375,6 +1416,10 @@ def create_subscription(
         # The client's own ceiling, on the channel it is creating for. A client's webhook ceiling is
         # not spent by a traveller's `web_push` document in the same collection (U12-U14).
         equality={"client_id": spec.client_id, "status": "active", "channel": spec.channel},
+        # The instant is the caller's, taken once outside the transaction like every other clock
+        # here -- a transaction body may run more than once and must read no clock of its own, and
+        # a query built inside it would take a different `now` on the retry.
+        inequality={"expires_at": instant},
         limit=ceiling,
     )
     outcome, doc = _run_transaction(
@@ -1722,6 +1767,12 @@ def list_subscriptions(
     live rows -- the page equalled the read, so no cursor was ever emitted -- and 500 expired rows
     ahead of its live ones would end the scan on an empty page.
 
+    **The scan is additionally capped at ``MAX_SUBSCRIPTION_LIST_SCAN``** since U7. The client's
+    ceiling alone was a sound scan bound while it was bounded at 10 000; at 200 000 a listing over
+    a collection full of rows TTL has not deleted yet becomes a 200 000-document read driven by a
+    `?limit=1` request. The cap is that old bound, so nothing about the listing's worst case
+    changed when the quota did.
+
     **``limit`` reaches the QUERY**, and did not until 2026-09-09: this streamed the whole bounded
     set and the route sliced in Python, so a `?limit=1` page cost the same up-to-500-document read
     as the whole listing -- against a per-credential ceiling of
@@ -1742,7 +1793,10 @@ def list_subscriptions(
     ceiling, so a healthy list still costs exactly one round.
     """
     instant = now or _now()
-    bound = MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT if max_active is None else max_active
+    bound = min(
+        MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT if max_active is None else max_active,
+        MAX_SUBSCRIPTION_LIST_SCAN,
+    )
     ceiling = min(limit, bound)
     cursor: Any = None
     if after is not None:

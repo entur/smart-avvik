@@ -168,14 +168,20 @@ RETRY_AFTER_S = 60
 # both, and a constant published in the contract becomes the number a client builds around. The
 # bounds are why the fields are not simply "any positive integer":
 #
-#   max_active_subscriptions  bounded at 10 000 because `notification_store._create_body` COUNTS
-#                             the client's live subscriptions by READING them inside the create
-#                             transaction, up to the ceiling -- a bounded read at 500, and a
-#                             10 000-document read under pessimistic locks on every create at the
-#                             bound. Past it the count has to become a `count()` aggregation over
-#                             an `expires_at` inequality index (the operations document's
-#                             scale-out list), so raising this bound without that work only moves
-#                             the cost onto every create the client makes.
+#   max_active_subscriptions  bounded at 200 000 since U7, which is the number that work was
+#                             waiting on rather than a new judgement. It was 10 000 because
+#                             `notification_store._create_body` COUNTED the client's live
+#                             subscriptions by READING them inside the create transaction, up to
+#                             the ceiling -- a bounded read at 500 and a 10 000-document read under
+#                             pessimistic locks on every create at the bound, which is why the
+#                             comment here said raising it without the aggregation "only moves the
+#                             cost onto every create the client makes". The count is now a
+#                             `count()` over the `expires_at` inequality the `subscription_count`
+#                             spec declares, billed at roughly one read per thousand index entries
+#                             and taking no per-document lock, so the reason for the old bound is
+#                             gone. 200 000 is R1's population with room above it, not a capacity
+#                             measurement: what one client may actually hold is still decided by
+#                             the pass measurements this plan's harness takes.
 #   requests_per_minute       bounded at 10 000. Tier two of KTD8's limiter, spent after
 #                             authentication; tier one (`GLOBAL_PRELOOKUP_PER_MIN`) is unchanged and
 #                             is what bounds the credential lookup an anonymous flood can reach.
@@ -187,7 +193,7 @@ RETRY_AFTER_S = 60
 #                             change reaches a subscription the next time the client writes it --
 #                             the idempotent re-PUT included.
 QUOTA_BOUNDS: dict[str, tuple[int, int]] = {
-    "max_active_subscriptions": (1, 10_000),
+    "max_active_subscriptions": (1, 200_000),
     "requests_per_minute": (1, 10_000),
     "daily_cap": (1, 1_000),
 }
