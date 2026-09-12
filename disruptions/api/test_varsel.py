@@ -114,13 +114,28 @@ _snapshot: dict = {}
 impact.configure(snapshot_provider=lambda: (_snapshot, None))
 
 
+def _install_snapshot(by_situation):
+    """Refill the snapshot this suite serves, and tell the engine its index is out of date.
+
+    `impact` indexes a snapshot per GENERATION, and a generation is (dict identity, `refreshed_at`)
+    — neither of which moves when this suite refills the one dict it owns under a fixed `None`
+    stamp. Production never mutates in place (`main.refresh_call_predictions_cache` swaps the dict
+    and stamps a new time under one lock), so the engine deliberately cannot see it; a test that
+    refilled the dict without this is served the PREVIOUS test's situations, which reads as the
+    matcher having stopped matching rather than as leaked state.
+    """
+    _snapshot.clear()
+    _snapshot.update(by_situation)
+    impact.invalidate_generation()
+
+
 def install(by_situation):
     """Point varsel at main's real /impact provider over this synthetic snapshot.
 
     `with_alternative=False` keeps the Journey Planner out of the matcher tests — the alternative
     lookup has its own hermetic suite in test_alternatives.py.
     """
-    _snapshot.clear(); _snapshot.update(by_situation)
+    _install_snapshot(by_situation)
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
                  with_alternative=False, min_impact=0.0, path="poller"):
@@ -156,7 +171,7 @@ def test_the_real_provider_signature_matches():
     `install()` above and test_varsel_api's provider both hand-write a signature that happens to fit.
     Any test that only uses a double cannot catch this; this one must call the real function.
     """
-    _snapshot.clear(); _snapshot.update({"S1": _train(MON_0800)})
+    _install_snapshot({"S1": _train(MON_0800)})
     varsel.configure(impact_provider=main._varsel_impact, stops_provider=list)
     try:
         # Every keyword varsel._impact actually sends, through the real provider.
@@ -254,8 +269,7 @@ def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
     number of refs a place collapses. Which ref of one place the question names does not change the
     answer — the trains and the deadlines are the same — so the extra passes buy nothing. (Which
     TRAIN it is about does change it; that is `_alternatives_by_situation`'s axis, not this one.)"""
-    _snapshot.clear()
-    _snapshot.update({"S1": _twin(MON_0800, "A2", p_cancel=0.8, p_impact_dep=0.9)})
+    _install_snapshot({"S1": _twin(MON_0800, "A2", p_cancel=0.8, p_impact_dep=0.9)})
     asked = []
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
@@ -1698,7 +1712,7 @@ def test_match_journey_names_the_budget_its_lookups_spend():
     """`path` reaches the provider on EVERY call, keyword-only, and defaults to the poller's value
     so every existing caller is unchanged. Without it the pull read would spend the poller's
     Journey Planner budget — silently, since both refill every minute."""
-    _snapshot.clear(); _snapshot.update({"S1": _train(MON_0800)})
+    _install_snapshot({"S1": _train(MON_0800)})
     seen = []
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
@@ -1721,7 +1735,7 @@ def test_the_real_provider_charges_the_pull_ledger():
     keyword and ignores it satisfies the Protocol (CI runs no type checker) and every recording
     double alike; only the ledger can tell, so this asks the ledger through the real provider."""
     dep = datetime.now(tz=_OSLO) + timedelta(hours=2)
-    _snapshot.clear(); _snapshot.update({"S1": _nsr_train(dep, p_cancel=0.8, p_impact_dep=0.9)})
+    _install_snapshot({"S1": _nsr_train(dep, p_cancel=0.8, p_impact_dep=0.9)})
     varsel.configure(impact_provider=main._varsel_impact, stops_provider=list)
     saved = _install_budgeted_fetch(lambda *a, **k: [])
     try:
@@ -1739,7 +1753,7 @@ def test_an_unanswered_lookup_reaches_the_alert():
     """`answered` travels from the outcome onto `alert.impact` through `_collect_alerts`' projection,
     and through the back-fill onto a collapsed-ref alert about the same train — the two places the
     other alternative fields are carried, and where a forgotten field silently reads as answered."""
-    _snapshot.clear(); _snapshot.update({"S1": _train(MON_0800, p_cancel=0.8, p_impact_dep=0.9)})
+    _install_snapshot({"S1": _train(MON_0800, p_cancel=0.8, p_impact_dep=0.9)})
     install(_snapshot.copy())
     original = impact._best_remaining_journey
     impact._best_remaining_journey = lambda cells, **kw: impact.AlternativeOutcome(
@@ -1752,8 +1766,7 @@ def test_an_unanswered_lookup_reaches_the_alert():
 
         # The back-fill: the worst reading comes from a collapsed ref (asked without a lookup), and
         # the canonical pass's whole outcome — the flag included — transfers onto it.
-        _snapshot.clear()
-        _snapshot.update({"S1": [
+        _install_snapshot({"S1": [
             *_train(MON_0800, jkey="t1", p_cancel=0.30, p_impact_dep=0.55),
             *_twin(MON_0800, "A2", jkey="t1", p_cancel=0.80, p_impact_dep=0.95),
         ]})

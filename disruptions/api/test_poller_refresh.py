@@ -696,6 +696,143 @@ def test_the_servability_seam_is_the_same_one_the_notification_api_answers_from(
     )
 
 
+# ---- The inverted prediction index, built in the ingest loop (U2) --------------------------------
+
+
+class _PredRow:
+    """One `call_predictions_today` row, with every column `_call_pred_from_row` reads."""
+
+    def __init__(self, jkey, situation, stop_place, stop_order, dep):
+        self.jkey = jkey
+        self.situationNumber = situation  # the BigQuery column's own name
+        self.summary = "Signalfeil"
+        self.description = None
+        self.lineRef = "VYG:Line:R10"  # ditto
+        self.stop_place = stop_place
+        self.stop_name = None
+        self.stop_order = stop_order
+        self.aimed_dep = dep
+        self.aimed_arr = dep
+        self.et_declared_cancelled = False
+        self.et_dep_delay_min = None
+        self.call_source = "estimated"
+        self.p_cancel = 0.2
+        for name in (
+            "dep_delay_typ_min", "dep_delay_p90_min", "arr_delay_typ_min", "arr_delay_p90_min",
+            "p_arr_ge10", "p_arr_ge20", "arr_delay_p50_stack_min", "arr_delay_p90_stack_min",
+            "p_impact", "p_dep_ge10", "p_dep_ge20", "dep_delay_p50_stack_min",
+            "dep_delay_p90_stack_min", "p_impact_dep",
+        ):
+            setattr(self, name, None)
+
+
+class _PredictionClient:
+    """Rows for the rail prediction query, nothing for the bus one."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.queries: list[str] = []
+
+    def query(self, sql, *args, **kwargs):
+        self.queries.append(sql)
+        rows = self.rows if len(self.queries) == 1 else []
+
+        class _Job:
+            def result(self_inner, timeout=None):
+                return rows
+
+        return _Job()
+
+
+def _refresh_predictions(rows):
+    """Run the real `refresh_call_predictions_cache` over `rows`, restoring every cache after."""
+    before = (
+        main.bq_client, main._call_pred_by_key, main._call_pred_by_jkey_index,
+        main._call_pred_by_situation, main._call_pred_by_stop_ref, main._call_pred_refreshed_at,
+    )
+    main.bq_client = _PredictionClient(rows)
+    try:
+        main.refresh_call_predictions_cache()
+        return (
+            main._impact_snapshot(),
+            main._impact_stop_ref_index(),
+        )
+    finally:
+        (
+            main.bq_client, main._call_pred_by_key, main._call_pred_by_jkey_index,
+            main._call_pred_by_situation, main._call_pred_by_stop_ref,
+            main._call_pred_refreshed_at,
+        ) = before
+
+
+def test_the_ingest_loop_indexes_every_call_by_the_stop_it_calls_at():
+    """The fourth index (U2), which is what bounds the matcher's scan by the stop pair.
+
+    It has to cover EVERY call, not the ones some filter kept: the prune asks this index whether a
+    pair can possibly emit, so a call missing from it is a train the matcher can no longer see —
+    and the symptom is the card reading "ingen aktive avvik akkurat nå" with the situation sitting
+    in the cache, which is indistinguishable from a calm day.
+    """
+    now = datetime(2026, 8, 8, 7, 0, tzinfo=UTC)
+    rows = [
+        _PredRow("j1", "S1", "NSR:StopPlace:1", 1, now),
+        _PredRow("j1", "S1", "NSR:StopPlace:2", 2, now + timedelta(minutes=20)),
+        _PredRow("j2", "S1", "NSR:StopPlace:1", 1, now + timedelta(minutes=30)),
+        _PredRow("j3", "S2", "NSR:StopPlace:3", 1, now),
+    ]
+    (snapshot, stamp), (index, index_stamp) = _refresh_predictions(rows)
+    indexed = [(sit, c.jkey, c.stop_order) for entries in index.values() for sit, c in entries]
+    assert sorted(indexed) == sorted(
+        (sit, c.jkey, c.stop_order) for sit, calls in snapshot.items() for c in calls
+    ), "the index does not cover the snapshot call for call"
+    assert set(index) == {"NSR:StopPlace:1", "NSR:StopPlace:2", "NSR:StopPlace:3"}
+    assert [c.jkey for _sit, c in index["NSR:StopPlace:1"]] == ["j1", "j2"]
+    # The SITUATION travels in the entry, because the snapshot's key is what scopes a scan.
+    assert {sit for sit, _c in index["NSR:StopPlace:1"]} == {"S1"}
+    assert index_stamp == stamp, "the index and the snapshot must name one generation"
+
+
+def test_the_index_and_the_snapshot_are_published_together():
+    """A second rebuild replaces BOTH under the one lock, so no reader can straddle two loads.
+
+    `impact._stop_ref_index_for` compares the two stamps and falls back to indexing the snapshot
+    itself when they differ — a cheap safety net, and this is what keeps it from being the ordinary
+    case.
+    """
+    now = datetime(2026, 8, 8, 7, 0, tzinfo=UTC)
+    first = _refresh_predictions([_PredRow("j1", "S1", "NSR:StopPlace:1", 1, now)])
+    second = _refresh_predictions([_PredRow("j9", "S9", "NSR:StopPlace:9", 1, now)])
+    (snap_a, stamp_a), (index_a, _) = first
+    (snap_b, stamp_b), (index_b, stamp_index_b) = second
+    assert stamp_b >= stamp_a
+    assert set(snap_a) == {"S1"} and set(snap_b) == {"S9"}
+    assert set(index_a) == {"NSR:StopPlace:1"} and set(index_b) == {"NSR:StopPlace:9"}
+    assert stamp_index_b == stamp_b
+
+
+def test_the_engine_is_wired_to_the_pollers_index_and_varsel_to_the_heartbeat():
+    """Two seams U2 adds at the wiring, each silent if it is dropped.
+
+    Without `stop_ref_index` the engine still works — it indexes the snapshot itself — but the
+    O(calls) pass moves off the poller thread and onto whichever request thread arrives first after
+    a rebuild, which is the cost this wiring exists to place deliberately.
+
+    Without `beat` the whole match-and-write pass beats `/health` exactly once, at its end, and a
+    slow pass reads as a wedged poller. Neither failure shows up in any behaviour test, so both are
+    checked at the call site, over `lifespan`'s source — entering the lifespan would start the
+    poller thread, which spends real BigQuery money per cycle.
+    """
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    engine = source[source.index("impact_engine.configure(") :]
+    engine = engine[: engine.index("varsel.configure(")]
+    assert "stop_ref_index=_impact_stop_ref_index" in engine, engine
+    configure = source[source.index("varsel.configure(") :]
+    configure = configure[: configure.index("llm_message.configure(")]
+    assert "beat=_beat" in configure, configure
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
