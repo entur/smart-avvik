@@ -587,6 +587,33 @@ def store_documents(plan: Plan, *, destination_id: str, daily_cap: int, now) -> 
     return built
 
 
+def bind_store(target: Target) -> None:
+    """Point the store at the RESOLVED project, not at whatever ADC happens to name.
+
+    `resolve_target` refuses production four ways, and every one of them judges an ARGUMENT. None of
+    them reaches the Firestore client: `notification_store.firestore_client()` builds
+    `firestore.Client(database=...)` with no project, so the project comes from ambient ADC — which
+    means an exported `GOOGLE_CLOUD_PROJECT=ent-kixavvik-prd` would have this tool print that it is
+    seeding dev while writing synthetic subscriptions into PRODUCTION, where they become real push
+    notifications and real webhook deliveries to a real client's BFF.
+
+    `scripts/manage_notification_client.py` already documents exactly this trap -- "GOOGLE_CLOUD_PROJECT
+    would be one stale shell variable away from provisioning the wrong environment" -- and binds the
+    variable before configuring the store. This does the same, and additionally hands the store a
+    client built on the resolved project, so a caller that reaches `seed_via_store` or
+    `teardown_store` without going through `main()` is bound too rather than relying on call order.
+    """
+    import notification_store
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = target.project
+    from google.cloud import firestore
+
+    notification_store.configure(
+        client=firestore.Client(project=target.project, database=target.database),
+        database=target.database,
+    )
+
+
 def seed_via_store(plan: Plan, target: Target, *, destination_id: str) -> dict[str, int]:
     """Write the documents directly, in bulk.
 
@@ -598,7 +625,7 @@ def seed_via_store(plan: Plan, target: Target, *, destination_id: str) -> dict[s
     import notification_auth
     import notification_store
 
-    notification_store.configure(database=target.database)
+    bind_store(target)
     client = notification_store.firestore_client()
     account = notification_auth.get_account(LOADTEST_CLIENT_ID)
     if account is None:
@@ -611,6 +638,18 @@ def seed_via_store(plan: Plan, target: Target, *, destination_id: str) -> dict[s
     # on the field `cap_remaining` is computed from -- the point of seeding through the store's own
     # builder is that the two are indistinguishable, and a defaulted cap would be the one field
     # that gave it away, silently, on the number the delivery ceiling is judged by.
+    # And the destination must belong to the loadtest client. The API path cannot get this wrong --
+    # `get_destination(..., client_id=...)` raises Forbidden for another client's -- but seeding
+    # writes the document directly, so nothing would otherwise stop a mistyped `--destination` from
+    # pointing 100 000 synthetic subscriptions at ANOTHER client's receiver, which then takes a load
+    # test it never agreed to. Checked through the same tenancy-aware accessor rather than by
+    # comparing a field here, so there is one definition of "owns".
+    destination = notification_auth.get_destination(destination_id, client_id=LOADTEST_CLIENT_ID)
+    if destination is None:
+        raise Refused(
+            f"destination {destination_id!r} does not exist under client {LOADTEST_CLIENT_ID!r} in "
+            f"{target.project}; create it with scripts/manage_notification_client.py add-destination"
+        )
     daily_cap = int(account.quotas.daily_cap)
     documents = store_documents(
         plan, destination_id=destination_id, daily_cap=daily_cap, now=notification_store._now()
@@ -696,7 +735,7 @@ def teardown_store(target: Target, *, batch: int = 400) -> dict[str, int]:
     import notification_store
     from google.cloud.firestore_v1.base_query import FieldFilter
 
-    notification_store.configure(database=target.database)
+    bind_store(target)
     client = notification_store.firestore_client()
     names = {
         "subscriptions": notification_store.SUBSCRIPTIONS,
@@ -708,23 +747,41 @@ def teardown_store(target: Target, *, batch: int = 400) -> dict[str, int]:
     for label in TEARDOWN_COLLECTIONS:
         collection = client.collection(names[label])
         total = 0
+        cursor = None
         while True:
             # `filter=FieldFilter(...)`, the form `notification_store._query` uses: the
             # positional `where("client_id", "==", ...)` is deprecated and warns on every call.
-            page = list(
-                collection.where(
-                    filter=FieldFilter("client_id", "==", LOADTEST_CLIENT_ID)
-                )
+            query = (
+                collection.where(filter=FieldFilter("client_id", "==", LOADTEST_CLIENT_ID))
+                .order_by("__name__")
                 .limit(batch)
-                .stream()
             )
+            if cursor is not None:
+                query = query.start_after(cursor)
+            page = list(query.stream())
             if not page:
                 break
-            writer = client.batch()
-            for snapshot in page:
-                writer.delete(snapshot.reference)
-            writer.commit()
-            total += len(page)
+            cursor = page[-1]
+            # The client id narrows the read; the PREFIX decides the delete. SUBSCRIPTION_PREFIX
+            # promises that "even inside the loadtest client, teardown deletes only what this tool
+            # made", and until 2026-09-12 this swept the whole client instead -- so a subscription
+            # someone had created by hand under `loadtest` to reproduce a bug was collateral. The
+            # page is walked with a cursor rather than re-read from the top precisely because the
+            # filter is applied in Python: a page where nothing matches must advance, not repeat.
+            doomed = [
+                snapshot
+                for snapshot in page
+                if str(snapshot.id).startswith(SUBSCRIPTION_PREFIX)
+                or str(snapshot.to_dict().get("subscription_id", "")).startswith(
+                    SUBSCRIPTION_PREFIX
+                )
+            ]
+            if doomed:
+                writer = client.batch()
+                for snapshot in doomed:
+                    writer.delete(snapshot.reference)
+                writer.commit()
+                total += len(doomed)
         removed[label] = total
     return removed
 

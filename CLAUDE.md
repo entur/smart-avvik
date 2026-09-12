@@ -1497,9 +1497,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `rate_limited` and `deadline` beside `no_input`, `unreadable_input`, `disabled` and the statuses
     off `MessageResult` — and `ungrounded`/`rejected` carry the **discarded reply**, since those two
     are what a prompt edit most plausibly produces and a badge with no text defeats the loop. On top
-    of all four, `maximum_bytes_billed` is set to 2 GiB on every job: at ~11x the whole decision log
-    (181.6 MB in prd, 135 MB in dev, measured 2026-08-21) it will **not** catch a pruning regression —
-    it is a blast-radius bound against a mistyped join reaching a ~10 TiB ET table.
+    of all four, `maximum_bytes_billed` is set to 2 GiB on every job — and since 2026-09-12 so is
+    `/historikk`'s, from the one shared constant, where it had no cap at all. The RATIO has moved and
+    the conclusion has not: 2 GiB was ~11x the whole decision log when it was set (181.6 MB in prd,
+    135 MB in dev, 2026-08-21) and is ~1.3x it now (1.53 GB in prd, 2026-09-11), so it still will
+    **not** catch a pruning regression — it is a blast-radius bound against a mistyped join reaching a
+    ~10 TiB ET table. At ~1.3x it is approaching the point where it becomes both, which is what the
+    derived cap under R12 of the 100k plan is for.
   - **The latch is isolated, and that is not optional.** `llm_message`'s `_active`, `_active_at`,
     `_latched_off` and the lock guarding them were four module globals; they now live in a
     `_LatchState` holder, the module keeps one global instance so **every existing caller is

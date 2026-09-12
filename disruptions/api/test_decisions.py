@@ -766,16 +766,21 @@ class _BatchClient:
     def __init__(self, reject=(), raise_on=()):
         self.batches: list[list[dict]] = []
         self.timeouts: list[float | None] = []
+        # The retry policy each request was made under. Recorded because the library's default is
+        # a TEN-MINUTE deadline and `timeout=` bounds only one attempt of it — see
+        # `test_a_chunk_cannot_retry_for_ten_minutes_behind_the_per_attempt_ceiling`.
+        self.retries: list[object] = []
         self._reject = set(reject)
         self._raise = set(raise_on)
 
     def query(self, sql):
         return _FakeQueryJob(fail=False)
 
-    def insert_rows_json(self, table, rows, timeout=None):
+    def insert_rows_json(self, table, rows, timeout=None, retry=None):
         index = len(self.batches)
         self.batches.append(list(rows))
         self.timeouts.append(timeout)
+        self.retries.append(retry)
         if index in self._raise:
             raise RuntimeError("BigQuery is down")
         if index in self._reject:
@@ -905,6 +910,132 @@ def test_the_failed_write_is_logged_with_its_event_field():
         for f in captured.fields
     ), f"no structured error record: {captured.fields}"
     assert any("chunk" in f for f in captured.fields), "the record names which chunk was lost"
+
+
+# ---- a chunked write is bounded, and beats the poller's liveness seam (U4 review, 2026-09-12) ----
+#
+# Chunking introduced a second silence the heartbeat work (U2) had just removed. `timeout=` bounds
+# ONE HTTP attempt; the call runs under the client's DEFAULT_RETRY, whose deadline is ten minutes —
+# so several sequential chunks are several ten-minute waits with no progress signal, inside the
+# single `varsel_notify` phase, against a `HEALTH_STALE_AFTER_S` of 600 s whose restart comes up
+# with both ET planned-call tables cold.
+
+
+class _Beats:
+    """Counts heartbeats, and can fail on demand — the seam must never cost the write."""
+
+    def __init__(self, raises=False):
+        self.count = 0
+        self._raises = raises
+
+    def __call__(self):
+        self.count += 1
+        if self._raises:
+            raise RuntimeError("the liveness seam is having a day")
+
+
+def test_the_write_beats_the_heartbeat_once_per_chunk():
+    """A chunk boundary is a progress point in exactly /health's sense: the staleness rule means
+    "no STEP has finished", and a cycle's rows are now several steps. Without a beat between them
+    a big cycle reads as a wedged poller — and the restart is into a cold start, which is the one
+    failure mode the beat exists to prevent."""
+    before = decisions._MAX_ROWS_PER_INSERT
+    client = _BatchClient()
+    beats = _Beats()
+    _with_client(client)
+    decisions._MAX_ROWS_PER_INSERT = 1
+    try:
+        assert decisions.record(_rows_of(3, 100), beat=beats) == 3
+        assert len(client.batches) == 3, "control: the rows really did go as three requests"
+        assert beats.count == 3, (
+            f"expected one beat per chunk, got {beats.count} for {len(client.batches)} requests"
+        )
+    finally:
+        decisions._MAX_ROWS_PER_INSERT = before
+        _with_client(None)
+
+
+def test_a_chunk_that_failed_still_beats_because_the_thread_is_still_moving():
+    """The beat is in the loop body, not on the success path. A chunk that failed SLOWLY is the
+    most interesting reading there is and it is still evidence the poller is alive — the same rule
+    `main._phase` follows by beating from its `finally`."""
+    before = decisions._MAX_ROWS_PER_INSERT
+    client = _BatchClient(raise_on={0, 1})
+    beats = _Beats()
+    _with_client(client)
+    decisions._MAX_ROWS_PER_INSERT = 1
+    try:
+        assert decisions.record(_rows_of(2, 100), beat=beats) == 0
+        assert beats.count == 2, f"a failing chunk skipped its beat: {beats.count}"
+    finally:
+        decisions._MAX_ROWS_PER_INSERT = before
+        _with_client(None)
+
+
+def test_a_raising_heartbeat_never_costs_the_cycles_rows():
+    """`record` promises never to raise and its caller's ledger rollback depends on that promise:
+    a beat that escaped would unwind `varsel._record_decisions` before the rollback ran, losing the
+    very rows the return value exists to report. The seam is guarded here as well as inside it."""
+    before = decisions._MAX_ROWS_PER_INSERT
+    client = _BatchClient()
+    beats = _Beats(raises=True)
+    captured = _CapturingLogger()
+    logger_before = decisions.logger
+    decisions.logger = captured
+    _with_client(client)
+    decisions._MAX_ROWS_PER_INSERT = 1
+    try:
+        assert decisions.record(_rows_of(2, 100), beat=beats) == 2, (
+            "a broken liveness seam must not lose rows that BigQuery accepted"
+        )
+        assert beats.count == 2
+    finally:
+        decisions._MAX_ROWS_PER_INSERT = before
+        _with_client(None)
+        decisions.logger = logger_before
+    assert any(f.get("result") == "beat_failed" for f in captured.fields), captured.fields
+
+
+def test_a_write_with_no_beat_wired_behaves_exactly_as_it_did():
+    """Absent is a no-op, like every other seam in this package: a deployment that wired nothing
+    (and every suite that calls `record` directly) must be byte-for-byte what it was."""
+    client = _BatchClient()
+    _with_client(client)
+    try:
+        assert decisions.record(_rows_of(3, 100)) == 3
+    finally:
+        _with_client(None)
+
+
+def test_a_chunk_cannot_retry_for_ten_minutes_behind_the_per_attempt_ceiling():
+    """`timeout=` bounds one HTTP attempt; the library's DEFAULT_RETRY bounds the CALL at ten
+    minutes, and `insert_rows_json`'s signature defaults to it. So the 60 s ceiling beside it was
+    never the ceiling — several chunks could each spend ten minutes, on the poller thread.
+
+    Only the DEADLINE is narrowed: the predicate stays the library's, so exactly the same errors are
+    retried. The last assertion is what keeps this from going vacuous — if the guarded import ever
+    stops resolving, `_WRITE_RETRY` is None and every other check here still passes."""
+    assert decisions._BQ_DEFAULT_RETRY is not None, (
+        "google-cloud-bigquery is installed in CI, so the fallback must not be what is under test"
+    )
+    assert decisions._BQ_DEFAULT_RETRY.timeout > decisions._WRITE_TIMEOUT_S, (
+        "control: the library default is what needed narrowing"
+    )
+    assert decisions._WRITE_RETRY is not None
+    assert decisions._WRITE_RETRY.timeout == decisions._WRITE_TIMEOUT_S
+    assert decisions._WRITE_RETRY._predicate is decisions._BQ_DEFAULT_RETRY._predicate, (
+        "narrowing the deadline must not change WHICH errors are retried"
+    )
+
+    client = _BatchClient()
+    _with_client(client)
+    try:
+        assert decisions.record(_rows_of(3, 100)) == 3
+        assert client.retries == [decisions._WRITE_RETRY], (
+            "every request carries the narrowed policy, not the library's ten-minute default"
+        )
+    finally:
+        _with_client(None)
 
 
 def _run():

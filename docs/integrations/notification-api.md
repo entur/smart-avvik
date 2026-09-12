@@ -590,8 +590,11 @@ pass's own wording and `payload.notification` is **byte-identical to the event's
 wording spent. The boundary is worth stating precisely, because it is narrower than "the same as the
 event":
 
-- it is **exact-key**: `begin`, `end` and `days` are part of the key, so a favourite that differs
-  from the registration by a minute is a fresh draw;
+- it is **pair-keyed** (since 2026-09-12; it was exact-key before): the wording cache is keyed on
+  the canonical stop PAIR and the train, so a favourite on a corridor the pass has worded is served
+  that wording even when `begin`, `end` or `days` differ from any registration's. What still splits
+  an entry is the train, the situation, whether it is cancelled, whether it is tomorrow, the
+  alternative's identity and the prompt version;
 - it is **the notification only**: the figures are live where the event's were its mint-time
   snapshot (a revision is minted only on a lifecycle transition, so the event's numbers may be a
   cycle old), and the alternative can differ in one case the operating contract publishes;
@@ -606,10 +609,12 @@ definition is registered**.
 
 ### Three accepted exposures, published rather than closed
 
-1. **The completeness and latency of a first read reveal whether a registration with exactly those
-   five fields exists and is alert-worthy right now** — a registered definition answers complete at
-   once where a cold one waits. The mitigation is that no status ever says so, and that a definition
-   is a stop pair with a period, not a person.
+1. **The completeness and latency of a first read reveal whether a registration on the same stop
+   PAIR exists and is alert-worthy right now** — a registered pair answers complete at once where a
+   cold one waits. This WIDENED on 2026-09-12: the wording cache moved from the five fields to the
+   canonical pair and the train, so the signal no longer requires a favourite matching a
+   registration minute for minute, only one on the same corridor. The mitigation is unchanged and
+   still holds at this grain: no status ever says so, and a pair with a period is not a person.
 2. **The global ceiling and the allowances are shared by every anonymous caller**, the app's BFF
    included, with no reserved slice — one source at the ceiling holds every caller at 429; one at
    the daily wording allowance holds every caller template-only for the trailing day. Treat both as

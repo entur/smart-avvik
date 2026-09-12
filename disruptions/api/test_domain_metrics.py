@@ -142,7 +142,7 @@ class _InsertClient:
         self._errors = errors or []
         self._raise = raise_exc
 
-    def insert_rows_json(self, table, rows, timeout=None):
+    def insert_rows_json(self, table, rows, timeout=None, retry=None):
         if self._raise is not None:
             raise self._raise
         return self._errors

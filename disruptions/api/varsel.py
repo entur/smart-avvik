@@ -1327,6 +1327,13 @@ _daily_pushes: dict[str, tuple[str, int]] = {}
 # measurement to take before the pilot grows, and the lever if it binds is to store the closing
 # row's big text columns by reference to the last written row rather than by copy. It is NOT a
 # reason to drop the closing row: without it `final_*` describes a cycle the rule skipped.
+#
+# ONE MORE TERM SINCE THE U4 REVIEW, and it is the only one an OUTAGE grows: a retiring subject
+# whose closing row the write lost is put BACK here (`_record_decisions`' rollback) rather than
+# dropped, so a BigQuery outage holds every retirement it spanned on top of the live subjects.
+# ~1 KB each against prd's ~3 000 retirements a day -- tens of MB over a multi-hour outage today,
+# 15-30x that at the pilot's target scale, and it drains the moment an insert is accepted. Bounded
+# and worth the memory: a closing row exists nowhere else and no later cycle re-derives it.
 _decision_ledger: dict[tuple[str, str, str], dict[str, Any]] = {}
 #: How long a subject can go without a row when nothing about it has changed (KTD15).
 #:
@@ -2755,25 +2762,34 @@ def _thinning_reason(
     return None
 
 
-def _retire_decision_subjects(*, live: set[str]) -> list[dict]:
-    """Close out every ledger subject whose SITUATION has ended, and return their closing rows.
+def _retire_decision_subjects(*, live: set[str]) -> list[tuple[tuple[str, str, str], dict]]:
+    """Close out every ledger subject whose SITUATION has ended, and return what still owes a row.
 
     Called from the stale sweep at the top of a cycle, where `_messages`, `_notified` and the rest
     are pruned on this same liveness test — and it has to be called from there rather than left to
     the end-of-cycle absence check, because by then the sweep has already dropped the entry and
     there is nothing left to close.
 
-    It RETURNS the rows rather than writing them: the sweep holds `_state_lock` and does no I/O
-    under it, and a cycle makes exactly one decision-log write. A subject whose last observation was
-    itself written needs no closing row — that row is already in the log, and a second copy of it
-    would move `n_decisions` and nothing else.
+    It RETURNS rather than writing: the sweep holds `_state_lock` and does no I/O under it, and a
+    cycle makes exactly one decision-log write. A subject whose last observation was itself written
+    needs no closing row — that row is already in the log, and a second copy of it would move
+    `n_decisions` and nothing else, so it is popped and not returned.
+
+    **The ENTRY travels with the row, not the row alone**, and that pair is the whole point of the
+    return type. Retiring pops the subject, so a closing row lost to a failed insert used to be lost
+    for good: nothing was left in the ledger to offer it again, and `final_impact_probability` —
+    "the closest look we got before departure" — then described an older cycle for the life of the
+    table. The write fails open by design, so that was not a rare path. `_record_decisions` puts
+    these back when its write is short (see its rollback), and the next cycle's sweep retires them
+    again; each subject still retires exactly once, because a retirement that LANDED leaves nothing
+    to put back.
     """
-    closing: list[dict] = []
+    closing: list[tuple[tuple[str, str, str], dict]] = []
     with _state_lock:
         for key in [k for k in _decision_ledger if k[1] not in live]:
             entry = _decision_ledger.pop(key)
             if not entry.get("written") and entry.get("row") is not None:
-                closing.append(entry["row"])
+                closing.append((key, entry))
     return closing
 
 
@@ -2786,7 +2802,7 @@ def _record_decisions(
     *,
     push_on: bool,
     now: datetime | None = None,
-    closing_rows: list[dict] | None = None,
+    closing_rows: list[tuple[tuple[str, str, str], dict]] | None = None,
 ) -> None:
     """Append this cycle's alert decisions to the decision log.
 
@@ -2812,7 +2828,9 @@ def _record_decisions(
     description says so.
 
     `now` is the cycle's single clock (the same instant the match was made at), injectable for
-    tests. `closing_rows` are the sweep's, written with this cycle's own.
+    tests. `closing_rows` are the sweep's — `(key, entry)` pairs, not bare rows, so a closing row
+    lost to a failed insert can be put back in the ledger and offered again (see
+    :func:`_retire_decision_subjects`).
     """
     try:
         import decisions
@@ -2848,7 +2866,11 @@ def _record_decisions(
             # pins the count, because the per-alert form is correct, invisible and O(subjects).
             alternatives_snapshot = dict(_alternatives)
 
-        rows = list(closing_rows or [])
+        # Retiring subjects: the sweep's, plus this pass's own (collected below). Held as
+        # `(key, entry)` so a lost write can put them back — a closing row is a subject's LAST look
+        # and there is no later cycle that would produce it again.
+        retired: list[tuple[tuple[str, str, str], dict]] = list(closing_rows or [])
+        rows = [entry["row"] for _key, entry in retired]
         seen: set[tuple[str, str, str]] = set()
         # Ledger entries for the subjects this pass WRITES, held back until the insert has actually
         # been accepted. The write fails open by design, and committing before it lands would mark a
@@ -3033,13 +3055,36 @@ def _record_decisions(
             entry = _decision_ledger.pop(message_key)
             if not entry.get("written") and entry.get("row") is not None:
                 rows.append(entry["row"])
-        accepted = decisions.record(rows)
-        # A write that landed nothing at all (no table, or the insert raised) leaves the ledger
-        # where it was, so the next cycle offers the same subjects again rather than thinning rows
-        # nobody has. The fresh figures still move onto the stored row: a closing row must describe
-        # the last look whether or not the intervening writes landed. A first-seen subject keeps no
-        # entry at all, which is what makes its next cycle a first-seen one again.
-        lost = bool(rows) and not accepted
+                retired.append((message_key, entry))
+        # `beat` is the poller's liveness seam: a cycle's rows are several insertAll requests now,
+        # each able to spend `decisions._WRITE_RETRY`'s deadline plus an attempt, and /health reads
+        # "no STEP has finished in HEALTH_STALE_AFTER_S". Unbeaten they are one silence inside the
+        # single `varsel_notify` phase, and the restart it earns comes up with both planned-call
+        # tables cold. `_heartbeat` swallows, and so does `decisions.record` around it, because the
+        # rollback below must run whatever the seam does.
+        accepted = decisions.record(rows, beat=_heartbeat)
+        # A SHORT write, not only an empty one. `accepted` sums acceptances across the cycle's
+        # chunks, so `not accepted` is true only when every request failed -- and a cycle that lost
+        # one request of four would mark every subject in it written: thinned for the next quarter
+        # hour against rows nobody holds, with `max_impact` advanced past a peak no row in the log
+        # carries, so the peak can never be written even after BigQuery recovers.
+        #
+        # THE TRADE, both sides, because the conservative test is not free. On any short write the
+        # whole cycle is re-offered next time, so the subjects whose rows DID land are written
+        # twice. That is harmless: every figure `varsel_decision_groups` computes is a MIN, a MAX, a
+        # LOGICAL_OR or a first/last pick, and `n_decisions` -- the one column a duplicate moves --
+        # already changed meaning with the thinning rule and says so in its description. Losing a
+        # peak is not harmless, and it is silent. So: duplicate rather than drop.
+        #
+        # WHAT A PERSISTENT SHORT WRITE DOES, since the trade above only describes a one-off. One
+        # row BigQuery refuses on EVERY cycle -- a column drift, an oversized `message_input` --
+        # makes this true every cycle, so no ledger entry ever commits, `written_at` never advances
+        # and after one interval every subject writes every cycle: the pre-thinning volume is back
+        # until the bad row is fixed. That is no worse than the week before KTD15 and it is loud
+        # (`result="partial"` from `decisions` beside `result="rolled_back"` from here, every
+        # cycle) -- but the two firing together is what it looks like, and nothing else produces
+        # that pair.
+        lost = accepted < len(rows)
         for message_key, entry in wrote:
             prior = _decision_ledger.get(message_key) if lost else None
             if not lost:
@@ -3052,6 +3097,39 @@ def _record_decisions(
                 # older successful write rather than the last look, which is the exact hole the
                 # rollback exists to close.
                 prior["written"] = False
+        if lost and retired:
+            # Put the retiring subjects back so the next cycle's sweep (or its absence check) offers
+            # their closing rows again. `setdefault`, so a key this cycle re-created wins -- it
+            # cannot happen today (a retired key is popped before the pass reads the ledger, so its
+            # subject reads as first-seen and a lost cycle commits nothing under it) and that is
+            # exactly why the weaker call is the right one: it makes "retires exactly once" a
+            # property rather than a coincidence. The entry still carries `written=False`, so the
+            # closing row is owed until an insert actually takes it.
+            with _state_lock:
+                for message_key, entry in retired:
+                    _decision_ledger.setdefault(message_key, entry)
+        if lost:
+            # The loss stops being invisible. `decisions` logs per REQUEST and cannot see what the
+            # ledger did about it; this is the cycle-level line, and the closing count is the part
+            # worth reading -- those rows exist nowhere else and no later cycle re-derives them.
+            logger.warning(
+                "Decision write was short (%d of %d rows accepted); re-offering %d subjects and "
+                "%d closing rows next cycle",
+                accepted,
+                len(rows),
+                len(wrote),
+                len(retired),
+                extra={
+                    "fields": {
+                        "event": "varsel_decision_write",
+                        "result": "rolled_back",
+                        "n_rows": len(rows),
+                        "n_accepted": accepted,
+                        "n_subjects": len(wrote),
+                        "n_closing": len(retired),
+                    }
+                },
+            )
     except Exception:
         logger.warning("Could not record alert decisions this cycle", exc_info=True)
 
@@ -3938,11 +4016,13 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         changed = bool(stale)
 
     # The decision log's own sweep, on the same liveness test one line of reasoning above -- but it
-    # RETURNS rows rather than dropping state, because a thinned subject's last look has not been
-    # written yet (KTD15). Outside the lock block so the rows travel as a pass-local list to the
+    # RETURNS rather than dropping state, because a thinned subject's last look has not been
+    # written yet (KTD15). Outside the lock block so the subjects travel as a pass-local list to the
     # cycle's single decision-log write, which is the rule every other write here follows: no I/O
-    # under `_state_lock`, and one insert per cycle.
-    closing_rows = _retire_decision_subjects(live=live)
+    # under `_state_lock`, and one insert per cycle. `(key, entry)` pairs rather than bare rows:
+    # retiring pops the subject, so a closing row the write loses has to be restorable or it is
+    # gone for good.
+    closing_subjects = _retire_decision_subjects(live=live)
 
     # ---- The one client read: BEFORE pass 1a, and before the write budget's clock starts -----
     #
@@ -4617,7 +4697,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             # here. The thinning rule is an elapsed-minutes test, and a pass that takes 60 s would
             # otherwise measure it from an instant nothing else in the cycle shares.
             now=cycle_now,
-            closing_rows=closing_rows,
+            closing_rows=closing_subjects,
         )
 
     if changed:
