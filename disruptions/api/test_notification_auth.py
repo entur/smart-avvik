@@ -1459,6 +1459,61 @@ def test_quota_values_outside_their_bounds_are_refused_and_bad_stored_values_rea
         _uninstall()
 
 
+def test_the_delivery_destination_read_is_cached_and_every_writer_invalidates_it():
+    """U8: a worker draining a queue has no pass to hang a cache on.
+
+    `webhook_delivery._Skips` caches the record for one PASS, which is what makes twenty thousand
+    deliveries against four destinations four reads today. U11's worker has no pass boundary, so the
+    window moves here beside the account cache.
+
+    What the test is really about is the invalidation, because the stale value is not a stale
+    boolean: the record carries the SIGNING GENERATIONS, so a rotation whose invalidation was missed
+    keeps signing with a retired key and the receiver refuses deliveries it should accept. Every
+    writer therefore goes through one funnel, and this walks the three an operator actually uses.
+    """
+    store = _install()
+    _provision(store)
+    try:
+        notification_auth.create_destination(
+            "dest-a", client_id=CLIENT, callback_url="https://r.example.com/h", actor="op@entur.org"
+        )
+        first = notification_auth.destination_for_delivery("dest-a")
+        assert first is not None and first.deliverable is True
+        reads = store.reads
+        assert notification_auth.destination_for_delivery("dest-a") is not None
+        assert store.reads == reads, "the second read must come from the cache"
+
+        # A pause must be visible to the very next delivery, not a window later.
+        notification_auth.pause_destination("dest-a", reason="gone")
+        paused = notification_auth.destination_for_delivery("dest-a")
+        assert paused is not None and paused.deliverable is False
+        notification_auth.resume_destination("dest-a", actor="op@entur.org")
+        assert notification_auth.destination_for_delivery("dest-a").deliverable is True
+
+        # And a rotation: the generations the signer reads must be the new ones immediately.
+        before = notification_auth.destination_for_delivery("dest-a").signing_generations
+        notification_auth.rotate_signing_generation("dest-a", actor="op@entur.org")
+        after = notification_auth.destination_for_delivery("dest-a").signing_generations
+        assert after != before, "a rotation the cache hid would sign with a retired key"
+
+        # `get_destination` is deliberately NOT cached: an operator looking at what they just
+        # changed must see it, and this path is not the hot one.
+        assert "destination_for_delivery" in AUTH_SOURCE
+        reads = store.reads
+        notification_auth.get_destination("dest-a")
+        notification_auth.get_destination("dest-a")
+        assert store.reads - reads == 2, "the operator-facing read stays read-your-writes"
+
+        # A MISSING record is cached too, or a destination that has gone costs one read per
+        # pending event rather than one per window.
+        assert notification_auth.destination_for_delivery("nobody") is None
+        reads = store.reads
+        assert notification_auth.destination_for_delivery("nobody") is None
+        assert store.reads == reads
+    finally:
+        _uninstall()
+
+
 def test_quotas_for_answers_off_the_same_cached_account_read():
     """The emit and delivery passes hold a `client_id` and no Principal (U7).
 
