@@ -10,10 +10,25 @@ threshold. That asymmetry is the whole point: a journey we did not alert on leav
 otherwise, so `miss` and `correct_reject` would be unobservable and any "precision" figure would
 be measuring only the half of the confusion matrix that flatters us.
 
-Rows are written once per refresh cycle per (journey definition x situation x departure), so the
-same decision reappears as its prediction evolves. Those repeats are not duplicates to be
-suppressed — they are the lead-time series, the axis alerting quality varies along most
-(eval/impact_eval.py: alertable ~30-60 min pre-departure, and ask-time features decay).
+Rows are keyed on (journey definition x situation x departure), and the same decision reappears as
+its prediction evolves. Those repeats are not duplicates to be suppressed — they are the lead-time
+series, the axis alerting quality varies along most (eval/impact_eval.py: alertable ~30-60 min
+pre-departure, and ask-time features decay).
+
+**Not on every cycle, since 2026-09-12** (KTD15), and this qualifies the paragraph above rather than
+replacing it. One row per subject per cycle was the rule from the day this module existed and the
+reasoning for it stands; what does not stand is the arithmetic. Measured in prd on 2026-09-11:
+74 000-93 000 rows a day at 226 registered definitions, ~400 per definition per day, 88-95 % of them
+sub-threshold no-SX subjects re-scored every ~295 s with nothing about them having moved. At the
+35 000-80 000 definitions this stack is being taken to that is 14-32 M rows and 14-33 GB a DAY, and
+a 14-day /historikk window over it is 70-150 GB per request — a page that refuses rather than
+renders. So `varsel._thinning_reason` keeps every row a figure `varsel_decision_groups` computes is
+made of — the first sighting, every alert-worthy/sub-threshold transition, every new maximum
+probability, every push, and a closing row carrying the subject's last observation — and writes a
+standing subject nothing has changed about at most once per quarter hour. The lead-time series
+survives for the subjects it is a series ABOUT (an alerting subject transitions and re-peaks, so it
+keeps its cycles); what thins away is the flat middle of a subject nobody was ever told about.
+`n_decisions` is the one column whose meaning changes, and its description says so.
 
 Design notes
 ------------
@@ -56,6 +71,7 @@ Design notes
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -111,6 +127,24 @@ _ENSURE_TIMEOUT_S = 60.0
 # something wrong with it, and the write fails open anyway — the row is logged as lost and the
 # traveller's push is unaffected.
 _WRITE_TIMEOUT_S = 60.0
+
+# ---- One cycle is several insert REQUESTS (U4, 2026-09-12) ---------------------------------------
+#
+# `insert_rows_json` maps to one `insertAll` request, and BigQuery refuses one over **10 MB or
+# 50 000 rows**. Nothing in this repo stated those limits, and until this change a cycle's rows went
+# as a single call whatever their number: at today's 1 100-1 500 rows of ~1 KB on an evening cycle
+# that is a tenth of the byte bound, and at 100 000 commuters it is 30 000+ rows, where ONE refused
+# request loses the whole cycle's decisions rather than a share of them. A lost request is the
+# silent failure this module is built around — the write fails open by design, so the only trace is
+# a WARNING and a counter — which is why the bound is enforced here rather than discovered upstream.
+#
+# HALF of each documented limit, not the limit itself. The byte count below is an estimate of the
+# serialized row (see `_row_bytes`) and the wire form carries per-row insertIds and envelope on top
+# of it, so sending right up to the ceiling would fail for a reason no reading of this code
+# explains. Half is also far enough under that a row three times the size of anything measured
+# still fits the estimate's error.
+_MAX_ROWS_PER_INSERT = 10_000
+_MAX_BYTES_PER_INSERT = 5 * 1024 * 1024
 
 
 def configure(*, bq_client: Any) -> None:
@@ -497,11 +531,179 @@ def build_row(
     }
 
 
+def rescored(row: dict, alert: Alert) -> dict:
+    """`row` re-stated with a later cycle's figures — the cheap half of :func:`build_row`.
+
+    What the thinning rule (KTD15) carries between writes. A subject nothing has changed about does
+    not get a row, but its LAST look still has to reach the log when it retires, or
+    `final_impact_probability` — "the closest look we got before departure" — would describe a cycle
+    that was deliberately skipped. So every observation updates a stored row in place, and the one
+    left standing when the subject retires is written.
+
+    Deliberately only the fields that come off the `alert` by attribute read: the prediction block,
+    the observation, the alternative, and the two time columns derived from them. The expensive half
+    of a row — the deterministic template body and the message-input JSON — is exactly the work the
+    rule exists to stop repeating, and is carried over from the last row that was written. So a
+    closing row's WORDING can be up to one thinning interval older than its figures; the wording the
+    pages quote is taken off the first PUSHED row, which is never thinned.
+
+    `pushed` is forced False: a row nobody was notified on must not inherit an earlier cycle's mark,
+    which `pushed_any` would OR into a subject that never had a push.
+    """
+    departure = getattr(alert, "departure_time", None)
+    decided_at = getattr(alert, "decided_at", None) or datetime.now(UTC)
+    minutes_to_departure = None
+    if departure is not None:
+        minutes_to_departure = int((departure - decided_at).total_seconds() // 60)
+    impact = getattr(alert, "impact", None)
+    return {
+        **row,
+        **_observation_fields(alert),
+        **_alternative_fields(alert),
+        "decided_at": decided_at.isoformat(),
+        "minutes_to_departure": minutes_to_departure,
+        "et_cancelled": bool(getattr(alert, "cancelled", False)),
+        "impact_probability": getattr(alert, "impact_probability", None),
+        "cancel_probability": getattr(alert, "cancel_probability", None),
+        "ge10_probability": getattr(alert, "ge10_probability", None),
+        "delay_p50_min": getattr(alert, "delay_p50_min", None),
+        "delay_p90_min": getattr(alert, "delay_p90_min", None),
+        "alert_threshold": getattr(alert, "alert_threshold", None),
+        "alertworthy": bool(getattr(alert, "alertworthy", False)),
+        "pushed": False,
+        "snapshot_refreshed_at": (
+            impact.refreshed_at.isoformat()
+            if impact is not None and getattr(impact, "refreshed_at", None) is not None
+            else None
+        ),
+    }
+
+
+def _row_bytes(row: dict) -> int:
+    """About how many bytes this row costs in an insertAll request.
+
+    An ESTIMATE, deliberately: the exact figure is the client's own serialization plus per-row
+    insertIds and envelope, and reproducing that here would couple this module to a library detail
+    for a bound that is already set at half the documented limit. `ensure_ascii` (json.dumps'
+    default) escapes the Norwegian text the rows are full of, so the count errs HIGH — the safe
+    direction for a bound whose failure mode is a refused request.
+
+    Never raises. A row this cannot serialize is one `insert_rows_json` will refuse anyway, and
+    charging it the full request budget keeps it in a chunk of its own where its refusal costs
+    nothing else.
+    """
+    try:
+        return len(json.dumps(row, default=str))
+    except Exception:  # noqa: BLE001 - a sizing estimate must never be the thing that loses a cycle
+        return _MAX_BYTES_PER_INSERT
+
+
+def _chunks(rows: list[dict]) -> list[list[dict]]:
+    """Split one cycle's rows into requests under BOTH bounds, order preserved.
+
+    A row bigger than the byte bound on its own still goes out, alone: dropping it here would make
+    the loss invisible (the counter would read `ok`), and a loop that refuses to place it would
+    never terminate — on the poller thread, which is the tick `/health` watches.
+    """
+    out: list[list[dict]] = []
+    chunk: list[dict] = []
+    size = 0
+    for row in rows:
+        row_size = _row_bytes(row)
+        if chunk and (
+            len(chunk) >= _MAX_ROWS_PER_INSERT or size + row_size > _MAX_BYTES_PER_INSERT
+        ):
+            out.append(chunk)
+            chunk, size = [], 0
+        chunk.append(row)
+        size += row_size
+    if chunk:
+        out.append(chunk)
+    return out
+
+
+def _insert_chunk(chunk: list[dict], index: int, total: int) -> int:
+    """One insertAll request. Returns how many of ITS rows were accepted; never raises.
+
+    Scoped per chunk on purpose: a schema drift (`errors` returned) and an outage (an exception)
+    must each cost their own request's rows and nothing else, which is the whole reason a cycle is
+    split at all. The counter is per REQUEST for the same reason — a cycle that lost one chunk of
+    four is not an `error` cycle and not an `ok` one.
+    """
+    try:
+        errors = _bq_client.insert_rows_json(TABLE, chunk, timeout=_WRITE_TIMEOUT_S)
+    except Exception:
+        # `event` on this record, which it did not carry until 2026-09-12 — so the one branch that
+        # loses a whole request was the one branch a query on event="varsel_decision_write" could
+        # not find, and a dashboard built on that event read a losing cycle as a quiet one.
+        logger.warning(
+            "Could not record %d alert decisions (chunk %d of %d)",
+            len(chunk),
+            index + 1,
+            total,
+            exc_info=True,
+            extra={
+                "fields": {
+                    "event": "varsel_decision_write",
+                    "result": "error",
+                    "chunk": index + 1,
+                    "chunks": total,
+                    "n_rows": len(chunk),
+                }
+            },
+        )
+        # The write fails open by design, which is exactly why the failure needs a counter: the
+        # log going quiet is otherwise invisible (KTD11).
+        metrics.DECISION_WRITE_TOTAL.labels(result="error").inc()
+        return 0
+    if errors:
+        # insert_rows_json reports per-row failures instead of raising, so a schema drift shows up
+        # here as a silently short write unless it is logged explicitly.
+        logger.warning(
+            "%d of %d alert decisions rejected by BigQuery (chunk %d of %d): %s",
+            len(errors),
+            len(chunk),
+            index + 1,
+            total,
+            errors[:3],
+            extra={
+                "fields": {
+                    "event": "varsel_decision_write",
+                    "result": "partial",
+                    "chunk": index + 1,
+                    "chunks": total,
+                }
+            },
+        )
+        metrics.DECISION_WRITE_TOTAL.labels(result="partial").inc()
+        return len(chunk) - len(errors)
+    logger.info(
+        "Recorded %d alert decisions (chunk %d of %d)",
+        len(chunk),
+        index + 1,
+        total,
+        extra={
+            "fields": {
+                "event": "varsel_decision_write",
+                "result": "ok",
+                "n_rows": len(chunk),
+                "chunk": index + 1,
+                "chunks": total,
+            }
+        },
+    )
+    metrics.DECISION_WRITE_TOTAL.labels(result="ok").inc()
+    return len(chunk)
+
+
 def record(rows: list[dict]) -> int:
     """Append decision rows. Returns how many were accepted; never raises.
 
     A failure here is logged and dropped. The alternative — letting it propagate — would put a
     BigQuery outage on the path between a live disruption and a traveller's phone.
+
+    Sent as one insertAll request per `_chunks` bound, which at today's volumes is still exactly one
+    request per cycle; a request that fails costs its own rows and no others.
     """
     if not rows:
         return 0
@@ -517,33 +719,8 @@ def record(rows: list[dict]) -> int:
         if _bq_client is not None:
             metrics.DECISION_WRITE_TOTAL.labels(result="error").inc()
         return 0
-    try:
-        errors = _bq_client.insert_rows_json(TABLE, rows, timeout=_WRITE_TIMEOUT_S)
-    except Exception:
-        logger.warning("Could not record %d alert decisions", len(rows), exc_info=True)
-        # The write fails open by design, which is exactly why the failure needs a counter: the
-        # log going quiet is otherwise invisible (KTD11).
-        metrics.DECISION_WRITE_TOTAL.labels(result="error").inc()
-        return 0
-    if errors:
-        # insert_rows_json reports per-row failures instead of raising, so a schema drift shows up
-        # here as a silently short write unless it is logged explicitly.
-        logger.warning(
-            "%d of %d alert decisions rejected by BigQuery: %s",
-            len(errors),
-            len(rows),
-            errors[:3],
-            extra={"fields": {"event": "varsel_decision_write", "result": "partial"}},
-        )
-        metrics.DECISION_WRITE_TOTAL.labels(result="partial").inc()
-        return len(rows) - len(errors)
-    logger.info(
-        "Recorded %d alert decisions",
-        len(rows),
-        extra={"fields": {"event": "varsel_decision_write", "result": "ok", "n_rows": len(rows)}},
-    )
-    metrics.DECISION_WRITE_TOTAL.labels(result="ok").inc()
-    return len(rows)
+    chunks = _chunks(rows)
+    return sum(_insert_chunk(chunk, i, len(chunks)) for i, chunk in enumerate(chunks))
 
 
 # --- Labelling-freshness detector (R8, KTD7) ------------------------------------------------------

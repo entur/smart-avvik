@@ -94,7 +94,11 @@ WITH labelled AS (
 unlabelled AS (
   SELECT COUNTIF(g.jkey IS NOT NULL) AS n_pending,
          COUNTIF(g.jkey IS NULL)     AS n_unjoinable
-  FROM `disruptions.varsel_decision_groups` AS g
+  -- The table function, not the view: the cover prunes the partitioned table this aggregates
+  -- over. See the longer note in historikk_decisions.sql and the derivation on the function.
+  FROM `disruptions.varsel_decision_groups_between`(
+    DATE_SUB(@from_date, INTERVAL 1 DAY), DATE_ADD(@to_date, INTERVAL 1 DAY)
+  ) AS g
   WHERE g.call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR g.operator = @operator)
     AND (@line     IS NULL OR g.line     = @line)

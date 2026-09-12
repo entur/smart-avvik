@@ -14,6 +14,13 @@
 # executing or scanning, so it is free. It does need the tables to exist: run
 # disruptions/api/create_varsel_decisions.sql first (or let the app create them at startup).
 #
+# SINCE 2026-09-12 that prerequisite includes a ROUTINE, not only tables: the grouping body moved
+# into the table function `disruptions.varsel_decision_groups_between(d_start, d_end)` so the three
+# /historikk queries can pass their own partition cover (R12). Each statement of the DDL is dry-run
+# on its own, so the view over that function -- and all three historikk files -- resolve it by name
+# and report FAILED in a project where the app has never started. Same shape as the two togvarsel
+# tables noted further down: start the app once against the project, then validate.
+#
 # Run this after editing any of these files, and before re-registering the scheduled query.
 #
 # Usage: data/queries/validate_varsel_sql.sh [project]      (default ent-kixavvik-dev)

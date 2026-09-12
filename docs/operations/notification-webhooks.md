@@ -170,9 +170,16 @@ of what replaced the origin plan's dated-leg replay gate. It survives as five li
 **only the first three are inherited — the fourth is created by this plan, and the fifth by the
 public read that followed it.**
 
-1. **`/historikk`'s rows are one per subject per cycle**, the repeats being the lead-time series,
+1. **`/historikk`'s rows are repeats of one subject**, the repeats being the lead-time series,
    while a notification fires on the first threshold crossing. A rate over rows is not a rate over
-   notifications.
+   notifications. **They stopped being one per cycle on 2026-09-12** (the 100k plan's KTD15,
+   unit U4): a standing subject nothing has changed about is written at most once per quarter hour,
+   plus the first sighting, every alert-worthy/sub-threshold transition, every new maximum impact
+   probability, every push, and a closing row carrying the subject's last observation. `n_decisions`
+   therefore counts rows written rather than cycles scored, and no per-cycle rate may be computed
+   across that date. Measured over prd's own rows, the rule keeps 38 % of them (2.63x). What it does
+   NOT change is this clause: a rate over rows was never a rate over notifications, and it still is
+   not.
 2. **A subject nobody was notified about has no row at all**, so capped and missed subjects must be
    returned to the denominator by hand — and this channel *manufactures* capped subjects by design:
    nine of thirteen in the line-suspension case the daily cap is specified against. That limitation

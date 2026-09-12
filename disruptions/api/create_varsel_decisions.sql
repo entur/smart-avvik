@@ -14,9 +14,22 @@
 -- (data/queries/label_varsel_decisions.sql) reads this table and writes a separate outcomes table.
 -- "What we decided at 07:14" is a historical fact and should not be editable by a later job.
 --
--- One row per (journey definition x situation x departure) per refresh cycle -- including
--- decisions that did NOT alert, which is what makes a miss observable rather than invisible.
--- Duplicates across cycles are expected and intended: they are the lead-time series.
+-- Keyed on (journey definition x situation x departure) -- including decisions that did NOT alert,
+-- which is what makes a miss observable rather than invisible. Repeats across cycles are expected
+-- and intended: they are the lead-time series.
+--
+-- NOT one row per cycle since 2026-09-12 (KTD15). It was, from the day this table existed, and the
+-- reasoning above still holds -- what stopped holding is the arithmetic. Measured in prd
+-- 2026-09-11: ~400 rows per definition per day at 226 definitions, 88-95 % of them sub-threshold
+-- no-SX subjects re-scored every ~295 s with nothing having moved; at the 35 000-80 000 definitions
+-- this stack is being taken to that is 14-33 GB a DAY, and a 14-day /historikk window over it is
+-- 70-150 GB per request. varsel._thinning_reason now writes a standing subject at most once per
+-- quarter hour, PLUS every row the figures in varsel_decision_groups are made of: the first
+-- sighting, every alert-worthy/sub-threshold transition, every new maximum impact probability,
+-- every push, and a closing row carrying the subject's last observation, dated at the cycle it
+-- describes. So first_alert_at, max_impact_probability, the final_* block and the quoted wording
+-- are unchanged by construction; n_decisions counts rows written and says so in its description,
+-- and no per-cycle rate may be computed across that date.
 --
 -- Privacy: keyed on the journey DEFINITION (journey_digest, a SHA-256 prefix of the journey key)
 -- plus a device count. No device_id and no journey_id, so this is a record of what was said about
@@ -30,7 +43,7 @@
 -- Cost: negligible. Streaming inserts of a handful of rows per poller cycle.
 CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
 (
-  decided_at            TIMESTAMP NOT NULL OPTIONS(description="When this match was evaluated (UTC)."),
+  decided_at            TIMESTAMP NOT NULL OPTIONS(description="When this match was evaluated (UTC). NOT every cycle since 2026-09-12: a standing subject nothing has changed about is written at most once per quarter hour (varsel._thinning_reason), plus every cycle a figure is computed from -- first sighting, each alert-worthy/sub-threshold transition, each new maximum impact probability, each push, and a closing row carrying the subject's LAST observation, dated at the cycle it describes. So consecutive rows for one subject can be minutes or a quarter hour apart, and the gap is not a gap in the matching. Before that date every cycle wrote, which is why no per-cycle rate may be computed across it."),
   journey_digest        STRING    OPTIONS(description="SHA-256[:12] of the journey key; joins to jsonPayload.journey_digest on event='llm_message' log records."),
   from_stop             STRING    OPTIONS(description="Boarding StopPlace ref the traveller registered."),
   to_stop               STRING    OPTIONS(description="Alighting StopPlace ref the traveller registered."),
@@ -60,7 +73,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   delay_p90_min         INT64     OPTIONS(description="Bad-case (p90) departure delay (min)."),
   alert_threshold       FLOAT64   OPTIONS(description="The operator's threshold applied to impact_probability here."),
   alertworthy           BOOL      OPTIONS(description="Whether the score crossed the threshold."),
-  pushed                BOOL      OPTIONS(description="Whether a Web Push was actually delivered for this decision in this cycle."),
+  pushed                BOOL      OPTIONS(description="Whether a Web Push was delivered for THIS decision -- this journey definition, this situation, this departure -- in the cycle the row was written. Read rows before 2026-09-12 with care: the delivery loop marked pushes per (definition, situation) while rows are per (definition, situation, departure), so a push about one train could mark another departure under the same situation. In practice the two agreed, because match_journey keeps only the worst alert per situation across every window and a cycle therefore held one departure per situation; the key was fixed before either channel's `pushed` was read as ground truth per train (KTD4)."),
   n_devices             INT64     OPTIONS(description="How many registrations share this journey definition."),
 
   -- What had actually been OBSERVED on the line when we decided (as opposed to predicted). The
@@ -130,7 +143,23 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
 )
 PARTITION BY DATE(decided_at)
 CLUSTER BY operator, situation_number
-OPTIONS(description="Append-only log of Avviksvarsel alert decisions. Labelled with realized outcomes by data/queries/label_varsel_decisions.sql. Never CREATE OR REPLACE; never copied dev->prd.");
+OPTIONS(
+  description="Append-only log of Avviksvarsel alert decisions. Labelled with realized outcomes by data/queries/label_varsel_decisions.sql. Never CREATE OR REPLACE; never copied dev->prd.",
+  -- A YEAR, and this DELETES data: a partition older than this is dropped by BigQuery and is gone.
+  -- Deliberate, and sized against what reads the table rather than against sentiment. /historikk
+  -- and /meldinger bound every window at historikk._MAX_WINDOW_DAYS (180), the labelling job at 10
+  -- days, and the two data/queries side-by-sides at 30, so a year is more than twice the longest
+  -- question anything asks. Without it the table is unbounded, and R12's bytes cap on a public page
+  -- has to be sized against a table that only ever grows: 1.5 GB at 226 definitions (prd,
+  -- 2026-09-11) and 14-33 GB a DAY at 35 000-80 000 before thinning.
+  --
+  -- Reaches a FRESH environment from here and an existing one only through the ALTER in the
+  -- best-effort section (CREATE TABLE IF NOT EXISTS does nothing to a table that exists). It is in
+  -- the forgiven half on purpose: a table-metadata rate limit must never leave `ensure_table`
+  -- reporting "not ready", which is the 2026-08-07 mode where the decision log records nothing at
+  -- all. A retention rule that lands a quarter of an hour late costs nothing.
+  partition_expiration_days=365
+);
 
 
 -- llm_payload -> message_input, for tables written before the object had three consumers.
@@ -217,7 +246,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
   stop_order             INT64,
   departure_time         TIMESTAMP,
 
-  n_decisions            INT64   OPTIONS(description="How many refresh cycles scored this journey x situation x departure."),
+  n_decisions            INT64   OPTIONS(description="How many ROWS the decision log holds for this journey x situation x departure -- not how many refresh cycles scored it, and the two stopped being the same thing on 2026-09-12. A standing subject nothing has changed about is now written at most once per quarter hour (varsel._thinning_reason); every row the figures beside this are computed from is still written, which is why first_alert_at, max_impact_probability, the final_* block and the quoted wording are unchanged. Compute no per-cycle rate across that date."),
   first_decided_at       TIMESTAMP,
   last_decided_at        TIMESTAMP,
   ever_alerted           BOOL    OPTIONS(description="Whether ANY cycle crossed the threshold — the decision the verdict judges."),
@@ -262,25 +291,55 @@ ALTER TABLE `disruptions.varsel_decision_outcomes`
 -- The per-cycle rows above collapse here into the decision that was actually made — did we ever
 -- alert, how early, and what did we say.
 --
--- A view, and CREATE OR REPLACE rather than IF NOT EXISTS, for two reasons. It holds no data, so
--- replacing it is free and it can never drift from the definition in this file. And it has two
--- consumers — the nightly labelling job and /historikk-api — which MUST group identically: the
--- labelling job writes a verdict keyed on this grain, and the API looks decisions up by it. Two
--- hand-maintained copies of a GROUP BY would eventually disagree, and the symptom would be rows
--- that never match their own verdict.
+-- A TABLE FUNCTION since 2026-09-12, with the view below it as a windowless wrapper — one body, two
+-- ways in. CREATE OR REPLACE rather than IF NOT EXISTS for both, for two reasons. Neither holds
+-- data, so replacing them is free and neither can drift from the definition in this file. And this
+-- grouping has SIX consumers — the three /historikk queries, the nightly labelling job,
+-- backfill_outcome_pushed_message.sql and message_wording_comparison.sql — which MUST group
+-- identically: the labelling job writes a verdict keyed on this grain, and the API looks decisions
+-- up by it. Two hand-maintained copies of a GROUP BY would eventually disagree, and the symptom
+-- would be rows that never match their own verdict.
 --
--- Deliberately unfiltered by date: consumers add their own predicate, which pushes down into the
--- underlying partitioned table. Rows with a NULL jkey are kept — they can never be joined to a
--- realized outcome, but they are still decisions and belong on the page, marked unknown.
+-- WHY THE PARAMETERS (R12). `varsel_decisions` is PARTITION BY DATE(decided_at) and every consumer
+-- bounds `call_date` instead, which cannot prune a partition. A VIEW cannot take the window --
+-- views take no parameters, and the windowed readers ask for different ones -- so the body lives
+-- here, in a table function the caller passes its own partition cover to.
+--
+-- WHAT IT IS MEASURED TO BUY, and it is less than the paragraph above implies, so read this before
+-- quoting a saving. Real runs against dev on 2026-09-12 (804 235 rows / 854 MB, 14-day window,
+-- cache off), view vs function: `historikk_filters.sql` 158.9 MB -> 104.4 MB (-34 %),
+-- `historikk_summary.sql` 88.7 MB -> 78.8 MB (-11 %), `historikk_decisions.sql` UNCHANGED. In
+-- isolation the mechanism is worth far more -- `SELECT COUNT(*)` through the view is 116.2 MB and
+-- through a four-day cover 12.5 MB (-89 %) -- and the gap between those two readings is the point:
+-- BigQuery prunes BLOCKS on any column from its own columnar metadata, rows land here in
+-- `decided_at` order, and `call_date` tracks `decided_at` to within a day, so the `call_date`
+-- predicate the readers already carried was doing most of this work by accident. That accident is a
+-- property of the DATA, not a guarantee: it weakens as the log grows, and the thinning rule
+-- (KTD15) changes the write pattern it rests on. The partition cover makes the bound explicit and
+-- survives both. Do not remove it on the strength of the -0 % reading.
+--
+-- THE COVER IS DERIVED, and derived covers fail silently and cheaply (the lesson
+-- meldinger_decisions.sql states at length: a too-narrow one drops cycles out of the aggregates,
+-- which reads as a subject that was never alerted on, and the byte counts a validator prints report
+-- the loss as a CHEAPER query). Bound, measured in dev 2026-08-22 over 117 448 rows: a decision is
+-- made from 720 min before its departure to 54 min after (`catchable_after` keeps a delayed train
+-- catchable), `call_date` is the Oslo date of the departure, and Oslo is UTC+1/+2. So
+-- DATE(decided_at) lies in [call_date - 1, call_date], and the caller's `call_date` range widened
+-- by a day either side covers it with the +1 side as pure margin. RE-MEASURE BEFORE WIDENING THE
+-- 12 H HORIZON: at 24 h the lower bound stops covering the span.
 --
 -- Adding a column to the TABLE above is free; adding one HERE is not, and the asymmetry is easy to
--- get backwards. label_varsel_decisions.sql does `SELECT *` over this view, and the registered
+-- get backwards. label_varsel_decisions.sql does `SELECT *` over the view, and the registered
 -- varsel-label-daily scheduled query holds a COPY of that SQL in each environment — so a column
 -- added here changes the shape that copy sees, and the fix is an operator step in two projects
 -- rather than an edit. Because this SELECT names every column explicitly, the four alt_* columns
 -- added to varsel_decisions on 2026-08-06 reach the log without touching the nightly job at all.
--- That is the whole reason they were added there and not projected here.
-CREATE OR REPLACE VIEW `disruptions.varsel_decision_groups` AS
+-- That is the whole reason they were added there and not projected here. The move to a table
+-- function deliberately changed NEITHER the column set nor the GROUP BY, for the same reason: the
+-- nightly job's copy would otherwise need re-registering in two projects.
+CREATE OR REPLACE TABLE FUNCTION `disruptions.varsel_decision_groups_between`(
+  d_start DATE, d_end DATE
+) AS (
 -- Wrapped in an outer SELECT for one reason: `message` and `message_source` must come from ONE row
 -- (see `delivered` below), and two separate aggregates picking "the same" row is a promise the
 -- ordering cannot keep. `* EXCEPT` rather than a re-listed projection so a column added to the
@@ -308,8 +367,17 @@ SELECT
   ANY_VALUE(mode)            AS mode,
   ANY_VALUE(stop_place)      AS stop_place,
   ANY_VALUE(departure_time)  AS departure_time,
+  -- ROWS WRITTEN, not cycles scored, and the two stopped being the same thing on 2026-09-12.
+  -- `varsel._record_decisions` thins a standing subject to one row per quarter hour (KTD15) plus
+  -- every row a figure here is computed from: the first sighting, each alert-worthy/sub-threshold
+  -- transition, each new maximum probability, each push, and a closing row carrying the last look.
+  -- So this counts how often the subject was worth writing down, and a rate computed across that
+  -- date is measuring two different things. The other figures below are unchanged BY CONSTRUCTION,
+  -- which is what the rule is built around -- see the trigger list on `varsel._thinning_reason`.
   COUNT(*)                   AS n_decisions,
   MIN(decided_at)            AS first_decided_at,
+  -- The closing row is dated at the cycle it DESCRIBES (the subject's last observation), not at the
+  -- cycle that noticed the subject was gone, so this still reads as the last look we got.
   MAX(decided_at)            AS last_decided_at,
   LOGICAL_OR(alertworthy)    AS ever_alerted,
   MIN(IF(alertworthy, decided_at, NULL)) AS first_alert_at,
@@ -371,8 +439,30 @@ SELECT
               IGNORE NULLS ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)]
   ) AS delivered
 FROM `disruptions.varsel_decisions`
+-- THE PARTITION PREDICATE, and the only difference between this body and the one that ran until
+-- 2026-09-12. It is on DATE(decided_at), the partitioning column, which is what makes a request
+-- read its own window instead of the whole table.
+WHERE DATE(decided_at) BETWEEN d_start AND d_end
 GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
+)
 );
+
+
+-- The windowless way in, for the readers that have no window of their own to pass.
+--
+-- Three of the six consumers are here: the nightly labelling job (whose registered copy does
+-- `SELECT *` over this NAME and must keep seeing a view with exactly these columns — changing it is
+-- an operator step in two projects, not an edit), backfill_outcome_pushed_message.sql and
+-- message_wording_comparison.sql. All three are cheap or one-off. The three /historikk queries call
+-- the table function directly with their own cover.
+--
+-- The range is a constant pair wide enough to be "everything": the log starts in 2026 and the table
+-- drops partitions past a year, so nothing outside it can exist. Deliberately NOT a rolling
+-- CURRENT_DATE window, which would prune more and would also silently change what "the view" means
+-- from one day to the next — a reader asking for 180 days would get a different answer depending on
+-- when the question was asked.
+CREATE OR REPLACE VIEW `disruptions.varsel_decision_groups` AS
+SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DATE '2999-12-31');
 
 
 -- ==============================================================================================
@@ -391,7 +481,9 @@ GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
 -- The block only ever grows: every reworded description adds a permanent statement, because a
 -- fresh environment gets its text from the CREATE bodies above and only an EXISTING table needs
 -- carrying. Statements here whose text has demonstrably reached both dev and prd are dead weight
--- and can be pruned; until someone verifies that, the split is what keeps the cost bounded.
+-- and can be pruned; until someone verifies that, the split is what keeps the cost bounded. That
+-- verification was finally done on 2026-09-12 and took the block from eight statements to four --
+-- see the note below.
 -- ==============================================================================================
 
 -- Descriptions for columns that ALREADY exist.
@@ -410,50 +502,52 @@ GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
 -- ALTER TABLE. Descriptions are duplicated from the definitions above; keep them in step.
 -- NEWEST FIRST in this block, which is the opposite of the "new things go last" rule the CREATE and
 -- ADD COLUMN blocks above follow -- and the inversion is deliberate. BigQuery caps table-metadata
--- updates at 5 per 10 s per table and this block has 7 statements, so when the cap bites it truncates
--- the TAIL. Ordering newest-last would therefore drop exactly the descriptions that have not reached
--- an environment yet, while re-applying five that already landed: the failure would be silent and
--- perfectly counterproductive. Newest-first means a truncated run loses only re-applications.
+-- updates at 5 per 10 s per table; when the cap bites it truncates the TAIL, so ordering newest-last
+-- would drop exactly the statements that have not reached an environment yet while re-applying ones
+-- that already landed -- silent and perfectly counterproductive. Newest-first means a truncated run
+-- loses only re-applications. The block stood at 7 statements against that cap of 5, i.e. it could
+-- not complete at all; after the 2026-09-12 prune it is 3 on varsel_decisions and 1 on the outcomes
+-- table, which is inside the cap on both. Prune again before adding a fifth to either.
 --
 -- The real fix is to prune: a statement here exists solely to carry reworded text to a table that
 -- already exists, so once it has reached dev AND prd it is dead weight (a fresh environment reads
 -- its descriptions from the CREATE body). Verify with `bq show --schema` in both projects, then
 -- delete rather than letting the block grow past the cap again.
 
--- These two are the 2026-08-07 case: neither column changed, one value in
--- each did. Splitting VARSEL_LLM_ENABLED into a generation gate and a delivery selector left
--- message_source='deterministic' covering a second, new state — a model wording that exists and was
--- withheld — and moved llm_disabled from "the flag is false" to "no backend could be asked at all".
--- Both readings have to reach a dev and a prd table that already exist, and only SET OPTIONS can
--- carry them there. The values themselves are unchanged, so no row is rewritten and no consumer
--- (varsel_decision_groups, label_varsel_decisions.sql, /historikk-api) needs touching.
+-- PRUNED on 2026-09-12, all eight statements that stood here (U4 step 5).
+--
+-- Verified rather than assumed, which is what the paragraph above asks for: `bq show --schema` in
+-- BOTH ent-kixavvik-dev and ent-kixavvik-prd returned, for every one of the eight columns
+-- (varsel_decisions: message_status, message_source, et_cancelled, impact_probability,
+-- cancel_probability, has_alternative, alt_minutes_saved; varsel_decision_outcomes: message), text
+-- byte-identical to the statement carrying it — and the CREATE / ADD COLUMN body above carries the
+-- same text for each, so a fresh environment is covered too. They were dead weight.
+--
+-- That matters beyond tidiness: the block stood at 7 statements against a cap of 5 per 10 s per
+-- table, so it could not complete in one job at all and every startup spent three of them failing.
+-- What follows is what is actually owed to an existing table today: THREE on varsel_decisions and
+-- ONE on varsel_decision_outcomes, both inside the cap with room to grow. Prune again before
+-- adding a fifth.
+
+-- Retention (U4, 2026-09-12). Carries the CREATE body's partition_expiration_days to the tables
+-- that already exist — the whole point of this block, and the one statement here that is not a
+-- description. It goes FIRST because this block is newest-first and a truncated run must lose only
+-- re-applications, and it is below the marker rather than above it because a table-metadata rate
+-- limit must never make `ensure_table` report "not ready": that is the 2026-08-07 mode, where the
+-- decision log records nothing at all. A retention rule that lands one poller tick late costs
+-- nothing. IT DELETES DATA once it lands: partitions older than a year go, and are gone.
+ALTER TABLE `disruptions.varsel_decisions`
+  SET OPTIONS(partition_expiration_days=365);
+
+-- The three columns the thinning rule (KTD15, 2026-09-12) changed the READING of. None of them
+-- changed type or value; what changed is what a row's presence, and a count of rows, now means.
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN decided_at SET OPTIONS(description="When this match was evaluated (UTC). NOT every cycle since 2026-09-12: a standing subject nothing has changed about is written at most once per quarter hour (varsel._thinning_reason), plus every cycle a figure is computed from -- first sighting, each alert-worthy/sub-threshold transition, each new maximum impact probability, each push, and a closing row carrying the subject's LAST observation, dated at the cycle it describes. So consecutive rows for one subject can be minutes or a quarter hour apart, and the gap is not a gap in the matching. Before that date every cycle wrote, which is why no per-cycle rate may be computed across it.");
+
+ALTER TABLE `disruptions.varsel_decisions`
+  ALTER COLUMN pushed SET OPTIONS(description="Whether a Web Push was delivered for THIS decision -- this journey definition, this situation, this departure -- in the cycle the row was written. Read rows before 2026-09-12 with care: the delivery loop marked pushes per (definition, situation) while rows are per (definition, situation, departure), so a push about one train could mark another departure under the same situation. In practice the two agreed, because match_journey keeps only the worst alert per situation across every window and a cycle therefore held one departure per situation; the key was fixed before either channel's `pushed` was read as ground truth per train (KTD4).");
+
 -- The outcomes table's own budget: BigQuery's 5-updates-per-10s cap is PER TABLE, and this is the
--- only statement against this one, so it does not crowd the varsel_decisions block below it.
+-- only statement against this one.
 ALTER TABLE `disruptions.varsel_decision_outcomes`
-  ALTER COLUMN message SET OPTIONS(description="The wording the traveller was actually PUSHED for this decision, copied from varsel_decision_groups; when none was ever pushed (pushed_any = FALSE) it is the last wording produced instead, which is what /historikk marks 'ikke levert'. Deliberately not 'the last text produced', which it was until 2026-08-21: a wording is cached only while the situation stays above the alert gate (varsel._reconcile_caches), so a subject that eased off records the template on every later cycle and the card quoted text the traveller never received -- 41 % of dev's alerted subjects when it was measured, a tenth of them under the wrong writer's name.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN message_status SET OPTIONS(description="Why that source: ok | ok_cached | not_alertworthy | not_selected | push_disabled | llm_disabled | capped | attempts_exhausted | transient_exhausted | rejected | ungrounded | error | unavailable. Without it every failure mode looks like one deterministic row. TWO give-up statuses since 2026-08-22, judging different things: attempts_exhausted the PAYLOAD (asked, and refused/over-ran/invented a figure), transient_exhausted the ENVIRONMENT (backend reached and failed repeatedly). One counter served both before, charged on EVERY None including paths that asked no backend -- so read a pre-2026-08-22 attempts_exhausted as transient unless proven otherwise (in prd: 290 preceding errors, zero rejected/ungrounded), and compute no rate across the change. llm_disabled also changed meaning, on 2026-08-07: it means no backend could be ASKED (VARSEL_LLM_PROVIDER=off, no project, all latched off), never that the deployment sends the template -- that is message_source='deterministic' with a non-null message_llm, status ok.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN message_source SET OPTIONS(description="Which wording was SENT: 'llm' when the model's text went out, 'deterministic' for the template. Since 2026-08-07 it says nothing about which wordings EXIST — both are written for every alert-worthy decision and recorded in message_llm/message_deterministic, and VARSEL_LLM_ENABLED selects the one delivered. So 'deterministic' now covers two unlike states: no model wording exists, and one exists and was withheld by policy (prd's setting today). Separate them with message_llm IS NOT NULL, never with this column alone.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN et_cancelled SET OPTIONS(description="ET had ALREADY declared this boarding call cancelled when we decided, so impact_probability/cancel_probability are 1.0 by construction: the app RELAYED a known fact rather than predicting one. Segment on this rather than dropping the rows — the log answers two questions and no single figure serves both. SERVICE quality (was the traveller told the truth?) includes them, and should: relaying what ET already knows is most of the value, since nobody carries the ET feed on their phone. MODEL skill (did we see it coming?) excludes them: they are gimmes. Distrust either figure quoted alone, because the MIX of the two populations moves it with nothing about the app having changed.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN impact_probability SET OPTIONS(description="Calibrated P(cancelled OR >= 10 min late) — the alerting score; exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN cancel_probability SET OPTIONS(description="Calibrated P(the train is cancelled); exactly 1.0 when et_cancelled, where it is a relayed fact and not a prediction.");
-
--- These two are the 2026-08-06 case: the columns did not change, their MEANING did. The selection
--- rule no longer looks for a faster journey — it looks for the best remaining way there — so
--- "produced a faster way to to_stop" and "how much earlier it arrives" are both now false on the
--- face of them, and alt_minutes_saved is signed. Existing rows keep their values; what has to reach
--- dev and prd is the reading, and only these statements can carry it to a table that already exists.
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN has_alternative SET OPTIONS(description="Whether a replacement journey was offered to the traveller. NOT 'a faster way': the fallback tier legitimately arrives later than the disrupted train was due (see alt_arrives_before_original). FALSE covers three unlike states — a lookup that found nothing, a selection that kept the traveller on their own train, and no lookup at all — which is what alt_status separates.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN alt_minutes_saved SET OPTIONS(description="SIGNED minutes earlier this arrives than the disrupted train's PREDICTED arrival. Negative is a legitimate answer, not a bad row: a replacement for a cancelled train is worth offering even when it gets the traveller there later. Informational — nothing is dropped for being too slow.");
+  ALTER COLUMN n_decisions SET OPTIONS(description="How many ROWS the decision log holds for this journey x situation x departure -- not how many refresh cycles scored it, and the two stopped being the same thing on 2026-09-12. A standing subject nothing has changed about is now written at most once per quarter hour (varsel._thinning_reason); every row the figures beside this are computed from is still written, which is why first_alert_at, max_impact_probability, the final_* block and the quoted wording are unchanged. Compute no per-cycle rate across that date.");
