@@ -4414,8 +4414,7 @@ def test_a_broken_notification_store_costs_the_webhook_channel_and_nothing_else(
     `check_and_notify` entirely — loop 2 never runs, so no push at all goes out, and
     `_record_decisions` never runs, so the decision log gains a hole no later cycle backfills.
     """
-    import threading
-    from time import monotonic
+    import pathlib
 
     # --- 1. the store raises -------------------------------------------------------------------
     _reset_state()
@@ -4436,31 +4435,26 @@ def test_a_broken_notification_store_costs_the_webhook_channel_and_nothing_else(
     assert varsel._notified, "including the state the save persists"
     assert [e["result"] for e in _events(records, "varsel_webhook_load")] == ["error"]
 
-    # --- 2. the store hangs --------------------------------------------------------------------
-    # A real bound, not a mocked clock: the provider parks for `held` and the load is allowed 50 ms.
-    # The cycle must come back long before the provider does, which is the property KTD6 asks for --
-    # the poller thread is what ingestion for every other feature runs on.
-    _reset_state()
-    release = threading.Event()
-    monkeypatch.setattr(varsel, "_WEBHOOK_LOAD_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
-    sent.clear()
-    written = _capture_writes(monkeypatch)
+    # --- 2. the store cannot hang here any more, and that is a claim worth pinning -------------
+    # It used to: the provider was a Firestore cursor, so the pass wrapped it in a worker with
+    # `_WEBHOOK_LOAD_TIMEOUT_S` and abandoned the thread past it. U6 moved the store read out to its
+    # own step (`notification_store.sync_mirrors`, a phase in `main._rebuild_all`) and left this
+    # path reading memory -- so the wait went with the read it bounded.
+    #
+    # The risk that replaces it is a later change quietly pointing the provider back at a query,
+    # which would put a socket on the poller thread with nothing bounding it. Checked on the SOURCE,
+    # because the failure is "somebody re-added a read" and no behavioural test over an in-memory
+    # provider can see it.
+    import notification_store as _store
 
-    def hanging():
-        release.wait(30)  # bounded so a failing assertion cannot wedge the suite
-        return [WEBHOOK_DOC]
-
-    _use_notification_store(monkeypatch, hanging)
-    _register(DEVICE)
-    started = monotonic()
-    try:
-        varsel.check_and_notify(SNAPSHOT)
-    finally:
-        release.set()  # let the abandoned worker finish rather than leaking it into the next test
-    elapsed = monotonic() - started
-    assert elapsed < 5.0, f"a hanging store must not hold the poller thread; took {elapsed:.1f}s"
-    assert len(sent) == 1 and written, "and the browser cycle still completed"
+    reader = pathlib.Path(_store.__file__).read_text()
+    body = reader.split("def recipient_documents(", 1)[1].split("\ndef ", 1)[0]
+    for blocking in ("_query(", "_stream(", "_run_transaction("):
+        assert blocking not in body, (
+            f"recipient_documents calls {blocking} -- the pass reads this on the poller thread and "
+            "nothing bounds it since U6 removed the wait; the store read belongs in sync_mirrors"
+        )
+    assert "_WEBHOOK_LOAD_TIMEOUT_S" not in pathlib.Path(varsel.__file__).read_text()
 
     # --- 3. one unreadable document among readable ones ----------------------------------------
     _reset_state()
@@ -5221,31 +5215,30 @@ def test_the_webhook_loader_refuses_exactly_what_the_registration_api_refuses():
     assert kept.recipient_id == "sub-0001" and kept.delivered == frozenset()
 
 
-def test_the_client_read_is_bounded_by_a_document_ceiling():
-    """R21: the per-cycle read cannot exceed the ceiling, and the ceiling binds on the PAGING.
+def test_the_client_read_is_no_longer_bounded_by_a_document_ceiling():
+    """U6 removed the ceiling, and the whole point is that a big collection arrives WHOLE.
 
-    `islice` is applied inside the worker thread, so a lazy cursor stops fetching at the ceiling
-    rather than being fetched whole and then trimmed — which is what makes this a bound on the read
-    and not merely on the result. Anything approaching it in a pilot is a store bug or a quota
-    breach, so truncating is the right failure and it is reported.
+    It used to stop at `_MAX_WEBHOOK_RECIPIENTS` (2 000) and report `truncated`, on the reasoning
+    that a pilot is one client and a few hundred subscriptions so anything approaching the cap is a
+    store bug. At 100 000 it is growth, and a cap would have matched the first 2 000 and silently
+    retired the rest -- which is the failure this replaces: nothing is clipped, and what says
+    whether the population is complete is the mirror's readiness instead.
     """
-    fetched = []
+    n = 5000
+    provider_calls = []
 
-    def endless():
-        for i in range(varsel._MAX_WEBHOOK_RECIPIENTS + 500):
-            fetched.append(i)
-            yield {**WEBHOOK_DOC, "recipient_id": f"sub-{i}"}
+    def big():
+        provider_calls.append(1)
+        return [{**WEBHOOK_DOC, "recipient_id": f"sub-{i}"} for i in range(n)]
 
     before = (varsel._webhook_enabled, varsel._webhook_provider)
-    varsel._webhook_enabled, varsel._webhook_provider = (lambda: True), endless
+    varsel._webhook_enabled, varsel._webhook_provider = (lambda: True), big
     try:
         loaded = varsel._load_webhook_recipients()
     finally:
         varsel._webhook_enabled, varsel._webhook_provider = before
-    assert len(loaded) == varsel._MAX_WEBHOOK_RECIPIENTS
-    assert len(fetched) == varsel._MAX_WEBHOOK_RECIPIENTS, (
-        "the cursor must stop at the ceiling, not be drained and then trimmed"
-    )
+    assert len(loaded) == n, "the pass clipped a population it is supposed to carry whole"
+    assert provider_calls == [1], "one call: the mirror hands over the whole list"
 
 
 def test_the_suites_provider_forwards_the_fetch_path(monkeypatch):
@@ -5529,21 +5522,38 @@ SNAPSHOT_NSR = {
 def _pair_definitions(
     n: int, *, from_stop: str = "A", to_stop: str = "B", prefix: str = "pair"
 ) -> list[str]:
-    """`n` distinct definitions on ONE pair, each with its own window, straight into the store.
+    """`n` distinct definitions on ONE pair, straight into the store.
 
     `_seed_definitions`' shape, but returning the keys and taking the destination, because every
     scenario below is about what two definitions on one pair share and what two pairs do not.
+
+    **Distinct by WEEKDAY SET, not by window, and that is a bug fix rather than a preference.**
+    `journey_key` is (from, to, begin, end, days) and every one of those five also decides whether a
+    definition MATCHES -- so making the definitions distinct by giving them windows of `00:00`,
+    `01:00`, `02:00`... made the fixture depend on the wall clock. The snapshot's departure is about
+    two hours ahead of now, so from roughly 22:00 Oslo it lands before 02:00 and the third
+    definition stops matching: the tests over this fixture failed for four hours a night and passed
+    the rest of the time, which is worse than failing outright. Each definition now covers the whole
+    day and drops one weekday that is neither today nor tomorrow, so the keys differ and every one
+    of them matches whatever the hour is.
     """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _Zone
+
+    today = _dt.now(_Zone("Europe/Oslo")).weekday()
+    assert n <= 5, "past five, the excluded days would reach tomorrow and the fixture would bite"
     keys = []
     for i in range(n):
         device = f"{DEVICE}-{prefix}-{i:03d}"
         varsel._devices[device] = {
             "subscription": SUBSCRIPTION, "created_ts": "2026-01-01T00:00:00+00:00"
         }
+        dropped = (today + 2 + i) % 7
         record = {
             "device_id": device, "from_stop": from_stop, "to_stop": to_stop,
-            "begin": f"{i:02d}:00", "end": "23:59",
-            "days": [0, 1, 2, 3, 4, 5, 6], "created_ts": "2026-01-01T00:00:00+00:00",
+            "begin": "00:00", "end": "23:59",
+            "days": [d for d in range(7) if d != dropped],
+            "created_ts": "2026-01-01T00:00:00+00:00",
         }
         varsel._journeys[f"{prefix}-{i:03d}"] = record
         keys.append(varsel.journey_key(record))

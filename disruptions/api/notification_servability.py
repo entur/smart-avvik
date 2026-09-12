@@ -291,16 +291,38 @@ _LOAD_REUSE_S = 600.0
 
 
 def _load(now: datetime) -> notification_store.LoadedSubscriptions | None:
-    """This environment's live subscriptions, or ``None`` when the store could not be read.
+    """This environment's live subscriptions, or ``None`` when they could not be read.
 
     The notification pass's own read is reused when it is fresh (:data:`_LOAD_REUSE_S`): both walk
-    every live subscription, and two full reads per cycle bought nothing but a second bounded stream.
+    every live subscription, and two reads per cycle bought nothing but a second stream.
+
+    **The fallback is the mirror, not a query** (U6). It used to be `active_subscriptions`, a
+    bounded read of the collection; that function and its ceiling are gone, and reading the
+    collection here would reintroduce per-cycle the one full read the mirror exists to remove --
+    on the path least able to justify it, since a healthy list has nothing due. An unseeded mirror
+    yields ``None``, which is this function's existing "could not be read" and leaves every caveat
+    standing, exactly as a failed query did.
     """
     reused = notification_store.recent_load(now=now, max_age_s=_LOAD_REUSE_S)
     if reused is not None:
         return reused
     try:
-        return notification_store.active_subscriptions(now=now)
+        mirror = notification_store.subscription_mirror()
+        if not mirror.ready:
+            logger.warning(
+                "The subscription mirror is not loaded; the servability re-check is skipped this "
+                "cycle and every caveat stands",
+                extra={
+                    "fields": {"event": "notification_servability", "result": "mirror_not_ready"}
+                },
+            )
+            return None
+        return notification_store.LoadedSubscriptions(
+            subscriptions=tuple(mirror.recipients(now)),
+            truncated=False,
+            skipped=0,
+            expired=0,
+        )
     except Exception:
         logger.warning(
             "Webhook subscriptions could not be read for the servability re-check; caveats stand",

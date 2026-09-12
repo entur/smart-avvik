@@ -1304,6 +1304,58 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # and decision recording have run regardless of the keypair since /historikk shipped, and since
     # KTD4 the wording pass does too wherever a recipient on some channel can receive it. What a
     # missing keypair still stops is browser delivery, and nothing else.
+    # The notification store's mirrors, brought up to date BEFORE the pass reads them (U6, KTD5).
+    #
+    # **Its own phase, and ahead of `varsel_notify` rather than inside it.** The pass reads the
+    # mirror from memory now, so a slow store no longer costs the pass its cycle -- it costs the
+    # mirror its freshness, which is a different failure with a different response, and attributing
+    # the two to one phase would hide exactly that. Ahead of the pass because a mirror synced after
+    # it would serve every cycle the state of the one before.
+    #
+    # **On the poller thread, which is what "after the port binds" means.** The first call seeds
+    # both mirrors by paging the collections, and at 100 000 subscriptions that is a long read: in
+    # the lifespan it would hold the port closed for the whole of it and fail the readiness probe of
+    # a deployment doing exactly what it was told to. `_beat` moves the poller's liveness clock
+    # between pages, or `/health`'s "no step has finished in 600 s" restarts the pod mid-read,
+    # forever.
+    #
+    # Guarded like every other step, and the failure is deliberately NOT fatal to the cycle: the
+    # mirrors keep what they had, the pass matches against a slightly older population, and the
+    # browser half is untouched. An empty mirror on a transient error would read to every
+    # downstream reader as "every client unsubscribed".
+    if webhook_channel := varsel.webhook_channel_enabled():
+        try:
+            with _phase("notification_mirror", timings):
+                report = notification_store.sync_mirrors(beat=_beat)
+                logger.info(
+                    "Subscription mirror: %d held, %d synced, %d removed over %d page(s)%s",
+                    report.size,
+                    report.synced,
+                    report.removed,
+                    report.pages,
+                    " (re-seeded)" if report.reseeded else "",
+                    extra={
+                        "fields": {
+                            "event": "notification_store_load",
+                            "result": "mirror_reseed" if report.reseeded else "mirror_sync",
+                            "mirror_size": report.size,
+                            "synced": report.synced,
+                            "removed": report.removed,
+                            "pages": report.pages,
+                            "truncated": report.truncated,
+                            "watermark_age_s": report.watermark_age_s,
+                        }
+                    },
+                )
+                # The series an alert rule selects on. Set from the report rather than re-derived,
+                # so the gauge and the log record cannot disagree about the same cycle.
+                if report.watermark_age_s is not None:
+                    metrics.MIRROR_AGE.set(report.watermark_age_s)
+        except Exception:
+            logger.exception(
+                "The notification store's mirrors could not be synced; this cycle matches the "
+                "population from the last successful sync"
+            )
     outcome: varsel.PassOutcome | None = None
     try:
         with _phase("varsel_notify", timings):
@@ -1334,11 +1386,11 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # Guarded like every other step here, and the two halves are guarded separately (R20): an emit
     # failure must not cost the deliveries already committed. Delivery runs even when the pass above
     # raised and `outcome` is None — the pending set is Firestore's, not this cycle's.
-    # Read ONCE for the cycle, and used by both notification phases below. Two reads cannot disagree in
-    # practice -- the flag is an environment variable and a container does not change one while it
-    # runs -- but `webhook_channel_enabled` catches and logs a raise from the injected reader, so a
-    # broken reader wrote the same warning with the same traceback twice on every cycle.
-    webhook_channel = varsel.webhook_channel_enabled()
+    # `webhook_channel` was read ONCE for the cycle, above the mirror sync, and is used by all
+    # THREE notification steps. Two reads cannot disagree in practice -- the flag is an environment
+    # variable and a container does not change one while it runs -- but `webhook_channel_enabled`
+    # catches and logs a raise from the injected reader, so a second read wrote the same warning
+    # with the same traceback twice on every cycle.
     if webhook_channel:
         with _phase("notification_webhooks", timings):
             try:

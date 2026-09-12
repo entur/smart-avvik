@@ -32,6 +32,15 @@ MODULE_SOURCE = pathlib.Path(notification_servability.__file__).read_text()
 # ---- A recording store ------------------------------------------------------------------------
 
 
+class _NotReady(Exception):
+    """Marks a fake store as an UNSEEDED mirror rather than a failing one.
+
+    `_load` treats the two the same way -- no re-check, every caveat stands -- and the tests should
+    be able to drive both, because they arrive for different reasons: a restart window versus a
+    store outage.
+    """
+
+
 class _Store:
     """Records what the pass asked the store for, and what it wrote."""
 
@@ -51,16 +60,22 @@ class _Store:
         self.writes: list[tuple[str, bool | None]] = []
         self.versions: list[tuple[str, int]] = []
 
-    def active_subscriptions(self, **_: Any) -> notification_store.LoadedSubscriptions:
+    # Stands in for the subscription MIRROR since U6: `_load` falls back to it rather than to a
+    # bounded query, because reading the collection here would reintroduce per cycle the one full
+    # read the mirror exists to remove -- on the path least able to justify it, since a healthy
+    # list has nothing due.
+    @property
+    def ready(self) -> bool:
+        return not self.load_error or not isinstance(self.load_error, _NotReady)
+
+    def recipients(self, now: datetime, **_: Any) -> list[notification_store.Subscription]:
         self.loads += 1
         if self.load_error is not None:
             raise self.load_error
-        return notification_store.LoadedSubscriptions(
-            subscriptions=tuple(self.subscriptions),
-            truncated=self.truncated,
-            skipped=0,
-            expired=0,
-        )
+        return list(self.subscriptions)
+
+    def size(self) -> int:
+        return len(self.subscriptions)
 
     def set_servability(
         self,
@@ -152,11 +167,11 @@ def _run(
 
     mark = len(_SINK.records)
     before = (
-        notification_store.active_subscriptions,
+        notification_store.subscription_mirror,
         notification_store.set_servability,
         notification_servability.monotonic,
     )
-    notification_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
+    notification_store.subscription_mirror = lambda: store  # type: ignore[assignment]
     notification_store.set_servability = store.set_servability  # type: ignore[assignment]
     if monotonic is not None:
         notification_servability.monotonic = monotonic
@@ -165,7 +180,7 @@ def _run(
         notification_servability.recheck(now=now)
     finally:
         (
-            notification_store.active_subscriptions,
+            notification_store.subscription_mirror,
             notification_store.set_servability,
             notification_servability.monotonic,
         ) = before
@@ -195,8 +210,8 @@ def test_the_re_check_reuses_the_notification_passs_read_and_reads_for_itself_wh
     skipped the pass on) still reads for itself, which is what keeps the poller wiring free of a
     dependency on the pass's return value."""
     store = _Store([_sub("sub-1", servable=False, checked_at=None)])
-    before = (notification_store.active_subscriptions, notification_store.set_servability)
-    notification_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
+    before = (notification_store.subscription_mirror, notification_store.set_servability)
+    notification_store.subscription_mirror = lambda: store  # type: ignore[assignment]
     notification_store.set_servability = store.set_servability  # type: ignore[assignment]
     notification_store.configure(clock=lambda: NOW)
     notification_servability.configure(connectivity=lambda _f, _t: (True, False))
@@ -213,7 +228,7 @@ def test_the_re_check_reuses_the_notification_passs_read_and_reads_for_itself_wh
         notification_servability.recheck(now=NOW + timedelta(seconds=45))
         assert store.loads == 3, "nothing to reuse: read for itself"
     finally:
-        notification_store.active_subscriptions, notification_store.set_servability = before  # type: ignore[assignment]
+        notification_store.subscription_mirror, notification_store.set_servability = before  # type: ignore[assignment]
         notification_servability.reset_for_tests()
         notification_store.reset_for_tests()
 
@@ -409,13 +424,13 @@ def test_an_unreadable_store_leaves_every_caveat_standing():
 def test_no_seam_means_no_store_read():
     """An unwired deployment must not spend a store read to discover it has no seam."""
     store = _Store([_sub("s1")])
-    before = notification_store.active_subscriptions
-    notification_store.active_subscriptions = store.active_subscriptions  # type: ignore[assignment]
+    before = notification_store.subscription_mirror
+    notification_store.subscription_mirror = lambda: store  # type: ignore[assignment]
     notification_servability.reset_for_tests()
     try:
         notification_servability.recheck(now=NOW)
     finally:
-        notification_store.active_subscriptions = before  # type: ignore[assignment]
+        notification_store.subscription_mirror = before  # type: ignore[assignment]
     assert store.loads == 0
 
 
@@ -523,12 +538,37 @@ def test_nothing_due_costs_no_question_and_no_summary():
     assert fields == [], "a healthy list must not write a record on every cycle"
 
 
-def test_truncation_is_carried_on_the_summary_rather_than_warned_about_twice():
+def test_the_mirror_backed_read_is_never_truncated_and_the_summary_says_so():
+    """U6. `truncated` on this record used to mean R21's per-cycle read ceiling had bound.
+
+    There is no per-cycle read left to bound -- the mirror holds the whole collection -- so the
+    field is now always False here, and that is worth PINNING rather than leaving as a flag nobody
+    can make fire. A truncation claim that can never be true is indistinguishable from one that is
+    never checked, which is the failure mode this repo has been bitten by before.
+
+    The field itself stays on the record: `LoadedSubscriptions` is shared with readers that can
+    still truncate, and a reader supplying a truncated load must still be able to say so.
+    """
     store = _Store([_sub("s1", checked_at=None)], truncated=True)
     fields = _run(store, verdicts=(True, True))
     summary = [f for f in fields if f["result"] == "swept"]
-    assert summary and summary[0]["truncated"] is True
+    assert summary, fields
+    assert summary[0]["truncated"] is False, (
+        "the mirror served a truncated load; it holds the whole collection by construction"
+    )
     assert all("Webhook subscription load bounded" not in str(f) for f in fields)
+
+
+def test_an_unseeded_mirror_skips_the_re_check_and_leaves_every_caveat_standing():
+    """U6. A restart window and a store outage reach here for different reasons and the same way.
+
+    Re-checking against a half-loaded mirror would resolve a caveat from a population that is not
+    the population -- and R6's whole rule is that a stale answer must never read as an all-clear.
+    """
+    store = _Store([_sub("s1", checked_at=None)], load_error=_NotReady("still loading"))
+    fields = _run(store, verdicts=(True, True))
+    assert store.writes == [], "nothing may be written from an incomplete population"
+    assert [f["result"] for f in fields] == ["mirror_not_ready"], fields
 
 
 def test_no_log_record_carries_a_route_a_window_or_prose():
