@@ -66,6 +66,23 @@ _CACHE_MAX_ENTRIES = 500
 _cache_lock = threading.Lock()
 _cache: dict[tuple, tuple[float, Any]] = {}
 
+# The blast-radius bound on what one request can bill. This page ran with NO cap at all until
+# 2026-09-12, while `/meldinger` and `/rushhistorikk` -- the same shape of page, over the same
+# table, on the same public host -- both carried one; there was no reason for the difference beyond
+# the order the three were written in.
+#
+# Be honest about what it does. A correctly pruned read of the decision log is a few MB and the
+# whole log is ~1.5 GB (prd, 2026-09-11), so at 2 GiB this will NOT catch a pruning regression on
+# today's table. What it catches is a query that starts reading something BIG: the ET tables a
+# mistyped join can reach are ~10 TiB for a two-year scan, three orders of magnitude above this.
+#
+# The number is deliberately the same 2 GiB its two siblings use rather than a derived one. Once
+# the decision log's thinned volume is measured, this becomes four times the measured pruned
+# 14-day scan and is stated in one place for all three pages -- but a derived cap chosen ahead of
+# that measurement would turn the log's growth into refusals on the page that reads the longest
+# window, which is the failure this constant exists to prevent rather than to cause.
+_MAX_BYTES_BILLED = 2 * 1024**3
+
 # A page shows a window, not a history. Bounded so a hand-written query string cannot ask for a
 # scan of everything.
 _MAX_WINDOW_DAYS = 180
@@ -580,7 +597,9 @@ def _query(sql: str, params: list, cache_key: tuple):
             return hit[1]
     from google.cloud import bigquery
 
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=params, maximum_bytes_billed=_MAX_BYTES_BILLED
+    )
     try:
         rows = list(_bq_client.query(sql, job_config=job_config).result())
     except Exception as exc:
