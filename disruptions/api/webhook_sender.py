@@ -524,8 +524,17 @@ class _HostPool:
 
     # -- connections
 
-    def take(self, destination: Destination, resolved: ResolvedDestination) -> _PinnedHTTPSConnection | None:
-        """An idle connection worth trying, or ``None`` to open a fresh one."""
+    def take(self) -> _PinnedHTTPSConnection | None:
+        """An idle connection worth trying, or ``None`` to open a fresh one.
+
+        It takes neither the destination nor the resolution, and both omissions are deliberate. The
+        pool is keyed on (host, port), so every connection in it is already for the right receiver.
+        And each was pinned to an address this module VALIDATED at the instant it was opened
+        (KTD9), so reuse cannot reach an address the positive test would refuse -- re-checking it
+        against a newer resolution would only make a receiver that has since moved fail *sooner*,
+        which the caller's one retry on a fresh connection already handles, against the current
+        resolution, within the same attempt.
+        """
         cutoff = time.monotonic() - _IDLE_TIMEOUT_S
         stale: list[_PinnedHTTPSConnection] = []
         found: _PinnedHTTPSConnection | None = None
@@ -669,7 +678,7 @@ def _send(
             f"(limit {limit})"
         )
     try:
-        connection = pool.take(destination, resolved)
+        connection = pool.take()
         reused = connection is not None
         if connection is None:
             connection = _PinnedHTTPSConnection(
