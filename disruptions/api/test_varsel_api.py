@@ -145,6 +145,11 @@ llm_message.configure(stop_name_provider=lambda: STOPS)
 # exactly what happened when the single-call lookup became fetch -> score -> select. The second line
 # of defence does not depend on anyone remembering: alternatives._post_json refuses to open a socket
 # from a test process at all (test_a_forgotten_stub_cannot_reach_the_network pins it).
+# Kept before the stub: `impact.alternatives` IS this module object, so the line below REPLACES the
+# real function for the whole process and there is no other reference left to it. The Journey
+# Planner sharing pin (U3) has to drive the real one -- a stub sits ABOVE `alternatives._cache`, so
+# a pin taken through it would count one call per definition and prove nothing.
+_REAL_FETCH_CANDIDATES = alternatives.fetch_candidates
 impact.alternatives.fetch_candidates = lambda *a, **k: []
 
 app = FastAPI()
@@ -182,6 +187,11 @@ def _reset_state():
         # checking -- it reads as the give-up bug rather than as pollution.
         varsel._message_errors.clear()
         varsel._message_meta.clear()
+        # The decision log's thinning ledger (U4, 2026-09-12). Leaked, a subject from the previous
+        # test is already "seen", so the next test's first observation is thinned away and the log
+        # simply has one fewer row than the test asserts -- which reads as the rule misfiring rather
+        # than as pollution. It also leaves a closing row owed for a subject nothing will retire.
+        varsel._decision_ledger.clear()
         # The per-train push memory and the daily cap ledger (2026-09-02). A leaked count reads
         # exactly like the cap firing for no reason.
         varsel._pushed_trains.clear()
@@ -210,6 +220,11 @@ def _reset_state():
     import notification_wording
 
     notification_wording.reset_state()
+    # `impact`'s per-generation index (U2). This suite swaps the snapshot DICT rather than refilling
+    # one, so the generation check sees every change on its own — but the house rule is that every
+    # module-level cache is dropped from this one function, and the failure if a future test starts
+    # refilling in place is the matcher silently answering off the previous test's situations.
+    impact.invalidate_generation()
     # The webhook channel's two INJECTED SEAMS (U2, 2026-09-08). Not a ledger -- the pass holds no
     # notification state at module level, deliberately (KTD3: Firestore is the only dedup ledger for that
     # channel, and the snapshot `check_and_notify` matches from is pass-local) -- but a leaked stub
@@ -219,6 +234,13 @@ def _reset_state():
     # which is what an un-wired deployment holds.
     varsel._webhook_enabled = None
     varsel._webhook_provider = None
+    # The tracing seam (U1, 2026-09-12), reset for the same reason and with a sharper failure: a
+    # recorder left behind by an earlier test keeps appending to a list that test still holds, so
+    # its assertions about span counts drift with the order the suite happens to run in.
+    varsel._span_provider = None
+    # The liveness seam (U2), beside it and for the same reason: a `beat` recorder left behind keeps
+    # appending to a list an earlier test still holds, so its counts drift with the run order.
+    varsel._beat_provider = None
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
@@ -629,6 +651,105 @@ def test_journey_crud_and_live_match():
     assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
 
 
+def test_the_pass_opens_one_span_per_sub_pass_carrying_only_counts(monkeypatch):
+    """R16's trace half, and the span-attribute redaction rule at the call sites.
+
+    Until this existed a dev trace showed `varsel_notify` as one opaque phase with the decision
+    log's insert under it and nothing else, so "where does the pass spend its time" could only be
+    answered by adding log lines. The five children are the pass's own structure: match (16-wide),
+    reconcile (sequential), write wordings (16-wide), deliver (32-wide) and the decision rows.
+
+    Two things are asserted, and the second is the one that matters more. The spans exist and nest
+    under whatever the caller opened — and every attribute they carry is a COUNT from
+    `tracing_setup.SPAN_ATTRIBUTE_NAMES`. A span is exported to Cloud Trace, which project IAM is
+    the only gate on, and these five are opened exactly where the stop refs, the place names, the
+    departure times and the wordings are.
+
+    `varsel` must reach the tracer through an injected callable and never import `tracing_setup`
+    or `main` — the seam every other capability here uses — which is what this test drives.
+    """
+    import tracing_setup
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    opened: list[tuple[str, dict]] = []
+
+    @contextmanager
+    def _recorder(name, attributes=None, **kwargs):
+        opened.append((name, dict(attributes or {})))
+        yield None
+
+    varsel.configure(
+        impact_provider=varsel._impact_provider,
+        stops_provider=varsel._stops_provider,
+        span=_recorder,
+    )
+    try:
+        client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+        client.post(
+            "/varsel-api/journeys",
+            json={
+                "device_id": DEVICE,
+                "from_stop": "A",
+                "from_name": "Oslo S",
+                "to_stop": "B",
+                "to_name": "Lillehammer",
+                "begin": "00:00",
+                "end": "23:59",
+                "days": [0, 1, 2, 3, 4, 5, 6],
+            },
+        )
+        opened.clear()  # the registration's own connectivity work is not what this checks
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.configure(
+            impact_provider=varsel._impact_provider, stops_provider=varsel._stops_provider
+        )
+    names = [name for name, _ in opened]
+    assert names == [
+        "varsel_match",
+        "varsel_reconcile",
+        "varsel_write_wordings",
+        "varsel_deliver",
+        "varsel_record_decisions",
+    ], names
+    for name, attributes in opened:
+        assert attributes, f"{name} carries no counts, so the trace says nothing about it"
+        for key, value in attributes.items():
+            assert key in tracing_setup.SPAN_ATTRIBUTE_NAMES, f"{name}: {key}"
+            assert isinstance(value, (int, float)), f"{name}: {key}={value!r}"
+
+
+def test_an_unwired_span_seam_leaves_the_pass_exactly_as_it_was(monkeypatch):
+    """The default is off, and the pass must not know the difference.
+
+    Every seam in this module defaults to absent so an un-wired deployment is byte-for-byte the
+    code before the seam existed; a tracing seam is the one where a lazy default (import the tracer
+    here) would also break `varsel`'s import isolation. Driven rather than asserted in prose: the
+    same cycle with no provider still pushes.
+    """
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    assert varsel._span_provider is None, "_reset_state must return the seam to its off default"
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    client.post(
+        "/varsel-api/journeys",
+        json={
+            "device_id": DEVICE,
+            "from_stop": "A",
+            "from_name": "Oslo S",
+            "to_stop": "B",
+            "to_name": "Lillehammer",
+            "begin": "00:00",
+            "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+    )
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+
+
 def test_notify_pushes_once_then_dedups(monkeypatch):
     _reset_state()
     sent = []
@@ -851,6 +972,28 @@ def _register(device_id, **overrides):
     return r.json()["journey_id"]
 
 
+def _seed_definitions(n: int) -> None:
+    """`n` distinct journey definitions, written straight into the store.
+
+    Straight in rather than through `POST /varsel-api/journeys`, for two reasons a heartbeat test
+    cares about: that route renders the card, so it matches on the REQUEST path and would double
+    every count a test takes off the poller's pass; and at the hundreds of definitions these
+    heartbeat scenarios need, the round trips are most of the run time.
+
+    Each gets its own `begin`, so each is its own `journey_key` -- which is what the pass chunks.
+    """
+    for i in range(n):
+        device = f"{DEVICE}-seed-{i:04d}"
+        varsel._devices[device] = {
+            "subscription": SUBSCRIPTION, "created_ts": "2026-01-01T00:00:00+00:00"
+        }
+        varsel._journeys[f"seed-{i:04d}"] = {
+            "device_id": device, "from_stop": "A", "to_stop": "B",
+            "begin": f"{i % 24:02d}:{(i // 24) % 60:02d}", "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6], "created_ts": "2026-01-01T00:00:00+00:00",
+        }
+
+
 def _count_provider_calls(monkeypatch):
     """Wrap the impact provider so a test can count how many times it is consulted."""
     calls = []
@@ -968,6 +1111,7 @@ def test_message_writer_exception_is_contained(monkeypatch):
 def test_llm_call_cap_is_respected(monkeypatch):
     """With the cap at 1 and two alerting journeys, one gets written text and both are pushed."""
     _reset_state()
+    _use_snapshot(SNAPSHOT_TWO_PAIRS)
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
     monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 1)
@@ -981,11 +1125,13 @@ def test_llm_call_cap_is_respected(monkeypatch):
     )
 
     _register("dev-first-0001")
-    # A DIFFERENT journey definition (so it does not share the first one's message cache), but one
-    # that still contains DEP. Hardcoding "06:00"-"23:00" here made the test fail whenever it ran
-    # after ~21:00 Europe/Oslo, since DEP is now+2h: a latent CI landmine, not a real assertion.
-    _register("dev-second-002", begin="00:01", end="23:59")
-    varsel.check_and_notify(SNAPSHOT)
+    # A DIFFERENT PLACE PAIR, which since KTD9 (2026-09-12) is what "does not share the first one's
+    # message cache" means. A second WINDOW on the same corridor used to be a second cache entry and
+    # is now the same one -- so written under it this read "one call, two identical bodies", which
+    # is the sharing working rather than the cap. The same train serves both pairs
+    # (`SNAPSHOT_TWO_PAIRS`), so the cap still has two candidates to choose between.
+    _register("dev-second-002", to_stop="C", to_name="Hamar")
+    varsel.check_and_notify(SNAPSHOT_TWO_PAIRS)
 
     assert len(written) == 1, "the cap must bound written messages per cycle"
     assert len(sent) == 2, "both journeys are still pushed"
@@ -1167,6 +1313,7 @@ def test_a_cached_wording_is_recorded_beside_a_fresh_template(monkeypatch):
 
     _reset_state()
     log = _use_decision_log(monkeypatch)
+    _log_every_cycle(monkeypatch)  # two cycles one second apart: see the helper
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     monkeypatch.setattr(
         llm_message,
@@ -1231,8 +1378,11 @@ def test_a_message_written_about_another_train_is_not_shown(monkeypatch):
     assert len(varsel._messages) == 1
     stale_key = next(iter(varsel._messages))
 
-    # Same journey, same situation, a LATER train: the cached text must not be attached to it.
-    later = stale_key[0], stale_key[1], "2099-01-01T06:00:00+00:00"
+    # Same pair, same situation, a LATER train: the cached text must not be attached to it. Slot 2
+    # is the departure in KTD9's key; everything after it (cancelled, tomorrow, the alternative's
+    # identity, the prompt version) has to be carried across unchanged or the miss would be about
+    # the wrong element.
+    later = (*stale_key[:2], "2099-01-01T06:00:00+00:00", *stale_key[3:])
     varsel._messages[later] = varsel._messages.pop(stale_key)
     r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
     alerts = r.json()["journeys"][0]["alerts"]
@@ -1247,10 +1397,8 @@ def test_a_departed_alternative_is_not_offered(monkeypatch):
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     _register(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
-    key = varsel._message_key(
-        varsel.journey_key(next(iter(varsel._journeys.values()))),
-        varsel.match_journey(next(iter(varsel._journeys.values())))[0],
-    )
+    journey = next(iter(varsel._journeys.values()))
+    key = varsel._subject_key(varsel._pair(journey), varsel.match_journey(journey)[0])
     gone = alternatives.AlternativeJourney(
         departure_time=datetime.now(UTC) - timedelta(hours=1),
         arrival_time=datetime.now(UTC) - timedelta(minutes=20),
@@ -1620,11 +1768,22 @@ def test_the_suppressed_notice_is_still_recorded(monkeypatch):
 class _FakeBQ:
     """Enough of google.cloud.bigquery.Client for the decision log; records what was inserted."""
 
-    def __init__(self, insert_error: Exception | None = None, query_error: Exception | None = None):
+    def __init__(
+        self,
+        insert_error: Exception | None = None,
+        query_error: Exception | None = None,
+        fail_requests: tuple[int, ...] = (),
+    ):
         self.rows: list[dict] = []
         self.insert_error = insert_error
         self.query_error = query_error
         self.queries = 0
+        # One insert REQUEST per chunk since 2026-09-12, so a cycle can now be PARTLY written —
+        # `fail_requests` names the request indices that fail, which is the shape the ledger
+        # rollback has to survive. Counted rather than derived from `rows`, since a failed request
+        # contributes none.
+        self.requests = 0
+        self.fail_requests = set(fail_requests)
 
     def query(self, sql, **kw):  # the CREATE TABLE IF NOT EXISTS
         self.queries += 1
@@ -1639,22 +1798,42 @@ class _FakeBQ:
 
         return _Job()
 
-    def insert_rows_json(self, table, rows, timeout=None):
+    def insert_rows_json(self, table, rows, timeout=None, retry=None):
+        index = self.requests
+        self.requests += 1
         if self.insert_error is not None:
             raise self.insert_error
+        if index in self.fail_requests:
+            raise RuntimeError(f"BigQuery refused request {index}")
         self.rows.extend(rows)
         return []
 
 
-def _use_decision_log(monkeypatch, insert_error=None, query_error=None) -> _FakeBQ:
+def _use_decision_log(
+    monkeypatch, insert_error=None, query_error=None, fail_requests=()
+) -> _FakeBQ:
     import decisions
 
-    fake = _FakeBQ(insert_error, query_error)
+    fake = _FakeBQ(insert_error, query_error, fail_requests)
     monkeypatch.setattr(decisions, "_bq_client", fake)
     monkeypatch.setattr(decisions, "_table_ready", False)
     # The retry backoff is module state that would otherwise leak between tests.
     monkeypatch.setattr(decisions, "_ensure_failed_at", None)
     return fake
+
+
+def _log_every_cycle(monkeypatch):
+    """Turn the thinning rule off, so every cycle writes a row (U4, 2026-09-12).
+
+    For the tests whose subject is what a row SAYS rather than how many there are. They drive two
+    or three `check_and_notify` calls back to back on the wall clock, i.e. inside one quarter hour
+    with nothing about the subject having moved -- which is precisely the case KTD15 thins, so the
+    later cycles would write nothing and the assertion would read as the feature under test having
+    broken. Zero is the interval the log ran at until this change, so what these tests pin is
+    unchanged; `test_a_thinned_subject_groups_to_the_same_figures_as_an_unthinned_one` is the one
+    that asserts the two arms agree.
+    """
+    monkeypatch.setattr(varsel, "_DECISION_THINNING_INTERVAL_S", 0)
 
 
 def test_decisions_record_non_alerting_matches_too(monkeypatch):
@@ -1707,6 +1886,576 @@ def test_decision_row_records_delivery_and_device_count(monkeypatch):
     assert by_situation["S1"]["pushed"] is True
     assert by_situation["S2"]["pushed"] is False
     assert by_situation["S1"]["n_devices"] == 2
+
+
+def _alert(
+    situation: str, departure, *, jkey: str, p_impact: float = 0.9, decided_at=None
+) -> varsel.Alert:
+    """A minimal Alert for the paths that take a list of them directly."""
+    return varsel.Alert(
+        situation_number=situation,
+        summary="Signalfeil",
+        operator="VYG",
+        line="VYG:Line:R10",
+        departure_time=departure,
+        jkey=jkey,
+        stop_place="A",
+        stop_order=1,
+        decided_at=decided_at or datetime.now(UTC),
+        cancel_probability=0.8,
+        ge10_probability=0.8,
+        delay_p50_min=3,
+        delay_p90_min=12,
+        impact_probability=p_impact,
+        alert_threshold=0.65,
+        alertworthy=p_impact >= 0.65,
+    )
+
+
+def test_the_pushed_mark_is_keyed_per_departure_not_per_situation(monkeypatch):
+    """`pushed` is per TRAIN, and `pushed_keys` was keyed per SITUATION until 2026-09-12.
+
+    The rows this decides are keyed (journey definition x situation x DEPARTURE); the set it was
+    read against was keyed (journey definition x situation). One situation reaches 12 h from its
+    onset and routinely names several trains, so one push marked EVERY departure under it as
+    delivered -- into `pushed_any`, into `varsel_decision_groups`'s quoted-wording pick (which takes
+    the FIRST pushed row), and through the nightly job into `varsel_decision_outcomes`, where the
+    copy is frozen. KTD4 reads `pushed` as ground truth per train on both channels, so the key has
+    to carry the departure before either channel is scored on it.
+
+    Driven through `_record_decisions` directly rather than through a cycle, and that is the honest
+    shape: `match_journey` keeps the WORST alert per situation across every window
+    (`worst_by_situation`), so one cycle never holds two departures under one situation for one
+    definition and the two key shapes agree today. What the fix buys is that they keep agreeing --
+    the grain the log is written at is the grain the mark is read at, stated rather than implied by
+    a collapse three call levels away.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    first = _alert("S1", DEP, jkey="t1")
+    second = _alert("S1", DEP + timedelta(minutes=30), jkey="t4")
+
+    varsel._record_decisions(
+        {key: journey},
+        {key: [first, second]},
+        [(jid, journey)],
+        {varsel._decision_key(key, first)},
+        {},
+        push_on=True,
+    )
+
+    rows = sorted(log.rows, key=lambda r: r["departure_time"])
+    assert [r["situation_number"] for r in rows] == ["S1", "S1"], "two departures, one situation"
+    assert [r["pushed"] for r in rows] == [True, False], (
+        "the second departure inherited the first one's push"
+    )
+
+
+# ---- the thinning rule (KTD15, R11) -------------------------------------------------------------
+#
+# Until 2026-09-12 every matched subject wrote a row on every cycle, and the module said so in
+# prose: the repeats ARE the lead-time series. At 226 definitions that is 74 000-93 000 rows a day;
+# at 35 000-80 000 it is 14-32 M rows and 14-33 GB a day, which no bytes cap on /historikk can serve.
+# KTD15 overrides the intent with a rule that keeps every row the pages' figures are computed from.
+
+
+class _Clock:
+    """A cycle clock the tests advance by hand: the rule is about elapsed minutes."""
+
+    def __init__(self):
+        self.now = datetime.now(UTC).replace(microsecond=0)
+
+    def tick(self, minutes: int):
+        self.now += timedelta(minutes=minutes)
+        return self.now
+
+
+def _thinning_fixture(monkeypatch):
+    """A registered journey plus the decision log, ready for hand-driven cycles."""
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    return log, jid, journey, varsel.journey_key(journey)
+
+
+def _decide(key, journey, jid, alerts, *, now, pushed=()):
+    varsel._record_decisions(
+        {key: journey},
+        {key: list(alerts)},
+        [(jid, journey)],
+        {varsel._decision_key(key, a) for a in pushed},
+        {},
+        push_on=True,
+        now=now,
+    )
+
+
+def test_an_unchanged_subject_writes_at_most_one_row_per_quarter_hour(monkeypatch):
+    """t, t+5, t+10, t+15, t+20 with the same class and the same figures: rows at t and t+15.
+
+    This is the case thinning exists for -- 88-95 % of today's rows are sub-threshold no-SX subjects
+    re-scored every ~5 minutes with nothing having moved, and every one of them is a row the pages
+    read only through aggregates that MIN, MAX or COUNT over it.
+    """
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute in (0, 5, 10, 15, 20):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=now)],
+                now=now)
+
+    written = [r["decided_at"] for r in log.rows]
+    assert len(written) == 2, f"expected two rows (t and t+15), got {len(written)}: {written}"
+    assert written == [
+        clock.now.isoformat(),
+        (clock.now + timedelta(minutes=15)).isoformat(),
+    ]
+
+
+def test_a_new_maximum_probability_always_writes_a_row(monkeypatch):
+    """`max_impact_probability` is a MAX over the rows, so a peak that is not written is a peak the
+    page cannot see -- and it is the figure a threshold is tuned on. The rise at t+10 does not cross
+    the gate, so no transition fires and only this trigger keeps it."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.35), (10, 0.55)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+
+    assert [r["impact_probability"] for r in log.rows] == [0.40, 0.55], (
+        "a new maximum under the gate was thinned away"
+    )
+    assert all(r["alertworthy"] is False for r in log.rows)
+
+
+def test_crossing_the_alert_gate_always_writes_a_row(monkeypatch):
+    """`first_alert_at` is MIN(decided_at) over the alerting rows and `alert_lead_min` is computed
+    from it, so the cycle a subject crosses the gate can never be thinned. Both directions: easing
+    back off is a transition too, and `final_*` describes the class the subject ended in."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.90), (10, 0.40)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+
+    assert [(r["decided_at"], r["alertworthy"]) for r in log.rows] == [
+        (clock.now.isoformat(), False),
+        ((clock.now + timedelta(minutes=5)).isoformat(), True),
+        ((clock.now + timedelta(minutes=10)).isoformat(), False),
+    ]
+
+
+def test_a_push_always_writes_its_own_row(monkeypatch):
+    """`pushed_any` is a LOGICAL_OR and the quoted wording is taken off the FIRST pushed row, so a
+    thinned push would lose both the fact and the text. The push lands at t+10, inside the quarter
+    hour and with no figure having moved -- nothing else would write it."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    alerts = {}
+    for minute in (0, 5, 10):
+        now = clock.now + timedelta(minutes=minute)
+        alerts[minute] = _alert("S9", DEP, jkey="t1", p_impact=0.90, decided_at=now)
+        _decide(key, journey, jid, [alerts[minute]], now=now,
+                pushed=[alerts[minute]] if minute == 10 else ())
+
+    pushed = [r for r in log.rows if r["pushed"]]
+    assert len(pushed) == 1 and pushed[0]["decided_at"] == (
+        clock.now + timedelta(minutes=10)
+    ).isoformat()
+
+
+def test_a_train_that_leaves_the_match_gets_a_closing_row(monkeypatch):
+    """A train stops being matched the moment it can no longer be CAUGHT, while its situation lives
+    on for hours. Without a closing row the subject's last written figures are up to a quarter hour
+    old, and `final_impact_probability` -- "the closest look we got before departure" -- would
+    describe a cycle we deliberately skipped."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.38), (10, 0.36)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+    # t+15: the definition still matches, the train does not.
+    gone = clock.now + timedelta(minutes=15)
+    _decide(key, journey, jid, [], now=gone)
+
+    assert [r["impact_probability"] for r in log.rows] == [0.40, 0.36], (
+        "the closing row must carry the LAST scored figures, not the last written ones"
+    )
+    assert log.rows[-1]["decided_at"] == (clock.now + timedelta(minutes=10)).isoformat(), (
+        "the closing row is dated at the cycle it describes, not at the cycle that noticed"
+    )
+    assert not varsel._decision_ledger, "a retired subject must leave the ledger"
+
+
+def test_a_situation_the_sweep_retires_gets_a_closing_row(monkeypatch):
+    """The other way a subject retires: its situation ends. The stale sweep runs at the TOP of a
+    cycle and drops everything keyed on a dead situation, so a closing row left to the end-of-cycle
+    absence check would find nothing there to close."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    for minute, p in ((0, 0.40), (5, 0.38)):
+        now = clock.now + timedelta(minutes=minute)
+        _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)],
+                now=now)
+
+    # `(key, entry)` pairs, not bare rows: the entry is what makes a closing row lost to a failed
+    # insert restorable, since retiring has already popped it from the ledger.
+    closing = varsel._retire_decision_subjects(live={"S1"})
+    assert [e["row"]["impact_probability"] for _k, e in closing] == [0.38]
+    assert [k for k, _e in closing] == [varsel._decision_key(key, _alert("S9", DEP, jkey="t1"))]
+    assert not varsel._decision_ledger
+    # The sweep hands its rows to the cycle's single write; it must not write on its own.
+    assert [r["impact_probability"] for r in log.rows] == [0.40]
+
+
+def test_a_subject_whose_last_cycle_was_written_gets_no_closing_duplicate(monkeypatch):
+    """The closing row exists to carry figures the log does not already hold. When the last cycle a
+    subject was seen on wrote its own row, a second copy of it would be a duplicate that moves
+    `n_decisions` and nothing else."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=clock.now)],
+            now=clock.now)
+    _decide(key, journey, jid, [], now=clock.now + timedelta(minutes=5))
+
+    assert len(log.rows) == 1, f"the first-seen row was closed over: {log.rows}"
+
+
+def test_a_lost_write_leaves_the_ledger_where_it_was(monkeypatch):
+    """The write fails open, so a row can be lost — and the ledger must not then believe it landed.
+
+    Two consequences if it did, and the second is the one that would go unnoticed: the subject is
+    thinned for the next quarter hour though the log holds nothing about it, and `max_impact` has
+    advanced past a peak no row carries, so the peak can never be written even after BigQuery
+    recovers. `max_impact_probability` is what a threshold is tuned on.
+    """
+    import decisions
+
+    _reset_state()
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    clock = _Clock()
+
+    broken = _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.90, decided_at=clock.now)],
+            now=clock.now)
+    assert broken.rows == [] and not varsel._decision_ledger, (
+        "a lost first-seen row must leave no entry behind"
+    )
+
+    healthy = _FakeBQ()
+    monkeypatch.setattr(decisions, "_bq_client", healthy)
+    later = clock.tick(1)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.90, decided_at=later)],
+            now=later)
+    assert len(healthy.rows) == 1, "the subject was thinned against a row that was never written"
+
+    # The same rollback for an ESTABLISHED subject, which is the half the thinned branch does not
+    # already cover: this cycle is a new maximum, so it WRITES, and the write is lost. The entry
+    # must not go on believing its last look landed -- otherwise the subject retires with no closing
+    # row and `final_impact_probability` reads 0.90 (the older successful write) instead of 0.97.
+    broken2 = _FakeBQ(insert_error=RuntimeError("BigQuery is down"))
+    monkeypatch.setattr(decisions, "_bq_client", broken2)
+    lost_at = clock.tick(1)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.97, decided_at=lost_at)],
+            now=lost_at)
+    assert broken2.rows == [] and len(healthy.rows) == 1, "the new maximum was offered and lost"
+
+    monkeypatch.setattr(decisions, "_bq_client", healthy)
+    _decide(key, journey, jid, [], now=clock.tick(1))
+    assert len(healthy.rows) == 2, "the retired subject wrote no closing row for its lost look"
+    assert healthy.rows[-1]["impact_probability"] == 0.97, (
+        "the closing row carries the older successful write, so final_* understates the peak"
+    )
+
+
+def test_a_partly_written_cycle_advances_the_ledger_for_none_of_it(monkeypatch):
+    """A cycle is several insert REQUESTS since 2026-09-12, so "the write landed" is no longer a
+    boolean — and the rollback read it as one (`bool(rows) and not accepted`), which is true only
+    when NOTHING was accepted. A cycle whose second request was refused therefore returned a
+    non-zero count, and every subject of it was marked written: thinned for the next quarter hour
+    against rows nobody holds, with `max_impact` advanced past a peak no row in the log carries, so
+    the peak can never be written even after BigQuery recovers.
+
+    What the conservative test costs is the other side of the trade, and it is deliberate: on a
+    SHORT write the whole cycle is re-offered, so the subjects that did land are written twice.
+    That is harmless — every figure `varsel_decision_groups` computes is a MIN, a MAX, a
+    LOGICAL_OR or a first/last pick, and `n_decisions` already changed meaning in this same change
+    — while losing a peak is not.
+    """
+    import decisions
+
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    clock = _Clock()
+    # One row per request, so the two subjects below are two requests and the second can fail alone.
+    monkeypatch.setattr(decisions, "_MAX_ROWS_PER_INSERT", 1)
+
+    def _two(p, now):
+        return [
+            _alert("S1", DEP, jkey="t1", p_impact=p, decided_at=now),
+            _alert("S2", DEP + timedelta(minutes=7), jkey="t2", p_impact=p, decided_at=now),
+        ]
+
+    _decide(key, journey, jid, _two(0.40, clock.now), now=clock.now)
+    assert [r["impact_probability"] for r in log.rows] == [0.40, 0.40], "control: both landed"
+
+    # Both peak, both write a `new_max` row -- and the second request is refused.
+    partial = _use_decision_log(monkeypatch, fail_requests=(1,))
+    peak = clock.tick(1)
+    _decide(key, journey, jid, _two(0.60, peak), now=peak)
+    assert [r["situation_number"] for r in partial.rows] == ["S1"], (
+        "control: exactly one of the two requests landed, which is what makes this a SHORT write"
+    )
+
+    # Nothing about either subject has moved, so only the rollback can produce a row here.
+    healthy = _use_decision_log(monkeypatch)
+    again = clock.tick(1)
+    _decide(key, journey, jid, _two(0.60, again), now=again)
+    assert "S2" in {r["situation_number"] for r in healthy.rows}, (
+        "the lost subject's peak was thinned against a row BigQuery refused; "
+        "max_impact_probability -- the figure a threshold is tuned on -- can never reach 0.60 now"
+    )
+    assert [r["situation_number"] for r in healthy.rows] == ["S1", "S2"], (
+        "the accepted row is re-offered too, which is the stated cost of the conservative test"
+    )
+
+
+def test_a_closing_row_lost_to_a_failed_write_is_offered_again(monkeypatch):
+    """The sweep POPS a retiring subject, so a closing row lost to a failed insert used to be lost
+    for good: the entry was already gone, nothing would ever offer the row again, and `final_*`
+    then described an older cycle for the life of the table.
+
+    The rollback puts the entry back, so the next cycle's sweep retires it again and the closing row
+    lands as soon as BigQuery recovers. The rows travel opaquely here on purpose — this asserts the
+    behaviour, not the shape the sweep returns them in.
+    """
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=clock.now)],
+            now=clock.now)
+    later = clock.tick(5)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.38, decided_at=later)],
+            now=later)
+    assert [r["impact_probability"] for r in log.rows] == [0.40], "control: t+5 was thinned"
+
+    # The situation ends. The sweep hands its closing row to the cycle's write, which is lost.
+    broken = _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
+    retired = varsel._retire_decision_subjects(live=set())
+    assert retired, "control: the sweep had a closing row to hand over"
+    varsel._record_decisions({key: journey}, {key: []}, [(jid, journey)], set(), {},
+                             push_on=True, now=clock.tick(5), closing_rows=retired)
+    assert broken.rows == [], "control: the closing row was offered and refused"
+
+    healthy = _use_decision_log(monkeypatch)
+    again = varsel._retire_decision_subjects(live=set())
+    assert again, (
+        "the closing row was dropped for good: the subject is out of the ledger, nothing will ever "
+        "offer it again, and final_impact_probability keeps the older successful write (0.40)"
+    )
+    varsel._record_decisions({key: journey}, {key: []}, [(jid, journey)], set(), {},
+                             push_on=True, now=clock.tick(5), closing_rows=again)
+    assert [r["impact_probability"] for r in healthy.rows] == [0.38], (
+        "the retried closing row must carry the LAST look, not the last write"
+    )
+    assert not varsel._retire_decision_subjects(live=set()), (
+        "a subject retires exactly once: a landed closing row leaves nothing behind"
+    )
+
+
+def test_a_closing_row_for_a_train_that_left_the_match_survives_a_failed_write(monkeypatch):
+    """The other retirement path, with the same defect and the same fix: a subject this cycle did
+    not see is popped inside `_record_decisions` itself, so its closing row was lost with the write
+    that carried it. Both paths have to roll back, or half the closing rows are still dropped on a
+    BigQuery wobble."""
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    clock = _Clock()
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.40, decided_at=clock.now)],
+            now=clock.now)
+    later = clock.tick(5)
+    _decide(key, journey, jid, [_alert("S9", DEP, jkey="t1", p_impact=0.38, decided_at=later)],
+            now=later)
+    assert [r["impact_probability"] for r in log.rows] == [0.40], "control: t+5 was thinned"
+
+    # The train can no longer be caught, so it leaves the match while its situation lives on.
+    broken = _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
+    _decide(key, journey, jid, [], now=clock.tick(5))
+    assert broken.rows == [], "control: the closing row was offered and refused"
+
+    healthy = _use_decision_log(monkeypatch)
+    _decide(key, journey, jid, [], now=clock.tick(5))
+    assert [r["impact_probability"] for r in healthy.rows] == [0.38], (
+        "the closing row went with the failed write, so final_* describes the cycle before it"
+    )
+    _decide(key, journey, jid, [], now=clock.tick(5))
+    assert len(healthy.rows) == 1, "a subject retires exactly once"
+
+
+def test_the_decision_write_beats_the_poller_heartbeat_between_chunks(monkeypatch):
+    """/health's staleness rule means "no STEP has finished in HEALTH_STALE_AFTER_S", and a cycle's
+    decision write is now several steps — each able to spend the retry deadline plus an attempt.
+    Unbeaten, they are one silence inside the single `varsel_notify` phase, and the restart it earns
+    comes up with both ET planned-call tables cold. `decisions.record` takes the beat; this is the
+    check that `varsel` actually hands it over, which is the half most likely to drift."""
+    import decisions
+
+    log, jid, journey, key = _thinning_fixture(monkeypatch)
+    monkeypatch.setattr(decisions, "_MAX_ROWS_PER_INSERT", 1)
+    beats: list[int] = []
+    monkeypatch.setattr(varsel, "_beat_provider", lambda: beats.append(1))
+    now = datetime.now(UTC).replace(microsecond=0)
+    _decide(key, journey, jid, [
+        _alert("S1", DEP, jkey="t1", p_impact=0.40, decided_at=now),
+        _alert("S2", DEP + timedelta(minutes=7), jkey="t2", p_impact=0.40, decided_at=now),
+    ], now=now)
+
+    assert len(log.rows) == 2 and log.requests == 2, "control: two rows went as two requests"
+    assert len(beats) == 2, (
+        f"the write spanned {log.requests} requests and beat {len(beats)} times; a chunk boundary "
+        "is a progress point and /health cannot see one that is never reported"
+    )
+
+
+def _group(rows: list[dict]) -> dict:
+    """`varsel_decision_groups`' aggregates, transcribed from the view.
+
+    Nothing in this repo executes SQL, so the view is modelled here rather than run. Only the
+    figures R11 names are transcribed: the rows are all from one subject, so the GROUP BY is
+    implicit.
+    """
+    ordered = sorted(rows, key=lambda r: r["decided_at"])
+    alerting = [r for r in ordered if r["alertworthy"]]
+    pushed = [r for r in ordered if r["pushed"] and r["message"] is not None]
+    with_text = [r for r in ordered if r["message"] is not None]
+    last = ordered[-1]
+    return {
+        "first_decided_at": ordered[0]["decided_at"],
+        "ever_alerted": bool(alerting),
+        "first_alert_at": alerting[0]["decided_at"] if alerting else None,
+        "et_cancelled": alerting[0]["et_cancelled"] if alerting else any(r["et_cancelled"] for r in ordered),
+        "max_impact_probability": max(r["impact_probability"] for r in ordered),
+        "pushed_any": any(r["pushed"] for r in ordered),
+        "n_devices": max(r["n_devices"] for r in ordered),
+        "final_impact_probability": last["impact_probability"],
+        "final_cancel_probability": last["cancel_probability"],
+        "final_delay_p50_min": last["delay_p50_min"],
+        "final_delay_p90_min": last["delay_p90_min"],
+        "message": (pushed or with_text[::-1] or [{"message": None, "message_source": None}])[0]["message"],
+        "message_source": (pushed or with_text[::-1] or [{"message": None, "message_source": None}])[0]["message_source"],
+    }
+
+
+def test_a_thinned_subject_groups_to_the_same_figures_as_an_unthinned_one(monkeypatch):
+    """R11 in one test: the rule keeps every verdict, first-alert time, maximum probability,
+    lead-time figure and quoted wording the page computes today.
+
+    One synthetic history, replayed twice -- once with the rule and once with the rule disabled by
+    setting the interval to zero, which is exactly what "a row on every cycle" was. `n_decisions` is
+    deliberately not compared: it changes meaning, and its description says so.
+    """
+    history = [
+        (0, 0.30, False),
+        (5, 0.32, False),
+        (10, 0.55, False),
+        (15, 0.72, True),   # crosses the gate, and is pushed
+        (20, 0.70, False),
+        (25, 0.95, False),  # a new maximum
+        (30, 0.40, False),
+        (35, 0.38, False),
+        (40, 0.36, False),
+    ]
+
+    def replay(interval_s):
+        log, jid, journey, key = _thinning_fixture(monkeypatch)
+        monkeypatch.setattr(varsel, "_DECISION_THINNING_INTERVAL_S", interval_s)
+        clock = _Clock()
+        for minute, p, push in history:
+            now = clock.now + timedelta(minutes=minute)
+            alert = _alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)
+            _decide(key, journey, jid, [alert], now=now, pushed=[alert] if push else ())
+        _decide(key, journey, jid, [], now=clock.now + timedelta(minutes=45))
+        return list(log.rows)
+
+    thinned = replay(varsel._DECISION_THINNING_INTERVAL_S)
+    unthinned = replay(0)
+
+    assert len(thinned) < len(unthinned), "the rule wrote no fewer rows than writing every cycle"
+    assert _group(thinned) == _group(unthinned)
+
+
+def test_a_second_cycle_on_an_unchanged_situation_writes_nothing(monkeypatch):
+    """The rule through the REAL cycle, not through `_record_decisions` alone.
+
+    Two `check_and_notify` calls a moment apart on one snapshot: the first pushes and writes, the
+    second finds the same class, the same figures and `_notified` already holding the push. That is
+    the ordinary shape of every poller tick, and it is what 88-95 % of prd's rows are.
+    """
+    _reset_state()
+    _use_snapshot(SNAPSHOT)
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    after_first = len(log.rows)
+    assert after_first == 1 and log.rows[0]["pushed"] is True
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(log.rows) == after_first, (
+        f"the second cycle wrote {len(log.rows) - after_first} row(s) for an unchanged subject"
+    )
+
+
+def test_a_situation_that_ends_closes_its_subjects_through_the_real_cycle(monkeypatch):
+    """The sweep's half of the retirement, wired end to end: the situation leaves the snapshot, the
+    stale sweep at the top of the next cycle closes the subject, and its last look reaches the log
+    in that cycle's single write. The earlier unit test drives `_retire_decision_subjects` directly;
+    this one proves `live` and `closing_rows` are actually threaded through `check_and_notify`."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT)
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(log.rows) == 1
+    varsel.check_and_notify(SNAPSHOT)  # thinned: same class, same figures, push already sent
+    assert len(log.rows) == 1
+    # The situation is over. Nothing matches this cycle, so the ONLY row it can produce is the
+    # closing one -- carrying the second cycle's figures, which nothing else in the log holds.
+    _use_snapshot({})
+    varsel.check_and_notify({})
+    assert not varsel._decision_ledger, "the retired subject is still in the ledger"
+    assert len(log.rows) == 2, "the thinned last look never reached the log"
+    assert log.rows[1]["decided_at"] > log.rows[0]["decided_at"]
+    assert log.rows[1]["pushed"] is False, "a closing row is not a push"
+    _use_snapshot(SNAPSHOT)
+
+
+def test_the_thinning_ledger_is_swept_and_reset_like_every_other_module_budget():
+    """The house rule: a module-level ledger that outlives its subjects reads exactly like the
+    give-up bug the tests around it exist to pin. Its own structure, deliberately -- riding on
+    `_message_meta` would lose the prior class the instant `_forget_message` fires, which is the
+    tick a subject eases below the gate and precisely when the rule needs it."""
+    import pathlib
+
+    source = pathlib.Path(varsel.__file__).read_text()
+    assert "_decision_ledger" in source
+    assert "_decision_ledger.clear()" in pathlib.Path(__file__).read_text(), (
+        "_reset_state must clear the ledger"
+    )
+    # The sweep: the ledger is pruned on the same liveness test as `_messages` and `_notified`.
+    assert "_retire_decision_subjects" in source
 
 
 def test_decision_row_holds_no_device_or_journey_identifier(monkeypatch):
@@ -4211,9 +4960,11 @@ def test_the_webhook_wording_gate_is_the_webhook_switch_not_varsel_llm_enabled(m
 def test_a_confirmed_cancellation_never_carries_the_wording_written_before_it(monkeypatch):
     """The cancellation title over the pre-cancellation body, and why the cache cannot notice.
 
-    `_message_key` is (journey_key, situation_number, departure) and carries no `cancelled` flag, so
-    a wording written while the train was merely at risk shares one cache entry with the reading
-    taken after ET declared it gone. The TITLE is rebuilt from this cycle's `message_input`
+`_message_key` carried no `cancelled` flag until KTD9 (2026-09-12), so
+    a wording written while the train was merely at risk shared one cache entry with the reading
+    taken after ET declared it gone. Both halves of that are closed now — the flag is in the key,
+    AND `_subjects_for_key` still refuses the cache outright — and this is what says so. The TITLE
+    is rebuilt from this cycle's `message_input`
     (`innstilt: True`), the BODY is the cached string — so the notification event read «Tog L1 07:18 er
     innstilt» over «91 % sjanse for innstilling, typisk 15-27 min forsinket», beside
     `delay: null`, `effect: "cancelled"` and `probabilities.cancellation: 1.0` in the same payload.
@@ -4477,18 +5228,22 @@ def test_the_cached_wording_and_alternative_are_read_for_a_registered_definition
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: "Toget er innstilt.")
     _register(DEVICE)
-    varsel.check_and_notify(SNAPSHOT)
     journey = next(iter(varsel._journeys.values()))
-    key = varsel.journey_key(journey)
+    pair = varsel._pair(journey)
     alert = varsel.match_journey(journey)[0]
-    message_key = varsel._message_key(key, alert)
-    assert varsel._messages.get(message_key) == "Toget er innstilt.", "control: the pass cached it"
+    # Seeded BEFORE the pass, because since KTD9 the alternative is part of the wording key: the
+    # pass then writes its wording under the key naming this advice, which is the key the read
+    # derives. Injected afterwards it would be a different key and the read would correctly find
+    # no wording -- a true answer to a question this test is not asking.
     alternative = alternatives.AlternativeJourney(
         departure_time=DEP + timedelta(minutes=20),
         arrival_time=DEP + timedelta(minutes=50),
         duration_min=30, minutes_saved=10, legs=[],
     )
-    varsel._alternatives[message_key] = alternative
+    varsel._alternatives[varsel._subject_key(pair, alert)] = alternative
+    varsel.check_and_notify(SNAPSHOT)
+    message_key = varsel._message_key(pair, alert)
+    assert varsel._messages.get(message_key) == "Toget er innstilt.", "control: the pass cached it"
 
     def unchanged(call):
         messages, alts = dict(varsel._messages), dict(varsel._alternatives)
@@ -4496,19 +5251,17 @@ def test_the_cached_wording_and_alternative_are_read_for_a_registered_definition
         assert varsel._messages == messages and varsel._alternatives == alts, "the read wrote"
         return result
 
-    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, alert, enabled=True))
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(pair, alert, enabled=True))
     assert got == ("Toget er innstilt.", alternative)
 
     cancelled = alert.model_copy(update={"cancelled": True})
-    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, cancelled, enabled=True))
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(pair, cancelled, enabled=True))
     assert got == (None, alternative), "no wording for a declared cancellation, still the alternative"
 
-    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, alert, enabled=False))
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(pair, alert, enabled=False))
     assert got == (None, alternative), "the delivery gate withholds the wording only"
 
-    got = unchanged(
-        lambda: varsel.cached_wording_and_alternative("X|Y|07:00|09:00|0", alert, enabled=True)
-    )
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(("X", "Y"), alert, enabled=True))
     assert got == (None, None)
 
 
@@ -4576,6 +5329,667 @@ def test_a_failed_push_keeps_its_severity_and_an_unexpected_raise_keeps_its_trac
     assert "socket melted" in record.fields["push_error_traceback"]
     assert "Traceback" in record.fields["push_error_traceback"], (
         "the exception NAME is not the frame; a traceback is what makes the defect findable"
+    )
+
+
+# ---- One clock for the pass, and a heartbeat inside it (U2) -------------------------------------
+
+
+def test_every_definition_in_a_pass_is_matched_at_the_cycles_own_instant(monkeypatch):
+    """Pass 1a hands `match_journey` the cycle's `now`, not each worker's wall clock.
+
+    Three things ride on that instant and all three are decisions about the traveller: which
+    windows are open (`journey_windows`), which trains can still be caught (`catchable_after`) and
+    what `decided_at` the decision log records. Sampled per journey they disagree by however long
+    the pass takes -- which at ten times the pilot's registrations is seconds, not microseconds --
+    so two definitions on one stop pair could be told different things about one train, and the
+    decision log would carry a scatter of instants where the cycle has exactly one.
+
+    It is also what makes the per-generation index useful: a memo keyed on a window the caller
+    derived from its own clock is shared by nobody.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    seen: list = []
+    real = varsel.match_journey
+
+    def recording(journey, now=None, **kw):
+        seen.append(now)
+        return real(journey, now, **kw)
+
+    for i in range(4):
+        _register(f"{DEVICE}-clock-{i}", begin=f"0{i}:00", end="23:59")
+    # AFTER the registrations: `POST /journeys` renders the card, which matches on the REQUEST path
+    # and legitimately uses its own clock. What this is about is the poller's pass.
+    monkeypatch.setattr(varsel, "match_journey", recording)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(seen) == 4, f"four definitions, {len(seen)} matches"
+    assert all(n is not None for n in seen), "the pass left `now` to the worker's wall clock"
+    assert len(set(seen)) == 1, f"the pass matched at {len(set(seen))} different instants"
+
+
+def test_the_match_pass_beats_the_heartbeat_before_it_finishes(monkeypatch):
+    """A pass long enough to look wedged must not BE wedged as far as /health is concerned.
+
+    `/health`'s staleness rule is "no STEP has finished in `HEALTH_STALE_AFTER_S` (600 s)", and
+    `varsel_notify` is one `_phase`, so until now the whole pass beat exactly once -- at its end.
+    That was fine at 226 definitions and is the wrong shape at 100 000: a pass that slows for any
+    reason (a Journey Planner outage holding 16 workers at their timeout, a bad morning) reads as a
+    wedged poller, /health answers 503, the liveness probe restarts the pod, and the restart comes
+    up with both planned-call tables cold -- which is the self-sustaining crash loop `_beat`'s own
+    docstring describes.
+
+    So the beat is per CHUNK of definitions, and this pins it where it matters: beats land while
+    definitions are still being matched, not only after the last one.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    matched: list[str] = []
+    beats: list[int] = []
+    real = varsel.match_journey
+
+    def recording(journey, now=None, **kw):
+        matched.append(journey["from_stop"])
+        return real(journey, now, **kw)
+
+    definitions = varsel._HEARTBEAT_EVERY * 2 + 1
+    _seed_definitions(definitions)
+    monkeypatch.setattr(varsel, "match_journey", recording)
+    varsel.configure(
+        impact_provider=varsel._impact_provider,
+        stops_provider=varsel._stops_provider,
+        beat=lambda: beats.append(len(matched)),
+    )
+    try:
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.configure(
+            impact_provider=varsel._impact_provider, stops_provider=varsel._stops_provider
+        )
+    assert len(matched) == definitions, f"{len(matched)} of {definitions} definitions matched"
+    assert beats, "the pass never beat the heartbeat"
+    mid_pass = [n for n in beats if 0 < n < definitions]
+    assert mid_pass, f"every beat landed outside the match pass: {beats}"
+
+
+def test_a_broken_heartbeat_seam_never_takes_the_cycle(monkeypatch):
+    """Instrumentation must not be able to stop alerting -- `_span`'s rule, applied to the beat.
+
+    This runs on the ingestion thread, where an exception escaping pass 1a costs a whole cycle's
+    pushes. A heartbeat is a liveness signal about the pass; it is not allowed to end it.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+
+    def boom():
+        raise RuntimeError("heartbeat exploded")
+
+    _seed_definitions(varsel._HEARTBEAT_EVERY + 1)
+    varsel.configure(
+        impact_provider=varsel._impact_provider,
+        stops_provider=varsel._stops_provider,
+        beat=boom,
+    )
+    try:
+        outcome = varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.configure(
+            impact_provider=varsel._impact_provider, stops_provider=varsel._stops_provider
+        )
+    assert outcome is not None, "the pass died on its own heartbeat"
+
+
+# ---- U3: one wording and one alternative lookup per (place pair, train) -------------------------
+#
+# KTD9. Until 2026-09-12 every cache here was keyed on the journey DEFINITION
+# (`from|to|begin|end|days`), so two commuters on one corridor with different windows paid two
+# backend calls for one train and could be shown two different sentences about it. The key is now
+# the PAIR plus what the wording actually states, which is `notification_pull`'s own shape — moved
+# into `notification_wording` so both modules import it from a leaf and `varsel` never depends on
+# the read.
+
+# Train `t1` also calls C, so one departure serves two pairs (A→B and A→C). That is the other
+# direction of the same risk: a key shared too widely shows one trip another trip's text.
+SNAPSHOT_TWO_PAIRS = {
+    "S1": [
+        *SNAPSHOT["S1"],
+        FakeCall("t1", "C", 7, None, aimed_arr=DEP + timedelta(minutes=70)),
+    ]
+}
+
+
+# `alternatives.fetch_candidates` refuses a ref that is not NSR-shaped before it reaches the cache
+# (the refs are spliced into a GraphQL document), so the Journey Planner pin below cannot use the
+# suite's "A"/"B" placeholders.
+NSR_FROM = "NSR:StopPlace:337"
+NSR_TO = "NSR:StopPlace:418"
+SNAPSHOT_NSR = {
+    "S1": [
+        FakeCall("t9", NSR_FROM, 1, DEP, p_cancel=0.82, p_impact_dep=0.9),
+        FakeCall("t9", NSR_TO, 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+    ]
+}
+
+
+def _pair_definitions(
+    n: int, *, from_stop: str = "A", to_stop: str = "B", prefix: str = "pair"
+) -> list[str]:
+    """`n` distinct definitions on ONE pair, each with its own window, straight into the store.
+
+    `_seed_definitions`' shape, but returning the keys and taking the destination, because every
+    scenario below is about what two definitions on one pair share and what two pairs do not.
+    """
+    keys = []
+    for i in range(n):
+        device = f"{DEVICE}-{prefix}-{i:03d}"
+        varsel._devices[device] = {
+            "subscription": SUBSCRIPTION, "created_ts": "2026-01-01T00:00:00+00:00"
+        }
+        record = {
+            "device_id": device, "from_stop": from_stop, "to_stop": to_stop,
+            "begin": f"{i:02d}:00", "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6], "created_ts": "2026-01-01T00:00:00+00:00",
+        }
+        varsel._journeys[f"{prefix}-{i:03d}"] = record
+        keys.append(varsel.journey_key(record))
+    return keys
+
+
+def test_two_definitions_on_one_pair_share_one_wording(monkeypatch):
+    """KTD9's headline: one backend call per (pair, train), and both cards read the same sentence.
+
+    Two registrations of the SAME corridor with different windows — the ordinary shape of a
+    commuter corridor, and the one that multiplies at 100 000 subscriptions. Before this the two
+    were separate `_messages` keys, so the pair cost two Vertex calls per disrupted train and the
+    two travellers could be shown two different sentences about one departure.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: written.append(1) or f"Melding {len(written)}.",
+    )
+    _pair_definitions(2)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, f"one train on one pair must cost one call, not {len(written)}"
+    texts = set()
+    for jid in varsel._journeys:
+        model = varsel._journey_model(jid, varsel._journeys[jid])
+        texts.update(a.message for a in model.alerts)
+    assert texts == {"Melding 1."}, f"both cards must read the shared wording, got {texts}"
+
+
+def test_the_same_train_on_two_pairs_is_worded_twice(monkeypatch):
+    """The other direction: the key must not be so wide that two trips share one sentence.
+
+    One departure legitimately serves several corridors — the advice names the traveller's own
+    origin and destination, so A→B and A→C are two wordings about one train and always were.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda alert, **kw: written.append(1) or "Skrevet."
+    )
+    _use_snapshot(SNAPSHOT_TWO_PAIRS)
+    _pair_definitions(1, to_stop="B", prefix="to-b")
+    _pair_definitions(1, to_stop="C", prefix="to-c")
+
+    varsel.check_and_notify(SNAPSHOT_TWO_PAIRS)
+
+    assert len(written) == 2, f"two pairs is two wordings, got {len(written)}"
+
+
+def test_a_rejected_reply_retires_the_pair_and_not_each_definition(monkeypatch):
+    """`_message_attempts` is the pair's budget now, so a second definition does not re-ask.
+
+    The give-up rule exists because a payload the writer cannot handle fails again on every tick
+    for the situation's 12 h life. Keyed per definition, a corridor with 500 registrations would
+    spend 500 × `_MAX_MESSAGE_ATTEMPTS` calls learning one thing.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    attempts = []
+
+    def rejected(alert, *, outcome=None, **kw):
+        attempts.append(1)
+        if outcome is not None:
+            outcome["status"] = "rejected"
+
+    monkeypatch.setattr(varsel, "_write_message", rejected)
+    _pair_definitions(3)
+
+    for _ in range(8):
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert len(attempts) == varsel._MAX_MESSAGE_ATTEMPTS, (
+        f"the pair's budget is {varsel._MAX_MESSAGE_ATTEMPTS} attempts, "
+        f"{len(attempts)} were spent"
+    )
+
+
+def test_a_cycle_that_establishes_no_alternative_does_not_rewrite_the_wording(monkeypatch):
+    """REGRESSION GUARD, and the one the new key most easily breaks.
+
+    The alternative is part of the key (a wording quotes a specific replacement train), and the
+    alternative that belongs in it is the EFFECTIVE one — the cached answer — not the fresh alert's
+    field. A lookup is skipped on most cycles (the impact gate, the 6 h horizon,
+    `impact._MAX_ALTERNATIVE_LOOKUPS`, a Journey Planner outage), and `_reconcile_caches` keeps the
+    cached answer through that silence precisely so the card does not flap. Keying on the raw field
+    would make every silent cycle a cache miss: one backend call per alerting train per cycle, for
+    text that is already written.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda alert, **kw: written.append(1) or "Ta R10 kl 08:14."
+    )
+    offered = alternatives.AlternativeJourney(
+        departure_time=DEP.astimezone(UTC) + timedelta(minutes=10),
+        arrival_time=DEP.astimezone(UTC) + timedelta(minutes=45),
+        duration_min=35, minutes_saved=5, legs=[],
+    )
+    real = varsel.match_journey
+
+    def with_alternative(journey, now=None, **kw):
+        alerts = real(journey, now, **kw) if now is not None else real(journey, **kw)
+        for alert in alerts:
+            alert.alternative_journey = offered
+        return alerts
+
+    monkeypatch.setattr(varsel, "match_journey", with_alternative)
+    _pair_definitions(1)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(written) == 1, "the first cycle writes once"
+
+    # The lookup is skipped this cycle: the alert carries no alternative, and the cache keeps the
+    # one it found. Nothing about the advice has changed, so nothing may be re-written.
+    monkeypatch.setattr(varsel, "match_journey", real)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(written) == 1, (
+        f"a cycle that established no alternative re-wrote the wording ({len(written)} calls)"
+    )
+
+
+def test_varsel_does_not_import_the_pull_read(monkeypatch):
+    """The plan's stop condition, checked over the module's identifiers.
+
+    The key shape is shared, and the obvious way to share it is for whichever module got it second
+    to import the first. `notification_pull` imports `varsel` (it reads the poller's caches), so
+    the reverse would be a cycle, and `varsel` would gain the read's limiter, its executor and its
+    caches on the ingestion thread. The shape both use lives in `notification_wording`, a leaf.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(varsel))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "notification_pull" not in imported, "varsel must not depend on the pull read"
+    assert "notification_wording" in imported, "the shared key shape comes from the leaf module"
+    assert varsel._message_key.__module__ == "varsel"
+
+    import notification_wording
+
+    assert callable(notification_wording.wording_key), "the shape is the leaf module's to own"
+
+
+def test_a_webhook_only_pair_is_worded_once_under_the_webhook_policy(monkeypatch):
+    """Two client subscriptions on one pair cost one wording, and it is NOT the browser's.
+
+    R16. The new key names no definition, so a shared call could put a client route's origin and
+    destination into the browser policy's prompt/reply DEBUG record — which dev writes
+    (`VARSEL_LLM_LOG_PROMPTS=true`). `notification_wording.WEBHOOK` suppresses that record in code,
+    and the discriminator is now the PAIR: the webhook policy unless a browser registration on the
+    pair contributed this train.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch,
+        [
+            {**WEBHOOK_DOC_ROUTED, "recipient_id": "sub-0001", "begin": "00:00"},
+            {**WEBHOOK_DOC_ROUTED, "recipient_id": "sub-0002", "subscription_id": "sub-0002",
+             "begin": "01:00"},
+        ],
+    )
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, f"one pair, one train, one wording — got {len(written)}"
+    # `_capture_writes` records the browser writer's `journey_key` and the webhook writer's
+    # `subject_id`; only the webhook one ran, so nothing here came off `varsel._write_message`.
+    assert varsel._messages, "the shared wording must be cached under the pair's key"
+
+
+def test_a_browser_registration_on_the_pair_keeps_the_shared_call_on_the_browser_policy(monkeypatch):
+    """The other half of the same rule, and the half that must NOT change.
+
+    A definition a browser registration holds is written for by `varsel._write_message` today, and
+    a webhook subscription on the same PAIR (a different window, so a different definition) must
+    not move it to the client policy — the card reads that wording, and the prompt record for a
+    route a browser registration holds would exist with no webhook channel at all.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    browser_calls = []
+    client_calls = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: browser_calls.append(1) or "Skrevet av modellen.",
+    )
+
+    def webhook_write(route, facts, *, subject_id="", message_input=None, **_):
+        client_calls.append(subject_id)
+        return notification_wording.Wording(
+            title="t", body="b", source="llm", status="ok", message_input=message_input or {}
+        )
+
+    monkeypatch.setattr(notification_wording, "write_wording", webhook_write)
+    _pair_definitions(1, prefix="browser")  # begin 00:00
+    _use_notification_store(
+        monkeypatch, [{**WEBHOOK_DOC_ROUTED, "begin": "05:00"}]  # same pair, its own window
+    )
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(browser_calls) == 1, f"the browser writer ran {len(browser_calls)} times"
+    assert client_calls == [], "a browser registration on the pair owns the wording"
+
+
+def test_five_definitions_on_one_pair_issue_one_journey_planner_lookup(monkeypatch):
+    """PINS TODAY'S SHARING rather than adding a memo (KTD9).
+
+    `alternatives._cache` keys on (from, to, arrive-by, anchor) with a 10-minute TTL and
+    cross-thread single-flight, and the anchor for the in-time tier is the disrupted train's own
+    AIMED arrival — stable across definitions and across cycles. So five definitions on one pair
+    asking about one train already spend one outbound call, and this is what says so if a future
+    change to the key or the anchor quietly makes it five.
+
+    Driven through the REAL `fetch_candidates`: the suite stubs that function wholesale (it would
+    otherwise open a socket), and a stub there sits ABOVE the cache, so the pin would count five
+    and prove nothing. The HTTP call underneath it is what is counted instead.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda alert, **kw: None)
+    fetches = []
+    monkeypatch.setattr(
+        alternatives, "_fetch_trip_patterns",
+        lambda *a, **k: fetches.append(1) or [],
+    )
+    monkeypatch.setattr(impact.alternatives, "fetch_candidates", _REAL_FETCH_CANDIDATES)
+    alternatives._cache._entries.clear()
+    alternatives._cache._failed_at.clear()
+    alternatives._fetch_calls[alternatives._POLLER_PATH] = []
+    _use_snapshot(SNAPSHOT_NSR)
+    _pair_definitions(5, from_stop=NSR_FROM, to_stop=NSR_TO)
+
+    varsel.check_and_notify(SNAPSHOT_NSR)
+
+    assert fetches, "the lookup never ran; the pin proves nothing"
+    assert len(fetches) <= 2, (
+        f"five definitions on one pair issued {len(fetches)} Journey Planner lookups; the "
+        "in-time query and its fallback are the two a single train may cost"
+    )
+
+
+def test_the_written_wordings_are_capped_per_pair_and_not_per_definition(monkeypatch):
+    """`_MAX_MESSAGES_PER_JOURNEY` is a PAIR's cap now.
+
+    Per definition it multiplied by the number of registrations on a corridor, which is exactly
+    the number this plan is scaling. Two disrupted trains, two definitions, a cap of one: one
+    wording, for the soonest departure.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_MAX_MESSAGES_PER_JOURNEY", 1)
+    _use_snapshot(SNAPSHOT_TWO_DISRUPTED)
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: written.append(alert.situation_number) or "Skrevet.",
+    )
+    _pair_definitions(2)
+
+    varsel.check_and_notify(SNAPSHOT_TWO_DISRUPTED)
+
+    assert written == ["S1"], (
+        f"the pair's single write slot went to {written} rather than to the soonest departure"
+    )
+
+
+def _llm_log_fields(call):
+    """The `extra={"fields": ...}` bodies a call emitted from `llm_message`, DEBUG included.
+
+    `test_notification_wording._llm_log_fields`' shape, restated here for its own reason: importing
+    that suite would run its import-time environment pinning inside this process, and the two files
+    pin different things.
+    """
+    import llm_message
+
+    class _Collect(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _Collect()
+    logger = llm_message.logger
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        call()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    return [r.fields for r in handler.records if isinstance(getattr(r, "fields", None), dict)]
+
+
+def _real_wording_backend(monkeypatch, prose="Toget er innstilt."):
+    """Drive the REAL `notification_wording.write_wording` with only the model call stubbed.
+
+    Every other webhook assertion in this suite stubs `write_wording` wholesale (`_capture_writes`),
+    which is right for counting calls and useless for the question below: a stub cannot emit the
+    record the policy exists to suppress. Here the policy runs for real and only
+    `llm_message._BACKENDS` is replaced, which is where the network would be.
+    """
+    import llm_message
+
+    monkeypatch.setattr(llm_message, "_PROVIDER", "claude")
+    monkeypatch.setattr(llm_message, "_ENABLED", True)
+    monkeypatch.setattr(llm_message, "_LOG_PROMPTS", True)  # dev's own setting
+    monkeypatch.setattr(llm_message, "_STATE", llm_message._LatchState())
+    # The whole dict, not one entry: this suite's `_MonkeyPatch` is a `setattr`/`undo` shim with no
+    # `setitem`, and reaching for pytest's would make the file unrunnable as
+    # `python test_varsel_api.py`, which is how CI runs it. `_call_backend` reads the module global
+    # on every call, so rebinding it is the same thing and it is restored by `undo`.
+    monkeypatch.setattr(
+        llm_message,
+        "_BACKENDS",
+        {**llm_message._BACKENDS, "claude": lambda body: json.dumps({"melding": prose})},
+    )
+
+
+def test_a_pair_no_browser_registration_holds_writes_no_prompt_record(monkeypatch):
+    """R16, and the one thing the pair-shaped key could have broken silently.
+
+    The wording key names no definition, so "which policy writes for this train?" had to be re-asked
+    of the PAIR. Answered wrongly — browser whenever any definition on the corridor wants the train
+    — a client-only route's origin, destination and departure time would reach the prompt/reply DEBUG
+    record, which dev writes (`VARSEL_LLM_LOG_PROMPTS=true`). `notification_wording.WEBHOOK`
+    suppresses that record in code and drops `message` from the INFO record.
+
+    Driven through the REAL `write_wording` with only the model call stubbed, because a stubbed
+    writer cannot emit the record this is about: the wholesale stub every other webhook test here
+    uses would pass with the policy wired to anything at all.
+    """
+    import notification_wording
+
+    _reset_state()
+    _real_wording_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    # BOTH, and they are not the same switch. The module function is what the cycle reads to decide
+    # whether an event carries model prose; `WEBHOOK.deliver` was bound to the ORIGINAL function at
+    # construction, so the policy's own first bound still reads the env-backed flag — and with it
+    # off `write_wording` answers with the template and asks no backend at all, which would make the
+    # assertions below vacuously true.
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    monkeypatch.setattr(notification_wording, "_WEBHOOK_DELIVERY_ENABLED", True)
+    _use_notification_store(
+        monkeypatch,
+        [
+            {**WEBHOOK_DOC_ROUTED, "begin": "00:00"},
+            {**WEBHOOK_DOC_ROUTED, "recipient_id": "sub-0002", "subscription_id": "sub-0002",
+             "begin": "01:00"},
+        ],
+    )
+
+    fields = _llm_log_fields(lambda: varsel.check_and_notify(SNAPSHOT))
+
+    # The leak first, so a wrong discriminator fails on the thing R16 is about rather than on a
+    # missing marker three lines later.
+    assert not [f for f in fields if f.get("event") == "llm_message_prompt"], (
+        "a client-only route's prompt reached the audit record"
+    )
+    assert not any("message_input" in f for f in fields)
+    assert not any("message" in f for f in fields), "the prose must not reach the log either"
+    written = [f for f in fields if f.get("event") == "llm_message"]
+    assert len(written) == 1, f"two client subscriptions on one pair, one call — got {len(written)}"
+    assert written[0].get("caller") == "webhook", written[0]
+
+
+def test_a_browser_registration_on_the_pair_keeps_the_pollers_own_prompt_record(monkeypatch):
+    """The discriminator proven from the other side, which is what stops the fix above being a
+    blanket suppression.
+
+    A route a browser registration holds is the poller's own traffic: the prompt record exists with
+    no webhook channel at all, `VARSEL_LLM_LOG_PROMPTS` is the flag it exists for, and R16 never
+    claimed otherwise. Losing it would take `/varsel` message debugging with it, silently.
+    """
+    import notification_wording
+
+    _reset_state()
+    _real_wording_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    _pair_definitions(1, prefix="browser")  # begin 00:00, same pair as the subscription below
+    _use_notification_store(monkeypatch, [{**WEBHOOK_DOC_ROUTED, "begin": "05:00"}])
+
+    fields = _llm_log_fields(lambda: varsel.check_and_notify(SNAPSHOT))
+
+    written = [f for f in fields if f.get("event") == "llm_message"]
+    assert len(written) == 1, f"one call between the two channels — got {len(written)}"
+    assert "caller" not in written[0], "the browser policy marks no caller"
+    assert [f for f in fields if f.get("event") == "llm_message_prompt"], (
+        "the poller's own debugging record went missing with the client suppression"
+    )
+
+
+def test_every_definition_on_the_pair_records_the_shared_wording(monkeypatch):
+    """The integration end of KTD9: one call, and every registration's ROW carries its text.
+
+    `message_llm` is what `/historikk` and `/meldinger` read as "what the model wrote for this
+    decision", and the decision is still per definition — so the shared wording has to reach every
+    row on the pair, not only the representative's. Keyed per definition it did so by writing the
+    text N times; keyed per pair it is written once and read N times, and this is what says the
+    read follows the write.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: written.append(1) or "Ta neste tog fra Oslo S.",
+    )
+    keys = _pair_definitions(3)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, "control: one call for the corridor"
+    rows = [r for r in log.rows if r["situation_number"] == "S1"]
+    assert len(rows) == len(keys), f"one row per definition, got {len(rows)}"
+    assert {r["message_llm"] for r in rows} == {"Ta neste tog fra Oslo S."}, (
+        "a definition that did not pay for the wording still records it"
+    )
+    assert {r["message_source"] for r in rows} == {"llm"}
+
+
+class _CountingLock:
+    """A `_state_lock` stand-in that counts how many times it is TAKEN.
+
+    An RLock's `acquire` cannot be patched (it is a C type), so the counting has to happen in a
+    wrapper the module holds in place of the lock. Re-entrant like the real one, because
+    `_record_decisions` calls helpers that take it while it holds it.
+    """
+
+    def __init__(self, inner):
+        self.inner, self.takes = inner, 0
+
+    def __enter__(self):
+        self.takes += 1
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc):
+        return self.inner.__exit__(*exc)
+
+    def acquire(self, *a, **kw):
+        self.takes += 1
+        return self.inner.acquire(*a, **kw)
+
+    def release(self):
+        return self.inner.release()
+
+
+def test_recording_a_cycles_decisions_takes_the_state_lock_a_constant_number_of_times(monkeypatch):
+    """U4's own rule, which KTD9's pair-keyed lookup is the obvious way to break.
+
+    `_record_decisions` snapshots `_messages` and `_message_meta` under ONE take deliberately —
+    "tens of thousands of lock acquisitions on the poller thread, each of which the request path can
+    be waiting behind". The wording key is derived from `_alternatives`, so deriving it inside the
+    alert loop puts the lock back one take per subject, at the grain that scales with the pilot. The
+    snapshot travels into `_message_key` instead.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _log_every_cycle(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    alerts = [
+        _alert(f"S{i}", DEP + timedelta(minutes=i), jkey=f"t{i}", p_impact=0.90)
+        for i in range(50)
+    ]
+
+    counting = _CountingLock(varsel._state_lock)
+    monkeypatch.setattr(varsel, "_state_lock", counting)
+    varsel._record_decisions(
+        {key: journey}, {key: alerts}, [(jid, journey)], set(), {}, push_on=True
+    )
+
+    assert len(log.rows) == 50, "control: every subject was recorded"
+    assert counting.takes <= 5, (
+        f"the lock was taken {counting.takes} times for 50 subjects; it is O(1) by design and "
+        "this is O(subjects)"
     )
 
 

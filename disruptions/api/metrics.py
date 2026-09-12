@@ -50,8 +50,10 @@ POLLER_CYCLE_DURATION = Histogram(
     "kix_poller_cycle_duration_seconds",
     "Wall-clock duration of one full rebuild cycle (the event=\"poller_cycle\" total, in "
     "seconds). Buckets are tuned for the measured 10-180 s range (prd baseline 2026-08-21: "
-    "50-63 s against a ~177 s cycle period).",
-    buckets=(10, 20, 30, 45, 60, 90, 120, 180, 300),
+    "50-63 s against a ~177 s cycle period), with 600 and 900 added for the load harness: past "
+    "300 s every overshoot used to read as a bare +Inf, and how far a cycle runs past the ~295 s "
+    "period is exactly the question a capacity run is asking.",
+    buckets=(10, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900),
 )
 POLLER_PHASE_DURATION = Histogram(
     "kix_poller_phase_duration_seconds",
@@ -59,6 +61,20 @@ POLLER_PHASE_DURATION = Histogram(
     "seconds). `phase` is the step name main._phase was given — a small fixed vocabulary.",
     ["phase"],
     buckets=(0.5, 1, 2, 5, 10, 20, 40, 60, 120),
+)
+POLLER_PHASE_CPU = Histogram(
+    "kix_poller_phase_cpu_seconds",
+    "PROCESS CPU seconds burned during one step of the rebuild cycle (the event=\"poller_phase\" "
+    "`cpu_ms`, in seconds). The twin of the duration histogram above and the only one that "
+    "answers the question capacity work actually asks: a step that takes 9 s of wall clock is "
+    "either one CPython thread executing bytecode — which neither a second core nor a wider pool "
+    "makes faster, since the GIL serializes it — or a socket wait, which both do. `duration` "
+    "cannot tell those apart and `cpu` can. Two readings to keep honest: it is `time.process_time` "
+    "over the WHOLE process, so request-path work served concurrently with the phase is included "
+    "(the poller shares one interpreter with the API, which is the point rather than a defect); "
+    "and it counts every thread, so a 16-wide pool's CPU can exceed the phase's wall clock.",
+    ["phase"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 40, 60, 120),
 )
 POLLER_PHASE_TOTAL = Counter(
     "kix_poller_phase_total",

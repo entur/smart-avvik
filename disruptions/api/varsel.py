@@ -88,8 +88,9 @@ import re
 import threading
 import traceback
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from itertools import islice
@@ -253,13 +254,19 @@ _MAX_TRANSIENT_ATTEMPTS = 12
 # 693 `attempts_exhausted` across the same 11 subjects on 2026-08-07.
 _PAYLOAD_FAILURES = frozenset({"rejected", "ungrounded"})
 _TRANSIENT_FAILURES = frozenset({"error", "truncated"})
-# Written messages per JOURNEY per cycle. The cycle cap above bounds the poller thread; this one
-# stops a single journey spending all of it. A journey routinely has more disrupted trains than
-# either budget can cover -- measured on dev over 4 099 journey-cycles: p50 3 alert-worthy trains,
-# p90 12, max 22 -- but the trains that matter are the ones about to be PUSHED, and those are few
-# (p90 1, max 18; 88 % of cycles push nothing). Sized like _MAX_ALTERNATIVE_LOOKUPS and for the same
-# reason: three covers the overwhelming majority (39 of 489 pushing cycles push more than three) at
-# a bounded worst case. Trains past it take the deterministic wording and are recorded
+# Written messages per PLACE PAIR per cycle -- per JOURNEY DEFINITION until KTD9 (2026-09-12), and
+# the name is kept because it is referenced from CLAUDE.md, the operations document and several
+# suites. The cycle cap above bounds the poller thread; this one stops a single corridor spending
+# all of it. Per definition it multiplied by the number of registrations on that corridor, which is
+# precisely the number the 100 000-commuter plan scales: five hundred registrations between Asker
+# and Oslo S could queue fifteen hundred wordings for the same handful of trains.
+#
+# A corridor routinely has more disrupted trains than either budget can cover -- measured on dev
+# over 4 099 journey-cycles: p50 3 alert-worthy trains, p90 12, max 22 -- but the trains that matter
+# are the ones about to be PUSHED, and those are few (p90 1, max 18; 88 % of cycles push nothing).
+# Sized like _MAX_ALTERNATIVE_LOOKUPS and for the same reason: three covers the overwhelming
+# majority (39 of 489 pushing cycles push more than three) at a bounded worst case. The slots go to
+# the SOONEST departures on the pair; trains past it take the deterministic wording and are recorded
 # `not_selected`, so what the cap costs stays countable rather than being inferred from a log line.
 _MAX_MESSAGES_PER_JOURNEY = 3
 # At most this many alert pushes per REGISTRATION per Oslo day (design review 2026-09-01, finding
@@ -513,6 +520,24 @@ _togvarsel_notify_provider: Callable[[], bool] | None = None
 # so an environment change needs no import-time dance.
 _webhook_enabled: Callable[[], bool] | None = None
 _webhook_provider: WebhookRecipientProvider | None = None
+# The tracing seam (R16). `main` injects `tracing_setup.span`; absent, every sub-pass span is a
+# `nullcontext` and this module behaves exactly as it did before the seam existed. Injected rather
+# than imported for the reason every other seam here is: `varsel` must import neither `main` nor
+# the app's tracing wiring, and a module-level `import tracing_setup` would also run that module's
+# import-time `setup()` inside every suite that imports varsel.
+_span_provider: Callable[..., Any] | None = None
+# The liveness seam (U2). `main` injects its `_beat`; absent, the passes below beat nothing and this
+# module behaves exactly as it did before the seam existed. Same injection reasoning as the span
+# above, plus one of its own: `_beat` moves BOTH of main's clocks (the monotonic one /health reads
+# and the epoch gauge the runbook pages on), and a copy of that rule here would be the second place
+# it had to stay true.
+_beat_provider: Callable[[], None] | None = None
+#: How many definitions the match pass may get through between heartbeats, and likewise how many
+#: wordings the writing pass may. Small enough that a chunk cannot itself outlast
+#: `HEALTH_STALE_AFTER_S` (600 s) — a definition's match is bounded by the Journey Planner's own
+#: timeout and a wording by `llm_message`'s, so 64 of either is seconds, not minutes — and large
+#: enough that the beat is not a per-definition function call on the hot path.
+_HEARTBEAT_EVERY = 64
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -527,6 +552,8 @@ def configure(
     togvarsel_notify_provider: Callable[[], bool] | None = None,
     webhook_enabled: Callable[[], bool] | None = None,
     webhook_recipients_provider: WebhookRecipientProvider | None = None,
+    span: Callable[..., Any] | None = None,
+    beat: Callable[[], None] | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -541,15 +568,85 @@ def configure(
     absent — not a flag value — that guarantees it. The flag is injected separately from the store
     so the pass can decline to touch the store at all, which is what makes "the flag is unset, so
     nothing was read" a property of this module rather than of whoever wrote the provider.
+
+    `span` is main's `tracing_setup.span` (R16), and it is a CALLABLE for the same reason as the
+    two above rather than an import: this module must depend on neither `main` nor the app's
+    tracing wiring. Absent, :func:`_span` yields a `nullcontext` and the pass is byte-for-byte what
+    it was. Whatever is injected must accept `(name, attributes)` and honour the closed-vocabulary
+    attribute rule — `tracing_setup.safe_attributes` is where that is enforced.
+
+    `beat` is main's `_beat` (U2), injected for the same reason and with the same absent-is-a-no-op
+    default. `/health`'s staleness rule means "no STEP has finished in `HEALTH_STALE_AFTER_S`", and
+    this whole pass is ONE `_phase` — so without it a pass that merely got slow reads as a wedged
+    poller, and the restart that follows comes up with both planned-call tables cold. See
+    :data:`_HEARTBEAT_EVERY`.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
-    global _webhook_enabled, _webhook_provider
+    global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
     _webhook_enabled = webhook_enabled
     _webhook_provider = webhook_recipients_provider
+    _span_provider = span
+    _beat_provider = beat
+
+
+def _span(name: str, **attributes: Any):
+    """One sub-pass span, or a no-op when nothing was injected.
+
+    **Counts and timings only, and only the names in `tracing_setup.SPAN_ATTRIBUTE_NAMES`.** A span
+    reaches Cloud Trace, where project IAM is the only gate, and these open exactly where the stop
+    refs, place names, departure times and wordings are — so no attribute may carry one. The filter
+    lives in `tracing_setup.safe_attributes`; what lives here is the discipline at the call site,
+    and `test_tracing_setup` reads this file's own source to keep it.
+
+    A broken provider degrades to no span rather than taking the cycle: this runs on the ingestion
+    thread, where an instrumentation exception would cost a cycle's alerting. Only construction is
+    guarded — `__enter__`/`__exit__` are the OTel API's, which does not raise from instrumentation.
+    """
+    provider = _span_provider
+    if provider is None:
+        return nullcontext()
+    try:
+        return provider(name, attributes)
+    except Exception:  # noqa: BLE001 - instrumentation must never fail the pass it observes
+        return nullcontext()
+
+
+def _heartbeat() -> None:
+    """Tell the poller's liveness seam that this pass is still making progress, or do nothing.
+
+    Guarded for exactly `_span`'s reason and with a worse failure: this runs on the ingestion
+    thread, so a raising seam would cost a whole cycle's pushes to report that the cycle is alive.
+    """
+    provider = _beat_provider
+    if provider is None:
+        return
+    try:
+        provider()
+    except Exception:  # a liveness signal must never end the pass it reports on
+        logger.warning("Heartbeat seam failed; continuing the pass", exc_info=True)
+
+
+def _drain(results: Iterator[Any], total: int) -> list[Any]:
+    """Consume a pool's results, beating the heartbeat every `_HEARTBEAT_EVERY` of them.
+
+    `ThreadPoolExecutor.map` submits everything at once and yields in SUBMISSION order, so this
+    beats as the pass progresses rather than as workers happen to finish — and a single item that
+    never returns still blocks, which is correct: a pass wedged on one definition IS the state
+    `/health` exists to catch. What it stops is the other reading, where a pass that is merely long
+    (a Journey Planner outage holding `_MATCH_WORKERS` threads at their timeout, a bad morning at
+    100 000 subscriptions) is mistaken for a wedged poller and restarted — see
+    :data:`_HEARTBEAT_EVERY` and `main._beat`.
+    """
+    drained: list[Any] = []
+    for item in results:
+        drained.append(item)
+        if len(drained) % _HEARTBEAT_EVERY == 0 and len(drained) < total:
+            _heartbeat()
+    return drained
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -1004,16 +1101,101 @@ def _impact(
     )
 
 
-def _message_key(key: str, alert: "Alert") -> tuple[str, str, str]:
-    """Cache key for a written message / alternative: (journey definition, situation, departure).
+def _pair(journey: Mapping[str, Any]) -> tuple[str, str]:
+    """The place pair a journey definition runs over — the unit the shared work is keyed on (KTD9).
+
+    Both refs are already canonical: `create_journey` canonicalizes what a client submits
+    (`canonical_stop`), and `_parse_webhook_recipient` does the same for a subscription document,
+    so two registrations of one corridor cannot land on two pairs because one of them named a
+    collapsed ref.
+    """
+    return (journey["from_stop"], journey["to_stop"])
+
+
+def _decision_key(key: str, alert: "Alert") -> tuple[str, str, str]:
+    """The DEFINITION-grained subject: (journey definition, situation, departure).
+
+    This was `_message_key` until 2026-09-12, when the wording caches moved to the place pair
+    (KTD9). What stayed behind is everything that is genuinely about one registered definition and
+    would be WRONG to share across a corridor:
+
+    * `check_and_notify`'s `pushed_keys`, read by `_record_decisions` as the row's `pushed` column.
+      Two definitions on one pair routinely differ there — different windows, and `_notified` is
+      per registration — so a pair-grained mark would report a push to a traveller who got none,
+      into `pushed_any`, into `varsel_decision_groups`' quoted-wording pick and, through the
+      nightly job, permanently into `varsel_decision_outcomes`.
+    * `_decision_ledger`, the thinning rule's memory (KTD15): one row per definition per situation
+      per departure is the grain the log is written at.
+    * `message_inputs`, the pass-local document each row records.
 
     A tuple, not an f-string: `journey_key` itself embeds four `|` separators, so the string form
     needed `rsplit` on one line and `split` on the next three lines apart, with nothing declaring
-    which encoding a key used. Including the departure is what keeps the cached text tied to the
-    train it describes (see _journey_model).
+    which encoding a key used.
     """
     dep = alert.departure_time.isoformat() if alert.departure_time else ""
     return (key, alert.situation_number, dep)
+
+
+def _subject_key(pair: tuple[str, str], alert: "Alert") -> tuple[tuple[str, str], str, str]:
+    """The PAIR-grained train slot: (place pair, situation, departure).
+
+    The coarse half of KTD9's split, and it keys the three caches that must NOT carry the wording
+    key's last four elements:
+
+    * `_alternatives`, because the alternative cannot be keyed on its own identity — the lookup is
+      skipped on most cycles and `_reconcile_caches` keeps the cached answer through that silence,
+      which is a read that would miss under a key naming the answer it is looking for.
+    * `_message_attempts` and `_message_errors`, because `_forget_message` states in as many words
+      that a moved alternative must NOT restart either budget: keyed on the wording key, a
+      replacement train that shifted by a minute would hand a hopeless payload a fresh three
+      attempts on every cycle, which is the ~720-calls-per-situation hole those counters closed.
+    """
+    dep = alert.departure_time.isoformat() if alert.departure_time else ""
+    return (pair, alert.situation_number, dep)
+
+
+def _message_key(
+    pair: tuple[str, str],
+    alert: "Alert",
+    *,
+    now: datetime | None = None,
+    alternatives_snapshot: Mapping[tuple, AlternativeJourney] | None = None,
+) -> tuple:
+    """KTD9's wording key for one (pair, train) — what `_messages` and `_message_meta` are keyed on.
+
+    Built through `notification_wording.wording_key`, the leaf both this module and the
+    journey-alert read import, so the pass and the read cannot come to disagree about what makes
+    two wordings the same. See that function for what each element is doing there.
+
+    **The alternative is the EFFECTIVE one**, read out of `_alternatives` rather than off the
+    alert. That is the whole of the difference between this working and this costing a backend call
+    per alerting train per cycle: a Journey Planner lookup is skipped on most cycles (the impact
+    gate, the 6 h horizon, `impact._MAX_ALTERNATIVE_LOOKUPS`, an outage), the alert's own field is
+    then `None`, and `_reconcile_caches` deliberately keeps the cached answer through that silence
+    so the card does not flap. Keying on the raw field would turn every silent cycle into a miss.
+    Read under `_state_lock` because pass 1b and the request path both call this.
+
+    `now` is the cycle's single clock where the caller has one; «i morgen» is in the text, so it is
+    in the key, and `_departs_tomorrow` is the same derivation `llm_message.build_message_input`
+    uses for the `i_morgen` flag the read keys on.
+
+    `alternatives_snapshot` is how a caller that already holds a copy avoids the lock — which is not
+    an optimisation but a rule `_record_decisions` states in as many words: it snapshots `_messages`
+    and `_message_meta` under ONE take for the whole pass, because at the pilot's scale a take per
+    subject is tens of thousands of acquisitions on the poller thread that the request path can be
+    waiting behind. Deriving the key inside its alert loop would have put every one of them back.
+    """
+    if alternatives_snapshot is not None:
+        alternative = alternatives_snapshot.get(_subject_key(pair, alert))
+    else:
+        with _state_lock:
+            alternative = _alternatives.get(_subject_key(pair, alert))
+    return notification_wording.wording_key(
+        pair,
+        alert,
+        alternative,
+        tomorrow=_departs_tomorrow(alert.departure_time, now),
+    )
 
 
 def _still_catchable(alt: AlternativeJourney | None, now: datetime) -> bool:
@@ -1032,40 +1214,11 @@ def _still_catchable(alt: AlternativeJourney | None, now: datetime) -> bool:
     return alt.departure_time is None or alt.departure_time > now
 
 
-def _alternative_identity(alt: AlternativeJourney) -> tuple:
-    """What makes two alternatives the same advice: everything a wording actually states.
-
-    Not the whole model — both `*_prediction` blocks carry continuous probabilities re-scored
-    against the live prediction cache on every cycle, so comparing those would invalidate the
-    written message on nearly every tick, turning ``ok_cached`` into a per-cycle LLM call. That is
-    exactly what :data:`_MAX_LLM_CALLS_PER_CYCLE` and :data:`_MAX_LLM_SECONDS_PER_CYCLE` exist to
-    prevent.
-
-    The two BOOLEANS are here, though, and the two times are not the whole story (2026-08-06).
-    `at_risk` and `arrives_before_original` are each stated out loud — "(kan også bli rammet)",
-    and the caveat that the traveller arrives later than they planned — so an alternative whose
-    times round the same but whose `at_risk` has flipped false → true is NOT the same advice. It
-    was treated as such: `_reconcile_caches` stored the rescored journey and kept the message
-    written when the flag was false, so the cached text promised a clean escape that had stopped
-    existing. They cost nothing to include: a boolean flips at most once or twice in a situation's
-    life, where a probability moves every cycle, so this cannot reintroduce the flapping the
-    minute-rounding below exists to stop.
-
-    The times are compared AT THE MINUTE, for that same reason. Both are Journey Planner *expected*
-    times carried at second precision, while every wording renders ``%H:%M``: a realtime nudge from
-    08:24:12 to 08:24:41 changed the identity, dropped the message and spent an LLM call to produce
-    byte-identical prose — roughly every other cycle per alerting journey, out of the budget of 8.
-    The resolution of the comparison has to be the resolution of the advice.
-    """
-    def minute(ts: datetime | None) -> datetime | None:
-        return ts.replace(second=0, microsecond=0) if ts is not None else None
-
-    return (
-        minute(alt.departure_time),
-        minute(alt.arrival_time),
-        alt.at_risk,
-        alt.arrives_before_original,
-    )
+#: What makes two alternatives the same advice — moved to `notification_wording` on 2026-09-12
+#: (KTD9) so the wording key is one function rather than a copy per surface. Kept as a name here
+#: because `_reconcile_caches` asks the question in its own terms, and because the reasoning behind
+#: comparing at the MINUTE and carrying the two booleans lives in that function's docstring.
+_alternative_identity = notification_wording.alternative_identity
 
 
 # ---- State: devices, journeys, notified ------------------------------------------------------
@@ -1086,35 +1239,48 @@ _notified: set[str] = set()  # {"journey_id|situationNumber"} — dedup, pruned 
 # read as a new signup), when its last journey is deleted, and by «Slett alt» — an erasure keeps no
 # marker of what it erased. Persisted in the state blob beside the journeys it annotates.
 _device_tombstones: dict[str, dict[str, Any]] = {}
-# {"journey_key|situationNumber" -> written message}. Keyed on the journey *definition*, not the
-# registration, so every device on the same trip gets the same text and one message is written per
-# journey × situation rather than one per device. In-memory only: a redeploy re-writes messages
-# rather than restoring stale advice from before the restart.
-_messages: dict[tuple[str, str, str], str] = {}
-# Same key: the alternative the poller found for that journey x situation. Cached rather than
-# recomputed because the request path deliberately does NOT call the Journey Planner (see
-# match_journey) -- without this the field would be structurally null on the only endpoint that
-# serves it, which is how it shipped until review on 2026-07-29.
+# The written wording for one (place pair, train), keyed by :func:`_message_key` — KTD9's shape,
+# shared with the journey-alert read through `notification_wording.wording_key`. Keyed on the
+# PLACE PAIR since 2026-09-12 and on the journey *definition* before that: what a wording says is a
+# function of the trip's two ends and of the disrupted train, never of the window or weekday set a
+# particular commuter registered, so a corridor with five hundred registrations now costs one
+# backend call per disrupted train rather than five hundred. In-memory only: a redeploy re-writes
+# messages rather than restoring stale advice from before the restart.
+_messages: dict[tuple, str] = {}
+# The alternative the poller found for that (pair, train), keyed by :func:`_subject_key` — the
+# COARSE key, deliberately: an entry has to be findable on a cycle where no lookup ran, and a key
+# naming the alternative's own identity cannot be. Cached rather than recomputed because the
+# request path deliberately does NOT call the Journey Planner (see match_journey) -- without this
+# the field would be structurally null on the only endpoint that serves it, which is how it shipped
+# until review on 2026-07-29.
 #
-# The situation's end is the OUTER bound of both these caches' lives, not their whole lifecycle:
+# Pair-keyed for a second reason beyond sharing the cost: `impact._MAX_ALTERNATIVE_LOOKUPS` bounds
+# one /impact call, so which trains on a corridor get an answer depends on each definition's own
+# window. Shared, a lookup ANY definition on the pair paid for answers the whole corridor.
+#
+# The situation's end is the OUTER bound of these caches' lives, not their whole lifecycle:
 # _reconcile_caches drops an entry as soon as this cycle's match supersedes it (see its docstring).
 # A 12 h-long situation would otherwise keep advising an escape route chosen against numbers from
 # hours ago -- including one the selection rule has since decided against.
-_alternatives: dict[tuple[str, str, str], AlternativeJourney] = {}
-# Same key, same lifecycle: how many times writing this message has failed FOR REASONS TO DO WITH
-# THE PAYLOAD, so an input the LLM cannot handle is not retried on every tick for the situation's
-# whole life. See :data:`_MAX_MESSAGE_ATTEMPTS`.
-_message_attempts: dict[tuple[str, str, str], int] = {}
+_alternatives: dict[tuple, AlternativeJourney] = {}
+# `_subject_key` too, and that is the load-bearing half of KTD9's split: how many times writing
+# this message has failed FOR REASONS TO DO WITH THE PAYLOAD, so an input the LLM cannot handle is
+# not retried on every tick for the situation's whole life. Under the WORDING key a replacement
+# train shifting by a minute would hand a hopeless payload a fresh budget every cycle, which is
+# exactly the hole :data:`_MAX_MESSAGE_ATTEMPTS` closed -- see `_forget_message`, which refuses to
+# clear these for the same reason.
+_message_attempts: dict[tuple, int] = {}
 # Same key, same lifecycle: how many times the backend was reached and failed TRANSIENTLY. Counted
 # apart from `_message_attempts` because the two answer different questions -- "is this payload
 # hopeless?" and "is Vertex having a bad morning?" -- and one counter answering both meant a bad
 # morning permanently retired a perfectly writable payload. See :data:`_MAX_TRANSIENT_ATTEMPTS`.
-_message_errors: dict[tuple[str, str, str], int] = {}
-# Same key, same lifecycle: how this journey x situation's message came about —
-# {"status": ..., "provider": ..., "model": ...}. Written here rather than derived at record time
-# because only this loop can tell a per-cycle cap from an exhausted retry from a model that refused,
-# and once the deterministic wording is stored all three look identical. See decisions.build_row.
-_message_meta: dict[tuple[str, str, str], dict[str, Any]] = {}
+_message_errors: dict[tuple, int] = {}
+# The WORDING key, like `_messages` and dropped with it: how this (pair, train)'s message came
+# about — {"status": ..., "provider": ..., "model": ...}. Written here rather than derived at record
+# time because only this loop can tell a per-cycle cap from an exhausted retry from a model that
+# refused, and once the deterministic wording is stored all three look identical. See
+# decisions.build_row.
+_message_meta: dict[tuple, dict[str, Any]] = {}
 # Trains a push has already reached each REGISTRATION about, {"<journey_id>|<train key>": departure
 # (UTC)} -- design review 2026-09-01, findings 14 and 15. Two readers. `_notification_title` prefixes
 # a later push about the same train with «Bekreftet:» (the 65 % forecast and «er innstilt» used to
@@ -1128,6 +1294,73 @@ _pushed_trains: dict[str, datetime] = {}
 # the ledger behind :data:`_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`. In memory for the same reason as
 # the dict above -- a restart resets the count, which errs towards sending.
 _daily_pushes: dict[str, tuple[str, int]] = {}
+
+# ---- The decision log's thinning ledger (KTD15, R11) --------------------------------------------
+#
+# What `_record_decisions` remembers about a subject between cycles, keyed by :func:`_decision_key`:
+# (journey definition, situation, departure). DEFINITION-grained and staying that way (KTD9 moved
+# the wording caches to the place pair and left this alone): a row is written per definition, and a
+# corridor's registrations differ in exactly the things thinning judges -- their windows decide
+# which trains they see at all. One entry:
+#
+#   {"row": the last row BUILT for this subject, written or not,
+#    "written": whether that row was the one sent to BigQuery,
+#    "alertworthy": its class at the last observation,
+#    "max_impact": the highest impact probability ever seen for it,
+#    "written_at": when a row was last written (the quarter-hour clock)}
+#
+# ITS OWN STRUCTURE, not a field on `_message_meta`, and the reason is the one thing about this that
+# is easy to get wrong: `_forget_message` drops that entry the tick a subject eases below the gate
+# (`_reconcile_caches`), which is exactly the tick this rule needs the PRIOR class to notice a
+# transition. A ledger that forgets on the transition is a ledger that cannot see one.
+#
+# Swept with `_messages` and `_notified` on the same liveness test (the closing row is written from
+# the sweep -- see `_retire_decision_subjects`) and cleared by every suite's `_reset_state`, because
+# a leaked half-spent ledger reads exactly like the give-up bug.
+#
+# WHAT IT COSTS IN MEMORY, stated because it is the one thing about this that does not get cheaper
+# with scale: an entry holds a whole decision row, which prd measures at ~1 KB (`message_input` is
+# most of it), and the ledger holds one entry per LIVE subject. Today that is ~1 500 subjects in prd,
+# i.e. a megabyte and a half. At the 35 000-80 000 definitions R1 sizes for, extrapolating prd's
+# ~15-20 subjects per matched definition and its ~1/3 match rate, it is 200 000-500 000 entries --
+# 200-500 MB against a 2 048 MiB pod that already uses 350-435 MiB. That is the harness's
+# measurement to take before the pilot grows, and the lever if it binds is to store the closing
+# row's big text columns by reference to the last written row rather than by copy. It is NOT a
+# reason to drop the closing row: without it `final_*` describes a cycle the rule skipped.
+#
+# ONE MORE TERM SINCE THE U4 REVIEW, and it is the only one an OUTAGE grows: a retiring subject
+# whose closing row the write lost is put BACK here (`_record_decisions`' rollback) rather than
+# dropped, so a BigQuery outage holds every retirement it spanned on top of the live subjects.
+# ~1 KB each against prd's ~3 000 retirements a day -- tens of MB over a multi-hour outage today,
+# 15-30x that at the pilot's target scale, and it drains the moment an insert is accepted. Bounded
+# and worth the memory: a closing row exists nowhere else and no later cycle re-derives it.
+_decision_ledger: dict[tuple[str, str, str], dict[str, Any]] = {}
+#: How long a subject can go without a row when nothing about it has changed (KTD15).
+#:
+#: Measured 2026-09-11 in prd: 74 000-93 000 rows a day at 226 definitions, ~400 per definition per
+#: day, 88-95 % of them sub-threshold no-SX subjects re-scored on a ~295 s cycle with nothing having
+#: moved. At 35 000-80 000 definitions that is 14-32 M rows and 14-33 GB a day unthinned, which no
+#: bytes cap on a 14-day /historikk window can serve (R12).
+#:
+#: WHAT THE RULE ACTUALLY CUTS, replayed over prd's own rows (2026-09-12, the two days to 09-10:
+#: 168 436 rows over 6 462 subjects): **2.63x**, i.e. 38.1 % of the rows survive, and the same 38 %
+#: for the never-alerting subjects that are almost all of them. The kept rows are 6 462 first
+#: sightings, 44 pushes, 83 transitions, **13 502 new maxima** and 40 881 interval rows, plus 3 153
+#: closing rows. The new-maximum trigger being a fifth of the total is the surprise and it is
+#: correct rather than a leak: a no-SX probability drifts upward as the ask horizon shortens, and
+#: every one of those rows is the peak `max_impact_probability` would otherwise not hold.
+#:
+#: So 15 min is NOT enough on its own at 100 000 -- 33 GB a day becomes 12.5, and a 14-day window is
+#: still tens of GB. That is the decision-log volume question the plan carries, and its answer is a
+#: per-day summary table the pages read instead of the groups view, gated on exactly this
+#: measurement. A longer interval is not the answer: measured on the same rows, 30 min buys 3.76x
+#: and 60 min 4.96x, and past about an hour the interval stops being a thinning rule and starts
+#: deciding which cycle a reader is allowed to see. (A materiality band on the new maximum -- only
+#: writing a rise of 0.05 or more -- buys 2.93x and costs the exact peak; not taken.)
+#:
+#: Zero disables the rule: every observation writes. That is what the log did before 2026-09-12, and
+#: it is the arm the equivalence test replays against.
+_DECISION_THINNING_INTERVAL_S = 15 * 60
 
 # Togvarsel push round markers, {"<YYYY-MM-DD Oslo>": {"<issue>": {"level": str, "pushed": bool}}} —
 # togvarsel_notify's single state primitive (dedup + the follow-up baseline in one). Persisted in
@@ -2150,7 +2383,7 @@ def deliver_to_devices(
 
 
 def _remember_message_meta(
-    message_key: tuple[str, str, str],
+    message_key: tuple,
     *,
     status: str,
     provider: str | None = None,
@@ -2186,9 +2419,20 @@ def _write_message(
     *,
     journey_key: str,
     message_input: dict | None,
+    message_key: tuple | None = None,
     outcome: dict[str, Any] | None = None,
 ) -> str | None:
-    """The LLM-written body for this journey × situation, or None to use the template wording.
+    """The LLM-written body for this (place pair, train), or None to use the template wording.
+
+    `message_key` is KTD9's wording key, under which the provenance is recorded. Passed in rather
+    than derived here since 2026-09-12: the key now names the EFFECTIVE alternative, which only the
+    pass that reconciled the caches knows, and deriving a second one here is how two call sites come
+    to disagree about which entry they are writing. It defaults to `None` so the 25 suites that stub
+    this function wholesale keep working, and to the caller's own derivation for a legacy caller.
+
+    `journey_key` is the representative definition on the pair — see the queue in
+    `check_and_notify`. One call serves every definition on that pair, so the `journey_digest` in
+    the prompt audit record names the one whose row caused the call and not the others'.
 
     Takes the message input this cycle already built rather than building its own, so what the model
     is prompted with is the same object the decision log records and the template wording is
@@ -2243,13 +2487,14 @@ def _write_message(
             message_input, journey_key=journey_key, situation_number=alert.situation_number
         )
         note(result.status)
-        _remember_message_meta(
-            _message_key(journey_key, alert),
-            status=result.status,
-            provider=result.provider,
-            model=result.model,
-            message_input=message_input,
-        )
+        if message_key is not None:
+            _remember_message_meta(
+                message_key,
+                status=result.status,
+                provider=result.provider,
+                model=result.model,
+                message_input=message_input,
+            )
         return result.text
     except Exception:
         logger.warning(
@@ -2265,8 +2510,8 @@ def _write_message(
         return None
 
 
-def _deliverable_message(message_key: tuple[str, str, str]) -> str | None:
-    """The written wording this journey × situation × departure may actually be SHOWN, or None.
+def _deliverable_message(message_key: tuple) -> str | None:
+    """The written wording this (place pair, train) may actually be SHOWN, or None.
 
     The single reader of `_messages` on the traveller's side, and the reason it is one function
     rather than a check at each call site. Since 2026-08-07 a wording is written whenever a backend
@@ -2471,14 +2716,93 @@ def _message_input_json(message_input: dict | None) -> str | None:
         return None
 
 
+def _thinning_reason(
+    entry: dict[str, Any] | None, alert: Alert, *, pushed: bool, now: datetime
+) -> str | None:
+    """Why this observation has to be written down, or None to let the ledger carry it (KTD15).
+
+    Five triggers, and each one is the reason a figure `varsel_decision_groups` computes cannot be
+    recovered from any other row:
+
+    * ``first_seen`` — `first_decided_at` is MIN(decided_at) and nothing else can supply it.
+    * ``transition`` — `first_alert_at` is MIN over the ALERTING rows and `ever_alerted` a
+      LOGICAL_OR, so the cycle a subject crosses the gate in either direction is load-bearing; so is
+      the `et_cancelled` pick, which reads the first alerting row.
+    * ``new_max`` — `max_impact_probability` is a MAX, i.e. it is only ever as high as the highest
+      row written. This is the trigger that keeps a threshold tunable.
+    * ``pushed`` — `pushed_any` is a LOGICAL_OR and the quoted wording comes off the FIRST pushed
+      row. A thinned push loses the fact and the text together.
+    * ``interval`` — everything else, at most once per :data:`_DECISION_THINNING_INTERVAL_S`.
+
+    `final_*` and `last_decided_at` are not in that list because they are served by the CLOSING row
+    instead (see :func:`_retire_decision_subjects`): the subject's last observation is written when
+    it retires, so the last row in the log is the last look we got, exactly as it was unthinned.
+
+    ONE POPULATION DOES SHRINK, and it is not one R11 names: a cycle whose only news is that the
+    model wrote a wording (`message_status = 'ok'`) is thinned unless another trigger fires, so where
+    the push does not go out on that same cycle -- the daily cap, a push error -- the fresh
+    `message_llm` never reaches the log and a later cycle records `ok_cached` instead. That thins
+    `message_wording_comparison.sql`'s same-input population and any error-to-success recovery rate.
+    A sixth trigger on "a wording was written this cycle" would close it and would cost little (44
+    pushes in 168 436 measured rows), but KTD15 does not list one and this is not the unit to widen
+    the rule in.
+    """
+    if entry is None:
+        return "first_seen"
+    if pushed:
+        return "pushed"
+    if bool(alert.alertworthy) != bool(entry.get("alertworthy")):
+        return "transition"
+    impact_p = alert.impact_probability
+    if impact_p is not None and impact_p > entry.get("max_impact", float("-inf")):
+        return "new_max"
+    written_at = entry.get("written_at")
+    if written_at is None or (now - written_at).total_seconds() >= _DECISION_THINNING_INTERVAL_S:
+        return "interval"
+    return None
+
+
+def _retire_decision_subjects(*, live: set[str]) -> list[tuple[tuple[str, str, str], dict]]:
+    """Close out every ledger subject whose SITUATION has ended, and return what still owes a row.
+
+    Called from the stale sweep at the top of a cycle, where `_messages`, `_notified` and the rest
+    are pruned on this same liveness test — and it has to be called from there rather than left to
+    the end-of-cycle absence check, because by then the sweep has already dropped the entry and
+    there is nothing left to close.
+
+    It RETURNS rather than writing: the sweep holds `_state_lock` and does no I/O under it, and a
+    cycle makes exactly one decision-log write. A subject whose last observation was itself written
+    needs no closing row — that row is already in the log, and a second copy of it would move
+    `n_decisions` and nothing else, so it is popped and not returned.
+
+    **The ENTRY travels with the row, not the row alone**, and that pair is the whole point of the
+    return type. Retiring pops the subject, so a closing row lost to a failed insert used to be lost
+    for good: nothing was left in the ledger to offer it again, and `final_impact_probability` —
+    "the closest look we got before departure" — then described an older cycle for the life of the
+    table. The write fails open by design, so that was not a rare path. `_record_decisions` puts
+    these back when its write is short (see its rollback), and the next cycle's sweep retires them
+    again; each subject still retires exactly once, because a retirement that LANDED leaves nothing
+    to put back.
+    """
+    closing: list[tuple[tuple[str, str, str], dict]] = []
+    with _state_lock:
+        for key in [k for k in _decision_ledger if k[1] not in live]:
+            entry = _decision_ledger.pop(key)
+            if not entry.get("written") and entry.get("row") is not None:
+                closing.append((key, entry))
+    return closing
+
+
 def _record_decisions(
     by_journey_key: dict[str, dict],
     alerts_by_key: dict[str, list[Alert]],
     journeys: list[tuple[str, dict]],
-    pushed_keys: set[tuple[str, str]],
+    pushed_keys: set[tuple[str, str, str]],
     message_inputs: dict[tuple[str, str, str], dict | None],
     *,
     push_on: bool,
+    now: datetime | None = None,
+    closing_rows: list[tuple[tuple[str, str, str], dict]] | None = None,
 ) -> None:
     """Append this cycle's alert decisions to the decision log.
 
@@ -2494,6 +2818,19 @@ def _record_decisions(
     actually got. Those are different questions now that ``VARSEL_LLM_ENABLED`` only selects the
     wording — prd writes one and sends the other — and the pair on one row is the only way that
     deployment's own pushes can be compared against what the model would have said.
+
+    **Not every observation is a row, since 2026-09-12** (KTD15). The module used to write one per
+    subject per cycle and said so in prose — the repeats *are* the lead-time series — and at
+    35 000-80 000 definitions that is 14-33 GB a day, which no bytes cap on /historikk can serve.
+    :func:`_thinning_reason` states what is kept; what is dropped is a standing subject nothing
+    about which has moved, and the figures the pages compute are unchanged because the closing row
+    carries the last look. `n_decisions` is the one column whose MEANING changes, and its
+    description says so.
+
+    `now` is the cycle's single clock (the same instant the match was made at), injectable for
+    tests. `closing_rows` are the sweep's — `(key, entry)` pairs, not bare rows, so a closing row
+    lost to a failed insert can be put back in the ledger and offered again (see
+    :func:`_retire_decision_subjects`).
     """
     try:
         import decisions
@@ -2510,24 +2847,79 @@ def _record_decisions(
         # the same tick's deliveries, and a flag re-read per alert could label two rows from one
         # cycle as having sent different wordings.
         delivery_on = llm_message.delivery_enabled()
+        cycle_now = now or datetime.now(UTC)
         device_counts: dict[str, set[str]] = {}
         for _jid, journey in journeys:
             device_counts.setdefault(journey_key(journey), set()).add(journey["device_id"])
 
-        rows = []
+        # ONE take of the lock for the whole pass, not one per alert (KTD15). Both dicts are keyed
+        # like the alerts being walked, so the copies are the same order of magnitude as the work;
+        # what this removes is tens of thousands of lock acquisitions on the poller thread, each of
+        # which the request path can be waiting behind. Shallow on purpose — the inner meta dict is
+        # copied per alert below, exactly as it was when the lock was held per alert.
+        with _state_lock:
+            messages_snapshot = dict(_messages)
+            meta_snapshot = dict(_message_meta)
+            # The third copy is KTD9's: the wording key names the effective alternative, so deriving
+            # one reads `_alternatives`. Taken here rather than per alert for the reason above --
+            # `test_recording_a_cycles_decisions_takes_the_state_lock_a_constant_number_of_times`
+            # pins the count, because the per-alert form is correct, invisible and O(subjects).
+            alternatives_snapshot = dict(_alternatives)
+
+        # Retiring subjects: the sweep's, plus this pass's own (collected below). Held as
+        # `(key, entry)` so a lost write can put them back — a closing row is a subject's LAST look
+        # and there is no later cycle that would produce it again.
+        retired: list[tuple[tuple[str, str, str], dict]] = list(closing_rows or [])
+        rows = [entry["row"] for _key, entry in retired]
+        seen: set[tuple[str, str, str]] = set()
+        # Ledger entries for the subjects this pass WRITES, held back until the insert has actually
+        # been accepted. The write fails open by design, and committing before it lands would mark a
+        # lost row as written: the subject would then be thinned for the next quarter hour, and — the
+        # one that matters — its `max_impact` would have advanced past a peak no row in the log
+        # holds, so the peak could never be written even after BigQuery recovered.
+        wrote: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
         for key, journey in by_journey_key.items():
             digest = key_digest(key)
             n_devices = len(device_counts.get(key, ()))
+            pair = _pair(journey)
             for alert in alerts_by_key.get(key, []):
-                message_key = _message_key(key, alert)
+                # TWO KEYS PER ROW SINCE KTD9, and mixing them up is the defect this split exists to
+                # prevent. `decision_key` is DEFINITION-grained and owns everything about this row:
+                # the push mark, the thinning ledger, and the pass-local message input the row
+                # stores. `message_key` is the PAIR's wording, shared with every other definition on
+                # the corridor -- so `message_llm` and `message_status` describe the one wording
+                # that was written, which is exactly what those columns are for.
+                decision_key = _decision_key(key, alert)
+                message_key = _message_key(
+                    pair, alert, now=cycle_now, alternatives_snapshot=alternatives_snapshot
+                )
+                seen.add(decision_key)
+                pushed = decision_key in pushed_keys
+                entry = _decision_ledger.get(decision_key)
+                reason = _thinning_reason(entry, alert, pushed=pushed, now=cycle_now)
+                if reason is None and entry is not None:
+                    # Not written, but not forgotten: the stored row is re-stated with this cycle's
+                    # figures so the CLOSING row carries the last look rather than the last write.
+                    # Cheap by construction — no template rendering, no message-input JSON, which is
+                    # the work the rule exists to stop repeating.
+                    entry["row"] = {
+                        **decisions.rescored(entry["row"], alert),
+                        "n_devices": n_devices,
+                    }
+                    entry["written"] = False
+                    entry["alertworthy"] = bool(alert.alertworthy)
+                    if alert.impact_probability is not None:
+                        entry["max_impact"] = max(
+                            entry.get("max_impact", float("-inf")), alert.impact_probability
+                        )
+                    continue
                 # Read RAW, deliberately not through `_deliverable_message`: this is the half of the
                 # pair recorded as `message_llm`, which is what was WRITTEN whether or not it was
                 # sent. Since 2026-08-07 those differ by design — prd writes a wording and delivers
                 # the deterministic one — and gating this read would throw away exactly the column
                 # the comparison exists for. What was sent is decided below, on `delivery_on`.
-                with _state_lock:
-                    written = _messages.get(message_key)
-                    meta = dict(_message_meta.get(message_key) or {})
+                written = messages_snapshot.get(message_key)
+                meta = dict(meta_snapshot.get(message_key) or {})
                 # No meta means the writer was never reached for this alert, and why is knowable
                 # from the state that decided it: below the threshold, no deliverable recipient on
                 # any channel, no backend available to ask — or alert-worthy but not among the
@@ -2537,6 +2929,13 @@ def _record_decisions(
                 # that was not the journey's worst, or one past `_MAX_MESSAGES_PER_JOURNEY`. It used
                 # to mean "not the single worst situation on this journey" and so covered most of
                 # the alert-worthy log -- 29 501 of dev's 33 900 alert-worthy rows over 14 days.
+                #
+                # NARROWER AGAIN SINCE KTD9 (2026-09-12), and a rate computed across that date is
+                # measuring two things: a train written for because a SIBLING definition on the same
+                # corridor needed it now records `ok`/`ok_cached` on this row too, where it recorded
+                # `not_selected`. The wording is genuinely this row's -- it is the one text every
+                # registration on the pair is sent -- so the status describes it correctly; what
+                # changed is how many rows have one.
                 status = meta.get("status")
                 if status is None:
                     if not alert.alertworthy:
@@ -2572,7 +2971,7 @@ def _record_decisions(
                 # which the nightly job copies the pair into and never revises. It would also leave
                 # "written but withheld" (`message_source='deterministic' AND message_llm IS NOT
                 # NULL`) matching no row at all, which is the population prd's rollout is judged on.
-                message_input = message_inputs.get(message_key)
+                message_input = message_inputs.get(decision_key)
                 # Guarded per alert, not inside the cycle-wide try below -- the same rule
                 # `_message_input` states for itself: one journey with an awkward payload must cost
                 # that journey's row, not the whole cycle's decision log. This became load-bearing on
@@ -2596,25 +2995,141 @@ def _record_decisions(
                     continue
                 delivered = written if delivery_on else None
                 message = delivered or deterministic
-                rows.append(
-                    decisions.build_row(
-                        journey,
-                        alert,
-                        journey_digest=digest,
-                        n_devices=n_devices,
-                        pushed=(key, alert.situation_number) in pushed_keys,
-                        message=message,
-                        message_source="llm" if delivered else "deterministic",
-                        message_llm=written,
-                        message_deterministic=deterministic,
-                        message_input=_message_input_json(message_input),
-                        llm_provider=meta.get("provider"),
-                        llm_model=meta.get("model"),
-                        message_status=status,
-                        prompt_version=llm_message.PROMPT_VERSION,
+                row = decisions.build_row(
+                    journey,
+                    alert,
+                    journey_digest=digest,
+                    n_devices=n_devices,
+                        # `_decision_key`, not `(key, situation_number)` and NOT the pair-grained
+                        # wording key: the mark has to be read at the grain the row is written at,
+                        # which is (definition x situation x DEPARTURE) -- two definitions on one
+                        # corridor genuinely differ here, since their windows decide which trains
+                        # they see and `_notified` is per registration. One situation reaches 12 h
+                        # from its onset and names several
+                        # trains, so a two-part key lets one push mark every departure under it --
+                        # into `pushed_any`, into the groups view's quoted-wording pick (the FIRST
+                        # pushed row) and, through the nightly job, permanently into
+                        # `varsel_decision_outcomes`. It agreed with this grain by accident until
+                        # 2026-09-12, because `match_journey` keeps only the WORST alert per
+                        # situation across every window, so one cycle held one departure per
+                        # situation; KTD4 reads `pushed` as ground truth per TRAIN on both channels
+                    # and must not rest on a collapse three call levels away.
+                    pushed=pushed,
+                    message=message,
+                    message_source="llm" if delivered else "deterministic",
+                    message_llm=written,
+                    message_deterministic=deterministic,
+                    message_input=_message_input_json(message_input),
+                    llm_provider=meta.get("provider"),
+                    llm_model=meta.get("model"),
+                    message_status=status,
+                    prompt_version=llm_message.PROMPT_VERSION,
+                )
+                rows.append(row)
+                wrote.append(
+                    (
+                        decision_key,
+                        {
+                            "row": row,
+                            "written": True,
+                            "written_at": cycle_now,
+                            "alertworthy": bool(alert.alertworthy),
+                            "max_impact": max(
+                                (entry or {}).get("max_impact", float("-inf")),
+                                alert.impact_probability
+                                if alert.impact_probability is not None
+                                else float("-inf"),
+                            ),
+                        },
                     )
                 )
-        decisions.record(rows)
+
+        # Subjects the ledger holds that this cycle did not see. Two causes and one treatment: the
+        # train left the match because it can no longer be CAUGHT (its situation lives on for hours
+        # after the departures it describes), or the definition itself stopped matching. Either way
+        # the subject is over, and its closing row is the last look we got at it — which is what
+        # keeps `final_*` and `last_decided_at` equal to what an unthinned log would hold. The other
+        # retirement, a situation that has ENDED, is closed by the stale sweep at the top of the
+        # cycle and arrives here as `closing_rows`.
+        for message_key in [k for k in _decision_ledger if k not in seen]:
+            entry = _decision_ledger.pop(message_key)
+            if not entry.get("written") and entry.get("row") is not None:
+                rows.append(entry["row"])
+                retired.append((message_key, entry))
+        # `beat` is the poller's liveness seam: a cycle's rows are several insertAll requests now,
+        # each able to spend `decisions._WRITE_RETRY`'s deadline plus an attempt, and /health reads
+        # "no STEP has finished in HEALTH_STALE_AFTER_S". Unbeaten they are one silence inside the
+        # single `varsel_notify` phase, and the restart it earns comes up with both planned-call
+        # tables cold. `_heartbeat` swallows, and so does `decisions.record` around it, because the
+        # rollback below must run whatever the seam does.
+        accepted = decisions.record(rows, beat=_heartbeat)
+        # A SHORT write, not only an empty one. `accepted` sums acceptances across the cycle's
+        # chunks, so `not accepted` is true only when every request failed -- and a cycle that lost
+        # one request of four would mark every subject in it written: thinned for the next quarter
+        # hour against rows nobody holds, with `max_impact` advanced past a peak no row in the log
+        # carries, so the peak can never be written even after BigQuery recovers.
+        #
+        # THE TRADE, both sides, because the conservative test is not free. On any short write the
+        # whole cycle is re-offered next time, so the subjects whose rows DID land are written
+        # twice. That is harmless: every figure `varsel_decision_groups` computes is a MIN, a MAX, a
+        # LOGICAL_OR or a first/last pick, and `n_decisions` -- the one column a duplicate moves --
+        # already changed meaning with the thinning rule and says so in its description. Losing a
+        # peak is not harmless, and it is silent. So: duplicate rather than drop.
+        #
+        # WHAT A PERSISTENT SHORT WRITE DOES, since the trade above only describes a one-off. One
+        # row BigQuery refuses on EVERY cycle -- a column drift, an oversized `message_input` --
+        # makes this true every cycle, so no ledger entry ever commits, `written_at` never advances
+        # and after one interval every subject writes every cycle: the pre-thinning volume is back
+        # until the bad row is fixed. That is no worse than the week before KTD15 and it is loud
+        # (`result="partial"` from `decisions` beside `result="rolled_back"` from here, every
+        # cycle) -- but the two firing together is what it looks like, and nothing else produces
+        # that pair.
+        lost = accepted < len(rows)
+        for message_key, entry in wrote:
+            prior = _decision_ledger.get(message_key) if lost else None
+            if not lost:
+                _decision_ledger[message_key] = entry
+            elif prior is not None:
+                prior["row"] = entry["row"]
+                # And the row is NOT in the log, so the subject owes a closing row again. Without
+                # this the entry still claims its last look was written, and a subject that retires
+                # on the next cycle would close with nothing -- leaving `final_*` describing the
+                # older successful write rather than the last look, which is the exact hole the
+                # rollback exists to close.
+                prior["written"] = False
+        if lost and retired:
+            # Put the retiring subjects back so the next cycle's sweep (or its absence check) offers
+            # their closing rows again. `setdefault`, so a key this cycle re-created wins -- it
+            # cannot happen today (a retired key is popped before the pass reads the ledger, so its
+            # subject reads as first-seen and a lost cycle commits nothing under it) and that is
+            # exactly why the weaker call is the right one: it makes "retires exactly once" a
+            # property rather than a coincidence. The entry still carries `written=False`, so the
+            # closing row is owed until an insert actually takes it.
+            with _state_lock:
+                for message_key, entry in retired:
+                    _decision_ledger.setdefault(message_key, entry)
+        if lost:
+            # The loss stops being invisible. `decisions` logs per REQUEST and cannot see what the
+            # ledger did about it; this is the cycle-level line, and the closing count is the part
+            # worth reading -- those rows exist nowhere else and no later cycle re-derives them.
+            logger.warning(
+                "Decision write was short (%d of %d rows accepted); re-offering %d subjects and "
+                "%d closing rows next cycle",
+                accepted,
+                len(rows),
+                len(wrote),
+                len(retired),
+                extra={
+                    "fields": {
+                        "event": "varsel_decision_write",
+                        "result": "rolled_back",
+                        "n_rows": len(rows),
+                        "n_accepted": accepted,
+                        "n_subjects": len(wrote),
+                        "n_closing": len(retired),
+                    }
+                },
+            )
     except Exception:
         logger.warning("Could not record alert decisions this cycle", exc_info=True)
 
@@ -2714,8 +3229,8 @@ def handle_gone_device(device_id: str) -> bool:
     return True
 
 
-def _forget_message(message_key: tuple[str, str, str]) -> None:
-    """Drop the cached wording for this journey × situation × departure, and its provenance with it.
+def _forget_message(message_key: tuple) -> None:
+    """Drop the cached wording for this (place pair, train), and its provenance with it.
 
     Both or neither. `_message_meta` is what :func:`_record_decisions` reports as `message_status`,
     so a message dropped without its meta files the next cycle's deterministic row as ``ok_cached`` —
@@ -2732,8 +3247,13 @@ def _forget_message(message_key: tuple[str, str, str]) -> None:
         _message_meta.pop(message_key, None)
 
 
-def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
+def _reconcile_caches(pair: tuple[str, str], alerts: list[Alert], now: datetime) -> None:
     """Bring `_alternatives` and `_messages` into line with this cycle's fresh match.
+
+    Takes the PLACE PAIR since 2026-09-12 (KTD9), not the journey definition. Two definitions on
+    one corridor therefore reconcile the same entries: whichever of them this cycle established an
+    alternative for, the answer stands for the pair, and a definition whose own lookup was refused
+    by `impact._MAX_ALTERNATIVE_LOOKUPS` reads its neighbour's rather than silently offering none.
 
     Called BEFORE the "nothing is alert-worthy / push is off" early return, and over EVERY alert
     rather than the winning one. Both caches live as long as the SITUATION (up to its 12 h window)
@@ -2769,30 +3289,39 @@ def _reconcile_caches(key: str, alerts: list[Alert], now: datetime) -> None:
     """
     with _state_lock:
         for alert in alerts:
-            message_key = _message_key(key, alert)
+            subject_key = _subject_key(pair, alert)
+            # The wording key AS IT STANDS, i.e. naming whatever alternative is cached right now.
+            # Taken before any pop below, because that is the entry a superseded or below-threshold
+            # reading has to forget: once the cache moves, the old key is no longer derivable and
+            # the wording would sit there un-droppable until the situation ended.
+            stale_key = _message_key(pair, alert, now=now)
             if not alert.alertworthy:
-                _alternatives.pop(message_key, None)
-                _forget_message(message_key)
+                _alternatives.pop(subject_key, None)
+                _forget_message(stale_key)
                 continue
             fresh = alert.alternative_journey
             if fresh is not None:
-                cached = _alternatives.get(message_key)
+                cached = _alternatives.get(subject_key)
                 # Stored unconditionally (the card should show this tick's `at_risk` and this tick's
                 # scoring of the replacement), but the wording is only dropped when the advice
-                # itself changed -- see _alternative_identity.
+                # itself changed -- see _alternative_identity. Since KTD9 that identity is IN the
+                # key, so the new key would miss the old entry anyway; the forget is what stops the
+                # superseded one occupying memory for the rest of the situation's 12 h life.
                 if cached is None or _alternative_identity(cached) != _alternative_identity(fresh):
-                    _forget_message(message_key)
-                _alternatives[message_key] = fresh
+                    _forget_message(stale_key)
+                _alternatives[subject_key] = fresh
                 continue
             # getattr, like every other read off the impact response in this module: it is duck-typed
             # (a synthetic provider need not carry the newest field), and this runs on the ingestion
             # thread outside the per-journey guard, where an AttributeError would cost the cycle.
             chose_original = bool(getattr(alert.impact, "original_is_best", False))
             # A verdict supersedes the cached answer outright; silence does not, and only a cached
-            # alternative that has itself departed is dropped without one.
-            superseded = chose_original or not _still_catchable(_alternatives.get(message_key), now)
-            if superseded and _alternatives.pop(message_key, None) is not None:
-                _forget_message(message_key)
+            # alternative that has itself departed is dropped without one. THE SILENT CASE IS THE
+            # COMMON ONE and the one KTD9's key is built around: the cached answer stays, so
+            # `_message_key` keeps deriving the same key and the wording is not re-written.
+            superseded = chose_original or not _still_catchable(_alternatives.get(subject_key), now)
+            if superseded and _alternatives.pop(subject_key, None) is not None:
+                _forget_message(stale_key)
 
 
 # ---- The webhook channel's outgoing side: this cycle's subjects -------------------------------
@@ -2841,7 +3370,7 @@ def _webhook_delivery_enabled() -> bool:
         return False
 
 
-def _webhook_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str | None:
+def _webhook_wording(message_key: tuple, *, enabled: bool) -> str | None:
     """The written wording a Notification event may carry, or None for the template.
 
     Reads :data:`_messages` RAW, which is the whole reason this is not
@@ -2856,28 +3385,36 @@ def _webhook_wording(message_key: tuple[str, str, str], *, enabled: bool) -> str
 
 
 def cached_wording_and_alternative(
-    journey_key: str, alert: Alert, *, enabled: bool
+    pair: tuple[str, str], alert: Alert, *, enabled: bool
 ) -> tuple[str | None, AlternativeJourney | None]:
-    """The poller's cached wording and cached alternative for one (definition, train), READ ONLY.
+    """The poller's cached wording and cached alternative for one (place pair, train), READ ONLY.
 
     For the journey-keyed public read (2026-09-10), which serves a registered definition what the
-    pass already wrote rather than writing again. One `_state_lock` read for both, and
-    :func:`_webhook_wording`'s rules for the wording: the RAW entry, not through the browser's
-    delivery gate (`enabled` is the webhook channel's gate, as there); none for a declared
-    cancellation, because `_message_key` carries no `cancelled` flag and the entry may predate the
-    declaration; None where absent. The alternative is returned whatever `enabled` says — it is
-    the Journey Planner's answer and has nothing to do with whether a model's prose is delivered —
-    and it is the raw entry too: whether it is still catchable is `_journey_model`'s policy, applied
-    by the caller.
+    pass already wrote rather than writing again. Takes the PAIR since 2026-09-12 (KTD9), which is
+    what the read already holds and what the pass now keys on — so a read for one definition on a
+    corridor is served by a wording the pass wrote for another.
+
+    One `_state_lock` read for both, and :func:`_webhook_wording`'s rules for the wording: the RAW
+    entry, not through the browser's delivery gate (`enabled` is the webhook channel's gate, as
+    there); none for a declared cancellation; None where absent. The cancellation refusal is kept
+    even though `cancelled` is now IN the key and a forecast can no longer share an entry with a
+    certainty: it costs nothing (the template is the documented correct wording for a declared
+    cancellation — «Innstilt», no delay figures) and it is one fewer thing to be wrong about. The
+    alternative is returned whatever `enabled` says — it is the Journey Planner's answer and has
+    nothing to do with whether a model's prose is delivered — and it is the raw entry too: whether
+    it is still catchable is `_journey_model`'s policy, applied by the caller.
 
     **Never writes**, and that is a stop condition rather than a nicety: pass 1c records
     `ok_cached` for a key already in :data:`_messages`, so an entry a read had written would land
     on `/historikk` under the browser's attribution, and the poller's caches are its own.
     """
-    message_key = _message_key(journey_key, alert)
     with _state_lock:
-        alternative = _alternatives.get(message_key)
-        wording = None if (not enabled or alert.cancelled) else _messages.get(message_key)
+        alternative = _alternatives.get(_subject_key(pair, alert))
+        wording = (
+            None
+            if (not enabled or alert.cancelled)
+            else _messages.get(_message_key(pair, alert))
+        )
     return wording, alternative
 
 
@@ -3081,6 +3618,10 @@ def _subjects_for_key(
     if not alerts:
         return 0
     journey = match_targets.get(key) or {}
+    # The pair the shared wording is cached under. `match_targets` is built from these keys so the
+    # lookup always hits; the fallback is what keeps a missing record costing a template rather than
+    # a KeyError inside the caller's per-definition guard.
+    pair = _pair(journey) if journey.get("from_stop") and journey.get("to_stop") else ("", "")
     contributing: dict[tuple, list[Alert]] = {}
     for alert in alerts:
         train = _train_key(alert)
@@ -3093,8 +3634,13 @@ def _subjects_for_key(
             # and the receiver's own revision rule would suppress the second recipient's
             # notification. `notification_events.train_ref` refuses the same set and counts it.
             continue
-        message_key = _message_key(key, winner)
-        message_input = message_inputs.get(message_key) or _message_input_from_alert(winner)
+        # TWO KEYS, and they are not interchangeable (KTD9). The pass-local message input is
+        # per DEFINITION -- it is the document `_record_decisions` stores on this definition's row
+        # -- while the wording is per (pair, train), shared with every other definition on the
+        # corridor and with the browser channel.
+        message_input = (
+            message_inputs.get(_decision_key(key, winner)) or _message_input_from_alert(winner)
+        )
         resolved = message_input.get("reise") or {}
         # SERVER-SIDE names only, never a browser registration's `from_name`/`to_name`. Those are
         # up to 120 characters of unauthenticated free text, and on a definition both channels
@@ -3114,13 +3660,15 @@ def _subjects_for_key(
                 message_input,
                 from_name,
                 to_name,
-                # NO CACHED WORDING FOR A DECLARED CANCELLATION. `_message_key` is
-                # (journey_key, situation_number, departure) and carries no `cancelled` flag, so a
-                # wording written while the train was merely at risk shares one entry with the
-                # reading taken after ET declared it gone -- and nothing forgets it in between:
-                # `_reconcile_caches`' only unconditional forget is the below-threshold one, a
-                # declared cancellation stays alert-worthy at (1.0, 1.0), and the write pass
-                # short-circuits on `message_key in _messages`. The title is rebuilt from THIS
+                # NO CACHED WORDING FOR A DECLARED CANCELLATION. Kept as a belt-and-braces
+                # refusal: since KTD9 (2026-09-12) `cancelled` is IN the wording key, so a wording
+                # written while the train was merely at risk can no longer share an entry with the
+                # reading taken after ET declared it gone -- which is what this line was added for,
+                # nothing having forgotten it in between (`_reconcile_caches`' only unconditional
+                # forget is the below-threshold one, a declared cancellation stays alert-worthy at
+                # (1.0, 1.0), and the write pass short-circuits on `message_key in _messages`).
+                # It costs nothing to keep and the reasoning below is still the reason the template
+                # is right here. The title is rebuilt from THIS
                 # cycle's input, so the event read «Tog L1 07:18 er innstilt» over «91 % sjanse for
                 # innstilling, typisk 15-27 min forsinket» beside `delay: null` and
                 # `effect: "cancelled"` in the same payload. The template is the documented correct
@@ -3128,12 +3676,12 @@ def _subjects_for_key(
                 # figures, which is `impact._cancelled_prediction`'s own rule -- so refusing the
                 # cache costs nothing and states the certainty.
                 #
-                # The BROWSER card reads the same entry through `_deliverable_message` and still
-                # shows the stale text; that half is pre-existing and needs its own pass over
-                # `_messages`, `_message_meta`, `_alternatives` and `_message_attempts`. What this
-                # narrows is the one consumer that turns a stale cache entry into a DELIVERED
-                # notification a client's traveller then acts on.
-                None if winner.cancelled else _webhook_wording(message_key, enabled=webhook_llm),
+                # The BROWSER card's half of the same defect IS closed by the key change: it
+                # reads through `_deliverable_message` under the same key, which now carries
+                # `cancelled`, so a forecast's prose can no longer head a certainty's card either.
+                None
+                if winner.cancelled
+                else _webhook_wording(_message_key(pair, winner), enabled=webhook_llm),
                 # Always False, and structurally so. The browser's «Bekreftet:» prefix comes off
                 # `_pushed_trains`, which is per REGISTRATION and per device — a client has no
                 # such record here, and the envelope carries the same fact better:
@@ -3210,6 +3758,89 @@ class PassOutcome:
     """
 
     webhook_subjects: tuple[notification_events.WebhookSubject, ...] = ()
+
+
+@dataclass
+class _WriteSubject:
+    """One (place pair, train) the cycle may write a wording for — the write queue's unit (KTD9).
+
+    Was a six-tuple until 2026-09-12, when it grew two things a tuple was the wrong shape for: the
+    entry is now BUILT ONCE and ADOPTED by later definitions on the same corridor, and it carries
+    two different keys (`message_key` is pair-and-advice grained, `subject_key` is the coarse train
+    slot the two retry budgets are charged to).
+
+    `key` and `journey` are the REPRESENTATIVE definition — whichever one created the entry, with a
+    browser definition taking it over from a webhook-only one. One backend call now serves every
+    definition on the pair, so exactly one of them can appear as the `journey_digest` in the prompt
+    audit record; it is the one whose row could carry that record anyway, and the others record the
+    shared wording with no call of their own, which is the shape `ok_cached` already has.
+
+    `browser` is the P1 discriminator and decides three things at once: which wording policy runs,
+    whether the poller's own `llm_message` latch is consulted, and whether the call claims the
+    browser allowance or only the clock. True as soon as ANY browser registration on the pair
+    contributed this train.
+    """
+
+    pair: tuple[str, str]
+    key: str
+    subject: "Alert"
+    journey: dict
+    message_key: tuple
+    subject_key: tuple
+    message_input: dict | None
+    browser: bool
+    attempts: int = 0
+    errors: int = 0
+
+
+def _write_subject(
+    pair: tuple[str, str],
+    key: str,
+    subject: "Alert",
+    journey: dict,
+    now: datetime,
+    *,
+    own_input: dict | None,
+    browser: bool,
+) -> _WriteSubject:
+    """Build a queue entry, with the message input RECONCILED against the effective alternative.
+
+    The wording key names the alternative `_alternatives` holds for this (pair, train) — the
+    effective one — while a definition's own alert carries whatever ITS `/impact` call established,
+    which can be nothing at all: `impact._MAX_ALTERNATIVE_LOOKUPS` bounds one call, so on a corridor
+    the lookup a neighbour paid for is routinely the only answer there is. Prompting from the
+    definition's raw input would then write text that does not mention the replacement train the
+    key claims, and the next cycle would find that entry already written and never correct it.
+
+    So the input is rebuilt off an alert carrying the effective alternative, and only when the two
+    actually differ: the identity comparison is `_alternative_identity`'s, the same one that decides
+    whether a cached wording still stands, and in the ordinary case it matches and the pass-local
+    document is reused unchanged.
+    """
+    subject_key = _subject_key(pair, subject)
+    with _state_lock:
+        effective = _alternatives.get(subject_key)
+    own = subject.alternative_journey
+    same = (own is None and effective is None) or (
+        own is not None
+        and effective is not None
+        and _alternative_identity(own) == _alternative_identity(effective)
+    )
+    message_input = (
+        own_input
+        if same
+        else _message_input(journey, subject.model_copy(update={"alternative_journey": effective}))
+    )
+    return _WriteSubject(
+        pair=pair,
+        key=key,
+        subject=subject,
+        journey=journey,
+        message_key=_message_key(pair, subject, now=now),
+        subject_key=subject_key,
+        message_input=message_input,
+        browser=browser,
+    )
 
 
 class _LockedPassBudget(notification_wording.PassBudget):
@@ -3297,10 +3928,12 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
        device is notified once per situation. Collapsing dedup onto the journey key would mean the
        first device notified silently suppresses the push for everyone else on the same trip.
 
-    Written messages are one per TRAIN a push is still coming for, since that is the grain loop 2
-    delivers at (:func:`_pending_pushes`), bounded by :data:`_MAX_MESSAGES_PER_JOURNEY` and by
-    :data:`_MAX_LLM_CALLS_PER_CYCLE` for the cycle. Trains beyond either cap get the deterministic
-    wording this tick rather than delaying the poller thread.
+    Written messages are one per (PLACE PAIR, TRAIN) a push is still coming for — the grain loop 2
+    delivers at (:func:`_pending_pushes`) collapsed onto the corridor (KTD9), so two definitions of
+    one trip with different windows cost one call and read the same sentence. Bounded by
+    :data:`_MAX_MESSAGES_PER_JOURNEY` per pair and by :data:`_MAX_LLM_CALLS_PER_CYCLE` for the
+    cycle. Trains beyond either cap get the deterministic wording this tick rather than delaying the
+    poller thread.
 
     **Scoring and recording run even when push is disabled**; only delivery is gated. The decision
     log's guarantee is "every decision, not every push", and an early return here quietly broke it:
@@ -3381,6 +4014,15 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # from a give-up bug. The per-destination delivery skip is the deliberate exception and must
         # stay pass-local, or one failure pauses a destination permanently (KTD6).
         changed = bool(stale)
+
+    # The decision log's own sweep, on the same liveness test one line of reasoning above -- but it
+    # RETURNS rather than dropping state, because a thinned subject's last look has not been
+    # written yet (KTD15). Outside the lock block so the subjects travel as a pass-local list to the
+    # cycle's single decision-log write, which is the rule every other write here follows: no I/O
+    # under `_state_lock`, and one insert per cycle. `(key, entry)` pairs rather than bare rows:
+    # retiring pops the subject, so a closing row the write loses has to be restorable or it is
+    # gone for good.
+    closing_subjects = _retire_decision_subjects(live=live)
 
     # ---- The one client read: BEFORE pass 1a, and before the write budget's clock starts -----
     #
@@ -3463,7 +4105,13 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     def _match(item: tuple[str, dict]) -> tuple[str, list[Alert]]:
         key, journey = item
         try:
-            return key, match_journey(journey, with_alternative=True)
+            # `cycle_now`, never the worker's own wall clock (U2). Three decisions about the
+            # traveller ride on this instant -- which windows are open, which trains can still be
+            # caught, and the `decided_at` the decision log records -- and sampled per journey they
+            # disagree by however long the pass takes, which at 100 000 subscriptions is seconds.
+            # It is also what lets `impact`'s per-generation window memo be SHARED: a memo keyed on
+            # a window each caller derived from its own clock is shared by nobody.
+            return key, match_journey(journey, cycle_now, with_alternative=True)
         except Exception:
             # One journey's failure must not stop the remaining journeys being scored or any push
             # going out. Empty alerts for this key; the next tick retries. Caught INSIDE the worker
@@ -3478,9 +4126,24 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             return key, []
 
     matched: list[tuple[str, list[Alert]]] = []
-    if match_targets:
-        with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(match_targets))) as pool:
-            matched = list(pool.map(_match, list(match_targets.items())))
+    # The five sub-pass spans (R16) start here. `varsel_notify` showed as one opaque phase with the
+    # decision-log insert under it and nothing else, so "which of the five is the cycle in?" could
+    # only be answered by adding log lines. Opened unconditionally, including at zero definitions:
+    # a pass that did nothing is a reading, and a missing span reads as an uninstrumented one.
+    with _span(
+        "varsel_match",
+        definitions=len(match_targets),
+        recipients=len(webhook_recipients),
+        workers=min(_MATCH_WORKERS, len(match_targets)) if match_targets else 0,
+    ):
+        if match_targets:
+            with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(match_targets))) as pool:
+                matched = _drain(
+                    pool.map(_match, list(match_targets.items())), len(match_targets)
+                )
+    # A pass boundary is a progress point in exactly `main._phase`'s sense, and the two beats inside
+    # `_drain` above deliberately skip the last chunk so this is the one that reports the pass done.
+    _heartbeat()
 
     # ---- Pass 1b: reconcile, and decide what to write for -- SEQUENTIALLY ----------------------
     #
@@ -3490,105 +4153,177 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # of it blocks on anything. The split is behaviour-preserving -- `_reconcile_caches` for one
     # journey never reads another journey's alerts, and `_pending_pushes` reads `_notified`, which
     # only loop 2 writes.
-    write_queue: list[tuple[str, Alert, tuple[str, str, str], int, int, bool]] = []
-    for key, alerts in matched:
-        journey = match_targets[key]
-        alerts_by_key[key] = alerts
-        # WHICH WORDING POLICY writes for this definition, and the discriminator is `by_journey_key`
-        # itself -- browser-only by construction (KTD10), so "absent from it" is exactly "no browser
-        # registration holds this route". A webhook-only subject must go through
-        # `notification_wording.WEBHOOK`, because the browser policy's prompt audit record carries
-        # the traveller's origin, destination and departure time at DEBUG wherever
-        # VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and R16 forbids that for client data.
-        # WEBHOOK suppresses that record in CODE rather than by an environment variable, drops
-        # `message` from the INFO record, and latches against its own holder. Its FIRST bound is the
-        # webhook delivery switch, so with client prose undelivered — every deployment today — the
-        # writer is still invoked (AE10: a client registration with no VAPID keypair matches and is
-        # written for) and answers with the template, asking no backend and charging nothing.
-        #
-        # A SHARED definition stays on the browser policy, unavoidably and by design: AE1 pins one
-        # match and one wording between the two channels, so there is one call and it is the
-        # browser's. The prompt record for that route would exist with no webhook channel at all,
-        # because a browser registration holds the same route -- so R16's claim is about
-        # webhook-only routes plus every other client field, and U8 publishes exactly that.
-        webhook_only = key not in by_journey_key
-        for alert in alerts:
-            message_inputs[_message_key(key, alert)] = _message_input(journey, alert)
-        # ABOVE the early return, and over every alert: a superseded alternative most often goes
-        # stale precisely when nothing is alert-worthy any more, which is the case that returns.
-        # This is also what records a freshly found alternative, whether or not a message follows
-        # it (cap reached, LLM disabled, push off) -- the in-app list wants it either way.
-        #
-        # Guarded like the match above it, and for a strictly bigger blast radius than the
-        # 2026-07-29 incident that guard exists for: called bare, a raise here unwinds out of
-        # check_and_notify entirely, so loop 2 never runs (no pushes at all this cycle) and
-        # _record_decisions never runs (no rows either). What it touches is duck-typed -- an impact
-        # response from an injected provider, a cached AlternativeJourney, an aware/naive datetime
-        # comparison -- so "it cannot raise" is an assumption about somebody else's object. Keeping
-        # one cycle's stale cache is the smaller failure by a wide margin.
-        try:
-            _reconcile_caches(key, alerts, cycle_now)
-        except Exception:
-            logger.warning(
-                "Cache reconciliation failed for journey %s; keeping this cycle's cached "
-                "alternatives and messages",
-                key,
-                exc_info=True,
-                extra={"fields": {"event": "varsel_reconcile_error"}},
+    with _span("varsel_reconcile", matched=len(matched)):
+        # ONE ENTRY PER (PLACE PAIR, TRAIN), not per (definition, train) -- KTD9. A corridor with
+        # five hundred registrations is one wording and one backend call per disrupted train, and
+        # every traveller on it reads the same sentence. Keyed on `_train_key` where the alert
+        # names a train and on the pair-grained subject otherwise, which is the one case
+        # `one_alert_per_train` also refuses to merge: an alert that cannot be tied to a departure
+        # is never folded into another, because showing one card too many is a much smaller error
+        # than hiding an unrelated disruption.
+        queued: dict[tuple, _WriteSubject] = {}
+        for key, alerts in matched:
+            journey = match_targets[key]
+            pair = _pair(journey)
+            alerts_by_key[key] = alerts
+            # WHICH WORDING POLICY writes for this train, and since KTD9 the discriminator is the
+            # PAIR rather than the definition: `by_journey_key` is browser-only by construction
+            # (KTD10), so "some contributing definition is in it" is exactly "a browser
+            # registration on this pair needs this train". A train no browser registration
+            # contributed must go through `notification_wording.WEBHOOK`, because the browser
+            # policy's prompt audit record carries the traveller's origin, destination and
+            # departure time at DEBUG wherever VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and
+            # R16 forbids that for client data. WEBHOOK suppresses that record in CODE rather than
+            # by an environment variable, drops `message` from the INFO record, and latches against
+            # its own holder. Its FIRST bound is the webhook delivery switch, so with client prose
+            # undelivered — every deployment today — the writer is still invoked (AE10: a client
+            # registration with no VAPID keypair matches and is written for) and answers with the
+            # template, asking no backend and charging nothing.
+            #
+            # A SHARED pair stays on the browser policy, unavoidably and by design: AE1 pins one
+            # match and one wording between the two channels, so there is one call and it is the
+            # browser's. The prompt record for that route would exist with no webhook channel at
+            # all, because a browser registration holds the same route -- so R16's claim is about
+            # webhook-only routes plus every other client field, and U8 publishes exactly that.
+            # Widening it from the definition to the pair widens the browser side, never the
+            # client one: a pair no browser registration is on is still written under WEBHOOK.
+            browser = key in by_journey_key
+            # PER DEFINITION, and deliberately not shared. `build_message_input` reads only
+            # `from_stop`/`to_stop` off the record, so two definitions on one pair do produce the
+            # same document -- but this is the document `_record_decisions` stores on each row, and
+            # a row's `message_input` must be the one built beside its own alert.
+            for alert in alerts:
+                message_inputs[_decision_key(key, alert)] = _message_input(journey, alert)
+            # ABOVE the early return, and over every alert: a superseded alternative most often goes
+            # stale precisely when nothing is alert-worthy any more, which is the case that returns.
+            # This is also what records a freshly found alternative, whether or not a message follows
+            # it (cap reached, LLM disabled, push off) -- the in-app list wants it either way.
+            #
+            # Guarded like the match above it, and for a strictly bigger blast radius than the
+            # 2026-07-29 incident that guard exists for: called bare, a raise here unwinds out of
+            # check_and_notify entirely, so loop 2 never runs (no pushes at all this cycle) and
+            # _record_decisions never runs (no rows either). What it touches is duck-typed -- an impact
+            # response from an injected provider, a cached AlternativeJourney, an aware/naive datetime
+            # comparison -- so "it cannot raise" is an assumption about somebody else's object. Keeping
+            # one cycle's stale cache is the smaller failure by a wide margin.
+            try:
+                _reconcile_caches(pair, alerts, cycle_now)
+            except Exception:
+                logger.warning(
+                    "Cache reconciliation failed for journey %s; keeping this cycle's cached "
+                    "alternatives and messages",
+                    key,
+                    exc_info=True,
+                    extra={"fields": {"event": "varsel_reconcile_error"}},
+                )
+            # ONE WORDING PER TRAIN THIS CYCLE WILL NOTIFY ABOUT, not one per journey (2026-08-21).
+            #
+            # Loop 2 delivers per train -- `one_alert_per_train`, the same collapse applied here --
+            # while this loop wrote for `next(a for a in alerts if a.alertworthy)` alone. So a journey
+            # with several disrupted departures pushed the model's prose for its worst train and the
+            # template for every other one, recorded as `message_status = 'not_selected'`: 604 of dev's
+            # 844 pushes over 14 days, 83 % of everything that reached a lock screen.
+            #
+            # `_pending_pushes` and not simply "every alert-worthy train", which the measurement says
+            # would be the expensive way to fix the cheap half of the problem. Per journey-cycle on dev:
+            # alert-worthy trains run p50 3 / p90 12 / max 22, while PUSHES run p90 1 / max 18 and 3 610
+            # of 4 099 cycles push nothing at all -- the trains are alert-worthy again every tick, but
+            # `_notified` means each one reaches a phone once. Writing for all of them would spend a
+            # bounded budget re-wording trains nobody will be told about again, and starve the one train
+            # that is about to be.
+            #
+            # The fallback keeps today's behaviour where it was right: with no push pending, the worst
+            # train is still written for, because the in-app journey card reads these same wordings
+            # through `_deliverable_message` and would otherwise decay to the template as soon as
+            # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
+            # It is gated on `push_on` because the CARD is the reader it exists for, and the card is
+            # the browser channel; a webhook subject with nothing pending has already been told.
+            #
+            # KTD4's gate, expressed as three lines rather than a boolean somewhere else. `jids` are
+            # withheld when push is off -- see `_pending_pushes` for why that half is load-bearing --
+            # so `pending` is exactly "a recipient on some channel still needs telling about this
+            # train", and `push_on or pending` is exactly "some channel can deliver". With no client
+            # recipients (every deployment until the store lands, and every existing test) both
+            # predicates reduce to what they were: `pending` is the browser list, and the guard below
+            # is the old `if not push_on: continue`.
+            pending = _pending_pushes(
+                jids_by_key.get(key, ()) if push_on else (), alerts, webhook_by_key.get(key, ())
             )
-        # ONE WORDING PER TRAIN THIS CYCLE WILL NOTIFY ABOUT, not one per journey (2026-08-21).
+            if not push_on and not pending:
+                # No deliverable recipient on ANY channel: a keypair-less deployment with no client
+                # subscription pending for this journey. The decision is still recorded below, with the
+                # deterministic wording, and `message_status` still reads `push_disabled` for it.
+                continue
+            subjects = pending or (
+                [a for a in one_alert_per_train(alerts) if a.alertworthy][:1] if push_on else []
+            )
+            # NO PER-DEFINITION SLICE HERE any more: `_MAX_MESSAGES_PER_JOURNEY` is a PAIR's cap
+            # since KTD9 and is applied below, once the corridor's definitions have all been seen.
+            # Sliced here it multiplied by the number of registrations on a corridor, which is
+            # exactly the number this plan scales.
+            for subject in subjects:
+                train = _train_key(subject)
+                queue_key = (pair, train) if train is not None else ("_untied", _subject_key(pair, subject))
+                entry = queued.get(queue_key)
+                if entry is None:
+                    queued[queue_key] = _write_subject(
+                        pair, key, subject, journey, cycle_now,
+                        own_input=message_inputs.get(_decision_key(key, subject)),
+                        browser=browser,
+                    )
+                elif browser and not entry.browser:
+                    # A browser registration on the pair takes the entry over: the policy, the
+                    # latch and the call allowance all follow `browser`, and the representative
+                    # definition has to be one whose own row could carry the prompt record.
+                    queued[queue_key] = _write_subject(
+                        pair, key, subject, journey, cycle_now,
+                        own_input=message_inputs.get(_decision_key(key, subject)),
+                        browser=True,
+                    )
+
+        # SOONEST DEPARTURE FIRST, ACROSS PAIRS -- the ordering is from 2026-08-21 (it used to be
+        # `_journeys` insertion order, so a bound cap handed the budget to whichever travellers
+        # registered earliest, every cycle, forever) and KTD9 only changes the unit it orders from
+        # a (definition, train) to a (pair, train).
         #
-        # Loop 2 delivers per train -- `one_alert_per_train`, the same collapse applied here --
-        # while this loop wrote for `next(a for a in alerts if a.alertworthy)` alone. So a journey
-        # with several disrupted departures pushed the model's prose for its worst train and the
-        # template for every other one, recorded as `message_status = 'not_selected'`: 604 of dev's
-        # 844 pushes over 14 days, 83 % of everything that reached a lock screen.
+        # An alternative was considered and NOT taken, and is recorded here because it is an open
+        # product question rather than a settled one: spending the clock in DESCENDING SUBSCRIPTION
+        # COUNT per (pair, train), with the departure as tie-break, so a bad morning's bounded
+        # number of model wordings goes to the trains with the most recipients. It is refused for
+        # now because it inverts the premise the product rests on -- a push about a train that has
+        # left is worthless, so a busy train three hours out must not beat a quiet one leaving in
+        # five minutes -- and because departure order is the rule `impact._MAX_ALTERNATIVE_LOOKUPS`
+        # already spends its own budget by. Decide it with a measurement, not with this reasoning.
         #
-        # `_pending_pushes` and not simply "every alert-worthy train", which the measurement says
-        # would be the expensive way to fix the cheap half of the problem. Per journey-cycle on dev:
-        # alert-worthy trains run p50 3 / p90 12 / max 22, while PUSHES run p90 1 / max 18 and 3 610
-        # of 4 099 cycles push nothing at all -- the trains are alert-worthy again every tick, but
-        # `_notified` means each one reaches a phone once. Writing for all of them would spend a
-        # bounded budget re-wording trains nobody will be told about again, and starve the one train
-        # that is about to be.
-        #
-        # The fallback keeps today's behaviour where it was right: with no push pending, the worst
-        # train is still written for, because the in-app journey card reads these same wordings
-        # through `_deliverable_message` and would otherwise decay to the template as soon as
-        # `_reconcile_caches` forgot one. Same cost as before -- one call -- in the common cycle.
-        # It is gated on `push_on` because the CARD is the reader it exists for, and the card is
-        # the browser channel; a webhook subject with nothing pending has already been told.
-        #
-        # KTD4's gate, expressed as three lines rather than a boolean somewhere else. `jids` are
-        # withheld when push is off -- see `_pending_pushes` for why that half is load-bearing --
-        # so `pending` is exactly "a recipient on some channel still needs telling about this
-        # train", and `push_on or pending` is exactly "some channel can deliver". With no client
-        # recipients (every deployment until the store lands, and every existing test) both
-        # predicates reduce to what they were: `pending` is the browser list, and the guard below
-        # is the old `if not push_on: continue`.
-        pending = _pending_pushes(
-            jids_by_key.get(key, ()) if push_on else (), alerts, webhook_by_key.get(key, ())
+        # `.timestamp()` rather than the datetime itself: the key must be total, and comparing an aware
+        # datetime with a naive one raises. Trains with no departure time sort last and keep their
+        # relative order (Python's sort is stable), which is `_pending_pushes`' severity order.
+        ordered = sorted(
+            queued.values(),
+            key=lambda entry: (
+                entry.subject.departure_time is None,
+                entry.subject.departure_time.timestamp() if entry.subject.departure_time else 0.0,
+            ),
         )
-        if not push_on and not pending:
-            # No deliverable recipient on ANY channel: a keypair-less deployment with no client
-            # subscription pending for this journey. The decision is still recorded below, with the
-            # deterministic wording, and `message_status` still reads `push_disabled` for it.
-            continue
-        subjects = (
-            pending
-            or ([a for a in one_alert_per_train(alerts) if a.alertworthy][:1] if push_on else [])
-        )[:_MAX_MESSAGES_PER_JOURNEY]
-        for subject in subjects:
-            message_key = _message_key(key, subject)
+        # `_MAX_MESSAGES_PER_JOURNEY` PER PAIR, applied to the sorted list so the slots go to the
+        # soonest departures on each corridor. Trains past it take the deterministic wording and
+        # are recorded `not_selected`, exactly as a train past the per-definition cap was.
+        per_pair: dict[tuple[str, str], int] = {}
+        write_queue: list[_WriteSubject] = []
+        for entry in ordered:
+            spent = per_pair.get(entry.pair, 0)
+            if spent >= _MAX_MESSAGES_PER_JOURNEY:
+                continue
+            per_pair[entry.pair] = spent + 1
             with _state_lock:
                 # Read RAW, deliberately not through `_deliverable_message`: this asks whether a
-                # wording was already WRITTEN for this situation, which is a generation-side
+                # wording was already WRITTEN for this train, which is a generation-side
                 # question. Gating it on delivery would make the writer re-run every cycle wherever
                 # delivery is off (prd today) — burning the cycle budget re-writing text that is
                 # already cached.
-                already_written = message_key in _messages
-                attempts = _message_attempts.get(message_key, 0)
-                errors = _message_errors.get(message_key, 0)
+                already_written = entry.message_key in _messages
+                entry.attempts = _message_attempts.get(entry.subject_key, 0)
+                entry.errors = _message_errors.get(entry.subject_key, 0)
             # BEFORE the attempts check, and that ordering is the fix for a real give-up bug. A
             # `None` from `_write_message` costs an attempt (see pass 1c), but several of its paths
             # never call a backend at all — this one, where no backend can be asked. So three cycles
@@ -3603,53 +4338,34 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             # own holder precisely so the two callers cannot disable each other, and consulting the
             # browser latch for a webhook-only subject would hand that isolation straight back.
             # `write_wording` asks the same question against the right holder as its second bound.
-            if not webhook_only and not _generation_enabled():
-                _remember_message_meta(message_key, status="llm_disabled")
+            if entry.browser and not _generation_enabled():
+                _remember_message_meta(entry.message_key, status="llm_disabled")
                 continue
             if already_written:
                 # Reused from an earlier cycle: keep who wrote it, but say that this cycle's row
                 # carries text written against an earlier cycle's payload, not the one recorded
                 # beside it.
-                _remember_message_meta(message_key, status="ok_cached")
+                _remember_message_meta(entry.message_key, status="ok_cached")
                 continue
-            if attempts >= _MAX_MESSAGE_ATTEMPTS:
+            if entry.attempts >= _MAX_MESSAGE_ATTEMPTS:
                 # Without this the retry never stops. A write that fails for a payload-dependent
                 # reason (a refusal, an over-long reply, an unparseable one) fails again on every 60
                 # s tick for the situation's whole life -- ~720 Vertex calls that can change
                 # nothing, because the push already went out with the deterministic wording, each
                 # one burning a slot from _MAX_LLM_CALLS_PER_CYCLE that a train which WOULD have
-                # succeeded now cannot use.
-                _remember_message_meta(message_key, status="attempts_exhausted")
+                # succeeded now cannot use. Charged at the PAIR's grain (`_subject_key`), so a
+                # corridor learns a payload is hopeless once rather than once per registration.
+                _remember_message_meta(entry.message_key, status="attempts_exhausted")
                 continue
-            if errors >= _MAX_TRANSIENT_ATTEMPTS:
+            if entry.errors >= _MAX_TRANSIENT_ATTEMPTS:
                 # The same stop, on the other budget and with a different meaning: the backend has
                 # been unreachable for this subject a dozen times running. Recorded under its own
                 # status so the two never have to be told apart by guesswork -- `attempts_exhausted`
                 # is a verdict on the payload, `transient_exhausted` is a verdict on the morning,
                 # and a rate computed across both measures neither.
-                _remember_message_meta(message_key, status="transient_exhausted")
+                _remember_message_meta(entry.message_key, status="transient_exhausted")
                 continue
-            write_queue.append((key, subject, message_key, attempts, errors, webhook_only))
-
-    # SOONEST DEPARTURE FIRST, ACROSS JOURNEYS -- and this ordering is new (2026-08-21), because
-    # until the budget could actually bind across journeys there was nothing to order. The queue
-    # used to be walked in `_journeys` insertion order, so when the cap was reached the trains that
-    # got prose were whichever journeys happened to be registered earliest, every cycle, forever.
-    # That is invisible while ~44 registrations rarely reach a cap of 8 and indefensible at ten
-    # times that: the same handful of travellers would take the whole budget on every busy morning.
-    # Soonest-first is the rule `impact._MAX_ALTERNATIVE_LOOKUPS` already spends its own budget by,
-    # and it is the one that matches what the wording is FOR -- a train leaving in six minutes can
-    # still be acted on, one leaving in three hours will be written for again on a later cycle.
-    #
-    # `.timestamp()` rather than the datetime itself: the key must be total, and comparing an aware
-    # datetime with a naive one raises. Trains with no departure time sort last and keep their
-    # relative order (Python's sort is stable), which is `_pending_pushes`' severity order.
-    write_queue.sort(
-        key=lambda item: (
-            item[1].departure_time is None,
-            item[1].departure_time.timestamp() if item[1].departure_time else 0.0,
-        )
-    )
+            write_queue.append(entry)
 
     # ---- Pass 1c: write the wordings, CONCURRENTLY --------------------------------------------
     #
@@ -3657,10 +4373,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # `_MAX_LLM_CALLS_PER_CYCLE` of them run per cycle; sequentially that is the difference between
     # a budget of 8 (~18 s, all of the ceiling) and one of 64 (~140 s, absurd). Across
     # `_LLM_WORKERS` it is ~9 s.
-    def _write_webhook_only(
-        key: str, subject: Alert, message_key: tuple[str, str, str]
-    ) -> tuple[str | None, str | None]:
-        """One webhook-only definition's wording, through `notification_wording.WEBHOOK`.
+    def _write_webhook_only(entry: _WriteSubject) -> tuple[str | None, str | None]:
+        """One CLIENT-ONLY (pair, train)'s wording, through `notification_wording.WEBHOOK`.
 
         Returns `(message, status)` in `_write_message`'s own vocabulary, so pass 1c's budget
         bookkeeping below is one branch rather than two.
@@ -3672,30 +4386,29 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         webhook delivery switch off (every deployment today) it would freeze the first template
         forever, and with it on it would freeze whatever a transient Vertex failure produced.
 
-        `subject_id` is the journey key, which is what `_write_message` passes on the browser path
-        and is protected the same way: `llm_message` hashes it (`key_digest`) before it reaches a
-        log field, so the pattern itself never leaves the process. `write_wording`'s docstring asks
-        for an opaque service-issued id and names that hashing as the reason varsel's own value is
-        acceptable; there is no departure id at this grain, and two conventions for one parameter
-        would be worse than one. What actually keeps a webhook-only route out of the prompt audit
-        record is the POLICY -- `WEBHOOK.caller` suppresses the prompt/reply DEBUG record in code
-        and drops `message` from the INFO record -- not the shape of this argument.
+        `subject_id` is the representative definition's key, which is what `_write_message` passes
+        on the browser path and is protected the same way: `llm_message` hashes it (`key_digest`)
+        before it reaches a log field, so the pattern itself never leaves the process.
+        `write_wording`'s docstring asks for an opaque service-issued id and names that hashing as
+        the reason varsel's own value is acceptable; there is no departure id at this grain, and two
+        conventions for one parameter would be worse than one. What actually keeps a client route
+        out of the prompt audit record is the POLICY -- `WEBHOOK.caller` suppresses the prompt/reply
+        DEBUG record in code and drops `message` from the INFO record -- not the shape of this
+        argument.
         """
-        message_input = message_inputs.get(message_key)
+        message_input = entry.message_input
         if message_input is None:
             # Nothing to prompt with. Charges no retry budget, for `_write_message`'s reason: the
             # absence of an input is not evidence about the model.
             return None, "no_input"
         try:
             wording = notification_wording.write_wording(
-                notification_wording.Route(
-                    match_targets[key].get("from_stop"), match_targets[key].get("to_stop")
-                ),
+                notification_wording.Route(entry.pair[0], entry.pair[1]),
                 notification_wording.DepartureWordingFacts(
-                    situation_number=subject.situation_number
+                    situation_number=entry.subject.situation_number
                 ),
                 policy=notification_wording.WEBHOOK,
-                subject_id=key,
+                subject_id=entry.key,
                 budget=webhook_budget,
                 message_input=message_input,
             )
@@ -3707,11 +4420,12 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                                   "surface": "webhook"}},
             )
             return None, "error"
-        _remember_message_meta(message_key, status=wording.status, message_input=message_input)
+        _remember_message_meta(
+            entry.message_key, status=wording.status, message_input=message_input
+        )
         return (wording.body if wording.source == "llm" else None), wording.status
 
-    def _write_one(item: tuple[str, Alert, tuple[str, str, str], int, int, bool]) -> None:
-        key, subject, message_key, attempts, errors, webhook_only = item
+    def _write_one(entry: _WriteSubject) -> None:
         # Claimed here rather than filtered above, so the ceiling is spent on calls that actually
         # START. A pre-filter would hand the budget to the first N in the queue whether or not the
         # clock still allowed them.
@@ -3719,8 +4433,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # A webhook subject claims the CLOCK only -- see `_WriteBudget.claim_clock`. Its call
         # allowance is `notification_wording`'s own, which is what keeps a client with a few
         # hundred subscriptions from spending the browser wordings' budget.
-        if not (budget.claim_clock() if webhook_only else budget.claim()):
-            _remember_message_meta(message_key, status="capped")
+        if not (budget.claim() if entry.browser else budget.claim_clock()):
+            _remember_message_meta(entry.message_key, status="capped")
             return
         # _write_message catches Exception itself, so this is belt and braces for a future edit
         # that lets one escape. It charges a retry budget rather than returning past the counters, so
@@ -3728,25 +4442,26 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # loop 2 pushes independently and falls back to the deterministic wording.
         outcome: dict[str, Any] = {}
         try:
-            if webhook_only:
-                message, outcome["status"] = _write_webhook_only(key, subject, message_key)
-            else:
+            if entry.browser:
                 message = _write_message(
-                    subject,
-                    journey_key=key,
-                    message_input=message_inputs.get(message_key),
+                    entry.subject,
+                    journey_key=entry.key,
+                    message_input=entry.message_input,
+                    message_key=entry.message_key,
                     outcome=outcome,
                 )
+            else:
+                message, outcome["status"] = _write_webhook_only(entry)
         except Exception:
             logger.warning(
                 "Written-message step raised for %s; using the deterministic wording",
-                key,
+                entry.key,
                 exc_info=True,
                 extra={"fields": {"event": "llm_message", "result": "error"}},
             )
             message = None
             outcome["status"] = "error"
-            _remember_message_meta(message_key, status="error")
+            _remember_message_meta(entry.message_key, status="error")
         # WHICH BUDGET A FAILURE IS CHARGED TO -- the 2026-08-22 fix. Every `None` used to charge
         # `_message_attempts`, so three bad minutes at Vertex retired a subject's wording for the
         # situation's whole 12 h life. In prd that was not a corner case: of the subjects that ever
@@ -3760,191 +4475,207 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # a test). Nothing was spent and nothing was learned, so it charges nothing -- and it must
         # not fall through to a default, which is how this was wrong before.
         status = outcome.get("status")
+        # TWO KEYS AGAIN (KTD9): the wording is stored under the advice it names, while the two
+        # retry counters are charged to the COARSE train slot -- a replacement train that shifted
+        # by a minute must not hand a hopeless payload a fresh budget, which is the hole
+        # `_MAX_MESSAGE_ATTEMPTS` closed (`_forget_message` refuses to clear them for the same
+        # reason).
         with _state_lock:
             if message:
-                _messages[message_key] = message
+                _messages[entry.message_key] = message
                 # Both budgets, because a success says the payload is writable AND the backend is
                 # reachable. Leaving the error count standing would let a subject that recovers
                 # still be retired by errors it has demonstrably outlived.
-                _message_attempts.pop(message_key, None)
-                _message_errors.pop(message_key, None)
+                _message_attempts.pop(entry.subject_key, None)
+                _message_errors.pop(entry.subject_key, None)
             elif status in _PAYLOAD_FAILURES:
-                _message_attempts[message_key] = attempts + 1
+                _message_attempts[entry.subject_key] = entry.attempts + 1
             elif status in _TRANSIENT_FAILURES:
-                _message_errors[message_key] = errors + 1
+                _message_errors[entry.subject_key] = entry.errors + 1
 
-    if write_queue:
-        with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, len(write_queue))) as pool:
-            list(pool.map(_write_one, write_queue))
-    if budget.refused:
-        # ONCE per cycle, after the fact, and reporting what the ceiling actually cost rather than
-        # which journey happened to hit it first -- with the queue sorted and the calls concurrent,
-        # "from journey X onwards" would name an arbitrary thread's arbitrary moment.
-        logger.info(
-            "Written-message budget spent this cycle: %d written, %d trains capped (%d calls / "
-            "%.0fs ceiling); the capped trains take the deterministic wording",
-            budget.claimed,
-            budget.refused,
-            _MAX_LLM_CALLS_PER_CYCLE,
-            _MAX_LLM_SECONDS_PER_CYCLE,
-            extra={
-                "fields": {
-                    "event": "llm_message",
-                    "result": "capped",
-                    "written": budget.claimed,
-                    "capped": budget.refused,
-                }
-            },
-        )
+    with _span(
+        "varsel_write_wordings",
+        queued=len(write_queue),
+        workers=min(_LLM_WORKERS, len(write_queue)) if write_queue else 0,
+    ):
+        if write_queue:
+            with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, len(write_queue))) as pool:
+                _drain(pool.map(_write_one, write_queue), len(write_queue))
+        _heartbeat()  # the pass boundary, as after pass 1a
+        if budget.refused:
+            # ONCE per cycle, after the fact, and reporting what the ceiling actually cost rather than
+            # which journey happened to hit it first -- with the queue sorted and the calls concurrent,
+            # "from journey X onwards" would name an arbitrary thread's arbitrary moment.
+            logger.info(
+                "Written-message budget spent this cycle: %d written, %d trains capped (%d calls / "
+                "%.0fs ceiling); the capped trains take the deterministic wording",
+                budget.claimed,
+                budget.refused,
+                _MAX_LLM_CALLS_PER_CYCLE,
+                _MAX_LLM_SECONDS_PER_CYCLE,
+                extra={
+                    "fields": {
+                        "event": "llm_message",
+                        "result": "capped",
+                        "written": budget.claimed,
+                        "capped": budget.refused,
+                    }
+                },
+            )
 
     # ---- Loop 2: deliver per registration, deduped per device ---------------------------------
     # Collect first, then fan out through deliver_to_devices -- parallel ACROSS devices, sequential
     # WITHIN one; the worker/timeout rationale lives on that helper, which the togvarsel rounds
     # share. One broad situation produces one send per registration in a single cycle.
-    per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str, bool]]] = {}
-    oslo_today = cycle_now.astimezone(_OSLO).date().isoformat()
-    # Pushes this cycle will attempt per registration, so the daily cap is judged against what is
-    # about to go out as well as what has gone: without the reservation a cycle with five cancelled
-    # trains on one journey would pass all five through a ledger that still read zero.
-    reserved: dict[str, int] = {}
-    capped: dict[str, int] = {}
-    for jid, journey in journeys if push_on else []:
-        device = None
-        brand = DEFAULT_BRAND
-        with _state_lock:
-            if jid not in _journeys:  # deleted while iterating
-                continue
-            dev = _devices.get(journey["device_id"])
-            if dev is not None:
-                device = dev.get("subscription")
-                brand = normalize_brand(dev.get("brand"))
-        if device is None:
-            continue
-        key = journey_key(journey)
-        # One push per train, not per SX message. Two situations about one cancelled departure used
-        # to mean two notifications a minute apart, saying the same thing with different percentages
-        # (2026-08-05). `_notified` still keys on the surviving situation_number, so the suppressed
-        # one simply never notifies -- and `_record_decisions` below still sees both.
-        #
-        # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when the
-        # daily cap below binds, it must be spent on the trains the traveller can still act on.
-        trains = sorted(
-            (a for a in one_alert_per_train(alerts_by_key.get(key, [])) if a.alertworthy),
-            key=lambda a: (
-                a.departure_time is None,
-                a.departure_time.timestamp() if a.departure_time else 0.0,
-            ),
-        )
-        for alert in trains:
+    with _span("varsel_deliver", registrations=len(journeys) if push_on else 0):
+        per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str, bool]]] = {}
+        oslo_today = cycle_now.astimezone(_OSLO).date().isoformat()
+        # Pushes this cycle will attempt per registration, so the daily cap is judged against what is
+        # about to go out as well as what has gone: without the reservation a cycle with five cancelled
+        # trains on one journey would pass all five through a ledger that still read zero.
+        reserved: dict[str, int] = {}
+        capped: dict[str, int] = {}
+        for jid, journey in journeys if push_on else []:
+            device = None
+            brand = DEFAULT_BRAND
             with _state_lock:
-                if f"{jid}|{alert.situation_number}" in _notified:
+                if jid not in _journeys:  # deleted while iterating
                     continue
-                tag = _notification_tag(jid, alert)
-                # An earlier push about this TRAIN (another situation about it) already reached
-                # this registration: the new one replaces it on the lock screen under the same tag,
-                # so it is not counted against the cap and its title may say «Bekreftet:».
-                replaces = tag is not None and tag in _pushed_trains
-                day, count = _daily_pushes.get(jid, (oslo_today, 0))
-                sent_today = count if day == oslo_today else 0
-            if (
-                not replaces
-                and sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
-            ):
-                capped[jid] = capped.get(jid, 0) + 1
+                dev = _devices.get(journey["device_id"])
+                if dev is not None:
+                    device = dev.get("subscription")
+                    brand = normalize_brand(dev.get("brand"))
+            if device is None:
                 continue
-            if not replaces:
-                reserved[jid] = reserved.get(jid, 0) + 1
-            per_device.setdefault(journey["device_id"], []).append(
-                (jid, device, journey, alert, key, brand, replaces)
+            key = journey_key(journey)
+            # One push per train, not per SX message. Two situations about one cancelled departure used
+            # to mean two notifications a minute apart, saying the same thing with different percentages
+            # (2026-08-05). `_notified` still keys on the surviving situation_number, so the suppressed
+            # one simply never notifies -- and `_record_decisions` below still sees both.
+            #
+            # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when the
+            # daily cap below binds, it must be spent on the trains the traveller can still act on.
+            trains = sorted(
+                (a for a in one_alert_per_train(alerts_by_key.get(key, [])) if a.alertworthy),
+                key=lambda a: (
+                    a.departure_time is None,
+                    a.departure_time.timestamp() if a.departure_time else 0.0,
+                ),
             )
-    if capped:
-        # Once per cycle. The alerts themselves are still recorded below with pushed=False and are
-        # re-offered next cycle, so this line is the only place the suppression is visible.
-        logger.info(
-            "Daily push cap (%d per registration) withheld %d alert push(es) across %d "
-            "registration(s) this cycle",
-            _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
-            sum(capped.values()),
-            len(capped),
-            extra={
-                "fields": {
-                    "event": "push_capped",
-                    "withheld": sum(capped.values()),
-                    "registrations": len(capped),
-                    "cap": _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
-                }
-            },
-        )
-
-    def _prepare_alert(
-        item: tuple[str, dict, dict, Alert, str, str, bool],
-    ) -> tuple[dict, dict] | None:
-        """One pending alert → (subscription, payload), run on the fan-out's worker thread.
-
-        ``None`` means "the registration went away; skip the send". The collection loop above
-        already re-checks `_journeys` (a delete landing while it iterates), but everything it
-        collects -- the device's SUBSCRIPTION included -- is captured before the pool starts, so a
-        «Slett alt» arriving inside the fan-out window would otherwise still put a push on the
-        phone after the UI said everything was deleted, and the "sent" result below would write a
-        `_notified` key for a journey that no longer exists. This is the same re-check, moved to
-        the latest point that still precedes the network call. It takes `_state_lock` for two dict
-        lookups and never across `_send_push`.
-        """
-        jid, device, journey, alert, key, brand, replaces = item
-        with _state_lock:
-            if jid not in _journeys or journey["device_id"] not in _devices:
-                return None
-        message_key = _message_key(key, alert)
-        # The written wording only if this deployment delivers it; otherwise None, and
-        # _notification_payload words the push from the same message input the model was shown.
-        message = _deliverable_message(message_key)
-        payload = _notification_payload(
-            journey,
-            alert,
-            message,
-            journey_id=jid,
-            message_input=message_inputs.get(message_key),
-            brand=brand,
-            confirmed=replaces,
-        )
-        return device, payload
-
-    pushed_keys: set[tuple[str, str]] = set()
-    if per_device:
-        for _device_id, item, result, payload, error_detail in deliver_to_devices(
-            per_device, _prepare_alert
-        ):
-            jid, _device, journey, alert, _key, _brand, replaces = item
-            _log_push(
-                "alert",
-                result,
-                journey["device_id"],
-                payload,
-                journey_id=jid,
-                alert=alert,
-                error_detail=error_detail,
-            )
-            if result == "sent":
+            for alert in trains:
                 with _state_lock:
-                    # Same liveness rule as `_prepare_alert`, re-asked because the delete can also
-                    # land during the send itself: a dedup key for a journey that no longer exists
-                    # would be persisted by the save below and reloaded on the next restart.
-                    if jid in _journeys:
-                        _notified.add(f"{jid}|{alert.situation_number}")
+                    if f"{jid}|{alert.situation_number}" in _notified:
+                        continue
+                    tag = _notification_tag(jid, alert)
+                    # An earlier push about this TRAIN (another situation about it) already reached
+                    # this registration: the new one replaces it on the lock screen under the same tag,
+                    # so it is not counted against the cap and its title may say «Bekreftet:».
+                    replaces = tag is not None and tag in _pushed_trains
+                    day, count = _daily_pushes.get(jid, (oslo_today, 0))
+                    sent_today = count if day == oslo_today else 0
+                if (
+                    not replaces
+                    and sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
+                ):
+                    capped[jid] = capped.get(jid, 0) + 1
+                    continue
+                if not replaces:
+                    reserved[jid] = reserved.get(jid, 0) + 1
+                per_device.setdefault(journey["device_id"], []).append(
+                    (jid, device, journey, alert, key, brand, replaces)
+                )
+        if capped:
+            # Once per cycle. The alerts themselves are still recorded below with pushed=False and are
+            # re-offered next cycle, so this line is the only place the suppression is visible.
+            logger.info(
+                "Daily push cap (%d per registration) withheld %d alert push(es) across %d "
+                "registration(s) this cycle",
+                _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
+                sum(capped.values()),
+                len(capped),
+                extra={
+                    "fields": {
+                        "event": "push_capped",
+                        "withheld": sum(capped.values()),
+                        "registrations": len(capped),
+                        "cap": _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY,
+                    }
+                },
+            )
+
+        def _prepare_alert(
+            item: tuple[str, dict, dict, Alert, str, str, bool],
+        ) -> tuple[dict, dict] | None:
+            """One pending alert → (subscription, payload), run on the fan-out's worker thread.
+
+            ``None`` means "the registration went away; skip the send". The collection loop above
+            already re-checks `_journeys` (a delete landing while it iterates), but everything it
+            collects -- the device's SUBSCRIPTION included -- is captured before the pool starts, so a
+            «Slett alt» arriving inside the fan-out window would otherwise still put a push on the
+            phone after the UI said everything was deleted, and the "sent" result below would write a
+            `_notified` key for a journey that no longer exists. This is the same re-check, moved to
+            the latest point that still precedes the network call. It takes `_state_lock` for two dict
+            lookups and never across `_send_push`.
+            """
+            jid, device, journey, alert, key, brand, replaces = item
+            with _state_lock:
+                if jid not in _journeys or journey["device_id"] not in _devices:
+                    return None
+            # The PAIR's wording (KTD9) beside this DEFINITION's message input: the text is what
+            # every traveller on the corridor is sent, the input is the document this registration's
+            # own row records and the template is rendered from.
+            message = _deliverable_message(_message_key(_pair(journey), alert, now=cycle_now))
+            payload = _notification_payload(
+                journey,
+                alert,
+                message,
+                journey_id=jid,
+                message_input=message_inputs.get(_decision_key(key, alert)),
+                brand=brand,
+                confirmed=replaces,
+            )
+            return device, payload
+
+        # KEYED PER DEFINITION AND PER DEPARTURE (`_decision_key`'s shape), because that is the
+        # grain `_record_decisions` writes a row at -- NOT the pair-grained wording key, which two
+        # registrations on one corridor share while their pushes differ. See the note on the
+        # `pushed=` argument there.
+        pushed_keys: set[tuple[str, str, str]] = set()
+        if per_device:
+            for _device_id, item, result, payload, error_detail in deliver_to_devices(
+                per_device, _prepare_alert
+            ):
+                jid, _device, journey, alert, _key, _brand, replaces = item
+                _log_push(
+                    "alert",
+                    result,
+                    journey["device_id"],
+                    payload,
+                    journey_id=jid,
+                    alert=alert,
+                    error_detail=error_detail,
+                )
+                if result == "sent":
+                    with _state_lock:
+                        # Same liveness rule as `_prepare_alert`, re-asked because the delete can also
+                        # land during the send itself: a dedup key for a journey that no longer exists
+                        # would be persisted by the save below and reloaded on the next restart.
+                        if jid in _journeys:
+                            _notified.add(f"{jid}|{alert.situation_number}")
+                            changed = True
+                            tag = _notification_tag(jid, alert)
+                            if tag is not None and alert.departure_time is not None:
+                                _pushed_trains[tag] = alert.departure_time
+                            if not replaces:
+                                day, count = _daily_pushes.get(jid, (oslo_today, 0))
+                                _daily_pushes[jid] = (
+                                    oslo_today,
+                                    (count if day == oslo_today else 0) + 1,
+                                )
+                    pushed_keys.add(_decision_key(journey_key(journey), alert))
+                elif result == "gone":
+                    if handle_gone_device(journey["device_id"]):
                         changed = True
-                        tag = _notification_tag(jid, alert)
-                        if tag is not None and alert.departure_time is not None:
-                            _pushed_trains[tag] = alert.departure_time
-                        if not replaces:
-                            day, count = _daily_pushes.get(jid, (oslo_today, 0))
-                            _daily_pushes[jid] = (
-                                oslo_today,
-                                (count if day == oslo_today else 0) + 1,
-                            )
-                pushed_keys.add((journey_key(journey), alert.situation_number))
-            elif result == "gone":
-                if handle_gone_device(journey["device_id"]):
-                    changed = True
 
     # BROWSER subjects only, and structurally so: this iterates `by_journey_key`, which is built
     # from `_journeys` alone. KTD10 keeps webhook subjects out of `varsel_decisions` entirely --
@@ -3954,9 +4685,20 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # recorded there would mark a browser registration's row `pushed` with no browser push behind
     # it -- and `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed
     # row. That is why the webhook deliveries happen in a later phase entirely and not here.
-    _record_decisions(
-        by_journey_key, alerts_by_key, journeys, pushed_keys, message_inputs, push_on=push_on
-    )
+    with _span("varsel_record_decisions", definitions=len(by_journey_key)):
+        _record_decisions(
+            by_journey_key,
+            alerts_by_key,
+            journeys,
+            pushed_keys,
+            message_inputs,
+            push_on=push_on,
+            # The cycle's own clock, the one the match was made at -- not a second `now()` taken
+            # here. The thinning rule is an elapsed-minutes test, and a pass that takes 60 s would
+            # otherwise measure it from an instant nothing else in the cycle shares.
+            now=cycle_now,
+            closing_rows=closing_subjects,
+        )
 
     if changed:
         _save_state()
@@ -4381,7 +5123,7 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
     `alerts` lets the caller supply an already-scored result, so a device with several registrations
     of the same journey definition runs the matcher once rather than once per registration.
     """
-    key = journey_key(rec)
+    pair = _pair(rec)
     matched = match_journey(rec) if alerts is None else alerts
     # One card per train, not per SX message -- see one_alert_per_train. Collapsed here rather than
     # in match_journey because the matcher also feeds the decision log, which must keep every
@@ -4398,13 +5140,18 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
             # trains out of the result — so keyed on (journey, situation) alone, a message written
             # at 06:05 about the 07:52 train still headed the card at 08:40, above a freshly
             # computed line reading 40 % for the 09:12 one.
-            cache_key = _message_key(key, alert)
+            #
+            # Keyed on the PLACE PAIR since KTD9, which is what makes this card show the wording the
+            # pass wrote for a NEIGHBOUR's registration of the same corridor -- the whole point of
+            # the shared key, and why `_message_key` derives the alternative slot itself rather than
+            # taking it from a caller that has no cycle to read one from.
+            cache_key = _message_key(pair, alert, now=now)
             # Through the delivery gate, exactly as the push body is: the card must never quote a
             # wording the notification beside it did not carry. Only the message is gated -- the
             # alternative below is advice the traveller gets either way, worded by whichever
             # template or model wrote the text above it.
             alert.message = _deliverable_message(cache_key)
-            alt = _alternatives.get(cache_key)
+            alt = _alternatives.get(_subject_key(pair, alert))
             # An alternative that has itself departed is worse than none: it advises catching a
             # train that has already left. The boundary lives in one place (_still_catchable) --
             # this read used `>=` while the selection rule pools on `>`.

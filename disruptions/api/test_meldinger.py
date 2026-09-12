@@ -1038,8 +1038,7 @@ def test_the_decision_model_refuses_a_redacted_column():
 
 
 def test_the_job_config_caps_what_one_request_can_bill():
-    """Nothing else in this repo sets maximum_bytes_billed, and KTD3's cost argument is a pruning
-    claim no test can check — the suites are hermetic and no .sql here is ever executed. The cap is
+    """KTD3's cost argument is a pruning claim no test can check — the suites are hermetic and no .sql here is ever executed. The cap is
     the backstop: it bounds the blast radius of a query that starts reading something big, on a
     public unauthenticated endpoint that shares its project quota with the poller."""
     _reset([_row()])

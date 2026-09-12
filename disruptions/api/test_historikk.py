@@ -74,6 +74,7 @@ class _FakeBQ:
         self.filter_rows: list[dict] = []
         self.registry_rows: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
+        self.job_configs: list = []
         self.error: Exception | None = None
         # Fail ONE query while the others answer normally — how a dependency in another project
         # (the stop registry) actually goes away.
@@ -88,6 +89,7 @@ class _FakeBQ:
             for p in (job_config.query_parameters if job_config else [])
         }
         self.calls.append((sql, params))
+        self.job_configs.append(job_config)
         if self.error is not None:
             raise self.error
         if self.error_on is not None and sql == self.error_on:
@@ -147,6 +149,7 @@ def _reset(rows=None, error=None, filter_rows=None, registry=None):
         else [_place("NSR:StopPlace:337", "Oslo S"), _place("NSR:StopPlace:548", "Asker stasjon")]
     )
     fake.calls.clear()
+    fake.job_configs.clear()
     fake.error = error
     fake.error_on = None
     historikk._cache.clear()  # the TTL cache would otherwise serve a previous test's rows
@@ -915,6 +918,39 @@ def test_no_notification_store_field_or_collection_name_appears_in_this_pages_sq
         )
         for name in forbidden:
             assert name not in code, f"{path.name} names {name!r}: KTD10 keeps notification state out"
+
+
+
+def test_every_query_is_bounded_by_maximum_bytes_billed():
+    """/historikk ran with NO cap at all until 2026-09-12, while /meldinger and /rushhistorikk --
+    the same shape of page over the same table -- both capped at 2 GiB. The cap is not a pruning
+    detector: a correctly pruned read of the decision log is a few MB, and the whole log is ~1.5 GB.
+    It is a blast-radius bound on a public endpoint sharing its project quota with the poller, and
+    what it catches is a query that starts reading something big -- the ET tables a mistyped join
+    can reach are ~10 TiB for a two-year scan, three orders of magnitude above this.
+
+    Every query, not the decision rows alone: /filters and the stop-registry lookup sit on the
+    validation path of every request, so an uncapped one is reachable exactly as often."""
+    _reset([_row()])
+    client.get("/historikk-api/decisions")
+    assert fake.job_configs, "no query was made"
+    for job_config in fake.job_configs:
+        assert job_config is not None, "a query ran with no job config, so with no cap"
+        assert job_config.maximum_bytes_billed == historikk._MAX_BYTES_BILLED
+
+
+def test_the_bytes_cap_is_one_constant_shared_with_meldinger():
+    """R12 asks for the cap to be DERIVED from the measured thinned 14-day scan, and a derivation
+    has to live in one place or the next reader guesses which copy is authoritative. The two pages
+    ask the same question of the same table through the same grouping, so a cap that differed
+    between them would be an accident. /rushhistorikk reads other tables and keeps its own.
+
+    The value itself has deliberately not moved yet: the derivation waits on a measurement of the
+    pruned, thinned log that only the load harness can take, and a cap derived from today's 1.5 GB
+    would turn the log's growth into refusals on the page with the longest window."""
+    import meldinger
+
+    assert meldinger._MAX_BYTES_BILLED is historikk._MAX_BYTES_BILLED
 
 
 def _run():

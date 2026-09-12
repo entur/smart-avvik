@@ -569,6 +569,56 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     response copy its alert carries — but the Alert is still the field the wording is built from.
     Expect `alt_status = 'not_worth_lookup'` to grow against `offered` at long lead times: that is
     the horizon finally reaching the trains that used to inherit a nearer train's answer.
+  **The matcher scans a PRUNED scope, not the whole cache** (2026-09-12, U2 of the 100k plan).
+  `for_trip` used to hand `impact._trip_cells` the entire prediction snapshot — ~1 100 situations
+  over ~20 000 scored calls at the midnight peak — and `_trip_cells` rebuilt its two per-situation
+  groupings over all of it on **every** scan: once per definition, per window, per stop-ref pair. So
+  a cache sized by the *network* was re-walked for a question about two stops, and the cycle's cost
+  grew with registrations although its input does not. Measured on a synthetic late-evening cache,
+  pruning is **15.7x** cheaper per definition (0.52 ms against 8.2 ms), which is what brings 20 000
+  definitions inside R1's budget. `main.refresh_call_predictions_cache` now builds a fourth index in
+  the same O(calls) ingest loop, `_call_pred_by_stop_ref = {stop_place: [(situationNumber,
+  CallPred)]}`, and `impact` keeps a `_Generation` derived from it, identified by **(snapshot object,
+  refreshed_at)** so the poller's swap-and-restamp under `_call_pred_lock` invalidates it on both
+  counts.
+  **The scan is pruned, the matcher is not forked**, and that is the load-bearing choice: `_trip_cells`
+  stays the one implementation and is simply handed fewer situations, so byte-identity holds by
+  construction rather than by inspection — dicts preserve insertion order, the pruned scope is
+  rebuilt in the snapshot's own order, and a dropped situation emits nothing, so the cell list comes
+  out element for element the same. A second "pair half" reimplementing eligibility is the
+  arrangement this repo has already watched drift apart twice. **Both prune predicates are
+  deliberately SUPERSETS** and the two omissions each have a reason. `catchable_after` is *not* in
+  the prune: it comes from the caller's clock, so a memo keyed on it would never be shared between
+  the poller, the journey list and the pull read, and one ignoring it would show a departed train as
+  catchable for up to a cycle — left out, the cut stays exactly where `_trip_cells` already applies
+  it, in candidate selection *before* the per-line rollup, which is the ordering trap that docstring
+  warns about twice. And `stop_order > bcall.stop_order` is not in the alighting predicate, because
+  which boarding candidate wins is a per-call question. A superset can only leave a situation in that
+  emits nothing; it can never take out one that would have emitted.
+  Three things a later change has to keep. The posting list carries the situation **key** rather than
+  reading `CallPred.situation_number` back off the call: production always makes the two agree and
+  three suites rely on their being able to differ, which is exactly the assumption worth not encoding
+  twice. A suite that refills a snapshot **in place** under an unchanged `refreshed_at` must call
+  `impact.invalidate_generation()` — the generation cannot see a mutation it has no way to observe.
+  And the guarantee is pinned by a differential test
+  (`test_the_pruned_scan_answers_exactly_what_the_full_scan_answers`) that compares `for_trip`
+  against the unpruned scan over randomized snapshots x query shapes; it is an **oracle, not a
+  regression test**, so it is green by design and its worth is its falsifications — six are recorded
+  in its docstring, including one deliberately GREEN case (dropping the operator from the alighting group
+  key *loosens* the prune, so the answer is unchanged), which is what proves the superset argument is
+  the thing doing the work.
+  **The pass beats the heartbeat per chunk** (same unit). `varsel_notify` is one `_phase` and
+  `/health`'s staleness rule means "no STEP has finished in `HEALTH_STALE_AFTER_S`" (600 s), so a
+  pass that merely got *slow* — a Journey Planner outage holding all 16 match workers at their
+  timeout, or a bad morning at 100 000 subscriptions — read as a wedged poller, and the restart that
+  follows comes up with both planned-call tables cold. `varsel.configure(beat=...)` takes `main._beat`
+  as a callable (`varsel` may import neither `main` nor the tracing wiring) and `_drain` beats every
+  `_HEARTBEAT_EVERY` (64) results in passes 1a and 1c. It beats in **submission** order, since that
+  is what `ThreadPoolExecutor.map` yields, so a single definition that never returns still blocks —
+  which is correct, because a pass wedged on one definition *is* the state `/health` exists to catch.
+  **`_match` now passes `cycle_now`** to `match_journey`, so one instant governs the windows, the
+  catchability cut and `decided_at` across a pass; it was defaulting to each worker's own wall clock.
+
   **The poller's two blocking passes run CONCURRENTLY** (2026-08-21), which is what makes a pilot
   ten times the size affordable. `check_and_notify`'s loop 1 is now three passes: **1a** matches
   every journey across `varsel._MATCH_WORKERS` (16) — carrying the Journey Planner lookups with it,
@@ -600,6 +650,58 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   nobody noticed while ~44 registrations rarely reached a cap of 8, but at ten times that the cap
   binds on every busy morning and would hand the whole budget to whichever travellers registered
   earliest, every cycle, forever.
+  **One wording and one alternative per (PLACE PAIR, TRAIN), not per definition** (KTD9, 2026-09-12).
+  What a notification says is a function of the trip's two ends and of the disrupted train — never of
+  the window or weekday set one commuter registered (`llm_message.build_message_input` reads only
+  `from_stop`/`to_stop` off the record) — so keying the wording caches on `journey_key` made a
+  corridor with five hundred registrations cost five hundred Vertex calls per disrupted train and let
+  five hundred travellers be shown five hundred different sentences about one departure. The key is
+  `notification_wording.wording_key` — `(pair, situation, departure, cancelled, tomorrow, alternative
+  identity, prompt version)`, the shape `notification_pull` already used — and it and
+  `alternative_identity` live in that **leaf module** so `varsel` never imports `notification_pull`
+  (a plan stop condition, pinned by a source-inspection test both ways).
+  **It is TWO key shapes, and collapsing them to one breaks something specific each way.**
+  `varsel._message_key` (the wording) carries all seven elements; `varsel._subject_key` — `(pair,
+  situation, departure)` — carries `_alternatives`, `_message_attempts` and `_message_errors`. The
+  alternative cannot be keyed on its own identity, because a lookup is skipped on most cycles (the
+  impact gate, the 6 h horizon, `impact._MAX_ALTERNATIVE_LOOKUPS`, a Journey Planner outage) and
+  `_reconcile_caches` deliberately keeps the cached answer through that silence — a read that must
+  therefore not name the answer it is looking for. And the two retry budgets must not reset when a
+  replacement train shifts by a minute: `_forget_message` says so in as many words, and that is the
+  ~720-calls-per-situation hole `_MAX_MESSAGE_ATTEMPTS` closed. `_message_key` therefore reads the
+  EFFECTIVE alternative out of `_alternatives` itself rather than off the alert; keying on the raw
+  field would make every silent cycle a miss and re-word every alerting train.
+  `varsel._decision_key` is the third and is the OLD shape, kept for everything genuinely about one
+  registration: `pushed_keys` (two definitions on one corridor differ — different windows, and
+  `_notified` is per registration), `_decision_ledger` (KTD15) and the pass-local `message_inputs`
+  each row records. **`_MAX_MESSAGES_PER_JOURNEY` (3) is a PAIR's cap now**, spent soonest-departure
+  first within the pair, and the queue is still sorted soonest-first across pairs — spending it in
+  descending subscription count was considered and refused (a busy train three hours out must not
+  beat a quiet one leaving in five minutes), and the comment at the sort records that as an open
+  product question rather than a settled one.
+  **Which wording POLICY runs is now a question about the pair** (R16): browser as soon as ANY
+  browser registration on the corridor contributed the train, `notification_wording.WEBHOOK`
+  otherwise. One flag on the queue entry decides three things together — the policy, whether the
+  poller's own `llm_message` latch is consulted, and whether the call claims the browser allowance or
+  only the clock — because the new key names no definition, and answered per definition a
+  client-only route's origin, destination and departure time would reach the prompt/reply DEBUG
+  record dev writes. Two tests drive the REAL `write_wording` with only the model call stubbed and
+  assert the absence and the presence of that record; the wholesale stub every other webhook test
+  uses cannot see it. Two consequences to expect rather than discover: a train written for because a
+  SIBLING definition needed it records `ok`/`ok_cached` where it recorded `not_selected`, and the LLM
+  audit record is one per (pair, train) carrying the digest of the definition that caused the call,
+  so the `journey_digest` join resolves for that one and correctly for none of the others.
+  **The Journey Planner fetch was ALREADY shared per pair** and this unit pins it rather than adding
+  a memo: `alternatives._cache` keys on (from, to, arrive-by, anchor) with a 10-minute TTL and
+  cross-thread single-flight, and the in-time anchor is the train's own aimed arrival, so five
+  definitions on one pair spend one lookup (`test_five_definitions_on_one_pair_issue_one_journey_
+  planner_lookup`, which drives the real `fetch_candidates` — a stub sits above the cache and would
+  count five). What pair-keying ADDS is that a lookup any definition paid for now answers the whole
+  corridor through `_alternatives`. What is **not** done: `impact._MAX_ALTERNATIVE_LOOKUPS` is still
+  a per-`/impact`-call budget, so with different windows the three trains it covers still differ per
+  definition. Making it per (pair, train) per cycle needs a cycle-stable instant in `impact`, which
+  does not exist — `for_trip` samples its own `now` per call — so the seam is `main._rebuild_all`
+  calling something like `impact.begin_lookup_cycle()`, and `main.py` was outside this unit.
 
 - The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
   `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
@@ -904,12 +1006,40 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `GET /historikk-api/config`, sharing `deployment.environment_label()` with `/varsel`. It is its
     own endpoint, not a field on `/summary`, because both data endpoints 503 when the decision log
     cannot be read — precisely when "is this dev or prd?" matters — and it touches no BigQuery.
-  - **Every decision is logged, not every push.** `varsel.check_and_notify` appends one row per
-    (journey definition x situation x departure) per refresh cycle to `disruptions.varsel_decisions`
+  - **Every decision is logged, not every push.** `varsel.check_and_notify` appends rows keyed on
+    (journey definition x situation x departure) to `disruptions.varsel_decisions`
     via `disruptions/api/decisions.py`, *including* matches that stayed below the alert threshold.
     Without those, a `miss` leaves no trace and only precision is measurable. Repeats across cycles
     are intentional — they are the lead-time series. Writing fails open: a BigQuery problem never
     blocks a push.
+    **Not one row per cycle since 2026-09-12** (KTD15 of the 100k plan): it was from the day the
+    table existed, and what stopped holding is the arithmetic, not the reasoning — measured in prd
+    2026-09-11, ~400 rows per definition per day with 88-95 % of them sub-threshold no-SX subjects
+    re-scored every ~295 s with nothing having moved, which at 35 000-80 000 definitions is
+    14-33 GB a **day** and a 14-day `/historikk` window of 70-150 GB per request. `varsel.
+    _thinning_reason` now writes a standing subject at most once per 15 min, **plus** every row a
+    figure the pages compute is made of: the first sighting, every alert-worthy/sub-threshold
+    transition, every new maximum impact probability, every push, and a **closing row** carrying the
+    subject's last observation — written from the stale sweep when the situation ends and from the
+    match when a train leaves it uncatchable, and dated at the cycle it *describes*, so `final_*`
+    and `last_decided_at` mean what they always did. `first_alert_at`, `max_impact_probability`,
+    `et_cancelled`'s first-alerting-cycle pick and the quoted wording are therefore unchanged **by
+    construction**; `n_decisions` changes meaning (rows written, not cycles scored) and its
+    description says so, so **no per-cycle rate may be computed across that date**. The ledger is
+    its own module structure, not a field on `_message_meta` — `_forget_message` drops that the tick
+    a subject eases below the gate, which is exactly when the rule needs the prior class — and it
+    joins the stale sweep and `test_varsel_api._reset_state` like every other module budget.
+    **Measured ratio, replayed over prd's own rows** (two days to 2026-09-10, 168 436 rows /
+    6 462 subjects): **2.63x**, 38.1 % of rows kept — 6 462 first sightings, 13 502 new maxima,
+    40 881 interval rows, 3 153 closing rows, 83 transitions, 44 pushes. So 15 min alone is **not**
+    enough at 100 000, which is what gates the deferred per-day summary table; a longer interval is
+    not the answer either (30 min buys 3.76x, 60 min 4.96x, and past an hour the interval starts
+    deciding which cycle a reader may see).
+    `decisions.record` also **chunks** its insert under 10 000 rows and 5 MB per request (half the
+    streaming API's documented 50 000 / 10 MB): one refused request used to lose a whole cycle's
+    decisions, and at 100 000 a cycle is 30 000+ rows. A failed chunk costs its own rows only, and
+    every branch of the write — including the exception path, which did not until then — carries
+    `event="varsel_decision_write"` with its chunk index.
   - **The row records the writer's input, not just its output** (2026-08-05). `message_input` is the
     exact JSON `llm_message.build_message_input` produced, serialized by the shared
     `llm_message.message_input_json` so it is byte-identical to the prompt — written for **every**
@@ -998,6 +1128,34 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     any failure as "table not ready", one whole-file job meant a *cosmetic description edit* silently
     stopped the decision log recording anything at all. Prune statements whose text has demonstrably
     reached both dev and prd; a fresh environment reads its descriptions from the `CREATE` bodies.
+    **That prune was finally done on 2026-09-12**, verified with `bq show --schema` in both projects
+    rather than assumed: all eight statements carried text byte-identical to what dev and prd already
+    held *and* to the `CREATE`/`ADD COLUMN` body beside them, so the block could never complete
+    inside the cap and was spending three statements per startup failing. It is now three on
+    `varsel_decisions` and one on `varsel_decision_outcomes` — **prune again before adding a fifth to
+    either.** The block also carries the one thing there that is not a description: the
+    `partition_expiration_days=365` `SET OPTIONS` that gives the log a year's retention (the `CREATE`
+    body covers a fresh environment). It sits below the marker deliberately — a retention rule that
+    lands a poller tick late costs nothing, while a metadata rate limit above the marker is the
+    2026-08-07 outage — and **it deletes data** once it lands.
+    **The grouping body is a TABLE FUNCTION since 2026-09-12**,
+    `disruptions.varsel_decision_groups_between(d_start DATE, d_end DATE)`, with
+    `varsel_decision_groups` kept as a **windowless view over it**. A BigQuery view takes no
+    parameters, and the table is `PARTITION BY DATE(decided_at)` while every reader bounds
+    `call_date`, so through the view each `/historikk` request scanned the whole log — affordable at
+    1.5 GB and not at the volume R12 sizes for. The three `/historikk` queries now call the function
+    with a **derived cover** of their `call_date` window ± 1 day (a decision is made from 720 min
+    before its departure to 54 min after, and `call_date` is the Oslo date of that departure), which
+    fails **silently and cheaply** if it is ever too narrow — re-measure before widening the 12 h
+    horizon. The view keeps its **exact column set and GROUP BY**, because `label_varsel_decisions.
+    sql` does `SELECT *` over that name and the registered scheduled query holds a copy in each
+    environment. Six readers, not four: the three `/historikk` queries, the nightly job,
+    `backfill_outcome_pushed_message.sql` and `message_wording_comparison.sql`. **The function must
+    exist in a project before `validate_varsel_sql.sh` can dry-run anything that names it** (the app
+    creates it at startup), exactly like the two togvarsel tables. And `historikk._MAX_BYTES_BILLED`
+    is now the **one** cap for both pages — `meldinger` imports it — with the derivation (four times
+    the measured pruned, thinned 14-day scan) written out there and the value deliberately left at
+    2 GiB until that measurement exists.
     Note
     `validate_varsel_sql.sh` checks that file **statement by statement**: a dry run of a
     multi-statement script validates only the first one (`numChildJobs: 1`), so a broken ALTER
@@ -1339,9 +1497,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     `rate_limited` and `deadline` beside `no_input`, `unreadable_input`, `disabled` and the statuses
     off `MessageResult` — and `ungrounded`/`rejected` carry the **discarded reply**, since those two
     are what a prompt edit most plausibly produces and a badge with no text defeats the loop. On top
-    of all four, `maximum_bytes_billed` is set to 2 GiB on every job: at ~11x the whole decision log
-    (181.6 MB in prd, 135 MB in dev, measured 2026-08-21) it will **not** catch a pruning regression —
-    it is a blast-radius bound against a mistyped join reaching a ~10 TiB ET table.
+    of all four, `maximum_bytes_billed` is set to 2 GiB on every job — and since 2026-09-12 so is
+    `/historikk`'s, from the one shared constant, where it had no cap at all. The RATIO has moved and
+    the conclusion has not: 2 GiB was ~11x the whole decision log when it was set (181.6 MB in prd,
+    135 MB in dev, 2026-08-21) and is ~1.3x it now (1.53 GB in prd, 2026-09-11), so it still will
+    **not** catch a pruning regression — it is a blast-radius bound against a mistyped join reaching a
+    ~10 TiB ET table. At ~1.3x it is approaching the point where it becomes both, which is what the
+    derived cap under R12 of the 100k plan is for.
   - **The latch is isolated, and that is not optional.** `llm_message`'s `_active`, `_active_at`,
     `_latched_off` and the lock guarding them were four module globals; they now live in a
     `_LatchState` holder, the module keeps one global instance so **every existing caller is

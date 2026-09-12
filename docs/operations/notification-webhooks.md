@@ -170,9 +170,16 @@ of what replaced the origin plan's dated-leg replay gate. It survives as five li
 **only the first three are inherited — the fourth is created by this plan, and the fifth by the
 public read that followed it.**
 
-1. **`/historikk`'s rows are one per subject per cycle**, the repeats being the lead-time series,
+1. **`/historikk`'s rows are repeats of one subject**, the repeats being the lead-time series,
    while a notification fires on the first threshold crossing. A rate over rows is not a rate over
-   notifications.
+   notifications. **They stopped being one per cycle on 2026-09-12** (the 100k plan's KTD15,
+   unit U4): a standing subject nothing has changed about is written at most once per quarter hour,
+   plus the first sighting, every alert-worthy/sub-threshold transition, every new maximum impact
+   probability, every push, and a closing row carrying the subject's last observation. `n_decisions`
+   therefore counts rows written rather than cycles scored, and no per-cycle rate may be computed
+   across that date. Measured over prd's own rows, the rule keeps 38 % of them (2.63x). What it does
+   NOT change is this clause: a rate over rows was never a rate over notifications, and it still is
+   not.
 2. **A subject nobody was notified about has no row at all**, so capped and missed subjects must be
    returned to the denominator by hand — and this channel *manufactures* capped subjects by design:
    nine of thirteen in the line-suspension case the daily cap is specified against. That limitation
@@ -466,7 +473,7 @@ silently.
 | `notification_wording` | a webhook wording fault | `result` (`error`, `rate_limited`), `surface` |
 | `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`, and since U4 `enrich_failed` — the same WARNING shape, for the background enrichment task's matcher run or the task itself), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
 | `notification_pull_bounded` | a bound binding on the read's enrichment (U4) | `reason` (`queue_full` — the task was refused and every listed entry marked `capped`; `wordings_per_read`; `alternative_lookups`; `wording_allowance` — the PULL allowance answered `rate_limited`; `waiters` — no waiter slot, the read behaved as `wait=0`), `n` (entries the bound touched), `pair_digest`. Nothing identifying. The read's own record also carries `result="enrich_failed"` at WARNING when the task's matcher run raised — the exception's TYPE in the message, never its text |
-| `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"`, `ms`, `result` |
+| `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"`, `ms`, `cpu_ms`, `result`, and `rss_delta_bytes` where /proc can be read. `cpu_ms` is process CPU for the step, so it includes request-path work served during it and can exceed `ms` when a pool fans out; it is the figure the capacity table above is read from |
 
 **What no `notification_*` or `webhook_*` log line carries:** an origin, a destination, a departure time, a full callback
 URL, a credential secret, or any notification prose. Read the qualifier — it is about these events,
@@ -637,13 +644,84 @@ touches the wire contract, which is why the pilot could ship without them.
    aggregation over an `expires_at` inequality (a new composite index), so the quota a very large
    client needs is unlocked by this item, not by `set-quotas` alone.
 
+### What a bad morning is worded by, and what carries the template
+
+One wording and one Journey Planner lookup are produced per **(place pair, disrupted train)** rather
+than per journey definition (KTD9, 2026-09-12). What a notification says is a function of the trip's
+two ends and of the train — never of the window or weekday set one commuter registered — so a
+corridor with five hundred registrations costs one model call per disrupted train, every traveller
+on it reads the same sentence, and the cost of the writing pass stops scaling with subscriptions.
+`_MAX_MESSAGES_PER_JOURNEY` (3) is therefore a **pair's** cap now, spent on the soonest departures
+on that pair; it used to be a definition's, where it multiplied by the number of registrations.
+
+What still binds on a bad morning is the clock, and the arithmetic is worth stating rather than
+discovering: the writing pass reserves `_MAX_LLM_SECONDS_PER_CYCLE` (30 s) across
+`varsel._LLM_WORKERS` (16) at roughly 2.2 s per Gemini call. So the ceiling is **64 trains a cycle
+as configured today — the count cap, `_MAX_LLM_CALLS_PER_CYCLE`, which at ~9 s of wall clock binds
+long before the 30 s does — and about 200 if that count is ever raised to meet the clock**. Every
+train past whichever binds carries the deterministic template, which is a complete, correct
+notification naming the train, the route and the figures, not a degraded one. Raising one without
+the other only makes the poller block longer: the two are one limit wearing two names. Trains that take the template are
+recorded `message_status = 'capped'` or `'not_selected'`, so what the ceiling costs stays countable.
+
+Two consequences a reader of the logs should expect. `message_status` values shift across
+2026-09-12: a train written for because a *sibling* definition on the same corridor needed it now
+records `ok`/`ok_cached` where it recorded `not_selected`, so a rate computed across that date is
+measuring two different groupings. And the LLM audit record is one per (pair, train) rather than one
+per definition, carrying the `journey_digest` of the definition that caused the call — so a join
+from `varsel_decisions.journey_digest` to that record now resolves for one definition on the pair
+and, correctly, for none of the others: they were served a wording they did not pay for.
+
+### Capacity measurements
+
+Every capacity claim in `docs/plans/2026-09-11-002-feat-scale-to-100k-commuters-plan.md` is gated on
+a measurement recorded here, not on an argument. The harness is three scripts:
+
+| Script | What it does |
+|---|---|
+| `scripts/loadgen_subscriptions.py` | Seeds and tears down N synthetic subscriptions and M synthetic browser registrations in **dev** (it refuses production, in four ways) |
+| `scripts/loadgen_receiver.py` | The destination they point at: configurable latency, configurable refusals, a record of what arrived |
+| `scripts/bench_cycle.py` | Reads `poller_cycle` / `poller_phase` back and prints wall, CPU and RSS per phase; `profile` reports interpreter ms per definition |
+
+Three things about a row here, each of which a reader would otherwise have to guess.
+
+**A row is only comparable to a row with the same tags.** *Mode* is how the subscriptions were
+created — `store` writes the documents through `notification_store`'s own builder (byte-identical to
+what the API writes, but without the create path's in-transaction count, its log line or its inline
+servability ask), `api` goes through `POST /subscriptions` and cannot exceed the create path's own
+ceilings. *Shape* is which peak the run measured: the late-evening cache maximum, or a bad morning.
+*Ratio* is how much the load clusters: `prd` is prd's measured 1.22 journeys per definition and 1.41
+definitions per pair, `plan` is the first draft's ~2.9 and ~4.4. R1 is sized on the range between
+them, so a run at one ratio has measured half the question.
+
+**Wall and CPU answer different questions and only one of them is about capacity.** The poller and
+the request path share one CPython interpreter, so a phase bound by bytecode gets nothing from a
+wider pool or a second core, and a phase bound by a socket gets a lot from the first.
+`poller_phase.cpu_ms` (and `kix_poller_phase_cpu_seconds{phase}`) is what separates them.
+
+**What is where.** The per-phase figures are in Cloud Logging in the **cluster** project
+(`ent-kub-dev`, namespace `kix-avvik`) — a read against `ent-kixavvik-dev` returns nothing, silently.
+The five sub-pass spans under `varsel_notify` and the per-Firestore-call spans, including
+`firestore_transaction`'s `cpu_ms`, are in **Cloud Trace** and in no log line. The `kix_*`
+Prometheus series are in **Thanos behind Grafana** and not in Google Managed Prometheus, so no
+script can scrape them; they are for rules and dashboards, and the log records are for these rows.
+
+| Date | Unit | Subs | Defs | Pairs | Mode | Shape | Ratio | Cycle p50 / max | `varsel_notify` wall / CPU | `notification_webhooks` wall / CPU | `varsel_webhook_load` wall / CPU | Interpreter ms per definition | Emits/s, Firestore p50 | Delivery drain | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| — | U1 | — | — | — | — | — | — | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | *not yet measured* | The harness and the instrumentation landed with U1; the dev run that fills this row has not been made |
+
+Later units add their own columns rather than overwriting these: mirror documents and bytes per
+sync (U6), `/historikk` scanned bytes (U4), figures-cache hit rate and Journey Planner lookups
+wanted versus spent (U2, U3), index write amplification (U9) and log lines per cycle (U10).
+
 Two costs that arrive with larger caps rather than with volume: `notification_events._standing`'s
 client-wide pre-read enumerates at most `MAX_SUBJECTS_PER_READ` (500) subjects and falls back to one
 transaction per subject when it is incomplete, which a client with many subscriptions and a high
-`daily_cap` will hit more often (correct, slower); and the model wording is written per journey
-definition under a per-cycle budget, so at scale most events carry the template unless the wording
-is re-keyed on (place pair, train). Neither changes what a client receives, only how much prose and
-how fast.
+`daily_cap` will hit more often (correct, slower); and the model wording is written under a per-cycle
+budget, so at scale most events carry the template. That second one was stated here as conditional on
+the wording being re-keyed on (place pair, train); that re-keying SHIPPED on 2026-09-12 (KTD9), so
+the budget is now spent per pair rather than per definition and the section above states what a bad
+morning is worded by. Neither changes what a client receives, only how much prose and how fast.
 
 Two things that do NOT need to change for a hundred thousand commuters: the one-subscription-per-
 commuter grain (a client that prefers one subscription per route can already use the API that way,

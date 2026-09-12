@@ -743,6 +743,95 @@ def test_a_pull_wording_writes_no_prompt_record_and_no_definition_digest():
     assert records[0]["journey_digest"] != llm_message.key_digest(definition)
 
 
+# ---- KTD9: the wording key both surfaces build ---------------------------------------------------
+
+
+class _Alt:
+    """An `alternatives.AlternativeJourney` in the four fields the identity reads. A stand-in, not a
+    stub of convenience: `alternative_identity` is duck-typed precisely so this module never imports
+    the poller's model, and a test that used the real class would not check that."""
+
+    def __init__(self, dep, arr, at_risk=False, in_time=True):
+        self.departure_time, self.arrival_time = dep, arr
+        self.at_risk, self.arrives_before_original = at_risk, in_time
+
+
+class _Winner:
+    def __init__(self, situation="S1", departure=DEP, cancelled=False):
+        self.situation_number, self.departure_time, self.cancelled = situation, departure, cancelled
+
+
+def test_the_wording_key_is_the_place_pair_and_everything_the_wording_states():
+    """KTD9's shape, in one function so the poller and the pull read cannot come to disagree.
+
+    The PAIR and not the journey definition: what a wording says is a function of the trip's two
+    ends and the disrupted train, never of the window or weekday set one commuter registered. Every
+    other element is something the text states out loud, so two keys differing in one of them are
+    two different sentences.
+    """
+    pair = ("NSR:StopPlace:A", "NSR:StopPlace:B")
+    base = nw.wording_key(pair, _Winner(), None, tomorrow=False)
+    assert base[0] == pair and base[1] == "S1" and base[2] == DEP.isoformat()
+    assert base[-1] == llm_message.PROMPT_VERSION, "a reworded brief is a different writer"
+
+    for label, other in (
+        ("a different pair", nw.wording_key(("NSR:StopPlace:A", "NSR:StopPlace:C"), _Winner(), None, tomorrow=False)),
+        ("a different situation", nw.wording_key(pair, _Winner(situation="S2"), None, tomorrow=False)),
+        ("a different departure", nw.wording_key(pair, _Winner(departure=DEP + timedelta(hours=1)), None, tomorrow=False)),
+        ("a declared cancellation", nw.wording_key(pair, _Winner(cancelled=True), None, tomorrow=False)),
+        ("«i morgen»", nw.wording_key(pair, _Winner(), None, tomorrow=True)),
+        ("an alternative", nw.wording_key(pair, _Winner(), _Alt(DEP, DEP + timedelta(minutes=30)), tomorrow=False)),
+    ):
+        assert other != base, f"{label} must not share a cache entry with the plain reading"
+
+    # And the same inputs are the same key, which is the half that makes it a CACHE.
+    assert nw.wording_key(pair, _Winner(), None, tomorrow=False) == base
+
+    # A reworded brief invalidates every entry, which is what stops a prompt edit showing
+    # yesterday's answer under today's instructions. Patched on the module the helper reads through,
+    # not on a copy: `prompt_version` imports `llm_message` at call time for exactly this.
+    before = llm_message.PROMPT_VERSION
+    llm_message.PROMPT_VERSION = "deadbeef"
+    try:
+        assert nw.wording_key(pair, _Winner(), None, tomorrow=False) != base
+    finally:
+        llm_message.PROMPT_VERSION = before
+
+
+def test_the_alternative_identity_is_the_advice_and_not_the_rescoring():
+    """Moved from `varsel` with its reasoning intact: minute resolution because every wording renders
+    %H:%M, and both booleans because each is stated out loud. A key that moved with the continuous
+    re-scoring would spend an LLM call per cycle producing byte-identical prose."""
+    dep, arr = DEP, DEP + timedelta(minutes=30)
+    base = nw.alternative_identity(_Alt(dep, arr))
+    assert nw.alternative_identity(_Alt(dep.replace(second=41), arr)) == base, (
+        "a realtime nudge inside the minute is the same advice"
+    )
+    assert nw.alternative_identity(_Alt(dep + timedelta(minutes=1), arr)) != base
+    assert nw.alternative_identity(_Alt(dep, arr, at_risk=True)) != base, (
+        "«kan også bli rammet» is in the text"
+    )
+    assert nw.alternative_identity(_Alt(dep, arr, in_time=False)) != base, (
+        "arriving later than planned is in the text"
+    )
+    assert nw.alternative_identity(_Alt(None, None)) == (None, None, False, True)
+
+
+def test_both_surfaces_build_their_key_here_rather_than_each_keeping_a_copy():
+    """The plan's stop condition, from this side: `varsel` must not import `notification_pull` to
+    share the shape, and neither may keep its own copy. Checked over the identifiers rather than the
+    prose, so the paragraphs explaining the rule do not trip it."""
+    import notification_pull
+    import varsel
+
+    assert varsel._alternative_identity is nw.alternative_identity
+    assert "notification_wording.wording_key" in inspect.getsource(varsel._message_key)
+    assert "notification_wording.wording_key" in inspect.getsource(notification_pull._wording_key)
+    assert "varsel" not in _code_names(inspect.getsource(nw.wording_key)), (
+        "the leaf reached back into the poller"
+    )
+
+
 def _run():
     logging.getLogger("notification_wording").setLevel(logging.CRITICAL)
     tests = sorted(
