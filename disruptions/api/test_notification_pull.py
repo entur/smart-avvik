@@ -926,7 +926,7 @@ def test_neither_a_registered_nor_an_ad_hoc_read_writes_the_pollers_state_the_lo
     snapshot = {"S1": _train(dep, p_cancel=0.82, p_impact_dep=0.9)}
     _use_snapshot(snapshot)
     monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
-    _capture_writes(monkeypatch)
+    written = _capture_writes(monkeypatch)
     store_calls = _use_notification_store(monkeypatch, [_webhook_doc()])
     _register_here(monkeypatch)
     varsel.check_and_notify(snapshot)
@@ -935,12 +935,16 @@ def test_neither_a_registered_nor_an_ad_hoc_read_writes_the_pollers_state_the_lo
     monkeypatch.setattr(
         varsel, "_record_decisions", lambda *a, **k: decisions_written.append(1) or original_record(*a, **k)
     )
-    before = (_poller_caches(), len(store_calls), len(decisions_written))
+    before = (_poller_caches(), len(store_calls), len(decisions_written), len(written))
     assert _get(**REGISTERED).json()["alerts"][0]["wording"]["status"] == "ok"
     ad_hoc = _get(**ad_hoc_definition).json()
     assert ad_hoc["n_alerts"] == 1
-    _join(**ad_hoc_definition)
-    assert (_poller_caches(), len(store_calls), len(decisions_written)) == before
+    # SAME PAIR, different period -- and since KTD9 (2026-09-12) the poller's wording is keyed on
+    # the pair, so this read is served the registered definition's text too. It therefore submits
+    # NO enrichment task at all, which is why joining one would KeyError rather than block: an
+    # entry the poller already answered carries no `wording_key`.
+    assert ad_hoc["alerts"][0]["wording"] == {"source": "llm", "status": "ok"}
+    assert (_poller_caches(), len(store_calls), len(decisions_written), len(written)) == before
 
 
 def test_a_burst_past_the_pull_allowance_is_rate_limited_and_charges_no_other_surface(monkeypatch):

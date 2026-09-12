@@ -1206,7 +1206,7 @@ def test_the_last_resort_wording_quotes_a_real_saving_but_never_a_negative_one()
 # stale one not to be worth the code -- a belief measured for the first time on 2026-08-06 and found
 # wrong (26 % of alerting subjects under the OLD rule). Both outcomes are routine, and one of them
 # -- "stay on your own train" -- is advice that contradicts what may already be cached.
-_RECONCILE_KEY = "A|B|07:00|09:00|0,1,2,3,4"
+_RECONCILE_PAIR = ("A", "B")
 
 
 def _reconcile_cycle(*, cached=None, fresh=None, original_is_best=False, alertworthy=True,
@@ -1228,17 +1228,26 @@ def _reconcile_cycle(*, cached=None, fresh=None, original_is_best=False, alertwo
         alert.impact = alert.impact.model_copy(
             update={"original_is_best": True, "alternative_subject": (alert.operator, alert.jkey)}
         )
-    key = varsel._message_key(_RECONCILE_KEY, alert)
+    # TWO KEYS since KTD9 (2026-09-12): the alternative lives under the coarse train slot, the
+    # wording under a key that also names the advice. The wording key is derived AFTER the cached
+    # alternative is in place, because that is what it names -- and that ordering is the property
+    # under test here, since a forgotten wording is observed as the entry under THAT key going away.
     for cache in (varsel._alternatives, varsel._messages, varsel._message_meta):
         cache.clear()
+    subject_key = varsel._subject_key(_RECONCILE_PAIR, alert)
     if cached is not None:
-        varsel._alternatives[key] = cached
+        varsel._alternatives[subject_key] = cached
+    key = varsel._message_key(_RECONCILE_PAIR, alert)
     if message is not None:
         varsel._messages[key] = message
         varsel._message_meta[key] = {"status": "ok", "provider": "vertex-anthropic"}
     try:
-        varsel._reconcile_caches(_RECONCILE_KEY, alerts, now)
-        return varsel._alternatives.get(key), varsel._messages.get(key), varsel._message_meta.get(key)
+        varsel._reconcile_caches(_RECONCILE_PAIR, alerts, now)
+        return (
+            varsel._alternatives.get(subject_key),
+            varsel._messages.get(key),
+            varsel._message_meta.get(key),
+        )
     finally:
         for cache in (varsel._alternatives, varsel._messages, varsel._message_meta):
             cache.clear()

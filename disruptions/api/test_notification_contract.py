@@ -634,10 +634,20 @@ def test_the_two_halves_of_the_prompt_record_claim_are_both_published():
         "varsel no longer routes any subject through notification_wording.WEBHOOK; the closed half "
         "of R16's prompt-record claim is what that policy is for"
     )
-    assert "key not in by_journey_key" in varsel_source, (
+    assert "browser = key in by_journey_key" in varsel_source, (
         "the webhook-only discriminator has changed. It is `by_journey_key`, which is browser-only "
-        "by construction (KTD10), so absence from it is exactly 'no browser registration holds "
-        "this route'."
+        "by construction (KTD10), so presence in it is exactly 'a browser registration holds this "
+        "route'. Since KTD9 (2026-09-12) the flag is carried onto the (pair, train) queue entry and "
+        "OR-ed across the definitions that contributed it, so the policy question is asked of the "
+        "corridor rather than of one definition -- which widens the BROWSER side only: a pair no "
+        "browser registration is on is still written under notification_wording.WEBHOOK."
+    )
+    assert "if entry.browser:" in varsel_source, (
+        "the wording policy is no longer chosen from the queue entry's `browser` flag. That one "
+        "flag decides three things together -- which policy runs, whether the poller's own "
+        "`llm_message` latch is consulted, and whether the call claims the browser allowance or "
+        "only the clock -- and splitting them is how a client route reaches the browser policy's "
+        "prompt audit record (R16)."
     )
     operations = OPERATIONS_DOC.read_text(encoding="utf-8")
     assert "VARSEL_LLM_LOG_PROMPTS" in operations, (

@@ -145,6 +145,11 @@ llm_message.configure(stop_name_provider=lambda: STOPS)
 # exactly what happened when the single-call lookup became fetch -> score -> select. The second line
 # of defence does not depend on anyone remembering: alternatives._post_json refuses to open a socket
 # from a test process at all (test_a_forgotten_stub_cannot_reach_the_network pins it).
+# Kept before the stub: `impact.alternatives` IS this module object, so the line below REPLACES the
+# real function for the whole process and there is no other reference left to it. The Journey
+# Planner sharing pin (U3) has to drive the real one -- a stub sits ABOVE `alternatives._cache`, so
+# a pin taken through it would count one call per definition and prove nothing.
+_REAL_FETCH_CANDIDATES = alternatives.fetch_candidates
 impact.alternatives.fetch_candidates = lambda *a, **k: []
 
 app = FastAPI()
@@ -1106,6 +1111,7 @@ def test_message_writer_exception_is_contained(monkeypatch):
 def test_llm_call_cap_is_respected(monkeypatch):
     """With the cap at 1 and two alerting journeys, one gets written text and both are pushed."""
     _reset_state()
+    _use_snapshot(SNAPSHOT_TWO_PAIRS)
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
     monkeypatch.setattr(varsel, "_MAX_LLM_CALLS_PER_CYCLE", 1)
@@ -1119,11 +1125,13 @@ def test_llm_call_cap_is_respected(monkeypatch):
     )
 
     _register("dev-first-0001")
-    # A DIFFERENT journey definition (so it does not share the first one's message cache), but one
-    # that still contains DEP. Hardcoding "06:00"-"23:00" here made the test fail whenever it ran
-    # after ~21:00 Europe/Oslo, since DEP is now+2h: a latent CI landmine, not a real assertion.
-    _register("dev-second-002", begin="00:01", end="23:59")
-    varsel.check_and_notify(SNAPSHOT)
+    # A DIFFERENT PLACE PAIR, which since KTD9 (2026-09-12) is what "does not share the first one's
+    # message cache" means. A second WINDOW on the same corridor used to be a second cache entry and
+    # is now the same one -- so written under it this read "one call, two identical bodies", which
+    # is the sharing working rather than the cap. The same train serves both pairs
+    # (`SNAPSHOT_TWO_PAIRS`), so the cap still has two candidates to choose between.
+    _register("dev-second-002", to_stop="C", to_name="Hamar")
+    varsel.check_and_notify(SNAPSHOT_TWO_PAIRS)
 
     assert len(written) == 1, "the cap must bound written messages per cycle"
     assert len(sent) == 2, "both journeys are still pushed"
@@ -1370,8 +1378,11 @@ def test_a_message_written_about_another_train_is_not_shown(monkeypatch):
     assert len(varsel._messages) == 1
     stale_key = next(iter(varsel._messages))
 
-    # Same journey, same situation, a LATER train: the cached text must not be attached to it.
-    later = stale_key[0], stale_key[1], "2099-01-01T06:00:00+00:00"
+    # Same pair, same situation, a LATER train: the cached text must not be attached to it. Slot 2
+    # is the departure in KTD9's key; everything after it (cancelled, tomorrow, the alternative's
+    # identity, the prompt version) has to be carried across unchanged or the miss would be about
+    # the wrong element.
+    later = (*stale_key[:2], "2099-01-01T06:00:00+00:00", *stale_key[3:])
     varsel._messages[later] = varsel._messages.pop(stale_key)
     r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
     alerts = r.json()["journeys"][0]["alerts"]
@@ -1386,10 +1397,8 @@ def test_a_departed_alternative_is_not_offered(monkeypatch):
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     _register(DEVICE)
     varsel.check_and_notify(SNAPSHOT)
-    key = varsel._message_key(
-        varsel.journey_key(next(iter(varsel._journeys.values()))),
-        varsel.match_journey(next(iter(varsel._journeys.values())))[0],
-    )
+    journey = next(iter(varsel._journeys.values()))
+    key = varsel._subject_key(varsel._pair(journey), varsel.match_journey(journey)[0])
     gone = alternatives.AlternativeJourney(
         departure_time=datetime.now(UTC) - timedelta(hours=1),
         arrival_time=datetime.now(UTC) - timedelta(minutes=20),
@@ -1916,7 +1925,7 @@ def test_the_pushed_mark_is_keyed_per_departure_not_per_situation(monkeypatch):
         {key: journey},
         {key: [first, second]},
         [(jid, journey)],
-        {varsel._message_key(key, first)},
+        {varsel._decision_key(key, first)},
         {},
         push_on=True,
     )
@@ -1961,7 +1970,7 @@ def _decide(key, journey, jid, alerts, *, now, pushed=()):
         {key: journey},
         {key: list(alerts)},
         [(jid, journey)],
-        {varsel._message_key(key, a) for a in pushed},
+        {varsel._decision_key(key, a) for a in pushed},
         {},
         push_on=True,
         now=now,
@@ -4781,9 +4790,11 @@ def test_the_webhook_wording_gate_is_the_webhook_switch_not_varsel_llm_enabled(m
 def test_a_confirmed_cancellation_never_carries_the_wording_written_before_it(monkeypatch):
     """The cancellation title over the pre-cancellation body, and why the cache cannot notice.
 
-    `_message_key` is (journey_key, situation_number, departure) and carries no `cancelled` flag, so
-    a wording written while the train was merely at risk shares one cache entry with the reading
-    taken after ET declared it gone. The TITLE is rebuilt from this cycle's `message_input`
+`_message_key` carried no `cancelled` flag until KTD9 (2026-09-12), so
+    a wording written while the train was merely at risk shared one cache entry with the reading
+    taken after ET declared it gone. Both halves of that are closed now — the flag is in the key,
+    AND `_subjects_for_key` still refuses the cache outright — and this is what says so. The TITLE
+    is rebuilt from this cycle's `message_input`
     (`innstilt: True`), the BODY is the cached string — so the notification event read «Tog L1 07:18 er
     innstilt» over «91 % sjanse for innstilling, typisk 15-27 min forsinket», beside
     `delay: null`, `effect: "cancelled"` and `probabilities.cancellation: 1.0` in the same payload.
@@ -5047,18 +5058,22 @@ def test_the_cached_wording_and_alternative_are_read_for_a_registered_definition
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
     monkeypatch.setattr(varsel, "_write_message", lambda *a, **k: "Toget er innstilt.")
     _register(DEVICE)
-    varsel.check_and_notify(SNAPSHOT)
     journey = next(iter(varsel._journeys.values()))
-    key = varsel.journey_key(journey)
+    pair = varsel._pair(journey)
     alert = varsel.match_journey(journey)[0]
-    message_key = varsel._message_key(key, alert)
-    assert varsel._messages.get(message_key) == "Toget er innstilt.", "control: the pass cached it"
+    # Seeded BEFORE the pass, because since KTD9 the alternative is part of the wording key: the
+    # pass then writes its wording under the key naming this advice, which is the key the read
+    # derives. Injected afterwards it would be a different key and the read would correctly find
+    # no wording -- a true answer to a question this test is not asking.
     alternative = alternatives.AlternativeJourney(
         departure_time=DEP + timedelta(minutes=20),
         arrival_time=DEP + timedelta(minutes=50),
         duration_min=30, minutes_saved=10, legs=[],
     )
-    varsel._alternatives[message_key] = alternative
+    varsel._alternatives[varsel._subject_key(pair, alert)] = alternative
+    varsel.check_and_notify(SNAPSHOT)
+    message_key = varsel._message_key(pair, alert)
+    assert varsel._messages.get(message_key) == "Toget er innstilt.", "control: the pass cached it"
 
     def unchanged(call):
         messages, alts = dict(varsel._messages), dict(varsel._alternatives)
@@ -5066,19 +5081,17 @@ def test_the_cached_wording_and_alternative_are_read_for_a_registered_definition
         assert varsel._messages == messages and varsel._alternatives == alts, "the read wrote"
         return result
 
-    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, alert, enabled=True))
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(pair, alert, enabled=True))
     assert got == ("Toget er innstilt.", alternative)
 
     cancelled = alert.model_copy(update={"cancelled": True})
-    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, cancelled, enabled=True))
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(pair, cancelled, enabled=True))
     assert got == (None, alternative), "no wording for a declared cancellation, still the alternative"
 
-    got = unchanged(lambda: varsel.cached_wording_and_alternative(key, alert, enabled=False))
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(pair, alert, enabled=False))
     assert got == (None, alternative), "the delivery gate withholds the wording only"
 
-    got = unchanged(
-        lambda: varsel.cached_wording_and_alternative("X|Y|07:00|09:00|0", alert, enabled=True)
-    )
+    got = unchanged(lambda: varsel.cached_wording_and_alternative(("X", "Y"), alert, enabled=True))
     assert got == (None, None)
 
 
@@ -5254,6 +5267,560 @@ def test_a_broken_heartbeat_seam_never_takes_the_cycle(monkeypatch):
             impact_provider=varsel._impact_provider, stops_provider=varsel._stops_provider
         )
     assert outcome is not None, "the pass died on its own heartbeat"
+
+
+# ---- U3: one wording and one alternative lookup per (place pair, train) -------------------------
+#
+# KTD9. Until 2026-09-12 every cache here was keyed on the journey DEFINITION
+# (`from|to|begin|end|days`), so two commuters on one corridor with different windows paid two
+# backend calls for one train and could be shown two different sentences about it. The key is now
+# the PAIR plus what the wording actually states, which is `notification_pull`'s own shape — moved
+# into `notification_wording` so both modules import it from a leaf and `varsel` never depends on
+# the read.
+
+# Train `t1` also calls C, so one departure serves two pairs (A→B and A→C). That is the other
+# direction of the same risk: a key shared too widely shows one trip another trip's text.
+SNAPSHOT_TWO_PAIRS = {
+    "S1": [
+        *SNAPSHOT["S1"],
+        FakeCall("t1", "C", 7, None, aimed_arr=DEP + timedelta(minutes=70)),
+    ]
+}
+
+
+# `alternatives.fetch_candidates` refuses a ref that is not NSR-shaped before it reaches the cache
+# (the refs are spliced into a GraphQL document), so the Journey Planner pin below cannot use the
+# suite's "A"/"B" placeholders.
+NSR_FROM = "NSR:StopPlace:337"
+NSR_TO = "NSR:StopPlace:418"
+SNAPSHOT_NSR = {
+    "S1": [
+        FakeCall("t9", NSR_FROM, 1, DEP, p_cancel=0.82, p_impact_dep=0.9),
+        FakeCall("t9", NSR_TO, 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+    ]
+}
+
+
+def _pair_definitions(
+    n: int, *, from_stop: str = "A", to_stop: str = "B", prefix: str = "pair"
+) -> list[str]:
+    """`n` distinct definitions on ONE pair, each with its own window, straight into the store.
+
+    `_seed_definitions`' shape, but returning the keys and taking the destination, because every
+    scenario below is about what two definitions on one pair share and what two pairs do not.
+    """
+    keys = []
+    for i in range(n):
+        device = f"{DEVICE}-{prefix}-{i:03d}"
+        varsel._devices[device] = {
+            "subscription": SUBSCRIPTION, "created_ts": "2026-01-01T00:00:00+00:00"
+        }
+        record = {
+            "device_id": device, "from_stop": from_stop, "to_stop": to_stop,
+            "begin": f"{i:02d}:00", "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6], "created_ts": "2026-01-01T00:00:00+00:00",
+        }
+        varsel._journeys[f"{prefix}-{i:03d}"] = record
+        keys.append(varsel.journey_key(record))
+    return keys
+
+
+def test_two_definitions_on_one_pair_share_one_wording(monkeypatch):
+    """KTD9's headline: one backend call per (pair, train), and both cards read the same sentence.
+
+    Two registrations of the SAME corridor with different windows — the ordinary shape of a
+    commuter corridor, and the one that multiplies at 100 000 subscriptions. Before this the two
+    were separate `_messages` keys, so the pair cost two Vertex calls per disrupted train and the
+    two travellers could be shown two different sentences about one departure.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: written.append(1) or f"Melding {len(written)}.",
+    )
+    _pair_definitions(2)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, f"one train on one pair must cost one call, not {len(written)}"
+    texts = set()
+    for jid in varsel._journeys:
+        model = varsel._journey_model(jid, varsel._journeys[jid])
+        texts.update(a.message for a in model.alerts)
+    assert texts == {"Melding 1."}, f"both cards must read the shared wording, got {texts}"
+
+
+def test_the_same_train_on_two_pairs_is_worded_twice(monkeypatch):
+    """The other direction: the key must not be so wide that two trips share one sentence.
+
+    One departure legitimately serves several corridors — the advice names the traveller's own
+    origin and destination, so A→B and A→C are two wordings about one train and always were.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda alert, **kw: written.append(1) or "Skrevet."
+    )
+    _use_snapshot(SNAPSHOT_TWO_PAIRS)
+    _pair_definitions(1, to_stop="B", prefix="to-b")
+    _pair_definitions(1, to_stop="C", prefix="to-c")
+
+    varsel.check_and_notify(SNAPSHOT_TWO_PAIRS)
+
+    assert len(written) == 2, f"two pairs is two wordings, got {len(written)}"
+
+
+def test_a_rejected_reply_retires_the_pair_and_not_each_definition(monkeypatch):
+    """`_message_attempts` is the pair's budget now, so a second definition does not re-ask.
+
+    The give-up rule exists because a payload the writer cannot handle fails again on every tick
+    for the situation's 12 h life. Keyed per definition, a corridor with 500 registrations would
+    spend 500 × `_MAX_MESSAGE_ATTEMPTS` calls learning one thing.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    attempts = []
+
+    def rejected(alert, *, outcome=None, **kw):
+        attempts.append(1)
+        if outcome is not None:
+            outcome["status"] = "rejected"
+
+    monkeypatch.setattr(varsel, "_write_message", rejected)
+    _pair_definitions(3)
+
+    for _ in range(8):
+        varsel.check_and_notify(SNAPSHOT)
+
+    assert len(attempts) == varsel._MAX_MESSAGE_ATTEMPTS, (
+        f"the pair's budget is {varsel._MAX_MESSAGE_ATTEMPTS} attempts, "
+        f"{len(attempts)} were spent"
+    )
+
+
+def test_a_cycle_that_establishes_no_alternative_does_not_rewrite_the_wording(monkeypatch):
+    """REGRESSION GUARD, and the one the new key most easily breaks.
+
+    The alternative is part of the key (a wording quotes a specific replacement train), and the
+    alternative that belongs in it is the EFFECTIVE one — the cached answer — not the fresh alert's
+    field. A lookup is skipped on most cycles (the impact gate, the 6 h horizon,
+    `impact._MAX_ALTERNATIVE_LOOKUPS`, a Journey Planner outage), and `_reconcile_caches` keeps the
+    cached answer through that silence precisely so the card does not flap. Keying on the raw field
+    would make every silent cycle a cache miss: one backend call per alerting train per cycle, for
+    text that is already written.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel, "_write_message", lambda alert, **kw: written.append(1) or "Ta R10 kl 08:14."
+    )
+    offered = alternatives.AlternativeJourney(
+        departure_time=DEP.astimezone(UTC) + timedelta(minutes=10),
+        arrival_time=DEP.astimezone(UTC) + timedelta(minutes=45),
+        duration_min=35, minutes_saved=5, legs=[],
+    )
+    real = varsel.match_journey
+
+    def with_alternative(journey, now=None, **kw):
+        alerts = real(journey, now, **kw) if now is not None else real(journey, **kw)
+        for alert in alerts:
+            alert.alternative_journey = offered
+        return alerts
+
+    monkeypatch.setattr(varsel, "match_journey", with_alternative)
+    _pair_definitions(1)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(written) == 1, "the first cycle writes once"
+
+    # The lookup is skipped this cycle: the alert carries no alternative, and the cache keeps the
+    # one it found. Nothing about the advice has changed, so nothing may be re-written.
+    monkeypatch.setattr(varsel, "match_journey", real)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(written) == 1, (
+        f"a cycle that established no alternative re-wrote the wording ({len(written)} calls)"
+    )
+
+
+def test_varsel_does_not_import_the_pull_read(monkeypatch):
+    """The plan's stop condition, checked over the module's identifiers.
+
+    The key shape is shared, and the obvious way to share it is for whichever module got it second
+    to import the first. `notification_pull` imports `varsel` (it reads the poller's caches), so
+    the reverse would be a cycle, and `varsel` would gain the read's limiter, its executor and its
+    caches on the ingestion thread. The shape both use lives in `notification_wording`, a leaf.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(varsel))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "notification_pull" not in imported, "varsel must not depend on the pull read"
+    assert "notification_wording" in imported, "the shared key shape comes from the leaf module"
+    assert varsel._message_key.__module__ == "varsel"
+
+    import notification_wording
+
+    assert callable(notification_wording.wording_key), "the shape is the leaf module's to own"
+
+
+def test_a_webhook_only_pair_is_worded_once_under_the_webhook_policy(monkeypatch):
+    """Two client subscriptions on one pair cost one wording, and it is NOT the browser's.
+
+    R16. The new key names no definition, so a shared call could put a client route's origin and
+    destination into the browser policy's prompt/reply DEBUG record — which dev writes
+    (`VARSEL_LLM_LOG_PROMPTS=true`). `notification_wording.WEBHOOK` suppresses that record in code,
+    and the discriminator is now the PAIR: the webhook policy unless a browser registration on the
+    pair contributed this train.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(
+        monkeypatch,
+        [
+            {**WEBHOOK_DOC_ROUTED, "recipient_id": "sub-0001", "begin": "00:00"},
+            {**WEBHOOK_DOC_ROUTED, "recipient_id": "sub-0002", "subscription_id": "sub-0002",
+             "begin": "01:00"},
+        ],
+    )
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, f"one pair, one train, one wording — got {len(written)}"
+    # `_capture_writes` records the browser writer's `journey_key` and the webhook writer's
+    # `subject_id`; only the webhook one ran, so nothing here came off `varsel._write_message`.
+    assert varsel._messages, "the shared wording must be cached under the pair's key"
+
+
+def test_a_browser_registration_on_the_pair_keeps_the_shared_call_on_the_browser_policy(monkeypatch):
+    """The other half of the same rule, and the half that must NOT change.
+
+    A definition a browser registration holds is written for by `varsel._write_message` today, and
+    a webhook subscription on the same PAIR (a different window, so a different definition) must
+    not move it to the client policy — the card reads that wording, and the prompt record for a
+    route a browser registration holds would exist with no webhook channel at all.
+    """
+    import notification_wording
+
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    browser_calls = []
+    client_calls = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: browser_calls.append(1) or "Skrevet av modellen.",
+    )
+
+    def webhook_write(route, facts, *, subject_id="", message_input=None, **_):
+        client_calls.append(subject_id)
+        return notification_wording.Wording(
+            title="t", body="b", source="llm", status="ok", message_input=message_input or {}
+        )
+
+    monkeypatch.setattr(notification_wording, "write_wording", webhook_write)
+    _pair_definitions(1, prefix="browser")  # begin 00:00
+    _use_notification_store(
+        monkeypatch, [{**WEBHOOK_DOC_ROUTED, "begin": "05:00"}]  # same pair, its own window
+    )
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(browser_calls) == 1, f"the browser writer ran {len(browser_calls)} times"
+    assert client_calls == [], "a browser registration on the pair owns the wording"
+
+
+def test_five_definitions_on_one_pair_issue_one_journey_planner_lookup(monkeypatch):
+    """PINS TODAY'S SHARING rather than adding a memo (KTD9).
+
+    `alternatives._cache` keys on (from, to, arrive-by, anchor) with a 10-minute TTL and
+    cross-thread single-flight, and the anchor for the in-time tier is the disrupted train's own
+    AIMED arrival — stable across definitions and across cycles. So five definitions on one pair
+    asking about one train already spend one outbound call, and this is what says so if a future
+    change to the key or the anchor quietly makes it five.
+
+    Driven through the REAL `fetch_candidates`: the suite stubs that function wholesale (it would
+    otherwise open a socket), and a stub there sits ABOVE the cache, so the pin would count five
+    and prove nothing. The HTTP call underneath it is what is counted instead.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_write_message", lambda alert, **kw: None)
+    fetches = []
+    monkeypatch.setattr(
+        alternatives, "_fetch_trip_patterns",
+        lambda *a, **k: fetches.append(1) or [],
+    )
+    monkeypatch.setattr(impact.alternatives, "fetch_candidates", _REAL_FETCH_CANDIDATES)
+    alternatives._cache._entries.clear()
+    alternatives._cache._failed_at.clear()
+    alternatives._fetch_calls[alternatives._POLLER_PATH] = []
+    _use_snapshot(SNAPSHOT_NSR)
+    _pair_definitions(5, from_stop=NSR_FROM, to_stop=NSR_TO)
+
+    varsel.check_and_notify(SNAPSHOT_NSR)
+
+    assert fetches, "the lookup never ran; the pin proves nothing"
+    assert len(fetches) <= 2, (
+        f"five definitions on one pair issued {len(fetches)} Journey Planner lookups; the "
+        "in-time query and its fallback are the two a single train may cost"
+    )
+
+
+def test_the_written_wordings_are_capped_per_pair_and_not_per_definition(monkeypatch):
+    """`_MAX_MESSAGES_PER_JOURNEY` is a PAIR's cap now.
+
+    Per definition it multiplied by the number of registrations on a corridor, which is exactly
+    the number this plan is scaling. Two disrupted trains, two definitions, a cap of one: one
+    wording, for the soonest departure.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "_MAX_MESSAGES_PER_JOURNEY", 1)
+    _use_snapshot(SNAPSHOT_TWO_DISRUPTED)
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: written.append(alert.situation_number) or "Skrevet.",
+    )
+    _pair_definitions(2)
+
+    varsel.check_and_notify(SNAPSHOT_TWO_DISRUPTED)
+
+    assert written == ["S1"], (
+        f"the pair's single write slot went to {written} rather than to the soonest departure"
+    )
+
+
+def _llm_log_fields(call):
+    """The `extra={"fields": ...}` bodies a call emitted from `llm_message`, DEBUG included.
+
+    `test_notification_wording._llm_log_fields`' shape, restated here for its own reason: importing
+    that suite would run its import-time environment pinning inside this process, and the two files
+    pin different things.
+    """
+    import llm_message
+
+    class _Collect(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.records = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _Collect()
+    logger = llm_message.logger
+    previous = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        call()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+    return [r.fields for r in handler.records if isinstance(getattr(r, "fields", None), dict)]
+
+
+def _real_wording_backend(monkeypatch, prose="Toget er innstilt."):
+    """Drive the REAL `notification_wording.write_wording` with only the model call stubbed.
+
+    Every other webhook assertion in this suite stubs `write_wording` wholesale (`_capture_writes`),
+    which is right for counting calls and useless for the question below: a stub cannot emit the
+    record the policy exists to suppress. Here the policy runs for real and only
+    `llm_message._BACKENDS` is replaced, which is where the network would be.
+    """
+    import llm_message
+
+    monkeypatch.setattr(llm_message, "_PROVIDER", "claude")
+    monkeypatch.setattr(llm_message, "_ENABLED", True)
+    monkeypatch.setattr(llm_message, "_LOG_PROMPTS", True)  # dev's own setting
+    monkeypatch.setattr(llm_message, "_STATE", llm_message._LatchState())
+    # The whole dict, not one entry: this suite's `_MonkeyPatch` is a `setattr`/`undo` shim with no
+    # `setitem`, and reaching for pytest's would make the file unrunnable as
+    # `python test_varsel_api.py`, which is how CI runs it. `_call_backend` reads the module global
+    # on every call, so rebinding it is the same thing and it is restored by `undo`.
+    monkeypatch.setattr(
+        llm_message,
+        "_BACKENDS",
+        {**llm_message._BACKENDS, "claude": lambda body: json.dumps({"melding": prose})},
+    )
+
+
+def test_a_pair_no_browser_registration_holds_writes_no_prompt_record(monkeypatch):
+    """R16, and the one thing the pair-shaped key could have broken silently.
+
+    The wording key names no definition, so "which policy writes for this train?" had to be re-asked
+    of the PAIR. Answered wrongly — browser whenever any definition on the corridor wants the train
+    — a client-only route's origin, destination and departure time would reach the prompt/reply DEBUG
+    record, which dev writes (`VARSEL_LLM_LOG_PROMPTS=true`). `notification_wording.WEBHOOK`
+    suppresses that record in code and drops `message` from the INFO record.
+
+    Driven through the REAL `write_wording` with only the model call stubbed, because a stubbed
+    writer cannot emit the record this is about: the wholesale stub every other webhook test here
+    uses would pass with the policy wired to anything at all.
+    """
+    import notification_wording
+
+    _reset_state()
+    _real_wording_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    # BOTH, and they are not the same switch. The module function is what the cycle reads to decide
+    # whether an event carries model prose; `WEBHOOK.deliver` was bound to the ORIGINAL function at
+    # construction, so the policy's own first bound still reads the env-backed flag — and with it
+    # off `write_wording` answers with the template and asks no backend at all, which would make the
+    # assertions below vacuously true.
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    monkeypatch.setattr(notification_wording, "_WEBHOOK_DELIVERY_ENABLED", True)
+    _use_notification_store(
+        monkeypatch,
+        [
+            {**WEBHOOK_DOC_ROUTED, "begin": "00:00"},
+            {**WEBHOOK_DOC_ROUTED, "recipient_id": "sub-0002", "subscription_id": "sub-0002",
+             "begin": "01:00"},
+        ],
+    )
+
+    fields = _llm_log_fields(lambda: varsel.check_and_notify(SNAPSHOT))
+
+    # The leak first, so a wrong discriminator fails on the thing R16 is about rather than on a
+    # missing marker three lines later.
+    assert not [f for f in fields if f.get("event") == "llm_message_prompt"], (
+        "a client-only route's prompt reached the audit record"
+    )
+    assert not any("message_input" in f for f in fields)
+    assert not any("message" in f for f in fields), "the prose must not reach the log either"
+    written = [f for f in fields if f.get("event") == "llm_message"]
+    assert len(written) == 1, f"two client subscriptions on one pair, one call — got {len(written)}"
+    assert written[0].get("caller") == "webhook", written[0]
+
+
+def test_a_browser_registration_on_the_pair_keeps_the_pollers_own_prompt_record(monkeypatch):
+    """The discriminator proven from the other side, which is what stops the fix above being a
+    blanket suppression.
+
+    A route a browser registration holds is the poller's own traffic: the prompt record exists with
+    no webhook channel at all, `VARSEL_LLM_LOG_PROMPTS` is the flag it exists for, and R16 never
+    claimed otherwise. Losing it would take `/varsel` message debugging with it, silently.
+    """
+    import notification_wording
+
+    _reset_state()
+    _real_wording_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(notification_wording, "webhook_delivery_enabled", lambda: True)
+    _pair_definitions(1, prefix="browser")  # begin 00:00, same pair as the subscription below
+    _use_notification_store(monkeypatch, [{**WEBHOOK_DOC_ROUTED, "begin": "05:00"}])
+
+    fields = _llm_log_fields(lambda: varsel.check_and_notify(SNAPSHOT))
+
+    written = [f for f in fields if f.get("event") == "llm_message"]
+    assert len(written) == 1, f"one call between the two channels — got {len(written)}"
+    assert "caller" not in written[0], "the browser policy marks no caller"
+    assert [f for f in fields if f.get("event") == "llm_message_prompt"], (
+        "the poller's own debugging record went missing with the client suppression"
+    )
+
+
+def test_every_definition_on_the_pair_records_the_shared_wording(monkeypatch):
+    """The integration end of KTD9: one call, and every registration's ROW carries its text.
+
+    `message_llm` is what `/historikk` and `/meldinger` read as "what the model wrote for this
+    decision", and the decision is still per definition — so the shared wording has to reach every
+    row on the pair, not only the representative's. Keyed per definition it did so by writing the
+    text N times; keyed per pair it is written once and read N times, and this is what says the
+    read follows the write.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = []
+    monkeypatch.setattr(
+        varsel,
+        "_write_message",
+        lambda alert, **kw: written.append(1) or "Ta neste tog fra Oslo S.",
+    )
+    keys = _pair_definitions(3)
+
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(written) == 1, "control: one call for the corridor"
+    rows = [r for r in log.rows if r["situation_number"] == "S1"]
+    assert len(rows) == len(keys), f"one row per definition, got {len(rows)}"
+    assert {r["message_llm"] for r in rows} == {"Ta neste tog fra Oslo S."}, (
+        "a definition that did not pay for the wording still records it"
+    )
+    assert {r["message_source"] for r in rows} == {"llm"}
+
+
+class _CountingLock:
+    """A `_state_lock` stand-in that counts how many times it is TAKEN.
+
+    An RLock's `acquire` cannot be patched (it is a C type), so the counting has to happen in a
+    wrapper the module holds in place of the lock. Re-entrant like the real one, because
+    `_record_decisions` calls helpers that take it while it holds it.
+    """
+
+    def __init__(self, inner):
+        self.inner, self.takes = inner, 0
+
+    def __enter__(self):
+        self.takes += 1
+        return self.inner.__enter__()
+
+    def __exit__(self, *exc):
+        return self.inner.__exit__(*exc)
+
+    def acquire(self, *a, **kw):
+        self.takes += 1
+        return self.inner.acquire(*a, **kw)
+
+    def release(self):
+        return self.inner.release()
+
+
+def test_recording_a_cycles_decisions_takes_the_state_lock_a_constant_number_of_times(monkeypatch):
+    """U4's own rule, which KTD9's pair-keyed lookup is the obvious way to break.
+
+    `_record_decisions` snapshots `_messages` and `_message_meta` under ONE take deliberately —
+    "tens of thousands of lock acquisitions on the poller thread, each of which the request path can
+    be waiting behind". The wording key is derived from `_alternatives`, so deriving it inside the
+    alert loop puts the lock back one take per subject, at the grain that scales with the pilot. The
+    snapshot travels into `_message_key` instead.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _log_every_cycle(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    alerts = [
+        _alert(f"S{i}", DEP + timedelta(minutes=i), jkey=f"t{i}", p_impact=0.90)
+        for i in range(50)
+    ]
+
+    counting = _CountingLock(varsel._state_lock)
+    monkeypatch.setattr(varsel, "_state_lock", counting)
+    varsel._record_decisions(
+        {key: journey}, {key: alerts}, [(jid, journey)], set(), {}, push_on=True
+    )
+
+    assert len(log.rows) == 50, "control: every subject was recorded"
+    assert counting.takes <= 5, (
+        f"the lock was taken {counting.takes} times for 50 subjects; it is O(1) by design and "
+        "this is O(subjects)"
+    )
 
 
 if __name__ == "__main__":

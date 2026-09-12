@@ -303,6 +303,117 @@ def notification_title(
     return f"{train}: mulig avvik"
 
 
+# ---- What a wording is keyed on (KTD9) ----------------------------------------------------------
+#
+# One shape over two caches: the poller's (`varsel._messages`) and the journey-alert read's
+# (`notification_pull._wordings`), with a read-through order that never writes the poller's.
+# It lives here, in the leaf both import, because the alternative is a dependency between them --
+# and `notification_pull` already imports `varsel`, so the arrow could only point the wrong way.
+#
+# The unit is the PLACE PAIR and not the journey definition. What a wording says is a function of
+# the trip's two ends and of the disrupted train, never of the window or the weekday set a
+# particular commuter registered: `llm_message.build_message_input` reads `from_stop` and `to_stop`
+# off the definition and nothing else. Keyed per definition -- as `varsel` was until 2026-09-12 --
+# one corridor with five hundred registrations cost five hundred backend calls per disrupted train
+# and could show five hundred travellers five hundred different sentences about one departure.
+#
+# Every other element is something the wording STATES, so two keys that differ in one of them are
+# two different sentences and must not share an entry:
+#
+# * `situation_number` -- the operator's own text is quoted from it.
+# * the departure -- the wording names the train by its time; a message written at 06:05 about the
+#   07:52 headed the card above the 09:12 when the key carried only (journey, situation).
+# * `cancelled` -- a declared cancellation states a certainty and carries no delay figures, where a
+#   forecast hedges. Before this the two shared an entry and nothing forgot it in between.
+# * `tomorrow` -- «i morgen» is in the text (design review 2026-09-01, finding 48).
+# * the alternative's IDENTITY -- the replacement train is named with its departure time.
+# * the prompt version -- a reworded brief is a different writer.
+
+
+def alternative_identity(alt: Any) -> tuple:
+    """What makes two alternatives the same advice: everything a wording actually states.
+
+    Moved here from `varsel` on 2026-09-12 (KTD9) so the key above is one function rather than two
+    copies; duck-typed on an `alternatives.AlternativeJourney` exactly as everything else in this
+    module is duck-typed, so no import travels with it.
+
+    Not the whole model — both `*_prediction` blocks carry continuous probabilities re-scored
+    against the live prediction cache on every cycle, so comparing those would invalidate the
+    written message on nearly every tick, turning ``ok_cached`` into a per-cycle LLM call. That is
+    exactly what the per-cycle call and clock ceilings exist to prevent.
+
+    The two BOOLEANS are here, though, and the two times are not the whole story (2026-08-06).
+    `at_risk` and `arrives_before_original` are each stated out loud — "(kan også bli rammet)",
+    and the caveat that the traveller arrives later than they planned — so an alternative whose
+    times round the same but whose `at_risk` has flipped false → true is NOT the same advice. It
+    was treated as such: the cache stored the rescored journey and kept the message written when
+    the flag was false, so the cached text promised a clean escape that had stopped existing. They
+    cost nothing to include: a boolean flips at most once or twice in a situation's life, where a
+    probability moves every cycle, so this cannot reintroduce the flapping the minute-rounding
+    below exists to stop.
+
+    The times are compared AT THE MINUTE, for that same reason. Both are Journey Planner *expected*
+    times carried at second precision, while every wording renders ``%H:%M``: a realtime nudge from
+    08:24:12 to 08:24:41 changed the identity, dropped the message and spent an LLM call to produce
+    byte-identical prose — roughly every other cycle per alerting journey, out of a budget of 8.
+    The resolution of the comparison has to be the resolution of the advice.
+    """
+    def minute(ts: datetime | None) -> datetime | None:
+        return ts.replace(second=0, microsecond=0) if ts is not None else None
+
+    return (
+        minute(getattr(alt, "departure_time", None)),
+        minute(getattr(alt, "arrival_time", None)),
+        getattr(alt, "at_risk", None),
+        getattr(alt, "arrives_before_original", None),
+    )
+
+
+def prompt_version() -> str:
+    """`llm_message.PROMPT_VERSION`, or an empty marker on a deploy without the Vertex dependencies
+    — a wording is then never written anyway, so nothing is keyed wrongly.
+
+    A local import, like every other reach for that module from here: this runs on the poller
+    thread and on the read's own pool, and an ImportError there must cost a cache key rather than
+    a notification.
+    """
+    try:
+        import llm_message
+
+        return llm_message.PROMPT_VERSION
+    except ImportError:
+        return ""
+
+
+def wording_key(
+    pair: tuple[str, str], winner: Any, alternative: Any, *, tomorrow: bool
+) -> tuple:
+    """The cache key for one wording — see the block above for what each element is doing there.
+
+    `winner` is the alert the wording is about, duck-typed. `alternative` is the one the wording
+    would name, or `None`; the caller decides WHICH alternative that is, and the two callers
+    deliberately differ — the read passes the answer its own per-train cache holds, and the poller
+    passes the EFFECTIVE one from `varsel._alternatives`, which is the cached answer rather than
+    this cycle's raw field. That distinction is load-bearing on the poller side: a lookup is
+    skipped on most cycles, and keying on the raw field would make every silent cycle a miss and
+    re-write text that is already written.
+
+    `tomorrow` is passed rather than read off the message input, so a caller that has no input
+    (the in-app card reads the cache with nothing but the alert) derives the same key as the pass
+    that wrote it.
+    """
+    departure = getattr(winner, "departure_time", None)
+    return (
+        tuple(pair),
+        getattr(winner, "situation_number", None),
+        departure.isoformat() if departure is not None else "",
+        bool(getattr(winner, "cancelled", False)),
+        bool(tomorrow),
+        alternative_identity(alternative) if alternative is not None else None,
+        prompt_version(),
+    )
+
+
 # ---- The typed message input --------------------------------------------------------------------
 # `llm_message.build_message_input` is duck-typed on purpose: it reads an `/impact` response and a
 # `varsel.Alert` through `getattr` so it imports neither `main` nor `varsel`. That is exactly what

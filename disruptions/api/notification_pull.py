@@ -597,15 +597,9 @@ def _message_input(definition: dict, alert: varsel.Alert, now: datetime) -> dict
         return varsel._message_input_from_alert(alert)
 
 
-def _prompt_version() -> str:
-    """`llm_message.PROMPT_VERSION`, or an empty marker on a deploy without the Vertex dependencies
-    -- a wording is then never written anyway, so nothing is keyed wrongly."""
-    try:
-        import llm_message
-
-        return llm_message.PROMPT_VERSION
-    except ImportError:
-        return ""
+#: `llm_message.PROMPT_VERSION`, through the leaf module both surfaces key on (KTD9). Kept as a
+#: module-level name because the log record and the cache key both read it here.
+_prompt_version = notification_wording.prompt_version
 
 
 # ---- The enrichment caches (KTD3, phase 2) -----------------------------------------------------
@@ -672,14 +666,15 @@ def _alternative_key(pair: tuple[str, str], train_key: tuple) -> tuple:
 
 
 def _wording_key(pair: tuple[str, str], winner: varsel.Alert, alt, message_input: dict) -> tuple:
-    return (
-        pair,
-        winner.situation_number,
-        winner.departure_time.isoformat() if winner.departure_time else "",
-        bool(winner.cancelled),
-        bool(message_input.get("i_morgen")),
-        varsel._alternative_identity(alt) if alt is not None else None,
-        _prompt_version(),
+    """KTD9's key, built by `notification_wording` so the poller and this read cannot drift apart.
+
+    Kept as a thin local name rather than inlining the call at four sites: this module's caches,
+    its eviction sweep and its tests all speak of "the wording key", and the `i_morgen` term is
+    read off the input HERE while the poller derives it from its own clock — same answer, two
+    callers that hold different things.
+    """
+    return notification_wording.wording_key(
+        pair, winner, alt, tomorrow=bool(message_input.get("i_morgen"))
     )
 
 
@@ -806,7 +801,10 @@ def _entry_state(
     for this read, with its key still set so a later task words it once it moves under the cap;
     under it, `pending`, which is what tells the route a task is owed.
     """
-    text, poller_alt = varsel.cached_wording_and_alternative(journey_key, entry.winner, enabled=enabled)
+    # Keyed on the PAIR, not the definition (KTD9, 2026-09-12) -- the same shape this module's own
+    # caches use, and the whole reason the poller's entry is findable at all: the pass may have
+    # worded this train for a NEIGHBOUR's registration of the corridor, with a different window.
+    text, poller_alt = varsel.cached_wording_and_alternative(pair, entry.winner, enabled=enabled)
     if text:
         alt = poller_alt if varsel._still_catchable(poller_alt, now) else None
         winner = _enriched(entry.winner, alt)

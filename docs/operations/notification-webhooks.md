@@ -644,6 +644,34 @@ touches the wire contract, which is why the pilot could ship without them.
    aggregation over an `expires_at` inequality (a new composite index), so the quota a very large
    client needs is unlocked by this item, not by `set-quotas` alone.
 
+### What a bad morning is worded by, and what carries the template
+
+One wording and one Journey Planner lookup are produced per **(place pair, disrupted train)** rather
+than per journey definition (KTD9, 2026-09-12). What a notification says is a function of the trip's
+two ends and of the train — never of the window or weekday set one commuter registered — so a
+corridor with five hundred registrations costs one model call per disrupted train, every traveller
+on it reads the same sentence, and the cost of the writing pass stops scaling with subscriptions.
+`_MAX_MESSAGES_PER_JOURNEY` (3) is therefore a **pair's** cap now, spent on the soonest departures
+on that pair; it used to be a definition's, where it multiplied by the number of registrations.
+
+What still binds on a bad morning is the clock, and the arithmetic is worth stating rather than
+discovering: the writing pass reserves `_MAX_LLM_SECONDS_PER_CYCLE` (30 s) across
+`varsel._LLM_WORKERS` (16) at roughly 2.2 s per Gemini call. So the ceiling is **64 trains a cycle
+as configured today — the count cap, `_MAX_LLM_CALLS_PER_CYCLE`, which at ~9 s of wall clock binds
+long before the 30 s does — and about 200 if that count is ever raised to meet the clock**. Every
+train past whichever binds carries the deterministic template, which is a complete, correct
+notification naming the train, the route and the figures, not a degraded one. Raising one without
+the other only makes the poller block longer: the two are one limit wearing two names. Trains that take the template are
+recorded `message_status = 'capped'` or `'not_selected'`, so what the ceiling costs stays countable.
+
+Two consequences a reader of the logs should expect. `message_status` values shift across
+2026-09-12: a train written for because a *sibling* definition on the same corridor needed it now
+records `ok`/`ok_cached` where it recorded `not_selected`, so a rate computed across that date is
+measuring two different groupings. And the LLM audit record is one per (pair, train) rather than one
+per definition, carrying the `journey_digest` of the definition that caused the call — so a join
+from `varsel_decisions.journey_digest` to that record now resolves for one definition on the pair
+and, correctly, for none of the others: they were served a wording they did not pay for.
+
 ### Capacity measurements
 
 Every capacity claim in `docs/plans/2026-09-11-002-feat-scale-to-100k-commuters-plan.md` is gated on
