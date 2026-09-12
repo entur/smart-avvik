@@ -58,6 +58,10 @@ api = [
     "opentelemetry-exporter-otlp-proto-grpc>=1.44.0",
     "opentelemetry-instrumentation-fastapi>=0.65b0",
     "opentelemetry-instrumentation-requests>=0.65b0",
+    # Thread-pool context propagation, so worker spans join the cycle's trace instead of becoming
+    # sampled roots. Optional at runtime (its own guard inside setup()), listed here so a plain
+    # `uv sync` can run test_tracing_setup.py's propagation check.
+    "opentelemetry-instrumentation-threading>=0.65b0",
 ]
 
 [tool.uv]

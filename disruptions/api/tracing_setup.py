@@ -28,6 +28,8 @@ and a global provider is set, which is why main imports this module before it bu
 
 import logging
 import os
+import time
+from contextlib import contextmanager
 from urllib.parse import urlsplit, urlunsplit
 
 from opentelemetry import trace
@@ -63,6 +65,36 @@ _PUSH_HOSTS_ON_GOOGLE = frozenset({"fcm.googleapis.com"})
 #: diagnosable) while dropping the only part of it that identifies a person (R15b).
 _ID_BEARING_SEGMENTS = frozenset({"devices", "journeys", "subscriptions"})
 _REDACTED_SEGMENT = "<redacted>"
+
+#: The CLOSED vocabulary of span-attribute names, and the whole of the span-attribute rule.
+#:
+#: The repo's existing redaction requirement covers LOG LINES. A span is not a log line and is not
+#: covered by it, while it is exported to Cloud Trace — where project IAM is the only gate — and is
+#: opened in exactly the places the journey data lives: `varsel`'s sub-passes and the store's
+#: Firestore calls. So the rule `metrics.py` states for label values is restated here and applies
+#: to both halves of an attribute: **the NAME must be in this set and the VALUE must be a number
+#: or a bool**. Counts and timings, nothing else — never a stop ref, a place name, a departure
+#: time, a callback URL, a client or subscription id, or any prose.
+#:
+#: A bounded string is not an exception to make: the span's NAME is already a literal from a closed
+#: set at each call site, which is where "which pass is this" belongs. Adding a string-valued
+#: attribute here would also mint a Cloud Trace filter dimension per distinct value, which is the
+#: unbounded-cardinality half of the same rule.
+SPAN_ATTRIBUTE_NAMES = frozenset(
+    {
+        # varsel's sub-passes (R16): how many of each thing the pass carried.
+        "definitions",
+        "matched",
+        "queued",
+        "recipients",
+        "registrations",
+        "workers",
+        # Set by `measure=True` at close, never by a caller: what the span cost the one
+        # interpreter (KTD2 sizes the widened emit pass in interpreter ms per transaction).
+        "cpu_ms",
+        "wall_ms",
+    }
+)
 
 _enabled = False
 
@@ -184,6 +216,46 @@ def _default_exporter():
     return OTLPSpanExporter(credentials=channel_creds, endpoint=_ENDPOINT)
 
 
+def _threading_instrumented() -> bool:
+    """Is the thread-pool context propagation installed? False when the distribution is absent."""
+    try:
+        from opentelemetry.instrumentation.threading import ThreadingInstrumentor
+    except ImportError:
+        return False
+    return bool(ThreadingInstrumentor().is_instrumented_by_opentelemetry)
+
+
+def _instrument_threading() -> None:
+    """Carry the current OTel context into ``Thread`` and ``ThreadPoolExecutor`` workers.
+
+    Why it is needed: `varsel.check_and_notify` runs three pools (16 matchers, 16 wording writers,
+    32 push senders) and a ThreadPoolExecutor propagates no contextvars, which is where the OTel
+    context lives. Without this, every span created in a worker — the Journey Planner and Vertex
+    calls the `requests` instrumentation opens, and varsel's own sub-pass children — is an
+    independently sampled ROOT span. The trace then shows the pass and nothing underneath it, which
+    is precisely the question a capacity run is asking.
+
+    Its OWN nested guard, not folded into :func:`setup`'s one try/except, and the failure direction
+    is the reason: this is an optional extra, and an ImportError caught by that outer handler would
+    flip ``_enabled`` to False and cost the deployment every span it already had, to lose an
+    optimisation. Anything that goes wrong here logs once and leaves tracing on.
+
+    Note what it does: a process-wide monkeypatch of ``threading.Thread.start`` and
+    ``ThreadPoolExecutor.submit``. It runs only inside the TRACING_ENABLED gate.
+    """
+    try:
+        from opentelemetry.instrumentation.threading import ThreadingInstrumentor
+
+        ThreadingInstrumentor().instrument()
+    except Exception as exc:  # noqa: BLE001 - an optional extra must never disable tracing
+        logger.warning(
+            "Tracing: thread-pool context propagation unavailable (%s); worker spans will be "
+            "separate traces",
+            exc,
+            extra={"fields": {"event": "tracing_threading_unavailable", "reason": str(exc)}},
+        )
+
+
 def setup(exporter_factory=None) -> None:
     """Install the SDK tracer provider when ``TRACING_ENABLED`` is truthy; otherwise do nothing.
 
@@ -229,6 +301,7 @@ def setup(exporter_factory=None) -> None:
         from opentelemetry.instrumentation.requests import RequestsInstrumentor
 
         RequestsInstrumentor().instrument(request_hook=_requests_request_hook)
+        _instrument_threading()
         # LAST, after the final fallible step, which is what makes the docstring's promise true.
         # Set before the instrumentor — as it was — a contrib/SDK mismatch that made `instrument`
         # raise left the provider installed and its BatchSpanProcessor exporting poller and
@@ -258,7 +331,55 @@ def setup(exporter_factory=None) -> None:
         )
 
 
-def span(name: str):
+def safe_attributes(attributes) -> dict:
+    """``attributes`` reduced to what :data:`SPAN_ATTRIBUTE_NAMES` allows — a FILTER, never a raise.
+
+    The collapse-to-``other`` shape `metrics.HTTPMetrics` uses, for the same reason: this runs on
+    the poller thread inside the alerting pass, and an instrumentation exception there would take
+    a cycle's alerting with it. So an unknown name or a non-numeric value is dropped silently.
+
+    Silent dropping is the right failure and useless as feedback — an attribute that never arrives
+    looks exactly like a span nobody instrumented — which is why `test_tracing_setup` reads the two
+    instrumented modules' source and fails on a name this set does not carry.
+
+    ``bool`` passes the ``int`` check (it is a subclass) and is deliberately kept: a flag is a
+    bounded value.
+    """
+    if not attributes:
+        return {}
+    return {
+        key: value
+        for key, value in attributes.items()
+        if key in SPAN_ATTRIBUTE_NAMES and isinstance(value, (int, float))
+    }
+
+
+@contextmanager
+def _measured(cm):
+    """``cm``, with the span's own wall and interpreter cost set on it as it closes.
+
+    The cost is only knowable at CLOSE, and the attribute rule is enforced at OPEN — so it is
+    applied here, through :func:`safe_attributes`, rather than by letting a caller reach past the
+    filter with ``set_attribute``. ``process_time`` is process-wide, so a span whose body fans out
+    over a pool can legitimately report more CPU than wall.
+
+    In ``finally`` and inside the ``with``, so a call that fails slowly — the reading worth having —
+    still carries its cost, and so the span is still open when the attributes are set.
+    """
+    started, started_cpu = time.monotonic(), time.process_time()
+    with cm as current:
+        try:
+            yield current
+        finally:
+            cost = {
+                "wall_ms": round((time.monotonic() - started) * 1000),
+                "cpu_ms": round((time.process_time() - started_cpu) * 1000),
+            }
+            for key, value in safe_attributes(cost).items():
+                current.set_attribute(key, value)
+
+
+def span(name: str, attributes=None, *, record_exception: bool = True, measure: bool = False):
     """A context manager for one named span, safe to use whether or not tracing is enabled.
 
     With no SDK provider installed the OTel API hands out non-recording spans — a few attribute
@@ -266,8 +387,30 @@ def span(name: str):
     need to ask whether tracing is on. The tracer is fetched per call on purpose: it follows a
     provider set or reset after this module imported, and the call is nowhere near hot (one per
     poller phase, ~20 per multi-minute cycle).
+
+    ``attributes`` passes through :func:`safe_attributes`, which is where the span-attribute rule
+    is enforced rather than documented.
+
+    ``record_exception=False`` is the store's setting, and the two OTel flags move TOGETHER
+    because both carry ``str(exception)``: ``record_exception`` writes it into a span event and
+    ``set_status_on_exception`` writes it into the span's status description, so suppressing one
+    alone suppresses nothing. A Firestore error message names the document path, and a
+    subscription id embeds the client's own reference — the identifier the redaction rule keeps
+    out of the record. What it costs is that such a span is not marked failed; the caller's own
+    handling logs the failure, and the enclosing phase span still records anything that propagates.
+
+    ``measure=True`` adds ``wall_ms`` and ``cpu_ms`` at close — the store's setting, because KTD2
+    sizes the emit pass in interpreter ms per transaction and there is nowhere else to read it.
+    Left False the call returns the OTel context manager untouched, so the ~20 phase spans a cycle
+    already opens pay nothing for a feature they do not use.
     """
-    return trace.get_tracer(__name__).start_as_current_span(name)
+    cm = trace.get_tracer(__name__).start_as_current_span(
+        name,
+        attributes=safe_attributes(attributes),
+        record_exception=record_exception,
+        set_status_on_exception=record_exception,
+    )
+    return _measured(cm) if measure else cm
 
 
 def instrument_app(app) -> None:

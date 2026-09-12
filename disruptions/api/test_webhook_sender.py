@@ -776,6 +776,85 @@ def test_the_module_documents_the_measurement_behind_the_positive_test():
     assert "SVIXSEC-2026-0001" in MODULE_SOURCE
 
 
+# ---- The load harness's receiver gets no exemption (U1, 2026-09-12) ----------------------------
+
+
+def test_no_flag_or_environment_variable_bypasses_the_address_validation():
+    """The load harness needs a receiver, and the tempting shortcut is a bypass switch.
+
+    `scripts/loadgen_subscriptions.py` points a client's destination at a receiver that has to
+    answer thousands of POSTs, and the obvious way to run one is `https://localhost:8443/hook` —
+    which this module refuses, correctly, on three counts (scheme, port, address). The obvious fix
+    is a `--allow-local` flag or a `KIX_...` variable that skips the check, and that switch would
+    then exist in the code prd runs, one environment variable away from turning the delivery path
+    into an SSRF primitive against the metadata service. So there is no such switch: the harness
+    README requires a public `https` : 443 hostname (a tunnel), and this check is what keeps the
+    shortcut from being added later.
+
+    **The one environment variable this module reads is not it.** `KIX_ALLOW_WEBHOOK_NETWORK`
+    decides whether a socket may be opened from a TEST process at all — it is a fence in front of
+    the network, and it sits BEHIND the address checks rather than in front of them. Setting it,
+    or anything plausibly named like a bypass, changes no verdict below.
+
+    Two halves, because either alone is weak. Behaviourally: with every candidate variable set
+    truthy, a loopback, a link-local, a private and a metadata address are still refused, and so
+    are http and a non-443 port. Structurally: the address-safety functions read no environment at
+    all, so there is nothing to set.
+    """
+    import inspect
+
+    candidates = (
+        wc.ALLOW_NETWORK_ENV,
+        "KIX_ALLOW_LOCAL_WEBHOOK",
+        "KIX_WEBHOOK_ALLOW_INSECURE",
+        "KIX_LOADTEST",
+        "KIX_ALLOW_PRIVATE_DESTINATIONS",
+    )
+    before = {name: os.environ.get(name) for name in candidates}
+    for name in candidates:
+        os.environ[name] = "1"
+    try:
+        for address in ("127.0.0.1", "::1", "10.0.0.5", "169.254.169.254", "64:ff9b::a9fe:a9fe"):
+            assert not wc.is_safe_address(address), address
+        for url in (
+            "http://receiver.example/hook",
+            "https://receiver.example:8443/hook",
+            "https://receiver.example:443@evil.example/hook",
+        ):
+            try:
+                wc.validate_url(url)
+            except wc.UnsafeDestination:
+                continue
+            raise AssertionError(f"{url} was accepted")
+        # And the resolved-address half, which is where a `localhost` receiver actually dies:
+        # `validate_url` is syntactic, so the refusal has to come from resolution.
+        local = wc.validate_url("https://receiver.example/hook")
+        try:
+            wc.resolve_and_validate(
+                local, resolver=lambda host, port: [(socket.AF_INET, 0, 0, "", ("127.0.0.1", 443))]
+            )
+        except wc.UnsafeDestination:
+            pass
+        else:
+            raise AssertionError("a host resolving to loopback was accepted")
+    finally:
+        for name, value in before.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    reads_env = [
+        fn.__name__
+        for fn in (wc.is_safe_address, wc._routable, wc.validate_url, wc.resolve_and_validate)
+        if "os.environ" in inspect.getsource(fn) or "getenv" in inspect.getsource(fn)
+    ]
+    assert not reads_env, (
+        "the address checks must read no environment variable — a configurable one is a bypass "
+        f"whatever it is called: {reads_env}"
+    )
+
+
 def _run() -> None:
     checks = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
