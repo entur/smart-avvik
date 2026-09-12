@@ -96,7 +96,8 @@ jobs:
                    --with prometheus-client --with opentelemetry-api \
                    --with opentelemetry-sdk \
                    --with opentelemetry-instrumentation-fastapi \
-                   --with opentelemetry-instrumentation-requests python "$suite"
+                   --with opentelemetry-instrumentation-requests \
+                   --with opentelemetry-instrumentation-threading python "$suite"
             echo "::endgroup::"
           done
       # The notification store's EMULATOR-backed checks, which the loop above cannot run: it has no
@@ -134,6 +135,25 @@ jobs:
       # free text, which is the most sensitive path in the repo.
       - name: Run feedback export tests
         working-directory: data/feedback
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for suite in test_*.py; do
+            echo "::group::$suite"
+            uv run python "$suite"
+            echo "::endgroup::"
+          done
+      # The load harness under scripts/. Invisible to every loop above -- the API loop enters
+      # disruptions/api and the feedback loop enters data/feedback -- which is the same gap the
+      # feedback step above was added to close. The suite greps THIS step for itself
+      # (test_the_scripts_step_is_wired_in_ci), so deleting it fails the build rather than
+      # quietly retiring the checks. No `--with`: the harness is hermetic, and what it imports from
+      # disruptions/api (notification_store, notification_auth) needs only what the `uv sync` above
+      # already installed -- `api` is a DEFAULT dependency group. The Firestore client itself is a
+      # lazy import inside notification_store rather than a module-level one, which is why the
+      # suite runs with no emulator and no credentials.
+      - name: Run load-harness tests
+        working-directory: scripts
         run: |
           set -euo pipefail
           shopt -s nullglob

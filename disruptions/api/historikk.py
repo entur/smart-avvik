@@ -66,6 +66,40 @@ _CACHE_MAX_ENTRIES = 500
 _cache_lock = threading.Lock()
 _cache: dict[tuple, tuple[float, Any]] = {}
 
+# The blast-radius bound on what one request can bill. This page ran with NO cap at all until
+# 2026-09-12, while `/meldinger` and `/rushhistorikk` -- the same shape of page, over the same
+# table, on the same public host -- both carried one; there was no reason for the difference beyond
+# the order the three were written in.
+#
+# Be honest about what it does. A correctly pruned read of the decision log is a few MB and the
+# whole log is ~1.5 GB (prd, 2026-09-11), so at 2 GiB this will NOT catch a pruning regression on
+# today's table. What it catches is a query that starts reading something BIG: the ET tables a
+# mistyped join can reach are ~10 TiB for a two-year scan, three orders of magnitude above this.
+#
+# THE DERIVATION, and why the value has not moved yet (R12, U4 step 4).
+#
+# The cap is meant to become FOUR TIMES the measured pruned 14-day scan, stated in ONE place for
+# this page and /meldinger (which imports this constant) so the two cannot drift; /rushhistorikk
+# reads other tables and keeps its own. Three things have to be true before that number can be
+# written down, and only two of them are:
+#
+#   1. The read must prune. Since 2026-09-12 it does: the three queries go through
+#      `varsel_decision_groups_between(d_start, d_end)` rather than the windowless view, so a
+#      request reads its own `DATE(decided_at)` cover instead of the whole table.
+#   2. The volume must be thinned, or the derived figure describes a log that no longer exists.
+#      `varsel._thinning_reason` (KTD15) does that from the same date.
+#   3. The thinned pruned scan must be MEASURED, at a scale that matters -- the harness at 10 000
+#      definitions in dev, and prd's own `INFORMATION_SCHEMA.JOBS` figures for a 14-day request.
+#      That measurement is owed and this constant moves with it, not before.
+#
+# Until then the value stays the 2 GiB its siblings use. Deriving a cap from today's 1.5 GB log
+# would turn the log's growth into refusals on the page that reads the longest window (180 days),
+# which is the failure this constant exists to prevent rather than to cause -- and the cap is not a
+# pruning detector either way: a correctly pruned read is a few MB. It is a blast-radius bound on an
+# endpoint sharing its project quota with the poller, and what it catches is a query that starts
+# reading something big -- the ET tables a mistyped join can reach are ~10 TiB for a two-year scan.
+_MAX_BYTES_BILLED = 2 * 1024**3
+
 # A page shows a window, not a history. Bounded so a hand-written query string cannot ask for a
 # scan of everything.
 _MAX_WINDOW_DAYS = 180
@@ -580,7 +614,9 @@ def _query(sql: str, params: list, cache_key: tuple):
             return hit[1]
     from google.cloud import bigquery
 
-    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=params, maximum_bytes_billed=_MAX_BYTES_BILLED
+    )
     try:
         rows = list(_bq_client.query(sql, job_config=job_config).result())
     except Exception as exc:

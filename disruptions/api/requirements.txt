@@ -43,3 +43,10 @@ opentelemetry-sdk>=1.44.0
 opentelemetry-exporter-otlp-proto-grpc>=1.44.0
 opentelemetry-instrumentation-fastapi>=0.65b0
 opentelemetry-instrumentation-requests>=0.65b0
+# Thread-pool context propagation. check_and_notify runs three pools (16 matchers, 16 wording
+# writers, 32 push senders) and a ThreadPoolExecutor carries no contextvars, which is where the
+# OTel context lives -- so without this every Journey Planner, Vertex and push span created in a
+# worker is an independently sampled ROOT and the cycle's trace shows the pass with nothing under
+# it. Installed inside setup()'s TRACING_ENABLED gate behind its OWN guard: a missing distribution
+# degrades to separate traces, it never disables tracing.
+opentelemetry-instrumentation-threading>=0.65b0

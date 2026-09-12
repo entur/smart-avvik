@@ -384,6 +384,13 @@ _call_pred_by_jkey_index: dict[str, set[str]] = {}
 # (situation, from_stop, at) without a journey ref. situationNumber is publisher-namespaced, so the
 # NSB and bus tables merge here without collision.
 _call_pred_by_situation: dict[str, list[impact_engine.CallPred]] = {}
+# The SAME scored calls, indexed by the stop they call at (U2, 2026-09-12): `{stop_place:
+# [(situationNumber, CallPred)]}`. This is the posting list `impact` prunes a scan with, so the
+# matcher costs per place PAIR per generation instead of per registered definition — see the block
+# above `impact._index_lock`. Built here, in the ingest loop, rather than lazily in the engine so
+# the poller thread pays the O(calls) pass and never a request thread; the engine still builds its
+# own when this is missing or belongs to another generation.
+_call_pred_by_stop_ref: dict[str, list[tuple[str, impact_engine.CallPred]]] = {}
 _call_pred_refreshed_at: datetime | None = None
 
 # /impact matches the passenger's intended departure (`at`) to the nearest affected departure at
@@ -557,6 +564,7 @@ def refresh_call_predictions_cache() -> None:
     by_key: dict[tuple[str, str], list[impact_engine.CallPred]] = {}
     by_situation: dict[str, list[impact_engine.CallPred]] = {}
     by_jkey_index: dict[str, set[str]] = {}
+    by_stop_ref: dict[str, list[tuple[str, impact_engine.CallPred]]] = {}
 
     def _ingest(rows, operator_of: Callable[..., str]) -> None:
         for r in rows:
@@ -565,6 +573,12 @@ def refresh_call_predictions_cache() -> None:
             by_key.setdefault((op, r.jkey), []).append(pred)
             by_situation.setdefault(r.situationNumber, []).append(pred)
             by_jkey_index.setdefault(r.jkey, set()).add(op)
+            # The fourth index (U2): one more `setdefault` in a loop that is already O(calls), so
+            # the matcher's scan can be bounded by the stop pair it was asked about. The situation
+            # travels IN the entry rather than being read back off the CallPred, because the key of
+            # `by_situation` is what scopes a scan and the engine must not have to assume the two
+            # agree — they do here, and that is exactly the assumption worth not encoding twice.
+            by_stop_ref.setdefault(pred.stop_place, []).append((r.situationNumber, pred))
 
     # NSB/prod family: operator is the rail codespace of the lineRef (VYG:Line:... -> 'VYG').
     _ingest(
@@ -584,16 +598,19 @@ def refresh_call_predictions_cache() -> None:
         )
 
     with _call_pred_lock:
-        global _call_pred_by_key, _call_pred_by_jkey_index
+        global _call_pred_by_key, _call_pred_by_jkey_index, _call_pred_by_stop_ref
         global _call_pred_by_situation, _call_pred_refreshed_at
         _call_pred_by_key = by_key
         _call_pred_by_jkey_index = by_jkey_index
         _call_pred_by_situation = by_situation
+        _call_pred_by_stop_ref = by_stop_ref
         _call_pred_refreshed_at = datetime.now(UTC)
     logger.info(
-        "Refreshed per-call predictions cache: %d (operator, journey) keys, %d situations",
+        "Refreshed per-call predictions cache: %d (operator, journey) keys, %d situations, "
+        "%d stop refs",
         len(by_key),
         len(by_situation),
+        len(by_stop_ref),
     )
 
 
@@ -916,6 +933,21 @@ def _impact_snapshot() -> tuple[dict[str, list[impact_engine.CallPred]], datetim
         return _call_pred_by_situation, _call_pred_refreshed_at
 
 
+def _impact_stop_ref_index() -> (
+    tuple[dict[str, list[tuple[str, impact_engine.CallPred]]], datetime | None]
+):
+    """The stop-ref posting lists and the generation they were built for (U2).
+
+    The stamp travels with the index because this is a SECOND acquisition of `_call_pred_lock`,
+    taken after `_impact_snapshot`'s: a refresh landing between the two would otherwise hand the
+    engine an index describing calls the snapshot it holds no longer has, which is not a stale
+    answer but a wrong one. `impact._stop_ref_index_for` compares the two stamps and indexes the
+    snapshot itself when they disagree.
+    """
+    with _call_pred_lock:
+        return _call_pred_by_stop_ref, _call_pred_refreshed_at
+
+
 def _varsel_refreshed_at() -> datetime | None:
     """When the per-call prediction cache was last loaded, or None before the poller's first load.
 
@@ -1016,6 +1048,31 @@ def _reisevalg_call_predictions(journey_ref: str) -> list | None:
     return list(rows) if rows else None
 
 
+#: Where Linux publishes this process's resident set size, in pages, as the second field of a
+#: one-line file. Read directly rather than through psutil, which is not a dependency of the image
+#: and would be one more distribution in it for one integer. Absent everywhere but Linux — a
+#: developer's macOS has no /proc — which is why every reader here tolerates ``None``.
+_STATM = Path("/proc/self/statm")
+
+
+def _rss_bytes() -> int | None:
+    """This process's resident set size in bytes, or ``None`` where /proc does not exist.
+
+    ``resource.getrusage(RUSAGE_SELF).ru_maxrss`` is the portable alternative and is the wrong
+    number: it is the process's high-WATER mark, so it never falls, and a per-phase delta computed
+    from it reads 0 for every phase after the largest one — which is indistinguishable from a phase
+    that allocated nothing, and is exactly the reading a capacity run is looking for.
+
+    Returns ``None`` rather than 0 on failure for the same reason: a missing reading must be
+    absent from the record, never a plausible-looking zero.
+    """
+    try:
+        pages = int(_STATM.read_text().split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+    return pages * os.sysconf("SC_PAGE_SIZE")
+
+
 @contextmanager
 def _phase(name: str, timings: dict[str, int]):
     """Time one step of the poller's rebuild, recording what it cost whether or not it succeeded.
@@ -1037,9 +1094,22 @@ def _phase(name: str, timings: dict[str, int]):
 
     `timings` accumulates the whole cycle's breakdown for the one summary line at the end. Keys are
     stable and machine-readable (`jsonPayload.fields.phase`), so a per-step latency metric or an
-    alert on one step's regression can be built from these without parsing prose.
+    alert on one step's regression can be built from these without parsing prose. It stays a
+    name -> **int ms** map and nothing else: `poller_cycle` publishes it verbatim as `phases`, and
+    the two figures added below ride on the per-phase record instead.
+
+    **`cpu_ms` and `rss_delta_bytes` beside `ms`** (R16). Wall clock cannot say whether a step is
+    bound by one CPython thread or by a socket, and that is the only question a capacity decision
+    turns on: pools and cores buy wall clock for waits and nothing at all for bytecode (KTD17). So
+    the record carries process CPU for the step and how much resident memory it left behind.
+    Both are whole-process, not per-thread: request-path work served during the phase counts, which
+    is the honest reading — it is one interpreter — and a wide pool's CPU can legitimately exceed
+    the step's wall clock. `rss_delta_bytes` is omitted rather than zeroed where /proc does not
+    exist, so an absent reading cannot be mistaken for a phase that allocated nothing.
     """
     started = monotonic()
+    started_cpu = time.process_time()
+    rss_before = _rss_bytes()
     result = "ok"
     try:
         # A child span of the cycle root span via context (KTD4) — non-recording, and costless,
@@ -1052,17 +1122,33 @@ def _phase(name: str, timings: dict[str, int]):
         raise
     finally:
         ms = round((monotonic() - started) * 1000)
+        # `max(0.0, ...)` is not defensiveness about process_time, which is monotonic per process;
+        # it is about the ROUNDING below and about any future baseline mistake reaching the sum of
+        # a histogram, where a negative observation is accepted silently and shows up as nothing.
+        cpu_s = max(0.0, time.process_time() - started_cpu)
+        rss_after = _rss_bytes()
         timings[name] = ms
+        fields = {
+            "event": "poller_phase",
+            "phase": name,
+            "ms": ms,
+            "cpu_ms": round(cpu_s * 1000),
+            "result": result,
+        }
+        if rss_before is not None and rss_after is not None:
+            fields["rss_delta_bytes"] = rss_after - rss_before
         logger.info(
-            "Poller phase %s finished in %d ms (%s)",
+            "Poller phase %s finished in %d ms (%d ms CPU, %s)",
             name,
             ms,
+            fields["cpu_ms"],
             result,
-            extra={"fields": {"event": "poller_phase", "phase": name, "ms": ms, "result": result}},
+            extra={"fields": fields},
         )
         # Beside the log line, never instead of it (the event is an operator contract). `phase` is
         # the small fixed vocabulary of step names above, so the label stays bounded.
         metrics.POLLER_PHASE_DURATION.labels(phase=name).observe(ms / 1000)
+        metrics.POLLER_PHASE_CPU.labels(phase=name).observe(cpu_s)
         metrics.POLLER_PHASE_TOTAL.labels(phase=name, result=result).inc()
         # A finished step — successful or failed — is progress: the thread is moving, which is the
         # only thing /health's staleness branch asks about. In `finally` beside the rest, so a
@@ -1368,7 +1454,12 @@ async def lifespan(app: FastAPI):
     # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
     # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
     impact_engine.configure(
-        snapshot_provider=_impact_snapshot, call_lookup=_impact_journey_calls
+        snapshot_provider=_impact_snapshot,
+        call_lookup=_impact_journey_calls,
+        # The inverted index (U2): the matcher's scan is bounded by the stop pair it was asked
+        # about instead of by the size of the cache, so the cycle's cost scales with distinct place
+        # pairs rather than with registrations.
+        stop_ref_index=_impact_stop_ref_index,
     )
     varsel.configure(
         impact_provider=_varsel_impact,
@@ -1392,6 +1483,16 @@ async def lifespan(app: FastAPI):
         # its own, so a hung read costs a leaked thread and a delayed pod termination.
         webhook_enabled=_notification_webhooks_enabled,
         webhook_recipients_provider=notification_store.recipient_documents,
+        # The tracing seam (R16). `varsel` opens one span per sub-pass through this callable and
+        # imports neither this module nor `tracing_setup`: without it `varsel_notify` shows in a
+        # trace as one opaque phase with the decision-log insert under it and nothing else, so
+        # "which of the five passes is the cycle in?" has no answer a capacity run can read.
+        span=tracing_setup.span,
+        # The liveness seam (U2). This whole pass is ONE `_phase`, so without it the pass beats
+        # exactly once — at its end — and `/health`'s "no STEP has finished in 600 s" rule cannot
+        # tell a pass that got slow from a poller that is wedged. Injected as a callable for the
+        # same reason as `span`: `varsel` imports neither this module nor the tracing wiring.
+        beat=_beat,
     )
     # The journey-keyed public read's one seam (2026-09-10): when the per-call prediction cache
     # was loaded, so it can answer 503 rather than "no disruptions" before the poller's first load.
@@ -1418,7 +1519,13 @@ async def lifespan(app: FastAPI):
     # channel and one connection pool in a process whose poller already shares the thread. The
     # `notification_auth.configure()` call still earns its place: it resets that module's in-process
     # limiter ledgers, which must not survive a restart-in-place.
-    notification_store.configure(database=os.environ.get("NOTIFICATION_FIRESTORE_DATABASE", "").strip() or None)
+    notification_store.configure(
+        database=os.environ.get("NOTIFICATION_FIRESTORE_DATABASE", "").strip() or None,
+        # One span per Firestore call, carrying its own interpreter cost (KTD2 sizes the widened
+        # emit pass in interpreter ms per transaction). Injected for `varsel`'s reason: the store
+        # must import neither this module nor `tracing_setup`.
+        span=tracing_setup.span,
+    )
     notification_auth.configure()
     # The webhook channel's own slice of the connectivity budget, bound ONCE here so neither client
     # module has to know the vocabulary and neither can forget the tag. Bound rather than defaulted
@@ -1910,7 +2017,12 @@ def _beat() -> None:
     """Record that the poller thread is still making progress — BOTH clocks, always together.
 
     Called at the top of every iteration and again at each progress point inside it: the end of
-    every `_phase`, and after each of the wall-clock tick blocks. One beat per ITERATION was the
+    every `_phase`, after each of the wall-clock tick blocks, and — since U2 — once per chunk of
+    definitions inside `varsel`'s match and wording passes, through the `beat` seam injected at
+    `varsel.configure`. That last one is not a `_beat()` call any grep of this file will find, and
+    it is the one that matters most at scale: the whole alerting pass is a single `_phase`, so
+    without it a pass that merely got slow at 100 000 subscriptions is indistinguishable from a
+    wedged poller. One beat per ITERATION was the
     original shape and it made the threshold mean the wrong thing: an iteration is ~12-16
     sequential BigQuery calls (each bounded at `_POLLER_QUERY_TIMEOUT_S`), plus togvarsel's rebuild
     and reads, plus the notify and servability ceilings, plus the sleep — so its worst case is tens

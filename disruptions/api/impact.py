@@ -18,6 +18,7 @@ main injects a reader via `configure()`, the same pattern reisevalg/varsel/llm_m
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,16 @@ _snapshot_provider: Callable[[], tuple[dict[str, list[CallPred]], datetime | Non
 # Injected alongside it: (operator, jkey) -> that journey's scored calls, or None when no live
 # situation touches it. The SAME rows as the snapshot, indexed the other way -- see `configure`.
 _call_lookup: Callable[[str | None, str], list[CallPred] | None] | None = None
+# Injected alongside them (U2): stop ref -> every scored call at that stop as (situationNumber,
+# call), with the generation it was built for. The poller builds it in its own ingest loop so a
+# request thread never pays for it; absent (or stamped for another generation) the engine builds its
+# own — see `_stop_ref_index_for`. The situation travels IN the posting rather than being read back
+# off `CallPred.situation_number`, because the snapshot's KEY is what scopes a scan: the two agree
+# in production (`main` keys `by_situation` on the same `situationNumber`) and a posting that
+# assumed it would silently rescope any caller for whom they do not.
+_stop_ref_index_provider: (
+    Callable[[], tuple[dict[str, list[tuple[str, CallPred]]] | None, datetime | None]] | None
+) = None
 # Whether the "no call lookup wired" warning has been emitted yet. Once per process, not once per
 # candidate per refresh: the condition is a startup wiring fault, not a per-trip event.
 _warned_no_call_lookup = False
@@ -44,6 +55,9 @@ def configure(
     *,
     snapshot_provider: Callable[[], tuple[dict[str, list[CallPred]], datetime | None]],
     call_lookup: Callable[[str | None, str], list[CallPred] | None] | None = None,
+    stop_ref_index: (
+        Callable[[], tuple[dict[str, list[tuple[str, CallPred]]] | None, datetime | None]] | None
+    ) = None,
 ) -> None:
     """Wire in main's per-call prediction caches. Called once from main.lifespan.
 
@@ -62,11 +76,20 @@ def configure(
     `for_trip`'s fail-open guard, which would swallow the exception and make a wiring fault
     indistinguishable from "the Journey Planner had nothing to offer" — the exact class of silent
     contract break this module was extracted to prevent.
+
+    `stop_ref_index` is the third reader over the same rows (U2, 2026-09-12): `{stop_place:
+    [(situationNumber, CallPred)]}`, plus the `refreshed_at` it was built for, so the engine can tell an index that
+    belongs to THIS generation from one a refresh has already overtaken. It is a separate provider
+    rather than a third element of `snapshot_provider`'s tuple because that tuple is hand-written by
+    three test suites and by every duck-typed double — widening it would break them all for a value
+    the engine can, and does, derive itself when nothing is wired. Optional for the same reason.
     """
-    global _snapshot_provider, _call_lookup, _warned_no_call_lookup
+    global _snapshot_provider, _call_lookup, _stop_ref_index_provider, _warned_no_call_lookup
     _snapshot_provider = snapshot_provider
     _call_lookup = call_lookup
+    _stop_ref_index_provider = stop_ref_index
     _warned_no_call_lookup = False  # re-arm: a re-wiring deserves its own warning
+    invalidate_generation()  # whatever was indexed belonged to the wiring being replaced
 
 
 @dataclass(frozen=True)
@@ -1589,6 +1612,290 @@ def _alternatives_by_situation(
     return outcomes
 
 
+# ---- The inverted prediction index (U2, 2026-09-12) ---------------------------------------------
+#
+# **The matcher must cost per place PAIR per cache generation, not per registered definition.**
+# Until this, `for_trip` handed `_trip_cells` the whole snapshot — at the midnight peak ~1 100
+# situations over ~20 000 scored calls — and `_trip_cells` rebuilt its two per-situation groupings
+# over all of it on EVERY scan: once per definition, per window, per stop-ref pair. A cache sized by
+# the network was therefore re-walked for a question about two stops, and the cycle's cost grew with
+# registrations even though its input does not. At 100 000 commuters that is the whole budget.
+#
+# **The fix prunes the SCOPE; it does not fork the matcher.** `_trip_cells` stays the one
+# implementation and is handed only the situations that could possibly emit a cell for this
+# (from_ref, to_ref, window). Byte-identity is then true by construction rather than by inspection:
+# dicts preserve insertion order, so a scope built in the snapshot's own order iterates identically,
+# and a situation the prune drops emits nothing — so the cell LIST comes out element for element the
+# same, which is what the stable severity sorts in `_impact_response` rest on. The alternative — a
+# second "pair half" reimplementing eligibility — is the arrangement this repository has watched
+# drift apart twice (see `_call_severity`, `_worst_cell`).
+#
+# **Both prune predicates are deliberately SUPERSETS**, and the two conditions left out are left out
+# for a reason each:
+#
+# * `catchable_after` is NOT in the prune. It is derived from the caller's clock, so a memo keyed on
+#   it would never be shared between the poller, the journey list and the pull read (each passes its
+#   own), and a memo ignoring it would show a departed train as catchable for up to a cycle. Left
+#   out of the prune it is neither: the cut stays exactly where `_trip_cells` already applies it —
+#   in candidate selection, BEFORE the per-line rollup — so a departed worst-case train still cannot
+#   suppress a later, still-catchable, alert-worthy train on the same line. That ordering trap is
+#   stated twice in `_trip_cells`' docstring because it has been made twice; this does not make it a
+#   third time.
+# * `stop_order > bcall.stop_order` is NOT in the alighting predicate, because which boarding
+#   candidate wins is a per-call question. The prune asks only whether the SAME `(situation,
+#   operator, jkey)` group has any usable alighting call at `to_ref` at all.
+#
+# A superset prune can only leave a situation in that emits nothing, never take one out that would
+# have emitted — which is exactly the property the differential test exercises.
+
+_index_lock = threading.Lock()
+_index_generation: _Generation | None = None
+#: Build counters, for the tests that pin "costs per pair per generation" as a number rather than as
+#: a timing. Reset by :func:`invalidate_generation`.
+_index_stats: dict[str, int] = {"generation_builds": 0, "pair_builds": 0, "window_builds": 0}
+
+
+def _minute_aligned(t: datetime) -> bool:
+    """Whether `t` falls exactly on a minute — the test that decides if a window is worth filing."""
+    return t.second == 0 and t.microsecond == 0
+
+
+class _Generation:
+    """Everything derived from one prediction-cache load, built lazily and dropped as a unit.
+
+    Holds a strong reference to the snapshot it describes, which is also half of its identity: a
+    generation is `(snapshot object, refreshed_at)`, so a poller rebuild — which swaps the dict AND
+    stamps a new time under `main._call_pred_lock` — invalidates it on both counts. The consequence
+    worth stating is that one superseded generation (and the snapshot behind it) stays alive until
+    the next `for_trip` replaces it; at the measured peak that is tens of MB against a 2 GiB limit.
+
+    What it cannot see is a snapshot MUTATED IN PLACE under an unchanged stamp. Production never
+    does that; test suites do, and :func:`invalidate_generation` is how they say so.
+    """
+
+    __slots__ = ("_pairs", "_windows", "by_stop_ref", "refreshed_at", "sit_order", "snapshot")
+
+    def __init__(
+        self,
+        snapshot: dict[str, list[CallPred]],
+        refreshed_at: datetime | None,
+        by_stop_ref: dict[str, list[tuple[str, CallPred]]],
+    ) -> None:
+        self.snapshot = snapshot
+        self.refreshed_at = refreshed_at
+        self.by_stop_ref = by_stop_ref
+        # The snapshot's own iteration order, as an ordinal per situation. This is what lets a
+        # pruned scope be rebuilt in the ORDER the unpruned scan would have visited it in, which is
+        # what makes the output identical on a severity tie.
+        self.sit_order = {sit: i for i, sit in enumerate(snapshot)}
+        self._pairs: dict[
+            tuple[str, str | None], tuple[tuple[str, tuple[CallPred, ...]], ...]
+        ] = {}
+        self._windows: dict[tuple[str, str | None, datetime, datetime], tuple[str, ...]] = {}
+
+    def _pair(
+        self, from_ref: str, to_ref: str | None
+    ) -> tuple[tuple[str, tuple[CallPred, ...]], ...]:
+        """Per situation, the boarding candidates at `from_ref` whose train can also serve `to_ref`.
+
+        Two posting-list walks and an intersection on the group key — O(calls at from_ref + calls at
+        to_ref), against the O(every call in the cache) this replaces. `to_ref=None` is its own key
+        and skips the intersection: a caller who gave no destination is asking about departures.
+        """
+        key = (from_ref, to_ref)
+        entry = self._pairs.get(key)
+        if entry is not None:
+            return entry
+        boarding: dict[tuple[str, str, str], list[CallPred]] = {}
+        for sit, c in self.by_stop_ref.get(from_ref, ()):
+            # The same three tests `_trip_cells` applies to a boarding candidate before the window,
+            # and no others: an unstated activity is permission (`boarding_allowed` already carries
+            # the fail-open reading from the planned-call source).
+            if c.aimed_dep is None or not c.boarding_allowed:
+                continue
+            boarding.setdefault((sit, c.operator, c.jkey), []).append(c)
+        if to_ref is not None:
+            # The group key is `_trip_cells`' own — (situation, operator, jkey) — because a bus
+            # ServiceJourney ref is not date-scoped and the alighting call has to be the SAME
+            # train's, not another operator's journey that happens to strip to the same jkey.
+            usable: set[tuple[str, str, str]] = set()
+            for sit, c in self.by_stop_ref.get(to_ref, ()):
+                if c.aimed_arr is None or not c.alighting_allowed:
+                    continue
+                usable.add((sit, c.operator, c.jkey))
+            boarding = {k: v for k, v in boarding.items() if k in usable}
+        by_situation: dict[str, list[CallPred]] = {}
+        for (sit, _op, _jkey), candidates in boarding.items():
+            by_situation.setdefault(sit, []).extend(candidates)
+        entry = tuple(
+            (sit, tuple(candidates))
+            for sit, candidates in sorted(
+                by_situation.items(), key=lambda kv: self.sit_order.get(kv[0], 0)
+            )
+        )
+        self._pairs[key] = entry
+        _index_stats["pair_builds"] += 1
+        return entry
+
+    def situations(
+        self, from_ref: str, to_ref: str | None, window_start: datetime, window_end: datetime
+    ) -> tuple[str, ...]:
+        """The situations that could emit a cell for this pair and window, in snapshot order.
+
+        The window bound is `_trip_cells`' own, inclusive at both ends, applied to the same
+        `aimed_dep`. Memoised per (pair, window) because a pilot's definitions cluster on both — but
+        the memo is an optimisation, never load-bearing: `_pair` above already removes the term that
+        scaled with the cache.
+
+        **Only a minute-ALIGNED window is filed.** The poller's windows come from
+        `varsel.journey_windows` and are minute-aligned by construction, so registrations sharing a
+        window share an entry — which is the clustering this memo exists for. The public `/impact`
+        endpoint's are `at ± main._IMPACT_AT_TOLERANCE` off `datetime.now(UTC)`, so they are never
+        aligned and no two requests ever agree: filed, each one would deposit an entry nothing can
+        hit again for the life of the generation — a leak proportional to public request volume, in
+        a structure whose whole point is being sized by the timetable. Declining to file it costs
+        that caller the two posting-list walks it was going to pay for anyway.
+
+        **`at` is deliberately NOT rounded to make them align.** `select="nearest"` scores on
+        `abs(aimed_dep - at)`, so moving `at` would change which train the matcher picks — the one
+        thing U2 must not do, and the reason this is a write guard rather than a key normalisation.
+
+        `_pairs` is left unbounded on purpose, and the difference is in kind rather than in degree:
+        its key is the caller's stop refs and not a clock, so a repeat HITS — that is a cache doing
+        its job, where an unaligned window mints a dead entry per request on the very same pair. A
+        ref the index has never seen yields the empty tuple for a few bytes, and the generation and
+        everything memoised on it are dropped whole on the next cache rebuild.
+        """
+        key = (from_ref, to_ref, window_start, window_end)
+        found = self._windows.get(key)
+        if found is not None:
+            return found
+        found = tuple(
+            sit
+            for sit, candidates in self._pair(from_ref, to_ref)
+            if any(window_start <= c.aimed_dep <= window_end for c in candidates)
+        )
+        # Counted on every computation, not on every filing: "how often was this rebuilt" is what
+        # the tests read it for, and an unaligned window rebuilds it every single time.
+        _index_stats["window_builds"] += 1
+        if _minute_aligned(window_start) and _minute_aligned(window_end):
+            self._windows[key] = found
+        return found
+
+
+def invalidate_generation() -> None:
+    """Drop the index and its counters — for a caller that mutated a snapshot in place.
+
+    Production has no such caller: `main.refresh_call_predictions_cache` swaps the dict and stamps a
+    new `refreshed_at` under one lock, which the generation check sees on both counts. Test suites
+    do (`_snapshot.clear(); _snapshot.update(...)` under a fixed stamp), and a stale index there is
+    not a performance bug but a wrong answer, so this is part of every such suite's reset — the same
+    rule CLAUDE.md states for every module-level cache `check_and_notify`'s stale sweep covers.
+    """
+    global _index_generation
+    with _index_lock:
+        _index_generation = None
+        for name in _index_stats:
+            _index_stats[name] = 0
+
+
+def index_stats() -> dict[str, int]:
+    """A copy of the build counters. Tests only: nothing in the app reads them."""
+    with _index_lock:
+        return dict(_index_stats)
+
+
+def _build_stop_ref_index(
+    snapshot: dict[str, list[CallPred]],
+) -> dict[str, list[tuple[str, CallPred]]]:
+    """`{stop_place: [(situationNumber, CallPred)]}` — the engine's own fallback build, O(calls)."""
+    index: dict[str, list[tuple[str, CallPred]]] = {}
+    for sit, calls in snapshot.items():
+        for c in calls:
+            index.setdefault(c.stop_place, []).append((sit, c))
+    return index
+
+
+def _stop_ref_index_for(
+    snapshot: dict[str, list[CallPred]], refreshed_at: datetime | None
+) -> dict[str, list[tuple[str, CallPred]]]:
+    """The poller's index when it belongs to THIS generation, else one built here.
+
+    The stamp comparison is the whole point of the provider returning one. `main` reads the snapshot
+    and the index under two separate acquisitions of `_call_pred_lock`, so a refresh landing between
+    them would otherwise hand the engine an index describing calls the snapshot no longer has —
+    which is not a stale answer but a wrong one. On a mismatch (and on an unwired or raising
+    provider) the engine indexes the snapshot it actually holds, at the cost of one O(calls) pass.
+    """
+    provider = _stop_ref_index_provider
+    if provider is not None:
+        try:
+            index, stamped = provider()
+        except Exception:  # a broken provider costs a rebuild, never the cycle
+            logger.warning("Stop-ref index provider failed; indexing the snapshot", exc_info=True)
+        else:
+            if index is not None and stamped == refreshed_at:
+                return index
+    return _build_stop_ref_index(snapshot)
+
+
+def _generation_for(
+    snapshot: dict[str, list[CallPred]], refreshed_at: datetime | None
+) -> _Generation:
+    """The generation describing `snapshot`, building and publishing it if nobody has yet.
+
+    Built under the lock rather than optimistically, so `_MATCH_WORKERS` threads arriving on a cold
+    cache at the same instant produce ONE build: the work is pure bytecode, which the GIL serialises
+    anyway, so an optimistic build would buy no concurrency and would cost a thundering herd on
+    every rebuild.
+
+    **A generation older than the one held is built but not published.** A `for_trip` that sampled
+    the snapshot just before a refresh would otherwise swap its predecessor back in, and the next
+    caller would swap the new one back — a flip-flop that rebuilds on every call for as long as
+    pre-refresh callers are in flight, which is exactly when the cycle is busiest.
+    """
+    global _index_generation
+    with _index_lock:
+        held = _index_generation
+        if held is not None and held.snapshot is snapshot and held.refreshed_at == refreshed_at:
+            return held
+        fresh = _Generation(snapshot, refreshed_at, _stop_ref_index_for(snapshot, refreshed_at))
+        _index_stats["generation_builds"] += 1
+        if held is None or not _older(refreshed_at, held.refreshed_at):
+            _index_generation = fresh
+        return fresh
+
+
+def _older(a: datetime | None, b: datetime | None) -> bool:
+    """Whether generation stamp `a` precedes `b`. An unstamped generation is the oldest there is."""
+    if a is None:
+        return b is not None
+    return b is not None and a < b
+
+
+def _pruned_scope(
+    by_situation: dict[str, list[CallPred]],
+    refreshed_at: datetime | None,
+    *,
+    from_stop: str,
+    to_stop: str | None,
+    window_start: datetime,
+    window_end: datetime,
+    situation: str | None,
+) -> dict[str, list[CallPred]]:
+    """What `_trip_cells` is handed: the situations that can emit, in the snapshot's own order.
+
+    `situation=` narrowing composes with the prune rather than bypassing it — a named situation that
+    cannot serve the pair yields the empty scope, which is what scanning it would have produced.
+    """
+    generation = _generation_for(by_situation, refreshed_at)
+    with _index_lock:
+        candidates = generation.situations(from_stop, to_stop, window_start, window_end)
+    if situation is not None:
+        return {situation: by_situation[situation]} if situation in set(candidates) else {}
+    return {sit: by_situation[sit] for sit in candidates}
+
+
 def for_trip(
     *,
     from_stop: str,
@@ -1625,11 +1932,18 @@ def for_trip(
         raise RuntimeError("impact.configure(snapshot_provider=...) was never called")
     now = datetime.now(UTC)
     by_situation, refreshed_at = _snapshot_provider()
-    if situation is not None:
-        calls = by_situation.get(situation)
-        scope = {situation: calls} if calls else {}
-    else:
-        scope = by_situation
+    # The inverted index (U2): the situations that could possibly emit a cell for this pair and
+    # window, in the snapshot's own order — never the whole cache. See the block above
+    # `_index_lock` for why this is a prune and not a second matcher.
+    scope = _pruned_scope(
+        by_situation,
+        refreshed_at,
+        from_stop=from_stop,
+        to_stop=to_stop,
+        window_start=window_start,
+        window_end=window_end,
+        situation=situation,
+    )
 
     cells = _trip_cells(
         scope,
