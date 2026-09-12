@@ -694,7 +694,9 @@ def test_the_create_ceiling_query_is_bounded_by_the_ceiling():
     notification_store.create_subscription(_spec(), now=NOW)
     name, equality, _ineq, limit = client.query_calls[0]
     assert name == "subscription_count"
-    assert equality == {"client_id": CLIENT, "status": "active"}
+    # The channel is the spec's, not a constant: U12 creates `web_push` subscriptions through this
+    # same path, and each channel's ceiling is counted on its own documents.
+    assert equality == {"client_id": CLIENT, "status": "active", "channel": "webhook"}
     assert limit == notification_store.MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT
 
 
@@ -712,7 +714,7 @@ def test_the_create_count_sheds_dead_rows_before_live_ones():
     """
     spec = next(s for s in notification_store.QUERY_SPECS if s.name == "subscription_count")
     assert spec.order_by == (("expires_at", "DESCENDING"),)
-    assert spec.equality == ("client_id", "status")
+    assert spec.equality == ("client_id", "status", "channel")
     listing = next(s for s in notification_store.QUERY_SPECS if s.name == "subscriptions")
     assert listing.order_by == (("created_at", "ASCENDING"),), "the published list order is unchanged"
     # And the page the body counts from really is the one the store asks for: a page of `ceiling`
@@ -1619,9 +1621,13 @@ def test_the_load_query_sheds_dead_rows_before_live_ones():
     """
     spec = next(s for s in notification_store.QUERY_SPECS if s.name == "load_active_subscriptions")
     assert spec.order_by == (("expires_at", "DESCENDING"),)
+    # The index the ordering needs, with U5's `channel` equality ahead of it. Firestore serves a
+    # query from an index whose equality fields match and whose first ordering is the range field,
+    # so adding the equality REPLACES this index rather than adding one beside it -- the reason the
+    # PR's terraform plan shows a destroy and a create per changed query, not two creates.
     assert (
         notification_store.SUBSCRIPTIONS,
-        (("status", "ASCENDING"), ("expires_at", "DESCENDING")),
+        (("status", "ASCENDING"), ("channel", "ASCENDING"), ("expires_at", "DESCENDING")),
     ) in _declared_indexes()
 
 
@@ -3327,6 +3333,48 @@ def emulator_test_the_load_query_returns_only_live_subscriptions():
     assert [d["recipient_id"] for d in documents] == ["live"]
 
 
+def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_ceiling():
+    """U5, against a real client rather than the fake.
+
+    The emulator tracks no composite indexes, so this cannot prove the production index exists --
+    that is `test_every_query_in_the_module_has_a_checked_in_index`'s job, and the reason it exists.
+    What it DOES prove is the half a static check cannot: that the equality is really in the query
+    the client builds, that a `web_push` document is therefore not returned to the poller, and that
+    the client's webhook ceiling is not spent by one.
+    """
+    _emulator_setup()
+    notification_store.create_subscription(_spec(subscription_id="client-sub"), now=NOW)
+    notification_store.create_subscription(
+        _spec(subscription_id="browser-sub", channel=notification_store.CHANNEL_WEB_PUSH), now=NOW
+    )
+    loaded = notification_store.active_subscriptions(now=NOW)
+    assert [s.subscription_id for s in loaded.subscriptions] == ["client-sub"]
+    assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["client-sub"]
+
+    # The same collection, asked the other way: the browser document is there and readable.
+    on_browser = notification_store.active_subscriptions(
+        now=NOW, channel=notification_store.CHANNEL_WEB_PUSH
+    )
+    assert [s.subscription_id for s in on_browser.subscriptions] == ["browser-sub"]
+
+    # And the ceiling, with the one arrangement that DISCRIMINATES. The client holds two documents
+    # and a ceiling of two, so an unfiltered count refuses the next create; counted per channel it
+    # holds one webhook, and the create is admitted. At a ceiling of one both channels would refuse
+    # and the check would pass whether or not the filter was there at all.
+    notification_store.create_subscription(
+        _spec(subscription_id="client-sub-2"), max_active=2, now=NOW
+    )
+    # ... and the webhook ceiling still binds on webhooks alone, now that there are two of them.
+    try:
+        notification_store.create_subscription(
+            _spec(subscription_id="client-sub-3"), max_active=2, now=NOW
+        )
+    except notification_store.QuotaExceeded:
+        pass
+    else:
+        raise AssertionError("the webhook ceiling did not bind")
+
+
 def emulator_test_concurrent_emissions_converge_on_one_event():
     """Four writers on one subject: every permitted outcome, and no second event under any of them.
 
@@ -3834,9 +3882,33 @@ def test_a_subscription_document_names_its_channel_and_an_old_one_reads_as_webho
     legacy = {k: v for k, v in doc.items() if k != "channel"}
     assert notification_store._subscription_from_doc(legacy).channel == "webhook"
     assert notification_store.CHANNELS == ("webhook", "web_push")
-    # The recipient document the poller reads is unchanged: `varsel` pins its exact key set.
+    # The recipient document CARRIES the channel since U5, and `daily_cap` still does not: the
+    # reader is what decides whether it can route a document (R20), and from U12 this collection
+    # holds a `web_push` document per /varsel registration. `daily_cap` stays out because the pass
+    # never reads it -- the cap is spent inside the store's own transaction.
     recipient = notification_store._subscription_from_doc(doc).as_recipient_document(NOW)
-    assert "channel" not in recipient and "daily_cap" not in recipient
+    assert recipient["channel"] == "webhook"
+    assert "daily_cap" not in recipient
+    legacy_recipient = notification_store._subscription_from_doc(legacy).as_recipient_document(NOW)
+    assert legacy_recipient["channel"] == "webhook", legacy_recipient
+
+
+def test_the_two_bounded_subscription_queries_filter_on_the_channel():
+    """U5. Both are per-CHANNEL questions and neither said so before.
+
+    The load is bounded by a ceiling, so a Python-side test would let a `web_push` majority fill the
+    page and truncate the webhook recipients out of it; and a client's ceiling is its webhook
+    ceiling, which a traveller's own registration must not spend. Asserted on the specs rather than
+    on a fake query because `_query` builds every filter from them -- `test_every_filter_goes_
+    through_the_query_helper` is what makes that true.
+    """
+    specs = {spec.name: spec for spec in notification_store.QUERY_SPECS}
+    assert "channel" in specs["load_active_subscriptions"].equality
+    assert "channel" in specs["subscription_count"].equality
+    # The listing is deliberately NOT in that set: a client lists what it created, and until U13
+    # everything it can create is a webhook. Adding the equality here would need a fourth index for
+    # no question anybody asks.
+    assert "channel" not in specs["subscriptions"].equality
 
 
 def test_the_served_list_grows_with_the_clients_cap_and_never_shrinks_below_the_default():

@@ -758,6 +758,16 @@ def webhook_channel_enabled() -> bool:
         return False
 
 
+class UnroutableChannel(ValueError):
+    """A subscription document this pass is not the delivery path for (U5).
+
+    Its own class rather than a bare `ValueError` because it is not an UNREADABLE document and must
+    not be counted as one: the collection holds `web_push` documents from U12 onwards, and folding
+    them into the skip counter would put a warning naming tens of thousands of perfectly healthy
+    documents on every cycle -- which is how a real warning stops being read.
+    """
+
+
 def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
     """One raw client document → a :class:`WebhookRecipient`, raising on anything unreadable.
 
@@ -781,6 +791,15 @@ def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
     Raises rather than returning None: the caller's per-document guard is what turns a bad document
     into a skipped document, and a sentinel return would let a future edit forget to check it.
     """
+    # FIRST, before any field this pass matches on. The store's query already filters the channel,
+    # so this is the second of two independent statements and is meant to be: U6 replaces that query
+    # with a mirror that filters in Python, and from U12 the collection holds a `web_push` document
+    # per /varsel registration -- at which point "the load path forgot the filter" is a defect that
+    # delivers a traveller's own journey to a client's webhook. Missing reads as `webhook`, which is
+    # what every document written before the field meant.
+    channel = str(doc.get("channel") or "webhook")
+    if channel != "webhook":
+        raise UnroutableChannel(f"channel {channel!r} is not delivered by this pass")
     recipient_id = str(doc["recipient_id"])
     if not recipient_id:
         raise ValueError("recipient_id must be a non-empty string")
@@ -881,9 +900,14 @@ def _load_webhook_recipients() -> list[WebhookRecipient]:
 
     recipients: list[WebhookRecipient] = []
     skipped: dict[str, int] = {}
+    unroutable = 0
     for doc in docs:
         try:
             recipients.append(_parse_webhook_recipient(doc))
+        except UnroutableChannel:
+            # Not a skip and not a warning: another channel's document, correctly declined. Counted
+            # so "where did the other 90 000 go?" has an answer on the load record.
+            unroutable += 1
         except Exception as exc:
             # The traceback at DEBUG, the COUNT at WARNING below. Never the document: a client
             # subscription is a route with times and weekdays, and R16 keeps that out of routine
@@ -907,16 +931,18 @@ def _load_webhook_recipients() -> list[WebhookRecipient]:
             },
         )
     logger.info(
-        "Loaded %d webhook subscription(s) in %.0f ms (%d skipped)",
+        "Loaded %d webhook subscription(s) in %.0f ms (%d skipped, %d on another channel)",
         len(recipients),
         (monotonic() - started) * 1000,
         sum(skipped.values()),
+        unroutable,
         extra={
             "fields": {
                 "event": "varsel_webhook_load",
                 "result": "ok",
                 "n": len(recipients),
                 "skipped": sum(skipped.values()),
+                "unroutable": unroutable,
                 "ms": int((monotonic() - started) * 1000),
                 # `>=`, so a collection of exactly the ceiling reports truncated. That is not a
                 # rounding error to fix: the read stops AT the ceiling (R21 -- it may not exceed
