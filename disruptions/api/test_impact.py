@@ -35,6 +35,21 @@ impact.configure(
     call_lookup=lambda operator, jkey: _index.get((operator, jkey)),
 )
 
+
+def _install_snapshot(by_situation):
+    """Refill the snapshot this suite serves, and tell the engine its index is out of date.
+
+    `impact` indexes a snapshot per GENERATION, and a generation is (dict identity, `refreshed_at`)
+    — neither of which moves when this suite refills the one dict it owns under a fixed `None`
+    stamp. Production never mutates in place (`main.refresh_call_predictions_cache` swaps the dict
+    and stamps a new time under one lock), so the engine deliberately cannot see it; a test that
+    refilled the dict without this would be served the PREVIOUS test's situations, which reads as
+    the matcher having stopped matching.
+    """
+    _snapshot.clear()
+    _snapshot.update(by_situation)
+    impact.invalidate_generation()
+
 A, B, C = "NSR:StopPlace:A", "NSR:StopPlace:B", "NSR:StopPlace:C"
 
 
@@ -252,8 +267,7 @@ def test_journey_planner_is_skipped_below_the_impact_gate():
         # costs -- that is test_an_empty_first_query_falls_back_to_a_depart_after_search's business.
         for p_impact, gate, expected in ((0.20, 0.50, False), (0.93, 0.50, True), (0.20, 0.0, True)):
             asked.clear()
-            _snapshot.clear()
-            _snapshot.update(_scope(S1=_train("j1", 8, p_impact_dep=p_impact)))
+            _install_snapshot(_scope(S1=_train("j1", 8, p_impact_dep=p_impact)))
             impact.for_trip(
                 from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
                 select="worst", with_alternative=True, min_impact=gate,
@@ -563,8 +577,7 @@ def test_a_no_sx_situation_reports_its_population_to_its_readers():
     """`/impact` has to say which population a situation came from, or every reader downstream --
     the alert gate, both wordings, /historikk's segmentation -- is left inferring it from the
     `KIX:` prefix, which makes a naming convention load-bearing for alerting policy."""
-    _snapshot.clear()
-    _snapshot.update({NOSX_SIT: [_nosx_call()]})
+    _install_snapshot({NOSX_SIT: [_nosx_call()]})
     resp = impact.for_trip(
         from_stop=A, to_stop=None,
         window_start=_at(14, 0), window_end=_at(16, 0), with_alternative=False,
@@ -578,8 +591,7 @@ def test_a_no_sx_situation_reports_its_population_to_its_readers():
 def test_a_flagged_situation_still_reports_itself_as_flagged():
     """The default has to survive: every situation that predates this population is a flagged one,
     and a field that silently flipped would move which threshold they are all cut at."""
-    _snapshot.clear()
-    _snapshot.update({RELAY_SIT: [_relay_call()]})
+    _install_snapshot({RELAY_SIT: [_relay_call()]})
     resp = impact.for_trip(
         from_stop=A, to_stop=None,
         window_start=_at(14, 0), window_end=_at(16, 0), with_alternative=False,
@@ -1101,8 +1113,7 @@ class _JourneyPlanner:
 
 def _for_trip(scope, jp, *, now, to_stop=B, min_impact=0.0, window_min=(-5, 120), index=None):
     """Run `for_trip` over `scope` with `jp` standing in for the Journey Planner."""
-    _snapshot.clear()
-    _snapshot.update(scope)
+    _install_snapshot(scope)
     _index.clear()
     _index.update(index or {})
     original = alternatives.fetch_candidates
@@ -1146,8 +1157,7 @@ def test_the_public_endpoint_cannot_spend_the_pollers_fetch_budget():
     assert [c["path"] for c in jp.calls] == ["request"], "an unwired caller is charged publicly"
 
     poller = _JourneyPlanner([_live_candidate(now, dep_min=15, arr_min=45)])
-    _snapshot.clear()
-    _snapshot.update(scope)
+    _install_snapshot(scope)
     original = alternatives.fetch_candidates
     alternatives.fetch_candidates = poller
     try:
@@ -1772,7 +1782,7 @@ def test_no_journey_planner_call_without_a_to_stop():
     calls = []
     original = alternatives.fetch_candidates
     alternatives.fetch_candidates = lambda *a, **k: calls.append(1) or []
-    _snapshot.clear(); _snapshot.update(_scope(S1=_train("j1", 8)))
+    _install_snapshot(_scope(S1=_train("j1", 8)))
     try:
         resp = impact.for_trip(
             from_stop=A,
@@ -1839,7 +1849,7 @@ def test_real_http_route_satisfies_the_togpuls_contract():
     """
     from fastapi.testclient import TestClient
 
-    _snapshot.clear(); _snapshot.update(_scope(S1=_train("j1", 8, description="Signalfeil")))
+    _install_snapshot(_scope(S1=_train("j1", 8, description="Signalfeil")))
     main._call_pred_refreshed_at = _at(8)
     original = impact.alternatives.fetch_candidates
     impact.alternatives.fetch_candidates = lambda *a, **k: []  # no network from the suite
@@ -1870,7 +1880,7 @@ def test_real_http_route_satisfies_the_togpuls_contract():
 def test_real_http_route_handles_a_trip_with_nothing_affecting_it():
     from fastapi.testclient import TestClient
 
-    _snapshot.clear(); _snapshot.update({})
+    _install_snapshot({})
     r = TestClient(main.app).get("/impact", params={"from_stop": A, "to_stop": B})
     assert r.status_code == 200
     body = r.json()
@@ -1934,6 +1944,440 @@ def test_an_unanswered_lookup_is_distinguishable_from_an_empty_one_on_the_respon
     assert by_sit[last].alternative_subject is None, "control: the last train was capped"
     assert by_sit[last].answered is True, "capped is terminal, not transient"
     assert by_sit["S0"].answered is False, "while the looked-up trains were throttled"
+
+
+# ---- The inverted prediction index (U2) ---------------------------------------------------------
+#
+# The matcher's cost must scale with distinct place PAIRS per cache generation, not with the number
+# of registered definitions asking about them. Everything below pins that, plus the two things the
+# pruning must not change: which cells come out, and in what order.
+
+
+def _generation(scope, *, refreshed_at, index=None):
+    """Install `scope` as a NEW snapshot object stamped with `refreshed_at`.
+
+    A fresh dict every time on purpose: the generation is `(snapshot identity, refreshed_at)`, so a
+    test that mutated one in place would be asking the engine to notice a change it deliberately
+    cannot see (see `impact.invalidate_generation`).
+    """
+    _generation_state["snapshot"] = dict(scope)
+    _generation_state["refreshed_at"] = refreshed_at
+    _generation_state["index"] = index
+    impact.invalidate_generation()
+
+
+_generation_state: dict = {"snapshot": {}, "refreshed_at": None, "index": None}
+
+
+def _with_generation(fn):
+    """Run `fn()` with the engine reading `_generation_state` instead of the module `_snapshot`."""
+    original_snapshot = impact._snapshot_provider
+    original_index = impact._stop_ref_index_provider
+    impact.configure(
+        snapshot_provider=lambda: (
+            _generation_state["snapshot"],
+            _generation_state["refreshed_at"],
+        ),
+        call_lookup=lambda operator, jkey: _index.get((operator, jkey)),
+        stop_ref_index=(
+            (lambda: (_generation_state["index"], _generation_state["refreshed_at"]))
+            if _generation_state["index"] is not None
+            else None
+        ),
+    )
+    try:
+        return fn()
+    finally:
+        impact._snapshot_provider = original_snapshot
+        impact._stop_ref_index_provider = original_index
+        impact.invalidate_generation()
+
+
+def _noise(n, *, at_from=A, at_to=C):
+    """`n` situations that can never produce a cell for an A -> B trip."""
+    return {
+        f"N{i}": [
+            FakeCall(f"noise{i}", at_from, 1, _at(3), line=f"VYG:Line:N{i}",
+                     situation_number=f"N{i}"),
+            FakeCall(f"noise{i}", at_to, 5, None, aimed_arr=_at(4), line=f"VYG:Line:N{i}",
+                     situation_number=f"N{i}"),
+        ]
+        for i in range(n)
+    }
+
+
+def test_the_scan_is_bounded_by_the_pair_not_by_the_cache():
+    """The whole point of the index: 500 situations that cannot serve this pair are never grouped.
+
+    Before the index `_trip_cells` rebuilt `by_journey`/`by_line_all` for EVERY situation on EVERY
+    scan -- once per definition per window per stop-ref pair -- so a cache the size of the network
+    (~1 100 situations at the midnight peak) was re-walked for a question about two stops.
+    """
+    scope = dict(_noise(500))
+    scope["S1"] = _train("j1", 8)
+    seen: list[int] = []
+    original = impact._trip_cells
+
+    def counting(scope_arg, *args, **kwargs):
+        seen.append(len(scope_arg))
+        return original(scope_arg, *args, **kwargs)
+
+    _generation(scope, refreshed_at=_at(7))
+    impact._trip_cells = counting
+    try:
+        resp = _with_generation(
+            lambda: impact.for_trip(
+                from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+                select="worst", with_alternative=False,
+            )
+        )
+    finally:
+        impact._trip_cells = original
+    assert [s.situation_number for s in resp.situations] == ["S1"], "the real situation still matches"
+    assert seen == [1], f"scanned {seen} situations, want exactly the one that can emit"
+
+
+def test_the_pair_and_window_memos_are_built_once_for_many_definitions():
+    """200 definitions sharing one (pair, window) pay for the grouping once, not 200 times."""
+    scope = dict(_noise(20))
+    scope["S1"] = _train("j1", 8)
+    _generation(scope, refreshed_at=_at(7))
+
+    def run():
+        for _ in range(200):
+            impact.for_trip(
+                from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+                select="worst", with_alternative=False,
+            )
+        return impact.index_stats()
+
+    stats = _with_generation(run)
+    assert stats["generation_builds"] == 1, stats
+    assert stats["pair_builds"] == 1, stats
+    assert stats["window_builds"] == 1, stats
+
+
+def test_a_new_refreshed_at_drops_both_memos():
+    """A rebuild stamps a new generation, and the next scan must not answer off the old one."""
+    first = {"S1": _train("j1", 8)}
+    _generation(first, refreshed_at=_at(7))
+
+    def run():
+        before = impact.for_trip(
+            from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+            select="worst", with_alternative=False,
+        )
+        # A rebuild that dropped the situation and added another.
+        _generation_state["snapshot"] = {"S2": _train("j2", 8, 30, situation_number="S2")}
+        _generation_state["refreshed_at"] = _at(8)
+        after = impact.for_trip(
+            from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+            select="worst", with_alternative=False,
+        )
+        return before, after, impact.index_stats()
+
+    before, after, stats = _with_generation(run)
+    assert [s.situation_number for s in before.situations] == ["S1"]
+    assert [s.situation_number for s in after.situations] == ["S2"], "the stale memo answered"
+    assert stats["generation_builds"] == 2, stats
+
+
+def test_three_threads_on_one_pair_build_the_memo_once():
+    """Pass 1a matches `_MATCH_WORKERS` wide, so the memos meet contention on their first use."""
+    import threading
+
+    scope = dict(_noise(50))
+    scope["S1"] = _train("j1", 8)
+    _generation(scope, refreshed_at=_at(7))
+    results: list = []
+    errors: list = []
+
+    def run():
+        start = threading.Barrier(3)
+
+        def worker():
+            try:
+                start.wait(timeout=5)
+                results.append(
+                    impact.for_trip(
+                        from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+                        select="worst", with_alternative=False,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        return impact.index_stats()
+
+    stats = _with_generation(run)
+    assert not errors, errors
+    assert len(results) == 3, "every thread answered"
+    for resp in results:
+        assert [s.situation_number for s in resp.situations] == ["S1"]
+    assert stats["generation_builds"] == 1, stats
+    assert stats["pair_builds"] == 1, stats
+
+
+# ---- Byte identity: the pruned scan against the unpruned one ------------------------------------
+#
+# The one claim U2 rests on. `for_trip` hands `_trip_cells` only the situations that could emit;
+# this asks, over randomized snapshots built to contain every case the matcher has ever been got
+# wrong on, whether that produces the same response as handing it the whole cache — field for
+# field, including the orders the two stable severity sorts leave behind on a tie.
+#
+# It is green before this change and green after, by design: it is not a regression test but the
+# ORACLE the prune is checked against, and it re-runs on every CI. The red evidence for U2 is
+# elsewhere (the build counters, the dropped memo, the mid-pass beat).
+
+_IDENTITY_SEEDS = tuple(range(24))
+
+
+def _random_snapshot(rng):
+    """A snapshot drawn to contain the cases the matcher's own comments are about.
+
+    Deliberately small in situations and dense in awkwardness: two operators sharing one jkey (bus
+    ServiceJourney refs are not date-scoped), both boarding activities closed in both positions,
+    `PASS_THRU` (both closed at once), a circular route calling the boarding stop twice, departures
+    exactly on each window edge, declared cancellations, and calls that reach `to_stop` in the wrong
+    direction.
+    """
+    scope: dict[str, list] = {}
+    # Insertion order deliberately NOT alphabetical: the pruned scope has to be rebuilt in the
+    # snapshot's OWN order, and a prune that sorted by name would look right against `S0, S1, ...`
+    # while quietly reordering `situations`/`lines` on every severity tie.
+    names = [f"S{i}" for i in range(rng.randint(1, 4))]
+    rng.shuffle(names)
+    for sit in names:
+        # The snapshot KEY is what scopes a scan; `CallPred.situation_number` is what the emitted
+        # cell is labelled with. They agree in production (`main` keys `by_situation` on the same
+        # `situationNumber`) and the suites rely on their being able to differ -- so the index must
+        # carry the key and never read the field back off the call. Drawn apart sometimes, which is
+        # what makes that a checked property rather than a comment.
+        field_sit = sit if rng.random() < 0.7 else rng.choice(["S0", "S9", "ALIAS"])
+        calls: list = []
+        for t in range(rng.randint(1, 4)):
+            jkey = rng.choice(["j1", "j2", "shared"])
+            operator = rng.choice(["VYG", "VYG", "SKY"])  # `shared` + two operators is the trap
+            line = rng.choice(["VYG:Line:R10", "VYG:Line:L1", None])
+            # Window edges at 07:00 and 09:00, so these land inside, outside and exactly on them.
+            minute = rng.choice([-1, 0, 1, 30, 59, 60, 90, 119, 120, 121])
+            dep = _at(7) + timedelta(minutes=minute)
+            board_order = rng.choice([1, 1, 3])
+            common = {
+                "situation_number": field_sit, "operator": operator, "line": line,
+                "p_impact_dep": rng.choice([None, 0.1, 0.66, 0.9, 0.9]),
+                "p_cancel": rng.choice([0.05, 0.5, 0.9]),
+                "dep_delay_p90_stack_min": rng.choice([None, 5, 40]),
+                "dep_delay_p50_stack_min": rng.choice([None, 0, 25]),
+                "et_declared_cancelled": rng.random() < 0.2,
+                "has_situation": rng.random() < 0.8,
+            }
+            calls.append(FakeCall(
+                jkey, A, board_order, dep,
+                boarding_allowed=rng.random() > 0.25, alighting_allowed=rng.random() > 0.25,
+                **common,
+            ))
+            if rng.random() < 0.3:  # circular route: the same train calls A again, later
+                calls.append(FakeCall(
+                    jkey, A, board_order + 4, dep + timedelta(minutes=rng.choice([7, 45])),
+                    boarding_allowed=rng.random() > 0.25,
+                    alighting_allowed=rng.random() > 0.25, **common,
+                ))
+            for stop in (B, C):
+                if rng.random() < 0.8:
+                    order = rng.choice([board_order - 1, board_order + 2, board_order + 6])
+                    calls.append(FakeCall(
+                        jkey, stop, order, None,
+                        aimed_arr=dep + timedelta(minutes=20 + order),
+                        alighting_allowed=rng.random() > 0.25,
+                        boarding_allowed=rng.random() > 0.25, **common,
+                    ))
+            rng.shuffle(calls)
+        scope[sit] = calls
+    return scope
+
+
+def _identity_queries(rng, scope):
+    """The query shapes `for_trip` is reachable with, including the two narrowings."""
+    def q(**kw):
+        return {"to_stop": B, "select": "worst", "at": None, "catchable_after": None, **kw}
+
+    queries = [
+        q(),
+        q(to_stop=None),
+        q(select="nearest", at=_at(8)),
+        q(to_stop=C, select="nearest", at=_at(7, 30)),
+        q(catchable_after=_at(8)),
+        q(select="nearest", at=_at(8), catchable_after=_at(7, 45)),
+    ]
+    queries += [q(situation=sit) for sit in scope]
+    queries.append(q(situation="nope"))
+    return queries
+
+
+def test_the_pruned_scan_answers_exactly_what_the_full_scan_answers():
+    """Randomized differential: `for_trip` (pruned) against `_trip_cells` over the whole snapshot.
+
+    Compared as `model_dump()`, so a difference anywhere — a missing situation, a different worst
+    train, two situations in the other order after a severity tie, a delay figure off a different
+    call — fails. `now` is taken off the response under test and handed to the reference, because
+    `for_trip` samples it once for both `as_of` and the observation cut: reproducing that instant
+    is what makes the comparison total rather than "equal apart from timestamps".
+
+    **This is an ORACLE, not a regression test, so it is green by design and its worth is entirely
+    in what it can be made to fail on.** A differential test that cannot fail is the most
+    comfortable kind of vacuous check: it passes before the change, after it, and after a change
+    that breaks everything. So the falsifications it was proved against are recorded here, each one
+    applied to the prune and each one observed RED before being reverted:
+
+    1. Building the pruned scope in name order rather than the snapshot's own iteration order —
+       caught, because a severity tie resolves on scope order.
+    2. Requiring alighting permission on the BOARDING call.
+    3. Reading the situation off `CallPred.situation_number` instead of carrying the snapshot key
+       in the posting list (the two agree in production and three suites need them not to).
+    4. An exclusive window end (`<` for `<=`) in the prune.
+    5. Applying the catchable cut after the per-line rollup instead of in candidate selection.
+    6. Requiring an arrival time on the boarding candidate — a plausible narrowing, since an origin
+       station legitimately has none. Reported as
+       `seed 0, query {'to_stop': ..., 'select': 'worst'}: the prune changed the answer`.
+
+    And ONE that is deliberately GREEN: dropping the operator from the alighting group key. That
+    *loosens* the prune, so it stays a superset and the answer is unchanged — which is what shows
+    the superset property, rather than the exact predicate, is the thing doing the work.
+    """
+    import random
+
+    compared = 0
+    for seed in _IDENTITY_SEEDS:
+        rng = random.Random(seed)
+        scope = _random_snapshot(rng)
+        stamp = _at(6) + timedelta(seconds=seed)
+        for query in _identity_queries(rng, scope):
+            situation = query.get("situation")
+            # A NEW dict per query, so the generation check sees each install on its own.
+            _generation(scope, refreshed_at=stamp)
+
+            def run(q=query, s=situation):
+                return impact.for_trip(
+                    from_stop=A, to_stop=q["to_stop"],
+                    window_start=_at(7), window_end=_at(9),
+                    select=q["select"], at=q["at"], catchable_after=q["catchable_after"],
+                    situation=s, with_alternative=False,
+                )
+
+            got = _with_generation(run)
+            full = _generation_state["snapshot"]
+            if situation is not None:
+                reference_scope = {situation: full[situation]} if situation in full else {}
+            else:
+                reference_scope = full
+            cells = impact._trip_cells(
+                reference_scope, A, query["to_stop"], _at(7), _at(9),
+                select=query["select"], at=query["at"],
+                catchable_after=query["catchable_after"],
+            )
+            want = impact._impact_response(
+                cells, from_stop=A, to_stop=query["to_stop"], refreshed_at=stamp, now=got.as_of
+            )
+            assert got.model_dump() == want.model_dump(), (
+                f"seed {seed}, query {query}: the prune changed the answer"
+            )
+            compared += 1
+    assert compared >= 200, f"only {compared} comparisons — the generator stopped covering"
+
+
+def test_the_catchable_cut_is_per_call_and_never_in_the_pair_memo():
+    """The review finding this design turns on, and the ordering trap it must not walk into.
+
+    `catchable_after` comes from the CALLER's clock -- the poller's cycle instant, the journey
+    list's, the pull read's -- so a memo keyed to include it would be shared by nobody, and one that
+    ignored it would show a departed train as catchable for up to a cycle. So it is in neither: the
+    memo holds the window-eligible situations and the cut stays exactly where `_trip_cells` applies
+    it, in candidate selection, BEFORE the per-line rollup.
+
+    That ordering is the whole point. Two trains on ONE line here: the severe one has gone, the
+    milder one has not. Applied after the rollup, the departed train would win its line and then be
+    filtered out, taking the line -- and the alert about the catchable train -- with it. Applied
+    where it is, the catchable train wins the line and is reported.
+    """
+    scope = {
+        "S1": [
+            *_train("gone", 7, 10, p_impact_dep=0.99),
+            *_train("later", 8, 30, p_impact_dep=0.60),
+        ]
+    }
+    _generation(scope, refreshed_at=_at(6))
+
+    def run():
+        unfiltered = impact.for_trip(
+            from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+            select="worst", with_alternative=False,
+        )
+        filtered = impact.for_trip(
+            from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+            select="worst", catchable_after=_at(8), with_alternative=False,
+        )
+        return unfiltered, filtered, impact.index_stats()
+
+    unfiltered, filtered, stats = _with_generation(run)
+    assert unfiltered.situations[0].jkey == "gone", "control: the severe train wins while catchable"
+    assert unfiltered.situations[0].departure_prediction.impact_probability == 0.99
+    assert filtered.situations, "the departed train suppressed its whole line"
+    assert filtered.situations[0].jkey == "later", "the cut ran after the rollup"
+    assert filtered.situations[0].departure_prediction.impact_probability == 0.60
+    # Both calls asked the same (pair, window) question, so both memos were built exactly once --
+    # which is only possible because neither of them knows about `catchable_after`.
+    assert stats["pair_builds"] == 1, stats
+    assert stats["window_builds"] == 1, stats
+
+
+def test_a_train_nobody_may_alight_from_is_excluded_by_the_pruned_scan_too():
+    """The F4 rule at `for_trip`'s level, not just `_trip_cells`'.
+
+    Vy sells the local stretch of every long-distance run as boarding-only, and until 2026-09-01 a
+    cancellation on one of them was pushed to eight devices that could not have been aboard. The
+    prune has its own copy of the eligibility question (it is what bounds the scan), so the rule has
+    to be pinned on this path as well as on the matcher's.
+    """
+    board = FakeCall("f4", A, 1, _at(8), situation_number="S1")
+    for at_destination, expected in ((False, 0), (True, 1)):
+        scope = {"S1": [board, FakeCall(
+            "f4", B, 5, None, aimed_arr=_at(8, 40), situation_number="S1",
+            alighting_allowed=at_destination,
+        )]}
+        _generation(scope, refreshed_at=_at(6))
+        resp = _with_generation(lambda: impact.for_trip(
+            from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+            select="worst", with_alternative=False,
+        ))
+        assert len(resp.situations) == expected, (
+            f"alighting_allowed={at_destination} gave {len(resp.situations)} situations"
+        )
+
+
+def test_nearest_still_measures_from_at_through_the_pruned_scan():
+    """`select="nearest"` keeps the boarding call closest to `at`, severity notwithstanding.
+
+    The prune keeps EVERY boarding candidate of a group rather than a pre-selected one, precisely so
+    the two selection strategies still choose from the same pool; a prune that kept "the worst" here
+    would answer /impact's question with /varsel's.
+    """
+    scope = {"S1": [
+        *_train("close", 8, 20, p_impact_dep=0.2, line="VYG:Line:R10"),
+        *_train("far", 9, 10, p_impact_dep=0.99, line="VYG:Line:R10"),
+    ]}
+    _generation(scope, refreshed_at=_at(6))
+    resp = _with_generation(lambda: impact.for_trip(
+        from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(10),
+        select="nearest", at=_at(8), with_alternative=False,
+    ))
+    assert len(resp.situations) == 1
+    assert resp.situations[0].departure_prediction.scheduled_time == _at(8, 20)
 
 
 def _run():

@@ -210,6 +210,11 @@ def _reset_state():
     import notification_wording
 
     notification_wording.reset_state()
+    # `impact`'s per-generation index (U2). This suite swaps the snapshot DICT rather than refilling
+    # one, so the generation check sees every change on its own — but the house rule is that every
+    # module-level cache is dropped from this one function, and the failure if a future test starts
+    # refilling in place is the matcher silently answering off the previous test's situations.
+    impact.invalidate_generation()
     # The webhook channel's two INJECTED SEAMS (U2, 2026-09-08). Not a ledger -- the pass holds no
     # notification state at module level, deliberately (KTD3: Firestore is the only dedup ledger for that
     # channel, and the snapshot `check_and_notify` matches from is pass-local) -- but a leaked stub
@@ -223,6 +228,9 @@ def _reset_state():
     # recorder left behind by an earlier test keeps appending to a list that test still holds, so
     # its assertions about span counts drift with the order the suite happens to run in.
     varsel._span_provider = None
+    # The liveness seam (U2), beside it and for the same reason: a `beat` recorder left behind keeps
+    # appending to a list an earlier test still holds, so its counts drift with the run order.
+    varsel._beat_provider = None
     varsel.set_stop_aliases({})
     _use_snapshot(SNAPSHOT)
 
@@ -952,6 +960,28 @@ def _register(device_id, **overrides):
     )
     assert r.status_code == 200, r.text
     return r.json()["journey_id"]
+
+
+def _seed_definitions(n: int) -> None:
+    """`n` distinct journey definitions, written straight into the store.
+
+    Straight in rather than through `POST /varsel-api/journeys`, for two reasons a heartbeat test
+    cares about: that route renders the card, so it matches on the REQUEST path and would double
+    every count a test takes off the poller's pass; and at the hundreds of definitions these
+    heartbeat scenarios need, the round trips are most of the run time.
+
+    Each gets its own `begin`, so each is its own `journey_key` -- which is what the pass chunks.
+    """
+    for i in range(n):
+        device = f"{DEVICE}-seed-{i:04d}"
+        varsel._devices[device] = {
+            "subscription": SUBSCRIPTION, "created_ts": "2026-01-01T00:00:00+00:00"
+        }
+        varsel._journeys[f"seed-{i:04d}"] = {
+            "device_id": device, "from_stop": "A", "to_stop": "B",
+            "begin": f"{i % 24:02d}:{(i // 24) % 60:02d}", "end": "23:59",
+            "days": [0, 1, 2, 3, 4, 5, 6], "created_ts": "2026-01-01T00:00:00+00:00",
+        }
 
 
 def _count_provider_calls(monkeypatch):
@@ -4680,6 +4710,113 @@ def test_a_failed_push_keeps_its_severity_and_an_unexpected_raise_keeps_its_trac
     assert "Traceback" in record.fields["push_error_traceback"], (
         "the exception NAME is not the frame; a traceback is what makes the defect findable"
     )
+
+
+# ---- One clock for the pass, and a heartbeat inside it (U2) -------------------------------------
+
+
+def test_every_definition_in_a_pass_is_matched_at_the_cycles_own_instant(monkeypatch):
+    """Pass 1a hands `match_journey` the cycle's `now`, not each worker's wall clock.
+
+    Three things ride on that instant and all three are decisions about the traveller: which
+    windows are open (`journey_windows`), which trains can still be caught (`catchable_after`) and
+    what `decided_at` the decision log records. Sampled per journey they disagree by however long
+    the pass takes -- which at ten times the pilot's registrations is seconds, not microseconds --
+    so two definitions on one stop pair could be told different things about one train, and the
+    decision log would carry a scatter of instants where the cycle has exactly one.
+
+    It is also what makes the per-generation index useful: a memo keyed on a window the caller
+    derived from its own clock is shared by nobody.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    seen: list = []
+    real = varsel.match_journey
+
+    def recording(journey, now=None, **kw):
+        seen.append(now)
+        return real(journey, now, **kw)
+
+    for i in range(4):
+        _register(f"{DEVICE}-clock-{i}", begin=f"0{i}:00", end="23:59")
+    # AFTER the registrations: `POST /journeys` renders the card, which matches on the REQUEST path
+    # and legitimately uses its own clock. What this is about is the poller's pass.
+    monkeypatch.setattr(varsel, "match_journey", recording)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(seen) == 4, f"four definitions, {len(seen)} matches"
+    assert all(n is not None for n in seen), "the pass left `now` to the worker's wall clock"
+    assert len(set(seen)) == 1, f"the pass matched at {len(set(seen))} different instants"
+
+
+def test_the_match_pass_beats_the_heartbeat_before_it_finishes(monkeypatch):
+    """A pass long enough to look wedged must not BE wedged as far as /health is concerned.
+
+    `/health`'s staleness rule is "no STEP has finished in `HEALTH_STALE_AFTER_S` (600 s)", and
+    `varsel_notify` is one `_phase`, so until now the whole pass beat exactly once -- at its end.
+    That was fine at 226 definitions and is the wrong shape at 100 000: a pass that slows for any
+    reason (a Journey Planner outage holding 16 workers at their timeout, a bad morning) reads as a
+    wedged poller, /health answers 503, the liveness probe restarts the pod, and the restart comes
+    up with both planned-call tables cold -- which is the self-sustaining crash loop `_beat`'s own
+    docstring describes.
+
+    So the beat is per CHUNK of definitions, and this pins it where it matters: beats land while
+    definitions are still being matched, not only after the last one.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    matched: list[str] = []
+    beats: list[int] = []
+    real = varsel.match_journey
+
+    def recording(journey, now=None, **kw):
+        matched.append(journey["from_stop"])
+        return real(journey, now, **kw)
+
+    definitions = varsel._HEARTBEAT_EVERY * 2 + 1
+    _seed_definitions(definitions)
+    monkeypatch.setattr(varsel, "match_journey", recording)
+    varsel.configure(
+        impact_provider=varsel._impact_provider,
+        stops_provider=varsel._stops_provider,
+        beat=lambda: beats.append(len(matched)),
+    )
+    try:
+        varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.configure(
+            impact_provider=varsel._impact_provider, stops_provider=varsel._stops_provider
+        )
+    assert len(matched) == definitions, f"{len(matched)} of {definitions} definitions matched"
+    assert beats, "the pass never beat the heartbeat"
+    mid_pass = [n for n in beats if 0 < n < definitions]
+    assert mid_pass, f"every beat landed outside the match pass: {beats}"
+
+
+def test_a_broken_heartbeat_seam_never_takes_the_cycle(monkeypatch):
+    """Instrumentation must not be able to stop alerting -- `_span`'s rule, applied to the beat.
+
+    This runs on the ingestion thread, where an exception escaping pass 1a costs a whole cycle's
+    pushes. A heartbeat is a liveness signal about the pass; it is not allowed to end it.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+
+    def boom():
+        raise RuntimeError("heartbeat exploded")
+
+    _seed_definitions(varsel._HEARTBEAT_EVERY + 1)
+    varsel.configure(
+        impact_provider=varsel._impact_provider,
+        stops_provider=varsel._stops_provider,
+        beat=boom,
+    )
+    try:
+        outcome = varsel.check_and_notify(SNAPSHOT)
+    finally:
+        varsel.configure(
+            impact_provider=varsel._impact_provider, stops_provider=varsel._stops_provider
+        )
+    assert outcome is not None, "the pass died on its own heartbeat"
 
 
 if __name__ == "__main__":

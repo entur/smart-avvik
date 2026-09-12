@@ -569,6 +569,56 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     response copy its alert carries — but the Alert is still the field the wording is built from.
     Expect `alt_status = 'not_worth_lookup'` to grow against `offered` at long lead times: that is
     the horizon finally reaching the trains that used to inherit a nearer train's answer.
+  **The matcher scans a PRUNED scope, not the whole cache** (2026-09-12, U2 of the 100k plan).
+  `for_trip` used to hand `impact._trip_cells` the entire prediction snapshot — ~1 100 situations
+  over ~20 000 scored calls at the midnight peak — and `_trip_cells` rebuilt its two per-situation
+  groupings over all of it on **every** scan: once per definition, per window, per stop-ref pair. So
+  a cache sized by the *network* was re-walked for a question about two stops, and the cycle's cost
+  grew with registrations although its input does not. Measured on a synthetic late-evening cache,
+  pruning is **15.7x** cheaper per definition (0.52 ms against 8.2 ms), which is what brings 20 000
+  definitions inside R1's budget. `main.refresh_call_predictions_cache` now builds a fourth index in
+  the same O(calls) ingest loop, `_call_pred_by_stop_ref = {stop_place: [(situationNumber,
+  CallPred)]}`, and `impact` keeps a `_Generation` derived from it, identified by **(snapshot object,
+  refreshed_at)** so the poller's swap-and-restamp under `_call_pred_lock` invalidates it on both
+  counts.
+  **The scan is pruned, the matcher is not forked**, and that is the load-bearing choice: `_trip_cells`
+  stays the one implementation and is simply handed fewer situations, so byte-identity holds by
+  construction rather than by inspection — dicts preserve insertion order, the pruned scope is
+  rebuilt in the snapshot's own order, and a dropped situation emits nothing, so the cell list comes
+  out element for element the same. A second "pair half" reimplementing eligibility is the
+  arrangement this repo has already watched drift apart twice. **Both prune predicates are
+  deliberately SUPERSETS** and the two omissions each have a reason. `catchable_after` is *not* in
+  the prune: it comes from the caller's clock, so a memo keyed on it would never be shared between
+  the poller, the journey list and the pull read, and one ignoring it would show a departed train as
+  catchable for up to a cycle — left out, the cut stays exactly where `_trip_cells` already applies
+  it, in candidate selection *before* the per-line rollup, which is the ordering trap that docstring
+  warns about twice. And `stop_order > bcall.stop_order` is not in the alighting predicate, because
+  which boarding candidate wins is a per-call question. A superset can only leave a situation in that
+  emits nothing; it can never take out one that would have emitted.
+  Three things a later change has to keep. The posting list carries the situation **key** rather than
+  reading `CallPred.situation_number` back off the call: production always makes the two agree and
+  three suites rely on their being able to differ, which is exactly the assumption worth not encoding
+  twice. A suite that refills a snapshot **in place** under an unchanged `refreshed_at` must call
+  `impact.invalidate_generation()` — the generation cannot see a mutation it has no way to observe.
+  And the guarantee is pinned by a differential test
+  (`test_the_pruned_scan_answers_exactly_what_the_full_scan_answers`) that compares `for_trip`
+  against the unpruned scan over randomized snapshots x query shapes; it is an **oracle, not a
+  regression test**, so it is green by design and its worth is its falsifications — six are recorded
+  in its docstring, including one deliberately GREEN case (dropping the operator from the alighting group
+  key *loosens* the prune, so the answer is unchanged), which is what proves the superset argument is
+  the thing doing the work.
+  **The pass beats the heartbeat per chunk** (same unit). `varsel_notify` is one `_phase` and
+  `/health`'s staleness rule means "no STEP has finished in `HEALTH_STALE_AFTER_S`" (600 s), so a
+  pass that merely got *slow* — a Journey Planner outage holding all 16 match workers at their
+  timeout, or a bad morning at 100 000 subscriptions — read as a wedged poller, and the restart that
+  follows comes up with both planned-call tables cold. `varsel.configure(beat=...)` takes `main._beat`
+  as a callable (`varsel` may import neither `main` nor the tracing wiring) and `_drain` beats every
+  `_HEARTBEAT_EVERY` (64) results in passes 1a and 1c. It beats in **submission** order, since that
+  is what `ThreadPoolExecutor.map` yields, so a single definition that never returns still blocks —
+  which is correct, because a pass wedged on one definition *is* the state `/health` exists to catch.
+  **`_match` now passes `cycle_now`** to `match_journey`, so one instant governs the windows, the
+  catchability cut and `decided_at` across a pass; it was defaulting to each worker's own wall clock.
+
   **The poller's two blocking passes run CONCURRENTLY** (2026-08-21), which is what makes a pilot
   ten times the size affordable. `check_and_notify`'s loop 1 is now three passes: **1a** matches
   every journey across `varsel._MATCH_WORKERS` (16) — carrying the Journey Planner lookups with it,

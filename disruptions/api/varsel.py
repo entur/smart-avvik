@@ -88,7 +88,7 @@ import re
 import threading
 import traceback
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -520,6 +520,18 @@ _webhook_provider: WebhookRecipientProvider | None = None
 # the app's tracing wiring, and a module-level `import tracing_setup` would also run that module's
 # import-time `setup()` inside every suite that imports varsel.
 _span_provider: Callable[..., Any] | None = None
+# The liveness seam (U2). `main` injects its `_beat`; absent, the passes below beat nothing and this
+# module behaves exactly as it did before the seam existed. Same injection reasoning as the span
+# above, plus one of its own: `_beat` moves BOTH of main's clocks (the monotonic one /health reads
+# and the epoch gauge the runbook pages on), and a copy of that rule here would be the second place
+# it had to stay true.
+_beat_provider: Callable[[], None] | None = None
+#: How many definitions the match pass may get through between heartbeats, and likewise how many
+#: wordings the writing pass may. Small enough that a chunk cannot itself outlast
+#: `HEALTH_STALE_AFTER_S` (600 s) — a definition's match is bounded by the Journey Planner's own
+#: timeout and a wording by `llm_message`'s, so 64 of either is seconds, not minutes — and large
+#: enough that the beat is not a per-definition function call on the hot path.
+_HEARTBEAT_EVERY = 64
 # Collapsed stop ref -> the primary ref for the same physical place (see set_stop_aliases). Empty
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
@@ -535,6 +547,7 @@ def configure(
     webhook_enabled: Callable[[], bool] | None = None,
     webhook_recipients_provider: WebhookRecipientProvider | None = None,
     span: Callable[..., Any] | None = None,
+    beat: Callable[[], None] | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -555,9 +568,15 @@ def configure(
     tracing wiring. Absent, :func:`_span` yields a `nullcontext` and the pass is byte-for-byte what
     it was. Whatever is injected must accept `(name, attributes)` and honour the closed-vocabulary
     attribute rule — `tracing_setup.safe_attributes` is where that is enforced.
+
+    `beat` is main's `_beat` (U2), injected for the same reason and with the same absent-is-a-no-op
+    default. `/health`'s staleness rule means "no STEP has finished in `HEALTH_STALE_AFTER_S`", and
+    this whole pass is ONE `_phase` — so without it a pass that merely got slow reads as a wedged
+    poller, and the restart that follows comes up with both planned-call tables cold. See
+    :data:`_HEARTBEAT_EVERY`.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
-    global _webhook_enabled, _webhook_provider, _span_provider
+    global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
@@ -565,6 +584,7 @@ def configure(
     _webhook_enabled = webhook_enabled
     _webhook_provider = webhook_recipients_provider
     _span_provider = span
+    _beat_provider = beat
 
 
 def _span(name: str, **attributes: Any):
@@ -587,6 +607,40 @@ def _span(name: str, **attributes: Any):
         return provider(name, attributes)
     except Exception:  # noqa: BLE001 - instrumentation must never fail the pass it observes
         return nullcontext()
+
+
+def _heartbeat() -> None:
+    """Tell the poller's liveness seam that this pass is still making progress, or do nothing.
+
+    Guarded for exactly `_span`'s reason and with a worse failure: this runs on the ingestion
+    thread, so a raising seam would cost a whole cycle's pushes to report that the cycle is alive.
+    """
+    provider = _beat_provider
+    if provider is None:
+        return
+    try:
+        provider()
+    except Exception:  # a liveness signal must never end the pass it reports on
+        logger.warning("Heartbeat seam failed; continuing the pass", exc_info=True)
+
+
+def _drain(results: Iterator[Any], total: int) -> list[Any]:
+    """Consume a pool's results, beating the heartbeat every `_HEARTBEAT_EVERY` of them.
+
+    `ThreadPoolExecutor.map` submits everything at once and yields in SUBMISSION order, so this
+    beats as the pass progresses rather than as workers happen to finish — and a single item that
+    never returns still blocks, which is correct: a pass wedged on one definition IS the state
+    `/health` exists to catch. What it stops is the other reading, where a pass that is merely long
+    (a Journey Planner outage holding `_MATCH_WORKERS` threads at their timeout, a bad morning at
+    100 000 subscriptions) is mistaken for a wedged poller and restarted — see
+    :data:`_HEARTBEAT_EVERY` and `main._beat`.
+    """
+    drained: list[Any] = []
+    for item in results:
+        drained.append(item)
+        if len(drained) % _HEARTBEAT_EVERY == 0 and len(drained) < total:
+            _heartbeat()
+    return drained
 
 
 def set_stop_aliases(aliases: dict[str, str]) -> None:
@@ -3500,7 +3554,13 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     def _match(item: tuple[str, dict]) -> tuple[str, list[Alert]]:
         key, journey = item
         try:
-            return key, match_journey(journey, with_alternative=True)
+            # `cycle_now`, never the worker's own wall clock (U2). Three decisions about the
+            # traveller ride on this instant -- which windows are open, which trains can still be
+            # caught, and the `decided_at` the decision log records -- and sampled per journey they
+            # disagree by however long the pass takes, which at 100 000 subscriptions is seconds.
+            # It is also what lets `impact`'s per-generation window memo be SHARED: a memo keyed on
+            # a window each caller derived from its own clock is shared by nobody.
+            return key, match_journey(journey, cycle_now, with_alternative=True)
         except Exception:
             # One journey's failure must not stop the remaining journeys being scored or any push
             # going out. Empty alerts for this key; the next tick retries. Caught INSIDE the worker
@@ -3527,7 +3587,12 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     ):
         if match_targets:
             with ThreadPoolExecutor(max_workers=min(_MATCH_WORKERS, len(match_targets))) as pool:
-                matched = list(pool.map(_match, list(match_targets.items())))
+                matched = _drain(
+                    pool.map(_match, list(match_targets.items())), len(match_targets)
+                )
+    # A pass boundary is a progress point in exactly `main._phase`'s sense, and the two beats inside
+    # `_drain` above deliberately skip the last chunk so this is the one that reports the pass done.
+    _heartbeat()
 
     # ---- Pass 1b: reconcile, and decide what to write for -- SEQUENTIALLY ----------------------
     #
@@ -3828,7 +3893,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     ):
         if write_queue:
             with ThreadPoolExecutor(max_workers=min(_LLM_WORKERS, len(write_queue))) as pool:
-                list(pool.map(_write_one, write_queue))
+                _drain(pool.map(_write_one, write_queue), len(write_queue))
+        _heartbeat()  # the pass boundary, as after pass 1a
         if budget.refused:
             # ONCE per cycle, after the fact, and reporting what the ceiling actually cost rather than
             # which journey happened to hit it first -- with the queue sorted and the calls concurrent,
