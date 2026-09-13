@@ -990,12 +990,67 @@ def test_the_bytes_cap_is_one_constant_shared_with_meldinger():
     ask the same question of the same table through the same grouping, so a cap that differed
     between them would be an accident. /rushhistorikk reads other tables and keeps its own.
 
-    The value itself has deliberately not moved yet: the derivation waits on a measurement of the
-    pruned, thinned log that only the load harness can take, and a cap derived from today's 1.5 GB
-    would turn the log's growth into refusals on the page with the longest window."""
+    The value itself has deliberately not moved, and since 2026-09-13 that is a decision rather
+    than a gap: half the measurement the derivation waits on now exists (prd's own thinned scan,
+    written out on the constant), and it argues for a cap BELOW today's placeholder -- which would
+    refuse the 180-day window sooner, the very failure the constant exists to prevent. The half
+    still owed is the load harness at 10 000 definitions in dev."""
     import meldinger
 
     assert meldinger._MAX_BYTES_BILLED is historikk._MAX_BYTES_BILLED
+
+
+class _BytesCapError(RuntimeError):
+    """What `google.api_core.exceptions.BadRequest` looks like from this module's side.
+
+    Hand-built rather than imported: what the predicate reads is two attributes, not a class, so a
+    stub carrying exactly those is honest about the contract -- while importing the real class would
+    also assert a dependency this suite deliberately does not have. A TUPLE, because a mutable class
+    attribute is RUF012 and the predicate only ever iterates it.
+    """
+
+    errors = (
+        {
+            "reason": "bytesBilledLimitExceeded",
+            "message": "Query exceeded limit for bytes billed: 2147483648.",
+        },
+    )
+
+
+def test_a_bytes_cap_refusal_is_told_apart_from_a_log_that_was_never_written():
+    """Two failures BigQuery reports alike, which ask opposite things of the reader.
+
+    Not theoretical at the population this stack is being sized for. Measured against prd on
+    2026-09-13: the 14-day default reaches the 2 GiB cap at roughly 1 700 journey definitions and
+    the 180-day maximum at roughly 150, which is prd's registration count today -- so the old
+    sentence would tell a reader the log is EMPTY at the moment it has grown too full to scan, and
+    send them looking for a table that is missing.
+
+    THE THIRD ARM IS THE WHOLE TEST. A predicate answering "cap" to everything passes the first two
+    and is exactly the vacuous-guard shape this repo has been bitten by before, so an unrelated
+    failure must still get the other sentence.
+    """
+    _reset([], error=_BytesCapError("400 Bad Request"))
+    structured = client.get("/historikk-api/decisions")
+    assert structured.status_code == 503, structured.text
+    assert "shorter period" in structured.json()["detail"], (
+        "a refusal carrying BigQuery's own `bytesBilledLimitExceeded` reason must name the window "
+        f"as the thing to change: {structured.json()['detail']}"
+    )
+
+    _reset([], error=RuntimeError("400 Query exceeded limit for bytes billed: 2147483648."))
+    bare = client.get("/historikk-api/decisions")
+    assert "shorter period" in bare.json()["detail"], (
+        "the message fallback has to carry a client or wrapper that lost the structured errors, "
+        f"which is the only signal left when `errors` is absent: {bare.json()['detail']}"
+    )
+
+    _reset([], error=RuntimeError("404 Not found: Table disruptions.varsel_decisions"))
+    missing = client.get("/historikk-api/decisions")
+    assert "may not have been written" in missing.json()["detail"], (
+        "an unrelated failure must keep the unwritten-log sentence, or the new branch is a guard "
+        f"that cannot fail and tells every reader to narrow a window: {missing.json()['detail']}"
+    )
 
 
 def _run():
