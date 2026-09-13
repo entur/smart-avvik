@@ -959,6 +959,11 @@ def _log_connectivity(
     case a reader looks up by hand; ONE summary for a batch, because a sweep asking about thousands
     would otherwise be thousands of INFO lines a cycle — and each of those answers is stored on the
     record it is about, which is where a reader should look for it.
+
+    The digest here is over the first EXPANDED ref of each side, while `varsel._service_verdict`'s
+    own error path digests the caller's canonical refs — so one stop pair can carry two labels.
+    Cosmetic by construction: `pair_digest` is documented as a label for a human reading logs and
+    explicitly not a join key, and correlating within one record's own event name still works.
     """
     if len(asked) == 1:
         key = asked[0]
