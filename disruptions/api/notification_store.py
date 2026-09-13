@@ -418,6 +418,10 @@ def _mirror_stamp() -> Any:
 #: transaction and mints nothing for an unchanged subject -- and the standing-subject mirror is
 #: what closes the wasted wording. Same reasoning for the claim and reservation-release bodies.
 #:
+#: `_canonicalize_body` is in it: it rewrites `from_stop` and `to_stop`, which is the pair the pass
+#: matches on, so an unstamped rewrite would leave a RESTARTED process matching the ref the picker
+#: has collapsed -- the 2026-08-03 bug, arriving by the mirror rather than by the record.
+#:
 #: `_finish_cleanup_body` is out because it only ever runs on a subscription `_delete_body` has
 #: already tombstoned, which the mirror has already dropped on that stamp.
 #: `_erase_device_body` is in it and it is the one entry whose OMISSION would be a privacy defect
@@ -445,6 +449,7 @@ def _mirror_stamp() -> Any:
 #: which declares the bodies that apply, and `SubscriptionMirror._overtaken`, which is what keeps a
 #: sync that read before a local commit from putting the stale copy back.
 MIRROR_STAMPING_BODIES = (
+    "_canonicalize_body",
     "_create_body",
     "_replace_body",
     "_delete_body",
@@ -1340,6 +1345,12 @@ class Subscription:
     # "not established" and never reads as an all-clear -- U4 renders the difference.
     servable: bool | None = None
     servable_checked_at: datetime | None = None
+    #: Is the pair served in the OTHER direction? Only meaningful beside `servable is False`, where
+    #: it is what sharpens `/varsel`'s caveat from "no direct trip" to "this looks like a swap, and
+    #: here is the trip that does run". Carried since U13 because the browser channel renders it and
+    #: a store that stored only the bool would silently give every such traveller the blunter text
+    #: -- which reads as the check working, not as a field going missing.
+    servable_reverse: bool = False
     daily_deliveries: Mapping[str, int] = field(default_factory=dict)
     #: ``delivery_id`` -> ``{"day", "at"}`` for slots RESERVED and not yet confirmed or released.
     #: Kept separate from ``daily_deliveries`` on purpose: that map stays the count of confirmed
@@ -1452,6 +1463,7 @@ def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
         inactivity_expires_at=_as_dt(doc.get("inactivity_expires_at")),
         servable=doc.get("servable") if isinstance(doc.get("servable"), bool) else None,
         servable_checked_at=_as_dt(doc.get("servable_checked_at")),
+        servable_reverse=bool(doc.get("servable_reverse")),
         daily_deliveries=dict(doc.get("daily_deliveries") or {}),
         daily_reservations={
             str(k): dict(v)
@@ -1889,6 +1901,7 @@ def _servability_body(
     servable: bool | None,
     expected_version: int,
     now: datetime,
+    servable_reverse: bool = False,
 ) -> dict[str, Any]:
     snapshot = _read(transaction, refs.subscription(subscription_id))
     stored = _doc(snapshot)
@@ -1903,6 +1916,10 @@ def _servability_body(
         )
     patch = {
         "servable": servable,
+        # Written on EVERY established answer, including a servable one, so the qualifier cannot
+        # outlive the verdict it qualifies: a pair that was reverse-only and is now served directly
+        # would otherwise keep a `True` that nothing reads but everything can see.
+        "servable_reverse": bool(servable_reverse),
         "servable_checked_at": now,
         "updated_at": now,
         MIRROR_FIELD: _mirror_stamp(),
@@ -1911,11 +1928,115 @@ def _servability_body(
     return {**stored, **patch}
 
 
+def _spec_from_doc(doc: Mapping[str, Any], **over: Any) -> SubscriptionSpec:
+    """A stored document back as the spec that produced it, with fields overridden.
+
+    Exists for ONE reason: :func:`_definition_digest` takes a spec, and a body that rewrites a
+    field the digest covers has to recompute it. Building the material by hand there would be a
+    second statement of the digest's inputs, and the digest is a STORED value -- two statements
+    that drift mean a client's idempotent re-POST becomes a Conflict on the deploy that drifted.
+    """
+    base: dict[str, Any] = {
+        "subscription_id": str(doc["subscription_id"]),
+        "client_id": str(doc["client_id"]),
+        "destination_id": str(doc.get("destination_id") or ""),
+        "from_stop": str(doc["from_stop"]),
+        "to_stop": str(doc["to_stop"]),
+        "begin": str(doc["begin"]),
+        "end": str(doc["end"]),
+        "days": tuple(sorted({int(d) for d in doc.get("days") or ()})),
+        "external_ref": str(doc.get("external_ref") or ""),
+        "test": bool(doc.get("test")),
+        "channel": str(doc.get("channel") or CHANNEL_WEBHOOK),
+        "device_id": str(doc.get("device_id") or ""),
+        "from_name": str(doc.get("from_name") or ""),
+        "to_name": str(doc.get("to_name") or ""),
+        "consent_version": str(doc.get("consent_version") or ""),
+    }
+    base.update(over)
+    return SubscriptionSpec(**base)
+
+
+def _canonicalize_body(
+    transaction: Any,
+    refs: _Refs,
+    *,
+    subscription_id: str,
+    client_id: str,
+    from_stop: str,
+    to_stop: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Rewrite one registration onto canonical stop refs. ``None`` when it is gone.
+
+    `/varsel`'s `_canonicalize_journeys`: the stop-alias map can only be built after the registry is
+    read, which is long after a registration was made, so a record can name a ref the picker has
+    since collapsed -- and matching only the nominated ref is how a whole place's calls go missing.
+    Its own bounded body rather than `replace_subscription`, whose version bump means something
+    else entirely (the client changed the route) and whose semantics would retire the servability
+    answer this rewrite has no business touching.
+
+    Idempotent by testing the stored value first, which is what lets the caller run it on every
+    stop-list rebuild: a canonical record costs one read and no write.
+
+    The DIGEST is recomputed, and that is the part easy to leave out. It covers `from_stop` and
+    `to_stop`, so a rewrite without it stores a hash of a definition the document no longer holds --
+    and the next create under that id, which is the idempotent-retry path, would read as a different
+    definition and be refused.
+    """
+    stored = _doc(_read(transaction, refs.subscription(subscription_id)))
+    if not stored or stored.get("status") != "active":
+        return None
+    if stored.get("client_id") != client_id:
+        raise Forbidden("subscription belongs to another client")
+    if (stored.get("from_stop"), stored.get("to_stop")) == (from_stop, to_stop):
+        return stored
+    patch = {
+        "from_stop": from_stop,
+        "to_stop": to_stop,
+        "definition_digest": _definition_digest(
+            _spec_from_doc(stored, from_stop=from_stop, to_stop=to_stop)
+        ),
+        "updated_at": now,
+        MIRROR_FIELD: _mirror_stamp(),
+    }
+    transaction.update(refs.subscription(subscription_id), patch)
+    return {**stored, **patch}
+
+
+def canonicalize_stops(
+    *,
+    subscription_id: str,
+    client_id: str,
+    from_stop: str,
+    to_stop: str,
+    now: datetime | None = None,
+) -> bool:
+    """Rewrite one registration onto canonical stop refs; False when it is gone."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    doc = _mirror_subscription(
+        _run_transaction(
+            lambda txn: _canonicalize_body(
+                txn,
+                refs,
+                subscription_id=subscription_id,
+                client_id=client_id,
+                from_stop=from_stop,
+                to_stop=to_stop,
+                now=instant,
+            )
+        )
+    )
+    return doc is not None
+
+
 def set_servability(
     subscription_id: str,
     *,
     servable: bool | None,
     expected_version: int,
+    servable_reverse: bool = False,
     now: datetime | None = None,
 ) -> Subscription:
     """Record R6's servability answer and its freshness, for the route that was ASKED about.
@@ -1947,6 +2068,7 @@ def set_servability(
             subscription_id=subscription_id,
             servable=servable,
             expected_version=expected_version,
+            servable_reverse=servable_reverse,
             now=instant,
         )
     )
@@ -2189,6 +2311,7 @@ class MirrorEntry:
     # full read per cycle, which is most of what U6 exists to remove.
     servable: bool | None = None
     servable_checked_at: datetime | None = None
+    servable_reverse: bool = False
     # ---- what a `web_push` registration's cycle reads, and nothing more (U13).
     #
     # `/varsel`'s pass needs the device to push to and the two names its wording renders, and it
@@ -2212,6 +2335,10 @@ class MirrorEntry:
     device_id: str = ""
     from_name: str = ""
     to_name: str = ""
+    #: When the registration was made. Carried so the cycle's record and the request path's are the
+    #: SAME shape rather than nearly: `/varsel` reads one journey record from both, and a field
+    #: present in one is a reader that works until it is called from the other side.
+    created_at: datetime | None = None
     notified: Mapping[str, datetime] = field(default_factory=dict)
     pushed_trains: Mapping[str, datetime] = field(default_factory=dict)
     daily_pushes: Mapping[str, int] = field(default_factory=dict)
@@ -2262,9 +2389,11 @@ def _mirror_entry(doc: Mapping[str, Any]) -> MirrorEntry:
         mirror_updated_at=_as_dt(doc.get(MIRROR_FIELD)),
         servable=sub.servable,
         servable_checked_at=sub.servable_checked_at,
+        servable_reverse=sub.servable_reverse,
         device_id=sub.device_id,
         from_name=sub.from_name,
         to_name=sub.to_name,
+        created_at=sub.created_at,
         notified=dict(sub.notified),
         pushed_trains=dict(sub.pushed_trains),
         daily_pushes=dict(sub.daily_pushes),
@@ -2443,6 +2572,26 @@ class SubscriptionMirror:
         with self._lock:
             entries = list(self._entries.values())
         return [e for e in entries if e.channel == channel and e.is_live(now)]
+
+    def entry(
+        self, subscription_id: str, now: datetime, *, channel: str = CHANNEL_WEBHOOK
+    ) -> MirrorEntry | None:
+        """ONE live entry, by id. A dict lookup, never a scan.
+
+        `recipients` copies the whole entry list and tests liveness on every element, which is the
+        right shape for the pass -- it wants all of them -- and the wrong one for a caller that
+        wants a single registration. At a hundred thousand entries the difference is not constant
+        factors: `varsel`'s delivery loop asks `get_journey` three times per push and `push_ledger`
+        once per candidate, so a thousand pushes is ~4 000 full scans, and the store backend --
+        the one that exists to scale -- would be slower per cycle than the blob it replaces. The
+        liveness test stays on the read for `recipients`' own reason: expiry is the one state
+        change nothing writes a document for.
+        """
+        with self._lock:
+            entry = self._entries.get(subscription_id)
+        if entry is None or entry.channel != channel or not entry.is_live(now):
+            return None
+        return entry
 
     def documents(self, now: datetime, *, channel: str = CHANNEL_WEBHOOK) -> list[dict[str, Any]]:
         """:func:`recipient_documents`' shape, served from memory."""
@@ -2928,6 +3077,7 @@ SUBSCRIPTION_MIRRORING_BODIES = frozenset(
         "_delete_body",
         "_touch_body",
         "_servability_body",
+        "_canonicalize_body",
         "_mark_notified_body",
         "_record_push_body",
     }
@@ -3538,7 +3688,7 @@ def _record_push_body(
     refs: _Refs,
     *,
     subscription_id: str,
-    train_ref: str,
+    train_ref: str | None,
     now: datetime,
     charge_cap: bool = True,
 ) -> dict[str, Any]:
@@ -3557,6 +3707,11 @@ def _record_push_body(
     -- it is what the next replacement is recognised by, and a replacement that did not refresh it
     would let the mark age out mid-disruption and turn the third notification about one train into
     a fourth charged push.
+
+    `train_ref` is None when the alert cannot say which train it is about, and then NOTHING is
+    recorded for the train while the day's count is still charged -- the cap is spent per push, and
+    the lock screen falls back to the situation number, which is what it always did. A placeholder
+    would be a mark no later push can ever match, occupying a slot in a map `_prune_marks` bounds.
     """
     stored = _web_push_journey(transaction, refs, subscription_id)
     day = oslo_day(now)
@@ -3564,7 +3719,8 @@ def _record_push_body(
     if charge_cap:
         counters[day] = int(counters.get(day) or 0) + 1
     trains = dict(stored.get("pushed_trains") or {})
-    trains[train_ref] = now + timedelta(days=HISTORY_DAYS)
+    if train_ref is not None:
+        trains[train_ref] = now + timedelta(days=HISTORY_DAYS)
     patch = {
         "daily_pushes": _prune_daily(counters, now),
         "pushed_trains": _prune_marks(trains, now),
@@ -3601,7 +3757,7 @@ def mark_notified(*, subscription_id: str, situation_number: str, now: datetime 
 def record_push(
     *,
     subscription_id: str,
-    train_ref: str,
+    train_ref: str | None,
     charge_cap: bool = True,
     now: datetime | None = None,
 ) -> None:

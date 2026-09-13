@@ -20,17 +20,25 @@ import inspect
 import os
 import tempfile
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 _STATE_FD, _STATE_PATH = tempfile.mkstemp(prefix="varsel_state_seam_", suffix=".json")
 os.close(_STATE_FD)
 os.environ["VARSEL_STATE_PATH"] = _STATE_PATH
 
+import notification_store
 import varsel_state
 
 NOW = datetime(2026, 9, 13, 8, 0, tzinfo=UTC)
 DEVICE = "dev-abcdef12"
 OTHER = "dev-99999999"
 SUB = {"endpoint": "https://push.example.com/x", "keys": {"p256dh": "k", "auth": "a"}}
+
+
+#: Deliberately tiny, so the ceilings are reachable in a test at all. `/varsel`'s own are 5 000 and
+#: 20 000, which no suite can drive, and a ceiling nothing exercises is a ceiling nobody knows works.
+MAX_DEVICES = 3
+MAX_JOURNEYS = 5
 
 
 def _reset() -> varsel_state.BlobRegistrations:
@@ -43,7 +51,7 @@ def _reset() -> varsel_state.BlobRegistrations:
         varsel_state._daily_pushes.clear()
         varsel_state._togvarsel_rounds.clear()
         varsel_state._state_extra.clear()
-    return varsel_state.BlobRegistrations()
+    return varsel_state.BlobRegistrations(max_devices=MAX_DEVICES, max_journeys=MAX_JOURNEYS)
 
 
 def _journey(device_id: str = DEVICE, **over) -> dict:
@@ -77,6 +85,10 @@ def test_the_blob_backend_answers_every_method_the_protocol_declares(_mp):
         if not name.startswith("_") and callable(value)
     }
     assert len(declared) >= 18, f"the protocol shrank to {len(declared)} methods; is this right?"
+    assert "device_count" not in declared and "journey_count" not in declared, (
+        "a count the caller compares against a constant is back on the protocol; the ceiling is the "
+        "backend's, raised as CapacityExceeded -- see that class"
+    )
     for name, proto in declared.items():
         impl = getattr(varsel_state.BlobRegistrations, name, None)
         assert impl is not None, f"BlobRegistrations does not answer {name}"
@@ -171,7 +183,7 @@ def test_a_load_reads_the_local_file_back_into_the_state_it_came_from(_mp):
     assert store.save() is True, "bucket-less means there is no durable copy to be stale"
 
     _reset()
-    assert store.journey_count() == 0
+    assert store.device_journeys(DEVICE) == []
     store.load()
     assert store.get_device(DEVICE)["subscription"] == SUB
     assert [jid for jid, _rec in store.device_journeys(DEVICE)] == ["j1"]
@@ -186,7 +198,7 @@ def test_a_corrupt_blob_starts_empty_rather_than_refusing_to_serve(_mp):
     with open(_STATE_PATH, "w") as fh:
         fh.write("{not json at all")
     store.load()
-    assert store.journey_count() == 0 and store.device_count() == 0
+    assert store.all_journeys() == [] and store.get_device(DEVICE) is None
 
 
 def test_an_unknown_top_level_key_survives_a_load_and_a_serialize(_mp):
@@ -238,6 +250,50 @@ def test_a_device_with_no_journeys_left_behind_leaves_no_tombstone(_mp):
     assert DEVICE not in varsel_state._device_tombstones, "the last journey left the marker behind"
 
 
+def test_the_two_global_ceilings_refuse_through_the_backend_and_never_refuse_a_returning_device(_mp):
+    """The ceiling moved from a caller's read-then-compare into the backend (U13's store half).
+
+    Two properties, and the second is the one a pre-check got wrong for free: a ceiling must refuse
+    a NEW device and must never refuse one that already exists, or a deployment sitting at its
+    ceiling stops accepting the subscription refreshes that keep its own registrations alive -- and
+    the traveller whose push endpoint rotated is silently un-notifiable from then on.
+    """
+    store = _reset()
+    for i in range(MAX_DEVICES):
+        store.put_device(f"dev-fill{i:04d}", subscription=SUB, brand="entur")
+    try:
+        store.put_device("dev-oneMore1", subscription=SUB, brand="entur")
+    except varsel_state.CapacityExceeded as exc:
+        assert exc.kind == "devices"
+    else:
+        raise AssertionError("the device ceiling did not refuse")
+    # A device already stored is refreshed, not refused.
+    store.put_device("dev-fill0000", subscription=SUB, brand="none")
+    assert store.get_device("dev-fill0000")["brand"] == "none"
+
+    for i in range(MAX_JOURNEYS):
+        store.create_journey(f"j{i}", _journey())
+    try:
+        store.create_journey("one-more", _journey())
+    except varsel_state.CapacityExceeded as exc:
+        assert exc.kind == "journeys"
+    else:
+        raise AssertionError("the journey ceiling did not refuse")
+
+
+def test_several_devices_come_back_from_one_ask(_mp):
+    """`devices_for` is one call because the store answers it with one multi-get. Unknown ids are
+    absent rather than an error: a journey registered by a browser that never turned notifications
+    on is the ordinary case, not a failure."""
+    store = _reset()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.put_device(OTHER, subscription=SUB, brand="none")
+    found = store.devices_for([DEVICE, OTHER, "dev-nobody1", DEVICE])
+    assert set(found) == {DEVICE, OTHER}
+    assert found[OTHER]["brand"] == "none"
+    assert store.devices_for([]) == {}
+
+
 def test_forgetting_an_unknown_device_reports_nothing_rather_than_writing_a_marker(_mp):
     store = _reset()
     assert store.forget_device("dev-nothing1", reason="expired") == (None, 0)
@@ -255,7 +311,7 @@ def test_one_devices_journeys_are_its_own_and_come_back_in_creation_order(_mp):
     store.create_journey("other", _journey(device_id=OTHER))
     assert [jid for jid, _rec in store.device_journeys(DEVICE)] == ["j1", "j2", "j3"]
     assert [jid for jid, _rec in store.device_journeys(OTHER)] == ["other"]
-    assert store.journey_count() == 4 and store.device_count() == 0
+    assert len(store.all_journeys()) == 4 and store.get_device(DEVICE) is None
 
 
 def test_a_stamp_or_a_canonicalization_of_a_deleted_journey_reports_it_rather_than_resurrecting(_mp):
@@ -268,7 +324,7 @@ def test_a_stamp_or_a_canonicalization_of_a_deleted_journey_reports_it_rather_th
     assert store.get_journey("j1") is None
     assert store.set_canonical_stops("j1", from_stop="A", to_stop="B") is False
     assert store.stamp_service_check("j1", checked_ts="t", cleared=True, reverse_only=False) is False
-    assert store.journey_count() == 0
+    assert store.all_journeys() == []
 
 
 def test_an_established_service_answer_moves_the_stamp_whether_or_not_it_clears(_mp):
@@ -460,6 +516,327 @@ def test_the_markers_are_deliberately_off_the_registration_protocol(_mp):
     grow a `togvarsel_rounds` document to satisfy an interface nothing would read it through."""
     declared = set(vars(varsel_state.RegistrationStore))
     assert not {n for n in declared if "round" in n}, "a round marker reached the registration seam"
+
+
+# ---------------------------------------------------------------- the store backend
+# Driven over `test_notification_store`'s OWN fake client rather than a second one written here.
+# That suite's fake runs the real transaction bodies, applies their writes, enforces the read
+# deadlines and resolves the server timestamp against a clock deliberately ahead of the caller's --
+# every property this backend's correctness rests on. A private fake would be a second set of those
+# properties to keep true, and the first thing to rot would be the one that matters most: that a
+# body's writes are what a later read sees.
+import test_notification_store as store_suite
+
+STORE_CLIENT = varsel_state.BROWSER_CLIENT_ID
+
+
+def _stage(client: Any) -> None:
+    """Re-stage the fake's query pages from whatever it currently holds.
+
+    The fake serves a query from a page a test put there, and applies the query's EQUALITY over it
+    -- so staging every document of a collection and letting the filter run is the closest thing to
+    a real collection this suite can have, and it is what makes `device_journeys`' own filter
+    (client, channel, device) part of what is under test rather than something the fixture faked.
+    """
+    subscriptions = [
+        doc
+        for path, doc in client.docs.items()
+        if path.startswith(f"{notification_store.SUBSCRIPTIONS}/")
+    ]
+    devices = [
+        doc for path, doc in client.docs.items() if path.startswith(f"{notification_store.DEVICES}/")
+    ]
+    client.page("device_journeys", notification_store.SUBSCRIPTIONS, subscriptions)
+    client.page("subscription_count", notification_store.SUBSCRIPTIONS, subscriptions)
+    client.page("device_count", notification_store.DEVICES, devices)
+
+
+def _store() -> tuple[varsel_state.StoreRegistrations, Any]:
+    """A store-backed seam over a fresh fake, with the ceilings this suite can actually reach.
+
+    Every query re-stages first, so a read always sees what the writes before it did. Staged once
+    per test instead, the fixture would answer the question the test asked at setup time rather than
+    the one it is asking now -- which is the shape that let a fake show an erase loop terminating
+    when it could not.
+    """
+    client = store_suite._FakeClient()
+    store_suite._install(client)
+    notification_store.subscription_mirror().reset()
+    staged_query = notification_store._query
+
+    def _restaging_query(name: str, **kwargs: Any) -> Any:
+        _stage(client)
+        return staged_query(name, **kwargs)
+
+    notification_store._query = _restaging_query  # type: ignore[assignment]
+    return (
+        varsel_state.StoreRegistrations(
+            client_id=STORE_CLIENT, quotas=lambda: (MAX_DEVICES, MAX_JOURNEYS)
+        ),
+        client,
+    )
+
+
+def _seeded_mirror(client: Any) -> None:
+    """Seed the subscription mirror from whatever the fake currently holds.
+
+    The cycle reads the mirror and the request path reads the store, so a test about the cycle has
+    to seed one -- and seeding it from the fake's own documents is what keeps the two halves
+    describing the same state rather than two hand-built ones.
+    """
+    rows = [
+        dict(doc)
+        for path, doc in client.docs.items()
+        if path.startswith(f"{notification_store.SUBSCRIPTIONS}/")
+    ]
+    store_suite._mirror_page(client, "mirror_seed", rows)
+    notification_store.subscription_mirror().seed(now=datetime.now(UTC))
+
+
+def test_the_store_backend_answers_the_same_protocol_as_the_blob(_mp):
+    """Both backends, method for method and signature for signature.
+
+    Two implementations is where a protocol earns its keep and where it silently stops being one: a
+    keyword renamed on the blob is caught by every `/varsel` test, while the same rename on the
+    store backend is caught by nothing until a cycle runs in an environment that has it switched on.
+    """
+    declared = {
+        name: value
+        for name, value in vars(varsel_state.RegistrationStore).items()
+        if not name.startswith("_") and callable(value)
+    }
+    for name, proto in declared.items():
+        impl = getattr(varsel_state.StoreRegistrations, name, None)
+        assert impl is not None, f"StoreRegistrations does not answer {name}"
+        assert inspect.signature(impl) == inspect.signature(proto), (
+            f"{name} has drifted: {inspect.signature(impl)} against {inspect.signature(proto)}"
+        )
+
+
+def test_a_registration_created_on_the_request_path_is_listed_before_any_cycle(_mp):
+    """R15, and the reason the request path does not read the mirror: the mirror is at best as fresh
+    as the sync at the start of this cycle, and before the poller has seeded it, empty. A traveller
+    who has just registered a journey must see it in the next `list_journeys` regardless."""
+    store, _client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    assert notification_store.subscription_mirror().ready is False, "the mirror is deliberately cold"
+    listed = store.device_journeys(DEVICE)
+    assert [jid for jid, _rec in listed] == ["j1"]
+    record = listed[0][1]
+    assert record["device_id"] == DEVICE
+    assert (record["from_stop"], record["to_stop"]) == ("NSR:StopPlace:1", "NSR:StopPlace:2")
+    assert record["days"] == [1, 2, 3, 4, 5]
+    assert store.get_device(DEVICE)["subscription"] == SUB
+
+
+def test_every_field_varsels_own_record_carries_survives_the_round_trip(_mp):
+    """The shape is the contract: `varsel` reads ONE record type from `device_journeys` and from
+    `all_journeys`, renders the card from it and words a push from it. A field lost here does not
+    error -- the card renders a blank name, the caveat disappears, the consent version reads as
+    never given -- so every one of them is asserted by name."""
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey(
+        "j1",
+        _journey(
+            from_name="Oslo S",
+            to_name="Lillestrøm stasjon",
+            consent_text_version="2026-09-02.1",
+            no_direct_service=True,
+            service_reverse_only=True,
+            service_checked_ts=NOW.isoformat(),
+        ),
+    )
+    (_jid, record) = store.device_journeys(DEVICE)[0]
+    assert record["from_name"] == "Oslo S" and record["to_name"] == "Lillestrøm stasjon"
+    assert record["consent_text_version"] == "2026-09-02.1"
+    assert record["begin"] == "07:00" and record["end"] == "09:00"
+    assert record["no_direct_service"] is True, "the caveat did not survive"
+    assert record["service_reverse_only"] is True, "the swap qualifier did not survive"
+    assert record["service_checked_ts"], "the caveat has no age, so it can never be judged"
+    assert record["created_ts"], "the signup instant did not survive"
+    # And the cycle's copy is the same record MINUS exactly one field, which is what lets one
+    # reader serve both. `consent_text_version` is the difference and it is deliberate: the mirror
+    # carries what the PASS reads and nothing else -- `_journey_model` is the only reader of that
+    # field and it runs on the request path, where `device_journeys` answers. Asserted as a set
+    # difference rather than glossed, so a SECOND field going missing from the cycle's view fails
+    # here instead of rendering a blank name on somebody's card.
+    _seeded_mirror(client)
+    cycle = dict(store.all_journeys())["j1"]
+    assert set(record) - set(cycle) == {"consent_text_version"}
+    assert not set(cycle) - set(record), "the cycle's record carries a field the request path's does not"
+    assert {k: v for k, v in record.items() if k != "consent_text_version"} == cycle
+
+
+def test_a_servable_pair_carries_no_caveat_rather_than_a_false_one(_mp):
+    """`/varsel` says "not established" by the caveat's ABSENCE, and `_service_warning` reads it
+    that way. A `no_direct_service: False` would render as an all-clear the check never gave."""
+    store, _client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey(service_checked_ts=NOW.isoformat()))
+    (_jid, record) = store.device_journeys(DEVICE)[0]
+    assert "no_direct_service" not in record and "service_reverse_only" not in record
+    assert record["service_checked_ts"], "an established answer still has to carry its age"
+
+
+def test_a_push_mark_is_on_the_document_and_the_next_cycle_sees_it(_mp):
+    """The plan's second scenario. The write is the store's and the READ is the mirror's, which is
+    the reversal of what U12 recorded: the mark bodies apply their own commit, so the mirror's copy
+    is exact rather than a cycle behind -- and the alternative is a document read per registration
+    per cycle."""
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    _seeded_mirror(client)
+
+    store.mark_notified("j1", "S1")
+    store.record_push("j1", tag="j1|L1|07:18", departure=NOW, oslo_day="2026-09-13", charge_cap=True)
+
+    stored = client.doc(notification_store.SUBSCRIPTIONS, "j1")
+    assert set(stored["notified"]) == {"S1"}, "the mark is not on the document"
+    ledger = store.push_ledger("j1")
+    assert ledger.notified == {"S1"}, "the cycle cannot see a mark this process just wrote"
+    assert ledger.pushed_trains == {"j1|L1|07:18"}
+    assert ledger.sent_today == 1
+    assert store.notified_snapshot(["j1"]) == {"j1|S1"}
+
+
+def test_a_push_that_cannot_name_its_train_charges_the_day_and_marks_no_train(_mp):
+    """The `tag is None` branch, on BOTH backends, because they used to answer it differently.
+
+    An alert that cannot say which departure it is about gets no lock-screen tag -- the worker falls
+    back to the situation number. The store wrote a `"<jid>|unidentified"` placeholder for it: a
+    mark no later push can ever match, taking a slot in a map `_prune_marks` bounds by age. The
+    day's count is still spent, because the cap is per PUSH and not per train.
+    """
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    _seeded_mirror(client)
+    store.record_push("j1", tag=None, departure=None, oslo_day="2026-09-13", charge_cap=True)
+
+    stored = client.doc(notification_store.SUBSCRIPTIONS, "j1")
+    assert not stored["pushed_trains"], "an unnamed train left a mark nothing can match"
+    assert stored["daily_pushes"], "the day's count was not charged"
+    assert store.push_ledger("j1").sent_today == 1
+
+    blob = _reset()  # clears the module state this half writes, and `_reset()` again below
+    blob.create_journey("j1", _journey())
+    blob.record_push("j1", tag=None, departure=None, oslo_day="2026-09-13", charge_cap=True)
+    assert blob.push_ledger("j1").pushed_trains == frozenset(), "the two backends disagree"
+    assert blob.push_ledger("j1").sent_today == 1
+    _reset()  # the blob's state is MODULE state; left behind it reaches whatever runs next
+
+
+def test_a_mark_for_a_journey_erased_mid_push_is_dropped_rather_than_raised(_mp):
+    """The plan's fourth scenario. A push can be in flight past `_prepare_alert`'s re-check when the
+    traveller presses «Slett alt»: the push went out, and the only thing this call could add is a
+    mark on a document that no longer exists. Raising would take the whole delivery loop's result
+    handling with it, for a journey nobody is registered on any more."""
+    store, _client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    erasure = store.erase_device(DEVICE)
+    assert erasure.found and erasure.journeys_deleted == 1 and erasure.durable
+
+    store.mark_notified("j1", "S1")  # must not raise
+    store.record_push("j1", tag=None, departure=None, oslo_day="2026-09-13", charge_cap=True)
+    assert store.get_device(DEVICE) is None
+    assert store.device_journeys(DEVICE) == []
+
+
+def test_the_cycle_reads_nothing_at_all_from_an_unseeded_mirror(_mp):
+    """`recipient_documents`' rule, restated for this reader: a partial population is worse than
+    none, because the pass cannot tell "nobody is registered" from "the read has not finished" and
+    would silently retire whatever the seed had not reached yet."""
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    assert store.all_journeys() == [], "a cold mirror answered for somebody"
+    _seeded_mirror(client)
+    assert [jid for jid, _rec in store.all_journeys()] == ["j1"]
+
+
+def test_a_deleted_journey_is_gone_from_the_cycles_view_at_once(_mp):
+    """The liveness re-check the delivery loop makes twice per push, and what the commit-apply is
+    for: a watermark would carry this delete at the start of the NEXT cycle, by which time the push
+    has gone out to a traveller who deleted the journey."""
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    _seeded_mirror(client)
+    assert store.get_journey("j1") is not None
+
+    store.delete_journey("j1")
+    assert store.get_journey("j1") is None, "the cycle can still see a journey this request deleted"
+    assert store.all_journeys() == []
+
+
+def test_a_per_journey_read_is_keyed_and_never_a_scan_of_the_mirror(_mp):
+    """The cost the store backend exists to remove, pinned where a benchmark cannot reach it.
+
+    `recipients` copies the whole entry list and tests liveness on every element. The delivery loop
+    asks `get_journey` three times per push and `push_ledger` once per candidate, so answering
+    either by scanning makes a thousand pushes ~4 000 walks of a hundred thousand entries -- and a
+    suite running at n=2 sees nothing at all. So the mechanism is asserted rather than the timing:
+    with `recipients` refusing to answer, every per-journey read still does. `all_journeys` is
+    deliberately not in this test -- it wants all of them, which is exactly what `recipients` is.
+    """
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    _seeded_mirror(client)
+    store.mark_notified("j1", "S1")
+
+    def _refuse(self, *a, **k):
+        raise AssertionError("a per-journey read walked the whole mirror")
+
+    _mp.setattr(notification_store.SubscriptionMirror, "recipients", _refuse)
+    assert store.get_journey("j1") is not None
+    assert store.push_ledger("j1").notified == {"S1"}
+    assert store.notified_snapshot(["j1"]) == {"j1|S1"}
+    assert store.get_journey("nosuch") is None, "an unknown id must answer without a scan too"
+
+
+def test_the_ceilings_are_the_clients_quotas_under_the_store(_mp):
+    """`_MAX_DEVICES` and `_MAX_JOURNEYS` become the reserved client's quotas, resolved per write so
+    an operator's `set-quotas` takes effect without a restart. The refusal is the same
+    `CapacityExceeded` the blob raises, because the route maps one exception to one 503."""
+    store, _client = _store()
+    for i in range(MAX_DEVICES):
+        store.put_device(f"dev-fill{i:04d}", subscription=SUB, brand="entur")
+    try:
+        store.put_device("dev-oneMore1", subscription=SUB, brand="entur")
+    except varsel_state.CapacityExceeded as exc:
+        assert exc.kind == "devices"
+    else:
+        raise AssertionError("the device ceiling did not refuse")
+
+
+def test_a_tombstoned_device_is_no_device_at_all(_mp):
+    """`/varsel` POPS the record when a push endpoint dies and keeps the journeys, so "the record is
+    gone" is exactly what the caller means. A husk with no endpoint would be handed to the push loop
+    as a device, and every send against it would fail."""
+    store, _client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    record, kept = store.forget_device(DEVICE, reason="expired")
+    assert record is not None and kept == 1
+    assert store.get_device(DEVICE) is None
+    assert store.devices_for([DEVICE]) == {}
+    assert [jid for jid, _rec in store.device_journeys(DEVICE)] == ["j1"], "the journeys went too"
+
+
+def test_the_store_backend_has_nothing_to_flush_and_nothing_to_sweep(_mp):
+    """The protocol's one asymmetry, from this side. Each mutator is its own durable document write,
+    so `save()` is True with nothing to do -- which is what lets the caller's "mutate, then save"
+    sequence be correct on both backends and cost a blob upload on only one. `prune` returns 0 for
+    the same reason: the marks are pruned at write time, so no save is ever owed."""
+    store, _client = _store()
+    assert store.save() is True
+    assert store.prune(live_situations=set(), trains_gone_by=NOW, oslo_today="2026-09-13") == 0
+    store.load()  # a no-op: the mirror seeds on the poller thread
 
 
 class _MonkeyPatch:

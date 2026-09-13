@@ -176,6 +176,11 @@ def _expected_title(state: str = "kan bli innstilt", prefix: str = "") -> str:
 
 
 def _reset_state():
+    # The subscription mirror is module state like every cache below, and the store-backend tests
+    # seed it. Cleared here rather than only in `_store_backend` so a seeded mirror cannot reach a
+    # test that never asked for one -- the runner orders tests by NAME, so "the store tests are at
+    # the end of the file" is not the ordering that runs.
+    varsel_state.notification_store.subscription_mirror().reset()
     with varsel._state_lock:
         varsel._devices.clear()
         varsel._journeys.clear()
@@ -4103,6 +4108,153 @@ def test_a_single_journey_deleted_mid_cycle_is_not_pushed_to(monkeypatch):
     assert sent == []
     assert DEVICE in varsel._devices
     assert not any(k.split("|", 1)[0] == jid for k in varsel._notified)
+
+
+# ---------------------------------------------------------------------------- the store backend
+# `/varsel` end to end against U12's collections instead of the state blob (U13). The seam's own
+# suite covers each method; what these cover is the pair -- `varsel` calling the store backend the
+# way it actually calls it -- which is the half neither suite sees on its own. The fake is
+# `test_notification_store`'s, for that suite's own reason: it runs the real transaction bodies and
+# applies their writes, so what a read sees is what a body wrote.
+import test_notification_store as store_suite
+
+
+def _store_backend(monkeypatch):
+    """Point `varsel` at a store-backed seam over a fresh fake. Returns (backend, fake client).
+
+    The three module attributes are recorded through `monkeypatch` BEFORE `_install` overwrites
+    them, which is the only ordering that works: `monkeypatch.setattr` remembers what it finds, so
+    a call after the install would "restore" the fake permanently. `store_suite._install` has an
+    `_uninstall` these tests cannot reach from here, and a leaked fake client is invisible in this
+    suite -- these tests want it -- and fails somewhere else entirely.
+    """
+    ns = varsel_state.notification_store
+    monkeypatch.setattr(ns, "_firestore_client", ns._firestore_client)
+    monkeypatch.setattr(ns, "_run_transaction", ns._run_transaction)
+    monkeypatch.setattr(ns, "_query", ns._query)
+    fake = store_suite._FakeClient()
+    store_suite._install(fake)
+    varsel_state.notification_store.subscription_mirror().reset()
+    staged = varsel_state.notification_store._query
+
+    def _restaging_query(name, **kwargs):
+        subs = [
+            doc
+            for path, doc in fake.docs.items()
+            if path.startswith(f"{varsel_state.notification_store.SUBSCRIPTIONS}/")
+        ]
+        devices = [
+            doc
+            for path, doc in fake.docs.items()
+            if path.startswith(f"{varsel_state.notification_store.DEVICES}/")
+        ]
+        fake.page("device_journeys", varsel_state.notification_store.SUBSCRIPTIONS, subs)
+        fake.page("subscription_count", varsel_state.notification_store.SUBSCRIPTIONS, subs)
+        fake.page("device_count", varsel_state.notification_store.DEVICES, devices)
+        return staged(name, **kwargs)
+
+    varsel_state.notification_store._query = _restaging_query
+    return (
+        varsel_state.StoreRegistrations(
+            client_id=varsel_state.BROWSER_CLIENT_ID, quotas=lambda: (5000, 20000)
+        ),
+        fake,
+    )
+
+
+def _seed_cycle_mirror(fake) -> None:
+    """Seed the subscription mirror from the fake, which is what the poller does before a pass."""
+    rows = [
+        dict(doc)
+        for path, doc in fake.docs.items()
+        if path.startswith(f"{varsel_state.notification_store.SUBSCRIPTIONS}/")
+    ]
+    store_suite._mirror_page(fake, "mirror_seed", rows)
+    varsel_state.notification_store.subscription_mirror().seed(now=datetime.now(UTC))
+
+
+def test_a_journey_registered_against_the_store_is_listed_and_matched(monkeypatch):
+    """The request path end to end on the store backend: register a device, register a journey, list
+    it back. No cycle has run, so nothing has seeded the mirror -- which is R15's whole point, and
+    the failure it prevents is a traveller who registers a journey and is shown an empty list."""
+    _reset_state()
+    backend, _fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+
+    assert client.post(
+        "/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION}
+    ).status_code == 200
+    jid = _register_journey(DEVICE)
+    listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert [j["journey_id"] for j in listed] == [jid]
+    assert listed[0]["from_name"] == "Oslo S" and listed[0]["to_name"] == "Lillehammer"
+
+
+def test_a_push_against_the_store_marks_the_document_and_the_next_cycle_skips_it(monkeypatch):
+    """The plan's second scenario, end to end. The push writes its marks to the journey DOCUMENT,
+    and the cycle after it sees them -- from the mirror, which this process's own commit updated,
+    which is the reversal of what U12 recorded and the reason it is worth an end-to-end check."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1, "the store-backed cycle pushed nothing"
+    stored = fake.doc(varsel_state.notification_store.SUBSCRIPTIONS, jid)
+    assert stored["notified"], "the mark is not on the journey document"
+    assert stored["daily_pushes"], "the day's count is not on the journey document"
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1, "the second cycle pushed again; the mark did not reach the cycle's view"
+
+
+def test_slett_alt_against_the_store_answers_200_and_leaves_nothing(monkeypatch):
+    """The plan's third scenario. One paged transaction rather than a blob rewrite, and the route's
+    contract is unchanged: 200 with the count, and the traveller's journeys gone from both the
+    request path's view and the cycle's."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+
+    response = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "ok", "journeys_deleted": 2}
+    assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
+    assert varsel._registrations.all_journeys() == [], "the cycle can still see the erased journeys"
+
+
+def test_a_store_that_cannot_finish_the_erasure_answers_503_rather_than_200(monkeypatch):
+    """The other half of that scenario, and the one that matters: an erasure reported as done while
+    the store still holds the rows is an art. 17 request quietly undone. `erase_device` reports an
+    incomplete run and the route turns that into the 503 the client retries on."""
+    _reset_state()
+    backend, _fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+
+    monkeypatch.setattr(
+        varsel_state.notification_store,
+        "erase_device",
+        lambda **_kw: varsel_state.notification_store.DeviceErasure(
+            device_deleted=False, journeys_tombstoned=1, passes=10, complete=False
+        ),
+    )
+    with _capture_varsel_logs() as records:
+        response = client.delete(f"/varsel-api/devices/{DEVICE}/data")
+    assert response.status_code == 503, response.text
+    failures = _events(records, "varsel_delete_all_persist_failed")
+    assert len(failures) == 1 and failures[0]["device_id"] == DEVICE
 
 
 class _MonkeyPatch:

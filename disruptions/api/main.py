@@ -1617,6 +1617,75 @@ def _notification_webhooks_enabled() -> bool:
     return os.environ.get("NOTIFICATION_WEBHOOKS_ENABLED", "").strip().lower() in llm_message._TRUTHY
 
 
+#: What `VARSEL_STATE_BACKEND` may say. `gcs` is the GCS state blob `/varsel` has always had and is
+#: the DEFAULT, so an unset variable is byte-for-byte the deployment that ran before the seam
+#: existed; `store` is U12's Firestore collections. Spelled out rather than treated as a boolean
+#: because the value is what an operator types under pressure, and "which store?" wants a name.
+_VARSEL_STATE_BACKENDS = ("gcs", "store")
+
+
+def _registration_store() -> varsel_state.RegistrationStore:
+    """Where `/varsel` registrations live this deployment, from `VARSEL_STATE_BACKEND`.
+
+    **Fail loud at startup, never at runtime**, which is `webhook_worker`'s rule and is the whole
+    reason this is resolved in the lifespan rather than per call. Asking for `store` without the
+    Firestore database, or without the reserved `browser` client's account, is a deployment that
+    would answer every registration with a 500 and every cycle with an empty population -- the
+    failure that looks exactly like "nobody has registered anything". Raising here fails the
+    lifespan, which fails the readiness probe, which rolls the release back.
+
+    The `browser` account is required rather than defaulted for one specific number:
+    `notification_auth.quotas_for` answers an unknown client with `DEFAULT_QUOTAS`, whose
+    `max_active_subscriptions` is 500. A deployment that took that default would refuse the 501st
+    traveller with "Tjenesten er full" and nothing would say why. So the account has to exist, and
+    creating it -- with the two quotas that were `varsel._MAX_DEVICES` and `varsel._MAX_JOURNEYS` --
+    is the cutover's own runbook step.
+
+    The quotas are resolved PER WRITE rather than captured here, so an operator's `set-quotas` takes
+    effect without a restart; the lookup is the cached account read every request already pays for.
+    """
+    backend = os.environ.get("VARSEL_STATE_BACKEND", "").strip().lower() or "gcs"
+    if backend not in _VARSEL_STATE_BACKENDS:
+        raise RuntimeError(
+            f"VARSEL_STATE_BACKEND is {backend!r}; it must be one of {_VARSEL_STATE_BACKENDS}"
+        )
+    if backend == "gcs":
+        return varsel_state.BlobRegistrations(
+            max_devices=varsel._MAX_DEVICES, max_journeys=varsel._MAX_JOURNEYS
+        )
+    if not notification_store.enabled():
+        raise RuntimeError(
+            "VARSEL_STATE_BACKEND=store needs the notification store: set "
+            "NOTIFICATION_FIRESTORE_DATABASE"
+        )
+    account = notification_auth.get_account(varsel_state.BROWSER_CLIENT_ID)
+    if account is None or not account.active:
+        raise RuntimeError(
+            f"VARSEL_STATE_BACKEND=store needs an active {varsel_state.BROWSER_CLIENT_ID!r} client "
+            "account carrying the two /varsel ceilings as its quotas"
+        )
+    logger.info(
+        "/varsel registrations are served from the notification store (client %s)",
+        varsel_state.BROWSER_CLIENT_ID,
+        extra={
+            "fields": {
+                "event": "varsel_state_backend",
+                "result": "store",
+                "client_id": varsel_state.BROWSER_CLIENT_ID,
+            }
+        },
+    )
+    return varsel_state.StoreRegistrations(
+        client_id=varsel_state.BROWSER_CLIENT_ID,
+        quotas=lambda: (
+            notification_auth.quotas_for(varsel_state.BROWSER_CLIENT_ID).max_devices,
+            notification_auth.quotas_for(
+                varsel_state.BROWSER_CLIENT_ID
+            ).max_active_subscriptions,
+        ),
+    )
+
+
 def delivery_worker_enabled() -> bool:
     """Is webhook delivery somebody else's job? From NOTIFICATION_DELIVERY_WORKER_ENABLED (U11).
 
@@ -1674,12 +1743,11 @@ async def lifespan(app: FastAPI):
     varsel.configure(
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
-        # Where a `/varsel` registration lives (U13). The blob backend is today's five dicts and
-        # today's GCS state blob, moved behind `varsel_state`'s seam unchanged -- so this line
-        # changes nothing that is deployed and is the one place the cutover will change something.
-        # Passed explicitly rather than left to the module default, because a seam whose only
-        # caller is its own default is a seam nobody has to keep honest.
-        registrations=varsel_state.BlobRegistrations(),
+        # Where a `/varsel` registration lives (U13), from `VARSEL_STATE_BACKEND`. Unset is `gcs`,
+        # which is the five dicts and the state blob `/varsel` has always had -- so an untouched
+        # deployment is byte-for-byte what it was. `store` is U12's Firestore collections, and
+        # `_registration_store` refuses to start without what that needs.
+        registrations=_registration_store(),
         connectivity_provider=_varsel_connectivity,
         # The same question about many stop pairs at once, which is what BOTH servability sweeps
         # run on: one BigQuery job answers every pending pair (U10), where one job per pair bounded
