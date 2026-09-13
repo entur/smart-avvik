@@ -274,6 +274,9 @@ class _FakeClient:
         self.docs: dict[str, dict[str, Any]] = dict(docs or {})
         self.pages: dict[str, list[tuple[str, dict[str, Any]]]] = {}
         self.query_calls: list[tuple[str, dict[str, Any], dict[str, Any], int]] = []
+        #: One entry per `get_all`, holding the ids asked for IN ORDER. What a multi-get is for is
+        #: that there is one of them, so the count of calls is the assertion, not the contents.
+        self.get_all_calls: list[list[str]] = []
         self.transactions: list[_Txn] = []
         self.batch_deletes: list[str] = []
         self.fail_with: BaseException | None = None
@@ -284,6 +287,21 @@ class _FakeClient:
 
     def collection(self, name: str) -> _Collection:
         return _Collection(self, name)
+
+    def get_all(self, refs: list[Any], timeout: float | None = None) -> list[Any]:
+        """Firestore's multi-get: snapshots for the refs that exist, in no guaranteed order.
+
+        Returns nothing at all for a missing id rather than a snapshot whose `exists` is False,
+        which is what the real client does for `get_all` and is the behaviour the caller's
+        "unknown ids are simply absent" rule rests on.
+        """
+        assert timeout == notification_store._CALL_DEADLINE_S, "multi-get without a deadline"
+        self.get_all_calls.append([ref.path.split("/", 1)[1] for ref in refs])
+        return [
+            ref.get(timeout=notification_store._CALL_DEADLINE_S)
+            for ref in refs
+            if ref.path in self.docs
+        ]
 
     def batch(self) -> _Batch:
         return _Batch(self)
@@ -3895,12 +3913,12 @@ def emulator_test_a_journey_created_mid_erasure_leaves_no_orphan():
             },
             limit=2,
         )
-        n, deleted, complete = notification_store._run_transaction(
+        tombstoned, deleted, complete = notification_store._run_transaction(
             lambda txn: notification_store._erase_device_body(
                 txn, refs, query, device_id="device-1", client_id=CLIENT, now=NOW
             )
         )
-        assert n == 2 and not deleted and not complete
+        assert tombstoned == ["j1", "j2"] and not deleted and not complete
         # The interleaved create, committed between the passes.
         notification_store.create_subscription(_web_push_spec(subscription_id="j4"), now=NOW)
         # The rest of the erasure, through the public loop.
@@ -5574,6 +5592,247 @@ def test_the_open_withdrawal_runs_are_served_whole_environment():
     # A mint closes the run -- both fields, which is what the emit body writes.
     mirror.apply(_state("a1", notification_store.PHASE_CONFIRMED, below_threshold_at=None))
     assert mirror.open_runs(NOW) == {}
+
+
+def test_every_body_that_writes_a_subscription_is_declared_mirroring_or_declared_exempt():
+    """U13's commit-apply, pinned exactly as U9's is: as a property of the SET.
+
+    The rule is "every body whose write the CYCLE reads back must reach the mirror from its own
+    commit", and both mistakes are silent. Left out, a `/varsel` registration created or deleted
+    mid-cycle is invisible until the next sync -- and the delivery loop's two liveness re-checks
+    exist for precisely that delete, so the push goes out to a traveller who erased the journey.
+    Left in, a delivery body would put the webhook channel's busiest documents through an apply
+    that has no reader, which is the economy `MIRROR_STAMPING_BODIES` protects.
+
+    Read off the source, because the case that matters is a body added next year that no
+    behavioural check over today's seven could see.
+    """
+    source = pathlib.Path(notification_store.__file__).read_text()
+    bodies = {}
+    for chunk in source.split("\ndef ")[1:]:
+        name = "_" + chunk.split("(", 1)[0].lstrip("_")
+        bodies[name] = chunk
+    writers = {
+        name
+        for name, body in bodies.items()
+        if name.endswith("_body")
+        and (
+            "transaction.set(refs.subscription(" in body
+            or "transaction.update(refs.subscription(" in body
+            or "transaction.update(\n            refs.subscription(" in body
+        )
+    }
+    assert "_create_body" in writers and "_mark_notified_body" in writers, (
+        "the scan stopped seeing the main writers; the spelling changed"
+    )
+    declared = set(notification_store.SUBSCRIPTION_MIRRORING_BODIES) | set(
+        notification_store.SUBSCRIPTION_WRITERS_OUTSIDE_THE_MIRROR
+    )
+    # `_erase_device_body` is the declared exception and drops by ID rather than applying a
+    # document, so it is in neither set; it is asserted separately below.
+    writers.discard("_erase_device_body")
+    assert writers == declared, (
+        f"bodies writing a subscription document are {sorted(writers)}, the declared sets cover "
+        f"{sorted(declared)}. A new one must either reach `_mirror_subscription` and be declared "
+        "in SUBSCRIPTION_MIRRORING_BODIES, or be declared exempt with the reason."
+    )
+    assert notification_store.SUBSCRIPTION_MIRRORING_BODIES.isdisjoint(
+        notification_store.SUBSCRIPTION_WRITERS_OUTSIDE_THE_MIRROR
+    ), "a body cannot be both"
+    # The erasure's own path, named so the set reads as complete: it must drop by id, because it
+    # returns counts and ids rather than documents.
+    assert "_subscription_mirror.drop_committed(" in bodies["_erase_device_body"] or (
+        "drop_committed(ids)" in source
+    ), "the erasure no longer drops its journeys from the mirror"
+
+
+def test_the_declared_mirroring_bodies_are_the_ones_whose_commit_actually_applies():
+    """The other direction: a body IN the set whose public caller forgot the apply.
+
+    The set is a claim about what reaches `_mirror_subscription`, and a declaration with no call is
+    the same silent failure as an undeclared body -- worse, because it reads as covered. Checked by
+    walking each declared body back to the public function that runs it.
+    """
+    source = pathlib.Path(notification_store.__file__).read_text()
+    callers = {
+        "_create_body": "create_subscription",
+        "_replace_body": "replace_subscription",
+        "_delete_body": "delete_subscription",
+        "_touch_body": "touch_subscription",
+        "_servability_body": "set_servability",
+        "_mark_notified_body": "mark_notified",
+        "_record_push_body": "record_push",
+    }
+    assert set(callers) == set(notification_store.SUBSCRIPTION_MIRRORING_BODIES), (
+        "a declared body has no caller listed here; add it with its public function"
+    )
+    for body, public in callers.items():
+        chunk = source.split(f"\ndef {public}(", 1)[1].split("\ndef ", 1)[0]
+        assert body in chunk, f"{public} no longer runs {body}"
+        assert "_mirror_subscription(" in chunk, (
+            f"{public} runs {body}, which is declared mirroring, and never applies the commit"
+        )
+
+
+def test_a_committed_document_reaches_the_mirror_without_waiting_for_a_sync():
+    """The whole point of the commit-apply: a create is matchable in the cycle it happened in.
+
+    A watermark would carry it at the start of the NEXT cycle. For a webhook client that is a
+    freshness question; for a `/varsel` registration it is the difference between a traveller
+    seeing their own journey alerted on and the delivery loop pushing about one they just deleted.
+    """
+    client = _FakeClient()
+    _install(client)
+    mirror = notification_store.SubscriptionMirror()
+    _mirror_page(client, "mirror_seed", [])
+    mirror.seed(now=NOW)
+    assert mirror.size() == 0
+
+    doc = _mirrored(subscription_id="sub-1")
+    mirror.apply_committed(doc)
+    assert mirror.size() == 1
+    assert [e.subscription_id for e in mirror.recipients(NOW)] == ["sub-1"]
+
+    # A tombstone is applied as a REMOVAL, exactly as the sync applies one.
+    mirror.apply_committed({**doc, "status": "deleted"})
+    assert mirror.size() == 0
+    # And an unreadable document is skipped rather than raised: the transaction has already
+    # committed, so a raise here would fail a call whose write has landed.
+    mirror.apply_committed({"subscription_id": "broken"})
+    assert mirror.size() == 0
+
+
+def test_a_sync_does_not_overwrite_a_commit_this_process_made_while_it_was_reading():
+    """The race the local apply creates, and the reason `_overtaken` exists.
+
+    In order: the sync reads a page with `sub-1` in it; a request thread deletes `sub-1` and applies
+    the tombstone; the sync then applies its stale copy. Without the guard `sub-1` is live in the
+    mirror until the next sync -- and the delivery loop's re-check, which exists for exactly this
+    delete, waves the push through. Driven by applying the tombstone BETWEEN the sync's read and its
+    apply, which is the window itself.
+    """
+    client = _FakeClient()
+    _install(client)
+    mirror = notification_store.SubscriptionMirror()
+    live = _mirrored(subscription_id="sub-1")
+    _mirror_page(client, "mirror_seed", [live])
+    mirror.seed(now=NOW)
+    assert mirror.size() == 1
+
+    real_stream = notification_store._stream
+    interleaved: list[str] = []
+
+    def _stream_then_delete(query: Any) -> Any:
+        page = real_stream(query)
+        if not interleaved:
+            interleaved.append("sub-1")
+            mirror.apply_committed({**live, "status": "deleted"})
+        return page
+
+    _mirror_page(client, "mirror_sync", [live])
+    notification_store._stream = _stream_then_delete  # type: ignore[assignment]
+    try:
+        report = mirror.sync(now=NOW + timedelta(seconds=60))
+    finally:
+        notification_store._stream = real_stream  # type: ignore[assignment]
+
+    assert interleaved == ["sub-1"], "the competing delete never ran; this test proved nothing"
+    assert mirror.size() == 0, "a stale read resurrected a subscription this process had deleted"
+    assert report.overtaken == 1, "the skip is not reported, so an operator cannot see it happen"
+    assert report.watermark_age_s is not None, "the watermark still advanced past the document"
+
+
+def test_an_erasure_drops_its_journeys_from_the_mirror_at_once():
+    """«Slett alt» by id rather than by document: the body returns ids, not documents.
+
+    The tombstone does stamp the mirror field, so a sync WOULD carry it -- one cycle later, and one
+    cycle of matching, wording and writing decision rows about a traveller who asked to be forgotten
+    is what this path exists to prevent.
+    """
+    client = _FakeClient()
+    _install(client)
+    _device_doc(client)
+    rows = _journey_rows(client, ["j1", "j2"])
+    mirror = notification_store.subscription_mirror()
+    mirror.reset()
+    _mirror_page(client, "mirror_seed", [dict(r) for r in rows])
+    mirror.seed(now=NOW)
+    assert mirror.size() == 2
+
+    notification_store.erase_device(device_id="device-1", client_id=CLIENT, now=NOW)
+    assert mirror.size() == 0, "the erased journeys are still matchable this cycle"
+    mirror.reset()
+
+
+def test_a_replacement_push_records_the_train_without_spending_the_day():
+    """`charge_cap=False`: a notification that takes an earlier one's place on the lock screen under
+    the same tag does not add to the pile, so it must not spend one of the registration's four.
+
+    The train mark is written either way -- it is what the NEXT replacement is recognised by, and a
+    replacement that did not refresh it would let the mark age out mid-disruption and turn the third
+    notification about one train into a fourth charged push.
+    """
+    client = _FakeClient()
+    _install(client)
+    _journey_rows(client, ["j1"])
+    notification_store.record_push(subscription_id="j1", train_ref="t1", now=NOW)
+    notification_store.record_push(subscription_id="j1", train_ref="t1", charge_cap=False, now=NOW)
+    stored = client.doc(notification_store.SUBSCRIPTIONS, "j1")
+    assert stored["daily_pushes"] == {notification_store.oslo_day(NOW): 1}
+    assert set(stored["pushed_trains"]) == {"t1"}
+
+
+def test_a_web_push_documents_own_fields_are_parsed_back_and_mirrored():
+    """U12 wrote all six and read none of them back, so `/varsel`'s registration could be stored and
+    then not be read: the device it belongs to, the names the traveller typed and the three push
+    ledgers were write-only. Both readers are checked, because the cycle uses the mirror's copy and
+    the request path uses the parsed record, and two readers is two places to forget a field."""
+    _install(_FakeClient())
+    row = notification_store._new_subscription_doc(
+        _web_push_spec(subscription_id="j1", from_name="Oslo S", to_name="Lillestrøm"), NOW
+    )
+    row["notified"] = {"S1": NOW + timedelta(days=7)}
+    row["pushed_trains"] = {"t1": NOW + timedelta(days=7)}
+    row["daily_pushes"] = {"2026-09-13": 2}
+
+    parsed = notification_store._subscription_from_doc(row)
+    assert parsed.device_id == "device-1"
+    assert (parsed.from_name, parsed.to_name) == ("Oslo S", "Lillestrøm")
+    assert parsed.consent_version == row["consent_version"]
+    assert set(parsed.notified) == {"S1"}
+    assert set(parsed.pushed_trains) == {"t1"}
+    assert parsed.daily_pushes == {"2026-09-13": 2}
+
+    entry = notification_store._mirror_entry(row)
+    assert entry.device_id == "device-1"
+    assert (entry.from_name, entry.to_name) == ("Oslo S", "Lillestrøm")
+    assert set(entry.notified) == {"S1"}
+    assert set(entry.pushed_trains) == {"t1"}
+    assert entry.daily_pushes == {"2026-09-13": 2}
+    # A webhook document carries none of them and must not start failing to parse.
+    webhook = notification_store._mirror_entry(_live_doc())
+    assert webhook.device_id == "" and webhook.notified == {}
+
+
+def test_several_devices_come_back_in_one_round_trip():
+    """The delivery pass needs an endpoint and a brand per registration it is about to push to, and
+    on a disrupted corridor that is thousands in one cycle -- serially, on the poller's thread. One
+    multi-get costs one round trip; a loop of `get_device` costs one each.
+
+    Unknown ids are absent rather than an error, which is what lets the caller treat "no device" as
+    the ordinary case it is: a journey registered by a browser that never turned notifications on.
+    """
+    client = _FakeClient()
+    _install(client)
+    _device_doc(client, device_id="device-1")
+    _device_doc(client, device_id="device-2")
+    devices = notification_store.get_devices(["device-1", "device-2", "device-gone", "device-1"])
+    assert set(devices) == {"device-1", "device-2"}
+    assert devices["device-1"].endpoint
+    assert client.get_all_calls == [["device-1", "device-2", "device-gone"]], (
+        "the ids were not asked for in ONE call, or the duplicate was not folded"
+    )
+    assert notification_store.get_devices([]) == {}, "an empty ask must cost no call at all"
 
 
 def test_every_body_that_writes_a_subject_is_declared_mirroring_or_declared_exempt():

@@ -884,6 +884,36 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   prunes expired subjects, which correctness never needed (both readers test expiry) and memory
   does: a subject document lives `HISTORY_DAYS` (7), so an unpruned mirror holds every train every
   subscription was ever warned about for a week.
+  **The SUBSCRIPTION mirror learns from this process's own commits too since 2026-09-13** (U13's
+  store half), and that supersedes a constraint U12 recorded rather than merely adding to it. U12's
+  note at `MIRROR_STAMPING_BODIES` said the cycle cannot read `notified` or `pushed_trains` from the
+  mirror, because the two mark bodies deliberately do not stamp the watermark field — one push on a
+  corridor with a hundred thousand registrations would be a hundred thousand documents through the
+  watermark query. That is right about a WATERMARK and wrong about the mirror: a `/varsel`
+  registration has exactly one writer (the request path and the poller are one process, one replica
+  under Recreate, and the delivery worker writes webhook deliveries only), so every commit is
+  applied to the mirror from its own RESULT — `SubjectMirror`'s arrangement, one collection along —
+  which makes the copy exact rather than approximate and costs no read. The superseded reading
+  would have cost a document read per registration per cycle, which at this population IS the
+  cycle. `SUBSCRIPTION_MIRRORING_BODIES` declares the seven bodies that apply and
+  `SUBSCRIPTION_WRITERS_OUTSIDE_THE_MIRROR` the five that deliberately do not (the webhook delivery
+  half, which runs in the worker, plus the cleanup that only ever follows a tombstone the mirror has
+  already dropped); both are pinned off the source in both directions, and a second test walks each
+  declared body back to the public function that runs it — a declaration with no call reads as
+  covered and is the same silent failure as an undeclared body. **The race the local apply creates
+  is real and is guarded**: a sync that read a page before a request thread deleted a journey would
+  apply its stale copy after the delete, leaving the journey live in the mirror for a cycle and
+  waving a push through the delivery loop's own re-check. `SubscriptionMirror._overtaken` skips any
+  entry this process applied after the run's read began — conservatively, against the whole run's
+  start rather than the page's — and the count is published as `overtaken` on the mirror's log
+  record. What it costs is one cycle of staleness for a FOREIGN write to a locally-touched
+  document, which for this collection means a webhook subscription the API wrote in the same
+  process and has therefore already applied. **The erasure drops by id** rather than by document,
+  because `_erase_device_body` returns ids and not documents: the stamp is what makes a restarted
+  process agree, the drop is what makes this one agree now. `MirrorEntry` grew the six fields the
+  browser cycle reads (`device_id`, the two typed names and the three push ledgers), measured at
+  **87.7 MB → 158.8 MB per 100 000 entries** against the pod's 1 024 MiB — the delta is the marks
+  themselves, not the slots, so what bounds it is `_prune_marks` at write time.
   **Both 2 000 ceilings are gone**, with `active_subscriptions`, the `load_active_subscriptions` spec,
   its composite index and the `truncated` flag that reported it — an index paid for on every write with
   no reader is what the bidirectional index test exists to refuse. Note U5 added that index one PR
