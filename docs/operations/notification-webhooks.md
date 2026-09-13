@@ -456,8 +456,9 @@ silently.
 | `varsel_webhook_load` | the pass's one read of notification state | `result` (`ok`/`error`/`skipped`/`flag_error`), `n`, `skipped`, `unroutable`, `truncated`, `ms` |
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated` |
 | `notification_emit` | the emit step | `result` (`ok`, `timeout`, `overlap_refused`, `retryable`, `failed`, `ceiling_error`, `run_clear_error`, `subject_error`, `subjects_skipped`, `unroutable`, `build_error`), and on the one summary record per cycle: `created`, `withdrawn`, `unchanged`, `counting`, `obsolete`, `nothing_standing`, `unidentified`, `quota`, `capped`, `retryable`, `failed`, `abandoned`, `overlap_refused`, `run_cleared`, `run_stale`, `run_clear_capped`, `run_clear_error`, `n` (the (recipient, train) observations offered), `trains` (what the fan-out was over — `n` over `trains` is the corridor's sharing factor), `ms` |
-| `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
+| `webhook_delivery_round` | the delivery step — **from the poller OR from the worker**, so read it beside the pod's `container_name`: `kix-avvik` is the poller's, `worker` is the delivery worker's (U11) | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `backlog_age_s`, `ms`. **`backlog_age_s`** is how long ago the OLDEST DELIVERABLE record was minted — deliverable being the operative word, since a leased row, a row inside U7's backoff and a row past a destination's ceiling are all absent from it, so one unwell endpoint cannot drive it. Approaching 3600 means the backlog is expiring undelivered rather than merely lagging. A delivery minted before U11 carries no `created_at` and contributes nothing, so it reads 0 rather than infinite on the deploy that introduces it. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
 | `webhook_delivery` | one delivery FAULT — never a per-attempt outcome, which is what `webhook_delivery_round` carries for the whole pass | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
+| `webhook_worker` | the delivery worker PROCESS, not its rounds — those stay `webhook_delivery_round` | `result`: `started` (with `health_port`), `stopping` (with the `signal`), `stopped` (with `rounds`), `unconfigured` (with `missing` — the worker exits non-zero, so this line is followed by a rolled-back release rather than by a running pod) and `error` (a round raised, which `deliver_pending` documents it never does; the loop continues) |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
 | `notification_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
@@ -573,10 +574,12 @@ been noticed from our side. The claim mints a token; the two terminal writes com
 whose lease lapsed and was re-claimed cannot mark a delivery sent (spending one of the traveller's
 four for an outcome nobody knows) or set a re-claimed one back to `pending` (releasing the live
 claim's slot). Both outcomes are counted: `leased` is a claim refused because somebody else holds
-it, `lease_lost` a terminal write refused because the holder changed. **Both are unreachable while
-there is one writer** — one poller thread, one replica under Recreate — so they report on U11's
-worker rather than on today, and they are pinned against the fake anyway: a check that arrives with
-the second replica arrives after the duplicates it exists to prevent. A leased row is filtered out
+it, `lease_lost` a terminal write refused because the holder changed. **They became reachable with
+U11** and were not before — one poller thread, one replica under Recreate — so a non-zero count of
+either is now information rather than an impossibility: it says two processes read the same pending
+page, which during the rollout window is exactly what is supposed to happen and is the evidence the
+lease works. Outside that window, a steady `lease_lost` means attempts are outliving their 20 s
+lease, i.e. the store or the receiver is slower than the arithmetic above assumes. A leased row is filtered out
 of `pending_deliveries` in Python rather than in the query, because a second inequality would need
 its own composite index *and* would exclude every document that lacks the field, which on the deploy
 that introduces it is the whole backlog.
@@ -739,8 +742,8 @@ contract document says so in its own words; this is the operating half of the sa
    store read moved out of the pass into its own `notification_mirror` phase, so a slow store costs
    the mirror its freshness rather than costing the pass its cycle. What replaces the ceiling as the
    thing to watch is `kix_mirror_age_seconds` and the mirror's readiness.
-3. **Emit and delivery as their own Deployment — emit widened in place, 2026-09-13 (U9); delivery
-   still owed (U11).** Both ran on the poller thread one transaction at a time, bounded at
+3. **Emit and delivery as their own Deployment — emit widened in place and delivery moved out,
+   both 2026-09-13 (U9, U11).** Both ran on the poller thread one transaction at a time, bounded at
    `_MAX_EMITS_PER_CYCLE` (120) and `MAX_DELIVERY_ATTEMPTS_PER_CYCLE` (200) so a bad morning could
    not stall the cycle. One transaction at a time against a ~200 ms round trip is about **5 emits a
    second** however many are waiting, so a bad morning's lifecycle transitions could not be emitted
@@ -749,8 +752,14 @@ contract document says so in its own words; this is the operating half of the sa
    share of the cycle (`_EMIT_DEADLINE_S`) and 20 000 transactions (`_MAX_EMITS_PER_CYCLE`, which is
    that deadline times R2's 250/s — the two are one derivation and a test refuses them drifting
    apart). What is above the budget is re-offered on the next cycle and reported as `capped`.
-   Delivery is unchanged and still owed: `deliveries` is a queue with transactional claims and a
-   `DELIVERY_LEASE_S` lease (U8), so a second Deployment can drain it safely.
+
+   **Delivery moved out rather than widening in place**, because unlike emit it is not bound by
+   anything this process owns: `deliveries` is a queue with transactional claims and a
+   `DELIVERY_LEASE_S` lease (U8), so what it was waiting for was somewhere else to run. It runs in
+   `webhook_worker`, a second Helm release of the same chart and the same image — see "The delivery
+   worker" below for the rollout, the drain formula and how to scale it. Emit stays here: it is
+   KTD6's one writer of a subject's phase and revision, and moving it would need a second emitter,
+   which is the one thing the ledger's exactness rests on not existing.
 
    **Three sentences about the pending-event ceiling changed with the width, and none of them is
    cosmetic.** It is exact because emit has one writer — and the writer is now the 64 threads of one
@@ -812,6 +821,80 @@ contract document says so in its own words; this is the operating half of the sa
    predicates returns 18, which is what the mirror holds, so the checked-in index really does serve
    it. Worth doing rather than reasoning about — the emulator tracks no composite indexes, so it
    cannot answer this, and a missing one is a `FailedPrecondition` on *every* create.
+
+### The delivery worker (U11)
+
+`webhook_worker` is a second Helm release of the same chart and the same image, `kix-avvik-worker`,
+in the same namespace and under the same service account. The common chart renders exactly one
+Deployment per release — `containers` is a list of containers in one POD, not a list of workloads —
+so a second workload has to be a second release; there is no second service account, because the
+chart creates none at all and the platform provisions `application` in the namespace.
+
+**The rollout is two changes and the order is not interchangeable.**
+
+1. Deploy the worker release. The poller is still delivering, so both processes deliver for the
+   window. That is deliberate: U8's lease arbitrates, and `leased` / `lease_lost` on
+   `webhook_delivery_round` become reachable for the first time — seeing them is the evidence the
+   lease works. What it costs is that each reader applies the per-destination attempt ceiling to its
+   own read, so a destination can briefly see up to twice its `deliveries_per_minute`.
+2. Set `NOTIFICATION_DELIVERY_WORKER_ENABLED: "true"` in the API's configmap and deploy. The
+   poller's delivery step stops; its emit step and the servability sweep do not move.
+
+The other order is the one to avoid: a worker release that never becomes Ready would leave NOBODY
+delivering, and gha-helm's rollback reaches only the release it deployed. The flag's polarity is
+chosen for that — unset means the poller delivers, so a deployment with no worker at all is
+unchanged.
+
+**Rollback is the same two steps backwards**: flag to `"false"` and deploy, then scale the worker to
+zero (`kubectl -n kix-avvik scale deploy/kix-avvik-worker --replicas=0`) or leave it — with the flag
+off both would deliver, which is safe but pointless.
+
+**How long a backlog takes to drain.** One round claims up to `MAX_DELIVERY_ATTEMPTS_PER_CYCLE`
+(200) and works them four wide, and the loop turns again immediately while there is work:
+
+```
+drain ≈ N × (t_post + t_store) ÷ (concurrency × replicas)
+```
+
+with `concurrency` = 4 per replica. `t_store` is ~0.2 s measured in dev on 2026-09-11 (about twenty
+deliveries through a tunnelled receiver; the first draft guessed 0.15 s) and `t_post` is the
+receiver's own latency. At 0.2 s POST and 0.2 s store, 20 000 deliveries on one replica is
+20 000 × 0.4 ÷ 4 ≈ **33 minutes** — inside an event's one-hour validity, and only just, which is why
+the formula multiplies by `replicas`. A 2 s receiver is 20 000 × 2.2 ÷ 4 ≈ 3 hours on one replica and
+needs six. Note `deliveries_per_minute` is a per-destination ceiling applied per READ, so it is per
+replica too — the formula's `× replicas` is honest about that rather than hiding it.
+
+**Scaling is `deployment.forceReplicas` in `helm/kix-avvik/env/worker-values-kub-ent-<env>.yaml`.**
+By hand and not by HPA: the `kix_*` series live in Thanos rather than in Google Managed Prometheus,
+so common's HPA on custom metrics cannot see `kix_delivery_backlog_age_seconds`, and `forceReplicas`
+disables the HPA regardless. N replicas are safe — that is what the lease was taken for — and what
+they cost is N readers of the same pending page, each claiming what the others did not.
+
+**What to watch.** `kix_worker_last_tick_timestamp_seconds` is liveness: it moves on every round,
+including the ones that deliver nothing, so `time() - value` staying small is the whole check, and
+it is ABSENT from the API pods — an alert on it must count no data as firing, or a worker scaled to
+zero reads as healthy. `kix_delivery_backlog_age_seconds` is whether the queue is draining; read it
+beside `webhook_delivery_round`'s `throttled` and `truncated`, which are what say a single
+destination is unwell. The worker's own `/health` (port 8081, not 8080) answers 503 when no round
+has finished inside `HEALTH_STALE_AFTER_S` — the API's variable, one number for both workloads.
+
+**Pausing one destination does not need the worker.** It is R12's terminal pause in the store, set
+by the operator tool, and both processes honour it; the worker has no state of its own to clear. A
+`SIGTERM` is read BETWEEN rounds, never inside one, and
+`deployment.terminationGracePeriodSeconds` is 75 s so a round in flight finishes — below that the
+kubelet's SIGKILL lands mid-round and the claims return to the pending set when their 20 s leases
+lapse, which is safe but re-sends.
+
+**The `_sent_body` mirror exemption was re-checked when delivery moved, and stands.** U6 recorded
+that this exemption should be revisited at U11 because `delivered_revision`, `delivered_at` and
+`pending_delivery_id` are exactly what a worker writes. They are: the worker is now the writer of
+all three. What makes the exemption still right is that none of them is in `SUBJECT_MIRRORING_BODIES`
+or in the standing set the emit pass reads, so the `SubjectMirror` this process keeps is not made
+stale by a write it cannot see. **KTD6's "one writer" therefore has to be read more precisely from
+here on: one writer of a subject's PHASE and REVISION — still this process, still the emit pass —
+and delivery-side fields written elsewhere.** The subscription mirror's `delivered` set can lag, as
+it always could, and the cost is unchanged: a pass can WORD a train already delivered, and it cannot
+duplicate one, because `_emit_body` reads the real subject document inside its transaction.
 
 ### What a bad morning is worded by, and what carries the template
 
