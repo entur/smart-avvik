@@ -21,6 +21,15 @@
 // are not consented to at registration and are deliberately not versioned. They
 // have their own guards further down the suite.
 //
+// ONE EXCEPTION, and it is the privacy page's own date: personvern-page.tsx
+// renders «Sist oppdatert» from consentTextDate(), which reads
+// CONSENT_TEXT_VERSION. So a T5 edit that changes WHAT WE ACTUALLY DO — the
+// retention rule, who sees the data, where it goes — must bump the version too,
+// or the page dates its new text to the day the old text was written. The guard
+// below cannot catch that (T5 is not in the digest); this comment is what
+// carries it. A copy-edit that changes no fact does not need the bump, and the
+// page then keeps a date that is still true of its substance.
+//
 // This module is imported directly by `node --test` via type-stripping (the
 // alertFeedbackState.ts pattern): keep it free of runtime imports and of
 // non-erasable TS syntax (no enums, no namespaces, no decorators).
@@ -28,7 +37,7 @@
 /** Version of the registration-visible texts, persisted on each journey record
  * as `consent_text_version`. Format: YYYY-MM-DD.n — bump the date (or the
  * counter for a same-day change) whenever a text in REGISTRATION_TEXTS changes. */
-export const CONSENT_TEXT_VERSION = '2026-09-02.1';
+export const CONSENT_TEXT_VERSION = '2026-09-13.1';
 
 /** The version's date as a Norwegian date, for «Sist oppdatert» on the privacy page (design
  * review 2026-09-01, finding 44): the same value every registration is stamped with, so the page
@@ -198,14 +207,25 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
       { text: 'Meldinger', href: MELDINGER_HREF },
     ],
   },
+  // The inactivity clause (2026-09-13). «lagres til du sletter dem» was true of the GCS blob,
+  // which never expired anything, and stopped being true when /varsel's registrations moved into
+  // Firestore under a storage-limitation rule: a registration is deleted 180 days after the
+  // traveller was last here (notification_store.WEB_PUSH_INACTIVITY_DAYS). «rundt et halvt år»
+  // rather than «180 dager» on purpose — the anchor is refreshed at most weekly
+  // (WEB_PUSH_RENEW_AFTER_DAYS), so real deletion falls 173-180 days after the last visit, and a
+  // stated 180 would be a promise we beat by up to a week. The second sentence is the actionable
+  // half: what resets the clock is opening the app, because the journey list is what renews the
+  // anchor — a push arriving changes nothing.
   {
     title: 'Hvor lenge',
     body:
-      'Reiser du har registrert lagres til du sletter dem. Varselabonnementet slettes når du ' +
-      'skrur av varsler eller bruker «Slett alt». Loggen over varsler vi har vurdert å sende ' +
-      'lagres så lenge eksperimentet pågår; den identifiserer ikke enheten din. Driftslogger ' +
-      'slettes automatisk etter 30 dager og omfattes ikke av «Slett alt». Tilbakemeldinger du ' +
-      'sender lagres i inntil 45 dager.',
+      'Reiser du har registrert lagres til du sletter dem. Bruker du ikke tjenesten på rundt et ' +
+      'halvt år, slettes de automatisk — hver gang du åpner Avviksvarsel, starter det halve året ' +
+      'på nytt. Varselabonnementet slettes når du skrur av varsler, når du bruker «Slett alt», og ' +
+      'sammen med reisene dine. Loggen over varsler vi har vurdert å sende lagres så lenge ' +
+      'eksperimentet pågår; den identifiserer ikke enheten din. Driftslogger slettes automatisk ' +
+      'etter 30 dager og omfattes ikke av «Slett alt». Tilbakemeldinger du sender lagres i inntil ' +
+      '45 dager.',
   },
   {
     title: 'Rettighetene dine',
