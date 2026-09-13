@@ -1109,6 +1109,12 @@ def set_client_quotas(
             ("max_pending_events", max_pending_events),
             ("deliveries_per_minute", deliveries_per_minute),
             ("concurrent_deliveries", concurrent_deliveries),
+            # U14. Accepted by the signature and by the operator tool since U12 and dropped HERE
+            # until the cutover needed it: `max_devices` is one of the two ceilings the reserved
+            # `browser` account carries, so `set-quotas --max-devices` reported ok and changed
+            # nothing. Silent in both directions -- the patch wrote the STORED value back, so
+            # neither the audit record nor the account afterwards looked wrong.
+            ("max_devices", max_devices),
         )
         if value is not None
     }

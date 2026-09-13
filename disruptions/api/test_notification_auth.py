@@ -29,6 +29,7 @@ from typing import Any
 
 import notification_auth
 import notification_store
+import varsel_state  # only for the reserved `browser` client id (U13)
 import webhook_signing
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -1640,6 +1641,104 @@ def test_the_tool_sets_quotas_and_create_client_takes_them_for_a_new_account():
         ], "one audited change; the two refusals were refused before the audit row"
     finally:
         _uninstall()
+
+
+def test_the_reserved_browser_account_is_created_by_its_own_command_and_never_gets_a_key():
+    """U14's cutover step, and the two ways the reserved id could have gone wrong.
+
+    `create-client browser` has been refused since U13 with "use set-quotas on it rather than
+    creating it as a client" — advice that could not be followed, because `set_client_quotas`
+    raises `NotFound` on an account that does not exist. So the runbook step the operations
+    document called "not optional" had no command at all, and the deployment it guards fails its
+    lifespan by design: `quotas_for` answers an unknown client with `DEFAULT_QUOTAS`, whose
+    `max_active_subscriptions` is 500.
+
+    The second half is the credential. The operations document has claimed since U13 that nothing
+    may issue one for this id, and nothing enforced it: `issue-key --client-id browser` would have
+    minted an API token that reads and rewrites every traveller's registration through the client
+    API. A claim in prose that the code does not make is the shape this repo has been bitten by
+    before.
+    """
+    store = _install()
+    try:
+        allow = _allow()
+        base = ["--environment", "dev"]
+        browser = varsel_state.BROWSER_CLIENT_ID
+        # Still refused through the onboarding path, which is what the reserved id is reserved FROM.
+        code, _out = _run(
+            [*base, "create-client", "--client-id", browser, "--name", "x"],
+            authorizer=allow,
+            store=store,
+        )
+        assert code != 0, "the reserved id must not be creatable as an ordinary client"
+        assert notification_auth.get_account(browser) is None
+
+        code, out = _run(
+            [
+                *base,
+                "create-browser-account",
+                "--max-devices",
+                "5000",
+                "--max-active-subscriptions",
+                "20000",
+            ],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0, out
+        account = notification_auth.get_account(browser)
+        assert account is not None and account.active
+        assert account.quotas.max_devices == 5000
+        assert account.quotas.max_active_subscriptions == 20000
+
+        # No credential, ever.
+        code, out = _run(
+            [*base, "issue-key", "--client-id", browser], authorizer=allow, store=store
+        )
+        assert code != 0, "a credential for the reserved id must be refused"
+        assert notification_auth.list_credentials(browser) == []
+    finally:
+        _uninstall()
+
+
+def test_the_device_ceiling_can_actually_be_changed_by_the_command_that_offers_it():
+    """`set-quotas --max-devices` reported ok and changed nothing until U14.
+
+    `set_client_quotas` took the parameter and never put it in the dict it applies, so the patch
+    wrote the STORED value back: the audit row said `ok`, the account afterwards looked untouched
+    because it WAS untouched, and the only way to notice was to compare the number you asked for
+    with the number you got. It is one of the two ceilings the reserved `browser` account exists to
+    carry, so the cutover is where it would first have mattered.
+    """
+    store = _install()
+    try:
+        allow = _allow()
+        base = ["--environment", "dev"]
+        code, out = _run(
+            [*base, "create-client", "--client-id", CLIENT, "--name", "Acme"],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0, out
+        before = notification_auth.get_account(CLIENT)
+        assert before is not None
+        wanted = before.quotas.max_devices + 17
+        code, out = _run(
+            [*base, "set-quotas", "--client-id", CLIENT, "--max-devices", str(wanted)],
+            authorizer=allow,
+            store=store,
+        )
+        assert code == 0, out
+        after = notification_auth.get_account(CLIENT)
+        assert after is not None and after.quotas.max_devices == wanted, (
+            "set-quotas accepted --max-devices and left the ceiling where it was"
+        )
+        # And the audit row names what changed, or an operator cannot tell the two apart later.
+        rows = [r for r in store.audit() if r["action"] == "set_client_quotas"]
+        assert rows and f"max_devices={wanted}" in str(rows[-1].get("reason") or "")
+    finally:
+        _uninstall()
+
 
 if __name__ == "__main__":
     _run_all()
