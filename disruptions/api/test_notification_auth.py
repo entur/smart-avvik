@@ -1581,7 +1581,11 @@ def test_the_device_quota_is_declared_bounded_and_deliberately_unread():
     which is what makes shipping the field ahead of its caller safe rather than merely tidy.
 
     **Flip this assertion in U13**, exactly as U8 flipped `concurrent_deliveries`': the wiring
-    should trip a test rather than slip in unnoticed.
+    should trip a test rather than slip in unnoticed. Specifically in U13's SECOND PR, the one that
+    puts the store behind `varsel_state`'s seam -- the first lands the seam over today's in-memory
+    dicts and the GCS blob, touches no quota, and must leave this assertion exactly as it is. A U13
+    PR that flips it while `VARSEL_STATE_BACKEND` still resolves to `gcs` is claiming a caller that
+    does not exist yet.
     """
     defaults = notification_auth.DEFAULT_QUOTAS
     assert defaults.max_devices == notification_store.MAX_DEVICES_PER_CLIENT
