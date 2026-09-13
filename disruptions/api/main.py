@@ -752,25 +752,25 @@ _CONNECTIVITY_TTL_S = 10 * 60
 # "unknown" and registration proceeds unvalidated — the same degradation as a BigQuery outage, which
 # is the right way for a guard-rail to fail.
 _CONNECTIVITY_MAX_PER_MIN = 30
-# ...and the Webhook channel gets its own, smaller ceiling, because the paragraph above is an
-# argument about the public unauthenticated endpoint only. `alternatives._POLLER_FETCH_MAX_PER_MIN`
-# split from `_FETCH_MAX_PER_MIN` for exactly this reason — "an abuse-control number was setting the
-# alerting budget only by accident" — and this is the same mistake one layer over: client
-# onboarding (`notification_api._record_servability`, on every create and replace) and the poller's
-# `notification_servability.recheck` both reached this seam and spent the traveller's tally. A client may
-# issue `notification_auth.PER_CLIENT_PER_MIN` = 120 create/replace requests a minute, so a bulk
-# onboarding of an existing commuter base — which is what this channel is FOR — exhausted a
+# ...and the poller's two servability sweeps get their own, smaller ceiling, because the paragraph
+# above is an argument about the public unauthenticated endpoint only.
+# `alternatives._POLLER_FETCH_MAX_PER_MIN` split from `_FETCH_MAX_PER_MIN` for exactly this reason --
+# "an abuse-control number was setting the alerting budget only by accident" -- and this was the
+# same mistake one layer over: client onboarding and `notification_servability.recheck` both reached
+# this seam and spent the traveller's tally. A client may issue
+# `notification_auth.PER_CLIENT_PER_MIN` = 120 create/replace requests a minute, so a bulk
+# onboarding of an existing commuter base -- which is what that channel is FOR -- exhausted a
 # traveller-facing budget as a side effect, and did it silently: `None` reads as "could not
 # establish", so a real traveller's journey then registers with no no-direct-service caveat.
 #
-# 15, half the traveller's rather than equal to it, and the asymmetry is the point: a client's
-# onboarding is a batch that may legitimately take longer, a traveller is waiting on a page. 15/min
-# is 900 jobs an hour against a pilot measured in tens, and since U10 the sweep contributes exactly
-# ONE job per ~296 s cycle however many records are pending. The worst-case BigQuery draw from this
-# seam therefore goes 30/min -> 45/min, which is the honest cost of the split.
-_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN = 15
+# It was `_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN` (15) until U10, when onboarding stopped asking
+# at all. What is left on this path is the two sweeps -- `notification_servability.recheck` and
+# `varsel.recheck_service` -- each issuing ONE job per ~296 s cycle however many records are
+# pending, so 4/min is an order of magnitude above the reachable draw rather than a budget anybody
+# spends. The worst-case BigQuery draw from this seam therefore goes 30 + 15 -> 30 + 4 per minute.
+_POLLER_CONNECTIVITY_MAX_PER_MIN = 4
 _CONNECTIVITY_REQUEST_PATH = "request"
-_CONNECTIVITY_NOTIFICATION_API_PATH = "notification_api"
+_CONNECTIVITY_POLLER_PATH = "poller"
 # One job's worth of pairs. The callers bound their own sweeps well under this; it is here so a
 # caller that forgets to costs its own pairs an answer — they come back `None`, which every caller
 # already reads as "could not establish" and leaves due — rather than costing the process a
@@ -793,7 +793,7 @@ _connectivity_lock = threading.Lock()
 _connectivity_cache: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[float, tuple[bool, bool]]] = {}
 _connectivity_calls: dict[str, list[float]] = {
     _CONNECTIVITY_REQUEST_PATH: [],
-    _CONNECTIVITY_NOTIFICATION_API_PATH: [],
+    _CONNECTIVITY_POLLER_PATH: [],
 }
 
 
@@ -820,7 +820,7 @@ def _varsel_connectivity_batch(
     the cache already holds costs no place in the job at all.
 
     ``path`` names WHOSE per-minute budget this job spends — see
-    :data:`_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`. It defaults to the public one, which is the safe
+    :data:`_POLLER_CONNECTIVITY_MAX_PER_MIN`. It defaults to the public one, which is the safe
     direction: a caller that forgets to name itself is charged the tighter, traveller-facing tally
     rather than silently minting a budget of its own.
 
@@ -857,8 +857,8 @@ def _varsel_connectivity_batch(
             )
             asked = asked[:_CONNECTIVITY_MAX_PAIRS_PER_JOB]
         ceiling = (
-            _NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN
-            if path == _CONNECTIVITY_NOTIFICATION_API_PATH
+            _POLLER_CONNECTIVITY_MAX_PER_MIN
+            if path == _CONNECTIVITY_POLLER_PATH
             else _CONNECTIVITY_MAX_PER_MIN
         )
         calls = _connectivity_calls.setdefault(path, [])
@@ -1699,23 +1699,14 @@ async def lifespan(app: FastAPI):
         span=tracing_setup.span,
     )
     notification_auth.configure()
-    # The webhook channel's own slice of the connectivity budget, bound ONCE here so neither client
-    # module has to know the vocabulary and neither can forget the tag. Bound rather than defaulted
-    # because the default is the traveller-facing tally, which is what this seam was spending before
-    # `_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN` existed.
-    notification_api_connectivity = functools.partial(
-        varsel._service_verdict, path=_CONNECTIVITY_NOTIFICATION_API_PATH
-    )
     notification_api.configure(
         store=notification_store,
         auth=notification_auth,
-        # /varsel's own two, injected rather than imported by the module: `canonical_stop` so a
-        # client ref the stop registry has collapsed lands on the same journey key a browser
-        # registration would, and `_service_verdict` so R5's servability caveat is the answer
-        # /varsel gives -- it expands both places to every ref and already fails open to None,
-        # which is what keeps "we could not establish it" from ever reading as "no trips run".
+        # /varsel's own, injected rather than imported by the module, so a client ref the stop
+        # registry has collapsed lands on the same journey key a browser registration would. The
+        # connectivity seam that sat beside it is gone (U10): a create and a replace no longer ask
+        # BigQuery at all, and `servable` is answered by the poller's sweep.
         canonicalize=varsel.canonical_stop,
-        connectivity=notification_api_connectivity,
     )
     # The poller-side half of the same question (R6, AE13's second clause). The BATCH form of the
     # seam above since U10, and `varsel._service_verdicts` reaches the same
@@ -1725,9 +1716,7 @@ async def lifespan(app: FastAPI):
     # returns before it reads the store, so nothing here is a cost in a deployment that never sets
     # the seam.
     notification_servability.configure(
-        verdicts=functools.partial(
-            varsel._service_verdicts, path=_CONNECTIVITY_NOTIFICATION_API_PATH
-        )
+        verdicts=functools.partial(varsel._service_verdicts, path=_CONNECTIVITY_POLLER_PATH)
     )
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody

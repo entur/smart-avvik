@@ -464,7 +464,7 @@ silently.
 | `notification_auth` | a refused credential | `reason`, `key_id`. **The secret is logged nowhere at any level** |
 | `notification_admin` | an operator action | `action`, `result`, `actor`, `client_id`, `destination_id`, `key_id`. `action="show_signing_secret"` with `result="disclosed"` is a **credential read** — the audit document beside it carries the generation numbers in `reason`, never the secret |
 | `notification_test_event` | a synthetic send | `client_id`, `key_id`, `destination_id`, `result` (`ok`, `failed`, `timeout`), `status`. **`result="timeout"`** — a WARNING, and the only one of the three without a `status`, because no response was received — means the bounded wait around the whole delivery elapsed — DNS is the reason it exists, since `socket.getaddrinfo` is reached by no deadline in `webhook_sender`. The route still answers **200** with `delivered: false`; a 504 would read as our failure when it is the destination's |
-| `notification_servability` | the six-hourly re-check sweep, and its per-record faults | `result`: `swept` (a clean pass), `capped` / `deadline` (a bound bound — logged at WARNING, because a ceiling nobody can see binding is not a ceiling anybody can size), `load_failed` (the store could not be read; every caveat stands), `vanished` (deleted while we were asking), `superseded` (the route was replaced while the check ran, so the verdict describes a definition that no longer exists and is discarded rather than stamped — logged at DEBUG here on the poller's cadence and at INFO on the request path, where an operator may correlate it with a client's report), `error` (the seam raised or timed out) and `write_failed`. A sweep record also carries `due`, `checked`, `cleared`, `unservable`, `truncated`, `ms`. **`error` and `write_failed` now come from two call sites**: the create path logs neither id, the re-check logs `client_id` and `subscription_id` — both of which `notification_subscription` already logs, so this adds no new class of identifier |
+| `notification_servability` | the six-hourly re-check sweep, and its per-record faults | `result`: `swept` (a clean pass), `capped` / `deadline` (a bound bound — logged at WARNING, because a ceiling nobody can see binding is not a ceiling anybody can size), `load_failed` (the store could not be read; every caveat stands), `vanished` (deleted while we were asking), `superseded` (the route was replaced while the check ran, so the verdict describes a definition that no longer exists and is discarded rather than stamped — logged at DEBUG here on the poller's cadence and at INFO on the request path, where an operator may correlate it with a client's report), `error` (the seam raised or timed out) and `write_failed`. A sweep record also carries `due`, `asked` (distinct stop pairs put to the one BigQuery job), `established`, `cleared`, `unservable`, `vanished`, `superseded`, `write_failed`, `abandoned`, `capped`, `truncated`, `ms`. Two `result` values are U10's: `abandoned` (a write was still in flight when the bounded collection expired — its record stays due and the next cycle picks it up) and `misaligned` (the connectivity seam answered a different number of pairs than it was asked about, so the whole batch is discarded rather than paired up by position). Per-record outcomes are COUNTED rather than logged one by one — two thousand records a cycle is two thousand lines — and the one line worth having, an unexpected write failure's traceback, is written once per pass with `client_id` and `subscription_id`, both of which `notification_subscription` already logs |
 | `notification_alert_state` | a failed alert-state read behind a subscription response | `result` (`error`) |
 | `webhook_delivery_refused` | an outbound refusal | `reason` |
 | `webhook_delivery_response_truncated` | a 2xx body over the response cap | `limit` |
@@ -490,19 +490,21 @@ and the fourth entry below is why it needs one.
   path or query, but not nothing.
 - **`notification_admin.actor` identifies a named human** — the operator's ADC identity, usually an email
   address, falling back to `$USER` and then to `"unknown"`.
-- **A webhook subscription's origin and destination DO reach Cloud Logging — under `/varsel`'s event
-  name, not a client one.** `main._varsel_connectivity` writes both stop refs into the *message* of
-  an INFO record (`event="varsel_service_check"`, `result="ok"`) on every established verdict. Its
-  structured `fields` carry only `event`, `result`, `forward`, `reverse` and — since the budget was
-  split per caller — `path` (`request` or `notification_api`), which is why the claim
-  above stays literally true — and a reader who stopped there would be misled, which this document's
-  posture does not allow. The webhook channel reaches it at **create time** (it always did) and now
-  again **every six hours per unservable subscription**, through `notification_servability`. It is
-  **pre-existing and shared with `/varsel`'s own registrations**, so the honest framing is an
-  accepted exposure this feature extends rather than a new leak; and if it is ever to be closed, the
-  fix is `/varsel`'s log line, not this channel's. **The public read deliberately never reaches it**:
-  no servability question is asked for an anonymous pair, which is one reason the read has a
-  `coverage` block instead of a caveat.
+- **A webhook subscription's origin and destination used to reach Cloud Logging — under `/varsel`'s
+  event name, not a client one — and no longer do (2026-09-13, U10).** `main._varsel_connectivity`
+  wrote both stop refs into the *message* of an INFO record (`event="varsel_service_check"`,
+  `result="ok"`) on every established verdict, and into the message of its failure record; so did
+  `varsel._service_verdict`'s own error path. Three carriers, all of them `/varsel`'s rather than
+  this channel's, which is why the claim above stayed literally true and would have misled anyone
+  who stopped there. They now carry `alternatives.pair_digest` — salted per process, because an
+  unsalted SHA-256 over two public enumerable refs is a reversible pseudonym rather than an
+  anonymisation — and the structured fields carry `event`, `result`, `path` (`request` or `poller`),
+  `pair_digest`, and `forward`/`reverse` on a single-pair record. **A batch writes one summary
+  record** with `asked`, `established`, `forward` and `reverse_only` and no digest at all, because a
+  sweep asking about thousands of pairs would otherwise be thousands of INFO lines a cycle. The fix
+  was `/varsel`'s log line rather than this channel's, exactly as this paragraph used to predict it
+  would have to be. **The public read still never reaches it**: no servability question is asked for
+  an anonymous pair, which is one reason the read has a `coverage` block instead of a caveat.
 - **The public read's own three accepted exposures, published beside this one rather than closed**
   (plan 2026-09-10-001). (1) **The completeness and latency of a FIRST read reveal whether a
   registration with exactly those five fields exists and is alert-worthy now**: a registered
@@ -713,8 +715,14 @@ event grain (`alert_id` per subscription and train), the revision rules, the sig
 eight collections need no change, and the nullable `servable` already tolerates an asynchronous
 answer. What does **not** carry that far is the runtime topology, and it is pilot-grade on purpose:
 every ceiling above is a constant sized for one poller thread and a few hundred subscriptions. These
-are the moves, in the order they will bind, each behind a seam that already exists. None of them
-touches the wire contract, which is why the pilot could ship without them.
+are the moves, in the order they will bind, each behind a seam that already exists.
+
+**One of them turned out to touch the wire contract after all, and this sentence used to say none
+did.** The schema does not move — `servable` was already `boolean | null` and optional, and the
+generated TypeScript already typed it so — but the BEHAVIOUR a client sees does: since U10 a create
+and a replace answer `servable: null` always, and a background sweep establishes it within the hour.
+A client rendering the caveat from the create response now renders nothing until it re-reads. The
+contract document says so in its own words; this is the operating half of the same note.
 
 1. **The matcher, once per place pair rather than once per definition.** `impact._trip_cells` scans
    every scored call of every situation per journey definition at ~40 ms each; ten thousand
@@ -760,10 +768,28 @@ touches the wire contract, which is why the pilot could ship without them.
    When delivery moves to its own Deployment the ledger's figure becomes stale HIGH inside a pass —
    the worker drains events it does not hear about — so it refuses earlier than it needs to, which
    is the conservative direction. What would need a change is a second EMITTER.
-4. **Servability for every pending pair in one query per cycle.** Today a create asks BigQuery
-   inline under a 15/min budget and `notification_servability` re-asks four subscriptions a cycle
-   (~1 150 a day). Distinct stop pairs number in the thousands where subscriptions number in the
-   hundreds of thousands, and the planned tables already answer all of them in one query at cents.
+4. **Servability for every pending pair in one query per cycle — done, 2026-09-13 (U10).** A create
+   asked BigQuery inline under a 15/min budget and `notification_servability` re-asked four
+   subscriptions a cycle (~1 150 a day), because a BigQuery job was the unit of work. The sweep now
+   derives the distinct stop pairs from the records it is about to write and asks about all of them
+   in ONE job (`disruptions/api/varsel_connectivity.sql`), so a corridor with a hundred thousand
+   commuters is one place in one query, and the bound moved from questions to WRITES
+   (`_MAX_WRITES_PER_CYCLE`, 2 000, across a 32-wide pool with a bounded collection). The create and
+   replace paths ask nothing at all: **`servable` is null on those responses**, which is the one
+   wire-visible change of this move — see the note under the list. Measured against dev on
+   2026-09-13, a batch of one answers exactly what the single-pair query answered over six pairs
+   (including several refs a side, a pair served only in reverse, and a ref no table holds), and one
+   job over six pairs billed 20 MB.
+
+   The plan asked for batched Firestore writes with `last_update_time` preconditions and that was
+   **refused**, which is worth recording because the reasoning generalises. Firestore has exactly
+   two preconditions, `exists` and `last_update_time`, and neither can say "and the route has not
+   changed" — which is the only thing a servability answer is about, and what `set_servability`'s
+   `expected_version` already enforces inside a transaction. `last_update_time` read off the
+   subscription mirror is as old as the last sync and `_sent_body` deliberately does not stamp, so
+   the busiest subscriptions would fail the precondition every cycle with nothing in the logs to say
+   why. A `WriteBatch` is also atomic, so "a precondition failure leaves the subscription due and
+   the rest of the batch lands" is not what it would do.
 5. **A `count()` aggregation for the active-subscription ceiling — done, 2026-09-13 (U7).**
    `_create_body` counted a client's live subscriptions by READING them inside the create
    transaction, up to the ceiling: bounded, and paid on a create, which is what made it affordable
@@ -1151,7 +1177,7 @@ the repository root; Python suites are `disruptions/api/`, TypeScript ones `inte
 | AE10 | `test_varsel_api.py::test_a_webhook_subscription_matches_and_is_written_for_without_a_keypair` and the two budget tests beside it; `test_notification_wording.py::test_a_webhook_wording_needs_no_vapid_keypair_and_no_model`; the delivery half is structural and is now pinned by `test_notification_contract.py::test_the_store_and_delivery_modules_import_no_poller_state` | yes |
 | AE11 | `test_notification_api.py::test_a_missing_or_wrong_credential_reads_nothing` and `::test_one_client_cannot_reach_anothers_records_and_the_body_names_nothing`; `test_notification_store.py` tenant isolation; `test_llm_message.py::test_a_webhook_call_keeps_prose_and_the_prompt_out_of_the_log`; `test_varsel_api.py::test_a_webhook_only_route_records_no_decision_row`; and whole-tree in `test_notification_contract.py` (no client field in any `data/queries` SQL, any front-end bundle, the decision-log DDL or any structured log field). **Shape note:** the `/historikk` and `/meldinger` half is a grep over the uncommented SQL — the repo's idiom, structurally stronger than a response assertion, but not a rendered-page check | yes |
 | AE12 | `test_webhook_delivery.py::test_a_departed_train_becomes_expired_rather_than_failed_and_is_not_retried`; `test_notification_store.py::test_event_validity_is_the_earliest_of_three_things` | yes |
-| AE13 | **Stored with the caveat:** `test_notification_api.py::test_an_unservable_pair_is_stored_and_carries_the_caveat`, `::test_a_provider_timeout_stores_no_caveat_rather_than_a_false_one`, `::test_a_changed_route_retires_the_old_servability_answer`. **Re-checked as service appears:** `test_notification_servability.py` (27 checks) — `::test_service_that_appeared_clears_the_caveat`, `::test_a_never_established_answer_is_due`, `::test_an_unchanged_answer_still_moves_the_stamp`, `::test_a_verdict_that_could_not_be_established_writes_nothing_at_all`, `::test_the_interval_is_varsels_own`; wired and gated in `test_poller_refresh.py` | yes |
+| AE13 | **Stored, never refused, and not answered on the write path:** `test_notification_api.py::test_a_create_asks_nothing_and_answers_that_it_has_not_established_servability`, `::test_a_replace_also_answers_null_rather_than_carrying_the_old_verdict_forward`, `::test_no_write_path_reaches_a_connectivity_seam_at_all`. **Established and re-checked as service appears:** `test_notification_servability.py` (34 checks) — `::test_service_that_appeared_clears_the_caveat`, `::test_a_never_established_answer_is_due`, `::test_an_unchanged_answer_still_moves_the_stamp`, `::test_a_verdict_that_could_not_be_established_writes_nothing_at_all`, `::test_the_interval_is_varsels_own`, `::test_two_subscriptions_on_one_corridor_are_one_question`, `::test_the_ceiling_binds_on_WRITES_and_says_so`; wired and gated in `test_poller_refresh.py` | yes |
 | AE14 | `test_varsel_api.py::test_a_broken_notification_store_costs_the_webhook_channel_and_nothing_else` (raises, hangs and one unreadable document, in one test, asserting browser matching, wording, delivery, decision recording **and** state persistence all complete); `test_webhook_delivery.py::test_a_slow_store_cannot_extend_the_pass_past_its_bounded_wait`; `test_notification_events.py::test_a_hung_store_cannot_extend_the_step_past_its_bounded_wait` | yes |
 | AE15 | `test_webhook_delivery.py::test_a_restart_between_commit_and_delivery_resends_the_original_id_and_revision`; `test_notification_store.py::test_only_a_lifecycle_transition_mints_a_revision` and `::test_a_changed_payload_mints_nothing`; the receiver's suppression in `notifications-client/test/process.test.mjs` | yes |
 | AE16 | `notifications-client/test/policy.test.mjs`, `test/process.test.mjs`, `test/genericReceiver.test.mjs` (over a socket) and `firebase-notifications/test/emulator/store.test.mjs` (through the transaction) | yes |

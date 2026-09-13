@@ -282,12 +282,19 @@ def test_none_is_never_passed_to_the_store():
     assert "servable=servable" in inspect.getsource(notification_servability._record)
 
 
-def test_the_create_path_states_the_same_rule():
-    """`notification_api._record_servability` is the other half of R6 and holds rule 1 independently.
-    Pinned here because the two are only one rule if both say it: a create that stamped a None
-    would leave a record this pass reads as freshly answered and skips for six hours."""
-    create = inspect.getsource(notification_api._record_servability)
-    assert "if verdict is None:" in create and "return None" in create
+def test_the_create_path_no_longer_answers_the_question_at_all():
+    """R6's other half moved here entirely (U10).
+
+    A create and a replace used to ask the same 20-second BigQuery question in a second transaction
+    after the write, which put a job on the registration path of a channel built for bulk
+    onboarding. They answer `servable: null` now -- "not established", which the contract says must
+    never render as an all-clear -- and this pass establishes it on its own cadence. Pinned because
+    a seam re-introduced there would reinstate the cost silently, and because this pass is now the
+    ONLY writer of the field: rule 1 holding here is the whole of rule 1 holding.
+    """
+    source = pathlib.Path(notification_api.__file__).read_text()
+    assert "_record_servability" not in source
+    assert "set_servability" not in source
 
 
 # ---- Rule 2: per record, not per cycle ----------------------------------------------------------
@@ -724,12 +731,15 @@ def test_no_log_record_carries_a_route_a_window_or_prose():
         }, record
 
 
-def test_every_record_rides_the_event_name_the_create_path_already_uses():
-    """One event name for both halves of R6, so a query written for either finds both -- the
-    meldinger-rename lesson. A new name would silently drop these out of every existing query."""
+def test_every_record_rides_one_event_name():
+    """One event name for the whole of R6, so a query written for any of it finds all of it -- the
+    meldinger-rename lesson. A new name would silently drop these out of every existing query.
+
+    It used to be TWO halves, this pass and the create path, and the second one is gone with U10:
+    the API asks nothing, so this module is the only writer of `notification_servability` records.
+    """
     assert '"event": "notification_servability"' in MODULE_SOURCE
     assert MODULE_SOURCE.count('"event": "') == MODULE_SOURCE.count('"event": "notification_servability"')
-    assert '"event": "notification_servability"' in pathlib.Path(notification_api.__file__).read_text()
 
 
 if __name__ == "__main__":
