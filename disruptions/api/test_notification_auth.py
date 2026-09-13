@@ -16,6 +16,7 @@ write site in the repo, not of a document.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import io
 import json
@@ -1751,6 +1752,44 @@ def test_the_reserved_browser_account_is_created_by_its_own_command_and_never_ge
         )
         assert code != 0, "a credential for the reserved id must be refused"
         assert notification_auth.list_credentials(browser) == []
+    finally:
+        _uninstall()
+
+
+def test_the_reserved_id_is_refused_before_the_pepper_hint_asks_for_a_production_secret():
+    """A policy refusal must outrank the environment pre-check, or the hint costs a prd secret.
+
+    `main` pre-checks the pepper for `issue-key` so an operator who has not exported it gets a
+    one-line message about the variable rather than a failure about a Helm secret group. Right for
+    every id but the reserved one: that pre-check ran FIRST, so `issue-key --client-id browser`
+    answered "export this environment's value from Secret Manager", which for prd means fetching
+    the live NOTIFICATION_KEY_PEPPER onto a laptop -- the exposure the tool's own docstring names
+    -- only to be refused on policy once it was there. Hit for real during prd's 2026-09-13
+    cutover, while verifying that the reserved account created minutes earlier could not be given
+    a credential.
+
+    The refusal itself never moved, which is why the suite could not see this: every other case
+    here installs a pepper, and with one installed BOTH orders produce the same refusal. What
+    pins the order is an environment with NO pepper, and an assertion on which message comes back
+    rather than only on the exit code.
+    """
+    store = _install(pepper=None)
+    try:
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            code, _out = _run(
+                ["--environment", "prd", "issue-key", "--client-id", varsel_state.BROWSER_CLIENT_ID],
+                authorizer=_allow(),
+                store=store,
+            )
+        message = errors.getvalue()
+        assert code != 0, "a credential for the reserved id must be refused"
+        assert "reserved for /varsel" in message, message
+        assert notification_auth.PEPPER_ENV not in message, (
+            "the reserved id was refused only after the pre-check told the operator to export "
+            f"{notification_auth.PEPPER_ENV}: " + message
+        )
+        assert notification_auth.list_credentials(varsel_state.BROWSER_CLIENT_ID) == []
     finally:
         _uninstall()
 
