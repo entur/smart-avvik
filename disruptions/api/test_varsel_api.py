@@ -679,6 +679,42 @@ def test_the_re_check_is_bounded_per_cycle_and_the_rest_stay_due():
     assert len(answered) == 2 and len(untouched) == 4, (answered, untouched)
 
 
+def test_the_browser_re_check_reserves_the_question_rather_than_measuring_elapsed_time():
+    """A ceiling on when the step ENDS, not on when its question starts.
+
+    What can eat the budget before the question is the `_state_lock` wait and the scan itself -- at
+    a hundred thousand registrations this walks every one of them, under a lock the pass also takes
+    -- and the clock is driven here rather than slept on, because that is the only way to prove the
+    guard CAN fire. A reservation nothing can make bind is indistinguishable from no reservation.
+    """
+    _reset_state()
+    old_stamp = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    with varsel._state_lock:
+        _flag("j1", checked_ts=old_stamp)
+    jobs: list = []
+    _use_connectivity((True, False), None, jobs)
+    clock = {"t": 0.0}
+    original = varsel.monotonic
+
+    def creeping():
+        # Every reading costs all but a second of the budget, so the FIRST thing the pass does
+        # after starting its clock is already too late to ask.
+        reading = clock["t"]
+        clock["t"] += varsel._SERVICE_RECHECK_DEADLINE_S - 1.0
+        return reading
+
+    varsel.monotonic = creeping
+    try:
+        varsel.recheck_service()
+    finally:
+        varsel.monotonic = original
+        _no_connectivity()
+    assert jobs == [], "a question that cannot finish inside the deadline must not start"
+    with varsel._state_lock:
+        rec = varsel._journeys["j1"]
+    assert rec["no_direct_service"] is True and rec["service_checked_ts"] == old_stamp
+
+
 def test_an_unestablished_verdict_leaves_the_flag_and_the_stamp_alone():
     """`None` is "could not be established" and must never become a stamped non-answer: stamping it
     would take the journey out of the due set for six hours on the strength of an outage."""

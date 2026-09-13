@@ -128,6 +128,15 @@ _WORST_CASE_CHECK_S = 20.0
 #: It is also the bound on ONE JOB's pairs: `main._CONNECTIVITY_MAX_PAIRS_PER_JOB` is the same
 #: number from the other side, and `test_poller_refresh` pins this one at or under it, or the
 #: overflow would be answered as unknown by a job this pass had already decided to spend.
+#:
+#: **What a full cycle costs the mirror, stated rather than discovered.** `_servability_body` is in
+#: `notification_store.MIRROR_STAMPING_BODIES` -- it must be, or the mirror's copy of `servable`
+#: never moves, the record reads as due on the next cycle and the bound is spent re-asking the same
+#: pairs forever. So 2 000 writes here are 2 000 documents the NEXT `notification_mirror` phase
+#: re-reads, which is deliberate and is against the read-once-ever economy U6 was built for. At the
+#: full bound on every cycle that is ~580 000 extra document reads a day, on the order of $0.35;
+#: a `synced` count spiking to 2 000 on that phase is this pass working as designed, not a churn
+#: problem. It is self-limiting in practice, because a record stamped now is not due for six hours.
 _MAX_WRITES_PER_CYCLE = 2000
 
 #: How many of those writes are in flight at once. Derived, not picked: `notification_store`'s
