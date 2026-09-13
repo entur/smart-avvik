@@ -490,10 +490,57 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     cutover's decision, and `VARSEL_STATE_BACKEND` arrives with the implementation it would select.
     The togvarsel round markers are deliberately **off** the protocol — a rush round marker is not
     a registration, and putting it there would make the store grow a document nothing reads.
-    `disruptions/api/test_varsel_state.py` is the seam's own suite (26 checks), and what it exists
-    for is the three properties above plus a signature-by-signature comparison of the
-    implementation against the protocol: a `Protocol` nothing checks is a comment, and a method
+    `disruptions/api/test_varsel_state.py` is the seam's own suite (39 checks), and what it exists
+    for is the three properties above plus a signature-by-signature comparison of BOTH
+    implementations against the protocol: a `Protocol` nothing checks is a comment, and a method
     renamed on one side type-checks in the editor and fails on the poller's thread hours later.
+    **The store backend arrived the same day** (`varsel_state.StoreRegistrations` over U12's
+    collections, selected by `VARSEL_STATE_BACKEND`; unset and `gcs` are the blob, `store` is
+    Firestore). Which read goes where is the design and it is R15 plus one: the REQUEST path reads
+    the store, because a traveller who has just created a journey must see it in the next
+    `list_journeys` and the mirror is at best as fresh as this cycle's sync — and empty before the
+    poller has seeded it; the CYCLE reads the mirror, because at a hundred thousand registrations a
+    per-cycle read of the collection IS the cycle. `get_journey` answers both, preferring the mirror
+    and falling back to the store while it is not ready, and that is exact in both cases only
+    because every commit this process makes is applied to the mirror from its own result. **The two
+    global ceilings moved off the protocol**: `device_count()`/`journey_count()` are gone and
+    `put_device`/`create_journey` raise `varsel_state.CapacityExceeded` instead, because a count the
+    caller compares against a constant is two things the store cannot do — the ceiling there is the
+    CLIENT's quota, enforced inside the create transaction where U7 put it, and a read-then-compare
+    outside it is a race the blob only got away with because it held a lock across both halves. The
+    quotas belong to a **reserved `browser` client**, which is not one more onboarded integration:
+    the traveller behind those documents is a member of the public, so
+    `scripts/manage_notification_client.py` refuses to create it and nothing may issue a credential
+    for it — its `clients` document exists only to carry `max_devices` and
+    `max_active_subscriptions`, which were `varsel._MAX_DEVICES` and `varsel._MAX_JOURNEYS`.
+    `main._registration_store` **fails the lifespan** when `store` is asked for without the database
+    or without that account, which is `webhook_worker`'s fail-loud-at-startup rule and matters for
+    one number: `quotas_for` answers an unknown client with `DEFAULT_QUOTAS`, whose
+    `max_active_subscriptions` is 500, so a deployment that took the default would refuse the 501st
+    traveller with «Tjenesten er full» and nothing would say why. Two more things the store half
+    needed and U12 had not left behind: the servability answer's **reverse-only qualifier**
+    (`servable_reverse`, without which every such traveller silently gets the blunter caveat — which
+    reads as the check working), and a **canonicalization body** (`canonicalize_stops`), its own
+    bounded write rather than `replace_subscription`, whose version bump means the client changed the
+    route and whose semantics would retire the servability answer this rewrite has no business
+    touching; it recomputes the definition digest, which covers both stop refs. And the delivery
+    loop's collect pass was **re-ordered**: which registrations have an alert-worthy train at all is
+    decided first and from memory, and only then is one multi-get issued for their devices — device
+    first was one store round trip per registration per cycle, serial, on the poller's thread, for a
+    question almost every registration answers "no" to. **A per-journey mirror read is KEYED**
+    (`SubscriptionMirror.entry`), which is the same lesson one layer along: `recipients` copies the
+    whole entry list and tests liveness on every element — right for the pass, which wants all of
+    them, and the wrong shape for `get_journey` (three calls per push) and `push_ledger` (one per
+    candidate), where at a hundred thousand entries a thousand pushes is ~4 000 full walks and the
+    backend that exists to scale is slower per cycle than the blob it replaces. A suite at n=2 can
+    see none of that, so what pins it is a test that makes `recipients` RAISE and asserts every
+    per-journey read still answers. **The togvarsel round markers are NOT persisted under
+    `store`**, and that is U14's to settle rather than a defect this backend hides: the durable
+    write behind `store_togvarsel_rounds` is `_save_state()`, which is a no-op returning True on
+    the store, whose `load()` is a no-op too — so a restart re-fires the accepted crash window for
+    whatever rush round is inside its timeliness window. It costs nothing today (`SHOW_RUSHVARSEL`
+    is off everywhere and no environment sets this backend) and the two shapes are keeping the
+    markers on the blob regardless of backend, or one Firestore document.
   - Non-prod deployments label themselves in the PWA header and tab title —
     `Avviksvarsel (dev)` — and in the **push title** (`[dev] Oslo S → Lillehammer`, prefixed
     because phones truncate on the right), because dev and prd installs are otherwise identical on

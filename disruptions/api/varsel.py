@@ -1406,7 +1406,9 @@ _alternative_identity = notification_wording.alternative_identity
 # The six names below are ALIASES of the blob backend's own objects, kept for one release so the
 # `/varsel` suites and their siblings read exactly the state they always read while the seam itself
 # is proved. They are the blob backend's, and they retire with it -- do not add a reader.
-_registrations: varsel_state.RegistrationStore = varsel_state.BlobRegistrations()
+_registrations: varsel_state.RegistrationStore = varsel_state.BlobRegistrations(
+    max_devices=_MAX_DEVICES, max_journeys=_MAX_JOURNEYS
+)
 _state_lock = varsel_state.lock
 _devices = varsel_state._devices
 _journeys = varsel_state._journeys
@@ -4618,26 +4620,23 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # trains on one journey would pass all five through a ledger that still read zero.
         reserved: dict[str, int] = {}
         capped: dict[str, int] = {}
+        # WHICH REGISTRATIONS HAVE A TRAIN AT ALL, first and from memory. The device read used to
+        # come first, which is one store round trip per registration per cycle under the store
+        # backend -- serial, on this thread, for a question almost every registration answers "no"
+        # to. Ordering it this way makes the reads bounded by what is about to be PUSHED rather than
+        # by the population, and one multi-get then costs one round trip for all of them.
+        candidates: list[tuple[str, dict, str, list[Alert]]] = []
         for jid, journey in journeys if push_on else []:
-            device = None
-            brand = DEFAULT_BRAND
-            with _state_lock:
-                if _registrations.get_journey(jid) is None:  # deleted while iterating
-                    continue
-                dev = _registrations.get_device(journey["device_id"])
-                if dev is not None:
-                    device = dev.get("subscription")
-                    brand = normalize_brand(dev.get("brand"))
-            if device is None:
-                continue
             key = journey_key(journey)
-            # One push per train, not per SX message. Two situations about one cancelled departure used
-            # to mean two notifications a minute apart, saying the same thing with different percentages
-            # (2026-08-05). `_notified` still keys on the surviving situation_number, so the suppressed
-            # one simply never notifies -- and `_record_decisions` below still sees both.
+            # One push per train, not per SX message. Two situations about one cancelled departure
+            # used to mean two notifications a minute apart, saying the same thing with different
+            # percentages (2026-08-05). `_notified` still keys on the surviving situation_number, so
+            # the suppressed one simply never notifies -- and `_record_decisions` below still sees
+            # both.
             #
-            # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when the
-            # daily cap below binds, it must be spent on the trains the traveller can still act on.
+            # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when
+            # the daily cap below binds, it must be spent on the trains the traveller can still act
+            # on.
             trains = sorted(
                 (a for a in one_alert_per_train(alerts_by_key.get(key, [])) if a.alertworthy),
                 key=lambda a: (
@@ -4645,11 +4644,19 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                     a.departure_time.timestamp() if a.departure_time else 0.0,
                 ),
             )
-            if not trains:
-                # BEFORE the ledger read, deliberately: most registrations have no alert-worthy
-                # train on most cycles, and under the store backend a ledger is a document read --
-                # so reading it above this line would put one read per registration per cycle on a
-                # question nothing was going to ask.
+            if trains:
+                candidates.append((jid, journey, key, trains))
+        devices = _registrations.devices_for(j["device_id"] for _jid, j, _k, _t in candidates)
+        for jid, journey, key, trains in candidates:
+            with _state_lock:
+                if _registrations.get_journey(jid) is None:  # deleted while iterating
+                    continue
+            dev = devices.get(journey["device_id"])
+            if dev is None:
+                continue
+            device = dev.get("subscription")
+            brand = normalize_brand(dev.get("brand"))
+            if device is None:
                 continue
             # ONE read of this registration's push marks for the whole train loop below, which is
             # the shape the store backend needs: three fields of one journey document, so asking per
@@ -5044,24 +5051,26 @@ def upsert_device(body: DeviceIn) -> dict:
     every other route, `/health` included. Same rule as `list_journeys`/`create_journey`/`/impact`.
     """
     with _state_lock:
-        if (
-            _registrations.get_device(body.device_id) is None
-            and _registrations.device_count() >= _MAX_DEVICES
-        ):
-            logger.warning(
-                "Global device cap (%d) reached; refusing a new registration",
-                _MAX_DEVICES,
-                extra={"fields": {"event": "varsel_capacity", "kind": "devices"}},
-            )
-            raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
         # The signup instant and the tombstone that carries it across a lapse are the seam's (see
         # `varsel_state.BlobRegistrations.put_device`): which of the three sources it comes from is
-        # a property of the record's history, not of this request.
-        _registrations.put_device(
-            body.device_id,
-            subscription=body.subscription,
-            brand=normalize_brand(body.brand),
-        )
+        # a property of the record's history, not of this request. So is the CEILING, since U13's
+        # store half -- it is the client's quota there, enforced inside the create transaction where
+        # U7 put it, and a read-then-compare out here is a race the blob only got away with because
+        # it held a lock across both halves.
+        try:
+            _registrations.put_device(
+                body.device_id,
+                subscription=body.subscription,
+                brand=normalize_brand(body.brand),
+            )
+        except varsel_state.CapacityExceeded as exc:
+            logger.warning(
+                "Global device cap reached; refusing a new registration",
+                extra={"fields": {"event": "varsel_capacity", "kind": exc.kind}},
+            )
+            raise HTTPException(
+                status_code=503, detail="Tjenesten er full. Prøv igjen senere."
+            ) from None
         _save_state()
     return {"status": "ok"}
 
@@ -5415,13 +5424,6 @@ def create_journey(body: JourneyIn) -> Journey:
                 status_code=409,
                 detail=f"Maks {_MAX_JOURNEYS_PER_DEVICE} reiser per enhet.",
             )
-        if _registrations.journey_count() >= _MAX_JOURNEYS:
-            logger.warning(
-                "Global journey cap (%d) reached; refusing a new registration",
-                _MAX_JOURNEYS,
-                extra={"fields": {"event": "varsel_capacity", "kind": "journeys"}},
-            )
-            raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
         jid = uuid.uuid4().hex
         # Annotated: inferred from the literal alone the value type is `list[int] | str | None`, and
         # the service-check fields added below (a bool, a timestamp) then read as type errors.
@@ -5445,7 +5447,16 @@ def create_journey(body: JourneyIn) -> Journey:
             if not verdict[0]:
                 rec["no_direct_service"] = True
                 rec["service_reverse_only"] = verdict[1]
-        _registrations.create_journey(jid, rec)
+        try:
+            _registrations.create_journey(jid, rec)
+        except varsel_state.CapacityExceeded as exc:
+            logger.warning(
+                "Global journey cap reached; refusing a new registration",
+                extra={"fields": {"event": "varsel_capacity", "kind": exc.kind}},
+            )
+            raise HTTPException(
+                status_code=503, detail="Tjenesten er full. Prøv igjen senere."
+            ) from None
         _save_state()
     try:
         model = _journey_model(jid, rec)

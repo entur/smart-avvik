@@ -817,6 +817,53 @@ contract document says so in its own words; this is the operating half of the sa
    the busiest subscriptions would fail the precondition every cycle with nothing in the logs to say
    why. A `WriteBatch` is also atomic, so "a precondition failure leaves the subscription due and
    the rest of the batch lands" is not what it would do.
+6. **`/varsel`'s own registrations in the store — the seam and the backend, 2026-09-13 (U13).**
+   `/varsel` held its registrations in five module dicts persisted as ONE GCS blob, rewritten whole
+   on every device upsert, journey create and journey delete. Right for the ~200 prd carries, wrong
+   for 100 000: a write is O(registrations) and two concurrent writes are a lost update. They now
+   live behind `varsel_state.RegistrationStore`, with the blob as one backend and U12's collections
+   as the other, selected by **`VARSEL_STATE_BACKEND`** — unset and `gcs` are the blob (byte for
+   byte the deployment that ran before the seam), `store` is Firestore. Three operating facts.
+
+   **The reserved `browser` client.** Every `/varsel` registration is stored under client id
+   `browser`, which is NOT an onboarded integration: the traveller behind those documents is a
+   member of the public, so `scripts/manage_notification_client.py` refuses to create it and nothing
+   may issue a credential for it or aim a destination at it. Its `clients` document exists only to
+   carry two quotas — `max_devices` and `max_active_subscriptions`, which were `varsel._MAX_DEVICES`
+   (5 000) and `varsel._MAX_JOURNEYS` (20 000). **Creating it is a cutover step and it is not
+   optional**: `notification_auth.quotas_for` answers an unknown client with `DEFAULT_QUOTAS`, whose
+   `max_active_subscriptions` is 500, so a deployment that took the default would refuse the 501st
+   traveller with «Tjenesten er full» and nothing anywhere would say why. `main` therefore **fails
+   the lifespan** — and with it the readiness probe, and with that the release — when
+   `VARSEL_STATE_BACKEND=store` is set without the database or without that account.
+
+   **Which read goes where.** The request path reads the store (R15): a traveller who has just
+   created a journey must see it in the next `list_journeys`, and the mirror is at best as fresh as
+   this cycle's sync and empty before the poller has seeded it. The cycle reads the mirror: at this
+   population a per-cycle read of the collection is the cycle. The delivery loop's two liveness
+   re-checks read the mirror too, and are exact rather than a cycle behind only because every commit
+   this process makes is applied to it from the commit's own result — see the `SUBSCRIPTION_MIRRORING_BODIES`
+   note, which supersedes what U12 recorded about reading the push marks.
+
+   **What to watch after the cutover.** `varsel_state_backend` with `result: "store"` on startup,
+   `overtaken` on the mirror's own record (small numbers are the mechanism working; a steady
+   non-zero with no `/varsel` traffic means the local-apply ledger is not being pruned), and
+   `varsel_capacity` with its `kind` — under the store that line means a client QUOTA refused the
+   registration, so the fix is `set-quotas` on `browser` rather than a code change.
+
+   **One thing the cutover still owes: the togvarsel round markers are not persisted under
+   `store`.** They are off the protocol and ride in the blob half; the durable write behind
+   `varsel.store_togvarsel_rounds` is `_save_state()`, which on the store backend is a no-op
+   returning True, and the matching `load()` is a no-op too. So under `store` a restart re-fires
+   the accepted crash window for whatever rush round is still inside its timeliness window, rather
+   than only for a crash mid-round. It costs nothing as things stand — `SHOW_RUSHVARSEL` is off in
+   every environment, so no round is evaluated at all, and no environment sets this backend — which
+   is precisely why it is written down here rather than left to be found at the cutover. Two
+   shapes, neither chosen: keep the markers on the blob regardless of backend (`store_rounds` calls
+   `varsel_state.save_state()` itself and `main` always calls `load_state()`), or move them to one
+   Firestore document. **Decide it before `SHOW_RUSHVARSEL` and `VARSEL_STATE_BACKEND=store` are on
+   in the same environment**, which is the only state in which it can bite.
+
 5. **A `count()` aggregation for the active-subscription ceiling — done, 2026-09-13 (U7).**
    `_create_body` counted a client's live subscriptions by READING them inside the create
    transaction, up to the ceiling: bounded, and paid on a create, which is what made it affordable

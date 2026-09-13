@@ -127,6 +127,7 @@ if str(_API) not in sys.path:
 
 import notification_auth
 import notification_store
+import varsel_state  # the reserved client id /varsel's own registrations live under (U13)
 import webhook_signing
 
 logger = logging.getLogger("manage_notification_client")
@@ -396,6 +397,15 @@ def _quotas_from_args(args: argparse.Namespace) -> dict[str, int]:
 
 
 def _cmd_create_client(args: argparse.Namespace, actor: str) -> Any:
+    if args.client_id == varsel_state.BROWSER_CLIENT_ID:
+        # RESERVED for `/varsel`'s own registrations (U13). Not one more onboarded integration: the
+        # traveller behind those documents is a member of the public, so nothing may issue a
+        # credential for this id and nothing may aim a webhook destination at it. The account
+        # itself is created by the cutover runbook, which sets the two ceilings and no credential.
+        raise SystemExit(
+            f"{varsel_state.BROWSER_CLIENT_ID!r} is reserved for /varsel's own registrations; "
+            "use `set-quotas` on it rather than creating it as a client"
+        )
     given = _quotas_from_args(args)
     quotas = notification_auth.Quotas(**given) if given else None
     return notification_auth.create_client(

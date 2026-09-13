@@ -41,11 +41,13 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+
+import notification_store  # the store backend's collections (U12); never `varsel`
 
 logger = logging.getLogger("kix.varsel_state")
 
@@ -104,6 +106,25 @@ class Erasure:
     durable: bool
 
 
+class CapacityExceeded(Exception):
+    """A ceiling refused this registration. `kind` is `"devices"` or `"journeys"`.
+
+    RAISED by the backend rather than pre-checked by the caller, which is U13's one change to the
+    protocol step 1 shipped. `device_count()` and `journey_count()` were on it, and a count the
+    caller compares against a constant is two things the store cannot do: the ceiling is the
+    CLIENT's quota there, enforced inside the create transaction where U7 put it precisely so that
+    "bounded" and "affordable" stop being the same argument -- and a read-then-compare outside the
+    transaction is a race the blob got away with because it held a lock across both halves.
+
+    `kind` is carried because `/varsel` logs `varsel_capacity` with it and an operator selects on
+    it; the two ceilings are different numbers with different causes.
+    """
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(f"the {kind} ceiling refused this registration")
+        self.kind = kind
+
+
 class RegistrationStore(Protocol):
     """What `/varsel` needs of wherever registrations live.
 
@@ -112,11 +133,10 @@ class RegistrationStore(Protocol):
     """
 
     # ---- the request path
-    def device_count(self) -> int: ...
     def get_device(self, device_id: str) -> dict | None: ...
+    def devices_for(self, device_ids: Iterable[str]) -> dict[str, dict]: ...
     def put_device(self, device_id: str, *, subscription: dict, brand: str) -> None: ...
     def forget_device(self, device_id: str, *, reason: str) -> tuple[dict | None, int]: ...
-    def journey_count(self) -> int: ...
     def device_journeys(self, device_id: str) -> list[tuple[str, dict]]: ...
     def create_journey(self, journey_id: str, record: dict) -> None: ...
     def delete_journey(self, journey_id: str) -> dict | None: ...
@@ -214,8 +234,26 @@ _STATE_BUCKET = os.environ.get(
 _STATE_BLOB = os.environ.get("VARSEL_STATE_BLOB", "varsel_state.json")
 
 
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+    return _now().isoformat()
+
+
+def _iso_to_dt(value: str) -> datetime | None:
+    """An ISO-8601 stamp back to an aware instant, or None when it cannot be read.
+
+    `/varsel` passes its service-check stamp as the string its own record carries; the store takes
+    an instant. A value this cannot parse means the caller has no clock to offer, and the store's
+    own `now` is the right answer then -- never an invented one.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def serialize_state() -> str:
@@ -354,6 +392,16 @@ def save_state() -> bool:
 
 
 # ---- Togvarsel round markers (off the protocol; see `_togvarsel_rounds`) ------------------------
+# **They are not persisted under `VARSEL_STATE_BACKEND=store`, and that is U14's to settle.** These
+# two functions are module state either way, but the durable write behind them is the caller's
+# `_save_state()` -- which is `BlobRegistrations.save()` on the blob and a no-op that returns True
+# on the store, whose `load()` is a no-op too. So under the store backend a restart re-fires the
+# accepted crash window for whatever rush round is still inside its timeliness window, rather than
+# only for one mid-round crash. It costs nothing today: `SHOW_RUSHVARSEL` is off in every
+# environment and no environment sets this backend, so nothing evaluates a round at all. The two
+# shapes, neither decided here: keep the markers on the blob regardless of backend (this module
+# calls `save_state()` itself and `main` always calls `load_state()`), or move them to one
+# Firestore document. What must not happen is the cutover discovering it.
 def rounds_for(date_str: str) -> dict[str, Any]:
     """A copy of the togvarsel round markers for one Oslo date ({} when none exist)."""
     with lock:
@@ -379,13 +427,17 @@ class BlobRegistrations:
     A façade over this module's globals rather than a holder of its own, so constructing a second
     instance is free and shares one state — see the comment on the block above. Every method takes
     the module lock, and the lock is re-entrant because several of them call each other.
+
+    The two global ceilings are this backend's OWN, taken at construction so a suite can move them,
+    and they are checked under the same lock acquisition as the write they guard -- which is what
+    the read-then-compare they replaced could not promise.
     """
 
-    # ---- the request path
-    def device_count(self) -> int:
-        with lock:
-            return len(_devices)
+    def __init__(self, *, max_devices: int, max_journeys: int) -> None:
+        self._max_devices = max_devices
+        self._max_journeys = max_journeys
 
+    # ---- the request path
     def get_device(self, device_id: str) -> dict | None:
         """A COPY of the device record, or None.
 
@@ -401,6 +453,10 @@ class BlobRegistrations:
     def put_device(self, device_id: str, *, subscription: dict, brand: str) -> None:
         """Store the browser's push subscription for this device, KEEPING its original signup.
 
+        Raises :class:`CapacityExceeded` past the global device ceiling, and only for a device that
+        is NEW: an existing install re-registering must never be refused, or a deployment at its
+        ceiling stops accepting the subscription refreshes that keep its own registrations alive.
+
         The signup instant is resolved here rather than by the caller because it is a property of
         the record's history and not of the request: an existing record keeps its own, a device
         coming back after «Skru av» or an expired subscription takes it off the tombstone it
@@ -412,6 +468,8 @@ class BlobRegistrations:
         """
         with lock:
             existing = _devices.get(device_id)
+            if existing is None and len(_devices) >= self._max_devices:
+                raise CapacityExceeded("devices")
             tombstone = _device_tombstones.pop(device_id, None)
             if existing is not None:
                 created_ts = existing["created_ts"]
@@ -448,9 +506,20 @@ class BlobRegistrations:
                 _device_tombstones.pop(device_id, None)
             return record, journeys
 
-    def journey_count(self) -> int:
+    def devices_for(self, device_ids: Iterable[str]) -> dict[str, dict]:
+        """Several devices at once, keyed by id; ids with no pushable device are simply absent.
+
+        One call because the store answers it with one multi-get: the delivery pass needs an
+        endpoint and a brand for every registration it is about to push to, and on a disrupted
+        corridor that is thousands of serial round trips asked one at a time.
+        """
         with lock:
-            return len(_journeys)
+            found = {}
+            for device_id in dict.fromkeys(device_ids):
+                record = _devices.get(device_id)
+                if record is not None:
+                    found[device_id] = dict(record)
+            return found
 
     def device_journeys(self, device_id: str) -> list[tuple[str, dict]]:
         """One device's journeys as (id, copy) pairs, in creation order.
@@ -468,7 +537,14 @@ class BlobRegistrations:
             ]
 
     def create_journey(self, journey_id: str, record: dict) -> None:
+        """Store one registration, refusing past the global journey ceiling.
+
+        The per-DEVICE cap is the caller's: it is a product rule about one traveller's list, where
+        this is the deployment refusing to take more registrations at all.
+        """
         with lock:
+            if len(_journeys) >= self._max_journeys:
+                raise CapacityExceeded("journeys")
             _journeys[journey_id] = dict(record)
 
     def delete_journey(self, journey_id: str) -> dict | None:
@@ -684,3 +760,368 @@ class BlobRegistrations:
 
     def load(self) -> None:
         load_state()
+
+
+# ---- The store backend (U13, second half) -------------------------------------------------------
+#: The client id every `/varsel` registration is stored under. A reserved name rather than one more
+#: onboarded client, because the traveller behind these documents is not somebody's integration:
+#: nothing may issue a credential for it (`scripts/manage_notification_client.py` refuses the name),
+#: and its `clients` document exists only to carry the two quotas that were `varsel._MAX_DEVICES`
+#: and `varsel._MAX_JOURNEYS`. Hard-coded here and not configurable: it is a join key in four
+#: collections, so a deployment that changed it would orphan every registration it already had.
+BROWSER_CLIENT_ID = "browser"
+
+
+def _device_record(device: Any) -> dict[str, Any]:
+    """One stored device as `/varsel`'s own record shape.
+
+    The push subscription is rebuilt into the browser's `{endpoint, keys}` form because that is what
+    `pywebpush` is handed verbatim; the store holds the three parts flat, which is what lets a
+    tombstone clear them individually.
+    """
+    return {
+        "subscription": {
+            "endpoint": device.endpoint,
+            "keys": {"p256dh": device.p256dh, "auth": device.auth},
+        },
+        "created_ts": device.created_at.isoformat() if device.created_at else "",
+        "brand": device.brand,
+    }
+
+
+def _journey_record(record: Any) -> dict[str, Any]:
+    """One stored registration as `/varsel`'s own journey record.
+
+    Takes anything carrying the fields, so a `Subscription` from the request path and a
+    `MirrorEntry` from the cycle produce the SAME shape -- which is the property the whole backend
+    rests on, because `varsel` reads one record type from both and a second builder here would be
+    two shapes the day one of them gained a field.
+
+    The three servability fields are written only when there is an answer, because `/varsel`'s
+    record says "not established" by their ABSENCE and `_service_warning` reads it that way: a
+    `no_direct_service: False` would render as an all-clear the check never gave.
+    """
+    out: dict[str, Any] = {
+        "device_id": record.device_id,
+        "from_stop": record.from_stop,
+        "from_name": record.from_name,
+        "to_stop": record.to_stop,
+        "to_name": record.to_name,
+        "begin": record.begin,
+        "end": record.end,
+        "days": list(record.days),
+    }
+    created = getattr(record, "created_at", None)
+    if created is not None:
+        out["created_ts"] = created.isoformat()
+    consent = getattr(record, "consent_version", "")
+    if consent:
+        out["consent_text_version"] = consent
+    checked = getattr(record, "servable_checked_at", None)
+    if checked is not None:
+        out["service_checked_ts"] = checked.isoformat()
+    if record.servable is False:
+        out["no_direct_service"] = True
+        out["service_reverse_only"] = bool(getattr(record, "servable_reverse", False))
+    return out
+
+
+class StoreRegistrations:
+    """`/varsel`'s registrations in Firestore: U12's collections, behind the same seam.
+
+    **Which read goes where is the design, and it is R15 plus one.** The REQUEST path reads the
+    store: a traveller who has just created a journey must see it in the next `list_journeys`, and
+    the mirror is at best as fresh as the sync at the start of this cycle -- and, before the poller
+    has seeded it, empty. The CYCLE reads the mirror: at a hundred thousand registrations a
+    per-cycle read of the collection is the cycle. The one method that answers both, `get_journey`,
+    prefers the mirror and falls back to the store while it is not ready, which is exact in both
+    cases because every commit this process makes is applied to the mirror from its own result
+    (`notification_store.SUBSCRIPTION_MIRRORING_BODIES`).
+
+    **The ceilings are the client's, resolved by the CALLER.** This module must not import
+    `notification_auth` -- `notification_store` does not either, and U7's pattern is that a quota
+    arrives as a callable from whoever already reads the account. `quotas` yields
+    `(max_devices, max_active_subscriptions)` and is called per write rather than cached, so an
+    operator's `set-quotas` takes effect without a restart.
+
+    **`save()` has nothing to flush and says so**, which is the asymmetry the protocol publishes:
+    each mutator here is its own durable document write, so the caller's "mutate, then save"
+    sequence costs a blob upload on one backend and nothing at all on this one.
+    """
+
+    def __init__(self, *, client_id: str, quotas: Callable[[], tuple[int, int]]) -> None:
+        self._client_id = client_id
+        self._quotas = quotas
+
+    # ---- the request path
+    def get_device(self, device_id: str) -> dict | None:
+        device = notification_store.get_device(device_id)
+        if device is None or device.client_id != self._client_id or not device.pushable:
+            # A tombstoned device is NOT a device here. `/varsel` pops the record when a push
+            # endpoint dies and keeps the journeys, so "the record is gone" is exactly what the
+            # caller means, and a husk with no endpoint would be offered to the push loop.
+            return None
+        return _device_record(device)
+
+    def devices_for(self, device_ids: Iterable[str]) -> dict[str, dict]:
+        wanted = list(dict.fromkeys(device_ids))
+        found = notification_store.get_devices(wanted)
+        return {
+            device_id: _device_record(device)
+            for device_id, device in found.items()
+            if device.client_id == self._client_id and device.pushable
+        }
+
+    def put_device(self, device_id: str, *, subscription: dict, brand: str) -> None:
+        keys = subscription.get("keys") or {}
+        try:
+            notification_store.upsert_device(
+                device_id=device_id,
+                client_id=self._client_id,
+                endpoint=str(subscription.get("endpoint") or ""),
+                p256dh=str(keys.get("p256dh") or ""),
+                auth=str(keys.get("auth") or ""),
+                brand=brand,
+                max_devices=self._quotas()[0],
+            )
+        except notification_store.QuotaExceeded as exc:
+            raise CapacityExceeded("devices") from exc
+
+    def forget_device(self, device_id: str, *, reason: str) -> tuple[dict | None, int]:
+        device = notification_store.tombstone_device(
+            device_id=device_id, client_id=self._client_id, reason=reason
+        )
+        if device is None:
+            return None, 0
+        return _device_record(device), len(self.device_journeys(device_id))
+
+    def device_journeys(self, device_id: str) -> list[tuple[str, dict]]:
+        return [
+            (sub.subscription_id, _journey_record(sub))
+            for sub in notification_store.device_journeys(
+                device_id=device_id, client_id=self._client_id
+            )
+        ]
+
+    def create_journey(self, journey_id: str, record: dict) -> None:
+        spec = notification_store.SubscriptionSpec(
+            subscription_id=journey_id,
+            client_id=self._client_id,
+            destination_id="",
+            channel=notification_store.CHANNEL_WEB_PUSH,
+            device_id=str(record["device_id"]),
+            from_stop=str(record["from_stop"]),
+            to_stop=str(record["to_stop"]),
+            from_name=str(record.get("from_name") or ""),
+            to_name=str(record.get("to_name") or ""),
+            begin=str(record["begin"]),
+            end=str(record["end"]),
+            days=tuple(int(d) for d in record["days"]),
+            consent_version=str(record.get("consent_text_version") or ""),
+        )
+        try:
+            notification_store.create_subscription(spec, max_active=self._quotas()[1])
+        except notification_store.QuotaExceeded as exc:
+            raise CapacityExceeded("journeys") from exc
+        # The servability answer the create path already has, stamped as its own write rather than
+        # carried on the spec: `SubscriptionSpec` is what a CLIENT submits and a verdict is not a
+        # client's to submit -- `set_servability` is the one writer, and it is what R6's freshness
+        # stamp comes from.
+        if "no_direct_service" in record or "service_checked_ts" in record:
+            notification_store.set_servability(
+                journey_id,
+                servable=not record.get("no_direct_service"),
+                servable_reverse=bool(record.get("service_reverse_only")),
+                expected_version=1,
+            )
+
+    def delete_journey(self, journey_id: str) -> dict | None:
+        record = notification_store.delete_subscription(
+            journey_id, client_id=self._client_id
+        )
+        return None if record is None else _journey_record(record)
+
+    def erase_device(self, device_id: str) -> Erasure:
+        """«Slett alt» through U12's paged transaction.
+
+        `durable` is `complete`: each pass is atomic and the device document goes in the pass that
+        drains the last journey, so an incomplete run has left some journeys tombstoned and the
+        traveller is owed the 503 that makes their client retry. At `varsel._MAX_JOURNEYS_PER_DEVICE`
+        (20) against `MAX_ERASE_WRITES_PER_TRANSACTION` (400) it is always one pass, which is what
+        makes "nothing partially deleted" true rather than hopeful -- if that per-device cap ever
+        rises past the transaction bound, this sentence stops holding and the 503 becomes a retry
+        over a partially erased device.
+        """
+        result = notification_store.erase_device(device_id=device_id, client_id=self._client_id)
+        return Erasure(
+            found=bool(result.device_deleted or result.journeys_tombstoned),
+            journeys_deleted=result.journeys_tombstoned,
+            durable=result.complete,
+        )
+
+    # ---- the cycle
+    def all_journeys(self) -> list[tuple[str, dict]]:
+        """Every live registration, from the MIRROR and never from the collection.
+
+        This is the read U6 exists for: at a hundred thousand registrations a per-cycle query over
+        the collection is the cycle, and the mirror answers it from memory. An unseeded mirror
+        yields nothing rather than a partial set, `recipient_documents`' rule -- the pass cannot
+        tell "nobody is registered" from "the read has not finished", and half a population is the
+        worse answer because it silently retires the other half.
+        """
+        mirror = notification_store.subscription_mirror()
+        if not mirror.ready:
+            return []
+        return [
+            (entry.subscription_id, _journey_record(entry))
+            for entry in mirror.recipients(
+                _now(), channel=notification_store.CHANNEL_WEB_PUSH
+            )
+        ]
+
+    def get_journey(self, journey_id: str) -> dict | None:
+        """One registration, from the mirror when it is ready and from the store when it is not.
+
+        The mirror is EXACT for this process rather than merely fresh -- every commit is applied
+        from its own result -- so the delivery loop's two liveness re-checks, which exist to catch a
+        delete that landed mid-cycle, cost no read. The fallback is what makes the request path
+        correct before the poller has seeded: `/varsel-api` serves from the instant the port binds,
+        and the seed runs on the poller thread minutes later.
+        """
+        mirror = notification_store.subscription_mirror()
+        if mirror.ready:
+            entry = mirror.entry(
+                journey_id, _now(), channel=notification_store.CHANNEL_WEB_PUSH
+            )
+            return None if entry is None else _journey_record(entry)
+        record = notification_store.get_subscription(journey_id, client_id=self._client_id)
+        return None if record is None else _journey_record(record)
+
+    def set_canonical_stops(self, journey_id: str, *, from_stop: str, to_stop: str) -> bool:
+        return notification_store.canonicalize_stops(
+            subscription_id=journey_id,
+            client_id=self._client_id,
+            from_stop=from_stop,
+            to_stop=to_stop,
+        )
+
+    def stamp_service_check(
+        self, journey_id: str, *, checked_ts: str, cleared: bool, reverse_only: bool
+    ) -> bool:
+        """R6's answer and its freshness. False when the registration is gone or was replaced.
+
+        `expected_version` is read from the record rather than passed by the caller, and the window
+        it guards is smaller here than on the webhook channel: a `/varsel` registration is never
+        replaced, so the only way the version moves under a check in flight is a canonicalization.
+        A stale stamp would put a verdict about the old pair on the new one, with nothing in the
+        document saying so -- which is exactly the case `set_servability` refuses.
+        """
+        record = notification_store.get_subscription(journey_id, client_id=self._client_id)
+        if record is None:
+            return False
+        try:
+            notification_store.set_servability(
+                journey_id,
+                servable=cleared,
+                servable_reverse=reverse_only,
+                expected_version=record.version,
+                now=_iso_to_dt(checked_ts),
+            )
+        except (notification_store.NotFound, notification_store.Conflict):
+            return False
+        return True
+
+    # ---- the push side
+    def notified_snapshot(self, journey_ids: Iterable[str]) -> set[str]:
+        wanted = set(journey_ids)
+        marks: set[str] = set()
+        for journey_id, ledger in self._ledgers(wanted).items():
+            marks.update(f"{journey_id}|{situation}" for situation in ledger.notified)
+        return marks
+
+    def push_ledger(self, journey_id: str) -> PushLedger:
+        return self._ledgers({journey_id}).get(
+            journey_id, PushLedger(frozenset(), frozenset(), None, 0)
+        )
+
+    def _ledgers(self, journey_ids: set[str]) -> dict[str, PushLedger]:
+        """The push marks of these registrations, from the mirror.
+
+        From the mirror and not the store, which reverses what U12 recorded and is the reason the
+        mark bodies now apply their own commits: the alternative is a document read per registration
+        per cycle, and the mirror's copy is exact rather than approximate because this process is
+        the only writer of it. See `notification_store.SUBSCRIPTION_MIRRORING_BODIES`.
+
+        Keyed through :meth:`SubscriptionMirror.entry`, never `recipients` -- the pass asks this
+        per candidate, and a scan per question is the cost that read exists to remove.
+        """
+        mirror = notification_store.subscription_mirror()
+        if not mirror.ready or not journey_ids:
+            return {}
+        now = _now()
+        out: dict[str, PushLedger] = {}
+        for journey_id in journey_ids:
+            entry = mirror.entry(
+                journey_id, now, channel=notification_store.CHANNEL_WEB_PUSH
+            )
+            if entry is None:
+                continue
+            day, sent = (
+                max(entry.daily_pushes.items()) if entry.daily_pushes else (None, 0)
+            )
+            out[entry.subscription_id] = PushLedger(
+                notified=frozenset(entry.notified),
+                pushed_trains=frozenset(entry.pushed_trains),
+                day=day,
+                sent_today=sent,
+            )
+        return out
+
+    def mark_notified(self, journey_id: str, situation_number: str) -> None:
+        try:
+            notification_store.mark_notified(
+                subscription_id=journey_id, situation_number=situation_number
+            )
+        except notification_store.NotFound:
+            # The journey was erased between the delivery loop's re-check and this write. Nothing
+            # to resurrect and nothing to report: the push went out, and a mark on a document that
+            # no longer exists would be the only thing this call could add.
+            logger.info("Journey %s was erased before its push mark landed", journey_id)
+
+    def record_push(
+        self,
+        journey_id: str,
+        *,
+        tag: str | None,
+        departure: datetime | None,
+        oslo_day: str,
+        charge_cap: bool,
+    ) -> None:
+        # `tag` None records nothing for the train and still charges the day, which is the blob's
+        # own reading one layer down (`_record_push_body`) rather than a second rule here: the cap
+        # is spent per PUSH, and the lock screen falls back to the situation number.
+        try:
+            notification_store.record_push(
+                subscription_id=journey_id, train_ref=tag, charge_cap=charge_cap
+            )
+        except notification_store.NotFound:
+            logger.info("Journey %s was erased before its push was recorded", journey_id)
+
+    def prune(
+        self, *, live_situations: set[str], trains_gone_by: datetime, oslo_today: str
+    ) -> int:
+        """Nothing to sweep: the marks are pruned at write time and the rest is Firestore's TTL.
+
+        `_mark_notified_body` and `_record_push_body` drop their own expired entries on every write,
+        which is what bounds the maps without a sweep anywhere -- so there is no in-memory ledger to
+        forget and no blob to save. Returns 0, which is what tells the caller no save is owed.
+        """
+        return 0
+
+    # ---- persistence
+    def save(self) -> bool:
+        """Nothing to flush: every mutator above is its own durable document write."""
+        return True
+
+    def load(self) -> None:
+        """Nothing to load: the mirror seeds on the poller thread, after the port binds."""

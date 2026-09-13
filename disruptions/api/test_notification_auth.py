@@ -1570,22 +1570,18 @@ def test_the_three_delivery_quotas_are_bounded_and_seeded_from_the_constants():
     )
 
 
-def test_the_device_quota_is_declared_bounded_and_deliberately_unread():
-    """U12's `max_devices`, in `concurrent_deliveries`' own pattern -- declared a unit before it is
-    spent so that ONE `set-quotas` shape serves the whole plan rather than changing under a client
-    mid-way, and asserted UNREAD so it cannot quietly become decoration.
+def test_the_device_quota_is_resolved_by_the_registration_backend():
+    """U12's `max_devices`, FLIPPED at U13's second PR exactly as U8 flipped `concurrent_deliveries`.
 
-    Unread where? In `main`, which is the module that would have to resolve it: `notification_store.
-    upsert_device` takes the ceiling as an argument and there is no request path handing it one
-    until U13. The store's own default is the constant, so a call that omits it is still bounded --
-    which is what makes shipping the field ahead of its caller safe rather than merely tidy.
+    It was declared a unit ahead of its caller -- so that one `set-quotas` shape served the whole
+    plan rather than changing under a client mid-way -- and asserted UNREAD in `main` so it could
+    not quietly become decoration. `main._registration_store` now resolves it, per write, for the
+    reserved `browser` client that `/varsel`'s own registrations live under.
 
-    **Flip this assertion in U13**, exactly as U8 flipped `concurrent_deliveries`': the wiring
-    should trip a test rather than slip in unnoticed. Specifically in U13's SECOND PR, the one that
-    puts the store behind `varsel_state`'s seam -- the first lands the seam over today's in-memory
-    dicts and the GCS blob, touches no quota, and must leave this assertion exactly as it is. A U13
-    PR that flips it while `VARSEL_STATE_BACKEND` still resolves to `gcs` is claiming a caller that
-    does not exist yet.
+    The assertion is inverted rather than deleted, and that is the point of the pattern: a quota
+    that stops being resolved is as silent a defect as one that was never wired, and the failure it
+    produces is the worst kind -- `quotas_for` answers an unknown client with `DEFAULT_QUOTAS`, so
+    `/varsel` would go on serving until the 5001st device and then refuse with "Tjenesten er full".
     """
     defaults = notification_auth.DEFAULT_QUOTAS
     assert defaults.max_devices == notification_store.MAX_DEVICES_PER_CLIENT
@@ -1596,9 +1592,14 @@ def test_the_device_quota_is_declared_bounded_and_deliberately_unread():
     )
     tool = (HERE.parent.parent / "scripts" / "manage_notification_client.py").read_text()
     assert "--max-devices" in tool and '"max_devices"' in tool
-    assert "max_devices" not in (HERE / "main.py").read_text(), (
-        "main resolves this quota now, so the pass has a caller -- flip this assertion to require "
-        "it, the way U8 flipped concurrent_deliveries'"
+    main_source = (HERE / "main.py").read_text()
+    assert "max_devices" in main_source, (
+        "main no longer resolves this quota; the store backend would then take DEFAULT_QUOTAS and "
+        "refuse the 5001st device with no explanation anywhere"
+    )
+    assert "max_active_subscriptions" in main_source, (
+        "the journey ceiling is resolved beside it or not at all: the default is 500, which would "
+        "refuse the 501st registration on a channel sized for a hundred thousand"
     )
 
 
