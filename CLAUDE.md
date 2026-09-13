@@ -1921,6 +1921,23 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     their contents cannot be rebuilt). Because `IF NOT EXISTS` does nothing to an existing table,
     a new column also needs an `ALTER TABLE … ADD COLUMN IF NOT EXISTS` in that same file — without
     it the write path just logs "N of M rows rejected by BigQuery" every cycle.
+    **With that ALTER in place the very same line can still appear for ~10 minutes after a deploy,
+    and telling the two apart is the whole trap** (2026-09-13, prd, U16's `channel` /
+    `n_subscriptions`). `insertAll` is served by several backends that refresh their cached table
+    schema independently, so for a few minutes after an `ADD COLUMN` a request can land on one that
+    has not. Measured: the startup ALTER ran at 18:29:32, the new pod's **first** write at 18:30:39
+    carried both new columns and was accepted, as were 18:32 and 18:34 — then 18:36:06 rejected 9 of
+    9 rows with `no such field: channel`, and 18:38:56 onwards was clean. So it is not a cold cache
+    at startup, and a deployment cannot dodge it by sitting out a cycle before its first write; dev,
+    deployed ninety minutes earlier from the same commit, never saw it at all. **The discriminator is
+    whether it STOPS** — a missing ALTER fires every cycle forever, this fires once or twice inside
+    ten minutes of a deploy and goes quiet — so read a couple of hours of
+    `jsonPayload.event="varsel_decision_write"` before touching DDL that is probably already correct.
+    Note that field is `jsonPayload.event` and **not** `jsonPayload.fields.event`, which matches
+    nothing here and so reads as "no errors". Nothing is lost on either cause:
+    `varsel._record_decisions` rolls the thinning ledger back on any SHORT write and re-offers the
+    whole cycle — "duplicate rather than drop", which is what `result="partial"` beside
+    `result="rolled_back"` on one cycle *is*.
     **That file is two halves and `ensure_table` runs them as separate jobs** (2026-08-07): structure
     above the `-- BEST-EFFORT SECTION` marker decides readiness, the `ALTER COLUMN … SET OPTIONS`
     description refresh below it is best-effort and a failure there is logged and forgiven. BigQuery
