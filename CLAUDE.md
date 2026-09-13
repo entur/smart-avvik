@@ -64,9 +64,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   in 7 ms, emit of 200 subjects in 14 ms **one-wide, which is what that figure was taken at**.
   `notification_servability` is the six-hourly re-ask of a stale or never-established servability
   answer (`varsel.recheck_service`'s webhook copy, which cannot reach these because it walks
-  `_journeys`). Its own number is likewise a **ceiling**: `_DEADLINE_S` (30 s) **plus one
-  `set_servability`**, because the budget reserves the BigQuery question and not the store write that
-  follows it — typical is ~0, since nothing is due on a healthy list and a due one costs ~2 s. It is
+  `_journeys`). Its own number is likewise a **ceiling**, and since U10 (2026-09-13) the whole phase
+  is inside it: `_DEADLINE_S` (55 s) = one BigQuery question at `_WORST_CASE_CHECK_S` (20 s) plus one
+  write pass at `_WRITE_WAIT_S` (30 s) plus the load. It was 30 s **plus one `set_servability`**,
+  because the budget reserved the question and not the store write that followed it — a residual
+  that was unbounded in principle, since a transactional commit carries no client-side deadline.
+  Typical is still ~0: nothing is due on a healthy list. It is
   its own phase rather than folded into `notification_webhooks` for a reason that has outlived its
   original wording: that phase's measured `ms` was the unit KTD6's reversal trigger was stated in,
   and adding this reservation to its ceiling would have fired the trigger on a healthy cycle.
@@ -210,12 +213,21 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   rate limit — and never becomes a warning. Answers are cached 10 min.
   **That rate limit is TWO numbers since 2026-09-09**, keyed per caller in
   `alternatives._fetch_calls`' shape: `main._CONNECTIVITY_MAX_PER_MIN` (30) for this public
-  unauthenticated path, and `_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN` (15) for the notification API's
-  create/replace. One shared list was `alternatives`' own 2026-08-21 lesson repeated a module over —
-  a client may issue 120 create/replace requests a minute, and every one it spent came out of a
-  budget that exists as abuse control for a traveller's registration. What a traveller loses when it
-  binds is not an error: the caveat is simply not established, so the journey registers without it.
-  The *cache* stays shared, because an answer about a stop pair is an answer whoever asked.
+  unauthenticated path, and a second, smaller one for the poller. One shared list was `alternatives`'
+  own 2026-08-21 lesson repeated a module over — a client may issue 120 create/replace requests a
+  minute, and every one it spent came out of a budget that exists as abuse control for a traveller's
+  registration. What a traveller loses when it binds is not an error: the caveat is simply not
+  established, so the journey registers without it. The *cache* stays shared, because an answer about
+  a stop pair is an answer whoever asked.
+  **Since U10 (2026-09-13) the second number is `_POLLER_CONNECTIVITY_MAX_PER_MIN` (4), not
+  `_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN` (15)**, because the notification API's create and
+  replace stopped asking at all — see the webhook section's own paragraph. What is left on that tally
+  is the two servability sweeps, each issuing ONE BigQuery job per ~296 s cycle however many records
+  are pending, so the worst-case draw from this seam goes 30 + 15 → 30 + 4 per minute. `varsel.
+  recheck_service` moved onto it in the same change: it had been spending the traveller-facing 30/min
+  by default, which is the same mistake one layer further over. Whose budget a batch spends is bound
+  into the provider in `main.lifespan` rather than passed per call — both callers are poller sweeps,
+  and `varsel` does not own the vocabulary.
   **Calling at a stop is not the same as being usable from it** (2026-09-01): a traveller wrote in
   after an Oslo S → Drammen registration was pushed «Tog F4 16:23 er innstilt» — the 16:23 is the
   Bergen train, which calls Drammen with **alighting closed**. Vy sells the local stretch of every
@@ -234,10 +246,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   silently retire whole operators — and `PASS_THRU` bars both sides. Every default is
   permissive for the same reason, including `CallPred`'s and `_call_pred_from_row`'s `getattr`, which
   is what carries the app through the cycle after a deploy where the serving table predates the
-  columns. `main._VARSEL_CONNECTIVITY_QUERY` asks in the same shape — **four CTEs, not two**, because
-  the reverse direction boards at the *to*-place and alights at the *from*-place — so the caveat above
-  and the alerting cannot disagree; measured against dev's timetable it drops the Oslo S → Drammen
-  trip set from 173 journeys to 161, all twelve of them F4. Cost: ~0.68 GB more per planned rebuild
+  columns. `disruptions/api/varsel_connectivity.sql` asks in the same shape — **four groupings, not
+  two**, because the reverse direction boards at the *to*-place and alights at the *from*-place — so
+  the caveat above and the alerting cannot disagree; measured against dev's timetable it drops the
+  Oslo S → Drammen trip set from 173 journeys to 161, all twelve of them F4. It was an inline string
+  in `main.py` and therefore unvalidated until U10 moved it into a file registered in
+  `validate_varsel_sql.sh`; nothing in this repo executes SQL, so a query that is not a file is a
+  query no dry run can reach. Cost: ~0.68 GB more per planned rebuild
   on each side (+3.5 %). Nothing in `alternatives.py` needed the rule — the Journey Planner plans real
   trips and never offers a leg nobody may board.
   **What ET already knows is a fact, not a forecast** (2026-08-05): when a call carries
@@ -999,6 +1014,44 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   a cycle, so what a reader gets is the one `notification_emit` summary, and the events themselves
   are Firestore documents rather than log lines. `EmitReport.minted` is U16's seam, on the returned
   value and never a module global.
+  **Servability is ONE BigQuery job per cycle, and no write path asks it** (U10, 2026-09-13, R5/R6).
+  A job was the unit of work: a create and a replace each asked inline, and
+  `notification_servability` re-asked FOUR subscriptions a cycle — ~1 200 records a day, against a
+  population meant to reach 100 000, so a first pass would never have finished. Both sweeps now
+  derive the distinct stop PAIRS from the records they are about to write and put all of them to one
+  job (`disruptions/api/varsel_connectivity.sql`, `main._varsel_connectivity_batch`), fanning each
+  answer back out — so a corridor with a hundred thousand commuters is one place in one query, and
+  `main._varsel_connectivity` is a batch of one rather than a second implementation. The bound moved
+  from questions to WRITES: `_MAX_WRITES_PER_CYCLE` (2 000) across `_WRITE_WORKERS` (32), spent in
+  `_priority` order, collected under a bounded wait because a transactional commit carries no
+  client-side deadline. `varsel.recheck_service` had no per-cycle bound at all and now has the same
+  shape.
+  **The writes stay TRANSACTIONS, and the plan's batched-write step was refused.** Firestore has
+  exactly two preconditions, `exists` and `last_update_time`, and neither can say "and the route has
+  not changed" — which is the only thing a servability answer is about, and what
+  `set_servability`'s `expected_version` already enforces inside a transaction. `last_update_time`
+  read off the subscription mirror is as old as the last sync and `_sent_body` deliberately does not
+  stamp, so the busiest subscriptions would fail the precondition every cycle with nothing in the
+  logs to say why; a `WriteBatch` is also atomic, so "the rest of the batch lands" is not what it
+  would do. Pinned by an AST check over the module, not a grep — the prose explaining the refusal
+  would otherwise match as though it were the rule being broken.
+  **`servable` is null on a create and a replace response**, always, and this is the one
+  wire-VISIBLE change of the 100k work so far — the operations document's "none of it touches the
+  wire contract" line was wrong and now says so. The schema does not move (`boolean | null`,
+  optional, in both the JSON schema and the generated TypeScript); what moves is that a client
+  rendering the caveat from a write response renders nothing until it re-reads. A fresh bulk load of
+  100 000 settles in ~50 cycles, about four hours, and both contract documents say so.
+  **One fix in there is not about scale**: `varsel.recheck_service` saved its state only when a
+  verdict CHANGED, so the stamp that takes a still-unservable journey out of the due set for six
+  hours lived in memory until some other writer happened to persist — and a restart re-asked them
+  all. It saves whenever anything was stamped.
+  **The measured equivalence, recorded because nothing in CI executes SQL**: against dev on
+  2026-09-13, a batch of one answers exactly what the single-pair query answered over six pairs,
+  including several refs a side, a pair served only in reverse, a pair whose two ends are one place,
+  and a ref no table holds. One job over six pairs billed 20 MB. A `bq --parameter` dry run accepts
+  the `ARRAY<STRUCT<... ARRAY<STRING> ...>>` shape, so the file is in `validate_varsel_sql.sh` — but
+  a dry run does not evaluate parameters, so it proves the shape and the column types and nothing
+  about the join.
   **Six never-queried fields are exempt from Firestore's automatic single-field indexes** — `payload`
   and `situations` on `events`, `situations` on `deliveries`, and `delivered`, `daily_deliveries`
   and `daily_reservations` on `subscriptions`. Every field is indexed ascending and descending
@@ -1181,21 +1234,20 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   pins this copy of the list**, so treat that table as the authority and this sentence as a summary
   that can lag it.
   No **`notification_*` or `webhook_*`** log line carries an origin, a destination, a departure time, a full callback
-  URL, a credential secret or any prose — read the qualifier, because the fourth carrier below is why
-  it needs one. Four things are carried and named rather than glossed, the first three inside that
-  namespace and the fourth deliberately outside it: `subscription_id` embeds the client's own
-  reference, `webhook_delivery_refused.reason` can carry a refused destination's hostname and its
-  resolved addresses, `notification_admin.actor` is a named human, and **a webhook subscription's origin
-  and destination DO reach Cloud Logging, under `/varsel`'s event name rather than a client one.**
-  `main._varsel_connectivity` writes both stop refs into the *message* of an INFO record
-  (`event="varsel_service_check"`, `result="ok"`) on every established verdict, while its structured
-  `fields` carry only `event`, `result`, `forward` and `reverse` — which is exactly why the claim
-  above is true as stated and would mislead anybody who stopped there. The webhook channel reaches
-  that line at **create time** (it always did) and, since 2026-09-09, again **every six hours per
-  unservable subscription** through `notification_servability`. It is **pre-existing and shared with
-  `/varsel`'s own registrations**, so the honest framing is an accepted exposure this feature
-  *extends* rather than a new leak; if it is ever to be closed, the fix is `/varsel`'s log line, not
-  this channel's. App logs live in the **cluster** project
+  URL, a credential secret or any prose. **Three** things are carried and named rather than glossed,
+  all inside that namespace: `subscription_id` embeds the client's own reference,
+  `webhook_delivery_refused.reason` can carry a refused destination's hostname and its resolved
+  addresses, and `notification_admin.actor` is a named human.
+  **There was a FOURTH, deliberately outside that namespace, and U10 closed it** (2026-09-13). A
+  webhook subscription's origin and destination reached Cloud Logging under `/varsel`'s event name:
+  `main._varsel_connectivity` wrote both stop refs into the *message* of its success and failure
+  records (`event="varsel_service_check"`), and `varsel._service_verdict`'s own error path did the
+  same — three carriers, all `/varsel`'s rather than this channel's, which is exactly why the claim
+  above was true as stated and would have misled anybody who stopped there. They carry
+  `alternatives.pair_digest` now, salted per process because an unsalted SHA-256 over two public
+  enumerable refs is a reversible pseudonym; a BATCH writes one summary record with counts and no
+  digest at all. The fix was `/varsel`'s log line rather than this channel's, as the old paragraph
+  predicted it would have to be. App logs live in the **cluster** project
   (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
   **`NOTIFICATION_WEBHOOK_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
   other three flags; it defaults off and is set in **dev and prd** (both since 2026-09-10, for the
