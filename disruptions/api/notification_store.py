@@ -56,10 +56,11 @@ import logging
 import re
 import secrets
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -428,10 +429,21 @@ def _mirror_stamp() -> Any:
 #: `_mark_notified_body` and `_record_push_body` are deliberately OUT, for `_sent_body`'s reason
 #: exactly: they are the push-side ledgers, written once per push, so stamping them would resync the
 #: busiest documents on every cycle -- one push on a corridor with a hundred thousand registrations
-#: is a hundred thousand documents through the watermark query. **The consequence is a constraint on
-#: U13 and is written here so U13 finds it: the cycle cannot read `notified` or `pushed_trains` from
-#: the mirror.** A stale mark re-offers a train already pushed, so those reads go to the store, per
-#: push, exactly as `_emit_body` reads the real subject document rather than the mirror's copy.
+#: is a hundred thousand documents through the watermark query. That much is unchanged.
+#:
+#: **The constraint this used to record for U13 is SUPERSEDED, and the reasoning is worth keeping
+#: because the conclusion flipped.** It read: the cycle cannot use the mirror's copy of `notified`
+#: or `pushed_trains`, so those reads go to the store, per push. That followed from the mirror being
+#: watermark-synced and is right about a watermark -- and wrong about the mirror, because a
+#: watermark is not the only way a mirror can learn. A `/varsel` registration has exactly ONE
+#: writer: the request path and the poller are one process, one replica under Recreate, and the
+#: delivery worker writes webhook deliveries only. So every commit passes through this process and
+#: is applied to the mirror from its own RESULT -- `SubjectMirror`'s arrangement, one collection
+#: along -- which makes the mirror's copy exact rather than approximate and costs no read at all.
+#: What the superseded reading would have cost is a document read per registration per cycle, which
+#: at the population this plan sizes for is the cycle. See :data:`SUBSCRIPTION_MIRRORING_BODIES`,
+#: which declares the bodies that apply, and `SubscriptionMirror._overtaken`, which is what keeps a
+#: sync that read before a local commit from putting the stale copy back.
 MIRROR_STAMPING_BODIES = (
     "_create_body",
     "_replace_body",
@@ -1338,6 +1350,23 @@ class Subscription:
     cleanup: Mapping[str, Any] = field(default_factory=dict)
     channel: str = CHANNEL_WEBHOOK
     daily_cap: int = MAX_ALERT_DELIVERIES_PER_DAY
+    # ---- the `web_push` half, written by `_channel_fields` since U12 and PARSED BACK since U13.
+    # U12 wrote all six and read none of them: `device_journeys` returns these records, so
+    # `/varsel`'s own registration could be stored and then not be read back -- the device it
+    # belongs to, the names the traveller typed and the three push ledgers were all write-only.
+    # Every one defaults to the empty value a `webhook` document legitimately has, so nothing about
+    # that channel changes and no migration is owed.
+    device_id: str = ""
+    from_name: str = ""
+    to_name: str = ""
+    consent_version: str = ""
+    #: situation_number -> when the mark may be pruned. `/varsel`'s `_notified`, per REGISTRATION
+    #: and per situation, which is the browser's grain and deliberately not `delivered`'s.
+    notified: Mapping[str, datetime] = field(default_factory=dict)
+    #: train ref -> when the mark may be pruned. What titles a replacement «Bekreftet:».
+    pushed_trains: Mapping[str, datetime] = field(default_factory=dict)
+    #: Oslo day -> alert pushes spent. R11's cap at `/varsel`'s own grain.
+    daily_pushes: Mapping[str, int] = field(default_factory=dict)
 
     def as_recipient_document(self, now: datetime) -> dict[str, Any]:
         """The raw document ``varsel.WebhookRecipientProvider`` is contracted to yield.
@@ -1433,6 +1462,13 @@ def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
         cleanup=dict(doc.get("cleanup") or {}),
         channel=str(doc.get("channel") or CHANNEL_WEBHOOK),
         daily_cap=daily_cap_of(doc),
+        device_id=str(doc.get("device_id") or ""),
+        from_name=str(doc.get("from_name") or ""),
+        to_name=str(doc.get("to_name") or ""),
+        consent_version=str(doc.get("consent_version") or ""),
+        notified={k: v for k, v in (doc.get("notified") or {}).items()},
+        pushed_trains={k: v for k, v in (doc.get("pushed_trains") or {}).items()},
+        daily_pushes={str(k): int(v or 0) for k, v in (doc.get("daily_pushes") or {}).items()},
     )
 
 
@@ -1605,6 +1641,7 @@ def create_subscription(
             txn, refs, count_query, spec=spec, now=instant, max_active=ceiling, daily_cap=daily_cap
         )
     )
+    _mirror_subscription(doc)
     logger.info(
         "Webhook subscription %s (%s)",
         spec.subscription_id,
@@ -1702,7 +1739,7 @@ def replace_subscription(
             daily_cap=daily_cap,
         )
     )
-    return _subscription_from_doc(doc)
+    return _subscription_from_doc(_mirror_subscription(doc))
 
 
 def _delete_body(
@@ -1758,6 +1795,7 @@ def delete_subscription(
             txn, refs, subscription_id=subscription_id, client_id=client_id, now=instant
         )
     )
+    _mirror_subscription(doc)
     if doc is None:
         return None
     # Nothing may stand for a tombstoned subscription: `_subscription_obsolete` refuses every later
@@ -1840,7 +1878,7 @@ def touch_subscription(
             daily_cap=daily_cap,
         )
     )
-    return _subscription_from_doc(doc)
+    return _subscription_from_doc(_mirror_subscription(doc))
 
 
 def _servability_body(
@@ -1912,7 +1950,7 @@ def set_servability(
             now=instant,
         )
     )
-    return _subscription_from_doc(doc)
+    return _subscription_from_doc(_mirror_subscription(doc))
 
 
 def get_subscription(
@@ -2151,6 +2189,32 @@ class MirrorEntry:
     # full read per cycle, which is most of what U6 exists to remove.
     servable: bool | None = None
     servable_checked_at: datetime | None = None
+    # ---- what a `web_push` registration's cycle reads, and nothing more (U13).
+    #
+    # `/varsel`'s pass needs the device to push to and the two names its wording renders, and it
+    # asks three questions per (registration, train) that used to be three module dicts: has this
+    # SITUATION been pushed, has this TRAIN been pushed (so the notification replaces rather than
+    # adds), and how many of the day's four are spent. Every one of those is on the journey
+    # document, so the alternative to carrying them here is a document read per registration per
+    # cycle -- which on a disrupted corridor with a hundred thousand registrations is the cycle.
+    #
+    # A `webhook` entry carries the empty value for all six, which costs the six slots and nothing
+    # else.
+    #
+    # MEASURED, because U6 sized this class against the pod's memory limit and a guess here would
+    # retire that argument. 100 000 synthetic entries under `tracemalloc`, each `web_push` one
+    # carrying a realistic steady state (two marked situations, one pushed train, today's count):
+    # **87.7 MB without these six fields, 158.8 MB with them** -- +71 MB, against the API pod's
+    # 1 024 MiB. (A `webhook` entry of the same shape is 92.4 MB per 100 000, so the six empty
+    # slots cost nothing measurable; the 71 MB is the marks themselves.) Re-measure with
+    # `/tmp/mirror_mem.py`'s shape if the mark maps ever stop being pruned at write time -- that
+    # prune is what bounds this, not the field count.
+    device_id: str = ""
+    from_name: str = ""
+    to_name: str = ""
+    notified: Mapping[str, datetime] = field(default_factory=dict)
+    pushed_trains: Mapping[str, datetime] = field(default_factory=dict)
+    daily_pushes: Mapping[str, int] = field(default_factory=dict)
 
     def is_live(self, now: datetime) -> bool:
         return subscription_is_live(self.liveness, now)
@@ -2198,6 +2262,12 @@ def _mirror_entry(doc: Mapping[str, Any]) -> MirrorEntry:
         mirror_updated_at=_as_dt(doc.get(MIRROR_FIELD)),
         servable=sub.servable,
         servable_checked_at=sub.servable_checked_at,
+        device_id=sub.device_id,
+        from_name=sub.from_name,
+        to_name=sub.to_name,
+        notified=dict(sub.notified),
+        pushed_trains=dict(sub.pushed_trains),
+        daily_pushes=dict(sub.daily_pushes),
     )
 
 
@@ -2213,6 +2283,12 @@ class MirrorSync:
     truncated: bool = False
     watermark_age_s: float | None = None
     error: str | None = None
+    #: Documents the read returned that this process had already superseded with its own commit.
+    #: Its own number rather than folded into `synced`, because the two are different operator
+    #: answers: `synced` is "the store told us something new", this is "we were ahead of the read".
+    #: A steady non-zero here on a deployment with no `/varsel` traffic would mean the local-apply
+    #: ledger is not being pruned, which is the only way this mechanism can cost anything.
+    overtaken: int = 0
 
 
 class SubscriptionMirror:
@@ -2238,6 +2314,10 @@ class SubscriptionMirror:
         self._seeded = False
         self._seeded_at: datetime | None = None
         self._cursor: Any = None
+        #: subscription_id -> the `monotonic()` at which THIS process last applied its own commit
+        #: for it. Read by :meth:`_overtaken` and by nothing else. Bounded by a prune at the end of
+        #: every sync: an entry older than the sync that just finished can never win another race.
+        self._local_applied: dict[str, float] = {}
 
     # -- state a reader can ask about ------------------------------------------------------------
 
@@ -2271,6 +2351,84 @@ class SubscriptionMirror:
             self._seeded = False
             self._seeded_at = None
             self._cursor = None
+            self._local_applied = {}
+
+    # -- the local apply, and the race it has to win ---------------------------------------------
+
+    def apply_committed(self, doc: Mapping[str, Any] | None) -> None:
+        """Record a commit THIS process just made, without waiting for a sync to carry it.
+
+        The subscription mirror needs a watermark because a subscription can be written at any time
+        by a caller this process cannot see. That is true of the `webhook` channel's clients and it
+        is NOT true of a `web_push` registration: the request path and the poller are one process,
+        one replica under Recreate, and the delivery worker writes webhook deliveries only -- so
+        every write to a `/varsel` registration passes through here. `SubjectMirror` already rests
+        on exactly that argument (KTD6), and this is the same arrangement one collection along.
+
+        What it buys is not freshness for its own sake. It is what lets the cycle answer three
+        questions from memory that would otherwise be a document read per registration per cycle --
+        has this situation been pushed, has this train, how many of the day's four are spent -- and
+        it is what makes the two liveness re-checks in the delivery loop exact: a journey deleted
+        mid-cycle is gone from the mirror the instant the delete commits, where a watermark would
+        carry the news at the START OF THE NEXT CYCLE and a push would already have gone out.
+
+        Called on the RESULT of a transaction and never from inside a body, `_mirror_subject`'s rule
+        and for its reason: a body may run more than once, so an apply from inside records a state a
+        later attempt overwrote.
+
+        An unreadable document is DEBUG-logged and skipped rather than raised: this is a
+        best-effort freshening of a mirror the sync will correct, and a raise here would fail the
+        call whose transaction has already committed.
+        """
+        if not doc:
+            return
+        try:
+            entry = _mirror_entry(doc)
+        except Exception:
+            logger.debug("Committed subscription document is unreadable; not mirrored", exc_info=True)
+            return
+        with self._lock:
+            self._local_applied[entry.subscription_id] = monotonic()
+            if entry.liveness.get("status") != "active":
+                self._entries.pop(entry.subscription_id, None)
+            else:
+                self._entries[entry.subscription_id] = entry
+
+    def drop_committed(self, subscription_ids: Iterable[str]) -> None:
+        """Remove subscriptions a commit has just retired, by id.
+
+        The erasure's own path: `_erase_device_body` tombstones a page of journeys and returns
+        counts rather than documents, so there is nothing to parse -- and a tombstoned registration
+        must leave the mirror at once, or the cycle keeps matching, wording and logging decisions
+        about a traveller who pressed «Slett alt».
+        """
+        with self._lock:
+            instant = monotonic()
+            for subscription_id in subscription_ids:
+                self._local_applied[subscription_id] = instant
+                self._entries.pop(subscription_id, None)
+
+    def _overtaken(self, subscription_id: str, read_started: float) -> bool:
+        """Did this process apply its own commit for this id after the read began?
+
+        The race, in order: a sync reads a page at T_q with `j1` present; a request thread deletes
+        `j1` at T_d and applies the tombstone; the sync applies its stale `j1` at T_a > T_d. Without
+        this test `j1` is live in the mirror until the next sync, and the delivery loop's re-check
+        -- which exists for precisely this delete -- waves the push through. The window is the
+        read-to-apply span: short on a delta sync, minutes on the six-hourly re-seed.
+
+        Conservative on purpose: the comparison is against when the whole run started, not when the
+        page was read, so a local apply anywhere inside a sync always wins. What that costs is one
+        cycle of staleness for a FOREIGN write to a locally-touched document, which for this
+        collection means a webhook subscription the API wrote in the same process -- already applied
+        by that write's own commit.
+        """
+        return self._local_applied.get(subscription_id, 0.0) > read_started
+
+    def _prune_local_applied(self, before: float) -> None:
+        """Forget applies that can no longer win a race -- caller holds the lock."""
+        for subscription_id in [k for k, ts in self._local_applied.items() if ts < before]:
+            self._local_applied.pop(subscription_id, None)
 
     # -- reads -----------------------------------------------------------------------------------
 
@@ -2313,6 +2471,10 @@ class SubscriptionMirror:
         watermark: datetime | None = None
         cursor: Any = None
         pages = skipped = 0
+        # Before the first read, and compared against at the swap: a re-seed pages for minutes, and
+        # every registration a traveller creates or deletes inside that window is a commit this
+        # process has already applied. See :meth:`_overtaken`.
+        started = monotonic()
         while True:
             query = _query("mirror_seed", limit=MIRROR_PAGE_SIZE, start_after=cursor)
             page = _stream(query)
@@ -2336,11 +2498,23 @@ class SubscriptionMirror:
             if beat is not None:
                 beat()
         with self._lock:
+            # Whatever this process applied while the read was in flight is the newer answer, and
+            # the swap must not discard it: an id applied locally keeps its local state, up to and
+            # including having been removed.
+            for subscription_id, applied_at in self._local_applied.items():
+                if applied_at < started:
+                    continue
+                local = self._entries.get(subscription_id)
+                if local is None:
+                    entries.pop(subscription_id, None)
+                else:
+                    entries[subscription_id] = local
             self._entries = entries
             self._watermark = watermark
             self._seeded = True
             self._seeded_at = now
             self._cursor = None
+            self._prune_local_applied(started)
         return MirrorSync(synced=len(entries), pages=pages, size=len(entries), reseeded=True)
 
     def sync(self, *, now: datetime, beat: Callable[[], None] | None = None) -> MirrorSync:
@@ -2376,9 +2550,10 @@ class SubscriptionMirror:
             if watermark is not None
             else _REVISION_EPOCH
         )
-        synced = removed = pages = 0
+        synced = removed = pages = overtaken = 0
         newest = watermark
         truncated = False
+        started = monotonic()
         while pages < MIRROR_MAX_PAGES_PER_SYNC:
             query = _query(
                 "mirror_sync",
@@ -2395,6 +2570,21 @@ class SubscriptionMirror:
                 except Exception:
                     logger.debug("Unreadable subscription document; not mirrored", exc_info=True)
                     continue
+                if entry.mirror_updated_at is not None and (
+                    newest is None or entry.mirror_updated_at > newest
+                ):
+                    # BEFORE the overtake test, deliberately: the watermark means "read up to
+                    # here", and holding it back for a document this process is already ahead of
+                    # would re-read the same document on every cycle for as long as it stayed the
+                    # newest one.
+                    newest = entry.mirror_updated_at
+                with self._lock:
+                    was_overtaken = self._overtaken(entry.subscription_id, started)
+                if was_overtaken:
+                    # This process committed a newer state for it while the read was in flight and
+                    # has already applied that. See :meth:`_overtaken`.
+                    overtaken += 1
+                    continue
                 # A tombstone is a document whose status is no longer active. It is REMOVED here
                 # rather than left to the liveness pass, because `_delete_body` also pulls both
                 # horizons back to `now` -- so the two agree, and this is the path that carries a
@@ -2407,10 +2597,6 @@ class SubscriptionMirror:
                     with self._lock:
                         self._entries[entry.subscription_id] = entry
                     synced += 1
-                if entry.mirror_updated_at is not None and (
-                    newest is None or entry.mirror_updated_at > newest
-                ):
-                    newest = entry.mirror_updated_at
             if len(page) < MIRROR_PAGE_SIZE:
                 cursor = None
                 break
@@ -2426,6 +2612,7 @@ class SubscriptionMirror:
         with self._lock:
             self._watermark = newest
             self._cursor = cursor
+            self._prune_local_applied(started)
             size = len(self._entries)
         return MirrorSync(
             synced=synced,
@@ -2434,6 +2621,7 @@ class SubscriptionMirror:
             size=size,
             truncated=truncated,
             watermark_age_s=self.watermark_age_s(now),
+            overtaken=overtaken,
         )
 
 
@@ -2709,6 +2897,67 @@ SUBJECT_MIRRORING_BODIES = frozenset({"_mint", "_withdraw_body", "_clear_below_t
 #: of the document. The moment one of those three fields enters the standing set, that stops being
 #: true and this exemption has to go with it.
 SUBJECT_WRITERS_OUTSIDE_THE_MIRROR = frozenset({"_sent_body"})
+
+#: The transaction bodies whose committed document is applied to the SUBSCRIPTION mirror in memory,
+#: declared as a SET for `MIRROR_STAMPING_BODIES`' reason and pinned against the source both ways.
+#:
+#: This is the second half of U13's answer to a question U12 left with the opposite conclusion. A
+#: watermark cannot carry a `web_push` push mark -- `_mark_notified_body` and `_record_push_body`
+#: are out of `MIRROR_STAMPING_BODIES` because one push on a corridor with a hundred thousand
+#: registrations would be a hundred thousand documents through the watermark query -- and U12
+#: therefore recorded that the cycle must read those marks from the store, per push. That reading
+#: costs a document read per registration per cycle at exactly the scale the plan sizes for. The
+#: cheaper and STRONGER answer is `SubjectMirror`'s: a `/varsel` registration has one writer -- the
+#: request path and the poller are one process, one replica under Recreate, and the delivery worker
+#: writes webhook deliveries only -- so every commit passes through here and can be applied from
+#: its own result.
+#:
+#: Every body that changes a field the cycle reads back is in the set, not only the two mark
+#: bodies: a create, a delete and a servability stamp are all things the cycle must see WITHIN the
+#: cycle they happen in, because the delivery loop's two liveness re-checks exist to catch exactly
+#: a mid-cycle delete -- and a watermark would carry that at the start of the NEXT cycle, by which
+#: time the push has gone out.
+#:
+#: `_erase_device_body` is the deliberate exception and is handled by id rather than by document
+#: (`SubscriptionMirror.drop_committed`): it tombstones a page of journeys and returns counts, so
+#: there is no document to apply. It is named here so the set reads as complete.
+SUBSCRIPTION_MIRRORING_BODIES = frozenset(
+    {
+        "_create_body",
+        "_replace_body",
+        "_delete_body",
+        "_touch_body",
+        "_servability_body",
+        "_mark_notified_body",
+        "_record_push_body",
+    }
+)
+
+#: The bodies that write a subscription document and deliberately do NOT reach the mirror from
+#: their own commit. `_sent_body`, `_claim_body`, `_failed_body` and `_terminal_body` are the
+#: webhook channel's delivery half and none of them runs in this process at all once the worker
+#: owns delivery (U11) -- and the worker holds no mirror; the watermark does not carry them either
+#: (`MIRROR_STAMPING_BODIES`), and the cost of that is the wording lag that paragraph publishes.
+#: `_finish_cleanup_body` only ever runs on a subscription `_delete_body` has already tombstoned,
+#: which the mirror dropped on that commit.
+SUBSCRIPTION_WRITERS_OUTSIDE_THE_MIRROR = frozenset(
+    {"_sent_body", "_claim_body", "_failed_body", "_terminal_body", "_finish_cleanup_body"}
+)
+
+
+def _mirror_subscription(doc: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """Apply a committed subscription document to the in-memory mirror, and hand it back.
+
+    **The one place a committed subscription reaches the mirror**, so which writes it sees is a
+    property of this module rather than of whoever remembered;
+    :data:`SUBSCRIPTION_MIRRORING_BODIES` names them and the suite pins that set against the source.
+
+    Called on the RESULT of a transaction and never from inside a body, `_mirror_subject`'s rule and
+    for its reason. Returns its argument so a call site reads as one expression.
+    """
+    if doc is not None:
+        _subscription_mirror.apply_committed(doc)
+    return doc
 
 
 def _mirror_subject(state: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
@@ -3016,6 +3265,48 @@ def tombstone_device(
     return None if doc is None else _device_from_doc(doc)
 
 
+def get_devices(device_ids: Iterable[str]) -> dict[str, Device]:
+    """Several devices in ONE round trip, keyed by id; unknown ids are simply absent.
+
+    `get_all` and not a loop of :func:`get_device`, and the difference is the difference between a
+    cycle and a bill. The delivery pass needs an endpoint and a brand for every registration it is
+    about to push to, and on a disrupted corridor that is thousands of registrations in one cycle
+    -- serially, on the poller's thread, each one a round trip of its own. One multi-get costs one.
+
+    Deliberately NOT mirrored, unlike the subscriptions. A device is read only for a registration
+    that has an alert-worthy train THIS cycle, so the read count is bounded by what is about to be
+    pushed rather than by the population; mirroring 100 000 devices would spend ~40 MB of the pod's
+    limit to save reads nobody makes on an ordinary cycle. Revisit if a bad morning ever reads most
+    of them.
+
+    Unreadable documents are skipped rather than raised, `recipient_documents`' rule: one device
+    written by a newer binary must not cost the pass every other device in the same call.
+    """
+    refs = _Refs(_firestore_client())
+    wanted = list(dict.fromkeys(device_ids))
+    if not wanted:
+        return {}
+    devices: dict[str, Device] = {}
+    # No span attribute: `tracing_setup.SPAN_ATTRIBUTE_NAMES` is a closed vocabulary and a count of
+    # devices is not in it. The span's own duration is what sizes a multi-get; how many it carried
+    # belongs in the caller's log line, where a reader can join it to the cycle.
+    with _span("notification_store.get_devices"):
+        snapshots = _firestore_client().get_all(
+            [refs.device(device_id) for device_id in wanted], timeout=_CALL_DEADLINE_S
+        )
+        for snapshot in snapshots:
+            stored = _doc(snapshot)
+            if not stored:
+                continue
+            try:
+                device = _device_from_doc(stored)
+            except Exception:
+                logger.debug("Unreadable device document; skipped", exc_info=True)
+                continue
+            devices[device.device_id] = device
+    return devices
+
+
 def get_device(device_id: str) -> Device | None:
     """One device, read outside a transaction. The unknown-id path on the public endpoint costs
     exactly this one bounded read.
@@ -3051,10 +3342,14 @@ class DeviceErasure:
 
 def _erase_device_body(
     transaction: Any, refs: _Refs, journeys_query: Any, *, device_id: str, client_id: str, now: datetime
-) -> tuple[int, bool, bool]:
+) -> tuple[list[str], bool, bool]:
     """One pass of «Slett alt»: tombstone this device's journeys, and delete the device when done.
 
-    Returns ``(tombstoned, device_deleted, complete)``.
+    Returns ``(tombstoned_ids, device_deleted, complete)`` -- the IDS and not a count, because the
+    caller drops them from the subscription mirror by id. The tombstone does stamp `MIRROR_FIELD`,
+    so a watermark sync would carry it too; that is one cycle later, and one cycle of a cycle
+    matching, wording and logging decisions about a traveller who has asked to be forgotten is
+    exactly what this path must not spend.
 
     **The journeys are TOMBSTONED, not hard-deleted, and that is the load-bearing decision here.**
     The obvious reading of "erase everything" is `transaction.delete` on each journey document, and
@@ -3087,15 +3382,16 @@ def _erase_device_body(
         raise Forbidden("device belongs to another client")
     page = _read_query(transaction, journeys_query)
     complete = len(page) < MAX_ERASE_WRITES_PER_TRANSACTION
-    tombstoned = 0
+    tombstoned: list[str] = []
     for snapshot in page:
         stored = _doc(snapshot)
         if not stored or stored.get("status") == "deleted":
             continue
         if stored.get("client_id") != client_id:
             raise Forbidden("journey belongs to another client")
+        subscription_id = str(stored["subscription_id"])
         transaction.update(
-            refs.subscription(str(stored["subscription_id"])),
+            refs.subscription(subscription_id),
             {
                 "status": "deleted",
                 "deleted_at": now,
@@ -3123,7 +3419,7 @@ def _erase_device_body(
                 MIRROR_FIELD: _mirror_stamp(),
             },
         )
-        tombstoned += 1
+        tombstoned.append(subscription_id)
     device_deleted = False
     if complete and stored_device:
         transaction.delete(refs.device(device_id))
@@ -3163,7 +3459,7 @@ def erase_device(
             equality={"client_id": client_id, "channel": CHANNEL_WEB_PUSH, "device_id": device_id},
             limit=MAX_ERASE_WRITES_PER_TRANSACTION,
         )
-        n, device_deleted, complete = _run_transaction(
+        ids, device_deleted, complete = _run_transaction(
             lambda txn, q=journeys_query: _erase_device_body(
                 txn,
                 refs,
@@ -3173,7 +3469,9 @@ def erase_device(
                 now=instant,
             )
         )
-        tombstoned += n
+        # By id and at once, not through the watermark: see the body's own docstring.
+        _subscription_mirror.drop_committed(ids)
+        tombstoned += len(ids)
         deleted += int(device_deleted)
     logger.info(
         "Device %s erased: %d journey(s) tombstoned in %d pass(es)",
@@ -3236,7 +3534,13 @@ def _mark_notified_body(
 
 
 def _record_push_body(
-    transaction: Any, refs: _Refs, *, subscription_id: str, train_ref: str, now: datetime
+    transaction: Any,
+    refs: _Refs,
+    *,
+    subscription_id: str,
+    train_ref: str,
+    now: datetime,
+    charge_cap: bool = True,
 ) -> dict[str, Any]:
     """Record one delivered push: the train it was about, and the Oslo day it spent.
 
@@ -3247,12 +3551,18 @@ def _record_push_body(
 
     `daily_pushes` is R11's cap at `/varsel`'s own grain, per registration per Oslo day. **Durable
     where it was in memory**, which is the change worth stating: a restart used to hand every
-    registration a fresh four, and it no longer does.
+    registration a fresh four, and it no longer does. `charge_cap=False` records the train and
+    leaves the count alone, which is what a REPLACEMENT notification is: it takes the earlier one's
+    place under the same tag rather than adding to the pile. The train mark is written either way
+    -- it is what the next replacement is recognised by, and a replacement that did not refresh it
+    would let the mark age out mid-disruption and turn the third notification about one train into
+    a fourth charged push.
     """
     stored = _web_push_journey(transaction, refs, subscription_id)
     day = oslo_day(now)
     counters = dict(stored.get("daily_pushes") or {})
-    counters[day] = int(counters.get(day) or 0) + 1
+    if charge_cap:
+        counters[day] = int(counters.get(day) or 0) + 1
     trains = dict(stored.get("pushed_trains") or {})
     trains[train_ref] = now + timedelta(days=HISTORY_DAYS)
     patch = {
@@ -3265,23 +3575,58 @@ def _record_push_body(
 
 
 def mark_notified(*, subscription_id: str, situation_number: str, now: datetime | None = None) -> None:
-    """Record a browser push about one situation. Raises :class:`NotFound` on an erased journey."""
+    """Record a browser push about one situation. Raises :class:`NotFound` on an erased journey.
+
+    The commit is applied to the subscription mirror, which is what makes the next cycle's dedup
+    exact rather than a cycle behind: this body does not stamp `MIRROR_FIELD` (one push on a busy
+    corridor would be a hundred thousand documents through the watermark query), so the mirror would
+    otherwise never learn a mark at all and the wording pass would re-offer every delivered train
+    for as long as its situation stood. See :data:`SUBSCRIPTION_MIRRORING_BODIES`.
+    """
     instant = now or _now()
     refs = _Refs(_firestore_client())
-    _run_transaction(
-        lambda txn: _mark_notified_body(
-            txn, refs, subscription_id=subscription_id, situation_number=situation_number, now=instant
+    _mirror_subscription(
+        _run_transaction(
+            lambda txn: _mark_notified_body(
+                txn,
+                refs,
+                subscription_id=subscription_id,
+                situation_number=situation_number,
+                now=instant,
+            )
         )
     )
 
 
-def record_push(*, subscription_id: str, train_ref: str, now: datetime | None = None) -> None:
-    """Spend one of this registration's daily pushes. Raises :class:`NotFound` on an erased journey."""
+def record_push(
+    *,
+    subscription_id: str,
+    train_ref: str,
+    charge_cap: bool = True,
+    now: datetime | None = None,
+) -> None:
+    """Record one delivered push. Raises :class:`NotFound` on an erased journey.
+
+    `charge_cap` is the caller's answer to "is this a replacement?" and defaults to True, which is
+    what every push before U13 was. A notification that takes an earlier one's place on the lock
+    screen under the same tag does not add to the pile, so it must not spend one of the
+    registration's four for the day -- and the answer cannot be re-derived here, because it was
+    decided when the push was queued and this call is about to write the very map it would read.
+
+    The commit reaches the mirror for :func:`mark_notified`'s reason.
+    """
     instant = now or _now()
     refs = _Refs(_firestore_client())
-    _run_transaction(
-        lambda txn: _record_push_body(
-            txn, refs, subscription_id=subscription_id, train_ref=train_ref, now=instant
+    _mirror_subscription(
+        _run_transaction(
+            lambda txn: _record_push_body(
+                txn,
+                refs,
+                subscription_id=subscription_id,
+                train_ref=train_ref,
+                charge_cap=charge_cap,
+                now=instant,
+            )
         )
     )
 
