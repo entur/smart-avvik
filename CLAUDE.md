@@ -568,6 +568,20 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     and `upsert_device` gained a `created_at` override for it, deliberately NOT on
     `SubscriptionSpec`: the spec is what a CLIENT submits, and a caller-chosen creation instant
     there would let a client move the webhook channel's lifetime horizon by submitting a date.
+    **The blob is the rollback artefact and `varsel_state_export` is what keeps it one** — the last
+    phase of the poller's cycle, at most six-hourly, rewriting the blob from the store. Under this
+    backend `save()` is a no-op, so without it the blob freezes at the cutover while still holding
+    the journeys of anybody who has pressed «Slett alt» since, and a rollback resurrects them; the
+    export's read applies liveness, so an erasure reaches the artefact within one interval and six
+    hours is therefore the rollback loss WINDOW. On the poller's tick rather than a CronJob,
+    because a second workload would resolve the bucket and the database again per environment and
+    the bucket names differ. It writes the blob backend's own five keys through `_journey_record`
+    and `_device_record` so `apply_state` can load it verbatim, and carries `togvarsel_rounds` and
+    any unknown keys through from the existing blob — the store has no home for those, so a
+    document rebuilt from it alone would delete them from the only place they exist. Every device
+    is exported, including one with no journeys left (`all_devices` pages `device_listing` rather
+    than multi-getting the ids the journeys name), because that record is an endpoint, a brand and
+    the signup instant `_upsert_device_body` restores.
   - Non-prod deployments label themselves in the PWA header and tab title —
     `Avviksvarsel (dev)` — and in the **push title** (`[dev] Oslo S → Lillehammer`, prefixed
     because phones truncate on the right), because dev and prd installs are otherwise identical on
