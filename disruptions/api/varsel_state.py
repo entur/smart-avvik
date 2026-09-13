@@ -1610,10 +1610,23 @@ def export_store_to_blob(
     keys, built through `_journey_record` and `_device_record`, which are what both backends
     already answer `/varsel` with.
 
-    **Keys this backend does not hold ride through from the blob that is already there** — the
-    togvarsel round markers and anything under `_state_extra`. That is not tidiness: the round
-    markers have no home in the store (the cutover section names it), so an export that rebuilt the
-    document from the store alone would silently delete them from the only place they exist.
+    **Keys this backend does not hold ride through from the blob that is already there** --
+    anything under `_state_extra`. That is not tidiness: a key a future build wrote has no home in
+    the store, so an export that rebuilt the document from the store alone would delete that
+    feature's state from the only place it exists, and a rollback-and-forward would not notice.
+    The togvarsel round markers are NOT among them any more -- they have their own document in the
+    store, so they are written LIVE from `all_rounds()`; carrying the old object's copy through
+    would fossilise the day of the cutover.
+
+    **This artefact has a SECOND reader, and it is not a rollback.**
+    `scripts/make_device_report.py` renders every device and its journeys straight out of the blob,
+    which is how the 79-of-186 "registered a journey and never turned notifications on" split was
+    measured. It is worth knowing before anybody decides the rollback window has passed and turns
+    this phase off: the report would stop working, in an environment where nothing else reads the
+    blob at all. The report's own successor question -- which registrations are approaching the
+    inactivity horizon -- cannot be answered from here in any case, since `_journey_record` carries
+    no `last_seen_at` and the blob backend has no concept of one; that is the day it reads the
+    store instead.
 
     A device with no live journeys IS exported, which is why the device read is a paged scan rather
     than a multi-get over the ids the journeys name: that record is a push endpoint, a brand and

@@ -4,6 +4,14 @@ Downloads gs://<bucket>/varsel_state.json with `gcloud storage cp` (so an active
 needed), renders one HTML page — every device with its signup time and the journeys it watches,
 newest signup first — and opens it.
 
+Under VARSEL_STATE_BACKEND=store (dev since 2026-09-13) the registrations live in Firestore and
+this blob is written by the poller's `varsel_state_export` phase, at most six-hourly — so the
+report is up to six hours stale there, and it stops working entirely if that phase is ever turned
+off as the rollback window closes. One thing it cannot show under either backend: `last_seen_at`,
+and therefore how close a registration is to the 180-day inactivity horizon. The exported journey
+record has no such field and the blob backend has no concept of one, so answering that means
+reading the store — the move to make when prd cuts over and this stops being two code paths.
+
     python3 scripts/make_device_report.py              # prd (the default)
     python3 scripts/make_device_report.py --env dev
     python3 scripts/make_device_report.py --no-download  # re-render an already downloaded blob
