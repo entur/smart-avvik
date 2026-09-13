@@ -705,6 +705,58 @@ def test_the_journey_keyed_read_is_published_with_its_two_switch_revert_and_its_
     )
 
 
+def test_every_worker_values_file_is_linted_and_deployed():
+    """U11's three-way consistency: a values file, a lint entry and a deploy job.
+
+    The chart renders one Deployment per RELEASE, so the worker is a second release with its own
+    values file per environment — three files that no existing job would touch. Each omission fails
+    differently and none of them fails loudly. A file nobody lints is a file whose first render
+    happens during a deploy. A file nobody deploys is configuration that describes a workload which
+    does not exist, which is worse than absent because it reads as done. And a deploy job naming a
+    file that is not there fails the whole dispatch at `helm upgrade`, after the image is built.
+
+    Both directions, as always: the check that every file has a job, and the check that every job
+    names a file that exists.
+    """
+    env_dir = REPO_ROOT / "helm" / "kix-avvik" / "env"
+    files = sorted(p.name for p in env_dir.glob("worker-values-kub-ent-*.yaml"))
+    assert files == [
+        "worker-values-kub-ent-dev.yaml",
+        "worker-values-kub-ent-prd.yaml",
+        "worker-values-kub-ent-tst.yaml",
+    ], files
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    cd = (REPO_ROOT / ".github" / "workflows" / "cd.yml").read_text()
+    for name in files:
+        env = name.removeprefix("worker-values-kub-ent-").removesuffix(".yaml")
+        assert f"values: {name}" in ci, f"{name} is not in ci.yml's helm-lint matrix"
+        assert f"values: {name}" in cd, f"{name} is not deployed by cd.yml"
+        assert f"deploy-{env}-worker:" in cd, f"cd.yml has no worker deploy job for {env}"
+    assert cd.count("release_name: kix-avvik-worker") == len(files), (
+        "every worker deploy job must name the worker release; without it gha-helm defaults to the "
+        "repository name and the job would UPGRADE THE API RELEASE with the worker's values file"
+    )
+    # The render check is the one that sees a values file stop being a worker's, so it has to be a
+    # gate rather than an advisory job.
+    assert "bash helm/kix-avvik/test/worker_render.sh" in ci
+    assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
+
+
+def test_the_worker_release_is_never_the_api_release():
+    """One transposed name upgrades the API release with the worker's values file: no ingress, no
+    VAPID keys, no SSO secret, and `container.args` pointing every replica at the delivery loop. The
+    API would simply stop existing, and `helm --wait` would report it as a successful deploy of a
+    healthy Deployment, because it IS one — of the wrong thing.
+    """
+    cd = (REPO_ROOT / ".github" / "workflows" / "cd.yml").read_text()
+    for block in cd.split("  deploy-")[1:]:
+        head = block.split("\n\n", 1)[0]
+        is_worker_job = head.startswith(("dev-worker:", "tst-worker:", "prd-worker:"))
+        names_worker_release = "release_name: kix-avvik-worker" in head
+        names_worker_values = "values: worker-values-kub-ent-" in head
+        assert is_worker_job == names_worker_release == names_worker_values, head.split("\n")[0]
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
