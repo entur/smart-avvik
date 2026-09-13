@@ -39,6 +39,7 @@ import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel W
 import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
 import tracing_setup  # import side effect: OTel tracing when TRACING_ENABLED (fail-open, KTD3)
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
+import varsel_state  # where a /varsel registration lives: the seam and its blob backend
 import webhook_delivery  # sibling module: one bounded webhook attempt per pending notification event
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -1669,6 +1670,12 @@ async def lifespan(app: FastAPI):
     varsel.configure(
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
+        # Where a `/varsel` registration lives (U13). The blob backend is today's five dicts and
+        # today's GCS state blob, moved behind `varsel_state`'s seam unchanged -- so this line
+        # changes nothing that is deployed and is the one place the cutover will change something.
+        # Passed explicitly rather than left to the module default, because a seam whose only
+        # caller is its own default is a seam nobody has to keep honest.
+        registrations=varsel_state.BlobRegistrations(),
         connectivity_provider=_varsel_connectivity,
         # The same question about many stop pairs at once, which is what BOTH servability sweeps
         # run on: one BigQuery job answers every pending pair (U10), where one job per pair bounded

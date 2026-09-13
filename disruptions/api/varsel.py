@@ -93,7 +93,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
-from pathlib import Path
 from time import monotonic
 from typing import Annotated, Any, Protocol
 from urllib.parse import urlencode
@@ -106,6 +105,7 @@ import metrics  # sibling leaf module (no main import): the push-delivery counte
 import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
 import reserved_budget  # the one reserve-don't-check pass budget
+import varsel_state  # where a registration lives: the seam and today's blob backend (U13)
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
 # it back from here would be a cycle — see alert_policy's docstring). Bound at module level rather
@@ -571,6 +571,7 @@ def configure(
     *,
     impact_provider: ImpactProvider,
     stops_provider: Callable[[], list[dict]],
+    registrations: varsel_state.RegistrationStore | None = None,
     connectivity_provider: ConnectivityProvider | None = None,
     connectivity_batch_provider: BatchConnectivityProvider | None = None,
     togvarsel_notify_provider: Callable[[], bool] | None = None,
@@ -607,12 +608,21 @@ def configure(
     this whole pass is ONE `_phase` — so without it a pass that merely got slow reads as a wedged
     poller, and the restart that follows comes up with both planned-call tables cold. See
     :data:`_HEARTBEAT_EVERY`.
+
+    `registrations` is where a registration LIVES (U13) — `varsel_state.BlobRegistrations` today,
+    the Firestore-backed implementation next. Absent keeps the module's own blob backend, which is
+    what every suite and every deployment before the cutover gets: the seam is proved by this
+    module reaching its state only through it, not by a deployment having chosen a backend. Which
+    one `main` hands over is the cutover's decision and is deliberately not a flag read here.
     """
+    global _registrations
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
     global _connectivity_batch_provider
     global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
+    if registrations is not None:
+        _registrations = registrations
     _connectivity_provider = connectivity_provider
     _connectivity_batch_provider = connectivity_batch_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
@@ -709,7 +719,7 @@ def _canonicalize_journeys() -> None:
     """
     changed: list[tuple[str, str, str]] = []
     with _state_lock:
-        for jid, rec in _journeys.items():
+        for jid, rec in _registrations.all_journeys():
             new_from = canonical_stop(rec["from_stop"])
             new_to = canonical_stop(rec["to_stop"])
             if (new_from, new_to) == (rec["from_stop"], rec["to_stop"]):
@@ -729,8 +739,10 @@ def _canonicalize_journeys() -> None:
                 )
                 continue
             changed.append((jid, rec["from_stop"], rec["to_stop"]))
-            rec["from_stop"] = new_from
-            rec["to_stop"] = new_to
+            # Through the seam rather than into the record: `all_journeys` hands out copies, because
+            # the store backend cannot hand out a live document and an in-place edit would work on
+            # one backend and vanish on the other.
+            _registrations.set_canonical_stops(jid, from_stop=new_from, to_stop=new_to)
         if changed:
             _save_state()
     for jid, old_from, old_to in changed:
@@ -1130,7 +1142,7 @@ def recheck_service() -> None:
     with _state_lock:
         due = [
             (jid, rec["from_stop"], rec["to_stop"], rec.get("service_checked_ts") or "")
-            for jid, rec in _journeys.items()
+            for jid, rec in _registrations.all_journeys()
             if rec.get("no_direct_service") and _service_check_due(rec, now)
         ]
     if not due:
@@ -1164,17 +1176,12 @@ def recheck_service() -> None:
             verdict = verdicts.get((from_stop, to_stop))
             if verdict is None:
                 continue  # nothing established: the stored value AND its stamp are left alone
-            rec = _journeys.get(jid)
-            if rec is None:  # deleted while we were asking
-                continue
-            rec["service_checked_ts"] = _now_iso()
+            if not _registrations.stamp_service_check(
+                jid, checked_ts=_now_iso(), cleared=verdict[0], reverse_only=verdict[1]
+            ):
+                continue  # deleted while we were asking
             stamped += 1
-            if verdict[0]:
-                rec.pop("no_direct_service", None)
-                rec.pop("service_reverse_only", None)
-                cleared += 1
-            else:
-                rec["service_reverse_only"] = verdict[1]
+            cleared += 1 if verdict[0] else 0
         if stamped:
             # ONE save for the whole sweep, inside the lock that made the edits. It used to save
             # only when something cleared, which left every stamp of an unchanged `false` in memory
@@ -1390,23 +1397,32 @@ _alternative_identity = notification_wording.alternative_identity
 
 
 # ---- State: devices, journeys, notified ------------------------------------------------------
-# Re-entrant lock: mutations call _save_state while already holding it.
-_state_lock = threading.RLock()
-_devices: dict[str, dict] = {}  # device_id -> {"subscription": {...}, "created_ts": iso}
-_journeys: dict[str, dict] = {}  # journey_id -> journey record (see POST /journeys)
-_notified: set[str] = set()  # {"journey_id|situationNumber"} — dedup, pruned when a situation ends
-# Why a device record went away while its journeys stayed (2026-09-04):
-# device_id -> {"reason": "expired" | "turned_off", "ts": iso, "created_ts": <the record's original
-# signup>, "journeys": <count left behind>}. Two writers, `_drop_device` (the push service answered
-# 404/410) and `delete_device` («Skru av»), and it is what tells those two apart from the third and
-# — measured in prd on 2026-09-04 — much larger population: a journey registered by a device that
-# never turned notifications on at all, which has no record to lose and so no tombstone. Nothing
-# durable held that distinction before, so the device report could only guess. Written only when
-# journeys remain (a record with none leaves nothing to explain), removed when the device
-# re-registers (`upsert_device`, which also restores the original `created_ts` so a lapse does not
-# read as a new signup), when its last journey is deleted, and by «Slett alt» — an erasure keeps no
-# marker of what it erased. Persisted in the state blob beside the journeys it annotates.
-_device_tombstones: dict[str, dict[str, Any]] = {}
+#
+# WHERE A REGISTRATION LIVES IS `varsel_state`'s, not this module's, since U13: one seam
+# (`varsel_state.RegistrationStore`) with the blob backend below it today and U12's Firestore
+# collections behind it next. Every read and write this module makes goes through
+# :data:`_registrations`; nothing here indexes a state dict any more.
+#
+# The six names below are ALIASES of the blob backend's own objects, kept for one release so the
+# `/varsel` suites and their siblings read exactly the state they always read while the seam itself
+# is proved. They are the blob backend's, and they retire with it -- do not add a reader.
+_registrations: varsel_state.RegistrationStore = varsel_state.BlobRegistrations()
+_state_lock = varsel_state.lock
+_devices = varsel_state._devices
+_journeys = varsel_state._journeys
+_notified = varsel_state._notified
+_device_tombstones = varsel_state._device_tombstones
+_pushed_trains = varsel_state._pushed_trains
+_daily_pushes = varsel_state._daily_pushes
+_togvarsel_rounds = varsel_state._togvarsel_rounds
+_state_extra = varsel_state._state_extra
+# Read-only, and aliased for the same reason: `_STATE_KEYS` is what the blob's
+# rollback-insurance test asserts about, and `_STATE_BUCKET` is how a suite checks it is
+# running in the documented bucket-less mode.
+_STATE_KEYS = varsel_state._STATE_KEYS
+_STATE_PATH = varsel_state._STATE_PATH
+_STATE_BUCKET = varsel_state._STATE_BUCKET
+_STATE_BLOB = varsel_state._STATE_BLOB
 # The written wording for one (place pair, train), keyed by :func:`_message_key` — KTD9's shape,
 # shared with the journey-alert read through `notification_wording.wording_key`. Keyed on the
 # PLACE PAIR since 2026-09-12 and on the journey *definition* before that: what a wording says is a
@@ -1449,19 +1465,6 @@ _message_errors: dict[tuple, int] = {}
 # refused, and once the deterministic wording is stored all three look identical. See
 # decisions.build_row.
 _message_meta: dict[tuple, dict[str, Any]] = {}
-# Trains a push has already reached each REGISTRATION about, {"<journey_id>|<train key>": departure
-# (UTC)} -- design review 2026-09-01, findings 14 and 15. Two readers. `_notification_title` prefixes
-# a later push about the same train with «Bekreftet:» (the 65 % forecast and «er innstilt» used to
-# arrive as two unrelated notifications about one train), and the delivery loop exempts such a push
-# from the daily cap, because it REPLACES the earlier one on the lock screen (same notification tag)
-# rather than adding to the pile. In memory only: a restart forgets it, which costs at most one
-# missing prefix and one extra counted push, while persisting it would grow the state blob by a key
-# per train. Pruned by departure time -- a train is done being pushed about once it has left.
-_pushed_trains: dict[str, datetime] = {}
-# Alert pushes sent per REGISTRATION on the current Oslo day, journey_id -> ("YYYY-MM-DD", count):
-# the ledger behind :data:`_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`. In memory for the same reason as
-# the dict above -- a restart resets the count, which errs towards sending.
-_daily_pushes: dict[str, tuple[str, int]] = {}
 
 # ---- The decision log's thinning ledger (KTD15, R11) --------------------------------------------
 #
@@ -1530,172 +1533,74 @@ _decision_ledger: dict[tuple[str, str, str], dict[str, Any]] = {}
 #: it is the arm the equivalence test replays against.
 _DECISION_THINNING_INTERVAL_S = 15 * 60
 
-# Togvarsel push round markers, {"<YYYY-MM-DD Oslo>": {"<issue>": {"level": str, "pushed": bool}}} —
-# togvarsel_notify's single state primitive (dedup + the follow-up baseline in one). Persisted in
-# the state blob so a completed round never re-fires across restarts. Exactly one date is kept:
-# store_togvarsel_rounds prunes to the date it is given, which is how day rollover forgets
-# yesterday. Only the accessor pair below touches this — togvarsel_notify gets those injected and
-# never reads varsel globals.
-_togvarsel_rounds: dict[str, dict[str, Any]] = {}
-# Unknown top-level keys in the loaded blob, carried through apply→serialize verbatim (rollback
-# insurance): a key written by a future feature must survive THIS build rewriting the blob, so a
-# rollback-and-forward does not silently erase that feature's state.
-_state_extra: dict[str, Any] = {}
-_STATE_KEYS = frozenset({"devices", "journeys", "notified", "togvarsel_rounds", "device_tombstones"})
-
-_STATE_PATH = Path(os.environ.get("VARSEL_STATE_PATH", "/tmp/varsel_state.json"))
-_STATE_BUCKET = os.environ.get("VARSEL_STATE_BUCKET")  # GCS bucket for durable state (optional)
-_STATE_BLOB = os.environ.get("VARSEL_STATE_BLOB", "varsel_state.json")
-
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
 def _serialize_state() -> str:
-    with _state_lock:
-        return json.dumps(
-            {
-                **_state_extra,  # unknown keys ride along verbatim (rollback insurance)
-                "devices": _devices,
-                "journeys": _journeys,
-                "notified": sorted(_notified),
-                "togvarsel_rounds": _togvarsel_rounds,
-                "device_tombstones": _device_tombstones,
-            }
-        )
+    return varsel_state.serialize_state()
 
 
 def _apply_state(raw: str) -> None:
-    data = json.loads(raw)
-    with _state_lock:
-        global _devices, _journeys, _notified, _togvarsel_rounds, _device_tombstones, _state_extra
-        _devices = dict(data.get("devices", {}))
-        _journeys = dict(data.get("journeys", {}))
-        _notified = set(data.get("notified", []))
-        _togvarsel_rounds = dict(data.get("togvarsel_rounds", {}))
-        _device_tombstones = dict(data.get("device_tombstones", {}))
-        _state_extra = {k: v for k, v in data.items() if k not in _STATE_KEYS}
-
-
-_gcs_client = None
-_gcs_client_lock = threading.Lock()
-
-
-def _gcs_blob():
-    """The state blob handle when a bucket is configured, else None (import is lazy).
-
-    The client is built once and reused. Constructing a fresh `storage.Client()` per call meant every
-    device registration and every journey delete paid an ADC resolution plus a metadata-server token
-    fetch before the upload — on the request path, under `_state_lock`.
-    """
-    global _gcs_client
-    if not _STATE_BUCKET:
-        return None
-    from google.cloud import storage
-
-    with _gcs_client_lock:
-        if _gcs_client is None:
-            _gcs_client = storage.Client()
-    return _gcs_client.bucket(_STATE_BUCKET).blob(_STATE_BLOB)
+    varsel_state.apply_state(raw)
 
 
 def load_state() -> None:
-    """Load persisted state at startup — from GCS when configured, else the local file.
-
-    Tolerant: a missing/corrupt store just starts empty (logged), so a first-ever run or a fresh
-    bucket doesn't block serving."""
-    try:
-        blob = _gcs_blob()
-        if blob is not None:
-            if blob.exists():
-                _apply_state(blob.download_as_text())
-                logger.info(
-                    "Loaded varsel state from gs://%s/%s: %d devices, %d journeys",
-                    _STATE_BUCKET,
-                    _STATE_BLOB,
-                    len(_devices),
-                    len(_journeys),
-                )
-            else:
-                logger.info("No varsel state blob yet at gs://%s/%s", _STATE_BUCKET, _STATE_BLOB)
-            return
-        if _STATE_PATH.exists():
-            _apply_state(_STATE_PATH.read_text())
-            logger.info(
-                "Loaded varsel state from %s: %d devices, %d journeys",
-                _STATE_PATH,
-                len(_devices),
-                len(_journeys),
-            )
-    except Exception:
-        logger.exception("Could not load varsel state; starting empty")
+    """Load persisted state at startup -- the blob backend's, through the seam."""
+    _registrations.load()
 
 
 def _save_state() -> bool:
-    """Write state through to the local file and (when configured) the GCS blob. Best-effort:
-    a persistence failure is logged, not raised — the in-memory state is still authoritative.
+    """Make every mutation since the last call durable, and say whether it worked.
 
-    Returns whether the DURABLE copy is up to date: True when the GCS upload succeeded, and True
-    when no bucket is configured — there is then no durable copy to be stale, which is the
-    documented local-only dev mode (`VARSEL_STATE_BUCKET` unset). False only when a *configured*
-    upload actually failed, `_gcs_blob` itself blowing up on ADC included.
+    The seam's :meth:`varsel_state.RegistrationStore.save`, which is the ONE asymmetry between the
+    two backends and is stated rather than hidden: the blob batches, so this is the write that makes
+    the preceding mutations durable, while the store has already written each of them as its own
+    document and answers True with nothing to flush. So the call sequence -- mutate, then save -- is
+    correct on both, and it is what lets the request path stop writing a blob at the cutover without
+    a single call site moving.
 
-    The return value is backward compatible: nothing raises, the local-file write keeps its own
-    swallow-and-log, and every caller but :func:`delete_device_data` ignores it. That one is the
-    single place where "logged, not raised" is wrong — a GDPR art. 17 erasure that answers 200
-    while the blob still holds the data has it resurrected by the next restart's `load_state`, and
-    by then the client has cleared its device id, so the resurrected rows are unreachable by the
-    person they belong to.
+    A suite that needs persistence to FAIL, or that counts writes, patches `varsel_state.save_state`
+    rather than this name: everything persists through that function, this delegator and the
+    backend's own call alike, which is what makes such a patch total.
     """
-    payload = _serialize_state()
-    try:
-        _STATE_PATH.write_text(payload)
-    except Exception:
-        logger.exception("Could not write varsel state to %s", _STATE_PATH)
-    try:
-        blob = _gcs_blob()
-        if blob is None:
-            return True
-        blob.upload_from_string(payload, content_type="application/json")
-    except Exception:
-        logger.exception("Could not upload varsel state to gs://%s/%s", _STATE_BUCKET, _STATE_BLOB)
-        return False
-    return True
+    return _registrations.save()
 
 
 # ---- Togvarsel round markers + journey snapshot (injected into togvarsel_notify) --------------
 # That module imports neither varsel nor main (the package rule), so main hands it these
 # callables. Both marker accessors deal in detached copies: togvarsel_notify mutates its working
-# map freely and hands it back whole through the store — it never reaches varsel globals.
+# map freely and hands it back whole through the store -- it never reaches varsel globals.
+#
+# The markers themselves are deliberately OFF the registration seam (see `varsel_state`): a rush
+# round marker is not a registration, and making the store backend grow a document for it would be
+# inventing a reader. They ride in the blob half, and this pair is what togvarsel_notify sees.
 
 
 def togvarsel_rounds_for(date_str: str) -> dict[str, Any]:
     """A copy of the togvarsel round markers for one Oslo date ({} when none exist)."""
-    with _state_lock:
-        return {k: dict(v) for k, v in _togvarsel_rounds.get(str(date_str), {}).items()}
+    return varsel_state.rounds_for(date_str)
 
 
 def store_togvarsel_rounds(date_str: str, markers: Mapping[str, Any]) -> None:
-    """Replace the round markers for `date_str` — the current Oslo date — and persist.
+    """Replace the round markers for `date_str` -- the current Oslo date -- and persist.
 
     Every OTHER date is pruned: markers dedup rounds and seed follow-up baselines for one day
     only, so the first write after midnight is what forgets yesterday. Persistence is
-    :func:`_save_state`'s best-effort write-through — a failure there is logged, never raised, so
+    :func:`_save_state`'s best-effort write-through -- a failure there is logged, never raised, so
     the in-memory markers still dedup this process and the cost of a lost write is bounded by the
     next restart re-evaluating inside the timeliness window."""
     with _state_lock:
-        global _togvarsel_rounds
-        _togvarsel_rounds = {str(date_str): {k: dict(v) for k, v in markers.items()}}
+        varsel_state.store_rounds(date_str, markers)
         _save_state()
 
 
 def journeys_snapshot() -> dict[str, dict]:
-    """A shallow-copied snapshot of the registered journeys, for togvarsel_notify's matcher (it
-    only reads scalar fields, and one take of the lock keeps a concurrent delete from tearing a
-    record mid-iteration)."""
-    with _state_lock:
-        return {jid: dict(rec) for jid, rec in _journeys.items()}
+    """A snapshot of the registered journeys, for togvarsel_notify's matcher (it only reads scalar
+    fields, and the seam's own copy keeps a concurrent delete from tearing a record mid-iteration).
+    """
+    return dict(_registrations.all_journeys())
 
 
 # ---- Matcher ---------------------------------------------------------------------------------
@@ -2128,8 +2033,7 @@ def _pending_pushes(
     the wording from a push that does go out, and a missing wording is the failure this whole
     path exists to prevent.
     """
-    with _state_lock:
-        notified = set(_notified)
+    notified = _registrations.notified_snapshot(jids)
     return [
         alert
         for alert in one_alert_per_train(alerts)
@@ -3308,7 +3212,7 @@ def device_subscription(device_id: str) -> tuple[dict, str] | None:
     re-branded while a caller iterates a matched set, and a split read could describe one
     registration's subscription with another's icon."""
     with _state_lock:
-        dev = _devices.get(device_id)
+        dev = _registrations.get_device(device_id)
         subscription = dev.get("subscription") if dev else None
         brand = normalize_brand(dev.get("brand") if dev else None)
     if subscription is None:
@@ -3316,25 +3220,21 @@ def device_subscription(device_id: str) -> tuple[dict, str] | None:
     return subscription, brand
 
 
-def _record_device_gone(device_id: str, record: dict, reason: str) -> int:
-    """Leave a tombstone for a device record that was just removed while its journeys stay.
+def _forget_device(device_id: str, reason: str) -> tuple[dict | None, int]:
+    """Remove a device record while its journeys stay, and say so in the log.
 
-    Caller holds `_state_lock` and has already popped `record` from `_devices`. Returns the
-    number of journeys left behind; with none there is nothing a later reader needs explained, so
-    no tombstone is written (see `_device_tombstones`). Also emits the structured event the device
-    report and the log can be joined on — the plain text line each caller logs predates it and is
-    kept, since a saved log query may match on it.
+    The removal and its tombstone are the seam's (`varsel_state.RegistrationStore.forget_device`):
+    with journeys left behind the tombstone records WHY the record went, and with none there is
+    nothing a later reader needs explained. What stays here is the structured event the device
+    report and the log are joined on — the vocabulary is this module's, so a backend swap cannot
+    change one line of it. The plain text line each caller logs predates it and is kept, since a
+    saved log query may match on it.
+
+    Returns the removed record (None when the id was unknown) and the journeys left behind.
     """
-    journeys = sum(1 for rec in _journeys.values() if rec["device_id"] == device_id)
-    if journeys:
-        _device_tombstones[device_id] = {
-            "reason": reason,
-            "ts": _now_iso(),
-            "created_ts": record.get("created_ts"),
-            "journeys": journeys,
-        }
-    else:
-        _device_tombstones.pop(device_id, None)
+    record, journeys = _registrations.forget_device(device_id, reason=reason)
+    if record is None:
+        return None, 0
     logger.info(
         "Device %s lost its push subscription (%s), %d journeys kept",
         device_id,
@@ -3349,28 +3249,26 @@ def _record_device_gone(device_id: str, record: dict, reason: str) -> int:
             }
         },
     )
-    return journeys
+    return record, journeys
 
 
 def _drop_device(device_id: str) -> None:
     """Forget a device whose push subscription is gone (404/410). Journeys are kept — the client
     re-attaches its subscription (same device_id) if the user re-enables notifications, and since
     2026-09-04 the service worker does so by itself on `pushsubscriptionchange`. A tombstone
-    records the reason (`_record_device_gone`), or the journeys would later read as registered by
+    records the reason (`_forget_device`), or the journeys would later read as registered by
     someone who never turned notifications on."""
     with _state_lock:
-        record = _devices.pop(device_id, None)
+        record, _journeys_kept = _forget_device(device_id, "expired")
         if record is not None:
             logger.info("Dropped expired push subscription for device %s", device_id)
-            _record_device_gone(device_id, record, "expired")
 
 
 def _device_is_fresh(device_id: str) -> bool:
     """True while a device's subscription is younger than the propagation grace window. A 404/410
     for such a subscription is likely a transient push-service delay, not a dead endpoint, so the
     caller should retry later rather than drop it."""
-    with _state_lock:
-        dev = _devices.get(device_id)
+    dev = _registrations.get_device(device_id)
     if dev is None:
         return False
     try:
@@ -4167,12 +4065,20 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # carries, and one pass must not answer that two ways.
     webhook_llm = _webhook_delivery_enabled()
     with _state_lock:
-        journeys = list(_journeys.items())
+        journeys = _registrations.all_journeys()
         # Prune notified entries and cached messages whose situation is no longer live. In-place
         # updates (not `-=`) so the module globals stay globals rather than becoming function-locals.
         live = set(by_situation.keys())
-        stale = {k for k in _notified if k.split("|", 1)[1] not in live}
-        _notified.difference_update(stale)
+        # A train that left is done being pushed about (same grace as journey_windows, so a train
+        # still being advised as delayed-but-catchable keeps its entry), and the daily ledger
+        # forgets yesterday. All three are the seam's, because all three are registration state --
+        # the caches below are this process's own and stay here.
+        oslo_today = datetime.now(_OSLO).date().isoformat()
+        stale_marks = _registrations.prune(
+            live_situations=live,
+            trains_gone_by=datetime.now(UTC) - _WINDOW_CATCH_UP,
+            oslo_today=oslo_today,
+        )
         for key in [k for k in _messages if k[1] not in live]:
             _messages.pop(key, None)
         for key in [k for k in _alternatives if k[1] not in live]:
@@ -4183,15 +4089,6 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             _message_errors.pop(key, None)
         for key in [k for k in _message_meta if k[1] not in live]:
             _message_meta.pop(key, None)
-        # A train that left is done being pushed about (same grace as journey_windows, so a train
-        # still being advised as delayed-but-catchable keeps its entry), and the daily ledger
-        # forgets yesterday.
-        gone_by = datetime.now(UTC) - _WINDOW_CATCH_UP
-        for tag in [t for t, departed in _pushed_trains.items() if departed < gone_by]:
-            _pushed_trains.pop(tag, None)
-        oslo_today = datetime.now(_OSLO).date().isoformat()
-        for jid in [j for j, (day, _count) in _daily_pushes.items() if day != oslo_today]:
-            _daily_pushes.pop(jid, None)
         # NOTHING FOR THE WEBHOOK CHANNEL SWEEPS HERE, and that is a property worth stating rather
         # than an omission. The client snapshot loaded below is a pass-local list, and Firestore is
         # the only dedup ledger for that channel (KTD3), so this pass holds no notification state to go
@@ -4199,7 +4096,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # here AND in `test_varsel_api._reset_state`: a leaked half-spent budget is indistinguishable
         # from a give-up bug. The per-destination delivery skip is the deliberate exception and must
         # stay pass-local, or one failure pauses a destination permanently (KTD6).
-        changed = bool(stale)
+        changed = bool(stale_marks)
 
     # The decision log's own sweep, on the same liveness test one line of reasoning above -- but it
     # RETURNS rather than dropping state, because a thinned subject's last look has not been
@@ -4725,12 +4622,18 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             device = None
             brand = DEFAULT_BRAND
             with _state_lock:
-                if jid not in _journeys:  # deleted while iterating
+                if _registrations.get_journey(jid) is None:  # deleted while iterating
                     continue
-                dev = _devices.get(journey["device_id"])
+                dev = _registrations.get_device(journey["device_id"])
                 if dev is not None:
                     device = dev.get("subscription")
                     brand = normalize_brand(dev.get("brand"))
+                # ONE read of this registration's push marks for the whole train loop below, which
+                # is the shape the store backend needs: three fields of one journey document, so
+                # asking per train per question would be three reads per push. Safe as a snapshot
+                # because nothing in this loop writes them -- the marks are written in loop 2, after
+                # every delivery -- and `reserved` carries what THIS cycle is about to spend.
+                ledger = _registrations.push_ledger(jid)
             if device is None:
                 continue
             key = journey_key(journey)
@@ -4748,17 +4651,15 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                     a.departure_time.timestamp() if a.departure_time else 0.0,
                 ),
             )
+            sent_today = ledger.sent_today if ledger.day == oslo_today else 0
             for alert in trains:
-                with _state_lock:
-                    if f"{jid}|{alert.situation_number}" in _notified:
-                        continue
-                    tag = _notification_tag(jid, alert)
-                    # An earlier push about this TRAIN (another situation about it) already reached
-                    # this registration: the new one replaces it on the lock screen under the same tag,
-                    # so it is not counted against the cap and its title may say «Bekreftet:».
-                    replaces = tag is not None and tag in _pushed_trains
-                    day, count = _daily_pushes.get(jid, (oslo_today, 0))
-                    sent_today = count if day == oslo_today else 0
+                if alert.situation_number in ledger.notified:
+                    continue
+                tag = _notification_tag(jid, alert)
+                # An earlier push about this TRAIN (another situation about it) already reached
+                # this registration: the new one replaces it on the lock screen under the same tag,
+                # so it is not counted against the cap and its title may say «Bekreftet:».
+                replaces = tag is not None and tag in ledger.pushed_trains
                 if (
                     not replaces
                     and sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
@@ -4805,7 +4706,10 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             """
             jid, device, journey, alert, key, brand, replaces = item
             with _state_lock:
-                if jid not in _journeys or journey["device_id"] not in _devices:
+                if (
+                    _registrations.get_journey(jid) is None
+                    or _registrations.get_device(journey["device_id"]) is None
+                ):
                     return None
             # The PAIR's wording (KTD9) beside this DEFINITION's message input: the text is what
             # every traveller on the corridor is sent, the input is the document this registration's
@@ -4846,18 +4750,20 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                         # Same liveness rule as `_prepare_alert`, re-asked because the delete can also
                         # land during the send itself: a dedup key for a journey that no longer exists
                         # would be persisted by the save below and reloaded on the next restart.
-                        if jid in _journeys:
-                            _notified.add(f"{jid}|{alert.situation_number}")
+                        if _registrations.get_journey(jid) is not None:
+                            _registrations.mark_notified(jid, alert.situation_number)
                             changed = True
-                            tag = _notification_tag(jid, alert)
-                            if tag is not None and alert.departure_time is not None:
-                                _pushed_trains[tag] = alert.departure_time
-                            if not replaces:
-                                day, count = _daily_pushes.get(jid, (oslo_today, 0))
-                                _daily_pushes[jid] = (
-                                    oslo_today,
-                                    (count if day == oslo_today else 0) + 1,
-                                )
+                            # A replacement notification takes the earlier one's place on the lock
+                            # screen under the same tag, so the day's count is not charged for it --
+                            # decided HERE and not in the seam, because "is this a replacement" is
+                            # the caller's question and was answered when the push was queued.
+                            _registrations.record_push(
+                                jid,
+                                tag=_notification_tag(jid, alert),
+                                departure=alert.departure_time,
+                                oslo_day=oslo_today,
+                                charge_cap=not replaces,
+                            )
                     pushed_keys.add(_decision_key(journey_key(journey), alert))
                 elif result == "gone":
                     if handle_gone_device(journey["device_id"]):
@@ -5132,30 +5038,24 @@ def upsert_device(body: DeviceIn) -> dict:
     every other route, `/health` included. Same rule as `list_journeys`/`create_journey`/`/impact`.
     """
     with _state_lock:
-        existing = _devices.get(body.device_id)
-        if existing is None and len(_devices) >= _MAX_DEVICES:
+        if (
+            _registrations.get_device(body.device_id) is None
+            and _registrations.device_count() >= _MAX_DEVICES
+        ):
             logger.warning(
                 "Global device cap (%d) reached; refusing a new registration",
                 _MAX_DEVICES,
                 extra={"fields": {"event": "varsel_capacity", "kind": "devices"}},
             )
             raise HTTPException(status_code=503, detail="Tjenesten er full. Prøv igjen senere.")
-        # A device coming back after «Skru av» or an expired subscription keeps its original
-        # signup: the tombstone carried it (2026-09-04), and it is what the device report calls
-        # "signed up". Without this a lapse reads as a brand-new device.
-        tombstone = _device_tombstones.pop(body.device_id, None)
-        created_ts = (
-            existing["created_ts"]
-            if existing
-            else (tombstone or {}).get("created_ts") or _now_iso()
+        # The signup instant and the tombstone that carries it across a lapse are the seam's (see
+        # `varsel_state.BlobRegistrations.put_device`): which of the three sources it comes from is
+        # a property of the record's history, not of this request.
+        _registrations.put_device(
+            body.device_id,
+            subscription=body.subscription,
+            brand=normalize_brand(body.brand),
         )
-        _devices[body.device_id] = {
-            "subscription": body.subscription,
-            "created_ts": created_ts,
-            # Refreshed on every registration, so a device that reopens the app under a different
-            # ?brand= has its notifications follow it rather than keeping the brand it first used.
-            "brand": normalize_brand(body.brand),
-        }
         _save_state()
     return {"status": "ok"}
 
@@ -5167,9 +5067,7 @@ def delete_device(device_id: str) -> dict:
     Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
     """
     with _state_lock:
-        record = _devices.pop(device_id, None)
-        if record is not None:
-            _record_device_gone(device_id, record, "turned_off")
+        _forget_device(device_id, "turned_off")
         _save_state()
     return {"status": "ok"}
 
@@ -5235,66 +5133,48 @@ def delete_device_data(
     registration of that definition, so clearing them here would discard another device's wording.
     They expire with their situation.
     """
-    with _state_lock:
-        device = _devices.pop(device_id, None)
-        # The tombstone (see `_device_tombstones`) goes too: an art. 17 erasure keeps no record
-        # of what it erased, not even the reason the record was gone. Popped before the empty
-        # check so a lone stale marker is also cleaned up — that path still saves.
-        tombstone = _device_tombstones.pop(device_id, None)
-        deleted = [jid for jid, rec in _journeys.items() if rec["device_id"] == device_id]
-        if device is None and tombstone is None and not deleted:
-            return {"status": "ok", "journeys_deleted": 0}
-        removed_journeys = {jid: _journeys.pop(jid) for jid in deleted}
-        gone = set(deleted)
-        # Dedup keys are "journey_id|situationNumber" — see check_and_notify.
-        removed_notified = {key for key in _notified if key.split("|", 1)[0] in gone}
-        _notified.difference_update(removed_notified)
-        if not _save_state():
-            # The durable blob still holds everything, so the erasure did NOT happen. Reporting
-            # success here is how an art. 17 request gets quietly undone: `load_state` reads the
-            # blob on the next restart and brings the device, its journeys and their dedup keys
-            # back — by which time the client has cleared its device id, so what came back is
-            # unreachable by the person it belongs to.
-            #
-            # Restoring is what makes the retry correct, not tidiness: without it the second
-            # attempt finds nothing in memory, takes the zero-I/O unknown-id path above, and
-            # answers 200 over a blob that is still full. Done under the SAME lock acquisition, so
-            # memory and the blob cannot be observed disagreeing. Restored journeys land at the
-            # end of the dict rather than in their old positions; nothing reads that order (the
-            # write queue sorts by departure), and this is a failure path.
-            if device is not None:
-                _devices[device_id] = device
-            if tombstone is not None:
-                _device_tombstones[device_id] = tombstone
-            _journeys.update(removed_journeys)
-            _notified.update(removed_notified)
-            logger.error(
-                "Could not persist the data deletion for device %s; rolled it back",
-                device_id,
-                extra={
-                    "fields": {
-                        "event": "varsel_delete_all_persist_failed",
-                        "device_id": device_id,
-                        "journeys": len(deleted),
-                    }
-                },
-            )
-            raise HTTPException(
-                status_code=503, detail="Kunne ikke slette dataene akkurat nå. Prøv igjen."
-            )
+    # ONE seam call, because the two backends make it atomic by means neither can express in the
+    # other's steps: the blob pops under one lock and restores everything when the durable write
+    # fails, the store runs U12's paged erase transaction. What stays here is the HTTP shape and the
+    # log vocabulary.
+    erasure = _registrations.erase_device(device_id)
+    if not erasure.found:
+        return {"status": "ok", "journeys_deleted": 0}
+    if not erasure.durable:
+        # The durable copy still holds everything, so the erasure did NOT happen. Reporting
+        # success here is how an art. 17 request gets quietly undone: `load_state` reads the
+        # blob on the next restart and brings the device, its journeys and their dedup keys
+        # back — by which time the client has cleared its device id, so what came back is
+        # unreachable by the person it belongs to. The seam has put it all back, which is what
+        # makes the retry correct: without that the second attempt would find nothing, take the
+        # zero-I/O unknown-id path above, and answer 200 over a blob that is still full.
+        logger.error(
+            "Could not persist the data deletion for device %s; rolled it back",
+            device_id,
+            extra={
+                "fields": {
+                    "event": "varsel_delete_all_persist_failed",
+                    "device_id": device_id,
+                    "journeys": erasure.journeys_deleted,
+                }
+            },
+        )
+        raise HTTPException(
+            status_code=503, detail="Kunne ikke slette dataene akkurat nå. Prøv igjen."
+        )
     logger.info(
         "Deleted all data for device %s (%d journeys)",
         device_id,
-        len(deleted),
+        erasure.journeys_deleted,
         extra={
             "fields": {
                 "event": "varsel_delete_all",
                 "device_id": device_id,
-                "journeys_deleted": len(deleted),
+                "journeys_deleted": erasure.journeys_deleted,
             }
         },
     )
-    return {"status": "ok", "journeys_deleted": len(deleted)}
+    return {"status": "ok", "journeys_deleted": erasure.journeys_deleted}
 
 
 def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) -> Journey:
@@ -5457,8 +5337,7 @@ def list_journeys(
     make a blocking Journey Planner call, which must run in the anyio threadpool rather than on the
     single-worker event loop. The alternative lookup is additionally skipped on this request path —
     see :func:`match_journey`."""
-    with _state_lock:
-        mine = [(jid, rec) for jid, rec in _journeys.items() if rec["device_id"] == device_id]
+    mine = _registrations.device_journeys(device_id)
     # Score each distinct journey DEFINITION once, exactly as check_and_notify's loop 1 does. A
     # device at the 20-journey cap with overlapping registrations would otherwise run the full
     # matcher up to 20 times per page view, and the PWA polls this every 60 s.
@@ -5524,13 +5403,13 @@ def create_journey(body: JourneyIn) -> Journey:
     # life. The verdict never blocks the registration; it is carried as a warning (_service_warning).
     verdict = _service_verdict(from_stop, to_stop)
     with _state_lock:
-        mine = sum(1 for rec in _journeys.values() if rec["device_id"] == body.device_id)
+        mine = len(_registrations.device_journeys(body.device_id))
         if mine >= _MAX_JOURNEYS_PER_DEVICE:
             raise HTTPException(
                 status_code=409,
                 detail=f"Maks {_MAX_JOURNEYS_PER_DEVICE} reiser per enhet.",
             )
-        if len(_journeys) >= _MAX_JOURNEYS:
+        if _registrations.journey_count() >= _MAX_JOURNEYS:
             logger.warning(
                 "Global journey cap (%d) reached; refusing a new registration",
                 _MAX_JOURNEYS,
@@ -5560,7 +5439,7 @@ def create_journey(body: JourneyIn) -> Journey:
             if not verdict[0]:
                 rec["no_direct_service"] = True
                 rec["service_reverse_only"] = verdict[1]
-        _journeys[jid] = rec
+        _registrations.create_journey(jid, rec)
         _save_state()
     try:
         model = _journey_model(jid, rec)
@@ -5569,7 +5448,7 @@ def create_journey(body: JourneyIn) -> Journey:
         # burn one of the 20 per-device slots on every retry while the UI shows nothing (review
         # 2026-07-29). Roll it back and let the client retry cleanly.
         with _state_lock:
-            _journeys.pop(jid, None)
+            _registrations.delete_journey(jid)
             _save_state()
         logger.exception("Could not render the new journey; rolled the registration back")
         raise HTTPException(
@@ -5615,16 +5494,15 @@ def delete_journey(
     Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
     """
     with _state_lock:
-        rec = _journeys.get(journey_id)
+        # Ownership is checked HERE and the removal is the seam's: whose journey it is is this
+        # API's rule, while dropping the owner's tombstone with the last of its journeys is a
+        # property of how registrations are stored. By ID rather than by listing the device's
+        # journeys and looking for this one: that reads the same answer out of a query where a
+        # document read will do, and the store backend is where that difference is a bill.
+        rec = _registrations.get_journey(journey_id)
         if rec is None or rec["device_id"] != device_id:
             raise HTTPException(status_code=404, detail="Reise ikke funnet.")
-        del _journeys[journey_id]
-        # A tombstone explains journeys a vanished record left behind; with the last of them gone
-        # there is nothing left to explain, and keeping it would accumulate ids forever.
-        if device_id in _device_tombstones and not any(
-            j["device_id"] == device_id for j in _journeys.values()
-        ):
-            del _device_tombstones[device_id]
+        _registrations.delete_journey(journey_id)
         _save_state()
     return {"status": "ok"}
 
