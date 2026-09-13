@@ -1,62 +1,130 @@
-"""Render the Avviksvarsel device report from the varsel state blob and open it in a browser.
+"""Render the Avviksvarsel device report from the notification STORE and open it in a browser.
 
-Downloads gs://<bucket>/varsel_state.json with `gcloud storage cp` (so an active gcloud login is
-needed), renders one HTML page — every device with its signup time and the journeys it watches,
-newest signup first — and opens it.
+Reads Firestore directly -- every `web_push` registration of the reserved `browser` client and
+every device document -- and renders one HTML page: each device with its signup time, the journeys
+it watches, and how close each registration is to the inactivity horizon. Needs an active gcloud
+login whose ADC can read the environment's `notifications` database.
 
-Under VARSEL_STATE_BACKEND=store (dev since 2026-09-13) the registrations live in Firestore and
-this blob is written by the poller's `varsel_state_export` phase, at most six-hourly — so the
-report is up to six hours stale there, and it stops working entirely if that phase is ever turned
-off as the rollback window closes. One thing it cannot show under either backend: `last_seen_at`,
-and therefore how close a registration is to the 180-day inactivity horizon. The exported journey
-record has no such field and the blob backend has no concept of one, so answering that means
-reading the store — the move to make when prd cuts over and this stops being two code paths.
+**It read the exported GCS blob until 2026-09-13 and moving it was a correctness fix, not a
+freshness one.** Two things the blob cannot answer, and the second is why this could not wait:
+
+1. `last_seen_at`, and therefore how close a registration is to the 180-day inactivity horizon
+   (`WEB_PUSH_INACTIVITY_DAYS`). The exported journey record carries no such field and the blob
+   backend has no concept of one, so under either backend the blob simply cannot say.
+2. **Why a device stopped being pushable.** The blob has no shape for "a device with journeys and
+   no push subscription" other than a tombstone, so `varsel_state.export_store_to_blob` writes one
+   for every non-pushable device -- defaulting the reason to `expired` and the timestamp to the
+   export instant when the store holds no tombstone at all. Measured on prd's first export
+   (2026-09-13): `device_tombstones` went 1 -> 71, so 70 devices that had *never turned
+   notifications on* were rendered here as "Expired" at the export's own clock, and the one real
+   tombstone lost its original `ts`. That is precisely the «expired» vs «never turned on» split
+   this report exists to measure -- the split that decided where the inactivity anchor is renewed
+   -- so the artefact was not merely stale for this reader, it was wrong. The store holds the
+   truth: a device with no tombstone has no tombstone.
 
     python3 scripts/make_device_report.py              # prd (the default)
     python3 scripts/make_device_report.py --env dev
-    python3 scripts/make_device_report.py --no-download  # re-render an already downloaded blob
 """
 import argparse
 import html
-import json
-import subprocess
+import os
+import pathlib
 import sys
 import webbrowser
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+# Same convention as scripts/manage_notification_client.py: disruptions/api is a flat import root
+# rather than a package, so putting it on sys.path is what makes `import notification_store`
+# resolve the way it does inside the app.
+_API = pathlib.Path(__file__).resolve().parents[1] / "disruptions" / "api"
+if str(_API) not in sys.path:
+    sys.path.insert(0, str(_API))
+
+import notification_store
+import varsel_state
+
 OSLO = ZoneInfo("Europe/Oslo")
 DAY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-# The VARSEL_STATE_BUCKET of each environment (helm/kix-avvik/env/values-kub-ent-*.yaml).
-BUCKETS = {"prd": "ent-kixavvik-prd-varsel-state", "dev": "ent-kixavvik-dev-varsel-state-gke"}
+# Each environment is its own project with its own runtime identity, which is what keeps a dev
+# credential from naming prd's data: the Firestore client takes its project from the ambient
+# environment and never from an argument.
+PROJECTS = {"prd": "ent-kixavvik-prd", "dev": "ent-kixavvik-dev"}
+DATABASE = os.environ.get("NOTIFICATION_FIRESTORE_DATABASE") or "notifications"
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-parser.add_argument("--env", choices=sorted(BUCKETS), default="prd", help="Environment to read (default: prd).")
-parser.add_argument("--state", type=Path, help="Where to store the downloaded blob (default: /tmp/varsel_state_<env>.json).")
+parser.add_argument("--env", choices=sorted(PROJECTS), default="prd", help="Environment to read (default: prd).")
 parser.add_argument("--out", type=Path, help="HTML file to write (default: /tmp/avviksvarsel_device_report_<env>.html).")
-parser.add_argument("--no-download", action="store_true", help="Skip the download and render the existing --state file.")
 parser.add_argument("--no-open", action="store_true", help="Do not open the report in a browser.")
 args = parser.parse_args()
 
 env = args.env
-blob_uri = f"gs://{BUCKETS[env]}/varsel_state.json"
-state_path = args.state or Path(f"/tmp/varsel_state_{env}.json")
+project = PROJECTS[env]
 out_path = args.out or Path(f"/tmp/avviksvarsel_device_report_{env}.html")
+source = f"{project}/{DATABASE}"
 
-if not args.no_download:
-    print(f"Downloading {blob_uri} -> {state_path}", file=sys.stderr)
-    subprocess.run(["gcloud", "storage", "cp", blob_uri, str(state_path)], check=True)
-elif not state_path.exists():
-    sys.exit(f"{state_path} does not exist; run without --no-download first")
+# Set BEFORE the client is built, for `manage_notification_client.py`'s reason: an exported
+# GOOGLE_CLOUD_PROJECT naming another environment would otherwise decide which data this reads.
+existing_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+if existing_project and existing_project != project:
+    print(
+        f"GOOGLE_CLOUD_PROJECT is {existing_project} but --env {env} means {project}; using {project}",
+        file=sys.stderr,
+    )
+os.environ["GOOGLE_CLOUD_PROJECT"] = project
+notification_store.configure(database=DATABASE)
 
-state = json.loads(state_path.read_text())
-devices, journeys = state["devices"], state["journeys"]
-# Why a device record went away while its journeys stayed (varsel._device_tombstones, written since
-# 2026-09-04): device_id -> {reason: "expired" | "turned_off", ts, created_ts, journeys}. A journey
-# whose device has neither a record nor a tombstone was registered by a device that never turned
-# notifications on — or lost its record before the tombstones existed.
-tombstones = state.get("device_tombstones", {})
+print(f"Reading {source}", file=sys.stderr)
+_now = datetime.now(UTC)
+_client = varsel_state.BROWSER_CLIENT_ID
+_subs = notification_store.all_web_push_subscriptions(client_id=_client, now=_now)
+_devices = notification_store.all_devices(client_id=_client)
+
+# Rebuilt into the blob's own shapes so the rendering below is unchanged -- the report's question
+# has not moved, only where the answer comes from. `_iso` keeps the renderer's `ts()` working.
+def _iso(dt):
+    return dt.astimezone(UTC).isoformat() if dt else ""
+
+
+journeys = {
+    sub.subscription_id: {
+        "device_id": sub.device_id,
+        "from_stop": sub.from_stop,
+        "to_stop": sub.to_stop,
+        "from_name": sub.from_name,
+        "to_name": sub.to_name,
+        "begin": sub.begin,
+        "end": sub.end,
+        "days": list(sub.days),
+        "created_ts": _iso(sub.created_at),
+        # The two the blob could never carry.
+        "last_seen_ts": _iso(sub.last_seen_at),
+        "inactivity_expires_ts": _iso(sub.inactivity_expires_at),
+    }
+    for sub in _subs
+}
+# A device is "active" here when it can actually be pushed to, which is what `pushable` means and
+# what the blob's `devices` map used to hold. A non-pushable one falls through to the orphan
+# section exactly as a missing blob record did.
+devices = {
+    device_id: {"created_ts": _iso(device.created_at), "brand": device.brand}
+    for device_id, device in _devices.items()
+    if device.pushable
+}
+# ONLY where the store actually holds one. The export fabricates `expired`/now for every
+# non-pushable device; here an absent tombstone stays absent and renders as "never turned on",
+# which is the distinction this report is read for.
+tombstones = {
+    device_id: {
+        "reason": str(device.tombstone.get("reason") or "expired"),
+        "ts": _iso(device.tombstone.get("at")) or _iso(device.updated_at),
+        "created_ts": _iso(device.tombstone.get("original_created_at")) or _iso(device.created_at),
+        "journeys": sum(1 for j in journeys.values() if j["device_id"] == device_id),
+    }
+    for device_id, device in _devices.items()
+    if not device.pushable and device.tombstone
+}
 REASONS = {
     "turned_off": ("notifications turned off", "Turned off"),
     "expired": ("subscription expired", "Expired"),
@@ -122,6 +190,26 @@ n_orphan_j = sum(len(v) for v in orphans.values())
 e = html.escape
 
 
+def horizon_cell(j):
+    """How close this registration is to the 180-day inactivity horizon.
+
+    The column the move to the store exists for: `last_seen_at` has no representation in the blob
+    at all. The anchor is refreshed at most once per `WEB_PUSH_RENEW_AFTER_DAYS` (7) from the
+    JOURNEY LIST -- opening the app -- so a push arriving renews nothing, and "days left" is
+    therefore 173-180 for anyone who has opened it recently rather than a flat 180.
+    """
+    expires = j.get("inactivity_expires_ts")
+    if not expires:
+        # Absent rather than written far ahead: a horizon field that lies about its meaning is
+        # worse than a missing one, and `subscription_is_live` reads the absence as expired.
+        return '<td class="horizon"><span class="warn">no horizon</span></td>'
+    left = (ts(expires) - snapshot).days
+    seen = j.get("last_seen_ts")
+    title = f"last seen {fmt(ts(seen))}" if seen else "never seen since the cutover"
+    cls = "danger" if left <= 30 else ("warn" if left <= 60 else "ok")
+    return f'<td class="horizon" title="{e(title)}"><span class="{cls}">{left}d</span></td>'
+
+
 def journey_table(js):
     if not js:
         return '<p class="empty">No journeys registered on this device.</p>'
@@ -129,11 +217,14 @@ def journey_table(js):
         f'<tr><td class="route"><span>{e(name(j,"from"))}</span><span class="arrow" aria-hidden="true">→</span><span>{e(name(j,"to"))}</span></td>'
         f'<td class="days">{e(fmt_days(j["days"]))}</td>'
         f'<td class="win"><span class="mono">{e(j["begin"])}–{e(j["end"])}</span></td>'
-        f'<td class="reg"><span class="mono">{fmt(ts(j["created_ts"]))}</span></td></tr>'
+        f'<td class="reg"><span class="mono">{fmt(ts(j["created_ts"]))}</span></td>'
+        f'{horizon_cell(j)}</tr>'
         for j in js
     )
     return (
-        '<div class="tablewrap"><table><thead><tr><th>Journey</th><th>Days</th><th>Window</th><th>Registered</th></tr></thead>'
+        '<div class="tablewrap"><table><thead><tr><th>Journey</th><th>Days</th><th>Window</th>'
+        '<th>Registered</th><th title="Days until the 180-day inactivity horizon deletes it">'
+        'Expires in</th></tr></thead>'
         f"<tbody>{rows}</tbody></table></div>"
     )
 
@@ -231,6 +322,10 @@ h1 {{ margin:0; font-size:30px; line-height:1.15; font-weight:600; letter-spacin
 .summary > div {{ background:var(--surface); padding:16px 18px; display:flex; flex-direction:column; gap:2px; }}
 .summary .n {{ font-size:28px; font-weight:600; letter-spacing:-.02em; line-height:1.1; }}
 .summary .l {{ font-size:13px; color:var(--muted); }}
+.horizon {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; }}
+.horizon .ok {{ color:var(--muted); }}
+.horizon .warn {{ color:#8A5A00; font-weight:500; }}
+.horizon .danger {{ color:#9B1C1C; font-weight:600; }}
 h2 {{ margin:0; font-size:20px; font-weight:600; letter-spacing:-.01em; }}
 .section {{ display:flex; flex-direction:column; gap:14px; }}
 .section > p {{ margin:0; color:var(--muted); max-width:70ch; }}
@@ -271,7 +366,7 @@ td.reg {{ color:var(--muted); }}
   <div class="masthead">
     <div class="eyebrow">Avviksvarsel · {e(env)}</div>
     <h1>Registered devices and their journeys</h1>
-    <p class="lede">Read from <span class="mono">{e(blob_uri)}</span> on
+    <p class="lede">Read from <span class="mono">{e(source)}</span> on
     <span class="mono">{fmt(snapshot)}</span>. All times are Europe/Oslo. Devices are listed newest signup first;
     a device's signup is when it first registered its push subscription.</p>
   </div>
@@ -296,7 +391,9 @@ td.reg {{ color:var(--muted); }}
     journey never required notifications to be on, and most of these were registered by devices that never turned
     them on — typically an iPhone that opened the link in Safari without installing the app. Of the
     {len(orphans)} devices: {reason_summary()}. Since 2026-09-04 the server records why a record went away, and the
-    app warns on the journey list until notifications are on. The journeys are kept on purpose: the page still shows
+    app warns on the journey list until notifications are on. This split is read from the STORE, where a device that
+    never turned notifications on simply has no tombstone; the exported blob has no shape for that state and writes
+    every non-pushable device as «expired» at the export's own clock, which is why this report stopped reading it. The journeys are kept on purpose: the page still shows
     live disruptions for them whenever the app is opened, and they reattach the moment notifications are turned on.
     Where the reason is recorded the device's original signup is shown; otherwise the earliest journey registration.</p>
     <div class="devices">

@@ -414,9 +414,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   would need their artwork and permission to serve it, and that token overrides carry colour and
   logo but not design language.
   **A journey never needed notifications to be on, and the page now says so** (2026-09-04). The
-  device report (`scripts/make_device_report.py`, which downloads the prd state blob and renders
-  every device with its signup and journeys) found 79 of prd's 186 registered journeys on 41
-  device ids with no push subscription — and the logs over the days most of them registered showed
+  device report (`scripts/make_device_report.py`, which renders every device with its signup and
+  journeys — from the prd state blob then, from the STORE since 2026-09-13, because the blob writes
+  every non-pushable device as an «expired» tombstone stamped at the export instant and so destroys
+  the very split measured here; it also shows `last_seen_at` and the days left on each
+  registration's inactivity horizon, which the blob cannot carry) found 79 of prd's 186 registered
+  journeys on 41 device ids with no push subscription — and the logs over the days most of them registered showed
   **zero** expired subscriptions and no relevant «Skru av», so they are overwhelmingly devices that
   registered a journey and never turned notifications on (an iPhone opening the link in Safari
   without installing is the likely bulk). Such a journey is not dead: `list_journeys` runs the

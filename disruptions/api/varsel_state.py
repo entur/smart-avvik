@@ -1618,15 +1618,17 @@ def export_store_to_blob(
     store, so they are written LIVE from `all_rounds()`; carrying the old object's copy through
     would fossilise the day of the cutover.
 
-    **This artefact has a SECOND reader, and it is not a rollback.**
-    `scripts/make_device_report.py` renders every device and its journeys straight out of the blob,
-    which is how the 79-of-186 "registered a journey and never turned notifications on" split was
-    measured. It is worth knowing before anybody decides the rollback window has passed and turns
-    this phase off: the report would stop working, in an environment where nothing else reads the
-    blob at all. The report's own successor question -- which registrations are approaching the
-    inactivity horizon -- cannot be answered from here in any case, since `_journey_record` carries
-    no `last_seen_at` and the blob backend has no concept of one; that is the day it reads the
-    store instead.
+    **This artefact had a second reader until 2026-09-13 and no longer does.**
+    `scripts/make_device_report.py` read it, which is how the 79-of-186 "registered a journey and
+    never turned notifications on" split was measured; it reads the store directly now, so the
+    blob is once again ONLY a rollback artefact and turning this phase off costs nothing but the
+    rollback window. What moved it was not freshness but the tombstone mapping a dozen lines below:
+    the blob has no shape for "a device with journeys and no push subscription" other than a
+    tombstone, so every non-pushable device is written as one -- `expired`, stamped at the export
+    instant, when the store holds no tombstone at all. On prd's first export that turned 70 devices
+    that had NEVER TURNED NOTIFICATIONS ON into "expired" at this function's own clock, and cost
+    the one real tombstone its original `ts`. Harmless for a rollback, which only asks whether a
+    device is pushable; wrong for the one reader that asked WHY.
 
     A device with no live journeys IS exported, which is why the device read is a paged scan rather
     than a multi-get over the ids the journeys name: that record is a push endpoint, a brand and

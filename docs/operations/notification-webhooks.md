@@ -876,17 +876,20 @@ contract document says so in its own words; this is the operating half of the sa
    exception and are written LIVE rather than carried: they have a home of their own in the store
    now, so copying the old object's would fossilise the day of the cutover.
 
-   **Do not turn this phase off when the rollback window passes without checking the artefact's
-   other reader.** `scripts/make_device_report.py` renders every device and its journeys straight
-   out of the blob — it is how the "79 of 186 journeys sit on devices that never turned
-   notifications on" split was measured, which is what decided where the inactivity horizon is
-   renewed. Under the store backend this export is the only thing keeping that input current, and
-   nothing else in the deployment reads the blob at all, so switching the phase off retires the
-   report silently. Moving the report onto the store is the answer, and prd's cutover is the
-   natural moment: it is one code path rather than two only once both environments are on the
-   store, and the report's own successor question — which registrations are approaching the
-   180-day inactivity horizon — cannot be answered from the blob in any case, since the exported
-   journey record carries no `last_seen_at` and the blob backend has no concept of one.
+   **The artefact's second reader is gone as of 2026-09-13, so this phase is once again ONLY a
+   rollback artefact** and turning it off when the window passes costs nothing else.
+   `scripts/make_device_report.py` read the blob until then; it reads the store directly now
+   (`all_web_push_subscriptions` + `all_devices` on the reserved `browser` client), and what moved
+   it was correctness rather than freshness. The blob has no shape for "a device with journeys and
+   no push subscription" other than a tombstone, so the export writes one for every non-pushable
+   device, defaulting the reason to `expired` and the timestamp to its own instant when the store
+   holds no tombstone. On prd's first export `device_tombstones` went 1 → 71: seventy devices that
+   had never turned notifications on were rendered as «Expired» at the export's clock, and the one
+   real tombstone lost its original `ts`. That is exactly the split the report exists to measure —
+   the one that decided where the inactivity anchor is renewed — so the artefact was not stale for
+   that reader but wrong. It is harmless for a ROLLBACK, which only asks whether a device is
+   pushable. The report also now shows what the blob could never carry at all: `last_seen_at` and
+   the days left on each registration's 180-day inactivity horizon.
 
    **What to watch after the cutover.** `varsel_state_import` on startup — `result` is `imported`
    once and `skipped` at every restart after it, and a second `imported` in the same environment
