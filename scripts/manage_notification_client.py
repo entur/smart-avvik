@@ -396,16 +396,49 @@ def _quotas_from_args(args: argparse.Namespace) -> dict[str, int]:
     }
 
 
-def _cmd_create_client(args: argparse.Namespace, actor: str) -> Any:
-    if args.client_id == varsel_state.BROWSER_CLIENT_ID:
+def _reserved_id_refusal(command: str, client_id: str | None) -> str | None:
+    """Why this invocation is refused whatever the environment holds, or None. ONE statement each.
+
+    The reserved `browser` id is the only policy refusal this tool has, and it is refused by two
+    commands for two different reasons -- so the messages live here rather than at the `raise`, and
+    `main` consults the same function the commands do.
+
+    **What that ordering buys is not tidiness.** `main` runs two environment PRE-CHECKS that exist
+    to replace a deep failure with a one-line hint, and both hints say "export this environment's
+    value from Secret Manager for this one command". Run before the policy refusal, the pepper hint
+    answered `issue-key --client-id browser` with an instruction to fetch NOTIFICATION_KEY_PEPPER
+    onto the operator's machine -- for prd that is the live pepper, the exposure the module
+    docstring names -- to discover a refusal that never needed it. A command that is going to be
+    refused on policy needs no secret exported to say so.
+    """
+    if client_id != varsel_state.BROWSER_CLIENT_ID:
+        return None
+    if command == "create-client":
         # RESERVED for `/varsel`'s own registrations (U13). Not one more onboarded integration: the
         # traveller behind those documents is a member of the public, so nothing may issue a
         # credential for this id and nothing may aim a webhook destination at it. The account
         # itself is created by the cutover runbook, which sets the two ceilings and no credential.
-        raise SystemExit(
+        return (
             f"{varsel_state.BROWSER_CLIENT_ID!r} is reserved for /varsel's own registrations; "
             "use `set-quotas` on it rather than creating it as a client"
         )
+    if command == "issue-key":
+        # The operations document has claimed since U13 that nothing may issue a credential for
+        # this id, and until U14 nothing enforced it. What a credential for `browser` would be is
+        # an API token that reads and rewrites every traveller's registration through the client
+        # API -- the one account on the system whose subscriptions belong to members of the public.
+        return (
+            f"{varsel_state.BROWSER_CLIENT_ID!r} is reserved for /varsel's own registrations and "
+            "no credential may be issued for it; its documents belong to travellers, not to a "
+            "client"
+        )
+    return None
+
+
+def _cmd_create_client(args: argparse.Namespace, actor: str) -> Any:
+    refusal = _reserved_id_refusal("create-client", args.client_id)
+    if refusal:
+        raise SystemExit(refusal)
     given = _quotas_from_args(args)
     quotas = notification_auth.Quotas(**given) if given else None
     return notification_auth.create_client(
@@ -469,16 +502,9 @@ def _cmd_show_client(args: argparse.Namespace, actor: str) -> Any:
 
 
 def _cmd_issue_key(args: argparse.Namespace, actor: str) -> Any:
-    if args.client_id == varsel_state.BROWSER_CLIENT_ID:
-        # The operations document has claimed since U13 that nothing may issue a credential for
-        # this id, and until U14 nothing enforced it. What a credential for `browser` would be is
-        # an API token that reads and rewrites every traveller's registration through the client
-        # API -- the one account on the system whose subscriptions belong to members of the public.
-        raise SystemExit(
-            f"{varsel_state.BROWSER_CLIENT_ID!r} is reserved for /varsel's own registrations and "
-            "no credential may be issued for it; its documents belong to travellers, not to a "
-            "client"
-        )
+    refusal = _reserved_id_refusal("issue-key", args.client_id)
+    if refusal:
+        raise SystemExit(refusal)
     credential, bearer = notification_auth.issue_credential(
         args.client_id, actor=actor, label=args.label or ""
     )
@@ -815,6 +841,13 @@ def main(
             database=args.database or os.environ.get(DATABASE_ENV) or DEFAULT_DATABASE
         )
         notification_auth.configure()
+    # A POLICY refusal outranks both environment pre-checks below, because those two tell an
+    # operator to export a production secret for the command they just typed -- and this one is
+    # going to be refused whatever they export. See `_reserved_id_refusal`.
+    refusal = _reserved_id_refusal(args.command, getattr(args, "client_id", None))
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 2
     # The one subcommand that needs the pepper, checked BEFORE the group so the message an operator
     # gets is about the variable rather than about a Helm secret group they are not looking at.
     # Every other command works without it: the pepper hashes a new secret and verifies an existing
