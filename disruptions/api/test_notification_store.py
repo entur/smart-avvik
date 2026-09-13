@@ -175,6 +175,12 @@ class _Ref:
             transaction.ops.append(("read", self.path))
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
 
+    def set(self, data: dict[str, Any]) -> None:
+        """A write OUTSIDE a transaction, which exactly one caller makes: the migration marker,
+        whose single writer is a startup step under Recreate."""
+        self.client.docs[self.path] = dict(data)
+        self.client.direct_sets.append(self.path)
+
 
 class _Collection:
     def __init__(self, client: Any, name: str) -> None:
@@ -278,6 +284,9 @@ class _FakeClient:
         #: that there is one of them, so the count of calls is the assertion, not the contents.
         self.get_all_calls: list[list[str]] = []
         self.transactions: list[_Txn] = []
+        #: Paths written by `_Ref.set`, i.e. outside a transaction. Recorded rather than ignored so
+        #: a body that started writing this way is visible.
+        self.direct_sets: list[str] = []
         self.batch_deletes: list[str] = []
         self.fail_with: BaseException | None = None
         # The STORE's clock, which a server stamp resolves against. Deliberately ahead of `NOW` by
@@ -1845,8 +1854,24 @@ def test_every_index_entry_has_the_fields_the_for_each_reads():
 
 def test_every_collection_group_has_exactly_one_ttl_field():
     ttl_block = FIRESTORE_TF.split("firestore_ttl_collections = [", 1)[1].split("]", 1)[0]
+    # COMMENTS STRIPPED, because the block explains itself: the reason `migrations` is absent is
+    # written inside the list, and a naive substring search reads that prose as an entry -- which
+    # is the shape of vacuous check this repo has been bitten by before, in both directions (a
+    # collection named only in a comment would also read as covered).
+    ttl_block = "\n".join(
+        line for line in ttl_block.splitlines() if not line.strip().startswith("#")
+    )
     for collection in notification_store.COLLECTIONS:
         assert f'"{collection}"' in ttl_block, f"{collection} has no TTL field in Terraform"
+    # And the one collection that must NOT have one, pinned because the obvious edit is to add it
+    # for symmetry. A migration marker is the record that a one-shot has already run; U14's cutover
+    # import creates by document id and never deletes, so an expired marker re-runs it at the next
+    # restart -- dev restarts on every push -- and resurrects every registration a traveller erased
+    # since. The collection holds one document per migration and no personal data at all.
+    assert f'"{notification_store.MIGRATIONS}"' not in ttl_block, (
+        "the migrations collection must have NO TTL field: an expired one-shot marker re-runs the "
+        "migration it guards"
+    )
     assert notification_store.TTL_FIELD == "expires_at"
     assert f'field      = "{notification_store.TTL_FIELD}"' in FIRESTORE_TF
     assert FIRESTORE_TF_CODE.count("ttl_config {}") == 1  # one resource, for_each over four groups
@@ -3686,6 +3711,30 @@ def _emulator_setup() -> Any:
     notification_store.reset_for_tests()
     notification_store.configure(client=client, clock=lambda: NOW)
     return client
+
+
+def emulator_test_a_migration_marker_round_trips_and_is_absent_until_it_is_written():
+    """U14's one-shot marker against the real client, because it is the one write here that is not
+    a transaction.
+
+    `write_migration` is a plain `set` -- there is one writer, a startup step under Recreate, and
+    what the document has to survive is a restart rather than a concurrent writer. The hermetic
+    fake grew a `set` on its document ref to serve it, so this is the check that the real client
+    agrees; and `read_migration` answering None for a collection that does not exist yet is what
+    the very first cutover depends on.
+    """
+    client = _emulator_setup()
+    assert notification_store.read_migration("varsel_blob_to_store") is None
+    notification_store.write_migration(
+        "varsel_blob_to_store", {"result": "imported", "journeys": 3}, now=NOW
+    )
+    marker = notification_store.read_migration("varsel_blob_to_store")
+    assert marker is not None
+    assert marker["result"] == "imported" and marker["journeys"] == 3
+    assert marker["name"] == "varsel_blob_to_store" and marker["recorded_at"] == NOW
+    # No TTL field on it, ever: an expired marker re-runs the import it guards.
+    assert notification_store.TTL_FIELD not in marker
+    assert client is not None
 
 
 def emulator_test_a_renewal_moves_the_browser_horizon_through_the_real_client():

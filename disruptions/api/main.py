@@ -1675,7 +1675,7 @@ def _registration_store() -> varsel_state.RegistrationStore:
             }
         },
     )
-    return varsel_state.StoreRegistrations(
+    store = varsel_state.StoreRegistrations(
         client_id=varsel_state.BROWSER_CLIENT_ID,
         quotas=lambda: (
             notification_auth.quotas_for(varsel_state.BROWSER_CLIENT_ID).max_devices,
@@ -1683,6 +1683,34 @@ def _registration_store() -> varsel_state.RegistrationStore:
                 varsel_state.BROWSER_CLIENT_ID
             ).max_active_subscriptions,
         ),
+    )
+    _import_varsel_state(store)
+    return store
+
+
+def _import_varsel_state(store: varsel_state.StoreRegistrations) -> None:
+    """Run U14's cutover import, here in the lifespan and before the port binds (R15).
+
+    Before the port binds, so `/varsel` never answers a request against a half-imported store --
+    a traveller whose journey list came back empty would delete nothing and register again, and
+    the store would then hold both. Under the Recreate strategy the blob's writer has already
+    stopped, so what the import reads cannot move underneath it.
+
+    The LOG LINE is here rather than in the import, and that is `varsel_state`'s own rule: the seam
+    emits no structured event, so which vocabulary a reader greps for stays a property of the
+    caller whichever backend answered. A failure is re-raised: it fails the lifespan, which fails
+    the readiness probe, which rolls the release back to the binary still reading the blob -- which
+    is intact, because the import creates and never deletes.
+    """
+    report = varsel_state.import_blob_into_store(store)
+    logger.info(
+        "varsel state import: %s (%d devices, %d journeys, %d marks in %.1fs)",
+        report.result,
+        report.devices + report.devices_synthesised,
+        report.journeys,
+        report.marks,
+        report.seconds,
+        extra={"fields": {"event": "varsel_state_import", **report.as_fields()}},
     )
 
 

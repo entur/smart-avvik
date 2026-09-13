@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -349,6 +350,22 @@ def load_state() -> None:
             )
     except Exception:
         logger.exception("Could not load varsel state; starting empty")
+
+
+def read_blob_text() -> str | None:
+    """The persisted state exactly as stored, or None when there is none — STRICT about the
+    difference between "no blob" and "could not read one".
+
+    :func:`load_state` is tolerant on purpose: it swallows everything and starts empty, because
+    serving without state beats not serving at all. That is exactly the wrong rule for the cutover
+    import, which writes a one-shot marker afterwards — reading a transient GCS failure as "there
+    was nothing to import" would mark the migration complete over a blob full of registrations
+    nobody ever read. So this one raises, and the caller fails the lifespan.
+    """
+    blob = _gcs_blob()
+    if blob is not None:
+        return blob.download_as_text() if blob.exists() else None
+    return _STATE_PATH.read_text() if _STATE_PATH.exists() else None
 
 
 def save_state() -> bool:
@@ -941,7 +958,17 @@ class StoreRegistrations:
             consent_version=str(record.get("consent_text_version") or ""),
         )
         try:
-            notification_store.create_subscription(spec, max_active=self._quotas()[1])
+            notification_store.create_subscription(
+                spec,
+                max_active=self._quotas()[1],
+                # The record's own signup instant, which on the request path is this instant and on
+                # U14's cutover import is the day the traveller actually registered. Passed always
+                # rather than only by the import, so `created_ts` on the record and `created_at` on
+                # the document agree by construction instead of by happening to be written in the
+                # same millisecond -- `_journey_record` hands the document's value back out, so a
+                # divergence would be visible to the traveller as a re-ordered list.
+                created_at=_parse_ts(record.get("created_ts")),
+            )
         except notification_store.QuotaExceeded as exc:
             raise CapacityExceeded("journeys") from exc
         # The servability answer the create path already has, stamped as its own write rather than
@@ -1146,3 +1173,292 @@ class StoreRegistrations:
 
     def load(self) -> None:
         """Nothing to load: the mirror seeds on the poller thread, after the port binds."""
+
+
+# ---- The cutover import (U14) ------------------------------------------------------------------
+#: The one-shot marker's document id in `notification_store.MIGRATIONS`.
+IMPORT_MARKER = "varsel_blob_to_store"
+
+
+class ImportFailed(RuntimeError):
+    """The cutover import did not complete, or completed and its invariants did not hold.
+
+    Raised out of the lifespan so the port never binds: `helm --wait` then rolls the release back
+    to the binary that was still reading the blob, which is intact — the import creates and never
+    deletes, so a failed one leaves the rollback artefact untouched.
+    """
+
+
+@dataclass(frozen=True)
+class ImportReport:
+    """What one cutover import did, for the log line and for the operator.
+
+    Every field is a count somebody acts on. `stray_marks` is the one that is expected to be
+    non-zero and harmless: a push mark whose journey has since been deleted has nothing to attach
+    to, and the blob keeps such marks until `varsel`'s own sweep drops them.
+    """
+
+    #: `imported`, `skipped` (the marker was already there) or `empty` (there was no blob). The
+    #: caller logs it: this module emits no structured event, so which vocabulary a reader greps
+    #: for stays a property of the caller rather than of whichever backend answered.
+    result: str = "imported"
+    devices: int = 0
+    devices_synthesised: int = 0
+    tombstones: int = 0
+    journeys: int = 0
+    marks: int = 0
+    stray_marks: int = 0
+    seconds: float = 0.0
+    problems: tuple[str, ...] = ()
+
+    def as_fields(self) -> dict[str, Any]:
+        return {
+            "result": self.result,
+            "devices": self.devices,
+            "devices_synthesised": self.devices_synthesised,
+            "tombstones": self.tombstones,
+            "journeys": self.journeys,
+            "marks": self.marks,
+            "stray_marks": self.stray_marks,
+            "seconds": round(self.seconds, 3),
+            "problems": list(self.problems),
+        }
+
+
+def _parse_ts(raw: Any) -> datetime | None:
+    """One ISO timestamp out of the blob, or None. Never raises: a record with an unreadable
+    signup instant is still a registration, and the fallback is the import instant."""
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def import_blob_into_store(
+    store: StoreRegistrations, *, now: datetime | None = None
+) -> ImportReport:
+    """Move the GCS blob's registrations into the store, ONCE. U14's cutover (KTD13).
+
+    Runs as a startup step of the store-backed binary, inside `lifespan` and before the port binds,
+    so `/varsel` never serves a request against a half-imported store (R15). Under the Recreate
+    strategy the blob's writer has already stopped, so what it reads cannot move underneath it.
+
+    **One-shot behind a store marker, and that is not caution — it is the only thing standing
+    between this and a privacy defect.** The import creates by document id and never deletes, so a
+    second run against a store somebody has since erased themselves from would put every one of
+    their registrations back. It would not be rare: the import runs at startup, and dev restarts on
+    every push. So the marker is read FIRST — before the blob is opened at all — and written LAST,
+    only once the invariants below have held. Re-importing after a rollback is deliberately not
+    something a restart can do; it is an operator deleting that document on purpose.
+
+    **What it writes, and through what.** Every document goes through the same functions the
+    request path uses — `create_subscription`, `upsert_device`, `mark_notified`, `tombstone_device`
+    — rather than through hand-built documents. A second builder here would be a second definition
+    of what a registration IS, and it would drift the first time `_new_subscription_doc` gained a
+    field: the import would keep writing last quarter's shape, and the only symptom would be a
+    document that reads as slightly wrong months later. The cost is one transaction per document
+    instead of a batch: ~360 of them for prd's blob, ~20 s in-cluster, well inside the chart's
+    300 s startup probe beside the BigQuery loads. The duration is logged so a blob that grows
+    towards that bound is noticed before it reaches it.
+
+    **Two instants, two reasons.** `created_at` is the blob's own `created_ts` — the signup cohort
+    the device report groups on, and what `device_journeys` orders by, so restamping it would make
+    every registration look made on cutover day. `last_seen_at` is the import instant, because the
+    blob records no per-journey last-seen and there is nothing else to take; under U14's inactivity
+    horizon that is not a cliff but a fresh 180 days, and the only registration it ever expires is
+    one whose traveller does not open the app in the six months after the cutover.
+
+    **What it deliberately does not carry.** The togvarsel round markers: they are off the protocol
+    and ride in the blob half, which is the gap the operations document's cutover section names.
+    Importing them here would be inventing a home for them that nothing reads.
+    """
+    started = time.monotonic()
+    instant = now or _now()
+    marker = notification_store.read_migration(IMPORT_MARKER)
+    if marker:
+        return ImportReport(result="skipped", seconds=time.monotonic() - started)
+
+    raw = read_blob_text()
+    if raw is None:
+        # No blob at all is a legitimate first run of a fresh environment, and it is DONE rather
+        # than pending: marking it keeps a blob that appears later -- a restored backup, a rollback
+        # that wrote one -- from being imported by a pod restart nobody asked to migrate anything.
+        # A blob that could not be READ raises out of `read_blob_text` instead and never gets here.
+        notification_store.write_migration(
+            IMPORT_MARKER, {"result": "empty", "source": _blob_source()}, now=instant
+        )
+        return ImportReport(result="empty", seconds=time.monotonic() - started)
+
+    data = json.loads(raw)
+    devices: dict[str, Any] = dict(data.get("devices") or {})
+    journeys: dict[str, Any] = dict(data.get("journeys") or {})
+    tombstones: dict[str, Any] = dict(data.get("device_tombstones") or {})
+    marks = [str(mark) for mark in (data.get("notified") or [])]
+    max_devices, max_journeys = store._quotas()
+    client_id = store._client_id
+
+    written_devices = 0
+    for device_id, record in devices.items():
+        subscription = dict(record.get("subscription") or {})
+        keys = dict(subscription.get("keys") or {})
+        notification_store.upsert_device(
+            device_id=device_id,
+            client_id=client_id,
+            endpoint=str(subscription.get("endpoint") or ""),
+            p256dh=str(keys.get("p256dh") or ""),
+            auth=str(keys.get("auth") or ""),
+            brand=str(record.get("brand") or "entur"),
+            now=instant,
+            created_at=_parse_ts(record.get("created_ts")),
+            max_devices=max_devices,
+        )
+        written_devices += 1
+
+    # A journey whose device record is gone gets a device document with no push subscription. That
+    # is a state the product supports rather than a repair: 79 of prd's 186 journeys sat on such
+    # devices when the device report last counted, and the journey list works as a dashboard for
+    # them. Without the document the traveller's own «Slett alt» would have nothing to delete, and
+    # `device_journeys` would answer about a device that, as far as the store knows, never existed.
+    synthesised = 0
+    for journey_id, record in journeys.items():
+        device_id = str(record.get("device_id") or "")
+        if not device_id or device_id in devices:
+            continue
+        devices[device_id] = {}
+        notification_store.upsert_device(
+            device_id=device_id,
+            client_id=client_id,
+            endpoint="",
+            p256dh="",
+            auth="",
+            brand="entur",
+            now=instant,
+            created_at=_parse_ts((tombstones.get(device_id) or {}).get("created_ts"))
+            or _parse_ts(record.get("created_ts")),
+            max_devices=max_devices,
+        )
+        synthesised += 1
+
+    written_journeys = 0
+    for journey_id, record in journeys.items():
+        if written_journeys >= max_journeys:
+            raise ImportFailed(
+                f"the blob holds more journeys than the client's ceiling ({max_journeys})"
+            )
+        store.create_journey(journey_id, record)
+        written_journeys += 1
+
+    # After the devices exist, because a tombstone is a patch to a device document and there is no
+    # tombstone without one. The ORIGINAL instant is preserved where the blob recorded one: the
+    # device report renders it, and stamping the import over it would make every lapse look like it
+    # happened at the cutover.
+    written_tombstones = 0
+    for device_id, tombstone in tombstones.items():
+        if device_id not in devices:
+            continue
+        notification_store.tombstone_device(
+            device_id=device_id,
+            client_id=client_id,
+            reason=str(tombstone.get("reason") or "expired"),
+            now=_parse_ts(tombstone.get("ts")) or instant,
+        )
+        written_tombstones += 1
+
+    written_marks = 0
+    stray = 0
+    for mark in marks:
+        journey_id, _, situation = mark.partition("|")
+        if journey_id not in journeys:
+            # A mark whose journey is gone has nothing to attach to. Counted rather than dropped
+            # silently: it is the one number here that is legitimately non-zero, and a reader who
+            # does not know that would read it as data loss.
+            stray += 1
+            continue
+        store.mark_notified(journey_id, situation)
+        written_marks += 1
+
+    problems = _import_problems(store, devices=devices, journeys=journeys, marks=marks)
+    report = ImportReport(
+        devices=written_devices,
+        devices_synthesised=synthesised,
+        tombstones=written_tombstones,
+        journeys=written_journeys,
+        marks=written_marks,
+        stray_marks=stray,
+        seconds=time.monotonic() - started,
+        problems=tuple(problems),
+    )
+    if problems:
+        # The marker is NOT written, so the next start tries again -- which is right: nothing has
+        # been deleted, every create is idempotent on (id, definition), and the alternative is a
+        # half-imported store that no restart will ever finish.
+        raise ImportFailed("; ".join(problems))
+    notification_store.write_migration(
+        IMPORT_MARKER,
+        {"result": "imported", "source": _blob_source(), **report.as_fields()},
+        now=instant,
+    )
+    return report
+
+
+def _blob_source() -> str:
+    """Where the import read from, for the marker document. Not a credential and not personal
+    data — a bucket name and an object name, which is what a later operator needs to know which
+    artefact this store was built from."""
+    return f"gs://{_STATE_BUCKET}/{_STATE_BLOB}" if _STATE_BUCKET else str(_STATE_PATH)
+
+
+def _import_problems(
+    store: StoreRegistrations,
+    *,
+    devices: Mapping[str, Any],
+    journeys: Mapping[str, Any],
+    marks: Iterable[str],
+) -> list[str]:
+    """KTD13's invariants, read back OUT of the store rather than counted on the way in.
+
+    Counting what the import wrote would check the loop against itself: every invariant here is
+    about what a later reader will find, so every one is answered by the same read the request path
+    makes. `device_journeys` is that read, and it carries four of the invariants at once — the
+    query filters `client_id` and `channel`, and `subscription_is_live` filters `status` and the
+    horizons, so a journey that comes back has all four and a journey that is missing one does not
+    come back at all.
+    """
+    problems: list[str] = []
+    expected: dict[str, set[str]] = {}
+    for journey_id, record in journeys.items():
+        expected.setdefault(str(record.get("device_id") or ""), set()).add(journey_id)
+    found: dict[str, set[str]] = {}
+    for device_id in devices:
+        found[device_id] = {jid for jid, _rec in store.device_journeys(device_id)}
+    for device_id, wanted in expected.items():
+        got = found.get(device_id, set())
+        if got != wanted:
+            missing = sorted(wanted - got)
+            problems.append(
+                f"device {device_id} should hold {len(wanted)} journeys and the store returns "
+                f"{len(got)}; missing {len(missing)}"
+            )
+    total = sum(len(ids) for ids in found.values())
+    if total != len(journeys):
+        problems.append(f"the blob holds {len(journeys)} journeys and the store returns {total}")
+
+    wanted_marks = {mark for mark in marks if str(mark).partition("|")[0] in journeys}
+    stored_marks: set[str] = set()
+    for device_id in devices:
+        for subscription in notification_store.device_journeys(
+            device_id=device_id, client_id=store._client_id
+        ):
+            stored_marks.update(
+                f"{subscription.subscription_id}|{situation}"
+                for situation in subscription.notified
+            )
+    if stored_marks != wanted_marks:
+        problems.append(
+            f"the blob holds {len(wanted_marks)} live marks and the store returns "
+            f"{len(stored_marks)}"
+        )
+    return problems
