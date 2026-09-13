@@ -24,6 +24,17 @@ if ! command -v helm >/dev/null 2>&1; then
 fi
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# The common chart is FETCHED, not committed -- `.gitignore` excludes `helm/**/charts/` and
+# `Chart.lock` is what is versioned -- so a fresh checkout has no dependency to template against and
+# `helm template` fails with "found in Chart.yaml, but missing in charts/ directory". `build` and
+# not `update`: build resolves exactly what Chart.lock pins, so CI renders the same chart version
+# the deploy will, while `update` would silently re-resolve and could template a version nobody
+# chose. Skipped where the archive is already there, which is the local case.
+if ! ls "$CHART"/charts/common-*.tgz >/dev/null 2>&1; then
+  helm dependency build "$CHART" >/dev/null 2>&1 \
+    || fail "could not fetch the common chart pinned in $CHART/Chart.lock"
+fi
 checks=0
 check() { checks=$((checks + 1)); }
 
