@@ -933,7 +933,22 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `check_and_notify` has returned (KTD6), so a cycle's mints cannot reach the rows it already wrote —
   `varsel.record_minted_decisions` copies the thinning ledger's own row with `pushed` flipped rather
   than rebuilding one, and skips a subject the browser already pushed this cycle so the view's "first
-  pushed row" wording pick stays decidable. The groups view AGGREGATES `channel` onto the subject and
+  pushed row" wording pick stays decidable. **What the copy cannot carry is the five wording columns,
+  and they are restated** — on a thinned cycle the ledger's row came through `decisions.rescored`,
+  which refreshes the prediction figures but carries `message_input`, `message_deterministic` and
+  `message_status` from the last row actually WRITTEN, up to `_DECISION_THINNING_INTERVAL_S` ago. The
+  browser channel never meets that (`pushed` is one of the thinning rule's keep-reasons, so a pushed
+  row there is always a fresh `build_row`), and `/meldinger` replays the FIRST pushed row's
+  `message_input` under that row's own `decided_at` — so a straight copy had it wording "what we
+  would send now" from a quarter-hour-old document beside figures that are not. Two rules the
+  restatement follows, both silent if taken the other way: `message_llm` falls back to the pass's
+  answer where this channel read no cached wording, because `_webhook_wording` answers None when
+  `NOTIFICATION_WEBHOOK_LLM_ENABLED` is off while a model wording sits in the cache — which is the
+  "written but withheld" population, not an absence; and a mint row carrying a model wording reads
+  `ok_cached` rather than `ok`, since `ok` claims a same-input pair (`message_wording_comparison.sql`
+  filters on exactly that) and the row's `message_llm` is by construction from a different cycle's
+  input than the `message_input` now beside it. Anything else that reads `_decision_ledger`'s stored
+  row has the same trap. The groups view AGGREGATES `channel` onto the subject and
   never groups on it: grouping would split a shared definition into two subjects and two verdicts.
   **The operator step is not optional and its order is fixed**: two columns on
   `varsel_decision_outcomes` break the registered scheduled query until it is re-registered in BOTH
