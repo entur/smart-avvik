@@ -368,6 +368,20 @@ def read_blob_text() -> str | None:
     return _STATE_PATH.read_text() if _STATE_PATH.exists() else None
 
 
+def write_blob_text(payload: str) -> None:
+    """Replace the persisted state with this exact text. U14's export, and nothing else.
+
+    Separate from :func:`save_state`, which serialises the blob backend's own module dicts: under
+    the store backend those are empty, so `save_state` would write an empty blob over the rollback
+    artefact -- which is the one failure an export must not have.
+    """
+    blob = _gcs_blob()
+    if blob is not None:
+        blob.upload_from_string(payload, content_type="application/json")
+        return
+    _STATE_PATH.write_text(payload)
+
+
 def save_state() -> bool:
     """Write state through to the local file and (when configured) the GCS blob. Best-effort:
     a persistence failure is logged, not raised — the in-memory state is still authoritative.
@@ -1466,3 +1480,131 @@ def _import_problems(
             f"{len(stored_marks)}"
         )
     return problems
+
+
+# ---- The rollback artefact (U14) ---------------------------------------------------------------
+@dataclass(frozen=True)
+class ExportReport:
+    """What one export wrote back into the blob. Counts only; no identifiers."""
+
+    devices: int = 0
+    tombstones: int = 0
+    journeys: int = 0
+    marks: int = 0
+    seconds: float = 0.0
+    bytes_written: int = 0
+
+    def as_fields(self) -> dict[str, Any]:
+        return {
+            "devices": self.devices,
+            "tombstones": self.tombstones,
+            "journeys": self.journeys,
+            "marks": self.marks,
+            "seconds": round(self.seconds, 3),
+            "bytes_written": self.bytes_written,
+        }
+
+
+def export_store_to_blob(
+    store: StoreRegistrations,
+    *,
+    now: datetime | None = None,
+    beat: Callable[[], None] | None = None,
+) -> ExportReport:
+    """Write the store's registrations back into the state blob: the rollback artefact (U14).
+
+    **What this exists for is erasure, not backup.** The import creates and never deletes, so the
+    blob still holds everything that was in it at the cutover — including the journeys of a
+    traveller who has since pressed «Slett alt». Rolling back to `gcs` without an export would
+    therefore resurrect somebody who asked to be forgotten. The read behind it applies liveness, so
+    a tombstoned registration is ABSENT from what is written rather than written as deleted, and
+    the interval between exports is the window in which that is still true of the artefact. The
+    runbook states that interval as the rollback loss window.
+
+    **It writes the blob backend's own shape, verbatim**, so the artefact is something
+    `apply_state` can load rather than something a future reader has to convert: the same five
+    keys, built through `_journey_record` and `_device_record`, which are what both backends
+    already answer `/varsel` with.
+
+    **Keys this backend does not hold ride through from the blob that is already there** — the
+    togvarsel round markers and anything under `_state_extra`. That is not tidiness: the round
+    markers have no home in the store (the cutover section names it), so an export that rebuilt the
+    document from the store alone would silently delete them from the only place they exist.
+
+    A device with no live journeys IS exported, which is why the device read is a paged scan rather
+    than a multi-get over the ids the journeys name: that record is a push endpoint, a brand and
+    the signup instant `_upsert_device_body` restores, and dropping it would make that traveller
+    read as a new install on their next visit.
+    """
+    started = time.monotonic()
+    instant = now or _now()
+    subscriptions = notification_store.all_web_push_subscriptions(
+        client_id=store._client_id, now=instant, beat=beat
+    )
+    devices = notification_store.all_devices(client_id=store._client_id, beat=beat)
+
+    journeys: dict[str, Any] = {}
+    marks: list[str] = []
+    per_device: dict[str, int] = {}
+    for sub in subscriptions:
+        journeys[sub.subscription_id] = _journey_record(sub)
+        marks.extend(f"{sub.subscription_id}|{situation}" for situation in sub.notified)
+        per_device[sub.device_id] = per_device.get(sub.device_id, 0) + 1
+
+    records: dict[str, Any] = {}
+    tombstones: dict[str, Any] = {}
+    for device_id, device in devices.items():
+        if device.pushable:
+            records[device_id] = _device_record(device)
+            continue
+        # The blob's own shape for a device that has journeys and no push subscription: the record
+        # is ABSENT and the tombstone explains why, which is what `forget_device` writes.
+        stored = dict(device.tombstone or {})
+        tombstones[device_id] = {
+            "reason": str(stored.get("reason") or "expired"),
+            "ts": _as_iso(stored.get("at")) or instant.isoformat(),
+            "created_ts": _as_iso(stored.get("original_created_at"))
+            or _as_iso(device.created_at)
+            or "",
+            "journeys": per_device.get(device_id, 0),
+        }
+
+    existing: dict[str, Any] = {}
+    raw = read_blob_text()
+    if raw:
+        try:
+            existing = json.loads(raw)
+        except ValueError:
+            # A corrupt artefact is replaced rather than preserved: what it would carry through is
+            # unreadable anyway, and refusing would leave the erasure unreached.
+            logger.warning("The existing varsel state blob is unreadable; exporting without it")
+    carried = {key: value for key, value in existing.items() if key not in _STATE_KEYS}
+    payload = json.dumps(
+        {
+            **carried,
+            # The one key the store has no home for, carried through from whatever is already
+            # there rather than rebuilt or dropped.
+            "togvarsel_rounds": existing.get("togvarsel_rounds", {}),
+            "devices": records,
+            "journeys": journeys,
+            "notified": sorted(marks),
+            "device_tombstones": tombstones,
+        }
+    )
+    write_blob_text(payload)
+    return ExportReport(
+        devices=len(records),
+        tombstones=len(tombstones),
+        journeys=len(journeys),
+        marks=len(marks),
+        seconds=time.monotonic() - started,
+        bytes_written=len(payload.encode()),
+    )
+
+
+def _as_iso(value: Any) -> str:
+    """An ISO string from whatever the store handed back, or "". Never raises: an unreadable
+    instant in a tombstone is a field, not a reason to lose the export."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value) if value else ""

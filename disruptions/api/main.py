@@ -1570,6 +1570,57 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             except Exception:
                 logger.exception("Client servability re-check failed; existing caveats stand")
 
+    # LAST, and only under the store backend: the rollback artefact (U14). Writing the store back
+    # into the blob is what makes an erasure reach it -- the import creates and never deletes, so a
+    # rollback to `gcs` without this resurrects a traveller who pressed «Slett alt». The interval
+    # is the rollback loss window and the operations document states it as one.
+    #
+    # On the poller's tick rather than as a CronJob from the chart, which the plan offers as the
+    # alternative: a second workload would need the bucket name and the database resolved again,
+    # per environment, from values this process already has -- and the first thing to drift would
+    # be the bucket, whose name differs between dev and prd.
+    #
+    # After everything else, because it is the one step of the cycle nobody is waiting for: a slow
+    # or failing export costs the artefact its freshness and the cycle nothing.
+    if _varsel_store is not None:
+        with _phase("varsel_state_export", timings):
+            _export_varsel_state(_varsel_store)
+
+
+#: How often the rollback artefact is rewritten, and therefore the worst-case window in which it
+#: still holds a registration a traveller has erased. Six hours matches the servability sweep's
+#: cadence and is well inside the documented "within 24 hours" that the deletion contract already
+#: promises for cleanup.
+_VARSEL_EXPORT_INTERVAL_S = 6 * 3600
+_varsel_exported_at: float = 0.0
+
+
+def _export_varsel_state(store: varsel_state.StoreRegistrations) -> None:
+    """Rewrite the state blob from the store, at most every `_VARSEL_EXPORT_INTERVAL_S`.
+
+    Never raises into the cycle: an export that fails leaves the previous artefact in place, which
+    is stale rather than absent, and the next tick tries again. The log line is here rather than in
+    `varsel_state` for that module's own reason -- it emits no structured event, so which vocabulary
+    a reader greps for stays a property of the caller.
+    """
+    global _varsel_exported_at
+    now = time.monotonic()
+    if _varsel_exported_at and now - _varsel_exported_at < _VARSEL_EXPORT_INTERVAL_S:
+        return
+    try:
+        report = varsel_state.export_store_to_blob(store, beat=_beat)
+    except Exception:
+        logger.exception("Could not export varsel state; the previous rollback artefact stands")
+        return
+    _varsel_exported_at = now
+    logger.info(
+        "Exported varsel state to the rollback artefact: %d devices, %d journeys, %d marks",
+        report.devices,
+        report.journeys,
+        report.marks,
+        extra={"fields": {"event": "varsel_state_export", **report.as_fields()}},
+    )
+
 
 def _togvarsel_notify_enabled() -> bool:
     """The togvarsel push delivery gate, read per call so a check always reflects the environment.
@@ -1624,6 +1675,11 @@ def _notification_webhooks_enabled() -> bool:
 _VARSEL_STATE_BACKENDS = ("gcs", "store")
 
 
+#: The store backend when this deployment uses one, else None -- which is also what tells the
+#: poller whether there is a rollback artefact to write. Set by :func:`_registration_store`.
+_varsel_store: varsel_state.StoreRegistrations | None = None
+
+
 def _registration_store() -> varsel_state.RegistrationStore:
     """Where `/varsel` registrations live this deployment, from `VARSEL_STATE_BACKEND`.
 
@@ -1675,6 +1731,7 @@ def _registration_store() -> varsel_state.RegistrationStore:
             }
         },
     )
+    global _varsel_store
     store = varsel_state.StoreRegistrations(
         client_id=varsel_state.BROWSER_CLIENT_ID,
         quotas=lambda: (
@@ -1685,6 +1742,9 @@ def _registration_store() -> varsel_state.RegistrationStore:
         ),
     )
     _import_varsel_state(store)
+    # Kept so the poller can write the rollback artefact from it. A module global rather than a
+    # second `_registration_store()` call, which would re-run the import's marker read every cycle.
+    _varsel_store = store
     return store
 
 

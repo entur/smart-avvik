@@ -583,7 +583,12 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "varsel_notify",
         "notification_webhooks",
         "notification_servability",
+        "varsel_state_export",
     ), phases
+    # LAST, and the position is the assertion: the export is the one step of the cycle nobody is
+    # waiting for. A slow or failing rewrite of the rollback artefact costs the artefact its
+    # freshness; anywhere earlier it would cost the alerting pass its cycle.
+    assert phases[-1] == "varsel_state_export", phases
     # `notification_mirror` is BEFORE `varsel_notify`, and the order is the assertion. The pass
     # reads the store's mirror, so a mirror synced after it would serve every cycle the population
     # of the one before -- a whole cycle's lag on every create, replace and revocation, with

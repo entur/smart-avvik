@@ -1080,6 +1080,17 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         equality=("client_id",),
         why="the device ceiling, counted before an upsert writes anything",
     ),
+    QuerySpec(
+        name="device_listing",
+        collection=DEVICES,
+        # The same one equality as `device_count`, and its own spec rather than that one reused:
+        # the count is an aggregation over a ceiling and this is a paged read of every document,
+        # and a spec whose name says "count" being streamed is how the next reader concludes the
+        # ceiling is being read row by row again. No ordering, so Firestore's automatic
+        # single-field index serves it and the cursor walks `__name__`.
+        equality=("client_id",),
+        why="U14's export reads every device of the browser client back into the blob",
+    ),
     # The three cleanup queries filter on `subscription_id` alone, which Firestore's automatic
     # single-field indexes serve -- hence an empty `index_fields` and no entry in
     # firestore.indexes.json. Declared anyway, so "every query in the module is a spec" stays a
@@ -3991,6 +4002,107 @@ def write_migration(name: str, data: Mapping[str, Any], *, now: datetime | None 
     ref = _Refs(_firestore_client()).migration(name)
     with _span("notification_store.write_migration"):
         ref.set({**dict(data), "name": name, "recorded_at": now or _now()})
+
+
+#: How many device ids one multi-get of the export asks for. `get_devices` issues a single
+#: `get_all` for whatever it is handed, which is right for the delivery pass (bounded by what is
+#: about to be pushed) and wrong for a read of the whole population: one call for 100 000 refs is
+#: one call under one four-second deadline.
+EXPORT_DEVICE_CHUNK = 300
+
+
+def all_web_push_subscriptions(
+    *,
+    client_id: str,
+    now: datetime | None = None,
+    beat: Callable[[], None] | None = None,
+) -> list[Subscription]:
+    """Every LIVE `web_push` registration of one client, paged with a cursor. U14's export read.
+
+    **Paged and never streamed whole**, for :meth:`SubscriptionMirror.seed`'s reason: one
+    `stream()` over the collection is one call under one deadline, while a cursor makes each page
+    its own bounded call -- and lets `beat` move the poller's liveness clock between pages when the
+    caller is the poller rather than an operator's terminal.
+
+    It reads the whole collection and filters the channel and the client in PYTHON, which is what
+    the `mirror_seed` spec is for: the alternative is a query whose equality would need its own
+    composite index, paid for on every write, to serve a read that exists for one release.
+
+    Liveness is applied here, so a tombstoned registration is ABSENT from what this returns -- and
+    therefore from the blob the export writes. That is the whole point of the export: an erasure
+    has to reach the rollback artefact, or rolling back resurrects somebody who asked to be
+    forgotten.
+    """
+    instant = now or _now()
+    out: list[Subscription] = []
+    cursor: Any = None
+    while True:
+        page = _stream(_query("mirror_seed", limit=MIRROR_PAGE_SIZE, start_after=cursor))
+        for snapshot in page:
+            doc = _doc(snapshot)
+            if not doc:
+                continue
+            if doc.get("client_id") != client_id:
+                continue
+            if _channel_of(doc) != CHANNEL_WEB_PUSH:
+                continue
+            if not subscription_is_live(doc, instant):
+                continue
+            try:
+                out.append(_subscription_from_doc(doc))
+            except Exception:
+                logger.debug("Unreadable web_push registration; not exported", exc_info=True)
+        if len(page) < MIRROR_PAGE_SIZE:
+            return out
+        cursor = page[-1]
+        if beat is not None:
+            beat()
+
+
+def devices_in_chunks(device_ids: Iterable[str]) -> dict[str, Device]:
+    """:func:`get_devices` over an unbounded id list, in bounded multi-gets."""
+    wanted = list(dict.fromkeys(device_ids))
+    found: dict[str, Device] = {}
+    for start in range(0, len(wanted), EXPORT_DEVICE_CHUNK):
+        found.update(get_devices(wanted[start : start + EXPORT_DEVICE_CHUNK]))
+    return found
+
+
+def all_devices(*, client_id: str, beat: Callable[[], None] | None = None) -> dict[str, Device]:
+    """Every device document of one client, paged with a cursor. U14's export read.
+
+    EVERY device, including one with no registrations left: it holds a push endpoint, a brand and
+    the signup instant `_upsert_device_body` restores, and a rollback artefact missing it would
+    make that traveller read as a new install on their next visit. The alternative -- fetching only
+    the devices the exported journeys name -- is one multi-get instead of a paged scan, and it
+    drops exactly those records.
+    """
+    found: dict[str, Device] = {}
+    cursor: Any = None
+    while True:
+        page = _stream(
+            _query(
+                "device_listing",
+                equality={"client_id": client_id},
+                limit=MIRROR_PAGE_SIZE,
+                start_after=cursor,
+            )
+        )
+        for snapshot in page:
+            doc = _doc(snapshot)
+            if not doc:
+                continue
+            try:
+                device = _device_from_doc(doc)
+            except Exception:
+                logger.debug("Unreadable device document; not exported", exc_info=True)
+                continue
+            found[device.device_id] = device
+        if len(page) < MIRROR_PAGE_SIZE:
+            return found
+        cursor = page[-1]
+        if beat is not None:
+            beat()
 
 
 def note_web_push_activity(
