@@ -176,6 +176,11 @@ def _expected_title(state: str = "kan bli innstilt", prefix: str = "") -> str:
 
 
 def _reset_state():
+    # The subscription mirror is module state like every cache below, and the store-backend tests
+    # seed it. Cleared here rather than only in `_store_backend` so a seeded mirror cannot reach a
+    # test that never asked for one -- the runner orders tests by NAME, so "the store tests are at
+    # the end of the file" is not the ordering that runs.
+    varsel_state.notification_store.subscription_mirror().reset()
     with varsel._state_lock:
         varsel._devices.clear()
         varsel._journeys.clear()
@@ -4114,8 +4119,19 @@ def test_a_single_journey_deleted_mid_cycle_is_not_pushed_to(monkeypatch):
 import test_notification_store as store_suite
 
 
-def _store_backend():
-    """Point `varsel` at a store-backed seam over a fresh fake. Returns (backend, fake client)."""
+def _store_backend(monkeypatch):
+    """Point `varsel` at a store-backed seam over a fresh fake. Returns (backend, fake client).
+
+    The three module attributes are recorded through `monkeypatch` BEFORE `_install` overwrites
+    them, which is the only ordering that works: `monkeypatch.setattr` remembers what it finds, so
+    a call after the install would "restore" the fake permanently. `store_suite._install` has an
+    `_uninstall` these tests cannot reach from here, and a leaked fake client is invisible in this
+    suite -- these tests want it -- and fails somewhere else entirely.
+    """
+    ns = varsel_state.notification_store
+    monkeypatch.setattr(ns, "_firestore_client", ns._firestore_client)
+    monkeypatch.setattr(ns, "_run_transaction", ns._run_transaction)
+    monkeypatch.setattr(ns, "_query", ns._query)
     fake = store_suite._FakeClient()
     store_suite._install(fake)
     varsel_state.notification_store.subscription_mirror().reset()
@@ -4162,7 +4178,7 @@ def test_a_journey_registered_against_the_store_is_listed_and_matched(monkeypatc
     it back. No cycle has run, so nothing has seeded the mirror -- which is R15's whole point, and
     the failure it prevents is a traveller who registers a journey and is shown an empty list."""
     _reset_state()
-    backend, _fake = _store_backend()
+    backend, _fake = _store_backend(monkeypatch)
     monkeypatch.setattr(varsel, "_registrations", backend)
 
     assert client.post(
@@ -4179,7 +4195,7 @@ def test_a_push_against_the_store_marks_the_document_and_the_next_cycle_skips_it
     and the cycle after it sees them -- from the mirror, which this process's own commit updated,
     which is the reversal of what U12 recorded and the reason it is worth an end-to-end check."""
     _reset_state()
-    backend, fake = _store_backend()
+    backend, fake = _store_backend(monkeypatch)
     monkeypatch.setattr(varsel, "_registrations", backend)
     sent: list[dict] = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
@@ -4203,7 +4219,7 @@ def test_slett_alt_against_the_store_answers_200_and_leaves_nothing(monkeypatch)
     contract is unchanged: 200 with the count, and the traveller's journeys gone from both the
     request path's view and the cycle's."""
     _reset_state()
-    backend, fake = _store_backend()
+    backend, fake = _store_backend(monkeypatch)
     monkeypatch.setattr(varsel, "_registrations", backend)
     client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
     _register_journey(DEVICE)
@@ -4222,7 +4238,7 @@ def test_a_store_that_cannot_finish_the_erasure_answers_503_rather_than_200(monk
     the store still holds the rows is an art. 17 request quietly undone. `erase_device` reports an
     incomplete run and the route turns that into the 503 the client retries on."""
     _reset_state()
-    backend, _fake = _store_backend()
+    backend, _fake = _store_backend(monkeypatch)
     monkeypatch.setattr(varsel, "_registrations", backend)
     client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
     _register_journey(DEVICE)

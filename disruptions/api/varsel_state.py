@@ -392,6 +392,16 @@ def save_state() -> bool:
 
 
 # ---- Togvarsel round markers (off the protocol; see `_togvarsel_rounds`) ------------------------
+# **They are not persisted under `VARSEL_STATE_BACKEND=store`, and that is U14's to settle.** These
+# two functions are module state either way, but the durable write behind them is the caller's
+# `_save_state()` -- which is `BlobRegistrations.save()` on the blob and a no-op that returns True
+# on the store, whose `load()` is a no-op too. So under the store backend a restart re-fires the
+# accepted crash window for whatever rush round is still inside its timeliness window, rather than
+# only for one mid-round crash. It costs nothing today: `SHOW_RUSHVARSEL` is off in every
+# environment and no environment sets this backend, so nothing evaluates a round at all. The two
+# shapes, neither decided here: keep the markers on the blob regardless of backend (this module
+# calls `save_state()` itself and `main` always calls `load_state()`), or move them to one
+# Firestore document. What must not happen is the cutover discovering it.
 def rounds_for(date_str: str) -> dict[str, Any]:
     """A copy of the togvarsel round markers for one Oslo date ({} when none exist)."""
     with lock:
@@ -980,10 +990,10 @@ class StoreRegistrations:
         """
         mirror = notification_store.subscription_mirror()
         if mirror.ready:
-            for entry in mirror.recipients(_now(), channel=notification_store.CHANNEL_WEB_PUSH):
-                if entry.subscription_id == journey_id:
-                    return _journey_record(entry)
-            return None
+            entry = mirror.entry(
+                journey_id, _now(), channel=notification_store.CHANNEL_WEB_PUSH
+            )
+            return None if entry is None else _journey_record(entry)
         record = notification_store.get_subscription(journey_id, client_id=self._client_id)
         return None if record is None else _journey_record(record)
 
@@ -1041,13 +1051,20 @@ class StoreRegistrations:
         mark bodies now apply their own commits: the alternative is a document read per registration
         per cycle, and the mirror's copy is exact rather than approximate because this process is
         the only writer of it. See `notification_store.SUBSCRIPTION_MIRRORING_BODIES`.
+
+        Keyed through :meth:`SubscriptionMirror.entry`, never `recipients` -- the pass asks this
+        per candidate, and a scan per question is the cost that read exists to remove.
         """
         mirror = notification_store.subscription_mirror()
         if not mirror.ready or not journey_ids:
             return {}
+        now = _now()
         out: dict[str, PushLedger] = {}
-        for entry in mirror.recipients(_now(), channel=notification_store.CHANNEL_WEB_PUSH):
-            if entry.subscription_id not in journey_ids:
+        for journey_id in journey_ids:
+            entry = mirror.entry(
+                journey_id, now, channel=notification_store.CHANNEL_WEB_PUSH
+            )
+            if entry is None:
                 continue
             day, sent = (
                 max(entry.daily_pushes.items()) if entry.daily_pushes else (None, 0)
@@ -1080,10 +1097,9 @@ class StoreRegistrations:
         oslo_day: str,
         charge_cap: bool,
     ) -> None:
-        if tag is None:
-            # Nothing to record for the train, and the day's count is spent per PUSH rather than
-            # per train, so a push whose alert cannot name its departure still costs one.
-            tag = f"{journey_id}|unidentified"
+        # `tag` None records nothing for the train and still charges the day, which is the blob's
+        # own reading one layer down (`_record_push_body`) rather than a second rule here: the cap
+        # is spent per PUSH, and the lock screen falls back to the situation number.
         try:
             notification_store.record_push(
                 subscription_id=journey_id, train_ref=tag, charge_cap=charge_cap
