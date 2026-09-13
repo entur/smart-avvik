@@ -691,21 +691,28 @@ def test_the_servability_seam_is_the_same_one_the_notification_api_answers_from(
     import inspect
 
     import notification_api
+    import varsel
 
     source = inspect.getsource(main.lifespan)
-    sweep = (
-        "notification_servability.configure(\n"
-        "        verdicts=functools.partial(varsel._service_verdicts, path=_CONNECTIVITY_POLLER_PATH)\n"
-        "    )"
+    assert "notification_servability.configure(verdicts=varsel._service_verdicts)" in source, (
+        "the sweep must take the BATCH seam"
     )
-    assert sweep in source, "the sweep must take the BATCH seam, on the poller budget"
+    bound = (
+        "connectivity_batch_provider=functools.partial(\n"
+        "            _varsel_connectivity_batch, path=_CONNECTIVITY_POLLER_PATH\n"
+        "        ),"
+    )
+    assert bound in source, (
+        "both sweeps must spend the POLLER budget, not the traveller-facing one; it is bound at "
+        "wiring time because neither of them owns the vocabulary"
+    )
     # The signature rather than the call text: the comment beside the call explains why the seam
     # is gone, so matching the WORD would match the explanation.
     assert "connectivity" not in inspect.signature(notification_api.configure).parameters, (
         "a create or replace must not ask BigQuery: `servable` is the sweep's answer now"
     )
-    assert "connectivity_batch_provider=_varsel_connectivity_batch," in source
     assert notification_servability._WORST_CASE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
+    assert varsel._WORST_CASE_SERVICE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
     assert notification_servability._DEADLINE_S > notification_servability._WORST_CASE_CHECK_S, (
         "a deadline equal to the worst case admits exactly one check, making the count ceiling "
         "decoration"

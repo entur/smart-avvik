@@ -415,17 +415,29 @@ def test_existing_journeys_are_rewritten_when_the_registry_lands():
     assert [a["situation_number"] for a in listed[0]["alerts"]] == ["S1"]
 
 
-def _use_connectivity(verdict, seen=None):
-    """Install a connectivity provider returning `verdict`, recording the refs it was asked about."""
+def _use_connectivity(verdict, seen=None, jobs=None):
+    """Install a connectivity provider returning `verdict`, recording the refs it was asked about.
+
+    Both forms, from one answer: the single-pair seam a registration asks through, and the BATCH
+    seam `recheck_service` asks through since U10. Recording the batch's pairs into the SAME `seen`
+    list keeps every "what was asked" assertion below meaning what it meant; `jobs` counts the
+    batch CALLS, which is the thing the unit is about.
+    """
 
     def provider(from_refs, to_refs):
         if seen is not None:
             seen.append((tuple(from_refs), tuple(to_refs)))
         return verdict
 
+    def batch(pairs):
+        if jobs is not None:
+            jobs.append(len(pairs))
+        return [provider(from_refs, to_refs) for from_refs, to_refs in pairs]
+
     varsel.configure(
         impact_provider=_impact_provider, stops_provider=lambda: STOPS,
         connectivity_provider=provider,
+        connectivity_batch_provider=batch,
     )
 
 
@@ -592,6 +604,125 @@ def test_a_fresh_verdict_is_not_re_asked_every_cycle():
     assert seen == [], "the verdict is minutes old; nothing to re-ask"
     with varsel._state_lock:
         assert next(iter(varsel._journeys.values()))["no_direct_service"] is True
+
+
+def _flag(jid, *, from_stop="A", to_stop="B", checked_ts=None):
+    """Put one flagged, due journey straight into the state, for the sweep's own checks.
+
+    Registering through the route would ask the registration seam as well, which is a different
+    question from the one these are about.
+    """
+    varsel._journeys[jid] = {
+        "device_id": DEVICE,
+        "from_stop": from_stop,
+        "to_stop": to_stop,
+        "begin": "00:00",
+        "end": "23:59",
+        "days": [0, 1, 2, 3, 4, 5, 6],
+        "no_direct_service": True,
+        **({"service_checked_ts": checked_ts} if checked_ts else {}),
+    }
+
+
+def test_every_flagged_journey_on_one_corridor_costs_one_question():
+    """U10: the sweep asks about PAIRS, and a corridor is one pair however many watch it.
+
+    It used to issue one serial BigQuery job per flagged journey, on the ingestion thread, with no
+    per-cycle bound -- invisible at a pilot's few hundred and a stalled cycle at a hundred thousand.
+    """
+    _reset_state()
+    jobs: list = []
+    seen: list = []
+    with varsel._state_lock:
+        for i in range(25):
+            _flag(f"j{i}")
+        _flag("other", to_stop="C")
+    _use_connectivity((True, False), seen, jobs)
+    try:
+        varsel.recheck_service()
+    finally:
+        _no_connectivity()
+    assert jobs == [2], f"one job, two distinct pairs, not one per journey: {jobs}"
+    assert len(seen) == 2
+    with varsel._state_lock:
+        assert all("no_direct_service" not in rec for rec in varsel._journeys.values())
+
+
+def test_the_re_check_is_bounded_per_cycle_and_the_rest_stay_due():
+    """A bound nobody can see binding is not a bound anybody can size, and this one had none.
+
+    The journeys it does not reach keep their old stamp, so they are still due next cycle -- which
+    is the state they were already in.
+    """
+    _reset_state()
+    old_stamp = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    with varsel._state_lock:
+        for i in range(6):
+            _flag(f"j{i}", to_stop=f"S{i}", checked_ts=old_stamp)
+    jobs: list = []
+    _use_connectivity((True, False), None, jobs)
+    before = varsel._MAX_SERVICE_RECHECKS_PER_CYCLE
+    varsel._MAX_SERVICE_RECHECKS_PER_CYCLE = 2
+    try:
+        varsel.recheck_service()
+    finally:
+        varsel._MAX_SERVICE_RECHECKS_PER_CYCLE = before
+        _no_connectivity()
+    assert jobs == [2], f"only the admitted journeys' pairs are asked about: {jobs}"
+    with varsel._state_lock:
+        answered = [j for j, r in varsel._journeys.items() if "no_direct_service" not in r]
+        untouched = [
+            j
+            for j, r in varsel._journeys.items()
+            if r.get("service_checked_ts") == old_stamp
+        ]
+    assert len(answered) == 2 and len(untouched) == 4, (answered, untouched)
+
+
+def test_an_unestablished_verdict_leaves_the_flag_and_the_stamp_alone():
+    """`None` is "could not be established" and must never become a stamped non-answer: stamping it
+    would take the journey out of the due set for six hours on the strength of an outage."""
+    _reset_state()
+    old_stamp = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    with varsel._state_lock:
+        _flag("j1", checked_ts=old_stamp)
+    _use_connectivity(None)
+    try:
+        varsel.recheck_service()
+    finally:
+        _no_connectivity()
+    with varsel._state_lock:
+        rec = varsel._journeys["j1"]
+    assert rec["no_direct_service"] is True
+    assert rec["service_checked_ts"] == old_stamp
+
+
+def test_an_unchanged_false_is_stamped_and_the_sweep_saves_it():
+    """R6's freshness half, and the reason the save moved.
+
+    The stamp is what takes a still-unservable journey out of the due set for six hours. It used to
+    be written in memory and persisted only when something CLEARED, so a cycle that established
+    nothing new left every stamp unsaved and a restart re-asked them all.
+    """
+    _reset_state()
+    old_stamp = (datetime.now(UTC) - timedelta(days=3)).isoformat()
+    with varsel._state_lock:
+        _flag("j1", checked_ts=old_stamp)
+    saves: list = []
+    before = varsel._save_state
+    varsel._save_state = lambda *a, **k: saves.append(1)
+    _use_connectivity((False, True))
+    try:
+        varsel.recheck_service()
+    finally:
+        varsel._save_state = before
+        _no_connectivity()
+    with varsel._state_lock:
+        rec = varsel._journeys["j1"]
+    assert rec["no_direct_service"] is True, "a false verdict keeps the caveat"
+    assert rec["service_checked_ts"] != old_stamp, "an established answer always moves the stamp"
+    assert rec["service_reverse_only"] is True
+    assert saves == [1], "one save for the whole sweep, and it must happen"
 
 
 def test_a_journey_whose_ends_are_one_place_is_refused():
