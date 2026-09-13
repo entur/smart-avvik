@@ -73,6 +73,12 @@ SUBSCRIPTIONS = "subscriptions"
 SUBJECTS = "alert_subjects"
 EVENTS = "events"
 DELIVERIES = "deliveries"
+#: /varsel's browser installs (U12). A device is a Web Push endpoint and the brand it installed
+#: under; a JOURNEY is a `web_push` subscription in the collection above, carrying this device's id.
+#: Two collections rather than a subcollection, for the reason the other four are top level: a
+#: document delete does not remove subcollections and a TTL field does not cascade into them, so a
+#: deleted device would orphan every journey under it and the mirror would keep matching them.
+DEVICES = "devices"
 
 COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES)
 
@@ -98,6 +104,12 @@ HISTORY_DAYS = 7
 # R5's two subscription horizons. A subscription expires at the EARLIER of them, and both are
 # enforced on read rather than by TTL alone: TTL is up to ~24 h late, and a subscription that keeps
 # alerting for a day past its published expiry is a broken promise rather than a slow cleanup.
+#: How many browser installs one client may hold (U12). `/varsel`'s own `_MAX_DEVICES`, moved here
+#: because `notification_auth.Quotas` is where a per-client ceiling lives since U7 and that module
+#: must not import `varsel`. It bounds the `devices` collection the way
+#: `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT` bounds the journeys: a device is cheap, and what the
+#: ceiling refuses is an unauthenticated public endpoint minting documents without bound.
+MAX_DEVICES_PER_CLIENT = 5000
 SUBSCRIPTION_MAX_LIFETIME_DAYS = 180
 SUBSCRIPTION_INACTIVITY_DAYS = 60
 # R12's event validity horizon, quoted by U6, U8, AE12 and the client documentation. Validity is
@@ -407,12 +419,26 @@ def _mirror_stamp() -> Any:
 #:
 #: `_finish_cleanup_body` is out because it only ever runs on a subscription `_delete_body` has
 #: already tombstoned, which the mirror has already dropped on that stamp.
+#: `_erase_device_body` is in it and it is the one entry whose OMISSION would be a privacy defect
+#: rather than a freshness one: a hard-deleted document matches no watermark query, so without the
+#: stamp the mirror keeps a traveller's journeys for up to `MIRROR_MAX_AGE_S` after «Slett alt» and
+#: the cycle keeps matching, wording and logging decisions about them. That is why the erasure
+#: TOMBSTONES a journey instead of deleting it -- see the body's own docstring.
+#:
+#: `_mark_notified_body` and `_record_push_body` are deliberately OUT, for `_sent_body`'s reason
+#: exactly: they are the push-side ledgers, written once per push, so stamping them would resync the
+#: busiest documents on every cycle -- one push on a corridor with a hundred thousand registrations
+#: is a hundred thousand documents through the watermark query. **The consequence is a constraint on
+#: U13 and is written here so U13 finds it: the cycle cannot read `notified` or `pushed_trains` from
+#: the mirror.** A stale mark re-offers a train already pushed, so those reads go to the store, per
+#: push, exactly as `_emit_body` reads the real subject document rather than the mirror's copy.
 MIRROR_STAMPING_BODIES = (
     "_create_body",
     "_replace_body",
     "_delete_body",
     "_touch_body",
     "_servability_body",
+    "_erase_device_body",
 )
 
 
@@ -566,16 +592,45 @@ def subscription_is_live(doc: Mapping[str, Any], now: datetime) -> bool:
         return False
     if not _not_expired(doc, now):
         return False
-    for horizon in ("lifetime_expires_at", "inactivity_expires_at"):
+    for horizon in _horizon_fields(doc):
         at = _as_dt(doc.get(horizon))
         if at is None or at <= now:
             return False
     return True
 
 
-def _horizons(created_at: datetime, last_seen_at: datetime) -> dict[str, datetime]:
-    """R5's two horizons and the TTL field derived as their minimum."""
+def _horizon_fields(doc: Mapping[str, Any]) -> tuple[str, ...]:
+    """Which horizons this document has to be inside. Channel-dispatched since U12.
+
+    A `web_push` registration has a LIFETIME horizon and no inactivity one. The inactivity horizon
+    exists because a client's subscription that nobody has touched for sixty days is probably a
+    forgotten integration; a traveller's registered commute is the opposite -- not opening the PWA
+    for two months is what a working alert service looks like, and today's GCS blob has no expiry
+    on a registration at all.
+
+    **The fail-closed property survives, and it is worth saying which part.** A document with no
+    `channel` reads as `webhook` (U5's convention), so nothing written before this needs both
+    horizons any less. A `web_push` document missing its LIFETIME horizon is still dead, because
+    that field is still required and a missing one still reads as expired. What is given up is only
+    the second belt on the one channel that never had a second horizon.
+    """
+    if str(doc.get("channel") or CHANNEL_WEBHOOK) == CHANNEL_WEB_PUSH:
+        return ("lifetime_expires_at",)
+    return ("lifetime_expires_at", "inactivity_expires_at")
+
+
+def _horizons(
+    created_at: datetime, last_seen_at: datetime, *, channel: str = CHANNEL_WEBHOOK
+) -> dict[str, datetime]:
+    """R5's horizons and the TTL field derived as their minimum. Channel-dispatched since U12.
+
+    `web_push` gets the lifetime horizon only -- see :func:`_horizon_fields` for why, and note that
+    the inactivity field is OMITTED rather than set far ahead: a field that lies about its meaning
+    is worse than an absent one, and `subscription_is_live` reads the absence correctly.
+    """
     lifetime = created_at + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS)
+    if channel == CHANNEL_WEB_PUSH:
+        return {"lifetime_expires_at": lifetime, TTL_FIELD: lifetime}
     inactivity = last_seen_at + timedelta(days=SUBSCRIPTION_INACTIVITY_DAYS)
     return {
         "lifetime_expires_at": lifetime,
@@ -772,7 +827,14 @@ def _definition_digest(spec: SubscriptionSpec) -> str:
     material = "|".join(
         (
             spec.client_id,
-            spec.destination_id,
+            # ONE FIELD, not two, and the `or` is the whole point. `validate` refuses whichever of
+            # these two does not belong to the channel, so exactly one is ever non-empty -- and
+            # keeping them in ONE position means a webhook spec's material is byte-identical to what
+            # it was before `device_id` existed. Two positions would add a separator and change
+            # every hash, which turns every client's idempotent re-POST into a Conflict on the
+            # deploy that introduces the field. The digest is a stored value; its inputs cannot be
+            # reordered or extended without a migration.
+            spec.destination_id or spec.device_id,
             spec.from_stop,
             spec.to_stop,
             spec.begin,
@@ -927,6 +989,30 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         order_by=(("created_at", "ASCENDING"),),
         why="R21's pending-events-per-destination ceiling",
     ),
+    QuerySpec(
+        name="device_journeys",
+        collection=SUBSCRIPTIONS,
+        # The client AND the channel AND the device. All three, and dropping any one of them is a
+        # different bug: without `client_id` a second browser client would read this one's
+        # registrations, without `channel` a webhook subscription that happened to carry a
+        # `device_id` would be returned as somebody's journey (it cannot -- `validate` refuses the
+        # field -- and the filter is the second statement of that, for `load_active_subscriptions`'
+        # reason), and without `device_id` this is the whole collection.
+        equality=("client_id", "channel", "device_id"),
+        # `created_at`, which every subscription document carries, so the ordering excludes nothing.
+        # Ascending because `/varsel`'s journey list is oldest-first today and the page a traveller
+        # sees should not reorder itself on a deploy.
+        order_by=(("created_at", "ASCENDING"),),
+        why="one device's registered journeys, for /varsel's request path",
+    ),
+    QuerySpec(
+        name="device_count",
+        collection=DEVICES,
+        # One equality and no ordering, which Firestore's automatic single-field index serves --
+        # hence an empty `index_fields` and no entry in firestore.indexes.json.
+        equality=("client_id",),
+        why="the device ceiling, counted before an upsert writes anything",
+    ),
     # The three cleanup queries filter on `subscription_id` alone, which Firestore's automatic
     # single-field indexes serve -- hence an empty `index_fields` and no entry in
     # firestore.indexes.json. Declared anyway, so "every query in the module is a spec" stays a
@@ -1047,6 +1133,9 @@ class _Refs:
     def delivery(self, delivery_id: str) -> Any:
         return self._client.collection(DELIVERIES).document(delivery_id)
 
+    def device(self, device_id: str) -> Any:
+        return self._client.collection(DEVICES).document(device_id)
+
 
 def _run_transaction(body: Callable[[Any], Any]) -> Any:
     """Run ``body`` under a real Firestore transaction.
@@ -1139,6 +1228,10 @@ class SubscriptionSpec:
 
     subscription_id: str
     client_id: str
+    #: The webhook callback this subscription is delivered to. Required on `webhook` and REFUSED on
+    #: `web_push`, where delivery is a Web Push endpoint held on the DEVICE document rather than a
+    #: property of the registration: a traveller with two phones has two devices and one journey
+    #: each, and a destination id here would either duplicate the endpoint or name one of them.
     destination_id: str
     from_stop: str
     to_stop: str
@@ -1151,6 +1244,19 @@ class SubscriptionSpec:
     #: field would make this a breaking change to a shape three modules build. U12 gives /varsel's
     #: own registrations `web_push` through the same builder.
     channel: str = CHANNEL_WEBHOOK
+    #: The device this registration belongs to (`web_push` only; REFUSED on `webhook`). It is what
+    #: `list_journeys` reads one traveller's registrations by, and it is in the definition digest --
+    #: so the same journey id submitted from a different device is a Conflict rather than a retry.
+    device_id: str = ""
+    #: What the traveller typed in the picker, kept for display only. Free text from an
+    #: unauthenticated browser, so it never reaches a client's notification: the webhook event's
+    #: route line carries the stop REGISTRY's names (decided 2026-09-10), and these two exist so
+    #: /varsel's own card can render the words the traveller chose.
+    from_name: str = ""
+    to_name: str = ""
+    #: Which version of the privacy texts the traveller accepted. Stored per registration rather
+    #: than per device because consent is given when a journey is created and the texts move.
+    consent_version: str = ""
 
     def validate(self) -> None:
         """/varsel's own three window rules, restated rather than imported.
@@ -1162,13 +1268,27 @@ class SubscriptionSpec:
         windows are refused here exactly as they are in /varsel, or a client could register a
         window /varsel would not and R3's parity claim would be quietly false.
         """
-        if not self.subscription_id or not self.client_id or not self.destination_id:
-            raise Conflict("subscription_id, client_id and destination_id are required")
+        if not self.subscription_id or not self.client_id:
+            raise Conflict("subscription_id and client_id are required")
         # Validated against the vocabulary rather than left free, because it is now a QUERY key:
         # a typo'd channel writes a document that no read path's equality filter matches, which is
         # a subscription that exists, is billed for, and is never loaded or counted by anything.
         if self.channel not in CHANNELS:
             raise Conflict(f"channel must be one of {', '.join(CHANNELS)}")
+        # The two channel-specific fields are required on their own channel and REFUSED on the
+        # other, in both directions. Refusing matters as much as requiring: a `web_push` document
+        # carrying a destination id would be offered to the delivery pass by any future query that
+        # forgets its channel filter, which is a traveller's commute POSTed to a client's callback.
+        if self.channel == CHANNEL_WEBHOOK:
+            if not self.destination_id:
+                raise Conflict("destination_id is required on a webhook subscription")
+            if self.device_id:
+                raise Conflict("device_id is not a webhook subscription's field")
+        else:
+            if not self.device_id:
+                raise Conflict("device_id is required on a web_push subscription")
+            if self.destination_id:
+                raise Conflict("destination_id is not a web_push subscription's field")
         if not self.from_stop or not self.to_stop:
             raise Conflict("from_stop and to_stop must be non-empty")
         if self.from_stop == self.to_stop:
@@ -1345,7 +1465,35 @@ def _new_subscription_doc(
         "daily_reservations": {},
         "delivered": {},
         "cleanup": {},
-        **_horizons(now, now),
+        **_channel_fields(spec),
+        **_horizons(now, now, channel=spec.channel),
+    }
+
+
+def _channel_fields(spec: SubscriptionSpec) -> dict[str, Any]:
+    """The fields only one channel has, written only on that channel.
+
+    Not written as empty strings on the other channel, deliberately: a Firestore equality filter
+    does not match a document that LACKS a field, which is what makes an absent `device_id` on a
+    webhook subscription the right answer -- the `device_journeys` query can never return one,
+    whatever its channel filter does. Empty strings would make that a property of the filter
+    instead of a property of the data.
+
+    `notified`, `pushed_trains` and `daily_pushes` are the push-side ledgers `/varsel` keeps in
+    memory today (`_notified`, `_pushed_trains`, `_daily_pushes`). They start empty and are written
+    by `mark_notified` and `record_push`, neither of which stamps the mirror -- see
+    :data:`MIRROR_STAMPING_BODIES`.
+    """
+    if spec.channel != CHANNEL_WEB_PUSH:
+        return {}
+    return {
+        "device_id": spec.device_id,
+        "from_name": spec.from_name,
+        "to_name": spec.to_name,
+        "consent_version": spec.consent_version,
+        "notified": {},
+        "pushed_trains": {},
+        "daily_pushes": {},
     }
 
 
@@ -2034,8 +2182,15 @@ def _mirror_entry(doc: Mapping[str, Any]) -> MirrorEntry:
         end=sub.end,
         days=tuple(sub.days),
         delivered=dict(sub.delivered),
+        # EVERY field `subscription_is_live` reads, and `channel` is one of them since U12 --
+        # `_horizon_fields` dispatches on it, and a map without it reads as `webhook`, which demands
+        # an inactivity horizon a `web_push` document does not have. The symptom is the worst shape
+        # there is: the mirror holds the entry, reports its size, and serves it to nobody. Pinned by
+        # `test_the_liveness_map_carries_every_field_the_predicate_reads`, because the next field
+        # added to that predicate fails here in exactly the same silent way.
         liveness={
             "status": sub.status,
+            "channel": sub.channel,
             TTL_FIELD: sub.expires_at,
             "lifetime_expires_at": sub.lifetime_expires_at,
             "inactivity_expires_at": sub.inactivity_expires_at,
@@ -2546,9 +2701,13 @@ SUBJECT_MIRRORING_BODIES = frozenset({"_mint", "_withdraw_body", "_clear_below_t
 #: `_sent_body` writes `delivered_revision`, `delivered_at` and the pending pointer. None of the
 #: three is in the standing set, the emit pass never asks about them, and mirroring them would put
 #: the busiest documents in the hottest loop for no reader -- the same economy that keeps this body
-#: out of `MIRROR_STAMPING_BODIES`. **Re-check this sentence when U11 moves delivery to its own
-#: Deployment**: what a worker there writes is exactly those three fields, and the moment one of
-#: them enters the standing set this process stops being their only writer.
+#: out of `MIRROR_STAMPING_BODIES`. **Re-checked at U11 and it stands.** Delivery now runs in
+#: `webhook_worker`, its own Deployment, so those three fields really are written by a second
+#: process -- and none of them is in the standing set the emit pass reads, so the mirror this
+#: process keeps is not made stale by a write it cannot see. What the re-check DID change is the
+#: wording of KTD6: from U11 on it is one writer of a subject's PHASE and REVISION, not one writer
+#: of the document. The moment one of those three fields enters the standing set, that stops being
+#: true and this exemption has to go with it.
 SUBJECT_WRITERS_OUTSIDE_THE_MIRROR = frozenset({"_sent_body"})
 
 
@@ -2621,6 +2780,539 @@ def recipient_documents() -> list[dict[str, Any]]:
         },
     )
     return [e.as_recipient_document(instant) for e in entries]
+
+
+# ---- Devices: /varsel's browser installs (U12) -------------------------------------------------
+#
+# A DEVICE is one browser install: a Web Push endpoint, its two keys, and the brand it installed
+# under. A JOURNEY is a `web_push` subscription in the `subscriptions` collection carrying this
+# device's id -- the same collection, the same mirror and the same servability sweep as a client's
+# webhook subscription, which is the whole point of the move (KTD12): one matcher, one wording, one
+# set of horizons.
+#
+# **What is deliberately NOT here: a `create_web_push_journey` body.** The plan asked for one and
+# `create_subscription` already is it. Writing a second create would mean a second ceiling check, a
+# second idempotence rule and a second place that stamps the mirror -- three chances to disagree
+# with a function that already does all of it, over a `channel` value the spec carries anyway. The
+# same goes for the delete: a journey is tombstoned by `delete_subscription`, which is what teaches
+# the mirror that it is gone.
+
+
+@dataclass(frozen=True)
+class Device:
+    """One browser install, as every reader sees it."""
+
+    device_id: str
+    client_id: str
+    endpoint: str
+    p256dh: str
+    auth: str
+    brand: str
+    created_at: datetime | None
+    updated_at: datetime | None
+    last_seen_at: datetime | None
+    #: Why this device stopped being pushable, set by `/varsel`'s own two paths: `expired` when the
+    #: browser's subscription answered 410, `turned_off` when the traveller declined. A tombstoned
+    #: device keeps its journeys -- that is the 2026-09-04 finding, that a journey never needed
+    #: notifications to be on -- so this is a marker rather than a deletion.
+    tombstone: Mapping[str, Any]
+
+    @property
+    def pushable(self) -> bool:
+        """Is there an endpoint to push to? A tombstone does not erase one; it explains it."""
+        return bool(self.endpoint and self.p256dh and self.auth)
+
+
+def _device_from_doc(doc: Mapping[str, Any]) -> Device:
+    return Device(
+        device_id=str(doc["device_id"]),
+        client_id=str(doc.get("client_id") or ""),
+        endpoint=str(doc.get("endpoint") or ""),
+        p256dh=str(doc.get("p256dh") or ""),
+        auth=str(doc.get("auth") or ""),
+        # A document written before the brand existed means `entur`, which is what
+        # `varsel.normalize_brand` exists for -- an unknown slug indexed into `_BRAND_ASSETS` would
+        # KeyError on the poller thread and take the whole cycle's alerting with it.
+        brand=str(doc.get("brand") or "entur"),
+        created_at=_as_dt(doc.get("created_at")),
+        updated_at=_as_dt(doc.get("updated_at")),
+        last_seen_at=_as_dt(doc.get("last_seen_at")),
+        tombstone=dict(doc.get("tombstone") or {}),
+    )
+
+
+def _new_device_doc(
+    *,
+    device_id: str,
+    client_id: str,
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    brand: str,
+    now: datetime,
+) -> dict[str, Any]:
+    return {
+        "device_id": device_id,
+        "client_id": client_id,
+        "endpoint": endpoint,
+        "p256dh": p256dh,
+        "auth": auth,
+        "brand": brand,
+        "created_at": now,
+        "updated_at": now,
+        "last_seen_at": now,
+        "tombstone": {},
+        # A device nobody has upserted in `SUBSCRIPTION_MAX_LIFETIME_DAYS` is an uninstalled
+        # browser, and what the document holds until then is a push endpoint and two keys -- which
+        # is personal data with no reader. Refreshed on every upsert, so an install in use never
+        # expires; matched to the journeys' own lifetime horizon, so a device and its registrations
+        # go at the same time rather than leaving one without the other.
+        TTL_FIELD: now + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS),
+    }
+
+
+def _upsert_device_body(
+    transaction: Any,
+    refs: _Refs,
+    count_query: Any,
+    *,
+    device_id: str,
+    client_id: str,
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    brand: str,
+    now: datetime,
+    max_devices: int | None = None,
+) -> dict[str, Any]:
+    """Create or refresh one device. The ceiling is checked BEFORE any write.
+
+    **An upsert CLEARS the tombstone and keeps the original `created_at`**, which is `/varsel`'s own
+    rule (2026-09-04) rather than an invention here: a device whose push subscription lapsed and
+    came back is the same device, and restamping its signup would make a lapse look like a new
+    install in every report. The tombstone going with it is the same fact from the other side --
+    there is an endpoint again, so there is nothing to explain.
+
+    The ceiling is counted only for a device that does not exist yet: a refresh must not be refused
+    because the population is at its bound, or a client at the ceiling could never update an
+    endpoint again -- and an expired endpoint that cannot be replaced is a traveller who silently
+    stops being alerted.
+    """
+    stored = _doc(_read(transaction, refs.device(device_id)))
+    if stored:
+        if stored.get("client_id") != client_id:
+            raise Forbidden("device belongs to another client")
+        patch = {
+            "endpoint": endpoint,
+            "p256dh": p256dh,
+            "auth": auth,
+            "brand": brand,
+            "updated_at": now,
+            "last_seen_at": now,
+            "tombstone": {},
+            TTL_FIELD: now + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS),
+        }
+        transaction.update(refs.device(device_id), patch)
+        return {**stored, **patch}
+    ceiling = MAX_DEVICES_PER_CLIENT if max_devices is None else max_devices
+    live = _read_count(transaction, count_query)
+    if live >= ceiling:
+        raise QuotaExceeded(f"client is at its device ceiling ({ceiling})")
+    doc = _new_device_doc(
+        device_id=device_id,
+        client_id=client_id,
+        endpoint=endpoint,
+        p256dh=p256dh,
+        auth=auth,
+        brand=brand,
+        now=now,
+    )
+    transaction.set(refs.device(device_id), doc)
+    return doc
+
+
+def upsert_device(
+    *,
+    device_id: str,
+    client_id: str,
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    brand: str = "entur",
+    now: datetime | None = None,
+    max_devices: int | None = None,
+) -> Device:
+    """Register or refresh one browser install."""
+    instant = now or _now()
+    client = _firestore_client()
+    refs = _Refs(client)
+    count_query = _query(
+        "device_count",
+        equality={"client_id": client_id},
+        limit=MAX_DEVICES_PER_CLIENT if max_devices is None else max_devices,
+    )
+    doc = _run_transaction(
+        lambda txn: _upsert_device_body(
+            txn,
+            refs,
+            count_query,
+            device_id=device_id,
+            client_id=client_id,
+            endpoint=endpoint,
+            p256dh=p256dh,
+            auth=auth,
+            brand=brand,
+            now=instant,
+            max_devices=max_devices,
+        )
+    )
+    return _device_from_doc(doc)
+
+
+def _tombstone_device_body(
+    transaction: Any, refs: _Refs, *, device_id: str, client_id: str, reason: str, now: datetime
+) -> dict[str, Any] | None:
+    """Mark a device unpushable without touching its journeys. `/varsel`'s `_device_tombstones`.
+
+    The endpoint and the two keys are CLEARED here, and that is the whole write that matters: a
+    tombstone that left them in place would be a marker a later push path could ignore, and the
+    2026-09-04 measurement is that 79 of prd's 186 journeys sit on devices with no usable
+    subscription -- a state the product supports on purpose, because the journey list still works as
+    a dashboard. So the journeys stay and the device says why.
+    """
+    stored = _doc(_read(transaction, refs.device(device_id)))
+    if not stored:
+        return None
+    if stored.get("client_id") != client_id:
+        raise Forbidden("device belongs to another client")
+    patch = {
+        "endpoint": "",
+        "p256dh": "",
+        "auth": "",
+        "updated_at": now,
+        "tombstone": {
+            "reason": reason,
+            "at": now,
+            # The ORIGINAL signup, so a lapse is not read as a new install -- the same reason
+            # `_upsert_device_body` keeps `created_at`.
+            "original_created_at": stored.get("created_at"),
+        },
+    }
+    transaction.update(refs.device(device_id), patch)
+    return {**stored, **patch}
+
+
+def tombstone_device(
+    *, device_id: str, client_id: str, reason: str, now: datetime | None = None
+) -> Device | None:
+    """Record that a device can no longer be pushed to. Returns ``None`` if it never existed."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    doc = _run_transaction(
+        lambda txn: _tombstone_device_body(
+            txn, refs, device_id=device_id, client_id=client_id, reason=reason, now=instant
+        )
+    )
+    return None if doc is None else _device_from_doc(doc)
+
+
+def get_device(device_id: str) -> Device | None:
+    """One device, read outside a transaction. The unknown-id path on the public endpoint costs
+    exactly this one bounded read.
+    """
+    ref = _Refs(_firestore_client()).device(device_id)
+    with _span("notification_store.get_device"):
+        doc = _doc(ref.get(timeout=_CALL_DEADLINE_S))
+    return _device_from_doc(doc) if doc else None
+
+
+#: How many journeys one «Slett alt» transaction tombstones. Firestore allows 500 writes per
+#: transaction and each journey is one, so this leaves ample room for the device delete beside them.
+#: A device with more than this is drained across transactions, which is why :func:`erase_device`
+#: is a loop: the alternative is a transaction that cannot commit at all, i.e. a traveller who
+#: cannot exercise erasure BECAUSE they registered a lot of journeys.
+MAX_ERASE_WRITES_PER_TRANSACTION = 400
+
+#: How many times :func:`erase_device` will go round. At 400 journeys a pass this is 4 000, well
+#: past `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT`'s per-device share of anything real; it exists so a
+#: query that somehow never drains cannot spin a request thread forever.
+MAX_ERASE_PASSES = 10
+
+
+@dataclass(frozen=True)
+class DeviceErasure:
+    """What one «Slett alt» removed. Every field is a count an operator can act on."""
+
+    device_deleted: bool = False
+    journeys_tombstoned: int = 0
+    passes: int = 0
+    complete: bool = False
+
+
+def _erase_device_body(
+    transaction: Any, refs: _Refs, journeys_query: Any, *, device_id: str, client_id: str, now: datetime
+) -> tuple[int, bool, bool]:
+    """One pass of «Slett alt»: tombstone this device's journeys, and delete the device when done.
+
+    Returns ``(tombstoned, device_deleted, complete)``.
+
+    **The journeys are TOMBSTONED, not hard-deleted, and that is the load-bearing decision here.**
+    The obvious reading of "erase everything" is `transaction.delete` on each journey document, and
+    it is wrong for one reason nothing about the transaction would reveal: the poller matches
+    against `SubscriptionMirror`, which is kept current by a watermark query over
+    `mirror_updated_at`. A document that is GONE matches no query, so the mirror would never learn
+    -- it would keep the traveller's journeys for up to `MIRROR_MAX_AGE_S` (6 h), and for those six
+    hours the cycle would keep matching them, wording them, and writing decision rows about a
+    traveller who has asked to be forgotten. A tombstone travels the path the mirror already has.
+
+    What survives the tombstone is a redacted husk: the route, the window, the typed names and the
+    push ledgers are cleared in the same write, so nothing personal outlives the transaction. What
+    it keeps is an id, a status and a TTL, which is what makes the erasure idempotent and auditable
+    -- and is exactly the shape `_delete_body` already writes for a client's revocation.
+
+    The DEVICE document is hard-deleted, because nothing mirrors it: it is read per push, by id.
+
+    Order matters and the reverse is the bug: the device is deleted only on the pass that drains the
+    journeys, so a retry after a partial pass can still FIND them -- they carry `device_id`, and the
+    query is by that field rather than by a list on the device.
+    """
+    # BOTH READS FIRST, and the device one is not optional ordering. Firestore refuses a read after
+    # a write inside a transaction (`ReadAfterWriteError`), so reading the device below the
+    # tombstone loop raises on every erasure that has anything to erase -- which is every real one.
+    # The emulator is what caught it; the hermetic fake records the op order but does not enforce
+    # the client's rule. Reading it here also puts the ownership check ahead of the first write,
+    # which is where a refusal belongs.
+    stored_device = _doc(_read(transaction, refs.device(device_id)))
+    if stored_device and stored_device.get("client_id") != client_id:
+        raise Forbidden("device belongs to another client")
+    page = _read_query(transaction, journeys_query)
+    complete = len(page) < MAX_ERASE_WRITES_PER_TRANSACTION
+    tombstoned = 0
+    for snapshot in page:
+        stored = _doc(snapshot)
+        if not stored or stored.get("status") == "deleted":
+            continue
+        if stored.get("client_id") != client_id:
+            raise Forbidden("journey belongs to another client")
+        transaction.update(
+            refs.subscription(str(stored["subscription_id"])),
+            {
+                "status": "deleted",
+                "deleted_at": now,
+                "version": int(stored.get("version") or 0) + 1,
+                "updated_at": now,
+                TTL_FIELD: now + timedelta(days=HISTORY_DAYS),
+                "lifetime_expires_at": now,
+                # REDACTED IN THE SAME WRITE, unlike a client's revocation, which redacts only once
+                # `cleanup_subscription` completes. The difference is whose request it is: a client
+                # revoking a subscription is administering its own integration and the route is its
+                # own data, while this is a traveller exercising erasure, and "the route is gone
+                # within 24 hours" is not what that answer should be.
+                "from_stop": "",
+                "to_stop": "",
+                "from_name": "",
+                "to_name": "",
+                "device_id": "",
+                "definition_digest": "",
+                "notified": {},
+                "pushed_trains": {},
+                "daily_pushes": {},
+                "cleanup": {"state": "redacted", "attempts": 0, "requested_at": now},
+                # The one write the mirror learns from. Without it the entry lives in memory for up
+                # to MIRROR_MAX_AGE_S and the pass keeps matching a traveller who is gone.
+                MIRROR_FIELD: _mirror_stamp(),
+            },
+        )
+        tombstoned += 1
+    device_deleted = False
+    if complete and stored_device:
+        transaction.delete(refs.device(device_id))
+        device_deleted = True
+    return tombstoned, device_deleted, complete
+
+
+def erase_device(
+    *, device_id: str, client_id: str, now: datetime | None = None
+) -> DeviceErasure:
+    """«Slett alt»: every journey this device registered, and the device itself.
+
+    A LOOP of bounded transactions rather than one, because Firestore allows 500 writes per
+    transaction: a device with more journeys than :data:`MAX_ERASE_WRITES_PER_TRANSACTION` would
+    otherwise have a delete that cannot commit at all -- a traveller unable to exercise erasure
+    BECAUSE they registered a lot of journeys. Each pass is atomic; the device document goes in the
+    pass that drains the last journey, so a retry after a partial one still finds the rest.
+
+    Idempotent: a second call finds no device and no undeleted journey and reports zeros.
+    """
+    instant = now or _now()
+    client = _firestore_client()
+    refs = _Refs(client)
+    tombstoned = deleted = 0
+    passes = 0
+    complete = False
+    while passes < MAX_ERASE_PASSES and not complete:
+        passes += 1
+        # REBUILT each pass, not hoisted. The tombstone clears `device_id`, which is what drops a
+        # journey out of this query and therefore what ends the loop -- so the query has to be a
+        # fresh one against the state the last pass committed. A hoisted query is harmless with the
+        # real client (a `Query` is lazy and re-executes) and is what a re-reading loop should look
+        # like regardless; the suite's fake materialises it at build time, which is exactly the
+        # shape that turns "one query object" into "the same rows forever".
+        journeys_query = _query(
+            "device_journeys",
+            equality={"client_id": client_id, "channel": CHANNEL_WEB_PUSH, "device_id": device_id},
+            limit=MAX_ERASE_WRITES_PER_TRANSACTION,
+        )
+        n, device_deleted, complete = _run_transaction(
+            lambda txn, q=journeys_query: _erase_device_body(
+                txn,
+                refs,
+                q,
+                device_id=device_id,
+                client_id=client_id,
+                now=instant,
+            )
+        )
+        tombstoned += n
+        deleted += int(device_deleted)
+    logger.info(
+        "Device %s erased: %d journey(s) tombstoned in %d pass(es)",
+        device_id,
+        tombstoned,
+        passes,
+        extra={
+            "fields": {
+                "event": "notification_subscription",
+                "result": "device_erased" if complete else "device_erase_incomplete",
+                "client_id": client_id,
+                "journeys": tombstoned,
+                "passes": passes,
+            }
+        },
+    )
+    return DeviceErasure(
+        device_deleted=bool(deleted),
+        journeys_tombstoned=tombstoned,
+        passes=passes,
+        complete=complete,
+    )
+
+
+def _web_push_journey(transaction: Any, refs: _Refs, subscription_id: str) -> dict[str, Any]:
+    """The journey document, or :class:`NotFound`. The one read both mark bodies start from.
+
+    Raising rather than returning ``None``, because both callers are in `/varsel`'s push loop and
+    what the raise means there is "this registration was erased while the push was in flight" --
+    which must not resurrect it. `transaction.update` on a missing document raises in the client
+    too, but only after the write is attempted and with a message about a path rather than about a
+    registration; reading first is what makes the outcome legible.
+    """
+    stored = _doc(_read(transaction, refs.subscription(subscription_id)))
+    if not stored or stored.get("status") != "active":
+        raise NotFound(f"no active registration {subscription_id}")
+    return stored
+
+
+def _mark_notified_body(
+    transaction: Any, refs: _Refs, *, subscription_id: str, situation_number: str, now: datetime
+) -> dict[str, Any]:
+    """Record that this registration has been pushed about one SITUATION.
+
+    Per situation, not per train, and the difference is `/varsel`'s own and unchanged: a browser is
+    pushed once per situation (`varsel._notified`), while a webhook recipient's `delivered` marks
+    are per (subscription, train). The two live on the same document under different names because
+    they are different questions, and folding them would refuse the wording pass to a second
+    departure under a delivered situation.
+
+    Pruned at write time by the same rule the delivered marks use, so the map is bounded without a
+    sweep anywhere: a mark whose situation has ended simply falls out on the next write.
+    """
+    stored = _web_push_journey(transaction, refs, subscription_id)
+    marks = dict(stored.get("notified") or {})
+    marks[situation_number] = now + timedelta(days=HISTORY_DAYS)
+    patch = {"notified": _prune_marks(marks, now), "updated_at": now}
+    transaction.update(refs.subscription(subscription_id), patch)
+    return {**stored, **patch}
+
+
+def _record_push_body(
+    transaction: Any, refs: _Refs, *, subscription_id: str, train_ref: str, now: datetime
+) -> dict[str, Any]:
+    """Record one delivered push: the train it was about, and the Oslo day it spent.
+
+    `pushed_trains` is what `/varsel` titles a replacement «Bekreftet:» from -- today it is in
+    process memory and a restart loses only the prefix. On a document it survives one, which is a
+    small improvement and a real change: a confirmation after a restart now says «Bekreftet:» where
+    it used to say the plain title.
+
+    `daily_pushes` is R11's cap at `/varsel`'s own grain, per registration per Oslo day. **Durable
+    where it was in memory**, which is the change worth stating: a restart used to hand every
+    registration a fresh four, and it no longer does.
+    """
+    stored = _web_push_journey(transaction, refs, subscription_id)
+    day = oslo_day(now)
+    counters = dict(stored.get("daily_pushes") or {})
+    counters[day] = int(counters.get(day) or 0) + 1
+    trains = dict(stored.get("pushed_trains") or {})
+    trains[train_ref] = now + timedelta(days=HISTORY_DAYS)
+    patch = {
+        "daily_pushes": _prune_daily(counters, now),
+        "pushed_trains": _prune_marks(trains, now),
+        "updated_at": now,
+    }
+    transaction.update(refs.subscription(subscription_id), patch)
+    return {**stored, **patch}
+
+
+def mark_notified(*, subscription_id: str, situation_number: str, now: datetime | None = None) -> None:
+    """Record a browser push about one situation. Raises :class:`NotFound` on an erased journey."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    _run_transaction(
+        lambda txn: _mark_notified_body(
+            txn, refs, subscription_id=subscription_id, situation_number=situation_number, now=instant
+        )
+    )
+
+
+def record_push(*, subscription_id: str, train_ref: str, now: datetime | None = None) -> None:
+    """Spend one of this registration's daily pushes. Raises :class:`NotFound` on an erased journey."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    _run_transaction(
+        lambda txn: _record_push_body(
+            txn, refs, subscription_id=subscription_id, train_ref=train_ref, now=instant
+        )
+    )
+
+
+def device_journeys(*, device_id: str, client_id: str, now: datetime | None = None) -> list[Subscription]:
+    """One device's live registrations, read on the REQUEST path.
+
+    The request path and not the mirror, deliberately (R15): a traveller who has just created a
+    journey must see it in the next `list_journeys`, and the mirror is at best as fresh as the sync
+    at the start of this cycle. The cycle reads the mirror; the traveller reads the store.
+
+    Liveness is applied here rather than in the query for `load_active_subscriptions`' reason: a
+    second inequality would need its own index AND would exclude every document that lacks the
+    field.
+    """
+    instant = now or _now()
+    query = _query(
+        "device_journeys",
+        equality={"client_id": client_id, "channel": CHANNEL_WEB_PUSH, "device_id": device_id},
+        limit=MAX_SUBSCRIPTION_LIST_SCAN,
+    )
+    out: list[Subscription] = []
+    for snapshot in _stream(query):
+        doc = _doc(snapshot)
+        if not doc or not subscription_is_live(doc, instant):
+            continue
+        try:
+            out.append(_subscription_from_doc(doc))
+        except Exception:
+            logger.debug("Unreadable web_push registration; skipping it", exc_info=True)
+    return out
 
 
 # ---- Ordered, durable deletion ----------------------------------------------------------------

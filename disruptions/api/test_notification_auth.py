@@ -1570,6 +1570,34 @@ def test_the_three_delivery_quotas_are_bounded_and_seeded_from_the_constants():
     )
 
 
+def test_the_device_quota_is_declared_bounded_and_deliberately_unread():
+    """U12's `max_devices`, in `concurrent_deliveries`' own pattern -- declared a unit before it is
+    spent so that ONE `set-quotas` shape serves the whole plan rather than changing under a client
+    mid-way, and asserted UNREAD so it cannot quietly become decoration.
+
+    Unread where? In `main`, which is the module that would have to resolve it: `notification_store.
+    upsert_device` takes the ceiling as an argument and there is no request path handing it one
+    until U13. The store's own default is the constant, so a call that omits it is still bounded --
+    which is what makes shipping the field ahead of its caller safe rather than merely tidy.
+
+    **Flip this assertion in U13**, exactly as U8 flipped `concurrent_deliveries`': the wiring
+    should trip a test rather than slip in unnoticed.
+    """
+    defaults = notification_auth.DEFAULT_QUOTAS
+    assert defaults.max_devices == notification_store.MAX_DEVICES_PER_CLIENT
+    low, high = notification_auth.QUOTA_BOUNDS["max_devices"]
+    assert low == 1 and high >= defaults.max_devices
+    assert "max_devices" in notification_auth.set_client_quotas.__code__.co_varnames, (
+        "the operator tool cannot set a quota set_client_quotas does not take"
+    )
+    tool = (HERE.parent.parent / "scripts" / "manage_notification_client.py").read_text()
+    assert "--max-devices" in tool and '"max_devices"' in tool
+    assert "max_devices" not in (HERE / "main.py").read_text(), (
+        "main resolves this quota now, so the pass has a caller -- flip this assertion to require "
+        "it, the way U8 flipped concurrent_deliveries'"
+    )
+
+
 def test_the_tool_sets_quotas_and_create_client_takes_them_for_a_new_account():
     store = _install()
     try:

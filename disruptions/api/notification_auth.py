@@ -229,6 +229,11 @@ QUOTA_BOUNDS: dict[str, tuple[int, int]] = {
     "max_pending_events": (1, 10_000),
     "deliveries_per_minute": (1, 10_000),
     "concurrent_deliveries": (1, 64),
+    # U12. The `devices` collection's ceiling, for the client `/varsel`'s own registrations belong
+    # to. Bounded well under the subscription ceiling because a device is a browser INSTALL and a
+    # journey is a registration: a traveller has one or two of the first and several of the second,
+    # so a device count anywhere near the journey count means something is minting them.
+    "max_devices": (1, 50_000),
 }
 
 
@@ -242,6 +247,13 @@ class Quotas:
     max_pending_events: int = notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
     deliveries_per_minute: int = notification_store.MAX_DELIVERY_ATTEMPTS_PER_DESTINATION_PER_CYCLE
     concurrent_deliveries: int = DEFAULT_CONCURRENT_DELIVERIES
+    #: Declared and deliberately UNREAD until U13, which is when a request path exists to enforce it
+    #: -- `notification_store.upsert_device` takes the ceiling as an argument and `main` has nobody
+    #: to resolve it for yet. Declared now so the operator tool, the bounds table and the published
+    #: numbers move in ONE change rather than three, which is `concurrent_deliveries`' own precedent
+    #: (declared at U7, spent at U8). A test asserts it is still unread, so it cannot become
+    #: decoration.
+    max_devices: int = notification_store.MAX_DEVICES_PER_CLIENT
 
     def validate(self) -> None:
         for name, (low, high) in QUOTA_BOUNDS.items():
@@ -1065,6 +1077,7 @@ def set_client_quotas(
     max_pending_events: int | None = None,
     deliveries_per_minute: int | None = None,
     concurrent_deliveries: int | None = None,
+    max_devices: int | None = None,
     now: datetime | None = None,
 ) -> Account:
     """Raise or lower one client's ceilings; unnamed ones keep their value.

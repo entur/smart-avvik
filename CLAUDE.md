@@ -1052,6 +1052,72 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   the `ARRAY<STRUCT<... ARRAY<STRING> ...>>` shape, so the file is in `validate_varsel_sql.sh` — but
   a dry run does not evaluate parameters, so it proves the shape and the column types and nothing
   about the join.
+  **The store can hold a traveller's registration, and the shape dispatches on `channel`** (U12,
+  2026-09-13, KTD12). Nothing reads any of it yet — U13 is the wiring — and it is one PR ahead of
+  that on purpose, because U12 ADDS an index and a TTL config while U13 switches queries: the
+  2026-09-12 measurement is that adding an equality to an existing query is a destroy-and-create
+  with a **~7-minute** guarded outage on that read, and add-only has none.
+  **Validation refuses the other channel's field in both directions.** `destination_id` is required
+  on `webhook` and refused on `web_push`; `device_id` is the mirror image. Refusing matters as much
+  as requiring: a `web_push` document carrying a destination id would be offered to the delivery
+  pass by any future query that forgets its channel filter, which is a traveller's commute POSTed
+  to a client's callback. The channel-only fields are **absent** on the other channel rather than
+  written empty — a Firestore equality does not match a document that LACKS a field, so an absent
+  `device_id` is what makes it impossible for the `device_journeys` query to return a client's
+  subscription, as a property of the data rather than of whoever writes the query next.
+  **`web_push` has a lifetime horizon and no inactivity one.** The inactivity horizon exists
+  because a client's integration nobody has touched for sixty days is probably forgotten; a
+  traveller not opening the PWA for two months is what a working alert service looks like. The
+  field is OMITTED rather than written far ahead, because a field that lies about its meaning is
+  worse than an absent one, and `subscription_is_live` dispatches through `_horizon_fields`. The
+  fail-closed property survives and it is worth saying which part: a document with no `channel`
+  reads as `webhook` (U5's convention) and still needs both, and a `web_push` document missing its
+  LIFETIME horizon is still dead. **What it costs is a product question, flagged rather than
+  decided: a registration now expires 180 days after it was created, where the GCS blob has no
+  expiry on one at all.**
+  Two traps this had to not fall into, both of them silent. `device_id` shares `destination_id`'s
+  slot in the **definition digest** through an `or`, because exactly one is non-empty by
+  construction — a slot of its own would add a separator, change every stored hash and turn every
+  client's idempotent re-POST into a Conflict on the deploy that introduced the field. And
+  `MirrorEntry.liveness` is a hand-built map handed to `subscription_is_live`, so it had to gain
+  `channel` too: without it every `web_push` entry reads as a webhook one, demands the horizon it
+  does not have, and **the mirror holds the entry, reports it in its size, and serves it to
+  nobody**. A structural test now pins that map against every field the predicate reads.
+  **«Slett alt» TOMBSTONES the journeys and hard-deletes the device, and the reason is the mirror.**
+  The obvious erasure is `transaction.delete` on every document, and it is wrong for a reason
+  nothing about the transaction reveals: a deleted document matches no query, `mirror_sync`'s
+  watermark query included, so the poller's in-memory mirror would keep the traveller's journeys
+  for up to `MIRROR_MAX_AGE_S` (6 h) and keep matching, wording and writing decision rows about
+  somebody who asked to be forgotten. A tombstone travels the path the mirror already has, so
+  `_erase_device_body` is in `MIRROR_STAMPING_BODIES`. What survives is a husk — id, status, a
+  7-day TTL — because the route, the window, the typed names, the device id and the three push
+  ledgers are cleared in the SAME write, which is **stricter than a client's revocation** (that one
+  redacts only once cleanup completes): a client is administering its own integration, a traveller
+  is exercising erasure, and "within 24 hours" is not what that answer should be. The pass is
+  bounded at `MAX_ERASE_WRITES_PER_TRANSACTION` (400, under Firestore's 500 writes) and the caller
+  LOOPS, rebuilding the query each pass — the tombstone clears `device_id`, which is what drops a
+  journey out of the query and therefore what ends the loop — with the device document deleted in
+  the pass that drains the last journey, so a retry after a partial one still finds the rest.
+  **Both reads come first**: Firestore raises `ReadAfterWriteError` on a read below a write in a
+  transaction, so reading the device under the tombstone loop raised on every erasure that had
+  anything to erase. The emulator caught that; the hermetic fake records op order but does not
+  enforce the client's rule, so the check is now explicit.
+  **`_mark_notified_body` and `_record_push_body` deliberately do NOT stamp the mirror**, for
+  `_sent_body`'s reason one channel over: one push on a corridor with a hundred thousand
+  registrations would be a hundred thousand documents through the watermark query. **The
+  consequence is a constraint on U13 and is written at the declaration so U13 finds it — the cycle
+  cannot read `notified` or `pushed_trains` from the mirror**, because a stale mark re-offers a
+  train already pushed; those reads go to the store, per push. Two smaller changes ride with them:
+  `daily_pushes` and `pushed_trains` become DURABLE where they were in process memory, so a restart
+  no longer hands every registration a fresh four and a confirmation after one still says
+  «Bekreftet:».
+  What U12 deliberately did **not** build: a `create_web_push_journey` body. `create_subscription`
+  already is one, and a second create would mean a second ceiling check, a second idempotence rule
+  and a second place that stamps the mirror — three chances to disagree with a function that does
+  all of it — over a `channel` value the spec carries anyway. A journey is deleted by
+  `delete_subscription` for the same reason. `max_devices` joins `Quotas` **declared and unread**
+  until U13, in `concurrent_deliveries`' own pattern, with a test that asserts it is still unread so
+  it cannot become decoration.
   **Delivery left the poller and became its own workload** (U11, 2026-09-13, KTD18). It was a step
   of `main._rebuild_all`'s `notification_webhooks` phase, which put it behind ~30 s of BigQuery on a
   loop whose period is how often SIRI-SX moves — ~296 s — while a pending event is valid for an

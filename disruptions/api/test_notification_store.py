@@ -36,6 +36,7 @@ import json
 import os
 import pathlib
 import re
+import textwrap
 import threading
 import urllib.error
 import urllib.request
@@ -377,6 +378,16 @@ def _install(client: _FakeClient) -> None:
     ) -> _Page:
         client.query_calls.append((name, dict(equality or {}), dict(inequality or {}), limit))
         rows = client.pages.get(name, [])
+        # EQUALITY IS APPLIED, on the fields a row actually carries. The fake returned its page
+        # verbatim, which was harmless while every page was built for one query -- and became a
+        # fake that cannot show termination once `_erase_device_body` started CLEARING `device_id`
+        # as part of the tombstone. That clearing is what drops a journey out of `device_journeys`
+        # and therefore what ends the erase loop; a page that ignored the filter re-served the same
+        # rows forever. A row that lacks the field is left in rather than excluded, which is looser
+        # than Firestore (an equality excludes a document missing the field) and keeps every page
+        # built before this behaving as it did.
+        for field, wanted in (equality or {}).items():
+            rows = [(path, row) for path, row in rows if row.get(field, wanted) == wanted]
         # Positional, as Firestore's own cursor is: everything strictly after the snapshot in the
         # page's ordering. `pending_deliveries` pages past a throttled destination this way.
         if start_after is not None:
@@ -3746,9 +3757,9 @@ def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_c
     """
     _emulator_setup()
     notification_store.create_subscription(_spec(subscription_id="client-sub"), now=NOW)
-    notification_store.create_subscription(
-        _spec(subscription_id="browser-sub", channel=notification_store.CHANNEL_WEB_PUSH), now=NOW
-    )
+    # A REAL `web_push` spec since U12: `destination_id` is refused on this channel and `device_id`
+    # is required, so `_spec(channel=...)` alone is no longer a valid registration.
+    notification_store.create_subscription(_web_push_spec(subscription_id="browser-sub"), now=NOW)
     mirror = notification_store.subscription_mirror()
     mirror.seed(now=NOW)
     assert mirror.size() == 2, "one mirror holds both channels -- which is what U12 needs"
@@ -3775,6 +3786,116 @@ def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_c
         pass
     else:
         raise AssertionError("the webhook ceiling did not bind")
+
+
+def emulator_test_one_devices_journeys_and_its_erasure_against_a_real_client():
+    """U12's two store paths on a real Firestore: the device-scoped query and «Slett alt».
+
+    What this reaches that the hermetic half cannot. The QUERY runs with three equalities and an
+    ordering against a real index resolver -- though read the emulator's limit honestly: it tracks
+    no composite indexes, so a missing one raises `FailedPrecondition` in production and nothing
+    here. What this does prove is that the filter selects the right documents, which is the half a
+    hand-written page cannot show. And the ERASURE runs its bounded loop against a real query whose
+    rows change under it: the tombstone clears `device_id`, that is what drops a journey out of the
+    query, and that is what ends the loop -- a property the fake could only show after it learned
+    to apply equality at all.
+    """
+    _emulator_setup()
+    notification_store.upsert_device(
+        device_id="device-1",
+        client_id=CLIENT,
+        endpoint="https://push.example.com/x/abc",
+        p256dh="BPk",
+        auth="auth",
+        now=NOW,
+    )
+    for sid in ("j1", "j2", "j3"):
+        notification_store.create_subscription(_web_push_spec(subscription_id=sid), now=NOW)
+    # A second device's journey and a webhook subscription, which the query must not return.
+    notification_store.create_subscription(
+        _web_push_spec(subscription_id="other", device_id="device-2"), now=NOW
+    )
+    notification_store.create_subscription(_spec(subscription_id="client-sub"), now=NOW)
+
+    mine = notification_store.device_journeys(device_id="device-1", client_id=CLIENT, now=NOW)
+    assert sorted(s.subscription_id for s in mine) == ["j1", "j2", "j3"], [s.subscription_id for s in mine]
+
+    bound = notification_store.MAX_ERASE_WRITES_PER_TRANSACTION
+    notification_store.MAX_ERASE_WRITES_PER_TRANSACTION = 2
+    try:
+        result = notification_store.erase_device(device_id="device-1", client_id=CLIENT, now=NOW)
+    finally:
+        notification_store.MAX_ERASE_WRITES_PER_TRANSACTION = bound
+    assert result.complete and result.device_deleted and result.journeys_tombstoned == 3, result
+    assert result.passes >= 2, "the bound was two; three journeys cannot be one pass"
+    assert notification_store.get_device("device-1") is None
+    assert notification_store.device_journeys(device_id="device-1", client_id=CLIENT, now=NOW) == []
+    # The neighbours are untouched -- the erasure is scoped by device AND by channel AND by client.
+    assert len(notification_store.device_journeys(device_id="device-2", client_id=CLIENT, now=NOW)) == 1
+    assert notification_store.get_subscription("client-sub", client_id=CLIENT, now=NOW) is not None
+    # And the mirror learns, which is the whole reason the journeys are tombstoned rather than
+    # deleted: a seed after the erasure holds the husks and serves none of them.
+    mirror = notification_store.subscription_mirror()
+    mirror.seed(now=NOW)
+    live = mirror.recipients(NOW, channel=notification_store.CHANNEL_WEB_PUSH)
+    assert [e.subscription_id for e in live] == ["other"], [e.subscription_id for e in live]
+
+
+def emulator_test_a_journey_created_mid_erasure_leaves_no_orphan():
+    """The plan's interleaving scenario, and the only place it can run.
+
+    A traveller taps «Slett alt» while a create is in flight. Firestore's optimistic concurrency is
+    what settles it: the erase transaction read the journeys, the create writes one, and whichever
+    commits second is retried against the state the first left. Two outcomes are correct -- the new
+    journey is tombstoned by the retry, or it is created after the erasure and stands alone with no
+    device -- and exactly one is not: a live journey the erasure believes it removed.
+
+    Driven by creating BETWEEN the two passes rather than by racing threads, because what has to
+    hold is the state after the interleaving rather than the scheduler's order, and a real race
+    would make the test flaky for a reason having nothing to do with the store.
+    """
+    _emulator_setup()
+    notification_store.upsert_device(
+        device_id="device-1",
+        client_id=CLIENT,
+        endpoint="https://push.example.com/x/abc",
+        p256dh="BPk",
+        auth="auth",
+        now=NOW,
+    )
+    for sid in ("j1", "j2", "j3"):
+        notification_store.create_subscription(_web_push_spec(subscription_id=sid), now=NOW)
+
+    bound = notification_store.MAX_ERASE_WRITES_PER_TRANSACTION
+    notification_store.MAX_ERASE_WRITES_PER_TRANSACTION = 2
+    refs = notification_store._Refs(notification_store._firestore_client())
+    try:
+        # Pass one, by hand: two journeys tombstoned, not complete, device still there.
+        query = notification_store._query(
+            "device_journeys",
+            equality={
+                "client_id": CLIENT,
+                "channel": notification_store.CHANNEL_WEB_PUSH,
+                "device_id": "device-1",
+            },
+            limit=2,
+        )
+        n, deleted, complete = notification_store._run_transaction(
+            lambda txn: notification_store._erase_device_body(
+                txn, refs, query, device_id="device-1", client_id=CLIENT, now=NOW
+            )
+        )
+        assert n == 2 and not deleted and not complete
+        # The interleaved create, committed between the passes.
+        notification_store.create_subscription(_web_push_spec(subscription_id="j4"), now=NOW)
+        # The rest of the erasure, through the public loop.
+        notification_store.erase_device(device_id="device-1", client_id=CLIENT, now=NOW)
+    finally:
+        notification_store.MAX_ERASE_WRITES_PER_TRANSACTION = bound
+
+    assert notification_store.get_device("device-1") is None
+    left = notification_store.device_journeys(device_id="device-1", client_id=CLIENT, now=NOW)
+    assert left == [], f"an orphaned live journey survived the erasure: {[s.subscription_id for s in left]}"
 
 
 def emulator_test_the_create_ceiling_counts_through_the_index():
@@ -4372,12 +4493,30 @@ def test_exactly_the_mirror_consuming_bodies_stamp_the_watermark_field():
         f"{sorted(notification_store.MIRROR_STAMPING_BODIES)}. A new body that changes a field the "
         "mirror reads must stamp AND be declared; one that does not must do neither."
     )
-    for never in ("_sent_body", "_claim_body", "_failed_body", "_terminal_body"):
+    for never in (
+        "_sent_body",
+        "_claim_body",
+        "_failed_body",
+        "_terminal_body",
+        # U12's two push-side ledgers, out for `_sent_body`'s reason one channel over: they are
+        # written once per push, so stamping them would put one push on a hundred-thousand-strong
+        # corridor through the watermark query as a hundred thousand documents. **The consequence
+        # is a constraint on U13 and is recorded at the declaration: the cycle cannot read
+        # `notified` or `pushed_trains` from the mirror**, because a stale mark re-offers a train
+        # already pushed. Those reads go to the store, per push.
+        "_mark_notified_body",
+        "_record_push_body",
+    ):
         assert never in bodies, f"{never} is gone; this check has stopped checking anything"
         assert never not in stamping, (
             f"{never} stamps the watermark: every delivery would then make its subscription due "
             "for re-read and the watermark would sync the busiest documents on every cycle"
         )
+    # And the one whose OMISSION would be a privacy defect rather than a freshness one (U12). A
+    # hard-deleted document matches no watermark query, so an erasure that did not stamp would
+    # leave the mirror matching, wording and logging decisions about a traveller who asked to be
+    # forgotten, for up to MIRROR_MAX_AGE_S. That is why the erasure tombstones rather than deletes.
+    assert "_erase_device_body" in stamping
 
 
 def test_the_watermark_field_is_the_stores_clock_and_advances_on_each_write():
@@ -4415,6 +4554,461 @@ def test_the_watermark_field_is_the_stores_clock_and_advances_on_each_write():
         assert stored[notification_store.MIRROR_FIELD] == client.server_now, (
             f"{step} did not restamp the watermark field"
         )
+
+
+def _web_push_spec(**over: Any) -> notification_store.SubscriptionSpec:
+    """A `web_push` spec. `destination_id` is cleared because validation REFUSES it on this channel;
+    `_spec`'s default is the webhook one.
+    """
+    base: dict[str, Any] = {
+        "channel": notification_store.CHANNEL_WEB_PUSH,
+        "destination_id": "",
+        "device_id": "device-1",
+        "from_name": "Oslo S",
+        "to_name": "Ski stasjon",
+        "consent_version": "2026-09-02.1",
+    }
+    base.update(over)
+    return _spec(**base)
+
+
+def test_the_two_channel_fields_are_required_and_refused_in_both_directions():
+    """U12. Requiring is the obvious half; REFUSING is the one that matters.
+
+    A `web_push` document carrying a `destination_id` would be offered to the delivery pass by any
+    future query that forgets its channel filter -- which is a traveller's commute POSTed to a
+    client's callback. A `webhook` document carrying a `device_id` is the mirror image: it would be
+    returned by the `device_journeys` query as somebody's registration.
+    """
+    _web_push_spec().validate()
+    _spec().validate()
+    for over, expected in (
+        (
+            {
+                "channel": notification_store.CHANNEL_WEB_PUSH,
+                "destination_id": "dest-a",
+                "device_id": "device-1",
+            },
+            "destination_id is not",
+        ),
+        ({"channel": notification_store.CHANNEL_WEB_PUSH, "destination_id": "", "device_id": ""}, "device_id is required"),
+        ({"device_id": "device-1"}, "device_id is not"),
+        ({"destination_id": ""}, "destination_id is required"),
+    ):
+        try:
+            _spec(**over).validate()
+        except notification_store.Conflict as exc:
+            assert expected in str(exc), (over, str(exc))
+        else:
+            raise AssertionError(f"{over} was accepted")
+
+
+def test_the_webhook_definition_digest_did_not_move_when_device_id_arrived():
+    """The digest is a STORED value, so extending its material is a migration.
+
+    `device_id` shares `destination_id`'s position through an `or` rather than taking one of its
+    own: exactly one of the two is non-empty by construction, so a webhook spec's material is byte
+    for byte what it was. A second position would add a separator, change every hash, and turn every
+    client's idempotent re-POST into a Conflict on the deploy that introduced the field.
+
+    Recomputed here from the literal pre-U12 material rather than from a frozen constant, so the
+    check still means something if the surrounding fields ever move.
+    """
+    import hashlib
+
+    spec = _spec()
+    material = "|".join(
+        (
+            spec.client_id,
+            spec.destination_id,
+            spec.from_stop,
+            spec.to_stop,
+            spec.begin,
+            spec.end,
+            ",".join(str(d) for d in sorted(set(spec.days))),
+            spec.external_ref,
+            "test" if spec.test else "live",
+        )
+    )
+    assert notification_store._definition_digest(spec) == hashlib.sha256(material.encode()).hexdigest()[:32]
+    # And the two channels cannot collide: one carries a destination where the other carries a
+    # device, in the same slot, so the digests differ as long as the two ids do.
+    assert notification_store._definition_digest(_web_push_spec()) != notification_store._definition_digest(spec)
+
+
+def test_a_web_push_registration_has_a_lifetime_horizon_and_no_inactivity_one():
+    """U12's horizon rule, and the product change inside it.
+
+    The inactivity horizon exists because a client's integration nobody has touched for sixty days
+    is probably forgotten. A traveller's registered commute is the opposite: not opening the PWA for
+    two months is what a working alert service looks like. So `web_push` keeps the lifetime horizon
+    alone -- which is still a change, because today's GCS blob has NO expiry on a registration at
+    all, and 180 days from creation is a real ceiling somebody has to have chosen.
+
+    The field is OMITTED rather than written far ahead: a field that lies about its meaning is worse
+    than an absent one, and `subscription_is_live` reads the absence correctly.
+    """
+    doc = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    assert "inactivity_expires_at" not in doc
+    lifetime = NOW + timedelta(days=notification_store.SUBSCRIPTION_MAX_LIFETIME_DAYS)
+    assert doc["lifetime_expires_at"] == lifetime
+    assert doc[notification_store.TTL_FIELD] == lifetime
+    assert notification_store.subscription_is_live(doc, NOW)
+    assert not notification_store.subscription_is_live(doc, lifetime + timedelta(seconds=1))
+    # A webhook document is untouched: both horizons, TTL the minimum.
+    webhook = notification_store._new_subscription_doc(_spec(), NOW)
+    assert webhook["inactivity_expires_at"] == NOW + timedelta(
+        days=notification_store.SUBSCRIPTION_INACTIVITY_DAYS
+    )
+
+
+def test_a_document_with_no_channel_still_needs_both_horizons():
+    """The fail-closed half survives the dispatch, and this is the assertion that says so.
+
+    U5's convention is that a document without `channel` MEANS webhook, which is what every document
+    written before that field existed is. So the dispatch cannot weaken them: they still need both
+    horizons, and a `web_push` document missing its LIFETIME one is still dead.
+    """
+    doc = notification_store._new_subscription_doc(_spec(), NOW)
+    doc.pop("channel")
+    assert notification_store.subscription_is_live(doc, NOW)
+    doc.pop("inactivity_expires_at")
+    assert not notification_store.subscription_is_live(doc, NOW), (
+        "a channel-less document is a webhook document and still needs both horizons"
+    )
+    web_push = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    web_push.pop("lifetime_expires_at")
+    assert not notification_store.subscription_is_live(web_push, NOW)
+
+
+def test_the_channel_only_fields_are_absent_rather_than_empty_on_the_other_channel():
+    """Absent, not `""`. A Firestore equality filter does not match a document that LACKS the field,
+    so an absent `device_id` is what makes it impossible for the `device_journeys` query to return a
+    webhook subscription -- a property of the DATA rather than of the filter. Empty strings would
+    move that guarantee into whoever writes the query next.
+    """
+    webhook = notification_store._new_subscription_doc(_spec(), NOW)
+    for field in ("device_id", "from_name", "to_name", "consent_version", "notified", "pushed_trains", "daily_pushes"):
+        assert field not in webhook, field
+    web_push = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    assert web_push["device_id"] == "device-1"
+    assert web_push["from_name"] == "Oslo S" and web_push["to_name"] == "Ski stasjon"
+    assert web_push["consent_version"] == "2026-09-02.1"
+    assert web_push["notified"] == {} and web_push["pushed_trains"] == {} and web_push["daily_pushes"] == {}
+
+
+def test_the_liveness_map_carries_every_field_the_predicate_reads():
+    """A structural pin, because the failure it catches is silent in the worst possible way.
+
+    `MirrorEntry.liveness` is a hand-built map handed to `subscription_is_live`, and the predicate
+    grew a `channel` read at U12. Without it every `web_push` entry reads as a webhook one, demands
+    an inactivity horizon it does not have, and the mirror holds the entry, reports its size, and
+    serves it to NOBODY. That is what this test found while it was being written.
+
+    Asserted off the SOURCE of the predicate and its helper rather than by behaviour: what has to
+    hold is a property of the field set, and the next field added to the predicate fails here in
+    exactly the same way.
+    """
+    import ast
+    import inspect
+
+    read: set[str] = set()
+    for fn in (notification_store.subscription_is_live, notification_store._horizon_fields):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                read.add(str(node.args[0].value))
+        # The two horizon names arrive as a tuple the predicate iterates, not as `get` literals.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and str(node.value).endswith("_expires_at"):
+                read.add(str(node.value))
+    read |= {notification_store.TTL_FIELD}
+    assert {"status", "channel", "lifetime_expires_at", "inactivity_expires_at"} <= read, read
+    entry = notification_store._mirror_entry(notification_store._new_subscription_doc(_spec(), NOW))
+    missing = read - set(entry.liveness)
+    assert not missing, (
+        f"MirrorEntry.liveness does not carry {sorted(missing)}, which subscription_is_live reads. "
+        "The mirror would hold those entries, report them in its size, and serve them to nobody."
+    )
+
+
+# ---- Devices and the erasure path (U12) --------------------------------------------------------
+
+
+def _device_doc(client: _FakeClient, **over: Any) -> dict[str, Any]:
+    """A stored device built by the REAL writer, never a hand-written dict (`_live_doc`'s rule)."""
+    base: dict[str, Any] = {
+        "device_id": "device-1",
+        "client_id": CLIENT,
+        "endpoint": "https://push.example.com/x/abc",
+        "p256dh": "BPk-key",
+        "auth": "auth-token",
+        "brand": "entur",
+        "now": NOW,
+    }
+    base.update(over)
+    doc = notification_store._new_device_doc(**base)
+    client.put(notification_store.DEVICES, doc["device_id"], doc)
+    return doc
+
+
+def _journey_rows(client: _FakeClient, ids: list[str], **over: Any) -> list[dict[str, Any]]:
+    """`n` live `web_push` registrations on one device, stored AND paged for the erase query."""
+    rows = []
+    for sid in ids:
+        doc = notification_store._new_subscription_doc(
+            _web_push_spec(subscription_id=sid, **over), NOW
+        )
+        client.put(notification_store.SUBSCRIPTIONS, sid, doc)
+        # The STORED dict, by reference, so the page reflects what earlier writes did to it. The
+        # fake's `put` copies, and paging the copy would make a second erase pass re-read rows the
+        # first one had already tombstoned -- a fake that cannot show idempotence.
+        rows.append(client.docs[f"{notification_store.SUBSCRIPTIONS}/{sid}"])
+    client.page("device_journeys", notification_store.SUBSCRIPTIONS, rows)
+    return rows
+
+
+def test_an_upsert_keeps_the_original_signup_and_clears_the_tombstone():
+    """`/varsel`'s own rule (2026-09-04), not an invention here: a device whose push subscription
+    lapsed and came back is the SAME device. Restamping its signup would make every lapse read as a
+    new install in the device report, and the tombstone going with it is the same fact from the
+    other side -- there is an endpoint again, so there is nothing left to explain.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        _device_doc(client)
+        notification_store.tombstone_device(device_id="device-1", client_id=CLIENT, reason="expired")
+        stored = client.doc(notification_store.DEVICES, "device-1")
+        assert stored["tombstone"]["reason"] == "expired"
+        assert stored["endpoint"] == "" and stored["p256dh"] == "" and stored["auth"] == ""
+        assert stored["tombstone"]["original_created_at"] == NOW
+
+        later = NOW + timedelta(days=3)
+        device = notification_store.upsert_device(
+            device_id="device-1",
+            client_id=CLIENT,
+            endpoint="https://push.example.com/x/new",
+            p256dh="BPk-new",
+            auth="auth-new",
+            now=later,
+        )
+        assert device.created_at == NOW, "an upsert is a refresh, not a new install"
+        assert device.tombstone == {} and device.pushable
+        assert client.doc(notification_store.DEVICES, "device-1")["last_seen_at"] == later
+    finally:
+        _uninstall()
+
+
+def test_a_refresh_is_never_refused_by_the_device_ceiling():
+    """Counted only for a device that does not exist yet. A client AT its ceiling that could not
+    update an endpoint would have every expired subscription become permanent -- a traveller who
+    silently stops being alerted, which is the failure the whole re-subscribe path exists to avoid.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        _device_doc(client)
+        client.page("device_count", notification_store.DEVICES, [{"device_id": "d"} for _ in range(9)])
+        notification_store.upsert_device(
+            device_id="device-1",
+            client_id=CLIENT,
+            endpoint="https://push.example.com/x/refreshed",
+            p256dh="k",
+            auth="a",
+            max_devices=1,
+        )
+        try:
+            notification_store.upsert_device(
+                device_id="device-2",
+                client_id=CLIENT,
+                endpoint="https://push.example.com/x/other",
+                p256dh="k",
+                auth="a",
+                max_devices=1,
+            )
+        except notification_store.QuotaExceeded:
+            pass
+        else:
+            raise AssertionError("a NEW device past the ceiling must be refused")
+        assert client.doc(notification_store.DEVICES, "device-2") is None, "refused before any write"
+    finally:
+        _uninstall()
+
+
+def test_erasure_tombstones_the_journeys_so_the_mirror_learns_and_deletes_the_device():
+    """The decision this unit turns on, and the reason is not visible in the transaction.
+
+    The obvious «Slett alt» is `transaction.delete` on every document. A deleted document matches no
+    query -- including `mirror_sync`'s watermark query -- so the poller's mirror would keep the
+    traveller's journeys for up to MIRROR_MAX_AGE_S (6 h) and keep matching, wording and logging
+    decisions about somebody who asked to be forgotten. A TOMBSTONE travels the path the mirror
+    already has.
+
+    What survives is a husk: id, status, TTL. The route, the window, the typed names, the device id
+    and the three push ledgers are cleared in the SAME write, so nothing personal outlives the
+    transaction -- unlike a client's revocation, which redacts only once the cleanup completes.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        _device_doc(client)
+        _journey_rows(client, ["j1", "j2"])
+        result = notification_store.erase_device(device_id="device-1", client_id=CLIENT)
+        assert result.complete and result.device_deleted and result.journeys_tombstoned == 2
+        # READS BEFORE WRITES, and this one is not house style: Firestore raises
+        # `ReadAfterWriteError` on a read that follows a write inside a transaction, so a body that
+        # read the device BELOW the tombstone loop would raise on every erasure that has anything
+        # to erase -- which is every real one. The emulator found exactly that while this was being
+        # written; the fake records the op order, so this is where it is checked.
+        for txn in client.transactions:
+            assert _no_read_after_write(txn), f"a read follows a write: {txn.ops}"
+        assert client.doc(notification_store.DEVICES, "device-1") is None, "the device is GONE"
+        for sid in ("j1", "j2"):
+            husk = client.doc(notification_store.SUBSCRIPTIONS, sid)
+            assert husk is not None, "a tombstone, not a deletion -- the mirror has to see it"
+            assert husk["status"] == "deleted"
+            assert husk[notification_store.MIRROR_FIELD] == client.server_now, (
+                "without the stamp the mirror never learns and keeps matching an erased traveller"
+            )
+            for cleared in ("from_stop", "to_stop", "from_name", "to_name", "device_id"):
+                assert husk[cleared] == "", cleared
+            for emptied in ("notified", "pushed_trains", "daily_pushes"):
+                assert husk[emptied] == {}, emptied
+            assert not notification_store.subscription_is_live(husk, NOW)
+    finally:
+        _uninstall()
+
+
+def test_a_second_erasure_is_a_no_op():
+    """Idempotent in both directions: no device, and no journey that is not already a tombstone.
+    A traveller who taps twice, or a retried request, must not produce a second audit line's worth
+    of writes -- and must not raise, because the answer to "is it gone" is yes.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        _device_doc(client)
+        _journey_rows(client, ["j1"])
+        notification_store.erase_device(device_id="device-1", client_id=CLIENT)
+        writes_before = sum(len(t.writes) for t in client.transactions)
+        again = notification_store.erase_device(device_id="device-1", client_id=CLIENT)
+        assert again.complete and again.journeys_tombstoned == 0 and not again.device_deleted
+        assert sum(len(t.writes) for t in client.transactions) == writes_before, "no second write"
+    finally:
+        _uninstall()
+
+
+def test_erasure_drains_across_transactions_rather_than_refusing_a_busy_device():
+    """Firestore allows 500 writes per transaction. A device with more journeys than one pass can
+    carry must not become a traveller who CANNOT exercise erasure because they registered a lot --
+    so the pass is bounded and the caller loops, and the device document goes in the pass that
+    drains the last journey so a retry after a partial one still finds the rest.
+    """
+    client = _FakeClient()
+    _install(client)
+    bound = notification_store.MAX_ERASE_WRITES_PER_TRANSACTION
+    notification_store.MAX_ERASE_WRITES_PER_TRANSACTION = 2
+    try:
+        _device_doc(client)
+        _journey_rows(client, ["j1", "j2", "j3"])
+        result = notification_store.erase_device(device_id="device-1", client_id=CLIENT)
+        assert result.passes >= 2, result
+        assert result.complete and result.device_deleted and result.journeys_tombstoned == 3
+    finally:
+        notification_store.MAX_ERASE_WRITES_PER_TRANSACTION = bound
+        _uninstall()
+
+
+def test_a_mark_on_an_erased_journey_raises_and_creates_nothing():
+    """The push that was in flight when «Slett alt» landed. `transaction.update` on a missing
+    document raises in the client too -- but only after the write is attempted, and with a message
+    about a path. Reading first is what makes the outcome legible AND what guarantees the erased
+    registration is not resurrected by a `set`.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        _journey_rows(client, ["j1"])
+        notification_store.mark_notified(subscription_id="j1", situation_number="ENT:S:1")
+        assert client.doc(notification_store.SUBSCRIPTIONS, "j1")["notified"]
+        client.docs[f"{notification_store.SUBSCRIPTIONS}/j1"]["status"] = "deleted"
+        for call in (
+            lambda: notification_store.mark_notified(subscription_id="j1", situation_number="ENT:S:2"),
+            lambda: notification_store.record_push(subscription_id="j1", train_ref="VYG:L1:07:18"),
+            lambda: notification_store.mark_notified(subscription_id="gone", situation_number="x"),
+        ):
+            try:
+                call()
+            except notification_store.NotFound:
+                pass
+            else:
+                raise AssertionError("an erased registration must not be written to")
+        assert client.doc(notification_store.SUBSCRIPTIONS, "gone") is None
+    finally:
+        _uninstall()
+
+
+def test_the_two_mark_bodies_are_idempotent_under_one_clock():
+    """The transaction-suite rule: a body may run more than once, so two runs with one clock must
+    write the same document. `record_push` is the interesting one -- it INCREMENTS, so a naive
+    implementation is the counter-example, and what makes it safe is that the increment is computed
+    from the document the body just read rather than accumulated across runs.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        _journey_rows(client, ["j1"])
+        refs = notification_store._Refs(client)
+        first = notification_store._mark_notified_body(
+            _Txn(), refs, subscription_id="j1", situation_number="ENT:S:1", now=NOW
+        )
+        second = notification_store._mark_notified_body(
+            _Txn(), refs, subscription_id="j1", situation_number="ENT:S:1", now=NOW
+        )
+        assert first["notified"] == second["notified"]
+        a = notification_store._record_push_body(
+            _Txn(), refs, subscription_id="j1", train_ref="T", now=NOW
+        )
+        b = notification_store._record_push_body(
+            _Txn(), refs, subscription_id="j1", train_ref="T", now=NOW
+        )
+        assert a["daily_pushes"] == b["daily_pushes"] == {notification_store.oslo_day(NOW): 1}
+        assert a["pushed_trains"] == b["pushed_trains"]
+    finally:
+        _uninstall()
+
+
+def test_one_devices_journeys_are_read_from_the_store_and_liveness_is_applied_here():
+    """R15: a traveller who has just created a journey sees it in the next `list_journeys`, so the
+    request path reads the STORE and not the mirror -- which is at best as fresh as the sync at the
+    start of this cycle. Liveness is applied in Python for `load_active_subscriptions`' reason: a
+    second inequality would need its own index and would exclude every document lacking the field.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        rows = _journey_rows(client, ["j1", "j2"])
+        rows[1]["status"] = "deleted"
+        client.page("device_journeys", notification_store.SUBSCRIPTIONS, rows)
+        got = notification_store.device_journeys(device_id="device-1", client_id=CLIENT)
+        assert [s.subscription_id for s in got] == ["j1"], "a tombstone is not a registration"
+        _name, equality, _ineq, _limit = next(
+            call for call in client.query_calls if call[0] == "device_journeys"
+        )
+        assert equality == {
+            "client_id": CLIENT,
+            "channel": notification_store.CHANNEL_WEB_PUSH,
+            "device_id": "device-1",
+        }, equality
+    finally:
+        _uninstall()
 
 
 def test_the_create_ceiling_is_counted_per_channel():

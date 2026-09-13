@@ -389,6 +389,7 @@ def _quotas_from_args(args: argparse.Namespace) -> dict[str, int]:
             ("max_pending_events", args.max_pending_events),
             ("deliveries_per_minute", args.deliveries_per_minute),
             ("concurrent_deliveries", args.concurrent_deliveries),
+            ("max_devices", args.max_devices),
         )
         if value is not None
     }
@@ -599,6 +600,14 @@ def _parser() -> argparse.ArgumentParser:
             default=None,
             help=f"Authenticated requests per minute (default {defaults.requests_per_minute}, "
             f"at most {bounds['requests_per_minute'][1]}).",
+        )
+        p.add_argument(
+            "--max-devices",
+            type=int,
+            default=None,
+            help=f"Browser installs this client may hold (default {defaults.max_devices}, at most "
+            f"{bounds['max_devices'][1]}). Only the `web_push` channel has devices; for a webhook "
+            "client this is declared and never reached.",
         )
         p.add_argument(
             "--daily-cap",
