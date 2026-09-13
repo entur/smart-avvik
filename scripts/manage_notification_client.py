@@ -413,6 +413,35 @@ def _cmd_create_client(args: argparse.Namespace, actor: str) -> Any:
     )
 
 
+def _cmd_create_browser_account(args: argparse.Namespace, actor: str) -> Any:
+    """The cutover's own step: the reserved `browser` account, with its two ceilings and NO key.
+
+    Its own command rather than a flag on `create-client`, because what makes `browser` different
+    is not the arguments -- it is that the account exists to carry two numbers for a population of
+    the public, and that no credential may ever be issued against it. A flag would put the reserved
+    id one typo away from the onboarding path it is reserved FROM.
+
+    Creating it is not optional under `VARSEL_STATE_BACKEND=store`: `notification_auth.quotas_for`
+    answers an unknown client with `DEFAULT_QUOTAS`, whose `max_active_subscriptions` is 500, so a
+    deployment that took the default would refuse the 501st traveller with «Tjenesten er full» and
+    nothing would say why. `main._registration_store` fails the lifespan rather than let that
+    happen, which is what makes this a runbook step with teeth.
+
+    Idempotent through `create_client`: running it twice on the same name is `unchanged`, and a
+    quota change afterwards is `set-quotas`, which is audited as one.
+    """
+    quotas = notification_auth.Quotas(
+        max_devices=args.max_devices,
+        max_active_subscriptions=args.max_active_subscriptions,
+    )
+    return notification_auth.create_client(
+        varsel_state.BROWSER_CLIENT_ID,
+        name=args.name,
+        actor=actor,
+        quotas=quotas,
+    )
+
+
 def _cmd_set_quotas(args: argparse.Namespace, actor: str) -> Any:
     return notification_auth.set_client_quotas(args.client_id, actor=actor, **_quotas_from_args(args))
 
@@ -440,6 +469,16 @@ def _cmd_show_client(args: argparse.Namespace, actor: str) -> Any:
 
 
 def _cmd_issue_key(args: argparse.Namespace, actor: str) -> Any:
+    if args.client_id == varsel_state.BROWSER_CLIENT_ID:
+        # The operations document has claimed since U13 that nothing may issue a credential for
+        # this id, and until U14 nothing enforced it. What a credential for `browser` would be is
+        # an API token that reads and rewrites every traveller's registration through the client
+        # API -- the one account on the system whose subscriptions belong to members of the public.
+        raise SystemExit(
+            f"{varsel_state.BROWSER_CLIENT_ID!r} is reserved for /varsel's own registrations and "
+            "no credential may be issued for it; its documents belong to travellers, not to a "
+            "client"
+        )
     credential, bearer = notification_auth.issue_credential(
         args.client_id, actor=actor, label=args.label or ""
     )
@@ -551,6 +590,7 @@ def _cmd_retire_signing(args: argparse.Namespace, actor: str) -> Any:
 
 _COMMANDS: dict[str, Callable[[argparse.Namespace, str], Any]] = {
     "create-client": _cmd_create_client,
+    "create-browser-account": _cmd_create_browser_account,
     "suspend-client": _cmd_suspend_client,
     "resume-client": _cmd_resume_client,
     "show-client": _cmd_show_client,
@@ -660,6 +700,17 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--client-id", required=True)
     p.add_argument("--name", required=True)
     quota_flags(p)
+
+    p = add(
+        "create-browser-account",
+        help=(
+            "The reserved /varsel account: two ceilings, no credential. A cutover step for "
+            "VARSEL_STATE_BACKEND=store."
+        ),
+    )
+    p.add_argument("--name", default="/varsel travellers")
+    p.add_argument("--max-devices", type=int, required=True)
+    p.add_argument("--max-active-subscriptions", type=int, required=True)
 
     p = add("suspend-client", help="Refuse this client's credentials with 403.")
     p.add_argument("--client-id", required=True)
@@ -814,6 +865,16 @@ def main(
         result = _COMMANDS[args.command](args, actor)
     except notification_auth.ClientAuthError as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    except SystemExit as exc:
+        # A command refusing on POLICY rather than on a store error -- the reserved `browser` id is
+        # the only one today, in two places. `SystemExit` carries its message as `code`, so
+        # returning that would hand a STRING to the shell as an exit status; the message goes to
+        # stderr like every other refusal here and the status is 2, the tool's own "you asked for
+        # something it will not do". Caught rather than left to propagate so `main` has ONE exit
+        # contract: a caller that gets an integer from every other refusal and an exception from
+        # this one cannot test the refusals at all, which is how both of them went unpinned.
+        print(str(exc.code) if exc.code is not None else "refused", file=sys.stderr)
         return 2
     print(json.dumps(_serialise(result), indent=2, ensure_ascii=False), file=stream)
     return 0
