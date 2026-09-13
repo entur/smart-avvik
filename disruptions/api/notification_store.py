@@ -566,16 +566,45 @@ def subscription_is_live(doc: Mapping[str, Any], now: datetime) -> bool:
         return False
     if not _not_expired(doc, now):
         return False
-    for horizon in ("lifetime_expires_at", "inactivity_expires_at"):
+    for horizon in _horizon_fields(doc):
         at = _as_dt(doc.get(horizon))
         if at is None or at <= now:
             return False
     return True
 
 
-def _horizons(created_at: datetime, last_seen_at: datetime) -> dict[str, datetime]:
-    """R5's two horizons and the TTL field derived as their minimum."""
+def _horizon_fields(doc: Mapping[str, Any]) -> tuple[str, ...]:
+    """Which horizons this document has to be inside. Channel-dispatched since U12.
+
+    A `web_push` registration has a LIFETIME horizon and no inactivity one. The inactivity horizon
+    exists because a client's subscription that nobody has touched for sixty days is probably a
+    forgotten integration; a traveller's registered commute is the opposite -- not opening the PWA
+    for two months is what a working alert service looks like, and today's GCS blob has no expiry
+    on a registration at all.
+
+    **The fail-closed property survives, and it is worth saying which part.** A document with no
+    `channel` reads as `webhook` (U5's convention), so nothing written before this needs both
+    horizons any less. A `web_push` document missing its LIFETIME horizon is still dead, because
+    that field is still required and a missing one still reads as expired. What is given up is only
+    the second belt on the one channel that never had a second horizon.
+    """
+    if str(doc.get("channel") or CHANNEL_WEBHOOK) == CHANNEL_WEB_PUSH:
+        return ("lifetime_expires_at",)
+    return ("lifetime_expires_at", "inactivity_expires_at")
+
+
+def _horizons(
+    created_at: datetime, last_seen_at: datetime, *, channel: str = CHANNEL_WEBHOOK
+) -> dict[str, datetime]:
+    """R5's horizons and the TTL field derived as their minimum. Channel-dispatched since U12.
+
+    `web_push` gets the lifetime horizon only -- see :func:`_horizon_fields` for why, and note that
+    the inactivity field is OMITTED rather than set far ahead: a field that lies about its meaning
+    is worse than an absent one, and `subscription_is_live` reads the absence correctly.
+    """
     lifetime = created_at + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS)
+    if channel == CHANNEL_WEB_PUSH:
+        return {"lifetime_expires_at": lifetime, TTL_FIELD: lifetime}
     inactivity = last_seen_at + timedelta(days=SUBSCRIPTION_INACTIVITY_DAYS)
     return {
         "lifetime_expires_at": lifetime,
@@ -772,7 +801,14 @@ def _definition_digest(spec: SubscriptionSpec) -> str:
     material = "|".join(
         (
             spec.client_id,
-            spec.destination_id,
+            # ONE FIELD, not two, and the `or` is the whole point. `validate` refuses whichever of
+            # these two does not belong to the channel, so exactly one is ever non-empty -- and
+            # keeping them in ONE position means a webhook spec's material is byte-identical to what
+            # it was before `device_id` existed. Two positions would add a separator and change
+            # every hash, which turns every client's idempotent re-POST into a Conflict on the
+            # deploy that introduces the field. The digest is a stored value; its inputs cannot be
+            # reordered or extended without a migration.
+            spec.destination_id or spec.device_id,
             spec.from_stop,
             spec.to_stop,
             spec.begin,
@@ -1139,6 +1175,10 @@ class SubscriptionSpec:
 
     subscription_id: str
     client_id: str
+    #: The webhook callback this subscription is delivered to. Required on `webhook` and REFUSED on
+    #: `web_push`, where delivery is a Web Push endpoint held on the DEVICE document rather than a
+    #: property of the registration: a traveller with two phones has two devices and one journey
+    #: each, and a destination id here would either duplicate the endpoint or name one of them.
     destination_id: str
     from_stop: str
     to_stop: str
@@ -1151,6 +1191,19 @@ class SubscriptionSpec:
     #: field would make this a breaking change to a shape three modules build. U12 gives /varsel's
     #: own registrations `web_push` through the same builder.
     channel: str = CHANNEL_WEBHOOK
+    #: The device this registration belongs to (`web_push` only; REFUSED on `webhook`). It is what
+    #: `list_journeys` reads one traveller's registrations by, and it is in the definition digest --
+    #: so the same journey id submitted from a different device is a Conflict rather than a retry.
+    device_id: str = ""
+    #: What the traveller typed in the picker, kept for display only. Free text from an
+    #: unauthenticated browser, so it never reaches a client's notification: the webhook event's
+    #: route line carries the stop REGISTRY's names (decided 2026-09-10), and these two exist so
+    #: /varsel's own card can render the words the traveller chose.
+    from_name: str = ""
+    to_name: str = ""
+    #: Which version of the privacy texts the traveller accepted. Stored per registration rather
+    #: than per device because consent is given when a journey is created and the texts move.
+    consent_version: str = ""
 
     def validate(self) -> None:
         """/varsel's own three window rules, restated rather than imported.
@@ -1162,13 +1215,27 @@ class SubscriptionSpec:
         windows are refused here exactly as they are in /varsel, or a client could register a
         window /varsel would not and R3's parity claim would be quietly false.
         """
-        if not self.subscription_id or not self.client_id or not self.destination_id:
-            raise Conflict("subscription_id, client_id and destination_id are required")
+        if not self.subscription_id or not self.client_id:
+            raise Conflict("subscription_id and client_id are required")
         # Validated against the vocabulary rather than left free, because it is now a QUERY key:
         # a typo'd channel writes a document that no read path's equality filter matches, which is
         # a subscription that exists, is billed for, and is never loaded or counted by anything.
         if self.channel not in CHANNELS:
             raise Conflict(f"channel must be one of {', '.join(CHANNELS)}")
+        # The two channel-specific fields are required on their own channel and REFUSED on the
+        # other, in both directions. Refusing matters as much as requiring: a `web_push` document
+        # carrying a destination id would be offered to the delivery pass by any future query that
+        # forgets its channel filter, which is a traveller's commute POSTed to a client's callback.
+        if self.channel == CHANNEL_WEBHOOK:
+            if not self.destination_id:
+                raise Conflict("destination_id is required on a webhook subscription")
+            if self.device_id:
+                raise Conflict("device_id is not a webhook subscription's field")
+        else:
+            if not self.device_id:
+                raise Conflict("device_id is required on a web_push subscription")
+            if self.destination_id:
+                raise Conflict("destination_id is not a web_push subscription's field")
         if not self.from_stop or not self.to_stop:
             raise Conflict("from_stop and to_stop must be non-empty")
         if self.from_stop == self.to_stop:
@@ -1345,7 +1412,35 @@ def _new_subscription_doc(
         "daily_reservations": {},
         "delivered": {},
         "cleanup": {},
-        **_horizons(now, now),
+        **_channel_fields(spec),
+        **_horizons(now, now, channel=spec.channel),
+    }
+
+
+def _channel_fields(spec: SubscriptionSpec) -> dict[str, Any]:
+    """The fields only one channel has, written only on that channel.
+
+    Not written as empty strings on the other channel, deliberately: a Firestore equality filter
+    does not match a document that LACKS a field, which is what makes an absent `device_id` on a
+    webhook subscription the right answer -- the `device_journeys` query can never return one,
+    whatever its channel filter does. Empty strings would make that a property of the filter
+    instead of a property of the data.
+
+    `notified`, `pushed_trains` and `daily_pushes` are the push-side ledgers `/varsel` keeps in
+    memory today (`_notified`, `_pushed_trains`, `_daily_pushes`). They start empty and are written
+    by `mark_notified` and `record_push`, neither of which stamps the mirror -- see
+    :data:`MIRROR_STAMPING_BODIES`.
+    """
+    if spec.channel != CHANNEL_WEB_PUSH:
+        return {}
+    return {
+        "device_id": spec.device_id,
+        "from_name": spec.from_name,
+        "to_name": spec.to_name,
+        "consent_version": spec.consent_version,
+        "notified": {},
+        "pushed_trains": {},
+        "daily_pushes": {},
     }
 
 
@@ -2034,8 +2129,15 @@ def _mirror_entry(doc: Mapping[str, Any]) -> MirrorEntry:
         end=sub.end,
         days=tuple(sub.days),
         delivered=dict(sub.delivered),
+        # EVERY field `subscription_is_live` reads, and `channel` is one of them since U12 --
+        # `_horizon_fields` dispatches on it, and a map without it reads as `webhook`, which demands
+        # an inactivity horizon a `web_push` document does not have. The symptom is the worst shape
+        # there is: the mirror holds the entry, reports its size, and serves it to nobody. Pinned by
+        # `test_the_liveness_map_carries_every_field_the_predicate_reads`, because the next field
+        # added to that predicate fails here in exactly the same silent way.
         liveness={
             "status": sub.status,
+            "channel": sub.channel,
             TTL_FIELD: sub.expires_at,
             "lifetime_expires_at": sub.lifetime_expires_at,
             "inactivity_expires_at": sub.inactivity_expires_at,
@@ -2546,9 +2648,13 @@ SUBJECT_MIRRORING_BODIES = frozenset({"_mint", "_withdraw_body", "_clear_below_t
 #: `_sent_body` writes `delivered_revision`, `delivered_at` and the pending pointer. None of the
 #: three is in the standing set, the emit pass never asks about them, and mirroring them would put
 #: the busiest documents in the hottest loop for no reader -- the same economy that keeps this body
-#: out of `MIRROR_STAMPING_BODIES`. **Re-check this sentence when U11 moves delivery to its own
-#: Deployment**: what a worker there writes is exactly those three fields, and the moment one of
-#: them enters the standing set this process stops being their only writer.
+#: out of `MIRROR_STAMPING_BODIES`. **Re-checked at U11 and it stands.** Delivery now runs in
+#: `webhook_worker`, its own Deployment, so those three fields really are written by a second
+#: process -- and none of them is in the standing set the emit pass reads, so the mirror this
+#: process keeps is not made stale by a write it cannot see. What the re-check DID change is the
+#: wording of KTD6: from U11 on it is one writer of a subject's PHASE and REVISION, not one writer
+#: of the document. The moment one of those three fields enters the standing set, that stops being
+#: true and this exemption has to go with it.
 SUBJECT_WRITERS_OUTSIDE_THE_MIRROR = frozenset({"_sent_body"})
 
 

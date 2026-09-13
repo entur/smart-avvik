@@ -36,6 +36,7 @@ import json
 import os
 import pathlib
 import re
+import textwrap
 import threading
 import urllib.error
 import urllib.request
@@ -4415,6 +4416,188 @@ def test_the_watermark_field_is_the_stores_clock_and_advances_on_each_write():
         assert stored[notification_store.MIRROR_FIELD] == client.server_now, (
             f"{step} did not restamp the watermark field"
         )
+
+
+def _web_push_spec(**over: Any) -> notification_store.SubscriptionSpec:
+    """A `web_push` spec. `destination_id` is cleared because validation REFUSES it on this channel;
+    `_spec`'s default is the webhook one.
+    """
+    base: dict[str, Any] = {
+        "channel": notification_store.CHANNEL_WEB_PUSH,
+        "destination_id": "",
+        "device_id": "device-1",
+        "from_name": "Oslo S",
+        "to_name": "Ski stasjon",
+        "consent_version": "2026-09-02.1",
+    }
+    base.update(over)
+    return _spec(**base)
+
+
+def test_the_two_channel_fields_are_required_and_refused_in_both_directions():
+    """U12. Requiring is the obvious half; REFUSING is the one that matters.
+
+    A `web_push` document carrying a `destination_id` would be offered to the delivery pass by any
+    future query that forgets its channel filter -- which is a traveller's commute POSTed to a
+    client's callback. A `webhook` document carrying a `device_id` is the mirror image: it would be
+    returned by the `device_journeys` query as somebody's registration.
+    """
+    _web_push_spec().validate()
+    _spec().validate()
+    for over, expected in (
+        (
+            {
+                "channel": notification_store.CHANNEL_WEB_PUSH,
+                "destination_id": "dest-a",
+                "device_id": "device-1",
+            },
+            "destination_id is not",
+        ),
+        ({"channel": notification_store.CHANNEL_WEB_PUSH, "destination_id": "", "device_id": ""}, "device_id is required"),
+        ({"device_id": "device-1"}, "device_id is not"),
+        ({"destination_id": ""}, "destination_id is required"),
+    ):
+        try:
+            _spec(**over).validate()
+        except notification_store.Conflict as exc:
+            assert expected in str(exc), (over, str(exc))
+        else:
+            raise AssertionError(f"{over} was accepted")
+
+
+def test_the_webhook_definition_digest_did_not_move_when_device_id_arrived():
+    """The digest is a STORED value, so extending its material is a migration.
+
+    `device_id` shares `destination_id`'s position through an `or` rather than taking one of its
+    own: exactly one of the two is non-empty by construction, so a webhook spec's material is byte
+    for byte what it was. A second position would add a separator, change every hash, and turn every
+    client's idempotent re-POST into a Conflict on the deploy that introduced the field.
+
+    Recomputed here from the literal pre-U12 material rather than from a frozen constant, so the
+    check still means something if the surrounding fields ever move.
+    """
+    import hashlib
+
+    spec = _spec()
+    material = "|".join(
+        (
+            spec.client_id,
+            spec.destination_id,
+            spec.from_stop,
+            spec.to_stop,
+            spec.begin,
+            spec.end,
+            ",".join(str(d) for d in sorted(set(spec.days))),
+            spec.external_ref,
+            "test" if spec.test else "live",
+        )
+    )
+    assert notification_store._definition_digest(spec) == hashlib.sha256(material.encode()).hexdigest()[:32]
+    # And the two channels cannot collide: one carries a destination where the other carries a
+    # device, in the same slot, so the digests differ as long as the two ids do.
+    assert notification_store._definition_digest(_web_push_spec()) != notification_store._definition_digest(spec)
+
+
+def test_a_web_push_registration_has_a_lifetime_horizon_and_no_inactivity_one():
+    """U12's horizon rule, and the product change inside it.
+
+    The inactivity horizon exists because a client's integration nobody has touched for sixty days
+    is probably forgotten. A traveller's registered commute is the opposite: not opening the PWA for
+    two months is what a working alert service looks like. So `web_push` keeps the lifetime horizon
+    alone -- which is still a change, because today's GCS blob has NO expiry on a registration at
+    all, and 180 days from creation is a real ceiling somebody has to have chosen.
+
+    The field is OMITTED rather than written far ahead: a field that lies about its meaning is worse
+    than an absent one, and `subscription_is_live` reads the absence correctly.
+    """
+    doc = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    assert "inactivity_expires_at" not in doc
+    lifetime = NOW + timedelta(days=notification_store.SUBSCRIPTION_MAX_LIFETIME_DAYS)
+    assert doc["lifetime_expires_at"] == lifetime
+    assert doc[notification_store.TTL_FIELD] == lifetime
+    assert notification_store.subscription_is_live(doc, NOW)
+    assert not notification_store.subscription_is_live(doc, lifetime + timedelta(seconds=1))
+    # A webhook document is untouched: both horizons, TTL the minimum.
+    webhook = notification_store._new_subscription_doc(_spec(), NOW)
+    assert webhook["inactivity_expires_at"] == NOW + timedelta(
+        days=notification_store.SUBSCRIPTION_INACTIVITY_DAYS
+    )
+
+
+def test_a_document_with_no_channel_still_needs_both_horizons():
+    """The fail-closed half survives the dispatch, and this is the assertion that says so.
+
+    U5's convention is that a document without `channel` MEANS webhook, which is what every document
+    written before that field existed is. So the dispatch cannot weaken them: they still need both
+    horizons, and a `web_push` document missing its LIFETIME one is still dead.
+    """
+    doc = notification_store._new_subscription_doc(_spec(), NOW)
+    doc.pop("channel")
+    assert notification_store.subscription_is_live(doc, NOW)
+    doc.pop("inactivity_expires_at")
+    assert not notification_store.subscription_is_live(doc, NOW), (
+        "a channel-less document is a webhook document and still needs both horizons"
+    )
+    web_push = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    web_push.pop("lifetime_expires_at")
+    assert not notification_store.subscription_is_live(web_push, NOW)
+
+
+def test_the_channel_only_fields_are_absent_rather_than_empty_on_the_other_channel():
+    """Absent, not `""`. A Firestore equality filter does not match a document that LACKS the field,
+    so an absent `device_id` is what makes it impossible for the `device_journeys` query to return a
+    webhook subscription -- a property of the DATA rather than of the filter. Empty strings would
+    move that guarantee into whoever writes the query next.
+    """
+    webhook = notification_store._new_subscription_doc(_spec(), NOW)
+    for field in ("device_id", "from_name", "to_name", "consent_version", "notified", "pushed_trains", "daily_pushes"):
+        assert field not in webhook, field
+    web_push = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    assert web_push["device_id"] == "device-1"
+    assert web_push["from_name"] == "Oslo S" and web_push["to_name"] == "Ski stasjon"
+    assert web_push["consent_version"] == "2026-09-02.1"
+    assert web_push["notified"] == {} and web_push["pushed_trains"] == {} and web_push["daily_pushes"] == {}
+
+
+def test_the_liveness_map_carries_every_field_the_predicate_reads():
+    """A structural pin, because the failure it catches is silent in the worst possible way.
+
+    `MirrorEntry.liveness` is a hand-built map handed to `subscription_is_live`, and the predicate
+    grew a `channel` read at U12. Without it every `web_push` entry reads as a webhook one, demands
+    an inactivity horizon it does not have, and the mirror holds the entry, reports its size, and
+    serves it to NOBODY. That is what this test found while it was being written.
+
+    Asserted off the SOURCE of the predicate and its helper rather than by behaviour: what has to
+    hold is a property of the field set, and the next field added to the predicate fails here in
+    exactly the same way.
+    """
+    import ast
+    import inspect
+
+    read: set[str] = set()
+    for fn in (notification_store.subscription_is_live, notification_store._horizon_fields):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                read.add(str(node.args[0].value))
+        # The two horizon names arrive as a tuple the predicate iterates, not as `get` literals.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and str(node.value).endswith("_expires_at"):
+                read.add(str(node.value))
+    read |= {notification_store.TTL_FIELD}
+    assert {"status", "channel", "lifetime_expires_at", "inactivity_expires_at"} <= read, read
+    entry = notification_store._mirror_entry(notification_store._new_subscription_doc(_spec(), NOW))
+    missing = read - set(entry.liveness)
+    assert not missing, (
+        f"MirrorEntry.liveness does not carry {sorted(missing)}, which subscription_is_live reads. "
+        "The mirror would hold those entries, report them in its size, and serve them to nobody."
+    )
 
 
 def test_the_create_ceiling_is_counted_per_channel():
