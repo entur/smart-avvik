@@ -1954,6 +1954,42 @@ def test_the_per_destination_ceiling_is_per_MINUTE_and_not_per_read():
     assert webhook_delivery._spent_this_minute(DEST) == 4
 
 
+def test_a_pass_that_attempted_nothing_charges_nothing():
+    """The charge is on what was ATTEMPTED, not on what was read.
+
+    Between the read and the pool sits the stale-expiry sweep, and a sweep that hits its bounded
+    wait empties the shard list: the store is demonstrably hung, so nothing is dialled. A page
+    charged beside the read would spend a destination's whole minute for zero POSTs and then keep
+    refusing it for a minute after the store recovered -- the mechanism producing exactly the
+    self-inflicted outage it exists to prevent.
+    """
+    client = _install()
+    try:
+        _live(client)
+        deliveries = _pending(client, n=2)
+        # ONE stale and one ready, which is what makes this test see anything: the sibling hang test
+        # makes every delivery stale, so `pending.ready` is empty there and a charge beside the read
+        # would have charged nothing anyway. Here the ready one is exactly what a charge placed too
+        # early would spend.
+        client.docs[f"{notification_store.DELIVERIES}/{deliveries[0]['delivery_id']}"][
+            "valid_until"
+        ] = NOW - timedelta(seconds=1)
+        webhook_delivery.reset_destination_window()
+        client.hang = threading.Event()
+        report = webhook_delivery.deliver_pending(
+            now=NOW, sender=_sender(), wait_s=0.15, deadline_s=5.0, timeout_s=0.05, store_call_s=0.05
+        )
+    finally:
+        if client.hang is not None:
+            client.hang.set()
+        _uninstall()
+    assert report.timed_out and report.ready == 1, report
+    assert not _sent, "the hung sweep means nothing was dialled"
+    assert webhook_delivery._spent_this_minute(DEST) == 0, (
+        "a pass that dialled nothing must not spend the destination's minute"
+    )
+
+
 def test_the_window_rolls_and_a_destination_nothing_has_tried_is_unspent():
     """The other half: the tally has to expire, or one busy minute would throttle a destination for
     the life of the process. Driven by moving the marks backwards rather than by sleeping a minute.

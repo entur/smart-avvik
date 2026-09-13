@@ -869,10 +869,14 @@ applied inside the read. Under the poller that was once per ~296 s cycle, so 50 
 ten a minute — under the name, which is why nothing said otherwise. The worker's rounds are
 continuous while there is work, so the same ceiling per read would be ~600/min at one receiver.
 `webhook_delivery` therefore keeps a rolling per-destination minute tally and subtracts it from the
-ceiling before the read admits a row; the tally is charged on what the read ADMITTED rather than on
-what was POSTed, which over-counts by whatever the pass then skips — the safe direction, since what
-it slows is the next read against a destination that is already unwell. It is **per process**, so N
-replicas are N times the rate, which is the same thing the drain formula's `× replicas` says.
+ceiling before the read admits a row. The tally is charged on the page the pass is ABOUT TO
+ATTEMPT — after the stale sweep, because a sweep that hits its bounded wait empties the shard list
+and nothing is dialled at all, and a page charged before that would spend a destination's whole
+minute for zero POSTs and keep refusing it for a minute after the store recovered. It still
+over-counts by whatever the pass then skips mid-flight (a destination paused by a sibling attempt),
+which is the safe direction: what it slows is the next read against a destination already unwell. It
+is **per process**, so N replicas are N times the rate, which is the same thing the drain formula's
+`× replicas` says.
 
 **Scaling is `deployment.forceReplicas` in `helm/kix-avvik/env/worker-values-kub-ent-<env>.yaml`.**
 By hand and not by HPA: the `kix_*` series live in Thanos rather than in Google Managed Prometheus,
