@@ -430,6 +430,26 @@ class ConnectivityProvider(Protocol):
     ) -> tuple[bool, bool] | None: ...
 
 
+class BatchConnectivityProvider(Protocol):
+    """The same question about MANY stop pairs, in one job (U10).
+
+    Answers are POSITIONAL -- one per input pair, in order -- which is what lets the caller pair
+    each verdict with its own record without this module knowing what a pair is for. A provider
+    that answered a different number of them would stamp routes with other routes' answers, so
+    every caller checks the length rather than trusting it.
+
+    ``None`` in any position is "could not be established" and is never "no service", exactly as on
+    the single-pair form.
+    """
+
+    def __call__(
+        self,
+        pairs: Sequence[tuple[Sequence[str], Sequence[str]]],
+        *,
+        path: str = ...,
+    ) -> Sequence[tuple[bool, bool] | None]: ...
+
+
 @dataclass(frozen=True)
 class WebhookRecipient:
     """One webhook subscription as this pass sees it: a registration whose channel is a webhook.
@@ -512,6 +532,7 @@ class WebhookRecipientProvider(Protocol):
 _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 _connectivity_provider: ConnectivityProvider | None = None
+_connectivity_batch_provider: BatchConnectivityProvider | None = None
 _togvarsel_notify_provider: Callable[[], bool] | None = None
 # The webhook channel's two seams, both defaulting to "no webhook recipients" so an un-wired
 # deployment -- which is every deployment until the store lands -- behaves byte for byte as it did
@@ -549,6 +570,7 @@ def configure(
     impact_provider: ImpactProvider,
     stops_provider: Callable[[], list[dict]],
     connectivity_provider: ConnectivityProvider | None = None,
+    connectivity_batch_provider: BatchConnectivityProvider | None = None,
     togvarsel_notify_provider: Callable[[], bool] | None = None,
     webhook_enabled: Callable[[], bool] | None = None,
     webhook_recipients_provider: WebhookRecipientProvider | None = None,
@@ -558,7 +580,10 @@ def configure(
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
     `connectivity_provider` is optional: without it, registrations are simply not checked, which is
-    what every deploy did before the check existed. `togvarsel_notify_provider` is main's
+    what every deploy did before the check existed. `connectivity_batch_provider` is the same
+    question asked about many stop pairs at once, and the sweeps use only that one -- absent, they
+    establish nothing rather than falling back to a loop, because a loop is precisely the cost U10
+    removed and a silent fallback to it would read in the logs as a healthy pass. `togvarsel_notify_provider` is main's
     TOGVARSEL_NOTIFY_ENABLED read, surfaced through /config so the PWA can announce the rush
     forecasts only where they are actually delivered; absent reads as off.
 
@@ -582,10 +607,12 @@ def configure(
     :data:`_HEARTBEAT_EVERY`.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
+    global _connectivity_batch_provider
     global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
+    _connectivity_batch_provider = connectivity_batch_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
     _webhook_enabled = webhook_enabled
     _webhook_provider = webhook_recipients_provider
@@ -996,15 +1023,75 @@ def _service_verdict(
         return _connectivity_provider(place_refs(from_stop), place_refs(to_stop), path=path)
     except Exception:
         # Same rule as the provider's own failure path: an unanswerable question never blocks a
-        # registration, and never becomes a warning either.
+        # registration, and never becomes a warning either. The pair rides as a digest and never as
+        # two refs (U10): these two ARE a registered traveller's own journey, and this record is
+        # the last of the four carriers that put one in Cloud Logging.
         logger.warning(
-            "Planned-service check raised for %s -> %s; registering without it",
-            from_stop,
-            to_stop,
+            "Planned-service check raised for pair %s; registering without it",
+            alternatives.pair_digest(from_stop, to_stop),
             exc_info=True,
-            extra={"fields": {"event": "varsel_service_check", "result": "error"}},
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "error",
+                    "pair_digest": alternatives.pair_digest(from_stop, to_stop),
+                }
+            },
         )
         return None
+
+
+def _service_verdicts(
+    pairs: Sequence[tuple[str, str]], *, path: str | None = None
+) -> list[tuple[bool, bool] | None]:
+    """One question about many stop pairs, each expanded to every ref of both places.
+
+    The batch form of :func:`_service_verdict` and the seam both servability sweeps run on, so the
+    caveat a traveller is shown at registration and the answer a sweep stores six hours later stay
+    the same question. Answers are positional; a provider that answers a different number of them
+    discards the whole batch rather than pairing verdicts with the wrong routes.
+
+    ``path`` is forwarded only when a caller names one, for :func:`_service_verdict`'s reason: a
+    provider is an INJECTED seam and several suites supply single-argument fakes.
+    """
+    if _connectivity_batch_provider is None:
+        return [None] * len(pairs)
+    expanded = [(place_refs(from_stop), place_refs(to_stop)) for from_stop, to_stop in pairs]
+    try:
+        if path is None:
+            answers = list(_connectivity_batch_provider(expanded))
+        else:
+            answers = list(_connectivity_batch_provider(expanded, path=path))
+    except Exception:
+        logger.warning(
+            "Planned-service check raised for %d stop pair(s); every stored answer stands",
+            len(pairs),
+            exc_info=True,
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "error",
+                    "asked": len(pairs),
+                }
+            },
+        )
+        return [None] * len(pairs)
+    if len(answers) != len(pairs):
+        logger.warning(
+            "The planned-service provider answered %d of %d stop pairs; the batch is discarded",
+            len(answers),
+            len(pairs),
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "misaligned",
+                    "asked": len(pairs),
+                    "answers": len(answers),
+                }
+            },
+        )
+        return [None] * len(pairs)
+    return answers
 
 
 def recheck_service() -> None:
