@@ -5034,6 +5034,11 @@ def test_a_minted_client_notification_marks_its_subject_pushed_on_the_same_cycle
     assert not mint["message"].startswith(observation.body.split("\n")[0]), (
         "the route line is the event envelope's, not part of the recorded wording"
     )
+    assert mint["message_status"] == "ok", (
+        "the CONTROL the `ok_cached` demotion must not fire on: this subject was written fresh on "
+        "this very cycle, so the row's `message_llm` and the `message_input` beside it genuinely "
+        f"are a same-input pair, which is what `ok` claims: {mint['message_status']}"
+    )
 
 
 # Still alert-worthy and no new maximum — only the cancellation figure has eased, which is what
