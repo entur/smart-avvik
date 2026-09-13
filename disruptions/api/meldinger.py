@@ -159,6 +159,10 @@ _MAX_LIMIT = historikk._MAX_LIMIT
 # ONE place or the next reader has to guess which copy is authoritative. The derivation and the
 # three conditions it waits on are written out on `historikk._MAX_BYTES_BILLED`.
 _MAX_BYTES_BILLED = historikk._MAX_BYTES_BILLED
+# And the one test of what a refusal by that cap looks like, shared for the reason the cap
+# itself is: this page runs queries of the same shape over the same table, so a second copy
+# would be a second answer to one question.
+_bytes_cap_refusal = historikk._bytes_cap_refusal
 
 # ---- The replay bounds -------------------------------------------------------------------------
 # Four of them, every one a number rather than an adjective, because /messages is the only path in
@@ -1253,6 +1257,18 @@ def _query(sql: str, params: list, cache_key: tuple):
     try:
         rows = list(_bq_client.query(sql, job_config=job_config).result())
     except Exception as exc:
+        if _bytes_cap_refusal(exc):
+            # `historikk`'s branch and its reasoning, one page over. This one is the likelier
+            # of the two to be reached by a WIDE day rather than by a long period: the window here
+            # is a single day, so what grows the scan is the population.
+            logger.warning("Decision-log query refused by the bytes cap", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This day reads more of the decision log than the query cap allows. "
+                    "Narrow the time range or the filters."
+                ),
+            ) from exc
         # Most likely cause on a fresh environment: the tables do not exist yet because no decision
         # has been recorded. Say so rather than surfacing a raw BigQuery traceback.
         logger.warning("Decision-log query failed", exc_info=True)

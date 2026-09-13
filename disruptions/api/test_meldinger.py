@@ -2159,6 +2159,38 @@ def test_both_halves_of_the_surface_are_served():
     assert is_versioned, f"/meldinger is mounted with {type_name}, not _VersionedStaticFiles"
 
 
+def test_a_bytes_cap_refusal_is_told_apart_from_a_log_that_was_never_written():
+    """`historikk`'s branch, exercised through this page's own runner.
+
+    Worth its own check rather than trusting the shared predicate: the two modules keep SEPARATE
+    `_query` functions, so the alias proves the test is shared and only a request proves the branch
+    was wired into this one. The unrelated-error arm is the one that can fail, for the reason the
+    sibling suite spells out.
+
+    This page reaches the cap along a different axis: its window is one day, so what grows the scan
+    is the POPULATION rather than the period -- measured 2026-09-13 against prd, about 5 700
+    definitions for the decisions query against /historikk's 1 700 over fourteen days.
+    """
+
+    class _Cap(RuntimeError):
+        errors = ({"reason": "bytesBilledLimitExceeded", "message": "limit for bytes billed"},)
+
+    _reset([], error=_Cap("400 Bad Request"))
+    refused = client.get("/meldinger-api/decisions")
+    assert refused.status_code == 503, refused.text
+    assert "narrow the time range" in refused.json()["detail"].lower(), (
+        "a cap refusal on this page must name the time range, which is what a reader here can "
+        f"actually change: {refused.json()['detail']}"
+    )
+
+    _reset([], error=RuntimeError("404 Not found: Table disruptions.varsel_decisions"))
+    missing = client.get("/meldinger-api/decisions")
+    assert "may not have been written" in missing.json()["detail"], (
+        "an unrelated failure must keep the unwritten-log sentence, or the branch is a guard that "
+        f"cannot fail: {missing.json()['detail']}"
+    )
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
