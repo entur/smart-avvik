@@ -25,18 +25,24 @@ recognise as a duplicate and would turn into a second notification about the sam
 transactions, and the population this runs over is mostly *nothing to do*: about 83 % of matched
 alerts are sub-threshold (`varsel_decisions`' own split), and an alert-worthy train whose phase has
 not changed is a transaction that reads two documents and returns ``unchanged`` on every one of the
-~300 cycles in a day. So one client-scoped query (:func:`notification_store.client_alerts`) answers
-"which subjects stand, and in which phase" for the whole cycle, and the transactions are spent only
-where a write can actually happen. That is reading the store to decide what to write -- not
-re-deriving the pending set -- and it is exact rather than best-effort for the reason KTD6 names:
-the emit path has exactly one writer (one poller thread, no route invokes the pass, one replica
-under the Recreate strategy), so nothing can change a subject between the query and the commit.
+~300 cycles in a day. So "which subjects stand, and in which phase" is answered before the
+transactions are spent, and they are spent only where a write can actually happen. That is reading
+the store to decide what to write -- not re-deriving the pending set -- and it is exact rather than
+best-effort for the reason KTD6 names: the emit path has exactly one writer (one poller thread, no
+route invokes the pass, one replica under the Recreate strategy), so nothing can change a subject
+between the answer and the commit.
 
-The pre-read has one honest limit and it is handled rather than assumed. ``client_alerts`` serves
-at most :data:`notification_store.MAX_ALERTS_SERVED` subjects per subscription in its LIST while counting
-all of them, so a subscription holding more standing alerts than that -- AE3's line suspension,
-thirteen cancelled departures inside one window -- reports a count this module cannot enumerate.
-:class:`_Standing` calls that *incomplete* and falls back to asking the store per subject, which is
+**Where that answer comes from moved in U9, and the reason is a ceiling rather than a cost.** It
+was one client-scoped query per client (``notification_store.client_alerts``), which serves at most
+:data:`notification_store.MAX_ALERTS_SERVED` subjects per subscription in its LIST while counting
+all of them -- so a subscription holding more standing alerts than that (AE3's line suspension,
+thirteen cancelled departures inside one window) reported a count this module could not enumerate,
+and an incomplete answer means a store transaction PER SUBJECT. At one client with 100 000
+subscriptions that fallback is the steady state, which is to say the optimisation stops existing
+exactly where it is needed. :class:`notification_store.SubjectMirror` answers the same question
+completely, from memory, kept current by this process's own commits -- subject documents have
+exactly one writer, so every change passes through here. The fallback survives unchanged and is now
+the restart window only: an unseeded mirror is :data:`_INCOMPLETE` for every subscription, which is
 the slow path and the correct one.
 
 **Bounded twice, because the two failures are different.** A reservation budget
@@ -51,8 +57,9 @@ reads included, but a transactional COMMIT carries no timeout at all. Both numbe
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from time import monotonic
@@ -77,23 +84,54 @@ OSLO = ZoneInfo("Europe/Oslo")
 # for it, in the shape `varsel._load_webhook_recipients` already uses for the load step, and the
 # residual is a leaked thread rather than a stalled poller.
 #
-# Sized against the phase, not against this step: `webhook_delivery` reserves 20 s (KTD6's number,
-# not ours to move) and the two run in one `main._phase`, whose measured `ms` is the number KTD6's
-# reversal trigger reads -- "move delivery out when the webhook phase exceeds 30 s of measured phase
-# time on any cycle in a week". 8 + 20 = 28 s of ceiling leaves that trigger meaning what it says.
-_EMIT_DEADLINE_S = 6.0
-_EMIT_WAIT_S = 8.0
-# One bounded Firestore transaction, reserved up front. `commit_event` is a count aggregation plus a
-# transaction the client retries up to five times, so this is a budgeting assumption and not a
-# guarantee -- which is precisely why the outer wait exists as well.
+# **WIDENED IN U9, AND THE DEADLINE HAD TO MOVE WITH THE WIDTH.** It was 6 s against an 8 s wait,
+# sized so this step plus `webhook_delivery`'s 20 s stayed under KTD6's 30 s reversal trigger for
+# the phase -- a trigger stated in the phase's measured `ms`. That arithmetic was right for a
+# one-wide loop at the pilot's "a few hundred events a day" and is the wrong shape for R2's target:
+# a bad morning's lifecycle transitions have to be emitted INSIDE one cycle, and one transaction at
+# a time against a ~200 ms round trip is ~5 emits a second however many are waiting. A width
+# without a deadline to spend changes nothing -- at 6 s the pass stops after about four seconds of
+# claims whether it is one-wide or sixty-four-wide -- so the two move together or neither does.
+#
+# 80 s is emit's share of a cycle measured at a ~296 s period (2026-09-08), and the number it is
+# sized against is R2's 250 emits per second: 80 x 250 = 20 000, which is `_MAX_EMITS_PER_CYCLE`
+# below. What it gives up is stated rather than hidden and is dealt with in the operations
+# document: the phase's ceiling is now 90 + 20 = 110 s, so KTD6's "exceeds 30 s of measured phase
+# time" can no longer be read as a wall-clock ceiling -- the widened pass exceeds it BY DESIGN, and
+# the trigger is restated there as emit's share being exceeded (the pass ran to its deadline with
+# work left over) rather than as a number of seconds.
+_EMIT_DEADLINE_S = 80.0
+_EMIT_WAIT_S = 90.0
+#: How many store transactions run at once. **KTD2's derivation, not a guess**: the target rate
+#: times the measured transaction latency, 250/s x ~250 ms = 63, taken to 64. That latency is dev's
+#: first reading and it INCLUDED the per-mint count aggregation this unit removes, so the true
+#: figure is lower and this width is on the safe side of it -- re-measure with the harness before
+#: moving it, and move `_EMIT_DEADLINE_S` in the same breath if the rate is what changed.
+#:
+#: Two concurrent emits cannot contend on one document: `_mint` writes the subject, the event and
+#: the delivery, and READS the subscription without writing it, so the only shared document in a
+#: transaction is one nothing in this pass modifies.
+_EMIT_WORKERS = 64
+# One bounded Firestore transaction, reserved up front. `commit_event` is a transaction the client
+# retries up to five times, so this is a budgeting assumption and not a guarantee -- which is
+# precisely why the outer wait exists as well.
 _WORST_CASE_EMIT_S = 2.0
+#: How often the pass beats the poller's heartbeat while it submits. `/health`'s staleness rule
+#: means "no STEP has finished in `HEALTH_STALE_AFTER_S`" (600 s), and a step that may now run for
+#: 80 s is a long way inside that -- but it is a long way further inside it than 6 s was, and the
+#: cheapest insurance against the next widening is to beat already. `varsel._HEARTBEAT_EVERY`'s
+#: number and shape.
+_HEARTBEAT_EVERY = 64
 
 #: What one cycle may write, on top of the clock. A count as well as a clock for
 #: `varsel._WriteBudget`'s reason: the two answer different questions, and a caller must not be able
-#: to satisfy one and ignore the other. At the pilot's "a few hundred events a day" (KTD6) this is
-#: never reached; it is the bound that makes a store bug or a matcher regression cost one cycle's
-#: tail instead of the cycle.
-_MAX_EMITS_PER_CYCLE = 120
+#: to satisfy one and ignore the other.
+#:
+#: 20 000 since U9 -- `_EMIT_DEADLINE_S` times R2's target rate, so the two bounds bind at the same
+#: moment on a healthy store and the count is what binds first when the store is faster than
+#: expected. It was 120, sized for "a few hundred events a day"; anything above it is re-offered on
+#: the next cycle and counted as `capped`, which is what the plan calls `deferred`.
+_MAX_EMITS_PER_CYCLE = 20_000
 
 #: The least validity an observation the matcher admitted gets, in seconds past the emit instant.
 #: The match (pass 1a) and this emit are the same cycle but not the same instant -- the wording
@@ -171,6 +209,92 @@ class WebhookSubject:
 
 
 @dataclass(frozen=True)
+class Recipient:
+    """One subscription a shared observation is owed to. Everything routing needs and nothing else.
+
+    Split out of :class:`WebhookSubject` in U9 so the wording, the payload and the train identity
+    are held ONCE per (definition, train) instead of once per recipient -- see
+    :class:`WebhookObservation` for the arithmetic that forces it.
+    """
+
+    subscription_id: str
+    client_id: str
+    destination_id: str
+    subscription_version: int
+    external_ref: str = ""
+    test: bool = False
+
+
+@dataclass(frozen=True)
+class WebhookObservation:
+    """One (definition, train) this cycle observed, and every subscription watching it.
+
+    **What the pass hands over since U9, and the change is about memory rather than tidiness.** It
+    used to be one :class:`WebhookSubject` per (recipient, train), built in `varsel` before this
+    module saw any of them -- so a corridor with 100 000 subscriptions and AE3's thirteen cancelled
+    departures materialised 1.3 million dataclasses in one burst on the ingestion thread, every one
+    of them carrying the routing of a subscription whose subject may not even stand. The payload
+    was already shared by reference; the objects around it were not, and the pod's memory limit
+    equals its request.
+
+    Held this way, the wording and the train are one object per train and the per-recipient cost is
+    six strings. :meth:`subject` materialises the rest, and :func:`_run` calls it only where the
+    standing set says a store call can actually happen -- which for ~83 % of matched alerts (the
+    sub-threshold ones, `varsel_decisions`' own split) is never.
+
+    Every field below means exactly what the same-named field on :class:`WebhookSubject` means; the
+    docstring there is the one to read.
+    """
+
+    recipients: tuple[Recipient, ...] = ()
+
+    alertworthy: bool = False
+    cancelled: bool = False
+    situations: tuple[str, ...] = ()
+
+    operator: str | None = None
+    line: str | None = None
+    journey_ref: str | None = None
+    stop_place: str | None = None
+    stop_order: int | None = None
+    departure_time: datetime | None = None
+
+    title: str = ""
+    body: str = ""
+    payload: Mapping[str, Any] = field(default_factory=dict)
+    expected_departure_time: datetime | None = None
+
+    def subject(self, recipient: Recipient) -> WebhookSubject:
+        """This observation as one recipient's subject. The payload is SHARED, not copied.
+
+        `_emit_one` copies it into the request it builds, which is the one place a mutation could
+        matter; copying here instead would put a dict copy per recipient back into the hot loop
+        this class exists to empty.
+        """
+        return WebhookSubject(
+            subscription_id=recipient.subscription_id,
+            client_id=recipient.client_id,
+            destination_id=recipient.destination_id,
+            subscription_version=recipient.subscription_version,
+            external_ref=recipient.external_ref,
+            test=recipient.test,
+            alertworthy=self.alertworthy,
+            cancelled=self.cancelled,
+            situations=self.situations,
+            operator=self.operator,
+            line=self.line,
+            journey_ref=self.journey_ref,
+            stop_place=self.stop_place,
+            stop_order=self.stop_order,
+            departure_time=self.departure_time,
+            title=self.title,
+            body=self.body,
+            payload=self.payload,
+            expected_departure_time=self.expected_departure_time,
+        )
+
+
+@dataclass(frozen=True)
 class EmitReport:
     """What one emit step did, as counts an operator can read off one log line.
 
@@ -200,6 +324,37 @@ class EmitReport:
     run_clear_capped: int = 0
     run_clear_error: int = 0
     timed_out: bool = False
+    #: The alert ids this pass MINTED a revision for, in completion order. U9 step 5's seam for
+    #: U16, which puts the webhook channel's own work into the decision log.
+    #:
+    #: **On the report and never on a module global**, which is `varsel.PassOutcome`'s rule and for
+    #: its reason: a leaked half-cycle ledger reads exactly like the give-up bug every other pass
+    #: in this repository is swept to avoid, and it would need registering in two stale sweeps to
+    #: be safe.
+    #:
+    #: Two things U16 has to decide rather than inherit, both stated here so neither is discovered.
+    #: The ORDER is which transaction finished first, not which was submitted, so it carries no
+    #: meaning beyond membership. And this pass runs AFTER `_record_decisions` -- KTD6 puts every
+    #: client step after the cycle's two durable writes, deliberately -- so a cycle's ledger cannot
+    #: reach that cycle's rows; it reaches the next one's, or the row has to be written somewhere
+    #: else. The grain is also not the decision log's: an alert id is per (subscription, train)
+    #: while a decision row is per (definition, situation, departure), so U16 needs a mapping this
+    #: does not carry.
+    minted: tuple[str, ...] = ()
+    #: Transactions still in flight when the collection's deadline passed, walked away from rather
+    #: than waited on -- a transactional commit carries no client-side deadline, so waiting would
+    #: hold the pass lock on a hung store and refuse every later cycle. An abandoned transaction
+    #: that later commits is a committed event nothing delivered this cycle; the next cycle's
+    #: `pending_deliveries` finds it, because the pending set is the store's rather than a cycle's.
+    #: This is the number behind "at most one pool's width in flight across a cycle boundary", and
+    #: it is the field to read beside `capped`: a big `capped` with no `abandoned` is a pass that
+    #: was simply larger than its budget, and one with `abandoned` is a slow store.
+    abandoned: int = 0
+    #: The previous cycle's pass had not finished draining, so this one did not start. A refusal
+    #: rather than a second pass, because the emit path's exactness rests on there being exactly
+    #: one writer: two overlapping passes would each hold their own pending-event count and admit
+    #: past a destination's ceiling together.
+    overlap_refused: bool = False
     ms: int = 0
 
 
@@ -325,13 +480,131 @@ def skip_reason(stored_phase: str | None, subject: WebhookSubject) -> str | None
     ``_transition`` over the whole phase cross-product, so a client-side skip can never be looser
     than the store's own decision.
     """
-    if subject.alertworthy:
-        if notification_store._transition(stored_phase, requested_phase(subject)) is None:
+    return _skip_reason_for(
+        stored_phase, alertworthy=subject.alertworthy, phase=requested_phase(subject)
+    )
+
+
+def _skip_reason_for(
+    stored_phase: str | None, *, alertworthy: bool, phase: str
+) -> str | None:
+    """:func:`skip_reason` without a subject, so the hot loop needs none.
+
+    The rule is stated once, here; :func:`skip_reason` is the wrapper the source-inspection test
+    and every other caller use, and it is what keeps "a subject decides this" true as a statement
+    about the module even though the pass no longer builds one to ask.
+    """
+    if alertworthy:
+        if notification_store._transition(stored_phase, phase) is None:
             return "unchanged"
         return None
     if stored_phase in (None, notification_store.PHASE_WITHDRAWN):
         return "nothing_standing"
     return None
+
+
+class _Ledger:
+    """The alert ids a pass minted, appended by the workers as they commit.
+
+    Its own structure rather than a key on :class:`_Counts` because it is not a count: it is the
+    pass's own record of what it wrote, and `EmitReport.minted` is where it goes.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._minted: list[str] = []
+
+    def add(self, alert_id: str) -> None:
+        with self._lock:
+            self._minted.append(alert_id)
+
+    def frozen(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._minted)
+
+
+class _Counts:
+    """The pass's outcome tally, written by the workers as they go.
+
+    `webhook_delivery._Counts`' shape and for its reason: a still-running worker's completed work
+    must not be discarded when the bounded wait expires, which is exactly when the numbers are
+    worth having. A plain dict was right while the pass was one-wide and is a lost update at
+    sixty-four.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+
+    def add(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            self._counts[key] = self._counts.get(key, 0) + n
+
+    def get(self, key: str) -> int:
+        with self._lock:
+            return self._counts.get(key, 0)
+
+
+class _PendingLedger:
+    """How many pending events each destination holds, counted ONCE per pass and kept in step.
+
+    **The aggregation this replaces was the transaction latency.** `commit_event` counts a
+    destination's pending deliveries before every mint, and dev's first reading of ~200-250 ms per
+    emit included it -- so at sixty-four workers it would be sixty-four concurrent aggregation
+    queries against one collection, per mint, to re-derive a figure this process is the only writer
+    of.
+
+    **Charged on the coordinator, refunded by the worker, and the refund is what makes it exact.**
+    A mint that SUPERSEDES a pending delivery is net zero on the count: `_mint` flips the old
+    delivery to `superseded` in the same transaction that creates the new one. A ledger that only
+    counted up would refuse at half the ceiling on exactly the morning that matters -- one where
+    many mints are a `confirmed` replacing a `predicted`. So anything that did not leave a NEW
+    pending delivery behind gives its charge back: a superseding mint, an `unchanged`, a
+    `counting`, an `obsolete`, a refused budget claim, a raise.
+
+    Exact rather than best-effort for the reason KTD6 names -- the emit path has exactly one writer
+    -- with one change U9 makes to that sentence: the writer is now sixty-four threads of one pass
+    rather than one thread, so the ceiling is enforced by this lock instead of by the shape of the
+    loop. `emit` refuses to start a second pass over the same ledger, which is the other half.
+
+    When U11 moves delivery to its own Deployment the figure becomes stale HIGH inside a pass -- the
+    worker drains pending deliveries this ledger does not hear about -- so it refuses earlier than
+    it needs to. That is the conservative direction and it needs no change; what would need one is
+    a second EMITTER.
+    """
+
+    def __init__(self, count: Callable[[str, int], int]) -> None:
+        self._lock = threading.Lock()
+        self._count = count
+        self._pending: dict[str, int] = {}
+
+    def charge(self, destination_id: str, ceiling: int) -> int | None:
+        """Reserve one pending slot, answering how many were held BEFORE it, or ``None`` to refuse.
+
+        The pre-charge figure rather than a bare ``True`` so the caller can hand the store a real
+        number: `notification_store.commit_event` takes it as `pending` and spends no aggregation
+        of its own.
+        """
+        with self._lock:
+            if destination_id not in self._pending:
+                # INSIDE the lock, and the obvious tidy-up of counting outside it would be wrong:
+                # a count released and re-taken lets the same destination be counted twice, and the
+                # second answer overwrites the first one's charges.
+                self._pending[destination_id] = self._count(destination_id, ceiling)
+            held = self._pending[destination_id]
+            if held >= ceiling:
+                return None
+            self._pending[destination_id] = held + 1
+            return held
+
+    def refund(self, destination_id: str) -> None:
+        with self._lock:
+            if destination_id in self._pending:
+                self._pending[destination_id] = max(0, self._pending[destination_id] - 1)
+
+    def held(self, destination_id: str) -> int:
+        with self._lock:
+            return self._pending.get(destination_id, 0)
 
 
 def _close_run(
@@ -340,7 +613,7 @@ def _close_run(
     *,
     now: datetime,
     budget: _EmitBudget,
-    counts: dict[str, int],
+    counts: _Counts,
 ) -> None:
     """This train cleared the gate again: close any open withdrawal run. Usually writes nothing.
 
@@ -371,18 +644,18 @@ def _close_run(
     if at is None:
         return
     if (now - at).total_seconds() > notification_store.WITHDRAWAL_GAP_S:
-        counts["run_stale"] = counts.get("run_stale", 0) + 1
+        counts.add("run_stale")
         return
     if not budget.claim():
-        counts["run_clear_capped"] = counts.get("run_clear_capped", 0) + 1
+        counts.add("run_clear_capped")
         return
     try:
         if notification_store.clear_below_threshold(alert_id, now=now):
-            counts["run_cleared"] = counts.get("run_cleared", 0) + 1
+            counts.add("run_cleared")
     except Exception:
         # Never fatal and never re-raised: what a failed clear costs is the exactness of ONE
         # subject's withdrawal count, and the store's time window is still underneath it.
-        counts["run_clear_error"] = counts.get("run_clear_error", 0) + 1
+        counts.add("run_clear_error")
         logger.warning(
             "Could not close a withdrawal run; the store's time window still applies",
             exc_info=True,
@@ -394,89 +667,92 @@ def _close_run(
 class _Standing:
     """What stands per subscription, and whether that is a claim or a guess.
 
-    ``complete`` is the load-bearing half. ``client_alerts`` counts every live subject and
-    enumerates at most :data:`notification_store.MAX_ALERTS_SERVED` of them, so past that ceiling the
-    phases below are a subset and "absent" no longer means "nothing stands". Treating a subset as
-    complete would skip a withdrawal that was owed and, worse, skip a ``confirmed`` mint for a train
-    ET has cancelled -- so an incomplete answer falls back to asking the store per subject, which is
-    the slow path and the only correct one.
+    ``complete`` is the load-bearing half: "absent" may only mean "nothing stands" when the answer
+    enumerates everything. Treating a subset as complete would skip a withdrawal that was owed and,
+    worse, skip a ``confirmed`` mint for a train ET has cancelled -- so an incomplete answer falls
+    back to asking the store per subject, which is the slow path and the only correct one.
+
+    Since U9 the answer comes from :class:`notification_store.SubjectMirror`, which is complete by
+    construction, so ``complete`` is False in exactly one state: the restart window before the
+    mirror has finished seeding. It is KEPT rather than dropped because that window is real -- a
+    pod comes up cold on every deploy -- and because a flag whose only value is True is a flag
+    nobody notices has stopped being checked.
     """
 
     phases: Mapping[str, str]
     complete: bool
-    #: alert_id -> `below_threshold_at` for this client's subjects with an OPEN withdrawal run,
-    #: straight off `ClientAlerts.open_below_threshold`. Carried even when `complete` is False,
-    #: because it is derived from the whole live page rather than from the four-row display list --
-    #: so a truncated snapshot still resets runs exactly, and only a FAILED read loses them.
+    #: alert_id -> `below_threshold_at` for every subject with an OPEN withdrawal run, from the
+    #: whole standing set rather than per client: the run is a property of the SUBJECT and the
+    #: caller looks up the one alert id it is about. Read once per pass, not once per subject.
     open_runs: Mapping[str, datetime] = field(default_factory=dict)
 
 
 _INCOMPLETE = _Standing(phases={}, complete=False)
 
 
-def _standing(subjects: Sequence[WebhookSubject], now: datetime) -> dict[str, _Standing]:
-    """One client-scoped query per client: which subjects stand, in which phase.
+def _standing(subscription_ids: Iterable[str], now: datetime) -> dict[str, _Standing]:
+    """Which subjects stand, in which phase -- off the mirror, one lookup per SUBSCRIPTION.
 
-    Fails to :data:`_INCOMPLETE` for every subscription of a client whose read raised (R20 -- a
-    store outage suppresses that client's *optimisation*, never its correctness), which costs
-    transactions rather than events.
+    No store read at all since U9, and therefore no per-client failure mode: the whole
+    client-scoped query it replaces is gone, along with the truncation that made its answer
+    incomplete for exactly the clients this has to scale for. What survives is the fallback, and
+    the one state that reaches it is an unseeded mirror -- ``sync_mirrors`` runs as its own poller
+    step before the pass, so that is the restart window and nothing else.
+
+    **Per subscription and not per recipient**, which is why it takes ids rather than recipients: a
+    subscription watching thirteen disrupted departures appears thirteen times in the fan-out, and
+    ``phases_for`` is a lock, a list copy and a dict build every time -- so asking per recipient
+    would spend twelve of those thirteen answers on a dict comprehension that overwrites them. At
+    100 000 subscriptions on one corridor that is the difference between 100 000 lookups and 1.3
+    million.
+
+    ``open_runs`` is asked ONCE and shared for the same reason, one step further: it walks the
+    whole standing set, so per subscription it would be quadratic in a structure built to keep the
+    pass linear.
     """
-    out: dict[str, _Standing] = {}
-    for client_id in sorted({s.client_id for s in subjects if s.client_id}):
-        try:
-            alerts = notification_store.client_alerts(client_id, now=now)
-        except Exception:
-            logger.warning(
-                "Could not read standing client alerts; asking the store per subject this cycle",
-                exc_info=True,
-                extra={"fields": {"event": "notification_emit", "result": "standing_error",
-                                  "client_id": client_id}},
-            )
-            for subject in subjects:
-                if subject.client_id == client_id:
-                    out[subject.subscription_id] = _INCOMPLETE
-            continue
-        for subject in subjects:
-            if subject.client_id != client_id:
-                continue
-            snapshot = alerts.snapshots.get(subject.subscription_id)
-            if snapshot is None:
-                # Absent from a bounded read is "crowded out", not "calm" -- `client_alerts`
-                # documents exactly that, which is why the wrapper carries its own `truncated`.
-                out[subject.subscription_id] = _Standing(
-                    phases={},
-                    complete=not alerts.truncated,
-                    open_runs=alerts.open_below_threshold,
-                )
-                continue
-            out[subject.subscription_id] = _Standing(
-                phases={state.alert_id: state.phase for state in snapshot.subjects},
-                complete=not snapshot.truncated and snapshot.n_active <= len(snapshot.subjects),
-                open_runs=alerts.open_below_threshold,
-            )
-    return out
+    mirror = notification_store.subject_mirror()
+    ids = sorted(set(subscription_ids))
+    if not mirror.ready:
+        return dict.fromkeys(ids, _INCOMPLETE)
+    runs = mirror.open_runs(now)
+    return {
+        subscription_id: _Standing(
+            phases=mirror.phases_for(subscription_id, now),
+            complete=True,
+            open_runs=runs,
+        )
+        for subscription_id in ids
+    }
 
 
-def _sort_key(subject: WebhookSubject) -> tuple:
+def _sort_key(observation: WebhookObservation) -> tuple:
     """Alert-worthy first, then soonest departure, then a stable tie-break.
 
-    Soonest-departure-first across subscriptions is ``/varsel``'s own rule for spending a bounded
-    budget (`_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`, and the write queue since 2026-08-21), and the
-    reason is the same here: when the budget binds it must be spent on the trains a traveller can
-    still act on. Alert-worthy ahead of below-threshold so a squeezed cycle never spends its last
+    Soonest-departure-first is ``/varsel``'s own rule for spending a bounded budget
+    (`_MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY`, and the write queue since 2026-08-21), and the reason
+    is the same here: when the budget binds it must be spent on the trains a traveller can still
+    act on. Alert-worthy ahead of below-threshold so a squeezed cycle never spends its last
     transaction retracting a warning instead of raising one.
 
+    **It orders TRAINS since U9, where it used to order (recipient, train) pairs**, and the
+    subscription id has left the key with them. That is a sharper statement of the same rule rather
+    than a weakening of it: urgency is a property of the departure, so within one train every
+    recipient is equally urgent and the order among them is whatever the standing set hands over --
+    deterministic, and carrying no meaning it would be wrong to read into it. What the old key did
+    with `subscription_id` in third place was group one subscription's trains together inside an
+    identical departure instant, which nothing depended on.
+
     ``.timestamp()`` rather than the datetime, because the key must be total and comparing an aware
-    datetime with a naive one raises; a subject with no departure sorts last and keeps its relative
-    order, which :func:`train_ref` will refuse anyway.
+    datetime with a naive one raises; an observation with no departure sorts last and keeps its
+    relative order, which :func:`train_ref_of` will refuse anyway.
     """
     return (
-        not subject.alertworthy,
-        subject.departure_time is None,
-        subject.departure_time.timestamp() if subject.departure_time else 0.0,
-        subject.subscription_id,
-        subject.journey_ref or "",
-        subject.stop_order if subject.stop_order is not None else -1,
+        not observation.alertworthy,
+        observation.departure_time is None,
+        observation.departure_time.timestamp() if observation.departure_time else 0.0,
+        observation.journey_ref or "",
+        observation.stop_order if observation.stop_order is not None else -1,
+        observation.operator or "",
     )
 
 
@@ -487,6 +763,7 @@ def _emit_one(
     phase: str,
     now: datetime,
     max_pending: int | None = None,
+    pending: int | None = None,
 ) -> notification_store.EventCommit:
     """One observation, committed. The valid_until note is the only judgement here.
 
@@ -528,134 +805,347 @@ def _emit_one(
         test=bool(subject.test),
     )
     if subject.alertworthy:
-        return notification_store.commit_event(request, max_pending=max_pending, now=now)
+        return notification_store.commit_event(
+            request, max_pending=max_pending, pending=pending, now=now
+        )
     return notification_store.record_below_threshold(request, now=now)
 
 
 def _run(
-    subjects: Sequence[WebhookSubject],
+    observations: Sequence[WebhookObservation],
     *,
     now: datetime,
     deadline_s: float,
     worst_case_s: float,
     max_calls: int,
+    workers: int = _EMIT_WORKERS,
     pending_quota: Callable[[str], int] | None = None,
+    beat: Callable[[], None] | None = None,
+    release: Callable[[], None] | None = None,
 ) -> EmitReport:
-    """The emit loop itself, on a worker thread so the caller's wait can bound a hung store call."""
-    counts: dict[str, int] = {}
-    budget = _EmitBudget(max_calls, monotonic() + deadline_s, worst_case_s)
-    standing = _standing(subjects, now)
+    """The emit loop itself: decide serially, commit concurrently, bounded twice.
+
+    **The split is the whole of U9 step 3.** Everything that decides whether a store call is owed
+    -- the sort, the train identity, the standing set, the skip rule, the destination's pending
+    ceiling -- happens on THIS thread, in microseconds per recipient, with no lock needed because
+    there is one of it. Only the transaction is submitted. The alternative shapes are both wrong in
+    a way that is easy to miss: a whole observation as one task makes a 100 000-recipient corridor
+    a single task and defeats the pool entirely, and deciding inside the workers would put the
+    standing set and the ledger behind a lock that every one of them takes.
+
+    Submission order IS the sorted order, so soonest-departure-first survives as admission order
+    even though completion order does not.
+
+    **The budget is claimed inside the worker as its task starts, never at submit time.** Claimed
+    at submit, every task is admitted before the deadline is consulted and the bound guarantees
+    nothing -- `/meldinger`'s recorded lesson, and the one line here that is easy to move and fatal
+    to move.
+
+    ``release`` is the pass lock's, released HERE and not in ``emit``'s own ``finally``: the caller
+    may have given up on this thread long ago, and releasing there would let the next cycle start a
+    second pass over the store while this one's abandoned workers are still committing.
+    """
+    try:
+        return _run_pass(
+            observations,
+            now=now,
+            deadline_s=deadline_s,
+            worst_case_s=worst_case_s,
+            max_calls=max_calls,
+            workers=workers,
+            pending_quota=pending_quota,
+            beat=beat,
+        )
+    finally:
+        # OUTSIDE everything, because everything is inside: `_standing`, the ledger's construction
+        # and the pool's own are all above the loop's `try`, and a raise in any of them would
+        # otherwise leave the module lock held for the life of the pod -- every later cycle
+        # answering `overlap_refused` with nothing draining.
+        if release is not None:
+            release()
+
+
+def _run_pass(
+    observations: Sequence[WebhookObservation],
+    *,
+    now: datetime,
+    deadline_s: float,
+    worst_case_s: float,
+    max_calls: int,
+    workers: int,
+    pending_quota: Callable[[str], int] | None,
+    beat: Callable[[], None] | None,
+) -> EmitReport:
+    """:func:`_run` without the lock, so the lock's release cannot depend on any of this."""
+    counts = _Counts()
+    ledger_of_mints = _Ledger()
+    deadline = monotonic() + deadline_s
+    budget = _EmitBudget(max_calls, deadline, worst_case_s)
+    standing = _standing(
+        (r.subscription_id for observation in observations for r in observation.recipients), now
+    )
     # One lookup per CLIENT per pass, not one per subject. The resolver behind it is a cached
     # account read, but a pass touches tens of thousands of subjects across a handful of clients and
     # a cache hit is still a lock acquisition and a dict walk apiece.
-    quotas: dict[str, int | None] = {}
+    quotas: dict[str, int] = {}
 
-    def _pending_ceiling(client_id: str) -> int | None:
-        if pending_quota is None:
-            return None
+    def _pending_ceiling(client_id: str) -> int:
         if client_id not in quotas:
-            quotas[client_id] = pending_quota(client_id)
+            quotas[client_id] = (
+                notification_store.MAX_PENDING_EVENTS_PER_DESTINATION
+                if pending_quota is None
+                else int(pending_quota(client_id))
+            )
         return quotas[client_id]
 
-    # Pass-local, and pass-local for the reason KTD6 gives about the delivery skip: a destination at
-    # its pending-event ceiling refuses every further emit with the same answer, so asking again for
-    # each of a hundred subjects is a hundred wasted aggregation queries -- but a ceiling remembered
-    # across cycles would keep refusing a destination that has since drained, which is
-    # indistinguishable from the intended 410 pause.
-    over_quota: set[str] = set()
+    ledger = _PendingLedger(
+        lambda destination_id, ceiling: notification_store.count_pending_events(
+            destination_id, ceiling=ceiling
+        )
+    )
+    pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="client-emit")
+    futures: list[Any] = []
+    #: Destinations whose pending-event ceiling could not be established this pass. Pass-local for
+    #: the reason KTD6 gives about the delivery skip: the answer is the same for every recipient on
+    #: the destination right now, and a ceiling remembered across cycles would keep refusing one
+    #: whose store has since recovered.
+    uncountable: set[str] = set()
 
-    for subject in sorted(subjects, key=_sort_key):
-        train = train_ref(subject)
-        if train is None:
-            counts["unidentified"] = counts.get("unidentified", 0) + 1
-            continue
-        if subject.destination_id in over_quota:
-            counts["quota"] = counts.get("quota", 0) + 1
-            continue
-        known = standing.get(subject.subscription_id, _INCOMPLETE)
-        # Hoisted out of the `complete` branch: the withdrawal-run reset below needs it on both
-        # paths, and it is a pure hash of two strings.
-        alert_id = notification_store.alert_subject_id(subject.subscription_id, train)
-        if known.complete:
-            reason = skip_reason(known.phases.get(alert_id), subject)
-            if reason is not None:
-                if reason == "unchanged":
-                    # THE recovery case: alert-worthy, standing in the same phase, minting nothing
-                    # -- so the store is about to hear nothing about a cycle that proves any open
-                    # withdrawal run is broken. This is the one place that can tell it.
-                    _close_run(alert_id, known, now=now, budget=budget, counts=counts)
-                counts[reason] = counts.get(reason, 0) + 1
-                continue
+    def _commit(
+        observation: WebhookObservation,
+        recipient: Recipient,
+        *,
+        train: notification_store.TrainRef,
+        phase: str,
+        known: _Standing,
+        alert_id: str,
+        ceiling: int,
+        held: int,
+    ) -> None:
         if not budget.claim():
-            counts["capped"] = counts.get("capped", 0) + 1
-            continue
+            ledger.refund(recipient.destination_id)
+            counts.add("capped")
+            return
+        # MATERIALISED HERE AND NOWHERE EARLIER. Everything on the coordinator is decided from the
+        # observation and six strings; this is the first line that builds a per-recipient object,
+        # and it is reached only where a store call is actually going to happen.
+        subject = observation.subject(recipient)
         try:
             commit = _emit_one(
-                subject,
-                train=train,
-                phase=requested_phase(subject),
-                now=now,
-                max_pending=_pending_ceiling(subject.client_id),
+                subject, train=train, phase=phase, now=now, max_pending=ceiling, pending=held
             )
         except notification_store.QuotaExceeded:
-            # R21, and visible rather than silent: the store has already logged the breach with its
-            # own count. Skipping the rest of this destination's subjects is a cost decision, not a
-            # policy one -- they are re-offered on the next cycle.
-            over_quota.add(subject.destination_id)
-            counts["quota"] = counts.get("quota", 0) + 1
-            continue
+            # **UNREACHABLE FROM THIS PASS, and kept anyway.** `_emit_one` hands the store the
+            # ledger's pre-charge figure, and `charge` only returned it because it was under the
+            # ceiling -- so `commit_event`'s own comparison is a restatement of the one made two
+            # lines above and cannot fail. What makes it worth keeping is that `commit_event` is
+            # public: a caller passing `pending=None` gets the aggregation and the real refusal,
+            # and this is the branch that would carry it. Do not read it as a second, independent
+            # check on the ledger; the ledger IS the check here.
+            ledger.refund(recipient.destination_id)
+            counts.add("quota")
+            return
         except Exception as exc:
-            # `notification_store.is_retryable` and NOT a handler keyed on `google.api_core` exceptions:
-            # an exhausted transaction surfaces as a plain `ValueError` after five attempts, and
-            # treating that as terminal would mark a contended subject failed and never deliver it.
+            # `notification_store.is_retryable` and NOT a handler keyed on `google.api_core`
+            # exceptions: an exhausted transaction surfaces as a plain `ValueError` after five
+            # attempts, and treating that as terminal would mark a contended subject failed and
+            # never deliver it.
+            ledger.refund(recipient.destination_id)
             bucket = "retryable" if notification_store.is_retryable(exc) else "failed"
-            counts[bucket] = counts.get(bucket, 0) + 1
+            counts.add(bucket)
             logger.warning(
                 "Notification event could not be committed (%s); it is re-offered next cycle",
                 bucket,
                 exc_info=True,
                 extra={"fields": {"event": "notification_emit", "result": bucket,
-                                  "client_id": subject.client_id}},
+                                  "client_id": recipient.client_id}},
             )
-            continue
+            return
+        # THE REFUND, and it is what keeps the ceiling exact rather than merely safe: only a mint
+        # that left a NEW pending delivery behind spends a slot. A superseding mint is net zero --
+        # `_mint` flips the old delivery to `superseded` in the same transaction -- and every other
+        # status wrote no delivery at all.
+        if commit.status != "created" or commit.superseded_delivery_id:
+            ledger.refund(recipient.destination_id)
+        if commit.status == "created":
+            ledger_of_mints.add(commit.alert_id)
         if commit.status == "created" and commit.event_type == notification_store.EVENT_WITHDRAWN:
-            counts["withdrawn"] = counts.get("withdrawn", 0) + 1
-        else:
-            if commit.status == "unchanged":
-                # Same recovery, reached the long way: the pre-read was truncated or missing, so
-                # the store was asked and said "no transition". A mint would have closed the run
-                # itself (`_mint` writes both counter fields), which is why only `unchanged` needs
-                # this -- on either path.
-                _close_run(alert_id, known, now=now, budget=budget, counts=counts)
-            counts[commit.status] = counts.get(commit.status, 0) + 1
+            counts.add("withdrawn")
+            return
+        if commit.status == "unchanged":
+            # Same recovery as on the coordinator, reached the long way: the standing set was not
+            # ready, so the store was asked and said "no transition". A mint would have closed the
+            # run itself (`_mint` writes both counter fields), which is why only `unchanged` needs
+            # this -- on either path. Inline rather than submitted, because this worker is already
+            # on the pool and the budget bounds it either way.
+            _close_run(alert_id, known, now=now, budget=budget, counts=counts)
+        counts.add(commit.status)
+
+    try:
+        submitted = 0
+        for observation in sorted(observations, key=_sort_key):
+            # ONCE PER TRAIN, not once per recipient: the train identity, its `TrainRef` and the
+            # phase it asks for are properties of the observation, and at 100 000 subscriptions on
+            # one corridor the difference is four function calls against four hundred thousand.
+            train = train_ref_of(
+                operator=observation.operator,
+                line=observation.line,
+                journey_ref=observation.journey_ref,
+                stop_place=observation.stop_place,
+                stop_order=observation.stop_order,
+                departure_time=observation.departure_time,
+            )
+            if train is None:
+                counts.add("unidentified", len(observation.recipients))
+                continue
+            phase = (
+                notification_store.PHASE_CONFIRMED
+                if observation.cancelled
+                else notification_store.PHASE_PREDICTED
+            )
+            for recipient in observation.recipients:
+                known = standing.get(recipient.subscription_id, _INCOMPLETE)
+                # Hoisted out of the `complete` branch: the withdrawal-run reset below needs it on
+                # both paths, and it is a pure hash of two strings.
+                alert_id = notification_store.alert_subject_id(recipient.subscription_id, train)
+                if known.complete:
+                    reason = _skip_reason_for(
+                        known.phases.get(alert_id),
+                        alertworthy=observation.alertworthy,
+                        phase=phase,
+                    )
+                    if reason is not None:
+                        if reason == "unchanged":
+                            # THE recovery case: alert-worthy, standing in the same phase, minting
+                            # nothing -- so the store is about to hear nothing about a cycle that
+                            # proves any open withdrawal run is broken. This is the one place that
+                            # can tell it. Submitted, because it IS a store transaction.
+                            futures.append(
+                                pool.submit(
+                                    _close_run,
+                                    alert_id,
+                                    known,
+                                    now=now,
+                                    budget=budget,
+                                    counts=counts,
+                                )
+                            )
+                        counts.add(reason)
+                        continue
+                if recipient.destination_id in uncountable:
+                    counts.add("retryable")
+                    continue
+                try:
+                    ceiling = _pending_ceiling(recipient.client_id)
+                    held = ledger.charge(recipient.destination_id, ceiling)
+                except Exception:
+                    # **GUARDED, because both of these moved onto the coordinator in U9 and were
+                    # inside the per-subject `try` before it.** The quota resolver is a cached
+                    # account read and the ledger's first sight of a destination is a Firestore
+                    # aggregation with a 4 s deadline -- and a 100 000-subscription morning is
+                    # exactly when that deadline gets hit. Unguarded, one blip raises out of this
+                    # loop, through `_run`, into `emit`'s handler, which reports the whole cycle as
+                    # a timeout and discards the counts of every transaction already committed.
+                    #
+                    # Once per DESTINATION, in the shape the pass-local skip set already had: the
+                    # answer is the same for every recipient on it, so the rest are counted as
+                    # retryable without asking again, and the next cycle is the retry.
+                    uncountable.add(recipient.destination_id)
+                    counts.add("retryable")
+                    logger.warning(
+                        "Could not establish a destination's pending-event ceiling; its "
+                        "observations are re-offered on the next cycle",
+                        exc_info=True,
+                        extra={"fields": {"event": "notification_emit", "result": "ceiling_error",
+                                          "client_id": recipient.client_id}},
+                    )
+                    continue
+                if held is None:
+                    # R21's ceiling, refused before a transaction is spent discovering it. Charged
+                    # on the coordinator, where there is one thread and so no contention for the
+                    # decision; refunded by the worker for everything that did not leave a pending
+                    # delivery behind.
+                    counts.add("quota")
+                    continue
+                futures.append(
+                    pool.submit(
+                        _commit,
+                        observation,
+                        recipient,
+                        train=train,
+                        phase=phase,
+                        known=known,
+                        alert_id=alert_id,
+                        ceiling=ceiling,
+                        held=held,
+                    )
+                )
+                submitted += 1
+                if beat is not None and submitted % _HEARTBEAT_EVERY == 0:
+                    _beat_quietly(beat)
+        # THE COLLECTION IS BOUNDED TOO, and it has to be: `notification_store` plumbs a deadline
+        # into every READ, a transaction's reads included, but a transactional COMMIT carries none
+        # -- so a worker parked in one would hold an unbounded wait here forever, and with it the
+        # module lock that makes the next cycle refuse as `overlap_refused`. Stragglers are
+        # abandoned, exactly as the outer wait already abandons this thread: an abandoned
+        # transaction that later commits is a committed event nothing delivered this cycle, and the
+        # next cycle's `pending_deliveries` finds it. At most `workers` of them can be in flight
+        # across a cycle boundary, which is what the refusal above bounds to one cycle's worth.
+        _, unfinished = wait(futures, timeout=max(0.0, deadline - monotonic()))
+        counts.add("abandoned", len(unfinished))
+    finally:
+        pool.shutdown(wait=False)
+        if beat is not None:
+            _beat_quietly(beat)
     return EmitReport(
-        created=counts.get("created", 0),
-        unchanged=counts.get("unchanged", 0),
-        withdrawn=counts.get("withdrawn", 0),
-        counting=counts.get("counting", 0),
-        obsolete=counts.get("obsolete", 0),
-        unidentified=counts.get("unidentified", 0),
-        nothing_standing=counts.get("nothing_standing", 0),
-        quota=counts.get("quota", 0),
-        capped=counts.get("capped", 0),
-        retryable=counts.get("retryable", 0),
-        failed=counts.get("failed", 0),
-        run_cleared=counts.get("run_cleared", 0),
-        run_stale=counts.get("run_stale", 0),
-        run_clear_capped=counts.get("run_clear_capped", 0),
-        run_clear_error=counts.get("run_clear_error", 0),
+        created=counts.get("created"),
+        unchanged=counts.get("unchanged"),
+        withdrawn=counts.get("withdrawn"),
+        counting=counts.get("counting"),
+        obsolete=counts.get("obsolete"),
+        unidentified=counts.get("unidentified"),
+        nothing_standing=counts.get("nothing_standing"),
+        quota=counts.get("quota"),
+        capped=counts.get("capped"),
+        retryable=counts.get("retryable"),
+        failed=counts.get("failed"),
+        run_cleared=counts.get("run_cleared"),
+        run_stale=counts.get("run_stale"),
+        run_clear_capped=counts.get("run_clear_capped"),
+        run_clear_error=counts.get("run_clear_error"),
+        abandoned=counts.get("abandoned"),
+        minted=ledger_of_mints.frozen(),
     )
 
 
+def _beat_quietly(beat: Callable[[], None]) -> None:
+    """Beat the poller's heartbeat, and never let the seam cost the pass.
+
+    `varsel._heartbeat`'s rule: the heartbeat is an availability signal, so a provider that raises
+    must not unwind a pass that is otherwise healthy.
+    """
+    try:
+        beat()
+    except Exception:
+        logger.warning("Heartbeat seam failed; continuing the emit pass", exc_info=True)
+
+
+#: Held for the whole of one pass, including the part of it this thread has walked away from.
+#: See :func:`emit` for what a second pass over the same store would cost.
+_pass_lock = threading.Lock()
+
+
 def emit(
-    subjects: Sequence[WebhookSubject],
+    observations: Sequence[WebhookObservation],
     *,
     now: datetime | None = None,
     deadline_s: float = _EMIT_DEADLINE_S,
     wait_s: float = _EMIT_WAIT_S,
     worst_case_s: float = _WORST_CASE_EMIT_S,
     max_calls: int = _MAX_EMITS_PER_CYCLE,
+    workers: int = _EMIT_WORKERS,
     pending_quota: Callable[[str], int] | None = None,
+    beat: Callable[[], None] | None = None,
 ) -> EmitReport:
     """Commit this cycle's notification events. Never raises for a store problem.
 
@@ -684,22 +1174,43 @@ def emit(
     ``notification_store`` as this module does, and the edge would make every process that emits
     also carry the credential machinery. ``None`` keeps the module constant for every client, which
     is what every test that does not care about quotas gets.
+
+    **A second pass cannot start while the first is still draining** (U9). The store's
+    pending-event ceiling is exact because one pass holds the whole count
+    (:class:`_PendingLedger`); two overlapping passes would each hold their own and admit past a
+    destination's ceiling together, and the abandoned workers of the first are exactly the ones
+    still writing. So the module lock is taken here without blocking and released by ``_run``'s
+    own ``finally`` -- not by this thread, which may have walked away from ``_run`` long before it
+    finishes. A refused cycle is reported as ``overlap_refused`` and its work is re-offered on the
+    next one, which is what every other bound here does too.
     """
-    if not subjects:
+    if not observations:
         return EmitReport()
+    if not _pass_lock.acquire(blocking=False):
+        logger.warning(
+            "The previous notification emit pass is still draining; this cycle's observations are "
+            "re-offered on the next one",
+            extra={"fields": {"event": "notification_emit", "result": "overlap_refused"}},
+        )
+        return EmitReport(overlap_refused=True)
     instant = (now or datetime.now(UTC)).astimezone(UTC)
     started = monotonic()
-    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="client-emit")
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="client-emit-run")
+    released = False
     try:
         future = pool.submit(
             _run,
-            subjects,
+            observations,
             now=instant,
             deadline_s=deadline_s,
             worst_case_s=worst_case_s,
             max_calls=max_calls,
+            workers=workers,
             pending_quota=pending_quota,
+            beat=beat,
+            release=_pass_lock.release,
         )
+        released = True
         report = future.result(timeout=wait_s)
         timed_out = False
     except Exception:
@@ -713,6 +1224,9 @@ def emit(
         timed_out = True
     finally:
         pool.shutdown(wait=False)
+        if not released:
+            # The submit itself raised, so `_run` never started and nothing will release for us.
+            _pass_lock.release()
 
     ms = int((monotonic() - started) * 1000)
     report = replace(report, timed_out=timed_out, ms=ms)
@@ -743,7 +1257,13 @@ def emit(
                 "run_clear_error": report.run_clear_error,
                 "retryable": report.retryable,
                 "failed": report.failed,
-                "n": len(subjects),
+                "abandoned": report.abandoned,
+                "overlap_refused": report.overlap_refused,
+                # `n` keeps its meaning -- the (recipient, train) observations this cycle offered
+                # -- so a rate computed across U9 still measures one thing. `trains` is what the
+                # fan-out is over, and the ratio between them is the corridor's sharing factor.
+                "n": sum(len(o.recipients) for o in observations),
+                "trains": len(observations),
                 "ms": ms,
             }
         },
@@ -753,6 +1273,8 @@ def emit(
 
 __all__ = [
     "EmitReport",
+    "Recipient",
+    "WebhookObservation",
     "WebhookSubject",
     "emit",
     "requested_phase",

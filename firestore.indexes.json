@@ -101,5 +101,36 @@
       ]
     }
   ],
-  "fieldOverrides": []
+  "fieldOverrides": [
+    {
+      "collectionGroup": "events",
+      "fieldPath": "payload",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "events",
+      "fieldPath": "situations",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "deliveries",
+      "fieldPath": "situations",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "delivered",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "daily_deliveries",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "daily_reservations",
+      "indexes": []
+    }
+  ]
 }

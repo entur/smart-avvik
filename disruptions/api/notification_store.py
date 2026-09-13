@@ -1609,6 +1609,13 @@ def delete_subscription(
     )
     if doc is None:
         return None
+    # Nothing may stand for a tombstoned subscription: `_subscription_obsolete` refuses every later
+    # emit for it anyway, and the poller's subscription mirror stops matching it -- so the standing
+    # set would otherwise hold entries that can never move again until their week of TTL ran out.
+    # The subject DOCUMENTS survive until `cleanup_subscription` deletes them, which is what R19
+    # wants: the tombstone is the moment the subscription stops being routable, not the moment its
+    # history stops existing.
+    _subject_mirror.drop_subscription(subscription_id)
     logger.info(
         "Webhook subscription %s tombstoned",
         subscription_id,
@@ -2303,6 +2310,10 @@ class StandingSubject:
     phase: str
     below_threshold_at: datetime | None
     expires_at: datetime | None
+    #: How far the open withdrawal run has counted. Carried because it is free -- the document is
+    #: being read anyway -- and NOT because anything outside this module may decide a withdrawal
+    #: from it: `_withdraw_body` stays the one statement of that rule, run closure included.
+    below_threshold_cycles: int = 0
 
 
 def _standing_subject(doc: Mapping[str, Any]) -> StandingSubject:
@@ -2312,6 +2323,7 @@ def _standing_subject(doc: Mapping[str, Any]) -> StandingSubject:
         phase=str(doc["phase"]),
         below_threshold_at=_as_dt(doc.get("below_threshold_at")),
         expires_at=_as_dt(doc.get(TTL_FIELD)),
+        below_threshold_cycles=int(doc.get("below_threshold_cycles") or 0),
     )
 
 
@@ -2423,6 +2435,33 @@ class SubjectMirror:
             if s.expires_at is not None and s.expires_at > now
         }
 
+    def prune(self, now: datetime) -> int:
+        """Drop expired subjects, and answer how many. One step of the poller's sync.
+
+        Correctness never needed it -- :meth:`phases_for` and :meth:`open_runs` both test
+        ``expires_at`` on the read, for the reason the seed does: TTL runs up to ~24 h late, so a
+        document the store still returns can be long dead. This is about MEMORY, and the arithmetic
+        is worth stating because it is the one number this mirror grows in. A subject document
+        lives :data:`HISTORY_DAYS` (7), so without a prune a pod holds every train every
+        subscription was ever warned about for a week: at 100 000 subscriptions and a handful of
+        alert-worthy trains each that is high hundreds of thousands of entries, and the pod's
+        memory limit equals its request. Pruned, the set is what is still live.
+        """
+        with self._lock:
+            dropped = 0
+            for subscription_id in list(self._by_subscription):
+                subjects = self._by_subscription[subscription_id]
+                for alert_id in [
+                    a
+                    for a, s in subjects.items()
+                    if s.expires_at is None or s.expires_at <= now
+                ]:
+                    subjects.pop(alert_id, None)
+                    dropped += 1
+                if not subjects:
+                    self._by_subscription.pop(subscription_id, None)
+            return dropped
+
     def open_runs(self, now: datetime) -> dict[str, datetime]:
         """``alert_id -> below_threshold_at`` for every subject with an open withdrawal run.
 
@@ -2477,7 +2516,50 @@ def sync_mirrors(
     report = _subscription_mirror.sync(now=instant, beat=beat)
     if not _subject_mirror.ready:
         _subject_mirror.seed(now=instant, beat=beat)
+    else:
+        # Memory only -- both readers already test expiry -- and here rather than on the read
+        # because a prune walks the whole set while a read walks one subscription. See
+        # `SubjectMirror.prune` for the arithmetic it bounds.
+        _subject_mirror.prune(instant)
     return report
+
+
+#: The transaction bodies that write a subject document AND must be seen by the standing-subject
+#: mirror, declared as a SET for the reason `MIRROR_STAMPING_BODIES` is: what has to hold is a
+#: property of the set, and a body added next year is the case no behavioural test over today's
+#: four can see. `test_notification_store` pins it against the source both ways.
+#:
+#: Each of these moves something the emit pass READS BACK -- the phase, or the open withdrawal run
+#: -- so an unmirrored one leaves the next cycle answering from a stale standing set: a subject
+#: minted in cycle N reads as absent in cycle N+1, `skip_reason` answers `nothing_standing` for the
+#: below-threshold observation that follows, and the withdrawal is never counted.
+SUBJECT_MIRRORING_BODIES = frozenset({"_mint", "_withdraw_body", "_clear_below_threshold_body"})
+
+#: The one body that writes a subject document and deliberately does NOT mirror it.
+#: `_sent_body` writes `delivered_revision`, `delivered_at` and the pending pointer. None of the
+#: three is in the standing set, the emit pass never asks about them, and mirroring them would put
+#: the busiest documents in the hottest loop for no reader -- the same economy that keeps this body
+#: out of `MIRROR_STAMPING_BODIES`. **Re-check this sentence when U11 moves delivery to its own
+#: Deployment**: what a worker there writes is exactly those three fields, and the moment one of
+#: them enters the standing set this process stops being their only writer.
+SUBJECT_WRITERS_OUTSIDE_THE_MIRROR = frozenset({"_sent_body"})
+
+
+def _mirror_subject(state: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    """Record a committed subject in the standing set, and hand its document back.
+
+    **The one place a subject reaches the mirror**, so "which writes the mirror sees" is a property
+    of this module rather than of whoever remembered; :data:`SUBJECT_MIRRORING_BODIES` names the
+    bodies whose writes get here and the suite pins that set against the source.
+
+    Called on the RESULT of a transaction and never from inside a body: a body may run more than
+    once, so an apply from inside would record a state a later attempt then overwrote and the
+    mirror would answer the next cycle with a phase Firestore never held. Returns its argument so a
+    call site reads as one expression.
+    """
+    if state is not None:
+        _subject_mirror.apply(state)
+    return state
 
 
 def recipient_documents() -> list[dict[str, Any]]:
@@ -2646,6 +2728,11 @@ def cleanup_subscription(
         deleted[key] = len(page)
         full_page = full_page or len(page) >= batch
 
+    # Again after the deletes, and deliberately not only here: `delete_subscription` already
+    # dropped it, but cleanup is the retryable path R19 requires and can run long after a restart
+    # that re-seeded the mirror from documents this call is now deleting.
+    _subject_mirror.drop_subscription(subscription_id)
+
     done = not full_page
     doc = _run_transaction(
         lambda txn: _finish_cleanup_body(
@@ -2791,6 +2878,15 @@ class EventCommit:
     below_threshold_cycles: int = 0
     cap_exempt: bool = False
     reason: str | None = None
+    #: The subject document as it stands AFTER this commit, for the standing-subject mirror, or
+    #: ``None`` when nothing about the subject moved.
+    #:
+    #: **Carried out on the result rather than applied inside the body, and that is not a style
+    #: choice.** A transaction body may run more than once (the module header's rule, and the suite
+    #: runs every body twice against one fake transaction): an `apply` from inside would record a
+    #: state a later attempt then overwrote, and the mirror would answer the next cycle with a
+    #: phase Firestore never held. Only `_run_transaction`'s return value is the committed one.
+    subject_state: Mapping[str, Any] | None = None
 
 
 def _subscription_obsolete(
@@ -2957,6 +3053,7 @@ def _mint(
         event_type=event_type,
         superseded_delivery_id=superseded,
         cap_exempt=cap_exempt,
+        subject_state=subject_doc,
     )
 
 
@@ -2998,8 +3095,27 @@ def _emit_body(
     )
 
 
+def count_pending_events(destination_id: str, *, ceiling: int) -> int:
+    """How many pending deliveries this destination holds, bounded by ``ceiling``.
+
+    Public since U9 because the emit pass counts ONCE per destination per cycle and keeps its own
+    figure in step from there (`notification_events._PendingLedger`): a count per mint was most of
+    the transaction latency the widened pass had to remove, and at sixty-four workers it would be
+    sixty-four concurrent aggregations against one collection to re-derive a figure this process is
+    the only writer of.
+
+    Bounded by the ceiling and not by the collection: what the caller needs is "is it at or past
+    this number", so reading beyond it is a page nobody looks at.
+    """
+    return _count_destination_deliveries(destination_id, state="pending", ceiling=ceiling)
+
+
 def commit_event(
-    request: EmitRequest, *, max_pending: int | None = None, now: datetime | None = None
+    request: EmitRequest,
+    *,
+    max_pending: int | None = None,
+    pending: int | None = None,
+    now: datetime | None = None,
 ) -> EventCommit:
     """Record one observation about one train, minting a revision only on a lifecycle transition.
 
@@ -3009,14 +3125,22 @@ def commit_event(
     about the same train.
 
     The ceiling on pending events per destination is checked BEFORE the transaction. Exact rather
-    than best effort, and the reason is nameable instead of hoped for: the emit path has exactly one
-    writer (one poller thread, no route invokes the pass, one replica under the Recreate strategy),
-    so nothing can create a pending event between the count and the commit.
+    than best effort, and the reason was nameable instead of hoped for: the emit path has exactly
+    one writer -- **one sentence of which U9 changed.** The writer is now the sixty-four threads of
+    one emit pass rather than one thread, so what makes the ceiling exact is the caller's own
+    locked ledger (`notification_events._PendingLedger`) plus its refusal to run two passes at
+    once; the count here is the second, independent refusal, and it is the one a direct caller
+    still gets for free.
 
     ``max_pending`` is the CLIENT's (``notification_auth.Quotas.max_pending_events``); ``None``
     means the module constant, resolved here at call time exactly as ``max_active`` is on the create
     path. It is the caller's to look up rather than this module's, because the store must not import
     ``notification_auth`` -- that edge already runs the other way.
+
+    ``pending`` is how many pending events the destination already holds when the CALLER has
+    counted, which is what lets the pass spend one aggregation per destination per cycle instead of
+    one per mint. ``None`` means "count it here", which is what every other caller gets and what
+    keeps this function correct on its own.
     """
     if request.phase not in PHASES:
         raise Conflict(f"phase must be one of {PHASES}, not {request.phase!r}")
@@ -3024,9 +3148,10 @@ def commit_event(
     seed = revision_seed(instant)
     refs = _Refs(_firestore_client())
     ceiling = MAX_PENDING_EVENTS_PER_DESTINATION if max_pending is None else max_pending
-    pending = _count_destination_deliveries(
-        request.destination_id, state="pending", ceiling=ceiling
-    )
+    if pending is None:
+        pending = _count_destination_deliveries(
+            request.destination_id, state="pending", ceiling=ceiling
+        )
     if pending >= ceiling:
         logger.warning(
             "Destination %s holds %d pending events; refusing to emit (ceiling %d)",
@@ -3048,24 +3173,15 @@ def commit_event(
     commit = _run_transaction(
         lambda txn: _emit_body(txn, refs, request=request, now=instant, seed=seed)
     )
-    if commit.status == "created":
-        logger.info(
-            "Notification event %s revision %d (%s)",
-            commit.event_id,
-            commit.revision,
-            commit.event_type,
-            extra={
-                "fields": {
-                    "event": "notification_event",
-                    "result": commit.event_type,
-                    "client_id": request.client_id,
-                    "destination_id": request.destination_id,
-                    "alert_id": commit.alert_id,
-                    "revision": commit.revision,
-                    "superseded": bool(commit.superseded_delivery_id),
-                }
-            },
-        )
+    _mirror_subject(commit.subject_state)
+    # **NO PER-EVENT RECORD SINCE U9**, and it was `event="notification_event"` at INFO, one line
+    # per committed revision with the client, the destination, the alert id and the revision on it.
+    # At the pilot's few hundred events a day that was the right grain; at a widened pass it is
+    # 20 000 lines a cycle and ~300 cycles a day, which is a logging bill and a summary nobody can
+    # read. What replaces it is `notification_emit`, one record per cycle carrying the counts --
+    # and the events themselves, which are documents in Firestore rather than lines in a log, so
+    # nothing that was durable was lost. A question about ONE client still starts at the per-failure
+    # records, which carry `client_id` and never went away.
     return commit
 
 
@@ -3117,19 +3233,21 @@ def _withdraw_body(
     )
     count = int(subject.get("below_threshold_cycles") or 0) + 1 if same_run else 1
     if count < WITHDRAWAL_CYCLES:
-        transaction.update(
-            refs.subject(request.alert_id),
-            {
-                "below_threshold_cycles": count,
-                "below_threshold_at": now,
-                "updated_at": now,
-            },
-        )
+        patch = {
+            "below_threshold_cycles": count,
+            "below_threshold_at": now,
+            "updated_at": now,
+        }
+        transaction.update(refs.subject(request.alert_id), patch)
         return EventCommit(
             status="counting",
             alert_id=request.alert_id,
             below_threshold_cycles=count,
             revision=int(subject.get("revision") or 0),
+            # The document as the update leaves it, built from the copy this body READ rather than
+            # from a fresh one: a patch alone would tell the mirror nothing about the phase, and a
+            # re-read would be a second round trip for a document already in hand.
+            subject_state={**subject, **patch},
         )
     return _mint(
         transaction,
@@ -3166,30 +3284,35 @@ def record_below_threshold(request: EmitRequest, *, now: datetime | None = None)
     instant = now or _now()
     seed = revision_seed(instant)
     refs = _Refs(_firestore_client())
-    return _run_transaction(
+    commit = _run_transaction(
         lambda txn: _withdraw_body(txn, refs, request=request, now=instant, seed=seed)
     )
+    _mirror_subject(commit.subject_state)
+    return commit
 
 
 def _clear_below_threshold_body(
     transaction: Any, refs: _Refs, *, alert_id: str, now: datetime
-) -> bool:
+) -> dict[str, Any] | None:
+    """The subject as the clear leaves it, or ``None`` when there was nothing to clear.
+
+    The document rather than a bool since U9, so the caller can hand it to the standing-subject
+    mirror; the public :func:`clear_below_threshold` still answers whether it wrote.
+    """
     subject = _doc(_read(transaction, refs.subject(alert_id)))
     # NEVER creates a subject: this says "the run that was open is closed", which is meaningless
     # for a subject that does not exist, and a `set` here would mint a phase-less document the
     # snapshot readers would then have to skip.
     if not subject or not _not_expired(subject, now):
-        return False
+        return None
     if _as_dt(subject.get("below_threshold_at")) is None:
         # No run open, so no write. This is what makes U6's "zero writes on an ordinary standing
         # cycle" affordable: the overwhelmingly common case costs one read and nothing else, and
-        # with `ClientAlerts.open_below_threshold` in hand the caller does not even pay that.
-        return False
-    transaction.update(
-        refs.subject(alert_id),
-        {"below_threshold_cycles": 0, "below_threshold_at": None, "updated_at": now},
-    )
-    return True
+        # with the mirror's `open_runs` in hand the caller does not even pay that.
+        return None
+    patch = {"below_threshold_cycles": 0, "below_threshold_at": None, "updated_at": now}
+    transaction.update(refs.subject(alert_id), patch)
+    return {**subject, **patch}
 
 
 def clear_below_threshold(alert_id: str, *, now: datetime) -> bool:
@@ -3212,11 +3335,12 @@ def clear_below_threshold(alert_id: str, *, now: datetime) -> bool:
     if not alert_id:
         return False
     refs = _Refs(_firestore_client())
-    return bool(
+    cleared = _mirror_subject(
         _run_transaction(
             lambda txn: _clear_below_threshold_body(txn, refs, alert_id=alert_id, now=now)
         )
     )
+    return cleared is not None
 
 
 def get_subject(alert_id: str, *, now: datetime | None = None) -> AlertSubject | None:
@@ -4128,6 +4252,10 @@ def _sent_body(
         }
         if subject.get("pending_delivery_id") == delivery_id:
             subject_patch["pending_delivery_id"] = None
+        # NOT MIRRORED, and `_mirror_subject` carries the reasoning: none of these three fields is
+        # in the standing set the emit pass reads, so recording them would put the busiest
+        # documents in the hottest loop for no reader. The phase is untouched here by construction
+        # -- a delivery is not a lifecycle transition.
         transaction.update(refs.subject(alert_id), subject_patch)
     return {**delivery, **delivery_patch}, spent, False, False
 
@@ -4431,6 +4559,7 @@ __all__ = [
     "client_alerts",
     "commit_event",
     "configure",
+    "count_pending_events",
     "create_subscription",
     "daily_cap_of",
     "database_id",

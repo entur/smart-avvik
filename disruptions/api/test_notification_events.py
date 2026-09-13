@@ -114,8 +114,10 @@ class _Fake:
         self.fail_with: BaseException | None = None
         self.delay_s = 0.0
         # Keyed by spec NAME, because a blanket query failure would also break
-        # `_count_destination_deliveries` -- which runs inside `commit_event` -- and the point of
-        # the pre-read tests is that the emit still commits when only the pre-read failed.
+        # `_count_destination_deliveries` -- which the pass runs on the coordinator since U9, once
+        # per destination, and which failing takes that destination's observations with it
+        # (`test_a_destinations_uncountable_ceiling_...`). A test that wants one query to fail must
+        # be able to say which.
         self.query_fail_with: dict[str, BaseException] = {}
 
     def collection(self, name: str) -> _Collection:
@@ -250,7 +252,25 @@ def _install() -> _Fake:
     notification_store._run_transaction = _run  # type: ignore[assignment]
     notification_store._query = _query  # type: ignore[assignment]
     notification_store.configure(client=client, clock=lambda: NOW)
+    # The standing set the pass reads, seeded over an empty store exactly as the poller's own
+    # `sync_mirrors` step does before every cycle. It has to be READY or `_standing` answers
+    # `_INCOMPLETE` for everything and the whole pre-read optimisation is switched off -- which is
+    # the restart window's correct behaviour and would make every assertion here about the fallback
+    # instead. From here it is kept current by the commits themselves (`_mirror_subject`), which is
+    # what these tests are checking.
+    _sync_mirror()
     return client
+
+
+def _sync_mirror(now: datetime = NOW) -> None:
+    """The poller's own `sync_mirrors` step: read the standing set out of whatever the store holds.
+
+    A fresh process does exactly this before its first pass, which is what makes a withdrawal
+    counter survive a restart — the count lives on the subject document, and the mirror is how this
+    module gets to see it without a read per subject.
+    """
+    notification_store.reset_mirrors_for_tests()
+    notification_store.subject_mirror().seed(now=now)
 
 
 def _uninstall() -> None:
@@ -261,6 +281,9 @@ def _uninstall() -> None:
         notification_store._run_transaction = _saved["run"]  # type: ignore[assignment]
         notification_store._query = _saved["query"]  # type: ignore[assignment]
         _saved.clear()
+    # Module state, and it leaks between tests exactly as the configured client does: a mirror left
+    # holding the previous test's subjects reads here as a healthy one.
+    notification_store.reset_mirrors_for_tests()
     notification_store.reset_for_tests()
 
 
@@ -317,6 +340,70 @@ def _subject(**over: Any) -> notification_events.WebhookSubject:
     }
     base.update(over)
     return notification_events.WebhookSubject(**base)
+
+
+def _observed(subjects: list[notification_events.WebhookSubject]) -> list[Any]:
+    """Group subjects into observations the way `varsel._observations_for_key` does.
+
+    The pass hands `emit` one observation per (definition, train) with its recipients since U9;
+    this suite's fixtures stay written in SUBJECTS because a subject is what the store sees and
+    what every assertion here is about. The grouping key is the train plus the observation —
+    exactly what `varsel` shares across the recipients on one definition — with `payload` left out
+    because a dict is unhashable and, in this suite, identical wherever the rest of the key is.
+    """
+    grouped: dict[tuple, list[notification_events.WebhookSubject]] = {}
+    for subject in subjects:
+        grouped.setdefault(
+            (
+                subject.alertworthy,
+                subject.cancelled,
+                subject.situations,
+                subject.operator,
+                subject.line,
+                subject.journey_ref,
+                subject.stop_place,
+                subject.stop_order,
+                subject.departure_time,
+                subject.title,
+                subject.body,
+                subject.expected_departure_time,
+            ),
+            [],
+        ).append(subject)
+    return [
+        notification_events.WebhookObservation(
+            recipients=tuple(
+                notification_events.Recipient(
+                    subscription_id=s.subscription_id,
+                    client_id=s.client_id,
+                    destination_id=s.destination_id,
+                    subscription_version=s.subscription_version,
+                    external_ref=s.external_ref,
+                    test=s.test,
+                )
+                for s in group
+            ),
+            alertworthy=group[0].alertworthy,
+            cancelled=group[0].cancelled,
+            situations=group[0].situations,
+            operator=group[0].operator,
+            line=group[0].line,
+            journey_ref=group[0].journey_ref,
+            stop_place=group[0].stop_place,
+            stop_order=group[0].stop_order,
+            departure_time=group[0].departure_time,
+            title=group[0].title,
+            body=group[0].body,
+            payload=group[0].payload,
+            expected_departure_time=group[0].expected_departure_time,
+        )
+        for group in grouped.values()
+    ]
+
+
+def _emit(subjects: list[notification_events.WebhookSubject], **kwargs: Any) -> Any:
+    """`notification_events.emit` over the observations those subjects belong to."""
+    return notification_events.emit(_observed(subjects), **kwargs)
 
 
 # See `test_webhook_delivery`'s copy for the full argument: every fault this suite injects is
@@ -382,7 +469,7 @@ def test_an_alertworthy_train_mints_one_event_and_the_next_cycle_mints_nothing()
     client = _install()
     try:
         _live(client)
-        first = notification_events.emit([_subject()], now=NOW)
+        first = _emit([_subject()], now=NOW)
         events = client.in_collection(notification_store.EVENTS)
         assert first.created == 1 and len(events) == 1
         assert events[0]["type"] == notification_store.EVENT_CREATED
@@ -391,7 +478,7 @@ def test_an_alertworthy_train_mints_one_event_and_the_next_cycle_mints_nothing()
 
         # A LATER cycle, with a different probability in the payload: the facts moved, the lifecycle
         # did not. Nothing is minted, at any size of change -- there is no materiality threshold.
-        second = notification_events.emit(
+        second = _emit(
             [_subject(payload={"probabilities": {"impact": 0.99}})], now=NOW + timedelta(minutes=5)
         )
         assert second.created == 0 and second.unchanged == 1
@@ -418,11 +505,11 @@ def test_a_confirmed_cancellation_mints_an_updated_revision_and_supersedes_the_f
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         first = client.in_collection(notification_store.EVENTS)[0]
         notification_store.mark_delivery_sent(first["event_id"], now=NOW + timedelta(seconds=5))
 
-        notification_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
+        _emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
         events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
         assert len(events) == 2
         confirmed = events[-1]
@@ -453,9 +540,9 @@ def test_a_confirmation_whose_forecast_was_never_delivered_is_not_cap_exempt():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         first = client.in_collection(notification_store.EVENTS)[0]
-        notification_events.emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
+        _emit([_subject(cancelled=True)], now=NOW + timedelta(minutes=1))
         events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
         assert client.doc(notification_store.DELIVERIES, events[-1]["event_id"])["cap_exempt"] is False
         assert client.doc(notification_store.DELIVERIES, first["event_id"])["state"] == "superseded"
@@ -486,13 +573,16 @@ def test_thirteen_departures_produce_thirteen_events_soonest_first():
             )
             for i in range(13)
         ]
-        report = notification_events.emit(subjects, now=NOW)
+        report = _emit(subjects, now=NOW)
         assert report.created == 13
         events = client.in_collection(notification_store.EVENTS)
         assert len({e["alert_id"] for e in events}) == 13
         # Minted in departure order, which the revision (clamped to `stored + 1` per subject, seeded
         # from one instant) cannot show -- so read the order off the queue itself.
-        order = [s.journey_ref for s in sorted(subjects, key=notification_events._sort_key)]
+        order = [
+            o.journey_ref
+            for o in sorted(_observed(subjects), key=notification_events._sort_key)
+        ]
         assert order == [f"DatedServiceJourney:{2000 + i}" for i in range(12, -1, -1)]
     finally:
         _uninstall()
@@ -512,8 +602,8 @@ def test_two_below_threshold_cycles_withdraw_and_one_does_not():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        one = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        _emit([_subject()], now=NOW)
+        one = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         assert one.counting == 1 and one.withdrawn == 0, "one dip is noise"
         assert len(client.in_collection(notification_store.EVENTS)) == 1
 
@@ -522,7 +612,10 @@ def test_two_below_threshold_cycles_withdraw_and_one_does_not():
         _uninstall()
         client = _install()
         client.docs.update(docs)
-        two = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=2))
+        # Seeded AFTER the documents are back, because that is the order a pod comes up in: the
+        # standing set is read out of Firestore by the poller's own step, before the pass.
+        _sync_mirror()
+        two = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=2))
         assert two.withdrawn == 1, "the counter survived the restart"
         events = sorted(client.in_collection(notification_store.EVENTS), key=lambda e: e["revision"])
         assert events[-1]["type"] == notification_store.EVENT_WITHDRAWN
@@ -547,12 +640,12 @@ def test_a_recovered_cycle_breaks_the_run_so_a_later_dip_does_not_withdraw():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        dip = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        _emit([_subject()], now=NOW)
+        dip = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         assert dip.counting == 1, dip
 
         was = client.in_collection(notification_store.SUBJECTS)[0]
-        recovered = notification_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        recovered = _emit([_subject()], now=NOW + timedelta(minutes=2))
         assert recovered.unchanged == 1, "the same phase again: nothing is minted"
         assert recovered.run_cleared == 1, f"and the open run is closed; got {recovered}"
         subject = client.in_collection(notification_store.SUBJECTS)[0]
@@ -564,7 +657,7 @@ def test_a_recovered_cycle_breaks_the_run_so_a_later_dip_does_not_withdraw():
 
         # Well inside `WITHDRAWAL_GAP_S` of the first dip, so the time window alone would withdraw.
         assert timedelta(minutes=3).total_seconds() < notification_store.WITHDRAWAL_GAP_S
-        second = notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=3))
+        second = _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=3))
         assert second.withdrawn == 0 and second.counting == 1, (
             f"the recovery made this a FIRST dip, not the second of a run; got {second}"
         )
@@ -584,9 +677,9 @@ def test_an_ordinary_standing_cycle_still_writes_nothing():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         before = client.transactions
-        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=1))
+        report = _emit([_subject()], now=NOW + timedelta(minutes=1))
         assert report.unchanged == 1 and client.transactions == before, (
             f"an ordinary standing cycle writes nothing; "
             f"{client.transactions - before} transaction(s) happened"
@@ -605,32 +698,36 @@ def test_a_run_already_past_the_gap_is_left_for_the_store_to_reset():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        _emit([_subject()], now=NOW)
+        _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
         later = NOW + timedelta(seconds=notification_store.WITHDRAWAL_GAP_S + 120)
         before = client.transactions
-        report = notification_events.emit([_subject()], now=later)
+        report = _emit([_subject()], now=later)
         assert report.run_stale == 1 and report.run_cleared == 0, report
         assert client.transactions == before, "and it costs no transaction"
     finally:
         _uninstall()
 
 
-def test_a_failed_pre_read_loses_the_reset_and_never_reads_per_subject():
-    """R20, applied to the reset: an outage costs the optimisation's exactness, never a read.
+def test_an_unseeded_mirror_loses_the_reset_and_never_reads_per_subject():
+    """R20, applied to the reset: the restart window costs the optimisation's exactness, never a read.
 
-    A failed `client_alerts` leaves `open_runs` empty, so no run is closed this cycle and the
-    store's time window is what protects the traveller. What must NOT happen is a per-subject read
-    to recover the information — that is the cost the whole pre-read exists to avoid.
+    The failure this guards used to be a failed `client_alerts` query; since U9 the standing set is
+    in memory and the only state that cannot answer is a mirror that has not finished seeding — a
+    pod coming up cold, which happens on every deploy. `open_runs` is then empty, so no run is
+    closed this cycle and the store's time window is what protects the traveller. What must NOT
+    happen is a per-subject read to recover the information, which is the cost the whole pre-read
+    exists to avoid.
     """
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
-        notification_events.emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
-        client.query_fail_with["client_alerts"] = RuntimeError("Firestore is unreachable")
+        _emit([_subject()], now=NOW)
+        _emit([_subject(alertworthy=False)], now=NOW + timedelta(minutes=1))
+        notification_store.reset_mirrors_for_tests()
+        assert notification_store.subject_mirror().ready is False
         mark = len(_SINK.records)
-        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=2))
+        report = _emit([_subject()], now=NOW + timedelta(minutes=2))
         assert report.run_cleared == 0 and report.run_stale == 0, report
         assert report.unchanged == 1, "the store still answered the subject itself"
         assert not any("get_subject" in str(r.msg) for r in _SINK.records[mark:])
@@ -638,7 +735,6 @@ def test_a_failed_pre_read_loses_the_reset_and_never_reads_per_subject():
         subject = client.in_collection(notification_store.SUBJECTS)[0]
         assert subject["below_threshold_at"] is not None
     finally:
-        client.query_fail_with.pop("client_alerts", None)
         _uninstall()
 
 
@@ -647,17 +743,20 @@ def test_a_below_threshold_train_with_nothing_standing_costs_no_transaction():
 
     ~83 % of matched alerts are sub-threshold. A `record_below_threshold` for a train nobody was
     ever warned about writes nothing (`nothing_standing`), so paying a Firestore transaction to
-    discover that on every cycle for every such train is the cost the one client-scoped query
-    exists to avoid.
+    discover that on every cycle for every such train is the cost the standing set exists to avoid.
+
+    Since U9 it costs no QUERY either, which is the stronger claim and the one worth pinning: the
+    answer is in memory, so a cycle over a quiet population reaches Firestore not at all.
     """
     client = _install()
     try:
         _live(client)
         before = client.transactions
-        report = notification_events.emit([_subject(alertworthy=False)], now=NOW)
+        queries = len(client.queries)
+        report = _emit([_subject(alertworthy=False)], now=NOW)
         assert report.nothing_standing == 1
         assert client.transactions == before, "no transaction was spent"
-        assert client.queries.count("client_alerts") == 1, "one query for the whole cycle"
+        assert client.queries[queries:] == [], "and no query either — the mirror answered it"
     finally:
         _uninstall()
 
@@ -667,22 +766,168 @@ def test_an_unchanged_alertworthy_train_costs_no_transaction_either():
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject()], now=NOW)
+        _emit([_subject()], now=NOW)
         before = client.transactions
-        report = notification_events.emit([_subject()], now=NOW + timedelta(minutes=1))
+        report = _emit([_subject()], now=NOW + timedelta(minutes=1))
         assert report.unchanged == 1 and client.transactions == before
     finally:
         _uninstall()
 
 
-def test_a_truncated_or_over_full_pre_read_falls_back_to_asking_the_store():
-    """The pre-read's one honest limit, handled rather than assumed.
+def test_a_shared_observation_materialises_a_subject_only_where_a_store_call_happens():
+    """U9 step 1, and the number it prevents is the reason it exists.
 
-    `client_alerts` COUNTS every live subject and enumerates at most `MAX_ALERTS_SERVED` of them,
-    so a subscription holding more than that reports a count this module cannot resolve to phases.
-    Treating the subset as complete would skip a withdrawal that was owed and — worse — skip a
-    `confirmed` mint for a train ET has cancelled, silently, for exactly the subscriptions a line
-    suspension has hit hardest.
+    The pass used to hand over one `WebhookSubject` per (recipient, train), built in `varsel`
+    before this module saw any of them — so a corridor with 100 000 subscriptions and AE3's
+    thirteen cancelled departures materialised 1.3 million dataclasses in one burst, on the
+    ingestion thread, in a pod whose memory limit equals its request. The payload was already
+    shared by reference; the objects around it were not.
+
+    What is asserted is the property rather than a byte count: the observation is one object, and a
+    subject is built only where the standing set says a store call is going to happen. For the ~83 %
+    of matched alerts that are sub-threshold with nothing standing, that is never.
+    """
+    client = _install()
+    try:
+        recipients = []
+        for i in range(5):
+            sid = f"sub-{i}"
+            _live(client, subscription_id=sid)
+            recipients.append(
+                notification_events.Recipient(
+                    subscription_id=sid,
+                    client_id=CLIENT,
+                    destination_id=DEST,
+                    subscription_version=1,
+                )
+            )
+        shared = _observed([_subject(alertworthy=False)])[0]
+        quiet = notification_events.WebhookObservation(
+            **{**shared.__dict__, "recipients": tuple(recipients)}
+        )
+
+        built: list[str] = []
+        original = notification_events.WebhookObservation.subject
+
+        def counting(self: Any, recipient: Any) -> Any:
+            built.append(recipient.subscription_id)
+            return original(self, recipient)
+
+        notification_events.WebhookObservation.subject = counting  # type: ignore[method-assign]
+        try:
+            quietly = notification_events.emit([quiet], now=NOW)
+            assert quietly.nothing_standing == 5, quietly
+            assert built == [], (
+                f"a below-threshold observation nobody stands on built {len(built)} subject(s); "
+                "the whole point of the shape is that it builds none"
+            )
+
+            # And where they DO stand, every recipient is materialised — once each.
+            alert = notification_events.WebhookObservation(
+                **{**quiet.__dict__, "alertworthy": True}
+            )
+            loud = notification_events.emit([alert], now=NOW)
+            assert loud.created == 5, loud
+            assert sorted(built) == [f"sub-{i}" for i in range(5)]
+        finally:
+            notification_events.WebhookObservation.subject = original  # type: ignore[method-assign]
+    finally:
+        _uninstall()
+
+
+def test_the_train_identity_is_resolved_once_per_train_not_once_per_recipient():
+    """The other half of step 1: `train_ref_of` and the requested phase are per OBSERVATION.
+
+    At 100 000 subscriptions on one corridor the difference between per-train and per-recipient is
+    four calls against four hundred thousand, every cycle — and the answer cannot differ between
+    two recipients, because it is derived from the train alone.
+    """
+    client = _install()
+    try:
+        recipients = []
+        for i in range(4):
+            sid = f"sub-{i}"
+            _live(client, subscription_id=sid)
+            recipients.append(
+                notification_events.Recipient(
+                    subscription_id=sid,
+                    client_id=CLIENT,
+                    destination_id=DEST,
+                    subscription_version=1,
+                )
+            )
+        shared = _observed([_subject()])[0]
+        observation = notification_events.WebhookObservation(
+            **{**shared.__dict__, "recipients": tuple(recipients)}
+        )
+
+        calls = 0
+        original = notification_events.train_ref_of
+
+        def counting(**kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return original(**kwargs)
+
+        notification_events.train_ref_of = counting  # type: ignore[assignment]
+        try:
+            report = notification_events.emit([observation], now=NOW)
+        finally:
+            notification_events.train_ref_of = original  # type: ignore[assignment]
+        assert report.created == 4, report
+        assert calls == 1, f"the train was identified {calls} times for one observation"
+    finally:
+        _uninstall()
+
+
+def test_the_standing_set_is_asked_once_per_subscription_not_once_per_observation():
+    """AE3's line suspension is thirteen departures on ONE subscription.
+
+    `phases_for` is a lock, a list copy and a dict build; asked per recipient rather than per
+    subscription, twelve of those thirteen answers would be spent on a dict comprehension that
+    overwrites them. At 100 000 subscriptions on one corridor it is 100 000 lookups against 1.3
+    million, every cycle — the same quadratic-in-a-linear-structure mistake `open_runs` is asked
+    once to avoid.
+    """
+    client = _install()
+    try:
+        _live(client)
+        subjects = [
+            _subject(journey_ref=f"DatedServiceJourney:{4000 + i}", alertworthy=False)
+            for i in range(13)
+        ]
+        mirror = notification_store.subject_mirror()
+        asked: list[str] = []
+        original = mirror.phases_for
+
+        def counting(subscription_id: str, now: datetime) -> Any:
+            asked.append(subscription_id)
+            return original(subscription_id, now)
+
+        mirror.phases_for = counting  # type: ignore[method-assign]
+        try:
+            report = _emit(subjects, now=NOW)
+        finally:
+            del mirror.phases_for
+        assert report.nothing_standing == 13, report
+        assert asked == [SID], f"the standing set was asked {len(asked)} times for one subscription"
+    finally:
+        _uninstall()
+
+
+def test_the_pre_reads_own_ceiling_is_gone_and_a_line_suspension_costs_nothing():
+    """U9 step 2, and this test is the whole reason the standing set moved into memory.
+
+    The old pre-read was `client_alerts`, which COUNTS every live subject and enumerates at most
+    `MAX_ALERTS_SERVED` (4) of them — so a subscription holding more than that reported a count the
+    caller could not resolve to phases, and an incomplete answer means a store transaction PER
+    SUBJECT. AE3's line suspension is thirteen cancelled departures inside one window, so the
+    optimisation switched itself off in exactly the case it was written for, and at one client with
+    100 000 subscriptions that fallback was the steady state.
+
+    The mirror enumerates everything, so the same population now costs no transaction at all. The
+    ceiling it replaces is asserted by name rather than by a magic number, so this keeps meaning
+    what it says if `MAX_ALERTS_SERVED` ever moves.
     """
     client = _install()
     try:
@@ -691,30 +936,35 @@ def test_a_truncated_or_over_full_pre_read_falls_back_to_asking_the_store():
         subjects = [
             _subject(journey_ref=f"DatedServiceJourney:{3000 + i}") for i in range(served + 2)
         ]
-        notification_events.emit(subjects, now=NOW)
+        _emit(subjects, now=NOW)
         assert len(client.in_collection(notification_store.SUBJECTS)) == served + 2
 
         before = client.transactions
-        report = notification_events.emit(subjects, now=NOW + timedelta(minutes=1))
+        report = _emit(subjects, now=NOW + timedelta(minutes=1))
         assert report.unchanged == len(subjects), "every one still resolves to `no transition`"
-        assert client.transactions > before, (
-            "and it cost transactions, because the pre-read could not enumerate them: an "
-            "incomplete answer must ask the store rather than guess"
+        assert client.transactions == before, (
+            f"a subscription past the old display ceiling ({served}) cost "
+            f"{client.transactions - before} transaction(s); the mirror is complete by construction"
         )
     finally:
         _uninstall()
 
 
-def test_a_failed_pre_read_costs_transactions_and_never_events():
-    """R20: a store outage suppresses the OPTIMISATION, never the correctness."""
+def test_an_unseeded_mirror_costs_transactions_and_never_events():
+    """R20: the restart window suppresses the OPTIMISATION, never the correctness.
+
+    `sync_mirrors` runs as its own poller step before the pass, so an unseeded mirror is the window
+    between a pod starting and its first sync finishing. Every subject falls back to asking the
+    store, which is the slow path and the only correct one — and no event is lost to it.
+    """
     client = _install()
     try:
         _live(client)
-        client.query_fail_with["client_alerts"] = RuntimeError("Firestore is unreachable")
-        handler = _capture()
-        report = notification_events.emit([_subject()], now=NOW)
+        notification_store.reset_mirrors_for_tests()
+        before = client.transactions
+        report = _emit([_subject()], now=NOW)
         assert report.created == 1, "the event was still committed"
-        assert any(e["result"] == "standing_error" for e in _events(handler, "notification_emit"))
+        assert client.transactions > before, "and it was the store that answered, per subject"
     finally:
         _uninstall()
 
@@ -746,10 +996,10 @@ def test_the_revision_survives_the_oslo_dst_fall_back_and_a_clock_step_backwards
     client = _install()
     try:
         _live(client)
-        notification_events.emit([_subject(departure_time=before + timedelta(minutes=20))], now=before)
+        _emit([_subject(departure_time=before + timedelta(minutes=20))], now=before)
         first = client.in_collection(notification_store.EVENTS)[0]["revision"]
         # A step BACKWARDS, further than the fall-back: the clamp is what holds now.
-        notification_events.emit(
+        _emit(
             [_subject(cancelled=True, departure_time=before + timedelta(minutes=20))],
             now=before - timedelta(days=2),
         )
@@ -792,7 +1042,7 @@ def test_validity_follows_the_expected_departure_and_is_floored_when_already_pas
         aimed_only = _subject(
             journey_ref="DatedServiceJourney:aimed", departure_time=NOW + timedelta(minutes=12)
         )
-        notification_events.emit([late, gone, imminent, aimed_only], now=NOW)
+        _emit([late, gone, imminent, aimed_only], now=NOW)
         events = {e["event_id"]: e for e in client.in_collection(notification_store.EVENTS)}
         by_ref = {
             events[d["event_id"]]["journey_ref"]: d
@@ -904,7 +1154,7 @@ def test_an_observation_that_cannot_name_a_train_is_never_a_subject():
     try:
         _live(client)
         before = client.transactions
-        report = notification_events.emit([_subject(stop_order=None)], now=NOW)
+        report = _emit([_subject(stop_order=None)], now=NOW)
         assert report.unidentified == 1 and client.transactions == before
     finally:
         _uninstall()
@@ -938,8 +1188,11 @@ def test_the_reservation_stops_new_transactions_before_the_deadline_rather_than_
             _subject(journey_ref=f"DatedServiceJourney:{4000 + i}") for i in range(6)
         ]
         started = time.monotonic()
-        report = notification_events.emit(
-            subjects, now=NOW, deadline_s=0.2, wait_s=2.0, worst_case_s=0.12
+        # ONE worker, because what this checks is the reservation's arithmetic and not the pool's:
+        # at sixty-four the six slow transactions overlap and all six fit inside the deadline,
+        # which is the pool working rather than the budget failing.
+        report = _emit(
+            subjects, now=NOW, deadline_s=0.2, wait_s=2.0, worst_case_s=0.12, workers=1
         )
         elapsed = time.monotonic() - started
         assert report.capped, f"the budget must bind; got {report}"
@@ -969,7 +1222,7 @@ def test_a_hung_store_cannot_extend_the_step_past_its_bounded_wait():
         notification_store._run_transaction = hanging  # type: ignore[assignment]
         handler = _capture()
         started = time.monotonic()
-        report = notification_events.emit([_subject()], now=NOW, wait_s=0.1)
+        report = _emit([_subject()], now=NOW, wait_s=0.1)
         elapsed = time.monotonic() - started
         assert elapsed < 2.0, f"a hung store must not hold the poller thread; took {elapsed:.1f}s"
         assert report.timed_out is True
@@ -1000,12 +1253,12 @@ def test_a_destination_at_its_pending_ceiling_is_skipped_for_the_rest_of_the_ste
         subjects = [
             _subject(journey_ref=f"DatedServiceJourney:{5000 + i}") for i in range(4)
         ]
-        report = notification_events.emit(subjects, now=NOW)
+        report = _emit(subjects, now=NOW)
         assert report.quota == 4 and report.created == 0
         assert client.transactions == 0, "and only ONE of them paid for the discovery"
 
         notification_store._count_destination_deliveries = real  # type: ignore[assignment]
-        assert notification_events.emit(subjects, now=NOW).created == 4, (
+        assert _emit(subjects, now=NOW).created == 4, (
             "the skip is pass-local: a drained destination is attempted again next cycle"
         )
     finally:
@@ -1026,13 +1279,13 @@ def test_an_exhausted_transaction_is_classified_retryable_not_terminal():
         prefix = notification_store._exhausted_transaction_prefix()
         client.fail_with = ValueError(f"{prefix} 5 attempts.")
         handler = _capture()
-        report = notification_events.emit([_subject()], now=NOW)
+        report = _emit([_subject()], now=NOW)
         assert report.retryable == 1 and report.failed == 0
         assert any(e["result"] == "retryable" for e in _events(handler, "notification_emit"))
 
         client.fail_with = ValueError("something else entirely")
         mark = len(_SINK.records)
-        report = notification_events.emit([_subject()], now=NOW)
+        report = _emit([_subject()], now=NOW)
         assert report.failed == 1 and report.retryable == 0
         # Asserted rather than printed: `_events` above removed the per-test handler, so this
         # second injection's record fell through to `lastResort` and put a traceback on stderr on
@@ -1054,11 +1307,11 @@ def test_an_obsolete_subscription_emits_nothing_and_says_which_kind():
     client = _install()
     try:
         _live(client)
-        assert notification_events.emit([_subject(subscription_version=2)], now=NOW).obsolete == 1
+        assert _emit([_subject(subscription_version=2)], now=NOW).obsolete == 1
         assert client.in_collection(notification_store.EVENTS) == []
 
         client.docs.clear()
-        assert notification_events.emit([_subject()], now=NOW).obsolete == 1, "deleted subscription"
+        assert _emit([_subject()], now=NOW).obsolete == 1, "deleted subscription"
     finally:
         _uninstall()
 
@@ -1078,7 +1331,7 @@ def test_no_external_reference_route_or_prose_reaches_a_log_line():
     try:
         _live(client)
         handler = _capture()
-        notification_events.emit(
+        _emit(
             [
                 _subject(
                     external_ref="commuter-42",
@@ -1105,19 +1358,375 @@ def test_no_external_reference_route_or_prose_reaches_a_log_line():
         _uninstall()
 
 
-def test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger():
-    """KTD6's trigger is a number, so the ceilings that feed it have to add up to less than it.
+def test_the_transactions_of_one_pass_overlap_rather_than_queueing():
+    """U9 step 3. One transaction at a time is ~5 emits a second however many are waiting.
 
-    "Move delivery out when the webhook phase exceeds 30 s of measured phase time on any cycle in a
-    week." Emit and deliver run in ONE `main._phase`, so their two outer bounds add: a pair that
-    summed to 30 s or more would make the trigger fire on a bad morning by construction rather than
-    because anything was wrong.
+    Asserted with a `Barrier`, not with a timing: four store calls must be in flight AT ONCE or the
+    barrier times out and the test fails on its own clock rather than on a threshold somebody has
+    to tune. Four different subscriptions, because that is what a corridor looks like — and because
+    two emits about one train on one subscription would be one subject, not two.
+    """
+    client = _install()
+    try:
+        subjects = []
+        for i in range(4):
+            sid = f"sub-{i}"
+            _live(client, subscription_id=sid)
+            subjects.append(_subject(subscription_id=sid))
+        barrier = threading.Barrier(4, timeout=10)
+        met = threading.Event()
+        real = notification_store.commit_event
+
+        def meeting(request: Any, **kwargs: Any) -> Any:
+            try:
+                barrier.wait()
+                met.set()
+            except threading.BrokenBarrierError:
+                pass
+            return real(request, **kwargs)
+
+        notification_store.commit_event = meeting  # type: ignore[assignment]
+        try:
+            report = _emit(subjects, now=NOW, workers=4)
+        finally:
+            notification_store.commit_event = real  # type: ignore[assignment]
+        assert met.is_set(), "the four transactions never overlapped; the pass is still serial"
+        assert report.created == 4, report
+    finally:
+        _uninstall()
+
+
+def test_a_superseding_mint_gives_its_pending_slot_back():
+    """The ledger is net-zero on a replacement, and a counter that only counts up is not.
+
+    `_mint` flips the superseded delivery to `superseded` in the same transaction that creates the
+    new one, so a `confirmed` replacing an undelivered `predicted` leaves the destination holding
+    exactly as many pending events as before. A ledger that charged without refunding would refuse
+    at HALF the ceiling on precisely the morning that matters — one where many mints are a
+    confirmation — and the symptom is a quota refusal an operator cannot reconcile with the count
+    Firestore holds.
+
+    Both mints are in ONE pass, because the ledger is pass-local: across two passes it is recounted
+    from the store and the refund has nothing to show. The counter reads the fake's own pending
+    deliveries rather than a fixed number, so the ledger's arithmetic is checked against what
+    Firestore would actually answer.
+    """
+    client = _install()
+    try:
+        _live(client)
+        real = notification_store._count_destination_deliveries
+
+        def live_count(destination_id: str, *, state: str, ceiling: int) -> int:
+            return len(
+                [
+                    d
+                    for d in client.in_collection(notification_store.DELIVERIES)
+                    if d.get("destination_id") == destination_id and d.get("state") == state
+                ]
+            )
+
+        notification_store._count_destination_deliveries = live_count  # type: ignore[assignment]
+        try:
+            ceiling = 2
+            soon = _subject(
+                journey_ref="DatedServiceJourney:7000",
+                departure_time=NOW + timedelta(minutes=10),
+            )
+            first = _emit([soon], now=NOW, workers=1, pending_quota=lambda c: ceiling)
+            assert first.created == 1, first
+
+            # One pass, two trains, a destination holding ONE pending event and a ceiling of two.
+            # The soonest is the same train declared cancelled — a `predicted` -> `confirmed`
+            # transition, which supersedes rather than adds — and the later one is genuinely new.
+            # Without the refund the replacement spends the second slot and the new train is
+            # refused, which is the defect this exists to catch.
+            report = _emit(
+                [
+                    _subject(
+                        journey_ref="DatedServiceJourney:7000",
+                        departure_time=NOW + timedelta(minutes=10),
+                        cancelled=True,
+                    ),
+                    _subject(
+                        journey_ref="DatedServiceJourney:7001",
+                        departure_time=NOW + timedelta(minutes=40),
+                    ),
+                ],
+                now=NOW + timedelta(minutes=1),
+                workers=1,
+                pending_quota=lambda c: ceiling,
+            )
+            assert report.created == 2 and report.quota == 0, (
+                f"the superseded slot was never given back: {report}"
+            )
+            pending = [
+                d
+                for d in client.in_collection(notification_store.DELIVERIES)
+                if d["state"] == "pending"
+            ]
+            assert len(pending) == 2, f"one replacement and one new train; got {pending}"
+        finally:
+            notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+    finally:
+        _uninstall()
+
+
+def test_the_cycles_mints_are_reported_and_no_per_event_line_is_written():
+    """U9 step 5. One record per cycle with counts, not one per committed revision.
+
+    `commit_event` wrote an INFO line per mint carrying the client, the destination, the alert id
+    and the revision. At the pilot's few hundred events a day that was the right grain; a widened
+    pass writes 20 000 a cycle over ~300 cycles a day, which is a logging bill and a summary nobody
+    can read. Nothing durable was lost — the events are Firestore documents, not log lines — and a
+    question about one client still starts at the per-failure records, which carry `client_id`.
+
+    What replaces it for a reader inside the process is the ledger on the report: what this pass
+    minted, on the value the pass returns rather than on a module global, which is
+    `varsel.PassOutcome`'s rule and for its reason.
+    """
+    client = _install()
+    try:
+        _live(client)
+        handler = _capture()
+        # The per-revision record was `notification_store`'s, so that logger has to be watched too
+        # or this assertion could never see it come back.
+        store_logger = logging.getLogger("notification_store")
+        store_logger.setLevel(logging.INFO)
+        store_logger.addHandler(handler)
+        subjects = [
+            _subject(journey_ref=f"DatedServiceJourney:{9600 + i}") for i in range(3)
+        ]
+        report = _emit(subjects, now=NOW, workers=1)
+        records = list(handler.records)
+        store_logger.removeHandler(handler)
+        logging.getLogger("notification_events").removeHandler(handler)
+
+        assert report.created == 3, report
+        assert len(report.minted) == 3, report.minted
+        assert set(report.minted) == {
+            notification_store.alert_subject_id(SID, notification_events.train_ref(s))
+            for s in subjects
+        }
+        names = {getattr(r, "fields", {}).get("event") for r in records}
+        assert "notification_event" not in names, (
+            f"a per-revision line is back; a cycle would write 20 000 of them. Saw {names}"
+        )
+    finally:
+        _uninstall()
+
+
+def test_a_destinations_uncountable_ceiling_costs_that_destination_and_not_the_cycle():
+    """R20, applied to the two Firestore calls U9 moved onto the coordinator.
+
+    The quota resolver and the ledger's first sight of a destination were both INSIDE the
+    per-subject `try` before this unit — the resolver as an argument to `_emit_one`, the count
+    inside `commit_event` — so a blip cost one subject a `retryable` and the pass carried on.
+    Moved onto the coordinator and left unguarded, one raise leaves the loop, leaves `_run`, and
+    reaches `emit`'s handler, which reports the whole cycle as a timeout and DISCARDS the counts of
+    every transaction already committed. A 100 000-subscription morning is exactly when a 4 s
+    aggregation deadline gets hit.
+    """
+    client = _install()
+    try:
+        _live(client, subscription_id="sub-bad")
+        _live(client, subscription_id="sub-good")
+        real = notification_store._count_destination_deliveries
+
+        def flaky(destination_id: str, *, state: str, ceiling: int) -> int:
+            if destination_id == "dest-bad":
+                raise RuntimeError("Firestore is unreachable")
+            return 0
+
+        notification_store._count_destination_deliveries = flaky  # type: ignore[assignment]
+        try:
+            report = _emit(
+                [
+                    _subject(
+                        subscription_id="sub-bad",
+                        destination_id="dest-bad",
+                        journey_ref="DatedServiceJourney:9500",
+                    ),
+                    _subject(
+                        subscription_id="sub-good",
+                        destination_id="dest-good",
+                        journey_ref="DatedServiceJourney:9501",
+                    ),
+                ],
+                now=NOW,
+                workers=1,
+            )
+        finally:
+            notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+        assert report.timed_out is False, f"one destination's blip failed the whole cycle: {report}"
+        assert report.created == 1, report
+        assert report.retryable == 1, report
+    finally:
+        _uninstall()
+
+
+def test_a_raise_before_the_pool_exists_still_releases_the_pass_lock():
+    """The lock is held for the life of the pod otherwise, and nothing says so.
+
+    `_standing`, the ledger's construction and the pool's own all sit above the loop's `try`. A
+    raise in any of them would skip a `finally` that released there, and every later cycle would
+    answer `overlap_refused` with nothing actually draining — a pass that has stopped running and a
+    signal that says it is still running are the same reading.
+    """
+    client = _install()
+    try:
+        _live(client)
+        real = notification_events._standing
+        notification_events._standing = lambda ids, now: (_ for _ in ()).throw(  # type: ignore[assignment]
+            RuntimeError("the standing set exploded")
+        )
+        try:
+            broken = _emit([_subject()], now=NOW, workers=1)
+            assert broken.timed_out is True and broken.created == 0, broken
+        finally:
+            notification_events._standing = real  # type: ignore[assignment]
+
+        after = _emit([_subject()], now=NOW, workers=1)
+        assert after.overlap_refused is False, (
+            "the pass lock survived a raise above the pool; every later cycle is now refused"
+        )
+        assert after.created == 1, after
+    finally:
+        _uninstall()
+
+
+def test_a_second_pass_is_refused_while_the_first_is_still_draining():
+    """Two overlapping passes each hold their own pending count and admit past a ceiling together.
+
+    The emit path's exactness rests on there being one writer, and U9 makes that writer a pass
+    rather than a thread — so what enforces it is this refusal plus the ledger's lock. The
+    abandoned workers of a timed-out pass are exactly the ones still committing, which is why the
+    lock is released by `_run`'s own `finally` and not by the thread that gave up waiting.
+    """
+    client = _install()
+    try:
+        _live(client)
+        holding = threading.Event()
+        release = threading.Event()
+        real = notification_store.commit_event
+
+        def slow(request: Any, **kwargs: Any) -> Any:
+            holding.set()
+            release.wait(timeout=10)
+            return real(request, **kwargs)
+
+        notification_store.commit_event = slow  # type: ignore[assignment]
+        try:
+            first: list[Any] = []
+            runner = threading.Thread(
+                target=lambda: first.append(
+                    _emit([_subject()], now=NOW, workers=1, wait_s=0.2, deadline_s=5.0)
+                )
+            )
+            runner.start()
+            assert holding.wait(timeout=5), "the first pass never reached the store"
+            runner.join(timeout=5)
+            assert first and first[0].timed_out, first
+
+            # The first pass's worker is still parked in the store, so the second must refuse.
+            refused = _emit(
+                [_subject(journey_ref="DatedServiceJourney:8000")], now=NOW, workers=1
+            )
+            assert refused.overlap_refused is True, refused
+            assert refused.created == 0
+
+            release.set()
+            # Once it drains, the next cycle runs normally again — a refusal is one cycle, not a
+            # latch.
+            for _ in range(100):
+                time.sleep(0.02)
+                again = _emit(
+                    [_subject(journey_ref="DatedServiceJourney:8001")], now=NOW, workers=1
+                )
+                if not again.overlap_refused:
+                    break
+            assert again.overlap_refused is False and again.created == 1, again
+        finally:
+            release.set()
+            notification_store.commit_event = real  # type: ignore[assignment]
+    finally:
+        _uninstall()
+
+
+def test_the_pass_beats_the_heartbeat_while_it_submits():
+    """`/health`'s staleness rule means "no STEP has finished in 600 s", and this step may run 80 s.
+
+    A long way inside the threshold today, and a long way further inside it than the 6 s deadline
+    was — so the pass beats per chunk already rather than after the next widening. A seam that
+    raises must not cost the pass, which is `varsel._heartbeat`'s rule restated.
+    """
+    client = _install()
+    try:
+        _live(client)
+        beats = 0
+
+        def boom() -> None:
+            nonlocal beats
+            beats += 1
+            raise RuntimeError("heartbeat exploded")
+
+        subjects = [
+            _subject(journey_ref=f"DatedServiceJourney:{9000 + i}")
+            for i in range(notification_events._HEARTBEAT_EVERY + 1)
+        ]
+        report = _emit(subjects, now=NOW, workers=4, beat=boom)
+        assert report.created == len(subjects), report
+        assert beats >= 2, f"beat {beats} time(s) over {len(subjects)} submissions"
+    finally:
+        _uninstall()
+
+
+#: The poller cycle's measured period, 2026-09-08. A measurement, not a constant — it is set by how
+#: often the upstream SIRI-SX ingestion timestamp moves — so the bound below is a SHARE of it rather
+#: than a number, and re-measuring is what moves it.
+MEASURED_CYCLE_PERIOD_S = 296.0
+#: R2's target, which is what `_EMIT_DEADLINE_S` and `_MAX_EMITS_PER_CYCLE` are both derived from.
+TARGET_EMITS_PER_SECOND = 250
+
+
+def test_the_phase_ceiling_is_a_share_of_the_cycle_rather_than_ktd6s_thirty_seconds():
+    """U9 step 6. KTD6's trigger was a number and the widened pass exceeds it BY DESIGN.
+
+    It read "move delivery out when the webhook phase exceeds 30 s of measured phase time on any
+    cycle in a week", and until U9 the two outer bounds summed to 28 s, pinned here at 2 s under
+    it. That arithmetic was right for a one-wide loop at the pilot's few hundred events a day and
+    is the wrong shape for R2: a bad morning's transitions have to be emitted inside ONE cycle, and
+    one transaction at a time against a ~200 ms round trip is ~5 emits a second however many are
+    waiting. So the deadline moved with the width, and the trigger is restated in the operations
+    document as emit's share being exceeded — the pass ran to its deadline with work left over —
+    rather than as a wall-clock ceiling.
+
+    What still has to hold, and is checked here rather than argued:
+
+    * the phase's ceiling stays a MINORITY of the cycle it runs in, or a slow store turns every
+      cycle into the previous cycle's tail;
+    * the reservation binds before the backstop, or the backstop is the only bound there is;
+    * the two derived numbers stay derived: `_EMIT_DEADLINE_S` times R2's target rate IS
+      `_MAX_EMITS_PER_CYCLE`, so a change to one that forgets the other is caught here rather than
+      discovered as a pass that stops early with budget to spare.
     """
     import webhook_delivery
 
-    assert notification_events._EMIT_WAIT_S + webhook_delivery._DELIVERY_WAIT_S < 30.0
+    phase_ceiling = notification_events._EMIT_WAIT_S + webhook_delivery._DELIVERY_WAIT_S
+    assert phase_ceiling <= MEASURED_CYCLE_PERIOD_S / 2, (
+        f"the webhook phase's ceiling is {phase_ceiling:.0f} s against a ~{MEASURED_CYCLE_PERIOD_S:.0f} s "
+        "cycle period; past half of it a bad store makes every cycle the previous one's tail"
+    )
     assert notification_events._EMIT_DEADLINE_S < notification_events._EMIT_WAIT_S, (
         "the reservation must bind before the backstop, or the backstop is the only bound"
+    )
+    assert (
+        notification_events._MAX_EMITS_PER_CYCLE
+        == notification_events._EMIT_DEADLINE_S * TARGET_EMITS_PER_SECOND
+    ), (
+        f"{notification_events._MAX_EMITS_PER_CYCLE} emits over "
+        f"{notification_events._EMIT_DEADLINE_S:.0f} s is "
+        f"{notification_events._MAX_EMITS_PER_CYCLE / notification_events._EMIT_DEADLINE_S:.0f}/s, "
+        f"not R2's {TARGET_EMITS_PER_SECOND}/s. The count and the clock are one derivation."
     )
 
 
@@ -1134,6 +1743,12 @@ def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
     The resolver is a CALLABLE rather than an import for a reason this suite pins one test below:
     the answer lives in `notification_auth`, and the exact-import set is what keeps this module
     light enough for CI to run it in its own process.
+
+    **U9 moved the COUNT the ceiling is compared against.** It was an aggregation query per mint --
+    most of dev's first ~200-250 ms per emit, and at sixty-four workers sixty-four concurrent
+    aggregations against one collection to re-derive a figure this process is the only writer of.
+    It is now one count per destination per pass, kept in step by `_PendingLedger`, so the
+    assertion below is that the store was asked ONCE and that the ledger refused the rest.
     """
     client = _install()
     try:
@@ -1144,28 +1759,30 @@ def test_the_pending_ceiling_is_the_clients_own_and_is_asked_once_per_client():
 
         def _counted(destination_id: str, *, state: str, ceiling: int) -> int:
             seen.append(ceiling)
-            # One under the ceiling, so the emit proceeds and the NEXT one would not.
+            # One under the ceiling, so the FIRST emit proceeds and the rest must not.
             return ceiling - 1
 
         notification_store._count_destination_deliveries = _counted  # type: ignore[assignment]
         subjects = [_subject(journey_ref=f"DatedServiceJourney:{6000 + i}") for i in range(3)]
-        report = notification_events.emit(
+        report = _emit(
             subjects,
             now=NOW,
+            workers=1,
             pending_quota=lambda client_id: (asked.append(client_id), 9_999)[1],
         )
-        assert report.created == 3, report
-        assert seen == [9_999, 9_999, 9_999], "the client's own ceiling reached the store"
+        assert seen == [9_999], (
+            f"the destination was counted {len(seen)} times for three mints; U9 counts once per "
+            "pass and keeps its own figure in step"
+        )
+        assert report.created == 1 and report.quota == 2, report
         assert asked == [subjects[0].client_id], "asked once per client, not once per subject"
 
         # And with no resolver the module constant stands, which is what every caller that does not
         # care about quotas gets.
         seen.clear()
-        notification_events.emit(
-            [_subject(journey_ref="DatedServiceJourney:6100")], now=NOW
-        )
+        _emit([_subject(journey_ref="DatedServiceJourney:6100")], now=NOW, workers=1)
         assert seen == [notification_store.MAX_PENDING_EVENTS_PER_DESTINATION], (
-            "with no resolver the store resolves its own constant, at call time"
+            "with no resolver the pass resolves the store's own constant"
         )
     finally:
         notification_store._count_destination_deliveries = real  # type: ignore[assignment]
@@ -1183,9 +1800,10 @@ def test_the_module_imports_neither_varsel_nor_main():
     assert "varsel" not in imports and "main" not in imports and "impact" not in imports
     # An EXACT set, never a containment check: the point is that nothing heavy can be added without
     # a reader of this line deciding it is light. `reserved_budget` is the shared reserve-don't-check
-    # pass budget, stdlib-only (`threading`, `time.monotonic`), and it is why `threading` is no
-    # longer imported here directly -- the lock moved with the class that owns it.
-    assert imports == {"logging", "notification_store", "reserved_budget"}, imports
+    # pass budget, stdlib-only (`threading`, `time.monotonic`). `threading` is back since U9: the
+    # pass has its own locks now -- the outcome tally and the pending ledger the sixty-four workers
+    # share, and the module lock that refuses a second pass over them.
+    assert imports == {"logging", "notification_store", "reserved_budget", "threading"}, imports
 
 
 if __name__ == "__main__":
