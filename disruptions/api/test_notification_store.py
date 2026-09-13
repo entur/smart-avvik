@@ -59,9 +59,11 @@ def _uncommented(text: str, marker: str = "#") -> str:
     """The code half of a commented file, for the checks that must NOT match a comment.
 
     Every header in `terraform/firestore.tf` explains what it deliberately does not do -- it names
-    `google-beta`, `index_config {}`, `google_project_iam_member` and `roles/datastore.user` in
-    order to refuse them -- so a negative grep over the raw text matches the explanation and passes
-    (or fails) for the wrong reason. Same rule `test_rushhistorikk` applies to its SQL greps.
+    `google-beta`, `google_project_iam_member` and `roles/datastore.user` in order to refuse them,
+    and since U9 it names `index_config {}` twice, once to refuse it on the TTL field and once to
+    require it on the six exemptions -- so a negative grep over the raw text matches the
+    explanation and passes (or fails) for the wrong reason. Same rule `test_rushhistorikk` applies
+    to its SQL greps.
     """
     return "\n".join(
         line for line in text.splitlines() if not line.strip().startswith(marker)
@@ -1819,15 +1821,74 @@ def test_every_collection_group_has_exactly_one_ttl_field():
     assert notification_store.TTL_FIELD == "expires_at"
     assert f'field      = "{notification_store.TTL_FIELD}"' in FIRESTORE_TF
     assert FIRESTORE_TF_CODE.count("ttl_config {}") == 1  # one resource, for_each over four groups
-    # An empty index_config block DISABLES indexing on the field; deliberately not used.
-    assert "index_config {}" not in FIRESTORE_TF_CODE
-
-
-def test_field_overrides_stay_empty_so_ttl_has_one_source_of_truth():
-    assert INDEXES.get("fieldOverrides") == [], (
-        "the CLI format can express a TTL, but Terraform owns them here -- two writable sources "
-        "for a retention setting is how one of them quietly goes stale"
+    # An empty `index_config` block DISABLES indexing on the field, which is right for the six
+    # exemptions below and wrong for `expires_at` -- the poller's per-cycle read orders by it. The
+    # TTL resource must therefore OMIT the block, and the count is what says only the exemption
+    # resource carries one.
+    ttl_resource = FIRESTORE_TF_CODE.split('resource "google_firestore_field" "notification_ttl"', 1)[1]
+    ttl_resource = ttl_resource.split("\nresource ", 1)[0]
+    assert "index_config" not in ttl_resource, (
+        "the TTL field must keep Firestore's automatic single-field indexes: an empty "
+        "`index_config {}` disables them, and the poller's per-cycle read orders by `expires_at`"
     )
+    assert FIRESTORE_TF_CODE.count("index_config {}") == 1  # the exemption resource, for_each
+
+
+def test_every_exempted_field_is_named_by_no_query_and_declared_in_both_places():
+    """U9 step 4. An exemption is silent in both directions, so it is pinned in both.
+
+    Firestore indexes every field of every document automatically -- ascending and descending, and
+    every element of an array separately -- so each index below was paid for on every write by a
+    query that does not exist. What makes the removal safe is the SPEC TABLE: a field no query
+    filters or orders on cannot lose anything by not being indexed, and that is checked here
+    against `QUERY_SPECS` rather than by reading the module.
+
+    The failure the other way is worse and is why this is bidirectional: exempting a field a query
+    DOES name makes the query return nothing at all, with no error -- `retry_not_before` is the
+    live example, a range filter in `pending_deliveries`, and `expires_at` is the TTL field on all
+    four collections.
+    """
+    block = FIRESTORE_TF.split("firestore_index_exemptions = [", 1)[1].split("]", 1)[0]
+    declared = {
+        (line.split('collection = "', 1)[1].split('"', 1)[0],
+         line.split('field = "', 1)[1].split('"', 1)[0])
+        for line in block.splitlines()
+        if "collection = " in line and "field = " in line
+    }
+    assert declared, "the exemption list is empty; this check has stopped checking anything"
+
+    mirrored = {
+        (entry["collectionGroup"], entry["fieldPath"])
+        for entry in INDEXES.get("fieldOverrides", [])
+    }
+    assert declared == mirrored, (
+        f"Terraform exempts {sorted(declared)} and firestore.indexes.json {sorted(mirrored)}. The "
+        "two must agree: the JSON is what the emulator and a `firebase deploy` read, Terraform is "
+        "what applies, and a plan-time drift check that reads one of them is worth nothing."
+    )
+    for entry in INDEXES["fieldOverrides"]:
+        assert set(entry) == {"collectionGroup", "fieldPath", "indexes"}
+        assert entry["indexes"] == [], "an exemption is an EMPTY index list, not a missing key"
+
+    queried = {
+        (spec.collection, field)
+        for spec in notification_store.QUERY_SPECS
+        for field in (
+            *spec.equality,
+            *(path for path, _ in spec.inequality),
+            *(path for path, _ in spec.order_by),
+        )
+    }
+    collisions = declared & queried
+    assert not collisions, (
+        f"{sorted(collisions)} is both exempted from indexing and named by a query spec. The query "
+        "would return NOTHING, with no error and nothing in the logs."
+    )
+    for collection in notification_store.COLLECTIONS:
+        assert (collection, notification_store.TTL_FIELD) not in declared, (
+            f"{collection}.{notification_store.TTL_FIELD} is the TTL field; exempting it stops "
+            "expired documents being found at all"
+        )
 
 
 def test_every_filter_goes_through_the_query_helper():
@@ -3641,6 +3702,40 @@ def emulator_test_the_mirror_seed_holds_only_live_subscriptions():
     assert [d["recipient_id"] for d in notification_store.recipient_documents()] == ["live"]
 
 
+def emulator_test_a_committed_subject_reaches_the_standing_set_through_the_real_client():
+    """U9 step 2, against a real client, because the hermetic fake cannot check the ORDERING.
+
+    `_mirror_subject` runs on what `_run_transaction` RETURNS, never from inside a body, and the
+    reason is the real client's retry: a body may run more than once, so an apply from inside would
+    record a state a later attempt overwrote. The suite's fake runs each body exactly once, which
+    is precisely the property that makes it unable to see the difference.
+    """
+    _emulator_setup()
+    notification_store.create_subscription(_spec(), now=NOW)
+    mirror = notification_store.subject_mirror()
+    mirror.reset()
+    mirror.seed(now=NOW)
+    assert mirror.phases_for(SID, NOW) == {}
+
+    created = notification_store.commit_event(_emit(), now=NOW)
+    assert created.status == "created"
+    assert mirror.phases_for(SID, NOW) == {created.alert_id: notification_store.PHASE_PREDICTED}
+
+    later = NOW + timedelta(minutes=5)
+    counting = notification_store.record_below_threshold(_emit(), now=later)
+    assert counting.status == "counting"
+    assert mirror.open_runs(later) == {created.alert_id: later}
+    assert notification_store.clear_below_threshold(created.alert_id, now=later) is True
+    assert mirror.open_runs(later) == {}
+
+    # And a re-seed off the real documents agrees with what the commits put there, which is what
+    # says the in-memory shortcut and the durable state have not drifted.
+    mirror.reset()
+    mirror.seed(now=later)
+    assert mirror.phases_for(SID, later) == {created.alert_id: notification_store.PHASE_PREDICTED}
+    assert mirror.open_runs(later) == {}
+
+
 def emulator_test_a_web_push_subscription_is_invisible_to_the_webhook_load_and_ceiling():
     """U5's claim, against a real client, on U6's path.
 
@@ -4870,6 +4965,165 @@ def test_the_open_withdrawal_runs_are_served_whole_environment():
     # A mint closes the run -- both fields, which is what the emit body writes.
     mirror.apply(_state("a1", notification_store.PHASE_CONFIRMED, below_threshold_at=None))
     assert mirror.open_runs(NOW) == {}
+
+
+def test_every_body_that_writes_a_subject_is_declared_mirroring_or_declared_exempt():
+    """U9 step 2, pinned the way `MIRROR_STAMPING_BODIES` is: as a property of the SET.
+
+    The rule is "every body that changes a field the standing set CONSUMES must reach the mirror",
+    and both mistakes are silent. A mirroring body left out means the next cycle reads a phase
+    Firestore no longer holds — a withdrawal never counted, or a `confirmed` mint skipped for a
+    train ET has cancelled. `_sent_body` left IN would put the busiest documents in the hottest
+    loop for no reader, which is exactly the economy that keeps it out of `MIRROR_STAMPING_BODIES`.
+
+    Read off the source, because the case that matters is a body added next year and no
+    behavioural check over today's four could see it. The test is what answers "does the mirror
+    need a periodic re-seed?" with no: the failure mode is not a timing race, it is a forgotten
+    writer, and this is what refuses one.
+    """
+    source = pathlib.Path(notification_store.__file__).read_text()
+    bodies = {}
+    for chunk in source.split("\ndef ")[1:]:
+        name = "_" + chunk.split("(", 1)[0].lstrip("_")
+        bodies[name] = chunk
+    # `_mint` is not named `*_body` and is the most important writer of the four, which is why this
+    # scans every function rather than only the bodies.
+    writers = {
+        name
+        for name, body in bodies.items()
+        if "refs.subject(" in body
+        and ("transaction.set(refs.subject(" in body or "transaction.update(refs.subject(" in body)
+    }
+    assert "_mint" in writers, "the scan stopped seeing the main writer; the spelling changed"
+    declared = set(notification_store.SUBJECT_MIRRORING_BODIES) | set(
+        notification_store.SUBJECT_WRITERS_OUTSIDE_THE_MIRROR
+    )
+    assert writers == declared, (
+        f"bodies writing a subject document are {sorted(writers)}, the declared sets cover "
+        f"{sorted(declared)}. A new one must either reach `_mirror_subject` and be declared in "
+        "SUBJECT_MIRRORING_BODIES, or be declared exempt with the reason."
+    )
+    assert notification_store.SUBJECT_MIRRORING_BODIES.isdisjoint(
+        notification_store.SUBJECT_WRITERS_OUTSIDE_THE_MIRROR
+    ), "a body cannot be both"
+    # And the exemption is not a loophole: the one exempt body must not touch the phase, which is
+    # what makes skipping the mirror safe rather than merely cheap.
+    for exempt in notification_store.SUBJECT_WRITERS_OUTSIDE_THE_MIRROR:
+        patch = bodies[exempt].split("transaction.update(refs.subject(", 1)[1]
+        assert '"phase"' not in patch.split("return", 1)[0], (
+            f"{exempt} writes the phase and is declared exempt from the mirror; the standing set "
+            "would then answer with a phase this process itself has moved"
+        )
+
+
+def test_every_commit_that_moves_a_subject_reaches_the_standing_set():
+    """U9 step 2, and it is a CORRECTNESS step rather than an economy one.
+
+    U6 built this mirror and nothing outside its own tests ever wrote to it. Read from an
+    unmaintained standing set the emit pass is worse than useless: a subject minted in cycle N is
+    absent in cycle N+1, so `notification_events.skip_reason` answers `nothing_standing` for the
+    below-threshold observation that follows and the withdrawal is never counted at all -- a
+    traveller keeps a warning we have stopped believing, silently, forever.
+
+    Drives the three PUBLIC functions rather than `apply`, because what has to hold is that no
+    committing path can forget: `_mirror_subject` is the single statement and this is what pins it.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    mirror = notification_store.subject_mirror()
+
+    created = notification_store.commit_event(_emit(), now=NOW)
+    assert created.status == "created"
+    assert mirror.phases_for(SID, NOW) == {created.alert_id: notification_store.PHASE_PREDICTED}
+    # A mint closes any open run, and the mirror has to have heard that too.
+    assert mirror.open_runs(NOW) == {}
+
+    later = NOW + timedelta(minutes=5)
+    counting = notification_store.record_below_threshold(_emit(), now=later)
+    assert counting.status == "counting" and counting.below_threshold_cycles == 1
+    assert mirror.open_runs(later) == {created.alert_id: later}
+    # The phase does NOT move on a counting cycle: a below-threshold observation is not a
+    # withdrawal until the run is long enough, and a mirror that moved the phase here would make
+    # the next alert-worthy cycle mint a revision nobody is owed.
+    assert mirror.phases_for(SID, later) == {created.alert_id: notification_store.PHASE_PREDICTED}
+
+    assert notification_store.clear_below_threshold(created.alert_id, now=later) is True
+    assert mirror.open_runs(later) == {}
+    assert mirror.phases_for(SID, later) == {created.alert_id: notification_store.PHASE_PREDICTED}
+
+
+def test_a_delivery_writes_the_subject_and_deliberately_does_not_mirror_it():
+    """The omission `_mirror_subject` names, pinned so it stays a decision rather than an oversight.
+
+    `_sent_body` writes `delivered_revision`, `delivered_at` and the pending pointer onto the
+    subject. None of the three is in the standing set, so mirroring them would put the busiest
+    documents in the hottest loop for no reader -- the same economy that keeps that body out of
+    `MIRROR_STAMPING_BODIES`. The phase is untouched by construction, which is what makes the
+    omission safe and is asserted here rather than assumed.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    mirror = notification_store.subject_mirror()
+    created = notification_store.commit_event(_emit(), now=NOW)
+    before = dict(mirror.phases_for(SID, NOW))
+
+    claim = notification_store.claim_delivery(created.delivery_id, now=NOW)
+    assert claim.status == "ready", claim
+    notification_store.mark_delivery_sent(created.delivery_id, token=claim.token, now=NOW)
+
+    stored = client.doc(notification_store.SUBJECTS, created.alert_id) or {}
+    assert stored.get("delivered_revision") == created.revision, "the store did write the subject"
+    assert mirror.phases_for(SID, NOW) == before
+    assert stored.get("phase") == notification_store.PHASE_PREDICTED
+
+
+def test_a_tombstone_and_its_cleanup_both_take_the_standing_subjects_with_them():
+    """Nothing may stand for a subscription that can no longer be routed to (R13).
+
+    Two calls and not one: the tombstone is when the subscription stops being routable, cleanup is
+    the retryable path R19 requires -- and cleanup can run long after a restart that re-seeded the
+    mirror from the very documents it is deleting.
+    """
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    mirror = notification_store.subject_mirror()
+    created = notification_store.commit_event(_emit(), now=NOW)
+    assert mirror.phases_for(SID, NOW) != {}
+
+    notification_store.delete_subscription(SID, client_id=CLIENT, now=NOW)
+    assert mirror.phases_for(SID, NOW) == {}
+
+    mirror.apply(_state(created.alert_id, notification_store.PHASE_PREDICTED))
+    assert mirror.phases_for(SID, NOW) != {}
+    notification_store.cleanup_subscription(SID, now=NOW)
+    assert mirror.phases_for(SID, NOW) == {}
+
+
+def test_the_standing_set_is_pruned_of_expired_subjects_rather_than_growing_for_a_week():
+    """Memory, not correctness -- both readers already test expiry.
+
+    A subject document lives `HISTORY_DAYS` (7), so an unpruned mirror holds every train every
+    subscription was ever warned about for a week. At 100 000 subscriptions that is the one number
+    this structure grows in, and the pod's memory limit equals its request.
+    """
+    client = _FakeClient()
+    _install(client)
+    dying = _state("a-old", notification_store.PHASE_PREDICTED)
+    dying[notification_store.TTL_FIELD] = NOW + timedelta(minutes=1)
+    _subject_seed_page(client, [_state("a1", notification_store.PHASE_PREDICTED), dying])
+    mirror = notification_store.SubjectMirror()
+    mirror.seed(now=NOW)
+    assert mirror.size() == 2
+
+    assert mirror.prune(NOW) == 0, "nothing has expired yet"
+    assert mirror.prune(NOW + timedelta(minutes=2)) == 1
+    assert mirror.size() == 1 and set(mirror.phases_for(SID, NOW)) == {"a1"}
+    # An empty subscription leaves no bucket behind, or the index grows without holding anything.
+    assert mirror.prune(NOW + timedelta(days=notification_store.HISTORY_DAYS + 1)) == 1
+    assert mirror.size() == 0
 
 
 def _run() -> None:

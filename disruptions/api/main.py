@@ -1399,10 +1399,15 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                     # `notification_events` pins its own import set exactly, and the answer lives in
                     # `notification_auth`. This module already imports both.
                     notification_events.emit(
-                        outcome.webhook_subjects,
+                        outcome.webhook_observations,
                         pending_quota=lambda client_id: notification_auth.quotas_for(
                             client_id
                         ).max_pending_events,
+                        # The same seam `varsel.configure(beat=...)` takes, and for the same
+                        # reason one step further along: since U9 this pass may run for 80 s, and
+                        # `/health`'s staleness rule means "no STEP has finished in 600 s" — so a
+                        # phase that merely got slow must keep saying so while it works.
+                        beat=_beat,
                     )
             except Exception:
                 logger.exception("Notification event emission failed")

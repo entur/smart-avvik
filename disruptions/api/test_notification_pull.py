@@ -138,6 +138,20 @@ def _join(**definition):
 # ---- The answer ------------------------------------------------------------------------------
 
 
+
+def _subjects(outcome: object) -> list:
+    """Every (recipient, train) the pass observed, materialised as `notification_events` does.
+
+    The pass hands over one observation per (definition, train) with its recipients since U9 --
+    1.3 million dataclasses on a 100 000-subscription corridor is why -- so a test that wants to
+    read one recipient's subject asks for it the same way the emit loop does.
+    """
+    return [
+        observation.subject(recipient)
+        for observation in outcome.webhook_observations
+        for recipient in observation.recipients
+    ]
+
 def test_two_alert_worthy_trains_answer_two_entries_soonest_first():
     """R2: one entry per alert-worthy train ahead, soonest expected departure first, the rank
     carried so a client can re-sort worst first; `limit` cuts the list and says so."""
@@ -766,8 +780,8 @@ def test_a_registered_definition_serves_the_pollers_wording_byte_identical_to_th
     _register_here(monkeypatch)
 
     outcome = varsel.check_and_notify(snapshot)
-    assert len(outcome.webhook_subjects) == 1 and len(written) == 1, (written, outcome)
-    subject = outcome.webhook_subjects[0]
+    assert len(_subjects(outcome)) == 1 and len(written) == 1, (written, outcome)
+    subject = _subjects(outcome)[0]
     before = _poller_caches()
     assert before[0], "control: the poller cached a wording for the definition"
 
