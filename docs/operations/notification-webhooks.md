@@ -830,7 +830,18 @@ contract document says so in its own words; this is the operating half of the sa
    member of the public, so `scripts/manage_notification_client.py` refuses to create it and nothing
    may issue a credential for it or aim a destination at it. Its `clients` document exists only to
    carry two quotas — `max_devices` and `max_active_subscriptions`, which were `varsel._MAX_DEVICES`
-   (5 000) and `varsel._MAX_JOURNEYS` (20 000). **Creating it is a cutover step and it is not
+   (5 000) and `varsel._MAX_JOURNEYS` (20 000). It has its own command, because what makes this id
+   different is not its arguments but that no credential may ever be issued against it:
+
+   ```sh
+   python scripts/manage_notification_client.py --environment dev create-browser-account \
+       --max-devices 5000 --max-active-subscriptions 20000
+   ```
+
+   `create-client --client-id browser` is refused, and so is `issue-key --client-id browser` — the
+   second of those was a claim this document made from U13 and nothing enforced until U14, where a
+   credential for this id would have been an API token that reads and rewrites every traveller's
+   registration through the client API. **Creating the account is a cutover step and it is not
    optional**: `notification_auth.quotas_for` answers an unknown client with `DEFAULT_QUOTAS`, whose
    `max_active_subscriptions` is 500, so a deployment that took the default would refuse the 501st
    traveller with «Tjenesten er full» and nothing anywhere would say why. `main` therefore **fails
