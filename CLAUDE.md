@@ -1973,8 +1973,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     exist in a project before `validate_varsel_sql.sh` can dry-run anything that names it** (the app
     creates it at startup), exactly like the two togvarsel tables. And `historikk._MAX_BYTES_BILLED`
     is now the **one** cap for both pages — `meldinger` imports it — with the derivation (four times
-    the measured pruned, thinned 14-day scan) written out there and the value deliberately left at
-    2 GiB until that measurement exists.
+    the measured pruned, thinned 14-day scan) written out there. **Half that measurement exists
+    since 2026-09-13 and the value still did not move**, which is now a decision rather than a gap:
+    prd's thinned 14-day scan is ~190 MB, so the derived cap would be ~760 MB — *below* the
+    placeholder — and adopting it would refuse the 180-day window sooner, which is the failure the
+    constant exists to prevent. The half still owed is the dev harness at 10 000 definitions.
     Note
     `validate_varsel_sql.sh` checks that file **statement by statement**: a dry run of a
     multi-statement script validates only the first one (`numChildJobs: 1`), so a broken ALTER
@@ -2323,6 +2326,19 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     **not** catch a pruning regression — it is a blast-radius bound against a mistyped join reaching a
     ~10 TiB ET table. At ~1.3x it is approaching the point where it becomes both, which is what the
     derived cap under R12 of the 100k plan is for.
+    **Measured against prd on 2026-09-13, and what matters is not the ratio but the DEFINITION
+    COUNT the pages survive to**: post-thinning the log runs 153.7 rows per definition per day, and
+    at 515 B per scanned row `/historikk`'s 14-day default reaches 2 GiB at **~1 700 definitions**
+    and its 180-day maximum at **~150** — prd's registration count today, which does not bind yet
+    only because the log does not reach back that far. `/meldinger`'s one-day window survives to
+    ~5 700. So the FEEDBACK LOOP is the first thing to break on the way to R1's population, at
+    roughly 2 % of it: 35 000–80 000 definitions want 41–94 GiB for a 14-day window, 20–47x the cap.
+    No interval closes that — KTD15 measured 3.76x at 30 min and 4.96x at 60 against 15 min's
+    2.63x, so an hour buys ~3 200 definitions — which is what makes the deferred per-day summary
+    table required rather than merely desirable. The arithmetic is on the constant. **The refusal is
+    loud but it used to lie**: exceeding the cap raised into the same handler as a missing table and
+    answered 503 "it may not have been written to yet" — *empty* when the cause is *too full*. Since
+    2026-09-13 `historikk._bytes_cap_refusal` tells the two apart and both pages say which it was.
   - **The latch is isolated, and that is not optional.** `llm_message`'s `_active`, `_active_at`,
     `_latched_off` and the lock guarding them were four module globals; they now live in a
     `_LatchState` holder, the module keeps one global instance so **every existing caller is
