@@ -91,7 +91,7 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from time import monotonic
 from typing import Annotated, Any, Protocol
@@ -1324,6 +1324,79 @@ def _decision_key(key: str, alert: "Alert") -> tuple[str, str, str]:
     """
     dep = alert.departure_time.isoformat() if alert.departure_time else ""
     return (key, alert.situation_number, dep)
+
+
+@dataclass(frozen=True)
+class _Recipients:
+    """Who watches one journey definition, in the only shape the decision log records them.
+
+    U16's "unified recipient view" (2026-09-13, KTD4). Until then `_record_decisions` iterated
+    `by_journey_key` — the BROWSER grouping — and a webhook-only definition was matched, worded and
+    notified about while leaving no row anywhere: KTD10 held client routes out of a table
+    `/historikk` and `/meldinger` publish, and those pages were public. They are behind Entur SSO
+    since 2026-09-10, and at the population R1 sizes for "unscored" would have been the product.
+
+    **Counts, never identities.** `n_devices` and `n_subscriptions` are the whole of what the two
+    channels contribute beyond the channel name; no subscription, client, destination or external
+    reference is carried, so the grain stays the journey DEFINITION — a route, a window and a
+    weekday set, which names nobody. `test_notification_contract` pins that as a property of the
+    files rather than of this comment.
+
+    `journey` is the record the row is built from, and on a shared definition it is the BROWSER
+    registration's: `match_targets` is built that way (`setdefault`, browser first) because a
+    browser record carries `from_name`/`to_name`, the service caveat and the consent version, and
+    `_notification_payload` reads them. Note the row itself takes only `from_stop`/`to_stop` off it,
+    which both channels' records carry identically.
+    """
+
+    journey: dict
+    channel: str
+    n_devices: int = 0
+    n_subscriptions: int = 0
+
+
+def _recipient_view(
+    by_journey_key: dict[str, dict],
+    journeys: list[tuple[str, dict]],
+    webhook_by_key: dict[str, list] | None = None,
+    match_targets: dict[str, dict] | None = None,
+) -> dict[str, _Recipients]:
+    """Every journey definition this cycle matched, with who was watching it on each channel.
+
+    The webhook arguments default to empty so a caller with no client channel — every test that
+    drives the browser cycle, and a deployment with the flag off — gets exactly the view
+    `_record_decisions` used to build for itself.
+
+    A definition is in the result iff it is in `match_targets` (or, absent that, in
+    `by_journey_key`): that is the set pass 1a actually matched, so the view and the alerts cannot
+    disagree about which definitions exist.
+    """
+    webhook_by_key = webhook_by_key or {}
+    targets = match_targets if match_targets is not None else by_journey_key
+    device_ids: dict[str, set[str]] = {}
+    for _jid, journey in journeys:
+        device_ids.setdefault(journey_key(journey), set()).add(journey["device_id"])
+    view: dict[str, _Recipients] = {}
+    for key, journey in targets.items():
+        browser = key in by_journey_key
+        subscriptions = len(webhook_by_key.get(key, ()))
+        # The literals are `decisions.CHANNELS`, written out rather than imported: this module
+        # imports `decisions` LAZILY, inside `_record_decisions`, so that a deploy missing it
+        # degrades to "no log" rather than "no pushes" — and a module-level import here to save
+        # three string constants would retire that property.
+        if browser and subscriptions:
+            channel = "both"
+        elif browser:
+            channel = "browser"
+        else:
+            channel = "webhook"
+        view[key] = _Recipients(
+            journey=journey,
+            channel=channel,
+            n_devices=len(device_ids.get(key, ())),
+            n_subscriptions=subscriptions,
+        )
+    return view
 
 
 def _subject_key(pair: tuple[str, str], alert: "Alert") -> tuple[tuple[str, str], str, str]:
@@ -2888,13 +2961,13 @@ def _retire_decision_subjects(*, live: set[str]) -> list[tuple[tuple[str, str, s
 
 
 def _record_decisions(
-    by_journey_key: dict[str, dict],
+    recipients_by_key: dict[str, _Recipients],
     alerts_by_key: dict[str, list[Alert]],
-    journeys: list[tuple[str, dict]],
     pushed_keys: set[tuple[str, str, str]],
     message_inputs: dict[tuple[str, str, str], dict | None],
     *,
     push_on: bool,
+    webhook_llm: bool = False,
     now: datetime | None = None,
     closing_rows: list[tuple[tuple[str, str, str], dict]] | None = None,
 ) -> None:
@@ -2902,6 +2975,16 @@ def _record_decisions(
 
     Records **every** matched situation, not just the alert-worthy ones: a journey we decided not
     to alert on is exactly the evidence a miss is made of, and it exists nowhere else.
+
+    **BOTH CHANNELS since 2026-09-13** (U16, KTD4), where this took the browser grouping alone. It
+    now walks :func:`_recipient_view` — every definition pass 1a matched — and each row says on
+    `channel` whether a /varsel registration, a client subscription or both were watching, with
+    `n_devices` and `n_subscriptions` counting the two sides. Three things that follow are easy to
+    get backwards and are handled explicitly below: `push_disabled` is a BROWSER answer and must
+    not be given for a definition with no browser side; which LLM delivery switch chose the wording
+    depends on the channel (`VARSEL_LLM_ENABLED` for a push, `NOTIFICATION_WEBHOOK_LLM_ENABLED` for
+    an event); and `pushed` for the client side is a MINT, which happens after this function has
+    run and arrives through :func:`record_minted_decisions`.
 
     Runs after delivery so `pushed` reflects what actually reached a device rather than what was
     queued. Like every other dependency in this cycle it fails open — the import is local so a
@@ -2942,10 +3025,6 @@ def _record_decisions(
         # cycle as having sent different wordings.
         delivery_on = llm_message.delivery_enabled()
         cycle_now = now or datetime.now(UTC)
-        device_counts: dict[str, set[str]] = {}
-        for _jid, journey in journeys:
-            device_counts.setdefault(journey_key(journey), set()).add(journey["device_id"])
-
         # ONE take of the lock for the whole pass, not one per alert (KTD15). Both dicts are keyed
         # like the alerts being walked, so the copies are the same order of magnitude as the work;
         # what this removes is tens of thousands of lock acquisitions on the poller thread, each of
@@ -2972,9 +3051,10 @@ def _record_decisions(
         # one that matters — its `max_impact` would have advanced past a peak no row in the log
         # holds, so the peak could never be written even after BigQuery recovered.
         wrote: list[tuple[tuple[str, str, str], dict[str, Any]]] = []
-        for key, journey in by_journey_key.items():
+        for key, recipients in recipients_by_key.items():
+            journey = recipients.journey
             digest = key_digest(key)
-            n_devices = len(device_counts.get(key, ()))
+            n_devices = recipients.n_devices
             pair = _pair(journey)
             for alert in alerts_by_key.get(key, []):
                 # TWO KEYS PER ROW SINCE KTD9, and mixing them up is the defect this split exists to
@@ -2998,7 +3078,14 @@ def _record_decisions(
                     # the work the rule exists to stop repeating.
                     entry["row"] = {
                         **decisions.rescored(entry["row"], alert),
+                        # The three recipient facts, restated from THIS cycle's view rather than
+                        # carried: `rescored` only knows the alert, and a definition somebody
+                        # subscribed to (or unsubscribed from) during the quiet middle would
+                        # otherwise close with the count and the channel it had a quarter of an
+                        # hour ago.
                         "n_devices": n_devices,
+                        "channel": recipients.channel,
+                        "n_subscriptions": recipients.n_subscriptions,
                     }
                     entry["written"] = False
                     entry["alertworthy"] = bool(alert.alertworthy)
@@ -3034,14 +3121,18 @@ def _record_decisions(
                 if status is None:
                     if not alert.alertworthy:
                         status = "not_alertworthy"
-                    elif not push_on:
-                        # Unchanged on purpose (KTD4): every row `_record_decisions` writes is a
-                        # BROWSER subject (it iterates the browser grouping -- KTD10 keeps client
-                        # subjects out of this table), so "no keypair" is still exactly why this
-                        # subject got no wording, and the value keeps the meaning every existing row
-                        # in `varsel_decisions` carries. What changed above is only that a client
-                        # subscription can now earn a wording the browser channel could not deliver
-                        # -- and where one did, `meta` is set and this branch is never reached.
+                    elif not push_on and recipients.channel != "webhook":
+                        # A BROWSER answer, and the channel test is what keeps it one (U16). The
+                        # value means "this deployment has no VAPID keypair, so nothing could be
+                        # delivered to a browser and no wording was written" -- which is the reason
+                        # a shared or browser-only definition got none, and says nothing at all
+                        # about a definition only a client watches. Given for a webhook-only
+                        # subject it would be a false cause on a row the page can display, and
+                        # every historical row carrying this value would stop meaning one thing.
+                        # Such a subject falls through to `not_selected` or `llm_disabled` below,
+                        # which are the true answers: KTD4's write gate is "at least one
+                        # deliverable recipient on ANY channel", so where a client could receive
+                        # one, `meta` is set and neither branch is reached.
                         status = "push_disabled"
                     elif not generation_on:
                         # Kept as "llm_disabled" -- the value is an established column in
@@ -3087,13 +3178,28 @@ def _record_decisions(
                         extra={"fields": {"event": "varsel_decision_write", "result": "no_wording"}},
                     )
                     continue
-                delivered = written if delivery_on else None
+                # WHICH SWITCH, and it is the row's channel that decides (U16). `delivery_on` is
+                # `VARSEL_LLM_ENABLED`, which governs the Web Push and nothing else; the event a
+                # client receives follows `NOTIFICATION_WEBHOOK_LLM_ENABLED`, read once for the
+                # cycle as `webhook_llm` exactly as the two gates above are. So a webhook-only row
+                # records the wording ITS recipient was sent, and a shared row keeps the browser's
+                # -- the traveller's own push is what `/historikk` has always quoted, the row
+                # carries `n_devices` to say a browser was there, and `channel` says the client may
+                # have received the other one where a rollout has the two switches disagreeing.
+                # Reading one switch for both channels was the alternative and it is wrong in a way
+                # nothing would show: in a deployment with the webhook wording off, every
+                # webhook-only row would quote prose no client ever got.
+                delivered = written if (
+                    webhook_llm if recipients.channel == "webhook" else delivery_on
+                ) else None
                 message = delivered or deterministic
                 row = decisions.build_row(
                     journey,
                     alert,
                     journey_digest=digest,
                     n_devices=n_devices,
+                    channel=recipients.channel,
+                    n_subscriptions=recipients.n_subscriptions,
                         # `_decision_key`, not `(key, situation_number)` and NOT the pair-grained
                         # wording key: the mark has to be read at the grain the row is written at,
                         # which is (definition x situation x DEPARTURE) -- two definitions on one
@@ -3631,6 +3737,7 @@ def _webhook_observations(
     message_inputs: dict[tuple[str, str, str], dict | None],
     *,
     webhook_llm: bool,
+    wordings: dict[tuple[str, str, str], tuple[str, str]] | None = None,
 ) -> list[notification_events.WebhookObservation]:
     """This cycle's webhook observations — one per (definition, train), alert-worthy or not.
 
@@ -3663,6 +3770,7 @@ def _webhook_observations(
                 match_targets=match_targets,
                 message_inputs=message_inputs,
                 webhook_llm=webhook_llm,
+                wordings=wordings,
             )
         except Exception:
             # Per DEFINITION, the same rule `_reconcile_caches` and `_match` are guarded by: one
@@ -3703,10 +3811,17 @@ def _observations_for_key(
     match_targets: dict[str, dict],
     message_inputs: dict[tuple[str, str, str], dict | None],
     webhook_llm: bool,
+    wordings: dict[tuple[str, str, str], tuple[str, str]] | None = None,
 ) -> int:
     """One journey definition's observations, appended to `out`. Returns the unroutable count.
 
     Split out so the per-definition guard in :func:`_webhook_observations` has something to wrap.
+
+    `wordings` collects (message, message_source) per decision subject for U16: what the CLIENT was
+    told about this train, as the decision log stores a wording — the text alone, without the route
+    line the event body leads with. It is filled here because this is where the choice between the
+    model's text and the template is actually made; recovering it from the body afterwards would
+    mean stripping a line by convention, and recomputing it would be a second copy of that choice.
     """
     unroutable = 0
     alerts = alerts_by_key.get(key) or []
@@ -3750,7 +3865,16 @@ def _observations_for_key(
         # `test_a_webhook_subject_carries_byte_identical_wording_to_the_web_push` pins it.
         from_name = resolved.get("fra") or journey.get("from_stop") or ""
         to_name = resolved.get("til") or journey.get("to_stop") or ""
+        decision_key = _decision_key(key, winner)
         if winner.alertworthy:
+            # The cached wording, read once and kept, because it is BOTH the event's body and what
+            # U16 records as this client's `message`/`message_source`. Asking `_webhook_wording`
+            # twice would be a second read of a cache another thread can change mid-pass.
+            cached = (
+                None
+                if winner.cancelled
+                else _webhook_wording(_message_key(pair, winner), enabled=webhook_llm)
+            )
             title, body = notification_wording_for(
                 message_input,
                 from_name,
@@ -3774,9 +3898,7 @@ def _observations_for_key(
                 # The BROWSER card's half of the same defect IS closed by the key change: it
                 # reads through `_deliverable_message` under the same key, which now carries
                 # `cancelled`, so a forecast's prose can no longer head a certainty's card either.
-                None
-                if winner.cancelled
-                else _webhook_wording(_message_key(pair, winner), enabled=webhook_llm),
+                cached,
                 # Always False, and structurally so. The browser's «Bekreftet:» prefix comes off
                 # `_pushed_trains`, which is per REGISTRATION and per device — a client has no
                 # such record here, and the envelope carries the same fact better:
@@ -3784,8 +3906,17 @@ def _observations_for_key(
                 # an earlier one about this train, which is what the prefix was standing in for.
                 confirmed=False,
             )
+            if wordings is not None:
+                wordings[decision_key] = (
+                    (cached, "llm") if cached else (_deterministic_body(message_input), "deterministic")
+                )
         else:
             title, body = _webhook_withdrawal_wording(message_input, from_name, to_name)
+            if wordings is not None:
+                # A retraction has no model behind it by construction (`_webhook_withdrawal_wording`
+                # explains why there is no wording to retract WITH), so the source is the template
+                # whatever the flag says.
+                wordings[decision_key] = (_WEBHOOK_WITHDRAWAL_DETAIL, "deterministic")
         payload = _webhook_payload(
             winner,
             contributing.get(train, [winner]),
@@ -3830,6 +3961,7 @@ def _observations_for_key(
                 body=body,
                 payload=payload,
                 expected_departure_time=_expected_departure_of(winner),
+                decision_key=decision_key,
             )
         )
     return unroutable
@@ -3864,6 +3996,137 @@ class PassOutcome:
     """
 
     webhook_observations: tuple[notification_events.WebhookObservation, ...] = ()
+    #: What the CLIENT channel would tell each decision subject, as the log stores a wording: the
+    #: text alone, no route line, beside 'llm' or 'deterministic'. Read by
+    #: :func:`record_minted_decisions` after the emit step says which subjects were actually
+    #: notified — so this is a pass-local lookup rather than a claim that anything was sent.
+    #:
+    #: A mapping rather than a field on the observation because the reader is keyed the other way
+    #: round: emit reports decision keys, and walking every observation to find one would make the
+    #: mint write O(observations x mints) on exactly the corridor U9 emptied of per-recipient work.
+    webhook_wordings: Mapping[tuple[str, str, str], tuple[str, str]] = field(default_factory=dict)
+
+
+def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, str, str]]) -> int:
+    """Mark the decision subjects this cycle MINTED a client notification for. Returns rows written.
+
+    U16's answer to the one ordering problem KTD4 and KTD6 create between them, and it is worth
+    stating as a problem before it is stated as a mechanism. `pushed` has to mean "a notification
+    was issued on this cycle" for both channels (KTD4). The browser half is easy: loop 2 sends
+    before `_record_decisions` runs, so the mark is in hand when the row is built. The client half
+    is not: emit runs in `main`'s own phase AFTER `check_and_notify` has returned, deliberately, so
+    that a raise in it cannot unwind the decision log or the state save at all (KTD6). U9 wrote the
+    choice down on `EmitReport.minted`: a cycle's mints reach the NEXT cycle's rows, or the row is
+    written somewhere else. This is the second.
+
+    So: one extra row per newly-notified subject, written here, in the same phase as the emit that
+    produced it. It is a COPY of the ledger's own row — the one `_record_decisions` either wrote or
+    restated minutes ago — with `pushed` flipped and the client's wording in `message`. Copying
+    rather than rebuilding is the point: a second builder would be a second definition of what a
+    decision row is, and it would drift the first time `build_row` gained a field.
+
+    **What it costs, stated where it is paid.**
+
+    * A mint cycle can hold TWO rows for one subject at one `decided_at` — the pass's and this one.
+      `varsel_decision_groups` is a MIN/MAX/LOGICAL_OR/first-pick aggregate throughout, so the only
+      figure that moves is `n_decisions`, which already counts rows written rather than cycles
+      scored and says so. The row is skipped entirely where the ledger's row already says `pushed`,
+      so a subject never has two PUSHED rows at one instant and the view's "first pushed row"
+      wording pick stays deterministic.
+    * A lost write loses the mark for good; no later cycle re-derives it, because the mint is a
+      transition and the next cycle sees an unchanged phase. That is exactly the browser channel's
+      existing hole — `pushed_keys` is pass-local and a short write commits no ledger entry — so
+      this adds no new class of loss, and `decisions.record` logs the short write either way.
+    * A WITHDRAWAL mints too, and it marks a row whose `alertworthy` is false. That combination
+      cannot arise on the browser channel and it is not an error: a retraction is a notification the
+      client received, and a withdrawal can only exist where something was standing, so the
+      SUBJECT's `ever_alerted` is true regardless. The view quotes the FIRST pushed row, which is
+      the alert's rather than its retraction's.
+
+    Runs on the poller thread inside `main`'s `notification_webhooks` phase and swallows everything,
+    like every other decision-log path: a client-side bookkeeping row must never cost a cycle.
+    """
+    if not minted:
+        return 0
+    try:
+        import decisions
+
+        if not decisions.enabled():
+            return 0
+        rows: list[dict] = []
+        stamped: list[tuple[tuple[str, str, str], dict]] = []
+        missing = 0
+        now = datetime.now(UTC)
+        with _state_lock:
+            # One take of the lock for the whole pass, `_record_decisions`' rule: the ledger is read
+            # by the request path's own sweep and this runs on the poller thread.
+            entries = {key: _decision_ledger.get(key) for key in minted}
+        for key in minted:
+            entry = entries.get(key)
+            if entry is None or entry.get("row") is None:
+                # The subject retired between the match and the mint (its situation ended, or the
+                # train stopped being catchable), so the sweep has already popped it and written its
+                # closing row. Counted rather than warned per subject: at this population a per-row
+                # line is a log nobody reads.
+                missing += 1
+                continue
+            if entry["row"].get("pushed"):
+                # A Web Push already went out for this very subject on this cycle, so the fact
+                # `pushed` carries is recorded and a second row would only add a second PUSHED row
+                # at one `decided_at` — which is what makes the view's first-pushed wording pick
+                # ambiguous. The browser wording is the one the page then quotes; `channel` says a
+                # client was there too.
+                continue
+            message, source = outcome.webhook_wordings.get(key, (None, "deterministic"))
+            row = {
+                **entry["row"],
+                "pushed": True,
+                "message": message if message is not None else entry["row"].get("message"),
+                "message_source": source,
+            }
+            rows.append(row)
+            stamped.append((key, row))
+        if not rows:
+            if missing:
+                logger.info(
+                    "%d minted subject(s) had already retired; their closing rows stand",
+                    missing,
+                    extra={"fields": {"event": "varsel_decision_write", "result": "mint_retired",
+                                      "n": missing}},
+                )
+            return 0
+        accepted = decisions.record(rows, beat=_heartbeat)
+        if accepted < len(rows):
+            # No rollback to do and nothing to put back: unlike a closing row, a mint row describes
+            # an instant rather than a subject's last look, and the ledger entry it was copied from
+            # is untouched above. Saying so is the whole treatment.
+            logger.warning(
+                "The mint marks were short (%d of %d rows accepted); those subjects read as not "
+                "notified on this cycle",
+                accepted,
+                len(rows),
+                extra={"fields": {"event": "varsel_decision_write", "result": "mint_short",
+                                  "n_rows": len(rows), "n_accepted": accepted}},
+            )
+            return accepted
+        with _state_lock:
+            for key, row in stamped:
+                entry = _decision_ledger.get(key)
+                if entry is None:
+                    # Retired between the read above and here — one cycle's sweep runs on this same
+                    # thread, so this is only reachable through the request path's own deletes.
+                    continue
+                entry["row"] = row
+                entry["written"] = True
+                entry["written_at"] = now
+        return accepted
+    except Exception:
+        logger.warning(
+            "Could not record this cycle's mint marks; the events themselves are unaffected",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_decision_write", "result": "mint_error"}},
+        )
+        return 0
 
 
 @dataclass
@@ -4152,10 +4415,12 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         jids_by_key.setdefault(_key, []).append(_jid)
 
     # The same grouping for the webhook channel, and the merged set pass 1a actually matches.
-    # `by_journey_key` stays BROWSER-ONLY on purpose: it is what `_record_decisions` iterates, and
-    # KTD10 keeps webhook subjects out of `varsel_decisions` entirely (that table is published, with
-    # resolved place names, on public hosts). So a definition both channels share is matched once and
-    # recorded once, exactly as today, while a webhook-only definition is matched and never recorded.
+    # `by_journey_key` stays BROWSER-ONLY, but what that now buys is narrower than it was: it is one
+    # of the two inputs to `_recipient_view`, whose job is to say which CHANNEL a definition belongs
+    # to. Until 2026-09-13 it was what `_record_decisions` iterated, so a webhook-only definition was
+    # matched, worded and notified about and left no row anywhere (KTD10, while /historikk and
+    # /meldinger were public). Since U16 every matched definition is recorded, at the same definition
+    # grain and with a channel and two counts; no client identity goes with it.
     #
     # `setdefault` order matters: the browser record wins for a shared key. A browser registration
     # carries `from_name`/`to_name`, the service caveat and the consent version, none of which the
@@ -4832,22 +5097,19 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                     if handle_gone_device(journey["device_id"]):
                         changed = True
 
-    # BROWSER subjects only, and structurally so: this iterates `by_journey_key`, which is built
-    # from `_journeys` alone. KTD10 keeps webhook subjects out of `varsel_decisions` entirely --
-    # /historikk and /meldinger publish that table on public hosts, with resolved place names since
-    # 2026-08-22, and client-app travellers are members of the public. `pushed_keys` is likewise
-    # only ever written by loop 2 above: it is journey-DEFINITION grain, so a webhook delivery
-    # recorded there would mark a browser registration's row `pushed` with no browser push behind
-    # it -- and `varsel_decision_groups` picks the wording /historikk quotes off the FIRST pushed
-    # row. That is why the webhook deliveries happen in a later phase entirely and not here.
-    with _span("varsel_record_decisions", definitions=len(by_journey_key)):
+    # BOTH channels since 2026-09-13 (U16, KTD4), at the journey-DEFINITION grain both of them
+    # already share. `pushed_keys` is still only ever written by loop 2 above and is still purely
+    # the browser's: a client notification is a MINT, which happens in the phase after this function
+    # returns, and `record_minted_decisions` writes its own row for it there. Marking one here would
+    # be a claim about a transaction that has not been attempted yet.
+    with _span("varsel_record_decisions", definitions=len(match_targets)):
         _record_decisions(
-            by_journey_key,
+            _recipient_view(by_journey_key, journeys, webhook_by_key, match_targets),
             alerts_by_key,
-            journeys,
             pushed_keys,
             message_inputs,
             push_on=push_on,
+            webhook_llm=webhook_llm,
             # The cycle's own clock, the one the match was made at -- not a second `now()` taken
             # here. The thinning rule is an elapsed-minutes test, and a pass that takes 60 s would
             # otherwise measure it from an instant nothing else in the cycle shares.
@@ -4864,9 +5126,15 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # either of them at all. Guarded, because building a subject reads duck-typed objects (an
     # alternative journey from an injected provider, a pydantic dump) and a raise here would cost the
     # browser cycle its own tail for a client field.
+    webhook_wordings: dict[tuple[str, str, str], tuple[str, str]] = {}
     try:
         observations = _webhook_observations(
-            webhook_by_key, alerts_by_key, match_targets, message_inputs, webhook_llm=webhook_llm
+            webhook_by_key,
+            alerts_by_key,
+            match_targets,
+            message_inputs,
+            webhook_llm=webhook_llm,
+            wordings=webhook_wordings,
         )
     except Exception:
         logger.warning(
@@ -4875,7 +5143,9 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             extra={"fields": {"event": "notification_emit", "result": "build_error"}},
         )
         observations = []
-    return PassOutcome(webhook_observations=tuple(observations))
+    return PassOutcome(
+        webhook_observations=tuple(observations), webhook_wordings=webhook_wordings
+    )
 
 
 # ---- API models ------------------------------------------------------------------------------

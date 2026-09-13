@@ -627,9 +627,9 @@ def test_the_webhook_phase_is_gated_guarded_twice_and_fed_by_a_return_value():
 
     source = inspect.getsource(main._rebuild_all)
     # Bounded at the NEXT phase, not run to the end of the function. `notification_servability` follows
-    # this one and carries a guard of its own, so an unbounded slice would count three
+    # this one and carries a guard of its own, so an unbounded slice would count a fourth
     # `except Exception:` and pass only if the count assertion below were weakened -- which would
-    # retire the thing it checks, that emit and deliver are guarded separately.
+    # retire the thing it checks, that the phase's three steps are guarded separately.
     phase = source[
         source.index('_phase("notification_webhooks"') : source.index('_phase("notification_servability"')
     ]
@@ -651,9 +651,19 @@ def test_the_webhook_phase_is_gated_guarded_twice_and_fed_by_a_return_value():
     assert "outcome = varsel.check_and_notify(" in source, (
         "the notification phase is fed by check_and_notify's return value, not by module state"
     )
-    assert phase.count("except Exception:") == 2, phase
+    # THREE steps, three guards, since U16 put the mint marks in this phase (KTD4): emit, the
+    # decision-log rows saying which subjects were notified, and delivery. Each failure has to cost
+    # only its own step -- an event that was committed must not be un-notified by a bookkeeping row,
+    # and a decision-log problem must not be reported on a cycle where every event went out.
+    assert phase.count("except Exception:") == 3, phase
     assert "Notification event emission failed" in phase
+    assert "Recording this cycle's mint marks failed" in phase
     assert "Webhook delivery failed" in phase
+    # The mint marks read the emit REPORT, so they are downstream of it and inside its `if outcome
+    # is not None` -- a mint cannot exist for a pass that did not run.
+    assert phase.index("notification_events.emit(") < phase.index(
+        "varsel.record_minted_decisions("
+    ), "the mint marks describe what emit committed and cannot precede it"
     deliver = phase[phase.index("webhook_delivery.deliver_pending(") :]
     assert "outcome" not in deliver, (
         "delivery must run on a cycle whose notification pass raised: the pending set is the "
