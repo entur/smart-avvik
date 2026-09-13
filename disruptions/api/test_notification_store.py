@@ -5378,6 +5378,40 @@ def test_the_mirror_serves_one_channel_and_holds_them_all():
     assert mirror.documents(NOW) == [from_store]
 
 
+def test_one_entry_is_answered_by_key_and_still_applies_liveness_and_the_channel():
+    """`entry` exists so a per-journey read is not a scan (`varsel_state`'s cycle reads), and it has
+    to be the same ANSWER `recipients` would have given for that id -- the two filters included.
+
+    A bare dict get would pass every test built on fresh same-channel entries and diverge exactly
+    where it matters: the delivery loop's liveness re-check would stop seeing expiry while
+    `all_journeys` still filtered it out, so one pass would word a train for a registration the next
+    read of the same mirror says is gone.
+    """
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(
+        client,
+        "mirror_seed",
+        [
+            _mirrored(subscription_id="browser-sub", channel=notification_store.CHANNEL_WEB_PUSH),
+            _mirrored(subscription_id="client-sub"),
+        ],
+    )
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+    browser = notification_store.CHANNEL_WEB_PUSH
+
+    assert mirror.entry("browser-sub", NOW, channel=browser).subscription_id == "browser-sub"
+    assert mirror.entry("nosuch", NOW, channel=browser) is None
+    assert mirror.entry("client-sub", NOW, channel=browser) is None, "the other channel answered"
+    assert mirror.entry("client-sub", NOW) is not None, "its own channel must still answer"
+    # Expiry is the one state change nothing writes a document for, which is why `recipients` tests
+    # it on the read -- and why this one has to as well.
+    later = NOW + timedelta(days=notification_store.SUBSCRIPTION_MAX_LIFETIME_DAYS + 1)
+    assert mirror.recipients(later, channel=browser) == []
+    assert mirror.entry("browser-sub", later, channel=browser) is None
+
+
 def test_a_sync_that_raises_keeps_the_previous_mirror():
     """Scenario 7. An empty mirror on a transient error reads as "every client unsubscribed"."""
     client = _FakeClient()
