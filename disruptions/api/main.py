@@ -1633,10 +1633,14 @@ async def lifespan(app: FastAPI):
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
         connectivity_provider=_varsel_connectivity,
-        # The same question about many stop pairs at once, which is what the servability sweeps
+        # The same question about many stop pairs at once, which is what BOTH servability sweeps
         # run on: one BigQuery job answers every pending pair (U10), where one job per pair bounded
-        # the sweep to four records a cycle.
-        connectivity_batch_provider=_varsel_connectivity_batch,
+        # the client sweep to four records a cycle and the browser one to nothing at all. The
+        # poller budget is bound HERE rather than passed per call, because both callers are poller
+        # sweeps and the tag is a vocabulary `varsel` does not own.
+        connectivity_batch_provider=functools.partial(
+            _varsel_connectivity_batch, path=_CONNECTIVITY_POLLER_PATH
+        ),
         # /config tells the PWA whether rush-forecast pushes are delivered HERE, so the page's
         # notice can never promise a push class this environment's gate withholds.
         togvarsel_notify_provider=_togvarsel_notify_enabled,
@@ -1715,9 +1719,7 @@ async def lifespan(app: FastAPI):
     # could disagree about a pair while both looked right. Unwired, `notification_servability.recheck()`
     # returns before it reads the store, so nothing here is a cost in a deployment that never sets
     # the seam.
-    notification_servability.configure(
-        verdicts=functools.partial(varsel._service_verdicts, path=_CONNECTIVITY_POLLER_PATH)
-    )
+    notification_servability.configure(verdicts=varsel._service_verdicts)
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody
     # runs build scripts against — without this the table would simply be missing there. Its own
