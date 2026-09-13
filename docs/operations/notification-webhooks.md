@@ -455,7 +455,7 @@ silently.
 |---|---|---|
 | `varsel_webhook_load` | the pass's one read of notification state | `result` (`ok`/`error`/`skipped`/`flag_error`), `n`, `skipped`, `unroutable`, `truncated`, `ms` |
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated` |
-| `notification_emit` | the emit step | `result` (`ok`, `timeout`, `retryable`, `failed`, `standing_error`, `run_clear_error`), `created`, `withdrawn`, `unchanged`, `obsolete`, `quota`, `capped`, `retryable`, `ms` |
+| `notification_emit` | the emit step | `result` (`ok`, `timeout`, `overlap_refused`, `retryable`, `failed`, `ceiling_error`, `run_clear_error`, `subject_error`, `subjects_skipped`, `unroutable`, `build_error`), and on the one summary record per cycle: `created`, `withdrawn`, `unchanged`, `counting`, `obsolete`, `nothing_standing`, `unidentified`, `quota`, `capped`, `retryable`, `failed`, `abandoned`, `overlap_refused`, `run_cleared`, `run_stale`, `run_clear_capped`, `run_clear_error`, `n` (the (recipient, train) observations offered), `trains` (what the fan-out was over — `n` over `trains` is the corridor's sharing factor), `ms` |
 | `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
 | `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
@@ -652,25 +652,44 @@ only the second is checkable.
 |---|---|---|
 | a hanging destination, 30 pending on one subscription | ~5.0 s | timing — one attempt at the 5 s per-attempt ceiling. Since claims were sharded per subscription (`7072268`) all 30 are one shard, so the first failure sets the skip and the rest never dial. The earlier figure of four attempts and 26 skipped is from before that change |
 | a destination hanging forever | 20.0 s | **ceiling** — `webhook_delivery._DELIVERY_WAIT_S`, the outer bounded wait |
-| a hung store | **28.0 s** | **ceiling** — `_EMIT_WAIT_S` (8) + `_DELIVERY_WAIT_S` (20), pinned under 30 s by `test_notification_events.py::test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger` |
+| a hung store | **110.0 s** | **ceiling** — `_EMIT_WAIT_S` (90) + `_DELIVERY_WAIT_S` (20), pinned under half the measured cycle period by `test_notification_events.py::test_the_phase_ceiling_is_a_share_of_the_cycle_rather_than_ktd6s_thirty_seconds`. It was 28 s (8 + 20) until U9 widened the emit pass |
 | a healthy backlog of 200 pending | 7 ms | timing, recorded in `e70d291` |
-| emit of 200 subjects | 14 ms | timing, re-recorded in `7072268` after the sharding change |
+| emit of 200 subjects | 14 ms | timing, re-recorded in `7072268` after the sharding change. **Taken one-wide**; the widened pass's own figure is owed from the harness (see the capacity table) |
 
-Against the cycle period measured at **~296 s** (2026-09-08) the worst case is ~9.5 % of one cycle.
-`notification_webhooks` is now the cycle's **last** phase — `check_and_notify` was, and this step is what
-displaced it — so its tail delays nothing else in the rebuild.
+Against the cycle period measured at **~296 s** (2026-09-08) the worst case is ~37 % of one cycle,
+where it was ~9.5 % before U9. `notification_webhooks` is the cycle's **last** phase —
+`check_and_notify` was, and this step is what displaced it — so its tail delays nothing else in the
+rebuild, which is what makes that share affordable rather than merely tolerable.
 
-**KTD6's reversal trigger is a number, not a judgement. Move delivery out of the pass when any one of
-these is true:**
+**KTD6's reversal trigger was a number and the widened pass exceeds it by design, so the number is
+restated (U9, 2026-09-13).** It read "`poller_phase{phase="notification_webhooks"}` exceeds **30 s**
+on any cycle in a week", and the two outer bounds summed to 28 s, pinned 2 s under it by a test.
+That arithmetic was right for a one-wide loop at the pilot's few hundred events a day. It is the
+wrong SHAPE for R2: a bad morning's lifecycle transitions have to be emitted inside one cycle, and
+one transaction at a time against a ~200 ms round trip is about five emits a second however many
+are waiting — so a phase that never exceeds 30 s is a phase that has stopped emitting, not a
+healthy one.
 
-- `poller_phase{phase="notification_webhooks"}` exceeds **30 s** on any cycle in a week;
+**Move delivery out of the pass (U11) when any one of these is true:**
+
+- **emit's share is exceeded**: the pass ran to its own deadline with work left over — `capped`
+  above zero on the `notification_emit` record, on any cycle in a week. That is the same statement
+  the 30 s was making ("this no longer fits in a cycle") in the unit the pass is actually bounded
+  in. Read `abandoned` beside it: `capped` with no `abandoned` is a pass simply larger than its
+  budget, `capped` with `abandoned` is a slow store;
+- **`overlap_refused` is true on any cycle**: the previous pass had not finished draining, which is
+  the same signal one step further along;
+- **`poller_phase{phase="notification_webhooks"}` exceeds half the cycle period** (~148 s against
+  the 2026-09-08 measurement), which is the wall-clock bound that still means something — past it a
+  slow store makes every cycle the previous one's tail. The ceilings are pinned under it by test;
 - a **second replica** appears (the single-writer argument the emit path's exactness rests on is one
-  poller thread, no route invoking the pass, one replica under the Recreate strategy);
+  poller thread, no route invoking the pass, one replica under the Recreate strategy — and note U9
+  already made the writer 64 threads of ONE pass, which the ledger and `overlap_refused` are what
+  enforce);
 - **clients reach single digits.**
 
-The 28 s ceiling is 2 s under that trigger and is pinned by a test rather than argued. Re-measure
-before raising any ceiling; the numbers above are measurements from 2026-08-21 and 2026-09-08, not
-constants.
+Re-measure before raising any ceiling; the numbers above are measurements from 2026-08-21 and
+2026-09-08, not constants.
 
 **A slow client is the thing to watch, and its failure mode does not look like one.** A destination
 whose cold start exceeds the 5 s per-attempt ceiling is **never delivered to at all**, not merely a
@@ -680,7 +699,8 @@ next cycle repeats the cold start, and every event ends `expired` — which read
 
 **What to measure during a pilot:** evaluation-to-callback latency; **source age reported separately
 from delivery latency**, so a fast callback cannot disguise an old prediction; the webhook phase's
-share of the cycle against the 30 s trigger; the oldest pending event; per-destination outcomes;
+share of the cycle, and `capped`/`abandoned`/`overlap_refused` on the emit record against the
+triggers above; the oldest pending event; per-destination outcomes;
 suppression reasons; quota breaches; request rejections. **Do not count a 2xx from the BFF as a
 notification on a phone.**
 
@@ -840,6 +860,22 @@ script can scrape them; they are for rules and dashboards, and the log records a
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 2 000 | bench | evening (syn) | plan | — | — | — | — | **0.542** | — | — | 42 070 decision rows built. Laptop, one core, CPython 3.13 |
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 4 000 | bench | evening (syn) | plan | — | — | — | — | **0.604** | — | — | 41 687 rows. The pair term: +5 092 pairs over the row above costs +1.07 s, ~0.21 ms per pair |
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 7 092 | bench | evening (syn) | prd | — | — | — | — | **0.649** | — | — | 39 098 rows. prd's 1.41 definitions per pair — the honest floor on what the memo can buy |
+
+**What U7, U8 and U9 owe this table, named rather than left to be noticed.** Every unit from U7 on
+has shipped its bounds as arithmetic over constants, and none of the three has a measured row here
+yet. Specifically owed, all against dev with the harness above:
+
+| Owed measurement | Which unit's claim it settles |
+|---|---|
+| **Emits per second, p50**, over 20 000 transitions | R2's 250/s, which `_EMIT_DEADLINE_S` (80 s) and `_MAX_EMITS_PER_CYCLE` (20 000) are both derived from. A run that cannot reach it moves the deadline or the width, not the count |
+| **Emit transaction latency, p50, WITHOUT the per-mint count query** | `_EMIT_WORKERS` (64) is the target rate times this number. dev's first reading of ~200–250 ms INCLUDED the aggregation U9 removed, so the true figure is lower and 64 is on the safe side of it — by how much is the question |
+| **Firestore round-trip p50** under a 64-wide pass | Whether the width is bound by the store or by this process's own GIL, which `poller_phase.cpu_ms` is what separates |
+| **Write amplification with and without the field exemptions** | U9 step 4's six exemptions. Index entries per document written, before and after — the only figure that says what they bought |
+| **The create ceiling's aggregation cost** at a realistic subscription count | U7's `count()` (verified against dev at 18 documents, which proves correctness and not cost) |
+| **A cycle's `capped` / `abandoned` at 100 000 subscriptions** | Whether emit's share is already exceeded, which is U11's first trigger |
+
+Recorded as owed rather than estimated: a number in this table is a measurement, and the units above
+shipped with their reasoning published and their measurement outstanding.
 
 The three `bench` rows answer **half** of Phase A's gate and the half they answer is named: interpreter
 ms per definition at the two ratios, against R1's 3.4 ms at 35 000 definitions and 1.5 ms at 80 000.
