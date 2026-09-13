@@ -90,9 +90,18 @@ def test_varsel_state_imports_neither_varsel_nor_main(_mp):
     back would be a cycle, and importing `main` would put the whole app behind a state read. Checked
     off the SOURCE rather than off `sys.modules`, because by the time this suite runs `varsel` may
     well be imported by something else."""
-    source = inspect.getsource(varsel_state)
-    for forbidden in ("import varsel\n", "import main", "from varsel import", "from main import"):
-        assert forbidden not in source, f"varsel_state names `{forbidden.strip()}`"
+    import re
+
+    source = "\n".join(
+        line
+        for line in inspect.getsource(varsel_state).split("\n")
+        if not line.lstrip().startswith("#")
+    )
+    for forbidden in (r"^import varsel\b", r"^import main\b", r"^from varsel\b", r"^from main\b"):
+        # Anchored and word-bounded rather than a literal search: `import varsel as v` and a
+        # trailing comment both slip past `"import varsel\n" in source`, and an import this module
+        # must not have is precisely the thing a plain substring test would wave through.
+        assert not re.search(forbidden, source, re.MULTILINE), f"varsel_state matches `{forbidden}`"
 
 
 def test_the_seam_emits_no_varsel_log_event(_mp):

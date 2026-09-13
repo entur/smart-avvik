@@ -67,6 +67,17 @@ class PushLedger:
     `day` and `sent_today` describe the ledger AS STORED: a count from a previous Oslo day reads as
     that day with its own count, and it is the caller that decides a stale day means zero spent.
     Deciding it here would need this module to know which day "now" is, which is the caller's clock.
+
+    **The blob answers this by scanning, and that cost is accepted rather than hidden.** Its marks
+    are flat maps keyed `"<journey_id>|..."`, so one ledger is a pass over all of them where the
+    old loop's three membership tests were O(1) -- a real regression in the shape, bounded by three
+    things that make it not one in practice. The caller reads a ledger only for a registration that
+    has an alert-worthy train this cycle, which on an ordinary cycle is almost none of them; prd
+    carries ~200 registrations against a few hundred marks; and the blob backend retires at U14,
+    where the store answers the same call with one document read and the scan does not exist. If
+    the blob is still here when either number grows, the fix is a bulk `push_ledgers(journey_ids)`
+    -- one grouping per pass, which is what the old loop effectively had -- and NOT a per-journey
+    index, which would be a second copy of the marks to keep true.
     """
 
     notified: frozenset[str]
