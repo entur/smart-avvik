@@ -1604,6 +1604,33 @@ def test_the_device_quota_is_resolved_by_the_registration_backend():
     )
 
 
+def test_the_store_is_configured_before_the_registration_backend_resolves():
+    """A startup ORDER, pinned off the source because its failure names the wrong cause.
+
+    `varsel.configure(registrations=_registration_store(), ...)` resolves the backend inside its own
+    argument list, and under `VARSEL_STATE_BACKEND=store` that call immediately reads the store --
+    `notification_auth.get_account("browser")`, and then U14's cutover import. Both need the
+    database named, which only `notification_store.configure` does.
+
+    With the configure block below that call, as it was until U14, `notification_store.enabled()` --
+    "a client was injected, or a database id was named" -- answered False, and the backend refused
+    to start with "set NOTIFICATION_FIRESTORE_DATABASE": the one variable the deployment had
+    plainly set, in the base Helm values, for every environment. It would have failed the lifespan
+    and therefore the release, on the cutover deploy and on no deploy before it, with the cause in
+    a pod that no longer exists.
+
+    Off the source rather than by driving the lifespan, which needs BigQuery and a poller thread.
+    A reordering is exactly the edit that looks harmless in review.
+    """
+    source = (HERE / "main.py").read_text()
+    configured = source.index("notification_store.configure(")
+    resolved = source.index("registrations=_registration_store()")
+    assert configured < resolved, (
+        "main configures the notification store AFTER resolving the registration backend, so "
+        "VARSEL_STATE_BACKEND=store cannot start: `enabled()` is False until the database is named"
+    )
+
+
 def test_the_tool_sets_quotas_and_create_client_takes_them_for_a_new_account():
     store = _install()
     try:
