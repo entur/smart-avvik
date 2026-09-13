@@ -186,16 +186,34 @@ public read that followed it.**
    binds harder here than it did where it was written.
 3. **21 308 of 21 331 replayed subjects were VYG**, so the evidence is a statement about **Vy rail**
    and nothing else.
-4. **A webhook-only route produces no `varsel_decisions` row at all.** `_record_decisions` iterates
-   the browser grouping, and KTD10 keeps webhook subjects out of it, so `/historikk` scores the
-   *shared* definitions and nothing else. prd's own registrations are the team's test users, so a
-   client's route mix overlaps them only by accident. **Webhook-only routes are not thinly
-   evidenced; they are unscored, deliberately.** Scoring them is deferred work, and the seven-day
-   event retention below is the constraint that work would first have to lift. **Deferred by
-   decision on 2026-09-09** until `/historikk` and `/meldinger` are behind authentication, and to be
-   done then — see [Open questions](#open-questions-and-product-decisions), item 4. **They are, since
-   2026-09-10** (Entur SSO via Auth0's partner tenant, `disruptions/api/sso.py`, every environment),
-   so the deferral has ended and the work is owed.
+4. **CLOSED, 2026-09-13 (U16): a webhook-only route is scored like any other.** It produced no
+   `varsel_decisions` row at all until then — `_record_decisions` iterated the browser grouping, and
+   KTD10 kept client subjects out of a table `/historikk` and `/meldinger` published on public
+   hosts — so those pages scored the *shared* definitions and nothing else, and since prd's own
+   registrations are the team's test users a client's route mix overlapped them only by accident.
+   Both pages have been behind Entur SSO since 2026-09-10, which is the precondition the 2026-09-09
+   decision named, and at R1's population "unscored" would have been the whole product. Every
+   definition pass 1a matches is now written, with `channel` saying which side was watching
+   ('browser', 'webhook', 'both') and `n_subscriptions` counting the client side beside
+   `n_devices`. **Read the rest of this list as still binding**: a scored route is not a
+   generalized claim, and limitations 1, 2, 3 and 5 are untouched.
+
+   **What did NOT move is the grain, and that is the whole of the privacy answer.** A row is one
+   journey DEFINITION's view of one situation on one train — a route, a window and a weekday set.
+   No subscription, client, destination or external reference reaches the decision log, the
+   outcomes table, the groups view or either page; `test_notification_contract` greps the three
+   files for exactly those names and each page suite greps its own SQL. So the seven-day event
+   retention, which used to be the constraint this work would first have to lift, is not in the
+   path at all: the score is computed from the decision log and the nightly ET join, neither of
+   which reads an event.
+
+   **Two readings that change with it.** `pushed` now means "a notification was ISSUED on any
+   channel" — for the client side the event MINT and not its delivery, because a delivered mark
+   lags the mint by up to two cycles and a subject retired in between would read as never notified;
+   so a `both` subject can say `pushed` with no Web Push behind it. And the two LLM delivery
+   switches are separate (`VARSEL_LLM_ENABLED` for the push, `NOTIFICATION_WEBHOOK_LLM_ENABLED` for
+   the event), so where a rollout has them disagreeing, a shared subject's quoted `message` is the
+   browser's wording and the client received the other one. Both are in the column descriptions.
 5. **A definition nobody registered produces no `varsel_decisions` row at all, and the public read
    serves exactly those** (plan 2026-09-10-001, origin KTD10). `GET /journey-alerts` runs the
    matcher for whatever five fields a caller names, records nothing — no decision row, no Firestore
@@ -1131,6 +1149,50 @@ contract document says so in its own words; this is the operating half of the sa
    Nothing about this touches the wire contract, the wording policy or the allowances: a read burst
    still spends `notification_wording.PULL`'s own ledger and `alternatives._PULL_PATH`'s own fetch
    budget, and moves neither the browser's nor the webhook channel's.
+8. **Webhook routes in the decision log — done, 2026-09-13 (U16).** The last item on this list, and
+   the one that is about MEASUREMENT rather than about load: `_record_decisions` iterated the
+   browser grouping, so a client's route was matched, worded, emitted and delivered while leaving
+   no row anywhere. Right while `/historikk` and `/meldinger` were public (KTD10) and untenable at
+   R1's population, where "unscored" would have been the product. Both pages have been behind Entur
+   SSO since 2026-09-10.
+
+   Every definition pass 1a matches is written now, at the grain both channels already share, with
+   two new columns on `varsel_decisions` and on `varsel_decision_outcomes`: **`channel`**
+   ('browser', 'webhook', 'both') and **`n_subscriptions`** beside `n_devices`. `varsel_decision_
+   groups` AGGREGATES the channel onto the subject and does not group on it — grouping would split
+   a shared definition into two subjects, two verdicts and two rows in every rate, when what
+   happened is one match, one wording and one decision. Both pages gained a Kanal filter, which
+   narrows the POPULATION and therefore reaches `/summary`.
+
+   **`pushed` changed meaning and the ordering it ran into is worth recording.** It is now "a
+   notification was ISSUED on any channel": for the browser the push service's acceptance as
+   before, for the client the event MINT — not its delivery, which lags the mint by up to two
+   cycles and would read as never-notified for a subject retired in between. But emit runs in the
+   `notification_webhooks` phase, AFTER `check_and_notify` has returned, deliberately (KTD6), so a
+   cycle's mints cannot reach the rows that cycle already wrote. U9 had written the two ways out on
+   `EmitReport.minted`: the next cycle's rows, or somewhere else. U16 took the second —
+   `varsel.record_minted_decisions` writes one extra row per newly-notified subject in the same
+   phase as the emit, copied from the thinning ledger's own row with `pushed` flipped and the
+   client's wording in `message`. A subject the browser already pushed on that cycle gets no second
+   row, so a subject never has two PUSHED rows at one `decided_at` and the view's "first pushed
+   row" wording pick stays decidable. **What a reader has to know**: `n_decisions` can carry one
+   more row on a mint cycle, which is a column that already means "rows written" rather than
+   "cycles scored"; and a lost mint write loses the mark for good, exactly as the browser channel's
+   pass-local `pushed_keys` already could.
+
+   **The operator step this needed, and it is not optional.** Adding two columns to
+   `varsel_decision_outcomes` breaks the registered scheduled query until it is re-registered,
+   because the transfer config holds a COPY of the SQL and its INSERT names its columns. The order
+   is fixed: **deploy first** (the startup `ADD COLUMN IF NOT EXISTS` creates the columns), **then**
+   `bq update --transfer_config` in dev and in prd, in the same operation as the DDL. The old
+   stored text keeps working until then — it simply inserts two columns short, leaving them NULL —
+   and the new text fails outright against a table without the columns, which is why the order is
+   that way round and not the other.
+
+   **Nothing in prd will carry a webhook row today**, because prd has no webhook client: the column
+   is inert by population rather than by a switch, and there deliberately is no flag (see Open
+   questions, item 4). Dev's `kix-smoke` has 18 subscriptions and will write them from the first
+   cycle after the deploy.
 
 ### The delivery worker (U11)
 
@@ -1382,7 +1444,7 @@ support the clause, the clause was changed.
 | 18 | A **device document expires 180 days after the traveller was last here** | `_new_device_doc` and `_upsert_device_body` write `expires_at = now + SUBSCRIPTION_MAX_LIFETIME_DAYS`, refreshed on every upsert, and since U14 also by `renew_device` from the journey list -- which is what covers an install that never turned notifications on and is therefore never upserted at all. `devices` carries a TTL field config in `terraform/firestore.tf`. What the document holds until then is a Web Push endpoint and two keys -- personal data with no reader once the browser is gone. It is renewed by the same event as the journeys, so "a device and its registrations expire together" is a property of the mechanism rather than of the two numbers happening to match |
 | 19 | **«Slett alt» erases within the transaction, not within 24 hours** | `erase_device` -> `_erase_device_body`. The device document is hard-deleted; each journey is TOMBSTONED and redacted in the SAME write -- route, window, typed names, device id and the three push ledgers cleared -- so nothing personal outlives the transaction. That is stricter than clause 11, and deliberately: a client revoking a subscription is administering its own integration, while this is a traveller exercising erasure, and "the route is gone within 24 hours" is not what that answer should be |
 | 20 | A traveller's journeys are **tombstoned rather than deleted, and the reason is the mirror** | `_erase_device_body` is in `MIRROR_STAMPING_BODIES`. A hard-deleted document matches no query, including `mirror_sync`'s watermark query, so a deletion would leave the poller's in-memory mirror holding the journeys for up to `MIRROR_MAX_AGE_S` (6 h) -- still matching, wording and writing decision rows about somebody who asked to be forgotten. What survives the tombstone is an id, a status and a 7-day TTL. **Since U13 the erasure also drops them from the mirror by id, from its own commit**, so the window is not one sync but none: the stamp is what makes a RESTARTED process agree, the drop is what makes this one agree now |
-| 16 | The **7-day event retention is shorter than the 10-day outcome-labelling window**, so retrospectively scoring client alerts is foreclosed | `HISTORY_DAYS = 7` against the nightly job's retry window. Published, so lengthening it later is a contract change |
+| 16 | **Rewritten 2026-09-13 (U16).** The 7-day event retention is still shorter than the 10-day outcome-labelling window, and it no longer forecloses anything: client alerts ARE scored, at definition grain in `varsel_decisions`, which holds no client identity and reads no event. The clause it replaces said scoring was foreclosed; what was actually foreclosed was scoring an EVENT retrospectively, and nothing does | `HISTORY_DAYS = 7` still bounds the events collection, unchanged. The score comes from `varsel_decisions` + the nightly ET join, whose own retention is the table's 365-day partition expiry. `channel` and `n_subscriptions` are the whole of what the client side contributes, so lengthening `HISTORY_DAYS` remains a contract change and is not one this needs |
 
 ### Published numbers, and where they come from
 
@@ -1552,7 +1614,9 @@ R16 keeps client records, credentials, callback URLs and generated prose out of 
 
 - **A webhook-only route** — one no browser registration holds — is written for through
   `notification_wording.WEBHOOK`, selected in `varsel.check_and_notify` on the discriminator `key not
-  in by_journey_key` (`by_journey_key` is browser-only by construction, per KTD10). That policy
+  in by_journey_key` (`by_journey_key` is the BROWSER grouping, so "no browser registration holds
+  this route" is exactly what that test asks — unchanged by U16, which records both channels
+  through a separate view and leaves this discriminator where it was). That policy
   **suppresses the prompt/reply DEBUG record in code**, regardless of `VARSEL_LLM_LOG_PROMPTS`, and
   drops `message` from the INFO record. This is the half R16 requires and it is closed.
 - **A route a browser registration also holds** stays on the browser policy, unavoidably and by
@@ -1632,16 +1696,19 @@ beside each; the ones still open say who owns them.
    for the channel's own prose the decision is made when that step is. **Open for the
    product owner**: whether the read should have a prose switch of its own rather than sharing
    this one.
-4. **Webhook-only routes are unscored** (the fourth KTD12 limitation above). **Decided 2026-09-09:
-   they stay out of `varsel_decisions` until `/historikk` and `/meldinger` are behind
-   authentication — planned, and expected before any real client data — and go in once they are.**
-   **Unblocked 2026-09-10**: both pages and both APIs are behind Entur SSO in every environment
-   (#142), so this is now owed work, not a deferral: the channel discriminator on `varsel_decisions`,
-   the groups view, the labelling INSERT and the scheduled-query re-registration, in one operation.
-   Including them now was offered if it simplified the channel; it does not, it adds: `pushed` is
-   journey-definition grain and cannot tell a webhook from a Web Push (KTD10), so the row needs a
-   channel discriminator, and that column reaches `varsel_decision_groups`, the nightly labelling
-   INSERT and the scheduled-query re-registration in one operation.
+4. **Webhook-only routes are unscored. DONE, 2026-09-13 (U16)** — see the fourth KTD12 limitation
+   above, which is now the record of what was built. Decided 2026-09-09 that they stay out of
+   `varsel_decisions` until `/historikk` and `/meldinger` are behind authentication and go in once
+   they are; unblocked 2026-09-10 (Entur SSO, #142); built on 2026-09-13 as the one operation this
+   entry predicted it would have to be — the `channel` discriminator on both tables, the groups
+   view, the labelling INSERT and the scheduled-query re-registration in dev and prd.
+
+   **One thing it still gates**, and it is a product decision rather than an engineering one:
+   enabling webhook SCORING in prd for a real client's routes waits on the DPO answer to finding 46
+   and the controller question, exactly as enabling any client beyond `kix-smoke` does. Today prd
+   is inert by POPULATION and not by a switch — it has no webhook client, so no webhook row can be
+   written — and there is deliberately no flag, because a flag nobody sets is a second way for the
+   column to be silently empty.
 5. **R16's prompt-record claim is half-closed** ([above](#r16-and-the-half-of-it-that-is-not-what-it-looks-like)).
    **Decided 2026-09-09: accepted as it stands**, and R16 is kept — dashboard authentication does
    not reach the Cloud Logging half, and the code behind it is one field.
