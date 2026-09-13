@@ -3842,17 +3842,32 @@ def emulator_test_one_devices_journeys_and_its_erasure_against_a_real_client():
 
 
 def emulator_test_a_journey_created_mid_erasure_leaves_no_orphan():
-    """The plan's interleaving scenario, and the only place it can run.
+    """A journey created BETWEEN two erase passes is caught by the next one, and the device waits.
 
-    A traveller taps «Slett alt» while a create is in flight. Firestore's optimistic concurrency is
-    what settles it: the erase transaction read the journeys, the create writes one, and whichever
-    commits second is retried against the state the first left. Two outcomes are correct -- the new
-    journey is tombstoned by the retry, or it is created after the erasure and stands alone with no
-    device -- and exactly one is not: a live journey the erasure believes it removed.
+    This is the sequential half of the plan's interleaving scenario, and it is the half that can be
+    driven. `erase_device` rebuilds its query on every pass rather than hoisting it -- a create that
+    lands after pass one is therefore in pass two's page -- and the device is hard-deleted only on a
+    pass that did not fill, so the deletion cannot outrun a journey still arriving. Both are
+    properties of the loop, and both are what this drives: the bound is shrunk to 2, pass one is run
+    by hand, `j4` is created, and the public loop finishes the erasure.
 
-    Driven by creating BETWEEN the two passes rather than by racing threads, because what has to
-    hold is the state after the interleaving rather than the scheduler's order, and a real race
-    would make the test flaky for a reason having nothing to do with the store.
+    **The concurrent half is NOT tested here and cannot be, and the reason is a property of
+    Firestore rather than of this suite.** Read-write transactions take pessimistic locks on their
+    read set under Standard edition -- `_create_body`'s own docstring says so, which is why U7
+    replaced its read with an aggregation -- so a competing create committed from INSIDE the erase
+    transaction's body deadlocks: measured against the emulator, the inner `create_subscription`
+    exhausts `_run_transaction`'s five attempts while the outer transaction waits on it. Driven from
+    another THREAD it does not deadlock and it proves nothing either: the create blocks on the
+    erase's locks and commits after it, so what the assertion would be pinning is the emulator's
+    lock ordering.
+
+    What that leaves un-eliminated is worth stating rather than implying, because it is real and it
+    is U13's to close: a create whose transaction commits AFTER an erasure leaves a live journey
+    whose device no longer exists. `_create_body` reads no device document at all, so nothing in the
+    store refuses it. It is bounded -- no device means no endpoint, so nothing is ever pushed to it,
+    and its own TTL removes it -- but it is returned by `device_journeys` and counted by the ceiling
+    until then. The place to refuse it is the request path U13 puts over this store, not a fifth
+    read inside the create transaction.
     """
     _emulator_setup()
     notification_store.upsert_device(
