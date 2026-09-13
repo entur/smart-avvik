@@ -1431,9 +1431,22 @@ def _import_problems(
     expected: dict[str, set[str]] = {}
     for journey_id, record in journeys.items():
         expected.setdefault(str(record.get("device_id") or ""), set()).add(journey_id)
+
+    # `notification_store.device_journeys` and NOT the seam's, which is the same query and also
+    # RENEWS what it reads (U14's inactivity horizon). Nothing would go wrong today -- the import
+    # has just stamped every one of these, so the renewal's staleness cut skips them all -- but a
+    # verification pass that writes is one whose result depends on what it did, and this one exists
+    # to answer whether the import's own writes landed.
     found: dict[str, set[str]] = {}
+    stored_marks: set[str] = set()
     for device_id in devices:
-        found[device_id] = {jid for jid, _rec in store.device_journeys(device_id)}
+        subscriptions = notification_store.device_journeys(
+            device_id=device_id, client_id=store._client_id
+        )
+        found[device_id] = {sub.subscription_id for sub in subscriptions}
+        for sub in subscriptions:
+            stored_marks.update(f"{sub.subscription_id}|{sit}" for sit in sub.notified)
+
     for device_id, wanted in expected.items():
         got = found.get(device_id, set())
         if got != wanted:
@@ -1447,15 +1460,6 @@ def _import_problems(
         problems.append(f"the blob holds {len(journeys)} journeys and the store returns {total}")
 
     wanted_marks = {mark for mark in marks if str(mark).partition("|")[0] in journeys}
-    stored_marks: set[str] = set()
-    for device_id in devices:
-        for subscription in notification_store.device_journeys(
-            device_id=device_id, client_id=store._client_id
-        ):
-            stored_marks.update(
-                f"{subscription.subscription_id}|{situation}"
-                for situation in subscription.notified
-            )
     if stored_marks != wanted_marks:
         problems.append(
             f"the blob holds {len(wanted_marks)} live marks and the store returns "
