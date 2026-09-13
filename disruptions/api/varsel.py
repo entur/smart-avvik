@@ -559,7 +559,7 @@ _beat_provider: Callable[[], None] | None = None
 # absent, pass 1a is byte-for-byte what it was and the read computes on every miss, exactly as it
 # did before the seam existed. Injected rather than imported, and that is a PLAN STOP CONDITION
 # rather than a preference: `notification_pull` imports this module, so an import the other way is
-# a cycle, and `test_varsel_api.test_the_pull_read_is_the_dependent_side` pins the direction.
+# a cycle, and `test_varsel_api.test_varsel_does_not_import_the_pull_read` pins it.
 # `varsel` therefore knows nothing about figures, generations or caches -- it hands over the one
 # thing only pass 1a holds, this definition's alerts, and the read decides what to keep.
 _figures_warmer: Callable[[str, dict, list["Alert"], datetime], None] | None = None
