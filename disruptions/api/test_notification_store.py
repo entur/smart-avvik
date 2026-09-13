@@ -1872,6 +1872,12 @@ def test_every_collection_group_has_exactly_one_ttl_field():
         "the migrations collection must have NO TTL field: an expired one-shot marker re-runs the "
         "migration it guards"
     )
+    # And the second one, absent for its own reason rather than by analogy: it holds exactly ONE
+    # document, rewritten in place, so a TTL could only delete the live copy -- after which a
+    # restart re-decides every rush round still inside its timeliness window.
+    assert f'"{notification_store.ROUNDS}"' not in ttl_block, (
+        "the togvarsel rounds collection must have NO TTL field: its one document is the live one"
+    )
     assert notification_store.TTL_FIELD == "expires_at"
     assert f'field      = "{notification_store.TTL_FIELD}"' in FIRESTORE_TF
     assert FIRESTORE_TF_CODE.count("ttl_config {}") == 1  # one resource, for_each over four groups
@@ -3656,6 +3662,45 @@ def test_the_deny_all_rules_are_deliberately_not_released_by_terraform():
     )
 
 
+# ---- The togvarsel round markers' one document (U14) -------------------------------------------
+
+
+def test_the_round_markers_are_one_document_that_a_write_replaces_whole():
+    """One document, fixed id, in a collection of its own with no TTL.
+
+    A `set` and never an `update`, and that is the property worth pinning: the whole marker map is
+    the unit, so a merge would leave an issue marked from a date the writer has already rolled
+    past -- which is the dedup this document exists for, refusing a round that ought to fire.
+    """
+    client = _FakeClient()
+    _install(client)
+    assert notification_store.read_rounds() is None, "absent until something writes it"
+
+    notification_store.write_rounds(
+        {"date": "2026-09-14", "areas": {"oslo": {"0630": {"level": "yellow", "pushed": True}}}},
+        now=NOW,
+    )
+    body = notification_store.read_rounds()
+    assert body is not None
+    assert body["date"] == "2026-09-14"
+    assert body["areas"] == {"oslo": {"0630": {"level": "yellow", "pushed": True}}}
+    assert body["updated_at"] == NOW
+    assert notification_store.TTL_FIELD not in body, "no horizon: the one document is the live one"
+
+    # The next day replaces it rather than merging into it.
+    notification_store.write_rounds(
+        {"date": "2026-09-15", "areas": {"oslo": {}}}, now=NOW
+    )
+    body = notification_store.read_rounds()
+    assert body is not None and body["areas"] == {"oslo": {}}
+    assert body["date"] == "2026-09-15", "yesterday must not survive the write"
+
+    # One document, in its own collection, outside the four the TTL policy covers.
+    paths = [p for p in client.docs if p.startswith(f"{notification_store.ROUNDS}/")]
+    assert paths == [f"{notification_store.ROUNDS}/{notification_store.ROUNDS_DOC}"]
+    assert notification_store.ROUNDS not in notification_store.COLLECTIONS
+
+
 # ---- Emulator-backed ---------------------------------------------------------------------------
 
 _EMULATOR_DB: str | None = None
@@ -3734,6 +3779,32 @@ def emulator_test_a_migration_marker_round_trips_and_is_absent_until_it_is_writt
     assert marker["name"] == "varsel_blob_to_store" and marker["recorded_at"] == NOW
     # No TTL field on it, ever: an expired marker re-runs the import it guards.
     assert notification_store.TTL_FIELD not in marker
+    assert client is not None
+
+
+def emulator_test_the_round_marker_document_round_trips_through_the_real_client():
+    """The markers' one document against the real client, for the migration marker's reason: it is
+    a plain `set` outside a transaction, and the hermetic fake grew that method to serve it.
+
+    What only this can say is that a nested map comes back nested -- the body is keyed by rush area
+    so the planned split into several of them is a data change rather than a migration, and a
+    client that flattened or dropped the inner map would make that claim false in production only.
+    """
+    client = _emulator_setup()
+    assert notification_store.read_rounds() is None
+    notification_store.write_rounds(
+        {
+            "date": "2026-09-14",
+            "areas": {"oslo": {"0630": {"level": "yellow", "pushed": True}}},
+        },
+        now=NOW,
+    )
+    body = notification_store.read_rounds()
+    assert body is not None
+    assert body["date"] == "2026-09-14"
+    assert body["areas"]["oslo"]["0630"] == {"level": "yellow", "pushed": True}
+    assert body["updated_at"] == NOW
+    assert notification_store.TTL_FIELD not in body
     assert client is not None
 
 

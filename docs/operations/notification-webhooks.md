@@ -870,9 +870,23 @@ contract document says so in its own words; this is the operating half of the sa
    and the bucket is the first thing that would drift, since dev's and prd's names differ. The
    export writes the blob backend's own five keys through `_journey_record` and `_device_record`,
    so the artefact is something `apply_state` loads rather than something a reader has to convert,
-   and it carries the togvarsel round markers and any unknown keys through from whatever the blob
-   already held — the store has no home for those, so rebuilding the document from it alone would
-   delete them from the only place they exist.
+   and it carries any UNKNOWN top-level key through from whatever the blob already held — a key a
+   future build wrote has no home in the store, so rebuilding the document from it alone would
+   delete that feature's state from the only place it exists. The togvarsel round markers are the
+   exception and are written LIVE rather than carried: they have a home of their own in the store
+   now, so copying the old object's would fossilise the day of the cutover.
+
+   **Do not turn this phase off when the rollback window passes without checking the artefact's
+   other reader.** `scripts/make_device_report.py` renders every device and its journeys straight
+   out of the blob — it is how the "79 of 186 journeys sit on devices that never turned
+   notifications on" split was measured, which is what decided where the inactivity horizon is
+   renewed. Under the store backend this export is the only thing keeping that input current, and
+   nothing else in the deployment reads the blob at all, so switching the phase off retires the
+   report silently. Moving the report onto the store is the answer, and prd's cutover is the
+   natural moment: it is one code path rather than two only once both environments are on the
+   store, and the report's own successor question — which registrations are approaching the
+   180-day inactivity horizon — cannot be answered from the blob in any case, since the exported
+   journey record carries no `last_seen_at` and the blob backend has no concept of one.
 
    **What to watch after the cutover.** `varsel_state_import` on startup — `result` is `imported`
    once and `skipped` at every restart after it, and a second `imported` in the same environment
@@ -942,7 +956,8 @@ contract document says so in its own words; this is the operating half of the sa
 
    The first export ran on that pod's first cycle: 4 devices, 14 journeys, 7 226 bytes, 500 ms, as
    the cycle's last phase. Diffed against a copy of the pre-cutover blob it round-tripped
-   completely — same ids, same field names, round markers carried through — with two differences
+   completely — same ids, same field names, round markers carried through (they were still the
+   blob's own at that point; see the settled item below) — with two differences
    and neither is the export's: `service_checked_ts` moved forward on six journeys (the poller's
    own servability sweep), and a device's `subscription` lost a null `expirationTime`, which the
    store never held and nothing reads. **Take that copy before the first export**, since it is what
@@ -964,18 +979,30 @@ contract document says so in its own words; this is the operating half of the sa
    dev deletes on the new rule for a while with its notice unchanged. Dev's registrations are the
    team's own, and over-promising deletion on the public host is the worse of the two errors.
 
-   **One thing the cutover still owes: the togvarsel round markers are not persisted under
-   `store`.** They are off the protocol and ride in the blob half; the durable write behind
-   `varsel.store_togvarsel_rounds` is `_save_state()`, which on the store backend is a no-op
-   returning True, and the matching `load()` is a no-op too. So under `store` a restart re-fires
-   the accepted crash window for whatever rush round is still inside its timeliness window, rather
-   than only for a crash mid-round. It costs nothing as things stand — `SHOW_RUSHVARSEL` is off in
-   every environment, so no round is evaluated at all, and no environment sets this backend — which
-   is precisely why it is written down here rather than left to be found at the cutover. Two
-   shapes, neither chosen: keep the markers on the blob regardless of backend (`store_rounds` calls
-   `varsel_state.save_state()` itself and `main` always calls `load_state()`), or move them to one
-   Firestore document. **Decide it before `SHOW_RUSHVARSEL` and `VARSEL_STATE_BACKEND=store` are on
-   in the same environment**, which is the only state in which it can bite.
+   **The togvarsel round markers — settled 2026-09-13, one Firestore document.** They were the
+   one thing the cutover still owed: off the registration protocol and persisted only in the blob
+   half, so under `store` a restart re-fired the accepted crash window for whatever rush round was
+   still inside its timeliness window. They now have a home of their own,
+   `notification_store.ROUNDS` — a collection holding exactly ONE document, fixed id, **no TTL
+   field**, because there is nothing in it to age out and a TTL could only ever delete the live
+   copy. `varsel_state.configure_rounds` names the home and `main` sets it from the same
+   `VARSEL_STATE_BACKEND` the registrations follow; the two must agree, because a rollback to the
+   blob-reading binary has to find the markers where that binary looks. The shape that looks
+   simpler was the dangerous one and is worth recording: keeping the blob as their home under
+   `store` means writing through `save_state()`, which serialises the blob globals — empty under
+   that backend — and would therefore replace the rollback artefact with an empty registration set;
+   writing only the one key instead is a read-modify-write of the whole GCS object racing the
+   six-hourly export, with no generation precondition on either side.
+
+   Two consequences for an operator. The body is `{date, areas: {<area>: {<issue>: marker}}}` and
+   the **area** level is nested before it carries any weight — Rushvarsel is one rush geography
+   today and is planned to become several, so the split is a data change here rather than a
+   migration, and a build that knows one area reads its own key and ignores the rest. And the
+   markers are deliberately **not** imported at a cutover: they are keyed by Oslo date, so by the
+   first midnight after one there is nothing left to have migrated, and what a mid-day cutover
+   costs is that rounds still inside their timeliness window are decided again — the same window a
+   restart already produces. The export writes the live markers into the blob rather than carrying
+   the old object's copy through, so the artefact cannot fossilise the day of the cutover.
 
 5. **A `count()` aggregation for the active-subscription ceiling — done, 2026-09-13 (U7).**
    `_create_body` counted a client's live subscriptions by READING them inside the create

@@ -88,6 +88,25 @@ DEVICES = "devices"
 #: document therefore carries no `expires_at` at all, and `test_every_collection_group_has_exactly
 #: _one_ttl_field` pins the absence in Terraform so nobody adds one for symmetry.
 MIGRATIONS = "migrations"
+#: Where the togvarsel round markers are made durable under `VARSEL_STATE_BACKEND=store` (U14).
+#: Not in :data:`COLLECTIONS` and, like :data:`MIGRATIONS`, deliberately WITHOUT a TTL field -- for
+#: a different reason, so the two comments do not simply repeat each other: this collection holds
+#: exactly ONE document, rewritten in place, so there is nothing here to age out and a TTL could
+#: only ever delete the live one. Day rollover is the body's own business: `varsel_state` keeps a
+#: single date, and a marker filed under any other date reads as absent.
+#:
+#: The body is `{"date": "<YYYY-MM-DD Oslo>", "areas": {"<area>": {"<issue>": marker}}}`. The AREA
+#: level carries no weight today -- Rushvarsel is one geography, `disruptions.togvarsel_oslo_stations`
+#: -- and it is nested from the start because splitting the product into several rush areas is the
+#: near-term plan: nested, that split is a data change here rather than a migration, and a build
+#: that knows one area reads its own key and ignores the others, which is what makes a rollback
+#: ACROSS the split safe. ONE document rather than one per area because a day's rounds are decided
+#: in one pass on one thread and `store_rounds` replaces the map wholesale; per-area writers would
+#: need a transaction or a document each, and that is the moment to revisit this.
+ROUNDS = "togvarsel_rounds"
+#: The one document's id. Fixed rather than the Oslo date, which is the obvious alternative and
+#: would accumulate a document per day forever in a collection that has no TTL to clear them.
+ROUNDS_DOC = "current"
 
 COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES)
 
@@ -1216,6 +1235,9 @@ class _Refs:
 
     def migration(self, name: str) -> Any:
         return self._client.collection(MIGRATIONS).document(name)
+
+    def rounds(self) -> Any:
+        return self._client.collection(ROUNDS).document(ROUNDS_DOC)
 
 
 def _run_transaction(body: Callable[[Any], Any]) -> Any:
@@ -4002,6 +4024,32 @@ def write_migration(name: str, data: Mapping[str, Any], *, now: datetime | None 
     ref = _Refs(_firestore_client()).migration(name)
     with _span("notification_store.write_migration"):
         ref.set({**dict(data), "name": name, "recorded_at": now or _now()})
+
+
+def read_rounds() -> dict[str, Any] | None:
+    """The togvarsel round markers, or None when nothing has ever written them.
+
+    A bounded read outside a transaction, :func:`read_migration`'s shape and for its reason: there
+    is one writer -- the poller thread of the single always-on instance -- and what the document
+    has to survive is a restart rather than a concurrent writer. Called once per startup, never on
+    a request path: memory is the markers' primitive and this is the write-through's other half.
+    """
+    ref = _Refs(_firestore_client()).rounds()
+    with _span("notification_store.read_rounds"):
+        doc = _doc(ref.get(timeout=_CALL_DEADLINE_S))
+    return dict(doc) if doc else None
+
+
+def write_rounds(data: Mapping[str, Any], *, now: datetime | None = None) -> None:
+    """Replace the round markers. Roughly four writes a weekday, per environment.
+
+    A plain `set` and never an update: the whole map is the unit, so a merge would leave an issue
+    marked from a date the caller has already rolled past -- which is exactly the dedup this
+    document exists for, refusing a round that ought to fire.
+    """
+    ref = _Refs(_firestore_client()).rounds()
+    with _span("notification_store.write_rounds"):
+        ref.set({**dict(data), "updated_at": now or _now()})
 
 
 #: How many device ids one multi-get of the export asks for. `get_devices` issues a single

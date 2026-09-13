@@ -1549,8 +1549,11 @@ def _apply_state(raw: str) -> None:
 
 
 def load_state() -> None:
-    """Load persisted state at startup -- the blob backend's, through the seam."""
+    """Load persisted state at startup: registrations through the seam, round markers from
+    whichever home `varsel_state.configure_rounds` named. The second call is a no-op under the blob
+    backend, whose own load has already applied them."""
     _registrations.load()
+    varsel_state.load_rounds()
 
 
 def _save_state() -> bool:
@@ -1576,8 +1579,9 @@ def _save_state() -> bool:
 # map freely and hands it back whole through the store -- it never reaches varsel globals.
 #
 # The markers themselves are deliberately OFF the registration seam (see `varsel_state`): a rush
-# round marker is not a registration, and making the store backend grow a document for it would be
-# inventing a reader. They ride in the blob half, and this pair is what togvarsel_notify sees.
+# round marker is not a registration, so it does not belong on a protocol whose every method is a
+# question about one. Off the seam, not off durability -- `varsel_state.save_rounds` writes them to
+# whichever home the backend named. This pair is all togvarsel_notify ever sees.
 
 
 def togvarsel_rounds_for(date_str: str) -> dict[str, Any]:
@@ -1590,12 +1594,13 @@ def store_togvarsel_rounds(date_str: str, markers: Mapping[str, Any]) -> None:
 
     Every OTHER date is pruned: markers dedup rounds and seed follow-up baselines for one day
     only, so the first write after midnight is what forgets yesterday. Persistence is
-    :func:`_save_state`'s best-effort write-through -- a failure there is logged, never raised, so
-    the in-memory markers still dedup this process and the cost of a lost write is bounded by the
-    next restart re-evaluating inside the timeliness window."""
+    :func:`varsel_state.save_rounds`' best-effort write-through -- the whole state blob under the
+    blob backend, one Firestore document under the store -- and a failure there is logged, never
+    raised, so the in-memory markers still dedup this process and the cost of a lost write is
+    bounded by the next restart re-evaluating inside the timeliness window."""
     with _state_lock:
         varsel_state.store_rounds(date_str, markers)
-        _save_state()
+        varsel_state.save_rounds()
 
 
 def journeys_snapshot() -> dict[str, dict]:
