@@ -324,6 +324,23 @@ class EmitReport:
     run_clear_capped: int = 0
     run_clear_error: int = 0
     timed_out: bool = False
+    #: The alert ids this pass MINTED a revision for, in completion order. U9 step 5's seam for
+    #: U16, which puts the webhook channel's own work into the decision log.
+    #:
+    #: **On the report and never on a module global**, which is `varsel.PassOutcome`'s rule and for
+    #: its reason: a leaked half-cycle ledger reads exactly like the give-up bug every other pass
+    #: in this repository is swept to avoid, and it would need registering in two stale sweeps to
+    #: be safe.
+    #:
+    #: Two things U16 has to decide rather than inherit, both stated here so neither is discovered.
+    #: The ORDER is which transaction finished first, not which was submitted, so it carries no
+    #: meaning beyond membership. And this pass runs AFTER `_record_decisions` -- KTD6 puts every
+    #: client step after the cycle's two durable writes, deliberately -- so a cycle's ledger cannot
+    #: reach that cycle's rows; it reaches the next one's, or the row has to be written somewhere
+    #: else. The grain is also not the decision log's: an alert id is per (subscription, train)
+    #: while a decision row is per (definition, situation, departure), so U16 needs a mapping this
+    #: does not carry.
+    minted: tuple[str, ...] = ()
     #: Transactions still in flight when the collection's deadline passed, walked away from rather
     #: than waited on -- a transactional commit carries no client-side deadline, so waiting would
     #: hold the pass lock on a hung store and refuse every later cycle. An abandoned transaction
@@ -484,6 +501,26 @@ def _skip_reason_for(
     if stored_phase in (None, notification_store.PHASE_WITHDRAWN):
         return "nothing_standing"
     return None
+
+
+class _Ledger:
+    """The alert ids a pass minted, appended by the workers as they commit.
+
+    Its own structure rather than a key on :class:`_Counts` because it is not a count: it is the
+    pass's own record of what it wrote, and `EmitReport.minted` is where it goes.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._minted: list[str] = []
+
+    def add(self, alert_id: str) -> None:
+        with self._lock:
+            self._minted.append(alert_id)
+
+    def frozen(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._minted)
 
 
 class _Counts:
@@ -841,6 +878,7 @@ def _run_pass(
 ) -> EmitReport:
     """:func:`_run` without the lock, so the lock's release cannot depend on any of this."""
     counts = _Counts()
+    ledger_of_mints = _Ledger()
     deadline = monotonic() + deadline_s
     budget = _EmitBudget(max_calls, deadline, worst_case_s)
     standing = _standing(
@@ -929,6 +967,8 @@ def _run_pass(
         # status wrote no delivery at all.
         if commit.status != "created" or commit.superseded_delivery_id:
             ledger.refund(recipient.destination_id)
+        if commit.status == "created":
+            ledger_of_mints.add(commit.alert_id)
         if commit.status == "created" and commit.event_type == notification_store.EVENT_WITHDRAWN:
             counts.add("withdrawn")
             return
@@ -1074,6 +1114,7 @@ def _run_pass(
         run_clear_capped=counts.get("run_clear_capped"),
         run_clear_error=counts.get("run_clear_error"),
         abandoned=counts.get("abandoned"),
+        minted=ledger_of_mints.frozen(),
     )
 
 

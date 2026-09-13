@@ -3174,24 +3174,14 @@ def commit_event(
         lambda txn: _emit_body(txn, refs, request=request, now=instant, seed=seed)
     )
     _mirror_subject(commit.subject_state)
-    if commit.status == "created":
-        logger.info(
-            "Notification event %s revision %d (%s)",
-            commit.event_id,
-            commit.revision,
-            commit.event_type,
-            extra={
-                "fields": {
-                    "event": "notification_event",
-                    "result": commit.event_type,
-                    "client_id": request.client_id,
-                    "destination_id": request.destination_id,
-                    "alert_id": commit.alert_id,
-                    "revision": commit.revision,
-                    "superseded": bool(commit.superseded_delivery_id),
-                }
-            },
-        )
+    # **NO PER-EVENT RECORD SINCE U9**, and it was `event="notification_event"` at INFO, one line
+    # per committed revision with the client, the destination, the alert id and the revision on it.
+    # At the pilot's few hundred events a day that was the right grain; at a widened pass it is
+    # 20 000 lines a cycle and ~300 cycles a day, which is a logging bill and a summary nobody can
+    # read. What replaces it is `notification_emit`, one record per cycle carrying the counts --
+    # and the events themselves, which are documents in Firestore rather than lines in a log, so
+    # nothing that was durable was lost. A question about ONE client still starts at the per-failure
+    # records, which carry `client_id` and never went away.
     return commit
 
 
